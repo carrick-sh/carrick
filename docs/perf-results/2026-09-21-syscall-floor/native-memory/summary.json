@@ -1,0 +1,188 @@
+[
+  {
+    "operation": "Invalid add/remove pair",
+    "phase": 0,
+    "n": 65536,
+    "old_native_ns": 463.3973388671875,
+    "old_native_invocation_medians": [
+      443.09043884277344,
+      463.3973388671875,
+      464.00132751464844
+    ],
+    "native_ns": 474.12171936035156,
+    "native_invocation_medians": [
+      472.1565246582031,
+      474.12171936035156,
+      493.32110595703125
+    ],
+    "hvf_ns": 2883.0076751708984,
+    "hvf_invocation_medians": [
+      2853.7158966064453,
+      2883.0076751708984,
+      2901.5801696777344
+    ],
+    "linux_ns": 239.3983154296875,
+    "linux_invocation_medians": [
+      240.44354248046875,
+      239.3983154296875,
+      238.4815216064453
+    ],
+    "native_linux_ratio": 1.9804722456353436,
+    "old_new_speedup": 0.9773805331938124
+  },
+  {
+    "operation": "Two unchanged-watch adds",
+    "phase": 1,
+    "n": 65536,
+    "old_native_ns": 705.5238037109375,
+    "old_native_invocation_medians": [
+      705.5238037109375,
+      711.0830993652344,
+      695.1611938476562
+    ],
+    "native_ns": 697.0748901367188,
+    "native_invocation_medians": [
+      697.0748901367188,
+      673.2667388916016,
+      706.9091796875
+    ],
+    "hvf_ns": 3415.0829315185547,
+    "hvf_invocation_medians": [
+      3368.7305450439453,
+      3415.0829315185547,
+      3454.164505004883
+    ],
+    "linux_ns": 492.4113006591797,
+    "linux_invocation_medians": [
+      487.74273681640625,
+      499.67510986328125,
+      492.4113006591797
+    ],
+    "native_linux_ratio": 1.4156354437917258,
+    "old_new_speedup": 1.0121205249159981
+  },
+  {
+    "operation": "Fresh watch churn",
+    "phase": 2,
+    "n": 128,
+    "old_native_ns": 698.2421875,
+    "old_native_invocation_medians": [
+      698.2421875,
+      708.0078125,
+      689.125
+    ],
+    "native_ns": 693.359375,
+    "native_invocation_medians": [
+      722.65625,
+      693.359375,
+      681.96875
+    ],
+    "hvf_ns": 3516.9296875,
+    "hvf_invocation_medians": [
+      3461.9140625,
+      3516.9296875,
+      3555.3359375
+    ],
+    "linux_ns": 1123.375,
+    "linux_invocation_medians": [
+      1199.875,
+      1057.6171875,
+      1123.375
+    ],
+    "native_linux_ratio": 0.6172109714031379,
+    "old_new_speedup": 1.0070422535211268
+  },
+  {
+    "operation": "Churn growing into overflow",
+    "phase": 2,
+    "n": 65536,
+    "old_native_ns": 724.7149047851562,
+    "old_native_invocation_medians": [
+      713.1067962646484,
+      733.5402221679688,
+      724.7149047851562
+    ],
+    "native_ns": 727.8741149902344,
+    "native_invocation_medians": [
+      724.2527008056641,
+      732.5299530029297,
+      727.8741149902344
+    ],
+    "hvf_ns": 3329.6356201171875,
+    "hvf_invocation_medians": [
+      3329.6356201171875,
+      3331.48828125,
+      3313.028335571289
+    ],
+    "linux_ns": 865.8103942871094,
+    "linux_invocation_medians": [
+      856.4796447753906,
+      865.8103942871094,
+      866.1282806396484
+    ],
+    "native_linux_ratio": 0.8406853507338071,
+    "old_new_speedup": 0.995659675017952
+  },
+  {
+    "operation": "Integer loop",
+    "phase": 3,
+    "n": 65536,
+    "old_native_ns": 2.1419525146484375,
+    "old_native_invocation_medians": [
+      2.2112579345703125,
+      2.1419525146484375,
+      2.0847320556640625
+    ],
+    "native_ns": 2.211883544921875,
+    "native_invocation_medians": [
+      2.2068023681640625,
+      2.5189666748046875,
+      2.211883544921875
+    ],
+    "hvf_ns": 0.5098876953125,
+    "hvf_invocation_medians": [
+      0.5098876953125,
+      0.5099029541015625,
+      0.5092620849609375
+    ],
+    "linux_ns": 0.6097259521484375,
+    "linux_invocation_medians": [
+      0.6097259521484375,
+      0.607177734375,
+      0.628143310546875
+    ],
+    "native_linux_ratio": 3.627668360069071,
+    "old_new_speedup": 0.968383945694615
+  },
+  {
+    "operation": "Load/increment/store loop",
+    "phase": 4,
+    "n": 65536,
+    "old_native_ns": 151.9184112548828,
+    "old_native_invocation_medians": [
+      148.2391357421875,
+      153.10606384277344,
+      151.9184112548828
+    ],
+    "native_ns": 2.1158905029296875,
+    "native_invocation_medians": [
+      2.10888671875,
+      2.1158905029296875,
+      2.3275909423828125
+    ],
+    "hvf_ns": 1.204803466796875,
+    "hvf_invocation_medians": [
+      1.2041778564453125,
+      1.204803466796875,
+      1.206085205078125
+    ],
+    "linux_ns": 1.379638671875,
+    "linux_invocation_medians": [
+      1.2607574462890625,
+      1.379638671875,
+      1.3834686279296875
+    ],
+    "native_linux_ratio": 1.5336555476906741,
+    "old_new_speedup": 71.7988057721015
+  }
+]

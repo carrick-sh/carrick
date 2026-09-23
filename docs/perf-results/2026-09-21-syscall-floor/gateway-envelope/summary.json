@@ -1,0 +1,38 @@
+{
+  "1": {
+    "getpid": {
+      "direct_callback": 66.10146,
+      "gateway": 87.24771,
+      "paired_block_deltas_ns": [
+        18.382915000000004,
+        30.921875000000007
+      ]
+    },
+    "fstat": {
+      "direct_callback": 516.7558349999999,
+      "gateway": 534.211875,
+      "paired_block_deltas_ns": [
+        11.227295000000026,
+        23.001249999999914
+      ]
+    }
+  },
+  "2": {
+    "getpid": {
+      "direct_callback": 66.082085,
+      "gateway": 81.996245,
+      "paired_block_deltas_ns": [
+        14.854579999999991,
+        16.110625
+      ]
+    },
+    "fstat": {
+      "direct_callback": 521.841045,
+      "gateway": 545.14625,
+      "paired_block_deltas_ns": [
+        21.47145999999998,
+        24.79957999999999
+      ]
+    }
+  }
+}

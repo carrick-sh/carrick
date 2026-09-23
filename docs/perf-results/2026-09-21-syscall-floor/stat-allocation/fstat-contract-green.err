@@ -1,0 +1,1 @@
+Error: ScalingViolation { contract: ContractId("kernel.fs.stat-allocation"), metric: HostHeapAllocations, scale: 1, actual: 1, maximum: 0 }

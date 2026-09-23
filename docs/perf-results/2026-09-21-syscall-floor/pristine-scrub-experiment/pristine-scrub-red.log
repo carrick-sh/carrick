@@ -1,0 +1,136 @@
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling toml_edit v0.22.27
+   Compiling toml v0.8.23
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.15s
+     Running unittests src/lib.rs (target/debug/deps/carrick_aarch64-48d6ab17930721f6)
+
+running 2 tests
+test engine::pristine_scrub::tests::scrub_requires_complete_pristine_authority_and_preserves_errors ... ok
+[
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.pristine-scrub",
+        ),
+        layer: VmFree,
+        implementation_revision: "source-default-hasher:e74b4cc211c18f83",
+        fixture_identity: "unit:pristine-scrub",
+        scale: 1,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "pristine_provenance_preserved",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 1,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.pristine-scrub",
+        ),
+        layer: VmFree,
+        implementation_revision: "source-default-hasher:e74b4cc211c18f83",
+        fixture_identity: "unit:pristine-scrub",
+        scale: 8,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "pristine_provenance_preserved",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 1,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.pristine-scrub",
+        ),
+        layer: VmFree,
+        implementation_revision: "source-default-hasher:e74b4cc211c18f83",
+        fixture_identity: "unit:pristine-scrub",
+        scale: 32,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "pristine_provenance_preserved",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 1,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.pristine-scrub",
+        ),
+        layer: VmFree,
+        implementation_revision: "source-default-hasher:e74b4cc211c18f83",
+        fixture_identity: "unit:pristine-scrub",
+        scale: 128,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "pristine_provenance_preserved",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 1,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+]
+
+thread 'engine::pristine_scrub::tests::pristine_scrub_contract' (3110252) panicked at crates/carrick-aarch64/src/pristine_scrub.rs:55:88:
+called `Result::unwrap()` on an `Err` value: ScalingViolation { contract: ContractId("kernel.mm.pristine-scrub"), metric: HostBackendCalls, scale: 1, actual: 1, maximum: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test engine::pristine_scrub::tests::pristine_scrub_contract ... FAILED
+
+failures:
+
+failures:
+    engine::pristine_scrub::tests::pristine_scrub_contract
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p carrick-aarch64 --lib`

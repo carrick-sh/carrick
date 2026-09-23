@@ -1,0 +1,37 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.22s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-207122e8ce47be2c)
+
+running 29 tests
+test kernel::mm_access::tests::an_uninitialized_context_cannot_supply_execution_authority ... ok
+test kernel::mm_access::tests::cow_broken_is_stale_after_any_revision_or_owner_generation_changes ... ok
+test kernel::mm_access::tests::cow_broken_type_invariants_and_guard_containment ... ok
+test kernel::mm_access::tests::current_mm_rejects_another_threads_execution_lease ... ok
+test kernel::mm_access::tests::current_mm_rejects_same_identity_lease_from_another_kernel ... ok
+test kernel::mm_access::tests::current_mm_rejects_scheduler_authority_for_a_different_mm ... ok
+test kernel::mm_access::tests::execution_mm_validation_does_not_snapshot_mappings ... ok
+test kernel::mm_access::tests::foreign_cow_one_compound_authorizes_sequential_subrange_writes_through_runtime_facade ... ok
+test kernel::mm_access::tests::foreign_cow_rejects_genuine_proof_with_inflated_semantic_span ... ok
+test kernel::mm_access::tests::foreign_cow_rejects_internally_consistent_transport_forgery ... ok
+test kernel::mm_access::tests::foreign_cow_rejects_receipts_with_any_advanced_revision_domain ... ok
+test kernel::mm_access::tests::foreign_cow_rejects_wrong_mapping_frame_physical_range_and_current_owner ... ok
+test kernel::mm_access::tests::foreign_cow_write_separates_copied_parent_and_child_at_the_same_va ... ok
+test kernel::mm_access::tests::foreign_mm_rejects_a_churning_backend_snapshot ... ok
+test kernel::mm_access::tests::foreign_mm_rejects_another_threads_execution_lease ... ok
+test kernel::mm_access::tests::foreign_mm_rejects_same_identity_lease_from_another_kernel ... ok
+test kernel::mm_access::tests::foreign_write_no_fault_control_commits_exact_bytes_and_records_phase_counters ... ok
+test kernel::mm_access::tests::foreign_write_receipt_rejection_cannot_follow_target_mutation ... ok
+test kernel::mm_access::tests::foreign_write_revision_recheck_cannot_follow_target_mutation ... ok
+test kernel::mm_access::tests::foreign_write_transport_error_cannot_follow_target_mutation ... ok
+test kernel::mm_access::tests::instruction_fetch_borrows_exact_lease_and_detects_revision_changes ... ok
+test kernel::mm_access::tests::instruction_fetch_rejects_readable_non_executable_memory ... ok
+test kernel::mm_access::tests::mm_access_authority_enforces_one_overall_deadline_across_attempts ... ok
+test kernel::mm_access::tests::mm_access_authority_exhausts_a_fixed_retry_budget ... ok
+test kernel::mm_access::tests::mm_access_authority_rejects_nonempty_reads_without_owner_generations ... ok
+test kernel::mm_access::tests::mm_access_authority_retries_from_a_fresh_snapshot_and_authenticates_receipt ... ok
+test kernel::mm_access::tests::retained_foreign_token_keeps_the_exact_mm_across_target_exec_and_retirement ... ok
+test kernel::mm_access::tests::stale_task_key_is_rejected_after_pid_reuse ... ok
+test kernel::mm_access::tests::token_bound_ranges_require_permissions_and_complete_vma_coverage ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 2166 filtered out; finished in 0.08s
+

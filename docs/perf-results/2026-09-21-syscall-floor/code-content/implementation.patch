@@ -1,0 +1,1335 @@
+--- a/conformance-contracts/inventory.json
++++ b/conformance-contracts/inventory.json
+@@ -1598,7 +1598,9 @@
+       "support": "bring_up",
+       "handler": "process",
+       "authority": "guest",
+-      "contracts": [],
++      "contracts": [
++        "kernel.mm.native-code-content"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"
+@@ -3423,7 +3425,9 @@
+       "support": "bring_up",
+       "handler": "process",
+       "authority": "guest",
+-      "contracts": [],
++      "contracts": [
++        "kernel.mm.native-code-content"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"
+--- a/conformance-contracts/surfaces.toml
++++ b/conformance-contracts/surfaces.toml
+@@ -2,7 +2,7 @@
+ 
+ [[surfaces]]
+ path = "crates/carrick-observability/src/work_meter.rs"
+-contracts = ["hvpatch.syscall.portal", "kernel.execution.native-code-density"]
++contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.execution.native-code-density"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-mem/src/memory.rs"
+@@ -284,3 +284,35 @@
+ [[surfaces]]
+ path = "experiments/native-syscall-slice/src/lib.rs"
+ contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.execution.native-synchronous-syscall"]
++
++[[surfaces]]
++path = "crates/carrick-vmm-hvf/src/trap/code_content.rs"
++contracts = ["kernel.mm.native-code-content"]
++
++[[surfaces]]
++path = "crates/carrick-vmm-hvf/src/trap/global_frame.rs"
++contracts = ["kernel.mm.native-code-content"]
++
++[[surfaces]]
++path = "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs"
++contracts = ["kernel.mm.native-code-content"]
++
++[[surfaces]]
++path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/instruction_read.rs"
++contracts = ["kernel.mm.native-code-content"]
++
++[[surfaces]]
++path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs"
++contracts = ["kernel.mm.native-code-content"]
++
++[[surfaces]]
++path = "crates/carrick-hal/src/foreign_mm.rs"
++contracts = ["kernel.mm.native-code-content"]
++
++[[surfaces]]
++path = "crates/carrick-kernel/src/kernel/mm_access.rs"
++contracts = ["kernel.mm.native-code-content"]
++
++[[surfaces]]
++path = "crates/carrick-runtime/src/vcpu_loop/memory.rs"
++contracts = ["kernel.mm.native-code-content"]
+--- a/crates/carrick-hal/src/foreign_mm.rs
++++ b/crates/carrick-hal/src/foreign_mm.rs
+@@ -430,11 +430,24 @@
+     ) -> Result<(), ForeignMmTransportError>;
+ }
+ 
++/// Content status for participating carrier host writes only. No variant grants
++/// native execution: hardware stores, mapping/alias admission and executor drain
++/// require separate publication authority.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ForeignInstructionContentStatus {
++    Untracked,
++    UnchangedTrackedWrites,
++    Changed,
++}
++
+ /// Authenticated completion. Concrete receipts stay private to transports.
+ pub trait ForeignMmReadReceipt: Debug + Send + Sync {
+     fn bytes_read(&self) -> usize;
+     fn owner_generations(&self) -> &[ForeignOwnerGeneration];
+     fn authenticates(&self, snapshot: &dyn ForeignMmSnapshot) -> bool;
++    fn instruction_content_status(&self) -> ForeignInstructionContentStatus {
++        ForeignInstructionContentStatus::Untracked
++    }
+ }
+ 
+ /// Backend completion data for one exact post-COW compound. Implementations
+@@ -549,11 +562,18 @@
+         Err(ForeignMmTransportError::AuthorityUnavailable)
+     }
+ 
++    /// End the current bounded pointer access before retaining this span for
++    /// reuse. The kernel calls this on active-grant drop and when converting a
++    /// mutation-scoped grant to a prepared window. A later access must establish
++    /// writer admission again. Dropping the span must also end any access.
++    fn finish_native_access(&mut self) {}
++
+     /// # Safety
+     /// Retain either exact MM exclusion plus the COW witness, or an exact-MM
+     /// native execution scope with successful live activation in that scope.
+-    /// Access only the granted range, never after this span or authority drops,
+-    /// and do not re-enter kernel mutation/dispatch while using the pointer.
++    /// Access only the granted range, never after finish_native_access or after
++    /// this span or authority drops, and do not re-enter kernel mutation/dispatch
++    /// while using the pointer.
+     unsafe fn as_mut_ptr(&mut self) -> *mut u8;
+ }
+ 
+@@ -597,6 +617,21 @@
+         dst: &mut [u8],
+         deadline: Instant,
+     ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError>;
++
++    /// Instruction setup can retain backing-content dependencies when the
++    /// backend mediates writes. The default read remains explicitly Untracked.
++    /// The kernel, not this receipt, authenticates executable VMA permission.
++    fn read_instructions(
++        &self,
++        invocation: &ForeignMmInvocation,
++        authority: &dyn ForeignMmLiveAuthority,
++        snapshot: &dyn ForeignMmSnapshot,
++        va: GuestVa,
++        dst: &mut [u8],
++        deadline: Instant,
++    ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
++        self.read(invocation, authority, snapshot, va, dst, deadline)
++    }
+ 
+     #[allow(clippy::too_many_arguments)] // Object-safe transport carries exact mutation domains.
+     fn break_cow(
+@@ -792,6 +827,24 @@
+         let invocation = ForeignMmInvocation { _private: () };
+         self.lease
+             .read(&invocation, authority, snapshot, va, dst, deadline)
++    }
++
++    pub fn read_instructions(
++        &self,
++        authority: &dyn ForeignMmLiveAuthority,
++        snapshot: &dyn ForeignMmSnapshot,
++        va: GuestVa,
++        dst: &mut [u8],
++        deadline: Instant,
++    ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
++        self.lease.read_instructions(
++            &ForeignMmInvocation { _private: () },
++            authority,
++            snapshot,
++            va,
++            dst,
++            deadline,
++        )
+     }
+ 
+     pub fn break_cow(
+--- a/crates/carrick-kernel/src/kernel/mm_access.rs
++++ b/crates/carrick-kernel/src/kernel/mm_access.rs
+@@ -1234,6 +1234,10 @@
+     StaleInstructionRead,
+     #[error("instruction fetch must contain at least one byte")]
+     EmptyInstructionRead,
++    #[error("instruction bytes changed through a tracked carrier host writer")]
++    StaleInstructionContent,
++    #[error("instruction transport does not track backing content writes")]
++    UntrackedInstructionContent,
+     #[error("guest address {address:?} is not readable in this MM")]
+     ReadDenied { address: GuestVa },
+     #[error("guest address {address:?} is not writable in this MM")]
+@@ -1332,7 +1336,8 @@
+     /// Retain an opaque pin beyond this COW transaction. This consumes the
+     /// mutation-scoped pointer grant; only activation under a new execution
+     /// scope can restore pointer access. Preparation itself grants no access.
+-    pub fn prepare_for_execution(self) -> PreparedNativeData {
++    pub fn prepare_for_execution(mut self) -> PreparedNativeData {
++        self.transport.finish_native_access();
+         PreparedNativeData {
+             transport: self.transport,
+             token: self._witness.range.token.clone(),
+@@ -1571,6 +1576,12 @@
+     }
+ }
+ 
++impl Drop for ActiveNativeData<'_, '_> {
++    fn drop(&mut self) {
++        self.prepared.transport.finish_native_access();
++    }
++}
++
+ #[cfg(test)]
+ mod native_data_type_tests {
+     use super::{ActiveNativeData, CurrentNativeData, PreparedNativeData};
+@@ -1583,8 +1594,10 @@
+ ///
+ /// This retains the exact execution lease borrow for decoding. Mapping
+ /// validation detects topology/permission/backing changes, but does NOT detect
+-/// every in-place executable write and is NOT a code-cache publication permit.
+-/// A translator must add write invalidation and atomic publication authority
++/// every in-place executable write. The retained receipt additionally detects
++/// participating carrier host writes; untracked transports and deferred bytes
++/// explicitly decline that check. Neither check grants code-cache publication.
++/// A translator must mediate all writers and obtain atomic publication authority
+ /// before executing emitted code from these bytes.
+ pub struct InstructionRead<'execution> {
+     context: &'execution KernelContext,
+@@ -1592,9 +1605,26 @@
+     mm: Arc<Mm>,
+     snapshot: ProjectedForeignMmSnapshot,
+     bytes: Vec<u8>,
++    receipt: Box<dyn carrick_hal::ForeignMmReadReceipt>,
+ }
+ 
+ impl InstructionRead<'_> {
++    /// Reject mapping changes and participating host writes since capture.
++    /// Success is NOT a native execution/publication permit: mediation of guest
++    /// stores and all writers, alias admission, and active-code drain remain
++    /// separate obligations. An uninstrumented transport is never a success.
++    pub fn validate_tracked_content(&self) -> Result<(), MmAccessError> {
++        use carrick_hal::foreign_mm::ForeignInstructionContentStatus;
++        self.validate_mapping()?;
++        match self.receipt.instruction_content_status() {
++            ForeignInstructionContentStatus::UnchangedTrackedWrites => Ok(()),
++            ForeignInstructionContentStatus::Changed => Err(MmAccessError::StaleInstructionContent),
++            ForeignInstructionContentStatus::Untracked => {
++                Err(MmAccessError::UntrackedInstructionContent)
++            }
++        }
++    }
++
+     pub fn bytes(&self) -> &[u8] {
+         &self.bytes
+     }
+@@ -1640,7 +1670,7 @@
+         };
+         let mut bytes = vec![0; len.get()];
+         let receipt = lease
+-            .read(&live, &snapshot, start, &mut bytes, deadline)
++            .read_instructions(&live, &snapshot, start, &mut bytes, deadline)
+             .map_err(MmAccessError::ForeignTransport)?;
+         if !receipt.authenticates(&snapshot)
+             || receipt.bytes_read() != bytes.len()
+@@ -1654,6 +1684,7 @@
+             mm,
+             snapshot,
+             bytes,
++            receipt,
+         };
+         read.validate_mapping()?;
+         Ok(read)
+@@ -2549,6 +2580,10 @@
+                 .unwrap();
+             assert_eq!(read.bytes(), b"root");
+             read.validate_mapping().unwrap();
++            assert!(matches!(
++                read.validate_tracked_content(),
++                Err(MmAccessError::UntrackedInstructionContent)
++            ));
+             backend.advance(domain);
+             assert!(matches!(
+                 read.validate_mapping(),
+--- a/crates/carrick-observability/src/work_meter.rs
++++ b/crates/carrick-observability/src/work_meter.rs
+@@ -78,6 +78,8 @@
+     NativeDataActivations,
+     /// AArch64 instruction words emitted into a native translation publication.
+     NativeCodeWords,
++    /// Subscribed physical code pages visited by byte-write invalidation.
++    NativeCodeInvalidationPages,
+     /// Full kernel MM snapshots collected in the operation window.
+     MmSnapshotCollections,
+     /// Physical backing owner pins acquired in the operation window.
+@@ -85,7 +87,7 @@
+ }
+ 
+ impl WorkMetric {
+-    pub const COUNT: usize = 39;
++    pub const COUNT: usize = 40;
+     pub const ALL: [WorkMetric; Self::COUNT] = [
+         Self::KernelDispatches,
+         Self::KernelRedispatches,
+@@ -124,6 +126,7 @@
+         Self::NativeActivationLeafChecks,
+         Self::NativeDataActivations,
+         Self::NativeCodeWords,
++        Self::NativeCodeInvalidationPages,
+         Self::MmSnapshotCollections,
+         Self::ForeignOwnerPins,
+     ];
+--- a/crates/carrick-runtime/src/vcpu_loop/memory.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/memory.rs
+@@ -1153,6 +1153,7 @@
+             .expect("kernel-authorized execute-only fetch through production carrier");
+         assert_eq!(read.bytes(), b"same");
+         read.validate_mapping().unwrap();
++        read.validate_tracked_content().unwrap();
+         // Data-read authority must not inherit the instruction permission.
+         let current = fixture.child.current_mm(&execution).unwrap();
+         use carrick_kernel::kernel::mm_access::MmAccessTarget;
+@@ -1649,6 +1650,37 @@
+             }
+         }
+         assert_eq!(completed, 169);
++        // The prepared window is still retained, but every active pointer
++        // grant has ended. Making these fixture bytes executable must allow a
++        // fresh tracked read; a writer leaked past ActiveNativeData::drop would
++        // refuse it even though no native code is running.
++        fixture.dispatch_mm.set_foreign_cow_vma_access_for_test(
++            carrick_kernel::kernel::VmaAccess {
++                readable: false,
++                writable: false,
++                executable: true,
++                kernel_visible: true,
++            },
++        );
++        let captured = fixture
++            .child
++            .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4)
++            .unwrap();
++        captured.validate_tracked_content().unwrap();
++        assert_eq!(
++            captured.bytes(),
++            &(u32::from_le_bytes(*b"same") + completed).to_le_bytes()
++        );
++        drop(captured);
++        // The final foreign data read retains its original readable-VMA check.
++        fixture.dispatch_mm.set_foreign_cow_vma_access_for_test(
++            carrick_kernel::kernel::VmaAccess {
++                readable: true,
++                writable: true,
++                executable: false,
++                kernel_visible: true,
++            },
++        );
+         drop(executor);
+         fixture
+             .child
+--- a/crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs
++++ b/crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs
+@@ -801,6 +801,23 @@
+     let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(transport.clone()));
+     let lease = endpoint.retain(&installed.snapshot, deadline)?;
+     lease.read(
++        &installed.live,
++        &installed.snapshot,
++        GuestVa(TEST_VA),
++        dst,
++        deadline,
++    )
++}
++
++fn read_instructions_installed(
++    transport: &CarrierForeignMmTransport,
++    installed: &InstalledMm,
++    dst: &mut [u8],
++) -> Result<Box<dyn carrick_hal::ForeignMmReadReceipt>, carrick_hal::ForeignMmTransportError> {
++    let deadline = Instant::now() + Duration::from_secs(1);
++    let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(transport.clone()));
++    let lease = endpoint.retain(&installed.snapshot, deadline)?;
++    lease.read_instructions(
+         &installed.live,
+         &installed.snapshot,
+         GuestVa(TEST_VA),
+@@ -2210,10 +2227,14 @@
+     make_execute_only(&mut second, OWNER_LEN);
+     for (installed, expected) in [(&first, b"code"), (&second, b"else")] {
+         let mut bytes = [0; 4];
+-        let receipt = read_installed(&transport, installed, &mut bytes).unwrap();
++        let receipt = read_instructions_installed(&transport, installed, &mut bytes).unwrap();
+         assert_eq!(&bytes, expected);
+         assert!(receipt.authenticates(&installed.snapshot));
+         assert!(!receipt.owner_generations().is_empty());
++        assert_eq!(
++            receipt.instruction_content_status(),
++            carrick_hal::foreign_mm::ForeignInstructionContentStatus::UnchangedTrackedWrites
++        );
+     }
+ }
+ 
+@@ -2233,18 +2254,24 @@
+     );
+     make_execute_only(&mut installed, len);
+     let mut bytes = vec![0xaa; len];
+-    let receipt = read_installed(&transport, &installed, &mut bytes)
++    let receipt = read_instructions_installed(&transport, &installed, &mut bytes)
+         .expect("fetch executable sparse backing without granting readable permission");
+     assert_eq!(&bytes[..4], b"code");
+     assert!(bytes[4..].iter().all(|byte| *byte == 0));
+     assert_eq!(receipt.bytes_read(), len);
+     assert!(receipt.authenticates(&installed.snapshot));
+     assert!(!receipt.owner_generations().is_empty());
++    assert_eq!(
++        receipt.instruction_content_status(),
++        carrick_hal::foreign_mm::ForeignInstructionContentStatus::Untracked
++    );
+     // Losing the recipe must not silently manufacture executable zero bytes.
+     *installed.state.deferred_anonymous.write() = None;
+-    assert!(matches!(read_installed(&transport, &installed, &mut bytes),
++    assert!(
++        matches!(read_instructions_installed(&transport, &installed, &mut bytes),
+         Err(carrick_hal::ForeignMmTransportError::Translation(va))
+-            if va == GuestVa(TEST_VA + OWNER_LEN as u64)));
++            if va == GuestVa(TEST_VA + OWNER_LEN as u64))
++    );
+ }
+ 
+ #[test]
+@@ -9241,3 +9268,185 @@
+     )
+     .unwrap();
+ }
++
++#[test]
++fn native_code_content_foreign_write_revokes_backing_dependencies() {
++    let _guard = FOREIGN_MM_TEST_LOCK.lock();
++    let transport = CarrierForeignMmTransport::new();
++    let mut child = install_mm(
++        &transport,
++        198,
++        0x9a00_6100_0000,
++        0x9b00_6100_0000,
++        *b"old!",
++    );
++    let (_authority, lease, mut invalidator) = prepare_foreign_cow(&child);
++    let old_key = child.owners.0[1];
++    let deadline = Instant::now() + Duration::from_secs(1);
++    let cow = lease
++        .break_cow(
++            &mut invalidator,
++            &child.snapshot,
++            GuestVa(TEST_VA),
++            4,
++            deadline,
++        )
++        .unwrap();
++    let post = child.live.0.read().clone();
++    let new_key = (cow.physical_base().raw(), cow.physical_len());
++    child.owners.0.push(new_key);
++    let old_owner = global_frame_host_owners().lock()[&old_key].owner().clone();
++    let new_owner = global_frame_host_owners().lock()[&new_key].owner().clone();
++    let source = old_owner.mapping.code_content.observe(0, 4).unwrap();
++    let first_alias = new_owner.mapping.code_content.observe(0, 4).unwrap();
++    let second_alias = new_owner.mapping.code_content.observe(0, 4).unwrap();
++    let other_page = new_owner.mapping.code_content.observe(4096, 4).unwrap();
++    let mut captured = [0; 4];
++    let instruction = lease
++        .read_instructions(
++            &child.live,
++            &post,
++            GuestVa(TEST_VA),
++            &mut captured,
++            deadline,
++        )
++        .unwrap();
++    use carrick_hal::foreign_mm::ForeignInstructionContentStatus;
++    assert_eq!(captured, *b"old!");
++    assert_eq!(
++        instruction.instruction_content_status(),
++        ForeignInstructionContentStatus::UnchangedTrackedWrites
++    );
++    // The write mapping is non-executable. Physical dependencies must still
++    // revoke: checking only the target VA's executable flag misses RX aliases.
++    assert!(post.executable_ranges.is_empty());
++    lease
++        .prepare_write(
++            &child.live,
++            &post,
++            cow.as_ref(),
++            GuestVa(TEST_VA),
++            b"new!",
++            deadline,
++        )
++        .unwrap()
++        .commit();
++    assert_eq!(
++        unsafe { std::slice::from_raw_parts(new_owner.as_ptr(), 4) },
++        b"new!"
++    );
++    assert_eq!(
++        unsafe { std::slice::from_raw_parts(old_owner.as_ptr(), 4) },
++        b"old!"
++    );
++    assert!(source.is_current());
++    assert!(other_page.is_current());
++    assert!(
++        !first_alias.is_current(),
++        "committed byte write must revoke dependent translated bytes"
++    );
++    assert!(!second_alias.is_current());
++    assert_eq!(
++        instruction.instruction_content_status(),
++        ForeignInstructionContentStatus::Changed
++    );
++    assert!(
++        new_owner
++            .mapping
++            .code_content
++            .observe(0, 4)
++            .unwrap()
++            .is_current()
++    );
++}
++
++#[test]
++fn native_code_content_raw_data_pointer_revokes_and_blocks_observation() {
++    let _guard = FOREIGN_MM_TEST_LOCK.lock();
++    let transport = CarrierForeignMmTransport::new();
++    let mut installed = install_mm(
++        &transport,
++        199,
++        0x9a00_6300_0000,
++        0x9b00_6300_0000,
++        *b"old!",
++    );
++    let (_authority, lease, mut invalidator) = prepare_foreign_cow(&installed);
++    let deadline = Instant::now() + Duration::from_secs(1);
++    let cow = lease
++        .break_cow(
++            &mut invalidator,
++            &installed.snapshot,
++            GuestVa(TEST_VA),
++            4,
++            deadline,
++        )
++        .unwrap();
++    let key = (cow.physical_base().raw(), cow.physical_len());
++    installed.owners.0.push(key);
++    let post = installed.live.0.read().clone();
++    let owner = legacy_test_carrier_vm_custody()
++        .global_frame_host_owners
++        .lock()
++        .get(&key)
++        .unwrap()
++        .owner()
++        .clone();
++    let dependency = owner.mapping.code_content.observe(0, 4).unwrap();
++    let unrelated = owner.mapping.code_content.observe(4096, 4).unwrap();
++    let mut data = lease
++        .borrow_native_data(
++            &installed.live,
++            &post,
++            cow.as_ref(),
++            GuestVa(TEST_VA),
++            4,
++            deadline,
++        )
++        .unwrap();
++    // Preparing a retained window is not a write. Only pointer access admits a
++    // writer, and that admission lasts until this access grant ends.
++    assert!(dependency.is_current());
++    // SAFETY: the fixture retains the COW exclusion and authenticates this exact
++    // four-byte backing. The pointer never escapes its grant or this test.
++    unsafe { std::ptr::copy_nonoverlapping(b"new!".as_ptr(), data.as_mut_ptr(), 4) };
++    assert_eq!(
++        unsafe { std::slice::from_raw_parts(owner.ptr(), 4) },
++        b"new!"
++    );
++    assert!(
++        !dependency.is_current(),
++        "raw native write bypassed code dependency revocation"
++    );
++    assert!(unrelated.is_current());
++    assert!(matches!(
++        owner.mapping.code_content.observe(0, 4),
++        Err(super::super::code_content::ContentError::WriteInProgress)
++    ));
++    data.finish_native_access();
++    let fresh = owner.mapping.code_content.observe(0, 4).unwrap();
++    assert!(
++        fresh.is_current(),
++        "an inactive retained window is not a writer"
++    );
++    assert!(
++        !dependency.is_current(),
++        "ending access must not revive old code"
++    );
++    // Reusing the retained window must establish writer admission again.
++    unsafe { std::ptr::write(data.as_mut_ptr(), b'N') };
++    assert!(!fresh.is_current());
++    assert!(matches!(
++        owner.mapping.code_content.observe(0, 4),
++        Err(super::super::code_content::ContentError::WriteInProgress)
++    ));
++    drop(data);
++    assert!(
++        owner
++            .mapping
++            .code_content
++            .observe(0, 4)
++            .unwrap()
++            .is_current()
++    );
++}
+--- a/crates/carrick-vmm-hvf/src/trap/foreign_mm.rs
++++ b/crates/carrick-vmm-hvf/src/trap/foreign_mm.rs
+@@ -9,6 +9,8 @@
+ use super::*;
+ 
+ mod current_read;
++#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
++mod instruction_read;
+ 
+ /// Carrier-owned index of live HVPatch address spaces available to foreign-MM
+ /// operations. Entries retain only weak references: the kernel token keeps the
+@@ -1032,6 +1034,28 @@
+ #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+ impl carrick_hal::ForeignMmPreparedWrite for CarrierForeignPreparedWrite<'_> {
+     fn commit(self: Box<Self>) {
++        let owner = self._owner_pin.owner();
++        let offset = (self.dst_ptr as usize)
++            .checked_sub(owner.ptr() as usize)
++            .unwrap_or_else(|| {
++                carrick_fatal!(
++                    "hvf::code_content",
++                    "prepared copy precedes its authenticated owner"
++                )
++            });
++        // Backing-wide tracking deliberately ignores publish_instruction:
++        // a non-executable writable alias can change bytes translated via RX.
++        // Keep writer admission through copy and instruction-cache publication.
++        let _content_write = owner
++            .mapping
++            .code_content
++            .begin_write(offset, self.src.len())
++            .unwrap_or_else(|error| {
++                carrick_fatal!(
++                    "hvf::code_content",
++                    "prepared copy left its authenticated owner: {error:?}"
++                )
++            });
+         unsafe {
+             std::ptr::copy(self.src.as_ptr(), self.dst_ptr, self.src.len());
+             if self.publish_instruction {
+@@ -2348,6 +2372,7 @@
+ /// Only native grants retain carrier revalidation state. Ordinary prepared
+ /// copies keep the original pin/receipt path without additional Arc operations.
+ struct CarrierNativeDataSpan {
++    content_write: Option<super::code_content::ContentWrite<super::global_frame::OwnedCodeContent>>,
+     range: CarrierPinnedCowRange,
+     custody: std::sync::Arc<CarrierVmCustody>,
+     state: std::sync::Arc<MmAccessState>,
+@@ -2516,7 +2541,29 @@
+         }
+         Ok(())
+     }
++    fn finish_native_access(&mut self) {
++        self.content_write = None;
++    }
+     unsafe fn as_mut_ptr(&mut self) -> *mut u8 {
++        if self.content_write.is_none() {
++            let owner = self.range._owner_pin.owner();
++            let offset = (self.range.ptr as usize)
++                .checked_sub(owner.ptr() as usize)
++                .unwrap_or_else(|| {
++                    carrick_fatal!("hvf::code_content", "native pointer precedes pinned owner")
++                });
++            self.content_write = Some(
++                owner
++                    .mapping
++                    .begin_content_write(offset, self.range.len)
++                    .unwrap_or_else(|error| {
++                        carrick_fatal!(
++                            "hvf::code_content",
++                            "native pointer left pinned owner: {error:?}"
++                        )
++                    }),
++            );
++        }
+         self.range.ptr
+     }
+ }
+@@ -2679,6 +2726,19 @@
+ 
+ #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
++    fn read_instructions(
++        &self,
++        invocation: &carrick_hal::ForeignMmInvocation,
++        authority: &dyn carrick_hal::ForeignMmLiveAuthority,
++        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
++        va: carrick_guest_mem::GuestVa,
++        dst: &mut [u8],
++        deadline: std::time::Instant,
++    ) -> Result<Box<dyn carrick_hal::ForeignMmReadReceipt>, carrick_hal::ForeignMmTransportError>
++    {
++        instruction_read::read(self, invocation, authority, snapshot, va, dst, deadline)
++    }
++
+     fn prepare_read_window(
+         &self,
+         _invocation: &carrick_hal::ForeignMmInvocation,
+@@ -2966,6 +3026,7 @@
+         self.pin_cow_range(authority, snapshot, cow, start, len, deadline)
+             .map(|range| {
+                 Box::new(CarrierNativeDataSpan {
++                    content_write: None,
+                     validated_stage1: None,
+                     range,
+                     custody: std::sync::Arc::clone(&self.custody),
+--- a/crates/carrick-vmm-hvf/src/trap/global_frame.rs
++++ b/crates/carrick-vmm-hvf/src/trap/global_frame.rs
+@@ -386,17 +386,48 @@
+     }
+ }
+ 
++/// A content writer retains the existing physical owner rather than allocating
++/// a second shared tracker or keeping a self-reference inside a data span.
++#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
++#[derive(Debug)]
++pub(crate) struct OwnedCodeContent(std::sync::Arc<GlobalFrameSharedMapping>);
++
++#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
++impl std::ops::Deref for OwnedCodeContent {
++    type Target = super::code_content::CodeContent;
++    fn deref(&self) -> &Self::Target {
++        &self.0.code_content
++    }
++}
++
+ #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+ #[derive(Debug)]
+ pub(crate) struct GlobalFrameSharedMapping {
++    pub(crate) code_content: super::code_content::CodeContent,
+     backing: GlobalFrameBacking,
+     logical_pin_count: parking_lot::Mutex<u64>,
+ }
+ 
+ #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+ impl GlobalFrameSharedMapping {
++    pub(crate) fn begin_content_write(
++        self: &std::sync::Arc<Self>,
++        offset: usize,
++        len: usize,
++    ) -> Result<
++        super::code_content::ContentWrite<OwnedCodeContent>,
++        super::code_content::ContentError,
++    > {
++        super::code_content::ContentWrite::new(
++            OwnedCodeContent(std::sync::Arc::clone(self)),
++            offset,
++            len,
++        )
++    }
++
+     fn new(mapping: crate::host_mapping::OwnedHostMapping) -> Self {
+         Self {
++            code_content: super::code_content::CodeContent::new(mapping.len()),
+             backing: GlobalFrameBacking::Owned(mapping),
+             logical_pin_count: parking_lot::Mutex::new(0),
+         }
+@@ -404,6 +435,7 @@
+ 
+     fn from_pooled(handle: crate::frame_pool::PooledFrameHandle) -> Self {
+         Self {
++            code_content: super::code_content::CodeContent::new(handle.len()),
+             backing: GlobalFrameBacking::Pooled(handle),
+             logical_pin_count: parking_lot::Mutex::new(0),
+         }
+@@ -411,6 +443,7 @@
+ 
+     fn from_pooled_root(handle: crate::frame_pool::PooledRootSlotHandle) -> Self {
+         Self {
++            code_content: super::code_content::CodeContent::new(handle.len()),
+             backing: GlobalFrameBacking::PooledRoot(handle),
+             logical_pin_count: parking_lot::Mutex::new(0),
+         }
+--- a/crates/carrick-vmm-hvf/src/trap.rs
++++ b/crates/carrick-vmm-hvf/src/trap.rs
+@@ -180,6 +180,8 @@
+ use sysreg::*;
+ #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+ mod carrier_custody;
++#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
++mod code_content;
+ #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+ mod global_frame;
+ #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+--- /dev/null
++++ b/crates/carrick-vmm-hvf/src/trap/code_content.rs
+@@ -0,0 +1,402 @@
++//! Physical-backing content dependencies for translation setup.
++//!
++//! These witnesses detect participating host writes. They are NOT permission
++//! to execute translated code: guest stores, alias admission, mapping changes,
++//! active-executor drain and link publication require separate authority.
++//! A page identity is never revived after a write or backing retirement.
++use parking_lot::Mutex;
++use std::{
++    collections::BTreeMap,
++    ops::{Deref, RangeInclusive},
++    sync::{
++        Arc, OnceLock, Weak,
++        atomic::{AtomicBool, AtomicUsize, Ordering},
++    },
++};
++
++const PAGE_SHIFT: usize = 12;
++
++#[derive(Debug, Default)]
++struct Registry {
++    pages: Mutex<BTreeMap<usize, Weak<AtomicBool>>>,
++}
++
++#[derive(Debug)]
++pub(crate) struct CodeContent {
++    len: usize,
++    writers: AtomicUsize,
++    observed: AtomicBool,
++    registry: OnceLock<Arc<Registry>>,
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) enum ContentError {
++    OutOfBounds,
++    WriteInProgress,
++}
++
++impl CodeContent {
++    pub(crate) fn new(len: usize) -> Self {
++        Self {
++            len,
++            writers: AtomicUsize::new(0),
++            observed: AtomicBool::new(false),
++            registry: OnceLock::new(),
++        }
++    }
++
++    fn pages(&self, offset: usize, len: usize) -> Result<RangeInclusive<usize>, ContentError> {
++        let end = offset.checked_add(len).ok_or(ContentError::OutOfBounds)?;
++        if len == 0 || end > self.len {
++            return Err(ContentError::OutOfBounds);
++        }
++        Ok((offset >> PAGE_SHIFT)..=((end - 1) >> PAGE_SHIFT))
++    }
++
++    // Translation publication is deliberately not exposed by this witness.
++    pub(crate) fn observe(
++        &self,
++        offset: usize,
++        len: usize,
++    ) -> Result<ContentObservation, ContentError> {
++        let range = self.pages(offset, len)?;
++        let registry = self.registry.get_or_init(|| Arc::new(Registry::default()));
++        let mut pages = registry.pages.lock();
++        // Paired with writer admission: either a new observer sees the writer,
++        // or that writer sees the initialized registry before changing bytes.
++        self.observed.store(true, Ordering::SeqCst);
++        if self.writers.load(Ordering::SeqCst) != 0 {
++            return Err(ContentError::WriteInProgress);
++        }
++        let dependencies = range
++            .map(|page| {
++                let existing = pages.get(&page).and_then(Weak::upgrade);
++                let valid = match existing {
++                    Some(valid) if valid.load(Ordering::Acquire) => valid,
++                    _ => {
++                        let valid = Arc::new(AtomicBool::new(true));
++                        pages.insert(page, Arc::downgrade(&valid));
++                        valid
++                    }
++                };
++                (page, valid)
++            })
++            .collect();
++        drop(pages);
++        let observation = ContentObservation {
++            registry: Arc::clone(registry),
++            dependencies,
++        };
++        if self.writers.load(Ordering::SeqCst) != 0 || !observation.is_current() {
++            return Err(ContentError::WriteInProgress);
++        }
++        Ok(observation)
++    }
++
++    pub(crate) fn begin_write(
++        &self,
++        offset: usize,
++        len: usize,
++    ) -> Result<ContentWrite<&Self>, ContentError> {
++        ContentWrite::new(self, offset, len)
++    }
++}
++
++impl Drop for CodeContent {
++    fn drop(&mut self) {
++        if let Some(registry) = self.registry.get() {
++            for dependency in registry.pages.lock().values() {
++                if let Some(valid) = dependency.upgrade() {
++                    valid.store(false, Ordering::Release);
++                }
++            }
++        }
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct ContentObservation {
++    registry: Arc<Registry>,
++    dependencies: Vec<(usize, Arc<AtomicBool>)>,
++}
++
++impl ContentObservation {
++    pub(crate) fn is_current(&self) -> bool {
++        self.dependencies
++            .iter()
++            .all(|(_, valid)| valid.load(Ordering::Acquire))
++    }
++}
++
++impl Drop for ContentObservation {
++    fn drop(&mut self) {
++        let mut pages = self.registry.pages.lock();
++        for (page, valid) in self.dependencies.drain(..) {
++            if Arc::strong_count(&valid) == 1
++                && pages
++                    .get(&page)
++                    .is_some_and(|current| current.as_ptr() == Arc::as_ptr(&valid))
++            {
++                pages.remove(&page);
++            }
++            drop(valid);
++        }
++    }
++}
++
++/// The owner is either a lexical borrow or retained physical backing. Both
++/// close writer admission on drop without allocating another writer object.
++#[derive(Debug)]
++pub(crate) struct ContentWrite<O: Deref<Target = CodeContent>> {
++    content: O,
++    #[cfg(test)]
++    visited_pages: usize,
++}
++impl<O: Deref<Target = CodeContent>> ContentWrite<O> {
++    pub(crate) fn new(content: O, offset: usize, len: usize) -> Result<Self, ContentError> {
++        let range = content.pages(offset, len)?;
++        content
++            .writers
++            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
++                count.checked_add(1)
++            })
++            .unwrap_or_else(|_| {
++                carrick_fatal::carrick_fatal!("hvf::code_content", "content writer count exhausted")
++            });
++        #[cfg(test)]
++        let mut visited_pages = 0;
++        if content.observed.load(Ordering::SeqCst) {
++            let registry = content.registry.get().unwrap_or_else(|| {
++                carrick_fatal::carrick_fatal!(
++                    "hvf::code_content",
++                    "observed content lacks registry"
++                )
++            });
++            let pages = registry.pages.lock();
++            for (_, dependency) in pages.range(range) {
++                #[cfg(test)]
++                {
++                    visited_pages += 1;
++                }
++                if let Some(valid) = dependency.upgrade() {
++                    valid.store(false, Ordering::Release);
++                }
++            }
++        }
++        Ok(ContentWrite {
++            content,
++            #[cfg(test)]
++            visited_pages,
++        })
++    }
++    #[cfg(test)]
++    pub(crate) fn visited_pages(&self) -> usize {
++        self.visited_pages
++    }
++}
++impl<O: Deref<Target = CodeContent>> Drop for ContentWrite<O> {
++    fn drop(&mut self) {
++        self.content.writers.fetch_sub(1, Ordering::SeqCst);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn overlapping_writes_prevent_observation_until_both_finish() {
++        let content = CodeContent::new(8192);
++        let old = content.observe(0, 4).unwrap();
++        let untouched = content.observe(4096, 4).unwrap();
++        let first = content.begin_write(0, 4).unwrap();
++        let second = content.begin_write(2, 4).unwrap();
++        assert!(!old.is_current());
++        assert!(untouched.is_current());
++        assert_eq!(
++            content.observe(0, 4).unwrap_err(),
++            ContentError::WriteInProgress
++        );
++        drop(first);
++        assert_eq!(
++            content.observe(0, 4).unwrap_err(),
++            ContentError::WriteInProgress
++        );
++        drop(second);
++        let fresh = content.observe(0, 4).unwrap();
++        assert!(fresh.is_current());
++        assert!(!old.is_current());
++        drop(old);
++        assert!(fresh.is_current());
++    }
++
++    #[test]
++    fn cold_writer_prevents_first_observer_and_dropped_observers_leave_no_history() {
++        let content = CodeContent::new(1024 * 4096);
++        let writer = content.begin_write(0, 4).unwrap();
++        assert_eq!(writer.visited_pages(), 0);
++        assert!(content.registry.get().is_none());
++        assert_eq!(
++            content.observe(0, 4).unwrap_err(),
++            ContentError::WriteInProgress
++        );
++        drop(writer);
++        for page in 0..1024 {
++            let observation = content.observe(page * 4096, 4).unwrap();
++            assert!(observation.is_current());
++            drop(observation);
++        }
++        assert!(content.registry.get().unwrap().pages.lock().is_empty());
++    }
++
++    #[test]
++    fn simultaneous_final_observers_leave_no_history() {
++        let content = CodeContent::new(4096);
++        for _ in 0..64 {
++            let first = content.observe(0, 4).unwrap();
++            let second = content.observe(0, 4).unwrap();
++            let start = std::sync::Barrier::new(2);
++            std::thread::scope(|scope| {
++                scope.spawn(|| {
++                    start.wait();
++                    drop(first);
++                });
++                scope.spawn(|| {
++                    start.wait();
++                    drop(second);
++                });
++            });
++            assert!(content.registry.get().unwrap().pages.lock().is_empty());
++        }
++    }
++
++    #[test]
++    fn racing_first_observation_cannot_survive_an_admitted_write() {
++        use std::sync::{Barrier, mpsc};
++        use std::time::Duration;
++        for _ in 0..64 {
++            let content = CodeContent::new(4096);
++            let start = Barrier::new(2);
++            let (admitted_tx, admitted_rx) = mpsc::channel();
++            let (finish_tx, finish_rx) = mpsc::channel();
++            let observation = std::thread::scope(|scope| {
++                let content_ref = &content;
++                let start_ref = &start;
++                scope.spawn(move || {
++                    start_ref.wait();
++                    let writer = content_ref.begin_write(0, 4).unwrap();
++                    admitted_tx.send(()).unwrap();
++                    finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
++                    drop(writer);
++                });
++                start.wait();
++                let observation = content.observe(0, 4);
++                admitted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
++                finish_tx.send(()).unwrap();
++                observation
++            });
++            match observation {
++                Ok(observation) => assert!(!observation.is_current()),
++                Err(error) => assert_eq!(error, ContentError::WriteInProgress),
++            }
++            assert!(content.observe(0, 4).unwrap().is_current());
++        }
++    }
++
++    #[test]
++    fn retirement_and_equal_offsets_in_another_owner_do_not_revive_dependencies() {
++        let first = CodeContent::new(4096);
++        let second = CodeContent::new(4096);
++        let a = first.observe(0, 4).unwrap();
++        let b = second.observe(0, 4).unwrap();
++        drop(first);
++        assert!(!a.is_current());
++        assert!(b.is_current());
++        let replacement = CodeContent::new(4096);
++        assert!(replacement.observe(0, 4).unwrap().is_current());
++        assert!(!a.is_current());
++    }
++
++    #[test]
++    fn partial_page_crossings_and_invalid_ranges() {
++        let content = CodeContent::new(3 * 4096);
++        let a = content.observe(0, 4).unwrap();
++        let b = content.observe(4096, 4).unwrap();
++        let c = content.observe(8192, 4).unwrap();
++        for (offset, len) in [(0, 0), (usize::MAX, 2), (3 * 4096, 1)] {
++            assert_eq!(
++                content.begin_write(offset, len).unwrap_err(),
++                ContentError::OutOfBounds
++            );
++            assert!(a.is_current());
++        }
++        let write = content.begin_write(4095, 2).unwrap();
++        assert_eq!(write.visited_pages(), 2);
++        assert!(!a.is_current());
++        assert!(!b.is_current());
++        assert!(c.is_current());
++    }
++    #[test]
++    fn native_code_content_invalidation_contract() {
++        use carrick_conformance_contract::{
++            Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
++            SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
++        };
++        use sha2::{Digest, Sha256};
++        let mut observations = Vec::new();
++        for scale in [1u64, 8, 32, 128] {
++            let content = CodeContent::new(129 * 4096);
++            let unrelated: Vec<_> = (1..129)
++                .map(|page| content.observe(page * 4096, 4).unwrap())
++                .collect();
++            let mut stale = Vec::new();
++            let mut visits = 0;
++            for _ in 0..scale {
++                let dependent = content.observe(0, 4).unwrap();
++                assert!(dependent.is_current());
++                let write = content.begin_write(0, 4).unwrap();
++                visits += write.visited_pages() as u64;
++                assert!(!dependent.is_current());
++                assert!(unrelated.iter().all(ContentObservation::is_current));
++                drop(write);
++                stale.push(dependent);
++            }
++            assert_eq!(visits, scale, "the invalidation instrument must fire");
++            assert!(stale.iter().all(|dep| !dep.is_current()));
++            let mut work = WorkSnapshot::new();
++            work.insert(WorkMetric::NativeCodeInvalidationPages, visits)
++                .unwrap();
++            observations.push(ContractObservation {
++                contract_id: ContractId::new("kernel.mm.native-code-content").unwrap(),
++                layer: ExecutionLayer::VmFree,
++                implementation_revision: format!(
++                    "sha256:{:x}",
++                    Sha256::digest(include_bytes!("code_content.rs"))
++                ),
++                fixture_identity: "unit:native-code-content".into(),
++                scale,
++                semantic_assertions: vec![SemanticAssertion::pass(
++                    "affected_pages_revoke_without_touching_unrelated_dependencies",
++                )],
++                work: Some(work),
++                timing: None,
++                completeness: Completeness::Complete,
++            });
++        }
++        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++            .parent()
++            .unwrap()
++            .parent()
++            .unwrap();
++        let registry = ContractRegistry::load(root).unwrap();
++        println!(
++            "native_code_content_observations {}",
++            serde_json::to_string(&observations).unwrap()
++        );
++        evaluate(
++            registry.require("kernel.mm.native-code-content").unwrap(),
++            &observations,
++        )
++        .unwrap();
++    }
++}
+--- /dev/null
++++ b/crates/carrick-vmm-hvf/src/trap/foreign_mm/instruction_read.rs
+@@ -0,0 +1,114 @@
++//! Authenticated instruction reads retain physical content dependencies.
++//! The dependencies cover participating host writers, not executable admission.
++use super::super::code_content::ContentObservation;
++use super::*;
++use carrick_hal::foreign_mm::ForeignInstructionContentStatus;
++use carrick_hal::{ForeignMmReadLease, ForeignMmReadReceipt, ForeignMmSnapshot};
++
++type Error = carrick_hal::ForeignMmTransportError;
++
++#[derive(Debug)]
++struct InstructionReceipt {
++    read: Box<dyn ForeignMmReadReceipt>,
++    content: Vec<ContentObservation>,
++}
++impl ForeignMmReadReceipt for InstructionReceipt {
++    fn bytes_read(&self) -> usize {
++        self.read.bytes_read()
++    }
++    fn owner_generations(&self) -> &[carrick_hal::ForeignOwnerGeneration] {
++        self.read.owner_generations()
++    }
++    fn authenticates(&self, snapshot: &dyn carrick_hal::ForeignMmSnapshot) -> bool {
++        self.read.authenticates(snapshot)
++    }
++    fn instruction_content_status(&self) -> ForeignInstructionContentStatus {
++        if self.content.iter().all(ContentObservation::is_current) {
++            ForeignInstructionContentStatus::UnchangedTrackedWrites
++        } else {
++            ForeignInstructionContentStatus::Changed
++        }
++    }
++}
++
++pub(super) fn read(
++    lease: &CarrierForeignMmReadLease,
++    invocation: &carrick_hal::ForeignMmInvocation,
++    authority: &dyn carrick_hal::ForeignMmLiveAuthority,
++    snapshot: &dyn carrick_hal::ForeignMmSnapshot,
++    va: carrick_guest_mem::GuestVa,
++    dst: &mut [u8],
++    deadline: std::time::Instant,
++) -> Result<Box<dyn ForeignMmReadReceipt>, Error> {
++    if dst.is_empty() {
++        return Err(Error::Translation(va));
++    }
++    let content = match observe_resident(lease, authority, snapshot, va, dst.len(), deadline) {
++        Ok(content) => content,
++        // The normal reader also authenticates deferred pristine recipes.
++        // Preserve those bytes, but never describe an unresident recipe as a
++        // tracked physical dependency. Native admission must reject Untracked.
++        Err(Error::Translation(_)) => {
++            return lease.read(invocation, authority, snapshot, va, dst, deadline);
++        }
++        Err(error) => return Err(error),
++    };
++    let read = lease.read(invocation, authority, snapshot, va, dst, deadline)?;
++    let receipt = InstructionReceipt { read, content };
++    if receipt.instruction_content_status()
++        != ForeignInstructionContentStatus::UnchangedTrackedWrites
++    {
++        return Err(Error::Retry);
++    }
++    Ok(Box::new(receipt))
++}
++
++fn observe_resident(
++    lease: &CarrierForeignMmReadLease,
++    authority: &dyn carrick_hal::ForeignMmLiveAuthority,
++    snapshot: &dyn carrick_hal::ForeignMmSnapshot,
++    va: carrick_guest_mem::GuestVa,
++    len: usize,
++    deadline: std::time::Instant,
++) -> Result<Vec<ContentObservation>, Error> {
++    let inner = lease
++        .inner
++        .try_lock_until(deadline)
++        .ok_or(Error::TimedOut)?;
++    if !inner.retained.has_same_contents(snapshot) {
++        return Err(Error::LeaseStale);
++    }
++    let _coordinator = lease
++        .state
++        .mutation_coordinator
++        .try_lock_until(deadline)
++        .ok_or(Error::TimedOut)?;
++    if !live_snapshot_matches(authority, &inner.retained, deadline)? {
++        return Err(Error::Retry);
++    }
++    let mut content = Vec::new();
++    let mut offset = 0;
++    let mut owners = Vec::new();
++    while offset < len {
++        let address = va
++            .raw()
++            .checked_add(offset as u64)
++            .ok_or(Error::Translation(va))?;
++        let chunk = (0x1000 - (address as usize & 0xfff)).min(len - offset);
++        let physical = foreign_stage1_translate(
++            &inner.backing,
++            snapshot.binding().stage1_root(),
++            carrick_guest_mem::GuestVa(address),
++            &mut owners,
++        )?;
++        let extent = inner.backing.extent_for(physical, chunk)?;
++        let within = usize::try_from(physical - extent.key.0).map_err(|_| Error::OwnerStale)?;
++        let tracker = match &extent.owner {
++            RetainedPhysicalOwner::Global(pin) => &pin.owner().mapping.code_content,
++            RetainedPhysicalOwner::Structural(owner) => &owner.retained.mapping.code_content,
++        };
++        content.push(tracker.observe(within, chunk).map_err(|_| Error::Retry)?);
++        offset += chunk;
++    }
++    Ok(content)
++}
+--- /dev/null
++++ b/conformance-contracts/contracts/native-code-content.toml
+@@ -0,0 +1,24 @@
++schema_version = 1
++id = "kernel.mm.native-code-content"
++title = "Carrier byte writes revoke physical instruction dependencies"
++guest_surfaces = ["execution:linux-aarch64", "kernel:current-mm", "syscall:process_vm_writev", "syscall:ptrace"]
++semantic_authority = ["Linux AArch64 instruction visibility and syscall memory writes", "Carrick physical backing ownership and exact current-MM authority"]
++fixture = "unit:native-code-content"
++scale_points = [1, 8, 32, 128]
++rationale = "A host write must invalidate every translation dependency on its physical pages even when the writing alias is not executable. COW source and disjoint pages remain valid. Native data pointer access invalidates before handing out the pointer and prevents observation until that access ends. Content dependency tracking is not yet an executable publication permit or proof of every writer being mediated."
++
++[bindings]
++vm_free = "carrick-vmm-hvf::trap::code_content::tests::native_code_content_invalidation_contract; trap::foreign_mm::tests::native_code_content_foreign_write_revokes_backing_dependencies; trap::foreign_mm::tests::native_code_content_raw_data_pointer_revokes_and_blocks_observation"
++
++[bindings.unresolved]
++embed_structural = "Active native execution drain, ordinary hardware/syscall-buffer writers, mapping/alias admission and linked-code publication remain unbound. No native entry is authorized by the content observation."
++embed_timing = "No original inotify09 hybrid timing accepted."
++docker = "Backing dependency invariant is internal; self-modifying-code and mixed native/HVF guest differentials remain required before publication."
++
++[[structural_budgets]]
++kind = "affine"
++metric = "native_code_invalidation_pages"
++base = 0
++per_unit = 1
++layers = ["vm-free"]
++rationale = "N one-page writes visit N subscribed physical pages regardless of 128 other subscribed pages; unrelated translations are not scanned."

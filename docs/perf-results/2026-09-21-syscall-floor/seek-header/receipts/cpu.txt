@@ -1,0 +1,1 @@
+machdep.cpu.brand_string: Apple M4

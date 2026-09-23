@@ -1,0 +1,14 @@
+planned_stop_42_sigstop=true
+poketext_43_ok=true
+poketext_43_errno=0
+post_fail_peek_errno=0
+post_fail_peek_is_42=false
+ptrace_cont_43_ok=true
+ptrace_cont_43_errno=0
+warm_42=true
+patch_43_ok=true
+executed_43=true
+patch_44_ok=true
+executed_44=true
+peer_remains_42=true
+guest_store_faulted=true

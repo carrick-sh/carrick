@@ -1,0 +1,9 @@
+{
+  "head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "binary": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/transport/hvf-svc-tax",
+  "sha256": "f6c9c2f02355b764ef2b07271ed3c8d1f8188a17316c34071a43063b38e58e24",
+  "source_sha256": "20194b959ff0a831749c2675eb4cc946e683a608218dd9d450faa072bdf2933a",
+  "signature": "Executable=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/transport/hvf-svc-tax\nIdentifier=hvf-svc-tax.tmp.68175\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=1550 flags=0x2(adhoc) hashes=38+7 location=embedded\nHash type=sha256 size=32\nCandidateCDHash sha256=57315964a149a86a134c889c80f7a9ae2e3b467f\nCandidateCDHashFull sha256=57315964a149a86a134c889c80f7a9ae2e3b467fc884ee27842075a0d37bb7d8\nHash choices=sha256\nCMSDigest=57315964a149a86a134c889c80f7a9ae2e3b467fc884ee27842075a0d37bb7d8\nCMSDigestType=2\nCDHash=57315964a149a86a134c889c80f7a9ae2e3b467f\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements count=0 size=12\nTotal signatures=1\nChosen signature=1\n",
+  "entitlements": "[Dict]\n\t[Key] com.apple.security.hypervisor\n\t[Value]\n\t\t[Bool] true\nExecutable=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/transport/hvf-svc-tax\n",
+  "uuid": "UUID: E6E5D6EC-5276-39FF-81D2-3EE2EDE5E5E6 (arm64) /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/transport/hvf-svc-tax\n"
+}

@@ -959,6 +959,20 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         "hvpatch-carrier-cpu-low-rate requires --trace-out so its complete raw stack population is retained"
                     );
                 }
+                if profile
+                    == Some(crate::trace_profile::TraceProfileKind::HvpatchInotify09Population)
+                {
+                    if trace_out.is_none() {
+                        bail!(
+                            "hvpatch-inotify09-population requires --trace-out to retain the complete raw census"
+                        );
+                    }
+                    if summary_jsonl.is_some() {
+                        bail!(
+                            "hvpatch-inotify09-population retains a strict raw census; no JSON ledger schema is defined"
+                        );
+                    }
+                }
                 let me = std::env::current_exe()
                     .context("failed to resolve current carrick binary path")?;
                 if unsafe { libc::geteuid() } != 0 {
@@ -1038,6 +1052,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     .as_deref()
                     .or_else(|| internal_trace.as_ref().map(tempfile::NamedTempFile::path));
                 let script_src = match profile {
+                    Some(crate::trace_profile::TraceProfileKind::HvpatchInotify09Population) => {
+                        Some(crate::hvpatch_inotify_population_profile::render_profile_script()?)
+                    }
                     Some(crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuLowRate) => {
                         let template = script_template.as_deref().ok_or_else(|| {
                             anyhow::anyhow!(
@@ -1090,6 +1107,14 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let report =
                     carrick_runtime::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
                         .map_err(|error| anyhow::anyhow!("trace failed: {error}"))?;
+                if profile
+                    == Some(crate::trace_profile::TraceProfileKind::HvpatchInotify09Population)
+                    && custom_trace_report_is_rejected(report, true)
+                {
+                    bail!(
+                        "inotify09 population capture was lossy, interrupted, or lacked a successful script exit"
+                    );
+                }
                 if opts.script.is_some()
                     && profile.is_none()
                     && custom_trace_report_is_rejected(report, require_script_exit)
@@ -1188,6 +1213,16 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                 capture_status,
                             )?;
                             eprintln!("{}", summary.render_human());
+                        } else if requested_profile
+                            == crate::trace_profile::TraceProfileKind::HvpatchInotify09Population
+                        {
+                            let raw = std::fs::read_to_string(raw_path)
+                                .context("read completed inotify09 population")?;
+                            let counts = crate::hvpatch_inotify_population_profile::validate(&raw)?;
+                            eprintln!(
+                                "inotify09 host-service population accepted: {} syscall numbers, 3000000 add/remove pairs; excludes EL1/engine fast paths",
+                                counts.len()
+                            );
                         } else if requested_profile
                             == crate::trace_profile::TraceProfileKind::HvpatchExecRuntimeStages
                         {

@@ -1,0 +1,493 @@
+   Compiling conformance-probes v0.0.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/conformance-probes)
+warning: direct cast of function item into an integer
+  --> src/bin/epolloutxthread.rs:48:36
+   |
+48 |     sa.sa_sigaction = noop_handler as usize;
+   |                                    ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+48 |     sa.sa_sigaction = noop_handler as *const () as usize;
+   |                                    ++++++++++++
+
+warning: direct cast of function item into an integer
+   --> src/bin/sysvsem.rs:396:38
+    |
+396 |     action.sa_sigaction = handle_hup as usize;
+    |                                      ^^^^^^^^
+    |
+    = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+    |
+396 |     action.sa_sigaction = handle_hup as *const () as usize;
+    |                                      ++++++++++++
+
+warning: `conformance-probes` (bin "epolloutxthread") generated 1 warning (run `cargo fix --bin "epolloutxthread" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/blockingpipewrite.rs:42:36
+   |
+42 |         sa.sa_sigaction = on_alarm as usize;
+   |                                    ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+42 |         sa.sa_sigaction = on_alarm as *const () as usize;
+   |                                    ++++++++++++
+
+warning: unnecessary parentheses around block return value
+  --> src/bin/iopriovhangup.rs:27:5
+   |
+27 |     (((class << 13) | level) as i64)
+   |     ^                              ^
+   |
+   = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+   |
+27 -     (((class << 13) | level) as i64)
+27 +     ((class << 13) | level) as i64
+   |
+
+warning: `conformance-probes` (bin "blockingpipewrite") generated 1 warning (run `cargo fix --bin "blockingpipewrite" -p conformance-probes` to apply 1 suggestion)
+warning: `conformance-probes` (bin "iopriovhangup") generated 1 warning (run `cargo fix --bin "iopriovhangup" -p conformance-probes` to apply 1 suggestion)
+warning: `conformance-probes` (bin "sysvsem") generated 1 warning (run `cargo fix --bin "sysvsem" -p conformance-probes` to apply 1 suggestion)
+warning: unnecessary `unsafe` block
+   --> src/bin/futexextra.rs:110:44
+    |
+ 76 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+110 |         let parked = std::thread::spawn(|| unsafe {
+    |                                            ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: direct cast of function item into an integer
+  --> src/bin/ppollsig.rs:15:28
+   |
+15 |     sa.sa_sigaction = noop as usize;
+   |                            ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+15 |     sa.sa_sigaction = noop as *const () as usize;
+   |                            ++++++++++++
+
+warning: `conformance-probes` (bin "ppollsig") generated 1 warning (run `cargo fix --bin "ppollsig" -p conformance-probes` to apply 1 suggestion)
+warning: `conformance-probes` (bin "futexextra") generated 1 warning
+warning: use of deprecated type alias `libc::time_t`: This type is changed to 64-bit in musl 1.2.0, we'll follow that change in the future release. See #1848 for more info.
+  --> src/bin/clocksettimevdso.rs:88:26
+   |
+88 |     let shift_sec: libc::time_t = 3600;
+   |                          ^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `ts_vdso_0`
+  --> src/bin/clocksettimevdso.rs:79:21
+   |
+79 |     let (rc_vdso_0, ts_vdso_0) = libc_clock_gettime(libc::CLOCK_REALTIME);
+   |                     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_ts_vdso_0`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `tv_gtod_0`
+  --> src/bin/clocksettimevdso.rs:80:21
+   |
+80 |     let (rc_gtod_0, tv_gtod_0) = libc_gettimeofday();
+   |                     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_tv_gtod_0`
+
+warning: `conformance-probes` (bin "clocksettimevdso") generated 3 warnings (run `cargo fix --bin "clocksettimevdso" -p conformance-probes` to apply 2 suggestions)
+warning: direct cast of function item into an integer
+  --> src/bin/xsignal.rs:22:36
+   |
+22 |         act.sa_sigaction = on_usr1 as usize;
+   |                                    ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+22 |         act.sa_sigaction = on_usr1 as *const () as usize;
+   |                                    ++++++++++++
+
+warning: `conformance-probes` (bin "xsignal") generated 1 warning (run `cargo fix --bin "xsignal" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/sigpairrace.rs:40:30
+   |
+40 |         sa.sa_sigaction = h1 as usize;
+   |                              ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+40 |         sa.sa_sigaction = h1 as *const () as usize;
+   |                              ++++++++++++
+
+warning: direct cast of function item into an integer
+  --> src/bin/sigpairrace.rs:42:30
+   |
+42 |         sa.sa_sigaction = h2 as usize;
+   |                              ^^^^^^^^
+   |
+help: first cast to a pointer `as *const ()`
+   |
+42 |         sa.sa_sigaction = h2 as *const () as usize;
+   |                              ++++++++++++
+
+warning: `conformance-probes` (bin "sigpairrace") generated 2 warnings (run `cargo fix --bin "sigpairrace" -p conformance-probes` to apply 2 suggestions)
+warning: direct cast of function item into an integer
+  --> src/bin/itimer.rs:26:36
+   |
+26 |         sa.sa_sigaction = on_timer as usize;
+   |                                    ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+26 |         sa.sa_sigaction = on_timer as *const () as usize;
+   |                                    ++++++++++++
+
+warning: `conformance-probes` (bin "itimer") generated 1 warning (run `cargo fix --bin "itimer" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/pidfdprocdir.rs:38:37
+   |
+38 |         sa.sa_sigaction = on_sigint as usize;
+   |                                     ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+38 |         sa.sa_sigaction = on_sigint as *const () as usize;
+   |                                     ++++++++++++
+
+warning: `conformance-probes` (bin "pidfdprocdir") generated 1 warning (run `cargo fix --bin "pidfdprocdir" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/killchld.rs:17:35
+   |
+17 |         sa.sa_sigaction = on_chld as usize;
+   |                                   ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+17 |         sa.sa_sigaction = on_chld as *const () as usize;
+   |                                   ++++++++++++
+
+warning: `conformance-probes` (bin "killchld") generated 1 warning (run `cargo fix --bin "killchld" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/procstatussig.rs:45:36
+   |
+45 |         cgt.sa_sigaction = handler as usize;
+   |                                    ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+45 |         cgt.sa_sigaction = handler as *const () as usize;
+   |                                    ++++++++++++
+
+warning: `conformance-probes` (bin "procstatussig") generated 1 warning (run `cargo fix --bin "procstatussig" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/epollinmemwake.rs:35:36
+   |
+35 |     sa.sa_sigaction = noop_handler as usize;
+   |                                    ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+35 |     sa.sa_sigaction = noop_handler as *const () as usize;
+   |                                    ++++++++++++
+
+warning: `conformance-probes` (bin "epollinmemwake") generated 1 warning (run `cargo fix --bin "epollinmemwake" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/siginfo.rs:39:35
+   |
+39 |         sa.sa_sigaction = on_usr1 as usize;
+   |                                   ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+39 |         sa.sa_sigaction = on_usr1 as *const () as usize;
+   |                                   ++++++++++++
+
+warning: `conformance-probes` (bin "siginfo") generated 1 warning (run `cargo fix --bin "siginfo" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/sigchld.rs:26:38
+   |
+26 |         sa.sa_sigaction = on_sigchld as usize;
+   |                                      ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+26 |         sa.sa_sigaction = on_sigchld as *const () as usize;
+   |                                      ++++++++++++
+
+warning: use of deprecated type alias `libc::time_t`: This type is changed to 64-bit in musl 1.2.0, we'll follow that change in the future release. See #1848 for more info.
+  --> src/bin/vdsogtod.rs:92:47
+   |
+92 | type TimeFn = unsafe extern "C" fn(*mut libc::time_t) -> libc::time_t;
+   |                                               ^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated type alias `libc::time_t`: This type is changed to 64-bit in musl 1.2.0, we'll follow that change in the future release. See #1848 for more info.
+  --> src/bin/vdsogtod.rs:92:64
+   |
+92 | type TimeFn = unsafe extern "C" fn(*mut libc::time_t) -> libc::time_t;
+   |                                                                ^^^^^^
+
+warning: use of deprecated type alias `libc::time_t`: This type is changed to 64-bit in musl 1.2.0, we'll follow that change in the future release. See #1848 for more info.
+   --> src/bin/vdsogtod.rs:142:65
+    |
+142 |             (t_v - t_s).abs() <= 2 && t_v > SANE_EPOCH as libc::time_t
+    |                                                                 ^^^^^^
+
+warning: `conformance-probes` (bin "sigchld") generated 1 warning (run `cargo fix --bin "sigchld" -p conformance-probes` to apply 1 suggestion)
+warning: `conformance-probes` (bin "vdsogtod") generated 3 warnings
+warning: direct cast of function item into an integer
+  --> src/bin/sigreenter.rs:59:35
+   |
+59 |         sa.sa_sigaction = handler as usize;
+   |                                   ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+59 |         sa.sa_sigaction = handler as *const () as usize;
+   |                                   ++++++++++++
+
+warning: direct cast of function item into an integer
+  --> src/bin/epollpwait.rs:85:40
+   |
+85 |         sa.sa_sigaction = noop_handler as usize;
+   |                                        ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+85 |         sa.sa_sigaction = noop_handler as *const () as usize;
+   |                                        ++++++++++++
+
+warning: `conformance-probes` (bin "sigreenter") generated 1 warning (run `cargo fix --bin "sigreenter" -p conformance-probes` to apply 1 suggestion)
+warning: `conformance-probes` (bin "epollpwait") generated 1 warning (run `cargo fix --bin "epollpwait" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/killfault.rs:33:41
+   |
+33 |             chld.sa_sigaction = on_chld as usize;
+   |                                         ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+33 |             chld.sa_sigaction = on_chld as *const () as usize;
+   |                                         ++++++++++++
+
+warning: `conformance-probes` (bin "killfault") generated 1 warning (run `cargo fix --bin "killfault" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/xthreadsig.rs:29:35
+   |
+29 |         sa.sa_sigaction = handler as usize;
+   |                                   ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+29 |         sa.sa_sigaction = handler as *const () as usize;
+   |                                   ++++++++++++
+
+warning: `conformance-probes` (bin "xthreadsig") generated 1 warning (run `cargo fix --bin "xthreadsig" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/epolloutrearm.rs:38:36
+   |
+38 |         sa.sa_sigaction = on_alarm as usize;
+   |                                    ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+38 |         sa.sa_sigaction = on_alarm as *const () as usize;
+   |                                    ++++++++++++
+
+warning: use of deprecated type alias `libc::time_t`: This type is changed to 64-bit in musl 1.2.0, we'll follow that change in the future release. See #1848 for more info.
+  --> src/bin/shmnestedfork.rs:24:44
+   |
+24 |         tv_sec: timeout.as_secs() as libc::time_t,
+   |                                            ^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated type alias `libc::time_t`: This type is changed to 64-bit in musl 1.2.0, we'll follow that change in the future release. See #1848 for more info.
+   --> src/bin/tmpfileatime.rs:127:49
+    |
+127 |                     tv_sec: past_atime as libc::time_t,
+    |                                                 ^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: `conformance-probes` (bin "shmnestedfork") generated 1 warning
+warning: unnecessary `unsafe` block
+  --> src/bin/tmpfileatime.rs:82:44
+   |
+53 |     unsafe {
+   |     ------ because it's nested under this `unsafe` block
+...
+82 |         let h = std::thread::spawn(move || unsafe {
+   |                                            ^^^^^^ unnecessary `unsafe` block
+   |
+   = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: `conformance-probes` (bin "epolloutrearm") generated 1 warning (run `cargo fix --bin "epolloutrearm" -p conformance-probes` to apply 1 suggestion)
+warning: `conformance-probes` (bin "tmpfileatime") generated 2 warnings
+warning: direct cast of function item into an integer
+  --> src/bin/procsignalmask.rs:50:35
+   |
+50 |         sa.sa_sigaction = handler as usize;
+   |                                   ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+50 |         sa.sa_sigaction = handler as *const () as usize;
+   |                                   ++++++++++++
+
+warning: field `sq_entries` is never read
+  --> src/bin/iouring.rs:66:5
+   |
+63 | struct Ring {
+   |        ---- field in this struct
+...
+66 |     sq_entries: u32,
+   |     ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `conformance-probes` (bin "iouring") generated 1 warning
+warning: `conformance-probes` (bin "procsignalmask") generated 1 warning (run `cargo fix --bin "procsignalmask" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/sigqueueusr1.rs:32:35
+   |
+32 |         sa.sa_sigaction = on_usr1 as usize;
+   |                                   ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+32 |         sa.sa_sigaction = on_usr1 as *const () as usize;
+   |                                   ++++++++++++
+
+warning: `conformance-probes` (bin "sigqueueusr1") generated 1 warning (run `cargo fix --bin "sigqueueusr1" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/nativebrk.rs:31:39
+   |
+31 |         action.sa_sigaction = handler as usize;
+   |                                       ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+31 |         action.sa_sigaction = handler as *const () as usize;
+   |                                       ++++++++++++
+
+warning: `conformance-probes` (bin "nativebrk") generated 1 warning (run `cargo fix --bin "nativebrk" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/killgroup.rs:37:35
+   |
+37 |         sa.sa_sigaction = on_usr1 as usize;
+   |                                   ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+37 |         sa.sa_sigaction = on_usr1 as *const () as usize;
+   |                                   ++++++++++++
+
+warning: direct cast of function item into an integer
+  --> src/bin/killgroup.rs:41:36
+   |
+41 |         sa2.sa_sigaction = on_alrm as usize;
+   |                                    ^^^^^^^^
+   |
+help: first cast to a pointer `as *const ()`
+   |
+41 |         sa2.sa_sigaction = on_alrm as *const () as usize;
+   |                                    ++++++++++++
+
+warning: `conformance-probes` (bin "killgroup") generated 2 warnings (run `cargo fix --bin "killgroup" -p conformance-probes` to apply 2 suggestions)
+warning: direct cast of function item into an integer
+  --> src/bin/selfraise.rs:16:35
+   |
+16 |         sa.sa_sigaction = handler as usize;
+   |                                   ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+16 |         sa.sa_sigaction = handler as *const () as usize;
+   |                                   ++++++++++++
+
+warning: `conformance-probes` (bin "selfraise") generated 1 warning (run `cargo fix --bin "selfraise" -p conformance-probes` to apply 1 suggestion)
+warning: direct cast of function item into an integer
+  --> src/bin/sigunblockpending.rs:52:42
+   |
+52 |         sa.sa_sigaction = wakeup_handler as usize;
+   |                                          ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+52 |         sa.sa_sigaction = wakeup_handler as *const () as usize;
+   |                                          ++++++++++++
+
+warning: `conformance-probes` (bin "sigunblockpending") generated 1 warning (run `cargo fix --bin "sigunblockpending" -p conformance-probes` to apply 1 suggestion)
+warning: unused import: `Ordering`
+  --> src/bin/ltpcheckpoint.rs:33:36
+   |
+33 | use std::sync::atomic::{AtomicU32, Ordering};
+   |                                    ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `conformance-probes` (bin "ltpcheckpoint") generated 1 warning (run `cargo fix --bin "ltpcheckpoint" -p conformance-probes` to apply 1 suggestion)
+warning: use of deprecated type alias `libc::time_t`: This type is changed to 64-bit in musl 1.2.0, we'll follow that change in the future release. See #1848 for more info.
+  --> src/bin/sotimeo.rs:34:30
+   |
+34 |         tv_sec: sec as libc::time_t,
+   |                              ^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated type alias `libc::suseconds_t`: This type is changed to 64-bit in musl 1.2.0, we'll follow that change in the future release. See #1848 for more info.
+  --> src/bin/sotimeo.rs:35:32
+   |
+35 |         tv_usec: usec as libc::suseconds_t,
+   |                                ^^^^^^^^^^^
+
+warning: use of deprecated type alias `libc::time_t`: This type is changed to 64-bit in musl 1.2.0, we'll follow that change in the future release. See #1848 for more info.
+  --> src/bin/sigtimedwaitintr.rs:29:38
+   |
+29 |         tv_sec: d.as_secs() as libc::time_t,
+   |                                      ^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: `conformance-probes` (bin "sotimeo") generated 2 warnings
+warning: `conformance-probes` (bin "sigtimedwaitintr") generated 1 warning
+warning: direct cast of function item into an integer
+  --> src/bin/killrt.rs:29:33
+   |
+29 |         sa.sa_sigaction = on_rt as usize;
+   |                                 ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+29 |         sa.sa_sigaction = on_rt as *const () as usize;
+   |                                 ++++++++++++
+
+warning: `conformance-probes` (bin "killrt") generated 1 warning (run `cargo fix --bin "killrt" -p conformance-probes` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 8.27s

@@ -213,3 +213,47 @@ print('foreign_immutable_private_file_copyout=ok')
     );
     assert!(result.stderr.is_empty(), "{}", result.stderr_utf8());
 }
+
+#[test]
+fn deferred_anonymous_pristine_scrub_semantics() {
+    let _guard = common::guest_lock();
+    let container = TestContainer::new("localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30")
+        .pull_policy(PullPolicy::Missing);
+    let (result, _) = common::run_or_fail(container.run_with_audit([
+        "/usr/local/bin/python3",
+        "-c",
+        include_str!("fixtures/pristine_scrub.py"),
+    ]));
+    result.assert_success();
+    result.assert_exit_code(0);
+    assert_eq!(result.signal, None);
+    assert!(!result.trap_limit_hit);
+    assert_eq!(result.terminal_reason, None);
+    assert_eq!(
+        result.stdout_utf8(),
+        "pristine_scrub_pages=1=ok\npristine_scrub_pages=8=ok\npristine_scrub_pages=32=ok\npristine_scrub_pages=128=ok\npartial_scrub_fork=ok\nmixed_scrub_private_shared=ok\n"
+    );
+    assert!(result.stderr.is_empty(), "{}", result.stderr_utf8());
+}
+
+#[test]
+fn deferred_anonymous_unaligned_discard() {
+    let _guard = common::guest_lock();
+    let container = TestContainer::new("localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30")
+        .pull_policy(PullPolicy::Missing);
+    let (result, _) = common::run_or_fail(container.run_with_audit([
+        "/usr/local/bin/python3",
+        "-c",
+        include_str!("fixtures/unaligned_discard.py"),
+    ]));
+    result.assert_success();
+    result.assert_exit_code(0);
+    assert_eq!(result.signal, None);
+    assert!(!result.trap_limit_hit);
+    assert_eq!(result.terminal_reason, None);
+    assert_eq!(
+        result.stdout_utf8(),
+        "unaligned_discard_pages=1=ok\nunaligned_discard_pages=8=ok\nunaligned_discard_pages=32=ok\nunaligned_discard_pages=128=ok\n"
+    );
+    assert!(result.stderr.is_empty(), "{}", result.stderr_utf8());
+}

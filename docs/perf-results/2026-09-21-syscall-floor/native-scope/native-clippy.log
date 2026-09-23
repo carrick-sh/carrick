@@ -1,0 +1,56 @@
+    Checking carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+    Checking carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+    Checking carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+    Checking carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+    Checking carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+    Checking carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example)
+    Checking native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/experiments/native-syscall-slice)
+error: use of a disallowed method `std::process::id`
+  --> tests/scoped_execution.rs:30:17
+   |
+30 |                 std::process::id()
+   |                 ^^^^^^^^^^^^^^^^
+   |
+   = note: HA-CATALOG-PROCESS-ID: host carrier identity requires reviewed authority
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#disallowed_methods
+   = note: `-D clippy::disallowed-methods` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::disallowed_methods)]`
+
+error: use of a disallowed method `std::fs::create_dir_all`
+  --> tests/scoped_execution.rs:39:17
+   |
+39 |                 std::fs::create_dir_all(&dir).unwrap();
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: HA-CATALOG-FS-CREATE-DIR-ALL: recursive host directory creation requires reviewed backing authority
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#disallowed_methods
+
+error: use of a disallowed method `std::fs::write`
+  --> tests/scoped_execution.rs:41:17
+   |
+41 |                 std::fs::write(dir.join(format!("{run_id}.out")), &output.stdout).unwrap();
+   |                 ^^^^^^^^^^^^^^
+   |
+   = note: HA-CATALOG-FS-WRITE: host file mutation requires reviewed backing authority
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#disallowed_methods
+
+error: use of a disallowed method `std::fs::write`
+  --> tests/scoped_execution.rs:42:17
+   |
+42 |                 std::fs::write(dir.join(format!("{run_id}.err")), &output.stderr).unwrap();
+   |                 ^^^^^^^^^^^^^^
+   |
+   = note: HA-CATALOG-FS-WRITE: host file mutation requires reviewed backing authority
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#disallowed_methods
+
+error: use of a disallowed method `std::fs::write`
+  --> tests/scoped_execution.rs:95:9
+   |
+95 |         std::fs::write(
+   |         ^^^^^^^^^^^^^^
+   |
+   = note: HA-CATALOG-FS-WRITE: host file mutation requires reviewed backing authority
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#disallowed_methods
+
+error: could not compile `native-syscall-slice` (test "scoped_execution") due to 5 previous errors
+warning: build failed, waiting for other jobs to finish...

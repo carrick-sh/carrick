@@ -1,0 +1,56 @@
+[
+  {
+    "arm": "mailbox",
+    "argv": [
+      "/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-itc-c3fb9fd30706",
+      "trace",
+      "--require-script-exit",
+      "-s",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/scripts/dtrace/hvpatch-inotify-transport-control.d",
+      "-o",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/inotify-transport-control/itc-trace-mailbox-20260922.raw",
+      "--",
+      "run",
+      "--max-traps",
+      "18446744073709551615",
+      "--fs",
+      "host",
+      "-v",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/inotify-transport-control/probe-current:/probe:ro",
+      "--entrypoint",
+      "/bin/sh",
+      "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+      "-c",
+      "/probe invalid-contract"
+    ],
+    "returncode": 0,
+    "cleanup_returncode": 0
+  },
+  {
+    "arm": "legacy",
+    "argv": [
+      "/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-itc-c3fb9fd30706",
+      "trace",
+      "--require-script-exit",
+      "-s",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/scripts/dtrace/hvpatch-inotify-transport-control.d",
+      "-o",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/inotify-transport-control/itc-trace-legacy-20260922.raw",
+      "--",
+      "run",
+      "--max-traps",
+      "18446744073709551615",
+      "--fs",
+      "host",
+      "-v",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/inotify-transport-control/probe-current:/probe:ro",
+      "--entrypoint",
+      "/bin/sh",
+      "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+      "-c",
+      "/probe invalid-contract"
+    ],
+    "returncode": 0,
+    "cleanup_returncode": 0
+  }
+]

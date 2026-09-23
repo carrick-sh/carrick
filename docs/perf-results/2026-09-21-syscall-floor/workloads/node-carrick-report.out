@@ -1,0 +1,76 @@
+app-smoke ok
+{
+  "command": [
+    "-c",
+    "/opt/node-src/v24/out/Release/node /opt/nodejs-conformance/fixtures/app-smoke.js"
+  ],
+  "exit_code": 0,
+  "image": "localhost:5005/carrick-nodejs-conformance@sha256:1ed49af83bd30401e1b275957b99a1c28f6c582ab3d987997afb5888fa302718",
+  "report": {
+    "deferred_syscalls": [],
+    "partial_syscalls": [
+      {
+        "count": 5,
+        "name": "io_uring_setup",
+        "number": 425,
+        "reason": "denied by launch-time container syscall policy (Docker default-seccomp model)"
+      },
+      {
+        "count": 2,
+        "name": "futex",
+        "number": 98,
+        "reason": "non-private futex treated as private (shared address space)"
+      },
+      {
+        "count": 1,
+        "name": "clone3",
+        "number": 435,
+        "reason": "denied by launch-time container syscall policy (Docker default-seccomp model)"
+      }
+    ],
+    "proc_read_unimplemented": [
+      {
+        "count": 1,
+        "path": "/proc/version_signature"
+      }
+    ],
+    "summary": {
+      "deferred_syscall_invocations": 0,
+      "distinct_deferred_syscalls": 0,
+      "distinct_partial_syscalls": 3,
+      "distinct_proc_read_unimplemented": 1,
+      "distinct_sys_read_unimplemented": 2,
+      "distinct_unhandled_ioctls": 0,
+      "distinct_unhandled_syscalls": 0,
+      "distinct_unknown_syscall_flags": 0,
+      "distinct_unsupported_signals": 0,
+      "fast_path_blind_spots": 0,
+      "partial_syscall_invocations": 8,
+      "syscall_invocations": 1589,
+      "syscall_returns_errno": 73,
+      "syscall_returns_ok": 1513,
+      "unhandled_ioctl_invocations": 0,
+      "unhandled_syscall_invocations": 0,
+      "unknown_syscall_flag_invocations": 0
+    },
+    "sys_read_unimplemented": [
+      {
+        "count": 3,
+        "path": "/sys/fs/cgroup/memory.high"
+      },
+      {
+        "count": 3,
+        "path": "/sys/fs/cgroup/memory.max"
+      }
+    ],
+    "unhandled_ioctls": [],
+    "unhandled_syscalls": [],
+    "unknown_syscall_flags": [],
+    "unsupported_signals": []
+  },
+  "stderr": "",
+  "stdout": "",
+  "store": "/Users/tjfontaine/.carrick",
+  "trap_limit_hit": false,
+  "traps": 3889
+}

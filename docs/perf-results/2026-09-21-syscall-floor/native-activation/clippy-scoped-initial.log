@@ -1,0 +1,78 @@
+    Checking carrick-fatal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-fatal)
+    Checking carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-abi)
+    Checking carrick-kernel-arena v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-arena)
+    Checking carrick-portable v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-portable)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+    Checking carrick-test-support v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-test-support)
+    Checking carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+    Checking carrick-host v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host)
+    Checking carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-timer-core)
+    Checking carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-signal-core)
+    Checking carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+    Checking carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+    Checking carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-spec)
+    Checking carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-image)
+    Checking carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+    Checking carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+    Checking carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+    Checking carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+    Checking carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+    Checking carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+error: call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1237:17
+     |
+1237 |                 drop(active);
+     |                 ^^^^^^^^^^^^
+     |
+note: argument has type `carrick_kernel::kernel::mm_access::ActiveNativeData<'_, '_>`
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1237:22
+     |
+1237 |                 drop(active);
+     |                      ^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#drop_non_drop
+     = note: `-D clippy::drop-non-drop` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::drop_non_drop)]`
+
+error: call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1318:17
+     |
+1318 |                 drop(prepared.activate(&scope).unwrap());
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+note: argument has type `carrick_kernel::kernel::mm_access::ActiveNativeData<'_, '_>`
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1318:22
+     |
+1318 |                 drop(prepared.activate(&scope).unwrap());
+     |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#drop_non_drop
+
+error: call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1484:9
+     |
+1484 |         drop(active);
+     |         ^^^^^^^^^^^^
+     |
+note: argument has type `carrick_kernel::kernel::mm_access::ActiveNativeData<'_, '_>`
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1484:14
+     |
+1484 |         drop(active);
+     |              ^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#drop_non_drop
+
+error: call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1526:9
+     |
+1526 |         drop(prepared.activate(&scope).unwrap());
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+note: argument has type `carrick_kernel::kernel::mm_access::ActiveNativeData<'_, '_>`
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1526:14
+     |
+1526 |         drop(prepared.activate(&scope).unwrap());
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#drop_non_drop
+
+error: could not compile `carrick-runtime` (lib test) due to 4 previous errors
+warning: build failed, waiting for other jobs to finish...

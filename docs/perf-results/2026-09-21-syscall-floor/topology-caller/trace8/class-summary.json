@@ -1,0 +1,110 @@
+[
+  {
+    "phase": "hold",
+    "operation": 0,
+    "class": "frame_registry",
+    "ns": 692002
+  },
+  {
+    "phase": "hold",
+    "operation": 0,
+    "class": "mm_transaction",
+    "ns": 21335376
+  },
+  {
+    "phase": "hold",
+    "operation": 1,
+    "class": "frame_registry",
+    "ns": 1036041
+  },
+  {
+    "phase": "hold",
+    "operation": 1,
+    "class": "mm_transaction",
+    "ns": 1174762541
+  },
+  {
+    "phase": "hold",
+    "operation": 3,
+    "class": "frame_registry",
+    "ns": 140821051
+  },
+  {
+    "phase": "hold",
+    "operation": 7,
+    "class": "frame_registry",
+    "ns": 3582288
+  },
+  {
+    "phase": "hold",
+    "operation": 7,
+    "class": "mm_transaction",
+    "ns": 12338420
+  },
+  {
+    "phase": "hold",
+    "operation": 9,
+    "class": "frame_registry",
+    "ns": 25620509
+  },
+  {
+    "phase": "hold",
+    "operation": 10,
+    "class": "frame_registry",
+    "ns": 121414211
+  },
+  {
+    "phase": "wait",
+    "operation": 0,
+    "class": "frame_registry",
+    "ns": 14479834
+  },
+  {
+    "phase": "wait",
+    "operation": 0,
+    "class": "mm_transaction",
+    "ns": 0
+  },
+  {
+    "phase": "wait",
+    "operation": 1,
+    "class": "frame_registry",
+    "ns": 27337337
+  },
+  {
+    "phase": "wait",
+    "operation": 1,
+    "class": "mm_transaction",
+    "ns": 0
+  },
+  {
+    "phase": "wait",
+    "operation": 3,
+    "class": "frame_registry",
+    "ns": 6024421775
+  },
+  {
+    "phase": "wait",
+    "operation": 7,
+    "class": "frame_registry",
+    "ns": 23940919
+  },
+  {
+    "phase": "wait",
+    "operation": 7,
+    "class": "mm_transaction",
+    "ns": 0
+  },
+  {
+    "phase": "wait",
+    "operation": 9,
+    "class": "frame_registry",
+    "ns": 2879194130
+  },
+  {
+    "phase": "wait",
+    "operation": 10,
+    "class": "frame_registry",
+    "ns": 2144130441
+  }
+]

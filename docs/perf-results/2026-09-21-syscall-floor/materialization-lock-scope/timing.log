@@ -1,0 +1,101 @@
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.703498540999135, "guest_timing": [[0.255, 0.102, 0.068]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.57523683400359, "guest_timing": [[0.182, 0.067, 0.069]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.23252166699967347, "guest_timing": [[0.179, 0.069, 0.067]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.2601737079967279, "guest_timing": [[0.207, 0.064, 0.064]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.23302174999844283, "guest_timing": [[0.179, 0.068, 0.063]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.2327229590009665, "guest_timing": [[0.18, 0.068, 0.069]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.22889354199287482, "guest_timing": [[0.175, 0.063, 0.064]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.2264740829996299, "guest_timing": [[0.173, 0.062, 0.059]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.22898091599927284, "guest_timing": [[0.179, 0.068, 0.068]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.23180379199038725, "guest_timing": [[0.178, 0.067, 0.07]]}
+{"name": "parallel1", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.23125820799032226, "guest_timing": [[0.178, 0.067, 0.068]]}
+{"name": "parallel1", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.23299208299431484, "guest_timing": [[0.181, 0.067, 0.06]]}
+{"name": "parallel1", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.24490437499480322, "guest_timing": [[0.193, 0.08, 0.073]]}
+{"name": "parallel1", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.2319498750002822, "guest_timing": [[0.18, 0.068, 0.067]]}
+{"name": "parallel1", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.23355912500119302, "guest_timing": [[0.181, 0.07, 0.072]]}
+{"name": "parallel1", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.22632495799916796, "guest_timing": [[0.174, 0.062, 0.06]]}
+{"name": "parallel1", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.23294333399098832, "guest_timing": [[0.18, 0.067, 0.066]]}
+{"name": "parallel1", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.23644624999724329, "guest_timing": [[0.183, 0.072, 0.067]]}
+{"name": "parallel1", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.23271858299267478, "guest_timing": [[0.181, 0.07, 0.069]]}
+{"name": "parallel1", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.2298129999981029, "guest_timing": [[0.177, 0.065, 0.064]]}
+{"name": "parallel8", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.8199612079915823, "guest_timing": [[0.756, 0.626, 1.007]]}
+{"name": "parallel8", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.8422767910087714, "guest_timing": [[0.778, 0.644, 1.036]]}
+{"name": "parallel8", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.751124999995227, "guest_timing": [[0.695, 0.632, 1.019]]}
+{"name": "parallel8", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.7743067499977769, "guest_timing": [[0.691, 0.642, 1.034]]}
+{"name": "parallel8", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.7535037500056205, "guest_timing": [[0.696, 0.639, 1.049]]}
+{"name": "parallel8", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.7836336250038585, "guest_timing": [[0.718, 0.634, 1.035]]}
+{"name": "parallel8", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.7632328329927986, "guest_timing": [[0.701, 0.635, 1.012]]}
+{"name": "parallel8", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.7852024579915451, "guest_timing": [[0.705, 0.648, 1.044]]}
+{"name": "parallel8", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.7487842090049526, "guest_timing": [[0.69, 0.651, 1.039]]}
+{"name": "parallel8", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.7716901249950752, "guest_timing": [[0.708, 0.626, 1.011]]}
+{
+  "node-app": {
+    "A": {
+      "samples_s": [
+        0.179,
+        0.18,
+        0.175,
+        0.178
+      ],
+      "mean_s": 0.178,
+      "median_s": 0.1785
+    },
+    "B": {
+      "samples_s": [
+        0.207,
+        0.179,
+        0.173,
+        0.179
+      ],
+      "mean_s": 0.1845,
+      "median_s": 0.179
+    },
+    "candidate_control_ratio": 1.0365168539325844
+  },
+  "parallel1": {
+    "A": {
+      "samples_s": [
+        0.193,
+        0.174,
+        0.18,
+        0.177
+      ],
+      "mean_s": 0.181,
+      "median_s": 0.1785
+    },
+    "B": {
+      "samples_s": [
+        0.18,
+        0.181,
+        0.183,
+        0.181
+      ],
+      "mean_s": 0.18125,
+      "median_s": 0.181
+    },
+    "candidate_control_ratio": 1.0013812154696133
+  },
+  "parallel8": {
+    "A": {
+      "samples_s": [
+        0.695,
+        0.718,
+        0.701,
+        0.708
+      ],
+      "mean_s": 0.7055,
+      "median_s": 0.7044999999999999
+    },
+    "B": {
+      "samples_s": [
+        0.691,
+        0.696,
+        0.705,
+        0.69
+      ],
+      "mean_s": 0.6955,
+      "median_s": 0.6935
+    },
+    "candidate_control_ratio": 0.9858256555634302
+  }
+}

@@ -849,6 +849,38 @@ impl AliasRegistry {
         self.va_classes.window_rows(start, end)
     }
 
+    /// Existence-only query. Candidate order carries no ownership authority;
+    /// the caller must check scope, full range and IPA consistency.
+    pub(crate) fn any_va_window_row(
+        &self,
+        start: u64,
+        end: u64,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> bool {
+        // A retained broad mapping commonly already owns the scrubbed page.
+        // Existence is order-independent: try wide classes first so unrelated
+        // narrow fragments need not be searched before that owner is found.
+        for &class in self.va_classes.class_counts.keys().rev() {
+            let radius = AliasClassIndex::class_radius(class);
+            let lower = start.saturating_sub(radius.saturating_sub(1));
+            if lower >= end {
+                continue;
+            }
+            for rows in self
+                .va_classes
+                .by_class_start
+                .range((class, lower)..(class, end))
+                .map(|(_, rows)| rows)
+            {
+                note_alias_state_rows_scanned(rows.len());
+                if rows.iter().any(|(_, alias)| matches(alias)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// [`Self::newest_matching`] for a predicate that requires the row's
     /// guest-VA window to contain `va`.
     pub(crate) fn newest_containing_va(
@@ -2976,14 +3008,12 @@ pub(crate) fn retained_private_reuse_alias_fragment_in(
     // replace a wider entry with this one-page reuse observation.
     // The VA-window candidate query locates any overlapping candidate without
     // scanning unrelated processes or rows.
-    let has_existing = registry
-        .va_window_rows(va, va.saturating_add(1))
-        .any(|(_, entry)| {
-            alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
-                && va >= entry.start
-                && end <= entry.start.saturating_add(entry.size as u64)
-                && entry.ipa.checked_add(va.saturating_sub(entry.start)) == Some(ipa)
-        });
+    let has_existing = registry.any_va_window_row(va, va.saturating_add(1), |entry| {
+        alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
+            && va >= entry.start
+            && end <= entry.start.saturating_add(entry.size as u64)
+            && entry.ipa.checked_add(va.saturating_sub(entry.start)) == Some(ipa)
+    });
     if has_existing {
         return None;
     }

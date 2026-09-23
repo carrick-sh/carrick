@@ -67,6 +67,7 @@ fn locked_ranges_insert_keeps_the_set_sorted_and_merged() {
 
 pub struct CountingMmapMemory {
     pub(crate) defer_anon: bool,
+    pub(crate) discard_anon: bool,
     pub(crate) fail_protect_non_zero: Cell<bool>,
     pub(crate) base: u64,
     pub(crate) bytes: Vec<u8>,
@@ -120,6 +121,7 @@ impl CountingMmapMemory {
     pub(crate) fn new(base: u64, len: usize) -> Self {
         Self {
             defer_anon: false,
+            discard_anon: false,
             fail_protect_non_zero: Cell::new(false),
             base,
             bytes: vec![0u8; len],
@@ -174,6 +176,23 @@ impl GuestMemory for CountingMmapMemory {
             .set(self.write_bytes_total.get() + bytes.len());
         self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
         Ok(())
+    }
+
+    fn discard_private_anonymous(
+        &mut self,
+        address: u64,
+        len: usize,
+    ) -> Result<bool, carrick_guest_mem::RepointPrivateError> {
+        if !self.discard_anon {
+            return Ok(false);
+        }
+        let offset = self
+            .range_offset(address, len)
+            .map_err(carrick_guest_mem::RepointPrivateError::clean)?;
+        // Scripted discard models fresh backing; physical scrub callbacks are
+        // counted separately and must not be invoked after this succeeds.
+        self.bytes[offset..offset + len].fill(0);
+        Ok(true)
     }
 
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {

@@ -809,6 +809,23 @@ fn read_installed(
     )
 }
 
+fn read_instructions_installed(
+    transport: &CarrierForeignMmTransport,
+    installed: &InstalledMm,
+    dst: &mut [u8],
+) -> Result<Box<dyn carrick_hal::ForeignMmReadReceipt>, carrick_hal::ForeignMmTransportError> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(transport.clone()));
+    let lease = endpoint.retain(&installed.snapshot, deadline)?;
+    lease.read_instructions(
+        &installed.live,
+        &installed.snapshot,
+        GuestVa(TEST_VA),
+        dst,
+        deadline,
+    )
+}
+
 fn prepare_foreign_cow(
     installed: &InstalledMm,
 ) -> (
@@ -2172,6 +2189,89 @@ fn foreign_cow_commit_cannot_be_reported_as_retryable_by_final_snapshot_contenti
     let cow = result.expect("committed COW returned retryable failure");
     let cow_key = (cow.physical_base().raw(), cow.physical_len());
     installed.owners.0.push(cow_key);
+}
+
+// These exercise the production carrier transport with fixture-owned backing;
+// they do not run a guest or establish code-cache publication authority.
+fn make_execute_only(installed: &mut InstalledMm, len: usize) {
+    installed.snapshot.readable_ranges.clear();
+    installed.snapshot.executable_ranges = vec![
+        carrick_hal::ForeignExecutableRange::from_kernel_projection(
+            GuestVa(TEST_VA),
+            GuestVa(TEST_VA + len as u64),
+        )
+        .unwrap(),
+    ];
+    *installed.live.0.write() = installed.snapshot.clone();
+}
+
+#[test]
+fn instruction_fetch_carrier_selects_exact_execute_only_mm() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = CarrierForeignMmTransport::new();
+    let mut first = install_mm(
+        &transport,
+        211,
+        0x9600_1000_0000,
+        0x9700_1000_0000,
+        *b"code",
+    );
+    let mut second = install_mm(
+        &transport,
+        212,
+        0x9600_1200_0000,
+        0x9700_1200_0000,
+        *b"else",
+    );
+    make_execute_only(&mut first, OWNER_LEN);
+    make_execute_only(&mut second, OWNER_LEN);
+    for (installed, expected) in [(&first, b"code"), (&second, b"else")] {
+        let mut bytes = [0; 4];
+        let receipt = read_instructions_installed(&transport, installed, &mut bytes).unwrap();
+        assert_eq!(&bytes, expected);
+        assert!(receipt.authenticates(&installed.snapshot));
+        assert!(!receipt.owner_generations().is_empty());
+        assert_eq!(
+            receipt.instruction_content_status(),
+            carrick_hal::foreign_mm::ForeignInstructionContentStatus::UnchangedTrackedWrites
+        );
+    }
+}
+
+#[test]
+fn instruction_fetch_carrier_reads_execute_only_deferred_bytes() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = CarrierForeignMmTransport::new();
+    let len = OWNER_LEN * 2;
+    let mut installed = install_mm_sparse(
+        &transport,
+        213,
+        0x9600_1400_0000,
+        0x9700_1400_0000,
+        OWNER_LEN,
+        len,
+        b"code",
+    );
+    make_execute_only(&mut installed, len);
+    let mut bytes = vec![0xaa; len];
+    let receipt = read_instructions_installed(&transport, &installed, &mut bytes)
+        .expect("fetch executable sparse backing without granting readable permission");
+    assert_eq!(&bytes[..4], b"code");
+    assert!(bytes[4..].iter().all(|byte| *byte == 0));
+    assert_eq!(receipt.bytes_read(), len);
+    assert!(receipt.authenticates(&installed.snapshot));
+    assert!(!receipt.owner_generations().is_empty());
+    assert_eq!(
+        receipt.instruction_content_status(),
+        carrick_hal::foreign_mm::ForeignInstructionContentStatus::Untracked
+    );
+    // Losing the recipe must not silently manufacture executable zero bytes.
+    *installed.state.deferred_anonymous.write() = None;
+    assert!(
+        matches!(read_instructions_installed(&transport, &installed, &mut bytes),
+        Err(carrick_hal::ForeignMmTransportError::Translation(va))
+            if va == GuestVa(TEST_VA + OWNER_LEN as u64))
+    );
 }
 
 #[test]
@@ -9040,3 +9140,362 @@ fn foreign_mm_failure_injection_at_composition_boundaries() {
     ));
     ScopedStage2MapTestStub::clear_events();
 }
+
+#[test]
+fn fresh_sparse_publication_avoids_stage1_maintenance() {
+    use carrick_conformance_contract::{
+        Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
+        SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
+    };
+    use sha2::{Digest, Sha256};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let contracts = ContractRegistry::load(root).unwrap();
+    let mut observations = Vec::new();
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    for scale in [1, 8, 32, 128] {
+        let _stub = ScopedStage2MapTestStub::enable();
+        let transport = CarrierForeignMmTransport::new();
+        let mut installed = install_mm(
+            &transport,
+            197,
+            0x9a00_6000_0000,
+            0x9b00_6000_0000,
+            *b"kept",
+        );
+        let (_authority, _lease, _invalidator) = prepare_foreign_cow(&installed);
+        let mut authority = TestForeignCowAuthority::new(&installed);
+        authority.allow_quiesce = true;
+        installed
+            .state
+            .cow_runtime
+            .write()
+            .as_mut()
+            .unwrap()
+            .authority = Arc::new(authority);
+        let identity = installed
+            .state
+            .cow_runtime
+            .read()
+            .as_ref()
+            .unwrap()
+            .identity;
+        let context = sparse_materialization::PublicationContext::for_local(
+            installed.state.clone(),
+            Arc::clone(legacy_test_carrier_vm_custody_arc()),
+            identity,
+        )
+        .unwrap();
+
+        let old_key = installed.owners.0[1];
+        let old_owner = global_frame_host_owner_identity(old_key.0, old_key.1).unwrap();
+        let start = TEST_VA + 0x10_0000;
+        let mut flushes = 0;
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
+            identity.linux_pid,
+            identity.linux_tid,
+        );
+        let published = sparse_materialization::publish(
+            &context,
+            start,
+            start + scale * 4096,
+            SparseExtentBacking::SeededAnon { bytes: b"next" },
+            &mut || {
+                flushes += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        drop(registry);
+        installed.owners.0.push((
+            published.region.physical_ipa,
+            published.region.physical_size as u64,
+        ));
+        installed
+            .state
+            .page_tables_authority()
+            .with_manager(|manager| {
+                for page in 0..scale {
+                    assert_eq!(manager.translate(start + page * 4096), None);
+                    assert!(
+                        manager
+                            .translate_retained_output(start + page * 4096)
+                            .is_some()
+                    );
+                }
+                assert_eq!(manager.translate(start + scale * 4096), None);
+            })
+            .unwrap();
+        assert_eq!(
+            global_frame_host_owner_identity(old_key.0, old_key.1),
+            Some(old_owner)
+        );
+        // OwnerCleanup retains this fixture owner throughout publication.
+        let bytes = unsafe { std::slice::from_raw_parts(old_owner.0 as *const u8, 4) };
+        assert_eq!(bytes, b"kept");
+        let mut work = WorkSnapshot::new();
+        work.insert(WorkMetric::PageTableInvalidations, flushes)
+            .unwrap();
+        observations.push(ContractObservation {
+            contract_id: ContractId::new("kernel.mm.fresh-publication-maintenance").unwrap(),
+            layer: ExecutionLayer::VmFree,
+            implementation_revision: format!(
+                "sha256:{:x}",
+                Sha256::digest(include_bytes!("../sparse_materialization.rs"))
+            ),
+            fixture_identity: "unit:fresh-sparse-maintenance".into(),
+            scale,
+            semantic_assertions: vec![SemanticAssertion {
+                name: "new_backing_inaccessible_old_mapping_preserved".into(),
+                passed: true,
+                detail: None,
+            }],
+            work: Some(work),
+            timing: None,
+            completeness: Completeness::Complete,
+        });
+    }
+    evaluate(
+        contracts
+            .require("kernel.mm.fresh-publication-maintenance")
+            .unwrap(),
+        &observations,
+    )
+    .unwrap();
+}
+
+#[test]
+fn native_code_content_foreign_write_revokes_backing_dependencies() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = CarrierForeignMmTransport::new();
+    let mut child = install_mm(
+        &transport,
+        198,
+        0x9a00_6100_0000,
+        0x9b00_6100_0000,
+        *b"old!",
+    );
+    let (_authority, lease, mut invalidator) = prepare_foreign_cow(&child);
+    let old_key = child.owners.0[1];
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let cow = lease
+        .break_cow(
+            &mut invalidator,
+            &child.snapshot,
+            GuestVa(TEST_VA),
+            4,
+            deadline,
+        )
+        .unwrap();
+    let post = child.live.0.read().clone();
+    let new_key = (cow.physical_base().raw(), cow.physical_len());
+    child.owners.0.push(new_key);
+    let old_owner = global_frame_host_owners().lock()[&old_key].owner().clone();
+    let new_owner = global_frame_host_owners().lock()[&new_key].owner().clone();
+    let source = old_owner.mapping.code_content.observe(0, 4).unwrap();
+    let first_alias = new_owner.mapping.code_content.observe(0, 4).unwrap();
+    let second_alias = new_owner.mapping.code_content.observe(0, 4).unwrap();
+    let other_page = new_owner.mapping.code_content.observe(4096, 4).unwrap();
+    let mut captured = [0; 4];
+    let instruction = lease
+        .read_instructions(
+            &child.live,
+            &post,
+            GuestVa(TEST_VA),
+            &mut captured,
+            deadline,
+        )
+        .unwrap();
+    use carrick_hal::foreign_mm::ForeignInstructionContentStatus;
+    assert_eq!(captured, *b"old!");
+    assert_eq!(
+        instruction.instruction_content_status(),
+        ForeignInstructionContentStatus::UnchangedTrackedWrites
+    );
+    // The write mapping is non-executable. Physical dependencies must still
+    // revoke: checking only the target VA's executable flag misses RX aliases.
+    assert!(post.executable_ranges.is_empty());
+    lease
+        .prepare_write(
+            &child.live,
+            &post,
+            cow.as_ref(),
+            GuestVa(TEST_VA),
+            b"new!",
+            deadline,
+        )
+        .unwrap()
+        .commit();
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(new_owner.as_ptr(), 4) },
+        b"new!"
+    );
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(old_owner.as_ptr(), 4) },
+        b"old!"
+    );
+    assert!(source.is_current());
+    assert!(other_page.is_current());
+    assert!(
+        !first_alias.is_current(),
+        "committed byte write must revoke dependent translated bytes"
+    );
+    assert!(!second_alias.is_current());
+    assert_eq!(
+        instruction.instruction_content_status(),
+        ForeignInstructionContentStatus::Changed
+    );
+    assert!(
+        new_owner
+            .mapping
+            .code_content
+            .observe(0, 4)
+            .unwrap()
+            .is_current()
+    );
+}
+
+#[test]
+fn native_code_content_raw_data_pointer_revokes_and_blocks_observation() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = CarrierForeignMmTransport::new();
+    let mut installed = install_mm(
+        &transport,
+        199,
+        0x9a00_6300_0000,
+        0x9b00_6300_0000,
+        *b"old!",
+    );
+    let (_authority, lease, mut invalidator) = prepare_foreign_cow(&installed);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let cow = lease
+        .break_cow(
+            &mut invalidator,
+            &installed.snapshot,
+            GuestVa(TEST_VA),
+            4,
+            deadline,
+        )
+        .unwrap();
+    let key = (cow.physical_base().raw(), cow.physical_len());
+    installed.owners.0.push(key);
+    let post = installed.live.0.read().clone();
+    let owner = legacy_test_carrier_vm_custody()
+        .global_frame_host_owners
+        .lock()
+        .get(&key)
+        .unwrap()
+        .owner()
+        .clone();
+    let dependency = owner.mapping.code_content.observe(0, 4).unwrap();
+    let unrelated = owner.mapping.code_content.observe(4096, 4).unwrap();
+    let mut data = lease
+        .borrow_native_data(
+            &installed.live,
+            &post,
+            cow.as_ref(),
+            GuestVa(TEST_VA),
+            4,
+            deadline,
+        )
+        .unwrap();
+    // Preparing a retained window is not a write. Only pointer access admits a
+    // writer, and that admission lasts until this access grant ends.
+    assert!(dependency.is_current());
+    // SAFETY: the fixture retains the COW exclusion and authenticates this exact
+    // four-byte backing. The pointer never escapes its grant or this test.
+    unsafe { std::ptr::copy_nonoverlapping(b"new!".as_ptr(), data.as_mut_ptr(), 4) };
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(owner.ptr(), 4) },
+        b"new!"
+    );
+    assert!(
+        !dependency.is_current(),
+        "raw native write bypassed code dependency revocation"
+    );
+    assert!(unrelated.is_current());
+    assert!(matches!(
+        owner.mapping.code_content.observe(0, 4),
+        Err(super::super::code_content::ContentError::WriteInProgress)
+    ));
+    data.finish_native_access();
+    let fresh = owner.mapping.code_content.observe(0, 4).unwrap();
+    assert!(
+        fresh.is_current(),
+        "an inactive retained window is not a writer"
+    );
+    assert!(
+        !dependency.is_current(),
+        "ending access must not revive old code"
+    );
+    // Reusing the retained window must establish writer admission again.
+    unsafe { std::ptr::write(data.as_mut_ptr(), b'N') };
+    assert!(!fresh.is_current());
+    assert!(matches!(
+        owner.mapping.code_content.observe(0, 4),
+        Err(super::super::code_content::ContentError::WriteInProgress)
+    ));
+    drop(data);
+    assert!(
+        owner
+            .mapping
+            .code_content
+            .observe(0, 4)
+            .unwrap()
+            .is_current()
+    );
+}
+
+#[test]
+fn native_code_content_syscall_copy_revokes_physical_dependencies() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = CarrierForeignMmTransport::new();
+    let installed = install_mm(
+        &transport,
+        200,
+        0x9a00_6500_0000,
+        0x9b00_6500_0000,
+        *b"old!",
+    );
+    let key = installed.owners.0[1];
+    let owner = global_frame_host_owners().lock()[&key].owner().clone();
+    let mut task = hvpatch_neutral_task_state_for_test();
+    task.mm_access = Arc::clone(&installed.state);
+    task.persistent_vm_lifecycle = true;
+    let mut row = super::super::thread_sibling_tests::mapped_region(
+        TEST_VA,
+        TEST_VA + OWNER_LEN as u64,
+        key.0,
+    );
+    row.host_addr = owner.ptr();
+    row.owner_generation = owner.generation();
+    task.mappings = TaskMappingIndex::from_region(row);
+    let dependent = owner.mapping.code_content.observe(0, 4).unwrap();
+    let unrelated = owner.mapping.code_content.observe(4096, 4).unwrap();
+    task.copy_guest_mapping_in(legacy_test_carrier_vm_custody(), TEST_VA, TEST_VA, b"new!")
+        .unwrap();
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(owner.ptr(), 4) },
+        b"new!"
+    );
+    assert!(
+        !dependent.is_current(),
+        "ordinary syscall copy left translated instructions current"
+    );
+    assert!(unrelated.is_current());
+    assert!(
+        owner
+            .mapping
+            .code_content
+            .observe(0, 4)
+            .unwrap()
+            .is_current()
+    );
+}
+
+mod syscall_writes;

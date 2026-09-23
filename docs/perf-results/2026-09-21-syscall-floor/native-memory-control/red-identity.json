@@ -1,0 +1,5 @@
+{
+  "binary_sha256": "e11546c3eca113c0a647adf09aa10cb5779727c70a557419fec32051355e4f33",
+  "test_source_sha256": "16cf983d1ffa9ac00fa327842bc7506322b73e19357a2b3453090299fb1dd0e3",
+  "outcome": "SIGABRT: foreign COW invalidation-error rollback"
+}

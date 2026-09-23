@@ -1,0 +1,42 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-engine)
+   Compiling carrick-cli v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-cli)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1m 14s
+     Running tests/trace_profile.rs (target/release/deps/trace_profile-52b90d020a68e266)
+
+running 26 tests
+test amp1_rejects_a_missing_drop_section ... ok
+test amp1_rejects_a_truncated_capture ... ok
+test amp1_accepts_a_complete_amplification_capture ... ok
+test amp1_rejects_a_wrong_backend_capture ... ok
+test amp1_rejects_a_program_digest_mismatch ... ok
+test amp1_rejects_a_declared_join_that_never_armed ... ok
+test amp1_requires_a_qualified_terminal_roster_in_both_scopes ... ok
+test completed_inotify_profile_accepts_original_workload_population ... ok
+test completed_inotify_profile_is_listed ... ok
+test completed_inotify_profile_rejects_incomplete_or_inconsistent_evidence ... ok
+test amp1_accepts_the_inherited_service_ends_every_threaded_guest_produces ... ok
+test hvpatch_alias_sharing_trace_fails_closed ... ok
+test amp1_rejects_nonzero_drop_counters_from_either_source ... ok
+test amplification_ledger_requires_the_in_band_consumer_drop_record ... ok
+test amp1_rejects_corrupt_amplification_records ... ok
+test native_amplification_program_scopes_bounds_and_sections_are_pinned ... ok
+HVPATCHALIAS validation: ok
+test trace_profile_keeps_raw_and_summary_outputs_distinct ... ok
+test hvpatch_carrier_low_rate_requires_a_retained_raw_capture ... ok
+test trace_profile_argument_relationships_are_enforced ... ok
+test hvpatch_carrier_low_rate_accepts_only_a_closed_complete_stack_population ... ok
+HVPATCHALIAS validation: incomplete companion capture
+HVPATCHALIAS validation: missing or duplicate completion
+HVPATCHALIAS validation: provider error
+HVPATCHALIAS validation: timeout
+test amplification_ledger_publishes_a_canonical_ledger_from_an_authenticated_capture ... ok
+test hvpatch_alias_sharing_saved_capture_validator_fails_closed ... ok
+test amplification_ledger_refuses_a_capture_that_is_not_evidence ... ok
+test amplification_compare_reports_exact_zeros_for_identical_censuses ... ok
+test amplification_compare_refuses_every_capture_determinant_drift ... ok
+test amplification_ledger_publishes_deterministically_and_never_clobbers ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.93s
+

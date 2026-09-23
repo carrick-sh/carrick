@@ -58,7 +58,7 @@ use crate::linux_abi::{
 };
 use carrick_vfs::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 
-use super::{EpollKqueue, Fd, GuestPtr, HostFd, inode_for_path, linux_mode};
+use super::{EpollKqueue, Fd, GuestPtr, HostFd, inode_for_path, linux_mode, linux_mode_fields};
 
 /// Peer credentials recorded at connect/accept/socketpair time for an AF_UNIX socket.
 pub(crate) use crate::kernel::SocketPeerCred;
@@ -3022,14 +3022,8 @@ impl StatRecord {
         }
     }
 
-    pub(super) fn from_real(path: &str, real: &carrick_vfs::fs_backend::RealStat) -> Self {
-        let metadata = RootFsMetadata {
-            path: Path::new(path).to_path_buf(),
-            kind: real.kind,
-            mode: real.mode,
-            size: real.size as usize,
-        };
-        let mode = linux_mode(&metadata);
+    pub(super) fn from_real(real: &carrick_vfs::fs_backend::RealStat) -> Self {
+        let mode = linux_mode_fields(real.kind, real.mode);
         Self {
             ino: real.ino,
             mode,
@@ -3100,7 +3094,9 @@ pub(super) enum OpenStatSource {
         /// [`HostFdRef::view`]) — valid while the caller's `OpenFile` clone
         /// keeps the description alive.
         host_fd: HostFd,
-        metadata: RootFsMetadata,
+        // Snapshot the scalar fallback while the description is locked. The
+        // normal host-fstat path needs no owned path or metadata allocation.
+        fallback: StatRecord,
     },
     /// A path-backed entry (an open Directory, or an in-memory File) whose
     /// fd-stat must agree with a path-based stat of the SAME path. Under
@@ -3248,7 +3244,7 @@ impl OpenDescription {
                 host_fd, metadata, ..
             } => OpenStatSource::HostFile {
                 host_fd: host_fd.view(),
-                metadata: metadata.clone(),
+                fallback: StatRecord::from_metadata(metadata),
             },
             OpenDescription::SyntheticFile { path, contents, .. } => {
                 let mut record = StatRecord::synthetic(path, contents.len(), LINUX_S_IFREG | 0o444);
@@ -3276,12 +3272,12 @@ impl OpenDescription {
                     };
                     return OpenStatSource::HostFile {
                         host_fd: HostFd(fd),
-                        metadata: RootFsMetadata {
+                        fallback: StatRecord::from_metadata(&RootFsMetadata {
                             path: std::path::PathBuf::from(executable.display_path()),
                             kind: RootFsEntryKind::File,
                             mode,
                             size: len,
-                        },
+                        }),
                     };
                 }
                 let (ino, mode, uid, gid, len) = match executable.source().stat_fields() {

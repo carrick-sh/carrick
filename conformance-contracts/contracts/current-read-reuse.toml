@@ -1,0 +1,37 @@
+schema_version = 1
+id = "kernel.mm.current-read-reuse"
+title = "Repeated current-MM reads do work proportional to the accessed range"
+guest_surfaces = ["kernel:current-mm", "syscall:inotify_add_watch", "syscall:write", "syscall:mprotect", "syscall:munmap"]
+semantic_authority = ["Linux readable syscall-buffer semantics", "Carrick exact task/execution/MM authority", "Carrick live mapping, permission and owner generation"]
+fixture = "unit:current-read-reuse"
+scale_points = [1, 8, 32, 128]
+rationale = "Sixteen warmed reads of one fixed 256-byte resident range must not enumerate or retain the whole address space as unrelated COW backing compounds grow. A reusable window must authenticate the current execution lease and live revisions, leaf validity, permissions and exact owner on every copy. No raw pointer escapes and no execution scope is held across dispatch. Cold preparation and unsupported-range fallback remain separately attributed."
+
+[bindings]
+vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_buffers::current_read_reuse_cost_contract (conformance-metrics), plus read-window revocation controls"
+
+[bindings.unresolved]
+embed_structural = "Bounded ELF carrier-buffer controls use private research text and mock stage-2; signed native execution remains unbound."
+embed_timing = "Host-only native research timings do not qualify as product-native workload acceptance."
+docker = "Same-ELF pinned native ARM64 Linux controls remain the diagnostic oracle. No full inotify09 or language-workload binding is closed."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "host_heap_allocations"
+value = 0
+layers = ["vm-free"]
+rationale = "Actual thread-local allocation calls after window preparation, with a positive control."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "mm_snapshot_collections"
+value = 0
+layers = ["vm-free"]
+rationale = "Fresh non-reusing authority generations validate an already-authenticated window without reconstructing full MM snapshots."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "foreign_owner_pins"
+value = 0
+layers = ["vm-free"]
+rationale = "An unchanged range retains its exact owner; unrelated owners must not be pinned on every copy."

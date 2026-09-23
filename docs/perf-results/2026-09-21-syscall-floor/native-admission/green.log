@@ -1,0 +1,18 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 40.23s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-207122e8ce47be2c)
+
+running 10 tests
+test kernel::guest_execution::tests::a_peer_that_releases_participation_leaves_the_census ... ok
+test kernel::guest_execution::tests::a_sole_executor_needs_no_barrier ... ok
+test kernel::guest_execution::tests::anonymous_identity_exhaustion_never_reuses_the_final_token ... ok
+test kernel::guest_execution::tests::dropping_one_exact_participant_preserves_the_other ... ok
+test kernel::guest_execution::tests::duplicate_admission_preserves_live_pause_endpoint ... ok
+test kernel::guest_execution::tests::duplicate_admission_without_endpoint_preserves_original_endpoint ... ok
+test kernel::guest_execution::tests::duplicate_exact_thread_admission_is_rejected ... ok
+test kernel::guest_execution::tests::failed_crash_participation_unwinds_exact_census_identity ... ok
+test kernel::guest_execution::tests::membership_ends_on_unwind ... ok
+test kernel::guest_execution::tests::probe_participant_count_saturates_at_i32_max ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 2188 filtered out; finished in 0.03s
+

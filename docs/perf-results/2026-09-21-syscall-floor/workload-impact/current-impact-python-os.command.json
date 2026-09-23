@@ -1,0 +1,24 @@
+{
+  "argv": [
+    "/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-fstat-allocation",
+    "trace",
+    "--require-script-exit",
+    "--profile",
+    "hvpatch-carrier-cpu-low-rate",
+    "-o",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/workloads/current-impact-python-os.raw",
+    "--",
+    "run",
+    "--max-traps",
+    "18446744073709551615",
+    "--fs",
+    "host",
+    "--entrypoint",
+    "/bin/bash",
+    "localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30",
+    "-c",
+    "set -eu; for i in $(seq 1 3); do ( time /usr/local/bin/python3 -m test -v --randseed 0 test_os ); done; echo PROFILE_WORKLOAD_OK"
+  ],
+  "run_id": "floor-current-impact-python-os",
+  "binary_sha256": "5936b1522fb26651edb376133cd4dc7c72e48569813c739bbb10b19db6e1f784"
+}

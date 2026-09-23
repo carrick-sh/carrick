@@ -1,0 +1,49 @@
+warning: unused return value of `set_realtime_off_ns` that must be used
+    --> carrick-dsr-aarch64/src/mapped_memory.rs:1586:13
+     |
+1586 |             carrick_mem::vdso::set_realtime_off_ns(realtime_off);
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+     |
+1586 |             let _ = carrick_mem::vdso::set_realtime_off_ns(realtime_off);
+     |             +++++++
+
+warning: `carrick-dsr-aarch64` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/lease-cost/dsr-reuse/target/debug/deps/carrick_dsr_aarch64-9aa5d69d129aabf3)
+
+running 29 tests
+test emit::tests::biased_dc_zva_recovery_restores_every_borrowed_scratch_at_every_boundary ... ok
+test emit::tests::biased_lowerings_never_emit_darwin_volatile_physical_x18 ... ok
+test emit::tests::commit_reserved_resident_takes_the_interrupted_physical_x19 ... ok
+test emit::tests::compact_biased_immediate_store_emits_the_orr_form ... ok
+test emit::tests::compact_biased_postindex_writeback_commits_with_full_width_sub ... ok
+test emit::tests::compact_multichunk_writeback_recovers_at_each_bias_materialization_boundary ... ok
+test emit::tests::direct_instruction_bytes_are_default_on_with_an_exact_opt_out ... ok
+test emit::tests::dsr_virtual_counter_mode_one_emits_inline_machine_code ... ok
+test emit::tests::fused_block_emits_a_single_generation_guard ... ok
+test emit::tests::fused_segment_edge_falls_through_in_two_words_without_saving_guest_x17 ... ok
+test emit::tests::fused_segments_after_an_exclusive_region_are_rejected ... ok
+test emit::tests::fused_virtual_condition_never_crosses_darwin_x18 ... ok
+test emit::tests::generation_guard_spills_no_guest_register ... ok
+test emit::tests::indirect_exit_hot_path_is_flag_free_and_branches_through_x19 ... ok
+test emit::tests::instruction_map_rejects_non_monotonic_cache_offsets ... ok
+test emit::tests::instruction_map_releases_owned_entries_without_cloning ... ok
+test emit::tests::negative_immediates_and_sub_aperture_biases_keep_the_general_form ... ok
+test emit::tests::pc_relative_address_materializes_through_resident_x19 ... ok
+test emit::tests::private_direct_edges_use_compact_gateway_stubs ... ok
+test emit::tests::recorded_emission_is_word_identical_to_native_emission ... ok
+test emit::tests::reserved_resident_read_only_base_is_two_words_with_no_recovery ... ok
+test emit::tests::reserved_resident_rejects_destination_feeding_the_address ... ok
+test emit::tests::reserved_resident_rejects_read_modify_write_movk ... ok
+test emit::tests::reserved_resident_write_only_definition_commits_without_loading ... ok
+test emit::tests::reserved_resident_writeback_base_is_three_words_with_commit ... ok
+test emit::tests::reserved_scratch_lowering_emits_no_context_spill ... ok
+test emit::tests::terminal_virtual_condition_never_crosses_darwin_x18 ... ok
+test emit::tests::trusted_entry_publishes_generation_past_the_guard ... ok
+test emit::tests::virtual_indirect_target_never_crosses_darwin_x18 ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 203 filtered out; finished in 0.00s
+

@@ -670,7 +670,9 @@ impl FrameInventoryAuthority {
             .map(|state| snapshot_state(&state, Some(mm)))
     }
 
-    pub(crate) fn revision_until(&self, deadline: Instant) -> Option<u64> {
+    /// Observe the inventory publication generation without copying its rows.
+    /// Only validates an already authenticated snapshot of this exact inventory.
+    pub fn revision_until(&self, deadline: Instant) -> Option<u64> {
         self.state
             .try_lock_until(deadline)
             .map(|state| state.revision)

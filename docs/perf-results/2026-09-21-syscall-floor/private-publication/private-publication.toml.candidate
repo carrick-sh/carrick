@@ -1,0 +1,22 @@
+schema_version = 1
+id = "kernel.mm.private-publication"
+title = "Fresh private frames publish without carrier-wide exclusion"
+guest_surfaces = ["syscall:mmap", "fault:private-first-touch"]
+semantic_authority = ["Linux private mapping content and isolation, failure atomicity, fork preservation"]
+fixture = "unit:private-sparse-publication"
+scale_points = [1, 8, 32, 128]
+rationale = "Fresh private backing has no globally reusable identity. Exact-MM exclusion and per-registry internal locks protect publication; shared-frame reuse and old-row retirement retain the carrier guard."
+[bindings]
+vm_free = "carrick-vmm-hvf::trap::foreign_mm::tests::private_sparse_publication_allows_independent_registry_progress"
+[bindings.unresolved]
+embed_structural = "Live-guest private publication concurrency work binding pending."
+production_kernel = "VM-free carrier test uses a test authority; composed real kernel concurrency proof pending."
+embed = "Signed private first-touch, fork isolation and replacement acceptance pending."
+docker = "Fresh paired workload acceptance pending."
+[[structural_budgets]]
+kind = "affine"
+metric = "host_backend_calls"
+base = 0
+per_unit = 0
+layers = ["vm-free"]
+rationale = "Publication checkpoints after staging and stage-1 sync at which an independent host thread cannot enter the frame registry. Scoped test-backend observation, not a total host-call budget."

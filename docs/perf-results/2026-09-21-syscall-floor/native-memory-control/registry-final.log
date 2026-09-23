@@ -1,0 +1,3 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running `target/debug/check-contracts`
+conformance contracts checked: 29 contracts, 15 claims, 59 surfaces (inventory: 338 syscalls, 14 with claims)

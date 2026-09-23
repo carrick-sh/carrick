@@ -1,0 +1,83 @@
+Attaching 7 probes...
+ORACLEMIX1|ready|root=35583
+ORACLEMIX1|complete|root=35583
+
+
+@calls[154]: 1
+@calls[157]: 1
+@calls[166]: 1
+@calls[131]: 1
+@calls[123]: 1
+@calls[205]: 2
+@calls[156]: 2
+@calls[53]: 2
+@calls[159]: 2
+@calls[223]: 2
+@calls[43]: 2
+@calls[179]: 3
+@calls[165]: 4
+@calls[93]: 4
+@calls[233]: 4
+@calls[155]: 4
+@calls[160]: 5
+@calls[143]: 6
+@calls[167]: 6
+@calls[216]: 6
+@calls[145]: 6
+@calls[132]: 6
+@calls[198]: 8
+@calls[158]: 8
+@calls[139]: 8
+@calls[203]: 8
+@calls[34]: 13
+@calls[20]: 14
+@calls[173]: 21
+@calls[23]: 24
+@calls[129]: 27
+@calls[35]: 44
+@calls[49]: 64
+@calls[172]: 75
+@calls[38]: 92
+@calls[115]: 267
+@calls[177]: 295
+@calls[176]: 298
+@calls[174]: 298
+@calls[175]: 304
+@calls[98]: 308
+@calls[178]: 311
+@calls[96]: 358
+@calls[293]: 362
+@calls[48]: 368
+@calls[94]: 370
+@calls[99]: 385
+@calls[220]: 395
+@calls[17]: 408
+@calls[261]: 423
+@calls[221]: 447
+@calls[278]: 589
+@calls[24]: 607
+@calls[436]: 751
+@calls[59]: 826
+@calls[78]: 1018
+@calls[72]: 1365
+@calls[73]: 1393
+@calls[25]: 1481
+@calls[215]: 2670
+@calls[214]: 2941
+@calls[61]: 2993
+@calls[226]: 3108
+@calls[29]: 3612
+@calls[135]: 3739
+@calls[62]: 4940
+@calls[63]: 7272
+@calls[222]: 8192
+@calls[64]: 8453
+@calls[57]: 10118
+@calls[56]: 10276
+@calls[79]: 15037
+@calls[260]: 15306
+@calls[134]: 43696
+@calls[80]: 16785982
+
+@total: 16942439
+

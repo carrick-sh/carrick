@@ -1,0 +1,3 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running `target/debug/generate-inventory`
+inventory generated at ./conformance-contracts/inventory.json: 338 syscalls (246 bring-up, 90 deferred, 2 planned; 14 with claims, 324 without claims)

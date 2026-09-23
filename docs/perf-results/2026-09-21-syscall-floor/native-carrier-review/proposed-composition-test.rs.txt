@@ -1,0 +1,39 @@
+    #[test]
+    fn native_data_borrow_composes_execution_lease_and_production_cow() {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        let (kernel, root) = bootstrap(31_180);
+        let fixture = real_production_cow_fixture(
+            &kernel, &root, 31_181, 0x9a00_3b00_0000, 0x9b00_3b00_0000,
+            ThreadId::synthetic_for_tests(31_181),
+        );
+        let execution = execution_lease(&fixture.child, 181);
+        let wrong = execution_lease(&root, 180);
+        let current = fixture.child.current_mm(&execution).unwrap();
+        use carrick_kernel::kernel::mm_access::MmAccessTarget;
+        let range = current.access_token().write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
+        let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+        authority.with_current_mutation(&current, ThreadId::synthetic_for_tests(31_181), |mutation| {
+            let mut cow = authority.break_foreign_cow(mutation, &current, range).unwrap();
+            assert!(fixture.child.borrow_current_native_data(&wrong, &mut cow).is_err());
+            let mut data = fixture.child.borrow_current_native_data(&execution, &mut cow)
+                .expect("authenticated resident native data span after production COW");
+            assert_eq!(data.start(), GuestVa(TEST_VA));
+            assert_eq!(data.len(), 4);
+            // This bounded native CPU operation qualifies the data grant only.
+            // It does not publish translated code or call the syscall dispatcher.
+            unsafe {
+                let ptr = data.as_mut_ptr();
+                std::arch::asm!(
+                    "ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
+                    ptr = in(reg) ptr, out("x9") _, options(nostack)
+                );
+            }
+            Ok(())
+        }).unwrap();
+        let current = foreign_mm(&kernel, &root, &wrong, fixture.child.task().key());
+        let read = current.access_token().read_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
+        let mut bytes = [0;4];
+        authority.read_foreign(&current, read, &mut bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes), u32::from_le_bytes(*b"same")+1);
+    }
+

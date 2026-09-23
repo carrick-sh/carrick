@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/current-read-reuse/red-runtime",
+    "native_buffers::current_read_reuse_cost_contract",
+    "--nocapture"
+  ],
+  "exit_code": 101,
+  "source_revision": "sha256:4ef740106e381803585e8866ba0564fe115dfa567bf3a2f42e66abc11c8679bb",
+  "binary_sha256": "c27022fa9b1468ece4d68720c304783931946a56a49b1c9086e4884f132f3c5c",
+  "original_work_reproduced": true
+}

@@ -1,0 +1,22 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.58s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-0aaee9123b867d4d)
+
+running 1 test
+test trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance ... FAILED
+
+failures:
+
+---- trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance stdout ----
+
+thread 'trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance' (3529616) panicked at crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs:9129:50:
+called `Result::unwrap()` on an `Err` value: MissingBinding { id: ContractId("kernel.mm.fresh-publication-maintenance"), layer: EmbedStructural }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 508 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`

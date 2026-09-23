@@ -102,7 +102,10 @@ fn hvf_vcpu_reclaim_enabled() -> bool {
 pub fn bring_up(image: &AddressSpace) -> Result<HvfAarch64Engine, TrapError> {
     let plan = GuestMappingPlan::from_address_space(image)?;
     let (state, vcpu, mailbox) = HvfVmState::new_with_plan(&plan)?;
-    let vmm = HvfAarch64Vmm { state };
+    let vmm = HvfAarch64Vmm {
+        state,
+        host_writes: Default::default(),
+    };
     Ok(Aarch64EngineCore::from_parts(
         vmm,
         HvfAarch64Vcpu::new(vcpu, mailbox),
@@ -440,6 +443,9 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
 /// the vCPU, which now lives in [`HvfAarch64Vcpu`]).
 pub struct HvfAarch64Vmm {
     pub(crate) state: HvfVmState,
+    // Executor-local scratch. A HostWriteGuard closes every admission before
+    // dispatch returns, so no raw destination survives a task switch.
+    host_writes: crate::trap::host_writes::HostWrites,
 }
 
 #[derive(Clone)]
@@ -1211,7 +1217,13 @@ impl HvpatchPersistentExecutorFactoryAuthority {
 
     pub fn create_executor_parts(&self) -> Result<(HvfAarch64Vmm, HvfAarch64Vcpu), TrapError> {
         let (state, vcpu, mailbox) = HvfVmState::from_persistent_executor_spec(&self.spec)?;
-        Ok((HvfAarch64Vmm { state }, HvfAarch64Vcpu::new(vcpu, mailbox)))
+        Ok((
+            HvfAarch64Vmm {
+                state,
+                host_writes: Default::default(),
+            },
+            HvfAarch64Vcpu::new(vcpu, mailbox),
+        ))
     }
 }
 
@@ -1302,7 +1314,70 @@ impl GuestVmBackend for HvfAarch64Vmm {
     }
 }
 
+/// Exact-MM retirement reservation, consumed only after stage-1 invalidation.
+pub struct HvfAnonymousDiscard {
+    va: u64,
+    len: usize,
+    mm: u64,
+    prepared: crate::trap::PreparedProcessAliasRetirement,
+}
+
 impl Aarch64Vmm for HvfAarch64Vmm {
+    type AnonymousDiscard = HvfAnonymousDiscard;
+
+    fn anonymous_discard_granule(&self) -> Option<u64> {
+        self.state.persistent_vm_lifecycle.then_some(16384)
+    }
+
+    fn prepare_anonymous_discard(
+        &self,
+        va: u64,
+        len: usize,
+    ) -> Result<Option<Self::AnonymousDiscard>, TrapError> {
+        // Partial host granules keep the authenticated scrub until retained
+        // neighbor retirement has a separate structural proof.
+        if !self.state.persistent_vm_lifecycle || va % 16384 != 0 || len == 0 || len % 16384 != 0 {
+            return Ok(None);
+        }
+        let identity = self
+            .state
+            .cow_identity
+            .ok_or_else(|| TrapError::Hypervisor("anonymous discard has no exact MM".into()))?;
+        let prepared = self.state.prepare_process_alias_retirement(va, len)?;
+        Ok(Some(HvfAnonymousDiscard {
+            va,
+            len,
+            mm: identity.mm,
+            prepared,
+        }))
+    }
+
+    fn commit_anonymous_discard(
+        &mut self,
+        ticket: Self::AnonymousDiscard,
+    ) -> Result<(), TrapError> {
+        let identity = self
+            .state
+            .cow_identity
+            .ok_or_else(|| TrapError::Hypervisor("anonymous discard lost MM identity".into()))?;
+        if identity.mm != ticket.mm {
+            return Err(TrapError::Hypervisor(
+                "anonymous discard MM identity changed".into(),
+            ));
+        }
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
+            identity.linux_pid,
+            identity.linux_tid,
+        );
+        self.state.commit_process_alias_retirement(
+            ticket.va,
+            ticket.len,
+            ticket.prepared,
+            &registry,
+        )
+    }
+
     fn fd_ceiling_publisher(&self) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
         self.state.fd_ceiling_publisher()
     }
@@ -1714,6 +1789,18 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.host_ptr_for_write(va, len)
     }
 
+    fn begin_host_write(
+        &mut self,
+        ranges: &[carrick_guest_mem::HostWriteRange],
+    ) -> Result<(), MemoryError> {
+        let custody = self.state.carrier_vm_custody();
+        self.host_writes.begin(&self.state.task, &custody, ranges)
+    }
+
+    fn finish_host_write(&mut self, _ranges: &[carrick_guest_mem::HostWriteRange]) {
+        self.host_writes.finish();
+    }
+
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
         self.state.set_no_access(address, len, no_access);
     }
@@ -1932,7 +2019,13 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // pair; the engine restores the seeded snapshot via `restore_thread_start`
         // (HVF's EL0-trampoline thread-start for a brand-new vCPU).
         let (state, vcpu, mailbox) = HvfVmState::from_thread_spec(builder)?;
-        Ok((Self { state }, HvfAarch64Vcpu::new(vcpu, mailbox)))
+        Ok((
+            Self {
+                state,
+                host_writes: Default::default(),
+            },
+            HvfAarch64Vcpu::new(vcpu, mailbox),
+        ))
     }
 
     fn build_process_builder(
@@ -1947,7 +2040,13 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn materialize_process(builder: Self::ProcessBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
         let (state, vcpu, mailbox) = HvfVmState::from_process_spec(builder)?;
-        Ok((Self { state }, HvfAarch64Vcpu::new(vcpu, mailbox)))
+        Ok((
+            Self {
+                state,
+                host_writes: Default::default(),
+            },
+            HvfAarch64Vcpu::new(vcpu, mailbox),
+        ))
     }
 
     fn commit_process_materialization(&mut self) -> Result<(), TrapError> {

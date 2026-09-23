@@ -1,0 +1,10 @@
+5ea5d0648c951954
+iterations=8
+completed_writes=8
+completed_rewinds=8
+file_limit_unlimited=true
+bytes_match=true
+offset_matches=true
+length_matches=true
+closed=true
+removed=true

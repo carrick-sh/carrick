@@ -101,7 +101,7 @@ impl<'a> FsView<'a> {
             && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, false)
             && real.kind == RootFsEntryKind::Fifo
         {
-            return Ok(StatRecord::from_real(&path, &real).with_fs_identity(fs_id));
+            return Ok(StatRecord::from_real(&real).with_fs_identity(fs_id));
         }
         let record = match source {
             OpenStatSource::Error(errno) => return Err(errno),
@@ -150,7 +150,7 @@ impl<'a> FsView<'a> {
             // synthetic record, so the `fallback` already matches.
             OpenStatSource::PathRecord { path, fallback } => {
                 if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, true) {
-                    StatRecord::from_real(&path, &real)
+                    StatRecord::from_real(&real)
                 } else if let Some(real) = self
                     .fs
                     .vfs_mounts
@@ -165,12 +165,12 @@ impl<'a> FsView<'a> {
                     // TestFileChdir; Python os.path.samestat). Without this the
                     // fd fell back to the path-HASH inode while the path-stat
                     // returned the real host inode.
-                    StatRecord::from_real(&path, &real)
+                    StatRecord::from_real(&real)
                 } else if let Some(real) = self
                     .fs
                     .rootfs_vfs
                     .immutable_lower_real_stat(&path, true)
-                    .map(|real| StatRecord::from_real(&path, &real))
+                    .map(|real| StatRecord::from_real(&real))
                     .filter(|real| real.mode & LINUX_S_IFMT == fallback.mode & LINUX_S_IFMT)
                 {
                     // A DIRECTORY only the immutable cache lower holds. Its
@@ -184,8 +184,7 @@ impl<'a> FsView<'a> {
                     fallback
                 }
             }
-            OpenStatSource::HostFile { host_fd, metadata } => {
-                let path = metadata.path.to_string_lossy().into_owned();
+            OpenStatSource::HostFile { host_fd, fallback } => {
                 let mut host_st: libc::stat = unsafe { std::mem::zeroed() };
                 // SAFETY: host_fd is a live host fd; &host_st is a valid out-param.
                 if unsafe { libc::fstat(host_fd.get(), &mut host_st) } == 0 {
@@ -202,11 +201,11 @@ impl<'a> FsView<'a> {
                     real.mode = inode_rec.mode & 0o7777;
                     real.uid = inode_rec.uid;
                     real.gid = inode_rec.gid;
-                    let mut record = StatRecord::from_real(&path, &real);
+                    let mut record = StatRecord::from_real(&real);
                     record.apply_device_node(device);
                     return Ok(record.with_fs_identity(fs_id));
                 }
-                StatRecord::from_metadata(&metadata)
+                fallback
             }
         };
         Ok(record.with_fs_identity(fs_id))
@@ -226,7 +225,7 @@ impl<'a> FsView<'a> {
         path: &str,
         real: &carrick_vfs::fs_backend::RealStat,
     ) -> StatRecord {
-        let mut record = StatRecord::from_real(path, real);
+        let mut record = StatRecord::from_real(real);
         let type_bits = real.mode & LINUX_S_IFMT;
         if type_bits == LINUX_S_IFCHR || type_bits == LINUX_S_IFBLK {
             let rdev = self
@@ -266,7 +265,7 @@ impl<'a> FsView<'a> {
         metadata: &RootFsMetadata,
     ) -> StatRecord {
         match self.fs.rootfs_vfs.immutable_lower_real_stat(path, follow) {
-            Some(real) if real.kind == metadata.kind => StatRecord::from_real(path, &real),
+            Some(real) if real.kind == metadata.kind => StatRecord::from_real(&real),
             _ => StatRecord::from_metadata(metadata),
         }
     }
@@ -619,7 +618,7 @@ impl<'a> FsView<'a> {
                 let uninit_real = std::mem::MaybeUninit::<carrick_vfs::fs_backend::RealStat>::uninit();
                 let uninit_md = std::mem::MaybeUninit::<RootFsMetadata>::uninit();
                 unsafe {
-                    let _ = write_statx_real(memory, 0, "", &*uninit_real.as_ptr());
+                    let _ = write_statx_real(memory, 0, &*uninit_real.as_ptr());
                     let _ = write_statx(memory, 0, &*uninit_md.as_ptr());
                 }
                 let _ = write_synthetic_statx(memory, 0, "", 0);

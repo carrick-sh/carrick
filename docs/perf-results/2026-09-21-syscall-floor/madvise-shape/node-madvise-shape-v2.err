@@ -1,0 +1,82 @@
+2026-09-22T03:35:46.325885Z  WARN carrick::commands: carrick trace: not root; re-executing under sudo
+TRACECHILD1|euid=501|egid=20|groups=12,20,33,61,79,80,81,98,100,204,250,395,398,399,400,701
+
+real	0m0.353s
+user	0m0.061s
+sys	0m0.247s
+
+real	0m0.295s
+user	0m0.061s
+sys	0m0.244s
+
+real	0m0.295s
+user	0m0.059s
+sys	0m0.246s
+
+real	0m0.300s
+user	0m0.062s
+sys	0m0.247s
+
+real	0m0.300s
+user	0m0.060s
+sys	0m0.248s
+
+real	0m0.299s
+user	0m0.060s
+sys	0m0.246s
+
+real	0m0.292s
+user	0m0.058s
+sys	0m0.243s
+
+real	0m0.292s
+user	0m0.058s
+sys	0m0.240s
+
+real	0m0.294s
+user	0m0.057s
+sys	0m0.248s
+
+real	0m0.300s
+user	0m0.061s
+sys	0m0.250s
+
+real	0m0.306s
+user	0m0.067s
+sys	0m0.249s
+
+real	0m0.294s
+user	0m0.056s
+sys	0m0.246s
+
+real	0m0.299s
+user	0m0.060s
+sys	0m0.249s
+
+real	0m0.295s
+user	0m0.056s
+sys	0m0.245s
+
+real	0m0.294s
+user	0m0.059s
+sys	0m0.243s
+
+real	0m0.296s
+user	0m0.059s
+sys	0m0.248s
+
+real	0m0.296s
+user	0m0.059s
+sys	0m0.245s
+
+real	0m0.296s
+user	0m0.060s
+sys	0m0.243s
+
+real	0m0.297s
+user	0m0.058s
+sys	0m0.245s
+
+real	0m0.302s
+user	0m0.060s
+sys	0m0.252s

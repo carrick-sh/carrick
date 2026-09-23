@@ -1,0 +1,6 @@
+{"schema":1,"phase":"fstat","sample":1,"iterations":1048576,"calls_per_iteration":1,"elapsed_ns":2422125958}
+{"schema":1,"phase":"fstat","sample":2,"iterations":1048576,"calls_per_iteration":1,"elapsed_ns":2412840208}
+{"schema":1,"phase":"fstat","sample":3,"iterations":1048576,"calls_per_iteration":1,"elapsed_ns":2435630708}
+{"schema":1,"phase":"fstat","sample":4,"iterations":1048576,"calls_per_iteration":1,"elapsed_ns":2405244333}
+{"schema":1,"phase":"fstat","sample":5,"iterations":1048576,"calls_per_iteration":1,"elapsed_ns":2444699959}
+{"schema":1,"verified":true,"bytes":64,"offset":0,"removed":true}

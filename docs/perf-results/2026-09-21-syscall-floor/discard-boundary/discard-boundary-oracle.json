@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "docker",
+    "run",
+    "--rm",
+    "--name",
+    "floor-discard-boundary-oracle",
+    "--platform",
+    "linux/arm64",
+    "--entrypoint",
+    "/usr/local/bin/python3",
+    "localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30",
+    "-c",
+    "import ctypes as c, os, select\nlib = c.CDLL(None, use_errno=True)\nlib.mmap.restype = c.c_void_p\nlib.mmap.argtypes = [c.c_void_p,c.c_size_t,c.c_int,c.c_int,c.c_int,c.c_long]\nlib.madvise.argtypes = [c.c_void_p,c.c_size_t,c.c_int]\nlib.mprotect.argtypes = [c.c_void_p,c.c_size_t,c.c_int]\nlib.munmap.argtypes = [c.c_void_p,c.c_size_t]\n\ndef zero(p, n):\n    assert lib.madvise(p, n, 4) == 0\n    assert c.string_at(p, n) == bytes(n)\n\nfor pages in [1,8,32,128]:\n    n = pages*4096\n    p = lib.mmap(None,n,3,0x22,-1,0)\n    assert p is not None and p != c.c_void_p(-1).value\n    # Two discards before any read/write; the full range is still pristine.\n    assert lib.madvise(p,n,4) == 0\n    zero(p,n)\n    # A partially dirty range must not skip its materialized bytes.\n    c.c_ubyte.from_address(p).value = 91\n    c.c_ubyte.from_address(p+n-1).value = 93\n    zero(p,n)\n    # Child discard must not clear the parent's shared COW source.\n    c.memset(p,0x5a,n)\n    r,w = os.pipe()\n    child = os.fork()\n    if child == 0:\n        try:\n            os.close(r)\n            zero(p,n)\n            os.write(w,b'K')\n            os._exit(0)\n        except BaseException:\n            os._exit(1)\n    os.close(w)\n    assert select.select([r],[],[],5)[0], 'child did not complete'\n    assert os.read(r,1) == b'K'\n    os.close(r)\n    assert os.waitpid(child,0) == (child,0)\n    assert c.string_at(p,n) == bytes([0x5a])*n\n    zero(p,n)\n    # Read-only anonymous discard still discards bytes; permissions stay read-only.\n    c.memset(p,0x31,n)\n    assert lib.mprotect(p,n,1) == 0\n    zero(p,n)\n    assert lib.mprotect(p,n,3) == 0\n    assert lib.munmap(p,n) == 0\n    print('pristine_scrub_pages='+str(pages)+'=ok',flush=True)\n\n# A Linux page can occupy only part of a host granule. Preserve both neighbors\n# and the fork peer while discarding the child's middle page.\nn = 16384\np = lib.mmap(None,n,3,0x22,-1,0)\nassert p is not None and p != c.c_void_p(-1).value\nc.memset(p,0x62,n)\nr,w = os.pipe()\nchild = os.fork()\nif child == 0:\n    try:\n        os.close(r)\n        zero(p+4096,4096)\n        assert c.string_at(p,4096) == bytes([0x62])*4096\n        assert c.string_at(p+8192,8192) == bytes([0x62])*8192\n        os.write(w,b'K')\n        os._exit(0)\n    except BaseException:\n        os._exit(1)\nos.close(w)\nassert select.select([r],[],[],5)[0], 'partial discard child did not complete'\nassert os.read(r,1) == b'K'\nos.close(r)\nassert os.waitpid(child,0) == (child,0)\nassert c.string_at(p,n) == bytes([0x62])*n\nassert lib.munmap(p,n) == 0\nprint('partial_scrub_fork=ok',flush=True)\n"
+  ],
+  "source_sha256": "fc0d7030c87ad138200471cd6ce7b24688938990747d71dccd93c601e366565a",
+  "returncode": 0
+}

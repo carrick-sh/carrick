@@ -1,0 +1,38 @@
+{
+  "0": {
+    "requests": 240,
+    "wait_ms": 48.092625,
+    "hold_ms": 103.548091,
+    "try_misses": 0
+  },
+  "1": {
+    "requests": 240,
+    "wait_ms": 65.513245,
+    "hold_ms": 1300.945118,
+    "try_misses": 0
+  },
+  "3": {
+    "requests": 63692,
+    "wait_ms": 13051.762563,
+    "hold_ms": 706.58071,
+    "try_misses": 0
+  },
+  "7": {
+    "requests": 243,
+    "wait_ms": 54.752206,
+    "hold_ms": 50.738839,
+    "try_misses": 0
+  },
+  "9": {
+    "requests": 22347,
+    "wait_ms": 6807.859018,
+    "hold_ms": 136.160233,
+    "try_misses": 0
+  },
+  "10": {
+    "requests": 11836,
+    "wait_ms": 5285.296428,
+    "hold_ms": 635.045174,
+    "try_misses": 0
+  }
+}

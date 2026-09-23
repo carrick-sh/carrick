@@ -1,0 +1,175 @@
+[
+  {
+    "name": "runtime-memory",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-runtime",
+      "--lib",
+      "vcpu_loop::memory::tests",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 25.336246967315674
+  },
+  {
+    "name": "kernel-mm",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-kernel",
+      "--lib",
+      "kernel::mm_access",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 41.468589067459106
+  },
+  {
+    "name": "native-lifetimes",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-kernel",
+      "--doc",
+      "CurrentNativeData"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 1.9731030464172363
+  },
+  {
+    "name": "hal-mm",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-hal",
+      "--lib",
+      "foreign_mm"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 1.9044439792633057
+  },
+  {
+    "name": "hvf-signed",
+    "argv": [
+      "bash",
+      "scripts/test-signed.sh",
+      "carrick-vmm-hvf",
+      "trap::foreign_mm::tests",
+      "--include-ignored"
+    ],
+    "exit_code": 1,
+    "elapsed_seconds": 34.480345249176025
+  },
+  {
+    "name": "hvf-lifecycle-signed",
+    "argv": [
+      "bash",
+      "scripts/test-signed.sh",
+      "carrick-vmm-hvf",
+      "trap::foreign_mm::tests::production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycle",
+      "--exact",
+      "--ignored"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 29.335810899734497
+  },
+  {
+    "name": "kernel-suite",
+    "argv": [
+      "just",
+      "test-kernel"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 73.90033984184265
+  },
+  {
+    "name": "native-experiment",
+    "argv": [
+      "cargo",
+      "test",
+      "--manifest-path",
+      "experiments/native-syscall-slice/Cargo.toml",
+      "--lib"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 18.902549028396606
+  },
+  {
+    "name": "clippy",
+    "argv": [
+      "cargo",
+      "clippy",
+      "-p",
+      "carrick-hal",
+      "-p",
+      "carrick-kernel",
+      "-p",
+      "carrick-vmm-hvf",
+      "-p",
+      "carrick-runtime",
+      "--lib",
+      "--tests",
+      "--no-deps",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 27.642112016677856
+  },
+  {
+    "name": "contracts",
+    "argv": [
+      "cargo",
+      "run",
+      "-p",
+      "carrick-conformance-contract",
+      "--bin",
+      "check-contracts",
+      "--",
+      "--root",
+      "."
+    ],
+    "exit_code": 1,
+    "elapsed_seconds": 0.32454395294189453
+  },
+  {
+    "name": "runtime-memory-final",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-runtime",
+      "--lib",
+      "vcpu_loop::memory::tests",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 27.402162075042725
+  },
+  {
+    "name": "clippy-runtime-final",
+    "argv": [
+      "cargo",
+      "clippy",
+      "-p",
+      "carrick-runtime",
+      "--lib",
+      "--tests",
+      "--no-deps",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 13.94072699546814
+  }
+]

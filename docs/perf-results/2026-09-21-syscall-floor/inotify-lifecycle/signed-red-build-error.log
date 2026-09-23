@@ -1,0 +1,9 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-embed)
+   Compiling carrick-conformance-next v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-next)
+error: could not compile `carrick-conformance-next` (test "inotify_lifecycle") due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+remaining carrick procs (run-id inotify-lifecycle-red-20260922) = 0
+remaining carrick procs (run-id inotify-lifecycle-red-20260922-cli) = 0

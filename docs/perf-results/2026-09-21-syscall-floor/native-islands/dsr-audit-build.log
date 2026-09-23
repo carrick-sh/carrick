@@ -1,0 +1,15 @@
+warning: unused return value of `set_realtime_off_ns` that must be used
+    --> carrick-dsr-aarch64/src/mapped_memory.rs:1586:13
+     |
+1586 |             carrick_mem::vdso::set_realtime_off_ns(realtime_off);
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+     |
+1586 |             let _ = carrick_mem::vdso::set_realtime_off_ns(realtime_off);
+     |             +++++++
+
+warning: `carrick-dsr-aarch64` (lib) generated 1 warning
+   Compiling dsr-text-audit v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/dsr-reuse/text-audit)
+    Finished `release` profile [optimized] target(s) in 0.83s

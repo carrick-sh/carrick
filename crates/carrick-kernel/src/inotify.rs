@@ -21,8 +21,7 @@
 //! Linux-style basename events. That dir-diff is macOS-only.
 
 use crate::linux_abi::{LINUX_EINVAL, LINUX_ENOSPC, LinuxErrno};
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::RawFd;
 
 use parking_lot::Mutex;
@@ -228,7 +227,6 @@ fn encode_event_record(wd: i32, mask: u32, cookie: u32, name: Option<&[u8]>) -> 
 #[derive(Debug)]
 struct Inner {
     next_wd: i32,
-    free_wds: BinaryHeap<Reverse<i32>>,
     watches: HashMap<i32, Watch>,
     wd_by_fd: HashMap<RawFd, WatchedFd>,
     /// Encoded `inotify_event` records observed but not yet handed to the guest
@@ -277,7 +275,6 @@ impl Inner {
     fn new() -> Self {
         Inner {
             next_wd: 1,
-            free_wds: BinaryHeap::new(),
             watches: HashMap::new(),
             wd_by_fd: HashMap::new(),
             pending: VecDeque::new(),
@@ -291,25 +288,23 @@ impl Inner {
         }
     }
 
-    /// Allocate the lowest available watch descriptor.
-    fn alloc_wd(&mut self) -> i32 {
-        if let Some(Reverse(wd)) = self.free_wds.pop() {
-            wd
-        } else {
+    /// Advance through positive descriptors without reusing removed watches
+    /// until wraparound, matching inotify(7). Pending events retain their wd;
+    /// eagerly recycling it can coalesce distinct IN_IGNORED notifications.
+    /// Only live descriptors are consulted, never the pending event queue.
+    fn alloc_wd(&mut self) -> Result<i32, LinuxErrno> {
+        if self.watches.len() >= i32::MAX as usize {
+            return Err(LINUX_ENOSPC);
+        }
+        // At most live-count collisions precede a free slot, including wrap.
+        for _ in 0..=self.watches.len() {
             let wd = self.next_wd;
-            self.next_wd += 1;
-            wd
+            self.next_wd = wd.checked_add(1).unwrap_or(1);
+            if !self.watches.contains_key(&wd) {
+                return Ok(wd);
+            }
         }
-    }
-
-    /// Return a watch descriptor to the pool, resetting the pool if empty.
-    fn free_wd(&mut self, wd: i32) {
-        if self.watches.is_empty() {
-            self.next_wd = 1;
-            self.free_wds.clear();
-        } else {
-            self.free_wds.push(Reverse(wd));
-        }
+        Err(LINUX_ENOSPC)
     }
 
     /// Append one already-encoded `inotify_event` record, enforcing the bounded
@@ -483,7 +478,20 @@ impl InotifyBackend for NativeLinuxInotify {
             unsafe { libc::close(watch_fds[0].host_fd) };
             return Ok(wd);
         }
-        let wd = inner.alloc_wd();
+        let wd = match inner.alloc_wd() {
+            Ok(wd) => wd,
+            Err(error) => {
+                for native_wd in native_wds {
+                    if !inner.native_wd_to_guest.contains_key(&native_wd) {
+                        unsafe { libc::inotify_rm_watch(self.inotify_fd, native_wd) };
+                    }
+                }
+                for fd in host_fds {
+                    unsafe { libc::close(fd) };
+                }
+                return Err(error);
+            }
+        };
         for (watch_fd, native_wd) in watch_fds.iter().zip(native_wds) {
             inner.wd_by_fd.insert(watch_fd.host_fd, WatchedFd { wd });
             inner.native_wd_to_guest.insert(native_wd, wd);
@@ -696,7 +704,16 @@ impl InotifyBackend for VnodeDiffInotify {
             unsafe { libc::close(fd) };
             return Ok(wd);
         }
-        let wd = inner.alloc_wd();
+        let wd = match inner.alloc_wd() {
+            Ok(wd) => wd,
+            Err(error) => {
+                // Closing these owned descriptors also removes their kqueue filters.
+                for watch_fd in &watch_fds {
+                    unsafe { libc::close(watch_fd.host_fd) };
+                }
+                return Err(error);
+            }
+        };
         for watch_fd in &watch_fds {
             let scan_dir = watch_fd.scan_dir.as_ref().and_then(|path| {
                 scan_dir_entries(path).ok().map(|entries| ScannedDir {
@@ -1057,9 +1074,9 @@ impl InotifyState {
     /// guest is entitled to a wd. Same-process events still flow via the
     /// dispatch-layer registry; cross-process directory wakeups (which need a
     /// real shared vnode) are simply unavailable for such a watch.
-    pub(crate) fn add_virtual_watch(&self, mask: u32) -> i32 {
+    pub(crate) fn add_virtual_watch(&self, mask: u32) -> Result<i32, LinuxErrno> {
         let mut inner = self.inner.lock();
-        let wd = inner.alloc_wd();
+        let wd = inner.alloc_wd()?;
         inner.watches.insert(
             wd,
             Watch {
@@ -1071,7 +1088,7 @@ impl InotifyState {
         {
             inner.dispatch_authoritative = true;
         }
-        wd
+        Ok(wd)
     }
 
     /// Replace or extend an existing watch mask while preserving its wd.
@@ -1130,7 +1147,6 @@ impl InotifyState {
         let Some(watch) = inner.watches.remove(&wd) else {
             return Err(LINUX_EINVAL);
         };
-        inner.free_wd(wd);
         for host_fd in &watch.host_fds {
             inner.wd_by_fd.remove(host_fd);
         }
@@ -2075,7 +2091,9 @@ mod readiness_tests {
     #[test]
     fn dispatch_enqueue_makes_the_inotify_poll_fd_readable() {
         let state = InotifyState::new().expect("inotify backend");
-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        let wd = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .expect("virtual watch");
 
         let poll_readable = || {
             let mut pfd = libc::pollfd {
@@ -2098,7 +2116,9 @@ mod readiness_tests {
     #[test]
     fn short_read_rearms_dispatch_queue_level_readiness() {
         let state = InotifyState::new().expect("inotify backend");
-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS);
+        let wd = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS)
+            .expect("virtual watch");
         state.enqueue(wd, carrick_abi::LINUX_IN_MODIFY, 0, None);
         state.enqueue(wd, carrick_abi::LINUX_IN_ATTRIB, 0, None);
 
@@ -2132,6 +2152,50 @@ mod readiness_tests {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn watch_descriptor_wrap_skips_live_watches() {
+        let state = InotifyState::new().expect("inotify");
+        let first = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .unwrap();
+        assert_eq!(first, 1);
+        state.inner.lock().next_wd = i32::MAX;
+        let last = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .unwrap();
+        assert_eq!(last, i32::MAX);
+        assert_eq!(
+            state
+                .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+                .unwrap(),
+            2
+        );
+        state.rm_watch(first).unwrap();
+        state.inner.lock().next_wd = i32::MAX;
+        assert_eq!(
+            state
+                .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+                .unwrap(),
+            1
+        );
+        assert!(state.inner.lock().watches.contains_key(&last));
+    }
+
+    #[test]
+    fn removed_watch_does_not_name_its_successor() {
+        let state = InotifyState::new().expect("inotify");
+        let first = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .unwrap();
+        state.rm_watch(first).unwrap();
+        let second = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(state.rm_watch(first), Err(LINUX_EINVAL));
+        assert!(state.inner.lock().watches.contains_key(&second));
+    }
 
     #[test]
     fn vnode_watch_reports_file_modification_as_in_modify() {
@@ -2441,7 +2505,9 @@ mod registry_tests {
         let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
         let reg = InotifyRegistry::default();
         // Watch the directory "/w" with all events.
-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS);
+        let wd = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS)
+            .expect("virtual watch");
         reg.register("/w", &state, wd, carrick_abi::LINUX_IN_ALL_EVENTS);
         state.mark_dispatch_authoritative();
         assert!(!reg.is_empty());
@@ -2481,7 +2547,9 @@ mod registry_tests {
         // An event the watch did not request is filtered out (empty → EAGAIN at
         // the dispatcher). Re-register with only IN_MODIFY.
         reg.unregister(&state, wd);
-        let wd2 = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        let wd2 = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .expect("virtual watch");
         reg.register("/w", &state, wd2, carrick_abi::LINUX_IN_MODIFY);
         reg.notify_self("/w", carrick_abi::LINUX_IN_ATTRIB, true); // not requested
         assert!(state.read_records(4096).expect("read").is_empty());
@@ -2493,7 +2561,9 @@ mod registry_tests {
         let parent = InotifyRegistry::default();
         let child = parent.clone();
 
-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        let wd = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .expect("virtual watch");
         parent.register("/shared", &state, wd, carrick_abi::LINUX_IN_MODIFY);
         child.notify_self("/shared", carrick_abi::LINUX_IN_MODIFY, false);
         assert!(
@@ -2515,7 +2585,9 @@ mod registry_tests {
     fn registry_unregister_and_rename_path_update_routing() {
         let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
         let reg = InotifyRegistry::default();
-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS);
+        let wd = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS)
+            .expect("virtual watch");
         reg.register("/old", &state, wd, carrick_abi::LINUX_IN_ALL_EVENTS);
 
         // rename_path moves the watch's key; a self event now routes via the new
@@ -2535,7 +2607,9 @@ mod registry_tests {
     fn registry_rename_replacement_removes_displaced_reverse_entries() {
         let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
         let reg = InotifyRegistry::default();
-        let original = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        let original = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .expect("virtual watch");
         reg.register(
             "/destination",
             &state,
@@ -2543,7 +2617,9 @@ mod registry_tests {
             carrick_abi::LINUX_IN_MODIFY,
         );
         for _ in 0..32 {
-            let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+            let wd = state
+                .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+                .expect("virtual watch");
             reg.register("/source", &state, wd, carrick_abi::LINUX_IN_MODIFY);
             reg.rename_path("/source", "/destination");
             let inner = reg.inner.read();
@@ -2562,7 +2638,9 @@ mod registry_tests {
     fn registry_unregister_removes_all_alias_paths() {
         let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
         let reg = InotifyRegistry::default();
-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        let wd = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .expect("virtual watch");
         reg.register("/first", &state, wd, carrick_abi::LINUX_IN_MODIFY);
         reg.register("/alias", &state, wd, carrick_abi::LINUX_IN_MODIFY);
         reg.unregister(&state, wd);
@@ -2577,7 +2655,9 @@ mod registry_tests {
     fn registry_path_removal_preserves_other_watch_aliases() {
         let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
         let reg = InotifyRegistry::default();
-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        let wd = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .expect("virtual watch");
         for path in ["/first", "/second", "/third"] {
             reg.register(path, &state, wd, carrick_abi::LINUX_IN_MODIFY);
         }
@@ -2593,8 +2673,12 @@ mod registry_tests {
     fn registry_notify_fd_event_delivers_to_both_parent_and_self() {
         let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
         let reg = InotifyRegistry::default();
-        let wd_parent = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
-        let wd_file = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        let wd_parent = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .expect("virtual watch");
+        let wd_file = state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .expect("virtual watch");
         reg.register("/dir", &state, wd_parent, carrick_abi::LINUX_IN_MODIFY);
         reg.register(
             "/dir/file.txt",

@@ -132,6 +132,8 @@ mod debug_exec_stamps;
 mod fs_setup;
 mod hvpatch_carrier_cpu_low_rate_profile;
 mod hvpatch_core_profile;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod hvpatch_inotify_population_profile;
 // Strict text reader for the bundled one-VM HVPatch K1 lifecycle profile.
 mod hvpatch_exec_runtime_profile;
 mod hvpatch_identity_host_safety_profile;

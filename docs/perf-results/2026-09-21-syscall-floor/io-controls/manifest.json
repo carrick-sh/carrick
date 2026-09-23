@@ -1,0 +1,680 @@
+[
+  {
+    "original": "target/lease-cost/io-floor/fstat-profile.err",
+    "sha256": "f873e1fa50585e62d07c71317e444a039d9859b2acb8b01302550dec5b204a8d",
+    "bytes": 416,
+    "preserved": "io-floor/fstat-profile.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/fstat-profile.out",
+    "sha256": "045f384180d1a2d27c623559a74ad7d89a8050951e83c7e4481e3e9f14439621",
+    "bytes": 1038,
+    "preserved": "io-floor/fstat-profile.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/fstat-profile.raw",
+    "sha256": "fc4ff549a1583ec5a5c5c4f159b311df150a500c921506a6d88a01bd6d1356ca",
+    "bytes": 164479,
+    "preserved": "io-floor/fstat-profile.raw.gz"
+  },
+  {
+    "original": "target/lease-cost/io-floor/fstat-profile.symbols.json",
+    "sha256": "d66a3692fe3b38c3f3793b7d155cc8032eaef655e3fc764f729c08a97c2c2ca0",
+    "bytes": 57194,
+    "preserved": "io-floor/fstat-profile.symbols.json.gz"
+  },
+  {
+    "original": "target/lease-cost/io-floor/fstat-ranking.json",
+    "sha256": "484221566e9cac9a4469496b7d21be9be0d2d305c9df2bb0aae43224f7b3b82b",
+    "bytes": 2295,
+    "preserved": "io-floor/fstat-ranking.json"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/driver.py",
+    "sha256": "563188933caad6c187957f719fda88f41add0dccb997924dc5e1d13483955360",
+    "bytes": 6249,
+    "preserved": "io-floor/screen1/driver.py"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/filesystem-supplement.txt",
+    "sha256": "00f82416a8d3f38876a557665aff261e21a98223c11e8cdb5d17e21141dd5269",
+    "bytes": 164,
+    "preserved": "io-floor/screen1/filesystem-supplement.txt"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/inputs.json",
+    "sha256": "0bde9cdd5777d1a71235fb3d9846ef13649fcd0df225ba5f60e825ecab8787fa",
+    "bytes": 2126,
+    "preserved": "io-floor/screen1/inputs.json"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-0.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-0.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-0.out",
+    "sha256": "bbf9a43e54320ada10cf33d8b69b049d2e1286249e3d9795c8458dcbdd90a66e",
+    "bytes": 3909,
+    "preserved": "io-floor/screen1/io-floor-screen1-0.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-1.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-1.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-1.out",
+    "sha256": "b6505301bf31c48610a98e3d4a7af9e4672a90be2ea84f66bc5c9c53b9e3f0f7",
+    "bytes": 3909,
+    "preserved": "io-floor/screen1/io-floor-screen1-1.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-10.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-10.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-10.out",
+    "sha256": "0ffb9d80aaa15fcac0e123c7c3c2a81083a7c4ac750924b3939c677f6ba88646",
+    "bytes": 3927,
+    "preserved": "io-floor/screen1/io-floor-screen1-10.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-11.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-11.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-11.out",
+    "sha256": "63296ed3aa9e1cbd9f2d1c8e63491c5fcf5c2256c5918b3c993fd4f360569d63",
+    "bytes": 3891,
+    "preserved": "io-floor/screen1/io-floor-screen1-11.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-12.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-12.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-12.out",
+    "sha256": "8c88b0a9649a23b340f2511b7e7a133a066ed823f8f7d6aeda1ded6ca141026f",
+    "bytes": 3891,
+    "preserved": "io-floor/screen1/io-floor-screen1-12.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-13.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-13.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-13.out",
+    "sha256": "41e8e958cc3fafcd872718a08ccb48dc731314dbd810ce123a80fd9e44ce7844",
+    "bytes": 3927,
+    "preserved": "io-floor/screen1/io-floor-screen1-13.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-14.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-14.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-14.out",
+    "sha256": "bc6d733b8e1ba4317ab84a5d52378284617becfd82c14465b2a39ac8f9fcb2f4",
+    "bytes": 3927,
+    "preserved": "io-floor/screen1/io-floor-screen1-14.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-15.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-15.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-15.out",
+    "sha256": "e8787112ab43cd88ac387681934de7847f0809d84fd0d901a001e0d7f35e3966",
+    "bytes": 3891,
+    "preserved": "io-floor/screen1/io-floor-screen1-15.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-2.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-2.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-2.out",
+    "sha256": "9eee67834b45c8dda54a06cd2ae8facdca5591e95f151b832c6ec350d2198115",
+    "bytes": 3909,
+    "preserved": "io-floor/screen1/io-floor-screen1-2.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-3.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-3.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-3.out",
+    "sha256": "30e6c5ce2be8d1da9dc609066c428365abec655fa3626dd19597b73a725461e9",
+    "bytes": 3909,
+    "preserved": "io-floor/screen1/io-floor-screen1-3.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-4.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-4.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-4.out",
+    "sha256": "a11a6ca51a6662d0a7579388e0b989863f8ce3ae302b58dd8b53d3246964a57e",
+    "bytes": 3909,
+    "preserved": "io-floor/screen1/io-floor-screen1-4.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-5.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-5.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-5.out",
+    "sha256": "cb8daebb836c7bd8fd23dffb2faa5fa39885bb346622b33b43e4d1d609c5cb0a",
+    "bytes": 3909,
+    "preserved": "io-floor/screen1/io-floor-screen1-5.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-6.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-6.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-6.out",
+    "sha256": "eacd149a631e481a790895a5168796da525e54effe309e57ad98df7d356c464a",
+    "bytes": 3909,
+    "preserved": "io-floor/screen1/io-floor-screen1-6.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-7.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-7.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-7.out",
+    "sha256": "f4f2f5fd49325005412f075a4cf9c34d2e394279088202b777aef58fb577358d",
+    "bytes": 3909,
+    "preserved": "io-floor/screen1/io-floor-screen1-7.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-8.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-8.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-8.out",
+    "sha256": "33720f39df80bab1bf6728b6131eb5dc4a2c0d8e1e42774662cc721130e306b6",
+    "bytes": 3891,
+    "preserved": "io-floor/screen1/io-floor-screen1-8.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-9.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "io-floor/screen1/io-floor-screen1-9.err"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/io-floor-screen1-9.out",
+    "sha256": "b7cdc8d6758513cebf015a355bdd2c70c906db13080838402502b607410efbde",
+    "bytes": 3927,
+    "preserved": "io-floor/screen1/io-floor-screen1-9.out"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/runs.jsonl",
+    "sha256": "7cfd861257fbd777b0690fd2224cec6783046c09b64eebf0d0043349998c80c6",
+    "bytes": 78937,
+    "preserved": "io-floor/screen1/runs.jsonl.gz"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/source.c",
+    "sha256": "469019727a4bbd50e5af6fdbe3f12b04c2844b408f8b2b5169dcc5a8e8875d29",
+    "bytes": 3669,
+    "preserved": "io-floor/screen1/source.c"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1/summary.json",
+    "sha256": "eac574bd0ca9eaa2a284a0638c81b69770f4e7e910ab8f2440e56ff15106907c",
+    "bytes": 630,
+    "preserved": "io-floor/screen1/summary.json"
+  },
+  {
+    "original": "target/lease-cost/io-floor/screen1.log",
+    "sha256": "3b3ca51d17b17f0751b07d50157cb61781d4e3813ee5dccd2c3d897d2e48e5fc",
+    "bytes": 3529,
+    "preserved": "io-floor/screen1.log"
+  },
+  {
+    "original": "target/lease-cost/io-floor/shared/io-floor-linux",
+    "sha256": "4e6b0dccf82e528b404aa5e04370170f454fab4742f156ab493ec98b308cb96c",
+    "bytes": 2686744,
+    "retained_local_path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/io-floor/shared/io-floor-linux"
+  },
+  {
+    "original": "target/lease-cost/io-floor/shared/io-floor-macos",
+    "sha256": "2f574e9a1097b710bf392a90bbe6b9156828d5c56248399f7767f5e86f678cb7",
+    "bytes": 34944,
+    "retained_local_path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/io-floor/shared/io-floor-macos"
+  },
+  {
+    "original": "target/lease-cost/io-floor/shared/io-floor-profile-linux",
+    "sha256": "2bc66ca7453884a95257832664900cb7d04622f03f2a5aaa51ec81442e1962e7",
+    "bytes": 2686744,
+    "retained_local_path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/io-floor/shared/io-floor-profile-linux"
+  },
+  {
+    "original": "target/lease-cost/lease-gap-focused.log",
+    "sha256": "4364902d0680bcd59a5a3fd2c13c831502d82e81aefc5935b0ca444a80b44320",
+    "bytes": 4463,
+    "preserved": "lease-gap-focused.log"
+  },
+  {
+    "original": "target/lease-cost/transport/artifact.json",
+    "sha256": "814f626391eab2adf2e4ba6a5aaff9c5c33b0991be8a69d276cab53b5dcd9e00",
+    "bytes": 1507,
+    "preserved": "transport/artifact.json"
+  },
+  {
+    "original": "target/lease-cost/transport/build.log",
+    "sha256": "0f52c48b6fdb801eee64103d9d85599792ccb31320353a05562804c6ee4d4f81",
+    "bytes": 2487,
+    "preserved": "transport/build.log"
+  },
+  {
+    "original": "target/lease-cost/transport/dispatch.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "transport/dispatch.err"
+  },
+  {
+    "original": "target/lease-cost/transport/dispatch.jsonl",
+    "sha256": "c8a00c62ffd411bae637f762e886620bd5b52a13ac9f24848f218bfcf9e767bc",
+    "bytes": 1139,
+    "preserved": "transport/dispatch.jsonl"
+  },
+  {
+    "original": "target/lease-cost/transport/hvf-svc-tax",
+    "sha256": "f6c9c2f02355b764ef2b07271ed3c8d1f8188a17316c34071a43063b38e58e24",
+    "bytes": 609152,
+    "retained_local_path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/transport/hvf-svc-tax"
+  },
+  {
+    "original": "target/lease-cost/transport/stage1.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "transport/stage1.err"
+  },
+  {
+    "original": "target/lease-cost/transport/stage1.jsonl",
+    "sha256": "017c58caddffcf829aa98c8ca490f44f21a8af0b970b2053b4e2a7a31c504587",
+    "bytes": 1055,
+    "preserved": "transport/stage1.jsonl"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-0-A-go-build-cold.err",
+    "sha256": "b1091e9d18f18e1fa3987acc1b7dbb8f6aa2f3b886bdc278005e0fb17b6c3bc3",
+    "bytes": 57,
+    "preserved": "workloads/floor-lease-gap-focused-0-A-go-build-cold.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-0-A-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "workloads/floor-lease-gap-focused-0-A-go-build-cold.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-0-A-node-app.err",
+    "sha256": "288eab4ed448e072c870014f4c847a708247dc9e92fec84f2cff9a76873714a3",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-0-A-node-app.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-0-A-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "workloads/floor-lease-gap-focused-0-A-node-app.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-0-A-python-os.err",
+    "sha256": "8b2dfc6e6b9321959a830f998a84a949e79a43cbd7683a5026f6d45c4844a900",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-0-A-python-os.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-0-A-python-os.out",
+    "sha256": "2d3a3530020241a55f3fee290b89f454ef871d57520f523265831170ac68f2ae",
+    "bytes": 28703,
+    "preserved": "workloads/floor-lease-gap-focused-0-A-python-os.out.gz"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-1-B-go-build-cold.err",
+    "sha256": "23b4a44348dc5e1816e097a57d0732cfad0ee8be90da94f843a8e3997307495a",
+    "bytes": 57,
+    "preserved": "workloads/floor-lease-gap-focused-1-B-go-build-cold.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-1-B-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "workloads/floor-lease-gap-focused-1-B-go-build-cold.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-1-B-node-app.err",
+    "sha256": "8d79054d34b1b10702def005d97b437e16e927237ac20ea33b9e7a388b820e9c",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-1-B-node-app.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-1-B-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "workloads/floor-lease-gap-focused-1-B-node-app.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-1-B-python-os.err",
+    "sha256": "7ea9798b6531d91854435a7ad411294bb24007cc2172b8cbd10102ccf74d2bdd",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-1-B-python-os.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-1-B-python-os.out",
+    "sha256": "b066ee2ac5803600901f1add68a984641303e7e649fe52f80abc6abf94800046",
+    "bytes": 28703,
+    "preserved": "workloads/floor-lease-gap-focused-1-B-python-os.out.gz"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-2-B-go-build-cold.err",
+    "sha256": "d672b17a0f1339d54de0c76fd37e720422642033d63607e733a2054f3a33dad7",
+    "bytes": 57,
+    "preserved": "workloads/floor-lease-gap-focused-2-B-go-build-cold.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-2-B-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "workloads/floor-lease-gap-focused-2-B-go-build-cold.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-2-B-node-app.err",
+    "sha256": "4a1bc66eb2354e64b34d70a503060d83b444e5ee910f0aec14f5a5b659b08d58",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-2-B-node-app.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-2-B-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "workloads/floor-lease-gap-focused-2-B-node-app.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-2-B-python-os.err",
+    "sha256": "25523f90d0f6596f94da731cc9086e89fc658d7c18a1e1a587ff911e60391d19",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-2-B-python-os.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-2-B-python-os.out",
+    "sha256": "83c7bb71e8fff82efe5e82c68ca7260e55aa0c6b84a177a8de253b28a88c9865",
+    "bytes": 28703,
+    "preserved": "workloads/floor-lease-gap-focused-2-B-python-os.out.gz"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-3-A-go-build-cold.err",
+    "sha256": "4d4eb5c8a2ce69ee4a949206744ee72d6af45761233ee850d69122c03003afa4",
+    "bytes": 57,
+    "preserved": "workloads/floor-lease-gap-focused-3-A-go-build-cold.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-3-A-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "workloads/floor-lease-gap-focused-3-A-go-build-cold.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-3-A-node-app.err",
+    "sha256": "41b5c13781da196274a12161d96fe6a55c50f384500fdb060e3d1f2ea267399d",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-3-A-node-app.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-3-A-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "workloads/floor-lease-gap-focused-3-A-node-app.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-3-A-python-os.err",
+    "sha256": "204c56e04182aa015bff66a6d337ce2329ca6fdad87b026ed9085935620a555f",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-3-A-python-os.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-3-A-python-os.out",
+    "sha256": "96c463f4bd05022cc882492e391d6b281fd9b6392ed8ee4c6128867d465d4c29",
+    "bytes": 28703,
+    "preserved": "workloads/floor-lease-gap-focused-3-A-python-os.out.gz"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-4-A-go-build-cold.err",
+    "sha256": "a534ad5a2c06c8685622e779e1f763263d98a08aeb4a871a509dc782ceb33910",
+    "bytes": 57,
+    "preserved": "workloads/floor-lease-gap-focused-4-A-go-build-cold.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-4-A-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "workloads/floor-lease-gap-focused-4-A-go-build-cold.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-4-A-node-app.err",
+    "sha256": "90036f1649430b7e6588af4a8454bb9052f5a5aa62156f48227c014ca84373cd",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-4-A-node-app.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-4-A-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "workloads/floor-lease-gap-focused-4-A-node-app.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-4-A-python-os.err",
+    "sha256": "4effa68a9ea3ea5d69e5152da7927270b42335cde7e0a0e6afc7c42bc934e075",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-4-A-python-os.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-4-A-python-os.out",
+    "sha256": "69278e2294c4cf1909ba8a5aff5e485b9d0e284efcd062675addc9332c49c3dd",
+    "bytes": 28703,
+    "preserved": "workloads/floor-lease-gap-focused-4-A-python-os.out.gz"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-5-B-go-build-cold.err",
+    "sha256": "4e0d6ecc765848248b49095f6be0574baf75de2ec6da49e16fabac3d502a2c9b",
+    "bytes": 57,
+    "preserved": "workloads/floor-lease-gap-focused-5-B-go-build-cold.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-5-B-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "workloads/floor-lease-gap-focused-5-B-go-build-cold.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-5-B-node-app.err",
+    "sha256": "d324d1884da3328ae503a54a49e4d97fe68cfb24637bde4e836cb8799bf19a94",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-5-B-node-app.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-5-B-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "workloads/floor-lease-gap-focused-5-B-node-app.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-5-B-python-os.err",
+    "sha256": "01efed739b1c56531bfc7982a6727c18da67169ae0bc514f44b19b872fbd74a1",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-5-B-python-os.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-5-B-python-os.out",
+    "sha256": "18d70eee256ca3b8f24f2fd1a3da93c83e6fa9d359b1ea11d200ec32cca7852e",
+    "bytes": 28703,
+    "preserved": "workloads/floor-lease-gap-focused-5-B-python-os.out.gz"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-6-B-go-build-cold.err",
+    "sha256": "126cb4c49b1f3835c068e385d5983b48e2c15f6568c70ba6ef2e3ce4422babc7",
+    "bytes": 57,
+    "preserved": "workloads/floor-lease-gap-focused-6-B-go-build-cold.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-6-B-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "workloads/floor-lease-gap-focused-6-B-go-build-cold.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-6-B-node-app.err",
+    "sha256": "6fc2d8a1ee8fd97269ed9631c77a0e8ebdfe30d4177094087cc3b437704af807",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-6-B-node-app.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-6-B-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "workloads/floor-lease-gap-focused-6-B-node-app.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-6-B-python-os.err",
+    "sha256": "af145e9746430edf9691e4853c3f85dc586c1dadd1642e86463c34fc1b3054f8",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-6-B-python-os.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-6-B-python-os.out",
+    "sha256": "004144393e5db5ef56474bc11264762c995dda9fbcd8270da7371f58a32e4881",
+    "bytes": 28703,
+    "preserved": "workloads/floor-lease-gap-focused-6-B-python-os.out.gz"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-7-A-go-build-cold.err",
+    "sha256": "a8b09aae601cd6a0004b094557edb981ad410de914b95c3d4b9611d61a96b89c",
+    "bytes": 57,
+    "preserved": "workloads/floor-lease-gap-focused-7-A-go-build-cold.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-7-A-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "workloads/floor-lease-gap-focused-7-A-go-build-cold.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-7-A-node-app.err",
+    "sha256": "233c9989f5c28a3d7630508c87d477afbb826cef812576f03f69a2e9d4313830",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-7-A-node-app.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-7-A-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "workloads/floor-lease-gap-focused-7-A-node-app.out"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-7-A-python-os.err",
+    "sha256": "da256085be55bfe05ddf6b7e5dd65d108384da8b861ab664c5d83da27a3130fa",
+    "bytes": 54,
+    "preserved": "workloads/floor-lease-gap-focused-7-A-python-os.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-focused-7-A-python-os.out",
+    "sha256": "face243ace70dfd5475849cdee46817dd4b1d4703b9bd44f2815c80d569da359",
+    "bytes": 28703,
+    "preserved": "workloads/floor-lease-gap-focused-7-A-python-os.out.gz"
+  },
+  {
+    "original": "target/lease-cost/workloads/lease-gap-focused-0-A.jsonl",
+    "sha256": "abcd2df19f879b14f3da8dbc5b698756720b2e6fe2cddda43bb9a0a05aa6744c",
+    "bytes": 2714,
+    "preserved": "workloads/lease-gap-focused-0-A.jsonl"
+  },
+  {
+    "original": "target/lease-cost/workloads/lease-gap-focused-1-B.jsonl",
+    "sha256": "913acfbfa336bbfa809f6d8fdb00a9c0c57f3dcc670c9d0f85e5d485d506e5de",
+    "bytes": 2694,
+    "preserved": "workloads/lease-gap-focused-1-B.jsonl"
+  },
+  {
+    "original": "target/lease-cost/workloads/lease-gap-focused-2-B.jsonl",
+    "sha256": "b2cbe7ffd8c6cafb5ca3afa04d19daad91c7e9a88a9f5fec2e305043b1e62c28",
+    "bytes": 2694,
+    "preserved": "workloads/lease-gap-focused-2-B.jsonl"
+  },
+  {
+    "original": "target/lease-cost/workloads/lease-gap-focused-3-A.jsonl",
+    "sha256": "821afbb0d89142b140282b4ecfc9ca3ad09c48cd39d5d0bba2fccdef688c207f",
+    "bytes": 2714,
+    "preserved": "workloads/lease-gap-focused-3-A.jsonl"
+  },
+  {
+    "original": "target/lease-cost/workloads/lease-gap-focused-4-A.jsonl",
+    "sha256": "7cbd0301fa3aa3b256d8b0f09412bd9fc7ef5f994a28c9d80a2412a7581f8602",
+    "bytes": 2714,
+    "preserved": "workloads/lease-gap-focused-4-A.jsonl"
+  },
+  {
+    "original": "target/lease-cost/workloads/lease-gap-focused-5-B.jsonl",
+    "sha256": "097c3f4c9789fd6e385878ba0618f5e92b88651181fc071bf056d939d0db5169",
+    "bytes": 2696,
+    "preserved": "workloads/lease-gap-focused-5-B.jsonl"
+  },
+  {
+    "original": "target/lease-cost/workloads/lease-gap-focused-6-B.jsonl",
+    "sha256": "bf3ab41dcaffd1473a4b386b1c2fca7f8fc64d32430bca8b05e9ddb7b6f08bad",
+    "bytes": 2696,
+    "preserved": "workloads/lease-gap-focused-6-B.jsonl"
+  },
+  {
+    "original": "target/lease-cost/workloads/lease-gap-focused-7-A.jsonl",
+    "sha256": "53c1e8f03ca3180260b765f59101b00c83ddc3f8b5e9977e5e4e704319c191be",
+    "bytes": 2711,
+    "preserved": "workloads/lease-gap-focused-7-A.jsonl"
+  },
+  {
+    "original": "target/lease-cost/workloads/lease-gap-focused-summary.json",
+    "sha256": "9a5ed016a076de09188376a98db6d90f6a17baef36e62fa6d0b62e06078958b4",
+    "bytes": 702,
+    "preserved": "workloads/lease-gap-focused-summary.json"
+  },
+  {
+    "original": "target/lease-cost/workloads/lease-gap-focused.py",
+    "sha256": "7e8c03823277982e3bd831a94f77cf82fe37293c48742b232a39559691f07d92",
+    "bytes": 1205,
+    "preserved": "workloads/lease-gap-focused.py"
+  }
+]

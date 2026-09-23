@@ -662,6 +662,75 @@ pub fn inotify_hotpath_contract(scale: usize) -> Result<ContractObservation, Exa
     inotify_hotpath_scenario(scale)
 }
 
+/// Watch-only churn must preserve the identity of every unread removal event.
+pub fn inotify_churn_contract(iterations: usize) -> Result<ContractObservation, ExampleError> {
+    assert!((1..=128).contains(&iterations));
+    let scratch = tempfile::TempDir::new().map_err(|e| ExampleError::Script(e.to_string()))?;
+    let host =
+        HostFsBackend::new_in(scratch.path()).map_err(|e| ExampleError::Script(e.to_string()))?;
+    let mut script = vec![
+        Step::Sys(
+            sys::openat(
+                LINUX_AT_FDCWD,
+                "/churn",
+                (LINUX_O_CREAT | LINUX_O_RDWR) as i32,
+                0o600,
+            )
+            .save(0),
+        ),
+        Step::Sys(sys::inotify_init1(LINUX_O_NONBLOCK as i32).save(1)),
+    ];
+    for _ in 0..iterations {
+        script.extend([
+            Step::Sys(sys::inotify_add_watch(slot(1), "/churn", LINUX_IN_MODIFY).save(2)),
+            Step::Sys(sys::inotify_rm_watch(slot(1), slot(2)).ret(0)),
+        ]);
+    }
+    script.extend([
+        Step::Sys(sys::ioctl_fionread_labeled("queued_bytes", slot(1)).ret(0)),
+        Step::Sys(sys::read_tagged(slot(1), iterations * 16, "ignored")),
+        Step::Sys(sys::close(slot(0)).ret(0)),
+        Step::Sys(sys::close(slot(1)).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ]);
+    let report = ScriptedBackend::new()
+        .with_fs_backend(Box::new(host))
+        .run_root(script)?;
+    let bytes = report.output_tagged("ignored");
+    let exact = report.ret("read") == (iterations * 16) as i64
+        && bytes.len() == iterations * 16
+        && bytes.chunks_exact(16).enumerate().all(|(i, event)| {
+            i32::from_ne_bytes([event[0], event[1], event[2], event[3]]) == (i + 1) as i32
+                && u32::from_ne_bytes([event[4], event[5], event[6], event[7]])
+                    == carrick_abi::LINUX_IN_IGNORED
+                && event[8..].iter().all(|&v| v == 0)
+        });
+    let assertion = if exact {
+        SemanticAssertion::pass("each_removed_watch_keeps_its_unread_event")
+    } else {
+        SemanticAssertion::fail(
+            "each_removed_watch_keeps_its_unread_event",
+            format!(
+                "{} iterations: read={} bytes",
+                iterations,
+                report.ret("read")
+            ),
+        )
+    };
+    Ok(ContractObservation {
+        contract_id: ContractId::new("kernel.inotify.watch-churn")
+            .map_err(|e| ExampleError::Script(e.to_string()))?,
+        layer: ExecutionLayer::VmFree,
+        implementation_revision: env!("CARGO_PKG_VERSION").into(),
+        fixture_identity: "inotify-watch-churn".into(),
+        scale: iterations as u64,
+        semantic_assertions: vec![assertion],
+        work: Some(report.work_snapshot().clone()),
+        timing: None,
+        completeness: Completeness::Complete,
+    })
+}
+
 /// Run a fork memory mappings scenario with `mappings` anonymous unpopulated mappings in the parent.
 pub fn fork_mappings_scenario(mappings: usize) -> Result<ContractObservation, ExampleError> {
     assert!(mappings >= 1, "mappings must be at least 1");

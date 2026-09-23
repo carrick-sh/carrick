@@ -1,0 +1,911 @@
+[
+  {
+    "arm": "native",
+    "repeat": 0,
+    "phase": 0,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-0-0-65536-20260922",
+    "pid": 90367,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-0-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.6217365829943446,
+    "elf_sha256": "07deb13f32e1149a68b9da1c626bf68ba9d56dea889d8bd902c280ef4e4987e8",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      496.4790344238281,
+      438.34686279296875,
+      443.09043884277344,
+      449.9200134277344,
+      443.0713653564453,
+      459.34104919433594,
+      447.0252990722656,
+      438.2006378173828,
+      443.0338592529297
+    ],
+    "warmup_ns": 712.6617431640625,
+    "median_ns": 443.09043884277344,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 1310782,
+      "elapsed_ms": 314,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-0-65536",
+      "errno_returns": 1310720,
+      "exit": 0,
+      "gateway_transitions": 1310793,
+      "host_signal_bridge": "null",
+      "requests": 1310783,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 655360,
+        "28": 655360,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 0,
+    "phase": 1,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-0-1-65536-20260922",
+    "pid": 90378,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-1-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.5284200000023702,
+    "elf_sha256": "fa6854c1bb771993c5d55beae096a968ffa7ebaf7e14b5693a477767bfa2fc04",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      688.5604858398438,
+      698.3521728515625,
+      687.3200836181641,
+      710.8961791992188,
+      718.2394714355469,
+      705.5238037109375,
+      709.0250701904297,
+      716.5730743408203,
+      696.7137756347656
+    ],
+    "warmup_ns": 668.0126190185547,
+    "median_ns": 705.5238037109375,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 1310792,
+      "elapsed_ms": 459,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-1-65536",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 1310803,
+      "host_signal_bridge": "null",
+      "requests": 1310793,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 1310730,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 0,
+    "phase": 2,
+    "n": 128,
+    "run_id": "nslice-memory-old-native-0-2-128-20260922",
+    "pid": 90392,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-2-128"
+    ],
+    "returncode": 0,
+    "wall_s": 0.06926783399831038,
+    "elf_sha256": "d6274e782b3563282b152e04e6c162aec44cc6df96783db7ae54afb6a4943641",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      698.2421875,
+      700.84375,
+      688.796875,
+      696.2890625,
+      698.890625,
+      691.734375,
+      689.1328125,
+      699.546875,
+      708.65625
+    ],
+    "warmup_ns": 935.8671875,
+    "median_ns": 698.2421875,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 2632,
+      "elapsed_ms": 1,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-2-128",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 6483,
+      "host_signal_bridge": "null",
+      "requests": 2633,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 1280,
+        "28": 1280,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "63": 10,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 0,
+    "phase": 2,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-0-2-65536-20260922",
+    "pid": 90403,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-2-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.5725751659920206,
+    "elf_sha256": "2e6a2789d0be91fbb1f9d05ae9fd5550b6491b19d08dd15ed064c7aff05ea07c",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      702.9406280517578,
+      722.0516204833984,
+      713.1067962646484,
+      721.2912292480469,
+      712.5371398925781,
+      720.9523620605469,
+      708.3346099853516,
+      707.2302398681641,
+      729.3561401367188
+    ],
+    "warmup_ns": 690.8130645751953,
+    "median_ns": 713.1067962646484,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 1310792,
+      "elapsed_ms": 505,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-2-65536",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 1802353,
+      "host_signal_bridge": "null",
+      "requests": 1310793,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 655360,
+        "28": 655360,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "63": 10,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 0,
+    "phase": 3,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-0-3-65536-20260922",
+    "pid": 90414,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-3-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.0676452089974191,
+    "elf_sha256": "adf637224cbb17dedcd95c1c08d6237f202f06c6307ce07791101a70f9134862",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      2.231597900390625,
+      2.5908203125,
+      2.4706573486328125,
+      2.2112579345703125,
+      2.201080322265625,
+      2.199798583984375,
+      2.155303955078125,
+      2.1298828125,
+      2.227783203125
+    ],
+    "warmup_ns": 2.1152496337890625,
+    "median_ns": 2.2112579345703125,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 62,
+      "elapsed_ms": 1,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-3-65536",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 2633,
+      "host_signal_bridge": "null",
+      "requests": 63,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 0,
+    "phase": 4,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-0-4-65536-20260922",
+    "pid": 90425,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-4-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.1691748750017723,
+    "elf_sha256": "65816b9c54b2c2a8f374fc670e1f0fdfca7fb3f9eed2dc0867f9c92bec628669",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      146.06983947753906,
+      149.0650177001953,
+      148.2391357421875,
+      147.37319946289062,
+      149.89598083496094,
+      146.82896423339844,
+      153.3864288330078,
+      153.60768127441406,
+      148.0242462158203
+    ],
+    "warmup_ns": 149.07899475097656,
+    "median_ns": 148.2391357421875,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 62,
+      "elapsed_ms": 98,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-4-65536",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 1310813,
+      "host_signal_bridge": "null",
+      "requests": 63,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 1,
+    "phase": 0,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-1-0-65536-20260922",
+    "pid": 90436,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-0-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.3724205830076244,
+    "elf_sha256": "07deb13f32e1149a68b9da1c626bf68ba9d56dea889d8bd902c280ef4e4987e8",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      479.38282775878906,
+      447.01385498046875,
+      451.080322265625,
+      480.35557556152344,
+      481.2094421386719,
+      463.3973388671875,
+      481.81024169921875,
+      443.4426574707031,
+      448.2339172363281
+    ],
+    "warmup_ns": 447.4983215332031,
+    "median_ns": 463.3973388671875,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 1310782,
+      "elapsed_ms": 303,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-0-65536",
+      "errno_returns": 1310720,
+      "exit": 0,
+      "gateway_transitions": 1310793,
+      "host_signal_bridge": "null",
+      "requests": 1310783,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 655360,
+        "28": 655360,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 1,
+    "phase": 1,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-1-1-65536-20260922",
+    "pid": 90447,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-1-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.5321722500084434,
+    "elf_sha256": "fa6854c1bb771993c5d55beae096a968ffa7ebaf7e14b5693a477767bfa2fc04",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      701.4656066894531,
+      711.8740081787109,
+      692.3974304199219,
+      697.4207458496094,
+      714.630126953125,
+      711.0830993652344,
+      718.53955078125,
+      723.4884948730469,
+      699.7318267822266
+    ],
+    "warmup_ns": 691.5938110351562,
+    "median_ns": 711.0830993652344,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 1310792,
+      "elapsed_ms": 463,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-1-65536",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 1310803,
+      "host_signal_bridge": "null",
+      "requests": 1310793,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 1310730,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 1,
+    "phase": 2,
+    "n": 128,
+    "run_id": "nslice-memory-old-native-1-2-128-20260922",
+    "pid": 90458,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-2-128"
+    ],
+    "returncode": 0,
+    "wall_s": 0.06934379099402577,
+    "elf_sha256": "d6274e782b3563282b152e04e6c162aec44cc6df96783db7ae54afb6a4943641",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      708.0078125,
+      717.453125,
+      711.59375,
+      694.6640625,
+      712.234375,
+      700.1953125,
+      717.453125,
+      703.7734375,
+      707.359375
+    ],
+    "warmup_ns": 863.609375,
+    "median_ns": 708.0078125,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 2632,
+      "elapsed_ms": 1,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-2-128",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 6483,
+      "host_signal_bridge": "null",
+      "requests": 2633,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 1280,
+        "28": 1280,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "63": 10,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 1,
+    "phase": 2,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-1-2-65536-20260922",
+    "pid": 90469,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-2-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.5844301249890123,
+    "elf_sha256": "2e6a2789d0be91fbb1f9d05ae9fd5550b6491b19d08dd15ed064c7aff05ea07c",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      734.9300384521484,
+      754.2660980224609,
+      733.5402221679688,
+      740.6247406005859,
+      731.9488525390625,
+      735.4195861816406,
+      722.62255859375,
+      722.6784973144531,
+      718.5281066894531
+    ],
+    "warmup_ns": 713.8544616699219,
+    "median_ns": 733.5402221679688,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 1310792,
+      "elapsed_ms": 517,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-2-65536",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 1802353,
+      "host_signal_bridge": "null",
+      "requests": 1310793,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 655360,
+        "28": 655360,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "63": 10,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 1,
+    "phase": 3,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-1-3-65536-20260922",
+    "pid": 90480,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-3-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.0674929999950109,
+    "elf_sha256": "adf637224cbb17dedcd95c1c08d6237f202f06c6307ce07791101a70f9134862",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      2.138763427734375,
+      2.1718292236328125,
+      2.1419525146484375,
+      2.205535888671875,
+      2.0236968994140625,
+      2.143218994140625,
+      2.0885467529296875,
+      2.1254119873046875,
+      2.208709716796875
+    ],
+    "warmup_ns": 2.1025390625,
+    "median_ns": 2.1419525146484375,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 62,
+      "elapsed_ms": 1,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-3-65536",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 2633,
+      "host_signal_bridge": "null",
+      "requests": 63,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 1,
+    "phase": 4,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-1-4-65536-20260922",
+    "pid": 90491,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-4-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.16748004099645186,
+    "elf_sha256": "65816b9c54b2c2a8f374fc670e1f0fdfca7fb3f9eed2dc0867f9c92bec628669",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      152.21023559570312,
+      152.91213989257812,
+      152.4976043701172,
+      153.8543701171875,
+      152.89942932128906,
+      153.1149444580078,
+      153.1111297607422,
+      153.35910034179688,
+      153.10606384277344
+    ],
+    "warmup_ns": 148.52841186523438,
+    "median_ns": 153.10606384277344,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 62,
+      "elapsed_ms": 100,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-4-65536",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 1310813,
+      "host_signal_bridge": "null",
+      "requests": 63,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 2,
+    "phase": 0,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-2-0-65536-20260922",
+    "pid": 90502,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-0-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.3748815410071984,
+    "elf_sha256": "07deb13f32e1149a68b9da1c626bf68ba9d56dea889d8bd902c280ef4e4987e8",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      464.00132751464844,
+      474.8585968017578,
+      466.65509033203125,
+      464.7045135498047,
+      457.7598571777344,
+      462.49517822265625,
+      457.79736328125,
+      463.00633239746094,
+      479.9010009765625
+    ],
+    "warmup_ns": 449.38404846191406,
+    "median_ns": 464.00132751464844,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 1310782,
+      "elapsed_ms": 304,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-0-65536",
+      "errno_returns": 1310720,
+      "exit": 0,
+      "gateway_transitions": 1310793,
+      "host_signal_bridge": "null",
+      "requests": 1310783,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 655360,
+        "28": 655360,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 2,
+    "phase": 1,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-2-1-65536-20260922",
+    "pid": 90513,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-1-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.52029174999916,
+    "elf_sha256": "fa6854c1bb771993c5d55beae096a968ffa7ebaf7e14b5693a477767bfa2fc04",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      682.9210815429688,
+      693.5583648681641,
+      695.1611938476562,
+      695.8948669433594,
+      696.0709838867188,
+      687.9857482910156,
+      693.0580139160156,
+      696.0919647216797,
+      700.5755004882812
+    ],
+    "warmup_ns": 663.9862060546875,
+    "median_ns": 695.1611938476562,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 1310792,
+      "elapsed_ms": 452,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-1-65536",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 1310803,
+      "host_signal_bridge": "null",
+      "requests": 1310793,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 1310730,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 2,
+    "phase": 2,
+    "n": 128,
+    "run_id": "nslice-memory-old-native-2-2-128-20260922",
+    "pid": 90524,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-2-128"
+    ],
+    "returncode": 0,
+    "wall_s": 0.07001929200487211,
+    "elf_sha256": "d6274e782b3563282b152e04e6c162aec44cc6df96783db7ae54afb6a4943641",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      682.296875,
+      669.2734375,
+      689.125,
+      674.8046875,
+      700.84375,
+      700.8515625,
+      701.171875,
+      711.9140625,
+      677.734375
+    ],
+    "warmup_ns": 833.3359375,
+    "median_ns": 689.125,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 2632,
+      "elapsed_ms": 1,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-2-128",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 6483,
+      "host_signal_bridge": "null",
+      "requests": 2633,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 1280,
+        "28": 1280,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "63": 10,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 2,
+    "phase": 2,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-2-2-65536-20260922",
+    "pid": 90535,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-2-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.5822548330033896,
+    "elf_sha256": "2e6a2789d0be91fbb1f9d05ae9fd5550b6491b19d08dd15ed064c7aff05ea07c",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      719.3857879638672,
+      724.7149047851562,
+      724.6252593994141,
+      739.9476318359375,
+      727.7132720947266,
+      730.4274291992188,
+      727.4932861328125,
+      715.6410217285156,
+      715.3809967041016
+    ],
+    "warmup_ns": 717.0454711914062,
+    "median_ns": 724.7149047851562,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 1310792,
+      "elapsed_ms": 513,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-2-65536",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 1802353,
+      "host_signal_bridge": "null",
+      "requests": 1310793,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 655360,
+        "28": 655360,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "63": 10,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 2,
+    "phase": 3,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-2-3-65536-20260922",
+    "pid": 90546,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-3-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.06970849999925122,
+    "elf_sha256": "adf637224cbb17dedcd95c1c08d6237f202f06c6307ce07791101a70f9134862",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      2.140045166015625,
+      2.0847320556640625,
+      2.1101531982421875,
+      2.0809173583984375,
+      2.082183837890625,
+      2.04150390625,
+      2.15594482421875,
+      2.108245849609375,
+      2.044036865234375
+    ],
+    "warmup_ns": 2.139404296875,
+    "median_ns": 2.0847320556640625,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 62,
+      "elapsed_ms": 1,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-3-65536",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 2633,
+      "host_signal_bridge": "null",
+      "requests": 63,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    }
+  },
+  {
+    "arm": "native",
+    "repeat": 2,
+    "phase": 4,
+    "n": 65536,
+    "run_id": "nslice-memory-old-native-2-4-65536-20260922",
+    "pid": 90557,
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-4-65536"
+    ],
+    "returncode": 0,
+    "wall_s": 0.16706725000403821,
+    "elf_sha256": "65816b9c54b2c2a8f374fc670e1f0fdfca7fb3f9eed2dc0867f9c92bec628669",
+    "binary_sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+    "samples_ns": [
+      154.1277618408203,
+      151.14657592773438,
+      153.0621795654297,
+      154.8798828125,
+      150.8013458251953,
+      149.39942932128906,
+      151.3048858642578,
+      151.9184112548828,
+      153.5695343017578
+    ],
+    "warmup_ns": 150.22149658203125,
+    "median_ns": 151.9184112548828,
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 62,
+      "elapsed_ms": 99,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-4-65536",
+      "errno_returns": 0,
+      "exit": 0,
+      "gateway_transitions": 1310813,
+      "host_signal_bridge": "null",
+      "requests": 63,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    }
+  }
+]

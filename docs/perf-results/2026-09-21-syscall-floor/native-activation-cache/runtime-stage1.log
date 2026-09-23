@@ -1,0 +1,38 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.87s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-206a8f631e68fc3c)
+
+running 29 tests
+test hvpatch::stage1_mm::tests::clean_inflight_load_cancellation_stays_cancelled_across_retirement_rollback ... ok
+test hvpatch::stage1_mm::tests::cow_invalidation_tracks_exact_generation_and_defers_inactive_residents ... ok
+test hvpatch::stage1_mm::tests::cow_invalidation_rejects_stale_or_wrong_executor_acknowledgement ... ok
+test hvpatch::stage1_mm::tests::dirty_replacement_abort_quarantines_until_exact_invalidation_completes ... ok
+test hvpatch::stage1_mm::tests::child_retirement_returns_extension_slots_leaving_parent_untouched ... ok
+test hvpatch::stage1_mm::tests::dirty_inflight_load_cancellation_survives_retirement_rollback_as_resident ... ok
+test hvpatch::stage1_mm::tests::clean_inflight_abort_retirement_completes_after_the_load_cancels ... ok
+test hvpatch::stage1_mm::tests::clean_replacement_abort_releases_exact_unpublished_asid_and_root ... ok
+test hvpatch::stage1_mm::tests::committed_mm_reuses_neither_asid_nor_root_until_all_residency_acks ... ok
+test hvpatch::stage1_mm::tests::concurrent_carrier_roots_allocate_distinct_asids_and_root_slots ... ok
+test hvpatch::stage1_mm::tests::dropping_dirty_replacement_without_settlement_quarantines_permanently ... ok
+test hvpatch::stage1_mm::tests::dirty_resident_replacement_abort_has_the_same_quarantine_requirement ... ok
+test hvpatch::stage1_mm::tests::dropped_preparation_returns_root_slot_and_asid_without_retirement_proof ... ok
+test hvpatch::stage1_mm::tests::fails_closed_when_vma_authority_is_unbound ... ok
+test hvpatch::stage1_mm::tests::dropped_retirement_preparation_reopens_the_exact_live_predecessor ... ok
+test hvpatch::stage1_mm::tests::extension_slots_return_to_free_root_slots_on_retirement ... ok
+test hvpatch::stage1_mm::tests::failure_after_allocator_preparation_restores_exact_generation_and_retry ... ok
+test hvpatch::stage1_mm::tests::explicit_abort_classifies_hardware_exposure_atomically ... ok
+test hvpatch::stage1_mm::tests::failure_after_residency_preparation_restores_every_earlier_layer ... ok
+test hvpatch::stage1_mm::tests::failure_after_lease_gate_transition_restores_an_exact_retry ... ok
+test hvpatch::stage1_mm::tests::old_observer_keeps_its_binding_after_exec_and_retirement ... ok
+test hvpatch::stage1_mm::tests::quarantined_root_slot_is_skipped_then_reused_exactly_after_completion ... ok
+test hvpatch::stage1_mm::tests::no_work_current_mm_reentry_never_enters_cow_invalidation_slow_path ... ok
+test hvpatch::stage1_mm::tests::implicit_drop_classifies_hardware_exposure_atomically ... ok
+test hvpatch::stage1_mm::tests::reusable_root_slot_stays_quarantined_without_backend_retirement_receipt ... ok
+test hvpatch::stage1_mm::tests::hvpatch_task_binding_carries_the_exact_shared_mm_residency_authority ... ok
+test hvpatch::stage1_mm::tests::pre_entry_service_is_exact_and_acknowledges_only_after_hardware_success ... ok
+test hvpatch::stage1_mm::tests::page_table_root_slots_scale_to_the_complete_arena ... ok
+test hvpatch::stage1_mm::tests::rollback_keeps_load_and_root_publication_blocked_until_every_layer_restores ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 580 filtered out; finished in 0.01s
+

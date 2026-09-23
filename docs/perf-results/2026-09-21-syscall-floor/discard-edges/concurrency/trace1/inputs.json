@@ -1,0 +1,26 @@
+{
+  "argv": [
+    "/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-discard-edges",
+    "trace",
+    "--require-script-exit",
+    "-s",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/scripts/dtrace/hvpatch-topology-operation-budget.d",
+    "-o",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/discard-edges/concurrency/trace1/trace.raw",
+    "--",
+    "run",
+    "--max-traps",
+    "18446744073709551615",
+    "--fs",
+    "host",
+    "--entrypoint",
+    "/bin/bash",
+    "localhost:5005/carrick-nodejs-conformance@sha256:1ed49af83bd30401e1b275957b99a1c28f6c582ab3d987997afb5888fa302718",
+    "-c",
+    "set -eu; for wave in 1 2 3 4 5; do pids=(); for ((i=0;i<1;i++)); do /opt/node-src/v24/out/Release/node /opt/nodejs-conformance/fixtures/app-smoke.js & pids+=(\"$!\"); done; status=0; for child in \"${pids[@]}\"; do wait \"$child\" || status=1; done; test \"$status\" -eq 0; echo GROUP_DONE; done"
+  ],
+  "run_id": "edges-topology-1-20260922",
+  "iterations": 5,
+  "binary_sha256": "3e2521515cc0af0324dbd2f7639bd43ea27fc324dd84e1dbd69a4e508e780972",
+  "script_sha256": "664f6a052a9c501f0b53b4b6061b4c68a40f309587c7447ac18d374f7f4ffad0"
+}

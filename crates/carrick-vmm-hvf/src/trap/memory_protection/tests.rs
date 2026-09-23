@@ -2528,3 +2528,63 @@ mod alias_registry_tests {
         );
     }
 }
+
+#[test]
+fn retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows() {
+    let template = AliasBacking {
+        start: 0x1000_0000,
+        ipa: 0x2000_0000,
+        host_addr: 0x3000_0000,
+        size: 0x1000,
+        physical_ipa: 0x2000_0000,
+        physical_host_addr: 0x3000_0000,
+        physical_size: 0x1000,
+        perms: 0,
+        guest_writable: true,
+        sharing: GuestMappingSharing::Private,
+        ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
+        inventory_backing: InventoryBackingIdentity::Private(1),
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation: 0,
+    };
+    for scale in [1, 8, 32, 128] {
+        let mut registry = AliasRegistry::default();
+        for index in 0..scale {
+            let mut unrelated = template;
+            unrelated.size = 0x1000 << (index % 8);
+            unrelated.ipa += 0x1000 * (index as u64 + 1);
+            registry.push(unrelated);
+        }
+        let mut owner = template;
+        owner.size = 0x100_0000;
+        registry.push(owner);
+        let mut examined = 0;
+        assert!(
+            registry.any_va_window_row(template.start, template.start + 1, |alias| {
+                examined += 1;
+                alias.ipa == owner.ipa && alias.size == owner.size
+            })
+        );
+        assert_eq!(
+            examined, 1,
+            "wide owner must not inspect {scale} unrelated narrow rows"
+        );
+        // Existence semantics remain identical to the original candidate query,
+        // including rejected broad candidates, absent matches and empty windows.
+        for offset in [0, 1, 0x1000, 0x10_0000, 0x100_0000] {
+            for wanted in [template.ipa, template.ipa + 0x1000, u64::MAX] {
+                let start = template.start + offset;
+                let expected = registry
+                    .va_window_rows(start, start + 1)
+                    .any(|(_, a)| a.ipa == wanted && start < a.start.saturating_add(a.size as u64));
+                assert_eq!(
+                    registry.any_va_window_row(start, start + 1, |a| a.ipa == wanted
+                        && start < a.start.saturating_add(a.size as u64)),
+                    expected
+                );
+            }
+        }
+        assert!(!registry.any_va_window_row(0, 0, |_| true));
+    }
+}

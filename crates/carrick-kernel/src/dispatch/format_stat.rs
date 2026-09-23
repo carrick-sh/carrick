@@ -145,10 +145,9 @@ pub(super) fn real_stat_from_libc(st: &libc::stat) -> carrick_vfs::fs_backend::R
 pub(crate) fn write_statx_real(
     memory: &mut impl CurrentMmMemory,
     statxbuf: u64,
-    path: &str,
     real: &carrick_vfs::fs_backend::RealStat,
 ) -> DispatchOutcome {
-    write_statx_record(memory, statxbuf, &StatRecord::from_real(path, real))
+    write_statx_record(memory, statxbuf, &StatRecord::from_real(real))
 }
 
 pub(crate) fn write_statx(

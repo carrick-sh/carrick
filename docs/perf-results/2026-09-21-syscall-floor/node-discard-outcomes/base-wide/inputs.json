@@ -1,0 +1,26 @@
+{
+  "argv": [
+    "/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-discard-retire",
+    "trace",
+    "--require-script-exit",
+    "-s",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/scripts/dtrace/hvpatch-madvise-discard-outcomes.d",
+    "-o",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/node-discard-outcomes/base-wide/trace.raw",
+    "--",
+    "run",
+    "--max-traps",
+    "18446744073709551615",
+    "--fs",
+    "host",
+    "--entrypoint",
+    "/bin/sh",
+    "localhost:5005/carrick-nodejs-conformance@sha256:1ed49af83bd30401e1b275957b99a1c28f6c582ab3d987997afb5888fa302718",
+    "-c",
+    "set -eu; printf %s ''\"'\"'use strict'\"'\"';\n\nconst assert = require('\"'\"'assert'\"'\"');\nconst childProcess = require('\"'\"'child_process'\"'\"');\nconst crypto = require('\"'\"'crypto'\"'\"');\nconst fs = require('\"'\"'fs'\"'\"');\nconst net = require('\"'\"'net'\"'\"');\nconst os = require('\"'\"'os'\"'\"');\nconst path = require('\"'\"'path'\"'\"');\nconst { Worker } = require('\"'\"'worker_threads'\"'\"');\n\nasync function main() {\n  process.title = '\"'\"'carrick-nodejs-app-smoke'\"'\"';\n  process.stdout.write('\"'\"''\"'\"');\n\n  const dir = fs.mkdtempSync(path.join(os.tmpdir(), '\"'\"'nodejs-app-smoke-'\"'\"'));\n  const file = path.join(dir, '\"'\"'data.txt'\"'\"');\n  fs.writeFileSync(file, '\"'\"'hello'\"'\"');\n  assert.strictEqual(fs.readFileSync(file, '\"'\"'utf8'\"'\"'), '\"'\"'hello'\"'\"');\n  assert.strictEqual(crypto.randomBytes(16).length, 16);\n\n  const server = net.createServer((socket) => {\n    socket.once('\"'\"'data'\"'\"', (buf) => {\n      socket.end(Buffer.from(buf.toString().toUpperCase()));\n    });\n  });\n  await new Promise((resolve) => server.listen(0, '\"'\"'127.0.0.1'\"'\"', resolve));\n  const port = server.address().port;\n  const tcpReply = await new Promise((resolve, reject) => {\n    const client = net.createConnection({ host: '\"'\"'127.0.0.1'\"'\"', port }, () => {\n      client.write('\"'\"'tcp-ok'\"'\"');\n    });\n    client.once('\"'\"'data'\"'\"', (buf) => resolve(buf.toString()));\n    client.once('\"'\"'error'\"'\"', reject);\n  });\n  server.close();\n  assert.strictEqual(tcpReply, '\"'\"'TCP-OK'\"'\"');\n\n  await new Promise((resolve) => setTimeout(resolve, 1));\n  console.log('\"'\"'app-smoke ok'\"'\"');\n}\n\nmain().catch((err) => {\n  console.error(err && err.stack ? err.stack : err);\n  process.exit(1);\n});\n' > /tmp/node-child.js; for n in 1 2 3 4 5; do /opt/node-src/v24/out/Release/node /tmp/node-child.js; done; echo POPULATION_DONE"
+  ],
+  "run_id": "node-discard-base-20260922-2",
+  "iterations": 5,
+  "binary_sha256": "fd96c7d450060e04ec7cc28933d82843c28521ecf80875567bd17dbdb5cec27f",
+  "script_sha256": "d14574346089a34f69360372c61aaed9d09f949ccc4a8e18c52f6dec88a5a19e"
+}

@@ -5,6 +5,79 @@ use crate::dispatch::ThreadCtx;
 use crate::dispatch::dispatcher::FsCrossSubsystem;
 use std::sync::Arc;
 
+/// Exercise the production lease grant with an actual identity-page mapping.
+/// An alias write must advance the same Linux open-file-description offset.
+#[cfg(feature = "syscall-shim")]
+#[test]
+fn seek_lease_regrant_after_dup_preserves_shared_offset() {
+    use std::os::fd::IntoRawFd;
+
+    for duplication in [23, 24, 25] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let fd = dispatcher
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::HostFile {
+                        host_fd: HostFdRef::new(tempfile::tempfile().unwrap().into_raw_fd()),
+                        metadata: RootFsMetadata {
+                            path: "/lease-alias".into(),
+                            kind: RootFsEntryKind::File,
+                            mode: 0o600,
+                            size: 0,
+                        },
+                        base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                        writable: true,
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+        let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+        let mut memory = LinearMemory::new(base, vec![0; 4096]);
+        memory.write_bytes_raw(base + 256, b"x").unwrap();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut call = |number, args, memory: &mut LinearMemory| {
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(number, SyscallArgs::from(args)),
+                    memory,
+                    &CompatReporter::default(),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            call(62, [fd as u64, 0, 0, 0, 0, 0], &mut memory),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let duplicate_args = if duplication == 24 {
+            [fd as u64, 99, 0, 0, 0, 0]
+        } else {
+            [fd as u64, 0, 0, 0, 0, 0]
+        };
+        let DispatchOutcome::Returned { value: alias } =
+            call(duplication, duplicate_args, &mut memory)
+        else {
+            panic!("dup failed")
+        };
+        assert_eq!(
+            call(62, [fd as u64, 0, 0, 0, 0, 0], &mut memory),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            call(64, [alias as u64, base + 256, 1, 0, 0, 0], &mut memory),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            call(62, [fd as u64, 0, 1, 0, 0, 0], &mut memory),
+            DispatchOutcome::Returned { value: 1 },
+            "alias write must advance the leased descriptor's offset (duplication syscall {duplication})"
+        );
+    }
+}
+
 #[test]
 fn host_file_lseek_does_not_publish_description_mutation() {
     use std::os::fd::IntoRawFd;
@@ -1190,8 +1263,8 @@ fn hvpatch_blocking_classic_record_lock_wakes_after_unlock() {
 
 #[derive(Default)]
 struct HostWriteEvents {
-    begins: Vec<Vec<(u64, usize)>>,
-    finishes: Vec<Vec<(u64, usize)>>,
+    begins: Vec<Vec<carrick_guest_mem::HostWriteRange>>,
+    finishes: Vec<Vec<carrick_guest_mem::HostWriteRange>>,
 }
 
 impl GuestMemory for HostWriteEvents {
@@ -1206,18 +1279,23 @@ impl GuestMemory for HostWriteEvents {
         })
     }
 
-    fn begin_host_write(&mut self, ranges: &[(u64, usize)]) {
+    fn begin_host_write(
+        &mut self,
+        ranges: &[carrick_guest_mem::HostWriteRange],
+    ) -> Result<(), MemoryError> {
         self.begins.push(ranges.to_vec());
+        Ok(())
     }
 
-    fn finish_host_write(&mut self, ranges: &[(u64, usize)]) {
+    fn finish_host_write(&mut self, ranges: &[carrick_guest_mem::HostWriteRange]) {
         self.finishes.push(ranges.to_vec());
     }
 }
 
 fn fail_with_readv_host_write_guard(memory: &mut HostWriteEvents) -> Result<(), LinuxErrno> {
-    let ranges = [(0x1000, 0x1000), (0x5000, 0x1000)];
-    let _guard = carrick_guest_mem::HostWriteGuard::new(memory, &ranges);
+    let ranges = test_host_write_ranges();
+    let _guard =
+        carrick_guest_mem::HostWriteGuard::new(memory, &ranges).map_err(|_| LINUX_EFAULT)?;
     Err(LINUX_EINVAL)
 }
 
@@ -1230,7 +1308,7 @@ fn readv_host_write_guard_finishes_every_exposed_range_on_error() {
         Err(LINUX_EINVAL)
     );
 
-    let expected = vec![(0x1000, 0x1000), (0x5000, 0x1000)];
+    let expected = test_host_write_ranges().to_vec();
     assert_eq!(events.begins.as_slice(), std::slice::from_ref(&expected));
     assert_eq!(events.finishes.as_slice(), std::slice::from_ref(&expected));
 }
@@ -10040,4 +10118,12 @@ fn fcntl_f_created_query_semantics() {
         DispatchOutcome::errno(LINUX_EBADF),
         "unallocated high fd must return EBADF",
     );
+}
+
+fn test_host_write_ranges() -> [carrick_guest_mem::HostWriteRange; 2] {
+    [0x1000, 0x5000].map(|address| carrick_guest_mem::HostWriteRange {
+        guest: carrick_guest_mem::GuestVa(address),
+        len: 0x1000,
+        host: carrick_guest_mem::HostVa(address as usize),
+    })
 }

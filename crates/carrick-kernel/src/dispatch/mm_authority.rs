@@ -256,6 +256,10 @@ pub struct MmExecutorParticipation {
 
 #[derive(Clone)]
 pub(in crate::dispatch) enum MmExecutorAdmissionRecipe {
+    NativeThread {
+        thread: crate::kernel::ThreadRef,
+        state: Arc<super::native_execution::NativeExecutorState>,
+    },
     Anonymous,
     AnonymousWithPauseEndpoint {
         registry: Arc<dyn carrick_hal::VcpuRegistry>,
@@ -276,6 +280,9 @@ impl MmExecutorAdmissionRecipe {
     {
         match self {
             Self::Anonymous => authority.guest_executors.enter(None),
+            Self::NativeThread { thread, state } => authority
+                .guest_executors
+                .enter_native(thread.clone(), Arc::clone(state)),
             Self::AnonymousWithPauseEndpoint { registry, tid } => authority
                 .guest_executors
                 .enter_with_pause_endpoint(None, Arc::clone(registry), *tid),
@@ -327,6 +334,9 @@ impl MmExecutorParticipation {
             MmExecutorAdmissionRecipe::Anonymous
             | MmExecutorAdmissionRecipe::AnonymousWithPauseEndpoint { .. } => true,
             MmExecutorAdmissionRecipe::Thread {
+                thread: admitted, ..
+            }
+            | MmExecutorAdmissionRecipe::NativeThread {
                 thread: admitted, ..
             } => Arc::ptr_eq(admitted, thread),
         }

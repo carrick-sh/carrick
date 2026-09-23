@@ -1,0 +1,20 @@
+schema_version = 1
+id = "kernel.mm.sparse-scrub"
+title = "Backing maintenance does not materialize pristine anonymous subranges"
+guest_surfaces = ["syscall:madvise", "syscall:mmap", "syscall:brk"]
+semantic_authority = ["Linux private anonymous zero-fill and fork isolation; exact-MM pristine provenance"]
+fixture = "unit:sparse-scrub"
+scale_points = [1, 8, 32, 128]
+rationale = "Discarding one untouched range then the same range with one materialized 4-KiB page requires exactly one page of physical clearing regardless of virtual extent. Keep per-materialized-range COW and owner authentication. Missing authority falls back to the complete original path."
+[bindings]
+vm_free = "carrick-aarch64::engine::sparse_scrub::tests::sparse_scrub_contract"
+[bindings.unresolved]
+embed_structural = "Production scrub-byte observation and signed mixed-pristine/fork semantics pending."
+docker = "Same-source Linux semantics and paired workload acceptance pending."
+[[structural_budgets]]
+kind = "affine"
+metric = "guest_memory_zero_bytes"
+base = 4096
+per_unit = 0
+layers = ["vm-free"]
+rationale = "The byte-backed decision fixture clears one dirty 4-KiB page; pristine subranges remain zero without writes."

@@ -1,0 +1,28 @@
+{
+  "command": [
+    "docker",
+    "run",
+    "--rm",
+    "--name",
+    "carrick-syscall-code-write-oracle-final-20260922",
+    "--network",
+    "none",
+    "--platform",
+    "linux/arm64",
+    "--mount",
+    "type=bind,src=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/syscall-code-writes/oracle-input,dst=/input,readonly",
+    "sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a",
+    "python3",
+    "/input/test.py",
+    "/input/data"
+  ],
+  "image_id": "sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a",
+  "repo_digests": [
+    "python@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a"
+  ],
+  "architecture": "arm64",
+  "fixture_sha256": "7fe368ca6503721ac4bad126ecb61975c21ca752b8d3b7b8d7ee1af2ff1d37d1",
+  "exit_code": 0,
+  "after_carrick_run": "syscall-code-writes-final-20260922",
+  "serialized": true
+}

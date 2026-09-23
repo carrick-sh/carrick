@@ -1,0 +1,68 @@
+[
+  {
+    "phase": 0,
+    "scale": 65536,
+    "equal_across_all_six_invocations": {
+      "requests": 1310783,
+      "completions": 1310782,
+      "errno_returns": 1310720,
+      "transitions": 1310783,
+      "memory_checkpoints": 0
+    }
+  },
+  {
+    "phase": 1,
+    "scale": 65536,
+    "equal_across_all_six_invocations": {
+      "requests": 1310793,
+      "completions": 1310792,
+      "errno_returns": 0,
+      "transitions": 1310793,
+      "memory_checkpoints": 0
+    }
+  },
+  {
+    "phase": 2,
+    "scale": 128,
+    "equal_across_all_six_invocations": {
+      "requests": 2633,
+      "completions": 2632,
+      "errno_returns": 0,
+      "transitions": 2633,
+      "memory_checkpoints": 0
+    }
+  },
+  {
+    "phase": 2,
+    "scale": 65536,
+    "equal_across_all_six_invocations": {
+      "requests": 1310793,
+      "completions": 1310792,
+      "errno_returns": 0,
+      "transitions": 1794813,
+      "memory_checkpoints": 484020
+    }
+  },
+  {
+    "phase": 3,
+    "scale": 65536,
+    "equal_across_all_six_invocations": {
+      "requests": 63,
+      "completions": 62,
+      "errno_returns": 0,
+      "transitions": 2623,
+      "memory_checkpoints": 2560
+    }
+  },
+  {
+    "phase": 4,
+    "scale": 65536,
+    "equal_across_all_six_invocations": {
+      "requests": 63,
+      "completions": 62,
+      "errno_returns": 0,
+      "transitions": 2623,
+      "memory_checkpoints": 2560
+    }
+  }
+]

@@ -1,0 +1,6 @@
+churn_scale_1=ok
+churn_scale_8=ok
+churn_scale_32=ok
+churn_scale_128=ok
+overflow_drain_rearm=ok
+probe_complete=1

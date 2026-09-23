@@ -1031,3 +1031,90 @@ fn hvpatch_alias_sharing_saved_capture_validator_fails_closed() {
         assert_eq!(status.code(), Some(expected), "fixture {name}");
     }
 }
+
+#[test]
+fn completed_inotify_profile_is_listed() {
+    cli()
+        .args(["trace", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("hvpatch-inotify09-population"));
+}
+
+#[path = "../src/hvpatch_inotify_population_profile.rs"]
+mod hvpatch_inotify_population_profile;
+
+fn completed_inotify_stream() -> String {
+    include_str!("fixtures/inotify09-population-complete.raw").replace(
+        "@PROGRAM_SHA256@",
+        &hvpatch_inotify_population_profile::program_sha256(),
+    )
+}
+
+#[test]
+fn completed_inotify_profile_accepts_original_workload_population() {
+    let rows = hvpatch_inotify_population_profile::validate(&completed_inotify_stream()).unwrap();
+    assert_eq!(rows.get(&27), Some(&3_000_000));
+    assert_eq!(rows.get(&28), Some(&3_000_000));
+    assert_eq!(rows.get(&62), Some(&1));
+    assert_eq!(rows.get(&64), Some(&32));
+    let rendered = hvpatch_inotify_population_profile::render_profile_script().unwrap();
+    assert!(rendered.contains(&hvpatch_inotify_population_profile::program_sha256()));
+    assert!(!rendered.contains("/* CARRICK_SYSCALLPOP_PROGRAM_SHA256 */"));
+}
+
+#[test]
+fn completed_inotify_profile_rejects_incomplete_or_inconsistent_evidence() {
+    let raw = completed_inotify_stream();
+    let end = "SYSCALLPOP1|end|nr=28|count=3000000";
+    let cases = [
+        ("empty", String::new()),
+        (
+            "header missing",
+            raw.lines().skip(1).collect::<Vec<_>>().join("\n"),
+        ),
+        (
+            "wrong program",
+            raw.replace(
+                &hvpatch_inotify_population_profile::program_sha256(),
+                &"0".repeat(64),
+            ),
+        ),
+        ("nonfiring", raw.replace("seen=1", "seen=0")),
+        ("dtrace error", raw.replace("errors=0", "errors=1")),
+        (
+            "incomplete root",
+            raw.replace("root_exited=1", "root_exited=0"),
+        ),
+        ("missing end", raw.replace(end, "")),
+        (
+            "mismatched end",
+            raw.replace(end, "SYSCALLPOP1|end|nr=28|count=2999999"),
+        ),
+        ("duplicate row", format!("{raw}\n{end}\n")),
+        (
+            "shortened workload",
+            raw.replace("count=3000000", "count=128"),
+        ),
+        ("zero row", raw.replace("count=32", "count=0")),
+        ("extra field", raw.replace(end, &format!("{end}|extra=1"))),
+        ("unknown phase", raw.replace("|args|", "|unknown|")),
+        ("noncanonical", raw.replace("nr=28|", "nr=+28|")),
+        (
+            "integer overflow",
+            raw.replace("count=32", "count=18446744073709551616"),
+        ),
+        (
+            "sum overflow",
+            format!(
+                "{raw}\nSYSCALLPOP1|begin|nr=999|count=18446744073709551615\nSYSCALLPOP1|args|nr=999|count=18446744073709551615\nSYSCALLPOP1|end|nr=999|count=18446744073709551615\n"
+            ),
+        ),
+    ];
+    for (name, bad) in cases {
+        assert!(
+            hvpatch_inotify_population_profile::validate(&bad).is_err(),
+            "accepted invalid capture: {name}"
+        );
+    }
+}

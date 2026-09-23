@@ -1,0 +1,126 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 38.10s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-207122e8ce47be2c)
+
+running 8 tests
+test dispatch::mem::madvise::tests::eager_mlock_uses_committed_vma_metadata_before_lazy_backing_is_resident ... ok
+test dispatch::mem::madvise::tests::mincore_onfault_lock_is_not_resident_until_page_is_touched ... ok
+test dispatch::mem::madvise::tests::mincore_unmapped_end_page_is_enomem_not_abort ... ok
+test dispatch::mem::madvise::tests::mincore_mapped_first_and_last_with_hole_is_enomem ... ok
+test dispatch::mem::madvise::tests::mincore_overflowing_length_is_enomem_not_abort ... ok
+test dispatch::mem::madvise::tests::eager_lock_paths_populate_mincore_residency ... ok
+test dispatch::mem::madvise::tests::madvise_reports_vma_rejection_before_unmapped_hole_enomem ... ok
+[
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.anonymous-discard",
+        ),
+        layer: VmFree,
+        implementation_revision: "madvise-sha256:a4f9a96d22e9628a981f168bd67e2f790553ea8bfbf6da8aafef425ca7c677b4",
+        fixture_identity: "unit:readonly-anonymous-discard",
+        scale: 1,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "readonly_discard_removes_old_contents",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 1,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.anonymous-discard",
+        ),
+        layer: VmFree,
+        implementation_revision: "madvise-sha256:a4f9a96d22e9628a981f168bd67e2f790553ea8bfbf6da8aafef425ca7c677b4",
+        fixture_identity: "unit:readonly-anonymous-discard",
+        scale: 8,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "readonly_discard_removes_old_contents",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 1,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.anonymous-discard",
+        ),
+        layer: VmFree,
+        implementation_revision: "madvise-sha256:a4f9a96d22e9628a981f168bd67e2f790553ea8bfbf6da8aafef425ca7c677b4",
+        fixture_identity: "unit:readonly-anonymous-discard",
+        scale: 32,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "readonly_discard_removes_old_contents",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 1,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.anonymous-discard",
+        ),
+        layer: VmFree,
+        implementation_revision: "madvise-sha256:a4f9a96d22e9628a981f168bd67e2f790553ea8bfbf6da8aafef425ca7c677b4",
+        fixture_identity: "unit:readonly-anonymous-discard",
+        scale: 128,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "readonly_discard_removes_old_contents",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 1,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+]
+test dispatch::mem::madvise::tests::readonly_private_anonymous_dontneed_retires_populated_residency ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 2181 filtered out; finished in 0.03s
+

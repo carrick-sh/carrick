@@ -67,3 +67,7 @@ carrick-host-bsd = { path = "../carrick-host-bsd" }
 # actual C compile on the macos/aarch64 target.
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+carrick-conformance-contract = { path = "../carrick-conformance-contract" }
+sha2.workspace = true

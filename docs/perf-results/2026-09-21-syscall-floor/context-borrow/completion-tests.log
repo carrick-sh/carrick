@@ -1,0 +1,117 @@
+warning: variable does not need to be mutable
+  --> crates/carrick-kernel-example/src/contracts.rs:63:9
+   |
+63 |     let mut snapshot = report.work_snapshot().clone();
+   |         ----^^^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:203:9
+    |
+203 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:319:9
+    |
+319 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:405:9
+    |
+405 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:505:9
+    |
+505 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:605:9
+    |
+605 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:754:9
+    |
+754 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:821:9
+    |
+821 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: `carrick-kernel-example` (lib) generated 8 warnings (run `cargo fix --lib -p carrick-kernel-example` to apply 8 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (target/release/deps/carrick_runtime-b18d7539281a8391)
+
+running 37 tests
+test vcpu_loop::exec::tests::executor_failure_after_a_lost_exit_claim_publishes_its_own_result ... ok
+test vcpu_loop::exec::tests::guest_syscall_completion_owner_retains_token_inline ... ok
+test vcpu_loop::exec::tests::interception_completion_dynamic_blocking_partial_runs_driver_before_one_publication ... ok
+test vcpu_loop::exec::tests::interception_completion_dynamic_clone_child_job_preserves_exact_observer_identity_once ... ok
+test vcpu_loop::exec::tests::interception_completion_dynamic_fork_and_clone_children_publish_once_at_bootstrap ... ok
+test vcpu_loop::exec::tests::interception_completion_dynamic_fork_child_job_preserves_exact_observer_identity_once ... ok
+test vcpu_loop::exec::tests::interception_completion_dynamic_guest_exec_failure_completes_errno_once ... ok
+test vcpu_loop::exec::tests::interception_completion_dynamic_readiness_once_and_twice_redispatches_handler_only ... ok
+test vcpu_loop::exec::tests::interception_completion_dynamic_signal_and_partial_return_publish_after_engine_once ... ok
+test vcpu_loop::exec::tests::interception_completion_dynamic_timeout_and_interruption_resume_through_scheduler_once ... ok
+test vcpu_loop::exec::tests::invalid_inotify_quantum_wrapper_cost ... ignored, explicit release-mode syscall cost diagnostic
+test vcpu_loop::exec::tests::invalid_inotify_resident_poll_cost ... ignored, explicit release-mode syscall cost diagnostic
+test vcpu_loop::exec::tests::invalid_inotify_service_completion_cost ... ignored, explicit release-mode syscall cost diagnostic
+test vcpu_loop::exec::tests::invalid_inotify_worker_operations_cost ... ignored, explicit release-mode syscall cost diagnostic
+test vcpu_loop::exec::tests::pending_exec_completion_ownership_is_drop_safe_for_external_settlement_and_unwind ... 
+thread 'vcpu_loop::exec::tests::pending_exec_completion_ownership_is_drop_safe_for_external_settlement_and_unwind' (4608413) panicked at crates/carrick-runtime/src/vcpu_loop/exec.rs:5538:13:
+exercise pending exec owner unwind
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+test vcpu_loop::exec::tests::pending_exec_completion_ownership_survives_control_context_failure_without_abort ... ok
+test vcpu_loop::exec::tests::pending_exec_completion_ownership_survives_mm_readmission_failure_without_masking_error ... ok
+test vcpu_loop::exec::tests::pending_exec_owner_executor_failure_converts_exec_close_to_exit ... ok
+test vcpu_loop::exec::tests::production_poll_exec_failure_at_image_replacement_exits_and_retires_predecessor ... ok
+test vcpu_loop::exec::tests::production_poll_exec_terminal_context_changes_only_at_kernel_successor_commit ... ok
+test vcpu_loop::exec::tests::production_poll_preserves_immediate_exec_drain_begin_errors_for_both_origins ... ok
+test vcpu_loop::exec::tests::production_poll_preserves_immediate_exec_suffix_errors_for_both_origins ... ok
+test vcpu_loop::exec::tests::production_poll_preserves_successor_context_on_actual_duplicate_replacement_publication ... ok
+test vcpu_loop::exec::tests::production_poll_terminal_outcome_after_successor_commit_keeps_successor_context ... ok
+test vcpu_loop::exec::tests::syscall_context_retention_contract ... context_retention_observations redispatch=false [{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:3795db790357a3a424e080e7506bf67e9fdcaf236b0f63f3dbbd3ec3353f1d67","fixture_identity":"unit:syscall-context-retention","scale":1,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":1,"kernel_redispatches":1,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":1},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:3795db790357a3a424e080e7506bf67e9fdcaf236b0f63f3dbbd3ec3353f1d67","fixture_identity":"unit:syscall-context-retention","scale":8,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":8,"kernel_redispatches":8,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":8},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:3795db790357a3a424e080e7506bf67e9fdcaf236b0f63f3dbbd3ec3353f1d67","fixture_identity":"unit:syscall-context-retention","scale":32,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":32,"kernel_redispatches":32,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":32},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:3795db790357a3a424e080e7506bf67e9fdcaf236b0f63f3dbbd3ec3353f1d67","fixture_identity":"unit:syscall-context-retention","scale":128,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":128,"kernel_redispatches":128,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":128},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}]
+context_retention_observations redispatch=true [{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:3795db790357a3a424e080e7506bf67e9fdcaf236b0f63f3dbbd3ec3353f1d67","fixture_identity":"unit:syscall-context-retention","scale":1,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":1,"kernel_redispatches":2,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":1},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:3795db790357a3a424e080e7506bf67e9fdcaf236b0f63f3dbbd3ec3353f1d67","fixture_identity":"unit:syscall-context-retention","scale":8,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":8,"kernel_redispatches":16,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":8},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:3795db790357a3a424e080e7506bf67e9fdcaf236b0f63f3dbbd3ec3353f1d67","fixture_identity":"unit:syscall-context-retention","scale":32,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":32,"kernel_redispatches":64,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":32},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:3795db790357a3a424e080e7506bf67e9fdcaf236b0f63f3dbbd3ec3353f1d67","fixture_identity":"unit:syscall-context-retention","scale":128,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":128,"kernel_redispatches":256,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":128},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}]
+ok
+test vcpu_loop::exec::tests::two_task_mm_thread_sibling_sharing_manager_does_not_error ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_delayed_guest_and_internal_suffix_errors_consume_origins ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_delayed_guest_exec_drain_finish_error_consumes_origin ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_delayed_internal_exec_drain_finish_error_consumes_origin ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_external_exec_bootstrap_is_tokenless_and_nonpublishing ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_guest_exec_missing_token_is_rejected ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_guest_valid_exec_authenticates_before_preparation ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_immediate_guest_exec_drain_begin_error_consumes_origin ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_immediate_guest_exec_suffix_error_consumes_origin ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_immediate_internal_exec_drain_begin_error_consumes_origin ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_immediate_internal_exec_suffix_error_consumes_origin ... ok
+test vcpu_loop::exec::tests::typed_completion_ownership_internal_exec_failure_is_tokenless_and_nonpublishing ... ok
+
+test result: ok. 33 passed; 0 failed; 4 ignored; 0 measured; 591 filtered out; finished in 0.58s
+

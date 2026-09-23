@@ -153,7 +153,11 @@ impl Aarch64Vcpu for KvmVcpu {
                     carrick_hal::read_aarch64_syscall_frame(|r| <Self as HvVcpu>::reg(self, r))
                         .map_err(os_to_trap)?;
                 let resume_pc = <Self as HvVcpu>::reg(self, Reg::ElrEl1).map_err(os_to_trap)?;
-                Ok(Aarch64Exit::Syscall { frame, resume_pc })
+                Ok(Aarch64Exit::Syscall {
+                    frame,
+                    resume_pc,
+                    current_guest_sp: None,
+                })
             }
             VcpuExit::MmioWrite { gpa, .. } if gpa == FAULT_SENTINEL_GPA => {
                 // An EL0 SYNCHRONOUS FAULT (data/instruction abort, alignment)
@@ -268,6 +272,7 @@ impl GuestVmBackend for KvmAarch64Vmm {
 }
 
 impl Aarch64Vmm for KvmAarch64Vmm {
+    type AnonymousDiscard = ();
     type Vcpu = KvmVcpu;
     type KickHandle = KvmKickHandle;
     type SiblingBuilder = KvmAarch64SiblingBuilder;

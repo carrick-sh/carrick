@@ -1,0 +1,42 @@
+{
+  "contract_id": "kernel.execution.native-synchronous-syscall",
+  "layer": "embed-structural",
+  "implementation_revision": "9bb2392396b8531e93f5262657bf3aa9c5767488+experiment:c55a4fa9405b4c7aa139189a65796dbbc45c8822390a6231fdc498cb61aa1cc8",
+  "fixture_identity": "bounded-native watch-0-128; nine post-warmup guest windows",
+  "scale": 128,
+  "semantic_assertions": [
+    {
+      "name": "actual_guest_syscalls_match_EBADF",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "exactly_two_requests_and_completions_per_pair",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "allocator_positive_control_fired",
+      "passed": true,
+      "detail": null
+    }
+  ],
+  "work": {
+    "values": {
+      "kernel_dispatches": 256,
+      "host_heap_allocations": 0
+    },
+    "dropped_events": 0,
+    "unknown_metrics": [
+      "hvf_syscall_exits: no live HVF-exit instrument in this research binary"
+    ]
+  },
+  "timing": null,
+  "completeness": {
+    "status": "incomplete",
+    "reasons": [
+      "research executor is not a registered embed binding",
+      "unified-carrier MM, COW, signal/cancellation and foreign-write obligations remain unproved"
+    ]
+  }
+}

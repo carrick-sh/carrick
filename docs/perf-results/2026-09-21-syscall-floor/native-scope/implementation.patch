@@ -1,0 +1,1304 @@
+--- /dev/null
++++ b/conformance-contracts/contracts/native-execution-scope.toml
+@@ -0,0 +1,23 @@
++schema_version = 1
++id = "kernel.mm.native-execution-scope"
++title = "Native execution owns its running handshake until the safe point"
++guest_surfaces = ["kernel:current-mm", "scheduler:execution-admission", "scheduler:page-table-quiescence"]
++semantic_authority = ["Carrick exact task execution lease", "Carrick exact-MM pause-modify-resume protocol", "man 2 mprotect", "man 2 munmap"]
++fixture = "unit:native-execution-scope"
++scale_points = [1, 8, 32, 128]
++rationale = "Normal native execution must retain exact census membership and a private running handshake without holding mutation exclusion. An interrupt requests a safe point; only scope exit acknowledges it. Repeated entry after setup must allocate no host memory. This scope grants no memory pointers or executable publication."
++
++[bindings]
++vm_free = "carrick-kernel-example::native_execution_scope::native_execution_scope_contract"
++
++[bindings.unresolved]
++embed_structural = "The lifecycle and allocation contract is VM-free. Carrier pointer activation, native code publication, signals, cancellation and scheduling require signed execution composition."
++embed_timing = "No new performance measurement or native workload acceptance."
++docker = "Internal admission invariant; Linux mapping semantics remain the external obligation. No corresponding differential guest race is registered."
++
++[[structural_budgets]]
++kind = "exact"
++metric = "host_heap_allocations"
++value = 0
++layers = ["vm-free"]
++rationale = "After one-time executor admission and warmup, N enter/checkpoint/leave cycles must allocate zero times. The fixture intercepts actual thread-local allocator calls and verifies a positive control."
+--- a/conformance-contracts/contracts/native-synchronous-syscall.toml
++++ b/conformance-contracts/contracts/native-synchronous-syscall.toml
+@@ -8,8 +8,8 @@
+ rationale = "The native adapter must execute real guest instructions through current unified-kernel policy and completion paths. Matching errno output alone does not prove executable permission, frame ownership, signal delivery, TLS, or translation revocation. The existing host callback gateway is not a binding for this contract."
+ 
+ [bindings.unresolved]
+-vm_free = "Authenticated instruction fetch and a mutation-scoped carrier native-data grant now have focused tests for exact execution/MM authority, permissions, revisions and COW backing. They do not provide concurrent execution admission, revocation or generation-bound translation publication. CurrentMmMemory remains a marker. No VM-free execution binding is registered. See docs/perf-results/2026-09-21-syscall-floor/native-carrier."
+-embed_structural = "A bounded non-product executor now runs real ELF instructions against the public kernel and emits partial observations; it is not an embed binding. Carrier COW and pinned data access are now composed under existing exact-MM mutation exclusion in a separate fixture; the ELF executor still uses private backing. Concurrent carrier execution, foreign-write invalidation, guest signals/cancellation and scheduling remain unproved. Require actual register/TLS behavior, two-MM isolation, revocation and measured dispatch/completion/transition counts. See docs/perf-results/2026-09-21-syscall-floor/native-slice."
++vm_free = "Authenticated instruction fetch and a mutation-scoped carrier native-data grant now have focused tests for exact execution/MM authority, permissions, revisions and COW backing. The separate kernel.mm.native-execution-scope contract now proves scoped admission and exact-MM draining without mutation exclusion. Carrier pointer activation, revocation and generation-bound translation publication remain unbound. CurrentMmMemory remains a marker. No VM-free execution binding is registered. See docs/perf-results/2026-09-21-syscall-floor/native-carrier."
++embed_structural = "A bounded non-product executor now runs real ELF instructions against the public kernel and emits partial observations; it is not an embed binding. Carrier COW and pinned data access are now composed under existing exact-MM mutation exclusion in a separate fixture; the ELF executor still uses private backing. The private-backing ELF controls now enter/leave the scoped native census capability at existing checkpoints. Carrier pointer activation, foreign-write invalidation, guest signals/cancellation and scheduling remain unproved. Require actual register/TLS behavior, two-MM isolation, revocation and measured dispatch/completion/transition counts. See docs/perf-results/2026-09-21-syscall-floor/native-slice."
+ embed_timing = "No native adapter timing accepted. Same-ELF diagnostic native/HVF/Linux measurements exist. Native scalar lowering reduced the private-backing memory control from 151.92 ns to 2.12 ns (1.53x Linux), but is not a current-carrier memory grant. Compute, COW, JIT, signals and full current-runtime controls remain acceptance requirements. See docs/perf-results/2026-09-21-syscall-floor/native-memory."
+ docker = "Exact errno control matches native ARM64 Docker at all scales; versioned observation emission and remaining register/TLS/signal/memory fixtures are not yet bound. Evidence: docs/perf-results/2026-09-21-syscall-floor/dsr-guest-contract."
+ 
+--- a/crates/carrick-kernel-example/src/contracts.rs
++++ b/crates/carrick-kernel-example/src/contracts.rs
+@@ -700,8 +700,8 @@
+     let exact = report.ret("read") == (iterations * 16) as i64
+         && bytes.len() == iterations * 16
+         && bytes.chunks_exact(16).enumerate().all(|(i, event)| {
+-            i32::from_ne_bytes(event[..4].try_into().unwrap()) == (i + 1) as i32
+-                && u32::from_ne_bytes(event[4..8].try_into().unwrap())
++            i32::from_ne_bytes([event[0], event[1], event[2], event[3]]) == (i + 1) as i32
++                && u32::from_ne_bytes([event[4], event[5], event[6], event[7]])
+                     == carrick_abi::LINUX_IN_IGNORED
+                 && event[8..].iter().all(|&v| v == 0)
+         });
+--- /dev/null
++++ b/crates/carrick-kernel-example/tests/native_execution_scope.rs
+@@ -0,0 +1,154 @@
++#![allow(clippy::unwrap_used, clippy::expect_used)]
++
++use carrick_conformance_contract::{
++    Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
++    SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
++};
++use carrick_hal::{NullGuestTimerBridge, NullHostSignalBridge, ThreadId};
++use carrick_kernel::{
++    dispatch::{CarrierBridges, SyscallDispatcher},
++    kernel::{CarrierProcess, objects::ExecutorId},
++};
++use carrick_kernel_example::{
++    driver::seed_initial_task_state,
++    process::{AddressSpace, AsidAllocator, ExampleProcess},
++};
++use std::{
++    alloc::{GlobalAlloc, Layout, System},
++    cell::Cell,
++    sync::Arc,
++};
++
++thread_local! { static ALLOCATIONS: Cell<Option<u64>> = const { Cell::new(None) }; }
++struct CountingAllocator;
++#[global_allocator]
++static ALLOCATOR: CountingAllocator = CountingAllocator;
++fn allocated() {
++    let _ = ALLOCATIONS.try_with(|count| {
++        if let Some(n) = count.get() {
++            count.set(Some(n.checked_add(1).unwrap()));
++        }
++    });
++}
++// SAFETY: forwards every layout, pointer and size unchanged to System. The
++// observation cell uses const TLS and performs no allocations itself.
++unsafe impl GlobalAlloc for CountingAllocator {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        allocated();
++        unsafe { System.alloc(layout) }
++    }
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        allocated();
++        unsafe { System.alloc_zeroed(layout) }
++    }
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
++        allocated();
++        unsafe { System.realloc(ptr, layout, size) }
++    }
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        unsafe { System.dealloc(ptr, layout) }
++    }
++}
++
++#[test]
++fn native_execution_scope_contract() {
++    ALLOCATIONS.set(Some(0));
++    let positive = std::hint::black_box(vec![std::hint::black_box(42u8); 64]);
++    assert!(ALLOCATIONS.replace(None).unwrap() > 0);
++    drop(positive);
++
++    let bridges = CarrierBridges {
++        host_signal: Arc::new(NullHostSignalBridge::default()),
++        timers: Arc::new(NullGuestTimerBridge::default()),
++    };
++    let tid = ThreadId::from_guest_supplied_tid(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
++    let (process, context) = ExampleProcess::boot_root(
++        tid.raw(),
++        "native-scope-contract",
++        bridges.host_signal.clone(),
++        AddressSpace::allocate(&AsidAllocator::new()).unwrap(),
++    )
++    .unwrap();
++    let process = Arc::new(process);
++    let dispatcher = SyscallDispatcher::with_bridges(bridges);
++    dispatcher.bind_hvpatch_process(process.clone() as Arc<dyn CarrierProcess>);
++    assert!(process.take_bind_failure().is_none());
++    seed_initial_task_state(&context, process.asid_generation()).unwrap();
++    let mut execution = context
++        .thread()
++        .claim_runnable(ExecutorId::for_transitional_thread(tid).unwrap())
++        .unwrap();
++    let mut executor = dispatcher
++        .admit_native_executor(&context, &execution)
++        .unwrap();
++    let interrupt = executor.interrupt_handle();
++    drop(
++        dispatcher
++            .enter_native_execution(&mut executor, &context, &mut execution)
++            .unwrap(),
++    );
++    let mut observations = Vec::new();
++    for scale in [1, 8, 32, 128] {
++        let mut completed = 0;
++        let mut exact = true;
++        ALLOCATIONS.set(Some(0));
++        for _ in 0..scale {
++            let scope = dispatcher
++                .enter_native_execution(&mut executor, &context, &mut execution)
++                .unwrap();
++            exact &= !scope.stop_requested();
++            interrupt.request_stop();
++            exact &= scope.stop_requested();
++            // Requesting a stop never drops membership or acknowledges running.
++            drop(scope);
++            exact &= executor.take_stop_request();
++            completed += 1;
++        }
++        let allocations = ALLOCATIONS.replace(None).unwrap();
++        let mut work = WorkSnapshot::new();
++        work.insert(WorkMetric::HostHeapAllocations, allocations)
++            .unwrap();
++        observations.push(ContractObservation {
++            contract_id: ContractId::new("kernel.mm.native-execution-scope").unwrap(),
++            layer: ExecutionLayer::VmFree,
++            implementation_revision: std::env::var("CARRICK_NATIVE_SCOPE_REVISION")
++                .unwrap_or_else(|_| "unarchived-working-tree".into()),
++            fixture_identity: "unit:native-execution-scope".into(),
++            scale,
++            semantic_assertions: vec![
++                SemanticAssertion {
++                    name: "exact_completed_scopes_and_sticky_interrupt".into(),
++                    passed: exact && completed == scale,
++                    detail: Some(format!("completed={completed}")),
++                },
++                SemanticAssertion::pass("allocator_positive_control_fired"),
++            ],
++            work: Some(work),
++            timing: None,
++            completeness: Completeness::Complete,
++        });
++    }
++    if let Some(dir) = std::env::var_os("CARRICK_NATIVE_SCOPE_RECEIPT_DIR") {
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(
++            std::path::Path::new(&dir).join("observations.json"),
++            serde_json::to_vec_pretty(&observations).unwrap(),
++        )
++        .unwrap();
++    }
++    drop(executor);
++    context.thread().yield_from_executor(execution).unwrap();
++    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++        .parent()
++        .unwrap()
++        .parent()
++        .unwrap();
++    let registry = ContractRegistry::load(root).unwrap();
++    evaluate(
++        registry
++            .require("kernel.mm.native-execution-scope")
++            .unwrap(),
++        &observations,
++    )
++    .unwrap();
++}
+--- a/crates/carrick-kernel/src/dispatch/mm_authority.rs
++++ b/crates/carrick-kernel/src/dispatch/mm_authority.rs
+@@ -256,6 +256,10 @@
+ 
+ #[derive(Clone)]
+ pub(in crate::dispatch) enum MmExecutorAdmissionRecipe {
++    NativeThread {
++        thread: crate::kernel::ThreadRef,
++        state: Arc<super::native_execution::NativeExecutorState>,
++    },
+     Anonymous,
+     AnonymousWithPauseEndpoint {
+         registry: Arc<dyn carrick_hal::VcpuRegistry>,
+@@ -276,6 +280,9 @@
+     {
+         match self {
+             Self::Anonymous => authority.guest_executors.enter(None),
++            Self::NativeThread { thread, state } => authority
++                .guest_executors
++                .enter_native(thread.clone(), Arc::clone(state)),
+             Self::AnonymousWithPauseEndpoint { registry, tid } => authority
+                 .guest_executors
+                 .enter_with_pause_endpoint(None, Arc::clone(registry), *tid),
+@@ -327,6 +334,9 @@
+             MmExecutorAdmissionRecipe::Anonymous
+             | MmExecutorAdmissionRecipe::AnonymousWithPauseEndpoint { .. } => true,
+             MmExecutorAdmissionRecipe::Thread {
++                thread: admitted, ..
++            }
++            | MmExecutorAdmissionRecipe::NativeThread {
+                 thread: admitted, ..
+             } => Arc::ptr_eq(admitted, thread),
+         }
+--- a/crates/carrick-kernel/src/dispatch/mod.rs
++++ b/crates/carrick-kernel/src/dispatch/mod.rs
+@@ -808,6 +808,7 @@
+ pub(in crate::dispatch) use io_buffers::*;
+ pub mod mm_authority;
+ pub mod mm_quiesce;
++pub mod native_execution;
+ #[cfg(test)]
+ pub(crate) use carrick_abi::LINUX_FUTEX_PRIVATE_FLAG;
+ #[allow(unused_imports)]
+--- /dev/null
++++ b/crates/carrick-kernel/src/dispatch/native_execution.rs
+@@ -0,0 +1,248 @@
++//! Normal native execution admission. This owns the exact-MM running handshake,
++//! not memory access or code publication. Carrier data must still be activated
++//! under separately authenticated mapping/owner/leaf authority.
++
++use super::{
++    MmExecutorAdmissionRecipe, MmExecutorParticipation, SyscallDispatcher, outcome::DispatchError,
++};
++use crate::kernel::{
++    KernelContext, MmAccessError,
++    objects::{ExecutionGeneration, ExecutorId, ThreadExecutionLease},
++};
++use carrick_hal::{InGuestFlag, ThreadId};
++use std::{
++    marker::PhantomData,
++    rc::Rc,
++    sync::{
++        Arc,
++        atomic::{AtomicBool, Ordering},
++    },
++};
++
++/// The census owns this exact state directly. Registry replacement/removal can
++/// neither conceal its running flag nor redirect a page-table drain's request.
++pub(crate) struct NativeExecutorState {
++    tid: ThreadId,
++    running: InGuestFlag,
++    stop: AtomicBool,
++}
++impl NativeExecutorState {
++    fn new(tid: ThreadId) -> Self {
++        Self {
++            tid,
++            running: InGuestFlag::for_guest_thread(),
++            stop: AtomicBool::new(false),
++        }
++    }
++    pub(crate) fn tid(&self) -> ThreadId {
++        self.tid
++    }
++    pub(crate) fn is_running(&self) -> bool {
++        self.running.is_in_guest()
++    }
++    pub(crate) fn request_stop(&self) {
++        self.stop.store(true, Ordering::SeqCst);
++    }
++}
++
++/// Request-only control endpoint. A request does not acknowledge a safe point.
++/// The owner must return from native code and drop its `NativeExecution` first.
++#[derive(Clone)]
++pub struct NativeExecutionInterrupt(Arc<NativeExecutorState>);
++impl NativeExecutionInterrupt {
++    pub fn request_stop(&self) {
++        self.0.request_stop();
++    }
++}
++impl carrick_hal::VcpuKick for NativeExecutionInterrupt {
++    fn kick(&self) {
++        self.request_stop();
++    }
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++struct LeaseIdentity {
++    generation: ExecutionGeneration,
++    executor: ExecutorId,
++    epoch: u64,
++}
++impl LeaseIdentity {
++    fn of(lease: &ThreadExecutionLease) -> Self {
++        Self {
++            generation: lease.generation(),
++            executor: lease.executor(),
++            epoch: lease.executor_epoch(),
++        }
++    }
++}
++
++/// One exact task/executor quantum, reusable across synchronous native entries.
++/// Setup allocates its census endpoint once. Entry/exit takes no census lock and
++/// holds no MM mutation authority. Drop this admission before scheduler handoff;
++/// a successor lease must receive a fresh admission and control endpoint.
++///
++/// This is only the execution facet. It neither registers an HVF vCPU nor
++/// services carrier COW invalidation tickets or delivers Linux signal handlers.
++pub struct NativeExecutor {
++    participant: MmExecutorParticipation,
++    state: Arc<NativeExecutorState>,
++    lease: LeaseIdentity,
++    _thread: PhantomData<Rc<()>>,
++}
++impl NativeExecutor {
++    pub fn interrupt_handle(&self) -> NativeExecutionInterrupt {
++        NativeExecutionInterrupt(Arc::clone(&self.state))
++    }
++    /// Consume the request at a host safe point. The mutable borrow prevents
++    /// acknowledging it while an execution scope still exists. A subsequent
++    /// concurrent request remains sticky for the next entry check.
++    pub fn take_stop_request(&mut self) -> bool {
++        self.state.stop.swap(false, Ordering::SeqCst)
++    }
++    /// Ordinary dispatch may borrow the admitted executor only outside native
++    /// execution. This preserves the existing exact-MM dispatch/mutation path.
++    pub fn dispatch_participation(&mut self) -> &mut MmExecutorParticipation {
++        &mut self.participant
++    }
++}
++
++/// The running half of admission. Only dropping this scope clears the flag
++/// observed by an exact-MM drain. Future native data capabilities must borrow
++/// this scope, so all pointers expire before that acknowledgement.
++///
++/// ```compile_fail
++/// use carrick_kernel::{dispatch::{SyscallDispatcher, native_execution::NativeExecutor}, kernel::{KernelContext, objects::ThreadExecutionLease}};
++/// fn acknowledge_while_running(d: &SyscallDispatcher, n: &mut NativeExecutor, c: &KernelContext, e: &mut ThreadExecutionLease) {
++///     let scope = d.enter_native_execution(n, c, e).unwrap();
++///     n.take_stop_request();
++///     drop(scope);
++/// }
++/// ```
++/// ```compile_fail
++/// use carrick_kernel::{dispatch::{SyscallDispatcher, native_execution::NativeExecutor}, kernel::{KernelContext, objects::ThreadExecutionLease}};
++/// fn migrate_while_running(d: &SyscallDispatcher, n: &mut NativeExecutor, c: &KernelContext, mut e: ThreadExecutionLease) {
++///     let scope = d.enter_native_execution(n, c, &mut e).unwrap();
++///     c.thread().yield_from_executor(e).unwrap();
++///     drop(scope);
++/// }
++/// ```
++pub struct NativeExecution<'scope> {
++    executor: &'scope mut NativeExecutor,
++    context: &'scope KernelContext,
++    _lease: &'scope mut ThreadExecutionLease,
++}
++impl NativeExecution<'_> {
++    /// The translator must reach a bounded checkpoint and end this scope when
++    /// true. This only observes control; it never clears running or a request.
++    pub fn stop_requested(&self) -> bool {
++        self.executor.state.stop.load(Ordering::SeqCst)
++            || self
++                .executor
++                .participant
++                .authority
++                .pt_quiesce()
++                .is_quiescing()
++            || self
++                .executor
++                .participant
++                .authority
++                .fork_quiesce()
++                .is_quiescing()
++            || self.context.thread().may_have_pending_signals()
++    }
++}
++impl Drop for NativeExecution<'_> {
++    fn drop(&mut self) {
++        self.executor.state.running.leave_guest();
++    }
++}
++
++#[derive(Debug, thiserror::Error)]
++pub enum NativeExecutionError {
++    #[error(transparent)]
++    Memory(#[from] MmAccessError),
++    #[error(transparent)]
++    Dispatch(#[from] DispatchError),
++    #[error(transparent)]
++    Admission(#[from] crate::kernel::GuestExecutorCensusError),
++    #[error("native admission belongs to another execution lease")]
++    ChangedExecutionLease,
++    #[error("native admission lost its exact running endpoint")]
++    EndpointMismatch,
++    #[error("native execution is already active")]
++    AlreadyRunning,
++    #[error("native entry requires a host control safe point")]
++    ControlPending,
++}
++
++impl SyscallDispatcher {
++    pub fn admit_native_executor(
++        &self,
++        context: &KernelContext,
++        execution: &ThreadExecutionLease,
++    ) -> Result<NativeExecutor, NativeExecutionError> {
++        context.validate_current_execution_mm(execution)?;
++        let authority = self.mm_binding.current.load_full();
++        let state = Arc::new(NativeExecutorState::new(context.thread().registry_id()));
++        let admission = MmExecutorAdmissionRecipe::NativeThread {
++            thread: context.thread().clone(),
++            state: Arc::clone(&state),
++        };
++        let participation = admission.enter(&authority)?;
++        let participant = MmExecutorParticipation {
++            authority,
++            admission,
++            participation: Some(participation),
++        };
++        // Admission can wait behind a mutator. Re-authenticate after joining,
++        // then fail closed on exec/MM drift; never carry a stale owner forward.
++        self.validate_current_mm_executor(&participant, context, execution)?;
++        context.validate_current_execution_mm(execution)?;
++        Ok(NativeExecutor {
++            participant,
++            state,
++            lease: LeaseIdentity::of(execution),
++            _thread: PhantomData,
++        })
++    }
++
++    pub fn enter_native_execution<'scope>(
++        &self,
++        executor: &'scope mut NativeExecutor,
++        context: &'scope KernelContext,
++        execution: &'scope mut ThreadExecutionLease,
++    ) -> Result<NativeExecution<'scope>, NativeExecutionError> {
++        if !matches!(&executor.participant.admission,
++            MmExecutorAdmissionRecipe::NativeThread { state, .. } if Arc::ptr_eq(state, &executor.state))
++        {
++            return Err(NativeExecutionError::EndpointMismatch);
++        }
++        if executor.state.is_running() {
++            return Err(NativeExecutionError::AlreadyRunning);
++        }
++        if executor.lease != LeaseIdentity::of(execution) {
++            return Err(NativeExecutionError::ChangedExecutionLease);
++        }
++        self.validate_current_mm_executor(&executor.participant, context, execution)?;
++        context.validate_current_execution_mm(execution)?;
++        if executor.participant.participation.is_none() {
++            return Err(DispatchError::MmExecutorParticipationUnavailable.into());
++        }
++        // SeqCst publish-before-check is the existing page-table entry
++        // handshake: either we see the barrier or the drain sees us. Nothing
++        // here holds the census lock, so simultaneous readers remain possible.
++        executor.state.running.enter_guest();
++        let scope = NativeExecution {
++            executor,
++            context,
++            _lease: execution,
++        };
++        if scope.stop_requested() {
++            return Err(NativeExecutionError::ControlPending);
++        }
++        Ok(scope)
++    }
++}
++
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/crates/carrick-kernel/src/dispatch/native_execution/tests.rs
+@@ -0,0 +1,266 @@
++use super::*;
++use crate::dispatch::mm_quiesce::{PtPauseBudget, PtPauseError, acquire_pt_pause};
++use crate::kernel::mm_access::test_support::execution_lease;
++use std::time::Duration;
++
++static_assertions::assert_not_impl_any!(NativeExecutor: Send, Sync, Clone, Copy);
++static_assertions::assert_not_impl_any!(NativeExecution<'static>: Send, Sync, Clone, Copy);
++
++fn fixture(marker: u64) -> (SyscallDispatcher, KernelContext, ThreadExecutionLease) {
++    let dispatcher = SyscallDispatcher::new();
++    let context = dispatcher.capture_one_task_context().unwrap();
++    let lease = execution_lease(&context, marker);
++    (dispatcher, context, lease)
++}
++fn settle(context: &KernelContext, executor: NativeExecutor, lease: ThreadExecutionLease) {
++    drop(executor);
++    context.thread().yield_from_executor(lease).unwrap();
++}
++
++#[test]
++fn stop_request_does_not_acknowledge_running_and_entry_takes_no_census_lock() {
++    let (dispatcher, context, mut lease) = fixture(19401);
++    let mut executor = dispatcher.admit_native_executor(&context, &lease).unwrap();
++    let interrupt = executor.interrupt_handle();
++    let census = dispatcher.mm_executor_census();
++    for _ in 0..128 {
++        // Holding the census election here makes any hidden entry-time census
++        // acquisition deadlock. Its immutable membership already admits us.
++        let held = census.lock_for_frame_cow();
++        let scope = dispatcher
++            .enter_native_execution(&mut executor, &context, &mut lease)
++            .unwrap();
++        assert!(held.any_in_guest());
++        interrupt.request_stop();
++        assert!(scope.stop_requested());
++        assert!(held.any_in_guest());
++        held.kick_all_in_guest();
++        assert!(held.any_in_guest());
++        drop(scope);
++        assert!(!held.any_in_guest());
++        drop(held);
++        assert!(executor.take_stop_request());
++    }
++    settle(&context, executor, lease);
++    assert_eq!(census.participant_count_for_probe(), 0);
++}
++
++#[test]
++fn raised_pause_refuses_entry_and_rolls_back_running() {
++    let (dispatcher, context, mut lease) = fixture(19402);
++    let mut executor = dispatcher.admit_native_executor(&context, &lease).unwrap();
++    let barrier = executor.participant.pt_quiesce().clone();
++    assert!(barrier.try_become_coordinator());
++    barrier.set_quiescing();
++    assert!(matches!(
++        dispatcher.enter_native_execution(&mut executor, &context, &mut lease),
++        Err(NativeExecutionError::ControlPending)
++    ));
++    assert!(!executor.state.is_running());
++    barrier.end();
++    drop(
++        dispatcher
++            .enter_native_execution(&mut executor, &context, &mut lease)
++            .unwrap(),
++    );
++    settle(&context, executor, lease);
++}
++
++#[test]
++fn real_mutation_drain_cannot_pass_until_execution_scope_ends() {
++    let (dispatcher, context, mut lease) = fixture(19403);
++    let mut executor = dispatcher.admit_native_executor(&context, &lease).unwrap();
++    let census = dispatcher.mm_executor_census();
++    let barrier = executor.participant.pt_quiesce().clone();
++    let tid = ThreadId::synthetic_for_tests(19404);
++    let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
++    let mut mutator = census
++        .enter_with_pause_endpoint(None, registry, tid)
++        .unwrap();
++    let scope = dispatcher
++        .enter_native_execution(&mut executor, &context, &mut lease)
++        .unwrap();
++    let result = acquire_pt_pause(
++        &barrier,
++        &mut mutator,
++        tid,
++        PtPauseBudget {
++            election: Duration::ZERO,
++            drain: Duration::ZERO,
++        },
++    );
++    assert!(matches!(result, Err(PtPauseError::TimedOut)));
++    drop(result);
++    assert!(scope.stop_requested());
++    assert!(!barrier.is_quiescing()); // refusal rolls back the mutation request
++    assert!(census.lock_for_frame_cow().any_in_guest());
++    drop(scope);
++    let pause = acquire_pt_pause(&barrier, &mut mutator, tid, PtPauseBudget::DEFAULT).unwrap();
++    assert!(barrier.is_quiescing());
++    assert!(matches!(
++        dispatcher.enter_native_execution(&mut executor, &context, &mut lease),
++        Err(NativeExecutionError::ControlPending)
++    ));
++    drop(pause);
++    assert!(executor.take_stop_request());
++    drop(
++        dispatcher
++            .enter_native_execution(&mut executor, &context, &mut lease)
++            .unwrap(),
++    );
++    drop(mutator);
++    settle(&context, executor, lease);
++}
++
++#[test]
++fn wrong_context_and_transferred_lease_cannot_reuse_admission() {
++    let (dispatcher, context, mut lease) = fixture(19405);
++    let (other, other_context, mut other_lease) = fixture(19406);
++    assert!(
++        dispatcher
++            .admit_native_executor(&context, &other_lease)
++            .is_err()
++    );
++    let mut executor = dispatcher.admit_native_executor(&context, &lease).unwrap();
++    assert!(
++        other
++            .enter_native_execution(&mut executor, &context, &mut lease)
++            .is_err()
++    );
++    assert!(
++        dispatcher
++            .enter_native_execution(&mut executor, &other_context, &mut other_lease)
++            .is_err()
++    );
++    context.thread().yield_from_executor(lease).unwrap();
++    let mut successor = context
++        .thread()
++        .claim_runnable(ExecutorId::synthetic_for_tests(19407))
++        .unwrap();
++    assert!(matches!(
++        dispatcher.enter_native_execution(&mut executor, &context, &mut successor),
++        Err(NativeExecutionError::ChangedExecutionLease)
++    ));
++    let stale_interrupt = executor.interrupt_handle();
++    drop(executor);
++    let mut successor_executor = dispatcher
++        .admit_native_executor(&context, &successor)
++        .unwrap();
++    stale_interrupt.request_stop();
++    let scope = dispatcher
++        .enter_native_execution(&mut successor_executor, &context, &mut successor)
++        .unwrap();
++    assert!(!scope.stop_requested());
++    drop(scope);
++    settle(&context, successor_executor, successor);
++    other_context
++        .thread()
++        .yield_from_executor(other_lease)
++        .unwrap();
++}
++
++#[test]
++fn unwind_clears_running_before_admission_is_removed() {
++    let (dispatcher, context, mut lease) = fixture(19408);
++    let mut executor = dispatcher.admit_native_executor(&context, &lease).unwrap();
++    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        let _scope = dispatcher
++            .enter_native_execution(&mut executor, &context, &mut lease)
++            .unwrap();
++        panic!("bounded unwind test");
++    }));
++    assert!(result.is_err());
++    assert!(!executor.state.is_running());
++    settle(&context, executor, lease);
++    assert_eq!(
++        dispatcher
++            .mm_executor_census()
++            .participant_count_for_probe(),
++        0
++    );
++}
++
++#[test]
++fn replacing_dispatch_participation_cannot_detach_native_running_authority() {
++    let (dispatcher, context, mut lease) = fixture(19409);
++    let mut executor = dispatcher.admit_native_executor(&context, &lease).unwrap();
++    // The ordinary dispatch interface accepts a mutable participation. Moving
++    // another admissible token into that slot must never authenticate native
++    // execution whose private flag is absent from the replacement census row.
++    let replacement = dispatcher
++        .enter_mm_executor_for_thread(
++            None,
++            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
++            ThreadId::synthetic_for_tests(19410),
++        )
++        .unwrap();
++    let original = std::mem::replace(executor.dispatch_participation(), replacement);
++    drop(original);
++    assert!(
++        dispatcher
++            .enter_native_execution(&mut executor, &context, &mut lease)
++            .is_err()
++    );
++    assert!(!executor.state.is_running());
++    settle(&context, executor, lease);
++}
++
++#[test]
++fn same_mm_readers_remain_simultaneously_admitted_at_all_scales() {
++    for scale in [1, 8, 32, 128] {
++        let (dispatcher, root, root_lease) = fixture(19500 + scale);
++        let mut contexts = Vec::new();
++        for index in 0..scale {
++            let plan = crate::kernel::ClonePlan::from_flags(
++                carrick_abi::LinuxCloneFlags::THREAD
++                    | carrick_abi::LinuxCloneFlags::VM
++                    | carrick_abi::LinuxCloneFlags::SIGHAND,
++            )
++            .unwrap();
++            contexts.push(
++                root.kernel()
++                    .reserve_thread_clone(&root, plan, None)
++                    .unwrap()
++                    .prepare(ThreadId::synthetic_for_tests(20000 + index as i32))
++                    .unwrap()
++                    .commit()
++                    .unwrap()
++                    .into_context()
++                    .unwrap(),
++            );
++        }
++        let mut leases: Vec<_> = contexts
++            .iter()
++            .enumerate()
++            .map(|(i, context)| execution_lease(context, 21000 + i as u64))
++            .collect();
++        let mut executors: Vec<_> = contexts
++            .iter()
++            .zip(&leases)
++            .map(|(context, lease)| dispatcher.admit_native_executor(context, lease).unwrap())
++            .collect();
++        let census = dispatcher.mm_executor_census();
++        let mut scopes = Vec::new();
++        for ((executor, context), lease) in executors.iter_mut().zip(&contexts).zip(&mut leases) {
++            scopes.push(
++                dispatcher
++                    .enter_native_execution(executor, context, lease)
++                    .unwrap(),
++            );
++        }
++        let held = census.lock_for_frame_cow();
++        assert_eq!(held.participant_count(), scale as usize);
++        assert_eq!(held.pause_endpoint_tids().len(), scale as usize);
++        assert!(held.any_in_guest());
++        held.kick_all_in_guest();
++        assert!(scopes.iter().all(NativeExecution::stop_requested));
++        drop(scopes);
++        assert!(!held.any_in_guest());
++        drop(held);
++        for ((context, executor), lease) in contexts.iter().zip(executors).zip(leases) {
++            settle(context, executor, lease);
++        }
++        assert_eq!(census.participant_count_for_probe(), 0);
++        root.thread().yield_from_executor(root_lease).unwrap();
++    }
++}
+--- a/crates/carrick-kernel/src/kernel/guest_execution.rs
++++ b/crates/carrick-kernel/src/kernel/guest_execution.rs
+@@ -131,7 +131,21 @@
+         registry: Arc<dyn carrick_hal::VcpuRegistry>,
+         tid: carrick_hal::ThreadId,
+     ) -> Result<GuestExecutorParticipation, GuestExecutorCensusError> {
+-        self.enter_inner(thread, Some(GuestExecutorPauseEndpoint { registry, tid }))
++        self.enter_inner(
++            thread,
++            Some(GuestExecutorPauseEndpoint::Registered { registry, tid }),
++        )
++    }
++
++    pub(crate) fn enter_native(
++        self: &Arc<Self>,
++        thread: ThreadRef,
++        state: Arc<crate::dispatch::native_execution::NativeExecutorState>,
++    ) -> Result<GuestExecutorParticipation, GuestExecutorCensusError> {
++        self.enter_inner(
++            Some(thread),
++            Some(GuestExecutorPauseEndpoint::Native(state)),
++        )
+     }
+ 
+     fn enter_inner(
+@@ -209,16 +223,46 @@
+ }
+ 
+ #[derive(Clone)]
+-struct GuestExecutorPauseEndpoint {
+-    registry: Arc<dyn carrick_hal::VcpuRegistry>,
+-    tid: carrick_hal::ThreadId,
++enum GuestExecutorPauseEndpoint {
++    Registered {
++        registry: Arc<dyn carrick_hal::VcpuRegistry>,
++        tid: carrick_hal::ThreadId,
++    },
++    Native(Arc<crate::dispatch::native_execution::NativeExecutorState>),
++}
++
++impl GuestExecutorPauseEndpoint {
++    fn tid(&self) -> carrick_hal::ThreadId {
++        match self {
++            Self::Registered { tid, .. } => *tid,
++            Self::Native(state) => state.tid(),
++        }
++    }
++    fn is_in_guest(&self) -> bool {
++        match self {
++            Self::Registered { registry, tid } => registry.is_in_guest(*tid),
++            Self::Native(state) => state.is_running(),
++        }
++    }
++    fn kick_if_in_guest(&self) {
++        match self {
++            Self::Registered { registry, tid } => {
++                let _ = registry.kick_if_in_guest(*tid);
++            }
++            Self::Native(state) => {
++                if state.is_running() {
++                    state.request_stop();
++                }
++            }
++        }
++    }
+ }
+ 
+ impl fmt::Debug for GuestExecutorPauseEndpoint {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+         formatter
+             .debug_struct("GuestExecutorPauseEndpoint")
+-            .field("tid", &self.tid)
++            .field("tid", &self.tid())
+             .finish()
+     }
+ }
+@@ -243,7 +287,7 @@
+             .participants
+             .values()
+             .flatten()
+-            .map(|endpoint| endpoint.tid)
++            .map(GuestExecutorPauseEndpoint::tid)
+             .collect()
+     }
+ 
+@@ -252,7 +296,7 @@
+             .participants
+             .values()
+             .flatten()
+-            .any(|endpoint| endpoint.registry.is_in_guest(endpoint.tid))
++            .any(GuestExecutorPauseEndpoint::is_in_guest)
+     }
+ 
+     pub(crate) fn first_in_guest_tid(&self) -> Option<carrick_hal::ThreadId> {
+@@ -260,17 +304,12 @@
+             .participants
+             .values()
+             .flatten()
+-            .find_map(|endpoint| {
+-                endpoint
+-                    .registry
+-                    .is_in_guest(endpoint.tid)
+-                    .then_some(endpoint.tid)
+-            })
++            .find_map(|endpoint| endpoint.is_in_guest().then_some(endpoint.tid()))
+     }
+ 
+     pub(crate) fn kick_all_in_guest(&self) {
+         for endpoint in self.state.participants.values().flatten() {
+-            let _ = endpoint.registry.kick_if_in_guest(endpoint.tid);
++            endpoint.kick_if_in_guest();
+         }
+     }
+ }
+--- a/experiments/native-syscall-slice/README.md
++++ b/experiments/native-syscall-slice/README.md
+@@ -13,7 +13,7 @@
+ 
+ ```sh
+ sh experiments/native-syscall-slice/fixtures/build.sh
+-RUSTC_WRAPPER= CARGO_TARGET_DIR=target cargo test --manifest-path experiments/native-syscall-slice/Cargo.toml --lib
++RUSTC_WRAPPER= CARGO_TARGET_DIR=target cargo test --manifest-path experiments/native-syscall-slice/Cargo.toml --tests
+ RUSTC_WRAPPER= CARGO_TARGET_DIR=target cargo build --release --manifest-path experiments/native-syscall-slice/Cargo.toml
+ codesign --force --sign - --identifier sh.carrick.native-slice target/release/native-syscall-slice
+ CARRICK_RUN_ID=native-slice-local target/release/native-syscall-slice target/lease-cost/native-slice/fixtures/watch-2-128
+@@ -37,8 +37,12 @@
+ 
+ - SVC enters the current policy/interceptor/observer preparation and semantic
+   dispatch. The host never fabricates the loop's syscall arguments or results.
+-- The public kernel owns the exact task/thread/MM lease. Resume checks validate
+-  its identity without creating a VMA snapshot. This identity grants no memory
++- The public kernel owns the exact task/thread/MM lease. Each native segment now
++  holds a `NativeExecution` scope; the existing checkpoint returns to Rust and
++  drops that scope before semantic dispatch. The scope owns its census running
++  flag and a request-only interrupt endpoint, without holding mutation exclusion.
++  Pending carrier control work stops this research runner for lack of a service.
++  Resume checks validate its identity without creating a VMA snapshot. This identity grants no memory
+   access or code publication rights.
+ - The experimental memory object exclusively owns ELF backing, permissions and
+   code generation. No guest VA becomes a host pointer or the physical SP. The
+@@ -67,3 +71,9 @@
+ All new source here is MIT OR Apache-2.0. No third-party implementation code was
+ copied. The old DSR planner remains a separate recovered research artifact; its
+ identity/bias memory model and native-process fork model were not restored.
++
++The current scope integration and its functional receipts are recorded in
++[native-scope](../../docs/perf-results/2026-09-21-syscall-floor/native-scope/README.md).
++The `scoped_execution` integration test executes all five unchanged ELF controls
++at 1/8/32/128 and checks 200 guest records plus syscall/completion counts. These
++are debug functional runs, and do not update the earlier release timing results.
+--- a/experiments/native-syscall-slice/src/main.rs
++++ b/experiments/native-syscall-slice/src/main.rs
+@@ -51,11 +51,11 @@
+     }
+     dispatcher.activate_file_authority(context.resources().files())?;
+     seed_initial_task_state(&context, process.asid_generation())?;
+-    let execution = context
++    let mut execution = context
+         .thread()
+         .claim_runnable(ExecutorId::for_transitional_thread(tid)?)?;
+     let owner = context.validate_current_execution_mm(&execution)?;
+-    let mut executor = dispatcher.enter_mm_executor()?;
++    let mut executor = dispatcher.admit_native_executor(&context, &execution)?;
+     let registry = ThreadRegistry::new(tid);
+     let futex = FutexTable::new();
+     let reporter = CompatReporter::default();
+@@ -71,100 +71,137 @@
+     #[cfg(feature = "allocation-metrics")]
+     let mut window = None;
+     let started = Instant::now();
+-    let result = code.run(&image, &mut memory, &mut state, &mut |state, memory| {
+-        transitions += 1;
+-        ensure!(
+-            transitions <= 100_000_000 && started.elapsed() < Duration::from_secs(40),
+-            "native diagnostic execution bound"
+-        );
+-        ensure!(
+-            context.validate_current_execution_mm(&execution)? == owner,
+-            "current MM changed"
+-        );
+-        // A real pending signal is never silently bypassed. Guest handler and
+-        // host signal bridge support remain explicit unsatisfied capabilities.
+-        while let Some(pending) = dispatcher.take_deliverable_pending_from(&context, tid) {
+-            let action = dispatcher.signal_action(&context, pending.signum);
+-            match carrick_kernel::kernel::evaluate_signal_delivery_action(pending.signum, action) {
+-                carrick_kernel::kernel::SignalDeliveryAction::Ignore => {}
+-                other => bail!("native slice cannot deliver pending signal: {other:?}"),
++    let mut service =
++        |state: &mut State,
++         memory: &mut Memory,
++         executor: &mut carrick_kernel::dispatch::native_execution::NativeExecutor,
++         execution: &carrick_kernel::kernel::objects::ThreadExecutionLease|
++         -> Result<bool> {
++            transitions += 1;
++            ensure!(
++                transitions <= 100_000_000 && started.elapsed() < Duration::from_secs(40),
++                "native diagnostic execution bound"
++            );
++            ensure!(
++                context.validate_current_execution_mm(execution)? == owner,
++                "current MM changed"
++            );
++            // A real pending signal is never silently bypassed. Guest handler and
++            // host signal bridge support remain explicit unsatisfied capabilities.
++            while let Some(pending) = dispatcher.take_deliverable_pending_from(&context, tid) {
++                let action = dispatcher.signal_action(&context, pending.signum);
++                match carrick_kernel::kernel::evaluate_signal_delivery_action(
++                    pending.signum,
++                    action,
++                ) {
++                    carrick_kernel::kernel::SignalDeliveryAction::Ignore => {}
++                    other => bail!("native slice cannot deliver pending signal: {other:?}"),
++                }
++            }
++            let index = state
++                .pc
++                .checked_sub(image.base())
++                .filter(|n| n % 4 == 0)
++                .and_then(|n| usize::try_from(n / 4).ok())
++                .ok_or_else(|| anyhow::anyhow!("invalid semantic PC"))?;
++            let w = *image
++                .words()
++                .get(index)
++                .ok_or_else(|| anyhow::anyhow!("guest fell outside code"))?;
++            if classify(w).map_err(anyhow::Error::msg)? != Instruction::Syscall {
++                emulate(w, state, memory)?;
++                return Ok(true);
++            }
++            let number = state.x[8];
++            #[cfg(feature = "allocation-metrics")]
++            let closing = number == 113 && window.is_some();
++            #[cfg(feature = "allocation-metrics")]
++            if closing {
++                let count = allocations::end();
++                let (r, c) = window.take().unwrap();
++                windows.push((requests - r, completions - c, count));
++            }
++            // No mapping/exec/clone/handler syscall can claim unsupported semantics.
++            ensure!(
++                matches!(number, 26 | 27 | 28 | 29 | 56 | 57 | 63 | 64 | 93 | 113),
++                "unsupported syscall {number}"
++            );
++            requests += 1;
++            *by_number.entry(number).or_default() += 1;
++            let request = SyscallRequest::new(
++                number,
++                SyscallArgs::from([
++                    state.x[0], state.x[1], state.x[2], state.x[3], state.x[4], state.x[5],
++                ]),
++            );
++            let outcome = dispatcher.dispatch_threaded_with_mm_executor(
++                executor.dispatch_participation(),
++                &context,
++                request,
++                memory,
++                &reporter,
++                ThreadCtx::new(tid, &registry, &futex),
++            )?;
++            let (value, errno) = match outcome {
++                DispatchOutcome::Returned { value } => (value, None),
++                DispatchOutcome::Errno { errno } => {
++                    errors += 1;
++                    let value = errno.guest_retval();
++                    (value, Some((-value) as i32))
++                }
++                DispatchOutcome::Exit { code } => {
++                    exited = Some(code);
++                    return Ok(false);
++                }
++                other => bail!("unsupported synchronous outcome: {other:?}"),
++            };
++            completions += 1;
++            let meta = carrick_abi::syscall::lookup_aarch64(number)
++                .ok_or_else(|| anyhow::anyhow!("missing syscall metadata"))?;
++            reporter.record(CompatEvent::SyscallReturn {
++                number,
++                name: meta.name.into(),
++                retval: value,
++                errno,
++            });
++            state.x[0] = value as u64;
++            state.pc += 4;
++            #[cfg(feature = "allocation-metrics")]
++            if number == 113 && !closing {
++                window = Some((requests, completions));
++                allocations::begin();
++            }
++            Ok(true)
++        };
++    let result = (|| -> Result<()> {
++        loop {
++            // Return to Rust at the existing SVC/memory/backedge checkpoint.
++            // The scope ends before semantic dispatch may mutate this MM.
++            let scope =
++                dispatcher.enter_native_execution(&mut executor, &context, &mut execution)?;
++            let mut reached_checkpoint = false;
++            let run = code.run(&image, &mut memory, &mut state, &mut |_, _| {
++                reached_checkpoint = true;
++                Ok(false)
++            });
++            drop(scope);
++            run?;
++            ensure!(
++                reached_checkpoint,
++                "native execution returned without a checkpoint"
++            );
++            // Control requests cannot be silently acknowledged as delivered
++            // signals/cancellation: this research runner has no such service.
++            ensure!(
++                !executor.take_stop_request(),
++                "native execution requires carrier control service"
++            );
++            if !service(&mut state, &mut memory, &mut executor, &execution)? {
++                break;
+             }
+         }
+-        let index = state
+-            .pc
+-            .checked_sub(image.base())
+-            .filter(|n| n % 4 == 0)
+-            .and_then(|n| usize::try_from(n / 4).ok())
+-            .ok_or_else(|| anyhow::anyhow!("invalid semantic PC"))?;
+-        let w = *image
+-            .words()
+-            .get(index)
+-            .ok_or_else(|| anyhow::anyhow!("guest fell outside code"))?;
+-        if classify(w).map_err(anyhow::Error::msg)? != Instruction::Syscall {
+-            emulate(w, state, memory)?;
+-            return Ok(true);
+-        }
+-        let number = state.x[8];
+-        #[cfg(feature = "allocation-metrics")]
+-        let closing = number == 113 && window.is_some();
+-        #[cfg(feature = "allocation-metrics")]
+-        if closing {
+-            let count = allocations::end();
+-            let (r, c) = window.take().unwrap();
+-            windows.push((requests - r, completions - c, count));
+-        }
+-        // No mapping/exec/clone/handler syscall can claim unsupported semantics.
+-        ensure!(
+-            matches!(number, 26 | 27 | 28 | 29 | 56 | 57 | 63 | 64 | 93 | 113),
+-            "unsupported syscall {number}"
+-        );
+-        requests += 1;
+-        *by_number.entry(number).or_default() += 1;
+-        let request = SyscallRequest::new(
+-            number,
+-            SyscallArgs::from([
+-                state.x[0], state.x[1], state.x[2], state.x[3], state.x[4], state.x[5],
+-            ]),
+-        );
+-        let outcome = dispatcher.dispatch_threaded_with_mm_executor(
+-            &mut executor,
+-            &context,
+-            request,
+-            memory,
+-            &reporter,
+-            ThreadCtx::new(tid, &registry, &futex),
+-        )?;
+-        let (value, errno) = match outcome {
+-            DispatchOutcome::Returned { value } => (value, None),
+-            DispatchOutcome::Errno { errno } => {
+-                errors += 1;
+-                let value = errno.guest_retval();
+-                (value, Some((-value) as i32))
+-            }
+-            DispatchOutcome::Exit { code } => {
+-                exited = Some(code);
+-                return Ok(false);
+-            }
+-            other => bail!("unsupported synchronous outcome: {other:?}"),
+-        };
+-        completions += 1;
+-        let meta = carrick_abi::syscall::lookup_aarch64(number)
+-            .ok_or_else(|| anyhow::anyhow!("missing syscall metadata"))?;
+-        reporter.record(CompatEvent::SyscallReturn {
+-            number,
+-            name: meta.name.into(),
+-            retval: value,
+-            errno,
+-        });
+-        state.x[0] = value as u64;
+-        state.pc += 4;
+-        #[cfg(feature = "allocation-metrics")]
+-        if number == 113 && !closing {
+-            window = Some((requests, completions));
+-            allocations::begin();
+-        }
+-        Ok(true)
+-    });
++        Ok(())
++    })();
+     if let Err(e) = result {
+         bail!(
+             "guest pc={:#x} x0={} x8={}: {e:#}",
+--- /dev/null
++++ b/experiments/native-syscall-slice/tests/scoped_execution.rs
+@@ -0,0 +1,133 @@
++//! Actual ELF controls through the executable's scoped entry/dispatch boundary.
++//! Fixtures are built by fixtures/build.sh; absence is a failure, never a skip.
++//! Debug execution validates semantics and checkpoint composition, not timing.
++use std::{
++    path::Path,
++    process::{Command, Stdio},
++};
++
++#[test]
++#[expect(
++    clippy::disallowed_methods,
++    reason = "Non-product functional harness: execute the selected native test binary and save operator-selected host receipts; guest file paths remain under the kernel VFS"
++)]
++fn scoped_execution_preserves_all_five_elf_controls() {
++    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
++        .parent()
++        .unwrap()
++        .parent()
++        .unwrap();
++    let binary = env!("CARGO_BIN_EXE_native-syscall-slice");
++    let mut receipts = Vec::new();
++    for phase in 0..5u64 {
++        for scale in [1, 8, 32, 128] {
++            let elf = root.join(format!(
++                "target/lease-cost/native-slice/fixtures/watch-{phase}-{scale}"
++            ));
++            assert!(
++                elf.is_file(),
++                "build the exact ELF controls first: {}",
++                elf.display()
++            );
++            let run_id = format!(
++                "native-scope-functional-{phase}-{scale}-{}",
++                std::process::id()
++            );
++            let output = Command::new(binary)
++                .arg(&elf)
++                .env("CARRICK_RUN_ID", &run_id)
++                .stdin(Stdio::null())
++                .output()
++                .unwrap();
++            if let Some(dir) = std::env::var_os("CARRICK_NATIVE_SCOPE_RECEIPT_DIR") {
++                std::fs::create_dir_all(&dir).unwrap();
++                let dir = Path::new(&dir);
++                std::fs::write(dir.join(format!("{run_id}.out")), &output.stdout).unwrap();
++                std::fs::write(dir.join(format!("{run_id}.err")), &output.stderr).unwrap();
++            }
++            assert!(
++                output.status.success(),
++                "{run_id}: {}",
++                String::from_utf8_lossy(&output.stderr)
++            );
++            assert_eq!(
++                output.stdout.len(),
++                560,
++                "ten complete 56-byte guest records"
++            );
++            for record in output.stdout.chunks_exact(56) {
++                let words: Vec<u64> = record
++                    .chunks_exact(8)
++                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
++                    .collect();
++                assert_eq!(words[0], phase);
++                assert_eq!(words[1], scale);
++                assert!(words[3] < 1_000_000_000 && words[5] < 1_000_000_000);
++                assert_eq!(words[6], if phase == 2 { scale * 16 } else { 0 });
++            }
++            let reports: Vec<serde_json::Value> = output
++                .stderr
++                .split(|b| *b == b'\n')
++                .filter(|line| !line.is_empty())
++                .map(|line| serde_json::from_slice(line).unwrap())
++                .collect();
++            let report = &reports[0];
++            assert_eq!(
++                reports.len(),
++                if cfg!(feature = "allocation-metrics") {
++                    2
++                } else {
++                    1
++                }
++            );
++            #[cfg(feature = "allocation-metrics")]
++            {
++                assert_eq!(reports[1]["positive_control"], true);
++                assert_eq!(reports[1]["timing_eligible"], false);
++                let windows = reports[1]["allocation_windows"].as_array().unwrap();
++                assert_eq!(windows.len(), 10);
++                if phase == 0 {
++                    for window in windows {
++                        assert_eq!(window[0], 2 * scale);
++                        assert_eq!(window[1], 2 * scale);
++                        assert_eq!(window[2], 0, "scoped invalid-call window allocated");
++                    }
++                }
++            }
++            assert_eq!(report["exit"], 0);
++            assert_eq!(
++                report["requests"].as_u64().unwrap(),
++                report["completions"].as_u64().unwrap() + 1
++            );
++            let count = |nr: &str| report["syscalls"][nr].as_u64().unwrap_or(0);
++            assert_eq!(
++                count("27"),
++                match phase {
++                    0 | 2 => 10 * scale,
++                    1 => 20 * scale + 10,
++                    _ => 0,
++                }
++            );
++            assert_eq!(
++                count("28"),
++                if phase == 0 || phase == 2 {
++                    10 * scale
++                } else {
++                    0
++                }
++            );
++            assert_eq!(
++                report["errno_returns"],
++                if phase == 0 { 20 * scale } else { 0 }
++            );
++            receipts.push(serde_json::json!({"run_id":run_id, "elf":elf, "phase":phase, "scale":scale, "records":10, "exit_code":output.status.code(), "requests":report["requests"], "completions":report["completions"], "gateway_transitions":report["gateway_transitions"], "timing_eligible":false}));
++        }
++    }
++    if let Some(dir) = std::env::var_os("CARRICK_NATIVE_SCOPE_RECEIPT_DIR") {
++        std::fs::write(
++            Path::new(&dir).join("elf-functional.json"),
++            serde_json::to_vec_pretty(&receipts).unwrap(),
++        )
++        .unwrap();
++    }
++}

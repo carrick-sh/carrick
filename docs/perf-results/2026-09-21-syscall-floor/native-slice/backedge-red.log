@@ -1,0 +1,22 @@
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.32s
+     Running unittests src/lib.rs (../../target/debug/deps/native_syscall_slice-772381d88cbbfe3f)
+
+running 1 test
+test tests::bounded_native_loop_does_not_call_rust_per_iteration ... FAILED
+
+failures:
+
+---- tests::bounded_native_loop_does_not_call_rust_per_iteration stdout ----
+
+thread 'tests::bounded_native_loop_does_not_call_rust_per_iteration' (3925160) panicked at src/lib.rs:305:9:
+1024 backedges made 1025 host callbacks
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::bounded_native_loop_does_not_call_rust_per_iteration
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

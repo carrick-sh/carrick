@@ -1,0 +1,17 @@
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.08s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-03983327039dd49b)
+
+running 4 tests
+test container_policy::tests::denying_fstat_requires_fast_path_visibility ... ok
+test dispatch::fs::tests::serial_host::fstat_caches_host_xattrs_and_invalidates_on_mutators ... ok
+test dispatch::fs::tests::serial_host::immutable_lower_reports_one_inode_through_stat_fstat_and_getdents ... ok
+test dispatch::overlay_dispatch_tests::mkdirat_creates_overlay_dir_and_fstatat_sees_it ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 2184 filtered out; finished in 0.03s
+

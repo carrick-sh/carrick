@@ -1,0 +1,23 @@
+schema_version = 1
+id = "kernel.mm.native-code-drain"
+title = "Participating host writes revoke and drain active instruction content"
+guest_surfaces = ["kernel:current-mm", "scheduler:execution-admission", "scheduler:page-table-quiescence", "syscall:process_vm_writev", "syscall:ptrace"]
+semantic_authority = ["Carrick exact task/execution/MM authority", "Carrick physical backing content identity and participating host-write ordering"]
+fixture = "unit:native-code-drain"
+scale_points = [1, 8, 32, 128]
+rationale = "A participating host writer must revoke future content use and wait for affected active users before changing bytes. Unrelated physical pages are not revoked or drained. Captured code content is activated only inside its exact kernel running scope. This is not proof of private RX admission, hardware-write mediation, executable publication, or linked native execution."
+
+[bindings]
+vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_instruction_content_scope_contract (feature conformance-metrics); carrick-vmm-hvf::trap::code_content::execution_tests; real carrier instruction receipt and syscall writer regressions"
+
+[bindings.unresolved]
+embed_structural = "No signed mixed native/HVF code publication or direct-link revocation binding yet. Guest hardware stores, writable aliases and private RX admission remain unresolved."
+embed_timing = "No new original inotify09 timing or native-residence acceptance."
+docker = "Internal lifetime ordering; the Linux syscall semantic regressions remain separate. No mixed-engine guest race oracle is bound."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "host_heap_allocations"
+value = 0
+layers = ["vm-free"]
+rationale = "After preparation, N exact-native-scope content activations, checkpoints and drops allocate no host memory; the actual thread-local allocator must pass a positive control. The existing content and syscall-write contracts retain their affected-page budgets."

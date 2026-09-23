@@ -1,0 +1,12 @@
+{
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "image": "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+  "sha256": {
+    "target/lease-cost/carrick-base": "726c6848cf145e2aa0474cb7b12189da08ad77931b620c243654e9a4690509c9",
+    "conformance-probes/src/bin/writeseek.rs": "e55936ec7788b3241304d4ebb69ee8c8932568dd150a093fa1eb6e32aaa6f3e0",
+    "conformance-probes/target/aarch64-unknown-linux-musl/release/writeseek": "5dcda67af45781f124f4a305a3f285578ef9d6ef6558f736ecb23edb6ebfe763",
+    "conformance-probes/src/bin/perf_inotify09_scale.rs": "93943dc179371e19f685380715ddc09819d29990993a42c078ff5c4513250ab8",
+    "conformance-probes/target/aarch64-unknown-linux-musl/release/perf_inotify09_scale": "84870b6a71098477ca5bc64f4324aa73dcd41edef6363947748aa388667f7270"
+  },
+  "scope": "Baseline production source unchanged; regression tests and probe mode added. Semantic diagnostic, not timing acceptance."
+}

@@ -2684,6 +2684,365 @@ pub(crate) mod tests {
         (kernel, root, state)
     }
 
+    /// Diagnostic only: production service/completion, without executor polling,
+    /// signal-boundary processing or a hardware transition. Run in release mode.
+    #[test]
+    #[ignore = "explicit release-mode syscall cost diagnostic"]
+    fn invalid_inotify_service_completion_cost() {
+        let (kernel, context, mut state) =
+            typed_completion_fixture(72_499, SyscallDispatcher::new());
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(
+                    Some(Arc::clone(context.thread())),
+                    Arc::clone(&state.kicker),
+                    state.this_tid,
+                )
+                .expect("MM executor admission"),
+        );
+        let iterations = 65_536_usize;
+        let mut engine = CrashCaptureTestEngine::default();
+        // Exclude growth of the test-only completion log from measured samples.
+        engine.completed_syscalls.reserve_exact(2 * iterations);
+        engine.guest_memory.insert(0x20_000, b"/data\0".to_vec());
+        for sample in 0..22 {
+            // Alternate order to control drift within this process.
+            for with_signals in if sample % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                engine.completed_syscalls.clear();
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    for (number, args) in [
+                        (
+                            carrick_abi::syscall::nr::INOTIFY_ADD_WATCH.raw(),
+                            [u64::MAX, 0x20_000, 2, 0, 0, 0],
+                        ),
+                        (
+                            carrick_abi::syscall::nr::INOTIFY_RM_WATCH.raw(),
+                            [u64::MAX, 0, 0, 0, 0, 0],
+                        ),
+                    ] {
+                        let frame = carrick_hal::RawSyscall {
+                            current_guest_sp: Some(0x80_000),
+                            number: carrick_abi::CanonicalNr(number),
+                            args,
+                            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                            native_number: carrick_abi::NativeNr(number),
+                        };
+                        let result = state
+                            .service_threaded_syscall(&kernel, &mut engine, frame, None)
+                            .expect("production service");
+                        let DispatchOutcome::Errno { errno } = result else {
+                            panic!("expected invalid descriptor errno, got {result:?}")
+                        };
+                        assert_eq!(errno.guest_retval(), -9);
+                        std::hint::black_box(
+                            state
+                                .complete_errno(&mut engine, &kernel.reporter, errno)
+                                .expect("production completion"),
+                        );
+                        if with_signals {
+                            let context = state
+                                .service_kernel_context
+                                .as_ref()
+                                .expect("service context")
+                                .retain_exact();
+                            assert!(
+                                service_signals_threaded(
+                                    &kernel,
+                                    &context,
+                                    &mut engine,
+                                    state.this_tid,
+                                    state.fatal_image_generation,
+                                    Some(-9),
+                                    None,
+                                    state.continuation_restart.take(),
+                                    state.reserved_signal.take(),
+                                    0,
+                                )
+                                .expect("production signal return boundary")
+                                .is_none()
+                            );
+                        }
+                    }
+                }
+                let ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+                assert_eq!(engine.completed_syscalls.len(), 2 * iterations);
+                assert!(engine.completed_syscalls.iter().all(|value| *value == -9));
+                assert!(state.syscall_completion.is_idle());
+                if sample > 0 {
+                    println!(
+                        "service_completion signals={with_signals} sample={} ns_per_pair={ns}",
+                        sample - 1
+                    );
+                }
+            }
+        }
+        let summary = kernel.reporter.snapshot().summary;
+        assert_eq!(
+            summary.syscall_invocations,
+            (22 * 2 * 2 * iterations) as u64
+        );
+        assert_eq!(summary.syscall_returns_errno, summary.syscall_invocations);
+        assert_eq!(summary.syscall_returns_ok, 0);
+    }
+
+    /// Production resident poll with exact invalidation binding, but no HVF.
+    #[test]
+    #[ignore = "explicit release-mode syscall cost diagnostic"]
+    fn invalid_inotify_resident_poll_cost() {
+        measure_invalid_inotify_poll(false, false);
+    }
+
+    #[test]
+    #[ignore = "explicit release-mode syscall cost diagnostic"]
+    fn invalid_inotify_quantum_wrapper_cost() {
+        measure_invalid_inotify_poll(true, false);
+    }
+
+    #[test]
+    #[ignore = "explicit release-mode syscall cost diagnostic"]
+    fn invalid_inotify_worker_operations_cost() {
+        measure_invalid_inotify_poll(true, true);
+    }
+
+    fn measure_invalid_inotify_poll(wrapped: bool, worker_ops: bool) {
+        let pid = 72_498;
+        let dispatcher = SyscallDispatcher::new();
+        let (runtime, scheduler, kernel, root, process, generation) = {
+            let (process, root) = crate::hvpatch::process_context_for_tests(pid);
+            dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
+            let kernel = Arc::new(KernelState::new(
+                dispatcher,
+                Arc::new(EndpointTestSignalPump),
+                Arc::new(EndpointTestSignalArrival),
+                Some(process.clone()),
+                None,
+            ));
+            let runtime = Arc::clone(kernel.hvpatch_runtime.as_ref().unwrap());
+            let (scheduler, _) = runtime.continuation_services(root.kernel());
+            runtime
+                .persistent_bindings()
+                .install_scheduler(&scheduler)
+                .unwrap();
+            let stage1_mm = process.stage1_mm_lease().unwrap();
+            let mut root_state = executor::tests::task_state(&root, 500);
+            root_state.asid_generation = process.asid_generation();
+            let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) = &mut root_state.cpu else {
+                unreachable!()
+            };
+            Arc::make_mut(cpu).asid_generation = process.asid_generation();
+            Arc::make_mut(cpu).ttbr0 = stage1_mm.binding().ttbr0.raw();
+            Arc::make_mut(cpu).ttbr1 = stage1_mm.binding().ttbr0.raw();
+            let root_generation = root
+                .thread()
+                .publish_initial_task_state(root_state.clone())
+                .unwrap();
+            let root_binding = executor::tests::hvpatch_test_binding(&root, &root_state, 600);
+            let root_binding = Arc::new(
+                continuation::HvpatchTaskBinding::new_with_stage1_mm(
+                    root_binding.identity(),
+                    Arc::clone(root_binding.quantum()),
+                    Box::new(()),
+                    stage1_mm,
+                )
+                .unwrap(),
+            );
+            root_binding.validate_state(&root_state).unwrap();
+            let dormant = runtime
+                .persistent_bindings()
+                .prepare_submission(
+                    &scheduler,
+                    executor::HvpatchSubmissionShape::Root,
+                    None,
+                    Arc::clone(root.thread()),
+                    root_generation,
+                    Arc::clone(&root_binding),
+                )
+                .unwrap();
+            executor::tests::activate_hvpatch_test_submission(
+                dormant,
+                &scheduler,
+                &root,
+                &root_state,
+                root_generation,
+                root_binding.as_ref(),
+            );
+            (runtime, scheduler, kernel, root, process, root_generation)
+        };
+        let authority = runtime
+            .persistent_bindings()
+            .take_submission_authority(root.thread().key(), generation)
+            .unwrap();
+        let binding = runtime
+            .persistent_bindings()
+            .resolve(root.thread().key(), generation)
+            .unwrap();
+        let registration = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .unwrap();
+        let mut running = scheduler.take(&registration).unwrap();
+        let this_tid = ThreadId::synthetic_for_tests(pid);
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(this_tid)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            this_tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(root.retain_exact());
+
+        state.max_traps = usize::MAX;
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(
+                    Some(Arc::clone(root.thread())),
+                    Arc::clone(&state.kicker),
+                    this_tid,
+                )
+                .unwrap(),
+        );
+        let job = suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        let mut direct = Some(job);
+        let quantum = wrapped.then(|| {
+            continuation::HvpatchTaskQuantum::new(
+                Box::new(HvpatchLoopJob::production(
+                    direct.take().unwrap(),
+                    crate::vcpu_loop::binding::InjectedExecutionLeaseSlot::new(),
+                )),
+                continuation::LogicalJobCompletion::pending(),
+            )
+        });
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        // Publish the same executor/ASID observation metadata as task load.
+        // No hardware is dirtied by this scripted engine.
+        binding
+            .begin_asid_load(registration.id())
+            .unwrap()
+            .mark_resident()
+            .unwrap();
+        let observer = binding.cow_invalidation_observer(registration.id());
+        let mut submission = executor::ExecutorSubmissionContext {
+            registration: None,
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: Some(&authority),
+            authority: executor::ExecutionLeaseAuthoritySlot::from(Some(running.take_lease())),
+            exec_replacement: None,
+        };
+        let mut control = executor::HvpatchQuantumControl {
+            need_resched: &need_resched,
+            submission: &mut submission,
+            executor_id: Some(registration.id()),
+            binding: Some(&binding),
+            cow_invalidation_observer: Some(&observer),
+        };
+        assert!(control.cow_invalidation_binding().is_some());
+        let receipts = executor::pool::ReceiptLog::default();
+        let iterations = 65_536;
+        let mut engine = CrashCaptureTestEngine::default();
+        engine.completed_syscalls.reserve_exact(iterations * 2);
+        engine.guest_memory.insert(0x20_000, b"/data\0".to_vec());
+        for sample in 0..22 {
+            engine.completed_syscalls.clear();
+            let start = Instant::now();
+            for _ in 0..iterations {
+                for (number, args) in [
+                    (
+                        carrick_abi::syscall::nr::INOTIFY_ADD_WATCH.raw(),
+                        [u64::MAX, 0x20_000, 2, 0, 0, 0],
+                    ),
+                    (
+                        carrick_abi::syscall::nr::INOTIFY_RM_WATCH.raw(),
+                        [u64::MAX, 0, 0, 0, 0, 0],
+                    ),
+                ] {
+                    engine.next_syscall = Some(carrick_hal::RawSyscall {
+                        current_guest_sp: Some(0x80_000),
+                        number: carrick_abi::CanonicalNr(number),
+                        args,
+                        guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                        native_number: carrick_abi::NativeNr(number),
+                    });
+                    assert!(matches!(
+                        match &quantum {
+                            Some(quantum) =>
+                                quantum.poll_quantum_with_engine(&mut engine, &mut control),
+                            None => direct
+                                .as_mut()
+                                .unwrap()
+                                .poll_with_engine(&mut engine, &mut control)
+                                .unwrap(),
+                        },
+                        executor::ExecutorExit::Syscall
+                    ));
+                    assert!(
+                        engine.next_syscall.is_none(),
+                        "poll must consume the request"
+                    );
+                    if worker_ops {
+                        let executor::TakenExecutionAuthority::Live(lease) =
+                            control.submission.take_execution_authority().unwrap()
+                        else {
+                            panic!("ordinary syscall consumed predecessor");
+                        };
+                        assert!(control.submission.exec_replacement.is_none());
+                        running.restore_lease(lease).unwrap();
+                        running.thread().charge_user_ns(0);
+                        running.thread().charge_system_ns(0);
+                        scheduler.note_syscall_boundary(&running);
+                        receipts.record(
+                            registration.id(),
+                            executor::ExecutorPoolEvent::OrdinarySyscall {
+                                thread: running.thread_key(),
+                                generation: running.generation(),
+                            },
+                        );
+                        assert!(!scheduler.should_preempt(&running));
+                        control.submission.authority =
+                            executor::ExecutionLeaseAuthoritySlot::from(Some(running.take_lease()));
+                    }
+                }
+            }
+            let ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+            assert_eq!(engine.completed_syscalls.len(), iterations * 2);
+            assert!(engine.completed_syscalls.iter().all(|v| *v == -9));
+            if let Some(job) = &direct {
+                assert!(job.state.syscall_completion.is_idle());
+            }
+            if sample > 0 {
+                println!(
+                    "resident_poll wrapped={wrapped} worker_ops={worker_ops} sample={} ns_per_pair={ns}",
+                    sample - 1
+                );
+            }
+        }
+        let summary = kernel.reporter.snapshot().summary;
+        assert_eq!(summary.syscall_invocations, (22 * 2 * iterations) as u64);
+        assert_eq!(summary.syscall_returns_errno, summary.syscall_invocations);
+        assert_eq!(summary.syscall_returns_ok, 0);
+        if let Some(job) = &direct {
+            assert_eq!(job.traps, 22 * 2 * iterations);
+        }
+    }
+
     fn install_typed_guest_completion(
         kernel: &Kernel,
         context: &carrick_kernel::kernel::KernelContext,
@@ -2819,6 +3178,7 @@ pub(crate) mod tests {
             .expect("parent MM executor participation");
         state.guest_execution = Some(mm_executor);
         let frame = carrick_hal::RawSyscall {
+            current_guest_sp: None,
             number: carrick_abi::CanonicalNr(220),
             args: [0; 6],
             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
@@ -3074,6 +3434,7 @@ pub(crate) mod tests {
             | carrick_abi::LinuxCloneFlags::VM)
             .bits();
         let frame = carrick_hal::RawSyscall {
+            current_guest_sp: None,
             number: carrick_abi::CanonicalNr(220),
             args: [flags, 0x9000, 0, 0, 0, 0],
             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
@@ -3350,6 +3711,7 @@ pub(crate) mod tests {
             timespec.extend_from_slice(&(duration.as_secs() as i64).to_le_bytes());
             timespec.extend_from_slice(&(i64::from(duration.subsec_nanos())).to_le_bytes());
             let frame = carrick_hal::RawSyscall {
+                current_guest_sp: None,
                 number: carrick_abi::CanonicalNr(101),
                 args: [request_address, 0, 0, 0, 0, 0],
                 guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
@@ -3598,6 +3960,7 @@ pub(crate) mod tests {
             timespec.extend_from_slice(&(duration.as_secs() as i64).to_le_bytes());
             timespec.extend_from_slice(&(i64::from(duration.subsec_nanos())).to_le_bytes());
             let frame = carrick_hal::RawSyscall {
+                current_guest_sp: None,
                 number: carrick_abi::CanonicalNr(101),
                 args: [request_address, 0, 0, 0, 0, 0],
                 guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
@@ -3835,6 +4198,7 @@ pub(crate) mod tests {
                 .expect("root MM executor participation"),
         );
         let frame = carrick_hal::RawSyscall {
+            current_guest_sp: None,
             number: carrick_abi::CanonicalNr(92),
             args: [0; 6],
             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
@@ -4313,6 +4677,7 @@ pub(crate) mod tests {
 
     fn execve_test_frame() -> carrick_hal::RawSyscall {
         carrick_hal::RawSyscall {
+            current_guest_sp: None,
             number: carrick_abi::CanonicalNr(221),
             args: [0; 6],
             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
@@ -4334,6 +4699,7 @@ pub(crate) mod tests {
         .into();
         CrashCaptureTestEngine {
             next_syscall: Some(carrick_hal::RawSyscall {
+                current_guest_sp: None,
                 number: carrick_abi::CanonicalNr(221),
                 args: [PATH, ARGV, 0, 0, 0, 0],
                 guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
@@ -5913,6 +6279,7 @@ pub(crate) mod tests {
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
         let frame = carrick_hal::RawSyscall {
+            current_guest_sp: None,
             number: carrick_abi::CanonicalNr(221),
             args: [0; 6],
             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,

@@ -1,0 +1,48 @@
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.99s
+     Running unittests src/lib.rs (target/debug/deps/carrick_conformance_contract-dfe069e75b30bace)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/check-contracts.rs (target/debug/deps/check_contracts-4ad1fc86de53b6f4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/generate-inventory.rs (target/debug/deps/generate_inventory-da0b327d2ae9b771)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/claims.rs (target/debug/deps/claims-1a8b40ac69dbce4c)
+
+running 6 tests
+test claim_id_rejects_invalid_format ... ok
+test claim_id_accepts_valid_format ... ok
+test violation_demonstrated_requires_known_bad_revision ... ok
+test claim_serialization_round_trip ... ok
+test registry_loads_claims_successfully ... ok
+test live_registry_loads_all_claims ... FAILED
+
+failures:
+
+---- live_registry_loads_all_claims stdout ----
+
+thread 'live_registry_loads_all_claims' (4217027) panicked at crates/carrick-conformance-contract/tests/claims.rs:146:5:
+assertion `left == right` failed
+  left: 29
+ right: 26
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    live_registry_loads_all_claims
+
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p carrick-conformance-contract --test claims`

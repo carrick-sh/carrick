@@ -1,0 +1,23 @@
+schema_version = 1
+id = "kernel.execution.native-data-demand"
+title = "Register-only native intervals do not activate unused data authority"
+guest_surfaces = ["execution:linux-aarch64", "kernel:current-mm", "scheduler:execution-admission"]
+semantic_authority = ["Linux AArch64 register and branch semantics", "Carrick exact native execution scope and authenticated carrier data authority"]
+fixture = "unit:native-data-demand"
+scale_points = [1, 8, 32, 128]
+rationale = "A bounded research interval which cannot reach a native memory access before a checkpoint needs execution authority but no data grant. Conservative control-flow analysis must include both conditional successors and backward edges, terminate at host checkpoints, reject invalid targets, and retain the existing backedge bound. Any interval that may access memory uses the unchanged activation path. This is private research code publication with mock stage-2, not product execution acceptance."
+
+[bindings]
+vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_floor::native_data_demand_contract; native-syscall-slice control-flow and register tests"
+
+[bindings.unresolved]
+embed_structural = "Carrier code publication, signed native execution, signal/cancellation and scheduling composition remain unbound."
+embed_timing = "Paired unchanged-ELF host controls are diagnostic, not signed native acceptance."
+docker = "Same ELF controls must retain identical Linux semantics; no product-native differential binding exists."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "native_data_activations"
+value = 0
+layers = ["vm-free"]
+rationale = "Count successful activation calls made by the research runner during N register-only intervals. A native memory interval is the positive control and must activate exactly once."

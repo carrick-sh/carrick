@@ -1,0 +1,59 @@
+[
+  {
+    "name": "final-format",
+    "argv": [
+      "rustfmt",
+      "--check",
+      "--edition",
+      "2024",
+      "--config",
+      "skip_children=true",
+      "experiments/native-syscall-slice/src/native.rs",
+      "experiments/native-syscall-slice/src/lib.rs",
+      "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
+      "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs",
+      "crates/carrick-observability/src/work_meter.rs",
+      "crates/carrick-conformance-contract/tests/claims.rs"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "final-runtime-clippy",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--no-deps",
+      "-p",
+      "carrick-runtime",
+      "--all-targets",
+      "--features",
+      "conformance-metrics",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "final-inventory",
+    "argv": [
+      "cargo",
+      "run",
+      "-p",
+      "carrick-conformance-contract",
+      "--bin",
+      "generate-inventory",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "layering",
+    "argv": [
+      "scripts/closure-assert-layering.sh"
+    ],
+    "exit_code": 0
+  }
+]

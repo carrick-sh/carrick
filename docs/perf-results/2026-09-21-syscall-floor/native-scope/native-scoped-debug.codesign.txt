@@ -1,0 +1,10 @@
+Executable=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-scope/native-scoped-debug
+Identifier=native_syscall_slice-d206fcb0050daad3
+Format=Mach-O thin (arm64)
+CodeDirectory v=20400 size=300638 flags=0x20002(adhoc,linker-signed) hashes=9391+0 location=embedded
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements=none
+warning: Specifying ':' in the path is deprecated and will not work in a future release

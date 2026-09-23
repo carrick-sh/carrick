@@ -1,0 +1,68 @@
+{
+  "status": "unfinished_checkpoint",
+  "latest_contract": "kernel.mm.native-code-drain",
+  "checks": [
+    {
+      "log": "content-final.log",
+      "result": "pass",
+      "passed": 22
+    },
+    {
+      "log": "runtime-contract-complete.log",
+      "result": "pass",
+      "scales": [
+        1,
+        8,
+        32,
+        128
+      ],
+      "warm_heap_allocations": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "log": "borrow-contract.log",
+      "result": "pass",
+      "compile_fail_tests": 2
+    },
+    {
+      "log": "syscall-cost.log",
+      "result": "pass",
+      "scales": [
+        1,
+        8,
+        32,
+        128
+      ]
+    },
+    {
+      "log": "check-scope.log",
+      "result": "pass"
+    },
+    {
+      "log": "registry.log",
+      "result": "pass"
+    }
+  ],
+  "red_controls": [
+    "red-active-write.log",
+    "red-retirement.log"
+  ],
+  "not_run": [
+    "signed mixed native/HVF content drain",
+    "original inotify09 native regions",
+    "new performance comparison",
+    "full CI",
+    "probe/smoke/full promotion"
+  ],
+  "open_prior_failures": [
+    "read-only readv EFAULT consumes 4 bytes of source offset",
+    "fresh-publication maintenance budget",
+    "intermittent signed anonymous foreign-copyout EFAULT",
+    "private-file oracle 16-KiB alignment assumption",
+    "prior broad aarch64 Clippy diagnostics"
+  ]
+}

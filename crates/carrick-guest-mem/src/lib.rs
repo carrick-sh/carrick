@@ -635,6 +635,21 @@ pub trait GuestMemory {
         })
     }
 
+    /// Discard private anonymous backing while preserving the semantic mapping
+    /// and its exact permissions. The caller holds current-MM mutation exclusion
+    /// and has authenticated private-anonymous VMA provenance. `Ok(false)` means
+    /// unsupported with no mutation; the caller uses authenticated zero_backing.
+    /// `Ok(true)` guarantees fresh-zero future access with fork peers preserved.
+    /// Any failure after translation publication begins is indeterminate and
+    /// must fail stopped, never fall through to a scrub of uncertain ownership.
+    fn discard_private_anonymous(
+        &mut self,
+        _address: u64,
+        _len: usize,
+    ) -> Result<bool, RepointPrivateError> {
+        Ok(false)
+    }
+
     /// Re-establish zero-filled anonymous backing for a reused mapping without
     /// changing its physical sharing contract. Identity-native backends may
     /// implement [`zero_backing`](Self::zero_backing) by replacing a hole with a
@@ -933,13 +948,15 @@ pub trait GuestMemory {
         None
     }
 
-    /// Begin/end a kernel-write bracket for mutable guest ranges whose raw host
-    /// pointers are about to be passed to one host syscall. Native translation
-    /// backends use an odd/even generation protocol so an exclusive reservation
-    /// cannot be created or committed while the kernel may be mutating memory.
-    /// Callers must use [`HostWriteGuard`] rather than pairing these manually.
-    fn begin_host_write(&mut self, _ranges: &[(u64, usize)]) {}
-    fn finish_host_write(&mut self, _ranges: &[(u64, usize)]) {}
+    /// Retain and admit the exact raw destinations passed to one host syscall.
+    /// Backends authenticate both the guest range and selected host address;
+    /// stale pointers must fail before the host syscall can consume input.
+    /// Callers must use [`HostWriteGuard`]. Finish must undo partial admission
+    /// too: the guard calls it on error and unwind from begin.
+    fn begin_host_write(&mut self, _ranges: &[HostWriteRange]) -> Result<(), MemoryError> {
+        Ok(())
+    }
+    fn finish_host_write(&mut self, _ranges: &[HostWriteRange]) {}
 }
 
 /// Marker trait for guest memory views that genuinely represent the currently
@@ -951,18 +968,28 @@ pub trait GuestMemory {
 /// explicitly.
 pub trait CurrentMmMemory: GuestMemory {}
 
+/// One already-resolved zero-copy destination. This is a request, not a grant;
+/// constructing it does not authorize a write or retain its backing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostWriteRange {
+    pub guest: GuestVa,
+    pub len: usize,
+    pub host: HostVa,
+}
+
 /// Panic-safe lifetime bracket for a host syscall that may write through raw
 /// guest-memory pointers. Construction marks every exposed range in progress;
 /// Drop always closes the bracket, including `?`, early return, and unwind paths.
 pub struct HostWriteGuard<'a, M: GuestMemory + ?Sized> {
     memory: &'a mut M,
-    ranges: &'a [(u64, usize)],
+    ranges: &'a [HostWriteRange],
 }
 
 impl<'a, M: GuestMemory + ?Sized> HostWriteGuard<'a, M> {
-    pub fn new(memory: &'a mut M, ranges: &'a [(u64, usize)]) -> Self {
-        memory.begin_host_write(ranges);
-        Self { memory, ranges }
+    pub fn new(memory: &'a mut M, ranges: &'a [HostWriteRange]) -> Result<Self, MemoryError> {
+        let guard = Self { memory, ranges };
+        guard.memory.begin_host_write(ranges)?;
+        Ok(guard)
     }
 }
 

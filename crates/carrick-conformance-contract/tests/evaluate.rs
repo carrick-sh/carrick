@@ -270,3 +270,77 @@ fn unresolved_signed_binding_is_not_execution_coverage() {
         Err(ContractFailure::UnsupportedLayer { .. })
     ));
 }
+
+// These are verifier negative controls, not native execution observations.
+// A copied HVF errno transcript or an empty counter snapshot must not qualify
+// an execution adapter whose real bindings have not been implemented.
+#[test]
+fn native_syscall_contract_rejects_unbound_execution_evidence() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let id = ContractId::new("kernel.execution.native-synchronous-syscall").unwrap();
+    let contract = registry.get(&id).expect("native syscall contract");
+    for layer in [
+        ExecutionLayer::VmFree,
+        ExecutionLayer::EmbedStructural,
+        ExecutionLayer::Docker,
+    ] {
+        let mut obs = observation(layer, 1);
+        obs.contract_id = id.clone();
+        obs.fixture_identity = contract.fixture.clone();
+        obs.semantic_assertions = vec![SemanticAssertion::pass("negative-control-errno-only")];
+        obs.work = None;
+        assert!(matches!(
+            evaluate(contract, &[obs]),
+            Err(ContractFailure::UnsupportedLayer { layer: actual, .. }) if actual == layer
+        ));
+    }
+    assert!(matches!(
+        evaluate(contract, &[]),
+        Err(ContractFailure::IncompleteMeasurement { .. })
+    ));
+}
+
+#[test]
+fn native_syscall_contract_requires_measured_zero_counters() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let id = ContractId::new("kernel.execution.native-synchronous-syscall").unwrap();
+    let mut contract = registry.get(&id).expect("native syscall contract").clone();
+    // Enable only a local synthetic binding to exercise the budget checker.
+    // This never registers a production binding or claims guest execution.
+    contract.bindings.embed = Some("verifier-negative-control".into());
+    let mut obs = observation(ExecutionLayer::EmbedStructural, 1);
+    obs.contract_id = id;
+    obs.fixture_identity = contract.fixture.clone();
+    obs.work = Some(WorkSnapshot::new());
+    assert!(matches!(evaluate(&contract, &[obs.clone()]),
+        Err(ContractFailure::IncompleteMeasurement { reason, .. })
+            if reason.contains("missing work metric")));
+    for metric in [WorkMetric::HvfSyscallExits, WorkMetric::HostHeapAllocations] {
+        let mut work = WorkSnapshot::new();
+        work.insert(WorkMetric::HvfSyscallExits, 0).unwrap();
+        work.insert(WorkMetric::HostHeapAllocations, 0).unwrap();
+        work.insert(WorkMetric::KernelDispatches, 2).unwrap();
+        // Build a fresh census with exactly one forbidden unit of work.
+        let mut violation = WorkSnapshot::new();
+        for item in [
+            WorkMetric::HvfSyscallExits,
+            WorkMetric::HostHeapAllocations,
+            WorkMetric::KernelDispatches,
+        ] {
+            violation
+                .insert(
+                    item,
+                    if item == metric {
+                        1
+                    } else {
+                        work.get(item).unwrap()
+                    },
+                )
+                .unwrap();
+        }
+        obs.work = Some(violation);
+        assert!(matches!(evaluate(&contract, &[obs.clone()]),
+            Err(ContractFailure::WorkBudgetExceeded { metric: actual, maximum: 0, .. })
+                if actual == metric));
+    }
+}

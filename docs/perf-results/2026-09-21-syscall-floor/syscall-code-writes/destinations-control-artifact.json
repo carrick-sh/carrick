@@ -1,0 +1,10 @@
+{
+  "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/syscall-code-writes/destinations-control",
+  "sha256": "53af292e5653a316b3bf95818246d48b3f83a4d1b41b327fbe445fd84edc7880",
+  "cdhash": "05e3fa743f30a9fb66f1a617070ea9388d254a52",
+  "lc_uuid": "0664B583-EB1F-398B-A9EB-04AA0934CD86",
+  "hypervisor_entitlement": true,
+  "dof_carrick": true,
+  "source_base_revision": "sha256:a1ec48ecf837313427ae3bfba6e9256fa8e7ff0d8aadf4c1d69eeea2022c50de",
+  "addition": "new destination fixture and test only; new unreferenced implementation files are not in the baseline module tree"
+}

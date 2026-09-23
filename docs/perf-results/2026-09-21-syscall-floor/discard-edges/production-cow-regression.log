@@ -1,0 +1,19 @@
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.50s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-3c2afd032626087b)
+
+running 10 tests
+test trap::foreign_mm::tests::concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit ... ok
+test trap::foreign_mm::tests::foreign_cow_commit_cannot_be_reported_as_retryable_by_final_snapshot_contention ... ok
+test trap::foreign_mm::tests::foreign_cow_each_reversible_boundary_restores_exact_stage1_inventory_and_owner_set ... ok
+test trap::foreign_mm::tests::foreign_cow_failpoint_leaves_lease_at_sn_and_retry_succeeds ... ok
+test trap::foreign_mm::tests::foreign_cow_invalidation_failure_rolls_back_and_republishes_the_old_stage1 ... ok
+test trap::foreign_mm::tests::foreign_cow_one_compound_authorizes_distinct_subrange_writes ... ok
+test trap::foreign_mm::tests::foreign_cow_prepare_write_rejects_in_span_leaf_discontinuity ... ok
+test trap::foreign_mm::tests::foreign_cow_prepare_write_rejects_out_of_span_alias ... ok
+test trap::foreign_mm::tests::foreign_cow_prepare_write_rejects_semantic_span_end_plus_one ... ok
+test trap::foreign_mm::tests::foreign_cow_write_keeps_the_shared_parent_owner_unchanged ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 498 filtered out; finished in 0.19s
+

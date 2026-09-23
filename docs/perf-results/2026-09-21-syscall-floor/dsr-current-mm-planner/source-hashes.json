@@ -1,0 +1,4 @@
+{
+  "target/lease-cost/dsr-reuse/carrick-dsr-aarch64/src/current_mm.rs": "fbd3c8944fc62517790935e7b1ca99e379896cd8cd8617c1c9ead8712f8bcd19",
+  "crates/carrick-kernel/src/kernel/mm_access.rs": "17bb4fafb99726dd3fe564184eb71dc53580fc8027bb56413f0a6534a8707a70"
+}

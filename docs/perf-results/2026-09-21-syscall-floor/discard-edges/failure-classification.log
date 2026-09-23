@@ -1,0 +1,13 @@
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.58s
+     Running unittests src/lib.rs (target/debug/deps/carrick_aarch64-ba2877fc7054433f)
+
+running 5 tests
+test anonymous_discard::tests::invalid_ranges_do_not_reach_backend ... ok
+test anonymous_discard::tests::interior_failure_preserves_classification_without_edge_work ... ok
+test anonymous_discard::tests::edge_failure_after_retirement_is_indeterminate ... ok
+test anonymous_discard::tests::refusal_and_empty_interior_do_not_mutate ... ok
+test anonymous_discard::tests::unaligned_discard_bounds_scrub_and_preserves_neighbors ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.24s
+

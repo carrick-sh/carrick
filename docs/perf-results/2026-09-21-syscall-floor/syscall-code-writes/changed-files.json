@@ -1,0 +1,22 @@
+[
+  "conformance-contracts/inventory.json",
+  "conformance-contracts/surfaces.toml",
+  "crates/carrick-aarch64/src/engine.rs",
+  "crates/carrick-aarch64/src/vmm.rs",
+  "crates/carrick-guest-mem/src/lib.rs",
+  "crates/carrick-kernel/src/dispatch/fs/rw.rs",
+  "crates/carrick-kernel/src/dispatch/fs/tests.rs",
+  "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
+  "crates/carrick-kernel/tests/integration/syscall_fs_rw.rs",
+  "crates/carrick-runtime/src/runtime.rs",
+  "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
+  "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+  "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs",
+  "crates/carrick-vmm-hvf/src/trap/guest_memory.rs",
+  "crates/carrick-vmm-hvf/src/trap.rs",
+  "conformance-contracts/contracts/syscall-code-write.toml",
+  "crates/carrick-vmm-hvf/src/trap/host_writes.rs",
+  "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs",
+  "crates/carrick-conformance-next/tests/syscall_write_destinations.rs",
+  "crates/carrick-conformance-next/tests/fixtures/syscall_write_destinations.py"
+]

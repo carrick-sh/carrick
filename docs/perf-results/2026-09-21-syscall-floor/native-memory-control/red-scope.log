@@ -1,0 +1,15 @@
+
+running 1 test
+
+thread 'native_execution_scope_contract' (4259217) panicked at crates/carrick-kernel-example/tests/native_execution_scope.rs:156:6:
+called `Result::unwrap()` on an `Err` value: WorkBudgetExceeded { contract: ContractId("kernel.mm.native-execution-scope"), metric: HostHeapAllocations, actual: 1, maximum: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test native_execution_scope_contract ... FAILED
+
+failures:
+
+failures:
+    native_execution_scope_contract
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+

@@ -1,0 +1,62 @@
+[
+  {
+    "target": "aarch64-unknown-linux-musl",
+    "probe": "fdstat",
+    "exists": true,
+    "sha256": "f7c1269c7ab2a4ee0d7b99dd87ee1583d86f620dafe24530018bc1f5f7d7a8b8"
+  },
+  {
+    "target": "aarch64-unknown-linux-musl",
+    "probe": "statfdino",
+    "exists": true,
+    "sha256": "683f62c8c4396b63a25d2dfcab1534de651512749004015b34eef686a25766c2"
+  },
+  {
+    "target": "aarch64-unknown-linux-musl",
+    "probe": "fstatatflags",
+    "exists": true,
+    "sha256": "1279f8da7e0f906fbec4a6d71146ade9e681f1cdde5b32be722acd3e686474bb"
+  },
+  {
+    "target": "aarch64-unknown-linux-musl",
+    "probe": "linkstat",
+    "exists": true,
+    "sha256": "65a0aaf0efd9eee96dbdbdddb2b31206dc5d276f8e3e93d27e55b7549456fdab"
+  },
+  {
+    "target": "aarch64-unknown-linux-musl",
+    "probe": "probeinit",
+    "exists": true,
+    "sha256": "c6371938a87310d6fa62e8ad68a4b74fd5703974fe757c7fd8f265091b8a3ad1"
+  },
+  {
+    "target": "aarch64-unknown-linux-gnu",
+    "probe": "fdstat",
+    "exists": true,
+    "sha256": "a49d42b844a1032ff0e5307ed0428670b503ceff1d01b2ac7db6885106feb5d1"
+  },
+  {
+    "target": "aarch64-unknown-linux-gnu",
+    "probe": "statfdino",
+    "exists": true,
+    "sha256": "5a98866432dcb8b702f96f888be32a040871dbc950ac632cb00fdacb5d369023"
+  },
+  {
+    "target": "aarch64-unknown-linux-gnu",
+    "probe": "fstatatflags",
+    "exists": true,
+    "sha256": "f503e06182e4ba4ffa66b0a1be3d873a28ec8fd4d10c932ddfa7fd7063764570"
+  },
+  {
+    "target": "aarch64-unknown-linux-gnu",
+    "probe": "linkstat",
+    "exists": true,
+    "sha256": "bdd3681a1e6314eed47138af167f037e4b34c87794e5e2f69251a3a010a3ed47"
+  },
+  {
+    "target": "aarch64-unknown-linux-gnu",
+    "probe": "probeinit",
+    "exists": true,
+    "sha256": "070ccb27bba8b23973e2d010a194ca01a9fe1037e3160e6859eb5e3f23fb04ee"
+  }
+]

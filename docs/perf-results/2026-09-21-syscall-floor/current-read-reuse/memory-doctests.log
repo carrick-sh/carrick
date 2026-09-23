@@ -1,0 +1,17 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+   Doc-tests carrick_kernel
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+running 4 tests
+test crates/carrick-kernel/src/kernel/mm_access.rs - kernel::mm_access::ActiveNativeData (line 1539) - compile fail ... ok
+test crates/carrick-kernel/src/kernel/mm_access.rs - kernel::mm_access::CurrentNativeData (line 1301) - compile fail ... ok
+test crates/carrick-kernel/src/kernel/mm_access.rs - kernel::mm_access::ActiveNativeData (line 1531) - compile fail ... ok
+test crates/carrick-kernel/src/kernel/mm_access.rs - kernel::mm_access::CurrentNativeData (line 1291) - compile fail ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.15s
+
+all doctests ran in 0.40s; merged doctests compilation took 0.13s

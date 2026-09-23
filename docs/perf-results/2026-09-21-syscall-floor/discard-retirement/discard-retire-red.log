@@ -1,0 +1,138 @@
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-spec)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 40.25s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-207122e8ce47be2c)
+
+running 1 test
+[
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.anonymous-discard-no-scrub",
+        ),
+        layer: VmFree,
+        implementation_revision: "madvise-sha256:a4f9a96d22e9628a981f168bd67e2f790553ea8bfbf6da8aafef425ca7c677b4",
+        fixture_identity: "unit:anonymous-discard-no-scrub",
+        scale: 1,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "discard_removes_old_contents",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 1,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.anonymous-discard-no-scrub",
+        ),
+        layer: VmFree,
+        implementation_revision: "madvise-sha256:a4f9a96d22e9628a981f168bd67e2f790553ea8bfbf6da8aafef425ca7c677b4",
+        fixture_identity: "unit:anonymous-discard-no-scrub",
+        scale: 8,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "discard_removes_old_contents",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 1,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.anonymous-discard-no-scrub",
+        ),
+        layer: VmFree,
+        implementation_revision: "madvise-sha256:a4f9a96d22e9628a981f168bd67e2f790553ea8bfbf6da8aafef425ca7c677b4",
+        fixture_identity: "unit:anonymous-discard-no-scrub",
+        scale: 32,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "discard_removes_old_contents",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 1,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.anonymous-discard-no-scrub",
+        ),
+        layer: VmFree,
+        implementation_revision: "madvise-sha256:a4f9a96d22e9628a981f168bd67e2f790553ea8bfbf6da8aafef425ca7c677b4",
+        fixture_identity: "unit:anonymous-discard-no-scrub",
+        scale: 128,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "discard_removes_old_contents",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 1,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+]
+
+thread 'dispatch::mem::madvise::tests::anonymous_discard_avoids_scrub_contract' (3165117) panicked at crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs:454:96:
+called `Result::unwrap()` on an `Err` value: ScalingViolation { contract: ContractId("kernel.mm.anonymous-discard-no-scrub"), metric: HostBackendCalls, scale: 1, actual: 1, maximum: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test dispatch::mem::madvise::tests::anonymous_discard_avoids_scrub_contract ... FAILED
+
+failures:
+
+failures:
+    dispatch::mem::madvise::tests::anonymous_discard_avoids_scrub_contract
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2189 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

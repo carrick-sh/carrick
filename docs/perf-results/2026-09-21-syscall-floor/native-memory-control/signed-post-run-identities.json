@@ -1,0 +1,85 @@
+{
+  "kind": "post-run identity snapshot; failed gate; no success receipt",
+  "executables": [
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_fork_probe-458c62b9625f6db1",
+      "sha256": "2fc8c14d254437c4bb89f17d92e0378b80d89789f0a91011bf31f4cda2eed224",
+      "cdhash": "4977fc123e6d7a1ba7ec339cd56ce1d262cebddd",
+      "lc_uuid": "94346AC8-C82B-320A-AAE6-D4EC1ED93268",
+      "hypervisor_entitlement": true,
+      "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "dof_carrick": false,
+      "selected_for_execution": false
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_compute_baseline_probe-86d8959a9b6518f8",
+      "sha256": "fccf3d497319979c0ae2dcdc54c0c29c491bc36772cb1a7bf1421e7208cc67e7",
+      "cdhash": "e73d16bfef70a5ccc907891471bbd5eba6fbc442",
+      "lc_uuid": "4E0AA49F-AFDC-36BC-AD8C-8D1DE1354971",
+      "hypervisor_entitlement": true,
+      "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "dof_carrick": false,
+      "selected_for_execution": false
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_bl_exit_free_probe-96770ae00f4d4df3",
+      "sha256": "39b868b9fd06d77a7b1baf1396db05f4fb0d7bdaf12dd14517b21b986ae71baf",
+      "cdhash": "138ba4588c8b4fb429007db4a1c25459fe8be29c",
+      "lc_uuid": "1F5A8B55-8DB5-3EA8-ACC9-3FD55748A29C",
+      "hypervisor_entitlement": true,
+      "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "dof_carrick": false,
+      "selected_for_execution": false
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/initial_runner_handoff-432e62fd81ead0df",
+      "sha256": "1882e15fb49e93929f500dd4ce8fba4136d767bd47c77ca83ac5f1ca366a7d86",
+      "cdhash": "5e0695319fd885ff68c972033116733dd6979ffe",
+      "lc_uuid": "577B4E50-5321-3FBC-B916-B2C436A9D305",
+      "hypervisor_entitlement": true,
+      "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "dof_carrick": true,
+      "selected_for_execution": false
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e",
+      "sha256": "c768b84a753a0cf86e4d8aa48836cbad0df9affe4e9328e12fbf6dd737ca6cb2",
+      "cdhash": "ab616f6025ff431ff7ff16618375822e0de2399d",
+      "lc_uuid": "4AFC9D09-2394-3514-AECB-D4675ACE1AAD",
+      "hypervisor_entitlement": true,
+      "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "dof_carrick": true,
+      "selected_for_execution": true
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_info_load_probe-9b39f95873f0d773",
+      "sha256": "dac53a5345b7df704133360adb7bfc2252224c8df2e9a75087ac0ad5cdaefa7a",
+      "cdhash": "f70c67856f34b0a9216a2e204f43b9668f4ee1b9",
+      "lc_uuid": "066AA6EE-F805-3211-9808-C9125C0CB620",
+      "hypervisor_entitlement": true,
+      "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "dof_carrick": false,
+      "selected_for_execution": false
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_svc_tax_probe-4dfefb4ce9012645",
+      "sha256": "2bfb0fbe86df6d304ed220a14f1d35192f7b12f5372f930eb819e33f16a751ec",
+      "cdhash": "54ca4289fa20eb519f3b04dceed5e33409486467",
+      "lc_uuid": "A9020DC0-12D0-3326-8B31-1AFB230FC27D",
+      "hypervisor_entitlement": true,
+      "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "dof_carrick": false,
+      "selected_for_execution": false
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_kernel_memory_probe-2fd29e549b7c51e1",
+      "sha256": "d61f79101a63f57b1d3ab479d22b2075ed0645c28975b29cf224a7b2fad2eeb3",
+      "cdhash": "4dc976d7416a4c484dc772926577d794fc553eb6",
+      "lc_uuid": "411E701B-1BA3-3A78-A042-458C9DAA382F",
+      "hypervisor_entitlement": true,
+      "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "dof_carrick": false,
+      "selected_for_execution": false
+    }
+  ]
+}

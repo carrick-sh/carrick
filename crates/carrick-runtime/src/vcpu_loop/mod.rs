@@ -1443,7 +1443,7 @@ where
         self.service_kernel_context = Some(kernel_context.retain_exact());
         let request = SyscallRequest::from_raw(frame)
             .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
-            .with_current_guest_sp(engine.get_reg(carrick_hal::Reg::Sp).ok());
+            .with_guest_sp_fallback(|| engine.get_reg(carrick_hal::Reg::Sp).ok());
         let (syscall, prepared_outcome) =
             match kernel
                 .dispatcher

@@ -1,0 +1,40 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling once_cell v1.21.4
+   Compiling tempfile v3.27.0
+   Compiling syn v2.0.117
+   Compiling syn v3.0.3
+   Compiling thiserror-impl v2.0.20
+   Compiling zerocopy-derive v0.8.48
+   Compiling serde_derive v1.0.228
+   Compiling scroll_derive v0.13.1
+   Compiling thiserror v2.0.20
+   Compiling scroll v0.13.0
+   Compiling zerocopy v0.8.48
+   Compiling goblin v0.10.5
+   Compiling serde v1.0.228
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+   Compiling carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-signal-core)
+   Compiling carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-timer-core)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.98s
+     Running unittests src/lib.rs (target/debug/deps/carrick_hal-85c8b2a6f0551766)
+
+running 1 test
+
+thread 'threaded::generic_registry_tests::kernel_wake_published_during_lease_gap_survives_rebind' (2912827) panicked at crates/carrick-hal/src/threaded.rs:1150:22:
+a live thread must retain wakes published without a physical lease
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test threaded::generic_registry_tests::kernel_wake_published_during_lease_gap_survives_rebind ... FAILED
+
+failures:
+
+failures:
+    threaded::generic_registry_tests::kernel_wake_published_during_lease_gap_survives_rebind
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-hal --lib`

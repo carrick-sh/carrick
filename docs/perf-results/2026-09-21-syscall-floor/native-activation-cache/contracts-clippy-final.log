@@ -1,0 +1,28 @@
+   Compiling syn v2.0.117
+    Checking once_cell v1.21.4
+    Checking tempfile v3.27.0
+   Compiling pest_generator v2.8.6
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling scroll_derive v0.13.1
+   Compiling pest_derive v2.8.6
+   Compiling dtrace-parser v0.3.0
+    Checking scroll v0.13.0
+    Checking zerocopy v0.8.48
+    Checking goblin v0.10.5
+    Checking serde v1.0.228
+    Checking serde_spanned v0.6.9
+    Checking toml_datetime v0.6.11
+   Compiling usdt-impl v0.6.0
+   Compiling serde_tokenstream v0.2.3
+    Checking toml_edit v0.22.27
+   Compiling usdt-attr-macro v0.6.0
+   Compiling usdt-macro v0.6.0
+    Checking dof v0.4.0
+    Checking carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+    Checking carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-abi)
+    Checking toml v0.8.23
+    Checking usdt v0.6.0
+    Checking carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+    Checking carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.58s

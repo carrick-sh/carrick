@@ -1,0 +1,146 @@
+{
+  "created_utc": "2026-09-22T15:41:40.440590+00:00",
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "worktree": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick",
+  "local_uncommitted": true,
+  "parent_checkpoint": "docs/perf-results/2026-09-21-syscall-floor/native-carrier/manifest.json",
+  "parent_manifest_sha256": "23476c4fee121757fd27037969af1a45cdb70705fdab22d55bf4e6b710213335",
+  "parent_dirty_source_archive": "../native-carrier/dirty-source.tar.gz",
+  "parent_dirty_source_archive_sha256": "233e825c5f8bc176216fc0ec096bfa157ad44e7a9ced3d1c770ac1f10813854d",
+  "source_sha256": {
+    "crates/carrick-kernel/src/kernel/guest_execution.rs": "120960de827776ce69d2cd0614826a936abf464d541ad94a59ef1c4de0bbf127",
+    "conformance-contracts/contracts/executor-admission.toml": "c6d7200bd3ec7152f49d6459444571bafb5a0ee2595bf0bfead94ea6a49e8f36"
+  },
+  "unrelated_parent_dirty_sources_unchanged": 107,
+  "unchanged_measured_executables": {
+    "target/release/carrick": {
+      "sha256": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+      "size": 34872912,
+      "unchanged": true
+    },
+    "target/lease-cost/inotify-transport-control/carrick-control": {
+      "sha256": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+      "size": 34872912,
+      "unchanged": true
+    },
+    "target/release/native-syscall-slice": {
+      "sha256": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65",
+      "size": 10412336,
+      "unchanged": true
+    }
+  },
+  "contract": "kernel.mm.executor-admission",
+  "parent_contract": "kernel.execution.native-synchronous-syscall",
+  "vm_free_contract_result": "red SemanticMismatch; green at scales 1/8/32/128",
+  "native_execution_integration_complete": false,
+  "performance_measurements": null,
+  "validation": [
+    {
+      "name": "census-final",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-kernel",
+        "--lib",
+        "kernel::guest_execution",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 40.838189125061035
+    },
+    {
+      "name": "kernel-suite",
+      "argv": [
+        "just",
+        "test-kernel"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 29.60136604309082
+    },
+    {
+      "name": "runtime-memory",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "vcpu_loop::memory::tests",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 25.857530117034912
+    },
+    {
+      "name": "runtime-quiesce",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "vcpu_loop::quiesce::",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.4351186752319336
+    },
+    {
+      "name": "native-experiment",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "experiments/native-syscall-slice/Cargo.toml",
+        "--lib"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 6.719810962677002
+    },
+    {
+      "name": "clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "-p",
+        "carrick-kernel",
+        "--lib",
+        "--tests",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 23.857939958572388
+    }
+  ],
+  "evidence_sha256": {
+    "README.md": "b4f49e141b4304206216c28621a73e443485f68e39935896a3a06e37e6aea160",
+    "census-final.log": "d75e923ad551739989e7642b33dd505613835afc78be23fd2f65fe8e45c92a07",
+    "clippy.log": "ce56434e10abf83f6f7de01e724274a531eaefbeb7134129441c2e9166509209",
+    "diff-check.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "executor-admission.toml": "c6d7200bd3ec7152f49d6459444571bafb5a0ee2595bf0bfead94ea6a49e8f36",
+    "fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "green/observations.json": "c773ca6ca958783f8228e520b04b7fbf67366982b4ea169ac55cea7d4dcfc1d2",
+    "green-final/observations.json": "9d3e6a8fcdb2c813f6c73b83cfc45319031e82ae211099ff55dd025ba04f5da4",
+    "green.log": "2b4009d447d8bcdea873935aae292a361cb909743533f3f476522de066fb75cc",
+    "guest_execution.before.rs": "62b1086f1b894d5b5fde3c89ccc452e3a0d786f046be33737db19a0c5afba265",
+    "guest_execution.final.rs": "120960de827776ce69d2cd0614826a936abf464d541ad94a59ef1c4de0bbf127",
+    "guest_execution.red.rs": "9af3cb9841cc130797ce5058e78542b24156ae67aec1776c24b85ce5e7e0124c",
+    "implementation.patch": "0e51a74859b962d2df4287a3028cecaaa62745fab6d9dc5bc9922c8afa5fff9f",
+    "kernel-suite.log": "262b48928a64a8a1cf077b472e9219a44df4a73b146a150abb4a36b6c10b7b2d",
+    "native-experiment.log": "cf262a448d7707628c1038d5623dc1f8cc945e107dcc030d49748ffce1594984",
+    "red/observations.json": "e74475b7a29c858cd41631036604219d705ec01572b408f4288cc6500939fc60",
+    "red-contract.log": "b53ab505a6a86b92979c3cfa55cf52547fe4784ffb6419c108d597bc336ba7b3",
+    "red.log": "30e39c6af079c7a015e3a17d7546d9b0c29241d7b63f494b193577f6d2337c26",
+    "runtime-memory.log": "10f30742c94400cc60969d558760945bf7fca0b62f0ffeff1a46ee27faf9b043",
+    "runtime-quiesce.log": "c18e62ddccdccb879f42b028fc7e63b418f93478baa30ba4af642e43f946a424",
+    "source.tar.gz": "17de3d67551dc387a8706951473b42a3bcad333fe2006e41c3a58482e9a4c7c0",
+    "validation.json": "09eee65e75967248b0dc9ef378aa69fe6eba86ad33cba657ffb929691d7307ad"
+  }
+}

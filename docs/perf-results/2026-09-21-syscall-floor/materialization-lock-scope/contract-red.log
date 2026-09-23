@@ -1,0 +1,22 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.22s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-0aaee9123b867d4d)
+
+running 1 test
+test trap::foreign_mm::tests::local_sparse_preparation_allows_independent_registry_progress ... FAILED
+
+failures:
+
+---- trap::foreign_mm::tests::local_sparse_preparation_allows_independent_registry_progress stdout ----
+
+thread 'trap::foreign_mm::tests::local_sparse_preparation_allows_independent_registry_progress' (3466561) panicked at crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs:1109:6:
+called `Result::unwrap()` on an `Err` value: ScalingViolation { contract: ContractId("kernel.mm.sparse-preparation-publication"), metric: HostBackendCalls, scale: 1, actual: 2, maximum: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    trap::foreign_mm::tests::local_sparse_preparation_allows_independent_registry_progress
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 508 filtered out; finished in 0.13s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`

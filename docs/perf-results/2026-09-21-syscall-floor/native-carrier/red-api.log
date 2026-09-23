@@ -1,0 +1,66 @@
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+error[E0599]: no method named `borrow_current_native_data` found for struct `KernelContext` in the current scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1191:35
+     |
+1191 |             assert!(fixture.child.borrow_current_native_data(&wrong, &mut cow).is_err());
+     |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `KernelContext`
+
+error[E0599]: no method named `borrow_current_native_data` found for struct `KernelContext` in the current scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1192:42
+     |
+1192 |             let mut data = fixture.child.borrow_current_native_data(&execution, &mut cow)
+     |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `KernelContext`
+
+error[E0308]: mismatched types
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1198:13
+     |
+1198 | /             unsafe {
+1199 | |                 let ptr = data.as_mut_ptr();
+1200 | |                 std::arch::asm!(
+1201 | |                     "ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
+1202 | |                     ptr = in(reg) ptr, out("x9") _, options(nostack)
+1203 | |                 );
+1204 | |             }
+     | |_____________^ expected `Result<_, MmAccessError>`, found `()`
+     |
+     = note:   expected enum `Result<_, MmAccessError>`
+             found unit type `()`
+
+error[E0308]: mismatched types
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1189:41
+     |
+1189 |         authority.with_foreign_mutation(&current, ThreadId::synthetic_for_tests(31_181), |mutation| {
+     |                   --------------------- ^^^^^^^^ expected `&ForeignMm`, found `&CurrentMm<'_>`
+     |                   |
+     |                   arguments to this method are incorrect
+     |
+     = note: expected reference `&ForeignMm`
+                found reference `&CurrentMm<'_>`
+note: method defined here
+    --> crates/carrick-kernel/src/kernel/mm_access.rs:527:12
+     |
+ 527 |     pub fn with_foreign_mutation<T>(
+     |            ^^^^^^^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1209:32
+     |
+1209 |         authority.read_foreign(&current, read, &mut bytes).unwrap();
+     |                   ------------ ^^^^^^^^ expected `&ForeignMm`, found `&CurrentMm<'_>`
+     |                   |
+     |                   arguments to this method are incorrect
+     |
+     = note: expected reference `&ForeignMm`
+                found reference `&CurrentMm<'_>`
+note: method defined here
+    --> crates/carrick-kernel/src/kernel/mm_access.rs:564:12
+     |
+ 564 |     pub fn read_foreign(
+     |            ^^^^^^^^^^^^
+
+Some errors have detailed explanations: E0308, E0599.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `carrick-runtime` (lib test) due to 5 previous errors

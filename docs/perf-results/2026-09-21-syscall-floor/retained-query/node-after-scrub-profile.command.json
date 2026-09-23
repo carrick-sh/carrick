@@ -1,0 +1,25 @@
+{
+  "argv": [
+    "/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-lease-gap",
+    "trace",
+    "--require-script-exit",
+    "--profile",
+    "hvpatch-carrier-cpu-low-rate",
+    "--trace-out",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/workloads/node-after-scrub-profile.raw",
+    "--",
+    "run",
+    "--max-traps",
+    "18446744073709551615",
+    "--fs",
+    "host",
+    "--entrypoint",
+    "/bin/bash",
+    "localhost:5005/carrick-nodejs-conformance@sha256:1ed49af83bd30401e1b275957b99a1c28f6c582ab3d987997afb5888fa302718",
+    "-c",
+    "set -eu; for i in $(seq 1 20); do /opt/node-src/v24/out/Release/node /opt/nodejs-conformance/fixtures/app-smoke.js; done; echo PROFILE_WORKLOAD_OK"
+  ],
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "binary_sha256": "15217a034e2f3286420e9464b1fb2fcf1f576f0b44c2c58f458a2b9a95f96efc",
+  "run_id": "floor-node-after-scrub-profile"
+}

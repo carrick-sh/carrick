@@ -1,0 +1,14 @@
+{
+  "source_and_artifact_hashes_verified": true,
+  "timing_runs": 72,
+  "retained_samples": 648,
+  "native_memory_gateway_count": 2623,
+  "native_memory_syscalls": 63,
+  "expected_backedge_callbacks": 2560,
+  "native_register_matrix_cases": 12288,
+  "warm_allocation_windows_verified": 36,
+  "product_cli_unchanged": true,
+  "registered_binding": false,
+  "signed_promotion_completed": false,
+  "leftover_native_processes": []
+}

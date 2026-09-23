@@ -1,0 +1,812 @@
+[
+  {
+    "source": "target/lease-cost/scrub-signed-shard0-receipt.log",
+    "sha256": "7d63a135ab10ee382fd696742b7698e38948a3a3efafc31cbf383c19e08d1837",
+    "bytes": 12020,
+    "preserved": "scrub-evidence/scrub-signed-shard0-receipt.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-focused.log",
+    "sha256": "e172935bd4c73a5b1f521d71743ff69b84603d08a405ccaceed6f5952fc5d524",
+    "bytes": 4460,
+    "preserved": "scrub-evidence/scrub-focused.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-docker.log",
+    "sha256": "32a4321720490cb6100888f4010e189824693381f0f6eede140c69988d9047d8",
+    "bytes": 468,
+    "preserved": "scrub-evidence/scrub-docker.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-candidate-build.log",
+    "sha256": "8dfb6ebf7cd07edc11a5b474e4e6bbf4f03bad6587a6bc29cdfe821d5bc48052",
+    "bytes": 749,
+    "preserved": "scrub-evidence/scrub-candidate-build.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-probes-musl.log",
+    "sha256": "7e15ffe7f23037eebd88dde7fab6ed8aeaca0d3b04501a608f8d4347382189dd",
+    "bytes": 184,
+    "preserved": "scrub-evidence/scrub-probes-musl.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-red.log",
+    "sha256": "64a8f94d5288457ca2f409bcaa51b9a4ebcbc5de92e35fb23842a507e15b423b",
+    "bytes": 2057,
+    "preserved": "scrub-evidence/scrub-red.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-green.log",
+    "sha256": "40f07c234a24e0deb66087edda776ed3235f7b059cdbaf39415c8c3a0d3af7b1",
+    "bytes": 559,
+    "preserved": "scrub-evidence/scrub-green.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-semantics.log",
+    "sha256": "7af53472497e7cf877e719fcfc60ba0ecadaf1ec2ce866e93e5dc764b795f8d6",
+    "bytes": 20974,
+    "preserved": "scrub-evidence/scrub-semantics.log.gz"
+  },
+  {
+    "source": "target/lease-cost/scrub-paired.log",
+    "sha256": "cdbb3685b8841f8a4d645cfc12a336185a3a7728f511034ee2dd4a319f112678",
+    "bytes": 3207,
+    "preserved": "scrub-evidence/scrub-paired.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-probes-gnu.log",
+    "sha256": "ceb66d30b9f59f0c65908c4471d29ae27cbf22c45801f31ef3a4f34322a2c188",
+    "bytes": 184,
+    "preserved": "scrub-evidence/scrub-probes-gnu.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-control-build.log",
+    "sha256": "76541c6850034036a4a01e9215f53161c6b8dd0f6ac6c37a5c172ca9ed492893",
+    "bytes": 870,
+    "preserved": "scrub-evidence/scrub-control-build.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-signed-shard2.log",
+    "sha256": "27532b5a16d292a8112f2dcc8456ece7332e5c735d1f990f19b6a73649e95799",
+    "bytes": 11753,
+    "preserved": "scrub-evidence/scrub-signed-shard2.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-signed-shard0.log",
+    "sha256": "5451ed757906cf5944e8bce130023f64c7dbcda2a9074cfed7b74e922d678afd",
+    "bytes": 7881,
+    "preserved": "scrub-evidence/scrub-signed-shard0.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-snapshot.log",
+    "sha256": "be8899bb9b10e44ae39bf8020d29b4341c791e67c881f28c45bf5fcfa7b46f8e",
+    "bytes": 277,
+    "preserved": "scrub-evidence/scrub-snapshot.log"
+  },
+  {
+    "source": "target/lease-cost/scrub-shard2-artifacts.jsonl",
+    "sha256": "f61ed4b830b66c2ae32d008489618c8aa34ae505f52a83a1fb21f1696ec0d393",
+    "bytes": 2638,
+    "preserved": "scrub-evidence/scrub-shard2-artifacts.jsonl"
+  },
+  {
+    "source": "target/lease-cost/scrub-shard0-artifacts.jsonl",
+    "sha256": "1e6d3d22e2136050b57fdfca27d332d1a52848070b1b901fcd872326f3b931b6",
+    "bytes": 2654,
+    "preserved": "scrub-evidence/scrub-shard0-artifacts.jsonl"
+  },
+  {
+    "source": "target/lease-cost/scrub-artifacts.json",
+    "sha256": "757c66e8600135f4fbd5489c5a06284266773c013fa1367044dc5eda09bf0fe2",
+    "bytes": 20072,
+    "preserved": "scrub-evidence/scrub-artifacts.json.gz"
+  },
+  {
+    "source": "target/lease-cost/scrub-candidate.patch",
+    "sha256": "ca1b13bb936f6156ad0a7faa7c9fd1fa8b42e5f616161f8fbba6df9f589e75e9",
+    "bytes": 43502,
+    "preserved": "scrub-evidence/scrub-candidate.patch.gz"
+  },
+  {
+    "source": "target/lease-cost/scrub-control.patch",
+    "sha256": "529bddfb91082f98c2f6468457a6d6c3414ab62b638591520f2f1d61fdf705c2",
+    "bytes": 43474,
+    "preserved": "scrub-evidence/scrub-control.patch.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-focused-0-A.jsonl",
+    "sha256": "0ce74f7dfae381c5d94c82494b23d440c151e7ef3af8c0e09ffa30bef4965442",
+    "bytes": 2695,
+    "preserved": "scrub-evidence/workloads/scrub-focused-0-A.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-paired-1-B.jsonl",
+    "sha256": "3e48f1d2c7eeb6e08c12be5c91378a843e01d54dab3b2860dcb4d15751af4f68",
+    "bytes": 3557,
+    "preserved": "scrub-evidence/workloads/scrub-paired-1-B.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-focused-2-B.jsonl",
+    "sha256": "3612e9ac84d64f75585d39d6151db7f8ccc85e832e6ec4b2f41f6aa0069f97d8",
+    "bytes": 2702,
+    "preserved": "scrub-evidence/workloads/scrub-focused-2-B.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-paired.py",
+    "sha256": "c92b15facda5bac4ef404db22426ab69bf7d93e8df68cc4b52dd85a715dd0639",
+    "bytes": 1116,
+    "preserved": "scrub-evidence/workloads/scrub-paired.py"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-paired-3-A.jsonl",
+    "sha256": "12eb672886ba5cd7da23b0c76d16246447951633075c91b21b503f2dbff92906",
+    "bytes": 3553,
+    "preserved": "scrub-evidence/workloads/scrub-paired-3-A.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-paired-2-B.jsonl",
+    "sha256": "18f168b0db0decc9c91dffc1a34b00da005d3859d74043d46a343298fa934a97",
+    "bytes": 3559,
+    "preserved": "scrub-evidence/workloads/scrub-paired-2-B.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-focused-3-A.jsonl",
+    "sha256": "88848dbb56ad45f5d439ce47f6015f3e6da567888eadb1ce164e4986df32b614",
+    "bytes": 2695,
+    "preserved": "scrub-evidence/workloads/scrub-focused-3-A.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-paired-0-A.jsonl",
+    "sha256": "c2542c5c7475370259ca0bd6b6cb497e7b71a5fa2bacb2026233eea2931708bb",
+    "bytes": 3552,
+    "preserved": "scrub-evidence/workloads/scrub-paired-0-A.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-focused-1-B.jsonl",
+    "sha256": "3ca34bb2df7e3c7e3d2cccf4a71cd767fe2706eec6c5e3f0b65c7ede511b8a5c",
+    "bytes": 2702,
+    "preserved": "scrub-evidence/workloads/scrub-focused-1-B.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-focused.py",
+    "sha256": "517e11fb0f1f0f8baa8270fcbacee0dfb1d90ce0aa1280d36ad3efb733e8f170",
+    "bytes": 1197,
+    "preserved": "scrub-evidence/workloads/scrub-focused.py"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-focused-7-A.jsonl",
+    "sha256": "6fe6fe57de546f1a329cf69925b0809bc0c7c96a3b821c2ec5c58eaa29c16ca0",
+    "bytes": 2696,
+    "preserved": "scrub-evidence/workloads/scrub-focused-7-A.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-paired-4-A.jsonl",
+    "sha256": "3cb29847c76aada3a07bc29acec6a1a54ba2827f9cda4b5e2bdfac9721a960fd",
+    "bytes": 3528,
+    "preserved": "scrub-evidence/workloads/scrub-paired-4-A.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-focused-summary.json",
+    "sha256": "c4f9e4ef47d9f99bc17ffeea681b3ddebb0f2d06d920620bfcd86a922bc2eeb2",
+    "bytes": 701,
+    "preserved": "scrub-evidence/workloads/scrub-focused-summary.json"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-focused-5-B.jsonl",
+    "sha256": "a37ffff5f85fe3906d3c07863f3328822c9125db112ffbc56f2fd2bbb088712b",
+    "bytes": 2698,
+    "preserved": "scrub-evidence/workloads/scrub-focused-5-B.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-focused-4-A.jsonl",
+    "sha256": "d0387afa187de4d8c12b285cda4c7041b993a7daf6d61b72bfe2105cc119be69",
+    "bytes": 2696,
+    "preserved": "scrub-evidence/workloads/scrub-focused-4-A.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-focused-6-B.jsonl",
+    "sha256": "1d20524ee19df11d14692d284472201c43d80728bf7e32266af6447a5e3b7f3a",
+    "bytes": 2699,
+    "preserved": "scrub-evidence/workloads/scrub-focused-6-B.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/scrub-docker-final.jsonl",
+    "sha256": "447e785fc393ea8a1a9aea657968ce2fa5b3c6b20caa0a75be1c8afc9e0dd90f",
+    "bytes": 2318,
+    "preserved": "scrub-evidence/workloads/scrub-docker-final.jsonl"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-docker-final-python-os.err",
+    "sha256": "a6cba39cab54235a4ec44732d808409efa529f5d3f0ff850f49e1af8105ed9d5",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-docker-final-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-0-A-python-os.err",
+    "sha256": "ff0f56e39cdf72068819f61bcf0823036cd7c70eda00ad2a4f7e73887ee6e572",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-0-A-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-1-B-node-app.err",
+    "sha256": "92daec2b0bae0902615ef1bcdf3d332b7918111d98fbc5809fdf952beb944251",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-1-B-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-docker-final-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-docker-final-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-7-A-go-build-cold.err",
+    "sha256": "cb8cc1d3d1c6d6222b11daf36cb75963c9585b98468c4186bbb849d0ddbde271",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-7-A-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-1-B-node-app.err",
+    "sha256": "8ab4323371f64b01b4d787cd061f5242d4cd80f0537726741bcb6c8096ad8d16",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-1-B-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-5-B-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-5-B-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-4-A-go-build-cold.err",
+    "sha256": "ff45661510cc8460990010b3145ac43920e82673e1d1c8d5ed9d0ee7a7797729",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-4-A-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-6-B-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-6-B-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-0-A-python-os.err",
+    "sha256": "486ee25f8b5e44001c66fd65f7de329b930ece4b88965fa1e9148200eac0350e",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-0-A-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-6-B-node-app.err",
+    "sha256": "3a5a6b7ed492047f3c2d8df1db80b77ca518d6f646cc9e07b741e0f16858311d",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-6-B-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-6-B-python-os.out",
+    "sha256": "5ae7debf5227d91487231432e4c63f269f3c520d6319b7651ffdb213e2010d90",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-6-B-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-3-A-go-build-cold.err",
+    "sha256": "42f2851d6ac285f1f7dd940aaa94c6e06e8da460413090fe2129a11ac4a423c6",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-3-A-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-1-B-python-os.out",
+    "sha256": "cf6483f74e04da054f7aa222a3c2c6ab7d0429f97c5005625ed272ca8584cdcf",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-1-B-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-1-B-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-1-B-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-5-B-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-5-B-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-2-B-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-2-B-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-1-B-python-os.out",
+    "sha256": "6ae4b921a026dba21585ee9411b2ab7d788d2376307752f62c2b4a5894d871b5",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-1-B-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-2-B-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-2-B-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-7-A-python-os.err",
+    "sha256": "b886f80524882b3cbbc75caede42f21e239ca624ed981e8ae3ecc90c085306ea",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-7-A-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-0-A-go-build-cold.err",
+    "sha256": "598f699dbdbcfbf3dd1a3e8fbbb7d34176745617496b36898dcf3749bf3a1a9b",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-0-A-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-2-B-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-2-B-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-2-B-node-app.err",
+    "sha256": "a021c4212f9aacd7a17449008607dcd7928219cafc8485f1248432dca5acca91",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-2-B-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-1-B-python-os.err",
+    "sha256": "2d793499149ccb326d47079ee6d50af17dcc2e058a99566b8f89a56cab8b3409",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-1-B-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-2-B-node-app.err",
+    "sha256": "a50d5ce47fdf5b73b8083bb1a34d1f04bd4a3e980c028b4f9ac0fc88b2434bb0",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-2-B-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-0-A-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-0-A-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-7-A-python-os.out",
+    "sha256": "ca4b7170da36d2ce3ed35b4cc85048e79a95c98e3a7647b1b8268050639ae42b",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-7-A-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-2-B-go-build-cold.err",
+    "sha256": "8b98b370f8db0070df8c4e39699b4607dbf0e153bdc47b122bcee7b79f83d959",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-2-B-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-5-B-node-app.err",
+    "sha256": "4cc4609121a474197396328a610828fd80123b1729799e924f2981fb3f4769d7",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-5-B-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-1-B-python-os.err",
+    "sha256": "bd0be7f3b0129f674f423d1ab31c18ed607566f72cff692ed31c85b0fcfd5494",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-1-B-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-3-A-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-3-A-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-1-B-go-build-cold.err",
+    "sha256": "e93b87d3c572c8618b23e2bbb164d8ef9f033b0bd561b321e5c3432fd509625b",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-1-B-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-0-A-python-os.out",
+    "sha256": "230f84ef2bc8b7975c9137b8c4d93e8b8691c38ca8775d25512e9f002d130eb4",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-0-A-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-4-A-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-4-A-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-6-B-go-build-cold.err",
+    "sha256": "29af71d3ee5b79c5806f63929883364b9f9d41a8c2b604ca3028ca1ff88260ab",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-6-B-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-6-B-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-6-B-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-6-B-python-os.err",
+    "sha256": "6469c3709753d4ff938ede306f14337fecf48d31b0bbfdb0728798add644e7db",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-6-B-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-docker-final-python-os.out",
+    "sha256": "f63441763f0a2990f3e24246850b22d58f4b3a0b3895755f1d51cf91cf69f4e2",
+    "bytes": 28704,
+    "preserved": "scrub-evidence/workloads/floor-scrub-docker-final-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-0-A-python-os.out",
+    "sha256": "c53ced089bfb3208b8d6e42ceac88f74acbc1e716e231608418e2ba4badc88e0",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-0-A-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-4-A-python-subprocess.cleanup",
+    "sha256": "1894da82c1fb973cc7fcd5dc426b6664a49bcbfeffc8579b22ecee16938be7f4",
+    "bytes": 152,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-4-A-python-subprocess.cleanup"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-7-A-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-7-A-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-5-B-go-build-cold.err",
+    "sha256": "cc1055f287eda41c7e6636ba52c6dfc00826eb287654556b5a739078b3c60fc6",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-5-B-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-1-B-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-1-B-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-1-B-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-1-B-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-docker-final-go-build-cold.err",
+    "sha256": "f4b9c407ea508e39e46a3a44f881bdb1b698d08b964b0e0283a1d54f887a9c65",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-docker-final-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-docker-final-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-docker-final-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-4-A-python-os.err",
+    "sha256": "ea06d167ae0beae7169d9e225aa0e907e5bc74dfbcd5b07261b5ce8633513222",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-4-A-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-0-A-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-0-A-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-4-A-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-4-A-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-2-B-python-os.out",
+    "sha256": "28480e7e13759587e53366365c0e89a5158e0180d289f6fb8db01fcaad4dc0a7",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-2-B-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-0-A-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-0-A-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-4-A-python-os.err",
+    "sha256": "ed1974e4490bf24af3c87089624076d031a1c841bbf012641fb60a59401eb28c",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-4-A-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-4-A-python-subprocess.out",
+    "sha256": "1d75f0c1d91041d8d68b18998d94e1caf63ba1e84e7a9d0aeac6add3f935280d",
+    "bytes": 22219,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-4-A-python-subprocess.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-2-B-python-os.out",
+    "sha256": "9a12ddd205b1fbcb607dd860207ab851b42978e6a1964869efe0f95de17966b3",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-2-B-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-7-A-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-7-A-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-4-A-node-app.err",
+    "sha256": "5ae61d7643b4c5a7c5175ff181adf253e80d344f1c36d77804cde274cb183afe",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-4-A-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-2-B-go-build-cold.err",
+    "sha256": "c6adcdab9122aa4e8c259214b084fd3de80f4dd89c1fce10d743ae6f8e283c36",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-2-B-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-4-A-node-app.err",
+    "sha256": "29698acdb407c7692223796c8c1b71a91da4b1d9ce159d57be9942fa39ae312d",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-4-A-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-0-A-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-0-A-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-3-A-python-os.err",
+    "sha256": "9e1d7330ddf42e8dcf4796a13aed8c2cb744a46ea14b7f769afd326743a072ee",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-3-A-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-3-A-node-app.err",
+    "sha256": "9a5d7663280f4db534477b586ec7530279a3d2c51ac46b44b7863572fd3075ca",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-3-A-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-5-B-python-os.out",
+    "sha256": "49271cf82b7bba4704a96fbd1765eb42689e78c84429f524d6a2694646f00c48",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-5-B-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-3-A-node-app.err",
+    "sha256": "baf2ffb0769f24abec355ab7afa7c201b9c8873efb384558161b34b496575dd9",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-3-A-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-3-A-python-subprocess.err",
+    "sha256": "f5876ad95c229c3aafb6eb432575f5159453efa1cecda8710127947a46539405",
+    "bytes": 55,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-3-A-python-subprocess.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-1-B-go-build-cold.err",
+    "sha256": "a3a815469f4cf5f3bb68dda2679bce52237bd05ad05e1c004a6a360c29ab7217",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-1-B-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-3-A-python-os.err",
+    "sha256": "9ff49f473895d4bea3f7790a515b40de1873d7e6bf3e43bcb8cd77c51bb095ee",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-3-A-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-3-A-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-3-A-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-2-B-python-subprocess.err",
+    "sha256": "f8db597adbd7951673bd9efd53240883886df1a2f9962cac94f3e6058c042fc0",
+    "bytes": 55,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-2-B-python-subprocess.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-1-B-python-subprocess.out",
+    "sha256": "d4e9035769958cd767f83b97b243733a955a84bb902103b576809714bf3133a8",
+    "bytes": 37483,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-1-B-python-subprocess.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-0-A-python-subprocess.out",
+    "sha256": "42c85545c60092fca070418af585d4571c542ba06afc573fae854fb0bc5a6dc3",
+    "bytes": 37483,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-0-A-python-subprocess.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-3-A-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-3-A-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-3-A-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-3-A-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-5-B-python-os.err",
+    "sha256": "b48a92a944e09fa5e3aed6e60ec12f4a9bc9ab440cda0c6670b6371213eb6b7b",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-5-B-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-1-B-python-subprocess.err",
+    "sha256": "cbf9d0324b0c10048badf65ddac2ef20462f1adc46dfe4ac851a886778504db2",
+    "bytes": 55,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-1-B-python-subprocess.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-0-A-python-subprocess.err",
+    "sha256": "aa149c0b5ca21e8314f00cbac8428b369953b8955bb1a54046e698d5b658a3de",
+    "bytes": 55,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-0-A-python-subprocess.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-3-A-python-os.out",
+    "sha256": "7f11b6f258c5b640a66990ddc6bad1a39094a044b184ac037dbb603dc03d65b1",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-3-A-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-3-A-python-subprocess.out",
+    "sha256": "11ce6a794edb6daa647172661effcc0fd65b6fba029877544a657aaef60667dd",
+    "bytes": 37483,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-3-A-python-subprocess.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-1-B-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-1-B-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-2-B-python-subprocess.out",
+    "sha256": "67a0a6ad10faa31f75a71fd759f9a84f7a0c2fe0bbe60886d36374563099c31e",
+    "bytes": 37483,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-2-B-python-subprocess.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-3-A-go-build-cold.err",
+    "sha256": "30d46eaf32dc658a386a0c94fa2bc6d8a5e72ea2920dc0c5c2d29932bc301a15",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-3-A-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-2-B-go-build-cold.out",
+    "sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+    "bytes": 9,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-2-B-go-build-cold.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-0-A-go-build-cold.err",
+    "sha256": "45d4ddae73d945d2e5afcb06bb445499bde35903cf288fda07ded2d7b60f5c15",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-0-A-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-4-A-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-4-A-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-4-A-node-app.out",
+    "sha256": "003ce2b5fd6f8acc6793af6ea192505a438bec6011b80ca9cb3cfebe819c58ff",
+    "bytes": 13,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-4-A-node-app.out"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-3-A-python-os.out",
+    "sha256": "08eb95b64fce1e0e785d4c5e15961f40070b8369b306a560ede7254b5518576d",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-3-A-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-4-A-python-subprocess.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-4-A-python-subprocess.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-4-A-python-os.out",
+    "sha256": "1145a813fe61df30e28e096a79902ea30208a69cfd2aae8b877c4ee55e7cc7f7",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-4-A-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-7-A-node-app.err",
+    "sha256": "edfc5e635a6a73ff97a890d4716afbe4a7502640e2546881b0483eac7c20fa4a",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-7-A-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-2-B-python-os.err",
+    "sha256": "36491ae499389097f5685691ae47f0bfe4f3837d5ca863d109e77b6dfe73a5e5",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-2-B-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-docker-final-node-app.err",
+    "sha256": "7aa36eb74f1bd81e9020a87a18ccc21e3985732c966e3c66a5cc4b6d9332e8a6",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-docker-final-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-4-A-python-os.out",
+    "sha256": "5d52b0d6da167bb6b2f250483fdd009c39689917cd4b690397138ed66cbd6db3",
+    "bytes": 28703,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-4-A-python-os.out.gz"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-0-A-node-app.err",
+    "sha256": "a6a4ed0632ab15b866904bae57042b800e374a7b9c38dd1918ae528854dfcfc5",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-0-A-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-focused-2-B-python-os.err",
+    "sha256": "6e749f648a726f2caad1b3590f9b7e8f6878253cef7023281a2e1d3471495b64",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-focused-2-B-python-os.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-0-A-node-app.err",
+    "sha256": "2905576e5799d287a67ca09280549a7a38e3329f5222ff44899aa8c3fbce33d2",
+    "bytes": 54,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-0-A-node-app.err"
+  },
+  {
+    "source": "target/lease-cost/workloads/floor-scrub-paired-4-A-go-build-cold.err",
+    "sha256": "be86c8b197bb01c4a5091785a8f99cd44b04def8b135ac2c09bda0b2762bad38",
+    "bytes": 57,
+    "preserved": "scrub-evidence/workloads/floor-scrub-paired-4-A-go-build-cold.err"
+  },
+  {
+    "source": "target/lease-cost/scrub-slow-control/floor-scrub-paired-4-A-python-subprocess.lldb.txt",
+    "sha256": "30515bd8285d3eb46a2812a08e7e8b299b0209311425a4830c1e0de6ab09615f",
+    "bytes": 583105,
+    "preserved": "scrub-evidence/scrub-slow-control/floor-scrub-paired-4-A-python-subprocess.lldb.txt.gz"
+  },
+  {
+    "source": "target/lease-cost/scrub-slow-control/floor-scrub-paired-4-A-python-subprocess.kernel-debug.json",
+    "sha256": "be79e2c827ad9ea19b43bad70bb365882acabeb0fe1a87506fe7265066bdf37f",
+    "bytes": 1025872,
+    "preserved": "scrub-evidence/scrub-slow-control/floor-scrub-paired-4-A-python-subprocess.kernel-debug.json.gz"
+  },
+  {
+    "source": "target/lease-cost/scrub-slow-control/floor-scrub-paired-4-A-python-subprocess.ps.txt",
+    "sha256": "b9cb20b2048de1f34ca79b469d6e31e51ddf9787dbd0fa2b379c1f0bad802469",
+    "bytes": 77,
+    "preserved": "scrub-evidence/scrub-slow-control/floor-scrub-paired-4-A-python-subprocess.ps.txt"
+  },
+  {
+    "source": "target/lease-cost/scrub-slow-control/floor-scrub-paired-4-A-python-subprocess.58009.core",
+    "sha256": "3528b742a2d8a7c59570432c93d90abc49e6b871c95d91a43851ae393944dcb5",
+    "bytes": 201707520,
+    "retained_local_path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/scrub-slow-control/floor-scrub-paired-4-A-python-subprocess.58009.core"
+  }
+]

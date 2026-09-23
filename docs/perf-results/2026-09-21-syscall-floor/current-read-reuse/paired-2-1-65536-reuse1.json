@@ -1,0 +1,32 @@
+{
+  "carrier_data_and_buffers": true,
+  "completions": 1310792,
+  "elapsed_ns": [
+    94586500,
+    95505792,
+    95471542,
+    95203583,
+    94612166,
+    95113625,
+    95477875,
+    95030084,
+    94882917,
+    95096667
+  ],
+  "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-1-65536",
+  "elf_sha256": "fa6854c1bb771993c5d55beae096a968ffa7ebaf7e14b5693a477767bfa2fc04",
+  "errno_returns": 0,
+  "exit": 0,
+  "memory_checkpoints": 0,
+  "mock_stage2": true,
+  "original_cow_unchanged": true,
+  "phase": 1,
+  "private_code_publication": true,
+  "private_data_unchanged": true,
+  "product_acceptance": false,
+  "read_window_reuse": true,
+  "requests": 1310793,
+  "scale": 65536,
+  "transitions": 1310793,
+  "wall_ms": 952
+}

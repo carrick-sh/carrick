@@ -1,0 +1,31 @@
+schema_version = 1
+id = "kernel.mm.syscall-code-write"
+title = "Ordinary syscall destinations retain and revoke exact physical backing"
+guest_surfaces = ["kernel:current-mm", "syscall:read", "syscall:readv", "syscall:pread64", "syscall:preadv", "syscall:recvfrom"]
+semantic_authority = ["Linux read, readv, preadv and recvfrom destination and EFAULT semantics", "Carrick exact physical owner and instruction dependency authority"]
+fixture = "unit:syscall-code-write"
+scale_points = [1, 8, 32, 128]
+rationale = "Copied and zero-copy host writes invalidate physical code dependencies before bytes can change. Zero-copy admission authenticates the exact selected host pointer and retains every destination through the host call, including partial failure and unwind. The current-MM read projection stays scalar. These byte-write observations do not authorize native execution."
+
+[bindings]
+vm_free = "carrick-vmm-hvf::trap::foreign_mm::tests::syscall_writes::syscall_code_write_cost_contract; native_code_content_syscall_copy_revokes_physical_dependencies; syscall_writes semantic controls for fragment crossings, stale pointers, owner generations, permissions, structural backing, alias fallback and error/unwind cleanup"
+
+[bindings.unresolved]
+embed_structural = "The signed syscall_write_destinations fixture checks copies, zero-copy destinations and COW, but its read-only readv offset assertion is still red on the before-step runtime and candidate. It does not observe native code revocation. Active native drain, remaining raw/hardware writes and private RX admission remain unbound."
+embed_timing = "No new original inotify09 timing or mixed native/HVF performance acceptance."
+docker = "The exact syscall_write_destinations.py fixture passes on native ARM64 Docker; the Carrick read-only readv offset differential remains open. Backing invalidation is internal and executable publication still needs mixed-engine differentials."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "host_heap_allocations"
+value = 0
+layers = ["vm-free"]
+rationale = "After warming per-executor scratch, ordinary one-page host-write admissions allocate nothing. Instruction capture is measured outside the write path; a positive allocator control must fire."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "native_code_invalidation_pages"
+base = 0
+per_unit = 1
+layers = ["vm-free"]
+rationale = "N one-page admissions visit exactly N subscribed physical pages; unrelated dependencies stay valid. The existing native-code-content contract separately scales unrelated subscriber population."

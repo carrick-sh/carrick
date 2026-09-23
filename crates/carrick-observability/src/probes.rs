@@ -5189,6 +5189,7 @@ mod real {
         /// syscall number, then guest arg0..arg3. The typed begin supplies guest
         /// PID/TID/ASID; five scalars keep this companion reliable on macOS.
         fn hvpatch__syscall__args(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        fn hvpatch__backing__scrub(_: u64, _: u64, _: u64, _: u32) {}
         fn hvpatch__syscall__service(_: i32, _: i32, _: u32, _: u64, _: u64) {}
         /// Distinct post-completion retirement marker. Keeping this separate
         /// lets DTrace consumers read and then clear thread-local join state
@@ -6577,6 +6578,14 @@ mod real {
             event.root_slot_size(),
             event.ttbr0()
         ));
+    }
+
+    /// Completed backing scrub: total bytes, explicitly zeroed bytes,
+    /// successfully remapped bytes, and remap eligibility (0 or 1).
+    /// Counts actual completed work, not the syscall's requested extent.
+    #[inline]
+    pub fn hvpatch_backing_scrub(total: u64, zeroed: u64, remapped: u64, eligible: u32) {
+        carrick_usdt::hvpatch__backing__scrub!(|| (total, zeroed, remapped, eligible));
     }
 
     /// Resolve service identity only when the begin probe is enabled.
@@ -8473,6 +8482,7 @@ mod stub {
     }
 
     stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService, args: [u64; 6]) -> Option<std::time::Instant> => None);
+    stub!(hvpatch_backing_scrub(total: u64, zeroed: u64, remapped: u64, eligible: u32));
     stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));
     stub!(hvpatch_syscall_service_clear(event: super::HvpatchSyscallService));
     stub!(hvpatch_core_lifecycle(phase: u32, pid: i32, tid: i32, generation: u64, outcome: u32));

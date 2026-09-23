@@ -1,0 +1,17 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.26s
+     Running tests/contracts.rs (target/debug/deps/contracts-173caa91935467f3)
+
+running 8 tests
+test inotify09_hotpath_is_semantically_exact_and_linear ... ok
+test inotify09_hotpath_structural_red_control ... ok
+test inotify_churn_preserves_unread_watch_identity ... ok
+test inotify_readiness_contract_does_not_scan_the_queue ... ok
+test inotify_readiness_cost_does_not_grow_with_queue_depth ... ok
+test inotify_readiness_structural_red_control ... ok
+test inotify_watch_contract_is_semantically_exact ... ok
+test inotify_watch_structural_red_control ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.15s
+

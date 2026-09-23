@@ -1,0 +1,16 @@
+{
+  "new_capability_implemented": false,
+  "red_kind": "missing API compile failure, not behavioral failure",
+  "red_errors": 2,
+  "red_method": "borrow_current_native_data",
+  "baseline_restored": true,
+  "existing_composition_test": {
+    "command": "RUSTC_WRAPPER= cargo test -p carrick-runtime --lib instruction_fetch_composes_kernel_lease_and_production_carrier -- --test-threads=1",
+    "result": "1 passed; 0 failed; 600 filtered out"
+  },
+  "requires_explicit_approval": "new unsafe raw-pointer data capability and core HAL/HVF supporting refactor",
+  "rejected_change_applied": false,
+  "native_timing_binary_preserved": true,
+  "product_cli_preserved": true,
+  "new_performance_measurement": false
+}

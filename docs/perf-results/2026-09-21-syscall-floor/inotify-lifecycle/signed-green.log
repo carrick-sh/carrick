@@ -1,0 +1,65 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-embed)
+   Compiling carrick-conformance-next v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-next)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1m 26s
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/signal_lease_gap-cbe70567e390ca19.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/signal_lease_gap-cbe70567e390ca19
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/inotify_lifecycle-1574f86931506faa.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/inotify_lifecycle-1574f86931506faa
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.tmp.69643: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7
+test-signed: running /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/inotify_lifecycle-1574f86931506faa case_inotify_watch_churn --nocapture
+
+running 1 test
+test case_inotify_watch_churn ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.18s
+
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.noent.69643: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.noent.69643
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.06s
+
+remaining carrick procs (run-id inotify-lifecycle-green-20260922) = 0
+remaining carrick procs (run-id inotify-lifecycle-green-20260922-cli) = 0
+test-signed: receipt target/test-results/carrick-conformance-next-signed-artifacts.jsonl
+test-signed: OK (carrick-conformance-next: 1 invoked signed executable(s) passed, 20 signed, negative control passed)

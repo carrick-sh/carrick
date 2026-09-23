@@ -1,0 +1,282 @@
+--- a/crates/carrick-kernel/src/dispatch/fs/rw.rs
++++ b/crates/carrick-kernel/src/dispatch/fs/rw.rs
+@@ -466,14 +466,17 @@
+                 let mut seek_authority_active = false;
+                 if crate::syscall_shim_enabled() {
+                     let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+-                    if let (Ok(gate_b), Ok(fd_b), Ok(off_b)) = (
+-                        cx.memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_GATE, 4),
+-                        cx.memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_FD, 4),
+-                        cx.memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_OFFSET, 8),
+-                    ) {
+-                        let gate = u32::from_le_bytes(gate_b.as_slice().try_into().unwrap_or([0; 4]));
+-                        let s_fd = i32::from_le_bytes(fd_b.as_slice().try_into().unwrap_or([u8::MAX; 4]));
+-                        let cur_off = i64::from_le_bytes(off_b.as_slice().try_into().unwrap_or([0; 8]));
++                    // These fixed fields share one identity-page header. Read
++                    // through the ordinary checked memory API once, into stack
++                    // storage, as the regular-file write path does above.
++                    let mut header = [0u8; 20];
++                    if cx.memory.read_into(
++                        base + crate::memory::IDENTITY_OFF_SEEK_GATE,
++                        &mut header,
++                    ).is_ok() {
++                        let gate = u32::from_le_bytes(header[0..4].try_into().unwrap_or([0; 4]));
++                        let s_fd = i32::from_le_bytes(header[4..8].try_into().unwrap_or([u8::MAX; 4]));
++                        let cur_off = i64::from_le_bytes(header[12..20].try_into().unwrap_or([0; 8]));
+                         if gate == 1 && s_fd == fd.0 && cur_off >= 0 {
+                             seek_authority_active = true;
+                             unsafe { libc::lseek(host_fd.raw(), cur_off as libc::off_t, libc::SEEK_SET) };
+--- a/crates/carrick-kernel/src/dispatch/fs/tests.rs
++++ b/crates/carrick-kernel/src/dispatch/fs/tests.rs
+@@ -10087,3 +10087,7 @@
+         "unallocated high fd must return EBADF",
+     );
+ }
++
++#[cfg(feature = "syscall-shim")]
++#[path = "tests/seek_header.rs"]
++mod seek_header;
+--- /dev/null
++++ b/crates/carrick-kernel/src/dispatch/fs/tests/seek_header.rs
+@@ -0,0 +1,209 @@
++//! Production-dispatch regression for fixed seek metadata input.
++use super::*;
++use std::cell::Cell;
++use std::os::fd::IntoRawFd;
++
++use carrick_conformance_contract::{
++    Completeness, ContractObservation, ContractRegistry, ExecutionLayer, SemanticAssertion,
++    WorkMetric, WorkSnapshot, evaluate,
++};
++use sha2::{Digest, Sha256};
++
++struct SeekMemory {
++    bytes: [u8; 4096],
++    reads: Cell<u64>,
++    allocations: Cell<u64>,
++    read_bytes: Cell<u64>,
++    readable: bool,
++}
++
++impl SeekMemory {
++    fn range(address: u64, length: usize) -> Result<std::ops::Range<usize>, MemoryError> {
++        let error = || MemoryError::OutOfBounds { address, length };
++        let offset = address
++            .checked_sub(crate::memory::LINUX_IDENTITY_PAGE_BASE)
++            .and_then(|v| usize::try_from(v).ok())
++            .ok_or_else(error)?;
++        let end = offset
++            .checked_add(length)
++            .filter(|v| *v <= 4096)
++            .ok_or_else(error)?;
++        Ok(offset..end)
++    }
++
++    fn read(&self, address: u64, length: usize) -> Result<&[u8], MemoryError> {
++        self.reads.set(self.reads.get() + 1);
++        if !self.readable {
++            return Err(MemoryError::OutOfBounds { address, length });
++        }
++        self.read_bytes.set(self.read_bytes.get() + length as u64);
++        Ok(&self.bytes[Self::range(address, length)?])
++    }
++}
++
++impl GuestMemory for SeekMemory {
++    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
++        let bytes = self.read(address, length)?.to_vec();
++        self.allocations
++            .set(self.allocations.get() + u64::from(length != 0));
++        Ok(bytes)
++    }
++
++    fn read_into_raw(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryError> {
++        output.copy_from_slice(self.read(address, output.len())?);
++        Ok(())
++    }
++
++    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
++        self.bytes[Self::range(address, bytes.len())?].copy_from_slice(bytes);
++        Ok(())
++    }
++}
++impl CurrentMmMemory for SeekMemory {}
++
++fn fixture() -> (SyscallDispatcher, i32, SeekMemory) {
++    let dispatcher = SyscallDispatcher::new();
++    let fd = dispatcher
++        .install_fd_at_or_above(
++            3,
++            OpenFile::from_open_description_with_status_flags(
++                Arc::new(RwLock::new(OpenDescription::HostFile {
++                    host_fd: HostFdRef::new(tempfile::tempfile().unwrap().into_raw_fd()),
++                    metadata: RootFsMetadata {
++                        path: "/seek-header".into(),
++                        kind: RootFsEntryKind::File,
++                        mode: 0o600,
++                        size: 0,
++                    },
++                    base: OpenDescriptionBase::new(LINUX_O_RDWR),
++                    writable: true,
++                })),
++                LINUX_O_RDWR,
++                0,
++            ),
++        )
++        .unwrap();
++    (
++        dispatcher,
++        fd,
++        SeekMemory {
++            bytes: [0; 4096],
++            reads: Cell::new(0),
++            allocations: Cell::new(0),
++            read_bytes: Cell::new(0),
++            readable: true,
++        },
++    )
++}
++
++#[test]
++fn seek_header_one_read_without_input_allocation() {
++    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++        .ancestors()
++        .nth(2)
++        .unwrap();
++    let registry = ContractRegistry::load(root).unwrap();
++    let contract = registry.require("kernel.fs.seek-header-input").unwrap();
++    let source = format!("sha256:{:x}", Sha256::digest(include_bytes!("../rw.rs")));
++    let mut observations = Vec::new();
++    let mut reads_complete = true;
++    for n in [1, 8, 32, 128] {
++        let (mut dispatcher, fd, mut memory) = fixture();
++        let context = dispatcher.capture_one_task_context().unwrap();
++        let reporter = CompatReporter::default();
++        for _ in 0..n {
++            assert_eq!(
++                dispatcher
++                    .dispatch(
++                        &context,
++                        SyscallRequest::new(
++                            62,
++                            SyscallArgs::from([fd as u64, 0, LINUX_SEEK_CUR, 0, 0, 0])
++                        ),
++                        &mut memory,
++                        &reporter
++                    )
++                    .unwrap(),
++                DispatchOutcome::Returned { value: 0 }
++            );
++        }
++        let mut work = WorkSnapshot::new();
++        work.values
++            .insert(WorkMetric::HostHeapAllocations, memory.allocations.get());
++        work.values
++            .insert(WorkMetric::GuestMemoryReadBytes, memory.read_bytes.get());
++        let observation = ContractObservation {
++            contract_id: contract.id.clone(),
++            layer: ExecutionLayer::VmFree,
++            implementation_revision: source.clone(),
++            fixture_identity: contract.fixture.clone(),
++            scale: n,
++            semantic_assertions: vec![SemanticAssertion::pass(
++                "host-owned SEEK_CUR returns the current offset",
++            )],
++            work: Some(work),
++            timing: None,
++            completeness: Completeness::Complete,
++        };
++        println!(
++            "SEEKHEADER1|{}",
++            serde_json::to_string(&observation).unwrap()
++        );
++        observations.push(observation);
++        reads_complete &= memory.reads.get() == n;
++    }
++    evaluate(contract, &observations).unwrap();
++    assert!(reads_complete, "one backend read per request");
++}
++
++#[test]
++fn seek_header_preserves_gate_fd_offset_and_read_failure() {
++    for (gate, matching_fd, offset, readable, expected) in [
++        (0_u32, true, 12_i64, true, 0),
++        (1, true, 12, true, 12),
++        (1, false, 12, true, 0),
++        (1, true, -1, true, 0),
++        (2, true, 12, true, 0),
++        (1, true, 12, false, 0),
++    ] {
++        let (mut dispatcher, fd, mut memory) = fixture();
++        let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
++        memory
++            .write_bytes_raw(
++                base + crate::memory::IDENTITY_OFF_SEEK_GATE,
++                &gate.to_le_bytes(),
++            )
++            .unwrap();
++        let header_fd = if matching_fd { fd } else { fd + 1 };
++        memory
++            .write_bytes_raw(
++                base + crate::memory::IDENTITY_OFF_SEEK_FD,
++                &header_fd.to_le_bytes(),
++            )
++            .unwrap();
++        memory
++            .write_bytes_raw(
++                base + crate::memory::IDENTITY_OFF_SEEK_OFFSET,
++                &offset.to_le_bytes(),
++            )
++            .unwrap();
++        memory.readable = readable;
++        let context = dispatcher.capture_one_task_context().unwrap();
++        let result = dispatcher
++            .dispatch(
++                &context,
++                SyscallRequest::new(
++                    62,
++                    SyscallArgs::from([fd as u64, 0, LINUX_SEEK_CUR, 0, 0, 0]),
++                ),
++                &mut memory,
++                &CompatReporter::default(),
++            )
++            .unwrap();
++        assert_eq!(
++            result,
++            DispatchOutcome::Returned { value: expected },
++            "gate={gate} matching_fd={matching_fd} offset={offset} readable={readable}"
++        );
++    }
++}
+--- /dev/null
++++ b/conformance-contracts/contracts/seek-header-input.toml
+@@ -0,0 +1,29 @@
++schema_version = 1
++id = "kernel.fs.seek-header-input"
++title = "Seek authority metadata is read once without allocating input buffers"
++guest_surfaces = ["syscall:lseek"]
++semantic_authority = ["man 2 lseek", "Carrick identity-page seek authority ABI"]
++fixture = "unit:seek_header_one_read_without_input_allocation"
++scale_points = [1, 8, 32, 128]
++rationale = "The fixed identity-page header fits in one stack buffer. Guest read permission and translation remain in the existing CurrentMmMemory API; host offset, active/inactive gate, descriptor matching, negative offsets and unavailable metadata retain their existing behavior. The measured allocations belong only to guest metadata input, not the full syscall."
++[bindings]
++vm_free = "carrick-kernel::dispatch::fs::tests::seek_header"
++embed = "carrick-conformance-next::write_seek_lease::write_seek_lease_alias_preserves_shared_offset"
++docker = "probe:writeseek"
++ecosystem = ["ltp:inotify09"]
++[bindings.unresolved]
++embed_structural = "The signed path preserves semantics; production guest-memory allocation counts are not emitted by this fixture."
++embed_timing = "Full inotify09 and fixed-work controls use independent uninstrumented runs, not an embed timing observation."
++[[structural_budgets]]
++kind = "exact"
++metric = "host_heap_allocations"
++value = 0
++layers = ["vm-free"]
++rationale = "The measured guest-memory backend counts actual Vec creation for this fixed input. Its read_into implementation copies directly into the caller buffer."
++[[structural_budgets]]
++kind = "affine"
++metric = "guest_memory_read_bytes"
++base = 0
++per_unit = 20
++layers = ["vm-free"]
++rationale = "Each request reads at most the 20-byte gate/fd/offset header, including its four padding bytes. The binding also asserts exactly one backend read per request."

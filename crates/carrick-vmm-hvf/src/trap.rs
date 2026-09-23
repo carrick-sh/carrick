@@ -181,7 +181,11 @@ use sysreg::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod carrier_custody;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod code_content;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod global_frame;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) mod host_writes;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use global_frame::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -7569,7 +7573,11 @@ impl HvfInner {
                 stack_host_base: 0,
                 stack_guest_end: 0,
             });
-            return Ok(Aarch64Exit::Syscall { frame, resume_pc });
+            return Ok(Aarch64Exit::Syscall {
+                frame,
+                resume_pc,
+                current_guest_sp: Some(request.sp),
+            });
         }
     }
 }

@@ -1,0 +1,40 @@
+[
+  {
+    "name": "kernel-suite-final",
+    "argv": [
+      "just",
+      "test-kernel"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 15.77641770800983
+  },
+  {
+    "name": "native-clippy-all-features",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--manifest-path",
+      "experiments/native-syscall-slice/Cargo.toml",
+      "--all-targets",
+      "--all-features",
+      "--no-deps",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.4708612499962328
+  },
+  {
+    "name": "native-tests-final",
+    "argv": [
+      "cargo",
+      "test",
+      "--manifest-path",
+      "experiments/native-syscall-slice/Cargo.toml",
+      "--tests"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 2.175217625001096
+  }
+]

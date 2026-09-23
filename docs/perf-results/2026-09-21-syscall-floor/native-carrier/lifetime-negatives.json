@@ -1,0 +1,40 @@
+[
+  {
+    "case": 1,
+    "argv": [
+      "rustc",
+      "--edition=2024",
+      "--crate-type=lib",
+      "--crate-name",
+      "native_lifetime_negative_1",
+      "target/lease-cost/native-carrier/lifetime-negative-1.rs",
+      "--extern",
+      "carrick_kernel=target/debug/deps/libcarrick_kernel-9cb6b2db6f757fa2.rlib",
+      "-L",
+      "dependency=target/debug/deps",
+      "--out-dir",
+      "target/lease-cost/native-carrier"
+    ],
+    "exit_code": 1,
+    "required_diagnostic": "lifetime may not live long enough"
+  },
+  {
+    "case": 2,
+    "argv": [
+      "rustc",
+      "--edition=2024",
+      "--crate-type=lib",
+      "--crate-name",
+      "native_lifetime_negative_2",
+      "target/lease-cost/native-carrier/lifetime-negative-2.rs",
+      "--extern",
+      "carrick_kernel=target/debug/deps/libcarrick_kernel-9cb6b2db6f757fa2.rlib",
+      "-L",
+      "dependency=target/debug/deps",
+      "--out-dir",
+      "target/lease-cost/native-carrier"
+    ],
+    "exit_code": 1,
+    "required_diagnostic": "error[E0505]"
+  }
+]

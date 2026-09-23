@@ -1,0 +1,3 @@
+carrick debug lldb-run: run_id=kill-floor-v2-base deadline=20s guest_log=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/kill-reducer/base-v2/kill-floor-v2-base.guest.log lldb_log=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/kill-reducer/base-v2/kill-floor-v2-base.lldb.txt
+pass 1: killing 1 procs (run-id kill-floor-v2-base)
+remaining carrick procs (run-id kill-floor-v2-base) = 0

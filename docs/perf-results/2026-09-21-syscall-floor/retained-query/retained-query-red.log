@@ -1,0 +1,28 @@
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.56s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-3c2afd032626087b)
+
+running 1 test
+test trap::memory_protection::tests::retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows ... FAILED
+
+failures:
+
+---- trap::memory_protection::tests::retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows stdout ----
+
+thread 'trap::memory_protection::tests::retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows' (2998322) panicked at crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs:2559:9:
+assertion `left == right` failed: wide owner must not inspect 1 unrelated narrow rows
+  left: 2
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    trap::memory_protection::tests::retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 505 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`

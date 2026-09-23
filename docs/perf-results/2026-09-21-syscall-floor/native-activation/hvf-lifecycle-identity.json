@@ -1,0 +1,9 @@
+{
+  "run_id": "native-activation-lifecycle-final-20260922",
+  "exit": 0,
+  "binaries": {
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e": {
+      "sha256": "5d1b581edfca1523ebdcadce7e4b3c0445f0b272d940c3f4887cad4b42db1acf"
+    }
+  }
+}

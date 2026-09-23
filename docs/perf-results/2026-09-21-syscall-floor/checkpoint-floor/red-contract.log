@@ -1,0 +1,28 @@
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 28.68s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-6abbf7196ab9319a)
+
+running 1 test
+
+thread 'vcpu_loop::memory::tests::native_floor::native_data_demand_contract' (4429941) panicked at crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs:276:18:
+called `Result::unwrap()` on an `Err` value: carrier grant is outside the ELF data region
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test vcpu_loop::memory::tests::native_floor::native_data_demand_contract ... FAILED
+
+failures:
+
+failures:
+    vcpu_loop::memory::tests::native_floor::native_data_demand_contract
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 622 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p carrick-runtime --lib`

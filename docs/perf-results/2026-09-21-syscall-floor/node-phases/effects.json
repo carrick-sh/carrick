@@ -1,0 +1,26 @@
+{
+  "carrick": {
+    "median_ms": {
+      "both": 236.5,
+      "child": 193.5,
+      "worker": 134.0,
+      "neither": 98.0
+    },
+    "child_increment_without_worker_ms": 95.5,
+    "child_increment_with_worker_ms": 102.5,
+    "worker_increment_without_child_ms": 36.0,
+    "worker_increment_with_child_ms": 43.0
+  },
+  "linux": {
+    "median_ms": {
+      "both": 46.0,
+      "child": 34.5,
+      "worker": 35.50000000000001,
+      "neither": 21.0
+    },
+    "child_increment_without_worker_ms": 13.5,
+    "child_increment_with_worker_ms": 10.499999999999993,
+    "worker_increment_without_child_ms": 14.500000000000007,
+    "worker_increment_with_child_ms": 11.5
+  }
+}

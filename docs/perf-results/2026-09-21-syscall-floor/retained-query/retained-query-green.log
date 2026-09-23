@@ -1,0 +1,20 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.15s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-3c2afd032626087b)
+
+running 12 tests
+test trap::foreign_mm::tests::retained_foreign_lease_advances_across_two_compound_cow_commits ... ok
+test trap::foreign_mm::tests::retained_foreign_lease_rejects_unrelated_or_tampered_successor_snapshot ... ok
+test trap::foreign_mm::tests::retained_old_token_drop_only_enqueues_before_the_executor_safe_point ... ok
+test trap::foreign_mm::tests::structural_backing_owner_lifecycle_and_retained_backing ... ok
+test trap::frame_inventory::tests::carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority ... ok
+test trap::frame_inventory::tests::exec_predecessor_rejects_each_retained_authority_anchor_mismatch ... ok
+test trap::frame_inventory::tests::retained_old_mm_reports_no_exec_retirement_extents ... ok
+test trap::frame_inventory::tests::retained_private_reuse_requires_and_preserves_exact_owner_generation ... ok
+test trap::frame_inventory::tests::retained_sibling_detection_reads_exact_old_frame_leaves ... ok
+test trap::memory_protection::tests::alias_registry_tests::retained_private_reuse_republishes_semantic_fragment_before_sibling_unmap ... ok
+test trap::memory_protection::tests::memory_protection_tests::deferred_prot_none_accepts_retained_rw_ap_on_invalid_leaf ... ok
+test trap::memory_protection::tests::retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 494 filtered out; finished in 0.07s
+

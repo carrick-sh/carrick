@@ -1,0 +1,24 @@
+schema_version = 1
+id = "kernel.mm.executor-admission"
+title = "Rejected executor admission preserves the live quiescence endpoint"
+guest_surfaces = ["kernel:current-mm", "scheduler:execution-admission", "scheduler:page-table-quiescence"]
+semantic_authority = ["man 2 mprotect", "man 2 munmap", "Carrick exact-MM executor census and pause-modify-resume authority"]
+fixture = "unit:duplicate-admission-live-endpoint"
+scale_points = [1, 8, 32, 128]
+rationale = "Rejecting an already-admitted thread must leave its exact original pause endpoint, crash participation and membership intact. Otherwise a mapping mutator can observe idle while the admitted owner still executes. The fixture rejects N replacements and then performs one drain kick per rejection; only the original owner may receive those kicks. This is a prerequisite for both HVF and native execution, not a native executor binding."
+
+[bindings]
+vm_free = "carrick-kernel::kernel::guest_execution::tests::duplicate_admission_preserves_live_pause_endpoint"
+
+[bindings.unresolved]
+embed_structural = "Kernel census regression is VM-free. Signed carrier lifecycle is supplementary; no signed race fixture for rejected native admission is registered."
+embed_timing = "No workload or admission timing is claimed for this invariant."
+docker = "Duplicate carrier admission is an internal invariant; Linux mapping semantics remain the external obligation. No differential guest race is registered for this fixture."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "host_backend_calls"
+base = 0
+per_unit = 1
+layers = ["vm-free"]
+rationale = "N rejected admissions followed by N explicit drain checks perform at most N kick-backend calls. Count actual calls to both original and rejected endpoints; semantic assertions require exactly N to the original owner and zero to replacements. Rejection itself must not kick or retry."

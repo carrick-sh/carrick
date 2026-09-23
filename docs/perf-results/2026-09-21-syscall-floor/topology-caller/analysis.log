@@ -1,0 +1,158 @@
+[
+  {
+    "phase": "hold",
+    "operation": 0,
+    "class": "frame_registry",
+    "ns": 692002
+  },
+  {
+    "phase": "hold",
+    "operation": 0,
+    "class": "mm_transaction",
+    "ns": 21335376
+  },
+  {
+    "phase": "hold",
+    "operation": 1,
+    "class": "frame_registry",
+    "ns": 1036041
+  },
+  {
+    "phase": "hold",
+    "operation": 1,
+    "class": "mm_transaction",
+    "ns": 1174762541
+  },
+  {
+    "phase": "hold",
+    "operation": 3,
+    "class": "frame_registry",
+    "ns": 140821051
+  },
+  {
+    "phase": "hold",
+    "operation": 7,
+    "class": "frame_registry",
+    "ns": 3582288
+  },
+  {
+    "phase": "hold",
+    "operation": 7,
+    "class": "mm_transaction",
+    "ns": 12338420
+  },
+  {
+    "phase": "hold",
+    "operation": 9,
+    "class": "frame_registry",
+    "ns": 25620509
+  },
+  {
+    "phase": "hold",
+    "operation": 10,
+    "class": "frame_registry",
+    "ns": 121414211
+  },
+  {
+    "phase": "wait",
+    "operation": 0,
+    "class": "frame_registry",
+    "ns": 14479834
+  },
+  {
+    "phase": "wait",
+    "operation": 0,
+    "class": "mm_transaction",
+    "ns": 0
+  },
+  {
+    "phase": "wait",
+    "operation": 1,
+    "class": "frame_registry",
+    "ns": 27337337
+  },
+  {
+    "phase": "wait",
+    "operation": 1,
+    "class": "mm_transaction",
+    "ns": 0
+  },
+  {
+    "phase": "wait",
+    "operation": 3,
+    "class": "frame_registry",
+    "ns": 6024421775
+  },
+  {
+    "phase": "wait",
+    "operation": 7,
+    "class": "frame_registry",
+    "ns": 23940919
+  },
+  {
+    "phase": "wait",
+    "operation": 7,
+    "class": "mm_transaction",
+    "ns": 0
+  },
+  {
+    "phase": "wait",
+    "operation": 9,
+    "class": "frame_registry",
+    "ns": 2879194130
+  },
+  {
+    "phase": "wait",
+    "operation": 10,
+    "class": "frame_registry",
+    "ns": 2144130441
+  }
+]
+wait 3 frame_registry 5342.079649 ms carrick_observability::probes::real::hvpatch_topology_lock::h89f8a706969e6498 (in carrick-discard-edges) + 36
+carrick_thread::fork_quiesce::FrameRegistryGuard::acquire::hd14a95b970df68a1 (in carrick-discard-edges) + 192
+carrick_vmm_hvf::trap::cow_engine::_$LT$impl$u20$carrick_vmm_hvf..trap..HvfVmState$GT$::materialize_sparse_mmap_extent_inner::hb55fcfc74b2fd134 (in carrick-discard-edges) + 2372
+carrick_vmm_hvf::trap::cow_engine::_$LT$impl$u20$carrick_vmm_hvf..trap..HvfVmState$GT$::ensure_sparse_mmap_backing_censused::h532cadb17bc6b296 (in carrick-discard-edges) + 2976
+carrick_aarch64::engine::Aarch64EngineCore$LT$V$GT$::ensure_sparse_mmap_backing::h5115a531644324e1 (in carrick-discard-edges) + 992
+_$LT$carrick_aarch64..engine..Aarch64EngineCore$LT$V$GT$$u20$as$u20$carrick_guest_mem..GuestMemory$GT$::protect_range::h93a8231d7fd3429f (in carrick-discard-edges) + 88
+wait 9 frame_registry 2749.052923 ms carrick_observability::probes::real::hvpatch_topology_lock::h89f8a706969e6498 (in carrick-discard-edges) + 36
+carrick_thread::fork_quiesce::FrameRegistryGuard::acquire::hd14a95b970df68a1 (in carrick-discard-edges) + 192
+carrick_vmm_hvf::trap::cow_engine::_$LT$impl$u20$carrick_vmm_hvf..trap..HvfTaskState$GT$::perform_frame_cow::hcf7afea0af6f25be (in carrick-discard-edges) + 5260
+carrick_vmm_hvf::trap::cow_engine::_$LT$impl$u20$carrick_vmm_hvf..trap..HvfVmState$GT$::resolve_frame_cow_fault::h9047090a54e04aca (in carrick-discard-edges) + 168
+_$LT$carrick_aarch64..engine..Aarch64EngineCore$LT$V$GT$$u20$as$u20$carrick_hal..threaded..ThreadedEngine$GT$::resolve_frame_cow_fault::h38feb362f703a93e (in carrick-discard-edges) + 364
+carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob$LT$E$GT$::poll_with_engine::hcb2c2ae916336a4a (in carrick-discard-edges) + 12144
+wait 10 frame_registry 1654.250121 ms carrick_observability::probes::real::hvpatch_topology_lock::h89f8a706969e6498 (in carrick-discard-edges) + 36
+carrick_thread::fork_quiesce::FrameRegistryGuard::acquire::hd14a95b970df68a1 (in carrick-discard-edges) + 192
+carrick_vmm_hvf::trap::cow_engine::_$LT$impl$u20$carrick_vmm_hvf..trap..HvfVmState$GT$::unregister_process_alias::h806da789b67eac0f (in carrick-discard-edges) + 468
+_$LT$carrick_aarch64..engine..Aarch64EngineCore$LT$V$GT$$u20$as$u20$carrick_guest_mem..GuestMemory$GT$::unmap_range::hd9dd63b99692402e (in carrick-discard-edges) + 1652
+carrick_kernel::dispatch::mem::mmap::_$LT$impl$u20$carrick_kernel..dispatch..dispatcher..MemView$GT$::munmap::h8e6027de110cde25 (in carrick-discard-edges) + 1712
+carrick_kernel::dispatch::mem::_$LT$impl$u20$carrick_kernel..dispatch..dispatcher..SyscallDispatcher$GT$::munmap::hc70b7e4bbd5078bf (in carrick-discard-edges) + 68
+hold 1 mm_transaction 1174.762541 ms carrick_observability::probes::real::hvpatch_topology_lock::h89f8a706969e6498 (in carrick-discard-edges) + 36
+carrick_thread::fork_quiesce::emit_topology_lock::h957291fd0caf5fd6 (in carrick-discard-edges) + 32
+core::mem::drop::h0a0d24aec310abcb (in carrick-discard-edges) + 44
+carrick_runtime::vcpu_loop::exec::_$LT$impl$u20$carrick_runtime..vcpu_loop..ThreadRuntimeState$LT$E$GT$$GT$::drive_execve::_$u7b$$u7b$closure$u7d$$u7d$::h783a5c13f04931b8 (in carrick-discard-edges) + 6196
+carrick_runtime::vcpu_loop::exec::_$LT$impl$u20$carrick_runtime..vcpu_loop..ThreadRuntimeState$LT$E$GT$$GT$::finish_prepared_execve_drain::h7a286d275a70672f (in carrick-discard-edges) + 348
+carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob$LT$E$GT$::service_outcome::ha15e19791b8f4403 (in carrick-discard-edges) + 9924
+wait 3 frame_registry 303.946337 ms carrick_observability::probes::real::hvpatch_topology_lock::h89f8a706969e6498 (in carrick-discard-edges) + 36
+carrick_thread::fork_quiesce::FrameRegistryGuard::acquire::hd14a95b970df68a1 (in carrick-discard-edges) + 192
+carrick_vmm_hvf::trap::cow_engine::_$LT$impl$u20$carrick_vmm_hvf..trap..HvfVmState$GT$::materialize_sparse_mmap_extent_inner::hb55fcfc74b2fd134 (in carrick-discard-edges) + 2372
+carrick_vmm_hvf::trap::cow_engine::_$LT$impl$u20$carrick_vmm_hvf..trap..HvfVmState$GT$::ensure_sparse_mmap_backing_censused::h532cadb17bc6b296 (in carrick-discard-edges) + 1676
+carrick_aarch64::engine::Aarch64EngineCore$LT$V$GT$::ensure_sparse_mmap_backing::h5115a531644324e1 (in carrick-discard-edges) + 992
+_$LT$carrick_aarch64..engine..Aarch64EngineCore$LT$V$GT$$u20$as$u20$carrick_guest_mem..GuestMemory$GT$::protect_range::h93a8231d7fd3429f (in carrick-discard-edges) + 88
+wait 10 frame_registry 277.316573 ms carrick_observability::probes::real::hvpatch_topology_lock::h89f8a706969e6498 (in carrick-discard-edges) + 36
+carrick_thread::fork_quiesce::FrameRegistryGuard::acquire::hd14a95b970df68a1 (in carrick-discard-edges) + 192
+carrick_vmm_hvf::trap::cow_engine::_$LT$impl$u20$carrick_vmm_hvf..trap..HvfVmState$GT$::unregister_process_alias::h806da789b67eac0f (in carrick-discard-edges) + 468
+_$LT$carrick_aarch64..engine..Aarch64EngineCore$LT$V$GT$$u20$as$u20$carrick_guest_mem..GuestMemory$GT$::unmap_range::hd9dd63b99692402e (in carrick-discard-edges) + 1652
+carrick_kernel::dispatch::mem::mmap::_$LT$impl$u20$carrick_kernel..dispatch..dispatcher..MemView$GT$::munmap::h8e6027de110cde25 (in carrick-discard-edges) + 1712
+carrick_kernel::dispatch::mem::_$LT$impl$u20$carrick_kernel..dispatch..dispatcher..SyscallDispatcher$GT$::munmap::hc70b7e4bbd5078bf (in carrick-discard-edges) + 68
+wait 3 frame_registry 139.901197 ms carrick_observability::probes::real::hvpatch_topology_lock::h89f8a706969e6498 (in carrick-discard-edges) + 36
+carrick_thread::fork_quiesce::FrameRegistryGuard::acquire::hd14a95b970df68a1 (in carrick-discard-edges) + 192
+carrick_vmm_hvf::trap::cow_engine::_$LT$impl$u20$carrick_vmm_hvf..trap..HvfVmState$GT$::materialize_sparse_mmap_extent_inner::hb55fcfc74b2fd134 (in carrick-discard-edges) + 2372
+carrick_vmm_hvf::trap::cow_engine::_$LT$impl$u20$carrick_vmm_hvf..trap..HvfVmState$GT$::materialize_private_file_backing::hf5f9964d58107362 (in carrick-discard-edges) + 888
+_$LT$carrick_aarch64..engine..Aarch64EngineCore$LT$V$GT$$u20$as$u20$carrick_guest_mem..GuestMemory$GT$::map_private_file_backed::h4903b798ae5f5b5b (in carrick-discard-edges) + 1080
+carrick_kernel::dispatch::mem::mmap::_$LT$impl$u20$carrick_kernel..dispatch..dispatcher..MemView$GT$::mmap::h72d0f211ec6d5243 (in carrick-discard-edges) + 20496
+hold 3 frame_registry 122.059304 ms carrick_observability::probes::real::hvpatch_topology_lock::h89f8a706969e6498 (in carrick-discard-edges) + 36
+_$LT$carrick_thread..fork_quiesce..FrameRegistryGuard$u20$as$u20$core..ops..drop..Drop$GT$::drop::hfedce37b29d71350 (in carrick-discard-edges) + 108
+core::ptr::drop_in_place$LT$carrick_thread..fork_quiesce..FrameRegistryGuard$GT$::h653ae64e6541f51a (in carrick-discard-edges) + 20
+carrick_vmm_hvf::trap::cow_engine::_$LT$impl$u20$carrick_vmm_hvf..trap..HvfVmState$GT$::materialize_sparse_mmap_extent_inner::hb55fcfc74b2fd134 (in carrick-discard-edges) + 2704
+carrick_vmm_hvf::trap::cow_engine::_$LT$impl$u20$carrick_vmm_hvf..trap..HvfVmState$GT$::ensure_sparse_mmap_backing_censused::h532cadb17bc6b296 (in carrick-discard-edges) + 2976
+carrick_aarch64::engine::Aarch64EngineCore$LT$V$GT$::ensure_sparse_mmap_backing::h5115a531644324e1 (in carrick-discard-edges) + 992

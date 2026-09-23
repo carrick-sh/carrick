@@ -1,0 +1,10 @@
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.23s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-206a8f631e68fc3c)
+
+running 1 test
+carrick fatal [hvpatch::mm_authority]: stage-1 TLB invalidation failed during foreign COW invalidation-error rollback
+error: test failed, to rerun pass `-p carrick-runtime --lib`
+
+Caused by:
+  process didn't exit successfully: `/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/debug/deps/carrick_runtime-206a8f631e68fc3c native_admission_allows_carrier_cow_without_hardware_ack --nocapture` (signal: 6, SIGABRT: process abort signal)

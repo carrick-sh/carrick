@@ -1,0 +1,45 @@
+   Compiling serde_derive v1.0.228
+   Compiling pest_generator v2.8.6
+   Compiling zerocopy-derive v0.8.48
+   Compiling scroll_derive v0.13.1
+   Compiling pest_derive v2.8.6
+   Compiling scroll v0.13.0
+   Compiling dtrace-parser v0.3.0
+   Compiling zerocopy v0.8.48
+   Compiling goblin v0.10.5
+   Compiling serde v1.0.228
+   Compiling usdt-impl v0.6.0
+   Compiling serde_tokenstream v0.2.3
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling toml_edit v0.22.27
+   Compiling usdt-macro v0.6.0
+   Compiling usdt-attr-macro v0.6.0
+   Compiling dof v0.4.0
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-abi)
+   Compiling toml v0.8.23
+   Compiling usdt v0.6.0
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.70s
+     Running tests/registry.rs (target/debug/deps/registry-7171c8ec86692658)
+
+running 1 test
+test futex_contract_has_structural_and_runtime_authority ... FAILED
+
+failures:
+
+---- futex_contract_has_structural_and_runtime_authority stdout ----
+
+thread 'futex_contract_has_structural_and_runtime_authority' (3015211) panicked at crates/carrick-conformance-contract/tests/registry.rs:70:57:
+registry: MissingBinding { id: ContractId("kernel.mm.retained-fragment-query"), layer: EmbedStructural }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    futex_contract_has_structural_and_runtime_authority
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-conformance-contract --test registry`

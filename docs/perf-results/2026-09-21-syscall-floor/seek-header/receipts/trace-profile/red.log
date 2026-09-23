@@ -1,0 +1,221 @@
+   Compiling serde_core v1.0.228
+   Compiling tokio-util v0.7.18
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling predicates-core v1.0.10
+   Compiling float-cmp v0.10.0
+   Compiling serde_repr v0.1.20
+   Compiling hex v0.4.3
+   Compiling difflib v0.4.0
+   Compiling termtree v0.5.1
+   Compiling assert_cmd v2.2.2
+   Compiling normalize-line-endings v0.3.0
+   Compiling predicates-tree v1.0.13
+   Compiling bstr v1.12.1
+   Compiling hyperlocal v0.9.1
+   Compiling predicates v3.1.4
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.149
+   Compiling camino v1.2.2
+   Compiling serde_with v3.20.0
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+   Compiling serde_urlencoded v0.7.1
+   Compiling chrono v0.4.44
+   Compiling dof v0.4.0
+   Compiling olpc-cjson v0.1.4
+   Compiling reqwest v0.12.28
+   Compiling oci-spec v0.8.4
+   Compiling jwt v0.16.0
+   Compiling usdt-impl v0.6.0
+   Compiling bollard-stubs v1.47.1-rc.27.3.1
+   Compiling usdt v0.6.0
+   Compiling oci-client v0.15.0
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+   Compiling carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-signal-core)
+   Compiling carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-timer-core)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-spec)
+   Compiling carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-image)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+   Compiling bollard v0.18.1
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-engine)
+   Compiling carrick-cli v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-cli)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1m 33s
+     Running tests/trace_profile.rs (target/release/deps/trace_profile-52b90d020a68e266)
+
+running 1 test
+test completed_inotify_profile_is_listed ... FAILED
+
+failures:
+
+---- completed_inotify_profile_is_listed stdout ----
+
+thread 'completed_inotify_profile_is_listed' (4574820) panicked at crates/carrick-cli/tests/trace_profile.rs:1038:56:
+Unexpected stdout, failed var.contains(hvpatch-inotify09-population)
+├── var: Run a carrick command under DTrace, in-process. Compiles the bundled D script via libdtrace, spawns the child carrick under `dtrace_proc_create`, and streams live per-syscall events + a frequency-sorted aggregation when the child exits. Requires root
+│   
+│   Usage: carrick trace [OPTIONS] [COMMAND]...
+│   
+│   Arguments:
+│     [COMMAND]...
+│             
+│   
+│   Options:
+│     -F, --flowindent
+│             Enable dtrace(1) `-F` style flow indentation. Each `entry/` or `return/` event in the live stream is indented by call depth, making it easier to follow nested syscall paths
+│   
+│     -s, --script <SCRIPT>
+│             Path to a custom D script to run instead of the bundled syscall tracer. Lets you write a targeted probe (e.g. fire only on a specific errno) without paying the full per-syscall stream cost. The script sees the same carrick USDT providers
+│   
+│         --require-script-exit
+│             Require a custom D script to terminate with `exit(0)`; missing or nonzero terminal receipts fail the trace. Legacy custom scripts retain their lossy/interruption-only acceptance unless opted in
+│   
+│         --profile <PROFILE>
+│             Run one of Carrick's bounded, machine-readable DSR profiles
+│             
+│             [possible values: hvpatch-carrier-cpu-low-rate, hvpatch-frame-cow, hvpatch-exec-runtime-stages, hvpatch-core-lifecycle, hvpatch-identity-host-safety, hvpatch-k1-lifecycle, native-amplification]
+│   
+│         --summary-jsonl <FILE>
+│             Atomically publish the parsed profile as versioned JSONL
+│   
+│         --core-artifact <FILE>
+│             Exact crash-produced core whose bytes the HVPatch lifecycle receipt must authenticate. Required for `hvpatch-core-lifecycle` and rejected for every other profile
+│   
+│         --profile-bound-seconds <SECONDS>
+│             Override the profile's capture bound, in seconds (multiple of 10)
+│   
+│         --preflight-quiet-host
+│             Refuse to capture on a host that is not quiet, and record what it settled to in the stream header.
+│             
+│             Waits for the one-minute load average to settle, then aborts if a `yes` load generator or a stray `carrick:` guest is still running. A contended host produces a CPU-ns figure that reads exactly like a real one, which is why this refuses rather than warns. Only `native-amplification` has a header field for the receipt today, so the flag is refused on other profiles rather than silently doing nothing.
+│   
+│     -o, --trace-out <FILE>
+│             Write DTrace events + aggregations to this file instead of stdout. Essential when tracing an interactive (`-t`) guest: without it the probe output intermixes with the guest's own terminal stream. The traced command's stdio is left untouched
+│   
+│         --forward-env <KEY=VAL>
+│             Internal: `KEY=VAL` env vars to set in the traced child. Used by the sudo re-exec to carry CARRICK_* vars across `sudo`'s env_reset (which would otherwise strip them) without needing SETENV in sudoers - CLI args survive sudo where env vars don't
+│   
+│         --store <STORE>
+│             [env: CARRICK_HOME=]
+│   
+│     -h, --help
+│             Print help (see a summary with '-h')
+└── var as str: Run a carrick command under DTrace, in-process. Compiles the bundled D script via libdtrace, spawns the child carrick under `dtrace_proc_create`, and streams live per-syscall events + a frequency-sorted aggregation when the child exits. Requires root
+    
+    Usage: carrick trace [OPTIONS] [COMMAND]...
+    
+    Arguments:
+      [COMMAND]...
+              
+    
+    Options:
+      -F, --flowindent
+              Enable dtrace(1) `-F` style flow indentation. Each `entry/` or `return/` event in the live stream is indented by call depth, making it easier to follow nested syscall paths
+    
+      -s, --script <SCRIPT>
+              Path to a custom D script to run instead of the bundled syscall tracer. Lets you write a targeted probe (e.g. fire only on a specific errno) without paying the full per-syscall stream cost. The script sees the same carrick USDT providers
+    
+          --require-script-exit
+              Require a custom D script to terminate with `exit(0)`; missing or nonzero terminal receipts fail the trace. Legacy custom scripts retain their lossy/interruption-only acceptance unless opted in
+    
+          --profile <PROFILE>
+              Run one of Carrick's bounded, machine-readable DSR profiles
+              
+              [possible values: hvpatch-carrier-cpu-low-rate, hvpatch-frame-cow, hvpatch-exec-runtime-stages, hvpatch-core-lifecycle, hvpatch-identity-host-safety, hvpatch-k1-lifecycle, native-amplification]
+    
+          --summary-jsonl <FILE>
+              Atomically publish the parsed profile as versioned JSONL
+    
+          --core-artifact <FILE>
+              Exact crash-produced core whose bytes the HVPatch lifecycle receipt must authenticate. Required for `hvpatch-core-lifecycle` and rejected for every other profile
+    
+          --profile-bound-seconds <SECONDS>
+              Override the profile's capture bound, in seconds (multiple of 10)
+    
+          --preflight-quiet-host
+              Refuse to capture on a host that is not quiet, and record what it settled to in the stream header.
+              
+              Waits for the one-minute load average to settle, then aborts if a `yes` load generator or a stray `carrick:` guest is still running. A contended host produces a CPU-ns figure that reads exactly like a real one, which is why this refuses rather than warns. Only `native-amplification` has a header field for the receipt today, so the flag is refused on other profiles rather than silently doing nothing.
+    
+      -o, --trace-out <FILE>
+              Write DTrace events + aggregations to this file instead of stdout. Essential when tracing an interactive (`-t`) guest: without it the probe output intermixes with the guest's own terminal stream. The traced command's stdio is left untouched
+    
+          --forward-env <KEY=VAL>
+              Internal: `KEY=VAL` env vars to set in the traced child. Used by the sudo re-exec to carry CARRICK_* vars across `sudo`'s env_reset (which would otherwise strip them) without needing SETENV in sudoers - CLI args survive sudo where env vars don't
+    
+          --store <STORE>
+              [env: CARRICK_HOME=]
+    
+      -h, --help
+              Print help (see a summary with '-h')
+
+command=`"/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/carrick" "trace" "--help"`
+code=0
+stdout=```
+Run a carrick command under DTrace, in-process. Compiles the bundled D script via libdtrace, spawns the child carrick under `dtrace_proc_create`, and streams live per-syscall events + a frequency-sorted aggregation when the child exits. Requires root
+
+Usage: carrick trace [OPTIONS] [COMMAND]...
+
+Arguments:
+  [COMMAND]...
+          
+
+Options:
+  -F, --flowindent
+          Enable dtrace(1) `-F` style flow indentation. Each `entry/` or `return/` event in the live stream is indented by call depth, making it easier to follow nested syscall paths
+
+  -s, --script <SCRIPT>
+          Path to a custom D script to run instead of the bundled syscall tracer. Lets you write a targeted probe (e.g. fire only on a specific errno) without paying the full per-syscall stream cost. The script sees the same carrick USDT providers
+
+      --require-script-exit
+          Require a custom D script to terminate with `exit(0)`; missing or nonzero terminal receipts fail the trace. Legacy custom scripts retain their lossy/interruption-only acceptance unless opted in
+
+      --profile <PROFILE>
+          Run one of Carrick\'s bounded, machine-readable DSR profiles
+          
+          [possible values: hvpatch-carrier-cpu-low-rate, hvpatch-frame-cow, hvpatch-exec-runtime-stages, hvpatch-core-lifecycle, hvpatch-identity-host-safety, hvpatch-k1-lifecycle, native-amplification]
+
+      --summary-jsonl <FILE>
+          Atomically publish the parsed profile as versioned JSONL
+
+      --core-artifact <FILE>
+          Exact crash-produced core whose bytes the HVPatch lifecycle receipt must authenticate. Required for `hvpatch-core-lifecycle` and rejected for every other profile
+
+      --profile-bound-seconds <SECONDS>
+          Override the profile\'s capture bound, in seconds (multiple of 10)
+
+      --preflight-quiet-host
+          Refuse to capture on a host that is not quiet, and record what it settled to in the stream header.
+          
+          Waits for the one-minute load average to settle, then aborts if a `yes` load generator or a stray `carrick:` guest is still running. A contended host produces a CPU-ns figure that reads exactly like a real one, which is why this refuses rather than warns. Only `native-amplification` has a header field for the receipt today, so the flag is refused on other profiles rather than silently doing nothing.
+
+  -o, --trace-out <FILE>
+          Write DTrace events + aggregations to this file instead of stdout. Essential when tracing an interactive (`-t`) guest: without it the probe output intermixes with the guest\'s own terminal stream. The traced command\'s stdio is left untouched
+
+      --forward-env <KEY=VAL>
+          Internal: `KEY=VAL` env vars to set in the traced child. Used by the sudo re-exec to carry CARRICK_* vars across `sudo`\'s env_reset (which would otherwise strip them) without needing SETENV in sudoers - CLI args survive sudo where env vars don\'t
+
+      --store <STORE>
+          [env: CARRICK_HOME=]
+
+  -h, --help
+          Print help (see a summary with \'-h\')
+```
+
+stderr=""
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    completed_inotify_profile_is_listed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.42s
+
+error: test failed, to rerun pass `-p carrick-cli --test trace_profile`

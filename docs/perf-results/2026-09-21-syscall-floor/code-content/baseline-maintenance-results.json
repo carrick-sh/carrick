@@ -1,0 +1,13 @@
+{
+  "runs": [
+    {
+      "sample": 0,
+      "exit_code": 101
+    },
+    {
+      "sample": 1,
+      "exit_code": 101
+    }
+  ],
+  "source_restored": true
+}

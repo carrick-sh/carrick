@@ -1,0 +1,23 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.28s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-48d4edbb97db71d0)
+
+running 1 test
+test vcpu_loop::memory::tests::native_data_activation_outlives_mutation_but_not_execution ... FAILED
+
+failures:
+
+---- vcpu_loop::memory::tests::native_data_activation_outlives_mutation_but_not_execution stdout ----
+
+thread 'vcpu_loop::memory::tests::native_data_activation_outlives_mutation_but_not_execution' (4116487) panicked at crates/carrick-runtime/src/vcpu_loop/memory.rs:1224:52:
+called `Result::unwrap()` on an `Err` value: ForeignTransport(AuthorityUnavailable)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    vcpu_loop::memory::tests::native_data_activation_outlives_mutation_but_not_execution
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 605 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p carrick-runtime --lib`

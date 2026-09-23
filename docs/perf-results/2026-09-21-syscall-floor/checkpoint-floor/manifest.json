@@ -1,0 +1,2162 @@
+{
+  "schema_version": 1,
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "source_revision": "sha256:558ef9553142fcdf137260b9700954ed64f537542cb3f36f363349017c379cd9",
+  "source_sha256": {
+    "Cargo.lock": "90ac0958e50d79cf464bc24a52c8c3a056e0014ed02bd4248acd02f3726db840",
+    "Cargo.toml": "e53212107184126bd23383c352cce6a203cc0ec4ee0d0814ea8f4a3fef258685",
+    "conformance-contracts/contracts/anonymous-discard-edges.toml": "333db27774b05d2a7dce1e52feb9406e66c9f61e6006f8c27bce635575a1b6af",
+    "conformance-contracts/contracts/anonymous-discard-no-scrub.toml": "7814b14e2ccc341037075e254a15658b1973c9e8aeb31c1b226a0cfeef941e23",
+    "conformance-contracts/contracts/anonymous-discard.toml": "032e1dee5f252d072bd7c6dd7a5b850e302a85ad303f7497d12fc557c18a59a7",
+    "conformance-contracts/contracts/current-read-reuse.toml": "48b398a4900cc863cfce2e0f06935f8d1252c48cc9d3fccbadf2565062186551",
+    "conformance-contracts/contracts/executor-admission.toml": "c6d7200bd3ec7152f49d6459444571bafb5a0ee2595bf0bfead94ea6a49e8f36",
+    "conformance-contracts/contracts/fresh-publication-maintenance.toml": "4f5025c588ee9b896438b9331a86ec61b54e4973a50527e0f4b183161bf8b7fe",
+    "conformance-contracts/contracts/inotify-watch-churn.toml": "899ce071068b918b5b631e2f1af2e848643b4f50adc94c0ddaa904444fb9bb9f",
+    "conformance-contracts/contracts/native-data-activation.toml": "b9dde84e2c8d70f29b6a146f35dc10d87f7156b0e0031b5be2dec7ca4cc9cbc5",
+    "conformance-contracts/contracts/native-data-demand.toml": "066da6bb1c20cf5142ac0a71fd6594f7958caa299dd383b47c32a9c54553f5a7",
+    "conformance-contracts/contracts/native-execution-scope.toml": "d2f4fdc5cec9dc9b36bf77e88643beac19464dcfcb09b445be670786042ee684",
+    "conformance-contracts/contracts/native-synchronous-syscall.toml": "ad0763e20111173f8654d47a44b0800dc50b87c2c7db3771e65d40af1a2533f6",
+    "conformance-contracts/contracts/native-syscall-buffers.toml": "63756a42b8543ffbe53d24eca04214cfb7f61782bb01f03495f2e884aad2cc26",
+    "conformance-contracts/contracts/retained-fragment-query.toml": "a08765ad0fe538e132ec9c10bb787028c9dec2acab480093c07ff42e0e147277",
+    "conformance-contracts/contracts/scrub-remap-query.toml": "316545654fa0b8fc6e14cdd37de9752165f0c63bb8dbbf2b04c4c0e07e3485aa",
+    "conformance-contracts/contracts/signal-lease-gap.toml": "d309146c434cd0c031577f80b8e021ccb89a18db4f850741818bd696bef676c7",
+    "conformance-contracts/contracts/stat-allocation.toml": "d4ab398f04a9b5f7ad8349cd3323d728ff893939da6ea6caed9c7636bbdc3938",
+    "conformance-contracts/contracts/syscall-captured-stack.toml": "348e49667b21dd5bf3dae3c5da2dbc8485bcd939f6645f6633c8dc36820ae6ab",
+    "conformance-contracts/inventory.json": "ddad1312aaaa89cb6bd44b64d4df4f15be6b4b0bf30d8948f668d83cc198ae5a",
+    "conformance-contracts/surfaces.toml": "bf5f47db52606f34d520378dfa346c6eaad498ebda851545408b1090bfda4c54",
+    "conformance-probes/src/bin/perf_inotify09_scale.rs": "7f37827a8a804c88831a0c4b0a5f34cc243f4044d32cbdc8cf4f7f6e0a998b93",
+    "conformance-probes/src/bin/writeseek.rs": "e55936ec7788b3241304d4ebb69ee8c8932568dd150a093fa1eb6e32aaa6f3e0",
+    "crates/carrick-aarch64/Cargo.toml": "b666014436db50bb35df8058f25bf56fd104eace68d9b67fbe44c684c21498e1",
+    "crates/carrick-aarch64/src/anonymous_discard.rs": "c6268ba7c12b49268b21b66e55f0cd3f91c559029a68263aa6f09c89aafa1c17",
+    "crates/carrick-aarch64/src/engine.rs": "7895af4a4ff779afc2dc4c86c08c0dee71128728c2055dda0145e432737fcfa9",
+    "crates/carrick-aarch64/src/lib.rs": "22c19b993f015439c3883685d976a5415fb18569e4e1fdd385e25431ea5b74e1",
+    "crates/carrick-aarch64/src/stage1_authority.rs": "b25889be4926b79d1da20da2140fa5ba05215c86c7df58b77df6364758af9f79",
+    "crates/carrick-aarch64/src/vmm.rs": "166652f45d69cfaa96884f7308ae5b5732f55a7b9061a1ca8cf71b9ed9f97603",
+    "crates/carrick-cli/tests/probe-oracle/arm64-gnu/writeseek": "1c8fcb4bbf2ab63dac41a7d6ba614b1b34c09d66766a2c7c00971d6ba4ef79d4",
+    "crates/carrick-cli/tests/probe-oracle/arm64-musl/writeseek": "1c8fcb4bbf2ab63dac41a7d6ba614b1b34c09d66766a2c7c00971d6ba4ef79d4",
+    "crates/carrick-conformance-contract/tests/claims.rs": "70cb2dfc29eee6377c5bb1f995a0591e59a9136751412c5be61683986510b8f6",
+    "crates/carrick-conformance-contract/tests/evaluate.rs": "94c18dc8a92123a97b92a7bfbe2397f51d828a8913ed666645a4b176f05eae28",
+    "crates/carrick-conformance-next/tests/deferred_anonymous.rs": "3cf00df12b1f49d372e000b87f2b45327d8b758984b80c53f1f8c003de734208",
+    "crates/carrick-conformance-next/tests/fixtures/inotify_lifecycle.py": "9906d6d685292adaa986f408c1b05f1e5bfeaeb4c78e24f69d7022ba2940013f",
+    "crates/carrick-conformance-next/tests/fixtures/pristine_scrub.py": "2b8b2187c9b92e9696d6f07fd5337a4979d9ba5de87289b2ce6587f4bae15897",
+    "crates/carrick-conformance-next/tests/fixtures/subprocess_kill_compute.py": "83b89dfdb49db0bd306743e00d774ce1bace32e298e37852503ee3f28e0083f5",
+    "crates/carrick-conformance-next/tests/fixtures/unaligned_discard.py": "fd2165d4860b6ff2e0015a07c96dc624ab0bdebb4d5fbd3df81bbd8838957572",
+    "crates/carrick-conformance-next/tests/inotify_lifecycle.rs": "a6eb8d2da7fbeee4bd4a1f26d39910e505cf358ceb37c9005e0f88ccc1ad763f",
+    "crates/carrick-conformance-next/tests/signal_lease_gap.rs": "69d758b548c0349496dabbc425da803cddc24a924f55d3473a4e1d12991091b8",
+    "crates/carrick-conformance-next/tests/write_seek_lease.rs": "5d6c5ecc7d8e7298e3c01304a5c1fcf616404d4847c2d41eadd4cd1a9ca0c9f2",
+    "crates/carrick-guest-mem/src/lib.rs": "f1e1d098161b301e0ac41096dc6e022e1038746a0d8e8e754a0bac0da106653e",
+    "crates/carrick-hal/src/foreign_mm.rs": "30a066d75a1e186e09f1d650d0c9bcac83dffc9915291210ff6efb0df929565d",
+    "crates/carrick-hal/src/lib.rs": "b4fd57cdb82436af9e2099443b5f5a4a7158070545da70edd38dfc89e204a2eb",
+    "crates/carrick-hal/src/threaded.rs": "3b8aed28eb2b6538811bc3f8a96c8ecd16f7b2af58c4ab3729211cdd6c7b0b50",
+    "crates/carrick-hal/src/trap.rs": "52b8dfd68dbc3272e249fb482bebf9a07e5d0ed6410ae6ca362f37125ac55df4",
+    "crates/carrick-hal/src/x8664_arch.rs": "e6ec074a85fb82ffa5011c70befa0c2942f01a6e15837a6a28a0ff8b87805d63",
+    "crates/carrick-kernel-example/Cargo.toml": "8a6d7752859d0b09fd941b05742dbfa18b6489b5c916455442d616b1519d1920",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor.rs": "746731da5b8da21086cade071ffca5b5156855323a710860697d63603b4fe995",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/allocations.rs": "781a5a772c02fb398e06bee337b9e99c73c07afaf205e5f5460382f70b62a162",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.S": "3bd151f4a3279a372d9aca1de25f05a4995b824f7ea4be290337fc707c4c0b95",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.rs": "03b036e38906d612ed6deb6831040e5a9fad5e2912bacdf205ab8de56cf78635",
+    "crates/carrick-kernel-example/src/contracts.rs": "89be01455534a1725c7f2e6dfbd555b569ec8672b465e51714cbc07ec193fb04",
+    "crates/carrick-kernel-example/tests/contracts.rs": "0a2cf7fdd316e6c17b52fb98f76fa6d800b5b22b5caac2dff9f5d9134ace773a",
+    "crates/carrick-kernel-example/tests/native_execution_scope.rs": "76c0d5d7dec35f2e039c387a32a4ad3bf9b4e0343d8827b9d8bd6ecec49c47c4",
+    "crates/carrick-kernel/Cargo.toml": "4c2d63f45840035fe9c50846955a20b4545ee89e1fd833f932ddbedc4f845e42",
+    "crates/carrick-kernel/src/dispatch/fd_table.rs": "9e60026af9559c361b38976ba11d4f3a38baa1caed2f5ee50af5eedc5bb862b2",
+    "crates/carrick-kernel/src/dispatch/format_stat.rs": "ccc8c586b1bed5ad8ba33333084f3f9101e69f09f9da4ce4445d33a1804febc4",
+    "crates/carrick-kernel/src/dispatch/fs/locks.rs": "3693a1f2d124c8cb54c21d27ffa1aada688333361ce36bf4136788156d98a0c5",
+    "crates/carrick-kernel/src/dispatch/fs/lookup.rs": "80075c0e81ebf7c02eed96f70e85509a0a149ec56fba1132e216aab335c9997a",
+    "crates/carrick-kernel/src/dispatch/fs/notify.rs": "b2a3c0e6c7f366faa646523f397dec6a0b6b000ad19894bfbb91d1b73bff253f",
+    "crates/carrick-kernel/src/dispatch/fs/rw.rs": "98155a1670fc429fc10ae7bbb7d6187897488b8836d26d5d9b0383ff5e5f39fa",
+    "crates/carrick-kernel/src/dispatch/fs/stat.rs": "7c3e9c8e10cd78209bc11e3f846a54b3ef36030d9fd825437f6babcfde069e40",
+    "crates/carrick-kernel/src/dispatch/fs/tests.rs": "6e6b687616313d32d82e993fc2c7838a874374069bd163750be4761bdebe61f7",
+    "crates/carrick-kernel/src/dispatch/mem/madvise.rs": "131f410c34a48490bde8b29cf4785e57d77ca20f2fdf553ecc470e5f88a14c20",
+    "crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs": "e916fc12233a1ad568e936417db65cf5f92ac08b1407ee26ca1c44edc4819b94",
+    "crates/carrick-kernel/src/dispatch/mem/tests.rs": "0a732219d6b7d1fc2551ffd7ea83aace7766aa422b02b8ff56437a246a3138d2",
+    "crates/carrick-kernel/src/dispatch/mm_authority.rs": "f1f1fb007c6caf79ed1ff114fdc7b3030c1d00f74c2ddbcce3a2227ac00f63b3",
+    "crates/carrick-kernel/src/dispatch/mm_mutation.rs": "a7277d63e349fc746d8793a13bb1d365d1511f6e175bd3e155f49df9ded79bd7",
+    "crates/carrick-kernel/src/dispatch/mm_quiesce.rs": "10e3cc39472f3b57522da49e1bcb8c62f88a28c70ddfa95d425a7adaa02aa907",
+    "crates/carrick-kernel/src/dispatch/mod.rs": "12cd13e624809e98bb355d0e11e79bba44b6d50056510a11c967e8d432913d20",
+    "crates/carrick-kernel/src/dispatch/native_execution.rs": "e83155d8bab81b6ace1048f715b88d2012f76f698b94dd3986e92afa4c1bcd6e",
+    "crates/carrick-kernel/src/dispatch/native_execution/tests.rs": "243b847d98e06a9c46980b6f30200e1f9981f816ec6e2e999d6fb3ae13542343",
+    "crates/carrick-kernel/src/dispatch/net.rs": "0977e21c7fc69deeed653e31b09b4dab77054c7c404365dc2042df8e129be08a",
+    "crates/carrick-kernel/src/dispatch/request.rs": "d870034c3ea563ada58b8e7028b647c8c41dbdd167fba968b9f344e745751083",
+    "crates/carrick-kernel/src/dispatch/rootfs_helpers.rs": "9f25a5ce7ad4c7261b1a5e43c6c0477e6f249637e48367fba6580d4de528e5e2",
+    "crates/carrick-kernel/src/dispatch/tests.rs": "9a82eba79d52db471554a35c49137fccc371a265d15b248fbb71ba1141258818",
+    "crates/carrick-kernel/src/inotify.rs": "69f7b2d4c4ce914adea4b1a4193ce0f5117319413e092fb6d0374b0b9292bee6",
+    "crates/carrick-kernel/src/kernel/address.rs": "4fd4940d1993279886adbd45d8f0ff208a3402c8e9557c1b002aa42182e5ae74",
+    "crates/carrick-kernel/src/kernel/frame_inventory.rs": "b91c9c75ce2276a0d1350ab3048237b9841ccd3c1b31bd18d60759fb19045ac6",
+    "crates/carrick-kernel/src/kernel/guest_execution.rs": "ab97e63144e5e5413ab271ab8ff84f4458291a2c0acd09150576cc3eba6ef3c9",
+    "crates/carrick-kernel/src/kernel/mm_access.rs": "0241700c6046a850161b72e815dbe333f64553750c6556f3bf9293c72bd31da9",
+    "crates/carrick-kernel/src/kernel/mm_access/current_read.rs": "b8397008f315e87011fdda640b4a433f384589e331f9d297ed14d6c25b8660fb",
+    "crates/carrick-kernel/src/kernel/mod.rs": "49ddb6c541129f2634f5f4ea09bcfe1b5dab32c9c92a19d19dbd0031246f28d4",
+    "crates/carrick-observability/src/probes.rs": "287a3220b432de2cea4b2f1ba70c7cf10fbc10657cb0cc87c86f12266d30c180",
+    "crates/carrick-observability/src/work_meter.rs": "9a0ccef9c527e408585ddbbc818909ebd89c4845264fc3956fab196a8a3e03d1",
+    "crates/carrick-runtime/Cargo.toml": "3ea66a9a2a008870b90436861d77d29cb556d8f37f36a51acde91f8ec62aecdb",
+    "crates/carrick-runtime/src/hvpatch/stage1_mm.rs": "41e777b54b650f2889967fb29016d156ff1379900ef270803b3e47e3181280ab",
+    "crates/carrick-runtime/src/runtime.rs": "1a2645a45e9554af6c86f810a5b75c05897223887680893c1a734a21694e32c1",
+    "crates/carrick-runtime/src/vcpu_loop/binding.rs": "5cbd6af11d487cc88b490e54b197224b76477d49eae53d6307d72be29b91d421",
+    "crates/carrick-runtime/src/vcpu_loop/exec.rs": "3d668eeefcf1d4f305b0ef48b6e0e8405cee6471416c7af871c1369057dd9f8a",
+    "crates/carrick-runtime/src/vcpu_loop/executor/tests.rs": "eab149cba4707fb640d20b7aaeccbef134517f0fc802f2ea31b5025c258de41a",
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs": "6de726e7df69a9a50871429b4031576a8bf8c1e8d26cb8e01ac06ebbd952222c",
+    "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs": "e2c15ea7c5b6cf7f42aec19fad9f87be39009c47a22d110275505d2a882a956f",
+    "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs": "521a7b4cbe48444724a965db2ecae719062a9209f51913a373b2557aae04cdce",
+    "crates/carrick-runtime/src/vcpu_loop/mod.rs": "9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e",
+    "crates/carrick-runtime/tests/runtime_loop.rs": "afc588c91902f25cccef16df02b8d563e1e81101d4b1d355df939b4408e2dbbc",
+    "crates/carrick-runtime/tests/syscall_process.rs": "2bdefac9ace07e3194fae25816e66a530c7dff3ef069c2a610f411ec3f90bea0",
+    "crates/carrick-vmm-hvf/Cargo.toml": "212f1e713b736faca8ac4c549ba7cfc332bcbe6fa293dafb6ad948f13d13d638",
+    "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs": "8e486381663c841436cc51c11dfa8a90924b09602195c32bc711766f5dfd7e0e",
+    "crates/carrick-vmm-hvf/src/trap.rs": "8bda92f14883fb2f222be0004ac000f82b1037c3772ab0c574b47927dbab04c4",
+    "crates/carrick-vmm-hvf/src/trap/cow_engine.rs": "d504fcb43c48e6708a2b99c76303575d5e1b984273ddf1189686927893b7ca9c",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "4909f5d64de92d10851a34013caab820648d32bf0d3b2bf0608b1dcd8e4533c2",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm/current_read.rs": "fcf13f33ff6771d4b67b6e48fc629c4bbe12eda6ce37f1d590012343c698f8b5",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs": "a88a83bbf3d9c94bb20c51225ae76e7c7a1398d2b5ed6403da062775c4d33179",
+    "crates/carrick-vmm-hvf/src/trap/guest_memory.rs": "6ed1b48bdb88004df125531f5adf482a0bed711c985df907b010097fc4011895",
+    "crates/carrick-vmm-hvf/src/trap/memory_protection.rs": "1f304a012a8616d191a90b87ea979700181114e6900b06f776bc9bac753468c9",
+    "crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs": "2c3b9c7c5aee0b1dc45a0bed090ff963c4fd4785e5a3401ed10e5263933f03cb",
+    "crates/carrick-vmm-kvm/src/kvm_aarch64_engine.rs": "c7633cc37149c0685021b96ff4460cc98868f141a269083b84777979957e4a16",
+    "experiments/native-syscall-slice/Cargo.lock": "a70475e51215b043381a64c77d91bf63228378b8b15bca7e92df9eeafbfd6dc1",
+    "experiments/native-syscall-slice/Cargo.toml": "37788f6db78dccabea6214b8e76cc4d6dd557e242e819fceb6c263ea891747db",
+    "experiments/native-syscall-slice/README.md": "79993a651f38c4f8fe938b35a54e389de8b7cefcb8d1367f3869a917cf642093",
+    "experiments/native-syscall-slice/fixtures/build.sh": "32d9d4cfd8f28b806475caea2cce9a15a26a3d77cb4379e46de42d2c8814935f",
+    "experiments/native-syscall-slice/fixtures/guest.ld": "887857d4cea5d0cbdc1ca98902125314763a475ab4c457e8d52c63fe344eeb62",
+    "experiments/native-syscall-slice/fixtures/host-compute-floor.c": "cc10f95ebe4d1646e4b68b220a5526be337c38d6d278b06518a3bce29014908c",
+    "experiments/native-syscall-slice/fixtures/watch.S": "b9aaa5d952620e64c3538f7cb7e8fd428e87b3a8a3826bc69cc538c96c583f68",
+    "experiments/native-syscall-slice/measure.py": "455bea04fd0d7e0fd730faaf46728efcc24d37500509ebae41c3d2b3bca0c85e",
+    "experiments/native-syscall-slice/src/allocations.rs": "60d854c0662c2c3ffd5496f4548c27b86f76f91f6684f8d7249018c273ebfadf",
+    "experiments/native-syscall-slice/src/carrier_memory.rs": "ef15220812eb376da45f0ff8c06fe66cfda636a6b0c04eca579a7b69fea78c2c",
+    "experiments/native-syscall-slice/src/gateway.S": "0eb6e54da30ec124e288eee2bd6321efe3653f78587d448530424ee683a2a987",
+    "experiments/native-syscall-slice/src/lib.rs": "407a2006a6aaefd761628987fc2d624a13fa6f6e4fd3046745e7de44a8ad7ed5",
+    "experiments/native-syscall-slice/src/main.rs": "5558985ccc32b1b76a5b11362fe146439540de110eec6a87e2d37f35581c6b9b",
+    "experiments/native-syscall-slice/src/native.rs": "f134f4e82a3cd1ab4ea71525f369ddb0472dee27c62ba76bb4a5035bfe5e6be7",
+    "experiments/native-syscall-slice/tests/scoped_execution.rs": "a28d3aae3f565d81edce73370a344a60c825bf973f4d3166f5b7ae8fe64ccc8c",
+    "scripts/bpftrace/oracle-syscall-mix.bt": "efb6d97cf3a02e263f6fe16e7e108eba1d8e3308aafdb38c61a55f07131512b1",
+    "scripts/dtrace/hvpatch-inotify-transport-control.d": "f469839538fc044dad9ec0c902049566a52ccd3407094b0237aaabc1820fbfbf",
+    "scripts/dtrace/hvpatch-madvise-discard-outcomes.d": "d14574346089a34f69360372c61aaed9d09f949ccc4a8e18c52f6dec88a5a19e",
+    "scripts/dtrace/hvpatch-madvise-shape.d": "33e17c4b58a69b992330ff2a7b0b7239c75f7fd819df0ccb83cacc126d6e47da",
+    "scripts/dtrace/hvpatch-node-child-stages.d": "da432e1c4ebacf64cb594c98dd3d9612bb49b54f2e4c4ea95e133f1fc13d3525",
+    "scripts/dtrace/hvpatch-stage1-maintenance-callers.d": "48b92080ff65df7ce7d454b9395f08d11d2b493de7215b1dd08db34161ce332e",
+    "scripts/dtrace/hvpatch-syscall-population.d": "60d75b0e596697a122e28742895b4b1f6923b241c4ea1cd9b6f95b0952c6d75e",
+    "scripts/dtrace/hvpatch-syscall-service-budget.d": "a7d2c4a04f5ee57f38ced0a6f0e57a38b31dbc3b4b98c5ddd97bde982cc3e288",
+    "scripts/dtrace/hvpatch-topology-caller-budget.d": "442d3a58df56f1fbd55e02d5643c9f400c2e5157fb521bbaa59e83087bcfc8ff",
+    "scripts/dtrace/hvpatch-topology-operation-budget.d": "664f6a052a9c501f0b53b4b6061b4c68a40f309587c7447ac18d374f7f4ffad0",
+    "scripts/perf/io-floor.c": "d77ec34dbc25793dd4befff9b8b89fa3e56ce01e5c64346e905bdbf6746b037d",
+    "scripts/perf/io_floor.py": "7217702024bccebbee54e743b3092052e8c4e5260b0a5d82b8d205cd8c917a30"
+  },
+  "measured_source_revision": "sha256:602f47f3cd175649d858e229d13be1611b482079592da37beb3bde095aea005c",
+  "measured_source_sha256": {
+    "Cargo.lock": "90ac0958e50d79cf464bc24a52c8c3a056e0014ed02bd4248acd02f3726db840",
+    "Cargo.toml": "e53212107184126bd23383c352cce6a203cc0ec4ee0d0814ea8f4a3fef258685",
+    "conformance-contracts/contracts/anonymous-discard-edges.toml": "333db27774b05d2a7dce1e52feb9406e66c9f61e6006f8c27bce635575a1b6af",
+    "conformance-contracts/contracts/anonymous-discard-no-scrub.toml": "7814b14e2ccc341037075e254a15658b1973c9e8aeb31c1b226a0cfeef941e23",
+    "conformance-contracts/contracts/anonymous-discard.toml": "032e1dee5f252d072bd7c6dd7a5b850e302a85ad303f7497d12fc557c18a59a7",
+    "conformance-contracts/contracts/current-read-reuse.toml": "48b398a4900cc863cfce2e0f06935f8d1252c48cc9d3fccbadf2565062186551",
+    "conformance-contracts/contracts/executor-admission.toml": "c6d7200bd3ec7152f49d6459444571bafb5a0ee2595bf0bfead94ea6a49e8f36",
+    "conformance-contracts/contracts/fresh-publication-maintenance.toml": "4f5025c588ee9b896438b9331a86ec61b54e4973a50527e0f4b183161bf8b7fe",
+    "conformance-contracts/contracts/inotify-watch-churn.toml": "899ce071068b918b5b631e2f1af2e848643b4f50adc94c0ddaa904444fb9bb9f",
+    "conformance-contracts/contracts/native-data-activation.toml": "b9dde84e2c8d70f29b6a146f35dc10d87f7156b0e0031b5be2dec7ca4cc9cbc5",
+    "conformance-contracts/contracts/native-execution-scope.toml": "d2f4fdc5cec9dc9b36bf77e88643beac19464dcfcb09b445be670786042ee684",
+    "conformance-contracts/contracts/native-synchronous-syscall.toml": "ad0763e20111173f8654d47a44b0800dc50b87c2c7db3771e65d40af1a2533f6",
+    "conformance-contracts/contracts/native-syscall-buffers.toml": "63756a42b8543ffbe53d24eca04214cfb7f61782bb01f03495f2e884aad2cc26",
+    "conformance-contracts/contracts/retained-fragment-query.toml": "a08765ad0fe538e132ec9c10bb787028c9dec2acab480093c07ff42e0e147277",
+    "conformance-contracts/contracts/scrub-remap-query.toml": "316545654fa0b8fc6e14cdd37de9752165f0c63bb8dbbf2b04c4c0e07e3485aa",
+    "conformance-contracts/contracts/signal-lease-gap.toml": "d309146c434cd0c031577f80b8e021ccb89a18db4f850741818bd696bef676c7",
+    "conformance-contracts/contracts/stat-allocation.toml": "d4ab398f04a9b5f7ad8349cd3323d728ff893939da6ea6caed9c7636bbdc3938",
+    "conformance-contracts/contracts/syscall-captured-stack.toml": "348e49667b21dd5bf3dae3c5da2dbc8485bcd939f6645f6633c8dc36820ae6ab",
+    "conformance-contracts/inventory.json": "ddad1312aaaa89cb6bd44b64d4df4f15be6b4b0bf30d8948f668d83cc198ae5a",
+    "conformance-probes/src/bin/perf_inotify09_scale.rs": "7f37827a8a804c88831a0c4b0a5f34cc243f4044d32cbdc8cf4f7f6e0a998b93",
+    "conformance-probes/src/bin/writeseek.rs": "e55936ec7788b3241304d4ebb69ee8c8932568dd150a093fa1eb6e32aaa6f3e0",
+    "crates/carrick-aarch64/Cargo.toml": "b666014436db50bb35df8058f25bf56fd104eace68d9b67fbe44c684c21498e1",
+    "crates/carrick-aarch64/src/anonymous_discard.rs": "c6268ba7c12b49268b21b66e55f0cd3f91c559029a68263aa6f09c89aafa1c17",
+    "crates/carrick-aarch64/src/engine.rs": "7895af4a4ff779afc2dc4c86c08c0dee71128728c2055dda0145e432737fcfa9",
+    "crates/carrick-aarch64/src/lib.rs": "22c19b993f015439c3883685d976a5415fb18569e4e1fdd385e25431ea5b74e1",
+    "crates/carrick-aarch64/src/stage1_authority.rs": "b25889be4926b79d1da20da2140fa5ba05215c86c7df58b77df6364758af9f79",
+    "crates/carrick-aarch64/src/vmm.rs": "166652f45d69cfaa96884f7308ae5b5732f55a7b9061a1ca8cf71b9ed9f97603",
+    "crates/carrick-cli/tests/probe-oracle/arm64-gnu/writeseek": "1c8fcb4bbf2ab63dac41a7d6ba614b1b34c09d66766a2c7c00971d6ba4ef79d4",
+    "crates/carrick-cli/tests/probe-oracle/arm64-musl/writeseek": "1c8fcb4bbf2ab63dac41a7d6ba614b1b34c09d66766a2c7c00971d6ba4ef79d4",
+    "crates/carrick-conformance-contract/tests/claims.rs": "70cb2dfc29eee6377c5bb1f995a0591e59a9136751412c5be61683986510b8f6",
+    "crates/carrick-conformance-contract/tests/evaluate.rs": "94c18dc8a92123a97b92a7bfbe2397f51d828a8913ed666645a4b176f05eae28",
+    "crates/carrick-conformance-next/tests/deferred_anonymous.rs": "3cf00df12b1f49d372e000b87f2b45327d8b758984b80c53f1f8c003de734208",
+    "crates/carrick-conformance-next/tests/fixtures/inotify_lifecycle.py": "9906d6d685292adaa986f408c1b05f1e5bfeaeb4c78e24f69d7022ba2940013f",
+    "crates/carrick-conformance-next/tests/fixtures/pristine_scrub.py": "2b8b2187c9b92e9696d6f07fd5337a4979d9ba5de87289b2ce6587f4bae15897",
+    "crates/carrick-conformance-next/tests/fixtures/subprocess_kill_compute.py": "83b89dfdb49db0bd306743e00d774ce1bace32e298e37852503ee3f28e0083f5",
+    "crates/carrick-conformance-next/tests/fixtures/unaligned_discard.py": "fd2165d4860b6ff2e0015a07c96dc624ab0bdebb4d5fbd3df81bbd8838957572",
+    "crates/carrick-conformance-next/tests/inotify_lifecycle.rs": "a6eb8d2da7fbeee4bd4a1f26d39910e505cf358ceb37c9005e0f88ccc1ad763f",
+    "crates/carrick-conformance-next/tests/signal_lease_gap.rs": "69d758b548c0349496dabbc425da803cddc24a924f55d3473a4e1d12991091b8",
+    "crates/carrick-conformance-next/tests/write_seek_lease.rs": "5d6c5ecc7d8e7298e3c01304a5c1fcf616404d4847c2d41eadd4cd1a9ca0c9f2",
+    "crates/carrick-guest-mem/src/lib.rs": "f1e1d098161b301e0ac41096dc6e022e1038746a0d8e8e754a0bac0da106653e",
+    "crates/carrick-hal/src/foreign_mm.rs": "30a066d75a1e186e09f1d650d0c9bcac83dffc9915291210ff6efb0df929565d",
+    "crates/carrick-hal/src/lib.rs": "b4fd57cdb82436af9e2099443b5f5a4a7158070545da70edd38dfc89e204a2eb",
+    "crates/carrick-hal/src/threaded.rs": "3b8aed28eb2b6538811bc3f8a96c8ecd16f7b2af58c4ab3729211cdd6c7b0b50",
+    "crates/carrick-hal/src/trap.rs": "52b8dfd68dbc3272e249fb482bebf9a07e5d0ed6410ae6ca362f37125ac55df4",
+    "crates/carrick-hal/src/x8664_arch.rs": "e6ec074a85fb82ffa5011c70befa0c2942f01a6e15837a6a28a0ff8b87805d63",
+    "crates/carrick-kernel-example/Cargo.toml": "8a6d7752859d0b09fd941b05742dbfa18b6489b5c916455442d616b1519d1920",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor.rs": "746731da5b8da21086cade071ffca5b5156855323a710860697d63603b4fe995",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/allocations.rs": "781a5a772c02fb398e06bee337b9e99c73c07afaf205e5f5460382f70b62a162",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.S": "3bd151f4a3279a372d9aca1de25f05a4995b824f7ea4be290337fc707c4c0b95",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.rs": "03b036e38906d612ed6deb6831040e5a9fad5e2912bacdf205ab8de56cf78635",
+    "crates/carrick-kernel-example/src/contracts.rs": "89be01455534a1725c7f2e6dfbd555b569ec8672b465e51714cbc07ec193fb04",
+    "crates/carrick-kernel-example/tests/contracts.rs": "0a2cf7fdd316e6c17b52fb98f76fa6d800b5b22b5caac2dff9f5d9134ace773a",
+    "crates/carrick-kernel-example/tests/native_execution_scope.rs": "76c0d5d7dec35f2e039c387a32a4ad3bf9b4e0343d8827b9d8bd6ecec49c47c4",
+    "crates/carrick-kernel/Cargo.toml": "4c2d63f45840035fe9c50846955a20b4545ee89e1fd833f932ddbedc4f845e42",
+    "crates/carrick-kernel/src/dispatch/fd_table.rs": "9e60026af9559c361b38976ba11d4f3a38baa1caed2f5ee50af5eedc5bb862b2",
+    "crates/carrick-kernel/src/dispatch/format_stat.rs": "ccc8c586b1bed5ad8ba33333084f3f9101e69f09f9da4ce4445d33a1804febc4",
+    "crates/carrick-kernel/src/dispatch/fs/locks.rs": "3693a1f2d124c8cb54c21d27ffa1aada688333361ce36bf4136788156d98a0c5",
+    "crates/carrick-kernel/src/dispatch/fs/lookup.rs": "80075c0e81ebf7c02eed96f70e85509a0a149ec56fba1132e216aab335c9997a",
+    "crates/carrick-kernel/src/dispatch/fs/notify.rs": "b2a3c0e6c7f366faa646523f397dec6a0b6b000ad19894bfbb91d1b73bff253f",
+    "crates/carrick-kernel/src/dispatch/fs/rw.rs": "98155a1670fc429fc10ae7bbb7d6187897488b8836d26d5d9b0383ff5e5f39fa",
+    "crates/carrick-kernel/src/dispatch/fs/stat.rs": "7c3e9c8e10cd78209bc11e3f846a54b3ef36030d9fd825437f6babcfde069e40",
+    "crates/carrick-kernel/src/dispatch/fs/tests.rs": "6e6b687616313d32d82e993fc2c7838a874374069bd163750be4761bdebe61f7",
+    "crates/carrick-kernel/src/dispatch/mem/madvise.rs": "131f410c34a48490bde8b29cf4785e57d77ca20f2fdf553ecc470e5f88a14c20",
+    "crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs": "e916fc12233a1ad568e936417db65cf5f92ac08b1407ee26ca1c44edc4819b94",
+    "crates/carrick-kernel/src/dispatch/mem/tests.rs": "0a732219d6b7d1fc2551ffd7ea83aace7766aa422b02b8ff56437a246a3138d2",
+    "crates/carrick-kernel/src/dispatch/mm_authority.rs": "f1f1fb007c6caf79ed1ff114fdc7b3030c1d00f74c2ddbcce3a2227ac00f63b3",
+    "crates/carrick-kernel/src/dispatch/mm_mutation.rs": "a7277d63e349fc746d8793a13bb1d365d1511f6e175bd3e155f49df9ded79bd7",
+    "crates/carrick-kernel/src/dispatch/mm_quiesce.rs": "10e3cc39472f3b57522da49e1bcb8c62f88a28c70ddfa95d425a7adaa02aa907",
+    "crates/carrick-kernel/src/dispatch/mod.rs": "12cd13e624809e98bb355d0e11e79bba44b6d50056510a11c967e8d432913d20",
+    "crates/carrick-kernel/src/dispatch/native_execution.rs": "e83155d8bab81b6ace1048f715b88d2012f76f698b94dd3986e92afa4c1bcd6e",
+    "crates/carrick-kernel/src/dispatch/native_execution/tests.rs": "243b847d98e06a9c46980b6f30200e1f9981f816ec6e2e999d6fb3ae13542343",
+    "crates/carrick-kernel/src/dispatch/net.rs": "0977e21c7fc69deeed653e31b09b4dab77054c7c404365dc2042df8e129be08a",
+    "crates/carrick-kernel/src/dispatch/request.rs": "d870034c3ea563ada58b8e7028b647c8c41dbdd167fba968b9f344e745751083",
+    "crates/carrick-kernel/src/dispatch/rootfs_helpers.rs": "9f25a5ce7ad4c7261b1a5e43c6c0477e6f249637e48367fba6580d4de528e5e2",
+    "crates/carrick-kernel/src/dispatch/tests.rs": "9a82eba79d52db471554a35c49137fccc371a265d15b248fbb71ba1141258818",
+    "crates/carrick-kernel/src/inotify.rs": "69f7b2d4c4ce914adea4b1a4193ce0f5117319413e092fb6d0374b0b9292bee6",
+    "crates/carrick-kernel/src/kernel/address.rs": "4fd4940d1993279886adbd45d8f0ff208a3402c8e9557c1b002aa42182e5ae74",
+    "crates/carrick-kernel/src/kernel/frame_inventory.rs": "b91c9c75ce2276a0d1350ab3048237b9841ccd3c1b31bd18d60759fb19045ac6",
+    "crates/carrick-kernel/src/kernel/guest_execution.rs": "ab97e63144e5e5413ab271ab8ff84f4458291a2c0acd09150576cc3eba6ef3c9",
+    "crates/carrick-kernel/src/kernel/mm_access.rs": "0241700c6046a850161b72e815dbe333f64553750c6556f3bf9293c72bd31da9",
+    "crates/carrick-kernel/src/kernel/mm_access/current_read.rs": "b8397008f315e87011fdda640b4a433f384589e331f9d297ed14d6c25b8660fb",
+    "crates/carrick-kernel/src/kernel/mod.rs": "49ddb6c541129f2634f5f4ea09bcfe1b5dab32c9c92a19d19dbd0031246f28d4",
+    "crates/carrick-observability/src/probes.rs": "287a3220b432de2cea4b2f1ba70c7cf10fbc10657cb0cc87c86f12266d30c180",
+    "crates/carrick-observability/src/work_meter.rs": "9a0ccef9c527e408585ddbbc818909ebd89c4845264fc3956fab196a8a3e03d1",
+    "crates/carrick-runtime/Cargo.toml": "3ea66a9a2a008870b90436861d77d29cb556d8f37f36a51acde91f8ec62aecdb",
+    "crates/carrick-runtime/src/hvpatch/stage1_mm.rs": "41e777b54b650f2889967fb29016d156ff1379900ef270803b3e47e3181280ab",
+    "crates/carrick-runtime/src/runtime.rs": "1a2645a45e9554af6c86f810a5b75c05897223887680893c1a734a21694e32c1",
+    "crates/carrick-runtime/src/vcpu_loop/binding.rs": "5cbd6af11d487cc88b490e54b197224b76477d49eae53d6307d72be29b91d421",
+    "crates/carrick-runtime/src/vcpu_loop/exec.rs": "3d668eeefcf1d4f305b0ef48b6e0e8405cee6471416c7af871c1369057dd9f8a",
+    "crates/carrick-runtime/src/vcpu_loop/executor/tests.rs": "eab149cba4707fb640d20b7aaeccbef134517f0fc802f2ea31b5025c258de41a",
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs": "6de726e7df69a9a50871429b4031576a8bf8c1e8d26cb8e01ac06ebbd952222c",
+    "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs": "e2c15ea7c5b6cf7f42aec19fad9f87be39009c47a22d110275505d2a882a956f",
+    "crates/carrick-runtime/src/vcpu_loop/mod.rs": "9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e",
+    "crates/carrick-runtime/tests/runtime_loop.rs": "afc588c91902f25cccef16df02b8d563e1e81101d4b1d355df939b4408e2dbbc",
+    "crates/carrick-runtime/tests/syscall_process.rs": "2bdefac9ace07e3194fae25816e66a530c7dff3ef069c2a610f411ec3f90bea0",
+    "crates/carrick-vmm-hvf/Cargo.toml": "212f1e713b736faca8ac4c549ba7cfc332bcbe6fa293dafb6ad948f13d13d638",
+    "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs": "8e486381663c841436cc51c11dfa8a90924b09602195c32bc711766f5dfd7e0e",
+    "crates/carrick-vmm-hvf/src/trap.rs": "8bda92f14883fb2f222be0004ac000f82b1037c3772ab0c574b47927dbab04c4",
+    "crates/carrick-vmm-hvf/src/trap/cow_engine.rs": "d504fcb43c48e6708a2b99c76303575d5e1b984273ddf1189686927893b7ca9c",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "4909f5d64de92d10851a34013caab820648d32bf0d3b2bf0608b1dcd8e4533c2",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm/current_read.rs": "fcf13f33ff6771d4b67b6e48fc629c4bbe12eda6ce37f1d590012343c698f8b5",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs": "a88a83bbf3d9c94bb20c51225ae76e7c7a1398d2b5ed6403da062775c4d33179",
+    "crates/carrick-vmm-hvf/src/trap/guest_memory.rs": "6ed1b48bdb88004df125531f5adf482a0bed711c985df907b010097fc4011895",
+    "crates/carrick-vmm-hvf/src/trap/memory_protection.rs": "1f304a012a8616d191a90b87ea979700181114e6900b06f776bc9bac753468c9",
+    "crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs": "2c3b9c7c5aee0b1dc45a0bed090ff963c4fd4785e5a3401ed10e5263933f03cb",
+    "crates/carrick-vmm-kvm/src/kvm_aarch64_engine.rs": "c7633cc37149c0685021b96ff4460cc98868f141a269083b84777979957e4a16",
+    "experiments/native-syscall-slice/Cargo.lock": "a70475e51215b043381a64c77d91bf63228378b8b15bca7e92df9eeafbfd6dc1",
+    "experiments/native-syscall-slice/Cargo.toml": "37788f6db78dccabea6214b8e76cc4d6dd557e242e819fceb6c263ea891747db",
+    "experiments/native-syscall-slice/README.md": "79993a651f38c4f8fe938b35a54e389de8b7cefcb8d1367f3869a917cf642093",
+    "experiments/native-syscall-slice/fixtures/build.sh": "32d9d4cfd8f28b806475caea2cce9a15a26a3d77cb4379e46de42d2c8814935f",
+    "experiments/native-syscall-slice/fixtures/guest.ld": "887857d4cea5d0cbdc1ca98902125314763a475ab4c457e8d52c63fe344eeb62",
+    "experiments/native-syscall-slice/fixtures/watch.S": "b9aaa5d952620e64c3538f7cb7e8fd428e87b3a8a3826bc69cc538c96c583f68",
+    "experiments/native-syscall-slice/measure.py": "455bea04fd0d7e0fd730faaf46728efcc24d37500509ebae41c3d2b3bca0c85e",
+    "experiments/native-syscall-slice/src/allocations.rs": "60d854c0662c2c3ffd5496f4548c27b86f76f91f6684f8d7249018c273ebfadf",
+    "experiments/native-syscall-slice/src/carrier_memory.rs": "ef15220812eb376da45f0ff8c06fe66cfda636a6b0c04eca579a7b69fea78c2c",
+    "experiments/native-syscall-slice/src/gateway.S": "0eb6e54da30ec124e288eee2bd6321efe3653f78587d448530424ee683a2a987",
+    "experiments/native-syscall-slice/src/lib.rs": "407a2006a6aaefd761628987fc2d624a13fa6f6e4fd3046745e7de44a8ad7ed5",
+    "experiments/native-syscall-slice/src/main.rs": "5558985ccc32b1b76a5b11362fe146439540de110eec6a87e2d37f35581c6b9b",
+    "experiments/native-syscall-slice/src/native.rs": "f134f4e82a3cd1ab4ea71525f369ddb0472dee27c62ba76bb4a5035bfe5e6be7",
+    "experiments/native-syscall-slice/tests/scoped_execution.rs": "a28d3aae3f565d81edce73370a344a60c825bf973f4d3166f5b7ae8fe64ccc8c",
+    "scripts/bpftrace/oracle-syscall-mix.bt": "efb6d97cf3a02e263f6fe16e7e108eba1d8e3308aafdb38c61a55f07131512b1",
+    "scripts/dtrace/hvpatch-inotify-transport-control.d": "f469839538fc044dad9ec0c902049566a52ccd3407094b0237aaabc1820fbfbf",
+    "scripts/dtrace/hvpatch-madvise-discard-outcomes.d": "d14574346089a34f69360372c61aaed9d09f949ccc4a8e18c52f6dec88a5a19e",
+    "scripts/dtrace/hvpatch-madvise-shape.d": "33e17c4b58a69b992330ff2a7b0b7239c75f7fd819df0ccb83cacc126d6e47da",
+    "scripts/dtrace/hvpatch-node-child-stages.d": "da432e1c4ebacf64cb594c98dd3d9612bb49b54f2e4c4ea95e133f1fc13d3525",
+    "scripts/dtrace/hvpatch-stage1-maintenance-callers.d": "48b92080ff65df7ce7d454b9395f08d11d2b493de7215b1dd08db34161ce332e",
+    "scripts/dtrace/hvpatch-syscall-population.d": "60d75b0e596697a122e28742895b4b1f6923b241c4ea1cd9b6f95b0952c6d75e",
+    "scripts/dtrace/hvpatch-syscall-service-budget.d": "a7d2c4a04f5ee57f38ced0a6f0e57a38b31dbc3b4b98c5ddd97bde982cc3e288",
+    "scripts/dtrace/hvpatch-topology-caller-budget.d": "442d3a58df56f1fbd55e02d5643c9f400c2e5157fb521bbaa59e83087bcfc8ff",
+    "scripts/dtrace/hvpatch-topology-operation-budget.d": "664f6a052a9c501f0b53b4b6061b4c68a40f309587c7447ac18d374f7f4ffad0",
+    "scripts/perf/io-floor.c": "d77ec34dbc25793dd4befff9b8b89fa3e56ce01e5c64346e905bdbf6746b037d",
+    "scripts/perf/io_floor.py": "7217702024bccebbee54e743b3092052e8c4e5260b0a5d82b8d205cd8c917a30",
+    "conformance-contracts/contracts/native-data-demand.toml": "066da6bb1c20cf5142ac0a71fd6594f7958caa299dd383b47c32a9c54553f5a7",
+    "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs": "424929060a8ea3cd8ffd3813014589a722ab14032172dafffcb89680a2bcb986"
+  },
+  "measured_to_final_changes": [
+    "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs"
+  ],
+  "measured_to_final_note": "Only the runtime diagnostic gains a resource-capture arm. Native implementation, guest fixtures, policy and timing runner code are unchanged. Additional final inputs include standalone host-control and registry metadata.",
+  "red_source_revision": "sha256:ca87fd6e9bfb756cb19850c96dda469f23851b0b6e058f3ffbe3e1aa4baff313",
+  "red_source_sha256": {
+    "Cargo.lock": "90ac0958e50d79cf464bc24a52c8c3a056e0014ed02bd4248acd02f3726db840",
+    "Cargo.toml": "e53212107184126bd23383c352cce6a203cc0ec4ee0d0814ea8f4a3fef258685",
+    "conformance-contracts/contracts/anonymous-discard-edges.toml": "333db27774b05d2a7dce1e52feb9406e66c9f61e6006f8c27bce635575a1b6af",
+    "conformance-contracts/contracts/anonymous-discard-no-scrub.toml": "7814b14e2ccc341037075e254a15658b1973c9e8aeb31c1b226a0cfeef941e23",
+    "conformance-contracts/contracts/anonymous-discard.toml": "032e1dee5f252d072bd7c6dd7a5b850e302a85ad303f7497d12fc557c18a59a7",
+    "conformance-contracts/contracts/current-read-reuse.toml": "48b398a4900cc863cfce2e0f06935f8d1252c48cc9d3fccbadf2565062186551",
+    "conformance-contracts/contracts/executor-admission.toml": "c6d7200bd3ec7152f49d6459444571bafb5a0ee2595bf0bfead94ea6a49e8f36",
+    "conformance-contracts/contracts/fresh-publication-maintenance.toml": "4f5025c588ee9b896438b9331a86ec61b54e4973a50527e0f4b183161bf8b7fe",
+    "conformance-contracts/contracts/inotify-watch-churn.toml": "899ce071068b918b5b631e2f1af2e848643b4f50adc94c0ddaa904444fb9bb9f",
+    "conformance-contracts/contracts/native-data-activation.toml": "b9dde84e2c8d70f29b6a146f35dc10d87f7156b0e0031b5be2dec7ca4cc9cbc5",
+    "conformance-contracts/contracts/native-execution-scope.toml": "d2f4fdc5cec9dc9b36bf77e88643beac19464dcfcb09b445be670786042ee684",
+    "conformance-contracts/contracts/native-synchronous-syscall.toml": "ad0763e20111173f8654d47a44b0800dc50b87c2c7db3771e65d40af1a2533f6",
+    "conformance-contracts/contracts/native-syscall-buffers.toml": "63756a42b8543ffbe53d24eca04214cfb7f61782bb01f03495f2e884aad2cc26",
+    "conformance-contracts/contracts/retained-fragment-query.toml": "a08765ad0fe538e132ec9c10bb787028c9dec2acab480093c07ff42e0e147277",
+    "conformance-contracts/contracts/scrub-remap-query.toml": "316545654fa0b8fc6e14cdd37de9752165f0c63bb8dbbf2b04c4c0e07e3485aa",
+    "conformance-contracts/contracts/signal-lease-gap.toml": "d309146c434cd0c031577f80b8e021ccb89a18db4f850741818bd696bef676c7",
+    "conformance-contracts/contracts/stat-allocation.toml": "d4ab398f04a9b5f7ad8349cd3323d728ff893939da6ea6caed9c7636bbdc3938",
+    "conformance-contracts/contracts/syscall-captured-stack.toml": "348e49667b21dd5bf3dae3c5da2dbc8485bcd939f6645f6633c8dc36820ae6ab",
+    "conformance-contracts/inventory.json": "ddad1312aaaa89cb6bd44b64d4df4f15be6b4b0bf30d8948f668d83cc198ae5a",
+    "conformance-probes/src/bin/perf_inotify09_scale.rs": "7f37827a8a804c88831a0c4b0a5f34cc243f4044d32cbdc8cf4f7f6e0a998b93",
+    "conformance-probes/src/bin/writeseek.rs": "e55936ec7788b3241304d4ebb69ee8c8932568dd150a093fa1eb6e32aaa6f3e0",
+    "crates/carrick-aarch64/Cargo.toml": "b666014436db50bb35df8058f25bf56fd104eace68d9b67fbe44c684c21498e1",
+    "crates/carrick-aarch64/src/anonymous_discard.rs": "c6268ba7c12b49268b21b66e55f0cd3f91c559029a68263aa6f09c89aafa1c17",
+    "crates/carrick-aarch64/src/engine.rs": "7895af4a4ff779afc2dc4c86c08c0dee71128728c2055dda0145e432737fcfa9",
+    "crates/carrick-aarch64/src/lib.rs": "22c19b993f015439c3883685d976a5415fb18569e4e1fdd385e25431ea5b74e1",
+    "crates/carrick-aarch64/src/stage1_authority.rs": "b25889be4926b79d1da20da2140fa5ba05215c86c7df58b77df6364758af9f79",
+    "crates/carrick-aarch64/src/vmm.rs": "166652f45d69cfaa96884f7308ae5b5732f55a7b9061a1ca8cf71b9ed9f97603",
+    "crates/carrick-cli/tests/probe-oracle/arm64-gnu/writeseek": "1c8fcb4bbf2ab63dac41a7d6ba614b1b34c09d66766a2c7c00971d6ba4ef79d4",
+    "crates/carrick-cli/tests/probe-oracle/arm64-musl/writeseek": "1c8fcb4bbf2ab63dac41a7d6ba614b1b34c09d66766a2c7c00971d6ba4ef79d4",
+    "crates/carrick-conformance-contract/tests/claims.rs": "9b365902c79e86d74055792d305f62830fa75db55381639243ff3a3a57714769",
+    "crates/carrick-conformance-contract/tests/evaluate.rs": "94c18dc8a92123a97b92a7bfbe2397f51d828a8913ed666645a4b176f05eae28",
+    "crates/carrick-conformance-next/tests/deferred_anonymous.rs": "3cf00df12b1f49d372e000b87f2b45327d8b758984b80c53f1f8c003de734208",
+    "crates/carrick-conformance-next/tests/fixtures/inotify_lifecycle.py": "9906d6d685292adaa986f408c1b05f1e5bfeaeb4c78e24f69d7022ba2940013f",
+    "crates/carrick-conformance-next/tests/fixtures/pristine_scrub.py": "2b8b2187c9b92e9696d6f07fd5337a4979d9ba5de87289b2ce6587f4bae15897",
+    "crates/carrick-conformance-next/tests/fixtures/subprocess_kill_compute.py": "83b89dfdb49db0bd306743e00d774ce1bace32e298e37852503ee3f28e0083f5",
+    "crates/carrick-conformance-next/tests/fixtures/unaligned_discard.py": "fd2165d4860b6ff2e0015a07c96dc624ab0bdebb4d5fbd3df81bbd8838957572",
+    "crates/carrick-conformance-next/tests/inotify_lifecycle.rs": "a6eb8d2da7fbeee4bd4a1f26d39910e505cf358ceb37c9005e0f88ccc1ad763f",
+    "crates/carrick-conformance-next/tests/signal_lease_gap.rs": "69d758b548c0349496dabbc425da803cddc24a924f55d3473a4e1d12991091b8",
+    "crates/carrick-conformance-next/tests/write_seek_lease.rs": "5d6c5ecc7d8e7298e3c01304a5c1fcf616404d4847c2d41eadd4cd1a9ca0c9f2",
+    "crates/carrick-guest-mem/src/lib.rs": "f1e1d098161b301e0ac41096dc6e022e1038746a0d8e8e754a0bac0da106653e",
+    "crates/carrick-hal/src/foreign_mm.rs": "30a066d75a1e186e09f1d650d0c9bcac83dffc9915291210ff6efb0df929565d",
+    "crates/carrick-hal/src/lib.rs": "b4fd57cdb82436af9e2099443b5f5a4a7158070545da70edd38dfc89e204a2eb",
+    "crates/carrick-hal/src/threaded.rs": "3b8aed28eb2b6538811bc3f8a96c8ecd16f7b2af58c4ab3729211cdd6c7b0b50",
+    "crates/carrick-hal/src/trap.rs": "52b8dfd68dbc3272e249fb482bebf9a07e5d0ed6410ae6ca362f37125ac55df4",
+    "crates/carrick-hal/src/x8664_arch.rs": "e6ec074a85fb82ffa5011c70befa0c2942f01a6e15837a6a28a0ff8b87805d63",
+    "crates/carrick-kernel-example/Cargo.toml": "8a6d7752859d0b09fd941b05742dbfa18b6489b5c916455442d616b1519d1920",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor.rs": "746731da5b8da21086cade071ffca5b5156855323a710860697d63603b4fe995",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/allocations.rs": "781a5a772c02fb398e06bee337b9e99c73c07afaf205e5f5460382f70b62a162",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.S": "3bd151f4a3279a372d9aca1de25f05a4995b824f7ea4be290337fc707c4c0b95",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.rs": "03b036e38906d612ed6deb6831040e5a9fad5e2912bacdf205ab8de56cf78635",
+    "crates/carrick-kernel-example/src/contracts.rs": "89be01455534a1725c7f2e6dfbd555b569ec8672b465e51714cbc07ec193fb04",
+    "crates/carrick-kernel-example/tests/contracts.rs": "0a2cf7fdd316e6c17b52fb98f76fa6d800b5b22b5caac2dff9f5d9134ace773a",
+    "crates/carrick-kernel-example/tests/native_execution_scope.rs": "76c0d5d7dec35f2e039c387a32a4ad3bf9b4e0343d8827b9d8bd6ecec49c47c4",
+    "crates/carrick-kernel/Cargo.toml": "4c2d63f45840035fe9c50846955a20b4545ee89e1fd833f932ddbedc4f845e42",
+    "crates/carrick-kernel/src/dispatch/fd_table.rs": "9e60026af9559c361b38976ba11d4f3a38baa1caed2f5ee50af5eedc5bb862b2",
+    "crates/carrick-kernel/src/dispatch/format_stat.rs": "ccc8c586b1bed5ad8ba33333084f3f9101e69f09f9da4ce4445d33a1804febc4",
+    "crates/carrick-kernel/src/dispatch/fs/locks.rs": "3693a1f2d124c8cb54c21d27ffa1aada688333361ce36bf4136788156d98a0c5",
+    "crates/carrick-kernel/src/dispatch/fs/lookup.rs": "80075c0e81ebf7c02eed96f70e85509a0a149ec56fba1132e216aab335c9997a",
+    "crates/carrick-kernel/src/dispatch/fs/notify.rs": "b2a3c0e6c7f366faa646523f397dec6a0b6b000ad19894bfbb91d1b73bff253f",
+    "crates/carrick-kernel/src/dispatch/fs/rw.rs": "98155a1670fc429fc10ae7bbb7d6187897488b8836d26d5d9b0383ff5e5f39fa",
+    "crates/carrick-kernel/src/dispatch/fs/stat.rs": "7c3e9c8e10cd78209bc11e3f846a54b3ef36030d9fd825437f6babcfde069e40",
+    "crates/carrick-kernel/src/dispatch/fs/tests.rs": "6e6b687616313d32d82e993fc2c7838a874374069bd163750be4761bdebe61f7",
+    "crates/carrick-kernel/src/dispatch/mem/madvise.rs": "131f410c34a48490bde8b29cf4785e57d77ca20f2fdf553ecc470e5f88a14c20",
+    "crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs": "e916fc12233a1ad568e936417db65cf5f92ac08b1407ee26ca1c44edc4819b94",
+    "crates/carrick-kernel/src/dispatch/mem/tests.rs": "0a732219d6b7d1fc2551ffd7ea83aace7766aa422b02b8ff56437a246a3138d2",
+    "crates/carrick-kernel/src/dispatch/mm_authority.rs": "f1f1fb007c6caf79ed1ff114fdc7b3030c1d00f74c2ddbcce3a2227ac00f63b3",
+    "crates/carrick-kernel/src/dispatch/mm_mutation.rs": "a7277d63e349fc746d8793a13bb1d365d1511f6e175bd3e155f49df9ded79bd7",
+    "crates/carrick-kernel/src/dispatch/mm_quiesce.rs": "10e3cc39472f3b57522da49e1bcb8c62f88a28c70ddfa95d425a7adaa02aa907",
+    "crates/carrick-kernel/src/dispatch/mod.rs": "12cd13e624809e98bb355d0e11e79bba44b6d50056510a11c967e8d432913d20",
+    "crates/carrick-kernel/src/dispatch/native_execution.rs": "e83155d8bab81b6ace1048f715b88d2012f76f698b94dd3986e92afa4c1bcd6e",
+    "crates/carrick-kernel/src/dispatch/native_execution/tests.rs": "243b847d98e06a9c46980b6f30200e1f9981f816ec6e2e999d6fb3ae13542343",
+    "crates/carrick-kernel/src/dispatch/net.rs": "0977e21c7fc69deeed653e31b09b4dab77054c7c404365dc2042df8e129be08a",
+    "crates/carrick-kernel/src/dispatch/request.rs": "d870034c3ea563ada58b8e7028b647c8c41dbdd167fba968b9f344e745751083",
+    "crates/carrick-kernel/src/dispatch/rootfs_helpers.rs": "9f25a5ce7ad4c7261b1a5e43c6c0477e6f249637e48367fba6580d4de528e5e2",
+    "crates/carrick-kernel/src/dispatch/tests.rs": "9a82eba79d52db471554a35c49137fccc371a265d15b248fbb71ba1141258818",
+    "crates/carrick-kernel/src/inotify.rs": "69f7b2d4c4ce914adea4b1a4193ce0f5117319413e092fb6d0374b0b9292bee6",
+    "crates/carrick-kernel/src/kernel/address.rs": "4fd4940d1993279886adbd45d8f0ff208a3402c8e9557c1b002aa42182e5ae74",
+    "crates/carrick-kernel/src/kernel/frame_inventory.rs": "b91c9c75ce2276a0d1350ab3048237b9841ccd3c1b31bd18d60759fb19045ac6",
+    "crates/carrick-kernel/src/kernel/guest_execution.rs": "ab97e63144e5e5413ab271ab8ff84f4458291a2c0acd09150576cc3eba6ef3c9",
+    "crates/carrick-kernel/src/kernel/mm_access.rs": "0241700c6046a850161b72e815dbe333f64553750c6556f3bf9293c72bd31da9",
+    "crates/carrick-kernel/src/kernel/mm_access/current_read.rs": "b8397008f315e87011fdda640b4a433f384589e331f9d297ed14d6c25b8660fb",
+    "crates/carrick-kernel/src/kernel/mod.rs": "49ddb6c541129f2634f5f4ea09bcfe1b5dab32c9c92a19d19dbd0031246f28d4",
+    "crates/carrick-observability/src/probes.rs": "287a3220b432de2cea4b2f1ba70c7cf10fbc10657cb0cc87c86f12266d30c180",
+    "crates/carrick-observability/src/work_meter.rs": "9a0ccef9c527e408585ddbbc818909ebd89c4845264fc3956fab196a8a3e03d1",
+    "crates/carrick-runtime/Cargo.toml": "3ea66a9a2a008870b90436861d77d29cb556d8f37f36a51acde91f8ec62aecdb",
+    "crates/carrick-runtime/src/hvpatch/stage1_mm.rs": "41e777b54b650f2889967fb29016d156ff1379900ef270803b3e47e3181280ab",
+    "crates/carrick-runtime/src/runtime.rs": "1a2645a45e9554af6c86f810a5b75c05897223887680893c1a734a21694e32c1",
+    "crates/carrick-runtime/src/vcpu_loop/binding.rs": "5cbd6af11d487cc88b490e54b197224b76477d49eae53d6307d72be29b91d421",
+    "crates/carrick-runtime/src/vcpu_loop/exec.rs": "3d668eeefcf1d4f305b0ef48b6e0e8405cee6471416c7af871c1369057dd9f8a",
+    "crates/carrick-runtime/src/vcpu_loop/executor/tests.rs": "eab149cba4707fb640d20b7aaeccbef134517f0fc802f2ea31b5025c258de41a",
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs": "6de726e7df69a9a50871429b4031576a8bf8c1e8d26cb8e01ac06ebbd952222c",
+    "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs": "e613030c5b96742258d8167eeba08d8328d68dd83fdfc3fa961ac3b947bf64e5",
+    "crates/carrick-runtime/src/vcpu_loop/mod.rs": "9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e",
+    "crates/carrick-runtime/tests/runtime_loop.rs": "afc588c91902f25cccef16df02b8d563e1e81101d4b1d355df939b4408e2dbbc",
+    "crates/carrick-runtime/tests/syscall_process.rs": "2bdefac9ace07e3194fae25816e66a530c7dff3ef069c2a610f411ec3f90bea0",
+    "crates/carrick-vmm-hvf/Cargo.toml": "212f1e713b736faca8ac4c549ba7cfc332bcbe6fa293dafb6ad948f13d13d638",
+    "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs": "8e486381663c841436cc51c11dfa8a90924b09602195c32bc711766f5dfd7e0e",
+    "crates/carrick-vmm-hvf/src/trap.rs": "8bda92f14883fb2f222be0004ac000f82b1037c3772ab0c574b47927dbab04c4",
+    "crates/carrick-vmm-hvf/src/trap/cow_engine.rs": "d504fcb43c48e6708a2b99c76303575d5e1b984273ddf1189686927893b7ca9c",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "4909f5d64de92d10851a34013caab820648d32bf0d3b2bf0608b1dcd8e4533c2",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm/current_read.rs": "fcf13f33ff6771d4b67b6e48fc629c4bbe12eda6ce37f1d590012343c698f8b5",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs": "a88a83bbf3d9c94bb20c51225ae76e7c7a1398d2b5ed6403da062775c4d33179",
+    "crates/carrick-vmm-hvf/src/trap/guest_memory.rs": "6ed1b48bdb88004df125531f5adf482a0bed711c985df907b010097fc4011895",
+    "crates/carrick-vmm-hvf/src/trap/memory_protection.rs": "1f304a012a8616d191a90b87ea979700181114e6900b06f776bc9bac753468c9",
+    "crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs": "2c3b9c7c5aee0b1dc45a0bed090ff963c4fd4785e5a3401ed10e5263933f03cb",
+    "crates/carrick-vmm-kvm/src/kvm_aarch64_engine.rs": "c7633cc37149c0685021b96ff4460cc98868f141a269083b84777979957e4a16",
+    "experiments/native-syscall-slice/Cargo.lock": "a70475e51215b043381a64c77d91bf63228378b8b15bca7e92df9eeafbfd6dc1",
+    "experiments/native-syscall-slice/Cargo.toml": "37788f6db78dccabea6214b8e76cc4d6dd557e242e819fceb6c263ea891747db",
+    "experiments/native-syscall-slice/README.md": "79993a651f38c4f8fe938b35a54e389de8b7cefcb8d1367f3869a917cf642093",
+    "experiments/native-syscall-slice/fixtures/build.sh": "32d9d4cfd8f28b806475caea2cce9a15a26a3d77cb4379e46de42d2c8814935f",
+    "experiments/native-syscall-slice/fixtures/guest.ld": "887857d4cea5d0cbdc1ca98902125314763a475ab4c457e8d52c63fe344eeb62",
+    "experiments/native-syscall-slice/fixtures/watch.S": "b9aaa5d952620e64c3538f7cb7e8fd428e87b3a8a3826bc69cc538c96c583f68",
+    "experiments/native-syscall-slice/measure.py": "455bea04fd0d7e0fd730faaf46728efcc24d37500509ebae41c3d2b3bca0c85e",
+    "experiments/native-syscall-slice/src/allocations.rs": "60d854c0662c2c3ffd5496f4548c27b86f76f91f6684f8d7249018c273ebfadf",
+    "experiments/native-syscall-slice/src/carrier_memory.rs": "ef15220812eb376da45f0ff8c06fe66cfda636a6b0c04eca579a7b69fea78c2c",
+    "experiments/native-syscall-slice/src/gateway.S": "0eb6e54da30ec124e288eee2bd6321efe3653f78587d448530424ee683a2a987",
+    "experiments/native-syscall-slice/src/lib.rs": "fd0a8069bc9b8bfa20e668f9cc0ab99e5e69c9d230f9767ba864a352bd031f7e",
+    "experiments/native-syscall-slice/src/main.rs": "5558985ccc32b1b76a5b11362fe146439540de110eec6a87e2d37f35581c6b9b",
+    "experiments/native-syscall-slice/src/native.rs": "dfcf8ffcae12529f331ae23ec281661ebe15703437869b070c757c19855f17ee",
+    "experiments/native-syscall-slice/tests/scoped_execution.rs": "a28d3aae3f565d81edce73370a344a60c825bf973f4d3166f5b7ae8fe64ccc8c",
+    "scripts/bpftrace/oracle-syscall-mix.bt": "efb6d97cf3a02e263f6fe16e7e108eba1d8e3308aafdb38c61a55f07131512b1",
+    "scripts/dtrace/hvpatch-inotify-transport-control.d": "f469839538fc044dad9ec0c902049566a52ccd3407094b0237aaabc1820fbfbf",
+    "scripts/dtrace/hvpatch-madvise-discard-outcomes.d": "d14574346089a34f69360372c61aaed9d09f949ccc4a8e18c52f6dec88a5a19e",
+    "scripts/dtrace/hvpatch-madvise-shape.d": "33e17c4b58a69b992330ff2a7b0b7239c75f7fd819df0ccb83cacc126d6e47da",
+    "scripts/dtrace/hvpatch-node-child-stages.d": "da432e1c4ebacf64cb594c98dd3d9612bb49b54f2e4c4ea95e133f1fc13d3525",
+    "scripts/dtrace/hvpatch-stage1-maintenance-callers.d": "48b92080ff65df7ce7d454b9395f08d11d2b493de7215b1dd08db34161ce332e",
+    "scripts/dtrace/hvpatch-syscall-population.d": "60d75b0e596697a122e28742895b4b1f6923b241c4ea1cd9b6f95b0952c6d75e",
+    "scripts/dtrace/hvpatch-syscall-service-budget.d": "a7d2c4a04f5ee57f38ced0a6f0e57a38b31dbc3b4b98c5ddd97bde982cc3e288",
+    "scripts/dtrace/hvpatch-topology-caller-budget.d": "442d3a58df56f1fbd55e02d5643c9f400c2e5157fb521bbaa59e83087bcfc8ff",
+    "scripts/dtrace/hvpatch-topology-operation-budget.d": "664f6a052a9c501f0b53b4b6061b4c68a40f309587c7447ac18d374f7f4ffad0",
+    "scripts/perf/io-floor.c": "d77ec34dbc25793dd4befff9b8b89fa3e56ce01e5c64346e905bdbf6746b037d",
+    "scripts/perf/io_floor.py": "7217702024bccebbee54e743b3092052e8c4e5260b0a5d82b8d205cd8c917a30",
+    "crates/carrick-runtime/src/vcpu_loop/._memory.rs": "5c7976e7d4803ed4d794acfd42a850a88fedee432a0deabdf0b9308f2a89ef09",
+    "crates/carrick-runtime/src/vcpu_loop/memory/tests/._native_floor.rs": "5c7976e7d4803ed4d794acfd42a850a88fedee432a0deabdf0b9308f2a89ef09",
+    "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs": "593392c2e104b31decf49c21b73617059a1b3e8bf4844fae7cfad5f5c3237862",
+    "crates/carrick-observability/src/._work_meter.rs": "5c7976e7d4803ed4d794acfd42a850a88fedee432a0deabdf0b9308f2a89ef09",
+    "experiments/native-syscall-slice/src/._native.rs": "5c7976e7d4803ed4d794acfd42a850a88fedee432a0deabdf0b9308f2a89ef09",
+    "conformance-contracts/contracts/._native-data-demand.toml": "5c7976e7d4803ed4d794acfd42a850a88fedee432a0deabdf0b9308f2a89ef09",
+    "conformance-contracts/contracts/native-data-demand.toml": "066da6bb1c20cf5142ac0a71fd6594f7958caa299dd383b47c32a9c54553f5a7"
+  },
+  "parent_manifest": "../current-read-reuse/manifest.json",
+  "binaries": [
+    {
+      "path": "target/lease-cost/checkpoint-floor/baseline-runtime",
+      "sha256": "1c9f9890dd6527cbecb2a0068fc0c843726e0f3cda91fc9088c392e424c2f565"
+    },
+    {
+      "path": "target/lease-cost/checkpoint-floor/red-runtime",
+      "sha256": "3e5b24c13bad6b1b8eb0a7d5a719a86f2960d71f64743df05926bf01ecfb4f7c"
+    },
+    {
+      "path": "target/lease-cost/checkpoint-floor/release-runtime",
+      "sha256": "6b383316c6ad628bda382d948b8fbfc48720784c1018ed87c79cb9b050b9d58e"
+    },
+    {
+      "path": "target/lease-cost/checkpoint-floor/attribution-runtime",
+      "sha256": "b4136b735ee6ba3370f2ec4fbedd9d2d73e7b77942399620c78fd85363059b54"
+    },
+    {
+      "path": "target/lease-cost/checkpoint-floor/host-compute-short",
+      "sha256": "9b6ceee39bdd9207ac8fcc8ef509ab60f962086e84871e65a74814a9718bcc01"
+    },
+    {
+      "path": "target/lease-cost/checkpoint-floor/host-compute-floor",
+      "sha256": "8e711a1c3d1c9a3d97205c2ac3130d61c1cc31f0787bcb119538235fdc4d874a"
+    }
+  ],
+  "frozen_artifacts": {
+    "target/release/carrick": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+    "target/lease-cost/inotify-transport-control/carrick-control": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+    "target/release/native-syscall-slice": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65",
+    "target/lease-cost/native-memory/native-guarded-executor": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65"
+  },
+  "control": {
+    "knob": "CARRICK_NATIVE_DATA_DEMAND=0/1",
+    "read_window_reuse": true,
+    "small_invocations": 40,
+    "paired_invocations": 36,
+    "linux_invocations": 18,
+    "samples_per_invocation": 10,
+    "discarded_warmup_samples": 1,
+    "ordering": "Alternating arm order by case and repetition",
+    "cpu_pinned": false,
+    "traced_timing": false,
+    "private_code_publication": true,
+    "mock_stage2": true,
+    "product_acceptance": false
+  },
+  "linux_image": "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+  "summary": [
+    {
+      "phase": 0,
+      "n": 65536,
+      "always_medians_ns": [
+        845.4119415283203,
+        842.4472808837891,
+        857.4358673095703
+      ],
+      "demand_medians_ns": [
+        618.8182830810547,
+        589.4044189453125,
+        606.6328735351562
+      ],
+      "linux_medians_ns": [
+        238.34800720214844,
+        239.80650329589844,
+        244.32373046875
+      ],
+      "always_ns": 845.4119415283203,
+      "demand_ns": 606.6328735351562,
+      "linux_ns": 239.80650329589844,
+      "time_reduction_pct": 28.244108731360427,
+      "raw_linux_ratio": 2.5296764899933883
+    },
+    {
+      "phase": 1,
+      "n": 65536,
+      "always_medians_ns": [
+        1452.6812286376953,
+        1440.1766357421875,
+        1410.3673248291016
+      ],
+      "demand_medians_ns": [
+        1177.2321014404297,
+        1202.1331787109375,
+        1194.6856231689453
+      ],
+      "linux_medians_ns": [
+        488.88206481933594,
+        504.91905212402344,
+        508.0210418701172
+      ],
+      "always_ns": 1440.1766357421875,
+      "demand_ns": 1194.6856231689453,
+      "linux_ns": 504.91905212402344,
+      "time_reduction_pct": 17.045896071403057,
+      "raw_linux_ratio": 2.3660933730729856
+    },
+    {
+      "phase": 2,
+      "n": 128,
+      "always_medians_ns": [
+        1390.625,
+        1382.15625,
+        1400.71875
+      ],
+      "demand_medians_ns": [
+        1152.34375,
+        1186.1953125,
+        1175.78125
+      ],
+      "linux_medians_ns": [
+        1183.59375,
+        1206.3828125,
+        1104.4921875
+      ],
+      "always_ns": 1390.625,
+      "demand_ns": 1175.78125,
+      "linux_ns": 1183.59375,
+      "time_reduction_pct": 15.44943820224719,
+      "raw_linux_ratio": 0.9933993399339934
+    },
+    {
+      "phase": 2,
+      "n": 65536,
+      "always_medians_ns": [
+        1285.308837890625,
+        1306.2445220947266,
+        1327.1910247802734
+      ],
+      "demand_medians_ns": [
+        1070.2769012451172,
+        1047.9907989501953,
+        1059.5137176513672
+      ],
+      "linux_medians_ns": [
+        873.9293365478516,
+        878.4618377685547,
+        898.3306884765625
+      ],
+      "always_ns": 1306.2445220947266,
+      "demand_ns": 1059.5137176513672,
+      "linux_ns": 878.4618377685547,
+      "time_reduction_pct": 18.888561848106022,
+      "raw_linux_ratio": 1.2061010189614105
+    },
+    {
+      "phase": 3,
+      "n": 65536,
+      "always_medians_ns": [
+        2.8934478759765625,
+        2.7599334716796875,
+        2.7841033935546875
+      ],
+      "demand_medians_ns": [
+        2.6232452392578125,
+        2.5723724365234375,
+        2.6136932373046875
+      ],
+      "linux_medians_ns": [
+        0.560760498046875,
+        0.6631317138671875,
+        0.56903076171875
+      ],
+      "always_ns": 2.7841033935546875,
+      "demand_ns": 2.6136932373046875,
+      "linux_ns": 0.56903076171875,
+      "time_reduction_pct": 6.120827144728402,
+      "raw_linux_ratio": 4.593237155422075
+    },
+    {
+      "phase": 4,
+      "n": 65536,
+      "always_medians_ns": [
+        3.15093994140625,
+        7.49969482421875,
+        3.124237060546875
+      ],
+      "demand_medians_ns": [
+        3.1503143310546875,
+        3.1960906982421875,
+        3.188446044921875
+      ],
+      "linux_medians_ns": [
+        1.3675689697265625,
+        1.3109893798828125,
+        1.2563018798828125
+      ],
+      "always_ns": 3.15093994140625,
+      "demand_ns": 3.188446044921875,
+      "linux_ns": 1.3109893798828125,
+      "time_reduction_pct": -1.1903147699757977,
+      "raw_linux_ratio": 2.4320914370846283
+    }
+  ],
+  "validation": {
+    "carrier_memory_tests": 41,
+    "research_executor_tests": 12,
+    "observability_tests": 83,
+    "contract_package_tests": 33,
+    "ignored_runtime_diagnostics": 3,
+    "scoped_research_cleanup": 76
+  },
+  "uncompleted": [
+    "Signed native execution and carrier code publication",
+    "Full inotify09 on native path",
+    "Node Go Python workload differentials",
+    "Full CI and product probe smoke full promotion",
+    "Prior checkpoint signed fresh_sparse_publication_avoids_stage1_maintenance failure remains unresolved"
+  ],
+  "evidence": [
+    {
+      "path": "README.md",
+      "sha256": "dc2cd1ea33af766c6d2a6540887224a65ea90f94d47af781a59261a63e5f79bf"
+    },
+    {
+      "path": "attribution-binary.sha256",
+      "sha256": "308c7200184d61ceb9933e14941f1e21c9b49887a83a257bd0a90a4afc349c43"
+    },
+    {
+      "path": "attribution-build.jsonl",
+      "sha256": "80e8d9bc94d6ad12c17c08384ec6ec00ce6c1edad8107443e162342d09429d81"
+    },
+    {
+      "path": "attribution-build.log",
+      "sha256": "9c2e28d09af742a92fab1de95c7fa8fab1c2162bd7c0f02b549cba9fef4806d9"
+    },
+    {
+      "path": "attribution-components.json",
+      "sha256": "00298865e95de71cbcbca65d293ca7253986a050a102241e1d125f24fed1219e"
+    },
+    {
+      "path": "attribution-components.log",
+      "sha256": "44adc21bfb73bdafdd1c5a9b3465c1fd66f0aea6da938ede1b2633f095663bee"
+    },
+    {
+      "path": "baseline-activation.log",
+      "sha256": "b667703ecefecbd968ba74da681a6c88d447a6fdeb6f1a18690b7351ad4accec"
+    },
+    {
+      "path": "baseline-binary.sha256",
+      "sha256": "b2a89c51d0738d902479638754323c4d6bca3a95d904602fffcc314cf2061ca7"
+    },
+    {
+      "path": "baseline-components.json",
+      "sha256": "d51567f6e4d08dbc7605e4b589ce2b69a66c4c82c0815f1187e892900f9205a3"
+    },
+    {
+      "path": "baseline-components.log",
+      "sha256": "ff6628dc86d11ff8f27319231de68f65368a2d11663dfba0d3ab65c8c0821e6f"
+    },
+    {
+      "path": "before-hashes.json",
+      "sha256": "21e0fd51ed79bfe98fa15d98ea0fb75bfc78c69c9cc46571816c9d69fd6cabbb"
+    },
+    {
+      "path": "before-status.txt",
+      "sha256": "7200fd1909ab7fe743c2a0a4403663e92791dd3a0e023c986ba01b8c22f39840"
+    },
+    {
+      "path": "before.tar.gz",
+      "sha256": "a7c582df7164cd39a195e6528c6051a7df622d8495251e3ed9595a6ccf79fd46"
+    },
+    {
+      "path": "cleanup.json",
+      "sha256": "77402f32539fd3e293580bf28441755132359c80949428e29c330059979828e7"
+    },
+    {
+      "path": "docker-phase.log",
+      "sha256": "78584d0a03dcdf9c9f26e7a6eb92d8db1c51f75b7b6edd29916df41f8cc57b9d"
+    },
+    {
+      "path": "elf-clippy.log",
+      "sha256": "c96abbd31e3419d97df1b56ef5b1d0c0b05e2c8996f7020380b383764196978c"
+    },
+    {
+      "path": "elf-tests.log",
+      "sha256": "f1f3e4bc1dc9eb7736e6e76ca0c9daa31235548e81a731e33c34decad78df1bd"
+    },
+    {
+      "path": "environment.json",
+      "sha256": "3d7b79b662b997d4144ef1a8015b427ca08eb787554b0244430311e99f25ff4b"
+    },
+    {
+      "path": "experiment.patch",
+      "sha256": "4b72b7d652efea25ef5bdb5cf5d703607c1d82e44b08782c82ffe2970948f9fb"
+    },
+    {
+      "path": "final-checks.json",
+      "sha256": "3546cfa1ff74ee905838b75ef8a78b9041df540a1a74cbf763db33e2c08e28a6"
+    },
+    {
+      "path": "final-components.json",
+      "sha256": "7397ac552e2f021061032d5017f404630da2743a6276bcfffe3e7cb37c9c1d81"
+    },
+    {
+      "path": "final-components.log",
+      "sha256": "37072cb79cea3bc4c9c38040e793a7a666e69a9bb5994f4499e27a6978d084a3"
+    },
+    {
+      "path": "final-format.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "final-inputs.tar.gz",
+      "sha256": "59cd766f92cfa5033d0002a84ec031112045809833bc2359116bbfd0f5e5270f"
+    },
+    {
+      "path": "final-inventory.log",
+      "sha256": "6170d981592193d9c2dfc407210274156807421f20947239870506b457449c39"
+    },
+    {
+      "path": "final-runtime-clippy.log",
+      "sha256": "2b9acfb908089d85cef0110f8961e7ad40dc7cbdae5b05c778e4f0ba93c52d11"
+    },
+    {
+      "path": "final-source-hashes.json",
+      "sha256": "62b6eda51dfe3ad61054d40ebf03ebbb6c002c161030582ddc08ef36f05df7c9"
+    },
+    {
+      "path": "finalize.py",
+      "sha256": "2d107047b5f37ba8589523f62068155d60223595b61a266b6efc2e20fe2beaf4"
+    },
+    {
+      "path": "frozen-hashes.json",
+      "sha256": "52c621d13c1b1ecc608155cb6f3ec4c282dea1df3bc82126f96470706ed72388"
+    },
+    {
+      "path": "green-bound-contract.log",
+      "sha256": "e27317800a6cdff72fd098d5dd3618a9566c647b7dfe89061968ae5127c00862"
+    },
+    {
+      "path": "green-bound-observations.json",
+      "sha256": "20c5cf76ec7da467263edca75f5ff6a1d012a400a97fbd08c3b9b5284de5ee6e"
+    },
+    {
+      "path": "green-contract-initial.log",
+      "sha256": "d240c353e37a24d9510ed92454a6c05b81fe22ce93b6e8e69922bc02c7484441"
+    },
+    {
+      "path": "green-observations.json",
+      "sha256": "20c5cf76ec7da467263edca75f5ff6a1d012a400a97fbd08c3b9b5284de5ee6e"
+    },
+    {
+      "path": "host-compute-0.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "host-compute-0.out",
+      "sha256": "f7cec1b9c1952a5a03df7a8132497505307f15564ddf5bfca819c1c1d68ff942"
+    },
+    {
+      "path": "host-compute-1.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "host-compute-1.out",
+      "sha256": "1108d53d1acb2ff4fe832287c90b40cb2d618fd02486a2f78d9e228ad78b16ac"
+    },
+    {
+      "path": "host-compute-2.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "host-compute-2.out",
+      "sha256": "501bababf22fe6f54d90290c236594571a80f8e9c7478a8485e18d5c702bfe4e"
+    },
+    {
+      "path": "host-compute-disassembly.txt",
+      "sha256": "91117d915b994558197198042afc47305f607c3df433530db8d7c94e6b03217e"
+    },
+    {
+      "path": "host-compute-runs.json",
+      "sha256": "21bdd9da09041a4542f9b436319a36781c0135afb01d01faa2e6cb485428e02f"
+    },
+    {
+      "path": "host-compute-short.c",
+      "sha256": "7f2b8ea041cdce12c918427f70271236eb02cce594731f695e3d89bab602de6f"
+    },
+    {
+      "path": "host-sweep-0-4194304.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "host-sweep-0-4194304.out",
+      "sha256": "19aefd4cc8ac9ebcec98038d971e2759d0b7d910b89ae9aa8b43fa5305687878"
+    },
+    {
+      "path": "host-sweep-0-65536.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "host-sweep-0-65536.out",
+      "sha256": "e969427e775b788cec0d93690c76c0f9ba4b4439d2907f4dc68344578c5aef28"
+    },
+    {
+      "path": "host-sweep-1-4194304.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "host-sweep-1-4194304.out",
+      "sha256": "15a1c609d20291461e797ab4214d8f643ae94770ba4c5602c2030cdd3a583502"
+    },
+    {
+      "path": "host-sweep-1-65536.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "host-sweep-1-65536.out",
+      "sha256": "16fa65d56b9288f5fe83e693fcfb85559ea923f182d2851f8de6c8ff22fc02e9"
+    },
+    {
+      "path": "host-sweep-2-4194304.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "host-sweep-2-4194304.out",
+      "sha256": "8d61155406c14e6cc72adb5412916fddc9c8c2aacaf08d38411ee243328b983a"
+    },
+    {
+      "path": "host-sweep-2-65536.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "host-sweep-2-65536.out",
+      "sha256": "521be69debd74a1b31c7df3b2b8eb9e7f1c42d9c847eb22c249ccc1dfc81646d"
+    },
+    {
+      "path": "host-sweep-runs.json",
+      "sha256": "4f67ad12efd18ecfd56405c957c6a3e8a44248af8c5a1eb1dba160538e9d621e"
+    },
+    {
+      "path": "initial-green-observations.json",
+      "sha256": "0d2d71a3a3516034d1ecdab3fbc9db0d67744ba2164dc650fa07d408bc3f468b"
+    },
+    {
+      "path": "initial-qualification-status.json",
+      "sha256": "19596e2e7e9c00c1c77604be01036f9bda853a247d3507486325ad435b4a28e5"
+    },
+    {
+      "path": "initial-registry.log",
+      "sha256": "68cde6ddb40f82c689b9cfab533cf5526a702534b8bcb8bb354c613ca50e8443"
+    },
+    {
+      "path": "initial-runtime-memory.log",
+      "sha256": "1a707d315b9e2278fd86d641c223b17f3126fbeeb27b574c2483bb287367fba3"
+    },
+    {
+      "path": "initial-tested-source-hashes.json",
+      "sha256": "719c92bff20bba74ef5bb5904ab61f4ac2ad11cfd43c7a2b3ff51e3bf69620dd"
+    },
+    {
+      "path": "initial-tested-source-revision.txt",
+      "sha256": "4618595489cf960170dfb6f675704d77d60f39504e146c258f2307e9742403d3"
+    },
+    {
+      "path": "inventory.log",
+      "sha256": "83cfc287914cc041845d27cb497ced08ae2586998f11148a8e563c4ed0b8c1c3"
+    },
+    {
+      "path": "layering.log",
+      "sha256": "dc05daf3603fc6f73ba4f36d97a846b40c630b9af8a99d3dbf2d1271d2efb78a"
+    },
+    {
+      "path": "linux-image.txt",
+      "sha256": "491c3922a001883e697814a7a67dc74aa40a326fbcd39f5c7d229f74652a39b7"
+    },
+    {
+      "path": "matrix-0-0-1-demand0.json",
+      "sha256": "06ec297862f1d2e20194aa8435bb10f76626174818b0d2d6268238ce9a46c586"
+    },
+    {
+      "path": "matrix-0-0-1-demand0.log",
+      "sha256": "3cb1b9e99d17ba446c2948e92e9afbcc0a21daf82696325963b6784ac1bd0366"
+    },
+    {
+      "path": "matrix-0-0-1-demand0.out",
+      "sha256": "bf51fc660e80c57903cf6c7b1f02cf255fc675911769b89cd69fa88708946376"
+    },
+    {
+      "path": "matrix-0-0-1-demand1.json",
+      "sha256": "8b3817986f332360f9d828c560d60092d8af6e9c7b9c3ae4c749a12cd5537ebb"
+    },
+    {
+      "path": "matrix-0-0-1-demand1.log",
+      "sha256": "b021ec0b139d6182a948814aad6df4f7bc693f85cd52b864b357c2f18093fe6d"
+    },
+    {
+      "path": "matrix-0-0-1-demand1.out",
+      "sha256": "ba09d54aa179e895b37471a8b2af3ea59f8a197af98a09cf64c2dbca6bdf5dc9"
+    },
+    {
+      "path": "matrix-0-0-128-demand0.json",
+      "sha256": "6cd7e99b5f0c800b26e3e0b04bb985c8779e063afe56dee53d71f443b754253c"
+    },
+    {
+      "path": "matrix-0-0-128-demand0.log",
+      "sha256": "80184002c420facb8f27d2f1dd767099af9d872f3614afa09a2bb15b3d77b9b0"
+    },
+    {
+      "path": "matrix-0-0-128-demand0.out",
+      "sha256": "57b548ced870cf13a52eb992c201f59ecb112c7fab39f602ef24638f14c4e606"
+    },
+    {
+      "path": "matrix-0-0-128-demand1.json",
+      "sha256": "dc418cffecdef5f6bfca28ad56802abca3cbc250198862ce57c77dc69bd4da36"
+    },
+    {
+      "path": "matrix-0-0-128-demand1.log",
+      "sha256": "68e6cae123369096086e52405d7b51a954316533c9f5ac341d71d29b9a718c5a"
+    },
+    {
+      "path": "matrix-0-0-128-demand1.out",
+      "sha256": "202097174ee295c2f7b8b2f4562ff36253d4ce5eb347af2e42fb828c0e1e6eef"
+    },
+    {
+      "path": "matrix-0-0-32-demand0.json",
+      "sha256": "1da6384994d94f8a5006d845b2dad85b960385bee56d74486e0866cae9dc76a2"
+    },
+    {
+      "path": "matrix-0-0-32-demand0.log",
+      "sha256": "d6d57d8d9b61297c3477a13ad6cab49fc2d6e18ec1358f54747a6f50a0b29613"
+    },
+    {
+      "path": "matrix-0-0-32-demand0.out",
+      "sha256": "322e97ea8f0688f9737bf17e2dcc189072be6341416a8b5d0dc00113621b093a"
+    },
+    {
+      "path": "matrix-0-0-32-demand1.json",
+      "sha256": "0ff89a23b20d36e7babd150e25e7c23a19bb1b0f8d10c8dcf23c4a993977c795"
+    },
+    {
+      "path": "matrix-0-0-32-demand1.log",
+      "sha256": "8dced4b912912fd5b4fbaf898b9d0d47506ddcf5fe2d8a41a5f1d1580c6f9891"
+    },
+    {
+      "path": "matrix-0-0-32-demand1.out",
+      "sha256": "5b4b581e31fd57b35aa56865f922107db6ab83e91c4cefbf874eafc85cb3a27c"
+    },
+    {
+      "path": "matrix-0-0-8-demand0.json",
+      "sha256": "8bc01886dad80d9bd4b9c0100fbc7eb8d7a910289f29b369b41dc6cc3d13ea21"
+    },
+    {
+      "path": "matrix-0-0-8-demand0.log",
+      "sha256": "c7127cdf17f3d3fc1d7a5687e03de32eb8316a765bece910875633fb5ae0ea2e"
+    },
+    {
+      "path": "matrix-0-0-8-demand0.out",
+      "sha256": "cedd51f7a1f9d6e5b02f065d2e15855500ef29b700a10845e09bff7e57252716"
+    },
+    {
+      "path": "matrix-0-0-8-demand1.json",
+      "sha256": "45eb08a1d4e1ccf6eb11ff1b21acc566f68c112d095e07ba224aa987cf71619c"
+    },
+    {
+      "path": "matrix-0-0-8-demand1.log",
+      "sha256": "e0b92dac4102c283db1d1cc1565a296ed316c53feeef6525b3c4632114764b3c"
+    },
+    {
+      "path": "matrix-0-0-8-demand1.out",
+      "sha256": "e71cc5cbede3f85da53827d51bf9d50903993c3e81b7a652f1dd8c9bcb1870fd"
+    },
+    {
+      "path": "matrix-0-1-1-demand0.json",
+      "sha256": "eb8ec6ed93a751fbfef3ba22fe3359ce821cb9f634452ef09d50d6be0dcc5faf"
+    },
+    {
+      "path": "matrix-0-1-1-demand0.log",
+      "sha256": "fef7762690d3b4a0609f347a7dc22e925c1ed1e4a6816bcb1a96ec6711aaa93e"
+    },
+    {
+      "path": "matrix-0-1-1-demand0.out",
+      "sha256": "34071384815dc6fcb875434bc74d06845041bb8d9cc987628bf890cd0e6e695e"
+    },
+    {
+      "path": "matrix-0-1-1-demand1.json",
+      "sha256": "984a580da8e3458b06ab28db5559835d2fcbfd49ec30f10c880f502772d5ed31"
+    },
+    {
+      "path": "matrix-0-1-1-demand1.log",
+      "sha256": "2c05dc51f58f053cdea1db33457b45662fcb1040724b23979e759d06b3d131e5"
+    },
+    {
+      "path": "matrix-0-1-1-demand1.out",
+      "sha256": "ea175d5dc584cb7b3f6d52e25123b03fba8584f66dfeb9f9815186718a813ba6"
+    },
+    {
+      "path": "matrix-0-1-128-demand0.json",
+      "sha256": "970ffe317b788cc061194960a8e39ed95f17f28d75a7d5649fcb1b28afc4ae37"
+    },
+    {
+      "path": "matrix-0-1-128-demand0.log",
+      "sha256": "6e9ab688b879d05faa5cb88462afa1d836124bbb6d781385704aa757707cbce7"
+    },
+    {
+      "path": "matrix-0-1-128-demand0.out",
+      "sha256": "ecbdce6e7efc4d763f44a8670ad8f599a5a921917779ff6d37ea17cc3dbeae34"
+    },
+    {
+      "path": "matrix-0-1-128-demand1.json",
+      "sha256": "85e4f6b949cafab332be916811f64a71ee26c9d35bc5a2982c28f900e5324be3"
+    },
+    {
+      "path": "matrix-0-1-128-demand1.log",
+      "sha256": "82793b04543da2c41360bcb17102a7304cd9bacbe80cf6d8dc6b860bd515cb50"
+    },
+    {
+      "path": "matrix-0-1-128-demand1.out",
+      "sha256": "0abd4bbf7df5016aa84fb434e858f8337e051f73753cb98c90bd87efafa20394"
+    },
+    {
+      "path": "matrix-0-1-32-demand0.json",
+      "sha256": "65dc364334d0ac86795bbd04c976b1ad525ac117b6b700e9076306c289866f46"
+    },
+    {
+      "path": "matrix-0-1-32-demand0.log",
+      "sha256": "b824b6e7310aea718e0b097dddb598ec53794c7854b9081b9556ffc074b06e5b"
+    },
+    {
+      "path": "matrix-0-1-32-demand0.out",
+      "sha256": "f1f8cc5fa39f7ea69b024cda58d49289bc51530bd887c8df88bbe1d91e85f7dc"
+    },
+    {
+      "path": "matrix-0-1-32-demand1.json",
+      "sha256": "e4fa17752a04fba974789c46f974ba148ce213e62d7fb4097db538455cc9f616"
+    },
+    {
+      "path": "matrix-0-1-32-demand1.log",
+      "sha256": "6de1f85a2cf51599a2ae9fbcf63258ef51ebb2c779595ed0ef1107d1db8fa620"
+    },
+    {
+      "path": "matrix-0-1-32-demand1.out",
+      "sha256": "e08e95012da0644b39ceec3a1c8e0d768debd6c27b1b4afc3a5ef173b74cc315"
+    },
+    {
+      "path": "matrix-0-1-8-demand0.json",
+      "sha256": "a1fd2c76f0500a456cee466d8aab41c607dd59bda5293e0ce1772eb1571646bc"
+    },
+    {
+      "path": "matrix-0-1-8-demand0.log",
+      "sha256": "263f7b6aecbdbc826d59a932d871b5e3d56692f335e6dcd8b36c0b7637edaa3c"
+    },
+    {
+      "path": "matrix-0-1-8-demand0.out",
+      "sha256": "aa13e75f8078adac76e85ecf8ef57d6d41de77a6b32e3f905c7f09ca8bbcd25f"
+    },
+    {
+      "path": "matrix-0-1-8-demand1.json",
+      "sha256": "99903b57a6079d3bb2a8e83f2162871ed55eb2522ac7104f4fc4728e85e9d779"
+    },
+    {
+      "path": "matrix-0-1-8-demand1.log",
+      "sha256": "0262b2a2af7246fde77b99405962ad941bbd98ec0507bb631e2e87d82388a55f"
+    },
+    {
+      "path": "matrix-0-1-8-demand1.out",
+      "sha256": "000c5c3c3bb851577e26615d591024703fd147ee397539c2555079fb7538aef9"
+    },
+    {
+      "path": "matrix-0-2-1-demand0.json",
+      "sha256": "748d7526aadeaac106cfd67c370345e3e81d2736a439baec3a85553f35bc5a6d"
+    },
+    {
+      "path": "matrix-0-2-1-demand0.log",
+      "sha256": "4d3167402b04be7729a64c958dc59e2531ff74ce6c9a88ab41be17da85441905"
+    },
+    {
+      "path": "matrix-0-2-1-demand0.out",
+      "sha256": "ff60a8171ff89b08a764432b819f1180ac8e988ac18ca542742d93c2e4f1a705"
+    },
+    {
+      "path": "matrix-0-2-1-demand1.json",
+      "sha256": "51efc62587292ffa91f1b6bad3df60d007341cfe79c69578f6473868cebe1872"
+    },
+    {
+      "path": "matrix-0-2-1-demand1.log",
+      "sha256": "4f024801b0edfc0fd43e62a8b155078c22b723fd791a81b8fcb5cf21d28b41da"
+    },
+    {
+      "path": "matrix-0-2-1-demand1.out",
+      "sha256": "2249362d51fa3b2ce47bf04ef270daa1dd8a34eaf451b94e80ddccda65a1c6e1"
+    },
+    {
+      "path": "matrix-0-2-128-demand0.json",
+      "sha256": "7b2719ae55a4a33a420e2dec520d3990d28ed9d23658dc3ef13b66745edd8a6f"
+    },
+    {
+      "path": "matrix-0-2-128-demand0.log",
+      "sha256": "07eadbb75a0545ccbea4a876b767d407fa6d31bdbef526026c9bca582c6b4549"
+    },
+    {
+      "path": "matrix-0-2-128-demand0.out",
+      "sha256": "cb97fa3f6be3ff718ed2d230fb7ea4ecdf45a6bf21db2567fa04e255928ed894"
+    },
+    {
+      "path": "matrix-0-2-128-demand1.json",
+      "sha256": "b00cd22be7f815c3fdde35939c14eda63ac8f4ea0ac609da6abbd4f59331863b"
+    },
+    {
+      "path": "matrix-0-2-128-demand1.log",
+      "sha256": "c591dff4543728eb48a46ca02b571b4b55dc4ce91d84ed1699ceb4369237526f"
+    },
+    {
+      "path": "matrix-0-2-128-demand1.out",
+      "sha256": "3fcfb7ea0b88090cbdb6259468f8a606b6b6b7787aee12d6d7ad746fd158426f"
+    },
+    {
+      "path": "matrix-0-2-32-demand0.json",
+      "sha256": "d93ff94528e6b0ad571efefe2e458e0d72b008c3b1384de3b259345f095dd460"
+    },
+    {
+      "path": "matrix-0-2-32-demand0.log",
+      "sha256": "3a2dbb35836d88d2437e28896c9fe2f02621d4806bfc6d039d06248c9d9bf6a6"
+    },
+    {
+      "path": "matrix-0-2-32-demand0.out",
+      "sha256": "980212c64b6b99dc144a0eb2b1643b8abe26c1e006efdc1ac43cd316f71496e8"
+    },
+    {
+      "path": "matrix-0-2-32-demand1.json",
+      "sha256": "d57336b1d0609ab55942f52ae4e156069161c93bc5a9bf01329e2b286a88dc8c"
+    },
+    {
+      "path": "matrix-0-2-32-demand1.log",
+      "sha256": "b66bb5d728ec6edbba7315ea402e8211c61065f5d5c1e6f7fe337754d51595b7"
+    },
+    {
+      "path": "matrix-0-2-32-demand1.out",
+      "sha256": "2d018007161fd0e494fd3f56d2fc279b55b288dd9cf452480aca4f31f5c93cba"
+    },
+    {
+      "path": "matrix-0-2-8-demand0.json",
+      "sha256": "eeac38ebd14f895bf87a4da52476007823460d3cb293c97e1c0e10cafeb17d10"
+    },
+    {
+      "path": "matrix-0-2-8-demand0.log",
+      "sha256": "72222c0f674eb4357be8fe6cfc9b803295c49f5c31ef3fa7444385ec960e1f66"
+    },
+    {
+      "path": "matrix-0-2-8-demand0.out",
+      "sha256": "9765ce4d5b52c1fdbe0b2929256d620f645d01486565e568991b4aede7bb9781"
+    },
+    {
+      "path": "matrix-0-2-8-demand1.json",
+      "sha256": "92fa81319e1406cd324ee07604315359568f54e6fcbe33c1e4fe73f0a059f335"
+    },
+    {
+      "path": "matrix-0-2-8-demand1.log",
+      "sha256": "c7afdada5fc9324ac78f3cf12ab8527acc4ccc84474c7e77f930e1b1c61b0941"
+    },
+    {
+      "path": "matrix-0-2-8-demand1.out",
+      "sha256": "898aa2c4edde5368990230854049996969ee744f3e1fc5fcca760ff7b6153822"
+    },
+    {
+      "path": "matrix-0-3-1-demand0.json",
+      "sha256": "01d6faa81c719ef4b3b6dcee5c2b988e8e6111540121ce689022c383cbb0aea7"
+    },
+    {
+      "path": "matrix-0-3-1-demand0.log",
+      "sha256": "a5ed8873575dd3e68119eaa014bf5a9c0f849c58eac85e504c636d258cbca149"
+    },
+    {
+      "path": "matrix-0-3-1-demand0.out",
+      "sha256": "514f216a53b5a60910b1b914c8076839ba2917442cf3857e8c44a1f100a80e41"
+    },
+    {
+      "path": "matrix-0-3-1-demand1.json",
+      "sha256": "1922c103e8c0c2a14b94765aa7663411832cce74fbca5ac7cb37ff72c824f3fe"
+    },
+    {
+      "path": "matrix-0-3-1-demand1.log",
+      "sha256": "4cdba97e43bf3c6ae548659c5249b7d9448147efce3966b80135229c64761611"
+    },
+    {
+      "path": "matrix-0-3-1-demand1.out",
+      "sha256": "f76f15c5f61dc39d6497de1e400a6cb8c79e5b369484806f530524a3f720ccf4"
+    },
+    {
+      "path": "matrix-0-3-128-demand0.json",
+      "sha256": "abf038508e7d7272978a5ebd566ccf411d1808a94e93a8c5ee7c5c9e34037daa"
+    },
+    {
+      "path": "matrix-0-3-128-demand0.log",
+      "sha256": "ca1b085599c8e5db7c80363ac977f4e34521c746dfa7721f0c1e20672c2264fa"
+    },
+    {
+      "path": "matrix-0-3-128-demand0.out",
+      "sha256": "e538c754f3bf00f137cc2742de415027adffc4144a27ade75bfa2abd9e43f6a3"
+    },
+    {
+      "path": "matrix-0-3-128-demand1.json",
+      "sha256": "3150666a9b6f53416f8883103bc8eb3de54fdf3616212f03012206796148ecc9"
+    },
+    {
+      "path": "matrix-0-3-128-demand1.log",
+      "sha256": "d3cd941983d4581f5488592833dae21c6057afe27a426ac13c8c6ec65d336bba"
+    },
+    {
+      "path": "matrix-0-3-128-demand1.out",
+      "sha256": "a3e2e3a986faf34b01403937d20ec4af0577cdd3cf48e6fd287e1ab693467e87"
+    },
+    {
+      "path": "matrix-0-3-32-demand0.json",
+      "sha256": "3a2e8a861c0423d0a011c3cf12e42679de114206e3551e4116133dafb353faa4"
+    },
+    {
+      "path": "matrix-0-3-32-demand0.log",
+      "sha256": "67b2e52478b7478e3bed5c013c9845f5b5c915c8c2ff88383975c374f1d1c676"
+    },
+    {
+      "path": "matrix-0-3-32-demand0.out",
+      "sha256": "6decd65bb5b211dd0d0e3a9759a8fc9f04b2d64184045fe8b9447a2c1d2461ae"
+    },
+    {
+      "path": "matrix-0-3-32-demand1.json",
+      "sha256": "4bff9c9dc8becc53ca860c0ab015731e2533b9d9f03d964e68526efa86fe1d8c"
+    },
+    {
+      "path": "matrix-0-3-32-demand1.log",
+      "sha256": "7bb901092e437bd7f3f0e0749babbda2041609d806388a8a897282474dd3cd53"
+    },
+    {
+      "path": "matrix-0-3-32-demand1.out",
+      "sha256": "d6e3d2523ab1ddb9782910c09b378422c5ef9c3485faf5063d2ac9fc6b660e5d"
+    },
+    {
+      "path": "matrix-0-3-8-demand0.json",
+      "sha256": "d32f8e86049f450b3d8156e4226b14117542cda5d1f897512d75b9639e65f804"
+    },
+    {
+      "path": "matrix-0-3-8-demand0.log",
+      "sha256": "31f12bd40a52ebfd246798305ca8483c72be8b2beb7baf15e8da4a461239dadc"
+    },
+    {
+      "path": "matrix-0-3-8-demand0.out",
+      "sha256": "e7e48e5a98cde58a9a0c1fd05ef9aa22b25530ae7138c20010a4c5d3aa44f3f1"
+    },
+    {
+      "path": "matrix-0-3-8-demand1.json",
+      "sha256": "c02a646218060923f4e3f92fed320776799380b22dee771ea18a5b5975c61185"
+    },
+    {
+      "path": "matrix-0-3-8-demand1.log",
+      "sha256": "3287cd2ead16ae5a08f47784c60098a651c018e9358dd94aead61be98f7819c9"
+    },
+    {
+      "path": "matrix-0-3-8-demand1.out",
+      "sha256": "f4c70700cf2780163efee7e3f2d3107d3a794683681ecd41e868b51058e7e4df"
+    },
+    {
+      "path": "matrix-0-4-1-demand0.json",
+      "sha256": "5c72cdcfba1756df68506087cae8e4ddace3efade6e5933523aeb78eecc83ea0"
+    },
+    {
+      "path": "matrix-0-4-1-demand0.log",
+      "sha256": "6dfa6b2a7bac14969e1f6b54f5e602ee4f8a65a3da4bc590ebbb74eff1f2fd73"
+    },
+    {
+      "path": "matrix-0-4-1-demand0.out",
+      "sha256": "a78728b3431b64469df0ac7e30fcc5b3ba3d50cf8e37b16361e828833674492e"
+    },
+    {
+      "path": "matrix-0-4-1-demand1.json",
+      "sha256": "daf8ef77ca904e43fdd9f763d61ec7b7880644c993a1afc16c64b5f9a17cbb61"
+    },
+    {
+      "path": "matrix-0-4-1-demand1.log",
+      "sha256": "3c2a958b9c0602ec7cb5cc7f8796dd3290398d2904f25225999e9314170c89d6"
+    },
+    {
+      "path": "matrix-0-4-1-demand1.out",
+      "sha256": "dc60e0bc35b51fe934c70b664200a76d976c8048671ad40c9f74f53cf89a0351"
+    },
+    {
+      "path": "matrix-0-4-128-demand0.json",
+      "sha256": "a9de4e5ad868a414560f76a82d74968ca2f1af8979038837852313ccfb0a170c"
+    },
+    {
+      "path": "matrix-0-4-128-demand0.log",
+      "sha256": "adccfe57935949b3baf75721e0e72142e7ffc62967d66e33d80274b9441fb88c"
+    },
+    {
+      "path": "matrix-0-4-128-demand0.out",
+      "sha256": "4631e7838eca7d002e6555633805ede0d5d73493266d2ae1a49ebc084c7fbd1c"
+    },
+    {
+      "path": "matrix-0-4-128-demand1.json",
+      "sha256": "479a38d11bd37243d9618df27831fed659ba3b9c4217d3548609c8d822a24f3a"
+    },
+    {
+      "path": "matrix-0-4-128-demand1.log",
+      "sha256": "b689387a4f29e724c4160bbefdc309e5c62ff6e5eb91af6969a373162e9a60a7"
+    },
+    {
+      "path": "matrix-0-4-128-demand1.out",
+      "sha256": "9331b6843ff611860b2e36be609e8867dc6af4d567a9a95423eebaa87ec127c3"
+    },
+    {
+      "path": "matrix-0-4-32-demand0.json",
+      "sha256": "a30453e6fe0b237404426d8fe69933f2ce8e854e04c36c73a2fdbf2265131fe7"
+    },
+    {
+      "path": "matrix-0-4-32-demand0.log",
+      "sha256": "19e4e818891b508165061fbc3d41d0d71f7f44b9cd96ff0b4c3614d85eca8802"
+    },
+    {
+      "path": "matrix-0-4-32-demand0.out",
+      "sha256": "a7d184a3e1e42d68fc00eb48d2c08bcd046dff221f969073a4e7e63de0d814d3"
+    },
+    {
+      "path": "matrix-0-4-32-demand1.json",
+      "sha256": "72c60e17c25eee68f30408ec4a207b64e1d5b0fcf40ac23453f9a858c895c27e"
+    },
+    {
+      "path": "matrix-0-4-32-demand1.log",
+      "sha256": "e28cbe67e96d83f8c109d3c33f867f1006d4bf02ce339e036a62fa2e84431ddb"
+    },
+    {
+      "path": "matrix-0-4-32-demand1.out",
+      "sha256": "cde7449b1dbc101405c5bc490c87c02ec6844ad229dc4d27fce7941993f9452e"
+    },
+    {
+      "path": "matrix-0-4-8-demand0.json",
+      "sha256": "8330d551d88d4953a21fc402daaca997da29ddd395ce968259abe0c642cbc5d1"
+    },
+    {
+      "path": "matrix-0-4-8-demand0.log",
+      "sha256": "538aaf3570af8e647a7e3e85a970da5b263e73e87245af67a41e05d5fca716dd"
+    },
+    {
+      "path": "matrix-0-4-8-demand0.out",
+      "sha256": "513f72267d75066a8cdab9341a82a37464ca419e771df0cef5f2ac8c5a7f288b"
+    },
+    {
+      "path": "matrix-0-4-8-demand1.json",
+      "sha256": "76735c8ceb14cdfe2b70d1b9c9daff312e2334f02b6eb6d4e11c4cbaf69228d9"
+    },
+    {
+      "path": "matrix-0-4-8-demand1.log",
+      "sha256": "9a3e857ade23fa573303ca6646e7d67450c5513e2681922739f8cf4438246f21"
+    },
+    {
+      "path": "matrix-0-4-8-demand1.out",
+      "sha256": "e1977f2d5e8a637a7688ab333fd620d75644c987f3625e777025901d5fc48df0"
+    },
+    {
+      "path": "matrix-runs.json",
+      "sha256": "538d142a28dcdc5c7d4ab2667f9789a11a44e5c1f8aa5728141c566876ddc363"
+    },
+    {
+      "path": "measure.py",
+      "sha256": "9c60860b8c1b1423ff03267d0dfe8f4713ae0156288998f59d09e4d4f134ef1b"
+    },
+    {
+      "path": "measured-inputs.tar.gz",
+      "sha256": "0078b3d1d6ef4b8a100238feb9c7507f8211996333606bc7bb2de2ffb69dc604"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-0-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-0-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-0-65536-20260922.out",
+      "sha256": "f2627f0fc2fb19732e5329f60c708d2d55998fa0affa6934fcb4ba21bee35cb1"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-1-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-1-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-1-65536-20260922.out",
+      "sha256": "73c6f99963b5868645543675a41ebd23e191e41d385d96afb84329702a61f969"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-2-128-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-2-128-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-2-128-20260922.out",
+      "sha256": "17f4e4a1c78d802a0224766562a6e6926af76ce03b17b1f17fedb460616fd0b3"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-2-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-2-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-2-65536-20260922.out",
+      "sha256": "5695fd99695c0101c92ff688e7890ff6c052382af68eea1d604d4ac3eedf830d"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-3-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-3-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-3-65536-20260922.out",
+      "sha256": "e4940d6d7f7d1166043544f24bcf96b893ad089660630d0d8c78f8642230c0c8"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-4-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-4-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-0-4-65536-20260922.out",
+      "sha256": "46355f39c6ba43245e300ddb8743cae43584378e8f86ea060b0d43b4101f2695"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-0-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-0-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-0-65536-20260922.out",
+      "sha256": "dda33c38eb3524e265c0eb35c861515a9b11bf99d38ecc3a5aa8037e8d06f9fb"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-1-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-1-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-1-65536-20260922.out",
+      "sha256": "8d9149b1d7fd36740893344955a7b4e9202b0652b2b3bff2a964933c1d981986"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-2-128-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-2-128-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-2-128-20260922.out",
+      "sha256": "38a2d03f267fc587f8b25453ad94389122850fbe64059106550a97f073b72bd1"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-2-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-2-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-2-65536-20260922.out",
+      "sha256": "b462ee5728a4742ca6f0e12845a283664ff379c1221b912874db854ea42c727d"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-3-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-3-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-3-65536-20260922.out",
+      "sha256": "41d8bd830d1ea50cbca6d5244de82eac9d62d57b872cdd5e4bd542ba2bb467e0"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-4-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-4-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-1-4-65536-20260922.out",
+      "sha256": "88948199d14b92e3a5a62f2affb65942cc4f08d327c7384890f616d01adebd41"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-0-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-0-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-0-65536-20260922.out",
+      "sha256": "dc0d060a5addf43fb18ccc2e74fe6fcf3517242c889b2e0caa7c6762dadddd6a"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-1-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-1-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-1-65536-20260922.out",
+      "sha256": "a7136a314da48f94ae22be817becdbd1828a3f07b39f0ff146b6764a6a2e609a"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-2-128-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-2-128-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-2-128-20260922.out",
+      "sha256": "2eb0772e4771101453a830d0d8dbd1e90b91f58ae55f373a56e8052917371e2b"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-2-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-2-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-2-65536-20260922.out",
+      "sha256": "035c561d9ec4d5e21a0bc81baf299996d3f6d31d7588fbebbe45bbce78c35536"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-3-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-3-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-3-65536-20260922.out",
+      "sha256": "0794ec84227871a75a57ca6facf7ecb2684aa841d84b7ef07390f5a06ff09602"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-4-65536-20260922.cleanup",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-4-65536-20260922.err",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "nslice-checkpoint-floor-docker-2-4-65536-20260922.out",
+      "sha256": "b5b4e9b0243cc58b92f386b4e191dd1c3c16fe0e4187ead26049883bccd1757e"
+    },
+    {
+      "path": "observability.log",
+      "sha256": "9e6743e6c9fd9f9015a5e25fea9296d1e532f2db3b878af01034209a4672ffdd"
+    },
+    {
+      "path": "paired-0-0-65536-demand0.json",
+      "sha256": "0e36a635b5af9352750e27bb862f946eaa59fb81f44a7ea49cdfbe7507c2fa1e"
+    },
+    {
+      "path": "paired-0-0-65536-demand0.log",
+      "sha256": "013d5d3b27d5be2718c88c15418645ab86588b6b2e448ddf836f4b8e0c0ef1f4"
+    },
+    {
+      "path": "paired-0-0-65536-demand0.out",
+      "sha256": "d2a0f3190f9058f675f39a96e312b947fa08bf75befe32aff5bba2fc41201994"
+    },
+    {
+      "path": "paired-0-0-65536-demand1.json",
+      "sha256": "10c6e0004d9be2cd0450a3a2956967bee64b458bb006482bf5264f8c6c6bc353"
+    },
+    {
+      "path": "paired-0-0-65536-demand1.log",
+      "sha256": "90aefc2999d9ab7724856c3a306bfe8643c5879d11b7ad9b0dd42a721330713e"
+    },
+    {
+      "path": "paired-0-0-65536-demand1.out",
+      "sha256": "ece25e5a50ec93862c8fe59791f2a27be77ae7fce1a50f6b9a22ae1831ffdac3"
+    },
+    {
+      "path": "paired-0-1-65536-demand0.json",
+      "sha256": "06c029998566c0dd4068fae50b5df888eeb7900fa4ebdf73e6f74ffac405a9b0"
+    },
+    {
+      "path": "paired-0-1-65536-demand0.log",
+      "sha256": "1eafaca5b6d9f35c2ba51a44612738ca50f3c08fbce0a2d45c88d6c53421e37e"
+    },
+    {
+      "path": "paired-0-1-65536-demand0.out",
+      "sha256": "46e972c8880042f716547aacae4de6775438eb0437fd86f1add325176c18a0a4"
+    },
+    {
+      "path": "paired-0-1-65536-demand1.json",
+      "sha256": "3953b86d71f37d7747d7f07da9759397754da6b9225288512a5313e95001bbce"
+    },
+    {
+      "path": "paired-0-1-65536-demand1.log",
+      "sha256": "292fecd0015a7e61ecdaa1ede6add036b40dbb05decd60e9d68ebc29a773bfb7"
+    },
+    {
+      "path": "paired-0-1-65536-demand1.out",
+      "sha256": "3e261c90cec2b7ad4fe787687563acffe1d0b2bdbc477d84f33b4e3b68bacf76"
+    },
+    {
+      "path": "paired-0-2-128-demand0.json",
+      "sha256": "5c266d9dd3b371ff07b11184e29d797e7f8a9c7fe509ff387e09b375228aafdc"
+    },
+    {
+      "path": "paired-0-2-128-demand0.log",
+      "sha256": "bad573382063eafef7897304d0162d93b4ec7c1b0f9665485453ea55e637b5bb"
+    },
+    {
+      "path": "paired-0-2-128-demand0.out",
+      "sha256": "30b5273ea37f10037d49a482a93acb6d6b733f7370ea339c0abdee8c08f423c8"
+    },
+    {
+      "path": "paired-0-2-128-demand1.json",
+      "sha256": "efb5a1e516ec695ffecde2f3caed03a50b427d5f840bbc93441f45e30ce043d5"
+    },
+    {
+      "path": "paired-0-2-128-demand1.log",
+      "sha256": "b7f4a60ad611d327b690cccbedfa3e91b631fb3e5fadf3b49e945fcffea48f62"
+    },
+    {
+      "path": "paired-0-2-128-demand1.out",
+      "sha256": "e76b321b8529ed719429920948e297aab152da5dfc969709b43289334190fe12"
+    },
+    {
+      "path": "paired-0-2-65536-demand0.json",
+      "sha256": "085c2ce35a9ef6789623abb0d760dfdb38f6bea96bb19fdbb0a814475e379d8a"
+    },
+    {
+      "path": "paired-0-2-65536-demand0.log",
+      "sha256": "7982768490e1e8d4f95cc2906667b5cae7b19039bf4624fe033d8d8183542371"
+    },
+    {
+      "path": "paired-0-2-65536-demand0.out",
+      "sha256": "484c1fc8b020bab44d87c2b369084c90747a12e2ffb6921501a35025e5fef8a4"
+    },
+    {
+      "path": "paired-0-2-65536-demand1.json",
+      "sha256": "752a7f8b3a5c0579497ee7c04fccae592ebb003e44bff1d52507065cea812078"
+    },
+    {
+      "path": "paired-0-2-65536-demand1.log",
+      "sha256": "2d0e07221c8a17b9e80438736d1cd464f90d62887c3cbf0dd07d323574f2d103"
+    },
+    {
+      "path": "paired-0-2-65536-demand1.out",
+      "sha256": "9bc280dd30fc540bade25f771de896e7387fea6755fce3844c2b113c36a6e6a6"
+    },
+    {
+      "path": "paired-0-3-65536-demand0.json",
+      "sha256": "4d5a8b0c3d3f94e6735393825c412102fa5ed2efa2f3715251c4fb1f1d1a52ca"
+    },
+    {
+      "path": "paired-0-3-65536-demand0.log",
+      "sha256": "85a5358b09aad1947974695d8fddd2ee85659701b8432cede80744b67f69825d"
+    },
+    {
+      "path": "paired-0-3-65536-demand0.out",
+      "sha256": "5d44660542932965ded1bbb3dae1c534194e73abfa1c216779916d2b57a2078a"
+    },
+    {
+      "path": "paired-0-3-65536-demand1.json",
+      "sha256": "edf8d01074f13433a3180c731c99f75e27a486656c5ba838d9a40b22f5f656a9"
+    },
+    {
+      "path": "paired-0-3-65536-demand1.log",
+      "sha256": "a9a05cf8528c5ac04c06fabd5243574ee8090e8614a767a30a53f5907cdef80f"
+    },
+    {
+      "path": "paired-0-3-65536-demand1.out",
+      "sha256": "a9994541c57a94846982ddda7be611571292874e06cca1be589dcde8a0433300"
+    },
+    {
+      "path": "paired-0-4-65536-demand0.json",
+      "sha256": "1224d7c80b0217b8a1ca6f7b7328ca780106d1d08c6f4caccebefc1a15e2d425"
+    },
+    {
+      "path": "paired-0-4-65536-demand0.log",
+      "sha256": "2a0ce2decb2ad3ecd74cd486a8101a5652b4b7bd5677216f4e5e30f127970b6b"
+    },
+    {
+      "path": "paired-0-4-65536-demand0.out",
+      "sha256": "3abefd9bf8656792575dc5c31dd5b8085d26f0fa127fba263fdc0e843bf56f76"
+    },
+    {
+      "path": "paired-0-4-65536-demand1.json",
+      "sha256": "fb7a5c6c2c336e17334c7c15e3dea1523d193b4a79e404f2e23bef78ea5d11c2"
+    },
+    {
+      "path": "paired-0-4-65536-demand1.log",
+      "sha256": "c339fe56ff6ea787f1194c19905b469f151d5b5880d31ab9c6135ed9dd38f1ba"
+    },
+    {
+      "path": "paired-0-4-65536-demand1.out",
+      "sha256": "1b1a1447e0b8b5f92a9b0a07ad8f6fb37e2ac793736b2be1312b631d59433b08"
+    },
+    {
+      "path": "paired-1-0-65536-demand0.json",
+      "sha256": "b466547b9f380c8912e3c4d30a917289bdadb9199a95f9e0f9f02b046c1ef28f"
+    },
+    {
+      "path": "paired-1-0-65536-demand0.log",
+      "sha256": "245f4748547e98f087433e040712af78760e09952683354bf4de45dc448e47c4"
+    },
+    {
+      "path": "paired-1-0-65536-demand0.out",
+      "sha256": "0d035ffdc720bb58a6d2bb3e69002efd3ae0209f8021337d268a24a1221071f5"
+    },
+    {
+      "path": "paired-1-0-65536-demand1.json",
+      "sha256": "c88bbb5f9ad236a995ed062ab9149e97daf9a144e2eae8644e29cbe89b69398d"
+    },
+    {
+      "path": "paired-1-0-65536-demand1.log",
+      "sha256": "a42e9d6a479b72e6995692d2534192c7969d457cef9c8164020c62690f130949"
+    },
+    {
+      "path": "paired-1-0-65536-demand1.out",
+      "sha256": "6d9914c48c236eedeed28d8029f10abe1ac20828727fe8ffb43dac157c5a11d2"
+    },
+    {
+      "path": "paired-1-1-65536-demand0.json",
+      "sha256": "4cc18b87da5326123ef3ab89e4e7c65d58c5a675d60ff236f75fe7cd49a6bcb9"
+    },
+    {
+      "path": "paired-1-1-65536-demand0.log",
+      "sha256": "39d6c7124a959dd0f6838d9cdc5b5503f256c3726a9c6378bcad9d38903b81ce"
+    },
+    {
+      "path": "paired-1-1-65536-demand0.out",
+      "sha256": "c1536ed870d8f9259586910654024e9a99f6531d0424a780c00c3b094bad3816"
+    },
+    {
+      "path": "paired-1-1-65536-demand1.json",
+      "sha256": "b34be15078fda94832d9b90d36935678d3ddddcabf188a27b9e318fb42482028"
+    },
+    {
+      "path": "paired-1-1-65536-demand1.log",
+      "sha256": "261bbea74963177c24c9f949f1ef5f65de31b7fa2b1656a54528c86f416b8961"
+    },
+    {
+      "path": "paired-1-1-65536-demand1.out",
+      "sha256": "28ae92efd058eefc113238ff4c0281b828b52f6053762c5511de6fd750eec6cd"
+    },
+    {
+      "path": "paired-1-2-128-demand0.json",
+      "sha256": "effc7f5b139ac7d2ae1336dd6c9c887dd3917b964a9f48242a74ced2a3fbe195"
+    },
+    {
+      "path": "paired-1-2-128-demand0.log",
+      "sha256": "3d0840008c15cab5819809b8f630cdbbe0c2d0186e8053e2b0b18a0fc0d12a0c"
+    },
+    {
+      "path": "paired-1-2-128-demand0.out",
+      "sha256": "8ca11d5b200ed5e41b18dbcb0e4a55d1f7ca97a864ddc74cb53678d27b4ba670"
+    },
+    {
+      "path": "paired-1-2-128-demand1.json",
+      "sha256": "8f3b5a3051776aeb1035bf90579bc2e714f82f1de9dfc8e3affb1b21a66231ae"
+    },
+    {
+      "path": "paired-1-2-128-demand1.log",
+      "sha256": "f01775a1eff3ac1b1eac4b9d48c0420ac6634e82dbcf0ca27905c06e1bacc999"
+    },
+    {
+      "path": "paired-1-2-128-demand1.out",
+      "sha256": "fab0987a67d96ad20c6cb844146c9839fdf3af5ea982190b08282d8f9dd8e26e"
+    },
+    {
+      "path": "paired-1-2-65536-demand0.json",
+      "sha256": "b782f124048dd74077c8cebc69ab4a132e8a6c3462ef3a075426953d68e918a2"
+    },
+    {
+      "path": "paired-1-2-65536-demand0.log",
+      "sha256": "f63e5a5c951548a94092cd85160669eff799d07bf713c59ebad6ac2e52453dab"
+    },
+    {
+      "path": "paired-1-2-65536-demand0.out",
+      "sha256": "9ceb09541ae2d5cc85b93df5b26a02de29b690d2fa89705c044d2a7dce9ff06e"
+    },
+    {
+      "path": "paired-1-2-65536-demand1.json",
+      "sha256": "b0ac3e348a261e0be66746972a261c7b1527f947464090f73eaf1a7b632a0cb2"
+    },
+    {
+      "path": "paired-1-2-65536-demand1.log",
+      "sha256": "4d51f994e8a53d67f4d158b899152534114173c4cf274b82b018d98b6c52a7cd"
+    },
+    {
+      "path": "paired-1-2-65536-demand1.out",
+      "sha256": "f6bb5ff2fe6dff9f71822a918be792f41773b3120c3248bca7277ac7f33a5a36"
+    },
+    {
+      "path": "paired-1-3-65536-demand0.json",
+      "sha256": "5479e2efd7bce8e1aee72a2cbc1215191076e2b614225dc7a6b32f9d93697618"
+    },
+    {
+      "path": "paired-1-3-65536-demand0.log",
+      "sha256": "fae19b601b9077da87f38f04b7f05341cebe15167dcb589e26da8d614c8c9fdf"
+    },
+    {
+      "path": "paired-1-3-65536-demand0.out",
+      "sha256": "ded74ca0c1a1d8c38854b9b012eb4edc273705e49e1899817e11312bd898036b"
+    },
+    {
+      "path": "paired-1-3-65536-demand1.json",
+      "sha256": "df29dbc74761747f3d1a82f13055cf0c7b743337241d37b81d2f986cfec4445e"
+    },
+    {
+      "path": "paired-1-3-65536-demand1.log",
+      "sha256": "c6b0b9d2c7c63215bbb20569f1367b5608382677bce095e608db60092118da78"
+    },
+    {
+      "path": "paired-1-3-65536-demand1.out",
+      "sha256": "e2e67b03a217a7a0519b44ef21d471bfa1bc3b7017578d2f0c55cba6dfa3fdc8"
+    },
+    {
+      "path": "paired-1-4-65536-demand0.json",
+      "sha256": "4cb0d4df19a2fc585a375686491b2e25e27f453a0e0ab6754bf256002025df66"
+    },
+    {
+      "path": "paired-1-4-65536-demand0.log",
+      "sha256": "c6b2d2bb85526d87817302d48dadead18a6ceaa1b1f659e2c9f83b2db99c7392"
+    },
+    {
+      "path": "paired-1-4-65536-demand0.out",
+      "sha256": "b0aad53e1bbb3b7ba6f2512ab791ab994456708f5807b29b674840fa5900a301"
+    },
+    {
+      "path": "paired-1-4-65536-demand1.json",
+      "sha256": "06cf0aa9909a14ecf7f66957cc68124c4b8ffbaadff6da0069616ef7aae5f249"
+    },
+    {
+      "path": "paired-1-4-65536-demand1.log",
+      "sha256": "84c237345ad9df7d5d2aa93dba3f2758375573be047980d898e56c282e394b70"
+    },
+    {
+      "path": "paired-1-4-65536-demand1.out",
+      "sha256": "889947ba1073471a92dbf3ac66488378bd02fa82142986b6f4a9a3a7698873ad"
+    },
+    {
+      "path": "paired-2-0-65536-demand0.json",
+      "sha256": "6a9c0ed2307199ae2e57ceea5a12929297f4c4cdd4c2ac87f94da8717c4354f7"
+    },
+    {
+      "path": "paired-2-0-65536-demand0.log",
+      "sha256": "b600a011b83a86efc0c1f82d78d4c22ab2dfd7dc4df0ac926c70ed234292bf3e"
+    },
+    {
+      "path": "paired-2-0-65536-demand0.out",
+      "sha256": "0b58c08bbb907162e467a7a54ed5ae431b0714aa9c96e4bb7a3af0614b15370f"
+    },
+    {
+      "path": "paired-2-0-65536-demand1.json",
+      "sha256": "8fc3a9b72f8ecabfaa0ff4ae4eeb0cc763ac1953b954fd0016d56e5233b96f3d"
+    },
+    {
+      "path": "paired-2-0-65536-demand1.log",
+      "sha256": "2d04efd8f96eacb7d0cdb480195af202fd2a14d0d6d85f451f9c1fa81fb0a4dc"
+    },
+    {
+      "path": "paired-2-0-65536-demand1.out",
+      "sha256": "4174d58beba251288c5d0bfb8aa1236bc3049c83fdbde76c2fa5e031559f2028"
+    },
+    {
+      "path": "paired-2-1-65536-demand0.json",
+      "sha256": "3a9bb96e98d0253112cbf1f92949685b04ee58f2595c96d82b740b8f11aff88c"
+    },
+    {
+      "path": "paired-2-1-65536-demand0.log",
+      "sha256": "2b601b541f8af09815e69766a915fc30431336343b7b507c64cc94bc7f23af4a"
+    },
+    {
+      "path": "paired-2-1-65536-demand0.out",
+      "sha256": "adc5125afcf6edc2453f109a44ed89461a66bfa84de08a40138e43544d853bc0"
+    },
+    {
+      "path": "paired-2-1-65536-demand1.json",
+      "sha256": "1aa23247364975d402ebd836053eb5845721dd385b83fe603f7693eab79539c3"
+    },
+    {
+      "path": "paired-2-1-65536-demand1.log",
+      "sha256": "15e78d85c09fcab0e0a35626b7ffe73db09cdba5b92cd0d1884750d7e16eec2b"
+    },
+    {
+      "path": "paired-2-1-65536-demand1.out",
+      "sha256": "4dea57b303afe0964e53f237c736f09bca318c770b468875ddf827401ebb2229"
+    },
+    {
+      "path": "paired-2-2-128-demand0.json",
+      "sha256": "89aa556c5a0294e34049dc329b857589d134c7bf275263c212b2ee2e658469d6"
+    },
+    {
+      "path": "paired-2-2-128-demand0.log",
+      "sha256": "e5e779da28019b670bd1ef3c526653c657e4ebdb15edcc42e71a1c3adac9e673"
+    },
+    {
+      "path": "paired-2-2-128-demand0.out",
+      "sha256": "f40e501dc3577c1dfdea1ffbdcfed4c7db6190cd90264a30ec31d8b26ca624fa"
+    },
+    {
+      "path": "paired-2-2-128-demand1.json",
+      "sha256": "29e8ec31e6cfa7b5003ca7a8478ffa90a96a352bde6a4fb0372fa42b1f4e8927"
+    },
+    {
+      "path": "paired-2-2-128-demand1.log",
+      "sha256": "52e2257cda7b43f00a78d34473ae626749ccc4214ad79ab9cd7c56a645bb08a2"
+    },
+    {
+      "path": "paired-2-2-128-demand1.out",
+      "sha256": "155024e5cd61713d27e5d9a36823a218f2147c3258a36d3e6576acd176f73c84"
+    },
+    {
+      "path": "paired-2-2-65536-demand0.json",
+      "sha256": "1c27d63e43449e47f3cafdd5a2b7fa9f9ba68cfa5b271b1b1388f9d06c707c3b"
+    },
+    {
+      "path": "paired-2-2-65536-demand0.log",
+      "sha256": "5d05cff2bf25e04b5597f7dcff913ea144ba390d2cf77e92655ce8fe6a8e9744"
+    },
+    {
+      "path": "paired-2-2-65536-demand0.out",
+      "sha256": "d8353fd0c7389a0db5e2a532781ad074362fca7146d887ffffbc7d1a3d21dc28"
+    },
+    {
+      "path": "paired-2-2-65536-demand1.json",
+      "sha256": "7908fcfe29408e8acc272a3e243d3376f10d2e8b897dff7ac79ec7889d72590a"
+    },
+    {
+      "path": "paired-2-2-65536-demand1.log",
+      "sha256": "f120935818921c8c5d95ac5ac1d5aa656bf61ae462c0e8eaff20a81c9e79993c"
+    },
+    {
+      "path": "paired-2-2-65536-demand1.out",
+      "sha256": "c3a0a0e5f5aa27ea3e6ec964ca820a260d3e7e779a1921193d1144806767bf11"
+    },
+    {
+      "path": "paired-2-3-65536-demand0.json",
+      "sha256": "88ce79503a6ce43fb21e41a2194166f4213089b9ee20707969cab31bca5c8ce3"
+    },
+    {
+      "path": "paired-2-3-65536-demand0.log",
+      "sha256": "04b75340cbe40b6aa03f20bca0124ec29e1733e5fd58eb2ce89e0aa82172724f"
+    },
+    {
+      "path": "paired-2-3-65536-demand0.out",
+      "sha256": "92392d125724fd247e7e952ae9ec402782a063cc9cdd13f09464d953eed18d96"
+    },
+    {
+      "path": "paired-2-3-65536-demand1.json",
+      "sha256": "98c0d5f74843aa8bcd75c9b4404de42357dccf7793e1d071cc0fa7ce59177ea5"
+    },
+    {
+      "path": "paired-2-3-65536-demand1.log",
+      "sha256": "8374678c88e9edfae1ad7c80eef0f3e2cbf069bea1ad71402f90e078ec4c8354"
+    },
+    {
+      "path": "paired-2-3-65536-demand1.out",
+      "sha256": "213045e3680309ae3f27e3c1f847f89b545255282b909720e6b6c4fc85732df6"
+    },
+    {
+      "path": "paired-2-4-65536-demand0.json",
+      "sha256": "60ab054e5a92de83dbf34f4ad1f163637ef6b71590879940e6d7392703cad600"
+    },
+    {
+      "path": "paired-2-4-65536-demand0.log",
+      "sha256": "973a9c640192f5d4cfa6fde09efbab67c20ec2dcd200ab4b7f82be5b07ae21af"
+    },
+    {
+      "path": "paired-2-4-65536-demand0.out",
+      "sha256": "06c0795715265eb05ed7a9813138c69898cdcf0ebde1378f42405c39fa262ce4"
+    },
+    {
+      "path": "paired-2-4-65536-demand1.json",
+      "sha256": "4ada7f49a07513f4a1ea7193b09abe9c0cbaa62f0da4809582c9de9b300f8937"
+    },
+    {
+      "path": "paired-2-4-65536-demand1.log",
+      "sha256": "3c00be4fffefe1e075cdbfb53f39d1e4b3180775295219d8264d480cac21faba"
+    },
+    {
+      "path": "paired-2-4-65536-demand1.out",
+      "sha256": "2e8b38086a430acdbb98467a4b2678d330f93da3e22e5da550ca27510f739842"
+    },
+    {
+      "path": "paired-runs.json",
+      "sha256": "32b14b64cf6fc0b94f63f8f4b793be0670b0984c0b9a6eb5bc592d186f5cd8a7"
+    },
+    {
+      "path": "pre-lint-fix-elf-clippy.log",
+      "sha256": "29b71b2026b1cbbbcff301bb5bf1096439db3a9e81462b4208e359ba6c0b6437"
+    },
+    {
+      "path": "pre-lint-fix-green-observations.json",
+      "sha256": "3b18231e2b6ff79577d3c1a0ed7a1e5ecd0c538bb1b7e936c3faccd479db6b30"
+    },
+    {
+      "path": "pre-lint-fix-qualification-status.json",
+      "sha256": "fd96d413942d1f91e1c75c6329f26d12d614de3acad89a1e0eac3647dfe452c6"
+    },
+    {
+      "path": "pre-lint-fix-tested-source-hashes.json",
+      "sha256": "5770facf26a67f21122deb6fe12234fa5558ea10caa4c139cdcc7a8a9fddba2b"
+    },
+    {
+      "path": "pre-lint-fix-tested-source-revision.txt",
+      "sha256": "8b05b2dcf3509d463d0b4be9730a7812a9f9c90dfc6e3721d266753896e3aec7"
+    },
+    {
+      "path": "qualification-status.json",
+      "sha256": "1770abac4d9e31999ba76b14a893c4b4324cbd33258832525d27cf384e272e6e"
+    },
+    {
+      "path": "qualify.py",
+      "sha256": "bdd85ee7d22b9992489068a265e8b9a8dd028e69e555e0d5302198e79e341147"
+    },
+    {
+      "path": "red-binary.sha256",
+      "sha256": "98b7a60bd155dd40851868e328bdb4a95a5576410131996df21aebaf1507aa3e"
+    },
+    {
+      "path": "red-bound-contract.log",
+      "sha256": "13c8f0f647939f5d982a57b46aa95a3e85267ccc31942aac096e43b2d9c9aabd"
+    },
+    {
+      "path": "red-bound-observations.json",
+      "sha256": "c10336df0dfa45e21d703890ca089532b7257abf8d22fa1b8e78016abc6c64a0"
+    },
+    {
+      "path": "red-change-inputs.tar.gz",
+      "sha256": "72336e40002ba60afeaa4567275fce65942a59d1266623bdf6db1fb44fed8862"
+    },
+    {
+      "path": "red-contract-corrected-fixture.log",
+      "sha256": "23ed9fab861024fd66aa211d5ccd531eb96af24767c86328c0aee96e19cb7a60"
+    },
+    {
+      "path": "red-contract-final.log",
+      "sha256": "991dd6ac52e83830943ffa80cfbf3838af5b275957df5ef3e09d5290fb8a3fa1"
+    },
+    {
+      "path": "red-contract.log",
+      "sha256": "dceba803d7e041b23c8db4964bc4c583ca394fc139959f4c4ee841e32bb42433"
+    },
+    {
+      "path": "red-observations.json",
+      "sha256": "1dc963bd2ef33c8bf24d37904d6662f6e919951f9748dae03647f32211d47f33"
+    },
+    {
+      "path": "red-source-hashes.json",
+      "sha256": "190fa422dacb5ab33d28215e37e8fa6000e68c7dfd04cbb3a497c1c5f9770da0"
+    },
+    {
+      "path": "registry.log",
+      "sha256": "0a49677b2bc0a2e7d713ba6d94dba45a00c8ea6cf5cf7b0583ce718683a25d7b"
+    },
+    {
+      "path": "release-binary.sha256",
+      "sha256": "6600c3e67b1efcb720a589c7bfde1687603eb05b31519afd79000e0107d85ca3"
+    },
+    {
+      "path": "release-build-final.jsonl",
+      "sha256": "09944bcff58c620c69adbd6d4d6b5e683e8d09ffbebb0cc47da4d7e781f9dc1e"
+    },
+    {
+      "path": "release-build-final.log",
+      "sha256": "963ed09d5200169f99825acae38fc08acac6eaf0b25e0997ac3544de951163ee"
+    },
+    {
+      "path": "release-build-fixed.jsonl",
+      "sha256": "8ecc0bd3d9733a861cdc519a807d5ceaf45793ed78cd560b94567dd9d1d3b5f3"
+    },
+    {
+      "path": "release-build-fixed.log",
+      "sha256": "fecfffa1d1e430354a017bfb6709dab34eb113404f654b3681d23b2879a3d828"
+    },
+    {
+      "path": "release-build.jsonl",
+      "sha256": "319e058ba5dd246f65cb5ed26e16b415a7c471206564613bce9c9d763a5bbb69"
+    },
+    {
+      "path": "release-build.log",
+      "sha256": "54ca6a44403a0c05ef2bbfafcf02d309cf0af0fedac2ab2d261190e1a252ea66"
+    },
+    {
+      "path": "runs-checkpoint-floor-docker.json",
+      "sha256": "820867a95a34af7ec1ddd5005ff734f2cee6c0ac894b21fb16aaa9b4ed7214a0"
+    },
+    {
+      "path": "runtime-clippy.log",
+      "sha256": "6e4f25a14922f9fa6190ff121dc01c2eccbf986bcaed2b45668dfda7e579853b"
+    },
+    {
+      "path": "runtime-memory.log",
+      "sha256": "147e910442041498b4a779162f48252087f19e96edebd37f6e16abe2323a1585"
+    },
+    {
+      "path": "summary.json",
+      "sha256": "f81e233c0465e2386d638fcf20d31a81d2b1985b9c1986da0828baeecd98db4c"
+    },
+    {
+      "path": "tested-source-hashes.json",
+      "sha256": "8866507a095dca739eaf17e9e3087e9f2a7281790fde8bce058c11617a773263"
+    },
+    {
+      "path": "tested-source-revision.txt",
+      "sha256": "f96e139c83c59e0f8749a2c9b93e02f3b1bbf1a38f0af9f0b124df09b9c6e793"
+    }
+  ]
+}

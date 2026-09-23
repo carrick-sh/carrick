@@ -1,0 +1,49 @@
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-spec)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-image)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/experiments/native-syscall-slice)
+error[E0433]: cannot find module or crate `activation_allocator` in this scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1173:9
+     |
+1173 |         activation_allocator::ALLOCATIONS.set(Some(0));
+     |         ^^^^^^^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `activation_allocator`
+     |
+     = help: if you wanted to use a crate named `activation_allocator`, use `cargo add activation_allocator` to add it to your `Cargo.toml`
+
+error[E0433]: cannot find module or crate `activation_allocator` in this scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1175:17
+     |
+1175 |         assert!(activation_allocator::ALLOCATIONS.replace(None).unwrap() > 0);
+     |                 ^^^^^^^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `activation_allocator`
+     |
+     = help: if you wanted to use a crate named `activation_allocator`, use `cargo add activation_allocator` to add it to your `Cargo.toml`
+
+error[E0433]: cannot find module or crate `activation_allocator` in this scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1186:13
+     |
+1186 |             activation_allocator::ALLOCATIONS.set(Some(0));
+     |             ^^^^^^^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `activation_allocator`
+     |
+     = help: if you wanted to use a crate named `activation_allocator`, use `cargo add activation_allocator` to add it to your `Cargo.toml`
+
+error[E0433]: cannot find module or crate `activation_allocator` in this scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1194:31
+     |
+1194 |             let allocations = activation_allocator::ALLOCATIONS.replace(None).unwrap();
+     |                               ^^^^^^^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `activation_allocator`
+     |
+     = help: if you wanted to use a crate named `activation_allocator`, use `cargo add activation_allocator` to add it to your `Cargo.toml`
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `carrick-runtime` (lib test) due to 4 previous errors

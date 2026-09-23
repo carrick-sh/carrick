@@ -1,0 +1,387 @@
+{
+  "created_utc": "2026-09-22T16:14:58.979841+00:00",
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "worktree": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick",
+  "local_uncommitted": true,
+  "parent_checkpoint": "docs/perf-results/2026-09-21-syscall-floor/native-admission/manifest.json",
+  "parent_manifest_sha256": "62f4e9b2ac38d95a39e5fa149843a917e438e5a81d0584ff2b2c9907e45bad5a",
+  "parent_carrier_manifest_sha256": "23476c4fee121757fd27037969af1a45cdb70705fdab22d55bf4e6b710213335",
+  "source_revision": "sha256:dae2a94b5c6f58bbae050ee52d312555003c155643235dcccd2cf9edb9a331ea",
+  "source_sha256": {
+    "conformance-contracts/contracts/native-execution-scope.toml": "455141738e29726f179346a08a7d376006801e69991fc0c8a7647d9a887895e3",
+    "conformance-contracts/contracts/native-synchronous-syscall.toml": "75203d63fc43a2e79421321054e7a484a396189fcd721fb072fe11aeb78a1bea",
+    "crates/carrick-kernel-example/src/contracts.rs": "89be01455534a1725c7f2e6dfbd555b569ec8672b465e51714cbc07ec193fb04",
+    "crates/carrick-kernel-example/tests/native_execution_scope.rs": "7a8d7bb15ef07962f938e2d0153eb6ea54e560266f9c67dbcf9d84ab5e14e0d1",
+    "crates/carrick-kernel/src/dispatch/mm_authority.rs": "f1f1fb007c6caf79ed1ff114fdc7b3030c1d00f74c2ddbcce3a2227ac00f63b3",
+    "crates/carrick-kernel/src/dispatch/mod.rs": "12cd13e624809e98bb355d0e11e79bba44b6d50056510a11c967e8d432913d20",
+    "crates/carrick-kernel/src/dispatch/native_execution.rs": "0787e842b8742a48890b8bbc7c7b093149f5b567cdf55e48a43ca77c35a20739",
+    "crates/carrick-kernel/src/dispatch/native_execution/tests.rs": "944db245558d51f2a6387027f132524a7b1fa670ebc1cdd9c32b431a4273f899",
+    "crates/carrick-kernel/src/kernel/guest_execution.rs": "79fb8f19c2ba3e26d4d4ca0e094282d397bfe2d535f91efc0c87073f5c22e6c8",
+    "experiments/native-syscall-slice/README.md": "79993a651f38c4f8fe938b35a54e389de8b7cefcb8d1367f3869a917cf642093",
+    "experiments/native-syscall-slice/src/main.rs": "a35de676977f6e59603cec10987ec1dc6c4c152b27d12954ddf66cb70744e895",
+    "experiments/native-syscall-slice/tests/scoped_execution.rs": "a28d3aae3f565d81edce73370a344a60c825bf973f4d3166f5b7ae8fe64ccc8c"
+  },
+  "parent_dirty_sources_unchanged": 103,
+  "changed_parent_dirty_sources": [
+    "conformance-contracts/contracts/native-synchronous-syscall.toml",
+    "crates/carrick-kernel-example/src/contracts.rs",
+    "experiments/native-syscall-slice/README.md",
+    "experiments/native-syscall-slice/src/main.rs"
+  ],
+  "unchanged_measured_executables": {
+    "target/release/carrick": {
+      "sha256": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+      "size": 34872912,
+      "unchanged": true
+    },
+    "target/lease-cost/inotify-transport-control/carrick-control": {
+      "sha256": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+      "size": 34872912,
+      "unchanged": true
+    },
+    "target/release/native-syscall-slice": {
+      "sha256": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65",
+      "size": 10412336,
+      "unchanged": true
+    }
+  },
+  "diagnostic_artifacts": {
+    "target/lease-cost/native-scope/native-scoped-debug": {
+      "sha256": "8083613c9d4e93e166397672db0cdb6d93f1400efb834a41863251f9f6f8d367",
+      "size": 38766168,
+      "lc_uuid": "5E882A8D-5003-39D5-84D8-5F4AFD552916",
+      "codesign_metadata_exit": 0,
+      "has_dof_carrick": true,
+      "profile": "debug",
+      "timing_eligible": false
+    },
+    "target/lease-cost/native-scope/native-scoped-alloc-debug": {
+      "sha256": "9f79da1a438c647594a18051b531c9f9a6c20cf91d9445fa4bc4c99c951a77a9",
+      "size": 39120136,
+      "lc_uuid": "726F14F8-2395-3B00-906B-FECF5991A1DB",
+      "codesign_metadata_exit": 0,
+      "has_dof_carrick": true,
+      "profile": "debug",
+      "timing_eligible": false
+    }
+  },
+  "unchanged_elf_fixture_sha256": {
+    "target/lease-cost/native-slice/fixtures/watch-0-1": "da215fd2e52667f2385f545d7ad5dced5c4804435e4a5b1381b423611dc19773",
+    "target/lease-cost/native-slice/fixtures/watch-0-8": "924a4293b6a0ba851075858c541c6a8ce1fbe9cca2c95caa0e87ff67e406115b",
+    "target/lease-cost/native-slice/fixtures/watch-0-32": "f200e9046b07a5a4d97efac905cf7dac69b4b8fc534a0701d703dd2bbb90d0b8",
+    "target/lease-cost/native-slice/fixtures/watch-0-128": "0af6eb393e1e975d7689c18a90a301c7cb89a799f0134728b0c8792db8000130",
+    "target/lease-cost/native-slice/fixtures/watch-1-1": "b73bc597cbd35843ca0b73e69efb59dcba4875e29bbbc98e2a36eecfd903ecbc",
+    "target/lease-cost/native-slice/fixtures/watch-1-8": "90f5f4e6474d06d93cb209b056d4acbe57a5e3d0926f02f63a4bc3d96f129a5b",
+    "target/lease-cost/native-slice/fixtures/watch-1-32": "266528ce8dd75a3927092e74ef7da4a0d1da51ee93eb42c9a819ee9acb305e6e",
+    "target/lease-cost/native-slice/fixtures/watch-1-128": "7c3448491856f9bad5f2f119ab139092ce43dfe6035a277ae9377fb498f3de18",
+    "target/lease-cost/native-slice/fixtures/watch-2-1": "43eeadd62b40a4ec92d414567a2e704ac476d4b11233cef2c405a049df0ee952",
+    "target/lease-cost/native-slice/fixtures/watch-2-8": "18ba1157aa6f3d6179bda53677c58dce03740274ce55a271672b98d577a260c4",
+    "target/lease-cost/native-slice/fixtures/watch-2-32": "f67f03597c78f0cf53206eb95fa1eeb198c1d58a76f6c7371ae2f67b560a2aa5",
+    "target/lease-cost/native-slice/fixtures/watch-2-128": "d6274e782b3563282b152e04e6c162aec44cc6df96783db7ae54afb6a4943641",
+    "target/lease-cost/native-slice/fixtures/watch-3-1": "21c9de745dd40a9cfae5ff5cdeca1cbc00a77ff7cd12a0d1194b4e94972d64e6",
+    "target/lease-cost/native-slice/fixtures/watch-3-8": "b687b8285d4cac83fe0b89dbdfd0264c1acb9a3cab0d5b4cd05a306a125a45bd",
+    "target/lease-cost/native-slice/fixtures/watch-3-32": "65a70a4a83a2a78c0a344c318c1dc99a0792f590d05b102e444ad3ba268fba29",
+    "target/lease-cost/native-slice/fixtures/watch-3-128": "8ec5a78882b84a43cf473f81516f3c64dff5160d7fd2553620564cea076fc8f7",
+    "target/lease-cost/native-slice/fixtures/watch-4-1": "d47b4c50091a5a007177b17dbe7c127f11397978c2a071058bcf8228b29268b3",
+    "target/lease-cost/native-slice/fixtures/watch-4-8": "f2e208320fae2ab1931f3c08749f65a68729587eedb0dd1e1247479fb0911c2a",
+    "target/lease-cost/native-slice/fixtures/watch-4-32": "1efbb7edaf985804db72ae53636fac910efd75bd14245e9a978d9c27eb245c4f",
+    "target/lease-cost/native-slice/fixtures/watch-4-128": "4d3202c8eb0b37978294bb07090bf6f2cd903b269e7215700703c2c13e180864"
+  },
+  "contract": "kernel.mm.native-execution-scope",
+  "parent_contract": "kernel.execution.native-synchronous-syscall",
+  "kernel_tests_passed": 2375,
+  "invalid_call_allocation_windows": 40,
+  "native_carrier_pointer_activation_complete": false,
+  "signed_native_execution_binding": false,
+  "new_performance_measurements": null,
+  "validation_initial": [
+    {
+      "name": "kernel-suite",
+      "argv": [
+        "just",
+        "test-kernel"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 14.627334791002795
+    },
+    {
+      "name": "scope-lifetimes",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-kernel",
+        "--doc",
+        "NativeExecution",
+        "--",
+        "--show-output"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 1.3752533329970902
+    },
+    {
+      "name": "runtime-memory",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "vcpu_loop::memory::tests",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 24.516900665999856
+    },
+    {
+      "name": "runtime-quiesce",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "vcpu_loop::quiesce::",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.4331475409999257
+    },
+    {
+      "name": "clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "-p",
+        "carrick-kernel",
+        "-p",
+        "carrick-kernel-example",
+        "--lib",
+        "--tests",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 101,
+      "elapsed_seconds": 21.93878695901367
+    },
+    {
+      "name": "native-clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--manifest-path",
+        "experiments/native-syscall-slice/Cargo.toml",
+        "--all-targets",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 101,
+      "elapsed_seconds": 7.13541366699792
+    }
+  ],
+  "validation_final": [
+    {
+      "name": "kernel-suite-final",
+      "argv": [
+        "just",
+        "test-kernel"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 15.77641770800983
+    },
+    {
+      "name": "native-clippy-all-features",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--manifest-path",
+        "experiments/native-syscall-slice/Cargo.toml",
+        "--all-targets",
+        "--all-features",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.4708612499962328
+    },
+    {
+      "name": "native-tests-final",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "experiments/native-syscall-slice/Cargo.toml",
+        "--tests"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 2.175217625001096
+    }
+  ],
+  "final_checks": [
+    {
+      "name": "fmt",
+      "argv": [
+        "rustfmt",
+        "--edition",
+        "2024",
+        "--check",
+        "--config",
+        "skip_children=true",
+        "crates/carrick-kernel-example/src/contracts.rs",
+        "crates/carrick-kernel-example/tests/native_execution_scope.rs",
+        "crates/carrick-kernel/src/dispatch/mm_authority.rs",
+        "crates/carrick-kernel/src/dispatch/mod.rs",
+        "crates/carrick-kernel/src/dispatch/native_execution.rs",
+        "crates/carrick-kernel/src/dispatch/native_execution/tests.rs",
+        "crates/carrick-kernel/src/kernel/guest_execution.rs",
+        "experiments/native-syscall-slice/src/main.rs",
+        "experiments/native-syscall-slice/tests/scoped_execution.rs"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "diff-check",
+      "argv": [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0
+    }
+  ],
+  "prior_failures_unclosed": [
+    "kernel.mm.fresh-publication-maintenance",
+    "generated syscall inventory drift"
+  ],
+  "cleanup": "Each native functional runner used Command::output to wait and reap the exact standalone child. No HVF or Docker guest was launched.",
+  "evidence_sha256": {
+    "README.md": "d2396a4644df4324ff67f6bc43e76936a6c33219f2888bc285e9657f6c89bf9f",
+    "before.tar.gz": "ed9a4b8e3e7f6833dcc5a327167f24a23e22f7ca03838e3eecb9ab5888fa6d31",
+    "clippy-final.log": "0001e0e9b8179f8d06987ed27170568b5ed9fe242161cdadaad94363d2bf4434",
+    "clippy.log": "d1b8695674e55d098f5f51cef376e0dfb6ff48c5b32178535b5f26ec8174905c",
+    "contract-final/observations.json": "b035af34bfecc1d3e5bccb38ea4f63f8b09732f208fc9afafb43edd0740a26c5",
+    "contract.log": "d2ba0590ac2d99bc2d52873ef38a60fe4350d13da087bbbf81cc99bcbe5d708d",
+    "diff-check.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "elf-alloc/elf-functional.json": "e552da5b528e6a95abdede5be4fec9496e52779a6ffb912fe40bd0070150ba40",
+    "elf-alloc/native-scope-functional-0-1-6235.err": "b9661453b657b5646e7497890d3cb1cfb126cf337fa223c2af58892c407594b0",
+    "elf-alloc/native-scope-functional-0-1-6235.out": "b8edecfce0db748685e7e4b539626dc00b50c98e1a499ac0dcae56f8c2ac37b6",
+    "elf-alloc/native-scope-functional-0-128-6235.err": "6f04c6c4e3933d741ced1906625e239d7aaecfd0a32012088eab4c49b1b19ddc",
+    "elf-alloc/native-scope-functional-0-128-6235.out": "407002f67ae606a05a38c5c4c613e40c836430492609feb931d6a839db8b8dce",
+    "elf-alloc/native-scope-functional-0-32-6235.err": "ff84a4a69e876115a911c9347efd25f6c6d14faf9a872e8e5a4140b670433a80",
+    "elf-alloc/native-scope-functional-0-32-6235.out": "4ea1889980fdc406da61b41c3655968de72e1bc83bbc88269e14d84d5891c265",
+    "elf-alloc/native-scope-functional-0-8-6235.err": "5241878f0c9769af77ed86a291ecdc9453c25037e7d9a99f86fbbc5861b9a077",
+    "elf-alloc/native-scope-functional-0-8-6235.out": "f0fcd1ebfa1170a317a7972707a929d2aeb097cf649168eb9f10a962347f26be",
+    "elf-alloc/native-scope-functional-1-1-6235.err": "a74f9a7d4cc50650288fc4931b51862e35f9092564ec40292bc5398bda4ec384",
+    "elf-alloc/native-scope-functional-1-1-6235.out": "000fb40f83e092d767e1fdea38058294de9efcf6b8c20c3ddcf61ecc4aad6db5",
+    "elf-alloc/native-scope-functional-1-128-6235.err": "10a9e99b8cc00d39ab6ba5dd0a19627107fdbe4bdd2288d6603efe383af49d91",
+    "elf-alloc/native-scope-functional-1-128-6235.out": "1be1c3ae8382007afa221921a72e117635e78f29c3bb63f70f0b876238424cff",
+    "elf-alloc/native-scope-functional-1-32-6235.err": "364e912fca1b89777eb9953f4addf805cfee5b95b0d517abd0635837707a4058",
+    "elf-alloc/native-scope-functional-1-32-6235.out": "d853f28dbd0c98b32650cb6d8d8cd9d49f613fae63994c30eb50b68d7ae54e52",
+    "elf-alloc/native-scope-functional-1-8-6235.err": "b5f8108f34eeccaba96d0d7f457dfaca5bd6c9d3639cb10a04299e37b85be4df",
+    "elf-alloc/native-scope-functional-1-8-6235.out": "1aa7b2cd7e812b519ec9e15f24b889f16638014cd35afad225bb300ea53b073b",
+    "elf-alloc/native-scope-functional-2-1-6235.err": "9f316ed94d4d3b4ca21ee27008760cedf2fa94d51b7b9fec53486648a9b13fbd",
+    "elf-alloc/native-scope-functional-2-1-6235.out": "a59b4c5e20eb5a6eff2bedef66f18c021bfca17a65b78a32bb2c21d597ed5d0e",
+    "elf-alloc/native-scope-functional-2-128-6235.err": "beacf3dd001d5196e5afd8b95b38dd5f6af7b4276252e643a04e795360cb2659",
+    "elf-alloc/native-scope-functional-2-128-6235.out": "004d8bacaa731cb2b8c2fa22e427cf3a48fddf6a18c9b41c29abcf70f89e05a2",
+    "elf-alloc/native-scope-functional-2-32-6235.err": "1f5197559b64c51b694cb874f405f40bca83720f6de4be7e398d2581a057de95",
+    "elf-alloc/native-scope-functional-2-32-6235.out": "a2782f5eb80384f9051103a693acf8069660728eb0eded0d976744d5bd576fc7",
+    "elf-alloc/native-scope-functional-2-8-6235.err": "f33a6dbc79be347cca283731ece05ae2875d65cbf8c5e79cc1bada1bb89ee233",
+    "elf-alloc/native-scope-functional-2-8-6235.out": "8b5ca9c0566c810100b969c751dd3a641fe5c9fd83bc9077ed69680075f0a277",
+    "elf-alloc/native-scope-functional-3-1-6235.err": "a2a41f9f95859239cb04f0051a22364abd0697f7a5b6f06695fac01b58dce7bc",
+    "elf-alloc/native-scope-functional-3-1-6235.out": "1798088f7ad6f37b1725dcebc6e09f8744c80fbb23e15fa3ae7a7ed46f1cd83d",
+    "elf-alloc/native-scope-functional-3-128-6235.err": "9b922d289dd5bacacbd7c57f461356a9872f9d99528612e2a2bc0b53641bfb09",
+    "elf-alloc/native-scope-functional-3-128-6235.out": "92edf00e2122385e40151a71e26d72f118810859d8a10645b3d7713903601b1b",
+    "elf-alloc/native-scope-functional-3-32-6235.err": "a7c7884c4294c6666ec395ed4758b2c60b6aa9286b9316b198759e968910158c",
+    "elf-alloc/native-scope-functional-3-32-6235.out": "faea32d5c616804961c8404e94a7c83821d3f853d2a42a1b71b40ae7cd3c4a31",
+    "elf-alloc/native-scope-functional-3-8-6235.err": "20907fc36b3e6f4962325da3c905283454eb3082b935a720622fd427dc3179d5",
+    "elf-alloc/native-scope-functional-3-8-6235.out": "dfa191c581e2014d0ef77bfbe4e98a87cf48a03fbae5d39b1c5bba0a6e125440",
+    "elf-alloc/native-scope-functional-4-1-6235.err": "b4961e9e58e3c0c33d86c7831b63034eca4e023251bdc43203fe72ab03305d8d",
+    "elf-alloc/native-scope-functional-4-1-6235.out": "2a8a9297a1045a6040753e0e82cabd4e62c1339caf78e40aeb290b8b98af314a",
+    "elf-alloc/native-scope-functional-4-128-6235.err": "a5a9b758429c0457309d5f060e9e066b8ffdcf5862d94331bbee6db8b42c9c08",
+    "elf-alloc/native-scope-functional-4-128-6235.out": "a8a87a8cbd94fdaedec736b09161ee36364c9d2ae6dd0465b32aeb7de48e9663",
+    "elf-alloc/native-scope-functional-4-32-6235.err": "03b93d1703cddd696327474b54455673e449e7ee3aceeaaf7067a7790f1dfd37",
+    "elf-alloc/native-scope-functional-4-32-6235.out": "cf9a3e2bd5921aed6dc941b67a52c14b00de2fc5d097ccf99e268307e5bae545",
+    "elf-alloc/native-scope-functional-4-8-6235.err": "b4c25df6cba617448b4b3c5ab6b99b1a2c75e5ec2f987a6794ed9b71d4df88ae",
+    "elf-alloc/native-scope-functional-4-8-6235.out": "1ef4647f3c4405f5d013692bc3f741e1c4aff8b043c1eb7f3a2904bed073358b",
+    "elf-final/elf-functional.json": "d7fba13d6cecf6f606c7a421d0d526e6cf21a578a41688de74f72ede6fe28253",
+    "elf-final/native-scope-functional-0-1-6706.err": "006ebb44640667ce6ef828b3d12bec92b55946199174e1035fa9785ff9a2232c",
+    "elf-final/native-scope-functional-0-1-6706.out": "cce73acaf5b8b30c356aec57c205ad8365a61b5c16f3dd24438530021032acf4",
+    "elf-final/native-scope-functional-0-128-6706.err": "5dd5abf0ad39a971f7715bd14cb73aa15a20425431c2f6aad9dc9b7d3e9d7de0",
+    "elf-final/native-scope-functional-0-128-6706.out": "7766376e0c95da80aafd9c45ac3e1d6407610e79432beb9e90f6360c331aaef1",
+    "elf-final/native-scope-functional-0-32-6706.err": "9520f5cf33d2baccb0ba30a56b11540fc60cef984e868b34ab324a7e911fb1bc",
+    "elf-final/native-scope-functional-0-32-6706.out": "8bb9dccc8fceb2845a5fa2a48e1db68595067106b7d604ed3427d1833eb14796",
+    "elf-final/native-scope-functional-0-8-6706.err": "923af1e6cecfc25777ea6acc07b8312a4b6218c6f0f6b560e894707c831d5f9f",
+    "elf-final/native-scope-functional-0-8-6706.out": "8bde9b1468ddc0d2765315976f49a6a16bdbdb2455d55cb7a2cf109160d2851b",
+    "elf-final/native-scope-functional-1-1-6706.err": "35e6b5fc11b36ec0cbadebcac54674d1413175d941ef573f1ad0eaafa7d6c021",
+    "elf-final/native-scope-functional-1-1-6706.out": "8f1a3d185a1b9c7d6dae9d900cd77cf5df89d59abc781c2c68a435d604bcf7b7",
+    "elf-final/native-scope-functional-1-128-6706.err": "ece1608ad169fa89b07d5355e6c1c56d9b67bbd0dcf43ac82e1a21cb84fdbd73",
+    "elf-final/native-scope-functional-1-128-6706.out": "2b708cea30458cc3c87ca35fa1f64d69c17e1eef49125ffdb86eeabc6224a5b0",
+    "elf-final/native-scope-functional-1-32-6706.err": "f7bb9ddc813a2678f0e571e471ead7fa3002726dfc2d605dc2acbd9e8bcfa45c",
+    "elf-final/native-scope-functional-1-32-6706.out": "ce5b0c301b3737de603243f9f505cf8b28e01c87f8dbd25d343559b25cdc831e",
+    "elf-final/native-scope-functional-1-8-6706.err": "ea5b1d206dba4240445245d8f0581defe148a8126facdcf91fac6dd75ae4e5fe",
+    "elf-final/native-scope-functional-1-8-6706.out": "c37527c8b6c3eef019ae72f6a84164e3b5d238fda154f7800060f9141a2fcbae",
+    "elf-final/native-scope-functional-2-1-6706.err": "f5192655c0d20055362564a946ac4a5c927483d5f3494894e35e15adf805595d",
+    "elf-final/native-scope-functional-2-1-6706.out": "f94185ab96deccb8570d382101d148cf2b2050ee62f2c50155d5471bd3ed710f",
+    "elf-final/native-scope-functional-2-128-6706.err": "41bcaeb2370d1e9f02abf2ff8641b699472c29fbd2e5efd01684fd72d0371964",
+    "elf-final/native-scope-functional-2-128-6706.out": "e4ccb9fb94bd8d9c5c0782305851f640d5dedcc9545f2271cde116da2d89ce91",
+    "elf-final/native-scope-functional-2-32-6706.err": "7bd52ade84487b974e357354f34a504bf3d7b2e68fae41bc09a3ce8015708211",
+    "elf-final/native-scope-functional-2-32-6706.out": "d69df829edc6134cf9750dfc8764f1c60c1742392420f560d168336036b3a3ce",
+    "elf-final/native-scope-functional-2-8-6706.err": "79803ecf60301e0c474d7222ec18d0c9d92d9eb3ae317aec61ef9c58ea7ebdef",
+    "elf-final/native-scope-functional-2-8-6706.out": "e18f9ec9a81cd8dbdb7ad9de1c58b37b447c41d30ad40403c78149481fcb8fc3",
+    "elf-final/native-scope-functional-3-1-6706.err": "437a2cd771c651d232cacc45553d7333c8871c6a3ad3525e65598540bbee6a08",
+    "elf-final/native-scope-functional-3-1-6706.out": "5fa1572e300527212e8713ce1bbfaab3b1b5d97148249f076f89bc4731c3b65a",
+    "elf-final/native-scope-functional-3-128-6706.err": "d8284ef1181c8d69d4c7ec94d219307058760b8fec8bc966093808881bc1a558",
+    "elf-final/native-scope-functional-3-128-6706.out": "5b503e67a7a264703e5151c5a7e67699a28b916fc3c59e8177f4f9dfde9ad47d",
+    "elf-final/native-scope-functional-3-32-6706.err": "256d8763563b41658ffbf92e2a5d0e3b117f12ab4bde4b5f13ab61bf041f0fb4",
+    "elf-final/native-scope-functional-3-32-6706.out": "896ceef973ca546e0c88694581e422bf59d06603a9a44ba2ae7e0cd6b11a5c87",
+    "elf-final/native-scope-functional-3-8-6706.err": "cf8c2627fa54ddf5e84ef5bd0ea78f1985a0cb04bb7271fb2474f3c3aef9c5ba",
+    "elf-final/native-scope-functional-3-8-6706.out": "5f3703ce7b9c755b7d86bdc586348459cedbe5404b1c565812d3660098e4dcf1",
+    "elf-final/native-scope-functional-4-1-6706.err": "e97965a9d40642b2b4ae67b9fc496332ac1b050978998b2de9e44d9e1663aeca",
+    "elf-final/native-scope-functional-4-1-6706.out": "a5b540d714c3647cfe965d7c4ff45116b75115d821198337773906df6a7073a3",
+    "elf-final/native-scope-functional-4-128-6706.err": "1ad3a98e4dd83e11c8680b3d7ef67d3836b7036865d8ac892b416783eb522ae7",
+    "elf-final/native-scope-functional-4-128-6706.out": "50db95a4cbd56c1c8cdbb015355622557e45f3cb7d372bdf5ea9a8a3e561ecc7",
+    "elf-final/native-scope-functional-4-32-6706.err": "f3c1e03bdc76741a7e9b923c25e32af816fa05000bea04f412ad1cd15f60cb58",
+    "elf-final/native-scope-functional-4-32-6706.out": "98953b9088fa6d469d6cf9059ae499a331899fc8b63c3ba6904411c7f712965d",
+    "elf-final/native-scope-functional-4-8-6706.err": "8d8ea8268174fc58badb6e8642adc2fa253e73f4a0dfbde6f5c342d2edc7aca2",
+    "elf-final/native-scope-functional-4-8-6706.out": "1d61eb31611e0a3eb7c8821205bab0938a5227cd74c012028a686f15d6c284f5",
+    "fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "implementation.patch": "515b82b9eb9240eeb0b081ace0cf1e0d70b3c003fc9c37b0f7d722f07c63766f",
+    "kernel-suite-final.log": "be5d248012804c197cf6c81351225cc27ca0e78c3363ba8b6e6396e092a8b1e5",
+    "kernel-suite.log": "593f1d992c40b293c1dae893bab891ba6d6da938509474e23ab4939ba7e36199",
+    "native-alloc-tests.log": "885946b8b133693b6f8bf4e1993047048f2dbed69110d5ad8094d089a94f0bab",
+    "native-build.log": "2720a3677c37592dce25ad0a72780e089c0f7636155afcfa2d80a3721f1828ba",
+    "native-clippy-all-features.log": "1d52805b492a36df890548a09fdba0f195d4ffd952ccade905e1833c8578fafe",
+    "native-clippy-final.log": "91ff6791d974d0599a9fcc91601343503971498ede78ec31cc1e6a63188d4eb8",
+    "native-clippy.log": "91b9daab6ad40b81959d859a2c7c311511fa2bde36d569c8826e612aeda6b1bc",
+    "native-scoped-alloc-debug.codesign.txt": "f191afa7b555462a9f8dbca3f6d9ede9c52383e4903a341d0b884359340636da",
+    "native-scoped-debug.codesign.txt": "1ad36adcc5ccf8bb54be263f681a39eaa4f0dba5c7b008bbe895d89f94867af9",
+    "native-tests-final.log": "c8f814cae30a274111237f03ae644fd18c381b1ed062b7c6d2eefbf45350f3d9",
+    "native-tests.log": "ffdc628968a730393e916ee597eaa5415f648b13ce0abaf5903a69d06df5507e",
+    "native_execution.endpoint-red.rs": "1ad451d3a4339cebbcd399df2259c8b6670836333205900788a2c027b60e53e9",
+    "native_execution_scope.api-red.rs": "d5f278f744287b5770c7b5e3071b5e808b6594e1db0e3753c38781b2bf104524",
+    "red-api-clean.log": "1c3ab329282c8061a98d62e45ee08ccea8aa3cfa5fc4a769eb46dc4eab2e205d",
+    "red-api.log": "b39990fe2315ee62a02e1fd089a589e4cbc952735024d5c7fa5f830df4e2b3f7",
+    "replacement-red-exact.log": "03eb930efcee2a001272261f4b61a2ceef9ed452ce918cfd22c7f6ac91f89b39",
+    "replacement-red.log": "ea29b4e030583e4b21cf9cf73441d6fba4ff955db4eabd2f29ac2fd6de71cf32",
+    "revision.txt": "a3f731ab5f47d3da85a41ddeb07e93e084894be41f101869e73eb698dd1c8052",
+    "runtime-memory.log": "603d8b462e9f209e1c0ce3ac7b7c4fc4c39d6695b150de0930a5ccb40abc2e28",
+    "runtime-quiesce.log": "322fe9aa22e9e92390557b5123c1c4813ff97e145052e9fff604440282144717",
+    "scope-lifetimes.log": "c3047e0df554ba249dc33a69e9623eded951bafc4b6418ee68add092b1affc27",
+    "source-hashes.json": "dae2a94b5c6f58bbae050ee52d312555003c155643235dcccd2cf9edb9a331ea",
+    "source.tar.gz": "22f6fbdd72ab9cd5a8eef1ada05b8a98294df7365301380ad51e2b6fab09d2fe",
+    "unit-final.log": "61829ed1d70218a375ccc596871ff0a749c6404924a97674fb4c0754adf6d6db",
+    "unit.log": "de5da12f5f81714ac99cca0906e04cd9d24039d89da233365af94501560c7c10",
+    "validation-final.json": "bbe4f6b1bbe984e33b78ae71cb2ff7c0f98f475481f595083ac2ba6051993b1b",
+    "validation.json": "6c001e079460518c188836187517a3295a6aeb9ecc2ba529442469c2f1ffb8e9"
+  }
+}

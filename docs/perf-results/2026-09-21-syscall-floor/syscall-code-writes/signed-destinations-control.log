@@ -1,0 +1,89 @@
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-spec)
+   Compiling carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-image)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-embed)
+   Compiling carrick-conformance-next v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-next)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1m 38s
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/signal_lease_gap-cbe70567e390ca19.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/signal_lease_gap-cbe70567e390ca19
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/syscall_write_destinations-4acf6b9bf34664f5.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/syscall_write_destinations-4acf6b9bf34664f5
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/inotify_lifecycle-1574f86931506faa.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/inotify_lifecycle-1574f86931506faa
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a.tmp.2992: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a
+test-signed: resolved exact filter syscall_write_destinations_preserve_bytes_permissions_and_cow -> syscall_write_destinations_preserve_bytes_permissions_and_cow
+test-signed: running /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/syscall_write_destinations-4acf6b9bf34664f5 syscall_write_destinations_preserve_bytes_permissions_and_cow --exact --nocapture
+
+running 1 test
+test syscall_write_destinations_preserve_bytes_permissions_and_cow ... 
+thread 'syscall_write_destinations_preserve_bytes_permissions_and_cow' (4811040) panicked at crates/carrick-embed/src/testing.rs:466:9:
+expected a successful run; exit_code=1 signal=None trap_limit_hit=false stderr="Traceback (most recent call last):\n  File \"<string>\", line 56, in <module>\nAssertionError\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    syscall_write_destinations_preserve_bytes_permissions_and_cow
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.13s
+
+test-signed: FAIL /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/syscall_write_destinations-4acf6b9bf34664f5
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.noent.2992: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.noent.2992
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.06s
+
+test-signed: FAILED (carrick-conformance-next)
+remaining carrick procs (run-id syscall-code-writes-control-20260922) = 0
+remaining carrick procs (run-id syscall-code-writes-control-20260922-cli) = 0

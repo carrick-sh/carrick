@@ -1,0 +1,27 @@
+{
+  "parent_files": 129,
+  "unchanged_parent_files": 120,
+  "changed_parent_files": [
+    "conformance-contracts/inventory.json",
+    "crates/carrick-conformance-contract/tests/claims.rs",
+    "crates/carrick-hal/src/foreign_mm.rs",
+    "crates/carrick-hal/src/lib.rs",
+    "crates/carrick-kernel/src/kernel/mm_access.rs",
+    "crates/carrick-observability/src/work_meter.rs",
+    "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
+    "experiments/native-syscall-slice/src/carrier_memory.rs"
+  ],
+  "new_source_files": [
+    "conformance-contracts/contracts/current-read-reuse.toml",
+    "crates/carrick-kernel/src/kernel/mm_access/current_read.rs",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm/current_read.rs"
+  ],
+  "source_files_verified": 132,
+  "frozen_artifacts_verified": {
+    "target/release/carrick": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+    "target/lease-cost/inotify-transport-control/carrick-control": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+    "target/release/native-syscall-slice": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65",
+    "target/lease-cost/native-memory/native-guarded-executor": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65"
+  }
+}

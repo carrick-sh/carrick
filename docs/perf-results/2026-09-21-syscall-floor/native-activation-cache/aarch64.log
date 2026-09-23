@@ -1,0 +1,73 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/carrick_aarch64-ba2877fc7054433f)
+
+running 66 tests
+test engine::tests::absent_sparse_editor_preserves_live_vcpu_bootstrap ... ok
+test engine::tests::core_resume_pair_uses_saved_el0_state_during_a_syscall_trap ... ok
+test engine::tests::core_resume_pair_uses_live_el0_state_outside_a_syscall_trap ... ok
+test engine::tests::core_resume_pair_uses_saved_el0_state_when_fatal_capture_runs_in_el1 ... ok
+test engine::tests::a_hardware_readback_of_the_bootstrap_sctlr_is_still_neutral ... ok
+test engine::tests::el1_signal_ignores_stale_caller_pc ... ok
+test anonymous_discard::tests::invalid_ranges_do_not_reach_backend ... ok
+test engine::tests::el1_signal_recovers_backend_mailbox_return_only_when_caller_has_none ... ok
+test engine::tests::asid_retirement_maintenance_is_exactly_scoped_and_ordered ... ok
+test engine::tests::core_register_capture_rejects_disabled_fpsimd_authority ... ok
+test anonymous_discard::tests::interior_failure_preserves_classification_without_edge_work ... ok
+test anonymous_discard::tests::edge_failure_after_retirement_is_indeterminate ... ok
+test engine::tests::existing_sparse_editor_skips_parked_vcpu_bootstrap ... ok
+test engine::tests::live_el0_signal_preserves_supplied_pc_without_reread ... ok
+test engine::tests::fresh_root_engine_and_exec_heap_lifecycle ... ok
+test engine::tests::live_el0_signal_without_caller_hint_uses_live_pc ... ok
+test engine::tests::migratable_snapshot_rejects_disabled_fpsimd_authority ... ok
+test anonymous_discard::tests::refusal_and_empty_interior_do_not_mutate ... ok
+test engine::tests::private_repoint_tlbi_failure_is_indeterminate ... ok
+test engine::tests::seed_applies_thread_entry_deltas ... ok
+test engine::tests::snapshot_roundtrip_preserves_complete_task_state_and_destination_local_state ... ok
+test engine::tests::snapshot_typed_state_roundtrips_every_task_field ... ok
+test engine::tests::frame_cow_binding_preserves_strong_asid_generation_distinct_from_mm ... ok
+test engine::tests::stage1_authority_conflicting_lease_rejection ... ok
+test engine::tests::live_hvpatch_stage1_edits_are_asid_scoped ... ok
+test engine::tests::execve_sharing_governed_solely_by_authority_even_on_disagreement ... ok
+test engine::tests::stage1_authority_sibling_lazy_build_sees_source ... ok
+test engine::tests::stage1_authority_source_survives_exec_while_shared ... ok
+test engine::tests::replace_page_tables_authority_preserves_parent_under_concurrent_vfork_children ... ok
+test engine::tests::task_only_terminal_cleanup_never_flushes_all_asids_or_destroys_worker_vcpu ... ok
+test engine::tests::wait_diagnostics_decode_hvpatch_island_back_to_original_svc ... ok
+test engine::tests::wait_diagnostics_prefer_post_syscall_guest_resume_pc ... ok
+test esr::tests::brk_aarch64_maps_to_sigtrap_brkpt ... ok
+test esr::tests::hw_breakpoint_and_watchpoint_map_to_sigtrap_hwbkpt ... ok
+test esr::tests::non_debug_faults_are_not_debug_signals ... ok
+test esr::tests::software_step_maps_to_sigtrap_trace ... ok
+test engine::tests::replace_page_tables_authority_preserves_parent_manager_and_source_when_shared ... ok
+test mailbox::tests::generation_rollover_never_publishes_zero ... ok
+test mailbox::tests::mailbox_layout_is_fixed ... ok
+test mailbox::tests::mailbox_ownership_transition_is_linear ... ok
+test engine::tests::hvpatch_process_aperture_reservation_removes_both_identity_ranges ... ok
+test mailbox::tests::mailbox_wire_values_are_unique_and_stable ... ok
+test mailbox::tests::portal_scalar_allowlist_is_exact ... ok
+test mailbox::tests::portal_wire_layout_and_transitions_are_closed ... ok
+test mailbox::tests::request_metadata_rejects_stale_and_duplicate_publications ... ok
+test mailbox::tests::response_cannot_publish_before_request_ownership ... ok
+test mailbox::tests::unpublished_payload_and_wrong_trap_kind_fail_closed ... ok
+test engine::tests::replace_page_tables_authority_retires_old_when_unshared ... ok
+test engine::tests::shared_futex_high_alias_uses_live_stage1_backing_ipa ... ok
+test engine::tests::stage1_authority_deferred_install_on_one_clone_then_build_on_another ... ok
+test engine::tests::stage1_authority_source_survives_rollback ... ok
+test engine::tests::stage1_authority_source_survives_snapshot_image ... ok
+test stage1_authority::tests::image_generation_exhaustion_never_reenables_reuse ... ok
+test stage1_authority::tests::retiring_child_authority_returns_its_image_to_the_shared_pool ... ok
+test engine::tests::stage1_protection_edit_fork_cow_downgrade_preserves_requested_exec_not_stale_arm ... ok
+test stage1_authority::tests::exec_replacement_drops_the_retired_source_so_the_replacement_lease_installs ... ok
+test vmm::completion_tests::default_complete_syscall_return_preserves_register_transport ... ok
+test stage1_authority::tests::stage1_authority_undo_journal_commit_and_rollback ... ok
+test stage1_authority::tests::rollback_retirement_failure_quarantines_arena_address ... ok
+test stage1_authority::tests::rollback_retires_backing_before_returning_arena_to_source ... ok
+test stage1_authority::tests::vfork_shares_prevents_exclusive_path_even_if_called_as_first_or_only_child ... ok
+test stage1_authority::tests::rollback_returns_allocated_extension_arena_to_source ... ok
+test stage1_authority::tests::concurrent_vfork_children_share_authority_and_detach_independently ... ok
+test stage1_authority::tests::image_pool_is_bounded_and_exec_recycles_the_retired_image ... ok
+test stage1_authority::tests::image_generation_invalidates_edits_errors_restore_and_replacement ... ok
+test anonymous_discard::tests::unaligned_discard_bounds_scrub_and_preserves_neighbors ... ok
+
+test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+

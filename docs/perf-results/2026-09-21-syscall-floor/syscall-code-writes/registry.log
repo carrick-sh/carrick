@@ -1,0 +1,4 @@
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running `target/debug/check-contracts --root .`
+conformance contracts checked: 35 contracts, 15 claims, 84 surfaces (inventory: 338 syscalls, 14 with claims)

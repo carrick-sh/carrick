@@ -1,0 +1,30 @@
+[
+  {
+    "name": "runtime-memory",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-runtime",
+      "--features",
+      "conformance-metrics",
+      "--lib",
+      "vcpu_loop::memory::tests::",
+      "--",
+      "--nocapture"
+    ],
+    "exit_code": 0,
+    "wall_s": 26.763471542013576
+  },
+  {
+    "name": "registry",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-conformance-contract"
+    ],
+    "exit_code": 101,
+    "wall_s": 2.8314679579925723
+  }
+]

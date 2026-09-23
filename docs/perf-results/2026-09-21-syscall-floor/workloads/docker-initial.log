@@ -1,0 +1,4 @@
+{"name": "node-app", "phase": "docker", "returncode": 0, "timed_out": false, "outer_wall_s": 0.25586579101218376, "guest_timing": [[0.102, 0.04, 0.024]]}
+{"name": "go-build-cold", "phase": "docker", "returncode": 0, "timed_out": false, "outer_wall_s": 1.050997667000047, "guest_timing": [[0.862, 1.989, 0.224]]}
+{"name": "python-os", "phase": "docker", "returncode": 0, "timed_out": false, "outer_wall_s": 0.8718232920073206, "guest_timing": [[0.715, 0.416, 0.238]]}
+{"name": "python-subprocess", "phase": "docker", "returncode": 0, "timed_out": false, "outer_wall_s": 20.483012208002037, "guest_timing": [[20.315, 7.91, 2.091]]}

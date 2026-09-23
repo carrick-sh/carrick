@@ -1,0 +1,4 @@
+unaligned_discard_pages=1=ok
+unaligned_discard_pages=8=ok
+unaligned_discard_pages=32=ok
+unaligned_discard_pages=128=ok

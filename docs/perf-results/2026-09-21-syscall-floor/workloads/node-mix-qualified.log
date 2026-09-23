@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/workloads/mix.py", line 52, in <module>
+    if __name__=='__main__':main()
+                            ~~~~^^
+  File "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/workloads/mix.py", line 42, in main
+    assert len(totals)==1 and int(totals[0])==sum(counts.values())>0,(totals,counts)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (['2053', '2029'], {201: 1, 34: 1, 203: 1, 200: 1, 242: 1, 139: 2, 48: 2, 96: 2, 198: 2, 17: 2, 221: 2, 210: 3, 78: 3, 199: 3, 260: 3, 94: 3, 24: 3, 62: 4, 160: 4, 165: 4, 123: 4, 291: 5, 278: 5, 204: 6, 209: 6, 19: 8, 20: 8, 178: 9, 93: 11, 59: 12, 208: 13, 220: 15, 293: 15, 99: 17, 29: 19, 167: 22, 261: 24, 64: 30, 22: 31, 21: 35, 90: 37, 174: 37, 175: 37, 177: 37, 176: 37, 56: 46, 214: 48, 80: 49, 25: 61, 63: 72, 172: 74, 57: 78, 226: 96, 135: 99, 233: 126, 134: 165, 222: 198, 98: 254, 215: 256})

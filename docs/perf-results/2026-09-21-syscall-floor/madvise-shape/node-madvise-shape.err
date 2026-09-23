@@ -1,0 +1,83 @@
+2026-09-22T03:34:52.135070Z  WARN carrick::commands: carrick trace: not root; re-executing under sudo
+TRACECHILD1|euid=501|egid=20|groups=12,20,33,61,79,80,81,98,100,204,250,395,398,399,400,701
+
+real	0m0.349s
+user	0m0.060s
+sys	0m0.243s
+
+real	0m0.295s
+user	0m0.060s
+sys	0m0.244s
+
+real	0m0.297s
+user	0m0.059s
+sys	0m0.247s
+
+real	0m0.301s
+user	0m0.060s
+sys	0m0.251s
+
+real	0m0.293s
+user	0m0.060s
+sys	0m0.242s
+
+real	0m0.301s
+user	0m0.057s
+sys	0m0.242s
+
+real	0m0.296s
+user	0m0.059s
+sys	0m0.247s
+
+real	0m0.315s
+user	0m0.068s
+sys	0m0.261s
+
+real	0m0.295s
+user	0m0.060s
+sys	0m0.244s
+
+real	0m0.294s
+user	0m0.058s
+sys	0m0.243s
+
+real	0m0.296s
+user	0m0.058s
+sys	0m0.245s
+
+real	0m0.295s
+user	0m0.060s
+sys	0m0.244s
+
+real	0m0.298s
+user	0m0.061s
+sys	0m0.246s
+
+real	0m0.304s
+user	0m0.058s
+sys	0m0.253s
+
+real	0m0.296s
+user	0m0.058s
+sys	0m0.248s
+
+real	0m0.300s
+user	0m0.059s
+sys	0m0.250s
+
+real	0m0.297s
+user	0m0.058s
+sys	0m0.249s
+
+real	0m0.304s
+user	0m0.063s
+sys	0m0.252s
+
+real	0m0.304s
+user	0m0.063s
+sys	0m0.248s
+
+real	0m0.300s
+user	0m0.059s
+sys	0m0.247s
+Error: custom DTrace capture was lossy, interrupted, or violated its required exit receipt

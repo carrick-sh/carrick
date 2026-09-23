@@ -1,0 +1,76 @@
+
+running 1 test
+native_checkpoint_cost {"arm":"authenticate","iterations":128,"pair_ns":240.5625,"runtime_conformance_metrics":false,"sample":0,"warmup":true,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"adapter","iterations":128,"pair_ns":83.984375,"runtime_conformance_metrics":false,"sample":0,"warmup":true,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"entry_activation","iterations":128,"pair_ns":648.4375,"runtime_conformance_metrics":false,"sample":0,"warmup":true,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"checkpoint_control","iterations":128,"pair_ns":391.2734375,"runtime_conformance_metrics":false,"sample":0,"warmup":true,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_fresh_adapter","iterations":128,"pair_ns":4964.515625,"runtime_conformance_metrics":false,"sample":0,"warmup":true,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"whole_host_path","iterations":128,"pair_ns":1471.03125,"runtime_conformance_metrics":false,"sample":0,"warmup":true,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"whole_host_path","iterations":65536,"pair_ns":1036.4068450927734,"runtime_conformance_metrics":false,"sample":1,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_fresh_adapter","iterations":65536,"pair_ns":327.1013946533203,"runtime_conformance_metrics":false,"sample":1,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"checkpoint_control","iterations":65536,"pair_ns":38.312286376953125,"runtime_conformance_metrics":false,"sample":1,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"entry_activation","iterations":65536,"pair_ns":278.37371826171875,"runtime_conformance_metrics":false,"sample":1,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"adapter","iterations":65536,"pair_ns":41.8211669921875,"runtime_conformance_metrics":false,"sample":1,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"authenticate","iterations":65536,"pair_ns":39.76567077636719,"runtime_conformance_metrics":false,"sample":1,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"authenticate","iterations":65536,"pair_ns":39.63661193847656,"runtime_conformance_metrics":false,"sample":2,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"adapter","iterations":65536,"pair_ns":41.45050048828125,"runtime_conformance_metrics":false,"sample":2,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"entry_activation","iterations":65536,"pair_ns":277.61778259277344,"runtime_conformance_metrics":false,"sample":2,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"checkpoint_control","iterations":65536,"pair_ns":38.363128662109375,"runtime_conformance_metrics":false,"sample":2,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_fresh_adapter","iterations":65536,"pair_ns":316.3229675292969,"runtime_conformance_metrics":false,"sample":2,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"whole_host_path","iterations":65536,"pair_ns":720.1474456787109,"runtime_conformance_metrics":false,"sample":2,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"whole_host_path","iterations":65536,"pair_ns":725.4136352539062,"runtime_conformance_metrics":false,"sample":3,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_fresh_adapter","iterations":65536,"pair_ns":326.6735076904297,"runtime_conformance_metrics":false,"sample":3,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"checkpoint_control","iterations":65536,"pair_ns":40.313720703125,"runtime_conformance_metrics":false,"sample":3,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"entry_activation","iterations":65536,"pair_ns":278.19886779785156,"runtime_conformance_metrics":false,"sample":3,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"adapter","iterations":65536,"pair_ns":39.23797607421875,"runtime_conformance_metrics":false,"sample":3,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"authenticate","iterations":65536,"pair_ns":38.7694091796875,"runtime_conformance_metrics":false,"sample":3,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"authenticate","iterations":65536,"pair_ns":39.02690124511719,"runtime_conformance_metrics":false,"sample":4,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"adapter","iterations":65536,"pair_ns":40.90690612792969,"runtime_conformance_metrics":false,"sample":4,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"entry_activation","iterations":65536,"pair_ns":277.0163269042969,"runtime_conformance_metrics":false,"sample":4,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"checkpoint_control","iterations":65536,"pair_ns":38.574859619140625,"runtime_conformance_metrics":false,"sample":4,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_fresh_adapter","iterations":65536,"pair_ns":313.229248046875,"runtime_conformance_metrics":false,"sample":4,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"whole_host_path","iterations":65536,"pair_ns":725.3990173339844,"runtime_conformance_metrics":false,"sample":4,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"whole_host_path","iterations":65536,"pair_ns":727.6280670166016,"runtime_conformance_metrics":false,"sample":5,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_fresh_adapter","iterations":65536,"pair_ns":325.0134735107422,"runtime_conformance_metrics":false,"sample":5,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"checkpoint_control","iterations":65536,"pair_ns":38.49284362792969,"runtime_conformance_metrics":false,"sample":5,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"entry_activation","iterations":65536,"pair_ns":277.7697296142578,"runtime_conformance_metrics":false,"sample":5,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"adapter","iterations":65536,"pair_ns":40.91009521484375,"runtime_conformance_metrics":false,"sample":5,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"authenticate","iterations":65536,"pair_ns":41.16058349609375,"runtime_conformance_metrics":false,"sample":5,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"authenticate","iterations":65536,"pair_ns":39.8375244140625,"runtime_conformance_metrics":false,"sample":6,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"adapter","iterations":65536,"pair_ns":41.068389892578125,"runtime_conformance_metrics":false,"sample":6,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"entry_activation","iterations":65536,"pair_ns":277.17018127441406,"runtime_conformance_metrics":false,"sample":6,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"checkpoint_control","iterations":65536,"pair_ns":38.39874267578125,"runtime_conformance_metrics":false,"sample":6,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_fresh_adapter","iterations":65536,"pair_ns":323.2930450439453,"runtime_conformance_metrics":false,"sample":6,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"whole_host_path","iterations":65536,"pair_ns":723.7319946289062,"runtime_conformance_metrics":false,"sample":6,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"whole_host_path","iterations":65536,"pair_ns":736.7000579833984,"runtime_conformance_metrics":false,"sample":7,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_fresh_adapter","iterations":65536,"pair_ns":324.2480010986328,"runtime_conformance_metrics":false,"sample":7,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"checkpoint_control","iterations":65536,"pair_ns":38.45343017578125,"runtime_conformance_metrics":false,"sample":7,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"entry_activation","iterations":65536,"pair_ns":278.0265808105469,"runtime_conformance_metrics":false,"sample":7,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"adapter","iterations":65536,"pair_ns":40.93424987792969,"runtime_conformance_metrics":false,"sample":7,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"authenticate","iterations":65536,"pair_ns":40.81282043457031,"runtime_conformance_metrics":false,"sample":7,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"authenticate","iterations":65536,"pair_ns":40.08039855957031,"runtime_conformance_metrics":false,"sample":8,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"adapter","iterations":65536,"pair_ns":42.80409240722656,"runtime_conformance_metrics":false,"sample":8,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"entry_activation","iterations":65536,"pair_ns":280.5875244140625,"runtime_conformance_metrics":false,"sample":8,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"checkpoint_control","iterations":65536,"pair_ns":38.54241943359375,"runtime_conformance_metrics":false,"sample":8,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_fresh_adapter","iterations":65536,"pair_ns":323.35154724121094,"runtime_conformance_metrics":false,"sample":8,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"whole_host_path","iterations":65536,"pair_ns":725.2667846679688,"runtime_conformance_metrics":false,"sample":8,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"whole_host_path","iterations":65536,"pair_ns":722.1940307617188,"runtime_conformance_metrics":false,"sample":9,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_fresh_adapter","iterations":65536,"pair_ns":322.9255676269531,"runtime_conformance_metrics":false,"sample":9,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"checkpoint_control","iterations":65536,"pair_ns":38.553863525390625,"runtime_conformance_metrics":false,"sample":9,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"entry_activation","iterations":65536,"pair_ns":275.55210876464844,"runtime_conformance_metrics":false,"sample":9,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"adapter","iterations":65536,"pair_ns":40.9119873046875,"runtime_conformance_metrics":false,"sample":9,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"authenticate","iterations":65536,"pair_ns":39.17820739746094,"runtime_conformance_metrics":false,"sample":9,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_reused_adapter","iterations":128,"pair_ns":281.25,"runtime_conformance_metrics":false,"sample":0,"warmup":true,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_reused_adapter","iterations":65536,"pair_ns":262.7887725830078,"runtime_conformance_metrics":false,"sample":1,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_reused_adapter","iterations":65536,"pair_ns":262.1345520019531,"runtime_conformance_metrics":false,"sample":2,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_reused_adapter","iterations":65536,"pair_ns":265.4196472167969,"runtime_conformance_metrics":false,"sample":3,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_reused_adapter","iterations":65536,"pair_ns":266.08848571777344,"runtime_conformance_metrics":false,"sample":4,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_reused_adapter","iterations":65536,"pair_ns":265.1844024658203,"runtime_conformance_metrics":false,"sample":5,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_reused_adapter","iterations":65536,"pair_ns":264.66114807128906,"runtime_conformance_metrics":false,"sample":6,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_reused_adapter","iterations":65536,"pair_ns":265.28041076660156,"runtime_conformance_metrics":false,"sample":7,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_reused_adapter","iterations":65536,"pair_ns":265.7604217529297,"runtime_conformance_metrics":false,"sample":8,"warmup":false,"workload_timing_eligible":false}
+native_checkpoint_cost {"arm":"dispatch_reused_adapter","iterations":65536,"pair_ns":265.9981994628906,"runtime_conformance_metrics":false,"sample":9,"warmup":false,"workload_timing_eligible":false}
+test vcpu_loop::memory::tests::native_floor::carrier_checkpoint_component_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 621 filtered out; finished in 1.04s
+

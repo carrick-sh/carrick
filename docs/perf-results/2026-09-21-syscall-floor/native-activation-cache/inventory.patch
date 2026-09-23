@@ -1,0 +1,151 @@
+diff --git a/conformance-contracts/inventory.json b/conformance-contracts/inventory.json
+index a669b2330..62d3b4aba 100644
+--- a/conformance-contracts/inventory.json
++++ b/conformance-contracts/inventory.json
+@@ -376,9 +376,11 @@
+       "handler": "filesystem",
+       "authority": "host",
+       "contracts": [
++        "kernel.execution.native-synchronous-syscall",
+         "kernel.inotify.mark-race-hotpath",
+         "kernel.inotify.readiness",
+-        "kernel.inotify.watch"
++        "kernel.inotify.watch",
++        "kernel.inotify.watch-churn"
+       ],
+       "claims": [
+         "kernel.inotify.mark-race-hotpath.linear-work",
+@@ -396,8 +398,10 @@
+       "authority": "host",
+       "contracts": [
+         "hvpatch.syscall.portal",
++        "kernel.execution.native-synchronous-syscall",
+         "kernel.inotify.mark-race-hotpath",
+-        "kernel.inotify.watch"
++        "kernel.inotify.watch",
++        "kernel.inotify.watch-churn"
+       ],
+       "claims": [
+         "hvpatch.syscall.portal.scalar-boundary",
+@@ -862,6 +866,7 @@
+       "authority": "host",
+       "contracts": [
+         "kernel.inotify.readiness",
++        "kernel.inotify.watch-churn",
+         "kernel.scheduler.host-wait-handoff"
+       ],
+       "claims": [
+@@ -1081,7 +1086,9 @@
+       "support": "bring_up",
+       "handler": "filesystem",
+       "authority": "host",
+-      "contracts": [],
++      "contracts": [
++        "kernel.fs.stat-allocation"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"
+@@ -1094,7 +1101,9 @@
+       "support": "bring_up",
+       "handler": "filesystem",
+       "authority": "host",
+-      "contracts": [],
++      "contracts": [
++        "kernel.fs.stat-allocation"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"
+@@ -1738,7 +1747,9 @@
+       "support": "bring_up",
+       "handler": "signal",
+       "authority": "guest",
+-      "contracts": [],
++      "contracts": [
++        "kernel.signal.lease-gap"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"
+@@ -1777,7 +1788,9 @@
+       "support": "bring_up",
+       "handler": "signal",
+       "authority": "guest",
+-      "contracts": [],
++      "contracts": [
++        "kernel.syscall.captured-stack"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"
+@@ -2858,7 +2871,10 @@
+       "support": "bring_up",
+       "handler": "memory",
+       "authority": "hybrid",
+-      "contracts": [],
++      "contracts": [
++        "kernel.mm.native-data-activation",
++        "kernel.mm.retained-fragment-query"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"
+@@ -2957,7 +2973,9 @@
+       "handler": "memory",
+       "authority": "hybrid",
+       "contracts": [
+-        "kernel.fork.mappings"
++        "kernel.fork.mappings",
++        "kernel.mm.retained-fragment-query",
++        "kernel.mm.scrub-remap-query"
+       ],
+       "claims": [
+         "kernel.fork.mappings.deferred-unpopulated"
+@@ -3009,7 +3027,9 @@
+       "support": "bring_up",
+       "handler": "memory",
+       "authority": "hybrid",
+-      "contracts": [],
++      "contracts": [
++        "kernel.mm.native-data-activation"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"
+@@ -3100,7 +3120,13 @@
+       "support": "bring_up",
+       "handler": "memory",
+       "authority": "hybrid",
+-      "contracts": [],
++      "contracts": [
++        "kernel.mm.anonymous-discard",
++        "kernel.mm.anonymous-discard-edges",
++        "kernel.mm.anonymous-discard-no-scrub",
++        "kernel.mm.retained-fragment-query",
++        "kernel.mm.scrub-remap-query"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"
+@@ -3244,7 +3270,8 @@
+       "handler": "lifecycle",
+       "authority": "guest",
+       "contracts": [
+-        "kernel.fork.stage1-image"
++        "kernel.fork.stage1-image",
++        "kernel.signal.lease-gap"
+       ],
+       "claims": [
+         "kernel.fork.stage1-image.image-pool-bound"
+@@ -3649,7 +3676,9 @@
+       "support": "bring_up",
+       "handler": "filesystem",
+       "authority": "host",
+-      "contracts": [],
++      "contracts": [
++        "kernel.fs.stat-allocation"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"

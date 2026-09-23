@@ -1,0 +1,25 @@
+{
+  "argv": [
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/carrick-base",
+    "debug",
+    "lldb-run",
+    "--deadline-seconds",
+    "20",
+    "--out-dir",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/kill-reducer/base-v2",
+    "--run-id",
+    "kill-floor-v2-base",
+    "--",
+    "--max-traps",
+    "18446744073709551615",
+    "--fs",
+    "host",
+    "--entrypoint",
+    "/usr/local/bin/python3",
+    "localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30",
+    "-c",
+    "import subprocess,sys,selectors\nsubprocess._PopenSelector=selectors.SelectSelector\nfor i in range(50):\n print('iteration',i,flush=True)\n try: subprocess.call([sys.executable,'-c','while True: pass'],timeout=0.1)\n except subprocess.TimeoutExpired: pass\n else: raise AssertionError('child returned')\nprint('KILL_WAIT_OK',flush=True)\n"
+  ],
+  "returncode": 124,
+  "sha256": "726c6848cf145e2aa0474cb7b12189da08ad77931b620c243654e9a4690509c9"
+}

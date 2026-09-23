@@ -1,0 +1,66 @@
+{
+  "workload": "python-os",
+  "total": 155750,
+  "top": [
+    {
+      "nr": 61,
+      "name": "getdents64",
+      "count": 33961
+    },
+    {
+      "nr": 80,
+      "name": "fstat",
+      "count": 23496
+    },
+    {
+      "nr": 57,
+      "name": "close",
+      "count": 23202
+    },
+    {
+      "nr": 79,
+      "name": "newfstatat",
+      "count": 20866
+    },
+    {
+      "nr": 56,
+      "name": "openat",
+      "count": 19280
+    },
+    {
+      "nr": 25,
+      "name": "fcntl",
+      "count": 12407
+    },
+    {
+      "nr": 62,
+      "name": "lseek",
+      "count": 5754
+    },
+    {
+      "nr": 134,
+      "name": "rt_sigaction",
+      "count": 3933
+    },
+    {
+      "nr": 35,
+      "name": "unlinkat",
+      "count": 1348
+    },
+    {
+      "nr": 63,
+      "name": "read",
+      "count": 1219
+    },
+    {
+      "nr": 64,
+      "name": "write",
+      "count": 1175
+    },
+    {
+      "nr": 98,
+      "name": "futex",
+      "count": 1169
+    }
+  ]
+}

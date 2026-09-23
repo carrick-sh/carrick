@@ -1,0 +1,13 @@
+{
+  "source_hashes_verified": true,
+  "artifact_hashes_verified": true,
+  "diff_check": true,
+  "kernel_mm_tests": 29,
+  "native_execution_tests": 7,
+  "contract_negative_controls": 2,
+  "native_and_kernel_clippy": "pass",
+  "signed_promotion": "not run; native binding incomplete and memory performance red",
+  "product_cli_unchanged": true,
+  "committed": false,
+  "pushed": false
+}

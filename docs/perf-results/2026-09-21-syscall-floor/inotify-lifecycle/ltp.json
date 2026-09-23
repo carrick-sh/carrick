@@ -1,0 +1,47 @@
+[
+  {
+    "phase": "carrick",
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/inotify-lifecycle/carrick-candidate",
+      "run",
+      "--max-traps",
+      "18446744073709551615",
+      "--fs",
+      "host",
+      "--entrypoint",
+      "/bin/sh",
+      "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+      "-c",
+      "/opt/ltp/testcases/bin/inotify09"
+    ],
+    "run_id": "inotify09-lifecycle-carrick-20260922",
+    "returncode": 0,
+    "elapsed_s": 21.336732333002146,
+    "bounded": false,
+    "cleanup_returncode": 0,
+    "binary_sha256": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0"
+  },
+  {
+    "phase": "docker",
+    "argv": [
+      "docker",
+      "run",
+      "--rm",
+      "--name",
+      "inotify09-lifecycle-docker-20260922",
+      "--platform",
+      "linux/arm64",
+      "--entrypoint",
+      "/bin/sh",
+      "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+      "-c",
+      "/opt/ltp/testcases/bin/inotify09"
+    ],
+    "run_id": "inotify09-lifecycle-docker-20260922",
+    "returncode": 0,
+    "elapsed_s": 5.786700417011161,
+    "bounded": false,
+    "cleanup_returncode": 0,
+    "binary_sha256": null
+  }
+]

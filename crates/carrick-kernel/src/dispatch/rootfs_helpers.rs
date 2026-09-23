@@ -41,7 +41,11 @@ pub(super) fn linux_dev_minor(dev: u64) -> u32 {
 }
 
 pub(super) fn linux_mode(metadata: &RootFsMetadata) -> u32 {
-    let kind = match metadata.kind {
+    linux_mode_fields(metadata.kind, metadata.mode)
+}
+
+pub(super) fn linux_mode_fields(kind: RootFsEntryKind, mode: u32) -> u32 {
+    let kind = match kind {
         RootFsEntryKind::File => LINUX_S_IFREG,
         RootFsEntryKind::Directory => LINUX_S_IFDIR,
         RootFsEntryKind::Symlink => LINUX_S_IFLNK,
@@ -49,7 +53,7 @@ pub(super) fn linux_mode(metadata: &RootFsMetadata) -> u32 {
         RootFsEntryKind::Fifo => LINUX_S_IFIFO,
         RootFsEntryKind::Socket => LINUX_S_IFSOCK,
     };
-    kind | (metadata.mode & 0o7777)
+    kind | (mode & 0o7777)
 }
 
 pub(super) fn access_metadata(metadata: &RootFsMetadata, mode: u64) -> DispatchOutcome {
@@ -221,12 +225,26 @@ pub(super) fn inode_for_path(path: &Path) -> u64 {
         }
         _ => os_bytes,
     };
-    let normalized =
-        carrick_vfs::fs_backend::normalize_raw(Path::new(std::ffi::OsStr::from_bytes(canon_bytes)));
-    let key_os = normalized
-        .as_ref()
-        .map(|p| p.as_os_str().as_bytes())
-        .unwrap_or(canon_bytes);
+    // normalize_raw removes the leading root separator. Already-normalized
+    // relative components can be hashed directly; preserve its existing slow
+    // path for dot components, repeated/trailing separators and root escapes.
+    let relative = canon_bytes.strip_prefix(b"/").unwrap_or(canon_bytes);
+    let normalized;
+    let key_os = if relative.is_empty()
+        || relative
+            .split(|&b| b == b'/')
+            .all(|part| !part.is_empty() && part != b"." && part != b"..")
+    {
+        relative
+    } else {
+        normalized = carrick_vfs::fs_backend::normalize_raw(Path::new(
+            std::ffi::OsStr::from_bytes(canon_bytes),
+        ));
+        normalized
+            .as_ref()
+            .map(|p| p.as_os_str().as_bytes())
+            .unwrap_or(canon_bytes)
+    };
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in key_os {
         hash ^= u64::from(*byte);

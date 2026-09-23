@@ -1,0 +1,14 @@
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.65s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-6abbf7196ab9319a)
+
+running 1 test
+native_carrier_elf scale=1 completed_total=1 close_errno=9 pause_requests_serviced=1
+native_carrier_elf scale=8 completed_total=9 close_errno=9 pause_requests_serviced=8
+native_carrier_elf scale=32 completed_total=41 close_errno=9 pause_requests_serviced=32
+native_carrier_elf scale=128 completed_total=169 close_errno=9 pause_requests_serviced=128
+test vcpu_loop::memory::tests::native_carrier_elf_memory_control_round_trip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 610 filtered out; finished in 0.05s
+

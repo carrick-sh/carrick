@@ -1,0 +1,9 @@
+{
+  "binary_sha256": "404e24a6ac362a7956bf2044720a0ba7ec50827e1b2168f39d6063e58342843a",
+  "verification": "--verify-gateway; no fresh timing claim",
+  "source_sha256": {
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor.rs": "19a47e631c7d32c631c994d3de890ba7758081bf2939dd8d0306841f9f1f97f9",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.rs": "03b036e38906d612ed6deb6831040e5a9fad5e2912bacdf205ab8de56cf78635",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.S": "3bd151f4a3279a372d9aca1de25f05a4995b824f7ea4be290337fc707c4c0b95"
+  }
+}

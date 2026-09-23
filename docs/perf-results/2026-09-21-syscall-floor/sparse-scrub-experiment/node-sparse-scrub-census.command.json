@@ -1,0 +1,24 @@
+{
+  "argv": [
+    "/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-sparse-scrub",
+    "trace",
+    "--require-script-exit",
+    "--script",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/scripts/dtrace/hvpatch-madvise-shape.d",
+    "-o",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/workloads/node-sparse-scrub-census.raw",
+    "--",
+    "run",
+    "--max-traps",
+    "18446744073709551615",
+    "--fs",
+    "host",
+    "--entrypoint",
+    "/bin/bash",
+    "localhost:5005/carrick-nodejs-conformance@sha256:1ed49af83bd30401e1b275957b99a1c28f6c582ab3d987997afb5888fa302718",
+    "-c",
+    "set -eu; for i in $(seq 1 20); do ( time /opt/node-src/v24/out/Release/node /opt/nodejs-conformance/fixtures/app-smoke.js ); done; echo PROFILE_WORKLOAD_OK"
+  ],
+  "run_id": "floor-node-sparse-scrub-census",
+  "binary_sha256": "9ba591aa5f0d1d269edea2b716d3f3165916b625f8d793e54164984b483f8dff"
+}

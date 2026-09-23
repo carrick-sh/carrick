@@ -1,0 +1,2 @@
+{"backend":"bounded-native-research","completions":222,"elapsed_ms":0,"elf":"/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-0-8","errno_returns":160,"exit":0,"gateway_transitions":233,"host_signal_bridge":"null","requests":223,"syscalls":{"113":20,"26":10,"27":80,"28":80,"29":10,"56":1,"57":11,"64":10,"93":1}}
+{"allocation_windows":[[16,16,0],[16,16,0],[16,16,0],[16,16,0],[16,16,0],[16,16,0],[16,16,0],[16,16,0],[16,16,0],[16,16,0]],"positive_control":true,"timing_eligible":false}

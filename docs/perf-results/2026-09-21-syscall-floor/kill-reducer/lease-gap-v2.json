@@ -1,0 +1,25 @@
+{
+  "argv": [
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/carrick-lease-gap",
+    "debug",
+    "lldb-run",
+    "--deadline-seconds",
+    "20",
+    "--out-dir",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/kill-reducer/lease-gap-v2",
+    "--run-id",
+    "kill-floor-v3-lease-gap",
+    "--",
+    "--max-traps",
+    "18446744073709551615",
+    "--fs",
+    "host",
+    "--entrypoint",
+    "/usr/local/bin/python3",
+    "localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30",
+    "-c",
+    "import subprocess,sys,selectors\nsubprocess._PopenSelector=selectors.SelectSelector\nfor i in range(50):\n print('iteration',i,flush=True)\n try: subprocess.call([sys.executable,'-c','while True: pass'],timeout=0.1)\n except subprocess.TimeoutExpired: pass\n else: raise AssertionError('child returned')\nprint('KILL_WAIT_OK',flush=True)\n"
+  ],
+  "returncode": 0,
+  "sha256": "15217a034e2f3286420e9464b1fb2fcf1f576f0b44c2c58f458a2b9a95f96efc"
+}

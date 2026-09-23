@@ -1,0 +1,41 @@
+{
+  "watch_empty_batch": {
+    "carrick": [
+      3962,
+      3436,
+      3530
+    ],
+    "docker": [
+      1168,
+      1140,
+      1131
+    ],
+    "raw_linux_ratio": 3.0964912280701755
+  },
+  "watch_growing": {
+    "carrick": [
+      3303,
+      3422,
+      3498
+    ],
+    "docker": [
+      884,
+      858,
+      849
+    ],
+    "raw_linux_ratio": 3.988344988344988
+  },
+  "watch_overflow": {
+    "carrick": [
+      3416,
+      3453,
+      3494
+    ],
+    "docker": [
+      901,
+      909,
+      909
+    ],
+    "raw_linux_ratio": 3.798679867986799
+  }
+}

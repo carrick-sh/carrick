@@ -971,10 +971,14 @@ impl<'a> NetView<'a> {
                 .chain(reuseport::steal_targets(host_fd.get()))
                 .collect();
             let outcome = this.blocking_io(fd, host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
-                let host_write_ranges = [(buf_addr, len)];
+                let host_write_ranges = [carrick_guest_mem::HostWriteRange {
+                    guest: carrick_guest_mem::GuestVa(buf_addr),
+                    len,
+                    host: carrick_guest_mem::HostVa(dst_ptr as usize),
+                }];
                 let host_write = zero_copy.then(|| {
                     carrick_guest_mem::HostWriteGuard::new(memory, &host_write_ranges)
-                });
+                }).transpose().map_err(|_| LINUX_EFAULT)?;
                 let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
                 let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
                 let used_addr = src_addr != 0;
@@ -1067,7 +1071,7 @@ impl<'a> NetView<'a> {
                     }
                     None => n,
                 };
-                // Close the odd-generation bracket before interpreting any
+                // Close the backing-write bracket before interpreting any
                 // result or touching `memory` again. Drop also runs on unwind.
                 drop(host_write);
                 let n = n.host_syscall_errno()?;

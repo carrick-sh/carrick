@@ -1,0 +1,20 @@
+{
+  "sha256": "31020ca8a1d3980e80ad0e382281bd9f7b5e6b639569b3d4858132f0147e46f6",
+  "runs": [
+    {
+      "sample": 0,
+      "exit_code": 101,
+      "same_structural_failure": true
+    },
+    {
+      "sample": 1,
+      "exit_code": 101,
+      "same_structural_failure": true
+    }
+  ],
+  "metadata_restored": true,
+  "unqualified_setup_logs": [
+    "baseline-maintenance-0.log",
+    "baseline-maintenance-1.log"
+  ]
+}

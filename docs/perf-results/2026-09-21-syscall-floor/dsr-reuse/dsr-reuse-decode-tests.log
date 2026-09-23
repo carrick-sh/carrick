@@ -1,0 +1,105 @@
+   Compiling cfg-if v1.0.5
+   Compiling memchr v2.8.3
+   Compiling libc v0.2.189
+   Compiling log v0.4.34
+   Compiling serde_core v1.0.229
+   Compiling bitflags v2.13.2
+   Compiling typenum v1.20.1
+   Compiling scopeguard v1.2.0
+   Compiling smallvec v1.16.1
+   Compiling zerocopy v0.8.57
+   Compiling libloading v0.8.9
+   Compiling lock_api v0.4.14
+   Compiling once_cell v1.21.4
+   Compiling scroll v0.13.0
+   Compiling thiserror v2.0.20
+   Compiling plain v0.2.3
+   Compiling fastrand v2.5.0
+   Compiling cty v0.2.2
+   Compiling mach2 v0.6.0
+   Compiling byteorder v1.5.0
+   Compiling tracing-core v0.1.36
+   Compiling nom v7.1.3
+   Compiling goblin v0.10.7
+   Compiling cstr_core v0.2.6
+   Compiling jobserver v0.1.35
+   Compiling clang-sys v1.9.1
+   Compiling generic-array v0.14.7
+   Compiling cc v1.4.7
+   Compiling parking_lot_core v0.9.12
+   Compiling carrick-fatal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-fatal)
+   Compiling parking_lot v0.12.5
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling errno v0.3.14
+   Compiling getrandom v0.4.3
+   Compiling digest v0.10.7
+   Compiling rustix v1.1.5
+   Compiling cpufeatures v0.2.17
+   Compiling carrick-kernel-arena v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-arena)
+   Compiling dynasm v5.1.0
+   Compiling carrick-portable v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-portable)
+   Compiling carrick-host v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host)
+   Compiling cexpr v0.6.0
+   Compiling memmap2 v0.9.11
+   Compiling serde v1.0.229
+   Compiling num-traits v0.2.19
+   Compiling zmij v1.0.23
+   Compiling sha2-asm v0.6.4
+   Compiling bindgen v0.72.1
+   Compiling tempfile v3.27.0
+   Compiling carrick-dsr-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/dsr-reuse/carrick-dsr-aarch64)
+   Compiling itoa v1.0.18
+   Compiling static_assertions v1.1.0
+   Compiling unty v0.0.4
+   Compiling pin-project-lite v0.2.17
+   Compiling fnv v1.0.7
+   Compiling tracing v0.1.44
+   Compiling bincode v2.0.1
+   Compiling serde_json v1.0.151
+   Compiling getrandom v0.3.4
+   Compiling anyhow v1.0.104
+   Compiling sha2 v0.10.9
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-abi)
+   Compiling bad64-sys v0.10.0
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+   Compiling dynasmrt v5.1.0
+   Compiling carrick-dsr v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/dsr-reuse/carrick-dsr)
+   Compiling bad64 v0.12.0
+warning: unused return value of `set_realtime_off_ns` that must be used
+    --> carrick-dsr-aarch64/src/mapped_memory.rs:1586:13
+     |
+1586 |             carrick_mem::vdso::set_realtime_off_ns(realtime_off);
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+     |
+1586 |             let _ = carrick_mem::vdso::set_realtime_off_ns(realtime_off);
+     |             +++++++
+
+warning: `carrick-dsr-aarch64` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.10s
+     Running unittests src/lib.rs (target/lease-cost/dsr-reuse/target/debug/deps/carrick_dsr_aarch64-9aa5d69d129aabf3)
+
+running 16 tests
+test decode::tests::audited_bad64_memory_operand_shapes_are_stable ... ok
+test decode::tests::classifies_audited_dual_virtual_alu_destinations ... ok
+test decode::tests::classifies_bic_writing_virtual_x18_from_virtual_x28 ... ok
+test decode::tests::classifies_memory_operands_for_biased_lowering ... ok
+test decode::tests::classifies_move_from_virtual_x18_to_virtual_x28 ... ok
+test decode::tests::copied_gpr_model_fails_closed_for_mixed_implicit_effects ... ok
+test decode::tests::exclusive_accesses_are_typed_execution_boundaries ... ok
+test decode::tests::instructions_naming_the_reserved_scratch_and_x28_are_dually_virtualized ... ok
+test decode::tests::instructions_naming_the_reserved_scratch_are_virtualized ... ok
+test decode::tests::memory_base_retains_virtual_register_metadata ... ok
+test decode::tests::memory_operand_base_must_match_encoded_rn ... ok
+test decode::tests::non_base_virtual_registers_keep_virtualization_precedence ... ok
+test decode::tests::sme_memory_is_not_standard_simd_or_scalar ... ok
+test decode::tests::sve_memory_is_not_standard_simd_or_scalar ... ok
+test decode::tests::unaudited_memory_family_remains_typed_for_direct_passthrough ... ok
+test decode::tests::unsupported_memory_retains_non_base_virtualization ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 216 filtered out; finished in 0.00s
+

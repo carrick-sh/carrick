@@ -3134,6 +3134,13 @@ impl ScrubRun {
                 core::ptr::write_bytes(host_start, 0u8, len);
             }
         }
+        let remapped_bytes = if remapped { aligned_len } else { 0 };
+        carrick_observability::probes::hvpatch_backing_scrub(
+            len as u64,
+            (len - remapped_bytes) as u64,
+            remapped_bytes as u64,
+            u32::from(eligible),
+        );
     }
 }
 
@@ -5392,6 +5399,20 @@ impl HvfTaskState {
         address: u64,
         length: usize,
     ) -> Option<MappingView> {
+        self.with_mapping_for_range_in(custody, address, length, |source| source.view())
+    }
+
+    /// Select exactly the same live mapping for read and write projections.
+    /// The writer can retain its owner before the temporary alias row expires;
+    /// the read projection remains a scalar value with no new Arc or pin.
+    pub(crate) fn with_mapping_for_range_in<T>(
+        &self,
+        custody: &CarrierVmCustody,
+        address: u64,
+        length: usize,
+        project: impl FnOnce(super::host_writes::MappingSource<'_>) -> T,
+    ) -> Option<T> {
+        use super::host_writes::MappingSource;
         let address = strip_pointer_tag(address);
         let stage1_ipa = self.translate_va_for_cow(address);
         let region_is_live = |mapping: &HvfMappedRegion| {
@@ -5425,7 +5446,7 @@ impl HvfTaskState {
                         && region_is_live(mapping)
                 })
             {
-                return Some(mapping.view());
+                return Some(project(MappingSource::Region(mapping)));
             }
             // Geometry under the registry lock; `alias_is_live` (the
             // carrier's owners map) only on the released candidates.
@@ -5456,7 +5477,7 @@ impl HvfTaskState {
                 .into_iter()
                 .find(|alias| alias_is_live(alias))
             {
-                return Some(MappingView::from_alias(&alias));
+                return Some(project(MappingSource::Alias(&alias)));
             }
             return None;
         }
@@ -5516,7 +5537,7 @@ impl HvfTaskState {
                     && row_projection_is_current(mapping)
             })
         {
-            return Some(mapping.view());
+            return Some(project(MappingSource::Region(mapping)));
         }
         if !self.protections.range_no_access(address, length) {
             let alias_candidates = alias_registry()
@@ -5538,7 +5559,7 @@ impl HvfTaskState {
                 .into_iter()
                 .find(|alias| alias_is_live(alias))
             {
-                return Some(MappingView::from_alias(&alias));
+                return Some(project(MappingSource::Alias(&alias)));
             }
         }
         None

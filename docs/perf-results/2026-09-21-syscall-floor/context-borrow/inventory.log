@@ -1,0 +1,30 @@
+   Compiling syn v2.0.117
+   Compiling once_cell v1.21.4
+   Compiling tempfile v3.27.0
+   Compiling pest_generator v2.8.6
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling scroll_derive v0.13.1
+   Compiling pest_derive v2.8.6
+   Compiling dtrace-parser v0.3.0
+   Compiling scroll v0.13.0
+   Compiling zerocopy v0.8.48
+   Compiling goblin v0.10.5
+   Compiling serde v1.0.228
+   Compiling serde_tokenstream v0.2.3
+   Compiling usdt-impl v0.6.0
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling toml_edit v0.22.27
+   Compiling usdt-macro v0.6.0
+   Compiling usdt-attr-macro v0.6.0
+   Compiling dof v0.4.0
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-abi)
+   Compiling toml v0.8.23
+   Compiling usdt v0.6.0
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+    Finished `release` profile [optimized + debuginfo] target(s) in 10.85s
+     Running `target/release/generate-inventory`
+inventory generated at ./conformance-contracts/inventory.json: 338 syscalls (246 bring-up, 90 deferred, 2 planned; 14 with claims, 324 without claims)

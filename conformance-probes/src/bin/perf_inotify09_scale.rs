@@ -147,6 +147,7 @@ fn contract_scale() -> Result<Option<usize>, ()> {
     if args.is_empty()
         || args.as_slice() == ["write-seek-only"]
         || args.as_slice() == ["pwrite-only"]
+        || args.as_slice() == ["watch-only"]
     {
         return Ok(None);
     }
@@ -199,8 +200,55 @@ fn concurrent_sample(ifd: i32, fd: i32, path: &CString, scale: usize) -> Option<
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if std::env::args().skip(1).eq(["watch-controls"]) {
+        watch_controls();
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::args().skip(1).eq(["watch-states"]) {
+        watch_states();
+        return;
+    }
+    // Untimed semantic control for transport experiments. Report actual Linux
+    // errno values so the native oracle supplies the answer independently.
+    #[cfg(target_os = "linux")]
+    if std::env::args().skip(1).eq(["invalid-contract"]) {
+        let path = CString::new("/unused-inotify-invalid-path").unwrap();
+        for scale in [1, 8, 32, 128] {
+            let mut add_result = (0, 0);
+            let mut remove_result = (0, 0);
+            let mut stable = true;
+            for index in 0..scale {
+                let add = raw_inotify_add_watch(-1, &path, IN_MODIFY);
+                let add_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                let remove = raw_inotify_rm_watch(-1, 0);
+                let remove_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if index > 0 {
+                    stable &=
+                        add_result == (add, add_errno) && remove_result == (remove, remove_errno);
+                }
+                add_result = (add, add_errno);
+                remove_result = (remove, remove_errno);
+            }
+            println!(
+                "scale={scale} add_ret={} add_errno={} remove_ret={} remove_errno={} stable={}",
+                add_result.0,
+                add_result.1,
+                remove_result.0,
+                remove_result.1,
+                u8::from(stable)
+            );
+            if !stable {
+                std::process::exit(1);
+            }
+        }
+        println!("probe_complete=1");
+        return;
+    }
     let write_seek_only = std::env::args().skip(1).eq(["write-seek-only"]);
     let pwrite_only = std::env::args().skip(1).eq(["pwrite-only"]);
+    let watch_only = std::env::args().skip(1).eq(["watch-only"]);
     #[cfg(not(target_os = "linux"))]
     if !write_seek_only && !pwrite_only {
         eprintln!(
@@ -213,7 +261,7 @@ fn main() {
         Ok(scale) => scale,
         Err(()) => {
             eprintln!(
-                "usage: perf_inotify09_scale [write-seek-only | pwrite-only | contract-scale <1|8|32|128>]"
+                "usage: perf_inotify09_scale [write-seek-only | pwrite-only | watch-only | contract-scale <1|8|32|128>]"
             );
             std::process::exit(2);
         }
@@ -320,6 +368,43 @@ fn main() {
                 .collect(),
             freq,
         );
+        if watch_only {
+            // Same two syscall numbers, no valid descriptor and therefore no
+            // path lookup or watch mutation. This is a low-work control, not
+            // a measurement of irreducible VM transition cost.
+            complete &= report_phase(
+                "watch_invalid_pair",
+                scale,
+                (0..SAMPLES)
+                    .map(|_| {
+                        measure(scale, || {
+                            raw_inotify_add_watch(-1, &path, IN_MODIFY) == -1
+                                && raw_inotify_rm_watch(-1, 0) == -1
+                        })
+                    })
+                    .collect(),
+                freq,
+            );
+            let wd = raw_inotify_add_watch(ifd, &path, IN_MODIFY);
+            complete &= wd >= 0;
+            complete &= report_phase(
+                "watch_existing_pair",
+                scale,
+                (0..SAMPLES)
+                    .map(|_| {
+                        measure(scale, || {
+                            raw_inotify_add_watch(ifd, &path, IN_MODIFY) == wd
+                                && raw_inotify_add_watch(ifd, &path, IN_MODIFY) == wd
+                        })
+                    })
+                    .collect(),
+                freq,
+            );
+            if wd >= 0 {
+                complete &= raw_inotify_rm_watch(ifd, wd) == 0;
+            }
+            continue;
+        }
         complete &= report_phase(
             "write_seek",
             scale,
@@ -378,4 +463,149 @@ fn main() {
     if !complete {
         std::process::exit(1);
     }
+}
+
+/// Every sample owns a fresh queue. Setup, observation and draining are untimed.
+#[cfg(target_os = "linux")]
+fn watch_controls() {
+    unsafe { arm_alarm_ms(90_000) };
+    let path = CString::new(format!(
+        "/tmp/carrick-watch-controls-{}",
+        std::process::id()
+    ))
+    .unwrap();
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o600,
+        )
+    };
+    assert!(fd >= 0);
+    let freq = frequency();
+    let scale = 65536;
+    for phase in ["watch_invalid_pair", "watch_unchanged_pair"] {
+        let mut samples = Vec::new();
+        for sample in 0..SAMPLES {
+            let q = raw_inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+            assert!(q >= 0);
+            let wd = raw_inotify_add_watch(q, &path, IN_MODIFY);
+            assert!(wd > 0);
+            let ticks = measure(scale, || {
+                if phase == "watch_invalid_pair" {
+                    // Read errno immediately after each operation, before the
+                    // following call can overwrite it. Both arms do this work.
+                    let add = raw_inotify_add_watch(-1, &path, IN_MODIFY);
+                    let add_errno = unsafe { *libc::__errno_location() };
+                    let remove = raw_inotify_rm_watch(-1, 0);
+                    let remove_errno = unsafe { *libc::__errno_location() };
+                    add == -1
+                        && add_errno == libc::EBADF
+                        && remove == -1
+                        && remove_errno == libc::EBADF
+                } else {
+                    raw_inotify_add_watch(q, &path, IN_MODIFY) == wd
+                        && raw_inotify_add_watch(q, &path, IN_MODIFY) == wd
+                }
+            })
+            .expect("complete watch control sample");
+            let mut queued: libc::c_int = -1;
+            assert_eq!(unsafe { libc::ioctl(q, libc::FIONREAD, &mut queued) }, 0);
+            assert_eq!(queued, 0, "control unexpectedly mutated queue");
+            assert_eq!(raw_inotify_rm_watch(q, wd), 0);
+            let mut ignored = [0u8; 16];
+            assert_eq!(
+                unsafe { libc::read(q, ignored.as_mut_ptr().cast(), ignored.len()) },
+                16
+            );
+            assert_eq!(i32::from_ne_bytes(ignored[..4].try_into().unwrap()), wd);
+            assert_eq!(
+                u32::from_ne_bytes(ignored[4..8].try_into().unwrap()),
+                0x8000
+            );
+            assert!(ignored[8..].iter().all(|&v| v == 0));
+            assert_eq!(unsafe { libc::ioctl(q, libc::FIONREAD, &mut queued) }, 0);
+            assert_eq!(queued, 0);
+            assert_eq!(unsafe { libc::close(q) }, 0);
+            println!("sample_phase={phase} sample={sample} scale={scale} ticks={ticks} frequency={freq} queued_events=0");
+            samples.push(Some(ticks));
+        }
+        assert!(report_phase(phase, scale, samples, freq));
+    }
+    assert_eq!(unsafe { libc::close(fd) }, 0);
+    assert_eq!(unsafe { libc::unlink(path.as_ptr()) }, 0);
+    unsafe { disarm_alarm() };
+    println!("probe_complete=1");
+}
+
+#[cfg(target_os = "linux")]
+fn watch_states() {
+    unsafe { arm_alarm_ms(90_000) };
+    let limit: usize = std::fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!((8192..=65536).contains(&limit));
+    let path = CString::new(format!("/tmp/carrick-watch-states-{}", std::process::id())).unwrap();
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o600,
+        )
+    };
+    assert!(fd >= 0);
+    let freq = frequency();
+    for (phase, scale, overflow) in [
+        ("watch_empty_batch", 128, false),
+        ("watch_growing", 8192, false),
+        ("watch_overflow", 65536, true),
+    ] {
+        let mut samples = Vec::new();
+        for sample in 0..SAMPLES {
+            let q = raw_inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+            assert!(q >= 0);
+            if overflow {
+                for _ in 0..limit + 1 {
+                    assert!(watch_cycle(q, &path));
+                }
+            }
+            let queued = |q| {
+                let mut count: libc::c_int = -1;
+                assert_eq!(unsafe { libc::ioctl(q, libc::FIONREAD, &mut count) }, 0);
+                count as usize
+            };
+            assert_eq!(queued(q), if overflow { (limit + 1) * 16 } else { 0 });
+            let ticks = measure(scale, || watch_cycle(q, &path)).expect("complete watch sample");
+            let expected = if overflow { limit + 1 } else { scale };
+            assert_eq!(queued(q), expected * 16, "unequal queue work in {phase}");
+            let mut buffer = vec![0u8; (limit + 1) * 16];
+            let read = unsafe { libc::read(q, buffer.as_mut_ptr().cast(), buffer.len()) };
+            assert_eq!(read, (expected * 16) as isize);
+            let mut overflow_events = 0;
+            for event in buffer[..read as usize].chunks_exact(16) {
+                let wd = i32::from_ne_bytes(event[..4].try_into().unwrap());
+                let mask = u32::from_ne_bytes(event[4..8].try_into().unwrap());
+                if mask == 0x4000 {
+                    assert_eq!(wd, -1);
+                    overflow_events += 1;
+                } else {
+                    assert!(wd > 0);
+                    assert_eq!(mask, 0x8000);
+                }
+                assert!(event[8..].iter().all(|&v| v == 0));
+            }
+            assert_eq!(overflow_events, usize::from(overflow));
+            assert_eq!(queued(q), 0);
+            assert_eq!(unsafe { libc::close(q) }, 0);
+            println!("sample_phase={phase} sample={sample} scale={scale} ticks={ticks} frequency={freq} queued_events={expected}");
+            samples.push(Some(ticks));
+        }
+        assert!(report_phase(phase, scale, samples, freq));
+    }
+    assert_eq!(unsafe { libc::close(fd) }, 0);
+    assert_eq!(unsafe { libc::unlink(path.as_ptr()) }, 0);
+    unsafe { disarm_alarm() };
+    println!("probe_complete=1");
 }

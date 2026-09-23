@@ -1,0 +1,4 @@
+{"name": "node-app", "phase": "carrick", "returncode": 125, "timed_out": false, "outer_wall_s": 0.03167595800186973, "guest_timing": []}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.5015047080087243, "guest_timing": [[1.43, 2.049, 0.686]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.648059083003318, "guest_timing": [[2.584, 0.791, 1.494]]}
+{"name": "python-subprocess", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 25.812581541002146, "guest_timing": [[22.974, 8.788, 3.717]]}

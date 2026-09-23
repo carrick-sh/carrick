@@ -1,0 +1,46 @@
+{
+  "contracts_passed": 33,
+  "registry_contracts": 29,
+  "registry_claims": 15,
+  "kernel_passed": 2375,
+  "kernel_ignored": 1,
+  "runtime_memory_metrics_passed": 27,
+  "runtime_memory_default_release_passed": 26,
+  "runtime_stage1_backend_passed": 29,
+  "runtime_quiescence_passed": 27,
+  "memory_lifetime_doctests_passed": 4,
+  "aarch64_passed": 66,
+  "hal_foreign_mm_passed": 1,
+  "observability_passed": 83,
+  "native_elf_cases": 20,
+  "native_elf_unit_tests_passed": 11,
+  "native_elf_uses_private_backing": true,
+  "signed_foreign_mm": {
+    "passed": 73,
+    "failed": 1,
+    "ignored": 1,
+    "failure": "kernel.mm.fresh-publication-maintenance: PageTableInvalidations at scale 1 is 1; maximum 0",
+    "negative_control_passed": true,
+    "cleanup_remaining": 0,
+    "success_receipt": false
+  },
+  "signed_lifecycle": {
+    "passed": 1,
+    "negative_control_passed": true,
+    "cleanup_remaining": 0,
+    "success_receipt": "signed-lifecycle-receipt.jsonl"
+  },
+  "clippy_changed_hal_kernel_runtime_hvf_passed": true,
+  "aarch64_clippy_unclosed": "six pre-existing manual_is_multiple_of errors in anonymous_discard.rs and engine.rs; parent hashes preserved",
+  "new_structural_contract": "0 allocations and 0 native_activation_leaf_checks at scales 1/8/32/128, with real completed native stores and positive controls",
+  "timing_completed_pairs": 144,
+  "timing_completed_activations": 24920064,
+  "product_workload_acceptance": false,
+  "notes": [
+    "Initial short exact filter in red-build.log selected zero tests; red-contract.log executes the full name and is the valid red result.",
+    "Initial runtime-quiesce.log selected zero tests; runtime-quiesce-final.log executes 27 tests.",
+    "Registry test initially expected 26 descriptors while the current registry had 29; it now requires all three native descriptors and exactly 29.",
+    "Derived inventory refresh includes previously unrefreshed campaign descriptors; it changes no claim or support status.",
+    "Final registry test and generated inventory changes do not affect the preserved measured runtime executable."
+  ]
+}

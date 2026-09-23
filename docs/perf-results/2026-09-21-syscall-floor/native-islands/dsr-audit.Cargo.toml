@@ -1,0 +1,12 @@
+[package]
+name = "dsr-text-audit"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+carrick-dsr-aarch64 = { path = "../carrick-dsr-aarch64" }
+carrick-guest-mem = { path = "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem" }
+anyhow.workspace = true
+serde_json.workspace = true

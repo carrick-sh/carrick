@@ -1,0 +1,1040 @@
+--- before/conformance-contracts/surfaces.toml
++++ after/conformance-contracts/surfaces.toml
+@@ -2,7 +2,7 @@
+ 
+ [[surfaces]]
+ path = "crates/carrick-observability/src/work_meter.rs"
+-contracts = ["hvpatch.syscall.portal"]
++contracts = ["hvpatch.syscall.portal", "kernel.execution.native-code-density"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-mem/src/memory.rs"
+@@ -267,8 +267,20 @@
+ 
+ [[surfaces]]
+ path = "experiments/native-syscall-slice/src/native.rs"
+-contracts = ["kernel.execution.native-data-demand", "kernel.execution.native-synchronous-syscall"]
++contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.execution.native-synchronous-syscall"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs"
+-contracts = ["kernel.execution.native-data-demand", "kernel.mm.native-execution-scope", "kernel.mm.native-data-activation"]
++contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.mm.native-execution-scope", "kernel.mm.native-data-activation"]
++
++[[surfaces]]
++path = "experiments/native-syscall-slice/src/native/compact.rs"
++contracts = ["kernel.execution.native-code-density", "kernel.execution.native-synchronous-syscall"]
++
++[[surfaces]]
++path = "experiments/native-syscall-slice/src/compact_tests.rs"
++contracts = ["kernel.execution.native-code-density", "kernel.execution.native-synchronous-syscall"]
++
++[[surfaces]]
++path = "experiments/native-syscall-slice/src/lib.rs"
++contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.execution.native-synchronous-syscall"]
+--- before/crates/carrick-conformance-contract/tests/claims.rs
++++ after/crates/carrick-conformance-contract/tests/claims.rs
+@@ -143,7 +143,7 @@
+         .unwrap();
+     let registry = carrick_conformance_contract::ContractRegistry::load(repo_root)
+         .expect("live registry should load");
+-    assert_eq!(registry.contracts().len(), 32);
++    assert_eq!(registry.contracts().len(), 33);
+     for id in [
+         "kernel.execution.native-synchronous-syscall",
+         "kernel.execution.native-data-demand",
+--- before/crates/carrick-observability/src/work_meter.rs
++++ after/crates/carrick-observability/src/work_meter.rs
+@@ -76,6 +76,8 @@
+     NativeActivationLeafChecks,
+     /// Successful data-grant activations during native execution intervals.
+     NativeDataActivations,
++    /// AArch64 instruction words emitted into a native translation publication.
++    NativeCodeWords,
+     /// Full kernel MM snapshots collected in the operation window.
+     MmSnapshotCollections,
+     /// Physical backing owner pins acquired in the operation window.
+@@ -83,7 +85,7 @@
+ }
+ 
+ impl WorkMetric {
+-    pub const COUNT: usize = 38;
++    pub const COUNT: usize = 39;
+     pub const ALL: [WorkMetric; Self::COUNT] = [
+         Self::KernelDispatches,
+         Self::KernelRedispatches,
+@@ -121,6 +123,7 @@
+         Self::HostHeapAllocations,
+         Self::NativeActivationLeafChecks,
+         Self::NativeDataActivations,
++        Self::NativeCodeWords,
+         Self::MmSnapshotCollections,
+         Self::ForeignOwnerPins,
+     ];
+--- before/crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs
++++ after/crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs
+@@ -161,7 +161,12 @@
+         })
+         .unwrap();
+     drop(current);
+-    let code = Code::publish(&image, &private).unwrap();
++    let layout = if std::env::var("CARRICK_NATIVE_CODE_LAYOUT").as_deref() == Ok("compact") {
++        native_syscall_slice::native::Layout::Compact
++    } else {
++        native_syscall_slice::native::Layout::Slots
++    };
++    let code = Code::publish_with_layout(&image, &private, layout).unwrap();
+     let mut state = State::new(image.entry());
+     let registry = ThreadRegistry::new(tid);
+     let futex = FutexTable::new();
+@@ -323,6 +328,7 @@
+         "read_window_reuse":reuse_reads,
+         "data_demand_enabled":!force_data,"data_activations":data_activations,
+         "carrier_data_and_buffers":true,"private_data_unchanged":true,"original_cow_unchanged":true,
++        "code_layout":format!("{layout:?}"),"emitted_words":code.emitted_words(),
+         "private_code_publication":true,"mock_stage2":true,"product_acceptance":false,
+     });
+     println!("{result}");
+--- before/crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs
++++ after/crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs
+@@ -473,3 +473,74 @@
+         .yield_from_executor(execution)
+         .unwrap();
+ }
++
++#[test]
++fn native_code_density_contract() {
++    use carrick_conformance_contract::{
++        Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
++        SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
++    };
++    use native_syscall_slice::{
++        Memory,
++        native::{Code, Layout, State},
++    };
++    let mut observations = Vec::new();
++    for scale in [1u64, 8, 32, 128] {
++        let mut words = vec![0x91000400; scale as usize];
++        words.push(0xd4000001);
++        let (mut memory, image) = Memory::load_elf(&native_carrier_elf(&words, TEST_VA)).unwrap();
++        let code = Code::publish_with_layout(&image, &memory, Layout::Compact).unwrap();
++        let mut state = State::new(image.entry());
++        state.x = std::array::from_fn(|n| n as u64 * 37);
++        state.nzcv = 0xa0000000;
++        state.vectors = std::array::from_fn(|n| (n as u128 + 1) << 64);
++        let original = state.x;
++        let vectors = state.vectors;
++        let mut checkpoints = 0;
++        code.run(&image, &mut memory, &mut state, &mut |_, _| {
++            checkpoints += 1;
++            Ok(false)
++        })
++        .unwrap();
++        assert_eq!(checkpoints, 1);
++        assert_eq!(state.pc, image.base() + scale * 4);
++        assert_eq!(state.x[0], scale);
++        assert_eq!(state.x[1..], original[1..]);
++        assert_eq!(state.nzcv, 0xa0000000);
++        assert_eq!(state.vectors, vectors);
++        let mut work = WorkSnapshot::new();
++        work.insert(WorkMetric::NativeCodeWords, code.emitted_words() as u64)
++            .unwrap();
++        observations.push(ContractObservation {
++            contract_id: ContractId::new("kernel.execution.native-code-density").unwrap(),
++            layer: ExecutionLayer::VmFree,
++            implementation_revision: std::env::var("CARRICK_NATIVE_SCOPE_REVISION")
++                .unwrap_or_else(|_| "unarchived-working-tree".into()),
++            fixture_identity: "unit:native-code-density".into(),
++            scale,
++            semantic_assertions: vec![SemanticAssertion::pass(
++                "exact_adds_and_checkpoint_with_complete_state_preserved",
++            )],
++            work: Some(work),
++            timing: None,
++            completeness: Completeness::Complete,
++        });
++    }
++    println!(
++        "native_code_density_observations {}",
++        serde_json::to_string(&observations).unwrap()
++    );
++    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++        .parent()
++        .unwrap()
++        .parent()
++        .unwrap();
++    let registry = ContractRegistry::load(root).unwrap();
++    evaluate(
++        registry
++            .require("kernel.execution.native-code-density")
++            .unwrap(),
++        &observations,
++    )
++    .unwrap();
++}
+--- before/experiments/native-syscall-slice/src/lib.rs
++++ after/experiments/native-syscall-slice/src/lib.rs
+@@ -393,7 +393,10 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    fn elf(words: &[u32]) -> Vec<u8> {
++    fn publish_compact(image: &Image, memory: &Memory) -> Result<native::Code> {
++        native::Code::publish_with_layout(image, memory, native::Layout::Compact)
++    }
++    pub(super) fn elf(words: &[u32]) -> Vec<u8> {
+         let mut bytes = vec![0u8; 0x3000];
+         bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+         for (at, v) in [(16, 2u16), (18, 183), (52, 64), (54, 56), (56, 2)] {
+@@ -459,7 +462,6 @@
+     }
+     #[test]
+     fn native_data_demand_covers_branches_cycles_and_checkpoint_barriers() {
+-        use native::Code;
+         // Explicit control-flow cases: a false result must exclude *every*
+         // native memory path, not merely the most likely or fallthrough path.
+         let cases: &[(&[u32], &[bool])] = &[
+@@ -486,7 +488,7 @@
+         ];
+         for &(words, expected) in cases {
+             let (memory, image) = Memory::load_elf(&elf(words)).unwrap();
+-            let code = Code::publish(&image, &memory).unwrap();
++            let code = publish_compact(&image, &memory).unwrap();
+             for (index, &demand) in expected.iter().enumerate() {
+                 assert_eq!(
+                     code.requires_native_data(image.base + index as u64 * 4)
+@@ -504,19 +506,19 @@
+         }
+         for word in [0x14000002, 0x17ffffff, 0xb4000040] {
+             let (memory, image) = Memory::load_elf(&elf(&[word, 0xd4000001])).unwrap();
+-            assert!(Code::publish(&image, &memory).is_err());
++            assert!(publish_compact(&image, &memory).is_err());
+         }
+     }
+ 
+     #[test]
+     fn native_integer_syscalls_preserve_registers_vectors_and_flags() {
+-        use native::{Code, State};
++        use native::State;
+         // mov x0,#7; mov x17,#17; cmp x0,#7; svc; add x0,x0,#1; svc
+         let (mut memory, image) = Memory::load_elf(&elf(&[
+             0xd28000e0, 0xd2800231, 0xf1001c1f, 0xd4000001, 0x91000400, 0xd4000001,
+         ]))
+         .unwrap();
+-        let code = Code::publish(&image, &memory).unwrap();
++        let code = publish_compact(&image, &memory).unwrap();
+         let mut state = State::new(image.entry);
+         for i in 0..31 {
+             state.x[i] = (i * 37 + 3) as u64;
+@@ -548,11 +550,11 @@
+     }
+     #[test]
+     fn executable_revocation_and_wrong_publication_stop_before_resume() {
+-        use native::{Code, State};
++        use native::State;
+         let bytes = elf(&[0xd4000001, 0x17ffffff]);
+         let (mut a, ai) = Memory::load_elf(&bytes).unwrap();
+         let (mut b, bi) = Memory::load_elf(&bytes).unwrap();
+-        let code = Code::publish(&ai, &a).unwrap();
++        let code = publish_compact(&ai, &a).unwrap();
+         assert!(
+             code.run(&bi, &mut b, &mut State::new(bi.entry), &mut |_, _| panic!(
+                 "must not enter"
+@@ -572,10 +574,10 @@
+     }
+     #[test]
+     fn backward_edges_are_bounded_and_tls_is_virtual() {
+-        use native::{Code, State};
++        use native::State;
+         // msr tpidr_el0,x0; mrs x1,tpidr_el0; b .
+         let (mut m, i) = Memory::load_elf(&elf(&[0xd51bd040, 0xd53bd041, 0x14000000])).unwrap();
+-        let code = Code::publish(&i, &m).unwrap();
++        let code = publish_compact(&i, &m).unwrap();
+         let mut state = State::new(i.entry);
+         state.x[0] = 0x987654321;
+         let mut callbacks = 0;
+@@ -590,11 +592,11 @@
+     }
+     #[test]
+     fn bounded_native_loop_does_not_call_rust_per_iteration() {
+-        use native::{Code, State};
++        use native::State;
+         // mov x0,#1024; sub x0,x0,#1; cbnz x0,previous; svc
+         let (mut m, i) =
+             Memory::load_elf(&elf(&[0xd2808000, 0xd1000400, 0xb5ffffe0, 0xd4000001])).unwrap();
+-        let code = Code::publish(&i, &m).unwrap();
++        let code = publish_compact(&i, &m).unwrap();
+         let mut state = State::new(i.entry);
+         let mut callbacks = 0;
+         code.run(&i, &mut m, &mut state, &mut |s, m| {
+@@ -615,7 +617,7 @@
+     }
+     #[test]
+     fn native_memory_work_budget() {
+-        use native::{Code, State};
++        use native::State;
+         // ldr x1,[x2]; add x1,x1,#1; str x1,[x2]; sub x0,x0,#1;
+         // cbnz x0,loop; svc. Same semantic data backing as syscall buffers.
+         let bytes = elf(&[
+@@ -624,7 +626,7 @@
+         let mut slow_counts = Vec::new();
+         for n in [1u64, 8, 32, 128, 1024] {
+             let (mut m, i) = Memory::load_elf(&bytes).unwrap();
+-            let code = Code::publish(&i, &m).unwrap();
++            let code = publish_compact(&i, &m).unwrap();
+             let mut state = State::new(i.entry);
+             state.x[0] = n;
+             state.x[2] = 0x500000;
+@@ -658,7 +660,7 @@
+ 
+     #[test]
+     fn native_scalar_access_all_registers_matches_checked_memory() {
+-        use native::{Code, State};
++        use native::State;
+         // All aliases, including scratch registers, Darwin-reserved virtual
+         // registers, virtual SP, and W/XZR. Offset 4095 exercises both ADD parts.
+         for rn in 0..32u32 {
+@@ -694,7 +696,7 @@
+                             expected.sp = state.sp;
+                             expected.nzcv = state.nzcv;
+                             emulate(word, &mut expected, &mut expected_memory).unwrap();
+-                            let code = Code::publish(&image, &memory).unwrap();
++                            let code = publish_compact(&image, &memory).unwrap();
+                             let mut calls = 0;
+                             code.run(&image, &mut memory, &mut state, &mut |s, _| {
+                                 calls += 1;
+@@ -721,7 +723,7 @@
+ 
+     #[test]
+     fn native_memory_misses_preserve_fault_state_and_permissions() {
+-        use native::{Code, State};
++        use native::State;
+         for width in [4u64, 8] {
+             for load in [false, true] {
+                 for address in [
+@@ -749,7 +751,7 @@
+                     let mut expected = State::new(image.entry);
+                     expected.x = state.x;
+                     let expected_ok = emulate(word, &mut expected, &mut expected_memory).is_ok();
+-                    let code = Code::publish(&image, &memory).unwrap();
++                    let code = publish_compact(&image, &memory).unwrap();
+                     let mut misses = 0;
+                     let result = code.run(&image, &mut memory, &mut state, &mut |s, m| {
+                         assert_eq!(s.nzcv, 0xb0000000);
+@@ -778,7 +780,7 @@
+         let mut bytes = elf(&[0xf9000040, 0xd4000001]);
+         bytes[124..128].copy_from_slice(&4u32.to_le_bytes());
+         let (mut memory, image) = Memory::load_elf(&bytes).unwrap();
+-        let code = Code::publish(&image, &memory).unwrap();
++        let code = publish_compact(&image, &memory).unwrap();
+         let mut state = State::new(image.entry);
+         state.x[2] = 0x500000;
+         assert!(
+@@ -793,7 +795,7 @@
+ 
+     #[test]
+     fn native_data_borrow_refresh_and_revocation_before_resume() {
+-        use native::{Code, State};
++        use native::State;
+         // Load; callback; load; callback. Native and syscall-side byte access
+         // must observe the exact same backing after every callback reborrow.
+         let bytes = elf(&[0xf9400040, 0xd4000001, 0xf9400041, 0xd4000001]);
+@@ -802,7 +804,7 @@
+             let (other, _) = Memory::load_elf(&bytes).unwrap();
+             let mut replacement = Some(other);
+             memory.write_bytes(0x500000, &7u64.to_le_bytes()).unwrap();
+-            let code = Code::publish(&image, &memory).unwrap();
++            let code = publish_compact(&image, &memory).unwrap();
+             let mut state = State::new(image.entry);
+             state.x[2] = 0x500000;
+             let mut calls = 0;
+@@ -831,3 +833,6 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod compact_tests;
+--- before/experiments/native-syscall-slice/src/native.rs
++++ after/experiments/native-syscall-slice/src/native.rs
+@@ -74,6 +74,16 @@
+     fn sys_icache_invalidate(address: *mut c_void, length: usize);
+ }
+ 
++mod compact;
++
++/// Explicit paired-control selection; both layouts use the same entry gateway,
++/// whitelist, data authority, and bounded checkpoint policy.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Layout {
++    Slots,
++    Compact,
++}
++
+ const SLOT: usize = 64;
+ // All encodings here are authored for the whitelisted unsigned scalar form.
+ fn load_state(r: u32, offset: u32) -> u32 {
+@@ -93,7 +103,13 @@
+ }
+ /// Native work is constant per access, independent of the mapping population.
+ /// Misses restore guest scratch/flags before the existing semantic callback.
+-fn emit_memory(words: &mut Vec<u32>, w: u32, slow: usize, next: usize) {
++fn emit_memory(
++    words: &mut Vec<u32>,
++    w: u32,
++    slow: usize,
++    next: usize,
++    live_x17: bool,
++) -> (usize, usize) {
+     let rn = (w >> 5) & 31;
+     let rt = w & 31;
+     let width = 1 << (w >> 30);
+@@ -133,11 +149,20 @@
+         words.push(store_state(16, rt * 8));
+     }
+     restore_memory_scratch(words);
+-    words.push(branch(words.len(), next));
++    if live_x17 {
++        words.push(load_state(17, 136));
++    }
++    let next_at = words.len();
++    words.push(branch(next_at, next));
+     let target = words.len();
+     words[miss] = 0x54000008 | (((target - miss) as u32) << 5);
+     restore_memory_scratch(words);
+-    words.push(branch(words.len(), slow));
++    if live_x17 {
++        words.push(load_state(17, 136));
++    }
++    let slow_at = words.len();
++    words.push(branch(slow_at, slow));
++    (next_at, slow_at)
+ }
+ /// Least fixed point of memory reachability before a carrier checkpoint.
+ /// Both conditional successors count, including backedges. Barriers are exactly
+@@ -186,8 +211,9 @@
+ pub struct Code {
+     ptr: *mut u8,
+     length: usize,
++    emitted_words: usize,
+     base: u64,
+-    count: usize,
++    entry_offsets: Vec<usize>,
+     data_demand: Vec<bool>,
+     identity: std::sync::Arc<()>,
+     epoch: u64,
+@@ -197,7 +223,12 @@
+     _thread: PhantomData<Rc<()>>,
+ }
+ impl Code {
++    /// Preserve the existing layout by default. Compact lowering is an opt-in
++    /// experiment until syscall/workload measurements justify promotion.
+     pub fn publish(image: &Image, memory: &Memory) -> Result<Self> {
++        Self::publish_with_layout(image, memory, Layout::Slots)
++    }
++    pub fn publish_with_layout(image: &Image, memory: &Memory, layout: Layout) -> Result<Self> {
+         memory.validate(image)?;
+         ensure!(image.words.len() <= 4096, "bounded executor code limit");
+         let data_demand = data_demand(image)?;
+@@ -210,117 +241,122 @@
+                 s.bytes.len(),
+             ))
+         });
+-        let mut words = vec![0xd503201f_u32; image.words.len() * SLOT / 4 + SLOT / 4];
+-        // Terminal fallthrough always enters the checked callback and fails.
+-        for i in 0..=image.words.len() {
+-            let at = i * SLOT / 4;
+-            words[at] = 0xf9400000 | (17 << 10) | (28 << 5) | 17;
+-            let pc = image.base + i as u64 * 4;
+-            let instruction = image.words.get(i).copied();
+-            if let Some(w) = instruction {
+-                let kind = classify(w).map_err(anyhow::Error::msg)?;
+-                if kind == Instruction::Integer {
+-                    words[at + 1] = w;
+-                    words[at + 2] = 0xf9000000 | (17 << 10) | (28 << 5) | 17;
+-                    words[at + 3] = 0x1400000d;
+-                    continue;
+-                }
+-                if kind == Instruction::Address {
+-                    let rd = w & 31;
+-                    if rd != 18 && rd != 28 {
+-                        let raw = ((((w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3)) << 11;
+-                        let imm = (raw as i32 >> 11) as i64;
+-                        let value = if w >> 31 == 0 {
+-                            pc.wrapping_add_signed(imm)
+-                        } else {
+-                            (pc & !4095).wrapping_add_signed(imm << 12)
+-                        };
+-                        words[at + 1] = 0xd2800000 | (((value & 65535) as u32) << 5) | rd;
+-                        for half in 1..4 {
+-                            words[at + 1 + half] = 0xf2800000
+-                                | ((half as u32) << 21)
+-                                | ((((value >> (half * 16)) & 65535) as u32) << 5)
+-                                | rd;
+-                        }
+-                        if rd == 17 {
+-                            words[at + 5] = 0xf9000000 | (17 << 10) | (28 << 5) | 17;
+-                        }
+-                        words[at + 6] = 0x1400000a;
++        let (words, entry_offsets) = if layout == Layout::Compact {
++            compact::emit(image, data_region.is_some())?
++        } else {
++            let mut words = vec![0xd503201f_u32; image.words.len() * SLOT / 4 + SLOT / 4];
++            // Terminal fallthrough always enters the checked callback and fails.
++            for i in 0..=image.words.len() {
++                let at = i * SLOT / 4;
++                words[at] = 0xf9400000 | (17 << 10) | (28 << 5) | 17;
++                let pc = image.base + i as u64 * 4;
++                let instruction = image.words.get(i).copied();
++                if let Some(w) = instruction {
++                    let kind = classify(w).map_err(anyhow::Error::msg)?;
++                    if kind == Instruction::Integer {
++                        words[at + 1] = w;
++                        words[at + 2] = 0xf9000000 | (17 << 10) | (28 << 5) | 17;
++                        words[at + 3] = 0x1400000d;
+                         continue;
+                     }
+-                }
+-                if kind == Instruction::Branch {
+-                    let target = branch_target(w, pc);
+-                    ensure!(
+-                        target >= image.base
+-                            && target < image.base + image.words.len() as u64 * 4
+-                            && target.is_multiple_of(4),
+-                        "branch outside executable authority"
+-                    );
+-                    // Forward edges remain native. Every backward edge checkpoints.
+-                    if target > pc {
+-                        let delta = (target - pc) / 4 * SLOT as u64 / 4 - 1;
+-                        words[at + 1] = if w & 0x7c000000 == 0x14000000 {
+-                            ensure!(delta < 1 << 25, "branch range");
+-                            (w & 0xfc000000) | delta as u32
+-                        } else {
+-                            ensure!(delta < 1 << 18, "conditional range");
+-                            (w & !0xffffe0) | ((delta as u32) << 5)
++                    if kind == Instruction::Address {
++                        let rd = w & 31;
++                        if rd != 18 && rd != 28 {
++                            let raw = ((((w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3)) << 11;
++                            let imm = (raw as i32 >> 11) as i64;
++                            let value = if w >> 31 == 0 {
++                                pc.wrapping_add_signed(imm)
++                            } else {
++                                (pc & !4095).wrapping_add_signed(imm << 12)
++                            };
++                            words[at + 1] = 0xd2800000 | (((value & 65535) as u32) << 5) | rd;
++                            for half in 1..4 {
++                                words[at + 1 + half] = 0xf2800000
++                                    | ((half as u32) << 21)
++                                    | ((((value >> (half * 16)) & 65535) as u32) << 5)
++                                    | rd;
++                            }
++                            if rd == 17 {
++                                words[at + 5] = 0xf9000000 | (17 << 10) | (28 << 5) | 17;
++                            }
++                            words[at + 6] = 0x1400000a;
++                            continue;
++                        }
++                    }
++                    if kind == Instruction::Branch {
++                        let target = branch_target(w, pc);
++                        ensure!(
++                            target >= image.base
++                                && target < image.base + image.words.len() as u64 * 4
++                                && target.is_multiple_of(4),
++                            "branch outside executable authority"
++                        );
++                        // Forward edges remain native. Every backward edge checkpoints.
++                        if target > pc {
++                            let delta = (target - pc) / 4 * SLOT as u64 / 4 - 1;
++                            words[at + 1] = if w & 0x7c000000 == 0x14000000 {
++                                ensure!(delta < 1 << 25, "branch range");
++                                (w & 0xfc000000) | delta as u32
++                            } else {
++                                ensure!(delta < 1 << 18, "conditional range");
++                                (w & !0xffffe0) | ((delta as u32) << 5)
++                            };
++                            words[at + 2] = 0x1400000e;
++                            continue;
++                        }
++                        // A fixed native decrement keeps all backward edges bounded.
++                        // SVC/other callbacks also check cancellation and reset it.
++                        // Thus 256 edges is a maximum interval, never a polling wait.
++                        words[at + 1] = 0xf9400000 | (106 << 10) | (28 << 5) | 17;
++                        words[at + 2] = 0xd1000000 | (1 << 10) | (17 << 5) | 17;
++                        words[at + 3] = 0xf9000000 | (106 << 10) | (28 << 5) | 17;
++                        words[at + 4] = 0xb4000000 | (5 << 5) | 17;
++                        words[at + 5] = 0xf9400000 | (17 << 10) | (28 << 5) | 17;
++                        let delta = (target as i64 - pc as i64) / 4 * (SLOT / 4) as i64 - 6;
++                        words[at + 6] = if w & 0x7c000000 == 0x14000000 {
++                            ensure!((-33554432..33554432).contains(&delta), "branch range");
++                            (w & 0xfc000000) | ((delta as u32) & 0x3ffffff)
++                        } else {
++                            ensure!((-262144..262144).contains(&delta), "conditional range");
++                            (w & !0xffffe0) | (((delta as u32) & 0x7ffff) << 5)
+                         };
+-                        words[at + 2] = 0x1400000e;
++                        words[at + 7] = 0x14000009;
++                        words[at + 9] = 0xd2800000 | (((pc & 65535) as u32) << 5) | 17;
++                        for half in 1..4 {
++                            words[at + 9 + half] = 0xf2800000
++                                | ((half as u32) << 21)
++                                | ((((pc >> (half * 16)) & 65535) as u32) << 5)
++                                | 17;
++                        }
++                        words[at + 13] = 0xf9000000 | (31 << 10) | (28 << 5) | 17;
++                        words[at + 14] = 0xf9400000 | (104 << 10) | (28 << 5) | 17;
++                        words[at + 15] = 0xd61f0220;
+                         continue;
+                     }
+-                    // A fixed native decrement keeps all backward edges bounded.
+-                    // SVC/other callbacks also check cancellation and reset it.
+-                    // Thus 256 edges is a maximum interval, never a polling wait.
+-                    words[at + 1] = 0xf9400000 | (106 << 10) | (28 << 5) | 17;
+-                    words[at + 2] = 0xd1000000 | (1 << 10) | (17 << 5) | 17;
+-                    words[at + 3] = 0xf9000000 | (106 << 10) | (28 << 5) | 17;
+-                    words[at + 4] = 0xb4000000 | (5 << 5) | 17;
+-                    words[at + 5] = 0xf9400000 | (17 << 10) | (28 << 5) | 17;
+-                    let delta = (target as i64 - pc as i64) / 4 * (SLOT / 4) as i64 - 6;
+-                    words[at + 6] = if w & 0x7c000000 == 0x14000000 {
+-                        ensure!((-33554432..33554432).contains(&delta), "branch range");
+-                        (w & 0xfc000000) | ((delta as u32) & 0x3ffffff)
+-                    } else {
+-                        ensure!((-262144..262144).contains(&delta), "conditional range");
+-                        (w & !0xffffe0) | (((delta as u32) & 0x7ffff) << 5)
+-                    };
+-                    words[at + 7] = 0x14000009;
+-                    words[at + 9] = 0xd2800000 | (((pc & 65535) as u32) << 5) | 17;
+-                    for half in 1..4 {
+-                        words[at + 9 + half] = 0xf2800000
+-                            | ((half as u32) << 21)
+-                            | ((((pc >> (half * 16)) & 65535) as u32) << 5)
+-                            | 17;
+-                    }
+-                    words[at + 13] = 0xf9000000 | (31 << 10) | (28 << 5) | 17;
+-                    words[at + 14] = 0xf9400000 | (104 << 10) | (28 << 5) | 17;
+-                    words[at + 15] = 0xd61f0220;
+-                    continue;
+                 }
+-            }
+-            // Save guest x17 before using it to identify the semantic guest PC.
+-            words[at + 1] = 0xf9000000 | (17 << 10) | (28 << 5) | 17;
+-            words[at + 2] = 0xd2800000 | (((pc & 65535) as u32) << 5) | 17;
+-            for half in 1..4 {
+-                words[at + 2 + half] = 0xf2800000
+-                    | ((half as u32) << 21)
+-                    | ((((pc >> (half * 16)) & 65535) as u32) << 5)
+-                    | 17;
+-            }
+-            words[at + 6] = 0xf9000000 | (31 << 10) | (28 << 5) | 17;
+-            words[at + 7] = 0xf9400000 | (104 << 10) | (28 << 5) | 17;
+-            words[at + 8] = 0xd61f0220; // br x17 into the private gateway only
+-            if let Some(w) = instruction
+-                && classify(w).map_err(anyhow::Error::msg)? == Instruction::Memory
+-                && data_region.is_some()
+-            {
+-                let stub = words.len();
+-                words[at + 1] = branch(at + 1, stub);
+-                emit_memory(&mut words, w, at + 2, at + SLOT / 4);
++                // Save guest x17 before using it to identify the semantic guest PC.
++                words[at + 1] = 0xf9000000 | (17 << 10) | (28 << 5) | 17;
++                words[at + 2] = 0xd2800000 | (((pc & 65535) as u32) << 5) | 17;
++                for half in 1..4 {
++                    words[at + 2 + half] = 0xf2800000
++                        | ((half as u32) << 21)
++                        | ((((pc >> (half * 16)) & 65535) as u32) << 5)
++                        | 17;
++                }
++                words[at + 6] = 0xf9000000 | (31 << 10) | (28 << 5) | 17;
++                words[at + 7] = 0xf9400000 | (104 << 10) | (28 << 5) | 17;
++                words[at + 8] = 0xd61f0220; // br x17 into the private gateway only
++                if let Some(w) = instruction
++                    && classify(w).map_err(anyhow::Error::msg)? == Instruction::Memory
++                    && data_region.is_some()
++                {
++                    let stub = words.len();
++                    words[at + 1] = branch(at + 1, stub);
++                    emit_memory(&mut words, w, at + 2, at + SLOT / 4, false);
++                }
+             }
+-        }
++            (words, (0..image.words.len()).map(|i| i * SLOT).collect())
++        };
+         ensure!(
+             unsafe { pthread_jit_write_protect_supported_np() } != 0,
+             "JIT W^X unsupported"
+@@ -352,8 +388,9 @@
+         Ok(Self {
+             ptr: ptr.cast(),
+             length,
++            emitted_words: words.len(),
+             base: image.base,
+-            count: image.words.len(),
++            entry_offsets,
+             data_demand,
+             identity: image.identity.clone(),
+             epoch: image.epoch,
+@@ -361,6 +398,11 @@
+             _thread: PhantomData,
+         })
+     }
++    /// Number of emitted AArch64 words, including entry and checkpoint code.
++    pub fn emitted_words(&self) -> usize {
++        self.emitted_words
++    }
++
+     /// Research adapter. The returned count records an actual successful data
+     /// activation, allowing the interval's demand contract to observe real work.
+     pub fn run_scoped_carrier_until_checkpoint(
+@@ -410,8 +452,11 @@
+             "invalid guest PC {pc:#x}"
+         );
+         let index = (pc - self.base) / 4;
+-        ensure!(index < self.count as u64, "guest PC outside code {pc:#x}");
+-        Ok(self.ptr as usize + index as usize * SLOT)
++        let offset = self
++            .entry_offsets
++            .get(usize::try_from(index)?)
++            .ok_or_else(|| anyhow::anyhow!("guest PC outside code {pc:#x}"))?;
++        Ok(self.ptr as usize + offset)
+     }
+     /// Refresh after every callback reborrow; the native pointer is never a
+     /// durable code-cache entry. Caller has already authenticated identity/epoch.
+--- before/experiments/native-syscall-slice/src/native/compact.rs
++++ after/experiments/native-syscall-slice/src/native/compact.rs
+@@ -0,0 +1,115 @@
++//! Compact native bodies. x17 remains a live guest register between boundaries.
++//! Only host entry veneers, memory scratch use and checkpoints touch its spill.
++//! Every guest PC has its own entry veneer, so callback re-entry cannot inherit
++//! stale host scratch. Internal branches target bodies and preserve live state.
++use super::{
++    Image, Instruction, branch, branch_target, classify, emit_memory, load_state, store_state,
++};
++use anyhow::{Result, ensure};
++
++fn immediate(words: &mut Vec<u32>, register: u32, value: u64) {
++    words.push(0xd2800000 | (((value & 65535) as u32) << 5) | register);
++    for half in 1..4 {
++        words.push(
++            0xf2800000 | (half << 21) | ((((value >> (half * 16)) & 65535) as u32) << 5) | register,
++        );
++    }
++}
++
++fn checkpoint(words: &mut Vec<u32>, pc: u64, save_x17: bool) {
++    if save_x17 {
++        words.push(store_state(17, 136));
++    }
++    immediate(words, 17, pc);
++    words.extend([store_state(17, 248), load_state(17, 832), 0xd61f0220]);
++}
++
++fn relocated(word: u32, from: usize, to: usize) -> Result<u32> {
++    let delta = to as i64 - from as i64;
++    if word & 0x7c000000 == 0x14000000 {
++        ensure!(
++            (-33554432..33554432).contains(&delta),
++            "native branch range"
++        );
++        Ok((word & 0xfc000000) | ((delta as u32) & 0x3ffffff))
++    } else {
++        ensure!(
++            (-262144..262144).contains(&delta),
++            "native conditional range"
++        );
++        Ok((word & !0xffffe0) | (((delta as u32) & 0x7ffff) << 5))
++    }
++}
++
++pub(super) fn emit(image: &Image, memory: bool) -> Result<(Vec<u32>, Vec<usize>)> {
++    let mut words = Vec::new();
++    let mut bodies = Vec::with_capacity(image.words.len() + 1);
++    let mut edges = Vec::new();
++    let mut cold = Vec::new();
++    for (i, &word) in image.words.iter().enumerate() {
++        bodies.push(words.len());
++        let pc = image.base + i as u64 * 4;
++        match classify(word).map_err(anyhow::Error::msg)? {
++            Instruction::Integer => words.push(word),
++            Instruction::Address if !matches!(word & 31, 18 | 28) => {
++                let raw = ((((word >> 5) & 0x7ffff) << 2) | ((word >> 29) & 3)) << 11;
++                let imm = (raw as i32 >> 11) as i64;
++                let value = if word >> 31 == 0 {
++                    pc.wrapping_add_signed(imm)
++                } else {
++                    (pc & !4095).wrapping_add_signed(imm << 12)
++                };
++                immediate(&mut words, word & 31, value);
++            }
++            Instruction::Branch => {
++                let target = branch_target(word, pc);
++                ensure!(
++                    target >= image.base
++                        && target < image.base + image.words.len() as u64 * 4
++                        && target.is_multiple_of(4),
++                    "branch outside executable authority"
++                );
++                if target <= pc {
++                    // Non-flag-setting decrement; x17 is saved before becoming
++                    // scratch, and reloaded before either guest successor.
++                    words.extend([
++                        store_state(17, 136),
++                        load_state(17, 848),
++                        0xd1000631,
++                        store_state(17, 848),
++                    ]);
++                    cold.push((words.len(), 0xb4000011, pc, false));
++                    words.push(0); // cbz x17, checkpoint at the original branch PC
++                    words.push(load_state(17, 136));
++                }
++                edges.push((words.len(), word, ((target - image.base) / 4) as usize));
++                words.push(0);
++            }
++            Instruction::Memory if memory => {
++                words.push(store_state(17, 136));
++                let (next, miss) = emit_memory(&mut words, word, 0, 0, true);
++                edges.push((next, 0x14000000, i + 1));
++                cold.push((miss, 0x14000000, pc, true));
++            }
++            _ => checkpoint(&mut words, pc, true),
++        }
++    }
++    // Out-of-range fallthrough reports the exact PC through the existing
++    // checked callback. It cannot fall into cold stubs or entry veneers.
++    bodies.push(words.len());
++    checkpoint(&mut words, image.base + image.words.len() as u64 * 4, true);
++    for (at, word, target) in edges {
++        words[at] = relocated(word, at, bodies[target])?;
++    }
++    for (at, word, pc, save_x17) in cold {
++        words[at] = relocated(word, at, words.len())?;
++        checkpoint(&mut words, pc, save_x17);
++    }
++    let mut entries = Vec::with_capacity(image.words.len());
++    for &body in bodies.iter().take(image.words.len()) {
++        entries.push(words.len() * 4);
++        words.push(load_state(17, 136));
++        words.push(branch(words.len(), body));
++    }
++    Ok((words, entries))
++}
+--- before/experiments/native-syscall-slice/src/compact_tests.rs
++++ after/experiments/native-syscall-slice/src/compact_tests.rs
+@@ -0,0 +1,168 @@
++//! Complete-state differential against the preserved slot emitter. These
++//! controls target joins and exact-PC re-entry where x17 changes representation.
++use crate::{
++    Instruction, Memory, classify, emulate,
++    native::{Code, Layout, State},
++    tests::elf,
++};
++
++#[derive(Debug, PartialEq, Eq)]
++struct Snapshot {
++    x: [u64; 31],
++    pc: u64,
++    sp: u64,
++    tls: u64,
++    nzcv: u64,
++    fpcr: u64,
++    fpsr: u64,
++    vectors: [u128; 32],
++}
++impl From<&State> for Snapshot {
++    fn from(s: &State) -> Self {
++        Self {
++            x: s.x,
++            pc: s.pc,
++            sp: s.sp,
++            tls: s.tls,
++            nzcv: s.nzcv,
++            fpcr: s.fpcr,
++            fpsr: s.fpsr,
++            vectors: s.vectors,
++        }
++    }
++}
++fn trace(words: &[u32], entry: usize, x17: u64, flags: u64, layout: Layout) -> Vec<Snapshot> {
++    let (mut memory, image) = Memory::load_elf(&elf(words)).unwrap();
++    let code = Code::publish_with_layout(&image, &memory, layout).unwrap();
++    let mut state = State::new(image.base() + entry as u64 * 4);
++    state.x = std::array::from_fn(|n| 0x1122334400000000 | n as u64);
++    state.x[0] = 0;
++    state.x[17] = x17;
++    state.sp = 0x500800;
++    state.tls = 0x77889900;
++    state.nzcv = flags;
++    state.fpcr = 0x400000; // supported rounding-mode bit
++    state.fpsr = 0x08000000; // cumulative saturation
++    state.vectors = std::array::from_fn(|n| (n as u128 + 1) * 0x123456789abcdef0123456789);
++    let mut records = Vec::new();
++    let mut syscalls = 0;
++    code.run(&image, &mut memory, &mut state, &mut |s, m| {
++        assert!(records.len() < 32, "unbounded checkpoint count");
++        records.push(Snapshot::from(&*s));
++        let word = image.words()[((s.pc - image.base()) / 4) as usize];
++        if classify(word).unwrap() == Instruction::Syscall {
++            syscalls += 1;
++            if s.pc == image.base() + (words.len() as u64 - 1) * 4 {
++                return Ok(false);
++            }
++            // Returning through a different guest-PC entry must reload the
++            // callback's new x17 value, even when the body is an arithmetic join.
++            s.x[17] = 0x12340000 + syscalls;
++            s.pc += 4;
++        } else {
++            emulate(word, s, m)?;
++        }
++        Ok(true)
++    })
++    .unwrap();
++    records
++}
++fn compare(words: &[u32], entry: usize, x17: u64, flags: u64) -> Vec<Snapshot> {
++    let slots = trace(words, entry, x17, flags, Layout::Slots);
++    let compact = trace(words, entry, x17, flags, Layout::Compact);
++    assert_eq!(
++        compact, slots,
++        "{words:08x?} entry={entry}, x17={x17}, flags={flags:x}"
++    );
++    compact
++}
++
++#[test]
++fn every_guest_pc_entry_restores_x17_and_complete_state() {
++    // add x17,#1; add x0,x17,#3; adr x17,.; svc; add x17,#1; svc
++    let words = [
++        0x91000631, 0x91000e20, 0x10000011, 0xd4000001, 0x91000631, 0xd4000001,
++    ];
++    for entry in 0..words.len() {
++        let records = compare(&words, entry, 0x5678, 0xb0000000);
++        assert!(!records.is_empty());
++    }
++}
++
++#[test]
++fn forward_conditionals_preserve_both_join_states() {
++    for condition in 0..14 {
++        for flags in 0..16 {
++            // b.cond skips add x17; target consumes live x17 before SVC.
++            let words = [0x54000040 | condition, 0x91000631, 0x91000e20, 0xd4000001];
++            compare(&words, 0, 37, flags << 28);
++        }
++    }
++    for wide in [0, 0x80000000] {
++        for nonzero in [0, 0x01000000] {
++            for x17 in [0, 1, 0x100000000] {
++                let words = [
++                    0x34000051 | wide | nonzero,
++                    0x91000631,
++                    0x91000e20,
++                    0xd4000001,
++                ];
++                compare(&words, 0, x17, 0x90000000);
++            }
++        }
++    }
++    compare(
++        &[0x14000002, 0x91000631, 0x91000e20, 0xd4000001],
++        0,
++        37,
++        0x90000000,
++    );
++}
++
++#[test]
++fn backward_edges_keep_exact_budget_and_live_x17() {
++    for count in [1u64, 255, 256, 257, 1024] {
++        for wide in [0, 0x80000000] {
++            // add x0,#1; sub(s) x17,#1; cbnz/b.ne loop; svc.
++            for conditional_flags in [false, true] {
++                let sub = 0x51000631 | wide | if conditional_flags { 1 << 29 } else { 0 };
++                let back = if conditional_flags {
++                    0x54ffffc1
++                } else {
++                    0x35ffffd1 | wide
++                };
++                let words = [0x91000400, sub, back, 0xd4000001];
++                let records = compare(&words, 0, count, 0xa0000000);
++                assert_eq!(records.len() as u64, count / 256 + 1);
++                let last = records.last().unwrap();
++                assert_eq!(last.x[0], count);
++                assert_eq!(last.x[17], 0);
++            }
++        }
++        // Forward exit plus unconditional backward edge also retains the bound.
++        let words = [0xb4000091, 0x91000400, 0xd1000631, 0x17fffffd, 0xd4000001];
++        let records = compare(&words, 0, count, 0x90000000);
++        assert_eq!(records.len() as u64, count / 256 + 1);
++        assert_eq!(records.last().unwrap().x[0], count);
++    }
++}
++
++#[test]
++fn adr_adrp_reserved_registers_and_tls_still_checkpoint() {
++    for rd in [0u32, 16, 17, 18, 28, 30, 31] {
++        for instruction in [0x10000000, 0x90000000, 0xd53bd040] {
++            if instruction == 0xd53bd040 && rd == 31 {
++                // The existing whitelist rejects the system/XZR encoding.
++                assert!(Memory::load_elf(&elf(&[instruction | rd, 0xd4000001])).is_err());
++                continue;
++            }
++            compare(&[instruction | rd, 0xd4000001], 0, 31, 0xc0000000);
++        }
++    }
++    compare(
++        &[0xd51bd051, 0xd53bd041, 0xd4000001],
++        0,
++        0xabcdef,
++        0xc0000000,
++    );
++}
+--- before/conformance-contracts/contracts/native-code-density.toml
++++ after/conformance-contracts/contracts/native-code-density.toml
+@@ -0,0 +1,24 @@
++schema_version = 1
++id = "kernel.execution.native-code-density"
++title = "Straight-line native arithmetic has no per-instruction spill or jump"
++guest_surfaces = ["execution:linux-aarch64"]
++semantic_authority = ["AArch64 integer, branch and complete register-state semantics"]
++fixture = "unit:native-code-density"
++scale_points = [1, 8, 32, 128]
++rationale = "A straight-line sequence of N add instructions followed by SVC emits one instruction per add, two words per guest-PC entry veneer, and fixed checkpoint code. Runtime state, exact-PC re-entry, conservative memory checks and the maximum 256 backward-edge checkpoint interval must remain intact. Research publication only; this does not authorize cached carrier text."
++
++[bindings]
++vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_floor::native_code_density_contract"
++
++[bindings.unresolved]
++embed_structural = "Carrier executable-byte revocation and signed native execution remain unbound."
++embed_timing = "Paired unchanged-ELF host controls are diagnostics, not signed product acceptance."
++docker = "The same ELF controls provide Linux comparisons; no product-native execution binding exists."
++
++[[structural_budgets]]
++kind = "affine"
++metric = "native_code_words"
++base = 18
++per_unit = 3
++layers = ["vm-free"]
++rationale = "N original instructions, 2*(N+1) entry-veneer words, and two 8-word checkpoint stubs (SVC and terminal refusal). Count the actual emitted words, including cold code."
+--- before/experiments/native-syscall-slice/README.md
++++ after/experiments/native-syscall-slice/README.md
+@@ -77,3 +77,19 @@
+ The `scoped_execution` integration test executes all five unchanged ELF controls
+ at 1/8/32/128 and checks 200 guest records plus syscall/completion counts. These
+ are debug functional runs, and do not update the earlier release timing results.
++
++## Compact emission control
++
++`Code::publish_with_layout(..., Layout::Compact)` selects compact native bodies
++and exact guest-PC entry veneers. The default `Code::publish` retains `Slots`.
++The separate carrier-data test runner
++`carrick-runtime::vcpu_loop::memory::tests::native_buffers::carrier_buffer_elf_control`
++selects this experiment with `CARRICK_NATIVE_CODE_LAYOUT=compact`; its default is
++`slots`. Both arms retain data-demand analysis, carrier scope/buffer authority,
++all architectural state and the maximum 256-backedge checkpoint interval.
++
++The [paired results](../../docs/perf-results/2026-09-21-syscall-floor/compact-native/README.md)
++show a compute improvement, but no material inotify syscall improvement, so
++compact emission remains opt-in. These runs use carrier data and syscall buffers
++with fixture stage-2 operations, and private research text. They do not establish
++carrier executable publication, signed native execution, or full inotify09 gains.

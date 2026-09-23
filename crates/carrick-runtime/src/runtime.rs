@@ -2364,10 +2364,13 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
         self.mem.host_ptr_for_write(address, len)
     }
-    fn begin_host_write(&mut self, ranges: &[(u64, usize)]) {
-        self.mem.begin_host_write(ranges);
+    fn begin_host_write(
+        &mut self,
+        ranges: &[carrick_guest_mem::HostWriteRange],
+    ) -> Result<(), MemoryError> {
+        self.mem.begin_host_write(ranges)
     }
-    fn finish_host_write(&mut self, ranges: &[(u64, usize)]) {
+    fn finish_host_write(&mut self, ranges: &[carrick_guest_mem::HostWriteRange]) {
         self.mem.finish_host_write(ranges);
     }
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
@@ -2617,6 +2620,7 @@ mod tests {
 
     fn scripted_syscall(number: u64, args: [u64; 6]) -> carrick_hal::RawSyscall {
         carrick_hal::RawSyscall {
+            current_guest_sp: None,
             number: carrick_abi::CanonicalNr(number),
             args,
             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,

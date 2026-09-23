@@ -1546,7 +1546,9 @@ mod netlink_readiness_tests {
             "an empty inotify instance is not readable"
         );
 
-        let wd = inotify_state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+        let wd = inotify_state
+            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+            .expect("virtual watch");
         inotify_state.enqueue(wd, carrick_abi::LINUX_IN_MODIFY, 0, None);
 
         assert_eq!(

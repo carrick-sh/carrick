@@ -1,0 +1,25 @@
+[
+  {
+    "case": "anonymous-immediate",
+    "exit_code": 0,
+    "image_id": "sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a",
+    "script_sha256": "8ad44a18aab775db8e213e925695e751dac0763bbb9f00165280f000ef0e4509"
+  },
+  {
+    "case": "anonymous-ready",
+    "exit_code": 0,
+    "image_id": "sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a",
+    "script_sha256": "8ad44a18aab775db8e213e925695e751dac0763bbb9f00165280f000ef0e4509"
+  },
+  {
+    "case": "private-file",
+    "exit_code": 1,
+    "image_id": "sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a",
+    "script_sha256": "e5ecd032ef682f8ab66bbf9beb318407ad258dfb66f565a1cfa7d21e90c2f0d3"
+  },
+  {
+    "case": "poketext",
+    "exit_code": 0,
+    "image_id": "sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517"
+  }
+]

@@ -1,0 +1,17 @@
+{
+  "status": "integration_pending",
+  "base_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "format_check": "pass after formatting-only changes to three older tests",
+  "main_untracked_preserved_expected": {
+    "docs/superpowers/plans/2026-09-13-loopback-tcp-correctness.md": "07234cbedaf0221bba76a1db260d3985e81cbd71ea8883a04fe25a9948fc786e",
+    "docs/superpowers/plans/2026-09-13-partial-dontfork.md": "f921c25afe7f258d992b59ef0dfe907c2b586cfdd394bc81bcd9f7424b5c0f8f",
+    "docs/superpowers/plans/2026-09-13-user-resolution-startup.md": "683953fedecf848bc2afc364244fe79a34284d21a57a6cdc4aaaf27a74525e1b"
+  },
+  "original_archive_checks": {
+    "manifests": 3,
+    "valid_files": 150,
+    "failures": 0
+  },
+  "post_merge_checks": "pending; this file will be updated with actual results",
+  "promotion": "not accepted; known failures and missing signed native bindings remain"
+}

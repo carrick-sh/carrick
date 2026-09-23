@@ -1,0 +1,50 @@
+[
+  {
+    "run": 0,
+    "wrapped": false,
+    "median_ns_per_pair": 933.6973724365234,
+    "binary_sha256": "2be264d14568e7aff7ede87996bfda31c1f5d8b6855d4bfe4fcc35265cb29bdc"
+  },
+  {
+    "run": 1,
+    "wrapped": true,
+    "median_ns_per_pair": 999.4500427246094,
+    "binary_sha256": "2be264d14568e7aff7ede87996bfda31c1f5d8b6855d4bfe4fcc35265cb29bdc"
+  },
+  {
+    "run": 2,
+    "wrapped": true,
+    "median_ns_per_pair": 1002.9779968261719,
+    "binary_sha256": "2be264d14568e7aff7ede87996bfda31c1f5d8b6855d4bfe4fcc35265cb29bdc"
+  },
+  {
+    "run": 3,
+    "wrapped": false,
+    "median_ns_per_pair": 932.0062103271484,
+    "binary_sha256": "2be264d14568e7aff7ede87996bfda31c1f5d8b6855d4bfe4fcc35265cb29bdc"
+  },
+  {
+    "run": 4,
+    "wrapped": true,
+    "median_ns_per_pair": 1003.0619201660156,
+    "binary_sha256": "2be264d14568e7aff7ede87996bfda31c1f5d8b6855d4bfe4fcc35265cb29bdc"
+  },
+  {
+    "run": 5,
+    "wrapped": false,
+    "median_ns_per_pair": 933.3699645996094,
+    "binary_sha256": "2be264d14568e7aff7ede87996bfda31c1f5d8b6855d4bfe4fcc35265cb29bdc"
+  },
+  {
+    "run": 6,
+    "wrapped": false,
+    "median_ns_per_pair": 934.6949310302734,
+    "binary_sha256": "2be264d14568e7aff7ede87996bfda31c1f5d8b6855d4bfe4fcc35265cb29bdc"
+  },
+  {
+    "run": 7,
+    "wrapped": true,
+    "median_ns_per_pair": 1001.6129760742188,
+    "binary_sha256": "2be264d14568e7aff7ede87996bfda31c1f5d8b6855d4bfe4fcc35265cb29bdc"
+  }
+]

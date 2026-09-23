@@ -376,9 +376,13 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.execution.native-synchronous-syscall",
         "kernel.inotify.mark-race-hotpath",
         "kernel.inotify.readiness",
-        "kernel.inotify.watch"
+        "kernel.inotify.watch",
+        "kernel.inotify.watch-churn",
+        "kernel.mm.current-read-reuse",
+        "kernel.mm.native-syscall-buffers"
       ],
       "claims": [
         "kernel.inotify.mark-race-hotpath.linear-work",
@@ -396,8 +400,11 @@
       "authority": "host",
       "contracts": [
         "hvpatch.syscall.portal",
+        "kernel.execution.native-synchronous-syscall",
         "kernel.inotify.mark-race-hotpath",
-        "kernel.inotify.watch"
+        "kernel.inotify.watch",
+        "kernel.inotify.watch-churn",
+        "kernel.mm.native-syscall-buffers"
       ],
       "claims": [
         "hvpatch.syscall.portal.scalar-boundary",
@@ -862,6 +869,9 @@
       "authority": "host",
       "contracts": [
         "kernel.inotify.readiness",
+        "kernel.inotify.watch-churn",
+        "kernel.mm.native-syscall-buffers",
+        "kernel.mm.syscall-code-write",
         "kernel.scheduler.host-wait-handoff"
       ],
       "claims": [
@@ -880,6 +890,8 @@
         "kernel.fs.write-seek",
         "kernel.inotify.mark-race-hotpath",
         "kernel.inotify.watch",
+        "kernel.mm.current-read-reuse",
+        "kernel.mm.native-syscall-buffers",
         "kernel.scheduler.host-wait-handoff"
       ],
       "claims": [
@@ -897,7 +909,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.mm.syscall-code-write"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -924,6 +938,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.mm.syscall-code-write",
         "kernel.scheduler.host-wait-handoff"
       ],
       "claims": [
@@ -951,7 +966,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.mm.syscall-code-write"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -1081,7 +1098,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.fs.stat-allocation"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -1094,7 +1113,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.fs.stat-allocation"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -1529,6 +1550,7 @@
       "handler": "time",
       "authority": "hybrid",
       "contracts": [
+        "kernel.mm.native-syscall-buffers",
         "kernel.time.realtime-calibration"
       ],
       "claims": [],
@@ -1582,7 +1604,10 @@
       "support": "bring_up",
       "handler": "process",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.mm.native-code-content",
+        "kernel.mm.native-code-drain"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -1738,7 +1763,9 @@
       "support": "bring_up",
       "handler": "signal",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.signal.lease-gap"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -1777,7 +1804,9 @@
       "support": "bring_up",
       "handler": "signal",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.syscall.captured-stack"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2754,7 +2783,9 @@
       "support": "bring_up",
       "handler": "network",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.mm.syscall-code-write"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2858,7 +2889,11 @@
       "support": "bring_up",
       "handler": "memory",
       "authority": "hybrid",
-      "contracts": [],
+      "contracts": [
+        "kernel.mm.current-read-reuse",
+        "kernel.mm.native-data-activation",
+        "kernel.mm.retained-fragment-query"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2957,7 +2992,9 @@
       "handler": "memory",
       "authority": "hybrid",
       "contracts": [
-        "kernel.fork.mappings"
+        "kernel.fork.mappings",
+        "kernel.mm.retained-fragment-query",
+        "kernel.mm.scrub-remap-query"
       ],
       "claims": [
         "kernel.fork.mappings.deferred-unpopulated"
@@ -3009,7 +3046,10 @@
       "support": "bring_up",
       "handler": "memory",
       "authority": "hybrid",
-      "contracts": [],
+      "contracts": [
+        "kernel.mm.current-read-reuse",
+        "kernel.mm.native-data-activation"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -3100,7 +3140,13 @@
       "support": "bring_up",
       "handler": "memory",
       "authority": "hybrid",
-      "contracts": [],
+      "contracts": [
+        "kernel.mm.anonymous-discard",
+        "kernel.mm.anonymous-discard-edges",
+        "kernel.mm.anonymous-discard-no-scrub",
+        "kernel.mm.retained-fragment-query",
+        "kernel.mm.scrub-remap-query"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -3244,7 +3290,8 @@
       "handler": "lifecycle",
       "authority": "guest",
       "contracts": [
-        "kernel.fork.stage1-image"
+        "kernel.fork.stage1-image",
+        "kernel.signal.lease-gap"
       ],
       "claims": [
         "kernel.fork.stage1-image.image-pool-bound"
@@ -3387,7 +3434,10 @@
       "support": "bring_up",
       "handler": "process",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.mm.native-code-content",
+        "kernel.mm.native-code-drain"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -3649,7 +3699,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.fs.stat-allocation"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"

@@ -1,0 +1,64 @@
+/*
+ * Linux ARM64 oracle syscall mix, including every descendant thread/process.
+ * Run in the privileged Docker oracle with tracefs mounted and --pid=host:
+ *   bpftrace -B line oracle-syscall-mix.bt <stopped-root-tid> <bound-seconds>
+ * Resume the root only after ORACLEMIX1|ready. The root must wait for its work.
+ *
+ * Scope uses TIDs: sched_process_fork's parent_pid/child_pid are task IDs.
+ * Removing a TGID when one worker exits would silently lose sibling activity.
+ * raw_syscalls:sys_enter supplies the architecture-native syscall number.
+ * Count-only instrumentation perturbs execution; its timings are not speed
+ * evidence. Accept only natural root completion, positive matching total/map
+ * counts, no remaining tracked tasks, successful workload, and no tool drops.
+ * Initial live qualification and exact host/image receipts are recorded in
+ * docs/perf-results/2026-09-21-syscall-floor/ after capture.
+ */
+
+BEGIN
+{
+    @tracked[$1] = 1;
+    @started = nsecs;
+    printf("ORACLEMIX1|ready|root=%d\n", $1);
+}
+
+tracepoint:sched:sched_process_fork
+/@tracked[args->parent_pid]/
+{
+    @tracked[args->child_pid] = 1;
+}
+
+tracepoint:raw_syscalls:sys_enter
+/@tracked[tid]/
+{
+    @calls[args->id] = count();
+    @total = count();
+}
+
+tracepoint:sched:sched_process_exit
+/@tracked[tid] && tid != $1/
+{
+    delete(@tracked[tid]);
+}
+
+tracepoint:sched:sched_process_exit
+/tid == $1/
+{
+    delete(@tracked[tid]);
+    printf("ORACLEMIX1|complete|root=%d\n", $1);
+    exit();
+}
+
+interval:s:1
+/nsecs - @started > (uint64)$2 * 1000000000/
+{
+    printf("ORACLEMIX1|error=bound\n");
+    exit();
+}
+
+/* Let bpftrace emit each count map exactly once at natural termination.
+ * Explicit print followed by mutation races asynchronous map printing.
+ */
+END
+{
+    delete(@started);
+}

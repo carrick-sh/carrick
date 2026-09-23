@@ -1,0 +1,9 @@
+{
+  "crates/carrick-vmm-hvf/src/trap/cow_engine.rs": "d504fcb43c48e6708a2b99c76303575d5e1b984273ddf1189686927893b7ca9c",
+  "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs": "276251172f6de96e986d0d62e9799509a4bc92d60848c58b13da9c5d778e8c04",
+  "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "522c10881aa0984dba3e886b87cb80c439a0ac16fa300e04485a72d15a3dbc40",
+  "crates/carrick-vmm-hvf/src/trap/global_frame.rs": "4d5131042fe386bd84c17e09639e34a6ae958df85566c4394aa1a8cfd6508edb",
+  "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs": "6408fd42a1783dffbee87730c385ee779c3a5186d893613c38d6739e695dbede",
+  "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs": "946e4f8dcd6d40573b5a6d56334522a56c44c2d94831f5d33447e4b39e32e692",
+  "crates/carrick-thread/src/fork_quiesce.rs": "8aa74dac6151da07379b2b2274af90d6e5de3dade0c59e09ca3236222ff03b03"
+}

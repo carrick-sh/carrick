@@ -1,0 +1,938 @@
+--- a/conformance-contracts/inventory.json
++++ b/conformance-contracts/inventory.json
+@@ -1605,7 +1605,8 @@
+       "handler": "process",
+       "authority": "guest",
+       "contracts": [
+-        "kernel.mm.native-code-content"
++        "kernel.mm.native-code-content",
++        "kernel.mm.native-code-drain"
+       ],
+       "claims": [],
+       "uncovered_behaviors": [
+@@ -3434,7 +3435,8 @@
+       "handler": "process",
+       "authority": "guest",
+       "contracts": [
+-        "kernel.mm.native-code-content"
++        "kernel.mm.native-code-content",
++        "kernel.mm.native-code-drain"
+       ],
+       "claims": [],
+       "uncovered_behaviors": [
+--- a/conformance-contracts/surfaces.toml
++++ b/conformance-contracts/surfaces.toml
+@@ -287,7 +287,7 @@
+ 
+ [[surfaces]]
+ path = "crates/carrick-vmm-hvf/src/trap/code_content.rs"
+-contracts = ["kernel.mm.native-code-content"]
++contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-vmm-hvf/src/trap/global_frame.rs"
+@@ -295,11 +295,11 @@
+ 
+ [[surfaces]]
+ path = "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs"
+-contracts = ["kernel.mm.native-code-content"]
++contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/instruction_read.rs"
+-contracts = ["kernel.mm.native-code-content"]
++contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs"
+@@ -307,15 +307,15 @@
+ 
+ [[surfaces]]
+ path = "crates/carrick-hal/src/foreign_mm.rs"
+-contracts = ["kernel.mm.native-code-content"]
++contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-kernel/src/kernel/mm_access.rs"
+-contracts = ["kernel.mm.native-code-content"]
++contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-runtime/src/vcpu_loop/memory.rs"
+-contracts = ["kernel.mm.native-code-content"]
++contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-vmm-hvf/src/trap/host_writes.rs"
+@@ -364,3 +364,11 @@
+ [[surfaces]]
+ path = "crates/carrick-conformance-next/tests/fixtures/syscall_write_destinations.py"
+ contracts = ["kernel.mm.syscall-code-write"]
++
++[[surfaces]]
++path = "crates/carrick-kernel/src/kernel/mm_access/instruction_content.rs"
++contracts = ["kernel.mm.native-code-drain"]
++
++[[surfaces]]
++path = "crates/carrick-kernel/src/dispatch/native_execution.rs"
++contracts = ["kernel.mm.native-code-drain"]
+--- a/crates/carrick-hal/src/foreign_mm.rs
++++ b/crates/carrick-hal/src/foreign_mm.rs
+@@ -448,6 +448,14 @@
+     fn instruction_content_status(&self) -> ForeignInstructionContentStatus {
+         ForeignInstructionContentStatus::Untracked
+     }
++    /// Begin a content-use scope over this captured observation. Writers must
++    /// revoke it and wait for finish before changing captured bytes. The caller
++    /// must check content status at bounded checkpoints and always finish, even
++    /// after partial failure. This is not executable-publication permission.
++    fn begin_instruction_content(&mut self) -> Result<(), ForeignMmTransportError> {
++        Err(ForeignMmTransportError::AuthorityUnavailable)
++    }
++    fn finish_instruction_content(&mut self) {}
+ }
+ 
+ /// Backend completion data for one exact post-COW compound. Implementations
+--- a/crates/carrick-kernel/src/dispatch/native_execution.rs
++++ b/crates/carrick-kernel/src/dispatch/native_execution.rs
+@@ -144,6 +144,18 @@
+     _lease: &'scope mut ThreadExecutionLease,
+ }
+ impl NativeExecution<'_> {
++    /// Authenticate content-use scopes against the actual running task/lease.
++    /// No caller-supplied numeric identity can stand in for this scope.
++    pub(crate) fn instruction_context(
++        &self,
++    ) -> Result<(&KernelContext, &ThreadExecutionLease), MmAccessError> {
++        self.context.validate_current_execution_mm(self._lease)?;
++        if self.stop_requested() {
++            return Err(MmAccessError::NativeDataControlPending);
++        }
++        Ok((self.context, self._lease))
++    }
++
+     /// Authenticate the mutation authority that originally prepared a data pin
+     /// against this scope's actual pause/census/coordinator objects, not MM IDs.
+     pub(crate) fn data_context(
+--- a/crates/carrick-kernel/src/kernel/mm_access.rs
++++ b/crates/carrick-kernel/src/kernel/mm_access.rs
+@@ -13,7 +13,9 @@
+ };
+ 
+ mod current_read;
++mod instruction_content;
+ pub use current_read::{CurrentReadCache, CurrentReadWindow};
++pub use instruction_content::{ActiveInstructionContent, PreparedInstructionContent};
+ 
+ const MM_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(50);
+ 
+--- a/crates/carrick-runtime/src/vcpu_loop/memory.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/memory.rs
+@@ -1116,6 +1116,192 @@
+             result.is_ok(),
+             "post-commit receipt validation reacquired a contended snapshot: {result:?}"
+         );
++    }
++
++    #[cfg(feature = "conformance-metrics")]
++    #[test]
++    fn native_instruction_content_scope_contract() {
++        use carrick_conformance_contract::{
++            Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
++            SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
++        };
++        use carrick_kernel::dispatch::SyscallDispatcher;
++        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
++        let (kernel, root) = bootstrap(41_100);
++        let fixture = real_production_cow_fixture(
++            &kernel,
++            &root,
++            41_101,
++            0x9a00_f500_0000,
++            0x9b00_f500_0000,
++            ThreadId::synthetic_for_tests(41_101),
++        );
++        fixture
++            .dispatch_mm
++            .set_foreign_cow_vma_access_for_test(VmaAccess {
++                readable: true,
++                writable: false,
++                executable: true,
++                kernel_visible: true,
++            });
++        let other = real_production_cow_fixture(
++            &kernel,
++            &root,
++            41_102,
++            0x9a00_f600_0000,
++            0x9b00_f600_0000,
++            ThreadId::synthetic_for_tests(41_102),
++        );
++        let mut execution = execution_lease(&fixture.child, 41101);
++        let mut content = fixture
++            .child
++            .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4)
++            .unwrap()
++            .prepare_tracked_content()
++            .unwrap();
++        assert_eq!(content.bytes(), b"same");
++        let dispatcher = SyscallDispatcher::with_native_mm_for_test(fixture.dispatch_mm.clone());
++        let mut executor = dispatcher
++            .admit_native_executor(&fixture.child, &execution)
++            .unwrap();
++        // A different live execution cannot adopt the receipt, even in one kernel.
++        let mut wrong_execution = execution_lease(&other.child, 41102);
++        let wrong_dispatcher =
++            SyscallDispatcher::with_native_mm_for_test(other.dispatch_mm.clone());
++        let mut wrong_executor = wrong_dispatcher
++            .admit_native_executor(&other.child, &wrong_execution)
++            .unwrap();
++        {
++            let scope = wrong_dispatcher
++                .enter_native_execution(&mut wrong_executor, &other.child, &mut wrong_execution)
++                .unwrap();
++            assert!(matches!(
++                content.activate(&scope),
++                Err(MmAccessError::ForeignRangeAuthorityMismatch)
++            ));
++        }
++        activation_allocator::ALLOCATIONS.set(Some(0));
++        let control = std::hint::black_box(vec![std::hint::black_box(42u8); 64]);
++        assert!(activation_allocator::ALLOCATIONS.replace(None).unwrap() > 0);
++        drop(control);
++        {
++            let scope = dispatcher
++                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                .unwrap();
++            let active = content.activate(&scope).unwrap();
++            assert!(!active.stop_requested());
++        }
++        // The content scope must expose the real execution control signal.
++        let interrupt = executor.interrupt_handle();
++        {
++            let scope = dispatcher
++                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                .unwrap();
++            let active = content.activate(&scope).unwrap();
++            interrupt.request_stop();
++            assert!(active.stop_requested());
++        }
++        assert!(executor.take_stop_request());
++        let mut observations = Vec::new();
++        for scale in [1, 8, 32, 128] {
++            activation_allocator::ALLOCATIONS.set(Some(0));
++            for _ in 0..scale {
++                let scope = dispatcher
++                    .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                    .unwrap();
++                let active = content.activate(&scope).unwrap();
++                assert!(!active.stop_requested());
++            }
++            let allocations = activation_allocator::ALLOCATIONS.replace(None).unwrap();
++            assert_eq!(allocations, 0);
++            let mut work = WorkSnapshot::new();
++            work.insert(WorkMetric::HostHeapAllocations, allocations)
++                .unwrap();
++            observations.push(ContractObservation {
++                contract_id: ContractId::new("kernel.mm.native-code-drain").unwrap(),
++                layer: ExecutionLayer::VmFree,
++                implementation_revision: format!(
++                    "sha256:{:x}",
++                    <sha2::Sha256 as sha2::Digest>::digest(include_bytes!(
++                        "../../../carrick-kernel/src/kernel/mm_access/instruction_content.rs"
++                    ))
++                ),
++                fixture_identity: "unit:native-code-drain".into(),
++                scale,
++                semantic_assertions: vec![SemanticAssertion::pass(
++                    "exact_carrier_content_scope_reuses_without_allocation",
++                )],
++                work: Some(work),
++                timing: None,
++                completeness: Completeness::Complete,
++            });
++        }
++        let root_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++            .parent()
++            .unwrap()
++            .parent()
++            .unwrap();
++        let registry = ContractRegistry::load(root_path).unwrap();
++        println!(
++            "native_code_drain_observations {}",
++            serde_json::to_string(&observations).unwrap()
++        );
++        evaluate(
++            registry.require("kernel.mm.native-code-drain").unwrap(),
++            &observations,
++        )
++        .unwrap();
++        // A participating physical write makes the old preparation unusable.
++        let original = fixture.carrier.pin_original_data_for_test().unwrap();
++        original.write_prefix_for_test(*b"new!").unwrap();
++        {
++            let scope = dispatcher
++                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                .unwrap();
++            assert!(content.activate(&scope).is_err());
++        }
++        let mut fresh = fixture
++            .child
++            .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4)
++            .unwrap()
++            .prepare_tracked_content()
++            .unwrap();
++        assert_eq!(fresh.bytes(), b"new!");
++        {
++            let scope = dispatcher
++                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                .unwrap();
++            let active = fresh.activate(&scope).unwrap();
++            assert!(!active.stop_requested());
++        }
++        fixture
++            .dispatch_mm
++            .set_foreign_cow_vma_access_for_test(VmaAccess {
++                readable: true,
++                writable: true,
++                executable: false,
++                kernel_visible: true,
++            });
++        {
++            let scope = dispatcher
++                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                .unwrap();
++            assert!(matches!(
++                fresh.activate(&scope),
++                Err(MmAccessError::StaleInstructionRead)
++            ));
++        }
++        drop((content, fresh, executor, wrong_executor));
++        fixture
++            .child
++            .thread()
++            .yield_from_executor(execution)
++            .unwrap();
++        other
++            .child
++            .thread()
++            .yield_from_executor(wrong_execution)
++            .unwrap();
+     }
+ 
+     #[test]
+--- a/crates/carrick-vmm-hvf/src/trap/code_content.rs
++++ b/crates/carrick-vmm-hvf/src/trap/code_content.rs
+@@ -1,10 +1,11 @@
+ //! Physical-backing content dependencies for translation setup.
+ //!
+ //! These witnesses detect participating host writes. They are NOT permission
+-//! to execute translated code: guest stores, alias admission, mapping changes,
+-//! active-executor drain and link publication require separate authority.
++//! to execute translated code: guest stores, mapping changes, alias admission
++//! and link publication require separate authority. Active
++//! participating-host-write users now drain before write admission completes.
+ //! A page identity is never revived after a write or backing retirement.
+-use parking_lot::Mutex;
++use parking_lot::{Condvar, Mutex};
+ use std::{
+     collections::BTreeMap,
+     ops::{Deref, RangeInclusive},
+@@ -18,7 +19,110 @@
+ 
+ #[derive(Debug, Default)]
+ struct Registry {
+-    pages: Mutex<BTreeMap<usize, Weak<AtomicBool>>>,
++    pages: Mutex<BTreeMap<usize, Weak<ContentPage>>>,
++}
++
++/// A never-revived dependency. Entry and revocation use the same
++/// publish-before-check handshake as the kernel's execution census.
++#[derive(Debug)]
++struct ContentPage {
++    valid: AtomicBool,
++    running: AtomicUsize,
++    drain: Mutex<()>,
++    idle: Condvar,
++}
++impl ContentPage {
++    fn new() -> Self {
++        Self {
++            valid: AtomicBool::new(true),
++            running: AtomicUsize::new(0),
++            drain: Mutex::new(()),
++            idle: Condvar::new(),
++        }
++    }
++    fn leave(&self) {
++        let before = self.running.fetch_sub(1, Ordering::SeqCst);
++        if before == 0 {
++            carrick_fatal::carrick_fatal!(
++                "hvf::code_content",
++                "unbalanced instruction content scope"
++            );
++        }
++        // Warm exits need no lock. If revocation follows this check, its
++        // SeqCst running check sees zero; otherwise we wake its locked wait.
++        if before == 1 && !self.valid.load(Ordering::SeqCst) {
++            let _drain = self.drain.lock();
++            self.idle.notify_all();
++        }
++    }
++    fn wait_idle(&self) {
++        let mut drain = self.drain.lock();
++        while self.running.load(Ordering::SeqCst) != 0 {
++            self.idle.wait(&mut drain);
++        }
++    }
++}
++impl Registry {
++    /// The common no-execution path visits the range once. If an affected
++    /// page is running, release the registry before parking, then resume
++    /// strictly after that page. No unrelated dependency is revoked/drained,
++    /// and no per-write scratch allocation or polling is needed.
++    fn revoke(&self, range: RangeInclusive<usize>) -> usize {
++        let mut start = *range.start();
++        let end = *range.end();
++        let mut visits = 0;
++        loop {
++            let pending = {
++                let pages = self.pages.lock();
++                let mut pending = None;
++                for (&page, dependency) in pages.range(start..=end) {
++                    visits += 1;
++                    if let Some(dependency) = dependency.upgrade() {
++                        dependency.valid.store(false, Ordering::SeqCst);
++                        if dependency.running.load(Ordering::SeqCst) != 0 {
++                            pending = Some((page, Some(dependency)));
++                            break;
++                        }
++                    } else {
++                        pending = Some((page, None));
++                        break;
++                    }
++                }
++                pending
++            };
++            let Some((page, dependency)) = pending else {
++                break;
++            };
++            if let Some(dependency) = dependency {
++                dependency.wait_idle();
++                // A last observer may have dropped while this writer held
++                // the final strong reference. Drop it under the registry lock
++                // so concurrent observer cleanup cannot miss the final owner.
++                let mut pages = self.pages.lock();
++                if Arc::strong_count(&dependency) == 1
++                    && pages
++                        .get(&page)
++                        .is_some_and(|current| current.as_ptr() == Arc::as_ptr(&dependency))
++                {
++                    pages.remove(&page);
++                }
++                drop(dependency);
++            } else {
++                let mut pages = self.pages.lock();
++                if pages
++                    .get(&page)
++                    .is_some_and(|current| current.strong_count() == 0)
++                {
++                    pages.remove(&page);
++                }
++            }
++            if page == end {
++                break;
++            }
++            start = page + 1;
++        }
++        visits
++    }
+ }
+ 
+ #[derive(Debug)]
+@@ -33,6 +137,8 @@
+ pub(crate) enum ContentError {
+     OutOfBounds,
+     WriteInProgress,
++    Changed,
++    AlreadyExecuting,
+ }
+ 
+ impl CodeContent {
+@@ -72,9 +178,9 @@
+             .map(|page| {
+                 let existing = pages.get(&page).and_then(Weak::upgrade);
+                 let valid = match existing {
+-                    Some(valid) if valid.load(Ordering::Acquire) => valid,
++                    Some(valid) if valid.valid.load(Ordering::Acquire) => valid,
+                     _ => {
+-                        let valid = Arc::new(AtomicBool::new(true));
++                        let valid = Arc::new(ContentPage::new());
+                         pages.insert(page, Arc::downgrade(&valid));
+                         valid
+                     }
+@@ -86,6 +192,7 @@
+         let observation = ContentObservation {
+             registry: Arc::clone(registry),
+             dependencies,
++            executing: 0,
+         };
+         if self.writers.load(Ordering::SeqCst) != 0 || !observation.is_current() {
+             return Err(ContentError::WriteInProgress);
+@@ -105,11 +212,7 @@
+ impl Drop for CodeContent {
+     fn drop(&mut self) {
+         if let Some(registry) = self.registry.get() {
+-            for dependency in registry.pages.lock().values() {
+-                if let Some(valid) = dependency.upgrade() {
+-                    valid.store(false, Ordering::Release);
+-                }
+-            }
++            registry.revoke(0..=usize::MAX);
+         }
+     }
+ }
+@@ -117,19 +220,52 @@
+ #[derive(Debug)]
+ pub(crate) struct ContentObservation {
+     registry: Arc<Registry>,
+-    dependencies: Vec<(usize, Arc<AtomicBool>)>,
++    dependencies: Vec<(usize, Arc<ContentPage>)>,
++    executing: usize,
+ }
+ 
+ impl ContentObservation {
++    /// Participating host writers cannot finish admission until this scope
++    /// ends. This covers content only: it does not authorize executable entry
++    /// or prove absence of guest hardware stores and writable aliases.
++    pub(crate) fn begin_execution(&mut self) -> Result<(), ContentError> {
++        if self.executing != 0 {
++            return Err(ContentError::AlreadyExecuting);
++        }
++        for (_, page) in &self.dependencies {
++            page.running
++                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
++                .unwrap_or_else(|_| {
++                    carrick_fatal::carrick_fatal!(
++                        "hvf::code_content",
++                        "instruction content count exhausted"
++                    )
++                });
++            self.executing += 1;
++            if !page.valid.load(Ordering::SeqCst) {
++                self.finish_execution();
++                return Err(ContentError::Changed);
++            }
++        }
++        Ok(())
++    }
++    pub(crate) fn finish_execution(&mut self) {
++        let count = std::mem::take(&mut self.executing);
++        for (_, page) in &self.dependencies[..count] {
++            page.leave();
++        }
++    }
++
+     pub(crate) fn is_current(&self) -> bool {
+         self.dependencies
+             .iter()
+-            .all(|(_, valid)| valid.load(Ordering::Acquire))
++            .all(|(_, valid)| valid.valid.load(Ordering::Acquire))
+     }
+ }
+ 
+ impl Drop for ContentObservation {
+     fn drop(&mut self) {
++        self.finish_execution();
+         let mut pages = self.registry.pages.lock();
+         for (page, valid) in self.dependencies.drain(..) {
+             if Arc::strong_count(&valid) == 1
+@@ -172,16 +308,13 @@
+                     "observed content lacks registry"
+                 )
+             });
+-            let pages = registry.pages.lock();
+-            for (_, dependency) in pages.range(range) {
+-                #[cfg(test)]
+-                {
+-                    visited_pages += 1;
+-                }
+-                if let Some(valid) = dependency.upgrade() {
+-                    valid.store(false, Ordering::Release);
+-                }
++            let visits = registry.revoke(range);
++            #[cfg(test)]
++            {
++                visited_pages = visits;
+             }
++            #[cfg(not(test))]
++            let _ = visits;
+         }
+         Ok(ContentWrite {
+             content,
+@@ -400,3 +533,146 @@
+         .unwrap();
+     }
+ }
++
++#[cfg(test)]
++mod execution_tests {
++    use super::*;
++    use std::{sync::mpsc, thread, time::Duration};
++
++    #[test]
++    fn native_code_drain_waits_for_active_content_before_writer_admission() {
++        let content = Arc::new(CodeContent::new(8192));
++        let mut observation = content.observe(0, 4).unwrap();
++        observation.begin_execution().unwrap();
++        let (started_tx, started_rx) = mpsc::channel();
++        let (admitted_tx, admitted_rx) = mpsc::channel();
++        let writer_content = Arc::clone(&content);
++        let writer = thread::spawn(move || {
++            started_tx.send(()).unwrap();
++            let _writer = writer_content.begin_write(0, 4).unwrap();
++            admitted_tx.send(()).unwrap();
++        });
++        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
++        let premature = admitted_rx.recv_timeout(Duration::from_millis(50)).is_ok();
++        observation.finish_execution();
++        if !premature {
++            admitted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
++        }
++        writer.join().unwrap();
++        assert!(
++            !premature,
++            "writer was admitted while captured instructions were active"
++        );
++        assert!(!observation.is_current());
++        assert!(observation.begin_execution().is_err());
++    }
++    #[test]
++    fn native_code_drain_last_active_observer_releases_registry_entry() {
++        let registry = Arc::new(Registry::default());
++        let dependency = Arc::new(ContentPage::new());
++        registry.pages.lock().insert(0, Arc::downgrade(&dependency));
++        let mut observation = ContentObservation {
++            registry: Arc::clone(&registry),
++            dependencies: vec![(0, dependency.clone())],
++            executing: 0,
++        };
++        observation.begin_execution().unwrap();
++        // This retained writer-side reference has the same lifetime as the
++        // pending drain's reference. Drop must account for it when cleaning up.
++        drop(observation);
++        assert!(registry.pages.lock().contains_key(&0));
++        drop(dependency);
++        // A subsequent real invalidation must sweep the dead selected entry.
++        registry.revoke(0..=0);
++        assert!(
++            registry.pages.lock().is_empty(),
++            "dead dependency retained after final active scope"
++        );
++    }
++    #[test]
++    fn native_code_drain_partial_entry_rolls_back_and_unrelated_scope_stays_live() {
++        let content = CodeContent::new(3 * 4096);
++        let mut combined = content.observe(0, 8192).unwrap();
++        let mut unrelated = content.observe(8192, 4).unwrap();
++        unrelated.begin_execution().unwrap();
++        drop(content.begin_write(4096, 4).unwrap());
++        assert_eq!(combined.begin_execution(), Err(ContentError::Changed));
++        assert!(
++            combined
++                .dependencies
++                .iter()
++                .all(|(_, p)| p.running.load(Ordering::SeqCst) == 0)
++        );
++        // A stale preparation and an unrelated active page cannot hold this
++        // writer hostage. No timed wait or polling is needed on this path.
++        drop(content.begin_write(0, 4).unwrap());
++        assert!(unrelated.is_current());
++        unrelated.finish_execution();
++    }
++
++    #[test]
++    fn native_code_drain_entry_write_race_leaves_no_active_count() {
++        use std::sync::Barrier;
++        for _ in 0..64 {
++            let content = CodeContent::new(4096);
++            let mut observation = content.observe(0, 4).unwrap();
++            let start = Barrier::new(2);
++            thread::scope(|threads| {
++                let writer = threads.spawn(|| {
++                    start.wait();
++                    drop(content.begin_write(0, 4).unwrap());
++                });
++                start.wait();
++                if observation.begin_execution().is_ok() {
++                    observation.finish_execution();
++                }
++                writer.join().unwrap();
++            });
++            assert!(!observation.is_current());
++            assert_eq!(observation.executing, 0);
++            assert_eq!(
++                observation.dependencies[0].1.running.load(Ordering::SeqCst),
++                0
++            );
++        }
++    }
++    #[test]
++    fn native_code_drain_waits_for_last_reader_and_cleans_pending_reference() {
++        let content = Arc::new(CodeContent::new(8192));
++        let mut first = content.observe(0, 4).unwrap();
++        let mut second = content.observe(0, 4).unwrap();
++        let mut unrelated = content.observe(4096, 4).unwrap();
++        first.begin_execution().unwrap();
++        second.begin_execution().unwrap();
++        unrelated.begin_execution().unwrap();
++        let (start_tx, start_rx) = mpsc::channel();
++        let (done_tx, done_rx) = mpsc::channel();
++        let writer_content = Arc::clone(&content);
++        let writer = thread::spawn(move || {
++            start_tx.send(()).unwrap();
++            drop(writer_content.begin_write(0, 4).unwrap());
++            done_tx.send(()).unwrap();
++        });
++        start_rx.recv_timeout(Duration::from_secs(2)).unwrap();
++        let mut premature = done_rx.recv_timeout(Duration::from_millis(50)).is_ok();
++        drop(first);
++        premature |= done_rx.recv_timeout(Duration::from_millis(50)).is_ok();
++        drop(second);
++        if !premature {
++            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
++        }
++        writer.join().unwrap();
++        assert!(!premature, "writer bypassed a remaining active observation");
++        assert!(unrelated.is_current());
++        assert!(
++            !content
++                .registry
++                .get()
++                .unwrap()
++                .pages
++                .lock()
++                .contains_key(&0)
++        );
++        unrelated.finish_execution();
++    }
++}
+--- a/crates/carrick-vmm-hvf/src/trap/foreign_mm/instruction_read.rs
++++ b/crates/carrick-vmm-hvf/src/trap/foreign_mm/instruction_read.rs
+@@ -21,6 +21,20 @@
+     }
+     fn authenticates(&self, snapshot: &dyn carrick_hal::ForeignMmSnapshot) -> bool {
+         self.read.authenticates(snapshot)
++    }
++    fn begin_instruction_content(&mut self) -> Result<(), Error> {
++        for index in 0..self.content.len() {
++            if self.content[index].begin_execution().is_err() {
++                self.finish_instruction_content();
++                return Err(Error::Retry);
++            }
++        }
++        Ok(())
++    }
++    fn finish_instruction_content(&mut self) {
++        for observation in &mut self.content {
++            observation.finish_execution();
++        }
+     }
+     fn instruction_content_status(&self) -> ForeignInstructionContentStatus {
+         if self.content.iter().all(ContentObservation::is_current) {
+--- a/crates/carrick-vmm-hvf/src/trap/foreign_mm.rs
++++ b/crates/carrick-vmm-hvf/src/trap/foreign_mm.rs
+@@ -3162,6 +3162,21 @@
+     /// Retains the original physical owner so tests can verify COW divergence.
+     pub struct ProductionCarrierSourcePin(GlobalFrameOwnerPin);
+     impl ProductionCarrierSourcePin {
++        /// Test-only alias writer over the production backing/content guard.
++        /// This does not mint kernel mapping or executable authority.
++        pub fn write_prefix_for_test(&self, bytes: [u8; 4]) -> Result<(), String> {
++            let owner = self.0.owner();
++            let _write = owner
++                .mapping
++                .begin_content_write(0, bytes.len())
++                .map_err(|error| format!("fixture content write: {error:?}"))?;
++            // SAFETY: the exact pin and write scope retain this four-byte range.
++            unsafe {
++                std::ptr::copy_nonoverlapping(bytes.as_ptr(), owner.ptr(), bytes.len());
++            }
++            Ok(())
++        }
++
+         pub fn prefix(&self) -> [u8; 4] {
+             let mut bytes = [0; 4];
+             // SAFETY: fixture data owners contain OWNER_LEN bytes and the pin
+--- /dev/null
++++ b/crates/carrick-kernel/src/kernel/mm_access/instruction_content.rs
+@@ -0,0 +1,143 @@
++//! Scoped content use for a future native publication permit. This binds the
++//! participating-host-write drain to the kernel's real execution lifetime; it
++//! deliberately grants no executable pointer or native publication authority.
++use super::*;
++use crate::dispatch::native_execution::NativeExecution;
++use crate::kernel::objects::{ExecutionGeneration, ExecutorId, ThreadKey};
++use carrick_hal::{ForeignMmLiveAuthority, foreign_mm::ForeignInstructionContentStatus};
++
++type ExecutionIdentity = (ThreadKey, ExecutionGeneration, ExecutorId, u64);
++fn identity(execution: &ThreadExecutionLease) -> ExecutionIdentity {
++    (
++        execution.thread_key(),
++        execution.generation(),
++        execution.executor(),
++        execution.executor_epoch(),
++    )
++}
++
++/// An authenticated copy plus participating-write dependencies. Keeping it does
++/// not hold the execution lease or a running handshake. Hardware writes, private
++/// RX admission, links and executable publication require additional authority.
++/// This object never exposes a host executable address.
++pub struct PreparedInstructionContent {
++    kernel: Arc<Kernel>,
++    task: TaskKey,
++    mm: Arc<Mm>,
++    execution: ExecutionIdentity,
++    snapshot: ProjectedForeignMmSnapshot,
++    bytes: Vec<u8>,
++    receipt: Box<dyn carrick_hal::ForeignMmReadReceipt>,
++    _thread: PhantomData<std::rc::Rc<()>>,
++}
++
++impl InstructionRead<'_> {
++    pub fn prepare_tracked_content(self) -> Result<PreparedInstructionContent, MmAccessError> {
++        self.validate_tracked_content()?;
++        Ok(PreparedInstructionContent {
++            kernel: Arc::clone(&self.context.kernel),
++            task: self.context.task.key(),
++            mm: self.mm,
++            execution: identity(self.execution),
++            snapshot: self.snapshot,
++            bytes: self.bytes,
++            receipt: self.receipt,
++            _thread: PhantomData,
++        })
++    }
++}
++
++impl PreparedInstructionContent {
++    pub fn bytes(&self) -> &[u8] {
++        &self.bytes
++    }
++
++    fn validate_scope(&self, scope: &NativeExecution<'_>) -> Result<(), MmAccessError> {
++        let (context, execution) = scope.instruction_context()?;
++        if !Arc::ptr_eq(&context.kernel, &self.kernel)
++            || context.task.key() != self.task
++            || !Arc::ptr_eq(&context.shared.mm(), &self.mm)
++            || identity(execution) != self.execution
++        {
++            return Err(MmAccessError::ForeignRangeAuthorityMismatch);
++        }
++        let live = RetainedMmLiveAuthority {
++            mm: Arc::clone(&self.mm),
++        };
++        if !live
++            .matches_authenticated_snapshot(&self.snapshot, Instant::now() + MM_SNAPSHOT_TIMEOUT)
++            .map_err(MmAccessError::ForeignTransport)?
++        {
++            return Err(MmAccessError::StaleInstructionRead);
++        }
++        Ok(())
++    }
++
++    pub fn activate<'active, 'scope>(
++        &'active mut self,
++        scope: &'active NativeExecution<'scope>,
++    ) -> Result<ActiveInstructionContent<'active, 'scope>, MmAccessError> {
++        self.validate_scope(scope)?;
++        // Install cleanup before the fallible backend callback; partial
++        // admission and unwind must both end before the running handshake.
++        let active = ActiveInstructionContent {
++            prepared: self,
++            scope,
++        };
++        active
++            .prepared
++            .receipt
++            .begin_instruction_content()
++            .map_err(MmAccessError::ForeignTransport)?;
++        active.prepared.validate_scope(scope)?;
++        if active.stop_requested() {
++            return Err(MmAccessError::StaleInstructionContent);
++        }
++        Ok(active)
++    }
++}
++
++/// Only participating host writers are excluded until drop. This is one facet
++/// of publication, not permission to execute translated code. A future native
++/// consumer must check stop_requested at bounded checkpoints and end this scope
++/// before dispatch, MM mutation, or acknowledging its running handshake.
++///
++/// ```compile_fail,E0505
++/// use carrick_kernel::{kernel::mm_access::PreparedInstructionContent, dispatch::native_execution::NativeExecution};
++/// fn drop_while_active(mut p: PreparedInstructionContent, scope: NativeExecution<'_>) {
++///     let active = p.activate(&scope).unwrap();
++///     drop(scope);
++///     active.stop_requested();
++/// }
++/// ```
++/// ```compile_fail,E0499
++/// use carrick_kernel::{kernel::mm_access::PreparedInstructionContent, dispatch::native_execution::NativeExecution};
++/// fn duplicate(p: &mut PreparedInstructionContent, scope: &NativeExecution<'_>) {
++///     let a = p.activate(scope).unwrap();
++///     let b = p.activate(scope).unwrap();
++///     drop((a, b));
++/// }
++/// ```
++pub struct ActiveInstructionContent<'active, 'scope> {
++    prepared: &'active mut PreparedInstructionContent,
++    scope: &'active NativeExecution<'scope>,
++}
++impl ActiveInstructionContent<'_, '_> {
++    pub fn stop_requested(&self) -> bool {
++        self.scope.stop_requested()
++            || self.prepared.receipt.instruction_content_status()
++                != ForeignInstructionContentStatus::UnchangedTrackedWrites
++    }
++}
++impl Drop for ActiveInstructionContent<'_, '_> {
++    fn drop(&mut self) {
++        self.prepared.receipt.finish_instruction_content();
++    }
++}
++
++#[cfg(test)]
++mod types {
++    use super::*;
++    static_assertions::assert_not_impl_any!(PreparedInstructionContent: Send, Sync, Clone, Copy);
++    static_assertions::assert_not_impl_any!(ActiveInstructionContent<'static, 'static>: Send, Sync, Clone, Copy);
++}
+--- /dev/null
++++ b/conformance-contracts/contracts/native-code-drain.toml
+@@ -0,0 +1,23 @@
++schema_version = 1
++id = "kernel.mm.native-code-drain"
++title = "Participating host writes revoke and drain active instruction content"
++guest_surfaces = ["kernel:current-mm", "scheduler:execution-admission", "scheduler:page-table-quiescence", "syscall:process_vm_writev", "syscall:ptrace"]
++semantic_authority = ["Carrick exact task/execution/MM authority", "Carrick physical backing content identity and participating host-write ordering"]
++fixture = "unit:native-code-drain"
++scale_points = [1, 8, 32, 128]
++rationale = "A participating host writer must revoke future content use and wait for affected active users before changing bytes. Unrelated physical pages are not revoked or drained. Captured code content is activated only inside its exact kernel running scope. This is not proof of private RX admission, hardware-write mediation, executable publication, or linked native execution."
++
++[bindings]
++vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_instruction_content_scope_contract (feature conformance-metrics); carrick-vmm-hvf::trap::code_content::execution_tests; real carrier instruction receipt and syscall writer regressions"
++
++[bindings.unresolved]
++embed_structural = "No signed mixed native/HVF code publication or direct-link revocation binding yet. Guest hardware stores, writable aliases and private RX admission remain unresolved."
++embed_timing = "No new original inotify09 timing or native-residence acceptance."
++docker = "Internal lifetime ordering; the Linux syscall semantic regressions remain separate. No mixed-engine guest race oracle is bound."
++
++[[structural_budgets]]
++kind = "exact"
++metric = "host_heap_allocations"
++value = 0
++layers = ["vm-free"]
++rationale = "After preparation, N exact-native-scope content activations, checkpoints and drops allocate no host memory; the actual thread-local allocator must pass a positive control. The existing content and syscall-write contracts retain their affected-page budgets."

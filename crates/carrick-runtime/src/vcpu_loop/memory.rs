@@ -632,6 +632,8 @@ pub(crate) fn proc_maps_from_address_space(image: &AddressSpace) -> Vec<ProcMaps
 
 #[cfg(test)]
 mod tests {
+    mod native_buffers;
+    mod native_floor;
     use super::*;
 
     #[test]
@@ -960,10 +962,31 @@ mod tests {
         data_ipa: u64,
         caller_tid: ThreadId,
     ) -> RealProductionCowFixture {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::{FixtureShape, TEST_VA};
+        let shape = FixtureShape::new(Gpa(stage1_root), Gpa(data_ipa)).unwrap();
+        production_cow_fixture_with_shape(
+            kernel,
+            parent,
+            registry_id,
+            caller_tid,
+            shape,
+            TEST_VA..TEST_VA + shape.data_len,
+        )
+    }
+
+    fn production_cow_fixture_with_shape(
+        kernel: &Arc<Kernel>,
+        parent: &KernelContext,
+        registry_id: i32,
+        caller_tid: ThreadId,
+        shape: carrick_vmm_hvf::trap::foreign_cow_test_support::FixtureShape,
+        semantic_data: std::ops::Range<u64>,
+    ) -> RealProductionCowFixture {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::{
-            FixtureShape, InitialInventoryIdentity, ProductionCarrierForeignCowCustody,
-            ProductionCarrierForeignCowHarness, ProductionCarrierForeignCowInstallArgs, TEST_VA,
+            InitialInventoryIdentity, ProductionCarrierForeignCowCustody,
+            ProductionCarrierForeignCowHarness, ProductionCarrierForeignCowInstallArgs,
         };
+        let stage1_root = shape.stage1_root.0;
 
         let (_stage1_pool, stage1) =
             crate::hvpatch::Stage1MmPool::new_root_for_tests(stage1_root, 4)
@@ -977,14 +1000,12 @@ mod tests {
             Arc::clone(&backend) as Arc<dyn MmBackend>,
         );
         let mm = child.shared().mm().id();
-        let shape = FixtureShape::new(Gpa(stage1_root), Gpa(data_ipa))
-            .expect("real production carrier fixture shape");
         let (dispatch_mm, mutation) =
             carrick_kernel::dispatch::DispatchMmAuthority::foreign_cow_composition_for_test(
                 mm,
                 Arc::clone(&stage1) as Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
-                TEST_VA,
-                TEST_VA + shape.data_len,
+                semantic_data.start,
+                semantic_data.end,
             );
         backend.bind_inventory(kernel, mm);
         let vma_source: carrick_kernel::kernel::SharedVmaSnapshotSource = dispatch_mm.clone();
@@ -1095,6 +1116,1692 @@ mod tests {
             result.is_ok(),
             "post-commit receipt validation reacquired a contended snapshot: {result:?}"
         );
+    }
+
+    #[cfg(feature = "conformance-metrics")]
+    #[test]
+    fn native_instruction_content_scope_contract() {
+        use carrick_conformance_contract::{
+            Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
+            SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
+        };
+        use carrick_kernel::dispatch::SyscallDispatcher;
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        let (kernel, root) = bootstrap(41_100);
+        let fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            41_101,
+            0x9a00_f500_0000,
+            0x9b00_f500_0000,
+            ThreadId::synthetic_for_tests(41_101),
+        );
+        fixture
+            .dispatch_mm
+            .set_foreign_cow_vma_access_for_test(VmaAccess {
+                readable: true,
+                writable: false,
+                executable: true,
+                kernel_visible: true,
+            });
+        let other = real_production_cow_fixture(
+            &kernel,
+            &root,
+            41_102,
+            0x9a00_f600_0000,
+            0x9b00_f600_0000,
+            ThreadId::synthetic_for_tests(41_102),
+        );
+        let mut execution = execution_lease(&fixture.child, 41101);
+        let mut content = fixture
+            .child
+            .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4)
+            .unwrap()
+            .prepare_tracked_content()
+            .unwrap();
+        assert_eq!(content.bytes(), b"same");
+        let dispatcher = SyscallDispatcher::with_native_mm_for_test(fixture.dispatch_mm.clone());
+        let mut executor = dispatcher
+            .admit_native_executor(&fixture.child, &execution)
+            .unwrap();
+        // A different live execution cannot adopt the receipt, even in one kernel.
+        let mut wrong_execution = execution_lease(&other.child, 41102);
+        let wrong_dispatcher =
+            SyscallDispatcher::with_native_mm_for_test(other.dispatch_mm.clone());
+        let mut wrong_executor = wrong_dispatcher
+            .admit_native_executor(&other.child, &wrong_execution)
+            .unwrap();
+        {
+            let scope = wrong_dispatcher
+                .enter_native_execution(&mut wrong_executor, &other.child, &mut wrong_execution)
+                .unwrap();
+            assert!(matches!(
+                content.activate(&scope),
+                Err(MmAccessError::ForeignRangeAuthorityMismatch)
+            ));
+        }
+        activation_allocator::ALLOCATIONS.set(Some(0));
+        let control = std::hint::black_box(vec![std::hint::black_box(42u8); 64]);
+        assert!(activation_allocator::ALLOCATIONS.replace(None).unwrap() > 0);
+        drop(control);
+        {
+            let scope = dispatcher
+                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                .unwrap();
+            let active = content.activate(&scope).unwrap();
+            assert!(!active.stop_requested());
+        }
+        // The content scope must expose the real execution control signal.
+        let interrupt = executor.interrupt_handle();
+        {
+            let scope = dispatcher
+                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                .unwrap();
+            let active = content.activate(&scope).unwrap();
+            interrupt.request_stop();
+            assert!(active.stop_requested());
+        }
+        assert!(executor.take_stop_request());
+        let mut observations = Vec::new();
+        for scale in [1, 8, 32, 128] {
+            activation_allocator::ALLOCATIONS.set(Some(0));
+            for _ in 0..scale {
+                let scope = dispatcher
+                    .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                    .unwrap();
+                let active = content.activate(&scope).unwrap();
+                assert!(!active.stop_requested());
+            }
+            let allocations = activation_allocator::ALLOCATIONS.replace(None).unwrap();
+            assert_eq!(allocations, 0);
+            let mut work = WorkSnapshot::new();
+            work.insert(WorkMetric::HostHeapAllocations, allocations)
+                .unwrap();
+            observations.push(ContractObservation {
+                contract_id: ContractId::new("kernel.mm.native-code-drain").unwrap(),
+                layer: ExecutionLayer::VmFree,
+                implementation_revision: format!(
+                    "sha256:{:x}",
+                    <sha2::Sha256 as sha2::Digest>::digest(include_bytes!(
+                        "../../../carrick-kernel/src/kernel/mm_access/instruction_content.rs"
+                    ))
+                ),
+                fixture_identity: "unit:native-code-drain".into(),
+                scale,
+                semantic_assertions: vec![SemanticAssertion::pass(
+                    "exact_carrier_content_scope_reuses_without_allocation",
+                )],
+                work: Some(work),
+                timing: None,
+                completeness: Completeness::Complete,
+            });
+        }
+        let root_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let registry = ContractRegistry::load(root_path).unwrap();
+        println!(
+            "native_code_drain_observations {}",
+            serde_json::to_string(&observations).unwrap()
+        );
+        evaluate(
+            registry.require("kernel.mm.native-code-drain").unwrap(),
+            &observations,
+        )
+        .unwrap();
+        // A participating physical write makes the old preparation unusable.
+        let original = fixture.carrier.pin_original_data_for_test().unwrap();
+        original.write_prefix_for_test(*b"new!").unwrap();
+        {
+            let scope = dispatcher
+                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                .unwrap();
+            assert!(content.activate(&scope).is_err());
+        }
+        let mut fresh = fixture
+            .child
+            .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4)
+            .unwrap()
+            .prepare_tracked_content()
+            .unwrap();
+        assert_eq!(fresh.bytes(), b"new!");
+        {
+            let scope = dispatcher
+                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                .unwrap();
+            let active = fresh.activate(&scope).unwrap();
+            assert!(!active.stop_requested());
+        }
+        fixture
+            .dispatch_mm
+            .set_foreign_cow_vma_access_for_test(VmaAccess {
+                readable: true,
+                writable: true,
+                executable: false,
+                kernel_visible: true,
+            });
+        {
+            let scope = dispatcher
+                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                .unwrap();
+            assert!(matches!(
+                fresh.activate(&scope),
+                Err(MmAccessError::StaleInstructionRead)
+            ));
+        }
+        drop((content, fresh, executor, wrong_executor));
+        fixture
+            .child
+            .thread()
+            .yield_from_executor(execution)
+            .unwrap();
+        other
+            .child
+            .thread()
+            .yield_from_executor(wrong_execution)
+            .unwrap();
+    }
+
+    #[test]
+    fn instruction_fetch_composes_kernel_lease_and_production_carrier() {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::{OWNER_LEN, TEST_VA};
+        let (kernel, root) = bootstrap(31_170);
+        let fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            31_171,
+            0x9a00_3a00_0000,
+            0x9b00_3a00_0000,
+            ThreadId::synthetic_for_tests(31_171),
+        );
+        let execution = execution_lease(&fixture.child, 171);
+        // Existing fixture starts writable and NX. Fetch must refuse before
+        // the same production VMA authority grants execution permission.
+        assert!(matches!(
+            fixture
+                .child
+                .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4),
+            Err(MmAccessError::ExecuteDenied { .. })
+        ));
+        fixture
+            .dispatch_mm
+            .set_foreign_cow_vma_access_for_test(VmaAccess {
+                readable: false,
+                writable: false,
+                executable: true,
+                kernel_visible: true,
+            });
+        let read = fixture
+            .child
+            .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4)
+            .expect("kernel-authorized execute-only fetch through production carrier");
+        assert_eq!(read.bytes(), b"same");
+        read.validate_mapping().unwrap();
+        read.validate_tracked_content().unwrap();
+        // Data-read authority must not inherit the instruction permission.
+        let current = fixture.child.current_mm(&execution).unwrap();
+        use carrick_kernel::kernel::mm_access::MmAccessTarget;
+        assert!(matches!(
+            current.access_token().read_range(GuestVa(TEST_VA), 4),
+            Err(MmAccessError::ReadDenied { .. })
+        ));
+        assert!(matches!(
+            fixture
+                .child
+                .fetch_instruction_bytes(&execution, GuestVa(TEST_VA + OWNER_LEN - 2), 4),
+            Err(MmAccessError::Unmapped { .. })
+        ));
+        let wrong = execution_lease(&root, 170);
+        assert!(matches!(
+            fixture
+                .child
+                .fetch_instruction_bytes(&wrong, GuestVa(TEST_VA), 4),
+            Err(MmAccessError::ExecutionAuthority(_))
+        ));
+        fixture
+            .dispatch_mm
+            .set_foreign_cow_vma_access_for_test(VmaAccess {
+                readable: true,
+                writable: false,
+                executable: false,
+                kernel_visible: true,
+            });
+        assert!(matches!(
+            read.validate_mapping(),
+            Err(MmAccessError::StaleInstructionRead)
+        ));
+        assert!(matches!(
+            fixture
+                .child
+                .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4),
+            Err(MmAccessError::ExecuteDenied { .. })
+        ));
+    }
+
+    fn native_carrier_elf(words: &[u32], data_va: u64) -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x3000];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        for (at, v) in [(16, 2u16), (18, 183), (52, 64), (54, 56), (56, 2)] {
+            bytes[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        }
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        for (at, v) in [(24, 0x400000u64), (32, 64)] {
+            bytes[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        for (i, base, len, flags) in [(0, 0x400000u64, words.len() * 4, 5u32), (1, data_va, 8, 6)] {
+            let h = 64 + i * 56;
+            bytes[h..h + 4].copy_from_slice(&1u32.to_le_bytes());
+            bytes[h + 4..h + 8].copy_from_slice(&flags.to_le_bytes());
+            for (offset, value) in [
+                (8, 0x1000u64 * (i as u64 + 1)),
+                (16, base),
+                (32, len as u64),
+                (40, len as u64),
+                (48, 4096),
+            ] {
+                bytes[h + offset..h + offset + 8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        for (i, w) in words.iter().enumerate() {
+            bytes[0x1000 + i * 4..0x1004 + i * 4].copy_from_slice(&w.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn native_carrier_elf_memory_control_round_trip() {
+        use carrick_kernel::{
+            compat::{CompatReporter, SyscallArgs},
+            dispatch::{
+                DispatchOutcome, SyscallRequest, ThreadCtx,
+                mm_quiesce::{PtPauseBudget, PtPauseError, acquire_mutation_pause_for_test},
+            },
+            kernel::mm_access::MmAccessTarget,
+            thread::{FutexTable, ThreadRegistry},
+        };
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        use native_syscall_slice::{
+            Memory,
+            native::{Code, State},
+        };
+        let (kernel, root) = bootstrap(37_000);
+        let root_execution = execution_lease(&root, 37000);
+        let tid = ThreadId::synthetic_for_tests(37_001);
+        let fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            37_001,
+            0x9a00_c000_0000,
+            0x9b00_c000_0000,
+            tid,
+        );
+        let original = fixture.carrier.pin_original_data_for_test().unwrap();
+        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
+            fixture.dispatch_mm.clone(),
+        );
+        let mut execution = execution_lease(&fixture.child, 37001);
+        let mut executor = dispatcher
+            .admit_native_executor(&fixture.child, &execution)
+            .unwrap();
+        let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+        let current = fixture.child.current_mm(&execution).unwrap();
+        let range = current
+            .access_token()
+            .write_range(GuestVa(TEST_VA), 8)
+            .unwrap()
+            .unwrap();
+        let mut prepared = authority
+            .with_current_mutation(&current, tid, |mutation| {
+                let mut cow = authority.break_foreign_cow(mutation, &current, range)?;
+                Ok(fixture
+                    .child
+                    .borrow_current_native_data(&execution, &mut cow)?
+                    .prepare_for_execution())
+            })
+            .unwrap();
+        drop(current);
+        // ldr w9,[x2]; add w9,w9,#1; str w9,[x2]; svc #0.
+        // Text remains a private, immutable research publication. Only this
+        // declared data segment uses carrier backing; close(-1) has no buffer.
+        let elf = native_carrier_elf(&[0xb9400049, 0x11000529, 0xb9000049, 0xd4000001], TEST_VA);
+        if let Some(dir) = std::env::var_os("CARRICK_NATIVE_SCOPE_RECEIPT_DIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(std::path::Path::new(&dir).join("native-carrier.elf"), &elf).unwrap();
+        }
+        let (mut memory, image) = Memory::load_elf(&elf).unwrap();
+        let code = Code::publish(&image, &memory).unwrap();
+        let mut state = State::new(image.entry());
+        let registry = ThreadRegistry::new(tid);
+        let futex = FutexTable::new();
+        let reporter = CompatReporter::default();
+        let mut mutator = dispatcher
+            .mm_executor_census()
+            .enter_with_pause_endpoint(
+                None,
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                ThreadId::synthetic_for_tests(37002),
+            )
+            .unwrap();
+        let mut completed = 0;
+        for scale in [1, 8, 32, 128] {
+            for _ in 0..scale {
+                state.pc = image.entry();
+                state.x[2] = TEST_VA;
+                state.x[0] = u64::MAX;
+                state.x[8] = 57;
+                let scope = dispatcher
+                    .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                    .unwrap();
+                {
+                    let mut active = prepared.activate(&scope).unwrap();
+                    // Request a real memory drain while code owns the grant. It
+                    // must refuse until the code reaches its checkpoint and exits.
+                    let refusal = acquire_mutation_pause_for_test(
+                        fixture.dispatch_mm.pt_quiesce(),
+                        &mut mutator,
+                        ThreadId::synthetic_for_tests(37002),
+                        fixture.child.shared().mm().id(),
+                        dispatcher.mm_mutation_coordinator(),
+                        PtPauseBudget {
+                            election: std::time::Duration::ZERO,
+                            drain: std::time::Duration::ZERO,
+                        },
+                    );
+                    assert!(matches!(refusal, Err(PtPauseError::TimedOut)));
+                    drop(refusal);
+                    assert!(scope.stop_requested());
+                    code.run_carrier_until_checkpoint(&image, &memory, &mut active, &mut state)
+                        .unwrap();
+                }
+                drop(scope);
+                assert_eq!(state.pc, image.entry() + 12);
+                assert!(executor.memory_pause_pending());
+                dispatcher
+                    .service_native_memory_control(&mut executor, &fixture.child, &execution)
+                    .unwrap();
+                assert!(!executor.take_stop_request());
+                let outcome = dispatcher
+                    .dispatch_threaded_with_mm_executor(
+                        executor.dispatch_participation(),
+                        &fixture.child,
+                        SyscallRequest::new(
+                            state.x[8],
+                            SyscallArgs::from([state.x[0], 0, 0, 0, 0, 0]),
+                        ),
+                        &mut memory,
+                        &reporter,
+                        ThreadCtx::new(tid, &registry, &futex),
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(outcome, DispatchOutcome::Errno { errno } if errno == carrick_abi::LINUX_EBADF)
+                );
+                completed += 1;
+                let current = fixture.child.current_mm(&execution).unwrap();
+                let foreign =
+                    foreign_mm(&kernel, &root, &root_execution, fixture.child.task().key());
+                let read = foreign
+                    .access_token()
+                    .read_range(GuestVa(TEST_VA), 4)
+                    .unwrap()
+                    .unwrap();
+                let mut actual = [0; 4];
+                authority.read_foreign(&foreign, read, &mut actual).unwrap();
+                drop(foreign);
+                assert_eq!(
+                    u32::from_le_bytes(actual),
+                    u32::from_le_bytes(*b"same") + completed,
+                    "ELF store did not reach carrier backing"
+                );
+                authority
+                    .with_current_mutation(&current, tid, |_mutation| {
+                        fixture
+                            .carrier
+                            .deny_native_data_for_test(TEST_VA, 6)
+                            .unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            println!(
+                "native_carrier_elf scale={scale} completed_total={completed} close_errno=9 pause_requests_serviced={scale}"
+            );
+        }
+        assert_eq!(completed, 169);
+        assert_eq!(original.prefix(), *b"same");
+        // The private ELF data segment is a decoy: carrier writes must never
+        // fall back into it, even when the translated access misses its grant.
+        let mut private_bytes = [0u8; 8];
+        carrick_guest_mem::GuestMemory::read_into(&memory, TEST_VA, &mut private_bytes).unwrap();
+        assert_eq!(private_bytes, [0; 8]);
+        let (other_memory, _) = Memory::load_elf(&elf).unwrap();
+        {
+            let scope = dispatcher
+                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                .unwrap();
+            let mut active = prepared.activate(&scope).unwrap();
+            for address in [TEST_VA + 5, TEST_VA + 8, u64::MAX] {
+                state.pc = image.entry();
+                state.x[2] = address;
+                state.x[9] = 0x12345678;
+                code.run_carrier_until_checkpoint(&image, &memory, &mut active, &mut state)
+                    .unwrap();
+                assert_eq!(
+                    state.pc,
+                    image.entry(),
+                    "out-of-grant load did not checkpoint"
+                );
+                assert_eq!(
+                    state.x[9], 0x12345678,
+                    "out-of-grant load changed destination"
+                );
+            }
+            assert!(
+                code.run_carrier_until_checkpoint(&image, &other_memory, &mut active, &mut state)
+                    .is_err()
+            );
+            memory.protect(image.base(), 4).unwrap();
+            assert!(
+                code.run_carrier_until_checkpoint(&image, &memory, &mut active, &mut state)
+                    .is_err()
+            );
+        }
+        let current = fixture.child.current_mm(&execution).unwrap();
+        authority
+            .with_current_mutation(&current, tid, |_mutation| {
+                fixture
+                    .carrier
+                    .deny_native_data_for_test(TEST_VA, 0)
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        drop(current);
+        let scope = dispatcher
+            .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+            .unwrap();
+        assert!(
+            prepared.activate(&scope).is_err(),
+            "revoked carrier data was executable"
+        );
+        drop(scope);
+        drop(mutator);
+        drop(executor);
+        fixture
+            .child
+            .thread()
+            .yield_from_executor(execution)
+            .unwrap();
+        assert_eq!(
+            dispatcher
+                .mm_executor_census()
+                .participant_count_for_probe(),
+            0
+        );
+        root.thread().yield_from_executor(root_execution).unwrap();
+    }
+
+    /// Native membership must drain, but cannot acknowledge a hardware ASID.
+    /// Historical hardware residency on the same executor stays pending until
+    /// the actual hardware entry path services it.
+    #[test]
+    fn native_admission_allows_carrier_cow_without_hardware_ack() {
+        use carrick_kernel::kernel::mm_access::MmAccessTarget;
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        for scale in [1, 8, 32, 128] {
+            let (kernel, root) = bootstrap(35_000 + scale);
+            let fixture = real_production_cow_fixture(
+                &kernel,
+                &root,
+                35_200 + scale,
+                0x9a00_b000_0000,
+                0x9b00_b000_0000,
+                ThreadId::synthetic_for_tests(35_200 + scale),
+            );
+            let original = fixture.carrier.pin_original_data_for_test().unwrap();
+            let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
+                fixture.dispatch_mm.clone(),
+            );
+            let mut peers = Vec::new();
+            for index in 1..scale {
+                let plan = carrick_kernel::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::VM
+                        | carrick_abi::LinuxCloneFlags::SIGHAND,
+                )
+                .unwrap();
+                peers.push(
+                    kernel
+                        .reserve_thread_clone(&fixture.child, plan, None)
+                        .unwrap()
+                        .prepare(ThreadId::synthetic_for_tests(36_000 + index))
+                        .unwrap()
+                        .commit()
+                        .unwrap()
+                        .into_context()
+                        .unwrap(),
+                );
+            }
+            let contexts: Vec<_> = std::iter::once(&fixture.child)
+                .chain(peers.iter())
+                .collect();
+            let mut leases: Vec<_> = contexts
+                .iter()
+                .enumerate()
+                .map(|(i, c)| execution_lease(c, 36000 + i as u64))
+                .collect();
+            let mut executors: Vec<_> = contexts
+                .iter()
+                .zip(&leases)
+                .map(|(c, e)| dispatcher.admit_native_executor(c, e).unwrap())
+                .collect();
+            // Model a previous hardware quantum on the current executor. Native
+            // execution must neither load this ASID nor consume its ticket.
+            let resident = leases[0].executor();
+            fixture
+                .stage1
+                .begin_asid_load(resident)
+                .unwrap()
+                .mark_resident()
+                .unwrap();
+            let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+            let current = fixture.child.current_mm(&leases[0]).unwrap();
+            let range = current
+                .access_token()
+                .write_range(GuestVa(TEST_VA), 8)
+                .unwrap()
+                .unwrap();
+            let result = authority.with_current_mutation(
+                &current,
+                fixture.child.thread().registry_id(),
+                |mutation| {
+                    let mut cow = authority.break_foreign_cow(mutation, &current, range)?;
+                    Ok(fixture
+                        .child
+                        .borrow_current_native_data(&leases[0], &mut cow)?
+                        .prepare_for_execution())
+                },
+            );
+            assert!(
+                result.is_ok(),
+                "native census scale {scale} blocked real carrier COW: {:?}",
+                result.as_ref().err()
+            );
+            let mut prepared = result.unwrap();
+            drop(current);
+            assert!(fixture.stage1.pending_cow_invalidation(resident).is_some());
+            for ((executor, context), lease) in executors.iter_mut().zip(&contexts).zip(&mut leases)
+            {
+                let scope = dispatcher
+                    .enter_native_execution(executor, context, lease)
+                    .unwrap();
+                {
+                    let mut data = prepared.activate(&scope).unwrap();
+                    // SAFETY: one exclusive activated carrier span, eight valid
+                    // bytes, and no Rust alias or dispatch while native code runs.
+                    unsafe {
+                        let ptr = data.as_mut_ptr();
+                        std::arch::asm!("ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
+                        ptr = in(reg) ptr, out("x9") _, options(nostack));
+                    }
+                }
+                drop(scope);
+                assert!(fixture.stage1.pending_cow_invalidation(resident).is_some());
+            }
+            assert_eq!(original.prefix(), *b"same");
+            for ((context, executor), lease) in contexts.iter().zip(executors).zip(leases) {
+                drop(executor);
+                context.thread().yield_from_executor(lease).unwrap();
+            }
+            assert_eq!(
+                dispatcher
+                    .mm_executor_census()
+                    .participant_count_for_probe(),
+                0
+            );
+            println!(
+                "native_carrier_cow scale={scale} completed={scale} hardware_ticket_retained=true"
+            );
+        }
+    }
+
+    #[test]
+    fn native_data_activation_outlives_mutation_but_not_execution() {
+        use carrick_kernel::kernel::mm_access::MmAccessTarget;
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        let (kernel, root) = bootstrap(32_180);
+        let fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            32_181,
+            0x9a00_6b00_0000,
+            0x9b00_6b00_0000,
+            ThreadId::synthetic_for_tests(32_181),
+        );
+        let original = fixture.carrier.pin_original_data_for_test().unwrap();
+        let mut execution = execution_lease(&fixture.child, 32181);
+        let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+        let current = fixture.child.current_mm(&execution).unwrap();
+        let range = current
+            .access_token()
+            .write_range(GuestVa(TEST_VA), 4)
+            .unwrap()
+            .unwrap();
+        let mut prepared = authority
+            .with_current_mutation(
+                &current,
+                ThreadId::synthetic_for_tests(32_181),
+                |mutation| {
+                    let mut cow = authority
+                        .break_foreign_cow(mutation, &current, range)
+                        .unwrap();
+                    Ok(fixture
+                        .child
+                        .borrow_current_native_data(&execution, &mut cow)
+                        .unwrap()
+                        .prepare_for_execution())
+                },
+            )
+            .unwrap();
+        drop(current);
+        assert!(!fixture.dispatch_mm.pt_quiesce().is_quiescing());
+        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
+            fixture.dispatch_mm.clone(),
+        );
+        let mut executor = dispatcher
+            .admit_native_executor(&fixture.child, &execution)
+            .unwrap();
+        let mut completed = 0u32;
+        for scale in [1, 8, 32, 128] {
+            for _ in 0..scale {
+                let scope = dispatcher
+                    .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                    .unwrap();
+                {
+                    let mut active = prepared.activate(&scope).unwrap();
+                    assert_eq!(active.start(), GuestVa(TEST_VA));
+                    assert_eq!(active.len(), 4);
+                    // Bounded CPU access to the actual pinned carrier bytes, after mutation
+                    // exclusion has ended. No syscall/dispatcher reentry or Rust aliases.
+                    unsafe {
+                        let ptr = active.as_mut_ptr();
+                        std::arch::asm!("ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
+                ptr = in(reg) ptr, out("x9") _, options(nostack));
+                    }
+                }
+                drop(scope);
+                completed += 1;
+            }
+        }
+        assert_eq!(completed, 169);
+        // The prepared window is still retained, but every active pointer
+        // grant has ended. Making these fixture bytes executable must allow a
+        // fresh tracked read; a writer leaked past ActiveNativeData::drop would
+        // refuse it even though no native code is running.
+        fixture.dispatch_mm.set_foreign_cow_vma_access_for_test(
+            carrick_kernel::kernel::VmaAccess {
+                readable: false,
+                writable: false,
+                executable: true,
+                kernel_visible: true,
+            },
+        );
+        let captured = fixture
+            .child
+            .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4)
+            .unwrap();
+        captured.validate_tracked_content().unwrap();
+        assert_eq!(
+            captured.bytes(),
+            &(u32::from_le_bytes(*b"same") + completed).to_le_bytes()
+        );
+        drop(captured);
+        // The final foreign data read retains its original readable-VMA check.
+        fixture.dispatch_mm.set_foreign_cow_vma_access_for_test(
+            carrick_kernel::kernel::VmaAccess {
+                readable: true,
+                writable: true,
+                executable: false,
+                kernel_visible: true,
+            },
+        );
+        drop(executor);
+        fixture
+            .child
+            .thread()
+            .yield_from_executor(execution)
+            .unwrap();
+        assert_eq!(original.prefix(), *b"same");
+        let root_execution = execution_lease(&root, 32180);
+        let current = foreign_mm(&kernel, &root, &root_execution, fixture.child.task().key());
+        let read = current
+            .access_token()
+            .read_range(GuestVa(TEST_VA), 4)
+            .unwrap()
+            .unwrap();
+        let mut bytes = [0; 4];
+        authority.read_foreign(&current, read, &mut bytes).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes),
+            u32::from_le_bytes(*b"same") + completed
+        );
+        root.thread().yield_from_executor(root_execution).unwrap();
+    }
+
+    #[cfg(feature = "conformance-metrics")]
+    mod activation_allocator {
+        use std::{
+            alloc::{GlobalAlloc, Layout, System},
+            cell::Cell,
+        };
+        thread_local! { pub(super) static ALLOCATIONS: Cell<Option<u64>> = const { Cell::new(None) }; }
+        struct CountingAllocator;
+        #[global_allocator]
+        static ALLOCATOR: CountingAllocator = CountingAllocator;
+        fn allocated() {
+            let _ = ALLOCATIONS.try_with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n.checked_add(1).unwrap()));
+                }
+            });
+        }
+        // SAFETY: every allocator argument is forwarded unchanged to System.
+        // The const TLS counter allocates nothing and observes only this thread.
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                allocated();
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                allocated();
+                unsafe { System.alloc_zeroed(layout) }
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                allocated();
+                unsafe { System.realloc(ptr, layout, size) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+    }
+
+    #[cfg(feature = "conformance-metrics")]
+    #[test]
+    fn native_data_activation_cost_contract() {
+        use carrick_kernel::kernel::mm_access::MmAccessTarget;
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        let (kernel, root) = bootstrap(34_180);
+        let fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            34_181,
+            0x9a00_cb00_0000,
+            0x9b00_cb00_0000,
+            ThreadId::synthetic_for_tests(34_181),
+        );
+        let original = fixture.carrier.pin_original_data_for_test().unwrap();
+        let mut execution = execution_lease(&fixture.child, 34181);
+        let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+        let current = fixture.child.current_mm(&execution).unwrap();
+        let range = current
+            .access_token()
+            .write_range(GuestVa(TEST_VA), 4)
+            .unwrap()
+            .unwrap();
+        let mut prepared = authority
+            .with_current_mutation(
+                &current,
+                ThreadId::synthetic_for_tests(34_181),
+                |mutation| {
+                    let mut cow = authority
+                        .break_foreign_cow(mutation, &current, range)
+                        .unwrap();
+                    Ok(fixture
+                        .child
+                        .borrow_current_native_data(&execution, &mut cow)
+                        .unwrap()
+                        .prepare_for_execution())
+                },
+            )
+            .unwrap();
+        drop(current);
+        assert!(!fixture.dispatch_mm.pt_quiesce().is_quiescing());
+        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
+            fixture.dispatch_mm.clone(),
+        );
+        let mut executor = dispatcher
+            .admit_native_executor(&fixture.child, &execution)
+            .unwrap();
+        use carrick_conformance_contract::{
+            Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
+            SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
+        };
+        // Qualify both instruments outside the measured reuse windows.
+        activation_allocator::ALLOCATIONS.set(Some(0));
+        let allocation = std::hint::black_box(vec![std::hint::black_box(42u8); 64]);
+        assert!(activation_allocator::ALLOCATIONS.replace(None).unwrap() > 0);
+        drop(allocation);
+        let leaves_before = fixture.carrier.native_activation_leaf_checks_for_test();
+        {
+            let scope = dispatcher
+                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                .unwrap();
+            let _active = prepared.activate(&scope).unwrap();
+        }
+        assert!(fixture.carrier.native_activation_leaf_checks_for_test() > leaves_before);
+        let mut observations = Vec::new();
+        let mut completed = 0u32;
+        for scale in [1, 8, 32, 128] {
+            let before = fixture.carrier.native_activation_leaf_checks_for_test();
+            let completed_before = completed;
+            activation_allocator::ALLOCATIONS.set(Some(0));
+            for _ in 0..scale {
+                let scope = dispatcher
+                    .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                    .unwrap();
+                {
+                    let mut active = prepared.activate(&scope).unwrap();
+                    assert_eq!(active.start(), GuestVa(TEST_VA));
+                    assert_eq!(active.len(), 4);
+                    // Bounded CPU access to the actual pinned carrier bytes, after mutation
+                    // exclusion has ended. No syscall/dispatcher reentry or Rust aliases.
+                    unsafe {
+                        let ptr = active.as_mut_ptr();
+                        std::arch::asm!("ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
+                ptr = in(reg) ptr, out("x9") _, options(nostack));
+                    }
+                }
+                drop(scope);
+                completed += 1;
+            }
+            let allocations = activation_allocator::ALLOCATIONS.replace(None).unwrap();
+            let leaves = fixture.carrier.native_activation_leaf_checks_for_test() - before;
+            let mut work = WorkSnapshot::new();
+            work.insert(WorkMetric::HostHeapAllocations, allocations)
+                .unwrap();
+            work.insert(WorkMetric::NativeActivationLeafChecks, leaves)
+                .unwrap();
+            observations.push(ContractObservation {
+                contract_id: ContractId::new("kernel.mm.native-data-activation").unwrap(),
+                layer: ExecutionLayer::VmFree,
+                implementation_revision: std::env::var("CARRICK_NATIVE_SCOPE_REVISION")
+                    .unwrap_or_else(|_| "unarchived-working-tree".into()),
+                fixture_identity: "unit:native-data-activation".into(),
+                scale: scale as u64,
+                semantic_assertions: vec![
+                    SemanticAssertion {
+                        name: "exact_completed_native_stores".into(),
+                        passed: completed - completed_before == scale,
+                        detail: None,
+                    },
+                    SemanticAssertion::pass("allocator_and_leaf_positive_controls_fired"),
+                ],
+                work: Some(work),
+                timing: None,
+                completeness: Completeness::Complete,
+            });
+        }
+        assert_eq!(completed, 169);
+        drop(executor);
+        fixture
+            .child
+            .thread()
+            .yield_from_executor(execution)
+            .unwrap();
+        assert_eq!(original.prefix(), *b"same");
+        let root_execution = execution_lease(&root, 34180);
+        let current = foreign_mm(&kernel, &root, &root_execution, fixture.child.task().key());
+        let read = current
+            .access_token()
+            .read_range(GuestVa(TEST_VA), 4)
+            .unwrap()
+            .unwrap();
+        let mut bytes = [0; 4];
+        authority.read_foreign(&current, read, &mut bytes).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes),
+            u32::from_le_bytes(*b"same") + completed
+        );
+        root.thread().yield_from_executor(root_execution).unwrap();
+        println!(
+            "native_activation_observations {}",
+            serde_json::to_string(&observations).unwrap()
+        );
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let registry = ContractRegistry::load(root).unwrap();
+        evaluate(
+            registry
+                .require("kernel.mm.native-data-activation")
+                .unwrap(),
+            &observations,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn native_data_activation_rejects_changes_after_preparation() {
+        use carrick_kernel::kernel::mm_access::MmAccessTarget;
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        // Each case starts with a successfully activated real COW span, then
+        // changes only one authority under the actual mutation/drain protocol.
+        for mode in 0..11 {
+            let id = 32_200 + mode;
+            let (kernel, root) = bootstrap(id);
+            let fixture = real_production_cow_fixture(
+                &kernel,
+                &root,
+                id + 100,
+                0x9a00_7000_0000 + mode as u64 * 0x100_0000,
+                0x9b00_7000_0000 + mode as u64 * 0x100_0000,
+                ThreadId::synthetic_for_tests(id + 100),
+            );
+            let mut execution = execution_lease(&fixture.child, id as u64);
+            let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+            let current = fixture.child.current_mm(&execution).unwrap();
+            let range = current
+                .access_token()
+                .write_range(GuestVa(TEST_VA), 8192)
+                .unwrap()
+                .unwrap();
+            let mut prepared = authority
+                .with_current_mutation(
+                    &current,
+                    ThreadId::synthetic_for_tests(id + 100),
+                    |mutation| {
+                        let mut cow = authority
+                            .break_foreign_cow(mutation, &current, range)
+                            .unwrap();
+                        Ok(fixture
+                            .child
+                            .borrow_current_native_data(&execution, &mut cow)
+                            .unwrap()
+                            .prepare_for_execution())
+                    },
+                )
+                .unwrap();
+            drop(current);
+            let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
+                fixture.dispatch_mm.clone(),
+            );
+            let mut executor = dispatcher
+                .admit_native_executor(&fixture.child, &execution)
+                .unwrap();
+            {
+                let scope = dispatcher
+                    .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                    .unwrap();
+                let _active = prepared.activate(&scope).unwrap();
+            }
+            let current = fixture.child.current_mm(&execution).unwrap();
+            authority
+                .with_current_mutation(
+                    &current,
+                    ThreadId::synthetic_for_tests(id + 100),
+                    |_mutation| {
+                        match mode {
+                            // The second page alone loses leaf write permission, tracker
+                            // permission, mapping, or exact owner generation. These do
+                            // not change kernel VMA revisions in this fixture.
+                            0..=3 => fixture
+                                .carrier
+                                .deny_native_data_for_test(TEST_VA + 4096, mode as u8)
+                                .unwrap(),
+                            4 | 5 => {
+                                fixture.dispatch_mm.set_foreign_cow_vma_access_for_test(
+                                    carrick_kernel::kernel::VmaAccess {
+                                        readable: true,
+                                        writable: false,
+                                        executable: false,
+                                        kernel_visible: true,
+                                    },
+                                );
+                                if mode == 5 {
+                                    fixture.dispatch_mm.set_foreign_cow_vma_access_for_test(
+                                        carrick_kernel::kernel::VmaAccess {
+                                            readable: true,
+                                            writable: true,
+                                            executable: false,
+                                            kernel_visible: true,
+                                        },
+                                    );
+                                }
+                            }
+                            6 => fixture.dispatch_mm.set_foreign_cow_vma_access_for_test(
+                                carrick_kernel::kernel::VmaAccess {
+                                    readable: true,
+                                    writable: true,
+                                    executable: true,
+                                    kernel_visible: true,
+                                },
+                            ),
+                            7 | 8 => fixture
+                                .carrier
+                                .deny_native_data_for_test(TEST_VA + 4096, (mode - 3) as u8)
+                                .unwrap(),
+                            // Equal binding values cannot revive an older backend revision.
+                            9 => {
+                                let backend = fixture.stage1.backend();
+                                backend.publish_binding(backend.binding());
+                            }
+                            10 => fixture
+                                .carrier
+                                .deny_native_data_for_test(TEST_VA + 4096, 6)
+                                .unwrap(),
+                            _ => unreachable!(),
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            drop(current);
+            let scope = dispatcher
+                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                .unwrap();
+            if mode == 10 {
+                let before = fixture.carrier.native_activation_leaf_checks_for_test();
+                {
+                    let _active = prepared.activate(&scope).unwrap();
+                }
+                assert_eq!(
+                    fixture.carrier.native_activation_leaf_checks_for_test() - before,
+                    2,
+                    "a restored image must revalidate both leaves"
+                );
+                {
+                    let _active = prepared.activate(&scope).unwrap();
+                }
+                assert_eq!(
+                    fixture.carrier.native_activation_leaf_checks_for_test() - before,
+                    2,
+                    "the new validation may now be reused"
+                );
+            } else {
+                assert!(
+                    prepared.activate(&scope).is_err(),
+                    "stale preparation accepted mode {mode}"
+                );
+            }
+            drop(scope);
+            drop(executor);
+            fixture
+                .child
+                .thread()
+                .yield_from_executor(execution)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn native_data_activation_requires_exact_authority_and_real_drain() {
+        use carrick_kernel::{
+            dispatch::mm_quiesce::{PtPauseBudget, PtPauseError, acquire_mutation_pause_for_test},
+            kernel::mm_access::{MmAccessError, MmAccessTarget},
+        };
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        let (kernel, root) = bootstrap(32_400);
+        let fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            32_401,
+            0x9a00_8000_0000,
+            0x9b00_8000_0000,
+            ThreadId::synthetic_for_tests(32_401),
+        );
+        let mut execution = execution_lease(&fixture.child, 32401);
+        let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+        let current = fixture.child.current_mm(&execution).unwrap();
+        let range = current
+            .access_token()
+            .write_range(GuestVa(TEST_VA), 4)
+            .unwrap()
+            .unwrap();
+        let mut prepared = authority
+            .with_current_mutation(
+                &current,
+                ThreadId::synthetic_for_tests(32_401),
+                |mutation| {
+                    let mut cow = authority
+                        .break_foreign_cow(mutation, &current, range)
+                        .unwrap();
+                    Ok(fixture
+                        .child
+                        .borrow_current_native_data(&execution, &mut cow)
+                        .unwrap()
+                        .prepare_for_execution())
+                },
+            )
+            .unwrap();
+        drop(current);
+        let mm = fixture.child.shared().mm().id();
+        // Equal MM number and stage-1 projection, different real census/barrier.
+        let (impostor, _) =
+            carrick_kernel::dispatch::DispatchMmAuthority::foreign_cow_composition_for_test(
+                mm,
+                fixture.stage1.clone(),
+                TEST_VA,
+                TEST_VA + 8192,
+            );
+        let wrong = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(impostor);
+        let mut wrong_executor = wrong
+            .admit_native_executor(&fixture.child, &execution)
+            .unwrap();
+        let wrong_scope = wrong
+            .enter_native_execution(&mut wrong_executor, &fixture.child, &mut execution)
+            .unwrap();
+        assert!(matches!(
+            prepared.activate(&wrong_scope),
+            Err(MmAccessError::ForeignMutationAuthorityMismatch)
+        ));
+        drop(wrong_scope);
+        drop(wrong_executor);
+
+        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
+            fixture.dispatch_mm.clone(),
+        );
+        let mut executor = dispatcher
+            .admit_native_executor(&fixture.child, &execution)
+            .unwrap();
+        let census = dispatcher.mm_executor_census();
+        let mutator_tid = ThreadId::synthetic_for_tests(32_402);
+        let mut mutator = census
+            .enter_with_pause_endpoint(
+                None,
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                mutator_tid,
+            )
+            .unwrap();
+        let barrier = fixture.dispatch_mm.pt_quiesce();
+        let scope = dispatcher
+            .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+            .unwrap();
+        {
+            let active = prepared.activate(&scope).unwrap();
+            let result = acquire_mutation_pause_for_test(
+                barrier,
+                &mut mutator,
+                mutator_tid,
+                mm,
+                dispatcher.mm_mutation_coordinator(),
+                PtPauseBudget {
+                    election: std::time::Duration::ZERO,
+                    drain: std::time::Duration::ZERO,
+                },
+            );
+            assert!(matches!(result, Err(PtPauseError::TimedOut)));
+            drop(result);
+            assert!(scope.stop_requested());
+            assert_eq!(active.len(), 4);
+        }
+        assert!(matches!(
+            prepared.activate(&scope),
+            Err(MmAccessError::NativeDataControlPending)
+        ));
+        drop(scope);
+        let pause = acquire_mutation_pause_for_test(
+            barrier,
+            &mut mutator,
+            mutator_tid,
+            mm,
+            dispatcher.mm_mutation_coordinator(),
+            PtPauseBudget::DEFAULT,
+        )
+        .unwrap();
+        assert!(barrier.is_quiescing());
+        drop(pause);
+        assert!(executor.take_stop_request());
+        // A new exact execution lease can activate the retained pin again; the
+        // prior scope/lease themselves cannot survive scheduler migration.
+        drop(executor);
+        fixture
+            .child
+            .thread()
+            .yield_from_executor(execution)
+            .unwrap();
+        let mut successor = fixture
+            .child
+            .thread()
+            .claim_runnable(
+                carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(
+                    ThreadId::synthetic_for_tests(32403),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut executor = dispatcher
+            .admit_native_executor(&fixture.child, &successor)
+            .unwrap();
+        let scope = dispatcher
+            .enter_native_execution(&mut executor, &fixture.child, &mut successor)
+            .unwrap();
+        {
+            let _active = prepared.activate(&scope).unwrap();
+        }
+        drop(scope);
+        drop(executor);
+        drop(mutator);
+        assert_eq!(census.participant_count_for_probe(), 0);
+        fixture
+            .child
+            .thread()
+            .yield_from_executor(successor)
+            .unwrap();
+    }
+
+    /// Same-binary diagnostic for the incremental cost of activating a retained
+    /// data pin at entry. No Linux ratio, guest ELF or workload speedup claim.
+    #[test]
+    #[ignore = "release-only native activation cost diagnostic"]
+    #[expect(
+        clippy::assertions_on_constants,
+        reason = "The ignored diagnostic must compile in debug and refuse only when run; a const assertion would break unrelated debug tests"
+    )]
+    fn native_data_activation_entry_cost() {
+        use carrick_kernel::kernel::mm_access::MmAccessTarget;
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        assert!(
+            !cfg!(debug_assertions),
+            "run this diagnostic with --release"
+        );
+        // A resident COW grant is bounded to one 16 KiB compound. Keep one
+        // valid page fixed and scale actual activation count, not an invalid
+        // synthetic range extending beyond the fixture's mapping.
+        const ITERATIONS: u32 = 4096;
+        for scale in [1u32, 8, 32, 128] {
+            let id = 33_000 + scale as i32;
+            let (kernel, root) = bootstrap(id);
+            let fixture = real_production_cow_fixture(
+                &kernel,
+                &root,
+                id + 200,
+                0x9a00_a000_0000 + scale as u64 * 0x100_0000,
+                0x9b00_a000_0000 + scale as u64 * 0x100_0000,
+                ThreadId::synthetic_for_tests(id + 200),
+            );
+            let mut execution = execution_lease(&fixture.child, id as u64);
+            let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+            let current = fixture.child.current_mm(&execution).unwrap();
+            let range = current
+                .access_token()
+                .write_range(GuestVa(TEST_VA), 4096)
+                .unwrap()
+                .unwrap();
+            let mut prepared = authority
+                .with_current_mutation(
+                    &current,
+                    ThreadId::synthetic_for_tests(id + 200),
+                    |mutation| {
+                        let mut cow = authority
+                            .break_foreign_cow(mutation, &current, range)
+                            .unwrap();
+                        Ok(fixture
+                            .child
+                            .borrow_current_native_data(&execution, &mut cow)
+                            .unwrap()
+                            .prepare_for_execution())
+                    },
+                )
+                .unwrap();
+            drop(current);
+            let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
+                fixture.dispatch_mm.clone(),
+            );
+            let mut executor = dispatcher
+                .admit_native_executor(&fixture.child, &execution)
+                .unwrap();
+            // Alternate paired arms. Preparation, COW and output stay outside
+            // both timed windows. Every requested activation must succeed.
+            let mut run = |activate: bool, count: u32| {
+                let start = std::time::Instant::now();
+                for _ in 0..count {
+                    let scope = dispatcher
+                        .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+                        .unwrap();
+                    if activate {
+                        let active = prepared.activate(&scope).unwrap();
+                        std::hint::black_box(active.len());
+                    } else {
+                        std::hint::black_box(&scope);
+                    }
+                }
+                start.elapsed().as_nanos() as f64 / f64::from(count)
+            };
+            run(false, 128);
+            run(true, 128);
+            for sample in 0..9 {
+                let (scope_ns, activated_ns) = if sample % 2 == 0 {
+                    let base = run(false, ITERATIONS * scale);
+                    (base, run(true, ITERATIONS * scale))
+                } else {
+                    let active = run(true, ITERATIONS * scale);
+                    (run(false, ITERATIONS * scale), active)
+                };
+                println!(
+                    "native_activation_cost {}",
+                    serde_json::json!({
+                        "scale": scale, "pages": 1, "sample": sample, "iterations": ITERATIONS * scale,
+                        "scope_ns": scope_ns, "activated_ns": activated_ns,
+                        "activation_delta_ns": activated_ns - scope_ns,
+                        "runtime_conformance_metrics": cfg!(feature = "conformance-metrics"),
+                        "workload_timing_eligible": false,
+                    })
+                );
+            }
+            drop(executor);
+            fixture
+                .child
+                .thread()
+                .yield_from_executor(execution)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn native_data_borrow_composes_execution_lease_and_production_cow() {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        let (kernel, root) = bootstrap(31_180);
+        let fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            31_181,
+            0x9a00_3b00_0000,
+            0x9b00_3b00_0000,
+            ThreadId::synthetic_for_tests(31_181),
+        );
+        let original = fixture.carrier.pin_original_data_for_test().unwrap();
+        let execution = execution_lease(&fixture.child, 181);
+        let wrong = execution_lease(&root, 180);
+        let current = fixture.child.current_mm(&execution).unwrap();
+        use carrick_kernel::kernel::mm_access::MmAccessTarget;
+        let range = current
+            .access_token()
+            .write_range(GuestVa(TEST_VA), 4)
+            .unwrap()
+            .unwrap();
+        let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+        authority
+            .with_current_mutation(
+                &current,
+                ThreadId::synthetic_for_tests(31_181),
+                |mutation| {
+                    let mut cow = authority
+                        .break_foreign_cow(mutation, &current, range)
+                        .unwrap();
+                    assert!(
+                        fixture
+                            .child
+                            .borrow_current_native_data(&wrong, &mut cow)
+                            .is_err()
+                    );
+                    let mut data = fixture
+                        .child
+                        .borrow_current_native_data(&execution, &mut cow)
+                        .expect("authenticated resident native data span after production COW");
+                    assert_eq!(data.start(), GuestVa(TEST_VA));
+                    assert_eq!(data.len(), 4);
+                    // This bounded native CPU operation qualifies the data grant only.
+                    // It does not publish translated code or call the syscall dispatcher.
+                    unsafe {
+                        let ptr = data.as_mut_ptr();
+                        std::arch::asm!(
+                            "ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
+                            ptr = in(reg) ptr, out("x9") _, options(nostack)
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            original.prefix(),
+            *b"same",
+            "COW must preserve original backing"
+        );
+        let current = foreign_mm(&kernel, &root, &wrong, fixture.child.task().key());
+        let read = current
+            .access_token()
+            .read_range(GuestVa(TEST_VA), 4)
+            .unwrap()
+            .unwrap();
+        let mut bytes = [0; 4];
+        authority.read_foreign(&current, read, &mut bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes), u32::from_le_bytes(*b"same") + 1);
+    }
+
+    #[test]
+    fn native_data_borrow_rechecks_all_vma_permissions_and_revision() {
+        use carrick_kernel::kernel::mm_access::MmAccessTarget;
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        for mode in 0..7 {
+            let id = 31_200 + mode;
+            let (kernel, root) = bootstrap(id);
+            let fixture = real_production_cow_fixture(
+                &kernel,
+                &root,
+                id + 100,
+                0x9a00_4000_0000 + mode as u64 * 0x100_0000,
+                0x9b00_4000_0000 + mode as u64 * 0x100_0000,
+                ThreadId::synthetic_for_tests(id + 100),
+            );
+            let execution = execution_lease(&fixture.child, id as u64);
+            let current = fixture.child.current_mm(&execution).unwrap();
+            let range = current
+                .access_token()
+                .write_range(GuestVa(TEST_VA), 4)
+                .unwrap()
+                .unwrap();
+            let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+            authority
+                .with_current_mutation(
+                    &current,
+                    ThreadId::synthetic_for_tests(id + 100),
+                    |mutation| {
+                        let mut cow = authority
+                            .break_foreign_cow(mutation, &current, range)
+                            .unwrap();
+                        fixture
+                            .dispatch_mm
+                            .set_foreign_cow_vma_access_for_test(VmaAccess {
+                                readable: mode != 0 && mode != 4,
+                                writable: mode == 2 || mode == 3,
+                                executable: mode <= 2,
+                                kernel_visible: true,
+                            });
+                        // mode 5 restores RW after an intervening protection change.
+                        if mode == 5 {
+                            fixture
+                                .dispatch_mm
+                                .set_foreign_cow_vma_access_for_test(VmaAccess {
+                                    readable: true,
+                                    writable: true,
+                                    executable: false,
+                                    kernel_visible: true,
+                                });
+                        }
+                        let result = fixture
+                            .child
+                            .borrow_current_native_data(&execution, &mut cow);
+                        let expected = match mode {
+                            0 | 4 => matches!(result, Err(MmAccessError::ReadDenied { .. })),
+                            1 | 6 => matches!(result, Err(MmAccessError::WriteDenied { .. })),
+                            2 => matches!(result, Err(MmAccessError::NativeDataExecutable { .. })),
+                            3 | 5 => matches!(result, Err(MmAccessError::StaleCowBroken)),
+                            _ => unreachable!(),
+                        };
+                        assert!(expected, "wrong refusal for permission mode {mode}");
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn native_data_borrow_refuses_denied_second_leaf_and_stale_owner() {
+        use carrick_kernel::kernel::mm_access::MmAccessTarget;
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        for kind in 0..4u8 {
+            let id = 31_400 + i32::from(kind);
+            let (kernel, root) = bootstrap(id);
+            let fixture = real_production_cow_fixture(
+                &kernel,
+                &root,
+                id + 100,
+                0x9a00_5000_0000 + u64::from(kind) * 0x100_0000,
+                0x9b00_5000_0000 + u64::from(kind) * 0x100_0000,
+                ThreadId::synthetic_for_tests(id + 100),
+            );
+            let execution = execution_lease(&fixture.child, id as u64);
+            let current = fixture.child.current_mm(&execution).unwrap();
+            let range = current
+                .access_token()
+                .write_range(GuestVa(TEST_VA + 4092), 8)
+                .unwrap()
+                .unwrap();
+            let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+            authority
+                .with_current_mutation(
+                    &current,
+                    ThreadId::synthetic_for_tests(id + 100),
+                    |mutation| {
+                        let mut cow = authority
+                            .break_foreign_cow(mutation, &current, range)
+                            .unwrap();
+                        // Both pages initially qualify. Deny only the second, keeping
+                        // the semantic VMA unchanged so the carrier must reject it.
+                        drop(
+                            fixture
+                                .child
+                                .borrow_current_native_data(&execution, &mut cow)
+                                .unwrap(),
+                        );
+                        fixture
+                            .carrier
+                            .deny_native_data_for_test(TEST_VA + 4096, kind)
+                            .unwrap();
+                        assert!(
+                            fixture
+                                .child
+                                .borrow_current_native_data(&execution, &mut cow)
+                                .is_err(),
+                            "kind {kind}"
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn native_data_borrow_isolates_same_va_and_accepts_private_identity() {
+        use carrick_kernel::kernel::mm_access::MmAccessTarget;
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        let (kernel, root) = bootstrap(31_600);
+        let a = real_production_cow_fixture(
+            &kernel,
+            &root,
+            31_601,
+            0x9a00_6000_0000,
+            0x9b00_6000_0000,
+            ThreadId::synthetic_for_tests(31_601),
+        );
+        let b = real_production_cow_fixture(
+            &kernel,
+            &root,
+            31_602,
+            0x9a00_6100_0000,
+            0x9b00_6100_0000,
+            ThreadId::synthetic_for_tests(31_602),
+        );
+        let ae = execution_lease(&a.child, 601);
+        let be = execution_lease(&b.child, 602);
+        let (_other_kernel, other_root) = bootstrap(31_600);
+        let other_execution = execution_lease(&other_root, 600);
+        let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+        for (fixture, execution, value) in [(&a, &ae, 11u32), (&b, &be, 22)] {
+            for round in 0..2 {
+                // copy-COW first, already-private identity next
+                let current = fixture.child.current_mm(execution).unwrap();
+                let range = current
+                    .access_token()
+                    .write_range(GuestVa(TEST_VA), 4)
+                    .unwrap()
+                    .unwrap();
+                authority
+                    .with_current_mutation(
+                        &current,
+                        ThreadId::synthetic_for_tests(if value == 11 { 31_601 } else { 31_602 }),
+                        |mutation| {
+                            let mut cow = authority
+                                .break_foreign_cow(mutation, &current, range)
+                                .unwrap();
+                            assert!(
+                                root.borrow_current_native_data(&other_execution, &mut cow)
+                                    .is_err()
+                            );
+                            assert!(a.child.borrow_current_native_data(&be, &mut cow).is_err());
+                            let (other_context, valid_other_execution) = if value == 11 {
+                                (&b.child, &be)
+                            } else {
+                                (&a.child, &ae)
+                            };
+                            assert!(
+                                other_context
+                                    .borrow_current_native_data(valid_other_execution, &mut cow)
+                                    .is_err()
+                            );
+                            let mut data = fixture
+                                .child
+                                .borrow_current_native_data(execution, &mut cow)
+                                .unwrap();
+                            // SAFETY: exact four-byte grant; no callback/escape; native
+                            // scalar memory access stays within the mutation scope.
+                            unsafe {
+                                if round == 1 {
+                                    assert_eq!(
+                                        std::ptr::read_unaligned(data.as_mut_ptr().cast::<u32>()),
+                                        value
+                                    );
+                                }
+                                std::ptr::write_unaligned(data.as_mut_ptr().cast::<u32>(), value);
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        // Revisit A after changing B: equal semantic VA never shares backing.
+        let current = a.child.current_mm(&ae).unwrap();
+        let range = current
+            .access_token()
+            .write_range(GuestVa(TEST_VA), 4)
+            .unwrap()
+            .unwrap();
+        authority
+            .with_current_mutation(
+                &current,
+                ThreadId::synthetic_for_tests(31_601),
+                |mutation| {
+                    let mut cow = authority
+                        .break_foreign_cow(mutation, &current, range)
+                        .unwrap();
+                    let mut data = a.child.borrow_current_native_data(&ae, &mut cow).unwrap();
+                    assert_eq!(
+                        unsafe { std::ptr::read_unaligned(data.as_mut_ptr().cast::<u32>()) },
+                        11
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
     }
 
     #[test]
@@ -1405,6 +3112,16 @@ mod tests {
             0x9b00_3200_0000,
             caller_tid,
         );
+        // Mixed execution modes share the drain, but only the hardware owner
+        // below services this phase's ASID invalidation.
+        let native_dispatcher =
+            carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
+                fixture.dispatch_mm.clone(),
+            );
+        let native_lease = execution_lease(&fixture.child, 31115);
+        let native_executor = native_dispatcher
+            .admit_native_executor(&fixture.child, &native_lease)
+            .unwrap();
         let mm = fixture.child.shared().mm().id();
         let active_tid = ThreadId::synthetic_for_tests(31_116);
         let active_executor = ExecutorId::for_transitional_thread(active_tid)
@@ -1497,6 +3214,18 @@ mod tests {
                 .is_none()
         );
         registry.unregister(active_tid);
+        drop(native_executor);
+        fixture
+            .child
+            .thread()
+            .yield_from_executor(native_lease)
+            .unwrap();
+        assert_eq!(
+            native_dispatcher
+                .mm_executor_census()
+                .participant_count_for_probe(),
+            0
+        );
     }
 
     #[test]

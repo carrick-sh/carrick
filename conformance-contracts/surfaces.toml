@@ -2,7 +2,7 @@ schema_version = 1
 
 [[surfaces]]
 path = "crates/carrick-observability/src/work_meter.rs"
-contracts = ["hvpatch.syscall.portal"]
+contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.execution.native-code-density"]
 
 [[surfaces]]
 path = "crates/carrick-mem/src/memory.rs"
@@ -74,7 +74,7 @@ contracts = ["kernel.fork.filetable", "kernel.fork.mappings"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs"
-contracts = ["kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration"]
 
 [[surfaces]]
 path = "crates/carrick-mem/src/vdso.rs"
@@ -94,7 +94,7 @@ contracts = ["kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/engine.rs"
-contracts = ["kernel.fork.stage1-image"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-mem/src/page_table.rs"
@@ -122,7 +122,7 @@ contracts = ["kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs"
-contracts = ["kernel.fork.stage1-image"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap.rs"
@@ -264,3 +264,111 @@ contracts = [
   "kernel.scheduler.preemption-lifecycle",
   "kernel.scheduler.preemption-cost",
 ]
+
+[[surfaces]]
+path = "experiments/native-syscall-slice/src/native.rs"
+contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.execution.native-synchronous-syscall"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs"
+contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.mm.native-execution-scope", "kernel.mm.native-data-activation"]
+
+[[surfaces]]
+path = "experiments/native-syscall-slice/src/native/compact.rs"
+contracts = ["kernel.execution.native-code-density", "kernel.execution.native-synchronous-syscall"]
+
+[[surfaces]]
+path = "experiments/native-syscall-slice/src/compact_tests.rs"
+contracts = ["kernel.execution.native-code-density", "kernel.execution.native-synchronous-syscall"]
+
+[[surfaces]]
+path = "experiments/native-syscall-slice/src/lib.rs"
+contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.execution.native-synchronous-syscall"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/code_content.rs"
+contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/global_frame.rs"
+contracts = ["kernel.mm.native-code-content"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs"
+contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/instruction_read.rs"
+contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs"
+contracts = ["kernel.mm.native-code-content"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/foreign_mm.rs"
+contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/mm_access.rs"
+contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/memory.rs"
+contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/host_writes.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/tests/integration/syscall_fs_rw.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-guest-mem/src/lib.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-aarch64/src/vmm.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/guest_memory.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/rw.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/tests.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/net/send_recv.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/runtime.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-conformance-next/tests/syscall_write_destinations.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-conformance-next/tests/fixtures/syscall_write_destinations.py"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/mm_access/instruction_content.rs"
+contracts = ["kernel.mm.native-code-drain"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/native_execution.rs"
+contracts = ["kernel.mm.native-code-drain"]

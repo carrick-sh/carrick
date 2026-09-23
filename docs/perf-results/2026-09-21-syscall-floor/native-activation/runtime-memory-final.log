@@ -1,0 +1,25 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+error[E0609]: no field `start` on type `&CarrierNativeDataSpan`
+    --> crates/carrick-vmm-hvf/src/trap/foreign_mm.rs:2432:14
+     |
+2432 |             .start
+     |              ^^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+2432 |             .range.start
+     |              ++++++
+
+error[E0609]: no field `initial_physical` on type `&CarrierNativeDataSpan`
+    --> crates/carrick-vmm-hvf/src/trap/foreign_mm.rs:2448:26
+     |
+2448 |                         .initial_physical
+     |                          ^^^^^^^^^^^^^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+2448 |                         .range.initial_physical
+     |                          ++++++
+
+For more information about this error, try `rustc --explain E0609`.
+error: could not compile `carrick-vmm-hvf` (lib) due to 2 previous errors

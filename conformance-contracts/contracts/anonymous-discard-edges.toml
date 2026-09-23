@@ -1,0 +1,23 @@
+schema_version = 1
+id = "kernel.mm.anonymous-discard-edges"
+title = "Unaligned anonymous discard scrubs only partial host-page edges"
+guest_surfaces = ["syscall:madvise"]
+semantic_authority = ["Linux private anonymous DONTNEED zero-fill, outside-range preservation and fork isolation"]
+fixture = "unit:anonymous-discard-edges"
+scale_points = [1, 8, 32, 128]
+rationale = "A capable backend retires the aligned interior before authenticated edge scrubbing. Whole-range scrub must not scale with interior size."
+[bindings]
+vm_free = "carrick-aarch64::anonymous_discard::tests::unaligned_discard_bounds_scrub_and_preserves_neighbors"
+embed = "carrick-conformance-next::deferred_anonymous_unaligned_discard"
+docker = "Same-source fixtures/unaligned_discard.py; pinned native ARM64 cpython-test image; discard-edges/oracle.json"
+[bindings.unresolved]
+production_carrier = "VM-free real-carrier failure injection still pending; scripted edge failures and signed fork semantics covered."
+embed_structural = "Node diagnostic scrub census exists; registered scale-dependent production work binding remains pending."
+promotion = "Full signed probe/smoke/ecosystem and concurrent scaling gates pending."
+[[structural_budgets]]
+kind = "affine"
+metric = "guest_memory_zero_bytes"
+base = 24576
+per_unit = 0
+layers = ["vm-free"]
+rationale = "Maximum actual scripted zero_backing bytes over all 4 KiB boundary offsets on 16 KiB host granules; this is orchestration proof, not physical COW or allocation proof."

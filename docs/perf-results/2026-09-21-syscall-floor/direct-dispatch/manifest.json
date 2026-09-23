@@ -1,0 +1,31 @@
+{
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "binary": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/kernel-syscall-floor-verified",
+  "binary_sha256": "c1bedd4285d889a34b54f755160fbe10f1848d2abe72aaf588664c1a71223282",
+  "signed_guest_claim": false,
+  "command": "target/release/kernel-syscall-floor",
+  "accepted_runs": [
+    3,
+    4
+  ],
+  "rejected_runs": {
+    "1": "fixture setup ENOENT; HostFsBackend creates nested root",
+    "2": "missing caller completion reporting, rejected by count check"
+  },
+  "files": {
+    "summary.json": "94fac445f482c82d32613509f37eabd1d4ef22b58ea8eda4396ce4340e29363d",
+    "run3.jsonl": "7f8dea58d6501a033b481d24defb2217b703479b026f88510446bd63e6bf62d8",
+    "run1.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "build2.log": "a6c8fbd7fcd8c2229003d58bb670db1f049bd0bdd433a6802f5adc0aa76d5139",
+    "build3.log": "5727cb0b57306eb137ed7eee9677ba1bc6894f8a698501b9d5c24c6e27ec8dc5",
+    "tracked-source.patch": "db5c675f2aa5103ffb314f3e6828120cc409734c84acf5f1c65ee340bc73779d",
+    "build1.log": "4ca014da3e8c5f290370a78eb3a4d5a857e829cc8ec50e40df3336199835f909",
+    "run2.jsonl": "a6a9375347dc5d65d8de12ef8cf342d85a727c054db5293e671aed97a67620f7",
+    "run4.jsonl": "8221ff36f199a942585e8155330a94cf79fdf28264d8c600144a7e91f8beb2cf",
+    "kernel-syscall-floor.rs": "cb96a83df0be47c34aca165f1020062942a29facbac7a0778170e23c2c2d7f02",
+    "run2.err": "6491729581cf6f219e330c0168d766bf046c4f7f62859047082348fd7615f3eb",
+    "run3.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "run1.err": "13b4569ad4cb5f1b50d0cf3fd2316a144d63e14cfedcbc778cea059bdf338885",
+    "run4.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

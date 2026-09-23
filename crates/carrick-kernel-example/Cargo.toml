@@ -43,6 +43,8 @@ tempfile.workspace = true
 thiserror.workspace = true
 
 [features]
+# Non-product allocation observation; never enabled for timing claims.
+allocation-metrics = []
 conformance-metrics = ["carrick-kernel/conformance-metrics", "carrick-observability/conformance-metrics"]
 
 [dev-dependencies]

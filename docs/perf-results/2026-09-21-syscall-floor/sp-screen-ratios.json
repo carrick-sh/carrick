@@ -1,0 +1,107 @@
+{
+  "watch_churn:1": {
+    "block_ratios": [
+      1.0754953949204578,
+      0.9813655336911151
+    ],
+    "geomean_candidate_over_base": 1.0273529637950394
+  },
+  "watch_invalid_pair:1": {
+    "block_ratios": [
+      1.0382204555878307,
+      0.987228804431451
+    ],
+    "geomean_candidate_over_base": 1.0124036443564643
+  },
+  "watch_existing_pair:1": {
+    "block_ratios": [
+      1.0710912906610703,
+      0.9892761394101877
+    ],
+    "geomean_candidate_over_base": 1.0293711949443014
+  },
+  "watch_churn:32": {
+    "block_ratios": [
+      1.053897978825794,
+      0.9507925568573398
+    ],
+    "geomean_candidate_over_base": 1.0010186581450713
+  },
+  "watch_invalid_pair:32": {
+    "block_ratios": [
+      1.0809864757358791,
+      0.9773973741066977
+    ],
+    "geomean_candidate_over_base": 1.0278878065378059
+  },
+  "watch_existing_pair:32": {
+    "block_ratios": [
+      1.0438032786885245,
+      0.9840120251434818
+    ],
+    "geomean_candidate_over_base": 1.0134668115501864
+  },
+  "watch_churn:1024": {
+    "block_ratios": [
+      0.9811872909698997,
+      0.9875122772555073
+    ],
+    "geomean_candidate_over_base": 0.9843447039121243
+  },
+  "watch_invalid_pair:1024": {
+    "block_ratios": [
+      0.9955911169170477,
+      0.9881857905810002
+    ],
+    "geomean_candidate_over_base": 0.9918815428094696
+  },
+  "watch_existing_pair:1024": {
+    "block_ratios": [
+      0.9892604676454595,
+      0.9920709582045424
+    ],
+    "geomean_candidate_over_base": 0.9906647162642388
+  },
+  "watch_churn:8192": {
+    "block_ratios": [
+      0.9840291398150742,
+      0.9805663520266519
+    ],
+    "geomean_candidate_over_base": 0.9822962200458635
+  },
+  "watch_invalid_pair:8192": {
+    "block_ratios": [
+      0.9826552115415789,
+      0.9869333763510244
+    ],
+    "geomean_candidate_over_base": 0.9847919707814745
+  },
+  "watch_existing_pair:8192": {
+    "block_ratios": [
+      0.9864185793834035,
+      0.9886547811993517
+    ],
+    "geomean_candidate_over_base": 0.9875360473275262
+  },
+  "watch_churn:65536": {
+    "block_ratios": [
+      0.9862860341449762,
+      0.9842530657748049
+    ],
+    "geomean_candidate_over_base": 0.9852690256158806
+  },
+  "watch_invalid_pair:65536": {
+    "block_ratios": [
+      0.9860615883306321,
+      0.985638212038083
+    ],
+    "geomean_candidate_over_base": 0.9858498774568247
+  },
+  "watch_existing_pair:65536": {
+    "block_ratios": [
+      0.9863050847457627,
+      0.9878771551724138
+    ],
+    "geomean_candidate_over_base": 0.9870908069933235
+  }
+}

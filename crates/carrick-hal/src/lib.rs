@@ -25,9 +25,10 @@ pub use foreign_mm::{
     ForeignExecutableRange, ForeignInstructionPublicationPlan, ForeignMmBinding, ForeignMmEndpoint,
     ForeignMmId, ForeignMmInvalidator, ForeignMmInvocation, ForeignMmLeaseEndpoint,
     ForeignMmLiveAuthority, ForeignMmPreparedWrite, ForeignMmReadLease, ForeignMmReadReceipt,
-    ForeignMmSnapshot, ForeignMmTransport, ForeignMmTransportError, ForeignMmWriteReceipt,
-    ForeignOwnerGeneration, ForeignPtraceTextAuthority, ForeignPtraceTextCowPlan,
-    ForeignReadableRange, ForeignStage1Identity,
+    ForeignMmReadWindow, ForeignMmSnapshot, ForeignMmTransport, ForeignMmTransportError,
+    ForeignMmWriteReceipt, ForeignNativeDataSpan, ForeignOwnerGeneration,
+    ForeignPtraceTextAuthority, ForeignPtraceTextCowPlan, ForeignReadableRange,
+    ForeignStage1Identity,
 };
 pub mod stage1_exclusive;
 pub mod stage1_mm;

@@ -26,8 +26,31 @@ pub enum ShareState {
     SharedWithVforkChild,
 }
 
+/// All mutable access to the software image advances this generation before
+/// exposing the manager. Failed edits and rollbacks invalidate too. Exhaustion
+/// permanently disables reuse; it never wraps to an older valid generation.
+struct TrackedStage1Image {
+    image: Option<PageTableManager>,
+    generation: Option<std::num::NonZeroU64>,
+}
+impl std::ops::Deref for TrackedStage1Image {
+    type Target = Option<PageTableManager>;
+    fn deref(&self) -> &Self::Target {
+        &self.image
+    }
+}
+impl std::ops::DerefMut for TrackedStage1Image {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.generation = self
+            .generation
+            .and_then(|g| g.get().checked_add(1))
+            .and_then(std::num::NonZeroU64::new);
+        &mut self.image
+    }
+}
+
 struct Stage1AuthorityInner {
-    manager: Option<PageTableManager>,
+    manager: TrackedStage1Image,
     arena_source: Option<Box<dyn TableArenaSource>>,
     vfork_shares: usize,
     engines: usize,
@@ -178,7 +201,10 @@ impl Stage1Authority {
     fn with_pool(manager: Option<PageTableManager>, image_pool: Arc<Stage1ImagePool>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Stage1AuthorityInner {
-                manager,
+                manager: TrackedStage1Image {
+                    image: manager,
+                    generation: std::num::NonZeroU64::new(1),
+                },
                 arena_source: None,
                 vfork_shares: 0,
                 engines: 1,
@@ -203,12 +229,12 @@ impl Stage1Authority {
     /// Replace or update the inner manager directly. Used primarily for test harnesses and initialization.
     pub fn replace_manager(&self, manager: Option<PageTableManager>) -> Option<PageTableManager> {
         let mut inner = self.inner.lock();
-        std::mem::replace(&mut inner.manager, manager)
+        std::mem::replace(&mut *inner.manager, manager)
     }
 
     /// Set the inner manager directly. Used primarily for test harnesses.
     pub fn set_manager(&self, manager: PageTableManager) {
-        self.inner.lock().manager = Some(manager);
+        *self.inner.lock().manager = Some(manager);
     }
 
     /// Number of active execution engines sharing this stage-1 authority.
@@ -296,7 +322,7 @@ impl Stage1Authority {
     /// Extension arenas are cloned, but the `TableArenaSource` remains exclusively
     /// owned by this `Stage1Authority`.
     pub fn snapshot_image(&self) -> Option<PageTableManager> {
-        self.inner.lock().manager.clone()
+        (*self.inner.lock().manager).clone()
     }
 
     /// Snapshot the current image into a recycled buffer when the pool holds
@@ -340,6 +366,25 @@ impl Stage1Authority {
         let guard = self.inner.try_lock_until(deadline).ok_or(on_timeout)?;
         let manager = guard.manager.as_ref().ok_or(on_absent)?;
         f(manager)
+    }
+
+    /// Observe the exact image and its mutation generation under one lock.
+    /// A generation has meaning only with this retained authority's identity.
+    /// `None` disables reuse after generation exhaustion. The callback cannot
+    /// mutate the image or retain a reference beyond this lock.
+    pub fn try_with_manager_generation_until<F, R, E>(
+        &self,
+        deadline: std::time::Instant,
+        on_timeout: E,
+        on_absent: E,
+        f: F,
+    ) -> Result<R, E>
+    where
+        F: FnOnce(&PageTableManager, Option<std::num::NonZeroU64>) -> Result<R, E>,
+    {
+        let guard = self.inner.try_lock_until(deadline).ok_or(on_timeout)?;
+        let manager = guard.manager.as_ref().ok_or(on_absent)?;
+        f(manager, guard.manager.generation)
     }
 
     /// Discard the open undo journal, committing all edits in the current transaction.
@@ -394,7 +439,7 @@ impl Stage1Authority {
                 0,
                 authority,
             );
-            inner.manager = Some(manager);
+            *inner.manager = Some(manager);
         }
         let Stage1AuthorityInner {
             ref mut manager,
@@ -462,7 +507,7 @@ impl Stage1Authority {
                 Ok(manager) => {
                     carrick_observability::probes::stage1_arena_install(2, 1, 0, authority);
                     inner.arena_source = Some(source);
-                    inner.manager = Some(manager);
+                    *inner.manager = Some(manager);
                     Ok(())
                 }
                 Err(_) => {
@@ -496,7 +541,7 @@ impl Stage1Authority {
                 0,
                 authority,
             );
-            inner.manager = Some(manager);
+            *inner.manager = Some(manager);
         }
         let Stage1AuthorityInner {
             ref mut manager,
@@ -637,7 +682,7 @@ impl Stage1Authority {
             let new_manager = builder()?;
             let authority = self.authority_id();
             let mut inner = self.inner.lock();
-            inner.manager = new_manager;
+            *inner.manager = new_manager;
             if inner.manager.is_some() {
                 carrick_observability::probes::stage1_arena_install(5, 0, 0, authority);
             }
@@ -676,9 +721,9 @@ impl Stage1Authority {
             if let Some(old) = prev_guard.manager.take() {
                 if let Some(new_mgr) = new_guard.manager.as_mut() {
                     new_mgr.adopt_live_extension_state(&old);
-                    prev_guard.manager = Some(old);
+                    *prev_guard.manager = Some(old);
                 } else {
-                    new_guard.manager = Some(old);
+                    *new_guard.manager = Some(old);
                 }
             }
             let after = u32::from(new_guard.arena_source.is_some());
@@ -1021,6 +1066,100 @@ mod tests {
 
         fn return_arena(&mut self, gpa: Gpa) {
             self.returned.lock().unwrap().push(gpa);
+        }
+    }
+
+    fn observed_generation(authority: &Stage1Authority) -> Option<std::num::NonZeroU64> {
+        authority
+            .try_with_manager_generation_until(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                (),
+                (),
+                |_, generation| Ok(generation),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn image_generation_invalidates_edits_errors_restore_and_replacement() {
+        let manager =
+            || PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let mut authority = Stage1Authority::new_with_manager(Some(manager()));
+        let original = observed_generation(&authority);
+        authority.with_manager(|m| m.debug_walk(0x40_0000));
+        let image = authority.snapshot_image().unwrap();
+        assert_eq!(
+            observed_generation(&authority),
+            original,
+            "reads preserve generation"
+        );
+        let failed = authority.edit(
+            || Err(()),
+            |editor| {
+                editor.set_readonly(0x40_0000, 0x1000, false).unwrap();
+                Err::<(), _>(())
+            },
+        );
+        assert!(failed.is_err());
+        let after_error = observed_generation(&authority);
+        assert_ne!(after_error, original);
+        authority.restore_image(image, 0);
+        let after_restore = observed_generation(&authority);
+        assert_ne!(after_restore, original);
+        assert_ne!(after_restore, after_error);
+        authority
+            .try_edit_until(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                (),
+                (),
+                || Err(()),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let after_try_edit = observed_generation(&authority);
+        assert_ne!(after_try_edit, after_restore);
+        authority.set_manager(manager());
+        let after_set = observed_generation(&authority);
+        assert_ne!(after_set, after_try_edit);
+        let saved = authority.replace_manager(None).unwrap();
+        authority.replace_manager(Some(saved));
+        let after_replace = observed_generation(&authority);
+        assert_ne!(after_replace, after_set);
+        let previous = Stage1Authority::new_with_manager(Some(manager()));
+        let previous_generation = observed_generation(&previous);
+        authority.adopt_unshared_predecessor(&previous);
+        assert_ne!(observed_generation(&previous), previous_generation);
+        assert_ne!(observed_generation(&authority), after_replace);
+        let before_exec = observed_generation(&authority);
+        let exact = authority.clone();
+        authority
+            .replace_for_exec(|| Ok::<_, ()>(Some(manager())), |_| Ok(()))
+            .unwrap();
+        assert!(authority.shares_exact_authority(&exact));
+        assert_ne!(observed_generation(&authority), before_exec);
+        // Taking an image invalidates even if exec preparation subsequently fails.
+        assert!(
+            authority
+                .replace_for_exec(|| Err::<Option<PageTableManager>, _>(()), |_| Ok(()))
+                .is_err()
+        );
+        assert!(authority.is_none());
+        authority.set_manager(manager());
+        assert_ne!(observed_generation(&authority), before_exec);
+    }
+
+    #[test]
+    fn image_generation_exhaustion_never_reenables_reuse() {
+        let authority = Stage1Authority::new_with_manager(Some(PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            LINUX_PAGE_TABLES_BASE,
+        )));
+        authority.inner.lock().manager.generation = std::num::NonZeroU64::new(u64::MAX);
+        for _ in 0..2 {
+            authority
+                .edit(|| Err::<PageTableManager, ()>(()), |_| Ok(()))
+                .unwrap();
+            assert_eq!(observed_generation(&authority), None);
         }
     }
 
@@ -1495,9 +1634,11 @@ mod tests {
             .expect("edit");
 
         // Rollback via Stage1Authority::rollback_undo
+        let before_rollback = observed_generation(&authority);
         unsafe {
             authority.rollback_undo(resolver);
         }
+        assert_ne!(observed_generation(&authority), before_rollback);
 
         // Verify that after rollback, the mapping is restored to writable
         authority

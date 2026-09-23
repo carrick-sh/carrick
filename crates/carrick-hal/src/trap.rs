@@ -29,6 +29,9 @@ use crate::error::OsError;
 /// moved into the backend (Phase 1, Task 3 of the x86_64 guest-ISA seam).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawSyscall {
+    /// Stack pointer captured by the trap transport for this exact request.
+    /// Backends that do not capture it leave it absent for a lazy register read.
+    pub current_guest_sp: Option<u64>,
     /// The CANONICAL (asm-generic/aarch64) syscall number the dispatcher
     /// switches on. Typed [`CanonicalNr`] so it cannot be swapped with
     /// [`native_number`](Self::native_number) at a constructor.

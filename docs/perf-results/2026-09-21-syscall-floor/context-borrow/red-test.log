@@ -1,0 +1,88 @@
+warning: variable does not need to be mutable
+  --> crates/carrick-kernel-example/src/contracts.rs:63:9
+   |
+63 |     let mut snapshot = report.work_snapshot().clone();
+   |         ----^^^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:203:9
+    |
+203 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:319:9
+    |
+319 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:405:9
+    |
+405 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:505:9
+    |
+505 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:605:9
+    |
+605 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:754:9
+    |
+754 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:821:9
+    |
+821 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: `carrick-kernel-example` (lib) generated 8 warnings (run `cargo fix --lib -p carrick-kernel-example` to apply 8 suggestions)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1m 16s
+     Running unittests src/lib.rs (target/release/deps/carrick_runtime-b18d7539281a8391)
+
+running 1 test
+test vcpu_loop::exec::tests::syscall_context_retention_contract ... context_retention_observations redispatch=false [{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e","fixture_identity":"unit:syscall-context-retention","scale":1,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":1,"kernel_redispatches":1,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":3},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e","fixture_identity":"unit:syscall-context-retention","scale":8,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":8,"kernel_redispatches":8,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":24},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e","fixture_identity":"unit:syscall-context-retention","scale":32,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":32,"kernel_redispatches":32,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":96},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e","fixture_identity":"unit:syscall-context-retention","scale":128,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":128,"kernel_redispatches":128,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":384},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}]
+context_retention_observations redispatch=true [{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e","fixture_identity":"unit:syscall-context-retention","scale":1,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":1,"kernel_redispatches":2,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":4},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e","fixture_identity":"unit:syscall-context-retention","scale":8,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":8,"kernel_redispatches":16,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":32},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e","fixture_identity":"unit:syscall-context-retention","scale":32,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":32,"kernel_redispatches":64,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":128},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.syscall.context-retention","layer":"vm-free","implementation_revision":"sha256:9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e","fixture_identity":"unit:syscall-context-retention","scale":128,"semantic_assertions":[{"name":"exact_completion_identity_and_errno_with_once_only_observers","passed":true,"detail":null}],"work":{"values":{"kernel_dispatches":128,"kernel_redispatches":256,"continuation_enrollments":0,"continuation_parks":0,"wake_publications":0,"continuation_resumes":0,"guest_memory_read_bytes":0,"guest_memory_write_bytes":0,"guest_memory_copy_bytes":0,"guest_memory_zero_bytes":0,"backing_materialized_bytes":0,"vfs_backend_operations":0,"directory_entries_visited":0,"host_backend_calls":0,"host_write_position_queries":0,"page_table_edits":0,"page_table_invalidations":0,"page_table_image_allocations":0,"host_mapping_allocations":0,"fork_projection_rows_visited":0,"inotify_queue_visits":0,"backing_allocations":0,"task_admissions":0,"vcpu_admissions":0,"vcpu_releases":0,"vcpu_migrations":0,"futex_queue_visits":0,"futex_waiters_woken":0,"hvf_syscall_exits":0,"portal_requests":0,"portal_completions":0,"portal_fallbacks":0,"portal_stale_rejects":0,"host_heap_allocations":0,"native_activation_leaf_checks":0,"native_data_activations":0,"native_code_words":0,"mm_snapshot_collections":0,"foreign_owner_pins":0,"kernel_context_retains":512},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}]
+
+thread 'vcpu_loop::exec::tests::syscall_context_retention_contract' (4606271) panicked at crates/carrick-runtime/src/vcpu_loop/exec.rs:2690:47:
+called `Result::unwrap()` on an `Err` value: ScalingViolation { contract: ContractId("kernel.syscall.context-retention"), metric: KernelContextRetains, scale: 1, actual: 3, maximum: 1 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    vcpu_loop::exec::tests::syscall_context_retention_contract
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 627 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p carrick-runtime --lib`

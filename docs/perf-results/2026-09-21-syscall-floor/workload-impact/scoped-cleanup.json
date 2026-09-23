@@ -1,0 +1,98 @@
+[
+  {
+    "run_id": "floor-fstat-workload-impact-0-A-node-app",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-0-A-node-app) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-0-A-go-build-cold",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-0-A-go-build-cold) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-0-A-python-os",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-0-A-python-os) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-1-B-node-app",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-1-B-node-app) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-1-B-go-build-cold",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-1-B-go-build-cold) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-1-B-python-os",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-1-B-python-os) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-2-B-node-app",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-2-B-node-app) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-2-B-go-build-cold",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-2-B-go-build-cold) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-2-B-python-os",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-2-B-python-os) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-3-A-node-app",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-3-A-node-app) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-3-A-go-build-cold",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-3-A-go-build-cold) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-3-A-python-os",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-3-A-python-os) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-4-A-node-app",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-4-A-node-app) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-4-A-go-build-cold",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-4-A-go-build-cold) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-4-A-python-os",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-4-A-python-os) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-5-B-node-app",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-5-B-node-app) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-5-B-go-build-cold",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-5-B-go-build-cold) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-5-B-python-os",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-5-B-python-os) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-6-B-node-app",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-6-B-node-app) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-6-B-go-build-cold",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-6-B-go-build-cold) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-6-B-python-os",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-6-B-python-os) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-7-A-node-app",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-7-A-node-app) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-7-A-go-build-cold",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-7-A-go-build-cold) = 0\n"
+  },
+  {
+    "run_id": "floor-fstat-workload-impact-7-A-python-os",
+    "cleanup": "remaining carrick procs (run-id floor-fstat-workload-impact-7-A-python-os) = 0\n"
+  }
+]

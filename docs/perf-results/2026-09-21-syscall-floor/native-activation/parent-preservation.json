@@ -1,0 +1,31 @@
+{
+  "checked": 115,
+  "unchanged": 109,
+  "changed": {
+    "conformance-contracts/contracts/native-synchronous-syscall.toml": {
+      "before": "75203d63fc43a2e79421321054e7a484a396189fcd721fb072fe11aeb78a1bea",
+      "after": "54c4ee9058475e6b6ca08a1d9d46e810b8ee83b64f67ad98775ca492051d1260"
+    },
+    "crates/carrick-hal/src/foreign_mm.rs": {
+      "before": "c9b758e11a4587193dafcfbc094c80353e8befb4733990b01a27109bb791578a",
+      "after": "6bf5203ad03bf48625b7a36064a96666be8098993105b3aad0c0179663a060f2"
+    },
+    "crates/carrick-kernel/src/kernel/mm_access.rs": {
+      "before": "908cb3327699ddabdb0db51325e69ee60e6a9adcda6dbff4dd291b0919f56fbd",
+      "after": "76df9e32539584ee763a52dd3e5059e48daa5262f2f33a5b62acc1fd93d3b66e"
+    },
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs": {
+      "before": "0a7f0ae52eb956ce041fb4cd5b7c56e1ab47ff5b7ced81461cb482072ec3af76",
+      "after": "c3abf8df778e8b5061d81fd6eda8f082f0bb2c7c0238fa025ffe29f5f1af7b5e"
+    },
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": {
+      "before": "d4c48e01cd695587d077b0719b31b426b367f9397fd4a70de2bcc346311c7a35",
+      "after": "b007a774650d9e2ad34c13b2d36dfd135a83703d9146e8e0dc9741f1aeed0491"
+    },
+    "crates/carrick-kernel/src/dispatch/native_execution.rs": {
+      "before": "0787e842b8742a48890b8bbc7c7b093149f5b567cdf55e48a43ca77c35a20739",
+      "after": "f6fabbb4436205d9621f0363f4157941e769e433123e1c999d478b13565062b2"
+    }
+  },
+  "unexpected": {}
+}

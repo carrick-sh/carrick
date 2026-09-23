@@ -1,0 +1,68 @@
+error: lifetime may not live long enough
+ --> target/lease-cost/native-carrier/lifetime-negative-1.rs:5:5
+  |
+3 | fn escape(c: &KernelContext, e: &ThreadExecutionLease, cow: &mut CowBroken<'_, '_, '_>)
+  |              - let's call the lifetime of this reference `'1`
+4 |     -> CurrentNativeData<'static, 'static, 'static, 'static, 'static> {
+5 |     c.borrow_current_native_data(e, cow).unwrap()
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'static`
+
+error: lifetime may not live long enough
+ --> target/lease-cost/native-carrier/lifetime-negative-1.rs:5:5
+  |
+3 | fn escape(c: &KernelContext, e: &ThreadExecutionLease, cow: &mut CowBroken<'_, '_, '_>)
+  |                                 - let's call the lifetime of this reference `'2`
+4 |     -> CurrentNativeData<'static, 'static, 'static, 'static, 'static> {
+5 |     c.borrow_current_native_data(e, cow).unwrap()
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'2` must outlive `'static`
+
+error: lifetime may not live long enough
+ --> target/lease-cost/native-carrier/lifetime-negative-1.rs:5:5
+  |
+3 | fn escape(c: &KernelContext, e: &ThreadExecutionLease, cow: &mut CowBroken<'_, '_, '_>)
+  |                                                             - let's call the lifetime of this reference `'3`
+4 |     -> CurrentNativeData<'static, 'static, 'static, 'static, 'static> {
+5 |     c.borrow_current_native_data(e, cow).unwrap()
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'3` must outlive `'static`
+
+error: lifetime may not live long enough
+ --> target/lease-cost/native-carrier/lifetime-negative-1.rs:5:5
+  |
+3 | fn escape(c: &KernelContext, e: &ThreadExecutionLease, cow: &mut CowBroken<'_, '_, '_>)
+  |                                                        --- has type `&mut CowBroken<'4, '_, '_>`
+4 |     -> CurrentNativeData<'static, 'static, 'static, 'static, 'static> {
+5 |     c.borrow_current_native_data(e, cow).unwrap()
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'4` must outlive `'static`
+  |
+  = note: requirement occurs because of the type `CurrentNativeData<'_, '_, '_, '_, '_>`, which makes the generic argument `'_` invariant
+  = note: the struct `CurrentNativeData<'execution, 'witness, 'mm, 'guard, 'authority>` is invariant over the parameter `'mm`
+  = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error: lifetime may not live long enough
+ --> target/lease-cost/native-carrier/lifetime-negative-1.rs:5:5
+  |
+3 | fn escape(c: &KernelContext, e: &ThreadExecutionLease, cow: &mut CowBroken<'_, '_, '_>)
+  |                                                        --- has type `&mut CowBroken<'_, '5, '_>`
+4 |     -> CurrentNativeData<'static, 'static, 'static, 'static, 'static> {
+5 |     c.borrow_current_native_data(e, cow).unwrap()
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'5` must outlive `'static`
+  |
+  = note: requirement occurs because of the type `CurrentNativeData<'_, '_, '_, '_, '_>`, which makes the generic argument `'_` invariant
+  = note: the struct `CurrentNativeData<'execution, 'witness, 'mm, 'guard, 'authority>` is invariant over the parameter `'mm`
+  = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error: lifetime may not live long enough
+ --> target/lease-cost/native-carrier/lifetime-negative-1.rs:5:5
+  |
+3 | fn escape(c: &KernelContext, e: &ThreadExecutionLease, cow: &mut CowBroken<'_, '_, '_>)
+  |                                                        --- has type `&mut CowBroken<'_, '_, '6>`
+4 |     -> CurrentNativeData<'static, 'static, 'static, 'static, 'static> {
+5 |     c.borrow_current_native_data(e, cow).unwrap()
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'6` must outlive `'static`
+  |
+  = note: requirement occurs because of the type `CurrentNativeData<'_, '_, '_, '_, '_>`, which makes the generic argument `'_` invariant
+  = note: the struct `CurrentNativeData<'execution, 'witness, 'mm, 'guard, 'authority>` is invariant over the parameter `'mm`
+  = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error: aborting due to 6 previous errors
+

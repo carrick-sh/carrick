@@ -1,0 +1,45 @@
+{
+  "parent_source_count": 116,
+  "unchanged": 108,
+  "changed": {
+    "Cargo.lock": {
+      "before": "6a7083ef251922d35685745be82882e45384515cdd3132d6eef75250a8d4a6c3",
+      "after": "f59f9a3974058143e0fb76ff2bf6b9d7771632ac55bed9cb3e9c8f056e608767"
+    },
+    "crates/carrick-conformance-contract/tests/claims.rs": {
+      "before": "e0733d48c05b3c46bb201fbe004562edf3b68978aef671a6857c9b7a595840d7",
+      "after": "f188cafca7cc1d7af030f4d9b878ea0c1714633569377292acefda2cbb132914"
+    },
+    "crates/carrick-hal/src/foreign_mm.rs": {
+      "before": "6bf5203ad03bf48625b7a36064a96666be8098993105b3aad0c0179663a060f2",
+      "after": "4643820fd6195f49459af4a81657b9c5e570d203bd948e4c35784f2e94e3af87"
+    },
+    "crates/carrick-kernel/src/kernel/mm_access.rs": {
+      "before": "76df9e32539584ee763a52dd3e5059e48daa5262f2f33a5b62acc1fd93d3b66e",
+      "after": "65e29580ef2db02458d08911b34b0feac6e45e74f36349ee44da98de1d5f806d"
+    },
+    "crates/carrick-kernel/src/kernel/mod.rs": {
+      "before": "c6631a56129e575ed78e9354251e2e0c11ea8e7d8d9bdb9106448a662ce17a3a",
+      "after": "49ddb6c541129f2634f5f4ea09bcfe1b5dab32c9c92a19d19dbd0031246f28d4"
+    },
+    "crates/carrick-observability/src/work_meter.rs": {
+      "before": "a5c7fbfe6a00b354a7d19027c80ee8490e85027a540308f6fb3ab17a5f7af399",
+      "after": "c28829aaf6a0153c9ff86ce3aa7823301d817b8da5c54ab7137fe6a64410a834"
+    },
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs": {
+      "before": "c3abf8df778e8b5061d81fd6eda8f082f0bb2c7c0238fa025ffe29f5f1af7b5e",
+      "after": "55eee540fff42001e00b2ad5ed7dbcb34348648cc0e07fee1aa44a14c44e639e"
+    },
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": {
+      "before": "b007a774650d9e2ad34c13b2d36dfd135a83703d9146e8e0dc9741f1aeed0491",
+      "after": "b9a27728862db734cca66af0ebdf7c96171bdc78029e34c932bf4c8c6e5b47cf"
+    }
+  },
+  "unexpected": {},
+  "controls": {
+    "target/release/carrick": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+    "target/lease-cost/inotify-transport-control/carrick-control": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+    "target/release/native-syscall-slice": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65",
+    "target/lease-cost/native-memory/native-guarded-executor": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65"
+  }
+}

@@ -1,0 +1,15 @@
+schema_version = 1
+id = "kernel.mm.cow-inventory-owner-query"
+title = "COW extent lookup excludes unrelated pinned owners"
+guest_surfaces = ["memory:private-cow", "syscall:madvise", "syscall:munmap"]
+semantic_authority = ["Linux private mapping and fork isolation", "Carrick exact physical owner generation"]
+fixture = "unit:cow_inventory_owner_bound_skips_unrelated_extents"
+scale_points = [1, 8, 32, 128]
+rationale = "An authenticated physical owner bounds the search for its compound. Search order within that owner remains ascending; unpinned sources retain the original search. No predecessor or non-overlap assumption is substituted for ownership."
+structural_budgets = []
+[bindings]
+vm_free = "carrick-vmm-hvf::trap::frame_inventory::tests::cow_inventory_owner_bound_skips_unrelated_extents"
+[bindings.unresolved]
+observation = "Direct candidate visit counts must remain one with 1/8/32/128 unrelated extents. A versioned inventory-query work metric and emitted observation remain open."
+embed_structural = "Signed COW and discard behavior plus production candidate counts pending."
+docker = "Signed differential and paired untraced Node impact pending."

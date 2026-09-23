@@ -1,0 +1,27 @@
+
+running 1 test
+test vcpu_loop::exec::tests::invalid_inotify_service_completion_cost ... service_completion sample=0 ns_per_pair=550.1639099121094
+service_completion sample=1 ns_per_pair=549.3214874267578
+service_completion sample=2 ns_per_pair=549.3971557617188
+service_completion sample=3 ns_per_pair=549.6762542724609
+service_completion sample=4 ns_per_pair=549.4295806884766
+service_completion sample=5 ns_per_pair=549.5376586914063
+service_completion sample=6 ns_per_pair=549.7976989746094
+service_completion sample=7 ns_per_pair=549.5675506591797
+service_completion sample=8 ns_per_pair=549.2471160888672
+service_completion sample=9 ns_per_pair=552.2410125732422
+service_completion sample=10 ns_per_pair=548.7855224609375
+service_completion sample=11 ns_per_pair=548.4638214111328
+service_completion sample=12 ns_per_pair=549.0220336914063
+service_completion sample=13 ns_per_pair=549.5128631591797
+service_completion sample=14 ns_per_pair=548.1726379394531
+service_completion sample=15 ns_per_pair=548.8872528076172
+service_completion sample=16 ns_per_pair=548.9768981933594
+service_completion sample=17 ns_per_pair=549.4874267578125
+service_completion sample=18 ns_per_pair=544.6751861572266
+service_completion sample=19 ns_per_pair=544.8837280273438
+service_completion sample=20 ns_per_pair=540.8267974853516
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 596 filtered out; finished in 0.79s
+

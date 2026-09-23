@@ -1,0 +1,5 @@
+{
+  "binary_sha256": "dceb124b53dbfb0242a5975f5af93228cdb4812cabade5bf8cf5fd4678fee2d2",
+  "test_source_sha256": "807f83d9ad19512c039843202dfdd46596b61663e940e68e95f9736f48c724a5",
+  "outcome": "expected carrier increment missing; private-backed ELF control"
+}

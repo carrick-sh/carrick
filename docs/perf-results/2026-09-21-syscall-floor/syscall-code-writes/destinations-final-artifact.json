@@ -1,0 +1,13 @@
+{
+  "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/syscall-code-writes/destinations-final",
+  "sha256": "f7fb67dd96d25064837b682c8a4a903c186d39b39a7a91355102d144cb346f35",
+  "cdhash": "7a61b0eda21521f906b294d1a3b2466d04bc5dc7",
+  "lc_uuid": "81CE12A6-64EF-3CD9-81CF-02676C40117B",
+  "hypervisor_entitlement": true,
+  "dof_carrick": true,
+  "source_revision": "sha256:475bc5fa32a0cbbaa1b818e4547f1cbb7ab690c5cbc7ee8c6f87c0eaa35c1a57",
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "run_id": "syscall-code-writes-final-20260922",
+  "runner_exit": 1,
+  "qualification": "independently attested failed-run artifact; not a passing runner receipt"
+}

@@ -92,6 +92,7 @@ carrick-host-bsd = { path = "../carrick-host-bsd" }
 carrick-host-linux = { path = "../carrick-host-linux" }
 
 [dev-dependencies]
+carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 # Self dev-dependency: enables `test-support` on this crate's own lib when it
 # is built for an integration test (`tests/`), which sees no `cfg(test)`.
 carrick-kernel = { path = ".", features = ["test-support"] }

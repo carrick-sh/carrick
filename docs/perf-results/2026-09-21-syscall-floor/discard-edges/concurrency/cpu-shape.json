@@ -1,0 +1,43 @@
+{
+  "host_logical": "10",
+  "docker_info": "10 16745824256",
+  "executor_overrides": {
+    "CARRICK_BOUND_EXECUTORS": null,
+    "CARRICK_SPARE_EXECUTORS": null
+  },
+  "carrick": {
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/discard-edges/carrick-candidate",
+      "run",
+      "--max-traps",
+      "18446744073709551615",
+      "--fs",
+      "host",
+      "--entrypoint",
+      "/bin/bash",
+      "localhost:5005/carrick-nodejs-conformance@sha256:1ed49af83bd30401e1b275957b99a1c28f6c582ab3d987997afb5888fa302718",
+      "-c",
+      "/opt/node-src/v24/out/Release/node -p 'JSON.stringify({cpus:require(\"os\").cpus().length,parallel:require(\"os\").availableParallelism()})'"
+    ],
+    "exit": 0,
+    "stdout": "{\"cpus\":4,\"parallel\":4}\n",
+    "stderr": ""
+  },
+  "docker": {
+    "argv": [
+      "docker",
+      "run",
+      "--rm",
+      "--platform",
+      "linux/arm64",
+      "--entrypoint",
+      "/bin/bash",
+      "localhost:5005/carrick-nodejs-conformance@sha256:1ed49af83bd30401e1b275957b99a1c28f6c582ab3d987997afb5888fa302718",
+      "-c",
+      "/opt/node-src/v24/out/Release/node -p 'JSON.stringify({cpus:require(\"os\").cpus().length,parallel:require(\"os\").availableParallelism()})'"
+    ],
+    "exit": 0,
+    "stdout": "{\"cpus\":10,\"parallel\":10}\n",
+    "stderr": ""
+  }
+}

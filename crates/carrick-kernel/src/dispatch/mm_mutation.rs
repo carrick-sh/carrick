@@ -235,6 +235,16 @@ impl ForeignMmMutationAuthority {
         }
     }
 
+    pub(in crate::dispatch) fn matches_native_authority(
+        &self,
+        authority: &super::DispatchMmAuthority,
+    ) -> bool {
+        self.mm == authority.mm_id
+            && Arc::ptr_eq(&self.coordinator, &authority.mutation_coordinator)
+            && Arc::ptr_eq(&self.census, &authority.guest_executors)
+            && Arc::ptr_eq(&self.pt_quiesce, &authority.pt_quiesce)
+    }
+
     pub(crate) fn authorizes(&self, guard: &MmMutationGuard<'_>) -> bool {
         guard.authorizes(&self.coordinator, self.mm)
     }

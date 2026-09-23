@@ -1,0 +1,17 @@
+{
+  "head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "binary_sha256": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+  "probe_sha256": "5b07bdf380dc16cb15d3e64e238377ec19ca2e7d4093d188437de5028d0bc53f",
+  "intervention": "CARRICK_HVF_SYSCALL_TRANSPORT=mailbox vs legacy, same image and binary; legacy retains mailbox publication and additionally reads registers, so this measures register decoding cost and does not remove mailbox or HVF exits",
+  "design": "one warmup per mode, two ABBA blocks; exact queue-state assertions per sample, 21 internal samples, original LTP separately; all runs and failures retained",
+  "acceptance": "no product change from frequency or synthetic control alone",
+  "runtime_changed_this_turn": false,
+  "source_evidence": "Runtime source snapshot and signed identity from previous inotify-lifecycle artifact; no relink this turn",
+  "independent_units": "Each fresh Carrick invocation runs watch-controls and watch-states as two sequential guest processes. 21 samples per phase within a process are not independent launches.",
+  "legacy_intervention": "Both arms publish and consume the mailbox; legacy adds 9 GPR reads, 4 sysreg reads and 1 GPR result write per ordinary syscall, qualified live at 169 add and 169 remove requests per arm.",
+  "default_transport": "HvfSyscallTransport::parse(None) is Mailbox, source checked; no default changed",
+  "trace_launch_failure": "Initial worktree binary path required a sudo password. Retried using byte-identical binary in the existing NOPASSWD Carrick diagnostic directory. No privilege configuration changed.",
+  "trace_binary": "/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-itc-c3fb9fd30706",
+  "formal_acceptance": "Diagnostic screen only. No new performance candidate, signed timing contract acceptance, or smoke/full promotion. Existing CLI probe evidence belongs to unchanged lifecycle artifact.",
+  "remaining_runtime_gap": "Invalid pair raw Linux ratio exceeds 10x; near-parity and 2x remain unachieved."
+}

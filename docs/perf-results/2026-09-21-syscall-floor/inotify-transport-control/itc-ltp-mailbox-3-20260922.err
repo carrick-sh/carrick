@@ -1,0 +1,29 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_inoeilBf2 as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 03m 00s
+../../../../include/tst_fuzzy_sync.h:484: TINFO: Minimum sampling period ended
+../../../../include/tst_fuzzy_sync.h:307: TINFO: loop = 1024, delay_bias = 0
+../../../../include/tst_fuzzy_sync.h:295: TINFO: start_a - start_b: { avg =   -13ns, avg_dev =    17ns, dev_ratio = 1.36 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - start_a  : { avg =  2330ns, avg_dev =    50ns, dev_ratio = 0.02 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: end_b - start_b  : { avg =  2928ns, avg_dev =    49ns, dev_ratio = 0.02 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - end_b    : { avg =  -610ns, avg_dev =    61ns, dev_ratio = 0.10 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: spins            : { avg =   800  , avg_dev =    79  , dev_ratio = 0.10 }
+../../../../include/tst_fuzzy_sync.h:494: TINFO: Reached deviation ratios < 0.10, introducing randomness
+../../../../include/tst_fuzzy_sync.h:497: TINFO: Delay range is [-3734, 2823]
+../../../../include/tst_fuzzy_sync.h:307: TINFO: loop = 1165, delay_bias = 0
+../../../../include/tst_fuzzy_sync.h:295: TINFO: start_a - start_b: { avg =   -40ns, avg_dev =     4ns, dev_ratio = 0.10 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - start_a  : { avg =  2383ns, avg_dev =    55ns, dev_ratio = 0.02 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: end_b - start_b  : { avg =  3152ns, avg_dev =    35ns, dev_ratio = 0.01 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - end_b    : { avg =  -809ns, avg_dev =    35ns, dev_ratio = 0.04 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: spins            : { avg =   958  , avg_dev =    39  , dev_ratio = 0.04 }
+../../../../include/tst_fuzzy_sync.h:654: TINFO: Exceeded execution loops, requesting exit
+inotify09.c:90: TPASS: kernel survived inotify beating
+
+Summary:
+passed   1
+failed   0
+broken   0
+skipped  0
+warnings 0

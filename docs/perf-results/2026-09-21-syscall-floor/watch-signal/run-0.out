@@ -1,0 +1,48 @@
+
+running 1 test
+test vcpu_loop::exec::tests::invalid_inotify_service_completion_cost ... service_completion signals=true sample=0 ns_per_pair=611.9855194091797
+service_completion signals=false sample=0 ns_per_pair=543.7812805175781
+service_completion signals=false sample=1 ns_per_pair=544.3032531738281
+service_completion signals=true sample=1 ns_per_pair=611.5055084228516
+service_completion signals=true sample=2 ns_per_pair=604.1666564941406
+service_completion signals=false sample=2 ns_per_pair=535.5587005615234
+service_completion signals=false sample=3 ns_per_pair=541.3449554443359
+service_completion signals=true sample=3 ns_per_pair=608.6012573242188
+service_completion signals=true sample=4 ns_per_pair=606.0231475830078
+service_completion signals=false sample=4 ns_per_pair=538.2328033447266
+service_completion signals=false sample=5 ns_per_pair=540.6360626220703
+service_completion signals=true sample=5 ns_per_pair=599.5394439697266
+service_completion signals=true sample=6 ns_per_pair=607.1058807373047
+service_completion signals=false sample=6 ns_per_pair=542.7303314208984
+service_completion signals=false sample=7 ns_per_pair=542.3183441162109
+service_completion signals=true sample=7 ns_per_pair=618.9231872558594
+service_completion signals=true sample=8 ns_per_pair=608.5364074707031
+service_completion signals=false sample=8 ns_per_pair=538.8228149414063
+service_completion signals=false sample=9 ns_per_pair=541.0391540527344
+service_completion signals=true sample=9 ns_per_pair=609.8849029541016
+service_completion signals=true sample=10 ns_per_pair=608.5675506591797
+service_completion signals=false sample=10 ns_per_pair=539.2335357666016
+service_completion signals=false sample=11 ns_per_pair=537.3973846435547
+service_completion signals=true sample=11 ns_per_pair=610.110595703125
+service_completion signals=true sample=12 ns_per_pair=611.5951538085938
+service_completion signals=false sample=12 ns_per_pair=542.0048980712891
+service_completion signals=false sample=13 ns_per_pair=543.9955444335938
+service_completion signals=true sample=13 ns_per_pair=610.9759063720703
+service_completion signals=true sample=14 ns_per_pair=611.4813537597656
+service_completion signals=false sample=14 ns_per_pair=541.1599578857422
+service_completion signals=false sample=15 ns_per_pair=541.2069854736328
+service_completion signals=true sample=15 ns_per_pair=610.9911651611328
+service_completion signals=true sample=16 ns_per_pair=611.5169525146484
+service_completion signals=false sample=16 ns_per_pair=541.7016296386719
+service_completion signals=false sample=17 ns_per_pair=542.8256988525391
+service_completion signals=true sample=17 ns_per_pair=609.5231323242188
+service_completion signals=true sample=18 ns_per_pair=609.3883514404297
+service_completion signals=false sample=18 ns_per_pair=543.3591156005859
+service_completion signals=false sample=19 ns_per_pair=541.1650390625
+service_completion signals=true sample=19 ns_per_pair=607.8440399169922
+service_completion signals=true sample=20 ns_per_pair=608.1250610351563
+service_completion signals=false sample=20 ns_per_pair=542.1574859619141
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 596 filtered out; finished in 1.69s
+

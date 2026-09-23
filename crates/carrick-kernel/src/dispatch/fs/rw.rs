@@ -93,7 +93,7 @@ fn prepare_pwritev_payloads(
 
 struct PreparedReadvTargets {
     host_iovecs: Vec<libc::iovec>,
-    guest_ranges: Vec<(u64, usize)>,
+    guest_ranges: Vec<carrick_guest_mem::HostWriteRange>,
 }
 
 fn prepare_readv_targets(
@@ -114,7 +114,11 @@ fn prepare_readv_targets(
             iov_base: ptr as *mut libc::c_void,
             iov_len,
         });
-        guest_ranges.push((iovec.iov_base, iov_len));
+        guest_ranges.push(carrick_guest_mem::HostWriteRange {
+            guest: carrick_guest_mem::GuestVa(iovec.iov_base),
+            len: iov_len,
+            host: carrick_guest_mem::HostVa(ptr as usize),
+        });
     }
     Ok(Some(PreparedReadvTargets {
         host_iovecs: borrowed_iovecs,
@@ -506,7 +510,12 @@ impl<'a> FsView<'a> {
                         open_file.description.common().status_flags(),
                     )
                     .contains(LinuxOpenFlags::APPEND);
-                    if writable && !is_append {
+                    // The identity-page offset is private to this execution
+                    // binding. An alias (including one inherited by fork) uses
+                    // the same Linux open file description, so a later seek
+                    // must not re-grant private authority after dup/fork revoked
+                    // it. Count logical descriptor owners, never Arc clones.
+                    if writable && !is_append && open_file.description.fd_ref_count() == 1 {
                         let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
                         let _ = crate::kernel::identity_page::stamp_seek_authority(
                             &mut *cx.memory,
@@ -1487,7 +1496,7 @@ impl<'a> FsView<'a> {
                             let _host_write = carrick_guest_mem::HostWriteGuard::new(
                                 memory,
                                 &targets.guest_ranges,
-                            );
+                            ).map_err(|_| LINUX_EFAULT)?;
                             unsafe { libc::readv(hfd, targets.host_iovecs.as_ptr(), iovcnt) }
                         };
                         let n = n.host_syscall_errno()?;
@@ -1980,7 +1989,7 @@ impl<'a> FsView<'a> {
                             let _host_write = carrick_guest_mem::HostWriteGuard::new(
                                 memory,
                                 &targets.guest_ranges,
-                            );
+                            ).map_err(|_| LINUX_EFAULT)?;
                             unsafe {
                                 if read_at_current {
                                     libc::readv(hfd, targets.host_iovecs.as_ptr(), iovcnt)

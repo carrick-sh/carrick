@@ -1,0 +1,21 @@
+operation 1
+0000000100499dcc	ldp	x20, x19, [sp], #0x20
+0000000100499dd0	ret
+0000000100499dd4	mov	x19, x0
+0000000100499dd8	bl	__ZN99_$LT$carrick_kernel..dispatch..mm_mutation..MmTransactionGuard$u20$as$u20$core..ops..drop..Drop$GT$4drop17hc1103cc606e2850aE
+0000000100499ddc	add	x0, x19, #0x1c
+0000000100499de0	ldp	x29, x30, [sp, #0x10]
+operation 7
+00000001004d6294	str	q1, [sp, #0x730]
+00000001004d6298	add	x20, sp, #0x720
+00000001004d629c	add	x0, sp, #0x720
+00000001004d62a0	bl	__ZN99_$LT$carrick_kernel..dispatch..mm_mutation..MmTransactionGuard$u20$as$u20$core..ops..drop..Drop$GT$4drop17hc1103cc606e2850aE
+00000001004d62a4	mov	w28, #0x1
+00000001004d62a8	mov	w21, #0x0
+operation 7
+00000001004d6294	str	q1, [sp, #0x730]
+00000001004d6298	add	x20, sp, #0x720
+00000001004d629c	add	x0, sp, #0x720
+00000001004d62a0	bl	__ZN99_$LT$carrick_kernel..dispatch..mm_mutation..MmTransactionGuard$u20$as$u20$core..ops..drop..Drop$GT$4drop17hc1103cc606e2850aE
+00000001004d62a4	mov	w28, #0x1
+00000001004d62a8	mov	w21, #0x0

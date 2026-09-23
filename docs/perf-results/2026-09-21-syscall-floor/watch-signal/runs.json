@@ -1,0 +1,26 @@
+[
+  {
+    "run": 0,
+    "medians": {
+      "false": 541.3449554443359,
+      "true": 609.5231323242188
+    },
+    "binary_sha256": "26e772edfbe2e919ae1953a0c7fbc5b29eb2df5b7ed56b9cf30372436eabb207"
+  },
+  {
+    "run": 1,
+    "medians": {
+      "false": 540.7269744873047,
+      "true": 606.2602996826172
+    },
+    "binary_sha256": "26e772edfbe2e919ae1953a0c7fbc5b29eb2df5b7ed56b9cf30372436eabb207"
+  },
+  {
+    "run": 2,
+    "medians": {
+      "false": 543.212890625,
+      "true": 609.8359375
+    },
+    "binary_sha256": "26e772edfbe2e919ae1953a0c7fbc5b29eb2df5b7ed56b9cf30372436eabb207"
+  }
+]

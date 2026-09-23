@@ -1,0 +1,46 @@
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-spec)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.02s
+     Running tests/integration/main.rs (target/debug/deps/integration-4fdcf55b2fd0f3e2)
+
+running 29 tests
+test syscall_fs_rw::copy_file_range_uses_darwin_fast_path_for_whole_host_files ... ok
+test syscall_fs_rw::f_getfl_strips_creation_only_open_flags ... ok
+test syscall_fs_rw::fsync_family_flushes_host_backed_files ... ok
+test syscall_fs_rw::lseek_repositions_rootfs_file_reads ... ok
+test syscall_fs_rw::pread64_reads_from_offset_without_changing_file_offset ... ok
+test syscall_fs_rw::preadv_host_file_preserves_offset_with_borrowed_iovecs ... ok
+test syscall_fs_rw::preadv_reads_from_offset_across_iovecs_without_changing_file_offset ... ok
+test syscall_fs_rw::pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds ... ok
+test syscall_fs_rw::pwritev_bootstrap_validates_iovecs_and_reports_stream_errors ... ok
+test syscall_fs_rw::pwritev_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr ... ok
+test syscall_fs_rw::pwritev_host_file_reads_each_guest_iovec_once ... ok
+test syscall_fs_rw::pwritev_host_file_reports_efault_when_fallback_payload_is_unreadable ... ok
+test syscall_fs_rw::pwritev_host_file_uses_guest_host_ptrs_without_payload_reads ... ok
+test syscall_fs_rw::readv_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr ... ok
+test syscall_fs_rw::readv_host_file_uses_guest_host_ptrs_for_writable_iovecs ... ok
+test syscall_fs_rw::readv_host_write_admission_failure_does_not_consume_file_input ... ok
+test syscall_fs_rw::readv_reads_file_across_packed_iovecs ... ok
+test syscall_fs_rw::readv_reads_host_pipe_across_packed_iovecs ... ok
+test syscall_fs_rw::sendfile_copies_rootfs_file_to_stdout_and_updates_offset_pointer ... ok
+test syscall_fs_rw::sendfile_host_files_completes_a_request_larger_than_the_staging_buffer ... ok
+test syscall_fs_rw::sendfile_null_offset_advances_host_backed_file_across_calls ... ok
+test syscall_fs_rw::sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe ... ok
+test syscall_fs_rw::splice_moves_bytes_between_rootfs_files_pipes_and_stdout ... ok
+test syscall_fs_rw::splice_moves_bytes_between_sockets_and_pipes ... ok
+test syscall_fs_rw::sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise ... ok
+test syscall_fs_rw::write_syscall_reads_guest_memory_and_writes_stdout ... ok
+test syscall_fs_rw::write_syscall_rejects_bad_guest_pointer_with_efault ... ok
+test syscall_fs_rw::writev_writes_host_pipe_from_packed_iovecs ... ok
+test syscall_fs_rw::writev_writes_stdout_from_packed_iovecs ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.11s
+

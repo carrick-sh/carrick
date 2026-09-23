@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-0aaee9123b867d4d)
+
+running 7 tests
+test trap::code_content::tests::cold_writer_prevents_first_observer_and_dropped_observers_leave_no_history ... ok
+test trap::code_content::tests::native_code_content_invalidation_contract ... native_code_content_observations [{"contract_id":"kernel.mm.native-code-content","layer":"vm-free","implementation_revision":"sha256:f188c84248b4b4b4b3c3c605398db8bf457aa5b4460673cc2941f2d7c3c1da1f","fixture_identity":"unit:native-code-content","scale":1,"semantic_assertions":[{"name":"affected_pages_revoke_without_touching_unrelated_dependencies","passed":true,"detail":null}],"work":{"values":{"native_code_invalidation_pages":1},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.mm.native-code-content","layer":"vm-free","implementation_revision":"sha256:f188c84248b4b4b4b3c3c605398db8bf457aa5b4460673cc2941f2d7c3c1da1f","fixture_identity":"unit:native-code-content","scale":8,"semantic_assertions":[{"name":"affected_pages_revoke_without_touching_unrelated_dependencies","passed":true,"detail":null}],"work":{"values":{"native_code_invalidation_pages":8},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.mm.native-code-content","layer":"vm-free","implementation_revision":"sha256:f188c84248b4b4b4b3c3c605398db8bf457aa5b4460673cc2941f2d7c3c1da1f","fixture_identity":"unit:native-code-content","scale":32,"semantic_assertions":[{"name":"affected_pages_revoke_without_touching_unrelated_dependencies","passed":true,"detail":null}],"work":{"values":{"native_code_invalidation_pages":32},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.mm.native-code-content","layer":"vm-free","implementation_revision":"sha256:f188c84248b4b4b4b3c3c605398db8bf457aa5b4460673cc2941f2d7c3c1da1f","fixture_identity":"unit:native-code-content","scale":128,"semantic_assertions":[{"name":"affected_pages_revoke_without_touching_unrelated_dependencies","passed":true,"detail":null}],"work":{"values":{"native_code_invalidation_pages":128},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}]
+ok
+test trap::code_content::tests::overlapping_writes_prevent_observation_until_both_finish ... ok
+test trap::code_content::tests::partial_page_crossings_and_invalid_ranges ... ok
+test trap::code_content::tests::racing_first_observation_cannot_survive_an_admitted_write ... ok
+test trap::code_content::tests::retirement_and_equal_offsets_in_another_owner_do_not_revive_dependencies ... ok
+test trap::code_content::tests::simultaneous_final_observers_leave_no_history ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 511 filtered out; finished in 0.02s
+

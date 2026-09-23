@@ -4,7 +4,7 @@ members = ["crates/*"]
 # conformance-probes is a STANDALONE crate (its own Cargo.lock) built as static
 # Linux/musl ELFs in a container by scripts/build-probes.sh, never as part of
 # the host workspace — exclude it so host `cargo` commands don't try to absorb it.
-exclude = ["fixtures/*", "crates/*/fixtures/*", "conformance-probes"]
+exclude = ["fixtures/*", "crates/*/fixtures/*", "conformance-probes", "experiments/native-syscall-slice"]
 # The product is the `carrick` binary, so an argument-less cargo command --
 # the signed release build in scripts/build-signed.sh, a bare
 # `cargo build --release`, `cargo build --bin carrick` -- selects carrick-cli

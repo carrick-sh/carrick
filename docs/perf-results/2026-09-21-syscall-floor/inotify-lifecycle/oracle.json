@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "docker",
+    "run",
+    "--rm",
+    "--name",
+    "inotify-lifecycle-oracle-20260922",
+    "--platform",
+    "linux/arm64",
+    "--entrypoint",
+    "/usr/local/bin/python3",
+    "localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30",
+    "-c",
+    "# SPDX-License-Identifier: Apache-2.0 OR MIT\n# Independent public-ABI contract; no LTP implementation source.\nimport ctypes as c, errno, os, struct\nlib = c.CDLL(None, use_errno=True)\nlib.inotify_add_watch.argtypes = [c.c_int, c.c_char_p, c.c_uint]\npath = ('/tmp/carrick-inotify-lifecycle-' + str(os.getpid())).encode()\nf = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)\n\ndef instance():\n    q = lib.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)\n    assert q >= 0\n    return q\n\ndef add(q):\n    wd = lib.inotify_add_watch(q, path, 2)\n    assert wd > 0\n    return wd\n\ndef remove(q, wd):\n    assert lib.inotify_rm_watch(q, wd) == 0\n\ndef queued(q):\n    n = c.c_int(-1)\n    assert lib.ioctl(q, 0x541b, c.byref(n)) == 0\n    return n.value\n\ndef records(q, size=65536):\n    try: data = os.read(q, size)\n    except BlockingIOError: return []\n    assert len(data) % 16 == 0\n    result = list(struct.iter_unpack('iIII', data))\n    assert all(cookie == 0 and length == 0 for wd, mask, cookie, length in result)\n    return [(wd, mask) for wd, mask, cookie, length in result]\n\nfor n in [1, 8, 32, 128]:\n    q = instance()\n    ids = []\n    for i in range(n):\n        wd = add(q); ids.append(wd); remove(q, wd)\n    assert len(set(ids)) == n, (n, ids)\n    assert queued(q) == 16 * n, (n, queued(q))\n    first = records(q, 16)\n    assert first == [(ids[0], 0x8000)]\n    assert queued(q) == 16 * (n-1)\n    rest = records(q)\n    assert first + rest == [(wd, 0x8000) for wd in ids]\n    assert queued(q) == 0 and records(q) == []\n    current = add(q)\n    c.set_errno(0)\n    assert lib.inotify_rm_watch(q, ids[-1]) == -1 and c.get_errno() == errno.EINVAL\n    assert os.write(f, b'x' * 64) == 64 and os.lseek(f, 0, 0) == 0\n    remove(q, current)\n    assert records(q) == [(current, 2), (current, 0x8000)]\n    os.close(q)\n    print('churn_scale_%d=ok' % n)\n\nlimit = int(open('/proc/sys/fs/inotify/max_queued_events').read())\nassert 1 <= limit <= 65536\nq = instance()\nids = []\nfor i in range(limit + 2):\n    wd = add(q); ids.append(wd); remove(q, wd)\nassert queued(q) == 16 * (limit + 1)\nall_events = []\nwhile True:\n    batch = records(q)\n    if not batch: break\n    all_events += batch\nassert all_events == [(wd, 0x8000) for wd in ids[:limit]] + [(-1, 0x4000)]\nassert queued(q) == 0\nwd = add(q); remove(q, wd)\nassert records(q) == [(wd, 0x8000)]\nos.close(q)\nprint('overflow_drain_rearm=ok')\nos.close(f); os.unlink(path)\nprint('probe_complete=1')\n"
+  ],
+  "source_sha256": "9906d6d685292adaa986f408c1b05f1e5bfeaeb4c78e24f69d7022ba2940013f",
+  "returncode": 0
+}

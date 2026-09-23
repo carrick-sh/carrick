@@ -1,0 +1,74 @@
+{
+  "input": "target/lease-cost/native-islands/inotify-coverage.json",
+  "limitation": "Decoder actions only, not current-MM emission, executable authority, native execution, branch linking, atomic ordering or measured coverage. Sensitive actions may require helpers or region fusion. No guest code is executed.",
+  "schema": "dsr-static-decoder-coverage-v1",
+  "symbols": [
+    {
+      "actions": {
+        "Copy": 437,
+        "PcRelative": 55,
+        "VirtualizedReserved": 3,
+        "VirtualizedX28": 10,
+        "direct.Branch": 34,
+        "direct.Call": 66,
+        "direct.CompareZero { nonzero: false }": 5,
+        "direct.CompareZero { nonzero: true }": 21,
+        "direct.Conditional": 51,
+        "direct.TestBit { nonzero: false }": 10,
+        "direct.TestBit { nonzero: true }": 6,
+        "memory.Atomic.None": 40,
+        "memory.Atomic.Reserved": 20,
+        "memory.Pair.None": 38,
+        "memory.Pair.Reserved": 2,
+        "memory.Pair.X28": 2,
+        "memory.Scalar.None": 63,
+        "memory.Scalar.X28": 1,
+        "memory.Simd.None": 41
+      },
+      "instruction_sites": 905,
+      "rejected_sites": [],
+      "rejected_sites_count": 0,
+      "symbol": "verify_inotify"
+    },
+    {
+      "actions": {
+        "Copy": 115,
+        "PcRelative": 6,
+        "VirtualizedReserved": 1,
+        "direct.Branch": 25,
+        "direct.Call": 21,
+        "direct.CompareZero { nonzero: false }": 1,
+        "direct.CompareZero { nonzero: true }": 19,
+        "direct.Conditional": 34,
+        "direct.TestBit { nonzero: false }": 6,
+        "direct.TestBit { nonzero: true }": 2,
+        "indirect.Return": 1,
+        "memory.Atomic.None": 38,
+        "memory.Atomic.Reserved": 20,
+        "memory.Pair.None": 6,
+        "memory.Pair.Reserved": 2,
+        "memory.Scalar.None": 32
+      },
+      "instruction_sites": 329,
+      "rejected_sites": [],
+      "rejected_sites_count": 0,
+      "symbol": "write_seek"
+    },
+    {
+      "actions": {
+        "Copy": 3,
+        "PcRelative": 1,
+        "direct.CompareZero { nonzero: false }": 1,
+        "direct.CompareZero { nonzero: true }": 1,
+        "indirect.Return": 2,
+        "memory.Atomic.None": 1,
+        "memory.Scalar.None": 1,
+        "sensitive.Exclusive": 2
+      },
+      "instruction_sites": 12,
+      "rejected_sites": [],
+      "rejected_sites_count": 0,
+      "symbol": "__aarch64_ldadd4_acq_rel"
+    }
+  ]
+}

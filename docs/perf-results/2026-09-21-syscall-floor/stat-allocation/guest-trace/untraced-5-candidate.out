@@ -1,0 +1,10 @@
+{"schema":1,"phase":"fstat","sample":1,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":136852709}
+{"schema":1,"phase":"fstat","sample":2,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":138020084}
+{"schema":1,"phase":"fstat","sample":3,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":137816500}
+{"schema":1,"phase":"fstat","sample":4,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":135918708}
+{"schema":1,"phase":"fstat","sample":5,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":136357000}
+{"schema":1,"phase":"fstat","sample":6,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":135955625}
+{"schema":1,"phase":"fstat","sample":7,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":136041166}
+{"schema":1,"phase":"fstat","sample":8,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":136208958}
+{"schema":1,"phase":"fstat","sample":9,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":135929667}
+{"schema":1,"verified":true,"bytes":64,"offset":0,"removed":true}

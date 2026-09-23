@@ -1,0 +1,2172 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.14s
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/signal_lease_gap-cbe70567e390ca19.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/signal_lease_gap-cbe70567e390ca19.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/signal_lease_gap-cbe70567e390ca19
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a.tmp.45943
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a.tmp.45943: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a
+test-signed: running /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892 generic_probe_shard_ --nocapture
+
+running 1 test
+test generic_probe_shard_2 ... RUN generic probe shard 2 aarch64-unknown-linux-musl:accessx
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:accessx elapsed_ms=40
+RUN generic probe shard 2 aarch64-unknown-linux-musl:adjtimexstate
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:adjtimexstate elapsed_ms=13
+RUN generic probe shard 2 aarch64-unknown-linux-musl:altstacktid
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:altstacktid elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:bigread
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:bigread elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:brkheapgrow
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:brkheapgrow elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:cachestatpages
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:cachestatpages elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:chmodfollowsymlink
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:chmodfollowsymlink elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:clone3args
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:clone3args elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:clone3signalflight
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:clone3signalflight elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:cloneexitsig
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:cloneexitsig elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:clonefsumask
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:clonefsumask elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:cluster10errno
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:cluster10errno elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:coredumpbit
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:coredumpbit elapsed_ms=27
+RUN generic probe shard 2 aarch64-unknown-linux-musl:credtransition
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:credtransition elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:devnullseek
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:devnullseek elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:dirops
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:dirops elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-musl:dsrconstantpool
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:dsrconstantpool elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:epollcluster
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:epollcluster elapsed_ms=113
+RUN generic probe shard 2 aarch64-unknown-linux-musl:epolletmanyhup
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:epolletmanyhup elapsed_ms=403
+RUN generic probe shard 2 aarch64-unknown-linux-musl:epollforkeventfd
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:epollforkeventfd elapsed_ms=21
+RUN generic probe shard 2 aarch64-unknown-linux-musl:epolloutxthread
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:epolloutxthread elapsed_ms=3020
+RUN generic probe shard 2 aarch64-unknown-linux-musl:epollstaledel
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:epollstaledel elapsed_ms=219
+RUN generic probe shard 2 aarch64-unknown-linux-musl:eventwaitmatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:eventwaitmatrix elapsed_ms=19
+RUN generic probe shard 2 aarch64-unknown-linux-musl:execsig
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:execsig elapsed_ms=15
+RUN generic probe shard 2 aarch64-unknown-linux-musl:execvenonutf8
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:execvenonutf8 elapsed_ms=13
+RUN generic probe shard 2 aarch64-unknown-linux-musl:exitgroupthreads
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:exitgroupthreads elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-musl:fallocatebig
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:fallocatebig elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:fchmoddir
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:fchmoddir elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:fcntllock
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:fcntllock elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:fcntlpipesz
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:fcntlpipesz elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:fdio
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:fdio elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:fdstatus
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:fdstatus elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:fifoepolleof
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:fifoepolleof elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:fifoopenmatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:fifoopenmatrix elapsed_ms=2410
+RUN generic probe shard 2 aarch64-unknown-linux-musl:forkaltstack
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:forkaltstack elapsed_ms=18
+RUN generic probe shard 2 aarch64-unknown-linux-musl:forkexecstorm
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:forkexecstorm elapsed_ms=422
+RUN generic probe shard 2 aarch64-unknown-linux-musl:forkfpreclaim
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:forkfpreclaim elapsed_ms=451
+RUN generic probe shard 2 aarch64-unknown-linux-musl:forkhighva
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:forkhighva elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:forkserial
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:forkserial elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-musl:forkstackstorm
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:forkstackstorm elapsed_ms=59
+RUN generic probe shard 2 aarch64-unknown-linux-musl:fsmeta
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:fsmeta elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:futexcheckpointexit
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:futexcheckpointexit elapsed_ms=17
+RUN generic probe shard 2 aarch64-unknown-linux-musl:futexforkrequeue
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:futexforkrequeue elapsed_ms=2431
+RUN generic probe shard 2 aarch64-unknown-linux-musl:futexpilock
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:futexpilock elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:futexrealtime
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:futexrealtime elapsed_ms=215
+RUN generic probe shard 2 aarch64-unknown-linux-musl:getrandomvdso
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:getrandomvdso elapsed_ms=24
+RUN generic probe shard 2 aarch64-unknown-linux-musl:getsocknameval
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:getsocknameval elapsed_ms=15
+RUN generic probe shard 2 aarch64-unknown-linux-musl:inotifymatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:inotifymatrix elapsed_ms=14
+RUN generic probe shard 2 aarch64-unknown-linux-musl:inzonetcp
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:inzonetcp elapsed_ms=170
+RUN generic probe shard 2 aarch64-unknown-linux-musl:ioctlcluster
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:ioctlcluster elapsed_ms=14
+RUN generic probe shard 2 aarch64-unknown-linux-musl:ipv6recvhoplimit
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:ipv6recvhoplimit elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-musl:itimerprofidle
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:itimerprofidle elapsed_ms=267
+RUN generic probe shard 2 aarch64-unknown-linux-musl:killchld
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:killchld elapsed_ms=2228
+RUN generic probe shard 2 aarch64-unknown-linux-musl:killreap
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:killreap elapsed_ms=388
+RUN generic probe shard 2 aarch64-unknown-linux-musl:killuidperm
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:killuidperm elapsed_ms=3175
+RUN generic probe shard 2 aarch64-unknown-linux-musl:legacyfs
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:legacyfs elapsed_ms=19
+RUN generic probe shard 2 aarch64-unknown-linux-musl:linkstat
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:linkstat elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-musl:ltpcheckpoint
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:ltpcheckpoint elapsed_ms=111
+RUN generic probe shard 2 aarch64-unknown-linux-musl:lxattr
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:lxattr elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:mapfixed
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:mapfixed elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:mcastjoingroup
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:mcastjoingroup elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:memfdsealmatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:memfdsealmatrix elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:memflagmatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:memflagmatrix elapsed_ms=16
+RUN generic probe shard 2 aarch64-unknown-linux-musl:mkdirsetgid
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:mkdirsetgid elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:mmapanonreuse
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:mmapanonreuse elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:mmapdevzero
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:mmapdevzero elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:mmapprivatefiletrack
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:mmapprivatefiletrack elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:mmapreuse
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:mmapreuse elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:mmapzerofill
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:mmapzerofill elapsed_ms=17
+RUN generic probe shard 2 aarch64-unknown-linux-musl:mprotectexec
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:mprotectexec elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-musl:mqueueworkerprogress
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:mqueueworkerprogress elapsed_ms=36
+RUN generic probe shard 2 aarch64-unknown-linux-musl:mremapmove
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:mremapmove elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-musl:msgctlstat
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:msgctlstat elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:namei_escape
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:namei_escape elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:nativeetexecfork
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:nativeetexecfork elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:netflagmatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:netflagmatrix elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:nofiledefault
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:nofiledefault elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:odirectory
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:odirectory elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:openat2resolve
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:openat2resolve elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:openeloop
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:openeloop elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:otmpfileforkexec
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:otmpfileforkexec elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-musl:pagetablegrow
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:pagetablegrow elapsed_ms=267
+RUN generic probe shard 2 aarch64-unknown-linux-musl:pathnonutf8
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:pathnonutf8 elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:pendingunblock
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:pendingunblock elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:pidnsinitsig
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:pidnsinitsig elapsed_ms=415
+RUN generic probe shard 2 aarch64-unknown-linux-musl:pidnswait
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:pidnswait elapsed_ms=18
+RUN generic probe shard 2 aarch64-unknown-linux-musl:pipeextra
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:pipeextra elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-musl:pipeszcrossend
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:pipeszcrossend elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:ppid
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:ppid elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-musl:prctlnnp
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:prctlnnp elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:preadvwronly
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:preadvwronly elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:processvmsparse
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:processvmsparse elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-musl:procladder
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:procladder elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-musl:procladder_mt
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:procladder_mt elapsed_ms=1019
+RUN generic probe shard 2 aarch64-unknown-linux-musl:procpeermem
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:procpeermem elapsed_ms=22
+RUN generic probe shard 2 aarch64-unknown-linux-musl:procselffdfail
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:procselffdfail elapsed_ms=17
+RUN generic probe shard 2 aarch64-unknown-linux-musl:procsignalmask
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:procsignalmask elapsed_ms=141
+RUN generic probe shard 2 aarch64-unknown-linux-musl:procstatstate
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:procstatstate elapsed_ms=20
+RUN generic probe shard 2 aarch64-unknown-linux-musl:protnonesyscall
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:protnonesyscall elapsed_ms=13
+RUN generic probe shard 2 aarch64-unknown-linux-musl:ptraceinvaliderrno
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:ptraceinvaliderrno elapsed_ms=33
+RUN generic probe shard 2 aarch64-unknown-linux-musl:ptracesigdeath
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:ptracesigdeath elapsed_ms=44
+RUN generic probe shard 2 aarch64-unknown-linux-musl:ptracetraceme
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:ptracetraceme elapsed_ms=34
+RUN generic probe shard 2 aarch64-unknown-linux-musl:ptyfionread
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:ptyfionread elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-musl:ptyisig
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:ptyisig elapsed_ms=5021
+RUN generic probe shard 2 aarch64-unknown-linux-musl:readpasteof
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:readpasteof elapsed_ms=23
+RUN generic probe shard 2 aarch64-unknown-linux-musl:recverrqueue
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:recverrqueue elapsed_ms=14
+RUN generic probe shard 2 aarch64-unknown-linux-musl:reparenttoinit
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:reparenttoinit elapsed_ms=218
+RUN generic probe shard 2 aarch64-unknown-linux-musl:rlimitnproc
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:rlimitnproc elapsed_ms=19
+RUN generic probe shard 2 aarch64-unknown-linux-musl:robustlist
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:robustlist elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-musl:rosharedbus
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:rosharedbus elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:rtsigtimedwaitsiginfo
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:rtsigtimedwaitsiginfo elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:schedgetattr
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:schedgetattr elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:schedthread
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:schedthread elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-musl:seccompexec
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:seccompexec elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-musl:selectnfds
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:selectnfds elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:selfraise
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:selfraise elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:semtimedop
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:semtimedop elapsed_ms=59
+RUN generic probe shard 2 aarch64-unknown-linux-musl:setgroupsroundtrip
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:setgroupsroundtrip elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:shared_buffer_mmap
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:shared_buffer_mmap elapsed_ms=61
+RUN generic probe shard 2 aarch64-unknown-linux-musl:shmnestedfork
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:shmnestedfork elapsed_ms=170
+RUN generic probe shard 2 aarch64-unknown-linux-musl:sigbadstack
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:sigbadstack elapsed_ms=23
+RUN generic probe shard 2 aarch64-unknown-linux-musl:siglongjmpaltstack
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:siglongjmpaltstack elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-musl:signalfdread
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:signalfdread elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-musl:sigpipewrite
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:sigpipewrite elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:sigreenter
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:sigreenter elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:sigtimedwaitintr
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:sigtimedwaitintr elapsed_ms=1533
+RUN generic probe shard 2 aarch64-unknown-linux-musl:sigwaitblock
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:sigwaitblock elapsed_ms=126
+RUN generic probe shard 2 aarch64-unknown-linux-musl:sockbufreuseport
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:sockbufreuseport elapsed_ms=21
+RUN generic probe shard 2 aarch64-unknown-linux-musl:sockoptdomainproto
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:sockoptdomainproto elapsed_ms=15
+RUN generic probe shard 2 aarch64-unknown-linux-musl:splicematrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:splicematrix elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-musl:splicepipeempty
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:splicepipeempty elapsed_ms=318
+RUN generic probe shard 2 aarch64-unknown-linux-musl:statfdino
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:statfdino elapsed_ms=18
+RUN generic probe shard 2 aarch64-unknown-linux-musl:symlinkfollow
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:symlinkfollow elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-musl:syscallregpreserve
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:syscallregpreserve elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:sysvmsg
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:sysvmsg elapsed_ms=9
+RUN generic probe shard 2 aarch64-unknown-linux-musl:sysvsem
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:sysvsem elapsed_ms=712
+RUN generic probe shard 2 aarch64-unknown-linux-musl:telemetrymap
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:telemetrymap elapsed_ms=17
+RUN generic probe shard 2 aarch64-unknown-linux-musl:tgsigqueue
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:tgsigqueue elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-musl:threadrecycle
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:threadrecycle elapsed_ms=14
+RUN generic probe shard 2 aarch64-unknown-linux-musl:threadstatuscount
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:threadstatuscount elapsed_ms=171
+RUN generic probe shard 2 aarch64-unknown-linux-musl:tlsswitch
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:tlsswitch elapsed_ms=4020
+RUN generic probe shard 2 aarch64-unknown-linux-musl:traceexecstop
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:traceexecstop elapsed_ms=31
+RUN generic probe shard 2 aarch64-unknown-linux-musl:udpconnectunspec
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:udpconnectunspec elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:uffdpolicy
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:uffdpolicy elapsed_ms=7
+RUN generic probe shard 2 aarch64-unknown-linux-musl:usernsisolation
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:usernsisolation elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-musl:vdsogtod
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:vdsogtod elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:vforkpid
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:vforkpid elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:vmsplicepipe
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:vmsplicepipe elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:waitidsiuid
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:waitidsiuid elapsed_ms=8
+RUN generic probe shard 2 aarch64-unknown-linux-musl:waitrestart
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:waitrestart elapsed_ms=128
+RUN generic probe shard 2 aarch64-unknown-linux-musl:writeseek
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:writeseek elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-musl:xsignal
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:xsignal elapsed_ms=63
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:accessx
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:accessx elapsed_ms=17
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:adjtimexstate
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:adjtimexstate elapsed_ms=13
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:altstacktid
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:altstacktid elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:bigread
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:bigread elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:brkheapgrow
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:brkheapgrow elapsed_ms=14
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:cachestatpages
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:cachestatpages elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:chmodfollowsymlink
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:chmodfollowsymlink elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:clone3args
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:clone3args elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:clone3signalflight
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:clone3signalflight elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:cloneexitsig
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:cloneexitsig elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:clonefsumask
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:clonefsumask elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:cluster10errno
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:cluster10errno elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:coredumpbit
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:coredumpbit elapsed_ms=41
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:credtransition
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:credtransition elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:devnullseek
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:devnullseek elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:dirops
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:dirops elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:dsrconstantpool
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:dsrconstantpool elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:epollcluster
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:epollcluster elapsed_ms=115
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:epolletmanyhup
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:epolletmanyhup elapsed_ms=408
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:epollforkeventfd
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:epollforkeventfd elapsed_ms=28
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:epolloutxthread
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:epolloutxthread elapsed_ms=3024
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:epollstaledel
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:epollstaledel elapsed_ms=233
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:eventwaitmatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:eventwaitmatrix elapsed_ms=26
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:execsig
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:execsig elapsed_ms=19
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:execvenonutf8
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:execvenonutf8 elapsed_ms=17
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:exitgroupthreads
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:exitgroupthreads elapsed_ms=13
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:fallocatebig
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:fallocatebig elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:fchmoddir
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:fchmoddir elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:fcntllock
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:fcntllock elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:fcntlpipesz
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:fcntlpipesz elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:fdio
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:fdio elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:fdstatus
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:fdstatus elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:fifoepolleof
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:fifoepolleof elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:fifoopenmatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:fifoopenmatrix elapsed_ms=2409
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:forkaltstack
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:forkaltstack elapsed_ms=29
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:forkexecstorm
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:forkexecstorm elapsed_ms=421
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:forkfpreclaim
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:forkfpreclaim elapsed_ms=461
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:forkhighva
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:forkhighva elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:forkserial
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:forkserial elapsed_ms=14
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:forkstackstorm
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:forkstackstorm elapsed_ms=117
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:fsmeta
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:fsmeta elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:futexcheckpointexit
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:futexcheckpointexit elapsed_ms=18
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:futexforkrequeue
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:futexforkrequeue elapsed_ms=2583
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:futexpilock
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:futexpilock elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:futexrealtime
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:futexrealtime elapsed_ms=220
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:getrandomvdso
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:getrandomvdso elapsed_ms=28
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:getsocknameval
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:getsocknameval elapsed_ms=17
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:inotifymatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:inotifymatrix elapsed_ms=17
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:inzonetcp
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:inzonetcp elapsed_ms=173
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:ioctlcluster
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:ioctlcluster elapsed_ms=21
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:ipv6recvhoplimit
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:ipv6recvhoplimit elapsed_ms=15
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:itimerprofidle
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:itimerprofidle elapsed_ms=271
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:killchld
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:killchld elapsed_ms=2236
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:killreap
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:killreap elapsed_ms=385
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:killuidperm
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:killuidperm elapsed_ms=3172
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:legacyfs
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:legacyfs elapsed_ms=30
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:linkstat
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:linkstat elapsed_ms=18
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:ltpcheckpoint
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:ltpcheckpoint elapsed_ms=114
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:lxattr
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:lxattr elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:mapfixed
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:mapfixed elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:mcastjoingroup
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:mcastjoingroup elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:memfdsealmatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:memfdsealmatrix elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:memflagmatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:memflagmatrix elapsed_ms=18
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:mkdirsetgid
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:mkdirsetgid elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:mmapanonreuse
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:mmapanonreuse elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:mmapdevzero
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:mmapdevzero elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:mmapprivatefiletrack
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:mmapprivatefiletrack elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:mmapreuse
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:mmapreuse elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:mmapzerofill
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:mmapzerofill elapsed_ms=21
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:mprotectexec
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:mprotectexec elapsed_ms=17
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:mqueueworkerprogress
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:mqueueworkerprogress elapsed_ms=57
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:mremapmove
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:mremapmove elapsed_ms=15
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:msgctlstat
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:msgctlstat elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:namei_escape
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:namei_escape elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:nativeetexecfork
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:nativeetexecfork elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:netflagmatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:netflagmatrix elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:nofiledefault
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:nofiledefault elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:odirectory
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:odirectory elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:openat2resolve
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:openat2resolve elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:openeloop
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:openeloop elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:otmpfileforkexec
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:otmpfileforkexec elapsed_ms=15
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:pagetablegrow
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:pagetablegrow elapsed_ms=248
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:pathnonutf8
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:pathnonutf8 elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:pendingunblock
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:pendingunblock elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:pidnsinitsig
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:pidnsinitsig elapsed_ms=419
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:pidnswait
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:pidnswait elapsed_ms=24
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:pipeextra
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:pipeextra elapsed_ms=16
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:pipeszcrossend
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:pipeszcrossend elapsed_ms=13
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:ppid
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:ppid elapsed_ms=13
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:prctlnnp
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:prctlnnp elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:preadvwronly
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:preadvwronly elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:processvmsparse
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:processvmsparse elapsed_ms=14
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:procladder
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:procladder elapsed_ms=14
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:procladder_mt
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:procladder_mt elapsed_ms=1025
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:procpeermem
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:procpeermem elapsed_ms=22
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:procselffdfail
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:procselffdfail elapsed_ms=15
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:procsignalmask
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:procsignalmask elapsed_ms=143
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:procstatstate
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:procstatstate elapsed_ms=22
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:protnonesyscall
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:protnonesyscall elapsed_ms=14
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:ptraceinvaliderrno
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:ptraceinvaliderrno elapsed_ms=36
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:ptracesigdeath
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:ptracesigdeath elapsed_ms=48
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:ptracetraceme
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:ptracetraceme elapsed_ms=35
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:ptyfionread
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:ptyfionread elapsed_ms=14
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:ptyisig
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:ptyisig elapsed_ms=5022
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:readpasteof
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:readpasteof elapsed_ms=27
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:recverrqueue
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:recverrqueue elapsed_ms=17
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:reparenttoinit
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:reparenttoinit elapsed_ms=223
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:rlimitnproc
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:rlimitnproc elapsed_ms=27
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:robustlist
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:robustlist elapsed_ms=14
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:rosharedbus
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:rosharedbus elapsed_ms=13
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:rtsigtimedwaitsiginfo
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:rtsigtimedwaitsiginfo elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:schedgetattr
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:schedgetattr elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:schedthread
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:schedthread elapsed_ms=13
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:seccompexec
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:seccompexec elapsed_ms=14
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:selectnfds
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:selectnfds elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:selfraise
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:selfraise elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:semtimedop
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:semtimedop elapsed_ms=64
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:setgroupsroundtrip
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:setgroupsroundtrip elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:shared_buffer_mmap
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:shared_buffer_mmap elapsed_ms=65
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:shmnestedfork
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:shmnestedfork elapsed_ms=173
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:sigbadstack
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:sigbadstack elapsed_ms=29
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:siglongjmpaltstack
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:siglongjmpaltstack elapsed_ms=15
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:signalfdread
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:signalfdread elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:sigpipewrite
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:sigpipewrite elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:sigreenter
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:sigreenter elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:sigtimedwaitintr
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:sigtimedwaitintr elapsed_ms=1533
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:sigwaitblock
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:sigwaitblock elapsed_ms=134
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:sockbufreuseport
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:sockbufreuseport elapsed_ms=24
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:sockoptdomainproto
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:sockoptdomainproto elapsed_ms=16
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:splicematrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:splicematrix elapsed_ms=13
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:splicepipeempty
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:splicepipeempty elapsed_ms=320
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:statfdino
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:statfdino elapsed_ms=24
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:symlinkfollow
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:symlinkfollow elapsed_ms=15
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:syscallregpreserve
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:syscallregpreserve elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:sysvmsg
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:sysvmsg elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:sysvsem
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:sysvsem elapsed_ms=1336
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:telemetrymap
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:telemetrymap elapsed_ms=17
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:tgsigqueue
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:tgsigqueue elapsed_ms=12
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:threadrecycle
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:threadrecycle elapsed_ms=15
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:threadstatuscount
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:threadstatuscount elapsed_ms=171
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:tlsswitch
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:tlsswitch elapsed_ms=4023
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:traceexecstop
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:traceexecstop elapsed_ms=35
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:udpconnectunspec
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:udpconnectunspec elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:uffdpolicy
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:uffdpolicy elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:usernsisolation
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:usernsisolation elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:vdsogtod
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:vdsogtod elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:vforkpid
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:vforkpid elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:vmsplicepipe
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:vmsplicepipe elapsed_ms=10
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:waitidsiuid
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:waitidsiuid elapsed_ms=11
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:waitrestart
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:waitrestart elapsed_ms=135
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:writeseek
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:writeseek elapsed_ms=16
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:xsignal
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:xsignal elapsed_ms=65
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 65.50s
+
+test-signed: running /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4 generic_probe_shard_ --nocapture
+
+running 1 test
+test generic_probe_shard_0 ... RUN generic probe shard 0 aarch64-unknown-linux-musl:abortdeath
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:abortdeath elapsed_ms=50
+RUN generic probe shard 0 aarch64-unknown-linux-musl:accounting
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:accounting elapsed_ms=178
+RUN generic probe shard 0 aarch64-unknown-linux-musl:alarmretval
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:alarmretval elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:archiveflagmatrix
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:archiveflagmatrix elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-musl:bindunixnode
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:bindunixnode elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:bsd_signal_xlate
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:bsd_signal_xlate elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:capbsetisolation
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:capbsetisolation elapsed_ms=9
+RUN generic probe shard 0 aarch64-unknown-linux-musl:chmodsetgid
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:chmodsetgid elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:clocknanosleepcpu
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:clocknanosleepcpu elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:clone3exithandled
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:clone3exithandled elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:clonebasic
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:clonebasic elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:clonefilesexec
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:clonefilesexec elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-musl:clonestack
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:clonestack elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:connrefused
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:connrefused elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:coredumpfile
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:coredumpfile elapsed_ms=15
+RUN generic probe shard 0 aarch64-unknown-linux-musl:ctrel0
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:ctrel0 elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:dirdac
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:dirdac elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:dirrenamecache
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:dirrenamecache elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:dupclosestdin
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:dupclosestdin elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:epolletblockedhup
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:epolletblockedhup elapsed_ms=314
+RUN generic probe shard 0 aarch64-unknown-linux-musl:epolletpipeeof
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:epolletpipeeof elapsed_ms=21
+RUN generic probe shard 0 aarch64-unknown-linux-musl:epollinmemwake
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:epollinmemwake elapsed_ms=3022
+RUN generic probe shard 0 aarch64-unknown-linux-musl:epollpri
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:epollpri elapsed_ms=21
+RUN generic probe shard 0 aarch64-unknown-linux-musl:etchostnamefile
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:etchostnamefile elapsed_ms=15
+RUN generic probe shard 0 aarch64-unknown-linux-musl:execfailsurvive
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:execfailsurvive elapsed_ms=119
+RUN generic probe shard 0 aarch64-unknown-linux-musl:execpermitchurn
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:execpermitchurn elapsed_ms=18
+RUN generic probe shard 0 aarch64-unknown-linux-musl:execsocket
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:execsocket elapsed_ms=22
+RUN generic probe shard 0 aarch64-unknown-linux-musl:execvereset
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:execvereset elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-musl:exitstatus127
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:exitstatus127 elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:fanotifyondir
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:fanotifyondir elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:fcntlgetlk
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:fcntlgetlk elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:fcntlofdlock
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:fcntlofdlock elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:fcntlstdio
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:fcntlstdio elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:fdsemantics
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:fdsemantics elapsed_ms=13
+RUN generic probe shard 0 aarch64-unknown-linux-musl:fexecveprobe
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:fexecveprobe elapsed_ms=13
+RUN generic probe shard 0 aarch64-unknown-linux-musl:fifoforkeof
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:fifoforkeof elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:fileaccessmode
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:fileaccessmode elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:forkcow
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:forkcow elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:forkfault
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:forkfault elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:forkfpregs
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:forkfpregs elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:forkprotectexec
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:forkprotectexec elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-musl:forkshared
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:forkshared elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:forksnapshot
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:forksnapshot elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:fsescapeguard
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:fsescapeguard elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:fstatatflags
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:fstatatflags elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:futexdeadline
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:futexdeadline elapsed_ms=214
+RUN generic probe shard 0 aarch64-unknown-linux-musl:futexforkwakegroups
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:futexforkwakegroups elapsed_ms=72
+RUN generic probe shard 0 aarch64-unknown-linux-musl:futexpingpong
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:futexpingpong elapsed_ms=249
+RUN generic probe shard 0 aarch64-unknown-linux-musl:futexsharedto
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:futexsharedto elapsed_ms=515
+RUN generic probe shard 0 aarch64-unknown-linux-musl:futexwakeexact
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:futexwakeexact elapsed_ms=359
+RUN generic probe shard 0 aarch64-unknown-linux-musl:getrandomvdsofork
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:getrandomvdsofork elapsed_ms=22
+RUN generic probe shard 0 aarch64-unknown-linux-musl:hugepage
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:hugepage elapsed_ms=14
+RUN generic probe shard 0 aarch64-unknown-linux-musl:inotifyqueue
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:inotifyqueue elapsed_ms=29
+RUN generic probe shard 0 aarch64-unknown-linux-musl:inzonetcpclose
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:inzonetcpclose elapsed_ms=9
+RUN generic probe shard 0 aarch64-unknown-linux-musl:iopriovhangup
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:iopriovhangup elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:iouringsqpoll
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:iouringsqpoll elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:ipv6sendhoplimit
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:ipv6sendhoplimit elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:killfault
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:killfault elapsed_ms=631
+RUN generic probe shard 0 aarch64-unknown-linux-musl:killrt
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:killrt elapsed_ms=226
+RUN generic probe shard 0 aarch64-unknown-linux-musl:lchownsymlink
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:lchownsymlink elapsed_ms=21
+RUN generic probe shard 0 aarch64-unknown-linux-musl:lifecycleflagmatrix
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:lifecycleflagmatrix elapsed_ms=40
+RUN generic probe shard 0 aarch64-unknown-linux-musl:linuxsysinfo
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:linuxsysinfo elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-musl:ltpcheckpointexec
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:ltpcheckpointexec elapsed_ms=13
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mailboxregs
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mailboxregs elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mapfixedfork
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mapfixedfork elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mem
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mem elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:memfdsecret
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:memfdsecret elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:memmap
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:memmap elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mknoddevnode
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mknoddevnode elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mmapcage
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mmapcage elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mmapexecshared
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mmapexecshared elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mmapfileshare_mt
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mmapfileshare_mt elapsed_ms=9
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mmapprivfile
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mmapprivfile elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mmaptrimprotect
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mmaptrimprotect elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mmsgmatrix
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mmsgmatrix elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mqnotifycrossproc
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mqnotifycrossproc elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mremapfixedshared
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mremapfixedshared elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mremapsharedshrink
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mremapsharedshrink elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:msgoverflow
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:msgoverflow elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:mtidlesleep
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:mtidlesleep elapsed_ms=20014
+RUN generic probe shard 0 aarch64-unknown-linux-musl:nanosleeprem
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:nanosleeprem elapsed_ms=86
+RUN generic probe shard 0 aarch64-unknown-linux-musl:nativex18
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:nativex18 elapsed_ms=20
+RUN generic probe shard 0 aarch64-unknown-linux-musl:netifmcast
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:netifmcast elapsed_ms=14
+RUN generic probe shard 0 aarch64-unknown-linux-musl:newmountapi
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:newmountapi elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-musl:nsfsioctl
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:nsfsioctl elapsed_ms=13
+RUN generic probe shard 0 aarch64-unknown-linux-musl:oomscoreadj
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:oomscoreadj elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-musl:openat2valid
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:openat2valid elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-musl:openempty
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:openempty elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:overlaysymlink
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:overlaysymlink elapsed_ms=12
+RUN generic probe shard 0 aarch64-unknown-linux-musl:patherrno
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:patherrno elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:pidfdprocdir
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:pidfdprocdir elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:pidnsorphanreap
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:pidnsorphanreap elapsed_ms=111
+RUN generic probe shard 0 aarch64-unknown-linux-musl:pidtaskdomain
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:pidtaskdomain elapsed_ms=42
+RUN generic probe shard 0 aarch64-unknown-linux-musl:pipelargewrite
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:pipelargewrite elapsed_ms=167
+RUN generic probe shard 0 aarch64-unknown-linux-musl:pollevent
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:pollevent elapsed_ms=1091
+RUN generic probe shard 0 aarch64-unknown-linux-musl:prctldumpable
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:prctldumpable elapsed_ms=16
+RUN generic probe shard 0 aarch64-unknown-linux-musl:preadspecial
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:preadspecial elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-musl:preemptsigstorm
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:preemptsigstorm elapsed_ms=2518
+RUN generic probe shard 0 aarch64-unknown-linux-musl:procexeidentity
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:procexeidentity elapsed_ms=189
+RUN generic probe shard 0 aarch64-unknown-linux-musl:procladder_epollmgr
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:procladder_epollmgr elapsed_ms=2622
+RUN generic probe shard 0 aarch64-unknown-linux-musl:proclife
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:proclife elapsed_ms=182
+RUN generic probe shard 0 aarch64-unknown-linux-musl:procprctlview
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:procprctlview elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-musl:procselfpid
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:procselfpid elapsed_ms=9
+RUN generic probe shard 0 aarch64-unknown-linux-musl:procsignalmulti
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:procsignalmulti elapsed_ms=574
+RUN generic probe shard 0 aarch64-unknown-linux-musl:procstatussig
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:procstatussig elapsed_ms=22
+RUN generic probe shard 0 aarch64-unknown-linux-musl:ptracekillcont
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:ptracekillcont elapsed_ms=18
+RUN generic probe shard 0 aarch64-unknown-linux-musl:ptracesignalstop
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:ptracesignalstop elapsed_ms=370
+RUN generic probe shard 0 aarch64-unknown-linux-musl:ptyexitrescue
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:ptyexitrescue elapsed_ms=24
+RUN generic probe shard 0 aarch64-unknown-linux-musl:ptyflagmatrix
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:ptyflagmatrix elapsed_ms=18
+RUN generic probe shard 0 aarch64-unknown-linux-musl:ptyjobcontrol
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:ptyjobcontrol elapsed_ms=15
+RUN generic probe shard 0 aarch64-unknown-linux-musl:readwronly
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:readwronly elapsed_ms=9
+RUN generic probe shard 0 aarch64-unknown-linux-musl:recvmsgtrunc
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:recvmsgtrunc elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:rlimitasdata
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:rlimitasdata elapsed_ms=17
+RUN generic probe shard 0 aarch64-unknown-linux-musl:rlimitresource
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:rlimitresource elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:roprotect
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:roprotect elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:rtsigqueueinfo
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:rtsigqueueinfo elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:saresethand
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:saresethand elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:schedparam
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:schedparam elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:scmrightsfds
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:scmrightsfds elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:seekholedata
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:seekholedata elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:semctlrange
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:semctlrange elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:sendfilebadf
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:sendfilebadf elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:setidthreadchurn
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:setidthreadchurn elapsed_ms=38
+RUN generic probe shard 0 aarch64-unknown-linux-musl:sharedanonfutexfork
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:sharedanonfutexfork elapsed_ms=528
+RUN generic probe shard 0 aarch64-unknown-linux-musl:shmrdonly
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:shmrdonly elapsed_ms=25
+RUN generic probe shard 0 aarch64-unknown-linux-musl:signalexit
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:signalexit elapsed_ms=57
+RUN generic probe shard 0 aarch64-unknown-linux-musl:signals
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:signals elapsed_ms=13
+RUN generic probe shard 0 aarch64-unknown-linux-musl:sigstopjobcontrol
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:sigstopjobcontrol elapsed_ms=219
+RUN generic probe shard 0 aarch64-unknown-linux-musl:sigunblockpending
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:sigunblockpending elapsed_ms=20
+RUN generic probe shard 0 aarch64-unknown-linux-musl:sigwaitmatrix
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:sigwaitmatrix elapsed_ms=15
+RUN generic probe shard 0 aarch64-unknown-linux-musl:socketcredmore
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:socketcredmore elapsed_ms=521
+RUN generic probe shard 0 aarch64-unknown-linux-musl:sotimeo
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:sotimeo elapsed_ms=125
+RUN generic probe shard 0 aarch64-unknown-linux-musl:spliceunixpoll
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:spliceunixpoll elapsed_ms=143
+RUN generic probe shard 0 aarch64-unknown-linux-musl:statfslifetime
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:statfslifetime elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-musl:symlinkmknod
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:symlinkmknod elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:sysinfo
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:sysinfo elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:sysvmsgselect
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:sysvmsgselect elapsed_ms=9
+RUN generic probe shard 0 aarch64-unknown-linux-musl:sysvsemstat
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:sysvsemstat elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:termiosbits
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:termiosbits elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:threadbarrier
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:threadbarrier elapsed_ms=9
+RUN generic probe shard 0 aarch64-unknown-linux-musl:threadspawn
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:threadspawn elapsed_ms=418
+RUN generic probe shard 0 aarch64-unknown-linux-musl:timeschildren
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:timeschildren elapsed_ms=325
+RUN generic probe shard 0 aarch64-unknown-linux-musl:tmpfileatime
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:tmpfileatime elapsed_ms=9
+RUN generic probe shard 0 aarch64-unknown-linux-musl:tty0state
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:tty0state elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:udplitesock
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:udplitesock elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:unicodenorm
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:unicodenorm elapsed_ms=8
+RUN generic probe shard 0 aarch64-unknown-linux-musl:usernsmap
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:usernsmap elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:vdsosymbols
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:vdsosymbols elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:vforkvmshare
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:vforkvmshare elapsed_ms=7
+RUN generic probe shard 0 aarch64-unknown-linux-musl:waitidspec
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:waitidspec elapsed_ms=73
+RUN generic probe shard 0 aarch64-unknown-linux-musl:writevpartial
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:writevpartial elapsed_ms=15
+RUN generic probe shard 0 aarch64-unknown-linux-musl:xthreadsig
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-musl:xthreadsig elapsed_ms=111
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:abortdeath
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:abortdeath elapsed_ms=24
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:accounting
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:accounting elapsed_ms=182
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:alarmretval
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:alarmretval elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:archiveflagmatrix
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:archiveflagmatrix elapsed_ms=14
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:bindunixnode
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:bindunixnode elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:bsd_signal_xlate
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:bsd_signal_xlate elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:capbsetisolation
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:capbsetisolation elapsed_ms=12
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:chmodsetgid
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:chmodsetgid elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:clocknanosleepcpu
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:clocknanosleepcpu elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:clone3exithandled
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:clone3exithandled elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:clonebasic
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:clonebasic elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:clonefilesexec
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:clonefilesexec elapsed_ms=25
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:clonestack
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:clonestack elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:connrefused
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:connrefused elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:coredumpfile
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:coredumpfile elapsed_ms=73
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:ctrel0
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:ctrel0 elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:dirdac
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:dirdac elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:dirrenamecache
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:dirrenamecache elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:dupclosestdin
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:dupclosestdin elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:epolletblockedhup
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:epolletblockedhup elapsed_ms=320
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:epolletpipeeof
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:epolletpipeeof elapsed_ms=22
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:epollinmemwake
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:epollinmemwake elapsed_ms=3023
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:epollpri
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:epollpri elapsed_ms=28
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:etchostnamefile
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:etchostnamefile elapsed_ms=15
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:execfailsurvive
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:execfailsurvive elapsed_ms=115
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:execpermitchurn
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:execpermitchurn elapsed_ms=25
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:execsocket
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:execsocket elapsed_ms=27
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:execvereset
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:execvereset elapsed_ms=14
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:exitstatus127
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:exitstatus127 elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:fanotifyondir
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:fanotifyondir elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:fcntlgetlk
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:fcntlgetlk elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:fcntlofdlock
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:fcntlofdlock elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:fcntlstdio
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:fcntlstdio elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:fdsemantics
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:fdsemantics elapsed_ms=17
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:fexecveprobe
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:fexecveprobe elapsed_ms=18
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:fifoforkeof
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:fifoforkeof elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:fileaccessmode
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:fileaccessmode elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:forkcow
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:forkcow elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:forkfault
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:forkfault elapsed_ms=12
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:forkfpregs
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:forkfpregs elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:forkprotectexec
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:forkprotectexec elapsed_ms=14
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:forkshared
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:forkshared elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:forksnapshot
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:forksnapshot elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:fsescapeguard
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:fsescapeguard elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:fstatatflags
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:fstatatflags elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:futexdeadline
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:futexdeadline elapsed_ms=218
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:futexforkwakegroups
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:futexforkwakegroups elapsed_ms=82
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:futexpingpong
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:futexpingpong elapsed_ms=286
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:futexsharedto
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:futexsharedto elapsed_ms=519
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:futexwakeexact
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:futexwakeexact elapsed_ms=368
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:getrandomvdsofork
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:getrandomvdsofork elapsed_ms=27
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:hugepage
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:hugepage elapsed_ms=16
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:inotifyqueue
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:inotifyqueue elapsed_ms=30
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:inzonetcpclose
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:inzonetcpclose elapsed_ms=12
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:iopriovhangup
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:iopriovhangup elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:iouringsqpoll
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:iouringsqpoll elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:ipv6sendhoplimit
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:ipv6sendhoplimit elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:killfault
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:killfault elapsed_ms=636
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:killrt
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:killrt elapsed_ms=234
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:lchownsymlink
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:lchownsymlink elapsed_ms=25
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:lifecycleflagmatrix
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:lifecycleflagmatrix elapsed_ms=40
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:linuxsysinfo
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:linuxsysinfo elapsed_ms=12
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:ltpcheckpointexec
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:ltpcheckpointexec elapsed_ms=17
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mailboxregs
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mailboxregs elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mapfixedfork
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mapfixedfork elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mem
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mem elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:memfdsecret
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:memfdsecret elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:memmap
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:memmap elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mknoddevnode
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mknoddevnode elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mmapcage
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mmapcage elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mmapexecshared
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mmapexecshared elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mmapfileshare_mt
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mmapfileshare_mt elapsed_ms=13
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mmapprivfile
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mmapprivfile elapsed_ms=14
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mmaptrimprotect
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mmaptrimprotect elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mmsgmatrix
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mmsgmatrix elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mqnotifycrossproc
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mqnotifycrossproc elapsed_ms=16
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mremapfixedshared
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mremapfixedshared elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mremapsharedshrink
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mremapsharedshrink elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:msgoverflow
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:msgoverflow elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:mtidlesleep
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:mtidlesleep elapsed_ms=20021
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:nanosleeprem
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:nanosleeprem elapsed_ms=89
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:nativex18
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:nativex18 elapsed_ms=23
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:netifmcast
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:netifmcast elapsed_ms=14
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:newmountapi
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:newmountapi elapsed_ms=13
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:nsfsioctl
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:nsfsioctl elapsed_ms=14
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:oomscoreadj
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:oomscoreadj elapsed_ms=12
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:openat2valid
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:openat2valid elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:openempty
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:openempty elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:overlaysymlink
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:overlaysymlink elapsed_ms=14
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:patherrno
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:patherrno elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:pidfdprocdir
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:pidfdprocdir elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:pidnsorphanreap
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:pidnsorphanreap elapsed_ms=113
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:pidtaskdomain
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:pidtaskdomain elapsed_ms=45
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:pipelargewrite
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:pipelargewrite elapsed_ms=157
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:pollevent
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:pollevent elapsed_ms=1117
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:prctldumpable
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:prctldumpable elapsed_ms=23
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:preadspecial
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:preadspecial elapsed_ms=14
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:preemptsigstorm
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:preemptsigstorm elapsed_ms=2515
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:procexeidentity
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:procexeidentity elapsed_ms=207
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:procladder_epollmgr
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:procladder_epollmgr elapsed_ms=2625
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:proclife
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:proclife elapsed_ms=200
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:procprctlview
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:procprctlview elapsed_ms=28
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:procselfpid
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:procselfpid elapsed_ms=15
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:procsignalmulti
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:procsignalmulti elapsed_ms=609
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:procstatussig
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:procstatussig elapsed_ms=27
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:ptracekillcont
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:ptracekillcont elapsed_ms=19
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:ptracesignalstop
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:ptracesignalstop elapsed_ms=370
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:ptyexitrescue
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:ptyexitrescue elapsed_ms=31
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:ptyflagmatrix
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:ptyflagmatrix elapsed_ms=19
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:ptyjobcontrol
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:ptyjobcontrol elapsed_ms=18
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:readwronly
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:readwronly elapsed_ms=12
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:recvmsgtrunc
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:recvmsgtrunc elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:rlimitasdata
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:rlimitasdata elapsed_ms=19
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:rlimitresource
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:rlimitresource elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:roprotect
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:roprotect elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:rtsigqueueinfo
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:rtsigqueueinfo elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:saresethand
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:saresethand elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:schedparam
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:schedparam elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:scmrightsfds
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:scmrightsfds elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:seekholedata
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:seekholedata elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:semctlrange
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:semctlrange elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:sendfilebadf
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:sendfilebadf elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:setidthreadchurn
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:setidthreadchurn elapsed_ms=25
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:sharedanonfutexfork
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:sharedanonfutexfork elapsed_ms=533
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:shmrdonly
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:shmrdonly elapsed_ms=32
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:signalexit
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:signalexit elapsed_ms=58
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:signals
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:signals elapsed_ms=14
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:sigstopjobcontrol
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:sigstopjobcontrol elapsed_ms=224
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:sigunblockpending
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:sigunblockpending elapsed_ms=26
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:sigwaitmatrix
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:sigwaitmatrix elapsed_ms=17
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:socketcredmore
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:socketcredmore elapsed_ms=525
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:sotimeo
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:sotimeo elapsed_ms=131
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:spliceunixpoll
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:spliceunixpoll elapsed_ms=115
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:statfslifetime
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:statfslifetime elapsed_ms=12
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:symlinkmknod
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:symlinkmknod elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:sysinfo
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:sysinfo elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:sysvmsgselect
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:sysvmsgselect elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:sysvsemstat
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:sysvsemstat elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:termiosbits
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:termiosbits elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:threadbarrier
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:threadbarrier elapsed_ms=13
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:threadspawn
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:threadspawn elapsed_ms=420
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:timeschildren
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:timeschildren elapsed_ms=333
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:tmpfileatime
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:tmpfileatime elapsed_ms=11
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:tty0state
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:tty0state elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:udplitesock
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:udplitesock elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:unicodenorm
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:unicodenorm elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:usernsmap
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:usernsmap elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:vdsosymbols
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:vdsosymbols elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:vforkvmshare
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:vforkvmshare elapsed_ms=10
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:waitidspec
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:waitidspec elapsed_ms=79
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:writevpartial
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:writevpartial elapsed_ms=18
+RUN generic probe shard 0 aarch64-unknown-linux-gnu:xthreadsig
+PROBE ELAPSED generic probe shard 0 aarch64-unknown-linux-gnu:xthreadsig elapsed_ms=115
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 76.25s
+
+test-signed: running /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4 generic_probe_shard_ --nocapture
+
+running 1 test
+test generic_probe_shard_1 ... RUN generic probe shard 1 aarch64-unknown-linux-musl:acceptsock
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:acceptsock elapsed_ms=42
+RUN generic probe shard 1 aarch64-unknown-linux-musl:adjtimexmodel
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:adjtimexmodel elapsed_ms=14
+RUN generic probe shard 1 aarch64-unknown-linux-musl:aliassize
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:aliassize elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:bigallocfree
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:bigallocfree elapsed_ms=72
+RUN generic probe shard 1 aarch64-unknown-linux-musl:blockingpipewrite
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:blockingpipewrite elapsed_ms=1023
+RUN generic probe shard 1 aarch64-unknown-linux-musl:budget_two_proc
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:budget_two_proc elapsed_ms=21
+RUN generic probe shard 1 aarch64-unknown-linux-musl:childsubreaper
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:childsubreaper elapsed_ms=14
+RUN generic probe shard 1 aarch64-unknown-linux-musl:clockcoherence
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:clockcoherence elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-musl:clocksettimevdso
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:clocksettimevdso elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:clone3pidfdsig
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:clone3pidfdsig elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:cloneexithandled
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:cloneexithandled elapsed_ms=14
+RUN generic probe shard 1 aarch64-unknown-linux-musl:clonefileshare
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:clonefileshare elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:closedstdio
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:closedstdio elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:copyrangeflags
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:copyrangeflags elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:cpucount
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:cpucount elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:dentrycache
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:dentrycache elapsed_ms=15
+RUN generic probe shard 1 aarch64-unknown-linux-musl:dirfdnotdir
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:dirfdnotdir elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:dnotify
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:dnotify elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:epollclosenodel
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:epollclosenodel elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:epolletchildhup
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:epolletchildhup elapsed_ms=315
+RUN generic probe shard 1 aarch64-unknown-linux-musl:epollexclusive
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:epollexclusive elapsed_ms=239
+RUN generic probe shard 1 aarch64-unknown-linux-musl:epolloutrearm
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:epolloutrearm elapsed_ms=51
+RUN generic probe shard 1 aarch64-unknown-linux-musl:epollpwait
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:epollpwait elapsed_ms=327
+RUN generic probe shard 1 aarch64-unknown-linux-musl:eventfdsignalmatrix
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:eventfdsignalmatrix elapsed_ms=21
+RUN generic probe shard 1 aarch64-unknown-linux-musl:execfatalstatus
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:execfatalstatus elapsed_ms=19
+RUN generic probe shard 1 aarch64-unknown-linux-musl:execpipe
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:execpipe elapsed_ms=23
+RUN generic probe shard 1 aarch64-unknown-linux-musl:execthreads
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:execthreads elapsed_ms=17
+RUN generic probe shard 1 aarch64-unknown-linux-musl:exitgroupmainthreads
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:exitgroupmainthreads elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-musl:expectcontinue
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:expectcontinue elapsed_ms=1064
+RUN generic probe shard 1 aarch64-unknown-linux-musl:faultaddr
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:faultaddr elapsed_ms=21
+RUN generic probe shard 1 aarch64-unknown-linux-musl:fcntllease
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:fcntllease elapsed_ms=15
+RUN generic probe shard 1 aarch64-unknown-linux-musl:fcntlowner
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:fcntlowner elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-musl:fdceiling
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:fdceiling elapsed_ms=2092
+RUN generic probe shard 1 aarch64-unknown-linux-musl:fdstat
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:fdstat elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:fgetflcreate
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:fgetflcreate elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:fifonode
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:fifonode elapsed_ms=60
+RUN generic probe shard 1 aarch64-unknown-linux-musl:flocklock
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:flocklock elapsed_ms=29
+RUN generic probe shard 1 aarch64-unknown-linux-musl:forkexecpthread
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:forkexecpthread elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-musl:forkfiletable
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:forkfiletable elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:forkheapalloc
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:forkheapalloc elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:forkreadexitcow
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:forkreadexitcow elapsed_ms=29
+RUN generic probe shard 1 aarch64-unknown-linux-musl:forksigwalk
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:forksigwalk elapsed_ms=25
+RUN generic probe shard 1 aarch64-unknown-linux-musl:forksplicestage
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:forksplicestage elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:fsetfl
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:fsetfl elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:fsx
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:fsx elapsed_ms=71
+RUN generic probe shard 1 aarch64-unknown-linux-musl:futexprivatewakeexact
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:futexprivatewakeexact elapsed_ms=113
+RUN generic probe shard 1 aarch64-unknown-linux-musl:futexwaiterstates
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:futexwaiterstates elapsed_ms=138
+RUN generic probe shard 1 aarch64-unknown-linux-musl:getrandomflags
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:getrandomflags elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:getrandomvdsoloop
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:getrandomvdsoloop elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:icmp
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:icmp elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:inotifywrite
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:inotifywrite elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:inzonetcpoob
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:inzonetcpoob elapsed_ms=3025
+RUN generic probe shard 1 aarch64-unknown-linux-musl:iovecedge
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:iovecedge elapsed_ms=20
+RUN generic probe shard 1 aarch64-unknown-linux-musl:keydeny
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:keydeny elapsed_ms=14
+RUN generic probe shard 1 aarch64-unknown-linux-musl:killgroup
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:killgroup elapsed_ms=218
+RUN generic probe shard 1 aarch64-unknown-linux-musl:killtarget
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:killtarget elapsed_ms=20
+RUN generic probe shard 1 aarch64-unknown-linux-musl:legacyaio
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:legacyaio elapsed_ms=15
+RUN generic probe shard 1 aarch64-unknown-linux-musl:linkatflag
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:linkatflag elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-musl:loopbacksubnet
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:loopbacksubnet elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:lutimesym
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:lutimesym elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:maskfork
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:maskfork elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:memfdcreate
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:memfdcreate elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:memfdsharedcoherence
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:memfdsharedcoherence elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:mincoreedge
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:mincoreedge elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:mlock2
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:mlock2 elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:mmapcluster
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:mmapcluster elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-musl:mmapfile
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:mmapfile elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:mmapmunmap
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:mmapmunmap elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:mmapv8align
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:mmapv8align elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:mock_network_socket
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:mock_network_socket elapsed_ms=19
+RUN generic probe shard 1 aarch64-unknown-linux-musl:mqueue
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:mqueue elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:mremapgrow
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:mremapgrow elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:mremapshrink
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:mremapshrink elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-musl:msyncalign
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:msyncalign elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:mtsigrelease
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:mtsigrelease elapsed_ms=3219
+RUN generic probe shard 1 aarch64-unknown-linux-musl:nativebrk
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:nativebrk elapsed_ms=20
+RUN generic probe shard 1 aarch64-unknown-linux-musl:net
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:net elapsed_ms=16
+RUN generic probe shard 1 aarch64-unknown-linux-musl:netlink_route
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:netlink_route elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-musl:nicepriority
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:nicepriority elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:oappendroundtrip
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:oappendroundtrip elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:opathfd
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:opathfd elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:openbrokensymlinkcreate
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:openbrokensymlinkcreate elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:openexcldir
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:openexcldir elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:packetv3state
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:packetv3state elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-musl:pathflagmatrix
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:pathflagmatrix elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-musl:pauseinterrupt2
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:pauseinterrupt2 elapsed_ms=18
+RUN generic probe shard 1 aarch64-unknown-linux-musl:pidnsroot
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:pidnsroot elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:pipeblockedge
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:pipeblockedge elapsed_ms=167
+RUN generic probe shard 1 aarch64-unknown-linux-musl:pipemass
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:pipemass elapsed_ms=677
+RUN generic probe shard 1 aarch64-unknown-linux-musl:ppollunblock
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:ppollunblock elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:prctlerrors
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:prctlerrors elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:preadv2flags
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:preadv2flags elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:procconfigloop
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:procconfigloop elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:procid
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:procid elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:procladder_mixed
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:procladder_mixed elapsed_ms=2618
+RUN generic probe shard 1 aarch64-unknown-linux-musl:procpeerdir
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:procpeerdir elapsed_ms=224
+RUN generic probe shard 1 aarch64-unknown-linux-musl:procselfdir
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:procselfdir elapsed_ms=15
+RUN generic probe shard 1 aarch64-unknown-linux-musl:procselfstatleader
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:procselfstatleader elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-musl:procstat
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:procstat elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:proctaskchild
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:proctaskchild elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-musl:ptraceattach
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:ptraceattach elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:ptracesequence
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:ptracesequence elapsed_ms=1467
+RUN generic probe shard 1 aarch64-unknown-linux-musl:ptracestop
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:ptracestop elapsed_ms=29
+RUN generic probe shard 1 aarch64-unknown-linux-musl:ptyfionbio
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:ptyfionbio elapsed_ms=14
+RUN generic probe shard 1 aarch64-unknown-linux-musl:ptyforkreopen
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:ptyforkreopen elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-musl:ptypair
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:ptypair elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:recursionguard
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:recursionguard elapsed_ms=13
+RUN generic probe shard 1 aarch64-unknown-linux-musl:renameexchange
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:renameexchange elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:rlimitnofile
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:rlimitnofile elapsed_ms=15
+RUN generic probe shard 1 aarch64-unknown-linux-musl:rlimitroundtrip
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:rlimitroundtrip elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:roreadwrite
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:roreadwrite elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:rtsigqueueinfoxthread
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:rtsigqueueinfoxthread elapsed_ms=12
+RUN generic probe shard 1 aarch64-unknown-linux-musl:schedaffinitysibling
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:schedaffinitysibling elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-musl:schedprio
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:schedprio elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:seccompenforce
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:seccompenforce elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:seekholemap
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:seekholemap elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:selfhostnameresolve
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:selfhostnameresolve elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:semgetnsems
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:semgetnsems elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:setfsid
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:setfsid elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:setpgidparentgroup
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:setpgidparentgroup elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:shmlinkat
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:shmlinkat elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:sigactionresetinfo
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:sigactionresetinfo elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:siginfo
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:siginfo elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:signalfd4
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:signalfd4 elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:sigpairrace
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:sigpairrace elapsed_ms=514
+RUN generic probe shard 1 aarch64-unknown-linux-musl:sigqueueusr1
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:sigqueueusr1 elapsed_ms=23
+RUN generic probe shard 1 aarch64-unknown-linux-musl:sigsuspendxthread
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:sigsuspendxthread elapsed_ms=125
+RUN generic probe shard 1 aarch64-unknown-linux-musl:sigwaitalarm
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:sigwaitalarm elapsed_ms=1063
+RUN generic probe shard 1 aarch64-unknown-linux-musl:sigwaitthread
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:sigwaitthread elapsed_ms=226
+RUN generic probe shard 1 aarch64-unknown-linux-musl:socketpartialsend
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:socketpartialsend elapsed_ms=110
+RUN generic probe shard 1 aarch64-unknown-linux-musl:spawnflagmatrix
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:spawnflagmatrix elapsed_ms=15
+RUN generic probe shard 1 aarch64-unknown-linux-musl:splicepipe
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:splicepipe elapsed_ms=7
+RUN generic probe shard 1 aarch64-unknown-linux-musl:stackgrowmain
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:stackgrowmain elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:streamdestmatrix
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:streamdestmatrix elapsed_ms=219
+RUN generic probe shard 1 aarch64-unknown-linux-musl:syncfilerange
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:syncfilerange elapsed_ms=21
+RUN generic probe shard 1 aarch64-unknown-linux-musl:syslogstate
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:syslogstate elapsed_ms=16
+RUN generic probe shard 1 aarch64-unknown-linux-musl:sysvmsgwake
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:sysvmsgwake elapsed_ms=118
+RUN generic probe shard 1 aarch64-unknown-linux-musl:sysvshm
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:sysvshm elapsed_ms=20
+RUN generic probe shard 1 aarch64-unknown-linux-musl:termiosflow
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:termiosflow elapsed_ms=837
+RUN generic probe shard 1 aarch64-unknown-linux-musl:threadcommname
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:threadcommname elapsed_ms=25
+RUN generic probe shard 1 aarch64-unknown-linux-musl:threadstatstate
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:threadstatstate elapsed_ms=16
+RUN generic probe shard 1 aarch64-unknown-linux-musl:tmpfilewrite
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:tmpfilewrite elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-musl:ttyencoding
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:ttyencoding elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-musl:udpreuseaddr
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:udpreuseaddr elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:unlinkatbindmount
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:unlinkatbindmount elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-musl:usernswrite
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:usernswrite elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:vfs_mount_rw
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:vfs_mount_rw elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:waitidcputime
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:waitidcputime elapsed_ms=238
+RUN generic probe shard 1 aarch64-unknown-linux-musl:waitpgid
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:waitpgid elapsed_ms=8
+RUN generic probe shard 1 aarch64-unknown-linux-musl:xprocsigign
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:xprocsigign elapsed_ms=516
+RUN generic probe shard 1 aarch64-unknown-linux-musl:zerolenio
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-musl:zerolenio elapsed_ms=21
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:acceptsock
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:acceptsock elapsed_ms=19
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:adjtimexmodel
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:adjtimexmodel elapsed_ms=13
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:aliassize
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:aliassize elapsed_ms=12
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:bigallocfree
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:bigallocfree elapsed_ms=32
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:blockingpipewrite
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:blockingpipewrite elapsed_ms=1026
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:budget_two_proc
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:budget_two_proc elapsed_ms=28
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:childsubreaper
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:childsubreaper elapsed_ms=17
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:clockcoherence
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:clockcoherence elapsed_ms=12
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:clocksettimevdso
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:clocksettimevdso elapsed_ms=12
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:clone3pidfdsig
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:clone3pidfdsig elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:cloneexithandled
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:cloneexithandled elapsed_ms=19
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:clonefileshare
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:clonefileshare elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:closedstdio
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:closedstdio elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:copyrangeflags
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:copyrangeflags elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:cpucount
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:cpucount elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:dentrycache
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:dentrycache elapsed_ms=16
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:dirfdnotdir
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:dirfdnotdir elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:dnotify
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:dnotify elapsed_ms=14
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:epollclosenodel
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:epollclosenodel elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:epolletchildhup
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:epolletchildhup elapsed_ms=318
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:epollexclusive
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:epollexclusive elapsed_ms=245
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:epolloutrearm
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:epolloutrearm elapsed_ms=52
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:epollpwait
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:epollpwait elapsed_ms=327
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:eventfdsignalmatrix
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:eventfdsignalmatrix elapsed_ms=20
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:execfatalstatus
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:execfatalstatus elapsed_ms=17
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:execpipe
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:execpipe elapsed_ms=27
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:execthreads
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:execthreads elapsed_ms=22
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:exitgroupmainthreads
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:exitgroupmainthreads elapsed_ms=12
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:expectcontinue
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:expectcontinue elapsed_ms=1045
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:faultaddr
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:faultaddr elapsed_ms=26
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:fcntllease
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:fcntllease elapsed_ms=15
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:fcntlowner
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:fcntlowner elapsed_ms=12
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:fdceiling
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:fdceiling elapsed_ms=2104
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:fdstat
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:fdstat elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:fgetflcreate
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:fgetflcreate elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:fifonode
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:fifonode elapsed_ms=62
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:flocklock
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:flocklock elapsed_ms=65
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:forkexecpthread
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:forkexecpthread elapsed_ms=15
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:forkfiletable
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:forkfiletable elapsed_ms=12
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:forkheapalloc
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:forkheapalloc elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:forkreadexitcow
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:forkreadexitcow elapsed_ms=38
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:forksigwalk
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:forksigwalk elapsed_ms=32
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:forksplicestage
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:forksplicestage elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:fsetfl
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:fsetfl elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:fsx
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:fsx elapsed_ms=78
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:futexprivatewakeexact
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:futexprivatewakeexact elapsed_ms=116
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:futexwaiterstates
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:futexwaiterstates elapsed_ms=145
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:getrandomflags
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:getrandomflags elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:getrandomvdsoloop
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:getrandomvdsoloop elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:icmp
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:icmp elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:inotifywrite
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:inotifywrite elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:inzonetcpoob
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:inzonetcpoob elapsed_ms=3028
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:iovecedge
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:iovecedge elapsed_ms=26
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:keydeny
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:keydeny elapsed_ms=16
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:killgroup
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:killgroup elapsed_ms=221
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:killtarget
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:killtarget elapsed_ms=24
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:legacyaio
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:legacyaio elapsed_ms=15
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:linkatflag
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:linkatflag elapsed_ms=14
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:loopbacksubnet
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:loopbacksubnet elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:lutimesym
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:lutimesym elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:maskfork
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:maskfork elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:memfdcreate
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:memfdcreate elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:memfdsharedcoherence
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:memfdsharedcoherence elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:mincoreedge
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:mincoreedge elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:mlock2
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:mlock2 elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:mmapcluster
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:mmapcluster elapsed_ms=15
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:mmapfile
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:mmapfile elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:mmapmunmap
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:mmapmunmap elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:mmapv8align
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:mmapv8align elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:mock_network_socket
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:mock_network_socket elapsed_ms=21
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:mqueue
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:mqueue elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:mremapgrow
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:mremapgrow elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:mremapshrink
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:mremapshrink elapsed_ms=17
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:msyncalign
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:msyncalign elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:mtsigrelease
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:mtsigrelease elapsed_ms=3225
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:nativebrk
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:nativebrk elapsed_ms=26
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:net
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:net elapsed_ms=16
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:netlink_route
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:netlink_route elapsed_ms=12
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:nicepriority
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:nicepriority elapsed_ms=12
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:oappendroundtrip
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:oappendroundtrip elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:opathfd
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:opathfd elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:openbrokensymlinkcreate
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:openbrokensymlinkcreate elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:openexcldir
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:openexcldir elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:packetv3state
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:packetv3state elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:pathflagmatrix
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:pathflagmatrix elapsed_ms=14
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:pauseinterrupt2
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:pauseinterrupt2 elapsed_ms=33
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:pidnsroot
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:pidnsroot elapsed_ms=12
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:pipeblockedge
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:pipeblockedge elapsed_ms=171
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:pipemass
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:pipemass elapsed_ms=677
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:ppollunblock
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:ppollunblock elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:prctlerrors
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:prctlerrors elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:preadv2flags
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:preadv2flags elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:procconfigloop
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:procconfigloop elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:procid
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:procid elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:procladder_mixed
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:procladder_mixed elapsed_ms=2623
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:procpeerdir
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:procpeerdir elapsed_ms=229
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:procselfdir
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:procselfdir elapsed_ms=21
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:procselfstatleader
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:procselfstatleader elapsed_ms=14
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:procstat
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:procstat elapsed_ms=12
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:proctaskchild
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:proctaskchild elapsed_ms=13
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:ptraceattach
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:ptraceattach elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:ptracesequence
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:ptracesequence elapsed_ms=1497
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:ptracestop
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:ptracestop elapsed_ms=38
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:ptyfionbio
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:ptyfionbio elapsed_ms=16
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:ptyforkreopen
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:ptyforkreopen elapsed_ms=15
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:ptypair
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:ptypair elapsed_ms=13
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:recursionguard
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:recursionguard elapsed_ms=16
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:renameexchange
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:renameexchange elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:rlimitnofile
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:rlimitnofile elapsed_ms=18
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:rlimitroundtrip
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:rlimitroundtrip elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:roreadwrite
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:roreadwrite elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:rtsigqueueinfoxthread
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:rtsigqueueinfoxthread elapsed_ms=20
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:schedaffinitysibling
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:schedaffinitysibling elapsed_ms=13
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:schedprio
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:schedprio elapsed_ms=9
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:seccompenforce
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:seccompenforce elapsed_ms=13
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:seekholemap
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:seekholemap elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:selfhostnameresolve
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:selfhostnameresolve elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:semgetnsems
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:semgetnsems elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:setfsid
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:setfsid elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:setpgidparentgroup
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:setpgidparentgroup elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:shmlinkat
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:shmlinkat elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:sigactionresetinfo
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:sigactionresetinfo elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:siginfo
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:siginfo elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:signalfd4
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:signalfd4 elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:sigpairrace
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:sigpairrace elapsed_ms=516
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:sigqueueusr1
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:sigqueueusr1 elapsed_ms=16
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:sigsuspendxthread
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:sigsuspendxthread elapsed_ms=122
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:sigwaitalarm
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:sigwaitalarm elapsed_ms=1062
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:sigwaitthread
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:sigwaitthread elapsed_ms=233
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:socketpartialsend
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:socketpartialsend elapsed_ms=90
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:spawnflagmatrix
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:spawnflagmatrix elapsed_ms=20
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:splicepipe
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:splicepipe elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:stackgrowmain
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:stackgrowmain elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:streamdestmatrix
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:streamdestmatrix elapsed_ms=222
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:syncfilerange
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:syncfilerange elapsed_ms=25
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:syslogstate
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:syslogstate elapsed_ms=15
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:sysvmsgwake
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:sysvmsgwake elapsed_ms=118
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:sysvshm
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:sysvshm elapsed_ms=24
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:termiosflow
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:termiosflow elapsed_ms=840
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:threadcommname
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:threadcommname elapsed_ms=29
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:threadstatstate
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:threadstatstate elapsed_ms=20
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:tmpfilewrite
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:tmpfilewrite elapsed_ms=13
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:ttyencoding
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:ttyencoding elapsed_ms=12
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:udpreuseaddr
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:udpreuseaddr elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:unlinkatbindmount
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:unlinkatbindmount elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:usernswrite
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:usernswrite elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:vfs_mount_rw
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:vfs_mount_rw elapsed_ms=11
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:waitidcputime
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:waitidcputime elapsed_ms=240
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:waitpgid
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:waitpgid elapsed_ms=10
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:xprocsigign
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:xprocsigign elapsed_ms=521
+RUN generic probe shard 1 aarch64-unknown-linux-gnu:zerolenio
+PROBE ELAPSED generic probe shard 1 aarch64-unknown-linux-gnu:zerolenio elapsed_ms=27
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 45.72s
+
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.noent.45943: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.noent.45943
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.06s
+
+remaining carrick procs (run-id discard-edges-probes-final-20260922) = 0
+remaining carrick procs (run-id discard-edges-probes-final-20260922-cli) = 0
+test-signed: receipt target/test-results/carrick-conformance-next-signed-artifacts.jsonl
+test-signed: OK (carrick-conformance-next: 3 invoked signed executable(s) passed, 19 signed, negative control passed)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.13s
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/signal_lease_gap-cbe70567e390ca19.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/signal_lease_gap-cbe70567e390ca19.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/signal_lease_gap-cbe70567e390ca19
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a.tmp.47079
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a.tmp.47079: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a
+test-signed: running /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda case_ --nocapture
+
+running 24 tests
+test case_01_exit_status_propagation ... ok
+test case_02_pid_namespace_root_getpid ... ok
+test case_03_uname_architecture ... ok
+test case_04_id_root_credentials ... ok
+test case_05_getcwd_and_mkdir_chdir ... ok
+test case_06_pipe_interprocess_communication ... ok
+test case_07_symlink_and_readlink ... ok
+test case_08_hardlink_creation_and_contents ... ok
+test case_09_file_permission_chmod_and_stat ... ok
+test case_10_file_truncation_truncate ... ok
+test case_11_stream_separation ... ok
+test case_12_fd_redirection_and_close ... ok
+test case_13_dpkg_print_architecture ... ok
+test case_14_mkdir_chdir ... ok
+test case_15_access_root_permissions ... ok
+test case_16_readdir_created_file ... ok
+test case_17_file_rename_and_absence ... ok
+test case_18_file_stat_format ... ok
+test case_19_file_copy_range ... ok
+test case_20_file_append_redirection ... ok
+test case_21_mkdir_and_rmdir ... ok
+test case_22_exit_zero_contract ... ok
+test case_23_exit_one_contract ... ok
+test case_24_stdout_only_contract ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.31s
+
+test-signed: running /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d case_ --nocapture
+
+running 1 test
+test case_private_file_cow_lanes_preserve_file_visibility_and_fork_isolation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.17s
+
+test-signed: running /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a case_ --nocapture
+
+running 6 tests
+test case_immutable_private_file_preserves_source_fork_and_discard ... ok
+test case_private_file_discard_retains_source_across_fd_close_and_remap ... ok
+test case_private_file_discard_shifted_named_restores_clean_visibility ... ok
+test case_private_file_discard_shifted_private_destination ... ok
+test case_private_file_discard_shifted_restores_clean_visibility ... ok
+test case_private_file_exec_discard_preserves_header ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.48s
+
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.noent.47079: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.noent.47079
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.06s
+
+remaining carrick procs (run-id discard-edges-probes-final-20260922) = 0
+remaining carrick procs (run-id discard-edges-probes-final-20260922-cli) = 0
+test-signed: receipt target/test-results/carrick-conformance-next-signed-artifacts.jsonl
+test-signed: OK (carrick-conformance-next: 3 invoked signed executable(s) passed, 19 signed, negative control passed)
+   Compiling carrick-cli v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.63s
+     Running tests/conformance_cli_contract.rs (target/debug/deps/conformance_cli_contract-dd729924ab7f2ea6)
+
+running 1 test
+PASS  exit_zero (exit=0)
+PASS  exit_one (exit=1)
+PASS  exit_42 (exit=42)
+PASS  stdout_only (exit=0)
+PASS  stream_separation (exit=3)
+test conformance_default_run_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 1.49s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running tests/conformance.rs (target/debug/deps/conformance-d0b56f2f3ea895c9)
+
+running 47 tests
+test bless_probe_oracle ... ignored, bless step: writes the committed probe-oracle cache from live Docker
+test bridge_probe_args_enable_bridge ... ok
+test bridge_publish_probe_args_enable_bridge_and_publish ... ok
+test clone_files_probes_run_without_container_seccomp ... ok
+test closure_generic_terminal_status_rejects_excuses_and_separates_errors ... ok
+test clock_settime_probe_is_granted_cap_sys_time_on_both_sides ... ok
+test closure_dedicated_scenarios_select_both_arm64_libc_artifact_sets ... ok
+test closure_requires_macos_arm64_runnable_host_and_both_executed_sets ... ok
+test cached_mailbox_register_oracle_matches_its_source ... ok
+test cached_probe_oracle_output_is_normalized ... ok
+test closure_gates_arm64_musl_and_gnu_and_rejects_skips ... ok
+test closure_probe_inventory_enforces_authoritative_runners_and_denominator ... ok
+test conformance_bridge_compose_pair ... ok
+test conformance_bridge_dns_epoll_wake ... ok
+test conformance_bridge_loopback_isolation ... ok
+test conformance_bridge_net_identity ... ok
+test conformance_bridge_publish_tcp ... ok
+test conformance_bridge_reuse_sockopts ... ok
+test conformance_bridge_tcp_nonblocking_refused ... ok
+test docker_bridge_publish_probe_args_publish_before_image ... ok
+test conformance_bridge_tcp_peer ... ok
+test excuse_fingerprint_lookup_misses_when_unrecorded ... ok
+test excused_probe_outcome_fingerprint_guard ... ok
+test failure_record_assembly ... ok
+test failure_record_exit_status_formatting ... ok
+test failure_record_stderr_tail_formatting ... ok
+test failure_record_stdout_status_formatting ... ok
+test native_musl_probe_campaign_uses_direct_elf_transport ... ok
+test native_probe_campaign_selects_only_same_isa_lane ... ok
+test native_probe_campaign_uses_pie_artifacts ... ok
+test probe_campaign_libc_filter_selects_exact_set ... ok
+test probe_campaign_name_filter_selects_requested_cases ... ok
+test probe_gates_decision_allowlist_logic ... ok
+test probe_oracle_entry_roundtrip ... ok
+test probe_workers_default_preserves_auto_parallelism ... ok
+test probe_workers_explicit_one_serializes_the_lane ... ok
+test probe_workers_explicit_values_are_clamped_to_the_supported_range ... ok
+test probe_workers_rejects_non_numeric_values ... ok
+test conformance_bridge_udp_connected_unreachable ... ok
+test conformance_bridge_udp_peer ... ok
+test conformance_bridge_udp_sendto_unreachable ... ok
+SKIP conformance_native_host_gateway: native backend not requested
+test conformance_container_gate ... ok
+SKIP conformance_native_multi_network_roles: native backend not requested
+test conformance_native_host_gateway ... ok
+SKIP conformance_native_udp_service_pair: native backend not requested
+test conformance_native_multi_network_roles ... ok
+test conformance_native_udp_service_pair ... ok
+PASS arm64:musl:clockgetres
+PASS arm64:musl:execfromthread
+PASS arm64:musl:futexextra
+PASS arm64:musl:futexghost
+PASS arm64:musl:futexrequeue
+PASS arm64:musl:futexshare
+PASS arm64:musl:futexsharedalias
+PASS arm64:musl:futexwakecount
+PASS arm64:musl:iouring
+PASS arm64:musl:iouringenterflag
+PASS arm64:musl:itimer
+PASS arm64:musl:kernelidentity
+PASS arm64:musl:mmapfileforkwriteback
+PASS arm64:musl:mmaprecl
+PASS arm64:musl:netpoll
+PASS arm64:musl:pauseeintr
+PASS arm64:musl:pidnsinitreap
+PASS arm64:musl:posixtimers
+PASS arm64:musl:ppollsig
+PASS arm64:musl:ppollwaitset
+PASS arm64:musl:pselecteintr
+PASS arm64:musl:selecttimeout
+PASS arm64:musl:sigchld
+PASS arm64:musl:sigprofvdso
+PASS arm64:musl:splicenetpoll
+PASS arm64:musl:timeclock
+PASS arm64:musl:timeextra
+PASS arm64:musl:timersettimeabs
+PASS arm64:musl:tlbibroadcast
+PASS arm64:musl:vforkexecthread
+PASS arm64:musl:waitexitstorm
+PASS arm64:musl:waitsiblingsigchld
+PASS arm64:musl:windowcoherence
+test conformance_probes has been running for over 60 seconds
+test docker_compose_shared_network_namespace_smoke has been running for over 60 seconds
+PASS arm64:gnu:clockgetres
+PASS arm64:gnu:execfromthread
+PASS arm64:gnu:futexextra
+PASS arm64:gnu:futexghost
+PASS arm64:gnu:futexrequeue
+PASS arm64:gnu:futexshare
+PASS arm64:gnu:futexsharedalias
+PASS arm64:gnu:futexwakecount
+PASS arm64:gnu:iouring
+PASS arm64:gnu:iouringenterflag
+PASS arm64:gnu:itimer
+PASS arm64:gnu:kernelidentity
+PASS arm64:gnu:mmapfileforkwriteback
+PASS arm64:gnu:mmaprecl
+PASS arm64:gnu:netpoll
+PASS arm64:gnu:pauseeintr
+PASS arm64:gnu:pidnsinitreap
+PASS arm64:gnu:posixtimers
+PASS arm64:gnu:ppollsig
+PASS arm64:gnu:ppollwaitset
+PASS arm64:gnu:pselecteintr
+PASS arm64:gnu:selecttimeout
+PASS arm64:gnu:sigchld
+PASS arm64:gnu:sigprofvdso
+PASS arm64:gnu:splicenetpoll
+PASS arm64:gnu:timeclock
+PASS arm64:gnu:timeextra
+PASS arm64:gnu:timersettimeabs
+PASS arm64:gnu:tlbibroadcast
+PASS arm64:gnu:vforkexecthread
+PASS arm64:gnu:waitexitstorm
+PASS arm64:gnu:waitsiblingsigchld
+PASS arm64:gnu:windowcoherence
+SUMMARY arm64:gnu (report-only): 0/33 probes DIFF from Linux
+SKIP conformance_probes[amd64:musl]: probes not built (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/conformance-probes/target/x86_64-unknown-linux-musl/release)
+SKIP conformance_probes[amd64:gnu]: probes not built (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/conformance-probes/target/x86_64-unknown-linux-gnu/release)
+test conformance_probes ... ok
+test docker_compose_shared_network_namespace_smoke ... ok
+
+test result: ok. 46 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 89.84s
+

@@ -1,0 +1,31 @@
+2026-09-22T22:28:05.346082Z  WARN carrick::commands: carrick trace: not root; re-executing under sudo
+TRACECHILD1|euid=501|egid=20|groups=12,20,33,61,79,80,81,98,100,204,250,395,398,399,400,701
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_inompI3e8 as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 03m 00s
+../../../../include/tst_fuzzy_sync.h:484: TINFO: Minimum sampling period ended
+../../../../include/tst_fuzzy_sync.h:307: TINFO: loop = 1024, delay_bias = 0
+../../../../include/tst_fuzzy_sync.h:295: TINFO: start_a - start_b: { avg =   -78ns, avg_dev =    22ns, dev_ratio = 0.29 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - start_a  : { avg =  3057ns, avg_dev =    69ns, dev_ratio = 0.02 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: end_b - start_b  : { avg =  2903ns, avg_dev =    93ns, dev_ratio = 0.03 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - end_b    : { avg =    75ns, avg_dev =    86ns, dev_ratio = 1.14 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: spins            : { avg =   183  , avg_dev =    52  , dev_ratio = 0.29 }
+../../../../include/tst_fuzzy_sync.h:494: TINFO: Reached deviation ratios < 0.10, introducing randomness
+../../../../include/tst_fuzzy_sync.h:497: TINFO: Delay range is [-3512, 3871]
+../../../../include/tst_fuzzy_sync.h:307: TINFO: loop = 1459, delay_bias = 0
+../../../../include/tst_fuzzy_sync.h:295: TINFO: start_a - start_b: { avg =   -80ns, avg_dev =     8ns, dev_ratio = 0.10 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - start_a  : { avg =  3002ns, avg_dev =    12ns, dev_ratio = 0.00 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: end_b - start_b  : { avg =  2723ns, avg_dev =    23ns, dev_ratio = 0.01 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: end_a - end_b    : { avg =   198ns, avg_dev =    18ns, dev_ratio = 0.09 }
+../../../../include/tst_fuzzy_sync.h:295: TINFO: spins            : { avg =   256  , avg_dev =    24  , dev_ratio = 0.09 }
+../../../../include/tst_fuzzy_sync.h:654: TINFO: Exceeded execution loops, requesting exit
+inotify09.c:90: TPASS: kernel survived inotify beating
+
+Summary:
+passed   1
+failed   0
+broken   0
+skipped  0
+warnings 0

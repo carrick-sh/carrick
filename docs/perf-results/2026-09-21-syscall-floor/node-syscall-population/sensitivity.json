@@ -1,0 +1,13 @@
+{
+  "basis": "Single complete five-iteration traced census, includes shell work; not a latency attribution or timing sample",
+  "host_serviced_calls_per_iteration": 2183.2,
+  "hypothetical_savings_ms": {
+    "0.5": 1.0916,
+    "1": 2.1832,
+    "2": 4.3664
+  },
+  "prior_candidate_mean_ms": 245.5,
+  "prior_linux_mean_ms": 56.0,
+  "prior_raw_gap_ms": 189.5,
+  "uniform_savings_us_per_call_to_cover_prior_gap": 86.79919384389888
+}

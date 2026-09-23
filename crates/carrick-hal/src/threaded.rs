@@ -351,7 +351,10 @@ struct VcpuRegistryState {
     next_freeze_generation: u64,
     next_enrollment: u64,
     next_kernel_wake_generation: u64,
-    kernel_wake_debts: HashMap<ThreadId, u64>,
+    // Logical membership outlives temporary physical lease unregistration.
+    // None means acknowledged, not retired; publication during a lease gap
+    // must still leave debt for this exact thread's next registration.
+    kernel_wake_debts: HashMap<ThreadId, Option<u64>>,
 }
 
 impl Default for VcpuRegistryState {
@@ -592,7 +595,7 @@ impl VcpuRegistry for GenericVcpuRegistry {
                     },
                 };
             }
-            let inherited_kernel_wake = state.kernel_wake_debts.get(&tid).copied();
+            let inherited_kernel_wake = *state.kernel_wake_debts.entry(tid).or_default();
             let enrollment = state.next_enrollment;
             state.next_enrollment = state.next_enrollment.checked_add(1).unwrap_or_else(|| {
                 carrick_fatal!("hal::kernel_wake", "vCPU enrollment generation exhausted")
@@ -703,9 +706,8 @@ impl VcpuRegistry for GenericVcpuRegistry {
         for entry in state.vcpus.values_mut() {
             entry.kernel_wake_generation = Some(generation);
         }
-        let tids: Vec<_> = state.vcpus.keys().copied().collect();
-        for tid in tids {
-            state.kernel_wake_debts.insert(tid, generation);
+        for debt in state.kernel_wake_debts.values_mut() {
+            *debt = Some(generation);
         }
     }
 
@@ -742,8 +744,10 @@ impl VcpuRegistry for GenericVcpuRegistry {
             && entry.kernel_wake_generation == Some(debt.generation)
         {
             entry.kernel_wake_generation = None;
-            if state.kernel_wake_debts.get(&tid) == Some(&debt.generation) {
-                state.kernel_wake_debts.remove(&tid);
+            if let Some(pending) = state.kernel_wake_debts.get_mut(&tid)
+                && *pending == Some(debt.generation)
+            {
+                *pending = None;
             }
         }
     }
@@ -1133,6 +1137,44 @@ mod generic_registry_tests {
             vec![(blocker, true), (coordinator, false)],
             "the timeout diagnostic must read the same authority as the predicate"
         );
+    }
+
+    #[test]
+    fn kernel_wake_published_during_lease_gap_survives_rebind() {
+        for scale in [1, 8, 32, 128] {
+            let r = GenericVcpuRegistry::new();
+            let a = t(1);
+            let flag = InGuestFlag::for_guest_thread();
+            register_for_test(&r, a, noop(), &flag);
+            for _ in 0..scale {
+                r.unregister(a);
+                r.publish_kernel_wake_debt();
+                register_for_test(&r, a, noop(), &flag);
+                let debt = r
+                    .kernel_wake_debt_for(a)
+                    .expect("a live thread must retain wakes published without a physical lease");
+                r.acknowledge_kernel_wake_debt(a, debt);
+                assert_eq!(r.kernel_wake_debt_for(a), None);
+                assert_eq!(
+                    r.lock().kernel_wake_debts.len(),
+                    1,
+                    "lease cycling retains one record per logical thread"
+                );
+            }
+            r.unregister(a);
+            r.retire_kernel_wake_debt(a);
+            assert!(
+                r.lock().kernel_wake_debts.is_empty(),
+                "logical retirement must release its wake record"
+            );
+            r.publish_kernel_wake_debt();
+            register_for_test(&r, a, noop(), &flag);
+            assert_eq!(
+                r.kernel_wake_debt_for(a),
+                None,
+                "retired identities must not collect future wake debt"
+            );
+        }
     }
 
     #[test]

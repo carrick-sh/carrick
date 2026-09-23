@@ -1,0 +1,15 @@
+{
+  "README.md": "c3c83048fa8ae00ea609a3a7ac12c14d7c5e7c25c85bff7ed6c22ac419cbb997",
+  "analysis.log": "37cf096a67c992a3177438a17e972f4eda1e358522526724b511e0ada0f3f413",
+  "analyze.py": "9ad53762f7a822b9f8bf5dfe3e015acf7892621276c64dfef9c2b0647c6e367e",
+  "trace8/class-summary.json": "ce41b7042601f969fd2fdc9709b07f39851010a09b04c0f18ea22880e219bcc4",
+  "trace8/cleanup.log": "34e2e7d2fc6dd0d7b2e8d5c86a77b07ce884915334af198508a3b88c84971685",
+  "trace8/inputs.json": "d4f980d3c461b241c90770bf06b183bf28325fc353febd0c5829c411edad8fea",
+  "trace8/resolved-stacks.json": "23acf0003a0c7b8993c063217e96dc6dc68a9688bc7b14858ca0507ac7a1a506",
+  "trace8/run.py": "253638551ce1c7cdf7fa8071e494478c9a40e2c75244c3a98c3b05d1f50ec742",
+  "trace8/status.json": "0010c447d55bdb0a96f22f75cef4e5fc6572e605fa4e0a268bbb29c20c918f25",
+  "trace8/stderr": "7f2ac50ca11ef2e519d3ea0c2b6d37be160c6f6ec851930d23b11684b54e7257",
+  "trace8/stdout": "b35250fc4ea71b343c0520407894f1319bc21308dd4d4bf75f7ee2551a558df4",
+  "trace8/symbol-qualification.txt": "4edaa379938f9364c5704305c23db08e98f07350826e9e5ef1058f8afd867a4a",
+  "trace8/trace.raw": "676af0dd8ec906e3c10dc7f59c3533fcff116dd7a5c333b0203feff9317237c8"
+}

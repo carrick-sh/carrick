@@ -59,6 +59,17 @@ passing.
 
 ## 1. `carrick trace` — in-process libdtrace tracer
 
+For the pinned LTP inotify09 (20260529, three million add/remove pairs), use
+`carrick trace --profile hvpatch-inotify09-population --trace-out FILE -- run …`.
+This retains a script-hash-bound raw census and rejects loss, interruption,
+missing script/root completion, inconsistent begin/argument/end populations,
+or a shortened watch workload. Check TPASS and the execution-loop completion
+in the guest output separately. These are kernel host-service counts: EL1 and
+engine fast paths are excluded. Neither these counts nor a shell wrapper's
+`run --json` counters identify critical-path time. See the
+[qualified experiment](perf-results/2026-09-21-syscall-floor/seek-header/README.md).
+
+
 ```sh
 carrick trace [-F/--flowindent] [-s/--script SCRIPT.d] [-o/--trace-out FILE] -- <cmd>
 ```

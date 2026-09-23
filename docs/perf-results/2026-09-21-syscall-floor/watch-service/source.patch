@@ -1,0 +1,146 @@
+diff --git a/crates/carrick-runtime/src/vcpu_loop/exec.rs b/crates/carrick-runtime/src/vcpu_loop/exec.rs
+index 378802ddf..69ffa176a 100644
+--- a/crates/carrick-runtime/src/vcpu_loop/exec.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/exec.rs
+@@ -2684,6 +2684,77 @@ pub(crate) mod tests {
+         (kernel, root, state)
+     }
+ 
++    /// Diagnostic only: production service/completion, without executor polling,
++    /// signal-boundary processing or a hardware transition. Run in release mode.
++    #[test]
++    #[ignore = "explicit release-mode syscall cost diagnostic"]
++    fn invalid_inotify_service_completion_cost() {
++        let (kernel, context, mut state) =
++            typed_completion_fixture(72_499, SyscallDispatcher::new());
++        state.guest_execution = Some(
++            kernel
++                .dispatcher
++                .enter_mm_executor_for_thread(
++                    Some(Arc::clone(context.thread())),
++                    Arc::clone(&state.kicker),
++                    state.this_tid,
++                )
++                .expect("MM executor admission"),
++        );
++        let iterations = 65_536_usize;
++        let mut engine = CrashCaptureTestEngine::default();
++        // Exclude growth of the test-only completion log from measured samples.
++        engine.completed_syscalls.reserve_exact(2 * iterations);
++        engine.guest_memory.insert(0x20_000, b"/data\0".to_vec());
++        for sample in 0..22 {
++            engine.completed_syscalls.clear();
++            let start = Instant::now();
++            for _ in 0..iterations {
++                for (number, args) in [
++                    (
++                        carrick_abi::syscall::nr::INOTIFY_ADD_WATCH.raw(),
++                        [u64::MAX, 0x20_000, 2, 0, 0, 0],
++                    ),
++                    (
++                        carrick_abi::syscall::nr::INOTIFY_RM_WATCH.raw(),
++                        [u64::MAX, 0, 0, 0, 0, 0],
++                    ),
++                ] {
++                    let frame = carrick_hal::RawSyscall {
++                        current_guest_sp: Some(0x80_000),
++                        number: carrick_abi::CanonicalNr(number),
++                        args,
++                        guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
++                        native_number: carrick_abi::NativeNr(number),
++                    };
++                    let result = state
++                        .service_threaded_syscall(&kernel, &mut engine, frame, None)
++                        .expect("production service");
++                    let DispatchOutcome::Errno { errno } = result else {
++                        panic!("expected invalid descriptor errno, got {result:?}")
++                    };
++                    assert_eq!(errno.guest_retval(), -9);
++                    std::hint::black_box(
++                        state
++                            .complete_errno(&mut engine, &kernel.reporter, errno)
++                            .expect("production completion"),
++                    );
++                }
++            }
++            let ns = start.elapsed().as_nanos() as f64 / iterations as f64;
++            assert_eq!(engine.completed_syscalls.len(), 2 * iterations);
++            assert!(engine.completed_syscalls.iter().all(|value| *value == -9));
++            assert!(state.syscall_completion.is_idle());
++            if sample > 0 {
++                println!("service_completion sample={} ns_per_pair={ns}", sample - 1);
++            }
++        }
++        let summary = kernel.reporter.snapshot().summary;
++        assert_eq!(summary.syscall_invocations, (22 * 2 * iterations) as u64);
++        assert_eq!(summary.syscall_returns_errno, summary.syscall_invocations);
++        assert_eq!(summary.syscall_returns_ok, 0);
++    }
++
+     fn install_typed_guest_completion(
+         kernel: &Kernel,
+         context: &carrick_kernel::kernel::KernelContext,
+@@ -2819,6 +2890,7 @@ pub(crate) mod tests {
+             .expect("parent MM executor participation");
+         state.guest_execution = Some(mm_executor);
+         let frame = carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(220),
+             args: [0; 6],
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -3074,6 +3146,7 @@ pub(crate) mod tests {
+             | carrick_abi::LinuxCloneFlags::VM)
+             .bits();
+         let frame = carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(220),
+             args: [flags, 0x9000, 0, 0, 0, 0],
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -3350,6 +3423,7 @@ pub(crate) mod tests {
+             timespec.extend_from_slice(&(duration.as_secs() as i64).to_le_bytes());
+             timespec.extend_from_slice(&(i64::from(duration.subsec_nanos())).to_le_bytes());
+             let frame = carrick_hal::RawSyscall {
++                current_guest_sp: None,
+                 number: carrick_abi::CanonicalNr(101),
+                 args: [request_address, 0, 0, 0, 0, 0],
+                 guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -3598,6 +3672,7 @@ pub(crate) mod tests {
+             timespec.extend_from_slice(&(duration.as_secs() as i64).to_le_bytes());
+             timespec.extend_from_slice(&(i64::from(duration.subsec_nanos())).to_le_bytes());
+             let frame = carrick_hal::RawSyscall {
++                current_guest_sp: None,
+                 number: carrick_abi::CanonicalNr(101),
+                 args: [request_address, 0, 0, 0, 0, 0],
+                 guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -3835,6 +3910,7 @@ pub(crate) mod tests {
+                 .expect("root MM executor participation"),
+         );
+         let frame = carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(92),
+             args: [0; 6],
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -4313,6 +4389,7 @@ pub(crate) mod tests {
+ 
+     fn execve_test_frame() -> carrick_hal::RawSyscall {
+         carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(221),
+             args: [0; 6],
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -4334,6 +4411,7 @@ pub(crate) mod tests {
+         .into();
+         CrashCaptureTestEngine {
+             next_syscall: Some(carrick_hal::RawSyscall {
++                current_guest_sp: None,
+                 number: carrick_abi::CanonicalNr(221),
+                 args: [PATH, ARGV, 0, 0, 0, 0],
+                 guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -5913,6 +5991,7 @@ pub(crate) mod tests {
+         };
+         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+         let frame = carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(221),
+             args: [0; 6],
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,

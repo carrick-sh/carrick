@@ -1,0 +1,482 @@
+{
+  "created_utc": "2026-09-22T17:55:32.118941+00:00",
+  "worktree": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick",
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "local_uncommitted": true,
+  "parent_checkpoint": "../native-activation/manifest.json",
+  "source_sha256": {
+    "Cargo.lock": "f59f9a3974058143e0fb76ff2bf6b9d7771632ac55bed9cb3e9c8f056e608767",
+    "conformance-contracts/contracts/native-data-activation.toml": "b1c3a058158bccd71f4b8dab945d6ab6919f042c24ee76ee2bd8e22f185555b5",
+    "crates/carrick-aarch64/src/stage1_authority.rs": "b25889be4926b79d1da20da2140fa5ba05215c86c7df58b77df6364758af9f79",
+    "crates/carrick-hal/src/foreign_mm.rs": "4643820fd6195f49459af4a81657b9c5e570d203bd948e4c35784f2e94e3af87",
+    "crates/carrick-kernel/src/kernel/address.rs": "4fd4940d1993279886adbd45d8f0ff208a3402c8e9557c1b002aa42182e5ae74",
+    "crates/carrick-kernel/src/kernel/frame_inventory.rs": "b91c9c75ce2276a0d1350ab3048237b9841ccd3c1b31bd18d60759fb19045ac6",
+    "crates/carrick-kernel/src/kernel/mm_access.rs": "65e29580ef2db02458d08911b34b0feac6e45e74f36349ee44da98de1d5f806d",
+    "crates/carrick-kernel/src/kernel/mod.rs": "49ddb6c541129f2634f5f4ea09bcfe1b5dab32c9c92a19d19dbd0031246f28d4",
+    "crates/carrick-observability/src/work_meter.rs": "c28829aaf6a0153c9ff86ce3aa7823301d817b8da5c54ab7137fe6a64410a834",
+    "crates/carrick-runtime/Cargo.toml": "5ba59157863f56b5dc0fe9ede79723c9ecde4eea5e50f6f14d320badd31e4c80",
+    "crates/carrick-runtime/src/hvpatch/stage1_mm.rs": "41e777b54b650f2889967fb29016d156ff1379900ef270803b3e47e3181280ab",
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs": "55eee540fff42001e00b2ad5ed7dbcb34348648cc0e07fee1aa44a14c44e639e",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "b9a27728862db734cca66af0ebdf7c96171bdc78029e34c932bf4c8c6e5b47cf",
+    "crates/carrick-conformance-contract/tests/claims.rs": "f188cafca7cc1d7af030f4d9b878ea0c1714633569377292acefda2cbb132914",
+    "conformance-contracts/inventory.json": "d779265d4210ceacd39f5bf178eb492132ba840dc1ea83e4233a2d7d6c079572"
+  },
+  "source_revision": "sha256:d4527f530907b199ca2db13e7c2576e8ce644aea55761899a10d69b5162a376d",
+  "measured_source_revision": "sha256:b702c0fab676db18559b428e8ec9dba244f205c39bf542c46d99677443cbd353",
+  "files_changed": [
+    "Cargo.lock",
+    "conformance-contracts/contracts/native-data-activation.toml",
+    "crates/carrick-aarch64/src/stage1_authority.rs",
+    "crates/carrick-hal/src/foreign_mm.rs",
+    "crates/carrick-kernel/src/kernel/address.rs",
+    "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+    "crates/carrick-kernel/src/kernel/mm_access.rs",
+    "crates/carrick-kernel/src/kernel/mod.rs",
+    "crates/carrick-observability/src/work_meter.rs",
+    "crates/carrick-runtime/Cargo.toml",
+    "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs",
+    "crates/carrick-conformance-contract/tests/claims.rs",
+    "conformance-contracts/inventory.json"
+  ],
+  "parent_preservation": {
+    "parent_source_count": 116,
+    "unchanged": 108,
+    "changed": {
+      "Cargo.lock": {
+        "before": "6a7083ef251922d35685745be82882e45384515cdd3132d6eef75250a8d4a6c3",
+        "after": "f59f9a3974058143e0fb76ff2bf6b9d7771632ac55bed9cb3e9c8f056e608767"
+      },
+      "crates/carrick-conformance-contract/tests/claims.rs": {
+        "before": "e0733d48c05b3c46bb201fbe004562edf3b68978aef671a6857c9b7a595840d7",
+        "after": "f188cafca7cc1d7af030f4d9b878ea0c1714633569377292acefda2cbb132914"
+      },
+      "crates/carrick-hal/src/foreign_mm.rs": {
+        "before": "6bf5203ad03bf48625b7a36064a96666be8098993105b3aad0c0179663a060f2",
+        "after": "4643820fd6195f49459af4a81657b9c5e570d203bd948e4c35784f2e94e3af87"
+      },
+      "crates/carrick-kernel/src/kernel/mm_access.rs": {
+        "before": "76df9e32539584ee763a52dd3e5059e48daa5262f2f33a5b62acc1fd93d3b66e",
+        "after": "65e29580ef2db02458d08911b34b0feac6e45e74f36349ee44da98de1d5f806d"
+      },
+      "crates/carrick-kernel/src/kernel/mod.rs": {
+        "before": "c6631a56129e575ed78e9354251e2e0c11ea8e7d8d9bdb9106448a662ce17a3a",
+        "after": "49ddb6c541129f2634f5f4ea09bcfe1b5dab32c9c92a19d19dbd0031246f28d4"
+      },
+      "crates/carrick-observability/src/work_meter.rs": {
+        "before": "a5c7fbfe6a00b354a7d19027c80ee8490e85027a540308f6fb3ab17a5f7af399",
+        "after": "c28829aaf6a0153c9ff86ce3aa7823301d817b8da5c54ab7137fe6a64410a834"
+      },
+      "crates/carrick-runtime/src/vcpu_loop/memory.rs": {
+        "before": "c3abf8df778e8b5061d81fd6eda8f082f0bb2c7c0238fa025ffe29f5f1af7b5e",
+        "after": "55eee540fff42001e00b2ad5ed7dbcb34348648cc0e07fee1aa44a14c44e639e"
+      },
+      "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": {
+        "before": "b007a774650d9e2ad34c13b2d36dfd135a83703d9146e8e0dc9741f1aeed0491",
+        "after": "b9a27728862db734cca66af0ebdf7c96171bdc78029e34c932bf4c8c6e5b47cf"
+      }
+    },
+    "unexpected": {},
+    "controls": {
+      "target/release/carrick": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+      "target/lease-cost/inotify-transport-control/carrick-control": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+      "target/release/native-syscall-slice": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65",
+      "target/lease-cost/native-memory/native-guarded-executor": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65"
+    }
+  },
+  "contract": "kernel.mm.native-data-activation",
+  "parent_contract": "kernel.execution.native-synchronous-syscall",
+  "native_execution_binding": false,
+  "new_workload_speedup_claim": false,
+  "cost_summary_ns": {
+    "1": {
+      "baseline": {
+        "scope_ns": 36.0107421875,
+        "activated_ns": 1463.9332275390625,
+        "activation_delta_ns": 1428.7210693359375
+      },
+      "candidate": {
+        "scope_ns": 52.9072265625,
+        "activated_ns": 200.74462890625,
+        "activation_delta_ns": 149.3427734375
+      },
+      "activation_reduction_pct": 89.54710078525588
+    },
+    "8": {
+      "baseline": {
+        "scope_ns": 36.098480224609375,
+        "activated_ns": 1418.5377807617188,
+        "activation_delta_ns": 1382.32421875
+      },
+      "candidate": {
+        "scope_ns": 37.485137939453125,
+        "activated_ns": 140.343994140625,
+        "activation_delta_ns": 104.13934326171875
+      },
+      "activation_reduction_pct": 92.46635906040268
+    },
+    "32": {
+      "baseline": {
+        "scope_ns": 36.0565185546875,
+        "activated_ns": 1413.4209938049316,
+        "activation_delta_ns": 1377.41597366333
+      },
+      "candidate": {
+        "scope_ns": 36.059696197509766,
+        "activated_ns": 138.3681297302246,
+        "activation_delta_ns": 102.33465957641602
+      },
+      "activation_reduction_pct": 92.57053340943548
+    },
+    "128": {
+      "baseline": {
+        "scope_ns": 36.05747318267822,
+        "activated_ns": 1421.8393964767456,
+        "activation_delta_ns": 1385.6426877975464
+      },
+      "candidate": {
+        "scope_ns": 36.1265344619751,
+        "activated_ns": 138.38406372070312,
+        "activation_delta_ns": 102.2116346359253
+      },
+      "activation_reduction_pct": 92.62352152282571
+    }
+  },
+  "diagnostic_binaries": {
+    "native-activation-cache-cost-release": "a291effbbdffeea80226243f362f0f028d5c140240e4b0bab15efc51f3626a4c",
+    "red-runtime": "f87089e249f3fdcd1b8941fe328f3d9bcc896e03afe398b021274e5157266141",
+    "native-activation-cache-metrics-debug": "16215a62ac552db6261bd763e721b5e3248a96a1ecce6c2b2c3b80b49e8f03d3",
+    "native-elf-default-debug": "290061a49018bcfc142d48c262ddf255db171453b13e3aaf03e7f0f5f866bd30"
+  },
+  "verification_initial": [
+    {
+      "name": "contract-final",
+      "argv": [
+        "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-activation-cache/native-activation-cache-metrics-debug",
+        "vcpu_loop::memory::tests::native_data_activation_cost_contract",
+        "--exact",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "run_id": null,
+      "finished_utc": "2026-09-22T17:45:39.763606+00:00"
+    },
+    {
+      "name": "release-memory",
+      "argv": [
+        "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-activation-cache/native-activation-cache-cost-release",
+        "vcpu_loop::memory::tests::",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "run_id": null,
+      "finished_utc": "2026-09-22T17:45:39.777023+00:00"
+    },
+    {
+      "name": "kernel",
+      "argv": [
+        "just",
+        "test-kernel"
+      ],
+      "exit_code": 0,
+      "run_id": null,
+      "finished_utc": "2026-09-22T17:46:54.029654+00:00"
+    },
+    {
+      "name": "runtime-stage1",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "hvpatch::stage1_mm::tests::"
+      ],
+      "exit_code": 0,
+      "run_id": null,
+      "finished_utc": "2026-09-22T17:47:18.655897+00:00"
+    },
+    {
+      "name": "runtime-quiesce",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "vcpu_loop::quiesce::tests::"
+      ],
+      "exit_code": 0,
+      "run_id": null,
+      "finished_utc": "2026-09-22T17:47:18.849207+00:00"
+    },
+    {
+      "name": "memory-doctests",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-kernel",
+        "--doc",
+        "kernel::mm_access"
+      ],
+      "exit_code": 0,
+      "run_id": null,
+      "finished_utc": "2026-09-22T17:47:20.467917+00:00"
+    },
+    {
+      "name": "hal",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-hal",
+        "--lib",
+        "foreign_mm::"
+      ],
+      "exit_code": 0,
+      "run_id": null,
+      "finished_utc": "2026-09-22T17:47:21.543879+00:00"
+    },
+    {
+      "name": "observability",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-observability",
+        "--lib",
+        "--features",
+        "conformance-metrics"
+      ],
+      "exit_code": 0,
+      "run_id": null,
+      "finished_utc": "2026-09-22T17:47:23.151687+00:00"
+    },
+    {
+      "name": "contracts",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-conformance-contract"
+      ],
+      "exit_code": 101,
+      "run_id": null,
+      "finished_utc": "2026-09-22T17:47:25.964444+00:00"
+    },
+    {
+      "name": "aarch64",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-aarch64",
+        "--lib"
+      ],
+      "exit_code": 0,
+      "run_id": null,
+      "finished_utc": "2026-09-22T17:47:26.337563+00:00"
+    },
+    {
+      "name": "aarch64-clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--no-deps",
+        "-p",
+        "carrick-aarch64",
+        "-p",
+        "carrick-observability",
+        "-p",
+        "carrick-conformance-contract",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 101,
+      "run_id": null,
+      "finished_utc": "2026-09-22T17:47:29.627392+00:00"
+    },
+    {
+      "name": "signed-foreign-mm",
+      "argv": [
+        "scripts/test-signed.sh",
+        "carrick-vmm-hvf",
+        "trap::foreign_mm::tests::"
+      ],
+      "exit_code": 1,
+      "run_id": "native-activation-cache-signed-foreign-mm-20260922",
+      "finished_utc": "2026-09-22T17:48:03.028361+00:00"
+    },
+    {
+      "name": "signed-lifecycle",
+      "argv": [
+        "scripts/test-signed.sh",
+        "carrick-vmm-hvf",
+        "trap::foreign_mm::tests::production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycle",
+        "--exact",
+        "--ignored"
+      ],
+      "exit_code": 0,
+      "run_id": "native-activation-cache-signed-lifecycle-20260922",
+      "finished_utc": "2026-09-22T17:48:07.150269+00:00"
+    }
+  ],
+  "validation_final": {
+    "contracts_passed": 33,
+    "registry_contracts": 29,
+    "registry_claims": 15,
+    "kernel_passed": 2375,
+    "kernel_ignored": 1,
+    "runtime_memory_metrics_passed": 27,
+    "runtime_memory_default_release_passed": 26,
+    "runtime_stage1_backend_passed": 29,
+    "runtime_quiescence_passed": 27,
+    "memory_lifetime_doctests_passed": 4,
+    "aarch64_passed": 66,
+    "hal_foreign_mm_passed": 1,
+    "observability_passed": 83,
+    "native_elf_cases": 20,
+    "native_elf_unit_tests_passed": 11,
+    "native_elf_uses_private_backing": true,
+    "signed_foreign_mm": {
+      "passed": 73,
+      "failed": 1,
+      "ignored": 1,
+      "failure": "kernel.mm.fresh-publication-maintenance: PageTableInvalidations at scale 1 is 1; maximum 0",
+      "negative_control_passed": true,
+      "cleanup_remaining": 0,
+      "success_receipt": false
+    },
+    "signed_lifecycle": {
+      "passed": 1,
+      "negative_control_passed": true,
+      "cleanup_remaining": 0,
+      "success_receipt": "signed-lifecycle-receipt.jsonl"
+    },
+    "clippy_changed_hal_kernel_runtime_hvf_passed": true,
+    "aarch64_clippy_unclosed": "six pre-existing manual_is_multiple_of errors in anonymous_discard.rs and engine.rs; parent hashes preserved",
+    "new_structural_contract": "0 allocations and 0 native_activation_leaf_checks at scales 1/8/32/128, with real completed native stores and positive controls",
+    "timing_completed_pairs": 144,
+    "timing_completed_activations": 24920064,
+    "product_workload_acceptance": false,
+    "notes": [
+      "Initial short exact filter in red-build.log selected zero tests; red-contract.log executes the full name and is the valid red result.",
+      "Initial runtime-quiesce.log selected zero tests; runtime-quiesce-final.log executes 27 tests.",
+      "Registry test initially expected 26 descriptors while the current registry had 29; it now requires all three native descriptors and exactly 29.",
+      "Derived inventory refresh includes previously unrefreshed campaign descriptors; it changes no claim or support status.",
+      "Final registry test and generated inventory changes do not affect the preserved measured runtime executable."
+    ]
+  },
+  "evidence_sha256": {
+    "release-build.jsonl": "e6726a4283348554ee944a2bd16632f0d81e899a4a04bea35c7888cb7b4fb76d",
+    "aarch64.log": "ce094243a398c591c594fc3a35cb890e3552eb811162e2eb779449a0293e2ee9",
+    "stage1-tests.log": "ab9e865cd447ce56d2b16fc8822ad7c87af3634f4d40074a2deff602fa3e969a",
+    "measure.py": "82da027187a7f7c55f93ed917da47d2da04fac37f6b89ceb0ed93d68b2621158",
+    "contracts-final.log": "b4d430870014e0ee456874edc856d4aa78c674de185b202896481b56824e3fdf",
+    "contracts.log": "09cfa2032f89dae15c20ce5223b57ab1e73b90f2f7470063185c8af07aecddbc",
+    "aarch64-clippy.log": "fac89a7588b6ade8cb6f06b2559aa62626c30f393682599b12d33c349fbf8119",
+    "baseline-1.log": "7394153eef3edaf4010338f00c9e4e5aa93f73513053e87c1aea1bad336685e7",
+    "measured-source.tar.gz": "6b899ff38718d1f0730a7b5b40482e096829abd43b64e3ab9ca219df6614a419",
+    "kernel.log": "cb0b55a2788afdf1d75dab31f0c6c1fc56ba387dfa2a23d65c92fb1ea7404ce7",
+    "red-binary.sha256": "0f5063639b6c01a6ed2dce02149e85e7a6b39489928daa6fba3048606360bbf3",
+    "validation-final.json": "64fc7c86dd773cac3a65c217714509e55270ee34ec8483f40189046eff8df279",
+    "baseline-2.log": "512f9e6ca8f08256f4952f461f52491b2003d0595e6ea2c1952f9864494b6186",
+    "red-source-reconstruction.json": "a193a5f256eda1df982c2179910d100953087b8d6d2b88e10b1dd235cb5ca49a",
+    "hal.log": "1f6d58a4244c7fff9c1349aad95ccf042ad4f5f77c5eec7994d01009535b0b72",
+    "memory-metrics.log": "c74ecfd45a901ff5299b4ac662a8a2d3ec7a1278a05b25c266e233bc9dfb3a9b",
+    "red-contract.log": "6dee17e2e966a65eeb004562401d92142c742af1f4c44440188fb2ef6d1f1130",
+    "signed-lifecycle-receipt.jsonl": "df07c93a83aacfdc0164ae60b17edb41c3b424e896fcd3b94a379ad9cb1e2060",
+    "before-hashes.json": "d7bb55509424864e811440a9f525f7238fbae1d62d9ad07423b29839ca34286a",
+    "memory-doctests.log": "73460ebc94e7ccf67f39dcc4ebcc5f4c5e8873646b04e0423d5dd04f6de72ad0",
+    "cost-identity.json": "cc833310328ebd88b2def8ce7f8355d153f160121aa5bf6557080d7acc3472da",
+    "native-elf.log": "b01daa04a4743c6042b81f2ea48240c33c188921079661cbb7bf5d0862f67af9",
+    "generate-inventory.log": "83cfc287914cc041845d27cb497ced08ae2586998f11148a8e563c4ed0b8c1c3",
+    "clippy.log": "2a8125e8ebb18d05851a84bcf56aef854e376a098b5357b5c1c3d0382c9a9156",
+    "preservation.json": "fb0a09efda8dfa4203aa03047aaeae8c32ef3f3bf40117368b727d371e9a9de4",
+    "before-complete.tar.gz": "c7e331fedeac50402997a3872284c7bb62052ab1e2889d31fd320473ad5bd584",
+    "candidate-1.log": "31b5aff97dc5980f4b455020b8e86f99e66e67a3ca13f466e355f7f1d9778468",
+    "check-contracts-final.log": "db2a25574ccfe641718d9d17526c962db2153e102082d3f551dfb01d628852fe",
+    "release-build.err": "cd59dad45053340f58a596a7ed1f840c7c00abc9d38abd2e9d8cf5bc63c13764",
+    "diff-check.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "release-memory.log": "5c856323ea96457c9ae9d77fef62fd7bd94744645500e7a150a450a27d024304",
+    "measured-source-hashes.json": "f071a31f4eb6aca1d5d3227c657476fb8b958a9fefa6b967d237bc8022cea247",
+    "check-contracts.log": "445a3526e6bb2209081123a4cd4179ebcf13b85e4c5470b400c5af798b23f183",
+    "measurement.log": "045bc5af99e5efa64ee456bdf29afd4ac8875a0a6f3b2a9ab5bbd3a108c7b62d",
+    "implementation.patch": "66fd1bbe7e83d7a0848b4c25c4884649cb5d4e35e118adc5fc470463244ec23b",
+    "candidate-2.log": "9a3e511579708c3100a7f3059c9a4a07b741461d72f7444c59e83beeeaaa92ad",
+    "contract-final.log": "148b61d3d71f727cbb7339c6873ce7516c3e0190098960be9a920368dda81827",
+    "before-inventory.json": "ed45e53cde1603a08d26766a3c4688528b92f0bdf10297a82fc264dce176653b",
+    "status-before.txt": "4d90b7892c9ce2c0a2921979dc07b834e93d8fca08a83e7a1b7ed9210074c707",
+    "green-build.log": "340f493a43f4660ac759a7b2461fce31bad0cfc7fb444a1047362b7bc326ea86",
+    "final-source.tar.gz": "c675e060b095c7605eac1d1ef0075242cfd8823779a47533682fe17de0acf187",
+    "observability.log": "f9705f22f543e0798e7a5a12d0f75517c2a52446b112e688b37e4da7fcbe4171",
+    "cost-samples.json": "9e58561830bd9d84371ac226f399c16b4f8b560043f40adf18ec574f195b0093",
+    "runtime-quiesce-final.log": "d4d294adc3a80298f476fc0d9641055c6621e013061ae12b83aa21db99358d86",
+    "fmt-check.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "verification-progress.log": "aeac58c4d1395b0c3d2a155c5960cf3270122c3d5e0389ac361405728f8651c5",
+    "signed-lifecycle.log": "3829d391e776c7eb43654781da799617ac587550c8ae7910816a8cc9579a9414",
+    "contracts-clippy-final.log": "ec4d3a6b7f8fdf1a55b3a0983a823aae0f05510b3ce0438f3e6058d4e63ea95e",
+    "runtime-quiesce.log": "8d19ff15803ea4828905211d69e58ea577df19ebe57c330c8be3843df82c0537",
+    "red-build.log": "35311815ef8ead4ef220ea902270ed6027e9bfcf8b55498f6fb181cffb8dd1a3",
+    "add-red.py": "dd6ca0f423639b890ff8f7f399c927ed9453973b0a8e640eec913c6e39bf7aa3",
+    "archive.py": "5fcdd38defea4d0724d700f35aa0b6c7fa5fb3378db34da2318875e1f47e99ab",
+    "implement.py": "14a09a8e06e8bbd7e81021d0e684f16d796297e365e157ead796f3ab2b0cd31b",
+    "inventory.patch": "ece8b5d436a7be07d4c1f8c274cb4051485e30fe4aa48f6687d507e77f066165",
+    "before.tar.gz": "b30afc52539437f649c18c35b5fdf0cccf5af0e95397d788a78b308f1e7bdfa0",
+    "verification.json": "6d485f47d01e1b81fed371efb0d2c0b9e8e725194404f34ed0fd9afc4173e1c9",
+    "cost-summary.json": "320a769985f0479b107f437be0b875e942d3f03c64a73ac349b19331b1ba1077",
+    "memory-metrics-final.log": "5af18f51bd5a2d960ddec09bab586783f0becb4c71f464ebd7755eb015778b4d",
+    "verify.py": "8d939aad85379cc01d23884b5dbba9a31fb21e01ebd8d9521fcebd8685f00b3e",
+    "signed-foreign-mm.log": "c5893266d87fe17328109c6adf712d6bfc00b45ff863259acb4a008eb26c906b",
+    "diff-check-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "red-source-reconstructed.tar.gz": "00fdadefe7abd7fd814c6e8bbc069ee70697d3f017c44d5d88d2b1d70b59b802",
+    "before-claims.rs": "e0733d48c05b3c46bb201fbe004562edf3b68978aef671a6857c9b7a595840d7",
+    "runtime-stage1.log": "502198194f82349b38f43e74243c59c1358141f732da7ad7e128317c5383289a",
+    "add-revocation-tests.py": "a49ea1fb71eeef4957f599c242e12a8708bda80ae9dc0a70fa1ea1cd67271da6",
+    "elf-receipts/native-scope-functional-1-8-24498.err": "ea5b1d206dba4240445245d8f0581defe148a8126facdcf91fac6dd75ae4e5fe",
+    "elf-receipts/native-scope-functional-3-1-24498.out": "5cab9c52e57a9f2614a4d4e76e3208d6fb9415e55712ea4dda3f8e22d6b408d2",
+    "elf-receipts/native-scope-functional-2-32-24498.err": "7bd52ade84487b974e357354f34a504bf3d7b2e68fae41bc09a3ce8015708211",
+    "elf-receipts/native-scope-functional-2-8-24498.out": "49eb26f66aca0b99cbe1e58857372ecffc8005fcade78ae29415ee202c518eb2",
+    "elf-receipts/native-scope-functional-0-1-24498.err": "006ebb44640667ce6ef828b3d12bec92b55946199174e1035fa9785ff9a2232c",
+    "elf-receipts/native-scope-functional-2-128-24498.err": "41bcaeb2370d1e9f02abf2ff8641b699472c29fbd2e5efd01684fd72d0371964",
+    "elf-receipts/native-scope-functional-1-128-24498.err": "c68bfa88783ab87f5514e3870d4abdf8657565e044851849994c52b391821869",
+    "elf-receipts/native-scope-functional-3-32-24498.err": "256d8763563b41658ffbf92e2a5d0e3b117f12ab4bde4b5f13ab61bf041f0fb4",
+    "elf-receipts/native-scope-functional-4-32-24498.err": "f3c1e03bdc76741a7e9b923c25e32af816fa05000bea04f412ad1cd15f60cb58",
+    "elf-receipts/native-scope-functional-4-8-24498.err": "8d8ea8268174fc58badb6e8642adc2fa253e73f4a0dfbde6f5c342d2edc7aca2",
+    "elf-receipts/native-scope-functional-4-8-24498.out": "b0fdb60d6be5d8484d1ba9a8391840bde1ae6f8b189c853b9f90406e0239745a",
+    "elf-receipts/native-scope-functional-1-128-24498.out": "2802e139012db08a27a9920fb9856afa7ff3e25bea3552726b2f8deab9537d98",
+    "elf-receipts/elf-functional.json": "46742351a67644e12e0a2e817499f62296e8d48b0fedb1601de831c5b23f32fa",
+    "elf-receipts/native-scope-functional-3-32-24498.out": "a11aba01c80d75d94078ce00cc60ad680a482a546dfcb410a31d304401ef4bf4",
+    "elf-receipts/native-scope-functional-4-32-24498.out": "93cb81da406dcf1ea2dbea9c9f277b689fc256f52114e004c575e5e8ad925892",
+    "elf-receipts/native-scope-functional-2-128-24498.out": "0edb03b8daf909e1e0bdd5f077cfa410b7201db5bb1eec7840dc6b513e8232b3",
+    "elf-receipts/native-scope-functional-3-1-24498.err": "437a2cd771c651d232cacc45553d7333c8871c6a3ad3525e65598540bbee6a08",
+    "elf-receipts/native-scope-functional-1-8-24498.out": "dd5f36a7af564ba9f5a59f0013785935af965050f28ea651f289a92436f2607a",
+    "elf-receipts/native-scope-functional-2-32-24498.out": "63e3563be79b6c040ea0b5394e66da2782275bcba00a05f00d73cac3734869c5",
+    "elf-receipts/native-scope-functional-0-1-24498.out": "fb1e570f555169be406fdecc45da194d15785ce0d7fa9b4d0b574fe2021469f2",
+    "elf-receipts/native-scope-functional-2-8-24498.err": "79803ecf60301e0c474d7222ec18d0c9d92d9eb3ae317aec61ef9c58ea7ebdef",
+    "elf-receipts/native-scope-functional-4-1-24498.err": "e97965a9d40642b2b4ae67b9fc496332ac1b050978998b2de9e44d9e1663aeca",
+    "elf-receipts/native-scope-functional-3-128-24498.out": "026f279314a21d4adab372429e0e877b75d156f207af990f1d0dc2368bd9aa92",
+    "elf-receipts/native-scope-functional-0-32-24498.out": "cf1fc3f2a365bde9ffb768049664f6ccbcc060b763fb19ca0f16db8e9437ce36",
+    "elf-receipts/native-scope-functional-1-1-24498.err": "35e6b5fc11b36ec0cbadebcac54674d1413175d941ef573f1ad0eaafa7d6c021",
+    "elf-receipts/native-scope-functional-4-128-24498.out": "72c571391ccfe94e8df9b9d020cfdc609c6bbc9438b3b647195708bfebf3e8b4",
+    "elf-receipts/native-scope-functional-3-8-24498.out": "d6f8e921d6c60b206b0c349c236cf237e2818a6c5e5bc9f5b6a1cb847c4b924d",
+    "elf-receipts/native-scope-functional-0-128-24498.out": "6056183505f8f1d3f6bf94b247875c6c62cedfcfec596844773b926bf901e3f6",
+    "elf-receipts/native-scope-functional-2-1-24498.out": "4503845172f50fb87e4d206c3c6dc224f0fa7933920e3e2550337a5c126f1706",
+    "elf-receipts/native-scope-functional-1-32-24498.out": "ecdf50de0f3a444e4d6b46a24c1e66efd903430ca254db8e48bf7c76931fa193",
+    "elf-receipts/native-scope-functional-0-8-24498.err": "923af1e6cecfc25777ea6acc07b8312a4b6218c6f0f6b560e894707c831d5f9f",
+    "elf-receipts/native-scope-functional-3-8-24498.err": "cf8c2627fa54ddf5e84ef5bd0ea78f1985a0cb04bb7271fb2474f3c3aef9c5ba",
+    "elf-receipts/native-scope-functional-4-128-24498.err": "1ad3a98e4dd83e11c8680b3d7ef67d3836b7036865d8ac892b416783eb522ae7",
+    "elf-receipts/native-scope-functional-1-1-24498.out": "50f4d46bc8828229ffd3e9edcf440075189e29c6b6fab215849132d490816b46",
+    "elf-receipts/native-scope-functional-0-128-24498.err": "5dd5abf0ad39a971f7715bd14cb73aa15a20425431c2f6aad9dc9b7d3e9d7de0",
+    "elf-receipts/native-scope-functional-0-8-24498.out": "cd7f529df5d168d2587f4e60de1ce52b9584b9055c41a4a2f123a8198e851897",
+    "elf-receipts/native-scope-functional-2-1-24498.err": "f5192655c0d20055362564a946ac4a5c927483d5f3494894e35e15adf805595d",
+    "elf-receipts/native-scope-functional-1-32-24498.err": "f7bb9ddc813a2678f0e571e471ead7fa3002726dfc2d605dc2acbd9e8bcfa45c",
+    "elf-receipts/native-scope-functional-0-32-24498.err": "9520f5cf33d2baccb0ba30a56b11540fc60cef984e868b34ab324a7e911fb1bc",
+    "elf-receipts/native-scope-functional-4-1-24498.out": "dc2e54d1f902375b1c2e8f22df88520e6c58d83efddf63e15a54f6e47d37c456",
+    "elf-receipts/native-scope-functional-3-128-24498.err": "d8284ef1181c8d69d4c7ec94d219307058760b8fec8bc966093808881bc1a558"
+  }
+}

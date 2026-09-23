@@ -1,0 +1,20 @@
+[
+  {
+    "run": 0,
+    "median_ns_per_pair": 541.6259765625,
+    "binary": "target/release/deps/carrick_runtime-f35e6b220553ee62",
+    "sha256": "62e5013534e950e9fea2a8028a194095a1b221eb4d915c7764f9ecbee45888d9"
+  },
+  {
+    "run": 1,
+    "median_ns_per_pair": 534.5598754882812,
+    "binary": "target/release/deps/carrick_runtime-f35e6b220553ee62",
+    "sha256": "62e5013534e950e9fea2a8028a194095a1b221eb4d915c7764f9ecbee45888d9"
+  },
+  {
+    "run": 2,
+    "median_ns_per_pair": 549.3214874267578,
+    "binary": "target/release/deps/carrick_runtime-f35e6b220553ee62",
+    "sha256": "62e5013534e950e9fea2a8028a194095a1b221eb4d915c7764f9ecbee45888d9"
+  }
+]

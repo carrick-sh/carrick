@@ -1,0 +1,7 @@
+readv_cross_page=ok
+preadv_offset=ok
+large_read=ok
+ordinary_copy_cross_page=ok
+readonly_efault=ok
+recvfrom_cross_page=ok
+fork_cow_isolation=ok

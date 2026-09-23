@@ -1,0 +1,50 @@
+[
+  {
+    "arm": "control",
+    "run_id": "private-publish-recheck-0-control-20260922",
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/private-publication/deferred-control",
+      "deferred_anonymous",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "returncode": 0,
+    "sha256": "6c4d1a301e8495e5e94a76ed71bd62cb4c59123bb99efb76b58d09888913df32"
+  },
+  {
+    "arm": "candidate",
+    "run_id": "private-publish-recheck-1-candidate-20260922",
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/private-publication/deferred-candidate",
+      "deferred_anonymous",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "returncode": 0,
+    "sha256": "021357500a8870d1a4babf9295c70d6c28333911ec2bbdfc66190bedeab6bb07"
+  },
+  {
+    "arm": "candidate",
+    "run_id": "private-publish-recheck-2-candidate-20260922",
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/private-publication/deferred-candidate",
+      "deferred_anonymous",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "returncode": 0,
+    "sha256": "021357500a8870d1a4babf9295c70d6c28333911ec2bbdfc66190bedeab6bb07"
+  },
+  {
+    "arm": "control",
+    "run_id": "private-publish-recheck-3-control-20260922",
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/private-publication/deferred-control",
+      "deferred_anonymous",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "returncode": 0,
+    "sha256": "6c4d1a301e8495e5e94a76ed71bd62cb4c59123bb99efb76b58d09888913df32"
+  }
+]

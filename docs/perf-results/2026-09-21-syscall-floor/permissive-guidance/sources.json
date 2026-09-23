@@ -1,0 +1,96 @@
+[
+  {
+    "repo": "plasma-umass/coz",
+    "commit": "256e3c389424d6a1691ee5d18b5ecb5a6c1001ec",
+    "path": "LICENSE.md",
+    "url": "https://github.com/plasma-umass/coz/blob/256e3c389424d6a1691ee5d18b5ecb5a6c1001ec/LICENSE.md",
+    "sha256": "23edff6c2aa7c5c3fce8ab54ba38925d7fed9e0b59e0b960d2423a1a126beb44",
+    "local": "plasma-umass--coz--LICENSE.md"
+  },
+  {
+    "repo": "plasma-umass/coz",
+    "commit": "256e3c389424d6a1691ee5d18b5ecb5a6c1001ec",
+    "path": "README.md",
+    "url": "https://github.com/plasma-umass/coz/blob/256e3c389424d6a1691ee5d18b5ecb5a6c1001ec/README.md",
+    "sha256": "45443e8af612112ebe73d8e3365918d849177d1c83c2c5035db9d6c5ba22f17e",
+    "local": "plasma-umass--coz--README.md"
+  },
+  {
+    "repo": "google/gvisor",
+    "commit": "164b166ce347fdb6790603318db3e4cbbe76c0b0",
+    "path": "LICENSE",
+    "url": "https://github.com/google/gvisor/blob/164b166ce347fdb6790603318db3e4cbbe76c0b0/LICENSE",
+    "sha256": "0fbab5c58efbdf6d31e8085214f2dd821659c03d73cff3ed2b08e98826ea1cd9",
+    "local": "google--gvisor--LICENSE"
+  },
+  {
+    "repo": "google/gvisor",
+    "commit": "164b166ce347fdb6790603318db3e4cbbe76c0b0",
+    "path": "website/_docs/architecture_guide/performance.md",
+    "error": "HTTP Error 404: Not Found"
+  },
+  {
+    "repo": "google/gvisor",
+    "commit": "164b166ce347fdb6790603318db3e4cbbe76c0b0",
+    "path": "pkg/sentry/vfs/g3doc/inotify.md",
+    "url": "https://github.com/google/gvisor/blob/164b166ce347fdb6790603318db3e4cbbe76c0b0/pkg/sentry/vfs/g3doc/inotify.md",
+    "sha256": "b2d3e94373840a626c344d0f60bef0ab2dff4e5ca007b014c4e79a1a42faacd6",
+    "local": "google--gvisor--pkg--sentry--vfs--g3doc--inotify.md"
+  },
+  {
+    "repo": "DynamoRIO/dynamorio",
+    "commit": "d53efb2f19e406e48bbf0c01f9664518ad8c5e3e",
+    "path": "License.txt",
+    "url": "https://github.com/DynamoRIO/dynamorio/blob/d53efb2f19e406e48bbf0c01f9664518ad8c5e3e/License.txt",
+    "sha256": "ffab4b87644cba09cfad3e4ad51c29250629f2b97f86f342d622706c4ee56369",
+    "local": "DynamoRIO--dynamorio--License.txt"
+  },
+  {
+    "repo": "DynamoRIO/dynamorio",
+    "commit": "d53efb2f19e406e48bbf0c01f9664518ad8c5e3e",
+    "path": "api/docs/intro.dox",
+    "url": "https://github.com/DynamoRIO/dynamorio/blob/d53efb2f19e406e48bbf0c01f9664518ad8c5e3e/api/docs/intro.dox",
+    "sha256": "601168222d36e8e5264c766f4e8708d1fe060bfb461ef33baef5257fd53245a7",
+    "local": "DynamoRIO--dynamorio--api--docs--intro.dox"
+  },
+  {
+    "repo": "DynamoRIO/dynamorio",
+    "commit": "d53efb2f19e406e48bbf0c01f9664518ad8c5e3e",
+    "path": "core/arch/aarch64/emit_utils.c",
+    "url": "https://github.com/DynamoRIO/dynamorio/blob/d53efb2f19e406e48bbf0c01f9664518ad8c5e3e/core/arch/aarch64/emit_utils.c",
+    "sha256": "ed18377dcd3d488423929651c791153845491fc617720b94e6637335cbb17643",
+    "local": "DynamoRIO--dynamorio--core--arch--aarch64--emit_utils.c"
+  },
+  {
+    "repo": "google/benchmark",
+    "commit": "ac13143d96b61cec419b49f76e58d2045aba8536",
+    "path": "LICENSE",
+    "url": "https://github.com/google/benchmark/blob/ac13143d96b61cec419b49f76e58d2045aba8536/LICENSE",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "local": "google--benchmark--LICENSE"
+  },
+  {
+    "repo": "google/benchmark",
+    "commit": "ac13143d96b61cec419b49f76e58d2045aba8536",
+    "path": "docs/random_interleaving.md",
+    "url": "https://github.com/google/benchmark/blob/ac13143d96b61cec419b49f76e58d2045aba8536/docs/random_interleaving.md",
+    "sha256": "e68c0e88e2323b82c119b21417f925aab77d9017bbb615393d836da971f214ed",
+    "local": "google--benchmark--docs--random_interleaving.md"
+  },
+  {
+    "repo": "google/benchmark",
+    "commit": "ac13143d96b61cec419b49f76e58d2045aba8536",
+    "path": "docs/reducing_variance.md",
+    "url": "https://github.com/google/benchmark/blob/ac13143d96b61cec419b49f76e58d2045aba8536/docs/reducing_variance.md",
+    "sha256": "cfa33b46f3fdb27d100dab3df476f96f4bf5bb5757a556fe851c8ad1735dc250",
+    "local": "google--benchmark--docs--reducing_variance.md"
+  },
+  {
+    "repo": "google/gvisor",
+    "commit": "164b166ce347fdb6790603318db3e4cbbe76c0b0",
+    "path": "g3doc/architecture_guide/performance.md",
+    "url": "https://github.com/google/gvisor/blob/164b166ce347fdb6790603318db3e4cbbe76c0b0/g3doc/architecture_guide/performance.md",
+    "sha256": "12c62d72d1c5194fb61330bcc428b2acf4d7417b4da1676d7d0900b34196b940",
+    "local": "google--gvisor--g3doc--architecture_guide--performance.md"
+  }
+]

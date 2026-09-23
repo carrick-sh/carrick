@@ -1,0 +1,25 @@
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.35813841699564364, "guest_timing": [[0.307, 0.079, 0.19]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.2989768749976065, "guest_timing": [[0.248, 0.064, 0.139]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.29883712499577086, "guest_timing": [[0.248, 0.064, 0.14]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.3495711669966113, "guest_timing": [[0.296, 0.068, 0.189]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.3447210409940453, "guest_timing": [[0.293, 0.065, 0.182]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.29441704199416563, "guest_timing": [[0.243, 0.059, 0.134]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.30753783299587667, "guest_timing": [[0.255, 0.068, 0.14]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.34291208400100004, "guest_timing": [[0.291, 0.059, 0.185]]}
+{
+  "node-app": {
+    "control_s": [
+      0.307,
+      0.296,
+      0.293,
+      0.291
+    ],
+    "candidate_s": [
+      0.248,
+      0.248,
+      0.243,
+      0.255
+    ],
+    "candidate_control_mean_ratio": 0.8374052232518957
+  }
+}

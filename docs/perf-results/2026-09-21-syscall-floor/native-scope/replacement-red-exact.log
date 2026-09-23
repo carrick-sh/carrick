@@ -1,0 +1,22 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.28s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-207122e8ce47be2c)
+
+running 1 test
+test dispatch::native_execution::tests::replacing_dispatch_participation_cannot_detach_native_running_authority ... FAILED
+
+failures:
+
+---- dispatch::native_execution::tests::replacing_dispatch_participation_cannot_detach_native_running_authority stdout ----
+
+thread 'dispatch::native_execution::tests::replacing_dispatch_participation_cannot_detach_native_running_authority' (4079633) panicked at crates/carrick-kernel/src/dispatch/native_execution/tests.rs:199:5:
+assertion failed: dispatcher.enter_native_execution(&mut executor, &context,
+        &mut lease).is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    dispatch::native_execution::tests::replacing_dispatch_participation_cannot_detach_native_running_authority
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2205 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

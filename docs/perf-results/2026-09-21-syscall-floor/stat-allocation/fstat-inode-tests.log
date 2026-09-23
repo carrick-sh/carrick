@@ -1,0 +1,16 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 37.85s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-03983327039dd49b)
+
+running 8 tests
+test dispatch::executable_authority::tests::dispatcher_memory_source_retains_live_inode_across_namespace_changes ... ok
+test dispatch::fd_table::tests::owned_inode_identity_survives_path_replacement_and_aliasing ... ok
+test dispatch::fs::state::sparse_identity_tests::sparse_writes_follow_owned_inode_across_path_replacement ... ok
+test dispatch::fs::tests::serial_host::immutable_lower_reports_one_inode_through_stat_fstat_and_getdents ... ok
+test dispatch::overlay_dispatch_tests::inode_fast_path_matches_existing_raw_normalization ... ok
+test dispatch::overlay_dispatch_tests::inode_for_path_reflects_identity_not_textual_spelling ... ok
+test dispatch::overlay_dispatch_tests::io_uring_fd_generic_operations_match_linux_anonymous_inode_semantics ... ok
+test fanotify::tests::inode_mark_reports_the_object_itself ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 2181 filtered out; finished in 0.03s
+

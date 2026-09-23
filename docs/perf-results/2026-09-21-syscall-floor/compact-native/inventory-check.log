@@ -1,0 +1,3 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running `target/debug/check-contracts --root .`
+kernel.execution.native-code-density: missing vm_free target crate ./crates/native-syscall-slice
