@@ -1,0 +1,23 @@
+schema_version = 1
+id = "kernel.mm.native-execution-scope"
+title = "Native execution owns its running handshake until the safe point"
+guest_surfaces = ["kernel:current-mm", "scheduler:execution-admission", "scheduler:page-table-quiescence"]
+semantic_authority = ["Carrick exact task execution lease", "Carrick exact-MM pause-modify-resume protocol", "man 2 mprotect", "man 2 munmap"]
+fixture = "unit:native-execution-scope"
+scale_points = [1, 8, 32, 128]
+rationale = "Normal native execution must retain exact census membership and a private running handshake without holding mutation exclusion. An interrupt requests a safe point; only scope exit acknowledges it. Repeated entry and host memory-control service after setup must allocate no host memory. Native endpoints join the exact-MM drain but never acknowledge hardware ASID tickets; memory service preserves external stops and authenticates the current lease. This scope grants no memory pointers or executable publication."
+
+[bindings]
+vm_free = "carrick-kernel-example::native_execution_scope::native_execution_scope_contract; kernel native_execution tests; runtime native_admission_allows_carrier_cow_without_hardware_ack and mixed hardware-owner COW composition"
+
+[bindings.unresolved]
+embed_structural = "The lifecycle and allocation contract is VM-free. Host carrier data and bounded ELF composition are exercised separately; native code publication, signals, cancellation and scheduling still require signed execution composition."
+embed_timing = "No new performance measurement or native workload acceptance."
+docker = "Internal admission invariant; Linux mapping semantics remain the external obligation. No corresponding differential guest race is registered."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "host_heap_allocations"
+value = 0
+layers = ["vm-free"]
+rationale = "After one-time executor admission and warmup, N enter/checkpoint/leave cycles must allocate zero times. The fixture intercepts actual thread-local allocator calls and verifies a positive control."

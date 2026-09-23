@@ -1,0 +1,26 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.14s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-3c2afd032626087b)
+
+running 18 tests
+test trap::foreign_mm::tests::local_sparse_preparation_allows_independent_registry_progress ... ok
+test trap::foreign_mm::tests::sparse_replacement_failure_preserves_preimage_before_retirement ... ok
+test trap::frame_inventory::tests::global_frame_exec_omits_sparse_mmap_arena_and_reserves_large_extents_first ... ok
+test trap::frame_inventory::tests::retire_initial_mmap_arena_is_idempotent_when_sparse_mapping_absent ... ok
+test trap::frame_inventory::tests::root_exec_rebuilds_tables_with_sparse_and_hvpatch_reservations ... ok
+test trap::frame_inventory::tests::sparse_exec_omission_requires_exact_private_hidden_arena ... ok
+test trap::memory_protection::tests::alias_registry_tests::sparse_shared_aperture_owner_does_not_require_a_base_leaf ... ok
+test trap::sparse_materialization::arena_pin_tests::local_publication_permit_requires_the_bound_mm_and_asid ... ok
+test trap::sparse_materialization::arena_pin_tests::local_publication_tolerates_equivalent_rebind_during_quiesce ... ok
+test trap::sparse_materialization::arena_pin_tests::publication_resolver_pins_exact_full_slot_until_edit_finishes ... ok
+test trap::sparse_materialization::arena_pin_tests::publication_resolver_pins_exact_primary_owner_until_edit_finishes ... ok
+test trap::sparse_materialization::arena_pin_tests::publication_resolver_pins_relocated_root_global_owner ... ok
+test trap::sparse_materialization::arena_pin_tests::rollback_arena_retirement_preserves_pinned_or_failed_backing_until_retry ... ok
+test trap::sparse_materialization::arena_pin_tests::rollback_arena_retirement_rejects_missing_journal_and_missing_mm_owner ... ok
+test trap::sparse_materialization::tests::anonymous_first_touch_never_allocates_a_block_of_padding ... ok
+test trap::sparse_materialization::tests::bulk_anonymous_views_preserve_block_congruence ... ok
+test trap::sparse_materialization::tests::file_view_layout_is_one_host_mapping_with_semantic_delta ... ok
+test trap::sparse_materialization::tests::sparse_allocation_rejects_invalid_semantic_ranges ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 491 filtered out; finished in 0.15s
+

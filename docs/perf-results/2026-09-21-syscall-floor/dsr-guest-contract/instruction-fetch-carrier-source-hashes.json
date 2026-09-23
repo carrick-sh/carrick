@@ -1,0 +1,5 @@
+{
+  "crates/carrick-hal/src/foreign_mm.rs": "62b3d65de07fcf39273418d416b33e2aa804566e3c64d1aae9b843c43441688b",
+  "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "522c10881aa0984dba3e886b87cb80c439a0ac16fa300e04485a72d15a3dbc40",
+  "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs": "999a5f1939ccd99fcbe93934153b1d4243805861759840c8d1105360a483d1a5"
+}

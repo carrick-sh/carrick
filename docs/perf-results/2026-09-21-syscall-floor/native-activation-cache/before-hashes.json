@@ -1,0 +1,13 @@
+{
+  "crates/carrick-aarch64/src/stage1_authority.rs": "1aa50d59b5fe88b1bccf13187e14d6393cf8c69e5d1ee320d1577300778580af",
+  "crates/carrick-hal/src/foreign_mm.rs": "6bf5203ad03bf48625b7a36064a96666be8098993105b3aad0c0179663a060f2",
+  "crates/carrick-kernel/src/kernel/address.rs": "1afd2f26ec8f0abc9060d93abb4822a97b813cbf11de1bd84f813ebfb762c386",
+  "crates/carrick-kernel/src/kernel/mod.rs": "c6631a56129e575ed78e9354251e2e0c11ea8e7d8d9bdb9106448a662ce17a3a",
+  "crates/carrick-kernel/src/kernel/frame_inventory.rs": "70a07e0bf139470f080a5f21ea1a48993e0d329280dd5d9c041d871f66ce79d3",
+  "crates/carrick-kernel/src/kernel/mm_access.rs": "76df9e32539584ee763a52dd3e5059e48daa5262f2f33a5b62acc1fd93d3b66e",
+  "crates/carrick-runtime/src/hvpatch/stage1_mm.rs": "26a449b328890d3dd02cede7ab3b1a7ede4f5879c058b980c41127be71dc781a",
+  "crates/carrick-runtime/src/vcpu_loop/memory.rs": "c3abf8df778e8b5061d81fd6eda8f082f0bb2c7c0238fa025ffe29f5f1af7b5e",
+  "crates/carrick-runtime/Cargo.toml": "fe2a63658fcd6248ecb64d8a0bdc6b700efa598faef138e93c9f687205fe9a0a",
+  "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "b007a774650d9e2ad34c13b2d36dfd135a83703d9146e8e0dc9741f1aeed0491",
+  "crates/carrick-observability/src/work_meter.rs": "a5c7fbfe6a00b354a7d19027c80ee8490e85027a540308f6fb3ab17a5f7af399"
+}

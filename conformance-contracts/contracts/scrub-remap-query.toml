@@ -1,0 +1,24 @@
+schema_version = 1
+id = "kernel.mm.scrub-remap-query"
+title = "Ineligible anonymous remaps need no physical COW query"
+guest_surfaces = ["syscall:madvise", "syscall:mmap"]
+semantic_authority = ["man 2 madvise", "Linux private anonymous memory and fork isolation"]
+fixture = "unit:scrub_remap_ineligible_needs_no_cow_query"
+scale_points = [1, 8, 32, 128]
+rationale = "Scrubbing retains owner authentication and zeroing. Physical COW provenance is queried only if every independent anonymous-remap guard passes; ineligible mappings cannot use its result. Eligible mappings must query once and reject remapping when a COW source exists."
+
+[bindings]
+vm_free = "carrick-vmm-hvf::trap::guest_memory::tests::scrub_remap_ineligible_needs_no_cow_query"
+docker = "probe:memflagmatrix"
+
+[bindings.unresolved]
+embed_structural = "Signed mem, forkcow, and memflagmatrix match cached Linux oracles on musl and glibc. Production guest query counting remains pending; unit callback counts do not attest the guest budget."
+observation = "Direct unit callback assertion; versioned WorkObservation pending."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "host_backend_calls"
+base = 0
+per_unit = 0
+layers = ["vm-free"]
+rationale = "For this decision fixture the backend operation is the physical COW query. Ineligible remaps invoke it zero times; eligible remaps are separately required to query once."

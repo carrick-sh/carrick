@@ -1,0 +1,22 @@
+{
+  "argv": [
+    "/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-fstat-allocation",
+    "run",
+    "--max-traps",
+    "18446744073709551615",
+    "--fs",
+    "host",
+    "-v",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/io-floor/shared:/bench",
+    "--entrypoint",
+    "/bench/io-floor-profile-linux",
+    "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+    "/bench/floor-fstat-untraced-6-candidate.data",
+    "65536",
+    "9",
+    "fstat"
+  ],
+  "run_id": "floor-fstat-untraced-6-candidate",
+  "binary_sha256": "5936b1522fb26651edb376133cd4dc7c72e48569813c739bbb10b19db6e1f784",
+  "fixture_sha256": "2bc66ca7453884a95257832664900cb7d04622f03f2a5aaa51ec81442e1962e7"
+}

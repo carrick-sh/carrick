@@ -1,0 +1,7 @@
+pristine_scrub_pages=1=ok
+pristine_scrub_pages=8=ok
+pristine_scrub_pages=32=ok
+pristine_scrub_pages=128=ok
+partial_scrub_fork=ok
+mixed_scrub_private_shared=ok
+

@@ -1,0 +1,69 @@
+warning: variable does not need to be mutable
+  --> /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example/src/contracts.rs:63:9
+   |
+63 |     let mut snapshot = report.work_snapshot().clone();
+   |         ----^^^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example/src/contracts.rs:203:9
+    |
+203 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example/src/contracts.rs:319:9
+    |
+319 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example/src/contracts.rs:405:9
+    |
+405 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example/src/contracts.rs:505:9
+    |
+505 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example/src/contracts.rs:605:9
+    |
+605 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example/src/contracts.rs:754:9
+    |
+754 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example/src/contracts.rs:821:9
+    |
+821 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: `carrick-kernel-example` (lib) generated 8 warnings (run `cargo clippy --fix --lib -p carrick-kernel-example -- --no-deps -D warnings` to apply 8 suggestions)
+    Checking native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/experiments/native-syscall-slice)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.31s

@@ -1,0 +1,27 @@
+
+running 1 test
+test vcpu_loop::exec::tests::invalid_inotify_resident_poll_cost ... resident_poll wrapped=false sample=0 ns_per_pair=928.5755157470703
+resident_poll wrapped=false sample=1 ns_per_pair=930.8795928955078
+resident_poll wrapped=false sample=2 ns_per_pair=928.9290008544922
+resident_poll wrapped=false sample=3 ns_per_pair=931.2388000488281
+resident_poll wrapped=false sample=4 ns_per_pair=934.4812927246094
+resident_poll wrapped=false sample=5 ns_per_pair=933.9892120361328
+resident_poll wrapped=false sample=6 ns_per_pair=923.0505523681641
+resident_poll wrapped=false sample=7 ns_per_pair=925.6985931396484
+resident_poll wrapped=false sample=8 ns_per_pair=931.3252716064453
+resident_poll wrapped=false sample=9 ns_per_pair=935.7783050537109
+resident_poll wrapped=false sample=10 ns_per_pair=939.9903717041016
+resident_poll wrapped=false sample=11 ns_per_pair=934.2524108886719
+resident_poll wrapped=false sample=12 ns_per_pair=936.2614898681641
+resident_poll wrapped=false sample=13 ns_per_pair=927.8297424316406
+resident_poll wrapped=false sample=14 ns_per_pair=933.1092834472656
+resident_poll wrapped=false sample=15 ns_per_pair=934.2848358154297
+resident_poll wrapped=false sample=16 ns_per_pair=934.9759368896484
+resident_poll wrapped=false sample=17 ns_per_pair=934.3948364257813
+resident_poll wrapped=false sample=18 ns_per_pair=935.9849243164063
+resident_poll wrapped=false sample=19 ns_per_pair=933.6973724365234
+resident_poll wrapped=false sample=20 ns_per_pair=933.4125518798828
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 598 filtered out; finished in 1.37s
+

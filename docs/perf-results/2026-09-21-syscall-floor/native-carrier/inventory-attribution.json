@@ -1,0 +1,80 @@
+{
+  "current_equals_before_metadata_update": true,
+  "generated_sha256": "d5d3981c9b04c6e6c95682709d2bf6328d4dce9f83b7010f80c895a564dc5ee5",
+  "existing_inventory_sha256": "ed45e53cde1603a08d26766a3c4688528b92f0bdf10297a82fc264dce176653b",
+  "changed_entries": [
+    {
+      "syscall": "inotify_add_watch",
+      "different_fields": [
+        "contracts"
+      ]
+    },
+    {
+      "syscall": "inotify_rm_watch",
+      "different_fields": [
+        "contracts"
+      ]
+    },
+    {
+      "syscall": "read",
+      "different_fields": [
+        "contracts"
+      ]
+    },
+    {
+      "syscall": "newfstatat",
+      "different_fields": [
+        "contracts"
+      ]
+    },
+    {
+      "syscall": "fstat",
+      "different_fields": [
+        "contracts"
+      ]
+    },
+    {
+      "syscall": "kill",
+      "different_fields": [
+        "contracts"
+      ]
+    },
+    {
+      "syscall": "sigaltstack",
+      "different_fields": [
+        "contracts"
+      ]
+    },
+    {
+      "syscall": "munmap",
+      "different_fields": [
+        "contracts"
+      ]
+    },
+    {
+      "syscall": "mmap",
+      "different_fields": [
+        "contracts"
+      ]
+    },
+    {
+      "syscall": "madvise",
+      "different_fields": [
+        "contracts"
+      ]
+    },
+    {
+      "syscall": "wait4",
+      "different_fields": [
+        "contracts"
+      ]
+    },
+    {
+      "syscall": "statx",
+      "different_fields": [
+        "contracts"
+      ]
+    }
+  ],
+  "checked_in_inventory_modified": false
+}

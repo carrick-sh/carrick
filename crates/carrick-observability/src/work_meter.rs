@@ -69,10 +69,25 @@ pub enum WorkMetric {
     PortalFallbacks,
     /// Requests or responses rejected for stale session identity.
     PortalStaleRejects,
+    /// Host allocator allocation/reallocation calls in the observed thread's
+    /// operation window. Distinct from guest backing allocation or bytes.
+    HostHeapAllocations,
+    /// Terminal leaves validated while activating a retained native data span.
+    NativeActivationLeafChecks,
+    /// Successful data-grant activations during native execution intervals.
+    NativeDataActivations,
+    /// AArch64 instruction words emitted into a native translation publication.
+    NativeCodeWords,
+    /// Subscribed physical code pages visited by byte-write invalidation.
+    NativeCodeInvalidationPages,
+    /// Full kernel MM snapshots collected in the operation window.
+    MmSnapshotCollections,
+    /// Physical backing owner pins acquired in the operation window.
+    ForeignOwnerPins,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 33;
+    pub const COUNT: usize = 40;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -107,6 +122,13 @@ impl WorkMetric {
         Self::PortalCompletions,
         Self::PortalFallbacks,
         Self::PortalStaleRejects,
+        Self::HostHeapAllocations,
+        Self::NativeActivationLeafChecks,
+        Self::NativeDataActivations,
+        Self::NativeCodeWords,
+        Self::NativeCodeInvalidationPages,
+        Self::MmSnapshotCollections,
+        Self::ForeignOwnerPins,
     ];
 }
 

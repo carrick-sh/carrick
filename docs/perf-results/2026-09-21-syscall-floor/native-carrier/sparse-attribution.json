@@ -1,0 +1,98 @@
+[
+  {
+    "arm": "approved",
+    "iteration": 1,
+    "exit_code": 101,
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-vmm-hvf",
+      "--release",
+      "--lib",
+      "trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance",
+      "--",
+      "--exact",
+      "--test-threads=1"
+    ],
+    "source_sha256": {
+      "crates/carrick-hal/src/foreign_mm.rs": "c9b758e11a4587193dafcfbc094c80353e8befb4733990b01a27109bb791578a",
+      "crates/carrick-hal/src/lib.rs": "d5e9e2ec98c9afd2dde9f40e387df4376a0da89bb77d5701bae6b7c0c178f727",
+      "crates/carrick-kernel/src/kernel/mm_access.rs": "908cb3327699ddabdb0db51325e69ee60e6a9adcda6dbff4dd291b0919f56fbd",
+      "crates/carrick-runtime/src/vcpu_loop/memory.rs": "95006d47914964f32b101f91ba93170df658dae0cc362b171b9407915287cff7",
+      "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "d4c48e01cd695587d077b0719b31b426b367f9397fd4a70de2bcc346311c7a35"
+    }
+  },
+  {
+    "arm": "approved",
+    "iteration": 2,
+    "exit_code": 101,
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-vmm-hvf",
+      "--release",
+      "--lib",
+      "trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance",
+      "--",
+      "--exact",
+      "--test-threads=1"
+    ],
+    "source_sha256": {
+      "crates/carrick-hal/src/foreign_mm.rs": "c9b758e11a4587193dafcfbc094c80353e8befb4733990b01a27109bb791578a",
+      "crates/carrick-hal/src/lib.rs": "d5e9e2ec98c9afd2dde9f40e387df4376a0da89bb77d5701bae6b7c0c178f727",
+      "crates/carrick-kernel/src/kernel/mm_access.rs": "908cb3327699ddabdb0db51325e69ee60e6a9adcda6dbff4dd291b0919f56fbd",
+      "crates/carrick-runtime/src/vcpu_loop/memory.rs": "95006d47914964f32b101f91ba93170df658dae0cc362b171b9407915287cff7",
+      "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "d4c48e01cd695587d077b0719b31b426b367f9397fd4a70de2bcc346311c7a35"
+    }
+  },
+  {
+    "arm": "before-approved",
+    "iteration": 1,
+    "exit_code": 101,
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-vmm-hvf",
+      "--release",
+      "--lib",
+      "trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance",
+      "--",
+      "--exact",
+      "--test-threads=1"
+    ],
+    "source_sha256": {
+      "crates/carrick-hal/src/foreign_mm.rs": "62b3d65de07fcf39273418d416b33e2aa804566e3c64d1aae9b843c43441688b",
+      "crates/carrick-hal/src/lib.rs": "25e5561ad53e0823c8886c4f881c0011096cbd3d4d66ed37755dc51c83f31a0a",
+      "crates/carrick-kernel/src/kernel/mm_access.rs": "a3c9da90c2dd346902602f89b2db84836b40f7dc0a24d2407cd973a00ae9a87f",
+      "crates/carrick-runtime/src/vcpu_loop/memory.rs": "de7b59168d2e4ed59f3d001c447aff8ff0d502416479b2e9dadb689d87057da2",
+      "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "522c10881aa0984dba3e886b87cb80c439a0ac16fa300e04485a72d15a3dbc40"
+    }
+  },
+  {
+    "arm": "before-approved",
+    "iteration": 2,
+    "exit_code": 101,
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-vmm-hvf",
+      "--release",
+      "--lib",
+      "trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance",
+      "--",
+      "--exact",
+      "--test-threads=1"
+    ],
+    "source_sha256": {
+      "crates/carrick-hal/src/foreign_mm.rs": "62b3d65de07fcf39273418d416b33e2aa804566e3c64d1aae9b843c43441688b",
+      "crates/carrick-hal/src/lib.rs": "25e5561ad53e0823c8886c4f881c0011096cbd3d4d66ed37755dc51c83f31a0a",
+      "crates/carrick-kernel/src/kernel/mm_access.rs": "a3c9da90c2dd346902602f89b2db84836b40f7dc0a24d2407cd973a00ae9a87f",
+      "crates/carrick-runtime/src/vcpu_loop/memory.rs": "de7b59168d2e4ed59f3d001c447aff8ff0d502416479b2e9dadb689d87057da2",
+      "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "522c10881aa0984dba3e886b87cb80c439a0ac16fa300e04485a72d15a3dbc40"
+    }
+  }
+]

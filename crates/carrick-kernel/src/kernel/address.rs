@@ -188,7 +188,24 @@ pub enum SnapshotError {
     TimedOut,
 }
 
+/// Revisions of all tables in an MM snapshot, observed through the same
+/// backend protocol. Valid only for the exact retained backend instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MmBackendStamp {
+    pub revision: u64,
+    pub binding: MmBinding,
+    pub vma_revision: VmaRevision,
+    pub frame_inventory_revision: u64,
+}
+
 pub trait MmBackend: Send + Sync {
+    /// Optional cheap validation of a previously authenticated snapshot.
+    /// Implementations must advance the relevant revision for EVERY content or
+    /// source change, including change/restoration, and never reuse a revision.
+    /// A stamp cannot itself authenticate a caller-created snapshot's contents.
+    fn snapshot_stamp(&self, _deadline: Instant) -> Result<Option<MmBackendStamp>, SnapshotError> {
+        Ok(None)
+    }
     fn snapshot(&self, deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError>;
     fn revision(&self) -> u64;
     fn vma_revision(&self, _deadline: Instant) -> Result<Option<VmaRevision>, SnapshotError> {

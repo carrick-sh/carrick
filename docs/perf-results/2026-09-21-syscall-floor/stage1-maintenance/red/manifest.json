@@ -1,0 +1,12 @@
+{
+  "stale-fixture-snapshot.log": "0b08b00356a5d616616d503d75601621fb3c254c46ef4dff267111a10238ad87",
+  "crates__carrick-vmm-hvf__Cargo.toml.before": "b09d4a3703fd54bb8e8eb1c0f95cea5fe5abdee47011ffc3f249618f379e868d",
+  "crates__carrick-vmm-hvf__Cargo.toml.red": "212f1e713b736faca8ac4c549ba7cfc332bcbe6fa293dafb6ad948f13d13d638",
+  "test.log": "5788158554abdec543e6ba33f0b931b3d9bf3688eebb70f1b5829e143fbdbf1e",
+  "conformance-contracts__contracts__fresh-publication-maintenance.toml.red": "4f5025c588ee9b896438b9331a86ec61b54e4973a50527e0f4b183161bf8b7fe",
+  "Cargo.lock.before": "40dd767931aa8cbc5051153d2922391a5157af8be80036c617ab418993aec2f2",
+  "README.md": "793a1e0c5142dd5109655b64b351a3a310dea7397956156c4552fdc820a859d8",
+  "setup-error.log": "09de2c46fae67e718805179f98504f4514f7a72fe78de2993c2f3df232b1961c",
+  "crates__carrick-vmm-hvf__src__trap__foreign_mm__tests.rs.before": "999a5f1939ccd99fcbe93934153b1d4243805861759840c8d1105360a483d1a5",
+  "crates__carrick-vmm-hvf__src__trap__foreign_mm__tests.rs.red": "a88a83bbf3d9c94bb20c51225ae76e7c7a1398d2b5ed6403da062775c4d33179"
+}

@@ -1,0 +1,42 @@
+{"index": 0, "lane": "macos", "median_ns_per_iteration": {"seek": 256.89697265625, "pwrite64": 957.3974609375, "write64_seek": 1220.458984375, "fstat": 238.037109375}}
+{"index": 1, "lane": "carrick", "median_ns_per_iteration": {"seek": 21.06219482421875, "pwrite64": 3209.0911865234375, "write64_seek": 2265.9047241210938, "fstat": 2019.7880859375}}
+{"index": 2, "lane": "carrick", "median_ns_per_iteration": {"seek": 21.06475830078125, "pwrite64": 3250.7603759765625, "write64_seek": 2241.345703125, "fstat": 2014.849365234375}}
+{"index": 3, "lane": "macos", "median_ns_per_iteration": {"seek": 205.01708984375, "pwrite64": 984.31396484375, "write64_seek": 1237.79296875, "fstat": 240.72265625}}
+{"index": 4, "lane": "macos", "median_ns_per_iteration": {"seek": 204.52880859375, "pwrite64": 969.7265625, "write64_seek": 1216.85791015625, "fstat": 241.69921875}}
+{"index": 5, "lane": "carrick", "median_ns_per_iteration": {"seek": 21.06732177734375, "pwrite64": 3351.6210327148438, "write64_seek": 2268.2647705078125, "fstat": 2047.54638671875}}
+{"index": 6, "lane": "carrick", "median_ns_per_iteration": {"seek": 21.06475830078125, "pwrite64": 3280.4489135742188, "write64_seek": 2287.9282836914062, "fstat": 2127.4286499023438}}
+{"index": 7, "lane": "macos", "median_ns_per_iteration": {"seek": 206.9091796875, "pwrite64": 981.38427734375, "write64_seek": 1243.7744140625, "fstat": 240.72265625}}
+{"index": 8, "lane": "linux-local", "median_ns_per_iteration": {"seek": 137.73345947265625, "pwrite64": 329.8924560546875, "write64_seek": 445.3455810546875, "fstat": 159.55609130859375}}
+{"index": 9, "lane": "docker-bind", "median_ns_per_iteration": {"seek": 139.39410400390625, "pwrite64": 11949.053466796875, "write64_seek": 12248.013793945312, "fstat": 157.758056640625}}
+{"index": 10, "lane": "docker-bind", "median_ns_per_iteration": {"seek": 140.8970947265625, "pwrite64": 12131.965637207031, "write64_seek": 12774.551391601562, "fstat": 157.99713134765625}}
+{"index": 11, "lane": "linux-local", "median_ns_per_iteration": {"seek": 138.0284423828125, "pwrite64": 339.17999267578125, "write64_seek": 476.00811767578125, "fstat": 169.843017578125}}
+{"index": 12, "lane": "linux-local", "median_ns_per_iteration": {"seek": 139.177978515625, "pwrite64": 339.1240234375, "write64_seek": 476.7303466796875, "fstat": 169.42596435546875}}
+{"index": 13, "lane": "docker-bind", "median_ns_per_iteration": {"seek": 140.2841796875, "pwrite64": 12588.546752929688, "write64_seek": 13004.020690917969, "fstat": 162.23907470703125}}
+{"index": 14, "lane": "docker-bind", "median_ns_per_iteration": {"seek": 143.5673828125, "pwrite64": 13144.363464355469, "write64_seek": 13578.473449707031, "fstat": 162.21112060546875}}
+{"index": 15, "lane": "linux-local", "median_ns_per_iteration": {"seek": 139.055908203125, "pwrite64": 339.2003173828125, "write64_seek": 476.00811767578125, "fstat": 170.67718505859375}}
+{
+  "macos": {
+    "seek": 205.963134765625,
+    "pwrite64": 975.555419921875,
+    "write64_seek": 1229.1259765625,
+    "fstat": 240.72265625
+  },
+  "carrick": {
+    "seek": 21.06475830078125,
+    "pwrite64": 3265.6046447753906,
+    "write64_seek": 2267.084747314453,
+    "fstat": 2033.667236328125
+  },
+  "linux-local": {
+    "seek": 138.54217529296875,
+    "pwrite64": 339.1520080566406,
+    "write64_seek": 476.00811767578125,
+    "fstat": 169.63449096679688
+  },
+  "docker-bind": {
+    "seek": 140.59063720703125,
+    "pwrite64": 12360.25619506836,
+    "write64_seek": 12889.286041259766,
+    "fstat": 160.1041259765625
+  }
+}

@@ -1,0 +1,21 @@
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.98s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-6abbf7196ab9319a)
+
+running 1 test
+
+thread 'vcpu_loop::memory::tests::native_carrier_elf_memory_control_round_trip' (4248373) panicked at crates/carrick-runtime/src/vcpu_loop/memory.rs:1276:17:
+assertion `left == right` failed: ELF store did not reach carrier backing
+  left: 1701667187
+ right: 1701667188
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test vcpu_loop::memory::tests::native_carrier_elf_memory_control_round_trip ... FAILED
+
+failures:
+
+failures:
+    vcpu_loop::memory::tests::native_carrier_elf_memory_control_round_trip
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 610 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p carrick-runtime --lib`

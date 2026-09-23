@@ -1,0 +1,14 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+error[E0425]: cannot find function `linux_mode_fields` in this scope
+    --> crates/carrick-kernel/src/dispatch/fd_table.rs:3026:20
+     |
+3026 |         let mode = linux_mode_fields(real.kind, real.mode);
+     |                    ^^^^^^^^^^^^^^^^^ not found in this scope
+     |
+help: consider importing this function through its public re-export
+     |
+  44 + use crate::dispatch::linux_mode_fields;
+     |
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `carrick-kernel` (lib) due to 1 previous error

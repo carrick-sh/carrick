@@ -1,0 +1,73 @@
+warning: unused return value of `set_realtime_off_ns` that must be used
+    --> carrick-dsr-aarch64/src/mapped_memory.rs:1586:13
+     |
+1586 |             carrick_mem::vdso::set_realtime_off_ns(realtime_off);
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+     |
+1586 |             let _ = carrick_mem::vdso::set_realtime_off_ns(realtime_off);
+     |             +++++++
+
+warning: `carrick-dsr-aarch64` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/lease-cost/dsr-reuse/target/debug/deps/carrick_dsr_aarch64-9aa5d69d129aabf3)
+
+running 53 tests
+test block::tests::counter_fallback_terminates_at_sensitive_exit ... ok
+test block::tests::dsr_block_does_not_decode_constant_pool_after_branch ... ok
+test block::tests::dsr_block_retains_memory_actions_in_the_instruction_stream ... ok
+test block::tests::dsr_block_retains_unsupported_virtualized_memory_actions ... ok
+test block::tests::dsr_block_stops_at_configured_instruction_limit ... ok
+test block::tests::dsr_block_stops_at_page_boundary ... ok
+test block::tests::dsr_block_stops_before_early_syscall ... ok
+test block::tests::dsr_virtual_counter_mode_one_plan_has_no_sensitive_exit ... ok
+test block::tests::exclusive_region_fusion::authenticated_branch_call_and_return_families_are_control_flow ... ok
+test block::tests::exclusive_region_fusion::biased_address_mode_selects_the_enabled_fusion_policy ... ok
+test block::tests::exclusive_region_fusion::biased_analysis_returns_the_structural_candidate ... ok
+test block::tests::exclusive_region_fusion::biased_analysis_types_reader_errors_as_unavailable ... ok
+test block::tests::exclusive_region_fusion::biased_planner_rejects_a_register_saturated_candidate ... ok
+test block::tests::exclusive_region_fusion::biased_planner_reports_canonical_region_as_eligible_but_disabled ... ok
+test block::tests::exclusive_region_fusion::biased_scratch_accounts_for_explicitly_modeled_chkfeat_x16 ... ok
+test block::tests::exclusive_region_fusion::biased_scratch_fails_closed_for_autia1716_implicit_pair ... ok
+test block::tests::exclusive_region_fusion::biased_scratch_fails_closed_for_implicit_lr_copies ... ok
+test block::tests::exclusive_region_fusion::blraa_is_rejected_as_unsupported_control_flow ... ok
+test block::tests::exclusive_region_fusion::direct_analysis_preserves_reader_errors ... ok
+test block::tests::exclusive_region_fusion::exclusive_store_is_a_typed_non_entry_site ... ok
+test block::tests::exclusive_region_fusion::falls_back_for_a_store_to_a_different_base_register ... ok
+test block::tests::exclusive_region_fusion::falls_back_for_an_x18_based_load_address ... ok
+test block::tests::exclusive_region_fusion::falls_back_for_an_x28_based_load_address ... ok
+test block::tests::exclusive_region_fusion::falls_back_on_a_pair_form_store_inside_the_region ... ok
+test block::tests::exclusive_region_fusion::falls_back_on_a_syscall_inside_the_region ... ok
+test block::tests::exclusive_region_fusion::falls_back_on_a_width_mismatched_store_inside_the_region ... ok
+test block::tests::exclusive_region_fusion::falls_back_on_a_word_load_with_a_doubleword_store ... ok
+test block::tests::exclusive_region_fusion::falls_back_on_an_ordinary_memory_access_inside_the_region ... ok
+test block::tests::exclusive_region_fusion::falls_back_on_another_exclusive_load_inside_the_region ... ok
+test block::tests::exclusive_region_fusion::falls_back_on_another_sensitive_op_inside_the_region ... ok
+test block::tests::exclusive_region_fusion::falls_back_on_unsupported_control_flow_inside_the_region ... ok
+test block::tests::exclusive_region_fusion::falls_back_when_an_early_conditional_branch_targets_inside_the_region ... ok
+test block::tests::exclusive_region_fusion::falls_back_when_no_matching_store_is_found_in_the_scan_window ... ok
+test block::tests::exclusive_region_fusion::falls_back_when_the_load_targets_a_reserved_register ... ok
+test block::tests::exclusive_region_fusion::falls_back_when_the_region_crosses_a_page_boundary ... ok
+test block::tests::exclusive_region_fusion::falls_back_when_the_retry_branch_uses_a_reserved_register ... ok
+test block::tests::exclusive_region_fusion::falls_back_when_the_store_uses_a_reserved_register ... ok
+test block::tests::exclusive_region_fusion::falls_back_when_the_trailing_branch_is_not_the_retry_edge ... ok
+test block::tests::exclusive_region_fusion::fuses_a_cas_retry_loop_into_one_block ... ok
+test block::tests::exclusive_region_fusion::production_planner_does_not_split_before_a_non_fusible_mid_block_load ... ok
+test block::tests::exclusive_region_fusion::production_planner_fuses_a_leading_exclusive_region_under_biased_enabled ... ok
+test block::tests::exclusive_region_fusion::production_planner_fuses_a_leading_exclusive_region_when_allowed ... ok
+test block::tests::exclusive_region_fusion::production_planner_keeps_the_trap_path_when_fusion_is_disallowed ... ok
+test block::tests::exclusive_region_fusion::production_planner_splits_before_a_mid_block_fusible_load ... ok
+test block::tests::exclusive_region_fusion::scratch_register_rejects_sp ... ok
+test block::tests::exclusive_region_fusion::superblock_refuses_to_fuse_a_leading_exclusive_region_as_a_segment ... ok
+test block::tests::superblock_chain_stays_contiguous_and_respects_the_segment_limit ... ok
+test block::tests::superblock_does_not_cross_a_page_boundary ... ok
+test block::tests::superblock_does_not_fuse_an_unconditional_branch_or_call ... ok
+test block::tests::superblock_fuses_the_fall_through_of_a_conditional_branch ... ok
+test block::tests::superblock_is_disabled_at_a_segment_limit_of_one ... ok
+test block::tests::superblock_of_bare_conditionals_is_bounded_by_the_segment_cap ... ok
+test block::tests::superblock_stops_at_the_instruction_budget ... ok
+
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 179 filtered out; finished in 0.00s
+

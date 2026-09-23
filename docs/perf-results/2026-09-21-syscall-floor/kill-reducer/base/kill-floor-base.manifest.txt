@@ -1,0 +1,15 @@
+run_id=kill-floor-base
+deadline_seconds=20
+fatal_hold_seconds=20
+stop_on_signal=<none>
+exe=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/carrick-base
+lldb_plugin=scripts/carrick_lldb.py
+run_args=--name kill-floor-base --max-traps 18446744073709551615 --fs host --entrypoint /usr/local/bin/python3 localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30 -u -c import subprocess,sys,selectors
+subprocess._PopenSelector=selectors.SelectSelector
+for i in range(50):
+ print('iteration',i,flush=True)
+ try: subprocess.call([sys.executable,'-c','while True: pass'],timeout=0.1)
+ except subprocess.TimeoutExpired: pass
+ else: raise AssertionError('child returned')
+print('KILL_WAIT_OK',flush=True)
+

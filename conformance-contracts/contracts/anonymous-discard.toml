@@ -1,0 +1,22 @@
+schema_version = 1
+id = "kernel.mm.anonymous-discard"
+title = "Private anonymous discard preserves mappings and removes old contents"
+guest_surfaces = ["syscall:madvise"]
+semantic_authority = ["Same-source native ARM64 Linux discard fixture; private anonymous zero-fill independent of guest write permission"]
+fixture = "unit:readonly-anonymous-discard"
+scale_points = [1, 8, 32, 128]
+rationale = "A contiguous private anonymous VMA requires one backend discard or scrub operation independent of its page count. Guest read-only protection does not retain discarded contents."
+[bindings]
+vm_free = "carrick-kernel::dispatch::mem::madvise::tests::readonly_private_anonymous_dontneed_retires_populated_residency"
+embed = "carrick-conformance-next::deferred_anonymous_pristine_scrub_semantics"
+docker = "same-source fixtures/pristine_scrub.py; pinned native ARM64 cpython-test image; discard-boundary evidence"
+[bindings.unresolved]
+embed_structural = "Actual zero-byte reduction and backing allocation budget require materialized backing retirement; current fallback eagerly clears."
+promotion = "Signed probe and ecosystem promotion pending."
+[[structural_budgets]]
+kind = "affine"
+metric = "host_backend_calls"
+base = 1
+per_unit = 0
+layers = ["vm-free"]
+rationale = "Count actual zero_backing callbacks for one contiguous VMA. This bounds dispatch amplification, not backing bytes or guest execution time."

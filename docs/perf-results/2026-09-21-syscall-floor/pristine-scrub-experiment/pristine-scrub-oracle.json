@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "docker",
+    "run",
+    "--rm",
+    "-i",
+    "--name",
+    "floor-pristine-scrub-oracle",
+    "--platform",
+    "linux/arm64",
+    "--entrypoint",
+    "/usr/local/bin/python3",
+    "localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30",
+    "-"
+  ],
+  "source_sha256": "b25289e34c710078071b673596abfc820b9995f4fe94c0d1baa2b54f2987f5fd",
+  "returncode": 0
+}

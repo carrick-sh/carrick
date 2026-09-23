@@ -1,0 +1,4 @@
+{
+  "crates/carrick-kernel/src/kernel/mm_access.rs": "17bb4fafb99726dd3fe564184eb71dc53580fc8027bb56413f0a6534a8707a70",
+  "crates/carrick-kernel/src/kernel/mod.rs": "c6631a56129e575ed78e9354251e2e0c11ea8e7d8d9bdb9106448a662ce17a3a"
+}

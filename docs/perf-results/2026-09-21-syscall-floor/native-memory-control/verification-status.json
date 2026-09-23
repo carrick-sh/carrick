@@ -1,0 +1,61 @@
+[
+  {
+    "name": "clippy",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--no-deps",
+      "-p",
+      "carrick-kernel",
+      "-p",
+      "carrick-runtime",
+      "--all-targets",
+      "--features",
+      "carrick-runtime/conformance-metrics",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 101
+  },
+  {
+    "name": "kernel",
+    "argv": [
+      "just",
+      "test-kernel"
+    ],
+    "exit_code": 101
+  },
+  {
+    "name": "runtime-quiesce",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-runtime",
+      "--lib",
+      "quiesce",
+      "--",
+      "--nocapture"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "layering",
+    "argv": [
+      "just",
+      "check-layering"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "contracts",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-conformance-contract"
+    ],
+    "exit_code": 0
+  }
+]

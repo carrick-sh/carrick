@@ -1,0 +1,11 @@
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.69s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-48d4edbb97db71d0)
+
+running 3 tests
+test vcpu_loop::memory::tests::native_data_activation_outlives_mutation_but_not_execution ... ok
+test vcpu_loop::memory::tests::native_data_activation_rejects_changes_after_preparation ... ok
+test vcpu_loop::memory::tests::native_data_activation_requires_exact_authority_and_real_drain ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 605 filtered out; finished in 0.15s
+

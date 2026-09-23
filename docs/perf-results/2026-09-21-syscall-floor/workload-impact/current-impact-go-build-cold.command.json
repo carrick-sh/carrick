@@ -1,0 +1,24 @@
+{
+  "argv": [
+    "/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-fstat-allocation",
+    "trace",
+    "--require-script-exit",
+    "--profile",
+    "hvpatch-carrier-cpu-low-rate",
+    "-o",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/workloads/current-impact-go-build-cold.raw",
+    "--",
+    "run",
+    "--max-traps",
+    "18446744073709551615",
+    "--fs",
+    "host",
+    "--entrypoint",
+    "/bin/bash",
+    "localhost:5005/carrick-go-conformance@sha256:357a08793e683c6a174d3955c704a5194e825f38fcdcb91d1d4ee2bccd6b188b",
+    "-c",
+    "set -eu; for i in $(seq 1 5); do ( cd /tmp; printf 'package main\\nfunc main(){println(\"ok\")}\\n' > floor.go; export GOCACHE=$(mktemp -d); time /usr/local/go/bin/go build -o /tmp/floor ./floor.go; /tmp/floor; echo BUILD_OK ); done; echo PROFILE_WORKLOAD_OK"
+  ],
+  "run_id": "floor-current-impact-go-build-cold",
+  "binary_sha256": "5936b1522fb26651edb376133cd4dc7c72e48569813c739bbb10b19db6e1f784"
+}

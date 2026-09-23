@@ -1,0 +1,110 @@
+[
+  {
+    "name": "clippy-final",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--no-deps",
+      "-p",
+      "carrick-kernel",
+      "-p",
+      "carrick-runtime",
+      "--all-targets",
+      "--features",
+      "carrick-runtime/conformance-metrics",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "kernel-final",
+    "argv": [
+      "just",
+      "test-kernel"
+    ],
+    "exit_code": 101
+  },
+  {
+    "name": "runtime-memory-final",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-runtime",
+      "--features",
+      "conformance-metrics",
+      "--lib",
+      "vcpu_loop::memory::tests::",
+      "--",
+      "--nocapture"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "runtime-quiesce-final",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-runtime",
+      "--features",
+      "conformance-metrics",
+      "--lib",
+      "quiesce",
+      "--",
+      "--nocapture"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "memory-doctests",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-kernel",
+      "--doc",
+      "mm_access"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "scope-doctests",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-kernel",
+      "--doc",
+      "native_execution"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "elf-private-controls",
+    "argv": [
+      "cargo",
+      "test",
+      "--manifest-path",
+      "experiments/native-syscall-slice/Cargo.toml",
+      "--tests"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "elf-clippy",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--manifest-path",
+      "experiments/native-syscall-slice/Cargo.toml",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0
+  }
+]

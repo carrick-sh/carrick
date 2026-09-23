@@ -1,0 +1,655 @@
+{
+  "input": "target/lease-cost/native-islands/libc.so.6",
+  "limitation": "Static instruction sites only; accepted decoding does not prove linked execution, memory authority, atomic ordering, or workload coverage. Linear runs ignore branch edges.",
+  "schema": "native-slice-static-text-coverage-v1",
+  "symbols": [
+    {
+      "accepted_classes": {
+        "Branch": 3,
+        "Integer": 9,
+        "Syscall": 1
+      },
+      "accepted_sites": 13,
+      "elf_virtual_address": "0xe9640",
+      "instruction_sites": 15,
+      "instructions": [
+        {
+          "address": "0xe9640",
+          "word": "0xd503201f"
+        },
+        {
+          "address": "0xe9644",
+          "word": "0x2a0003e8"
+        },
+        {
+          "address": "0xe9648",
+          "word": "0xaa0103e0"
+        },
+        {
+          "address": "0xe964c",
+          "word": "0xaa0203e1"
+        },
+        {
+          "address": "0xe9650",
+          "word": "0xaa0303e2"
+        },
+        {
+          "address": "0xe9654",
+          "word": "0xaa0403e3"
+        },
+        {
+          "address": "0xe9658",
+          "word": "0xaa0503e4"
+        },
+        {
+          "address": "0xe965c",
+          "word": "0xaa0603e5"
+        },
+        {
+          "address": "0xe9660",
+          "word": "0xaa0703e6"
+        },
+        {
+          "address": "0xe9664",
+          "word": "0xd4000001"
+        },
+        {
+          "address": "0xe9668",
+          "word": "0xb13ffc1f"
+        },
+        {
+          "address": "0xe966c",
+          "word": "0x54000042"
+        },
+        {
+          "address": "0xe9670",
+          "word": "0xd65f03c0"
+        },
+        {
+          "address": "0xe9674",
+          "word": "0x17fcfbfb"
+        },
+        {
+          "address": "0xe9678",
+          "word": "0x17fcfbfa"
+        }
+      ],
+      "longest_linear_accepted_run": 11,
+      "rejected_reasons": {
+        "instruction outside bounded native subset": 2
+      },
+      "rejected_sites": [
+        {
+          "address": "0xe9640",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xd503201f"
+        },
+        {
+          "address": "0xe9670",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xd65f03c0"
+        }
+      ],
+      "rejected_sites_count": 2,
+      "symbol": "syscall"
+    },
+    {
+      "accepted_classes": {
+        "Branch": 2,
+        "Integer": 2,
+        "Syscall": 1
+      },
+      "accepted_sites": 5,
+      "elf_virtual_address": "0xecf40",
+      "instruction_sites": 7,
+      "instructions": [
+        {
+          "address": "0xecf40",
+          "word": "0xd503201f"
+        },
+        {
+          "address": "0xecf44",
+          "word": "0xd2800368"
+        },
+        {
+          "address": "0xecf48",
+          "word": "0xd4000001"
+        },
+        {
+          "address": "0xecf4c",
+          "word": "0xb13ffc1f"
+        },
+        {
+          "address": "0xecf50",
+          "word": "0x54000042"
+        },
+        {
+          "address": "0xecf54",
+          "word": "0xd65f03c0"
+        },
+        {
+          "address": "0xecf58",
+          "word": "0x17fcedc2"
+        }
+      ],
+      "longest_linear_accepted_run": 4,
+      "rejected_reasons": {
+        "instruction outside bounded native subset": 2
+      },
+      "rejected_sites": [
+        {
+          "address": "0xecf40",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xd503201f"
+        },
+        {
+          "address": "0xecf54",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xd65f03c0"
+        }
+      ],
+      "rejected_sites_count": 2,
+      "symbol": "inotify_add_watch"
+    },
+    {
+      "accepted_classes": {
+        "Branch": 2,
+        "Integer": 2,
+        "Syscall": 1
+      },
+      "accepted_sites": 5,
+      "elf_virtual_address": "0xecfc0",
+      "instruction_sites": 7,
+      "instructions": [
+        {
+          "address": "0xecfc0",
+          "word": "0xd503201f"
+        },
+        {
+          "address": "0xecfc4",
+          "word": "0xd2800388"
+        },
+        {
+          "address": "0xecfc8",
+          "word": "0xd4000001"
+        },
+        {
+          "address": "0xecfcc",
+          "word": "0xb13ffc1f"
+        },
+        {
+          "address": "0xecfd0",
+          "word": "0x54000042"
+        },
+        {
+          "address": "0xecfd4",
+          "word": "0xd65f03c0"
+        },
+        {
+          "address": "0xecfd8",
+          "word": "0x17fceda2"
+        }
+      ],
+      "longest_linear_accepted_run": 4,
+      "rejected_reasons": {
+        "instruction outside bounded native subset": 2
+      },
+      "rejected_sites": [
+        {
+          "address": "0xecfc0",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xd503201f"
+        },
+        {
+          "address": "0xecfd4",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xd65f03c0"
+        }
+      ],
+      "rejected_sites_count": 2,
+      "symbol": "inotify_rm_watch"
+    },
+    {
+      "accepted_classes": {
+        "Address": 3,
+        "Branch": 5,
+        "Integer": 20,
+        "Memory": 4,
+        "Syscall": 2,
+        "Tls": 2
+      },
+      "accepted_sites": 36,
+      "elf_virtual_address": "0xe1ce0",
+      "instruction_sites": 51,
+      "instructions": [
+        {
+          "address": "0xe1ce0",
+          "word": "0xa9bd7bfd"
+        },
+        {
+          "address": "0xe1ce4",
+          "word": "0xd00006a3"
+        },
+        {
+          "address": "0xe1ce8",
+          "word": "0x910003fd"
+        },
+        {
+          "address": "0xe1cec",
+          "word": "0x3954a063"
+        },
+        {
+          "address": "0xe1cf0",
+          "word": "0xa90153f3"
+        },
+        {
+          "address": "0xe1cf4",
+          "word": "0x93407c13"
+        },
+        {
+          "address": "0xe1cf8",
+          "word": "0x34000163"
+        },
+        {
+          "address": "0xe1cfc",
+          "word": "0xaa1303e0"
+        },
+        {
+          "address": "0xe1d00",
+          "word": "0xd2800808"
+        },
+        {
+          "address": "0xe1d04",
+          "word": "0xd4000001"
+        },
+        {
+          "address": "0xe1d08",
+          "word": "0xaa0003f3"
+        },
+        {
+          "address": "0xe1d0c",
+          "word": "0xb140041f"
+        },
+        {
+          "address": "0xe1d10",
+          "word": "0x54000328"
+        },
+        {
+          "address": "0xe1d14",
+          "word": "0xaa1303e0"
+        },
+        {
+          "address": "0xe1d18",
+          "word": "0xa94153f3"
+        },
+        {
+          "address": "0xe1d1c",
+          "word": "0xa8c37bfd"
+        },
+        {
+          "address": "0xe1d20",
+          "word": "0xd65f03c0"
+        },
+        {
+          "address": "0xe1d24",
+          "word": "0xaa0203f4"
+        },
+        {
+          "address": "0xe1d28",
+          "word": "0xf90013f5"
+        },
+        {
+          "address": "0xe1d2c",
+          "word": "0xaa0103f5"
+        },
+        {
+          "address": "0xe1d30",
+          "word": "0x97fe7ed0"
+        },
+        {
+          "address": "0xe1d34",
+          "word": "0xaa1503e1"
+        },
+        {
+          "address": "0xe1d38",
+          "word": "0x2a0003e3"
+        },
+        {
+          "address": "0xe1d3c",
+          "word": "0xaa1403e2"
+        },
+        {
+          "address": "0xe1d40",
+          "word": "0xaa1303e0"
+        },
+        {
+          "address": "0xe1d44",
+          "word": "0xd2800808"
+        },
+        {
+          "address": "0xe1d48",
+          "word": "0xd4000001"
+        },
+        {
+          "address": "0xe1d4c",
+          "word": "0xaa0003f3"
+        },
+        {
+          "address": "0xe1d50",
+          "word": "0xb140041f"
+        },
+        {
+          "address": "0xe1d54",
+          "word": "0x540001e8"
+        },
+        {
+          "address": "0xe1d58",
+          "word": "0x2a0303e0"
+        },
+        {
+          "address": "0xe1d5c",
+          "word": "0x97fe7ee9"
+        },
+        {
+          "address": "0xe1d60",
+          "word": "0xf94013f5"
+        },
+        {
+          "address": "0xe1d64",
+          "word": "0xaa1303e0"
+        },
+        {
+          "address": "0xe1d68",
+          "word": "0xa94153f3"
+        },
+        {
+          "address": "0xe1d6c",
+          "word": "0xa8c37bfd"
+        },
+        {
+          "address": "0xe1d70",
+          "word": "0xd65f03c0"
+        },
+        {
+          "address": "0xe1d74",
+          "word": "0xd0000660"
+        },
+        {
+          "address": "0xe1d78",
+          "word": "0xf946ec00"
+        },
+        {
+          "address": "0xe1d7c",
+          "word": "0xd53bd041"
+        },
+        {
+          "address": "0xe1d80",
+          "word": "0x4b1303e2"
+        },
+        {
+          "address": "0xe1d84",
+          "word": "0x92800013"
+        },
+        {
+          "address": "0xe1d88",
+          "word": "0xb8206822"
+        },
+        {
+          "address": "0xe1d8c",
+          "word": "0x17ffffe2"
+        },
+        {
+          "address": "0xe1d90",
+          "word": "0xd0000660"
+        },
+        {
+          "address": "0xe1d94",
+          "word": "0xf946ec00"
+        },
+        {
+          "address": "0xe1d98",
+          "word": "0xd53bd041"
+        },
+        {
+          "address": "0xe1d9c",
+          "word": "0x4b1303e2"
+        },
+        {
+          "address": "0xe1da0",
+          "word": "0x92800013"
+        },
+        {
+          "address": "0xe1da4",
+          "word": "0xb8206822"
+        },
+        {
+          "address": "0xe1da8",
+          "word": "0x17ffffec"
+        }
+      ],
+      "longest_linear_accepted_run": 10,
+      "rejected_reasons": {
+        "instruction outside bounded native subset": 15
+      },
+      "rejected_sites": [
+        {
+          "address": "0xe1ce0",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xa9bd7bfd"
+        },
+        {
+          "address": "0xe1ce8",
+          "reason": "instruction outside bounded native subset",
+          "word": "0x910003fd"
+        },
+        {
+          "address": "0xe1cec",
+          "reason": "instruction outside bounded native subset",
+          "word": "0x3954a063"
+        },
+        {
+          "address": "0xe1cf0",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xa90153f3"
+        },
+        {
+          "address": "0xe1cf4",
+          "reason": "instruction outside bounded native subset",
+          "word": "0x93407c13"
+        },
+        {
+          "address": "0xe1d18",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xa94153f3"
+        },
+        {
+          "address": "0xe1d1c",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xa8c37bfd"
+        },
+        {
+          "address": "0xe1d20",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xd65f03c0"
+        },
+        {
+          "address": "0xe1d30",
+          "reason": "instruction outside bounded native subset",
+          "word": "0x97fe7ed0"
+        },
+        {
+          "address": "0xe1d5c",
+          "reason": "instruction outside bounded native subset",
+          "word": "0x97fe7ee9"
+        },
+        {
+          "address": "0xe1d68",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xa94153f3"
+        },
+        {
+          "address": "0xe1d6c",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xa8c37bfd"
+        },
+        {
+          "address": "0xe1d70",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xd65f03c0"
+        },
+        {
+          "address": "0xe1d88",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xb8206822"
+        },
+        {
+          "address": "0xe1da4",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xb8206822"
+        }
+      ],
+      "rejected_sites_count": 15,
+      "symbol": "write"
+    },
+    {
+      "accepted_classes": {
+        "Address": 1,
+        "Branch": 1,
+        "Integer": 4,
+        "Memory": 1,
+        "Syscall": 1,
+        "Tls": 1
+      },
+      "accepted_sites": 9,
+      "elf_virtual_address": "0xe03a0",
+      "instruction_sites": 18,
+      "instructions": [
+        {
+          "address": "0xe03a0",
+          "word": "0xa9bf7bfd"
+        },
+        {
+          "address": "0xe03a4",
+          "word": "0x93407c00"
+        },
+        {
+          "address": "0xe03a8",
+          "word": "0x93407c42"
+        },
+        {
+          "address": "0xe03ac",
+          "word": "0x910003fd"
+        },
+        {
+          "address": "0xe03b0",
+          "word": "0xd28007c8"
+        },
+        {
+          "address": "0xe03b4",
+          "word": "0xd4000001"
+        },
+        {
+          "address": "0xe03b8",
+          "word": "0xb140041f"
+        },
+        {
+          "address": "0xe03bc",
+          "word": "0x54000068"
+        },
+        {
+          "address": "0xe03c0",
+          "word": "0xa8c17bfd"
+        },
+        {
+          "address": "0xe03c4",
+          "word": "0xd65f03c0"
+        },
+        {
+          "address": "0xe03c8",
+          "word": "0xf0000661"
+        },
+        {
+          "address": "0xe03cc",
+          "word": "0xf946ec21"
+        },
+        {
+          "address": "0xe03d0",
+          "word": "0xd53bd042"
+        },
+        {
+          "address": "0xe03d4",
+          "word": "0x4b0003e3"
+        },
+        {
+          "address": "0xe03d8",
+          "word": "0x92800000"
+        },
+        {
+          "address": "0xe03dc",
+          "word": "0xb8216843"
+        },
+        {
+          "address": "0xe03e0",
+          "word": "0xa8c17bfd"
+        },
+        {
+          "address": "0xe03e4",
+          "word": "0xd65f03c0"
+        }
+      ],
+      "longest_linear_accepted_run": 5,
+      "rejected_reasons": {
+        "instruction outside bounded native subset": 9
+      },
+      "rejected_sites": [
+        {
+          "address": "0xe03a0",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xa9bf7bfd"
+        },
+        {
+          "address": "0xe03a4",
+          "reason": "instruction outside bounded native subset",
+          "word": "0x93407c00"
+        },
+        {
+          "address": "0xe03a8",
+          "reason": "instruction outside bounded native subset",
+          "word": "0x93407c42"
+        },
+        {
+          "address": "0xe03ac",
+          "reason": "instruction outside bounded native subset",
+          "word": "0x910003fd"
+        },
+        {
+          "address": "0xe03c0",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xa8c17bfd"
+        },
+        {
+          "address": "0xe03c4",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xd65f03c0"
+        },
+        {
+          "address": "0xe03dc",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xb8216843"
+        },
+        {
+          "address": "0xe03e0",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xa8c17bfd"
+        },
+        {
+          "address": "0xe03e4",
+          "reason": "instruction outside bounded native subset",
+          "word": "0xd65f03c0"
+        }
+      ],
+      "rejected_sites_count": 9,
+      "symbol": "lseek"
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+[
+  {
+    "name": "final-runtime",
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/compact-native/final-runtime",
+      "vcpu_loop::memory::tests::native_floor::native_code_density_contract",
+      "--exact",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "binary_sha256": "be1ffcf3fe73b2dea8058a138759b022b7f863f9cee23663b989ea5c26374dfc"
+  },
+  {
+    "name": "final-executor",
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/compact-native/final-executor",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "binary_sha256": "848414121ef53262158632cbb1d822ecf6d8a91e691b99fe0002b7c03925f80a"
+  },
+  {
+    "name": "format",
+    "argv": [
+      "rustfmt",
+      "--check",
+      "--edition",
+      "2024",
+      "--config",
+      "skip_children=true",
+      "experiments/native-syscall-slice/src/native.rs",
+      "experiments/native-syscall-slice/src/native/compact.rs",
+      "experiments/native-syscall-slice/src/lib.rs",
+      "experiments/native-syscall-slice/src/compact_tests.rs",
+      "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs",
+      "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs",
+      "crates/carrick-observability/src/work_meter.rs",
+      "crates/carrick-conformance-contract/tests/claims.rs"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "diff-check",
+    "argv": [
+      "git",
+      "-c",
+      "core.fsmonitor=false",
+      "diff",
+      "--check"
+    ],
+    "exit_code": 0
+  }
+]

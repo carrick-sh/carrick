@@ -1,0 +1,53 @@
+diff --git a/crates/carrick-observability/src/probes.rs b/crates/carrick-observability/src/probes.rs
+index ac1492312..04a4c5d47 100644
+--- a/crates/carrick-observability/src/probes.rs
++++ b/crates/carrick-observability/src/probes.rs
+@@ -5189,6 +5189,7 @@ mod real {
+         /// syscall number, then guest arg0..arg3. The typed begin supplies guest
+         /// PID/TID/ASID; five scalars keep this companion reliable on macOS.
+         fn hvpatch__syscall__args(_: u64, _: u64, _: u64, _: u64, _: u64) {}
++        fn hvpatch__backing__scrub(_: u64, _: u64, _: u64, _: u32) {}
+         fn hvpatch__syscall__service(_: i32, _: i32, _: u32, _: u64, _: u64) {}
+         /// Distinct post-completion retirement marker. Keeping this separate
+         /// lets DTrace consumers read and then clear thread-local join state
+@@ -6579,6 +6580,14 @@ mod real {
+         ));
+     }
+ 
++    /// Completed backing scrub: total bytes, explicitly zeroed bytes,
++    /// successfully remapped bytes, and remap eligibility (0 or 1).
++    /// Counts actual completed work, not the syscall's requested extent.
++    #[inline]
++    pub fn hvpatch_backing_scrub(total: u64, zeroed: u64, remapped: u64, eligible: u32) {
++        carrick_usdt::hvpatch__backing__scrub!(|| (total, zeroed, remapped, eligible));
++    }
++
+     /// Resolve service identity only when the begin probe is enabled.
+     pub fn hvpatch_syscall_service_begin_with(
+         resolve: impl FnOnce() -> Option<super::HvpatchSyscallService>,
+@@ -8473,6 +8482,7 @@ mod stub {
+     }
+ 
+     stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService, args: [u64; 6]) -> Option<std::time::Instant> => None);
++    stub!(hvpatch_backing_scrub(total: u64, zeroed: u64, remapped: u64, eligible: u32));
+     stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));
+     stub!(hvpatch_syscall_service_clear(event: super::HvpatchSyscallService));
+     stub!(hvpatch_core_lifecycle(phase: u32, pid: i32, tid: i32, generation: u64, outcome: u32));
+diff --git a/crates/carrick-vmm-hvf/src/trap/cow_engine.rs b/crates/carrick-vmm-hvf/src/trap/cow_engine.rs
+index b5da59dd4..9a10edb29 100644
+--- a/crates/carrick-vmm-hvf/src/trap/cow_engine.rs
++++ b/crates/carrick-vmm-hvf/src/trap/cow_engine.rs
+@@ -3134,6 +3134,13 @@ impl ScrubRun {
+                 core::ptr::write_bytes(host_start, 0u8, len);
+             }
+         }
++        let remapped_bytes = if remapped { aligned_len } else { 0 };
++        carrick_observability::probes::hvpatch_backing_scrub(
++            len as u64,
++            (len - remapped_bytes) as u64,
++            remapped_bytes as u64,
++            u32::from(eligible),
++        );
+     }
+ }
+ 

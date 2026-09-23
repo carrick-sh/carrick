@@ -1,0 +1,133 @@
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.71s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-207122e8ce47be2c)
+
+running 1 test
+[
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.anonymous-discard",
+        ),
+        layer: VmFree,
+        implementation_revision: "madvise-sha256:cfbc5b4d952e80bfdfbcf241e27f6839142155285e4a4e1a1752d844b872f59c",
+        fixture_identity: "unit:readonly-anonymous-discard",
+        scale: 1,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "readonly_discard_removes_old_contents",
+                passed: false,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 0,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.anonymous-discard",
+        ),
+        layer: VmFree,
+        implementation_revision: "madvise-sha256:cfbc5b4d952e80bfdfbcf241e27f6839142155285e4a4e1a1752d844b872f59c",
+        fixture_identity: "unit:readonly-anonymous-discard",
+        scale: 8,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "readonly_discard_removes_old_contents",
+                passed: false,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 0,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.anonymous-discard",
+        ),
+        layer: VmFree,
+        implementation_revision: "madvise-sha256:cfbc5b4d952e80bfdfbcf241e27f6839142155285e4a4e1a1752d844b872f59c",
+        fixture_identity: "unit:readonly-anonymous-discard",
+        scale: 32,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "readonly_discard_removes_old_contents",
+                passed: false,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 0,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.anonymous-discard",
+        ),
+        layer: VmFree,
+        implementation_revision: "madvise-sha256:cfbc5b4d952e80bfdfbcf241e27f6839142155285e4a4e1a1752d844b872f59c",
+        fixture_identity: "unit:readonly-anonymous-discard",
+        scale: 128,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "readonly_discard_removes_old_contents",
+                passed: false,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    HostBackendCalls: 0,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+]
+
+thread 'dispatch::mem::madvise::tests::readonly_private_anonymous_dontneed_retires_populated_residency' (3154789) panicked at crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs:211:87:
+called `Result::unwrap()` on an `Err` value: SemanticMismatch { contract: ContractId("kernel.mm.anonymous-discard"), assertion: "readonly_discard_removes_old_contents" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test dispatch::mem::madvise::tests::readonly_private_anonymous_dontneed_retires_populated_residency ... FAILED
+
+failures:
+
+failures:
+    dispatch::mem::madvise::tests::readonly_private_anonymous_dontneed_retires_populated_residency
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2188 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

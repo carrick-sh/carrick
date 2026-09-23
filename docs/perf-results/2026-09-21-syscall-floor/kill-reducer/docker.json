@@ -1,0 +1,5 @@
+{
+  "returncode": 0,
+  "image": "localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30",
+  "source_sha256": "83b89dfdb49db0bd306743e00d774ce1bace32e298e37852503ee3f28e0083f5"
+}

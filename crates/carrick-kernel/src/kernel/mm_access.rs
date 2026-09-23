@@ -12,6 +12,11 @@ use super::{
     Kernel, KernelContext, Mm, MmBackendSnapshot, MmId, SnapshotError, TaskKey, TaskLifecycle,
 };
 
+mod current_read;
+mod instruction_content;
+pub use current_read::{CurrentReadCache, CurrentReadWindow};
+pub use instruction_content::{ActiveInstructionContent, PreparedInstructionContent};
+
 const MM_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Unforgeable permission for the MM-access module to retrieve the carrier
@@ -179,6 +184,14 @@ fn validate_range_in_snapshot(
         }
 
         let access_error = match requested {
+            RangeAccess::Execute if !vma.access.kernel_visible => {
+                Some(MmAccessError::KernelHidden {
+                    address: GuestVa(cursor),
+                })
+            }
+            RangeAccess::Execute if !vma.access.executable => Some(MmAccessError::ExecuteDenied {
+                address: GuestVa(cursor),
+            }),
             RangeAccess::Read if !vma.access.readable => Some(MmAccessError::ReadDenied {
                 address: GuestVa(cursor),
             }),
@@ -212,6 +225,7 @@ fn validate_range_in_snapshot(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RangeAccess {
+    Execute,
     Read,
     KernelRead,
     Write,
@@ -558,7 +572,16 @@ impl MmAccessAuthority {
         range: MmReadRange<'_>,
         dst: &mut [u8],
     ) -> Result<ForeignReadReceipt, MmAccessError> {
-        if !Arc::ptr_eq(&range.token.mm, &mm.token.mm) || range.token.task != mm.token.task {
+        self.read_mm(&mm.token, range, dst)
+    }
+
+    fn read_mm(
+        &self,
+        token: &MmToken,
+        range: MmReadRange<'_>,
+        dst: &mut [u8],
+    ) -> Result<ForeignReadReceipt, MmAccessError> {
+        if !Arc::ptr_eq(&range.token.mm, &token.mm) || range.token.task != token.task {
             return Err(MmAccessError::ForeignRangeAuthorityMismatch);
         }
         if dst.len() != range.len.get() {
@@ -569,12 +592,11 @@ impl MmAccessAuthority {
         }
 
         let deadline = Instant::now() + Self::OVERALL_DEADLINE;
-        let token_lease = mm
-            .token
+        let token_lease = token
             .foreign_lease
             .read()
             .clone()
-            .ok_or(MmAccessError::MissingForeignTransport(mm.mm_id()))?;
+            .ok_or(MmAccessError::MissingForeignTransport(token.mm_id()))?;
         // A lease retained when the token was minted can predate the target's
         // current frame inventory (a sibling breaking COW on a frame it shares
         // with the target republishes that frame and bumps the target's
@@ -584,13 +606,13 @@ impl MmAccessAuthority {
         let mut lease = token_lease;
         let mut stale_retains = 0usize;
         let live = RetainedMmLiveAuthority {
-            mm: Arc::clone(&mm.token.mm),
+            mm: Arc::clone(&token.mm),
         };
         for _ in 0..Self::MAX_ATTEMPTS {
             if Instant::now() >= deadline {
                 return Err(MmAccessError::ForeignReadTimedOut);
             }
-            let before_snapshot = snapshot_backend(&mm.token.mm, deadline)?;
+            let before_snapshot = snapshot_backend(&token.mm, deadline)?;
             validate_snapshot_vmas(&before_snapshot)?;
             validate_range_in_snapshot(
                 &before_snapshot,
@@ -599,7 +621,7 @@ impl MmAccessAuthority {
                 RangeAccess::Read,
             )?;
             let snapshot =
-                ProjectedForeignMmSnapshot::from_backend(mm.token.mm_id(), &before_snapshot)?;
+                ProjectedForeignMmSnapshot::from_backend(token.mm_id(), &before_snapshot)?;
             let receipt = match lease.read(&live, &snapshot, range.start, dst, deadline) {
                 Ok(receipt) => receipt,
                 Err(carrick_hal::ForeignMmTransportError::Retry) => continue,
@@ -608,8 +630,8 @@ impl MmAccessAuthority {
                     if stale_retains > Self::MAX_ATTEMPTS {
                         return Err(MmAccessError::ForeignReadRetryExhausted);
                     }
-                    lease = retain_foreign_lease(&mm.token.mm, &snapshot, deadline)?;
-                    *mm.token.foreign_lease.write() = Some(lease.clone());
+                    lease = retain_foreign_lease(&token.mm, &snapshot, deadline)?;
+                    *token.foreign_lease.write() = Some(lease.clone());
                     continue;
                 }
                 Err(carrick_hal::ForeignMmTransportError::TimedOut) => {
@@ -618,8 +640,8 @@ impl MmAccessAuthority {
                 Err(error) => return Err(MmAccessError::ForeignTransport(error)),
             };
             let after = ProjectedForeignMmSnapshot::from_backend(
-                mm.token.mm_id(),
-                &snapshot_backend(&mm.token.mm, deadline)?,
+                token.mm_id(),
+                &snapshot_backend(&token.mm, deadline)?,
             )?;
             if after != snapshot {
                 continue;
@@ -1128,6 +1150,36 @@ struct RetainedMmLiveAuthority {
 }
 
 impl carrick_hal::ForeignMmLiveAuthority for RetainedMmLiveAuthority {
+    fn matches_authenticated_snapshot(
+        &self,
+        expected: &dyn carrick_hal::ForeignMmSnapshot,
+        deadline: Instant,
+    ) -> Result<bool, carrick_hal::ForeignMmTransportError> {
+        let backend = self
+            .mm
+            .backend()
+            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
+        if let Some(stamp) = backend
+            .snapshot_stamp(deadline)
+            .map_err(|e| snapshot_error_for_transport(MmAccessError::Snapshot(e)))?
+        {
+            return Ok(expected.mm().raw_for_probe() == self.mm.id().raw()
+                && expected.binding().asid().raw_for_probe() == stamp.binding.asid.raw()
+                && expected.binding().stage1_root() == stamp.binding.stage1_root.gpa()
+                && expected.backend_revision()
+                    == carrick_hal::ForeignBackendRevision::from_authority_raw(stamp.revision)
+                && expected.vma_revision()
+                    == carrick_hal::ForeignVmaRevision::from_authority_raw(
+                        stamp.vma_revision.raw(),
+                    )
+                && expected.frame_inventory_revision()
+                    == carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
+                        stamp.frame_inventory_revision,
+                    ));
+        }
+        Ok(self.snapshot(deadline)?.has_same_contents(expected))
+    }
+
     fn snapshot(
         &self,
         deadline: Instant,
@@ -1178,6 +1230,16 @@ pub enum MmAccessError {
     RangeOverflow { start: GuestVa, len: usize },
     #[error("guest address {address:?} is not mapped in this MM")]
     Unmapped { address: GuestVa },
+    #[error("guest address {address:?} is not executable in this MM")]
+    ExecuteDenied { address: GuestVa },
+    #[error("instruction read no longer names the same live MM mapping snapshot")]
+    StaleInstructionRead,
+    #[error("instruction fetch must contain at least one byte")]
+    EmptyInstructionRead,
+    #[error("instruction bytes changed through a tracked carrier host writer")]
+    StaleInstructionContent,
+    #[error("instruction transport does not track backing content writes")]
+    UntrackedInstructionContent,
     #[error("guest address {address:?} is not readable in this MM")]
     ReadDenied { address: GuestVa },
     #[error("guest address {address:?} is not writable in this MM")]
@@ -1212,13 +1274,540 @@ pub enum MmAccessError {
     ForeignWriteReceiptMismatch,
     #[error("foreign write source length {source_len} does not match range length {range}")]
     SourceLengthMismatch { range: usize, source_len: usize },
+    #[error("native data grant intersects executable memory at {address:?}")]
+    NativeDataExecutable { address: GuestVa },
+    #[error("native data activation requires a host control safe point")]
+    NativeDataControlPending,
+    #[error("prepared native data no longer names the exact live MM snapshot")]
+    StaleNativeData,
     #[error("foreign COW witness no longer matches the three live MM revisions")]
     StaleCowBroken,
     #[error("foreign MM write exceeded its overall deadline budget")]
     ForeignWriteTimedOut,
 }
 
+/// Resident native data scoped to a current execution lease and an existing
+/// COW mutation transaction. This is a data-only integration primitive, not a
+/// concurrent execution-quantum or translated-code publication permit.
+///
+/// The transport drops its owner pin before the witness borrow is released.
+/// Keeping real borrows prevents lease transfer or mutation-guard release while
+/// this capability is live. Raw-pointer use remains an unsafe backend operation.
+///
+/// ```compile_fail
+/// use carrick_kernel::kernel::{KernelContext, objects::ThreadExecutionLease};
+/// use carrick_kernel::kernel::mm_access::{CowBroken, CurrentNativeData};
+/// fn escape(c: &KernelContext, e: &ThreadExecutionLease, cow: &mut CowBroken<'_, '_, '_>)
+///     -> CurrentNativeData<'static, 'static, 'static, 'static, 'static> {
+///     c.borrow_current_native_data(e, cow).unwrap()
+/// }
+/// ```
+/// The execution lease cannot be transferred while its data grant is live.
+///
+/// ```compile_fail,E0505
+/// use carrick_kernel::kernel::{KernelContext, objects::ThreadExecutionLease};
+/// use carrick_kernel::kernel::mm_access::CowBroken;
+/// fn transfer(c: &KernelContext, e: ThreadExecutionLease, cow: &mut CowBroken<'_, '_, '_>) {
+///     let data = c.borrow_current_native_data(&e, cow).unwrap();
+///     c.thread().yield_from_executor(e).unwrap();
+///     let _ = data.len();
+/// }
+/// ```
+pub struct CurrentNativeData<'execution, 'witness, 'mm, 'guard, 'authority> {
+    transport: Box<dyn carrick_hal::ForeignNativeDataSpan>,
+    snapshot: ProjectedForeignMmSnapshot,
+    start: GuestVa,
+    len: NonZeroUsize,
+    _context: &'execution KernelContext,
+    _execution: &'execution ThreadExecutionLease,
+    _witness: &'witness mut CowBroken<'mm, 'guard, 'authority>,
+    _thread: PhantomData<std::rc::Rc<()>>,
+}
+
+impl CurrentNativeData<'_, '_, '_, '_, '_> {
+    pub fn start(&self) -> GuestVa {
+        self.start
+    }
+    pub fn len(&self) -> usize {
+        self.len.get()
+    }
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Retain an opaque pin beyond this COW transaction. This consumes the
+    /// mutation-scoped pointer grant; only activation under a new execution
+    /// scope can restore pointer access. Preparation itself grants no access.
+    pub fn prepare_for_execution(mut self) -> PreparedNativeData {
+        self.transport.finish_native_access();
+        PreparedNativeData {
+            transport: self.transport,
+            token: self._witness.range.token.clone(),
+            snapshot: self.snapshot,
+            start: self.start,
+            len: self.len,
+            _thread: PhantomData,
+        }
+    }
+
+    /// # Safety
+    /// Access only `[start(), start() + len())` through the returned backing
+    /// pointer and never use it after this grant drops. Do not re-enter kernel
+    /// dispatch/mutation, publish executable code, or manufacture Rust references
+    /// incompatible with other live backing access. The enclosing COW exclusion
+    /// must remain live for the whole bounded native operation.
+    pub unsafe fn as_mut_ptr(&mut self) -> *mut u8 {
+        // SAFETY: the wrapper retains the exact execution and COW exclusion;
+        // the caller accepts the bounded-use and no-escape obligations above.
+        unsafe { self.transport.as_mut_ptr() }
+    }
+}
+
 impl KernelContext {
+    /// Borrow resident data only after the current MM's exact COW transaction.
+    /// The data backing comes from the MM-installed carrier endpoint. No host
+    /// pointer, independent GuestMemory, or caller-selected MM is accepted.
+    pub fn borrow_current_native_data<'execution, 'witness, 'mm, 'guard, 'authority>(
+        &'execution self,
+        execution: &'execution ThreadExecutionLease,
+        witness: &'witness mut CowBroken<'mm, 'guard, 'authority>,
+    ) -> Result<CurrentNativeData<'execution, 'witness, 'mm, 'guard, 'authority>, MmAccessError>
+    {
+        let mm = self.authenticate_current_mm(execution)?;
+        let range = witness.range;
+        if !Arc::ptr_eq(&mm, &range.token.mm)
+            || !Arc::ptr_eq(&self.kernel, &range.token.kernel)
+            || self.task.key() != range.token.task
+        {
+            return Err(MmAccessError::ForeignRangeAuthorityMismatch);
+        }
+        let mutation = range
+            .token
+            .foreign_mutation
+            .as_ref()
+            .ok_or(MmAccessError::MissingForeignMutationAuthority(mm.id()))?;
+        if !mutation.authorizes(witness.guard) {
+            return Err(MmAccessError::ForeignMutationAuthorityMismatch);
+        }
+        let deadline = Instant::now() + MM_SNAPSHOT_TIMEOUT;
+        let before = snapshot_backend(&mm, deadline)?;
+        validate_snapshot_vmas(&before)?;
+        validate_range_in_snapshot(&before, range.start, range.len, RangeAccess::KernelRead)?;
+        validate_range_in_snapshot(&before, range.start, range.len, RangeAccess::Write)?;
+        let end = range
+            .start
+            .raw()
+            .checked_add(range.len.get() as u64)
+            .ok_or(MmAccessError::RangeOverflow {
+                start: range.start,
+                len: range.len.get(),
+            })?;
+        if let Some(vma) = before.vmas.iter().find(|vma| {
+            vma.start.raw() < end && range.start.raw() < vma.end.raw() && vma.access.executable
+        }) {
+            return Err(MmAccessError::NativeDataExecutable { address: vma.start });
+        }
+        let snapshot = ProjectedForeignMmSnapshot::from_backend(mm.id(), &before)?;
+        let cow = witness.transport.as_ref();
+        if snapshot.mm != cow.mm()
+            || snapshot.backend_revision != cow.backend_revision()
+            || snapshot.vma_revision != cow.vma_revision()
+            || snapshot.frame_inventory_revision != cow.frame_inventory_revision()
+            || !snapshot.mapping_ids.contains(&cow.mapping())
+            || !cow
+                .kernel_proof()
+                .downcast_ref::<crate::kernel::KernelForeignCowProof>()
+                .is_some_and(|proof| {
+                    proof.authenticates(
+                        &self.kernel,
+                        mm.id(),
+                        cow.range_start(),
+                        cow.range_len(),
+                        cow.frame_inventory_revision().raw_for_probe(),
+                        cow.mapping(),
+                        cow.frame(),
+                        cow.physical_base(),
+                        cow.physical_len(),
+                        cow.owner_generation(),
+                    )
+                })
+        {
+            return Err(MmAccessError::StaleCowBroken);
+        }
+        let lease = range
+            .token
+            .foreign_lease
+            .read()
+            .clone()
+            .ok_or(MmAccessError::MissingForeignTransport(mm.id()))?;
+        let live = RetainedMmLiveAuthority {
+            mm: Arc::clone(&mm),
+        };
+        let transport = lease
+            .borrow_native_data(
+                &live,
+                &snapshot,
+                cow,
+                range.start,
+                range.len.get(),
+                deadline,
+            )
+            .map_err(MmAccessError::ForeignTransport)?;
+        let after =
+            ProjectedForeignMmSnapshot::from_backend(mm.id(), &snapshot_backend(&mm, deadline)?)?;
+        if after != snapshot || !Arc::ptr_eq(&mm, &self.authenticate_current_mm(execution)?) {
+            return Err(MmAccessError::StaleCowBroken);
+        }
+        if !transport.authenticates(&snapshot, cow, range.start, range.len.get()) {
+            return Err(MmAccessError::ForeignReceiptMismatch);
+        }
+        Ok(CurrentNativeData {
+            transport,
+            snapshot,
+            start: range.start,
+            len: range.len,
+            _context: self,
+            _execution: execution,
+            _witness: witness,
+            _thread: PhantomData,
+        })
+    }
+}
+
+/// Opaque, pinned carrier backing prepared by an authenticated COW transaction.
+/// Keeping this value alive does not retain mutation exclusion or permit access.
+/// Activation checks the live MM snapshot and transport authority on every scope.
+pub struct PreparedNativeData {
+    transport: Box<dyn carrick_hal::ForeignNativeDataSpan>,
+    token: MmToken,
+    snapshot: ProjectedForeignMmSnapshot,
+    start: GuestVa,
+    len: NonZeroUsize,
+    _thread: PhantomData<std::rc::Rc<()>>,
+}
+
+impl PreparedNativeData {
+    pub fn activate<'active, 'scope>(
+        &'active mut self,
+        scope: &'active crate::dispatch::native_execution::NativeExecution<'scope>,
+    ) -> Result<ActiveNativeData<'active, 'scope>, MmAccessError> {
+        let mutation = self.token.foreign_mutation.as_ref().ok_or(
+            MmAccessError::MissingForeignMutationAuthority(self.token.mm.id()),
+        )?;
+        let context = scope.data_context(mutation)?;
+        if !Arc::ptr_eq(&context.kernel, &self.token.kernel)
+            || context.task.key() != self.token.task
+            || !Arc::ptr_eq(&context.shared.mm(), &self.token.mm)
+        {
+            return Err(MmAccessError::ForeignRangeAuthorityMismatch);
+        }
+        let deadline = Instant::now() + MM_SNAPSHOT_TIMEOUT;
+        use carrick_hal::ForeignMmLiveAuthority;
+        let live = RetainedMmLiveAuthority {
+            mm: Arc::clone(&self.token.mm),
+        };
+        // The opaque preparation already authenticated permissions and contents.
+        // These revisions belong to its immutable MM backend; they cannot grant
+        // authority to a new or caller-created snapshot.
+        if !live
+            .matches_authenticated_snapshot(&self.snapshot, deadline)
+            .map_err(MmAccessError::ForeignTransport)?
+        {
+            return Err(MmAccessError::StaleNativeData);
+        }
+        self.transport
+            .validate_native_activation(&self.snapshot, deadline)
+            .map_err(MmAccessError::ForeignTransport)?;
+        if !live
+            .matches_authenticated_snapshot(&self.snapshot, deadline)
+            .map_err(MmAccessError::ForeignTransport)?
+        {
+            return Err(MmAccessError::StaleNativeData);
+        }
+        scope.data_context(mutation)?;
+        Ok(ActiveNativeData {
+            prepared: self,
+            _scope: scope,
+        })
+    }
+}
+
+/// Data access borrowed from the exact native running scope. Dropping this grant
+/// releases access; dropping the scope afterward acknowledges the safe point.
+///
+/// ```compile_fail,E0505
+/// use carrick_kernel::{kernel::mm_access::PreparedNativeData, dispatch::native_execution::NativeExecution};
+/// fn end_scope(mut p: PreparedNativeData, scope: NativeExecution<'_>) {
+///     let mut active = p.activate(&scope).unwrap();
+///     drop(scope);
+///     unsafe { active.as_mut_ptr(); }
+/// }
+/// ```
+/// ```compile_fail,E0499
+/// use carrick_kernel::{kernel::mm_access::PreparedNativeData, dispatch::native_execution::NativeExecution};
+/// fn duplicate(p: &mut PreparedNativeData, scope: &NativeExecution<'_>) {
+///     let a = p.activate(scope).unwrap();
+///     let b = p.activate(scope).unwrap();
+///     drop((a, b));
+/// }
+/// ```
+pub struct ActiveNativeData<'active, 'scope> {
+    prepared: &'active mut PreparedNativeData,
+    _scope: &'active crate::dispatch::native_execution::NativeExecution<'scope>,
+}
+impl ActiveNativeData<'_, '_> {
+    pub fn start(&self) -> GuestVa {
+        self.prepared.start
+    }
+    pub fn len(&self) -> usize {
+        self.prepared.len.get()
+    }
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+    /// # Safety
+    /// Only access this grant's bounded range while both grant and execution
+    /// scope remain live. Do not manufacture incompatible Rust references,
+    /// publish executable code, re-enter dispatch/mutation or escape the pointer.
+    /// The native executor must return at bounded control checkpoints.
+    pub unsafe fn as_mut_ptr(&mut self) -> *mut u8 {
+        // SAFETY: activation validated the live carrier state after entering the
+        // exact running handshake. The retained scope prevents mutation passing
+        // its drain until this grant and all bounded pointer accesses have ended.
+        unsafe { self.prepared.transport.as_mut_ptr() }
+    }
+}
+
+impl Drop for ActiveNativeData<'_, '_> {
+    fn drop(&mut self) {
+        self.prepared.transport.finish_native_access();
+    }
+}
+
+#[cfg(test)]
+mod native_data_type_tests {
+    use super::{ActiveNativeData, CurrentNativeData, PreparedNativeData};
+    static_assertions::assert_not_impl_any!(PreparedNativeData: Send, Sync, Clone, Copy);
+    static_assertions::assert_not_impl_any!(ActiveNativeData<'static, 'static>: Send, Sync, Clone, Copy);
+    static_assertions::assert_not_impl_any!(CurrentNativeData<'static, 'static, 'static, 'static, 'static>: Send, Sync, Clone, Copy);
+}
+
+/// Copied instructions from one authenticated current-MM observation.
+///
+/// This retains the exact execution lease borrow for decoding. Mapping
+/// validation detects topology/permission/backing changes, but does NOT detect
+/// every in-place executable write. The retained receipt additionally detects
+/// participating carrier host writes; untracked transports and deferred bytes
+/// explicitly decline that check. Neither check grants code-cache publication.
+/// A translator must mediate all writers and obtain atomic publication authority
+/// before executing emitted code from these bytes.
+pub struct InstructionRead<'execution> {
+    context: &'execution KernelContext,
+    execution: &'execution ThreadExecutionLease,
+    mm: Arc<Mm>,
+    snapshot: ProjectedForeignMmSnapshot,
+    bytes: Vec<u8>,
+    receipt: Box<dyn carrick_hal::ForeignMmReadReceipt>,
+}
+
+impl InstructionRead<'_> {
+    /// Reject mapping changes and participating host writes since capture.
+    /// Success is NOT a native execution/publication permit: mediation of guest
+    /// stores and all writers, alias admission, and active-code drain remain
+    /// separate obligations. An uninstrumented transport is never a success.
+    pub fn validate_tracked_content(&self) -> Result<(), MmAccessError> {
+        use carrick_hal::foreign_mm::ForeignInstructionContentStatus;
+        self.validate_mapping()?;
+        match self.receipt.instruction_content_status() {
+            ForeignInstructionContentStatus::UnchangedTrackedWrites => Ok(()),
+            ForeignInstructionContentStatus::Changed => Err(MmAccessError::StaleInstructionContent),
+            ForeignInstructionContentStatus::Untracked => {
+                Err(MmAccessError::UntrackedInstructionContent)
+            }
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Reauthenticate execution and mapping identity. This does not authorize
+    /// execution or guarantee instruction contents remained unchanged.
+    pub fn validate_mapping(&self) -> Result<(), MmAccessError> {
+        let mm = self.context.authenticate_current_mm(self.execution)?;
+        if !Arc::ptr_eq(&mm, &self.mm) {
+            return Err(MmAccessError::StaleInstructionRead);
+        }
+        let live = snapshot_backend(&mm, Instant::now() + MM_SNAPSHOT_TIMEOUT)?;
+        validate_snapshot_vmas(&live)?;
+        if ProjectedForeignMmSnapshot::from_backend(mm.id(), &live)? != self.snapshot {
+            return Err(MmAccessError::StaleInstructionRead);
+        }
+        Ok(())
+    }
+}
+
+impl KernelContext {
+    /// Fetch through the carrier endpoint installed on the authenticated MM.
+    /// No independently supplied GuestMemory or caller-selected MM identity is
+    /// accepted. A concurrent mutation is returned to the caller, not retried
+    /// into a different translation generation. This is translation setup work,
+    /// not a per-syscall path.
+    pub fn fetch_instruction_bytes<'execution>(
+        &'execution self,
+        execution: &'execution ThreadExecutionLease,
+        start: GuestVa,
+        len: usize,
+    ) -> Result<InstructionRead<'execution>, MmAccessError> {
+        let mm = self.authenticate_current_mm(execution)?;
+        let len = NonZeroUsize::new(len).ok_or(MmAccessError::EmptyInstructionRead)?;
+        let deadline = Instant::now() + MM_SNAPSHOT_TIMEOUT;
+        let backend = snapshot_backend(&mm, deadline)?;
+        validate_snapshot_vmas(&backend)?;
+        validate_range_in_snapshot(&backend, start, len, RangeAccess::Execute)?;
+        let snapshot = ProjectedForeignMmSnapshot::from_backend(mm.id(), &backend)?;
+        let lease = retain_foreign_lease(&mm, &snapshot, deadline)?;
+        let live = RetainedMmLiveAuthority {
+            mm: Arc::clone(&mm),
+        };
+        let mut bytes = vec![0; len.get()];
+        let receipt = lease
+            .read_instructions(&live, &snapshot, start, &mut bytes, deadline)
+            .map_err(MmAccessError::ForeignTransport)?;
+        if !receipt.authenticates(&snapshot)
+            || receipt.bytes_read() != bytes.len()
+            || receipt.owner_generations().is_empty()
+        {
+            return Err(MmAccessError::ForeignReceiptMismatch);
+        }
+        let read = InstructionRead {
+            context: self,
+            execution,
+            mm,
+            snapshot,
+            bytes,
+            receipt,
+        };
+        read.validate_mapping()?;
+        Ok(read)
+    }
+}
+
+impl KernelContext {
+    /// Copy syscall input from the carrier of the authenticated current MM.
+    /// No caller-supplied byte store or numeric MM selector is accepted. The
+    /// execution lease stays borrowed; no native pointer or mapping grant
+    /// escapes this operation. Zero-length copies still authenticate the lease.
+    pub fn copy_current_into(
+        &self,
+        execution: &ThreadExecutionLease,
+        start: GuestVa,
+        dst: &mut [u8],
+    ) -> Result<(), MmAccessError> {
+        self.authenticate_current_mm(execution)?;
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let current = self.current_mm(execution)?;
+        let range = current.token.read_range(start, dst.len())?.ok_or(
+            MmAccessError::DestinationLengthMismatch {
+                range: 0,
+                destination: dst.len(),
+            },
+        )?;
+        MmAccessAuthority::new().read_mm(&current.token, range, dst)?;
+        Ok(())
+    }
+
+    /// Copy ordinary syscall output through the current carrier's COW path.
+    /// Exact-MM exclusion is local to this copy; it is never held across the
+    /// surrounding syscall. Each prepared write owns its real COW witness.
+    /// Executable writes require separate publication authority and are refused.
+    /// A later-chunk fault may leave earlier chunks copied, as with copy_to_user;
+    /// this is not an atomic multi-page transaction.
+    pub fn copy_current_from(
+        &self,
+        execution: &ThreadExecutionLease,
+        start: GuestVa,
+        src: &[u8],
+    ) -> Result<(), MmAccessError> {
+        self.authenticate_current_mm(execution)?;
+        if src.is_empty() {
+            return Ok(());
+        }
+        let current = self.current_mm(execution)?;
+        // Validate the complete semantic range before the first byte changes.
+        current.write_range(start, src.len())?;
+        let reject_executable = |current: &CurrentMm, address: GuestVa, len: usize| {
+            let snapshot =
+                snapshot_backend(&current.token.mm, Instant::now() + MM_SNAPSHOT_TIMEOUT)?;
+            let end =
+                address
+                    .raw()
+                    .checked_add(len as u64)
+                    .ok_or(MmAccessError::RangeOverflow {
+                        start: address,
+                        len,
+                    })?;
+            if let Some(vma) = snapshot.vmas.iter().find(|vma| {
+                vma.start.raw() < end && address.raw() < vma.end.raw() && vma.access.executable
+            }) {
+                return Err(MmAccessError::NativeDataExecutable { address: vma.start });
+            }
+            Ok(())
+        };
+        reject_executable(&current, start, src.len())?;
+        let authority = MmAccessAuthority::new();
+        authority.with_current_mutation(&current, self.thread().registry_id(), |mutation| {
+            let mut offset = 0;
+            while offset < src.len() {
+                let address =
+                    start
+                        .raw()
+                        .checked_add(offset as u64)
+                        .ok_or(MmAccessError::RangeOverflow {
+                            start,
+                            len: src.len(),
+                        })?;
+                // Identity receipts authenticate one 4 KiB guest leaf; a
+                // COW compound may be larger, but subsequent copies must use
+                // the same leaf-bounded contract as already-private memory.
+                let remaining = 0x1000 - address % 0x1000;
+                let len = (src.len() - offset).min(remaining as usize);
+                // A preceding compound COW may have advanced inventory. Mint
+                // this chunk against its current snapshot, not the first one.
+                let chunk_mm = self.current_mm(execution)?;
+                reject_executable(&chunk_mm, GuestVa(address), len)?;
+                let range = chunk_mm.write_range(GuestVa(address), len)?.ok_or(
+                    MmAccessError::SourceLengthMismatch {
+                        range: 0,
+                        source_len: len,
+                    },
+                )?;
+                let mut cow = authority.break_foreign_cow(mutation, &chunk_mm, range)?;
+                let prepared =
+                    authority.prepare_foreign_write(&mut cow, &src[offset..offset + len])?;
+                authority.commit_foreign_write(prepared);
+                offset += len;
+            }
+            Ok(())
+        })
+    }
+
+    /// Authenticate the exact live task, thread, execution lease and MM without
+    /// collecting a mapping snapshot. Execution backends use this at a resume
+    /// boundary when they already own their backing and executable capability.
+    ///
+    /// The returned identity grants no access to bytes, mappings or executable
+    /// publication. Those still require the appropriate memory authority. Use
+    /// `current_mm` when constructing a permission-checked memory range.
+    pub fn validate_current_execution_mm(
+        &self,
+        execution: &ThreadExecutionLease,
+    ) -> Result<MmId, MmAccessError> {
+        self.authenticate_current_mm(execution).map(|mm| mm.id())
+    }
+
     pub fn current_mm(
         &self,
         execution: &ThreadExecutionLease,
@@ -1356,7 +1945,21 @@ fn snapshot_token(
     })
 }
 
+/// Thread-local structural instrument for current-copy contract windows.
+#[cfg(feature = "conformance-metrics")]
+pub mod copy_work_for_test {
+    std::thread_local! { static SNAPSHOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+    pub fn snapshots() -> u64 {
+        SNAPSHOTS.get()
+    }
+    pub(super) fn collected() {
+        SNAPSHOTS.set(SNAPSHOTS.get() + 1);
+    }
+}
+
 fn snapshot_backend(mm: &Arc<Mm>, deadline: Instant) -> Result<MmBackendSnapshot, MmAccessError> {
+    #[cfg(feature = "conformance-metrics")]
+    copy_work_for_test::collected();
     let backend = mm
         .backend()
         .ok_or(MmAccessError::MissingBackendAuthority(mm.id()))?;
@@ -1579,6 +2182,60 @@ mod tests {
             ));
         });
         assert_eq!(&*bytes.lock(), b"same");
+    }
+
+    #[test]
+    fn native_data_borrow_refuses_unimplemented_transport_and_each_stale_revision() {
+        for domain in 0..3 {
+            let (kernel, root) = bootstrap(32_100 + domain as i32 * 10);
+            let execution = execution_lease(&root, 100 + domain as u64);
+            let (child, backend, _owner, bytes, counters) = cow_fixture(
+                &kernel,
+                &root,
+                32_101 + domain as i32 * 10,
+                MockCowFault::None,
+            );
+            let child_execution = execution_lease(&child, 200 + domain as u64);
+            let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+            let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+            with_foreign_mutation(&foreign, |mutation| {
+                let mut cow = super::MmAccessAuthority::new()
+                    .break_foreign_cow(mutation, &foreign, range)
+                    .unwrap();
+                // This transport supports prepared copies but has no resident
+                // pointer capability. A successful COW must not invent one.
+                assert!(matches!(
+                    child.borrow_current_native_data(&child_execution, &mut cow),
+                    Err(MmAccessError::ForeignTransport(
+                        ForeignMmTransportError::AuthorityUnavailable
+                    ))
+                ));
+                backend.set_access(super::super::VmaAccess {
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                    kernel_visible: false,
+                });
+                assert!(matches!(
+                    child.borrow_current_native_data(&child_execution, &mut cow),
+                    Err(MmAccessError::KernelHidden { .. })
+                ));
+                backend.set_access(super::super::VmaAccess {
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                    kernel_visible: true,
+                });
+                backend.advance(domain);
+                assert!(matches!(
+                    child.borrow_current_native_data(&child_execution, &mut cow),
+                    Err(MmAccessError::StaleCowBroken)
+                ));
+            });
+            assert_eq!(&*bytes.lock(), b"same");
+            assert_eq!(counters.prepare_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(counters.commit_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
@@ -1874,6 +2531,82 @@ mod tests {
     }
 
     #[test]
+    fn instruction_fetch_rejects_readable_non_executable_memory() {
+        let (_kernel, root) = bootstrap(31_150);
+        let execution = execution_lease(&root, 150);
+        assert!(matches!(
+            root.fetch_instruction_bytes(&execution, GuestVa(0x1000), 4),
+            Err(MmAccessError::ExecuteDenied {
+                address: GuestVa(0x1000)
+            })
+        ));
+    }
+
+    #[test]
+    fn instruction_fetch_borrows_exact_lease_and_detects_revision_changes() {
+        let (kernel, root) = bootstrap(31_151);
+        let (child, backend, _, _, _) = cow_fixture(&kernel, &root, 31_152, MockCowFault::None);
+        backend.set_access(super::super::VmaAccess {
+            readable: false,
+            writable: false,
+            executable: true,
+            kernel_visible: true,
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        child.shared().mm().install_foreign_mm_endpoint_for_test(
+            carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(MockForeignTransport {
+                calls: Arc::clone(&calls),
+                mode: MockReadMode::RetryOnce,
+            })),
+        );
+        let execution = execution_lease(&child, 152);
+        let wrong_execution = execution_lease(&root, 151);
+        assert!(matches!(
+            child.fetch_instruction_bytes(&wrong_execution, GuestVa(0x3000), 4),
+            Err(MmAccessError::ExecutionAuthority(_))
+        ));
+        assert!(matches!(
+            child.fetch_instruction_bytes(&execution, GuestVa(0x3ffe), 4),
+            Err(MmAccessError::Unmapped {
+                address: GuestVa(0x4000)
+            })
+        ));
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "rejections must precede backing read"
+        );
+        for domain in 0..3 {
+            let read = child
+                .fetch_instruction_bytes(&execution, GuestVa(0x3000), 4)
+                .unwrap();
+            assert_eq!(read.bytes(), b"root");
+            read.validate_mapping().unwrap();
+            assert!(matches!(
+                read.validate_tracked_content(),
+                Err(MmAccessError::UntrackedInstructionContent)
+            ));
+            backend.advance(domain);
+            assert!(matches!(
+                read.validate_mapping(),
+                Err(MmAccessError::StaleInstructionRead)
+            ));
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 4);
+        backend.set_access(super::super::VmaAccess {
+            readable: true,
+            writable: false,
+            executable: false,
+            kernel_visible: true,
+        });
+        assert!(matches!(
+            child.fetch_instruction_bytes(&execution, GuestVa(0x3000), 4),
+            Err(MmAccessError::ExecuteDenied { .. })
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
     fn current_mm_rejects_scheduler_authority_for_a_different_mm() {
         let (kernel, root) = bootstrap(31_116);
         let child = fork_with_backend(
@@ -1889,6 +2622,10 @@ mod tests {
             root.current_mm(&execution),
             Err(MmAccessError::StaleExecutionAuthority { .. })
         ));
+        assert!(matches!(
+            root.validate_current_execution_mm(&execution),
+            Err(MmAccessError::StaleExecutionAuthority { .. })
+        ));
     }
 
     #[test]
@@ -1899,6 +2636,12 @@ mod tests {
 
         assert!(matches!(
             root.current_mm(&execution),
+            Err(MmAccessError::ExecutionAuthority(
+                ThreadExecutionError::LeaseOwnerMismatch { .. }
+            ))
+        ));
+        assert!(matches!(
+            root.validate_current_execution_mm(&execution),
             Err(MmAccessError::ExecutionAuthority(
                 ThreadExecutionError::LeaseOwnerMismatch { .. }
             ))
@@ -1924,6 +2667,63 @@ mod tests {
                 ThreadExecutionError::LeaseOwnerMismatch { .. }
             ))
         ));
+        assert!(matches!(
+            root.validate_current_execution_mm(&foreign_execution),
+            Err(MmAccessError::ExecutionAuthority(
+                ThreadExecutionError::LeaseOwnerMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn execution_mm_validation_does_not_snapshot_mappings() {
+        struct ObservedBackend {
+            inner: Arc<dyn super::super::MmBackend>,
+            snapshots: std::sync::atomic::AtomicU64,
+        }
+        impl super::super::MmBackend for ObservedBackend {
+            fn snapshot(
+                &self,
+                deadline: Instant,
+            ) -> Result<super::super::MmBackendSnapshot, SnapshotError> {
+                self.snapshots.fetch_add(1, Ordering::Relaxed);
+                self.inner.snapshot(deadline)
+            }
+            fn revision(&self) -> u64 {
+                self.inner.revision()
+            }
+            fn vma_revision(
+                &self,
+                deadline: Instant,
+            ) -> Result<Option<VmaRevision>, SnapshotError> {
+                self.inner.vma_revision(deadline)
+            }
+        }
+        let (kernel, root) = bootstrap(31_180);
+        let backend = Arc::new(ObservedBackend {
+            inner: fixture_backend(),
+            snapshots: std::sync::atomic::AtomicU64::new(0),
+        });
+        let child = fork_with_backend(
+            &kernel,
+            &root,
+            31_181,
+            "execution identity",
+            backend.clone(),
+        );
+        let execution = execution_lease(&child, 180);
+        let before = backend.snapshots.load(Ordering::Relaxed);
+        for scale in [1, 8, 32, 128] {
+            for _ in 0..scale {
+                assert_eq!(
+                    child.validate_current_execution_mm(&execution).unwrap(),
+                    child.shared().mm().id()
+                );
+            }
+            assert_eq!(backend.snapshots.load(Ordering::Relaxed), before);
+        }
+        child.current_mm(&execution).unwrap();
+        assert!(backend.snapshots.load(Ordering::Relaxed) > before);
     }
 
     #[test]

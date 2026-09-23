@@ -1,0 +1,25 @@
+{
+  "hypothesis": "Move the fresh syscall KernelContext into the service owner and borrow it during dispatch; retain only for completion ownership.",
+  "structural_budget": "N exact context retains for N syscalls, including one redispatch per syscall; original counts 3N ordinary and 4N with redispatch.",
+  "performance_feature": "conformance-metrics disabled in release CLI",
+  "warmups": [
+    "baseline",
+    "candidate"
+  ],
+  "measured_sequence": [
+    "baseline",
+    "candidate",
+    "candidate",
+    "baseline",
+    "candidate",
+    "baseline",
+    "baseline",
+    "candidate"
+  ],
+  "full_workload": "unmodified /opt/ltp/testcases/bin/inotify09",
+  "image": "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+  "completion_bound_seconds": 40,
+  "acceptance": "All samples must TPASS and exceed execution loops. Require at least 1 percent median elapsed reduction and improvement in both balanced blocks; report spread and raw Linux separately. Do not retain for microbench gain alone.",
+  "io_controls": "Native macOS and Linux host bind measurements are separate and not subtracted from whole workload.",
+  "promotion": "Targeted experiment only; no complete near-native or broad signed gate claim."
+}

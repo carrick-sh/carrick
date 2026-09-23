@@ -1,0 +1,19 @@
+schema_version = 1
+id = "kernel.mm.retained-fragment-query"
+title = "Existing wide semantic fragments terminate reuse lookup"
+guest_surfaces = ["syscall:madvise", "syscall:mmap", "syscall:munmap"]
+semantic_authority = ["Linux private mapping isolation and zero-fill semantics"]
+fixture = "unit:retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows"
+scale_points = [1, 8, 32, 128]
+rationale = "Existence-only lookup may reorder candidates, but must preserve the full scope, range and IPA predicate. A matching widest-class owner needs one candidate predicate regardless of unrelated narrow fragments. No newest/oldest selection or owner-generation authentication is changed."
+
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-vmm-hvf::trap::memory_protection::tests::retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows"
+docker = "probe:memflagmatrix"
+
+[bindings.unresolved]
+observation = "Direct unit predicate count enforces exactly one candidate at scales 1/8/32/128. A versioned alias-query candidate metric and descriptor budget remain unresolved; no unrelated work metric is substituted."
+embed_structural = "Signed mem, forkcow and memflagmatrix matched cached Linux oracles on musl and glibc. Production candidate-work observation remains unresolved."
+promotion = "Independent paired Node confirmation measured 16.3 percent less execution time. Full signed promotion and concurrent scaling remain pending."

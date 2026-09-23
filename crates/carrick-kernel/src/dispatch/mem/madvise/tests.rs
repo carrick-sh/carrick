@@ -118,13 +118,14 @@ fn mincore_onfault_lock_is_not_resident_until_page_is_touched() {
     );
 }
 
-#[test]
-fn readonly_private_anonymous_dontneed_retires_populated_residency() {
+fn readonly_discard_observation(scale: u64, discard: bool) -> (bool, u64) {
+    let length = scale * LINUX_PAGE_SIZE;
     const SYS_MMAP: u64 = 222;
     const SYS_MADVISE: u64 = 233;
 
     let mut dispatcher = SyscallDispatcher::new();
-    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, length as usize);
+    memory.discard_anon = discard;
     let reporter = CompatReporter::default();
     let context = dispatcher
         .capture_one_task_context()
@@ -137,7 +138,7 @@ fn readonly_private_anonymous_dontneed_retires_populated_residency() {
                     SYS_MMAP,
                     SyscallArgs([
                         0,
-                        LINUX_PAGE_SIZE,
+                        length,
                         LINUX_PROT_READ,
                         LINUX_MAP_PRIVATE
                             | LINUX_MAP_ANONYMOUS
@@ -157,13 +158,15 @@ fn readonly_private_anonymous_dontneed_retires_populated_residency() {
         "MAP_POPULATE must begin resident"
     );
 
+    let before = memory.zero_backing_calls.get();
+    memory.bytes.fill(0x31);
     assert_eq!(
         dispatcher
             .dispatch(
                 &context,
                 SyscallRequest::new(
                     SYS_MADVISE,
-                    SyscallArgs([address, LINUX_PAGE_SIZE, LINUX_MADV_DONTNEED, 0, 0, 0]),
+                    SyscallArgs([address, length, LINUX_MADV_DONTNEED, 0, 0, 0]),
                 ),
                 &mut memory,
                 &reporter,
@@ -176,6 +179,58 @@ fn readonly_private_anonymous_dontneed_retires_populated_residency() {
         Some(vec![0]),
         "MADV_DONTNEED must retire synthetic residency even when the VMA is read-only"
     );
+    (
+        memory.bytes.iter().all(|byte| *byte == 0),
+        (memory.zero_backing_calls.get() - before) as u64,
+    )
+}
+
+#[test]
+fn readonly_private_anonymous_dontneed_retires_populated_residency() {
+    use carrick_conformance_contract::{
+        Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
+        SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
+    };
+    use sha2::{Digest, Sha256};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let registry = ContractRegistry::load(root).unwrap();
+    let revision = format!(
+        "madvise-sha256:{:x}",
+        Sha256::digest(include_bytes!("../madvise.rs"))
+    );
+    let observations: Vec<_> = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| {
+            let (zeroed, calls) = readonly_discard_observation(scale, false);
+            let mut work = WorkSnapshot::new();
+            work.insert(WorkMetric::HostBackendCalls, calls).unwrap();
+            ContractObservation {
+                contract_id: ContractId::new("kernel.mm.anonymous-discard").unwrap(),
+                layer: ExecutionLayer::VmFree,
+                implementation_revision: revision.clone(),
+                fixture_identity: "unit:readonly-anonymous-discard".into(),
+                scale,
+                semantic_assertions: vec![SemanticAssertion {
+                    name: "readonly_discard_removes_old_contents".into(),
+                    passed: zeroed,
+                    detail: None,
+                }],
+                work: Some(work),
+                timing: None,
+                completeness: Completeness::Complete,
+            }
+        })
+        .collect();
+    println!("{observations:#?}");
+    evaluate(
+        registry.require("kernel.mm.anonymous-discard").unwrap(),
+        &observations,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -370,4 +425,54 @@ fn madvise_reports_vma_rejection_before_unmapped_hole_enomem() {
         DispatchOutcome::errno(LINUX_ENOMEM),
         "every visited VMA accepts the advice, so the hole reports ENOMEM"
     );
+}
+
+#[test]
+fn anonymous_discard_avoids_scrub_contract() {
+    use carrick_conformance_contract::{
+        Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
+        SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
+    };
+    use sha2::{Digest, Sha256};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let registry = ContractRegistry::load(root).unwrap();
+    let revision = format!(
+        "madvise-sha256:{:x}",
+        Sha256::digest(include_bytes!("../madvise.rs"))
+    );
+    let observations: Vec<_> = [1, 8, 32, 128]
+        .into_iter()
+        .map(|scale| {
+            let (zeroed, calls) = readonly_discard_observation(scale, true);
+            let mut work = WorkSnapshot::new();
+            work.insert(WorkMetric::HostBackendCalls, calls).unwrap();
+            ContractObservation {
+                contract_id: ContractId::new("kernel.mm.anonymous-discard-no-scrub").unwrap(),
+                layer: ExecutionLayer::VmFree,
+                implementation_revision: revision.clone(),
+                fixture_identity: "unit:anonymous-discard-no-scrub".into(),
+                scale,
+                semantic_assertions: vec![SemanticAssertion {
+                    name: "discard_removes_old_contents".into(),
+                    passed: zeroed,
+                    detail: None,
+                }],
+                work: Some(work),
+                timing: None,
+                completeness: Completeness::Complete,
+            }
+        })
+        .collect();
+    println!("{observations:#?}");
+    evaluate(
+        registry
+            .require("kernel.mm.anonymous-discard-no-scrub")
+            .unwrap(),
+        &observations,
+    )
+    .unwrap();
 }

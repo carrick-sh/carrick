@@ -1,0 +1,25 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.32s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-207122e8ce47be2c)
+
+running 18 tests
+test dispatch::net::netlink_readiness_tests::queued_dispatch_inotify_event_is_readable_without_a_host_vnode_edge ... ok
+test inotify::readiness_tests::dispatch_enqueue_makes_the_inotify_poll_fd_readable ... ok
+test inotify::readiness_tests::short_read_rearms_dispatch_queue_level_readiness ... ok
+test inotify::registry_tests::bounded_queue_appends_single_overflow_marker_then_drops ... ok
+test inotify::registry_tests::encode_event_raw_lays_out_header_and_padded_name ... ok
+test inotify::registry_tests::identical_successive_records_coalesce_until_read ... ok
+test inotify::registry_tests::maintained_queued_bytes_equals_the_true_pending_sum ... ok
+test inotify::registry_tests::registry_clone_observes_later_watch_and_removal_updates ... ok
+test inotify::registry_tests::registry_notify_fd_event_delivers_to_both_parent_and_self ... ok
+test inotify::registry_tests::registry_path_removal_preserves_other_watch_aliases ... ok
+test inotify::registry_tests::registry_rename_replacement_removes_displaced_reverse_entries ... ok
+test inotify::registry_tests::registry_routes_self_child_and_move_to_the_right_watch ... ok
+test inotify::registry_tests::registry_unregister_and_rename_path_update_routing ... ok
+test inotify::registry_tests::registry_unregister_removes_all_alias_paths ... ok
+test inotify::tests::mask_translation_round_trips_common_events ... ok
+test inotify::tests::removed_watch_does_not_name_its_successor ... ok
+test inotify::tests::vnode_watch_reports_file_modification_as_in_modify ... ok
+test inotify::tests::watch_descriptor_wrap_skips_live_watches ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 2176 filtered out; finished in 0.07s
+

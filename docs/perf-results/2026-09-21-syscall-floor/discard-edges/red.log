@@ -1,0 +1,26 @@
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s
+     Running unittests src/lib.rs (target/debug/deps/carrick_aarch64-1b66ae92e703e1f3)
+
+running 3 tests
+
+thread 'anonymous_discard::tests::edge_failure_after_retirement_is_indeterminate' (3331633) panicked at crates/carrick-aarch64/src/anonymous_discard.rs:81:13:
+assertion failed: matches!(with_edges(&mut
+    memory,4096,49152,16384),Err(RepointPrivateError::Indeterminate(_)))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test anonymous_discard::tests::edge_failure_after_retirement_is_indeterminate ... FAILED
+test anonymous_discard::tests::refusal_and_empty_interior_do_not_mutate ... ok
+
+thread 'anonymous_discard::tests::unaligned_discard_bounds_scrub_and_preserves_neighbors' (3331635) panicked at crates/carrick-aarch64/src/anonymous_discard.rs:65:21:
+assertion failed: with_edges(&mut memory, start as u64, end - start, 16384).unwrap()
+test anonymous_discard::tests::unaligned_discard_bounds_scrub_and_preserves_neighbors ... FAILED
+
+failures:
+
+failures:
+    anonymous_discard::tests::edge_failure_after_retirement_is_indeterminate
+    anonymous_discard::tests::unaligned_discard_bounds_scrub_and_preserves_neighbors
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-aarch64 --lib`

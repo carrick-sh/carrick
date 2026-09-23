@@ -1,0 +1,115 @@
+sample_phase=watch_invalid_pair sample=0 scale=65536 ticks=518873 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=1 scale=65536 ticks=425249 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=2 scale=65536 ticks=405244 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=3 scale=65536 ticks=403057 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=4 scale=65536 ticks=401369 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=5 scale=65536 ticks=401617 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=6 scale=65536 ticks=403090 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=7 scale=65536 ticks=405627 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=8 scale=65536 ticks=406182 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=9 scale=65536 ticks=404073 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=10 scale=65536 ticks=401617 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=11 scale=65536 ticks=401813 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=12 scale=65536 ticks=402864 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=13 scale=65536 ticks=401192 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=14 scale=65536 ticks=400664 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=15 scale=65536 ticks=401267 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=16 scale=65536 ticks=401890 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=17 scale=65536 ticks=402768 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=18 scale=65536 ticks=400833 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=19 scale=65536 ticks=401388 frequency=24000000 queued_events=0
+sample_phase=watch_invalid_pair sample=20 scale=65536 ticks=402553 frequency=24000000 queued_events=0
+phase=watch_invalid_pair scale=65536 samples=21 p50_ns_per_iter=255 complete=1
+sample_phase=watch_unchanged_pair sample=0 scale=65536 ticks=873629 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=1 scale=65536 ticks=876766 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=2 scale=65536 ticks=882647 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=3 scale=65536 ticks=879251 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=4 scale=65536 ticks=882187 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=5 scale=65536 ticks=891701 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=6 scale=65536 ticks=865361 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=7 scale=65536 ticks=873678 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=8 scale=65536 ticks=862552 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=9 scale=65536 ticks=872868 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=10 scale=65536 ticks=871605 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=11 scale=65536 ticks=870143 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=12 scale=65536 ticks=873215 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=13 scale=65536 ticks=883831 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=14 scale=65536 ticks=883136 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=15 scale=65536 ticks=867942 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=16 scale=65536 ticks=872693 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=17 scale=65536 ticks=881388 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=18 scale=65536 ticks=893134 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=19 scale=65536 ticks=878496 frequency=24000000 queued_events=0
+sample_phase=watch_unchanged_pair sample=20 scale=65536 ticks=857757 frequency=24000000 queued_events=0
+phase=watch_unchanged_pair scale=65536 samples=21 p50_ns_per_iter=555 complete=1
+probe_complete=1
+sample_phase=watch_empty_batch sample=0 scale=128 ticks=3787 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=1 scale=128 ticks=4034 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=2 scale=128 ticks=4071 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=3 scale=128 ticks=3068 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=4 scale=128 ticks=3541 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=5 scale=128 ticks=3542 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=6 scale=128 ticks=3473 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=7 scale=128 ticks=3338 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=8 scale=128 ticks=3448 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=9 scale=128 ticks=3452 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=10 scale=128 ticks=3591 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=11 scale=128 ticks=3266 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=12 scale=128 ticks=3677 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=13 scale=128 ticks=3283 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=14 scale=128 ticks=3424 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=15 scale=128 ticks=3697 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=16 scale=128 ticks=3711 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=17 scale=128 ticks=3469 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=18 scale=128 ticks=3756 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=19 scale=128 ticks=3602 frequency=24000000 queued_events=128
+sample_phase=watch_empty_batch sample=20 scale=128 ticks=4114 frequency=24000000 queued_events=128
+phase=watch_empty_batch scale=128 samples=21 p50_ns_per_iter=1152 complete=1
+sample_phase=watch_growing sample=0 scale=8192 ticks=252900 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=1 scale=8192 ticks=202753 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=2 scale=8192 ticks=203546 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=3 scale=8192 ticks=190476 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=4 scale=8192 ticks=181714 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=5 scale=8192 ticks=180657 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=6 scale=8192 ticks=179676 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=7 scale=8192 ticks=175459 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=8 scale=8192 ticks=167662 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=9 scale=8192 ticks=171214 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=10 scale=8192 ticks=167159 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=11 scale=8192 ticks=168633 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=12 scale=8192 ticks=171358 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=13 scale=8192 ticks=172778 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=14 scale=8192 ticks=164687 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=15 scale=8192 ticks=168544 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=16 scale=8192 ticks=168377 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=17 scale=8192 ticks=169262 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=18 scale=8192 ticks=170984 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=19 scale=8192 ticks=166438 frequency=24000000 queued_events=8192
+sample_phase=watch_growing sample=20 scale=8192 ticks=170195 frequency=24000000 queued_events=8192
+phase=watch_growing scale=8192 samples=21 p50_ns_per_iter=870 complete=1
+sample_phase=watch_overflow sample=0 scale=65536 ticks=1446441 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=1 scale=65536 ticks=1451764 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=2 scale=65536 ticks=1443822 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=3 scale=65536 ticks=1453374 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=4 scale=65536 ticks=1416195 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=5 scale=65536 ticks=1458181 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=6 scale=65536 ticks=1412393 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=7 scale=65536 ticks=1535175 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=8 scale=65536 ticks=1438333 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=9 scale=65536 ticks=1432781 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=10 scale=65536 ticks=1468839 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=11 scale=65536 ticks=1437846 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=12 scale=65536 ticks=1446402 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=13 scale=65536 ticks=1420199 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=14 scale=65536 ticks=1429297 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=15 scale=65536 ticks=1450688 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=16 scale=65536 ticks=1441419 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=17 scale=65536 ticks=1432457 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=18 scale=65536 ticks=1456836 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=19 scale=65536 ticks=1466773 frequency=24000000 queued_events=16385
+sample_phase=watch_overflow sample=20 scale=65536 ticks=1455673 frequency=24000000 queued_events=16385
+phase=watch_overflow scale=65536 samples=21 p50_ns_per_iter=919 complete=1
+probe_complete=1
+contract_scale=128
+completed_iterations=128
+probe_complete=1

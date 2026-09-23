@@ -1,0 +1,50 @@
+[
+  {
+    "run": 0,
+    "arm": "control",
+    "getpid": 68.42291499999999,
+    "fstat": 541.81771
+  },
+  {
+    "run": 1,
+    "arm": "candidate",
+    "getpid": 69.61479,
+    "fstat": 475.36042
+  },
+  {
+    "run": 2,
+    "arm": "candidate",
+    "getpid": 67.775,
+    "fstat": 477.84229
+  },
+  {
+    "run": 3,
+    "arm": "control",
+    "getpid": 66.376665,
+    "fstat": 546.3887500000001
+  },
+  {
+    "run": 4,
+    "arm": "control",
+    "getpid": 67.391875,
+    "fstat": 558.5347899999999
+  },
+  {
+    "run": 5,
+    "arm": "candidate",
+    "getpid": 66.555,
+    "fstat": 468.10625
+  },
+  {
+    "run": 6,
+    "arm": "candidate",
+    "getpid": 67.45208,
+    "fstat": 462.357085
+  },
+  {
+    "run": 7,
+    "arm": "control",
+    "getpid": 69.644375,
+    "fstat": 560.64438
+  }
+]

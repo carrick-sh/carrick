@@ -1,0 +1,578 @@
+{
+  "ltp": {
+    "base": {
+      "raw_seconds": [
+        21.69,
+        21.8,
+        22,
+        22.03
+      ],
+      "median_s": 21.9,
+      "mean_s": 21.880000000000003
+    },
+    "candidate": {
+      "raw_seconds": [
+        21.91,
+        21.8,
+        22.13,
+        21.99
+      ],
+      "median_s": 21.95,
+      "mean_s": 21.9575
+    },
+    "docker": {
+      "raw_seconds": [
+        5.76,
+        5.68,
+        5.9
+      ],
+      "median_s": 5.76,
+      "mean_s": 5.78
+    },
+    "candidate_vs_base_median": 1.0022831050228311,
+    "base_vs_linux_median": 3.802083333333333,
+    "candidate_vs_linux_median": 3.810763888888889
+  },
+  "micro": {
+    "base": {
+      "watch_invalid_pair:65536": {
+        "raw_process_medians": [
+          3171,
+          3195
+        ],
+        "median_ns": 3183
+      },
+      "watch_unchanged_pair:65536": {
+        "raw_process_medians": [
+          3646,
+          3679
+        ],
+        "median_ns": 3662.5
+      },
+      "watch_empty_batch:128": {
+        "raw_process_medians": [
+          3400,
+          3473
+        ],
+        "median_ns": 3436.5
+      },
+      "watch_growing:8192": {
+        "raw_process_medians": [
+          3523,
+          3593
+        ],
+        "median_ns": 3558
+      },
+      "watch_overflow:65536": {
+        "raw_process_medians": [
+          3514,
+          3580
+        ],
+        "median_ns": 3547
+      }
+    },
+    "candidate": {
+      "watch_invalid_pair:65536": {
+        "raw_process_medians": [
+          3191,
+          3202
+        ],
+        "median_ns": 3196.5
+      },
+      "watch_unchanged_pair:65536": {
+        "raw_process_medians": [
+          3682,
+          3681
+        ],
+        "median_ns": 3681.5
+      },
+      "watch_empty_batch:128": {
+        "raw_process_medians": [
+          3281,
+          3300
+        ],
+        "median_ns": 3290.5
+      },
+      "watch_growing:8192": {
+        "raw_process_medians": [
+          3506,
+          3526
+        ],
+        "median_ns": 3516
+      },
+      "watch_overflow:65536": {
+        "raw_process_medians": [
+          3514,
+          3535
+        ],
+        "median_ns": 3524.5
+      }
+    },
+    "docker": {
+      "watch_invalid_pair:65536": {
+        "raw_process_medians": [
+          255,
+          255
+        ],
+        "median_ns": 255
+      },
+      "watch_unchanged_pair:65536": {
+        "raw_process_medians": [
+          555,
+          548
+        ],
+        "median_ns": 551.5
+      },
+      "watch_empty_batch:128": {
+        "raw_process_medians": [
+          1152,
+          1301
+        ],
+        "median_ns": 1226.5
+      },
+      "watch_growing:8192": {
+        "raw_process_medians": [
+          870,
+          862
+        ],
+        "median_ns": 866
+      },
+      "watch_overflow:65536": {
+        "raw_process_medians": [
+          919,
+          910
+        ],
+        "median_ns": 914.5
+      }
+    }
+  },
+  "io": {
+    "base": {
+      "seek": {
+        "raw_process_medians": [
+          21.062225341796875,
+          21.062225341796875
+        ],
+        "median_ns": 21.062225341796875
+      },
+      "pwrite64": {
+        "raw_process_medians": [
+          3312.2634887695312,
+          3325.536102294922
+        ],
+        "median_ns": 3318.8997955322266
+      },
+      "write64_seek": {
+        "raw_process_medians": [
+          2277.8104248046875,
+          2325.0045776367188
+        ],
+        "median_ns": 2301.407501220703
+      },
+      "fstat": {
+        "raw_process_medians": [
+          2019.0048217773438,
+          2013.1861267089844
+        ],
+        "median_ns": 2016.095474243164
+      }
+    },
+    "candidate": {
+      "seek": {
+        "raw_process_medians": [
+          21.062225341796875,
+          21.312713623046875
+        ],
+        "median_ns": 21.187469482421875
+      },
+      "pwrite64": {
+        "raw_process_medians": [
+          3402.345001220703,
+          3294.8811645507812
+        ],
+        "median_ns": 3348.613082885742
+      },
+      "write64_seek": {
+        "raw_process_medians": [
+          2288.4254455566406,
+          2308.331817626953
+        ],
+        "median_ns": 2298.378631591797
+      },
+      "fstat": {
+        "raw_process_medians": [
+          2056.4600524902344,
+          2020.062744140625
+        ],
+        "median_ns": 2038.2613983154297
+      }
+    },
+    "macos": {
+      "seek": {
+        "raw_process_medians": [
+          226.806640625,
+          205.047607421875
+        ],
+        "median_ns": 215.9271240234375
+      },
+      "pwrite64": {
+        "raw_process_medians": [
+          983.795166015625,
+          976.348876953125
+        ],
+        "median_ns": 980.072021484375
+      },
+      "write64_seek": {
+        "raw_process_medians": [
+          1228.973388671875,
+          1220.367431640625
+        ],
+        "median_ns": 1224.67041015625
+      },
+      "fstat": {
+        "raw_process_medians": [
+          239.532470703125,
+          237.945556640625
+        ],
+        "median_ns": 238.739013671875
+      }
+    },
+    "linux-local": {
+      "seek": {
+        "raw_process_medians": [
+          124.00308227539062,
+          124.28030395507812
+        ],
+        "median_ns": 124.14169311523438
+      },
+      "pwrite64": {
+        "raw_process_medians": [
+          324.3662414550781,
+          327.4218444824219
+        ],
+        "median_ns": 325.89404296875
+      },
+      "write64_seek": {
+        "raw_process_medians": [
+          448.0018615722656,
+          449.353515625
+        ],
+        "median_ns": 448.6776885986328
+      },
+      "fstat": {
+        "raw_process_medians": [
+          159.61709594726562,
+          161.79403686523438
+        ],
+        "median_ns": 160.70556640625
+      }
+    },
+    "linux-bind": {
+      "seek": {
+        "raw_process_medians": [
+          134.0484619140625,
+          130.11294555664062
+        ],
+        "median_ns": 132.08070373535156
+      },
+      "pwrite64": {
+        "raw_process_medians": [
+          12518.957763671875,
+          12994.169891357422
+        ],
+        "median_ns": 12756.563827514648
+      },
+      "write64_seek": {
+        "raw_process_medians": [
+          12646.757781982422,
+          13355.78921508789
+        ],
+        "median_ns": 13001.273498535156
+      },
+      "fstat": {
+        "raw_process_medians": [
+          162.30392456054688,
+          162.08901977539062
+        ],
+        "median_ns": 162.19647216796875
+      }
+    }
+  },
+  "trace_counts": {
+    "17": {
+      "begin": 3,
+      "args": 3,
+      "end": 3
+    },
+    "24": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "25": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "26": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "27": {
+      "begin": 3000000,
+      "args": 3000000,
+      "end": 3000000
+    },
+    "28": {
+      "begin": 3000000,
+      "args": 3000000,
+      "end": 3000000
+    },
+    "29": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "34": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "35": {
+      "begin": 3,
+      "args": 3,
+      "end": 3
+    },
+    "43": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "46": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "48": {
+      "begin": 12,
+      "args": 12,
+      "end": 12
+    },
+    "49": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "53": {
+      "begin": 2,
+      "args": 2,
+      "end": 2
+    },
+    "54": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "56": {
+      "begin": 26,
+      "args": 26,
+      "end": 26
+    },
+    "57": {
+      "begin": 28,
+      "args": 28,
+      "end": 28
+    },
+    "59": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "61": {
+      "begin": 2,
+      "args": 2,
+      "end": 2
+    },
+    "62": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "63": {
+      "begin": 18,
+      "args": 18,
+      "end": 18
+    },
+    "64": {
+      "begin": 32,
+      "args": 32,
+      "end": 32
+    },
+    "79": {
+      "begin": 11,
+      "args": 11,
+      "end": 11
+    },
+    "80": {
+      "begin": 20,
+      "args": 20,
+      "end": 20
+    },
+    "93": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "94": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "96": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "98": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "99": {
+      "begin": 7,
+      "args": 7,
+      "end": 7
+    },
+    "103": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "113": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "123": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "129": {
+      "begin": 3,
+      "args": 3,
+      "end": 3
+    },
+    "134": {
+      "begin": 108,
+      "args": 108,
+      "end": 108
+    },
+    "135": {
+      "begin": 15,
+      "args": 15,
+      "end": 15
+    },
+    "139": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "154": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "160": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "173": {
+      "begin": 9,
+      "args": 9,
+      "end": 9
+    },
+    "174": {
+      "begin": 3,
+      "args": 3,
+      "end": 3
+    },
+    "175": {
+      "begin": 6,
+      "args": 6,
+      "end": 6
+    },
+    "176": {
+      "begin": 4,
+      "args": 4,
+      "end": 4
+    },
+    "177": {
+      "begin": 3,
+      "args": 3,
+      "end": 3
+    },
+    "214": {
+      "begin": 15,
+      "args": 15,
+      "end": 15
+    },
+    "215": {
+      "begin": 17,
+      "args": 17,
+      "end": 17
+    },
+    "220": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "221": {
+      "begin": 8,
+      "args": 8,
+      "end": 8
+    },
+    "222": {
+      "begin": 33,
+      "args": 33,
+      "end": 33
+    },
+    "226": {
+      "begin": 21,
+      "args": 21,
+      "end": 21
+    },
+    "227": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "233": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "260": {
+      "begin": 16,
+      "args": 16,
+      "end": 16
+    },
+    "261": {
+      "begin": 7,
+      "args": 7,
+      "end": 7
+    },
+    "278": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "293": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "run_id": "native-activation-broad-final-20260922",
+  "exit": 1,
+  "binaries": {
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e": {
+      "sha256": "6013d77def55d9a68f4e752de2e59b35313b9df6eb60a10eb6364a8734763074"
+    }
+  }
+}

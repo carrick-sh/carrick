@@ -1,0 +1,24 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.20s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-3c2afd032626087b)
+
+running 1 test
+test trap::foreign_mm::tests::local_sparse_preparation_allows_independent_registry_progress ... FAILED
+
+failures:
+
+---- trap::foreign_mm::tests::local_sparse_preparation_allows_independent_registry_progress stdout ----
+
+thread 'trap::foreign_mm::tests::local_sparse_preparation_allows_independent_registry_progress' (3463756) panicked at crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs:1062:9:
+assertion `left == right` failed: preparing 1 pages blocked independent frame publication
+  left: Some(false)
+ right: Some(true)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    trap::foreign_mm::tests::local_sparse_preparation_allows_independent_registry_progress
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 508 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`

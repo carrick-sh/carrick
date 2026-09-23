@@ -1,0 +1,22 @@
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 40.31s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-03983327039dd49b)
+
+running 1 test
+
+thread 'dispatch::mem::madvise::tests::readonly_private_anonymous_dontneed_retires_populated_residency' (3153491) panicked at crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs:180:5:
+read-only private anonymous discard must remove old contents
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test dispatch::mem::madvise::tests::readonly_private_anonymous_dontneed_retires_populated_residency ... FAILED
+
+failures:
+
+failures:
+    dispatch::mem::madvise::tests::readonly_private_anonymous_dontneed_retires_populated_residency
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2188 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

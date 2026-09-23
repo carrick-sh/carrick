@@ -184,6 +184,16 @@ impl ForeignOwnerGeneration {
 /// Coherent kernel projection of one exact Linux MM incarnation.
 /// Implementations stay private to the kernel authority layer.
 pub trait ForeignMmSnapshot: Debug + Send + Sync {
+    fn has_same_contents(&self, other: &dyn ForeignMmSnapshot) -> bool {
+        self.mm() == other.mm()
+            && self.binding() == other.binding()
+            && self.backend_revision() == other.backend_revision()
+            && self.vma_revision() == other.vma_revision()
+            && self.frame_inventory_revision() == other.frame_inventory_revision()
+            && self.mapping_ids() == other.mapping_ids()
+            && self.executable_ranges() == other.executable_ranges()
+            && self.readable_ranges() == other.readable_ranges()
+    }
     fn mm(&self) -> ForeignMmId;
     fn binding(&self) -> ForeignMmBinding;
     fn backend_revision(&self) -> ForeignBackendRevision;
@@ -229,6 +239,14 @@ pub struct ForeignExecutableRange {
 impl ForeignExecutableRange {
     pub fn from_kernel_projection(start: GuestVa, end: GuestVa) -> Option<Self> {
         (start.raw() < end.raw()).then_some(Self { start, end })
+    }
+
+    pub const fn start(self) -> GuestVa {
+        self.start
+    }
+
+    pub const fn end(self) -> GuestVa {
+        self.end
     }
 }
 
@@ -385,6 +403,16 @@ impl ForeignInstructionPublicationPlan {
 
 /// Exact live backend used to re-observe real mutation authorities.
 pub trait ForeignMmLiveAuthority: Send + Sync {
+    /// Validate an already authenticated snapshot. Implementations may use
+    /// non-reusing revisions of the exact authority; otherwise copy and compare.
+    /// This does not authenticate arbitrary caller-supplied snapshot contents.
+    fn matches_authenticated_snapshot(
+        &self,
+        expected: &dyn ForeignMmSnapshot,
+        deadline: Instant,
+    ) -> Result<bool, ForeignMmTransportError> {
+        Ok(self.snapshot(deadline)?.has_same_contents(expected))
+    }
     fn snapshot(
         &self,
         deadline: Instant,
@@ -402,11 +430,32 @@ pub trait ForeignMmInvalidator {
     ) -> Result<(), ForeignMmTransportError>;
 }
 
+/// Content status for participating carrier host writes only. No variant grants
+/// native execution: hardware stores, mapping/alias admission and executor drain
+/// require separate publication authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForeignInstructionContentStatus {
+    Untracked,
+    UnchangedTrackedWrites,
+    Changed,
+}
+
 /// Authenticated completion. Concrete receipts stay private to transports.
 pub trait ForeignMmReadReceipt: Debug + Send + Sync {
     fn bytes_read(&self) -> usize;
     fn owner_generations(&self) -> &[ForeignOwnerGeneration];
     fn authenticates(&self, snapshot: &dyn ForeignMmSnapshot) -> bool;
+    fn instruction_content_status(&self) -> ForeignInstructionContentStatus {
+        ForeignInstructionContentStatus::Untracked
+    }
+    /// Begin a content-use scope over this captured observation. Writers must
+    /// revoke it and wait for finish before changing captured bytes. The caller
+    /// must check content status at bounded checkpoints and always finish, even
+    /// after partial failure. This is not executable-publication permission.
+    fn begin_instruction_content(&mut self) -> Result<(), ForeignMmTransportError> {
+        Err(ForeignMmTransportError::AuthorityUnavailable)
+    }
+    fn finish_instruction_content(&mut self) {}
 }
 
 /// Backend completion data for one exact post-COW compound. Implementations
@@ -487,8 +536,86 @@ pub trait ForeignMmPreparedWrite: Debug {
     fn receipt(&self) -> &dyn ForeignMmWriteReceipt;
 }
 
+/// Resident data pinned to one exact carrier owner. The kernel supplies either
+/// exact COW mutation exclusion or a live-validated native execution scope.
+/// This never authorizes executable code publication.
+///
+/// # Safety
+/// Implementors must pin the authenticated complete range for this object's
+/// lifetime, return its real backing pointer, and attest exact snapshot/COW
+/// identity. No copied buffer or unpinned address may implement this capability.
+/// An implementation enabling native activation must check the live mapping,
+/// owner generation, protection tracker and every crossed user-RW leaf (or an
+/// exact authority generation proving those leaf checks remain valid). A saved
+/// snapshot match alone cannot attest permissions after fork has rearmed COW.
+pub unsafe trait ForeignNativeDataSpan: Debug {
+    fn authenticates(
+        &self,
+        snapshot: &dyn ForeignMmSnapshot,
+        cow: &dyn ForeignCowReceipt,
+        start: GuestVa,
+        len: usize,
+    ) -> bool;
+
+    /// Called only after the kernel has entered the exact-MM running handshake.
+    /// The caller retains that scope until every pointer use has ended. The
+    /// kernel validates its authenticated snapshot before and after this call.
+    /// The default refuses activation, even for an otherwise valid pinned span.
+    fn validate_native_activation(
+        &mut self,
+        snapshot: &dyn ForeignMmSnapshot,
+        deadline: Instant,
+    ) -> Result<(), ForeignMmTransportError> {
+        let _ = (snapshot, deadline);
+        Err(ForeignMmTransportError::AuthorityUnavailable)
+    }
+
+    /// End the current bounded pointer access before retaining this span for
+    /// reuse. The kernel calls this on active-grant drop and when converting a
+    /// mutation-scoped grant to a prepared window. A later access must establish
+    /// writer admission again. Dropping the span must also end any access.
+    fn finish_native_access(&mut self) {}
+
+    /// # Safety
+    /// Retain either exact MM exclusion plus the COW witness, or an exact-MM
+    /// native execution scope with successful live activation in that scope.
+    /// Access only the granted range, never after finish_native_access or after
+    /// this span or authority drops, and do not re-enter kernel mutation/dispatch
+    /// while using the pointer.
+    unsafe fn as_mut_ptr(&mut self) -> *mut u8;
+}
+
+/// Reusable, pinned read capability. No host pointer or cached guest bytes
+/// escape. Every copy must validate live translation, permissions and owner.
+pub trait ForeignMmReadWindow: Debug {
+    fn authenticates(&self, snapshot: &dyn ForeignMmSnapshot, start: GuestVa, len: usize) -> bool;
+    fn copy_into(
+        &self,
+        authority: &dyn ForeignMmLiveAuthority,
+        snapshot: &dyn ForeignMmSnapshot,
+        va: GuestVa,
+        dst: &mut [u8],
+        deadline: Instant,
+    ) -> Result<(), ForeignMmTransportError>;
+}
+
 /// Strong lease for one exact carrier MM access state.
 pub trait ForeignMmReadLease: Debug + Send + Sync {
+    /// Optional single-leaf resident input window. Unsupported backing uses
+    /// the ordinary read protocol; failed live authority never becomes success.
+    fn prepare_read_window(
+        &self,
+        invocation: &ForeignMmInvocation,
+        authority: &dyn ForeignMmLiveAuthority,
+        snapshot: &dyn ForeignMmSnapshot,
+        start: GuestVa,
+        len: usize,
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignMmReadWindow>, ForeignMmTransportError> {
+        let _ = (invocation, authority, snapshot, start, len, deadline);
+        Err(ForeignMmTransportError::AuthorityUnavailable)
+    }
+
     fn read(
         &self,
         invocation: &ForeignMmInvocation,
@@ -498,6 +625,21 @@ pub trait ForeignMmReadLease: Debug + Send + Sync {
         dst: &mut [u8],
         deadline: Instant,
     ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError>;
+
+    /// Instruction setup can retain backing-content dependencies when the
+    /// backend mediates writes. The default read remains explicitly Untracked.
+    /// The kernel, not this receipt, authenticates executable VMA permission.
+    fn read_instructions(
+        &self,
+        invocation: &ForeignMmInvocation,
+        authority: &dyn ForeignMmLiveAuthority,
+        snapshot: &dyn ForeignMmSnapshot,
+        va: GuestVa,
+        dst: &mut [u8],
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
+        self.read(invocation, authority, snapshot, va, dst, deadline)
+    }
 
     #[allow(clippy::too_many_arguments)] // Object-safe transport carries exact mutation domains.
     fn break_cow(
@@ -519,6 +661,23 @@ pub trait ForeignMmReadLease: Debug + Send + Sync {
             executable,
             deadline,
         );
+        Err(ForeignMmTransportError::AuthorityUnavailable)
+    }
+
+    /// Optional resident data grant after exact-MM COW resolution. Backends
+    /// without this authority refuse; a copied-buffer fallback cannot qualify.
+    #[allow(clippy::too_many_arguments)] // Exact transport domains and bounded data range.
+    fn borrow_native_data(
+        &self,
+        invocation: &ForeignMmInvocation,
+        authority: &dyn ForeignMmLiveAuthority,
+        snapshot: &dyn ForeignMmSnapshot,
+        cow: &dyn ForeignCowReceipt,
+        start: GuestVa,
+        len: usize,
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignNativeDataSpan>, ForeignMmTransportError> {
+        let _ = (invocation, authority, snapshot, cow, start, len, deadline);
         Err(ForeignMmTransportError::AuthorityUnavailable)
     }
 
@@ -647,6 +806,24 @@ impl Debug for ForeignMmLeaseEndpoint {
 }
 
 impl ForeignMmLeaseEndpoint {
+    pub fn prepare_read_window(
+        &self,
+        authority: &dyn ForeignMmLiveAuthority,
+        snapshot: &dyn ForeignMmSnapshot,
+        start: GuestVa,
+        len: usize,
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignMmReadWindow>, ForeignMmTransportError> {
+        self.lease.prepare_read_window(
+            &ForeignMmInvocation { _private: () },
+            authority,
+            snapshot,
+            start,
+            len,
+            deadline,
+        )
+    }
+
     pub fn read(
         &self,
         authority: &dyn ForeignMmLiveAuthority,
@@ -658,6 +835,24 @@ impl ForeignMmLeaseEndpoint {
         let invocation = ForeignMmInvocation { _private: () };
         self.lease
             .read(&invocation, authority, snapshot, va, dst, deadline)
+    }
+
+    pub fn read_instructions(
+        &self,
+        authority: &dyn ForeignMmLiveAuthority,
+        snapshot: &dyn ForeignMmSnapshot,
+        va: GuestVa,
+        dst: &mut [u8],
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
+        self.lease.read_instructions(
+            &ForeignMmInvocation { _private: () },
+            authority,
+            snapshot,
+            va,
+            dst,
+            deadline,
+        )
     }
 
     pub fn break_cow(
@@ -725,6 +920,32 @@ impl ForeignMmLeaseEndpoint {
             va,
             len,
             Some(plan),
+            deadline,
+        )
+    }
+
+    /// The kernel must borrow its COW witness and mutation exclusion for the
+    /// returned span's entire use. No executable range can use this path.
+    pub fn borrow_native_data(
+        &self,
+        authority: &dyn ForeignMmLiveAuthority,
+        snapshot: &dyn ForeignMmSnapshot,
+        cow: &dyn ForeignCowReceipt,
+        start: GuestVa,
+        len: usize,
+        deadline: Instant,
+    ) -> Result<Box<dyn ForeignNativeDataSpan>, ForeignMmTransportError> {
+        let publication = instruction_publication(snapshot, start, len)?;
+        if publication.is_required() {
+            return Err(ForeignMmTransportError::MutationFailed);
+        }
+        self.lease.borrow_native_data(
+            &ForeignMmInvocation { _private: () },
+            authority,
+            snapshot,
+            cow,
+            start,
+            len,
             deadline,
         )
     }

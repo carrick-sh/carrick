@@ -1,0 +1,22 @@
+{
+  "echo-wide": {
+    "requests": 211,
+    "scrub_requests": 25,
+    "scrub_bytes": 207872000,
+    "summed_service_ms": 408.986292,
+    "scrub_request_service_ms": 405.264749,
+    "scrub_bytes_per_iteration": 41574400,
+    "edge_bytes_per_scrub_request": 8192,
+    "aligned_interior_bytes_per_scrub_request": 8306688
+  },
+  "base-wide": {
+    "requests": 212,
+    "scrub_requests": 25,
+    "scrub_bytes": 207872000,
+    "summed_service_ms": 42.525175,
+    "scrub_request_service_ms": 38.836335,
+    "scrub_bytes_per_iteration": 41574400,
+    "edge_bytes_per_scrub_request": 8192,
+    "aligned_interior_bytes_per_scrub_request": 8306688
+  }
+}

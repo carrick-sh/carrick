@@ -698,7 +698,7 @@ impl<'a> FsView<'a> {
                         return Ok(PathLookup {
                             resolved_path: path.clone(),
                             fast_path: FastPathKind::None,
-                            target: LookupTarget::Stat(StatRecord::from_real(&path, &real)),
+                            target: LookupTarget::Stat(StatRecord::from_real(&real)),
                         });
                     }
                     if let Ok(md) = if follow {

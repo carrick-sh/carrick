@@ -1,0 +1,48 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+   Doc-tests carrick_kernel
+
+running 2 tests
+test crates/carrick-kernel/src/dispatch/native_execution.rs - dispatch::native_execution::NativeExecution (line 113) - compile fail ... ok
+test crates/carrick-kernel/src/dispatch/native_execution.rs - dispatch::native_execution::NativeExecution (line 121) - compile fail ... ok
+
+successes:
+
+---- crates/carrick-kernel/src/dispatch/native_execution.rs - dispatch::native_execution::NativeExecution (line 113) stdout ----
+error[E0499]: cannot borrow `*n` as mutable more than once at a time
+   --> crates/carrick-kernel/src/dispatch/native_execution.rs:118:5
+    |
+117 |     let scope = d.enter_native_execution(n, c, e).unwrap();
+    |                                          - first mutable borrow occurs here
+118 |     n.take_stop_request();
+    |     ^ second mutable borrow occurs here
+119 |     drop(scope);
+    |          ----- first borrow later used here
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0499`.
+
+---- crates/carrick-kernel/src/dispatch/native_execution.rs - dispatch::native_execution::NativeExecution (line 121) stdout ----
+error[E0505]: cannot move out of `e` because it is borrowed
+   --> crates/carrick-kernel/src/dispatch/native_execution.rs:126:36
+    |
+124 | fn migrate_while_running(d: &SyscallDispatcher, n: &mut NativeExecutor, c: &KernelContext, mut e: ThreadExecutionLease) {
+    |                                                                                            ----- binding `e` declared here
+125 |     let scope = d.enter_native_execution(n, c, &mut e).unwrap();
+    |                                                ------ borrow of `e` occurs here
+126 |     c.thread().yield_from_executor(e).unwrap();
+    |                                    ^ move out of `e` occurs here
+127 |     drop(scope);
+    |          ----- borrow later used here
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0505`.
+
+
+successes:
+    crates/carrick-kernel/src/dispatch/native_execution.rs - dispatch::native_execution::NativeExecution (line 113)
+    crates/carrick-kernel/src/dispatch/native_execution.rs - dispatch::native_execution::NativeExecution (line 121)
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.12s
+

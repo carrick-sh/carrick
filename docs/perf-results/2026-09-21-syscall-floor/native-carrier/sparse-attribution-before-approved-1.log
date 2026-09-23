@@ -1,0 +1,26 @@
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Finished `release` profile [optimized + debuginfo] target(s) in 20.01s
+     Running unittests src/lib.rs (target/release/deps/carrick_vmm_hvf-c46177425ba8821e)
+
+running 1 test
+test trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance ... FAILED
+
+failures:
+
+---- trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance stdout ----
+
+thread 'trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance' (4019760) panicked at crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs:9242:6:
+called `Result::unwrap()` on an `Err` value: ScalingViolation { contract: ContractId("kernel.mm.fresh-publication-maintenance"), metric: PageTableInvalidations, scale: 1, actual: 1, maximum: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 508 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`

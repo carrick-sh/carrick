@@ -1,0 +1,15 @@
+error[E0505]: cannot move out of `e` because it is borrowed
+ --> target/lease-cost/native-carrier/lifetime-negative-2.rs:5:36
+  |
+3 | fn transfer(c: &KernelContext, e: ThreadExecutionLease, cow: &mut CowBroken<'_, '_, '_>) {
+  |                                - binding `e` declared here
+4 |     let data = c.borrow_current_native_data(&e, cow).unwrap();
+  |                                             -- borrow of `e` occurs here
+5 |     c.thread().yield_from_executor(e).unwrap();
+  |                                    ^ move out of `e` occurs here
+6 |     let _ = data.len();
+  |             ---- borrow later used here
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0505`.

@@ -1,0 +1,26 @@
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.82s
+     Running unittests src/lib.rs (target/debug/deps/carrick_hal-85c8b2a6f0551766)
+
+running 18 tests
+test threaded::generic_registry_tests::kernel_wake_retry_kicks_only_live_debt_in_guest ... ok
+test threaded::generic_registry_tests::lease_drain_absent_owner_still_waits_on_only_registration ... ok
+test threaded::generic_registry_tests::lease_drain_same_owner_reentry_is_busy ... ok
+test threaded::generic_registry_tests::lease_drain_is_identity_aware_and_freezes_registration ... ok
+test threaded::generic_registry_tests::lease_guard_drop_wakes_busy_drain_and_registration_waiters ... ok
+test threaded::generic_registry_tests::kick_all_except_skips_caller ... ok
+test threaded::generic_registry_tests::in_guest_flag_handshake ... ok
+test threaded::generic_registry_tests::lease_drain_returns_lowest_sibling_identity ... ok
+test threaded::generic_registry_tests::kernel_wake_debt_survives_exact_tid_rebind_only ... ok
+test threaded::generic_registry_tests::lease_membership_mutation_wakes_waiter_after_removal ... ok
+test threaded::generic_registry_tests::lease_registration_replacement_does_not_publish_membership_change ... ok
+test threaded::generic_registry_tests::lease_subscription_drop_cancels_only_unclaimed_listener ... ok
+test threaded::generic_registry_tests::register_unregister_tracks_exact_identities ... ok
+test threaded::generic_registry_tests::reregistration_keeps_the_in_guest_facet ... ok
+test threaded::generic_registry_tests::retiring_a_thread_discards_its_dormant_kernel_wake_debt ... ok
+test threaded::generic_registry_tests::sibling_ack_cannot_clear_an_in_guest_participants_debt ... ok
+test threaded::generic_registry_tests::unregistered_thread_is_invisible_to_the_drain ... ok
+test threaded::generic_registry_tests::kernel_wake_published_during_lease_gap_survives_rebind ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 115 filtered out; finished in 0.00s
+

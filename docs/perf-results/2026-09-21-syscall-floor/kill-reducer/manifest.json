@@ -1,0 +1,320 @@
+[
+  {
+    "original": "target/lease-cost/kill-reducer/base/kill-floor-base.guest.log",
+    "sha256": "4de6ff856f28a8f325c548a6f8b1e359ce4042edd952f8290fc1760be418abf7",
+    "bytes": 49,
+    "preserved": "base/kill-floor-base.guest.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/base/kill-floor-base.manifest.txt",
+    "sha256": "650e256b5cc8c7bc496abda129b2ca565040a71fa74849d9cbd4b2812e2447e8",
+    "bytes": 769,
+    "preserved": "base/kill-floor-base.manifest.txt"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/base-v2/kill-floor-v2-base.62698.core",
+    "sha256": "86253587f0ec2d524c0373262dc1d3a1fb6808436cd4270185faa0e61c5fe209",
+    "bytes": 58875904,
+    "retained_local_path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/kill-reducer/base-v2/kill-floor-v2-base.62698.core"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/base-v2/kill-floor-v2-base.guest.log",
+    "sha256": "7b440799582fba40decb3fae596a9cbcc17e5e5dca38e63c6a4726238a37cbf6",
+    "bytes": 72,
+    "preserved": "base-v2/kill-floor-v2-base.guest.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/base-v2/kill-floor-v2-base.kernel-debug.json",
+    "sha256": "7c07fbf5111d792bdb537f064a98b461532e0597e54c36f99233bcc308379ccf",
+    "bytes": 244279,
+    "preserved": "base-v2/kill-floor-v2-base.kernel-debug.json.gz"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/base-v2/kill-floor-v2-base.lldb.txt",
+    "sha256": "098957fdd924310639753d21c74f7a16ee1f1f2bcd631f5a36174031bfafd408",
+    "bytes": 286514,
+    "preserved": "base-v2/kill-floor-v2-base.lldb.txt.gz"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/base-v2/kill-floor-v2-base.manifest.txt",
+    "sha256": "1b4fed7295f3c776cae6293254d250330d7d0ea73763dc90c18ead138384e012",
+    "bytes": 772,
+    "preserved": "base-v2/kill-floor-v2-base.manifest.txt"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/base-v2/kill-floor-v2-base.ps.txt",
+    "sha256": "37b681cb0e146bfd7a7e741002a0b0c52c5eb386c92dc13f7d7325d4493d68ab",
+    "bytes": 55,
+    "preserved": "base-v2/kill-floor-v2-base.ps.txt"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/base-v2.json",
+    "sha256": "77bffd103e9d1bc9d3ba6cd898f98e76282de31ccb3d0bcde34e4804c867686d",
+    "bytes": 1047,
+    "preserved": "base-v2.json"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/base-v2.log",
+    "sha256": "4a0f2bc322d1c19a8afdab26f3b75a168e995a52066f495273ef1d5359cc02cb",
+    "bytes": 449,
+    "preserved": "base-v2.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/base.json",
+    "sha256": "5f54f46e0fff6e85fe4d1c4caf4bf7235dd7ef90ef67c88cc596b7d3cc0c162a",
+    "bytes": 1051,
+    "preserved": "base.json"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/base.log",
+    "sha256": "17a5ba175177e23c425c6802b563f1585888eb236149587da42a4e2b04c68b03",
+    "bytes": 326,
+    "preserved": "base.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/docker.err",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bytes": 0,
+    "preserved": "docker.err"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/docker.json",
+    "sha256": "df82f5aee8577ebdb1dd1fec7032bdc12e93caa3c07c471873b99555967bca4c",
+    "bytes": 223,
+    "preserved": "docker.json"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/docker.out",
+    "sha256": "e0a96e468e045f458020c724e26393341813709e03f3a690f6e0a558e8152e3a",
+    "bytes": 653,
+    "preserved": "docker.out"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/embed-green-artifacts.jsonl",
+    "sha256": "2918ef48fefc4090e3ce89dd700adfe75c486254222261b5325cc43e8fe8f653",
+    "bytes": 2780,
+    "preserved": "embed-green-artifacts.jsonl"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/embed-green.log",
+    "sha256": "abbd3eadfe0cb1b01744bf4fd13817d913d744cb6a456001c4f1726350359171",
+    "bytes": 8279,
+    "preserved": "embed-green.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/embed-red-artifact.json",
+    "sha256": "a46e74accd23ff4c999ef62a0ae2a271c423bd13e413a796e15d3718cde84552",
+    "bytes": 10158,
+    "preserved": "embed-red-artifact.json"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/embed-red-executable",
+    "sha256": "223cb1360f0f17852c568bef087fddeca370a9d93a0580906e348fb480c2c24f",
+    "bytes": 28282064,
+    "retained_local_path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/kill-reducer/embed-red-executable"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/embed-red.log",
+    "sha256": "c47ca2a30def1f6e511e28a8ad99e2b2afc485fe63f7dfd5a65075cd76989fa3",
+    "bytes": 414871,
+    "preserved": "embed-red.log.gz"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/full-subprocess.log",
+    "sha256": "304c0791e43f54136b4a18dd347b34a190516284ec51254ea7c1c485816e2499",
+    "bytes": 163,
+    "preserved": "full-subprocess.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/guest.py",
+    "sha256": "83b89dfdb49db0bd306743e00d774ce1bace32e298e37852503ee3f28e0083f5",
+    "bytes": 331,
+    "preserved": "guest.py"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/lease-gap-artifact.json",
+    "sha256": "2590c4a809eab99a3d53756717d710ed66498b5e3532b44f2da7f94d45cbce7f",
+    "bytes": 9873,
+    "preserved": "lease-gap-artifact.json"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/lease-gap-build.log",
+    "sha256": "5b677195101e17ca8036e987f00e0810305259685ca43092d594a82efd9f91ff",
+    "bytes": 1469,
+    "preserved": "lease-gap-build.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/lease-gap-final-unit.log",
+    "sha256": "307d0d8e60e7bacc24c325db7e03dc6572021197cdad51f670baaba774e957ec",
+    "bytes": 2091,
+    "preserved": "lease-gap-final-unit.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/lease-gap-green.log",
+    "sha256": "b33481abd518c368a7594af1249ddcaeff6e5335178574fb42ccc261b98498f9",
+    "bytes": 2091,
+    "preserved": "lease-gap-green.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/lease-gap-red.log",
+    "sha256": "fc07ad9203d625def7a10ff2e6940f436887391e59a7741b0d7e140e72ab2a37",
+    "bytes": 2088,
+    "preserved": "lease-gap-red.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/lease-gap-semantics.log",
+    "sha256": "e2c0ef75e35cb865371950df00879d6f86166a422c6d8806af0ecb9430540982",
+    "bytes": 21450,
+    "preserved": "lease-gap-semantics.log.gz"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/lease-gap-v2/kill-floor-v3-lease-gap.guest.log",
+    "sha256": "e0a96e468e045f458020c724e26393341813709e03f3a690f6e0a558e8152e3a",
+    "bytes": 653,
+    "preserved": "lease-gap-v2/kill-floor-v3-lease-gap.guest.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/lease-gap-v2/kill-floor-v3-lease-gap.manifest.txt",
+    "sha256": "7df155b5f768a12afad453b3b1b9416cc2dfa43917459023b29d23ee05a7ded5",
+    "bytes": 787,
+    "preserved": "lease-gap-v2/kill-floor-v3-lease-gap.manifest.txt"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/lease-gap-v2.json",
+    "sha256": "e6a09c390b70ebe90ab2f06f7d60f80db1c4280368bd2a01a00082c79ce99b51",
+    "bytes": 1060,
+    "preserved": "lease-gap-v2.json"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/lease-gap-v2.log",
+    "sha256": "dea83465f6ac3f109c89afb25a8413b575851b7893d7bccf19325740b053223d",
+    "bytes": 366,
+    "preserved": "lease-gap-v2.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/lease-gap.patch",
+    "sha256": "eecf553be77eaf4e18a87aed3641ee6d8ebc67c976edcef0fc9637be2d410a55",
+    "bytes": 47114,
+    "preserved": "lease-gap.patch.gz"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/run-v2.py",
+    "sha256": "1ac49c66117cb6e18acfe06fd6595f5db0b7215b6b12323c3440f5a8ffe62fd9",
+    "bytes": 1335,
+    "preserved": "run-v2.py"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/run-v3.py",
+    "sha256": "340eb07bc12d0a8c246f250604c0df7132f57117c94215d41bcf243d00e777c4",
+    "bytes": 1322,
+    "preserved": "run-v3.py"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/run.py",
+    "sha256": "29cac02f5d9eeebcea1de144f84c78b20aaeb76457cbb1eccfa800f24beafcf1",
+    "bytes": 1323,
+    "preserved": "run.py"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/scrub-candidate/kill-floor-scrub-candidate.guest.log",
+    "sha256": "4de6ff856f28a8f325c548a6f8b1e359ce4042edd952f8290fc1760be418abf7",
+    "bytes": 49,
+    "preserved": "scrub-candidate/kill-floor-scrub-candidate.guest.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/scrub-candidate/kill-floor-scrub-candidate.manifest.txt",
+    "sha256": "d485d3c7fd9da798eedd5ef3dbefb613a2f98acb32d19b879eabc9aac356bfcb",
+    "bytes": 802,
+    "preserved": "scrub-candidate/kill-floor-scrub-candidate.manifest.txt"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/scrub-candidate-v2/kill-floor-v2-scrub-candidate.62818.core",
+    "sha256": "05aecf8b0a50b89981e981639c7c4f5db93ef561bfbf96847422e08f8f47cb34",
+    "bytes": 56471552,
+    "retained_local_path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/kill-reducer/scrub-candidate-v2/kill-floor-v2-scrub-candidate.62818.core"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/scrub-candidate-v2/kill-floor-v2-scrub-candidate.guest.log",
+    "sha256": "d40c674d3ff4b36427af9acd7e69823a77c4cef177b44a685d5dc47260db06ab",
+    "bytes": 24,
+    "preserved": "scrub-candidate-v2/kill-floor-v2-scrub-candidate.guest.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/scrub-candidate-v2/kill-floor-v2-scrub-candidate.kernel-debug.json",
+    "sha256": "3b3374e0f8bbcb3da12b65763eabf453a9016caad47f8b0baea848d517c16768",
+    "bytes": 244231,
+    "preserved": "scrub-candidate-v2/kill-floor-v2-scrub-candidate.kernel-debug.json.gz"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/scrub-candidate-v2/kill-floor-v2-scrub-candidate.lldb.txt",
+    "sha256": "9be4f8185d548245d7a018d6c6ffcceb23165a1d28b8527a0e8c8175be727ef6",
+    "bytes": 250439,
+    "preserved": "scrub-candidate-v2/kill-floor-v2-scrub-candidate.lldb.txt.gz"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/scrub-candidate-v2/kill-floor-v2-scrub-candidate.manifest.txt",
+    "sha256": "3461d834991e682844d039ab769da48e8a8a096429066fd28945aa48c3b783bf",
+    "bytes": 805,
+    "preserved": "scrub-candidate-v2/kill-floor-v2-scrub-candidate.manifest.txt"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/scrub-candidate-v2/kill-floor-v2-scrub-candidate.ps.txt",
+    "sha256": "bcec0bf7492804783a93522d43282625255ea3238aca83c231ac48285e18de74",
+    "bytes": 66,
+    "preserved": "scrub-candidate-v2/kill-floor-v2-scrub-candidate.ps.txt"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/scrub-candidate-v2.json",
+    "sha256": "e22f2b2f87011178a4f0613ef57651a5d3ba4ed39d4184ec4e6adf01cbe30f2e",
+    "bytes": 1080,
+    "preserved": "scrub-candidate-v2.json"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/scrub-candidate-v2.log",
+    "sha256": "4ed84cc2244decf4711f7fb0a356521a7012fce7df4f1c740ca4c91529bc3df9",
+    "bytes": 526,
+    "preserved": "scrub-candidate-v2.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/scrub-candidate.json",
+    "sha256": "96f2d269f1eef1ff99e7ad09d5dcb5b8039eeb2bacf9ae9f1c6e9987ce640790",
+    "bytes": 1084,
+    "preserved": "scrub-candidate.json"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/scrub-candidate.log",
+    "sha256": "ff5f295936e2bc1e6be0c2cf2c19ef7ef0f86a18fe96650f4269a05da9f69857",
+    "bytes": 381,
+    "preserved": "scrub-candidate.log"
+  },
+  {
+    "original": "target/lease-cost/kill-reducer/threaded-fixed.rs",
+    "sha256": "798ffd76c30891b254b80255fb7cd4717b564f09fe97b12c9484914844421fe9",
+    "bytes": 112098,
+    "preserved": "threaded-fixed.rs.gz"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-subprocess-python-subprocess.err",
+    "sha256": "018cf62eb92e059ef03c818f521c82b39787f35dd6abdeab8a08833cec5a3cb8",
+    "bytes": 55,
+    "preserved": "floor-lease-gap-subprocess-python-subprocess.err"
+  },
+  {
+    "original": "target/lease-cost/workloads/floor-lease-gap-subprocess-python-subprocess.out",
+    "sha256": "655d7bb8281f57228208f331c809ae241e600594784ccf407d3d23fa23b8786d",
+    "bytes": 37483,
+    "preserved": "floor-lease-gap-subprocess-python-subprocess.out.gz"
+  },
+  {
+    "original": "target/lease-cost/workloads/lease-gap-screen.py",
+    "sha256": "46cf39411e7b01bf09271309a6566c3d3dc541573e5607e26cd7fc8e809aec7a",
+    "bytes": 3465,
+    "preserved": "lease-gap-screen.py"
+  },
+  {
+    "original": "target/lease-cost/workloads/lease-gap-subprocess.jsonl",
+    "sha256": "822c4c1e8af28e9829b03e4302fc567f7f879640ac5abe45bbe4ec0a3e7b5f9c",
+    "bytes": 859,
+    "preserved": "lease-gap-subprocess.jsonl"
+  }
+]

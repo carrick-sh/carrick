@@ -1,0 +1,42 @@
+[
+  {
+    "arm": "control",
+    "run": 0,
+    "median_ns": 2144.863754272461
+  },
+  {
+    "arm": "candidate",
+    "run": 1,
+    "median_ns": 2051.1099548339844
+  },
+  {
+    "arm": "candidate",
+    "run": 2,
+    "median_ns": 2049.3189544677734
+  },
+  {
+    "arm": "control",
+    "run": 3,
+    "median_ns": 2159.360885620117
+  },
+  {
+    "arm": "control",
+    "run": 4,
+    "median_ns": 2147.3553924560547
+  },
+  {
+    "arm": "candidate",
+    "run": 5,
+    "median_ns": 2078.383758544922
+  },
+  {
+    "arm": "candidate",
+    "run": 6,
+    "median_ns": 2090.1355743408203
+  },
+  {
+    "arm": "control",
+    "run": 7,
+    "median_ns": 2124.4913787841797
+  }
+]

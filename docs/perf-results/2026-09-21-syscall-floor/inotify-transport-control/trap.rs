@@ -1,0 +1,7605 @@
+//! # The HVF trap boundary
+//!
+//! This is the seam where a Linux guest's `svc #0` becomes a host Rust syscall
+//! dispatch. carrick runs unmodified Linux ELF code as guest EL0 inside a single
+//! Hypervisor.framework VM, with NO Linux kernel underneath it — when the guest
+//! issues a syscall, control must cross all the way out to host userspace, get
+//! serviced against Darwin primitives, and resume the guest as if a kernel had
+//! handled it. This module owns that crossing in both directions.
+//!
+//! ## Theory of operation: the round trip of one syscall
+//!
+//! 1. **Guest `svc #0` (EL0).** The guest executes a normal AArch64 supervisor
+//!    call. With `SCTLR_EL1.M=1` and our stage-1 identity tables installed, this
+//!    is a synchronous exception from the lowest EL.
+//! 2. **EL1 vector table (`VBAR_EL1`).** HVF does NOT exit to the host on a bare
+//!    EL0 `svc`; it routes the exception to EL1, which is *still inside the VM*.
+//!    `map_plan` programs `VBAR_EL1` to a guest-physical vector page (built by
+//!    `crate::memory`) whose lower-EL-synchronous entry is a tiny trampoline. The
+//!    trampoline runs at EL1 — this is carrick code executing in the guest, never
+//!    the guest's own code.
+//! 3. **`hvc #2` → EL2 VM-exit.** The vector trampoline issues a hypervisor call.
+//!    THAT is what HVF surfaces to the host as an `EXCEPTION` exit from
+//!    `hv_vcpu_run`. (Plain EL0 memory aborts HVF cannot satisfy — a stack
+//!    overflow running SP off the mapped stack — surface directly as an
+//!    `EXCEPTION` exit with `EC=0x20/0x24` instead; see
+//!    `is_aarch64_el0_abort_exception`.) The reason we trampoline through EL1
+//!    rather than letting HVF trap the `svc` directly is that the EL1 stage
+//!    gives us a place to do stage-1 TLB maintenance (`hvc #1`, see
+//!    `HvfInner::run_el1_maintenance`) on a platform whose public HVF has no
+//!    stage-2 TLBI.
+//! 4. **Host decode.** `HvfInner::run_until_syscall` reads the exit info,
+//!    confirms `EC=0x16` (our HVC) *and* that the underlying `ESR_EL1` is an
+//!    `svc` (anything else — an ID-register read, a real fault — is handled or
+//!    surfaced as [`TrapError::EL0Fault`]), then reads x0..x5/x8 into an
+//!    [`Aarch64SyscallFrame`] and returns it to the runtime dispatcher.
+//! 5. **Host dispatch + resume.** The dispatcher services the syscall against
+//!    Darwin and calls `HvfInner::complete_syscall`, which writes the retval
+//!    into x0. The next `hv_vcpu_run` resumes the trampoline's `eret`, dropping
+//!    back to EL0 at the instruction after the `svc` (HVF latched that address in
+//!    `ELR_EL1` when it took the exception).
+//!
+//! ## The load-bearing EL0/EL1 invariant
+//!
+//! The single most important distinction in this module is *whose code is the
+//! vCPU running*. EL0 is genuine Linux guest userspace; EL1+ is always carrick's
+//! trap trampoline. A PC (or register snapshot) captured at EL1 is a *carrick*
+//! address and must NEVER be treated as a guest resume target — injecting a
+//! signal frame at an EL1 PC overwrites an in-flight syscall and wedges the
+//! thread. [`ExecLevel::from_pstate`] is the systematic classifier; every site
+//! that captures a live vCPU PC for guest use must consult it. The kick path in
+//! `HvfInner::run_until_syscall` is the sharp example: a cross-thread
+//! `hv_vcpus_exit` can land while the vCPU is mid-trampoline at EL1, so it resumes
+//! the vCPU to a clean EL0 boundary before reporting the kick (this fixed a real
+//! SIGURG storm corrupting a futex waiter at `vectors_base+0x404`).
+//!
+//! ## The [`SyscallTrap`] contract
+//!
+//! The runtime loop drives the engine through one trait, [`SyscallTrap`]:
+//! `next_syscall` (run until a trap; `Ok(None)` is a no-syscall kick exit),
+//! `complete_syscall` (write the retval), process projection / `execve_into`
+//! (address-space
+//! lifecycle), and the signal pair `inject_signal` / `restore_from_sigframe`.
+//! [`HvfTrapEngine`] is the real implementation; the runtime also has a
+//! non-HVF `SplitView` adapter, which is why every method has a portable
+//! default and a `#[cfg(not(macos+aarch64))]` stub returning
+//! [`TrapError::UnsupportedPlatform`]. Errors are typed: most variants carry the
+//! syndrome/ELR/FAR so the runtime can translate a guest fault into the right
+//! Linux signal, and [`TrapError::SignalDeliveryFault`] specifically models
+//! Linux's `force_sigsegv` (an unwritable signal stack kills the thread-group by
+//! SIGSEGV rather than fatalling carrick).
+//!
+//! ## Address-space lifecycle: process projection, clone, execve
+//!
+//! HVPatch keeps process identity and address spaces inside one carrier. Guest
+//! process/thread creation updates Carrick's kernel graph and stage-1 projection;
+//! it never creates a host process:
+//!
+//! - **Process fork** shares stable global
+//!   frames read-only across distinct per-mm stage-1 graphs and copies only the
+//!   first writer's affected compound frame. Genuine guest `MAP_SHARED`
+//!   mappings remain shared.
+//! - **Thread clone** (`HvfInner::build_thread_spec` / `from_thread_spec`)
+//!   keeps ONE process VM and gives each guest thread its own vCPU in it. The
+//!   stage-2 mappings are VM-global, so a sibling only re-materialises local
+//!   syscall-path metadata (UNOWNED, `memory: None`) and never frees the main
+//!   engine's buffers. Because HVF caps concurrent vCPUs, sibling creation
+//!   passes through an admission gate (`wait_for_vcpu_slot`); see the
+//!   private `vcpu_gate` module for why a guest that out-threads the cap *blocks*
+//!   rather than failing `clone` (Linux has no such cap, so failing would
+//!   deadlock a join).
+//! - **`execve(2)`** (`HvfInner::execve_into`) tears down and rebuilds the VM
+//!   with a brand-new [`AddressSpace`] and resets the vCPU to
+//!   "initial process startup" (zeroed GPRs, entry trampoline) rather than
+//!   "resume mid-syscall". It has no successful return.
+//!
+//! ## Signals: synthesising kernel signal delivery in userspace
+//!
+//! `HvfInner::inject_signal` builds a Linux-shaped `CarrickSigframe` (siginfo +
+//! ucontext + a full GPR/PC/SP/PSTATE/FPSIMD snapshot), pushes it onto SP_EL0
+//! (or the SA_ONSTACK alt stack), points x30 at the restorer, sets x0..x2 to the
+//! handler arguments, and redirects the resumed PC to the handler. On
+//! `rt_sigreturn(2)`, `HvfInner::restore_from_sigframe` pops the frame and
+//! restores the pre-signal state. Two non-obvious subtleties:
+//!
+//! - The authoritative pre-signal PSTATE source DIFFERS by injection path. At a
+//!   syscall boundary the hardware latched EL0's PSTATE into `SPSR_EL1`; on a
+//!   kick exit no exception was taken, so `SPSR_EL1` is stale and `CPSR` holds
+//!   the live EL0 state. Reading the wrong one resumes the interrupted routine
+//!   with stale NZCV — conditional branches go the wrong way — which was exactly
+//!   Go's async-preemption (SIGURG) corruption.
+//! - V0–V31 / FPSR / FPCR must round-trip across both signals *and* fork/clone,
+//!   or a handler (or post-fork resume) that touches SIMD corrupts the
+//!   interrupted thread's vector file. This collides with an `applevisor-sys`
+//!   ABI bug: see `set_simd_fp_reg_v` — Apple's `hv_vcpu_set_simd_fp_reg` takes
+//!   a 16-byte vector BY VALUE in a V register, but the stable binding mistypes
+//!   it as `u128` (passed in a GP register pair), so the kernel reads garbage and
+//!   silently zeroes the target register while returning `HV_SUCCESS`. We route
+//!   every V-register *write* through a tiny C shim that gets the vector ABI
+//!   right on stable Rust; reads are pointer-based and unaffected.
+//!
+//! ## Guest memory access from the syscall path
+//!
+//! The dispatcher reads/writes guest buffers through this engine's
+//! [`GuestMemory`] impl. Because guest RAM is `MAP_SHARED` and another host
+//! thread's vCPU can mutate it concurrently, host-side copies go byte-wise
+//! `read_volatile`/`write_volatile` (`volatile_copy_from_guest`) to remove
+//! language-level UB (it does NOT make the data race "correct" — the guest owns
+//! its own synchronization). Writes from the syscall path are permission-checked
+//! (a write into a read-only / carrick-owned mapping returns EFAULT, not a host
+//! SIGBUS); carrick-internal writes (vdso, sigframe, bootstrap) use the unchecked
+//! path deliberately. High-VA Rosetta aliases can overlap by VA, so region
+//! lookup disambiguates by walking the guest's own stage-1 tables to the IPA the
+//! guest actually uses (`HvfInner::translate_va`).
+//!
+//! ## Sharp edges / known limitations
+//!
+//! - **No stage-2 TLBI on public arm64 HVF.** Guest-visible `mprotect`/`munmap`
+//!   semantics are implemented entirely in stage-1 (page-table edits + an EL1
+//!   `tlbi` trampoline); the stage-2 mapping is left in place. This is why
+//!   munmap'd arena backing is still physically mapped (only stage-1-invalidated)
+//!   and why `HvfInner::zero_guest_backing` can scrub a reclaimed region the
+//!   permission-checked writes would refuse.
+//! - **Stage-2 perm escalation.** `hvf_perms` escalates writable data regions
+//!   to `ReadWriteExec` to work around an HVF stage-2 quirk where RW-without-X
+//!   mappings fail to translate EL0 data accesses. Guest-visible W^X is enforced
+//!   in stage-1 instead.
+//! - **Drop is intentionally a no-op.** See above; touching applevisor
+//!   destructors post-fork panics.
+//! - **`ptr::write`-based in-place replacement.** Rebuilding the engine
+//!   (`replace_destroyed_hvf_inner`) and the post-fork/clone VM swaps use
+//!   `mem::forget`/`ptr::write` to avoid running Drop on already-raw-destroyed
+//!   handles. These are the single sanctioned no-drop replacement points; do not
+//!   assign an `HvfInner`/vCPU/VM field normally after a raw teardown.
+
+// The hub types live in the leaf crate carrick-guest-mem (A2); import them from
+// there, not via `crate::dispatch`, so trap.rs has NO dependency on the
+// dispatcher — the last edge blocking a future carrick-vmm-hvf crate (A3).
+use crate::elf::SegmentPerms;
+use crate::memory::AddressSpace;
+use crate::syscall_mailbox::{
+    HvfSyscallTransport, MailboxBinding, MailboxSlotAllocator, MailboxSlotId,
+};
+use carrick_aarch64::Aarch64VcpuSnapshot;
+use carrick_guest_mem::{GuestVa, MemoryError};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::os::fd::AsRawFd;
+
+use carrick_fatal::carrick_fatal;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod mapping_plan;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use mapping_plan::*;
+
+mod sparse_materialization;
+
+mod sysreg;
+use sysreg::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod carrier_custody;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod global_frame;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use global_frame::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod execve_rebuild;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use execve_rebuild::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod foreign_mm;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod frame_inventory;
+mod memory_protection;
+pub(crate) use self::memory_protection::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use carrier_custody::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use foreign_mm::HvpatchMmRootRetirementProof;
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "foreign-cow-test-support"
+))]
+pub use foreign_mm::foreign_cow_test_support;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use foreign_mm::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use frame_inventory::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod task_mapping_index;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use task_mapping_index::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod vcpu_admission;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod vcpu_gate;
+pub use vcpu_admission::cooperative_release_atomic_permit;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use vcpu_admission::*;
+mod persistent_executor;
+pub use persistent_executor::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod process_plan;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(unused_imports)]
+pub(crate) use process_plan::*;
+// The vvar clock calibration sources (a frequency-only EL0 read plus the
+// CLOCK_UPTIME_RAW monotonic base). The raw counter pair remains exported for
+// explicit divergence diagnostics, not production calibration. The
+// Darwin-native backend's vvar stamper uses the identical frequency/uptime
+// sources as `populate_vdso_data_page` below.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use sysreg::{host_clock_uptime_ns, host_counter, host_counter_frequency};
+
+// Process-wide PROT_NONE bookkeeping is a neutral-core abstraction shared with
+// every other backend (KVM included) — see carrick_mem::protections. Both hold
+// it as `Arc<MemoryProtections>` and clone it into each sibling vCPU thread.
+use carrick_mem::protections::MemoryProtections;
+
+// SyscallTrap/TrapError moved down into the carrick-hal leaf crate
+// (the runtime↔engine contract is platform-agnostic). Re-export them here so
+// existing `crate::trap::…` paths in carrick-vmm-hvf and carrick-runtime are
+// unchanged. HvfTrapEngine below implements the trait from its new home.
+use carrick_hal::aarch64::ExecLevel;
+// The ESR exception-class decode surface (classifier fns + the SVC/HVC class
+// consts) hoisted into carrick_hal::aarch64 must stay PUB-re-exported here:
+// `carrick_runtime::trap` is this module on macOS, and external consumers (the
+// trap_hvf integration test) import the classifiers through that path. A plain
+// `use` made them private and broke `cargo test -p carrick-runtime`
+// (E0603/E0432 in tests/trap_hvf.rs).
+pub use carrick_hal::aarch64::{
+    AARCH64_HVC_EXCEPTION_CLASS, AARCH64_SVC_EXCEPTION_CLASS, aarch64_exception_class,
+    is_aarch64_hvc_exception, is_aarch64_hvc_fault, is_aarch64_hvc_maintenance,
+    is_aarch64_svc_exception, is_aarch64_syscall_exception,
+};
+use carrick_hal::trap::{HostAliasBacking, HostAliasSharing};
+pub use carrick_hal::trap::{RawSyscall, SyscallTrap, TrapError};
+
+pub const HVF_PAGE_SIZE: u64 = carrick_guest_mem::HOST_PAGE_GRANULE;
+// Guest stage-1 uses a 4 KiB granule even though HVF maps stage-2 in 16 KiB
+// chunks. Syscall memory copies must reselect the backing at this boundary.
+const GUEST_STAGE1_PAGE_SIZE: u64 = 0x1000;
+// ESR exception-class decode (svc/hvc/maintenance/syscall classifiers, the
+// SVC/HVC class consts, and ExecLevel) live in the shared carrick_hal::aarch64
+// module — imported above. This SHIFT is kept local only for the counter-trap
+// TESTS that synthesize an ESR syndrome (cntfrq/cntvct/dczid), so it is test-only.
+#[cfg(test)]
+const AARCH64_EXCEPTION_CLASS_SHIFT: u64 = 26;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrapBackend {
+    HypervisorFramework,
+}
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) mod foreign_mm_tests {
+    pub(super) static FOREIGN_MM_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    pub(crate) use super::foreign_mm::tests::ExternalAliasStateRestore;
+}
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) mod task_only_carrier_directory_tests;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TrapCapabilities {
+    pub backend: TrapBackend,
+    pub available_on_this_host: bool,
+    pub implemented: bool,
+}
+
+pub fn hvf_capabilities() -> TrapCapabilities {
+    TrapCapabilities {
+        backend: TrapBackend::HypervisorFramework,
+        available_on_this_host: cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        implemented: cfg!(all(target_os = "macos", target_arch = "aarch64")),
+    }
+}
+
+// The public HVF trap engine IS `Aarch64EngineCore<HvfAarch64Vmm>`: the shared
+// `carrick-aarch64` scaffold parameterized over the thin HVF backend trait pair
+// (`crate::hvf_aarch64_engine`). Every existing `crate::trap::HvfTrapEngine`
+// reference (carrick-runtime's run loop, the integration tests) resolves through
+// this alias unchanged. The trap loop / register walk / guest-memory gate /
+// fork/execve/sibling sequencing / threaded lifecycle now live ONCE in
+// carrick-aarch64; the HVF-specific atoms below feed it through the trait pair.
+//
+// The leak-until-exit Drop discipline (NEVER run applevisor's Vcpu /
+// VirtualMachine destructors after a `fork(2)`, or they panic with "no VM or
+// vCPU available") now lives per-half: `HvfAarch64Vcpu`'s `Drop` skips
+// `ManuallyDrop::drop`, and `HvfVmState` holds the VM in a no-op `ManuallyDrop`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub type HvfTrapEngine =
+    carrick_aarch64::Aarch64EngineCore<crate::hvf_aarch64_engine::HvfAarch64Vmm>;
+
+/// Bring up the HVF trap engine from a loaded image: create the VM + vCPU, map
+/// the guest address space, and park the vCPU at the EL0-entry trampoline. The
+/// runtime calls this instead of the old `HvfTrapEngine::new()` + `map_plan`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn new_hvf_trap_engine(image: &AddressSpace) -> Result<HvfTrapEngine, TrapError> {
+    crate::hvf_aarch64_engine::bring_up(image)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GPR_TABLE: [applevisor::vcpu::Reg; 31] = [
+    applevisor::vcpu::Reg::X0,
+    applevisor::vcpu::Reg::X1,
+    applevisor::vcpu::Reg::X2,
+    applevisor::vcpu::Reg::X3,
+    applevisor::vcpu::Reg::X4,
+    applevisor::vcpu::Reg::X5,
+    applevisor::vcpu::Reg::X6,
+    applevisor::vcpu::Reg::X7,
+    applevisor::vcpu::Reg::X8,
+    applevisor::vcpu::Reg::X9,
+    applevisor::vcpu::Reg::X10,
+    applevisor::vcpu::Reg::X11,
+    applevisor::vcpu::Reg::X12,
+    applevisor::vcpu::Reg::X13,
+    applevisor::vcpu::Reg::X14,
+    applevisor::vcpu::Reg::X15,
+    applevisor::vcpu::Reg::X16,
+    applevisor::vcpu::Reg::X17,
+    applevisor::vcpu::Reg::X18,
+    applevisor::vcpu::Reg::X19,
+    applevisor::vcpu::Reg::X20,
+    applevisor::vcpu::Reg::X21,
+    applevisor::vcpu::Reg::X22,
+    applevisor::vcpu::Reg::X23,
+    applevisor::vcpu::Reg::X24,
+    applevisor::vcpu::Reg::X25,
+    applevisor::vcpu::Reg::X26,
+    applevisor::vcpu::Reg::X27,
+    applevisor::vcpu::Reg::X28,
+    applevisor::vcpu::Reg::X29,
+    applevisor::vcpu::Reg::X30,
+];
+
+/// Process-wide handoff for multithreaded fork: the forking thread (parent),
+/// after rebuilding its VM, publishes a clone here so quiesced sibling threads
+/// recreate their vCPUs in the same (new) process VM.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) type SharedVm = applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn rebuilt_vm_cell() -> &'static parking_lot::Mutex<Option<SharedVm>> {
+    static CELL: std::sync::OnceLock<parking_lot::Mutex<Option<SharedVm>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+/// Carrier-lifetime HVF VM authority: the ONE `hv_vm_create` per carrier plus
+/// the five VM-global control mappings and the mailbox-slot allocator that
+/// every container's executors share (`PersistentExecutorSpec`).
+///
+/// Published by the FIRST root bring-up (`HvfVmState::take_persistent_executor_spec`),
+/// consumed by every LATER root bring-up (`HvfVmState::new_with_plan` builds
+/// the new container's root inside this VM instead of calling `hv_vm_create`,
+/// which would return `HV_BUSY`), and drained exactly once by
+/// [`destroy_persistent_vm_at_carrier_exit`]. It is never drained at a
+/// container's run terminal: containers come and go inside one VM. Readers
+/// still consult [`rebuilt_vm_cell`] first, exactly as
+/// `from_persistent_executor_spec` does, so a VM rebuilt after publication
+/// supersedes the bundle's handle.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
+pub(crate) enum PersistentCarrierCellEntry {
+    Published(PersistentExecutorSpec),
+    CreateCleanup {
+        custody: std::sync::Arc<CarrierVmCustody>,
+        generation: CarrierVmGeneration,
+        vcpu_id: Option<applevisor_sys::hv_vcpu_t>,
+        raw_vm_destroyed: bool,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn persistent_carrier_cell()
+-> &'static parking_lot::Mutex<Option<PersistentCarrierCellEntry>> {
+    static CELL: std::sync::OnceLock<parking_lot::Mutex<Option<PersistentCarrierCellEntry>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+/// Signalled by `take_persistent_executor_spec` when the first root publishes
+/// the carrier bundle; paired with `persistent_carrier_cell`'s mutex.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn carrier_published() -> &'static parking_lot::Condvar {
+    static PUBLISHED: parking_lot::Condvar = parking_lot::Condvar::new();
+    &PUBLISHED
+}
+
+/// Whether this carrier has already retired the boot loader's eager mmap arena.
+///
+/// The retirement is a VM-wide `hv_vm_unmap` performed during a container's
+/// root bring-up, so it must happen exactly once for the carrier's VM rather
+/// than once per container: a second unmap would remove sparse arena pages a
+/// sibling container has already faulted in. Carrier scope is the correct
+/// scope here — the arena belongs to the VM, not to a Linux process — and is
+/// cleared with the VM in `record_vm_released` so a rebuilt VM retires its own
+/// fresh eager mapping.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn carrier_initial_arena_retired() -> &'static std::sync::atomic::AtomicBool {
+    static RETIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &RETIRED
+}
+
+/// Serializes the "does this carrier own a VM yet?" decision across roots
+/// booting at the same time. Held across the FIRST root's `hv_vm_create`, so
+/// a second root arriving mid-create observes `carrier_vm_live()` and waits
+/// for the published bundle instead of issuing its own `hv_vm_create`
+/// (which would return `HV_BUSY`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn carrier_root_boot_gate() -> &'static parking_lot::Mutex<()> {
+    static GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    &GATE
+}
+
+/// Bound on how long a later root waits for the first root to publish the
+/// carrier bundle (publication happens at that root's persistent-lane start,
+/// before any guest instruction runs).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const CARRIER_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether this carrier currently owns a live HVF VM. Set on the single create
+/// funnel's success (`create_vm_with_admission`), cleared by
+/// `record_vm_released` after a successful `hv_vm_destroy`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static CARRIER_VM_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True while this carrier owns a live HVF VM.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn carrier_vm_live() -> bool {
+    CARRIER_VM_LIVE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// How guest-visible sharing maps onto the host and HVPatch's one VM.
+///
+/// `ForkSharedAnonymous` deliberately shares only the host backing and explicit
+/// fork-child descriptor. It stays in the owning mm's IPA scope and does not
+/// acquire shared-file futex identity. `GlobalShared` is the existing shared
+/// aperture / MAP_SHARED-file behavior whose IPA is VM-global.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(dead_code)] // Stage-2 mapping is compiled out by the host-test support feature.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GuestMappingSharing {
+    Private,
+    ForkSharedAnonymous,
+    GlobalShared,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl GuestMappingSharing {
+    fn shares_across_fork(self) -> bool {
+        self != Self::Private
+    }
+
+    fn uses_global_ipa(self) -> bool {
+        self == Self::GlobalShared
+    }
+
+    fn has_shared_futex_identity(self) -> bool {
+        self != Self::Private
+    }
+}
+
+/// Process-global registry of dynamic alias mappings, so a vCPU can
+/// re-establish one in ITS shared VM after fork dropped it.
+///
+/// Threads share ONE hv_vm, but `fork()` tears that VM down and rebuilds it from
+/// ONLY the forking thread's per-thread `mappings` list (see `HvfInner::fork`).
+/// A global-shared alias mapped by a SIBLING thread is therefore lost from the
+/// rebuilt VM, and any later access stage-2-faults (the go-build telemetry
+/// counter: a counter file `mmap(MAP_SHARED)`'d on one thread, read via LDAR on
+/// another after `go` forks `compile`). arm64 HVF has no stage-2 TLB shootdown,
+/// so we cannot push the map to siblings eagerly; instead each vCPU LAZILY
+/// re-maps on the fault, keyed off this registry.
+///
+/// Every alias is registered for thread fallback. The sharing classification
+/// decides whether its IPA is process-scoped or global and whether fork reuses
+/// the backing; those decisions must not be inferred from host `MAP_SHARED`.
+/// A high-VA alias's IPA window → host backing, registered PROCESS-GLOBALLY. Two
+/// roles: (1) the stage-2 lazy on-fault re-map (a vCPU whose forked VM lost an
+/// alias re-establishes it), and (2) the SYSCALL-PATH cross-thread fallback —
+/// `mapping_for_range` consults this when a guest buffer lives in a high-VA alias
+/// ANOTHER thread mapped (each `HvfInner.mappings` is per-thread; Go's heap arenas
+/// are shared across goroutines, so a sibling-mapped arena was invisible to a
+/// thread's syscall and EFAULTed). The VA→IPA half is already process-shared
+/// (`translate_va` over the Arc-shared page tables); this supplies the IPA→host
+/// half. Stores a NON-OWNING raw `host_addr` only (never an OwnedHostMapping), so
+/// it never participates in Drop / double-free; the backing's lifetime stays with
+/// the owning thread's `mappings` Vec and this entry is removed on `munmap`
+/// (`unregister_alias`).
+/// A unique monotonic token identifying a container root address space within
+/// the carrier.
+///
+/// This distinguishes private alias ownership across independent containers
+/// sharing the single VM carrier, without conflating ownership scope with
+/// stage-1 page table root slot allocations. It identifies container instance
+/// scope in the VMM layer; it is not a guest PID or a security boundary.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ContainerRootToken(u64);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ContainerRootToken {
+    /// The sentinel used by fixtures and by contexts that predate container
+    /// minting. Minted tokens never take this value — see [`Self::next`].
+    pub const ROOT: Self = Self(1);
+
+    /// Mints a fresh, distinct token for a new container root.
+    ///
+    /// Starts ABOVE [`Self::ROOT`] deliberately: a minted token that aliased
+    /// the sentinel would make the first container's private aliases match
+    /// every ROOT-scoped alias again, which is the exact collision this type
+    /// exists to remove.
+    pub fn next() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(ContainerRootToken::ROOT.0 + 1);
+        Self(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ContainerRootToken(u64);
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+impl ContainerRootToken {
+    pub const ROOT: Self = Self(1);
+
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+// Futex-word keying for `MAP_SHARED` file mappings lives in
+// `carrick_host::futex_key` (portable POSIX) so the native (DSR) backend
+// derives its waiter keys with the SAME scheme on every host OS. Re-exported
+// here because this trap layer is where the keys are consumed on HVF.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use carrick_host::futex_key::{shared_file_key_base, shared_futex_waiter_key};
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn alias_registry() -> &'static parking_lot::Mutex<AliasRegistry> {
+    static CELL: std::sync::OnceLock<parking_lot::Mutex<AliasRegistry>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| parking_lot::Mutex::new(AliasRegistry::default()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type GlobalFrameHostOwnerDirectory =
+    parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), GlobalFrameOwnerEntry>>;
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn global_frame_host_owners() -> &'static GlobalFrameHostOwnerDirectory {
+    &legacy_test_carrier_vm_custody().global_frame_host_owners
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn legacy_test_carrier_vm_custody() -> &'static CarrierVmCustody {
+    legacy_test_carrier_vm_custody_arc().as_ref()
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn legacy_test_carrier_vm_custody_arc() -> &'static std::sync::Arc<CarrierVmCustody> {
+    static CELL: std::sync::OnceLock<std::sync::Arc<CarrierVmCustody>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Arc::new(CarrierVmCustody::new_live_fixture()))
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn carrier_stage2_leases()
+-> &'static parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2RecordIdentity>>
+{
+    &legacy_test_carrier_vm_custody_arc().carrier_stage2_records
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Process-global count of live HVF vCPUs, managed via [`carrick_hal::VcpuCensus`].
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn vcpu_census() -> &'static carrick_hal::VcpuCensus {
+    carrick_hal::vcpu_census::global()
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) static VCPU_CREATED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+thread_local! {
+    static THREAD_VCPU_CREATED_TOTAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn current_thread_vcpu_created_total() -> u64 {
+    THREAD_VCPU_CREATED_TOTAL.get()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn vcpu_created() {
+    VCPU_CREATED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    THREAD_VCPU_CREATED_TOTAL.set(THREAD_VCPU_CREATED_TOTAL.get().saturating_add(1));
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn global_vcpu_permits() -> &'static std::sync::Mutex<GlobalVcpuPermitState> {
+    static PERMITS: std::sync::OnceLock<std::sync::Mutex<GlobalVcpuPermitState>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| std::sync::Mutex::new(GlobalVcpuPermitState::default()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn permit_region() -> &'static PermitRegion {
+    static REGION: std::sync::OnceLock<PermitRegion> = std::sync::OnceLock::new();
+    REGION.get_or_init(PermitRegion::new_shared_global)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn vm_residency_region() -> &'static PermitRegion {
+    static REGION: std::sync::OnceLock<PermitRegion> = std::sync::OnceLock::new();
+    REGION.get_or_init(PermitRegion::new_shared_global_vm)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn destroy_persistent_vm_at_carrier_exit() -> Result<(), TrapError> {
+    if !carrier_vm_live() {
+        let terminal = persistent_carrier_cell().lock().take();
+        let Some(entry) = terminal else {
+            return Ok(());
+        };
+        if let PersistentCarrierCellEntry::CreateCleanup {
+            custody,
+            generation,
+            mut vcpu_id,
+            mut raw_vm_destroyed,
+        } = entry
+        {
+            if let Err(error) = drive_pending_carrier_vm_cleanup(
+                &custody,
+                generation,
+                &mut vcpu_id,
+                &mut raw_vm_destroyed,
+                "carrier create-cleanup retry",
+            ) {
+                *persistent_carrier_cell().lock() =
+                    Some(PersistentCarrierCellEntry::CreateCleanup {
+                        custody,
+                        generation,
+                        vcpu_id,
+                        raw_vm_destroyed,
+                    });
+                return Err(error);
+            }
+            return Ok(());
+        }
+        let PersistentCarrierCellEntry::Published(carrier) = entry else {
+            unreachable!()
+        };
+        let custody = std::sync::Arc::clone(&carrier.carrier_foreign_mm_transport.custody);
+        if let Err(error) = finalize_carrier_exit_global_frame_owners_in(&custody) {
+            *persistent_carrier_cell().lock() =
+                Some(PersistentCarrierCellEntry::Published(carrier));
+            return Err(error);
+        }
+        carrier
+            .carrier_mappings
+            .mark_vm_destroyed_after_custody_commit()?;
+        drop(carrier);
+        return Ok(());
+    }
+    let entry = persistent_carrier_cell().lock().take().ok_or_else(|| {
+        TrapError::Hypervisor("carrier-exit live VM has no published carrier custody".to_owned())
+    })?;
+    let PersistentCarrierCellEntry::Published(carrier) = entry else {
+        *persistent_carrier_cell().lock() = Some(entry);
+        return Err(TrapError::Hypervisor(
+            "carrier-exit live VM has only create-cleanup custody".to_owned(),
+        ));
+    };
+    let custody = std::sync::Arc::clone(&carrier.carrier_foreign_mm_transport.custody);
+    // Keep the published bundle recoverable until raw destroy succeeds. A
+    // failed destroy leaves the exact VM live, so its publication must remain
+    // reachable for retry rather than disappearing with a provisional take.
+    if let Err(error) = destroy_vm_with_custody(&custody, "carrier-exit") {
+        *persistent_carrier_cell().lock() = Some(PersistentCarrierCellEntry::Published(carrier));
+        return Err(error);
+    }
+    // A successful raw destroy is the terminal authority for every exact VM
+    // record. Pending pre-destroy unmap failures cannot veto that success.
+    // Carrier exit has no replay successor, so every remaining logical owner
+    // is retired after terminalization.
+    if let Err(error) = finalize_carrier_exit_global_frame_owners_in(&custody) {
+        *persistent_carrier_cell().lock() = Some(PersistentCarrierCellEntry::Published(carrier));
+        return Err(error);
+    }
+    carrier
+        .carrier_mappings
+        .mark_vm_destroyed_after_custody_commit()?;
+    drop(carrier);
+    Ok(())
+}
+
+/// Whether the atomic slot-table admission permit is active; cached once.
+///
+/// The atomic permit is the DEFAULT: it is enabled UNLESS
+/// `CARRICK_HVF_ATOMIC_PERMIT` is explicitly set to a falsey value
+/// (`0`/`false`/`no`, case-insensitive), which selects the legacy flock
+/// permit path (byte-for-byte unchanged) as a fallback. Unset → atomic on.
+/// `=1` (or any other value) → atomic on.
+/// Pure env → enabled mapping for [`atomic_permit_enabled`], factored out so it
+/// can be unit-tested without touching the process-global `FLAG` cache or the
+/// (unsafe, in edition 2024) `set_var`. Atomic is the default: enabled unless
+/// the value is an explicit falsey token (`0`/`false`/`no`, case-insensitive).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn atomic_permit_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static FLAG: AtomicU8 = AtomicU8::new(0);
+    match FLAG.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = atomic_permit_enabled_from_env(
+                std::env::var("CARRICK_HVF_ATOMIC_PERMIT").ok().as_deref(),
+            );
+            FLAG.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn admission_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CARRICK_HVF_ADMISSION_TRACE").is_some())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(in crate::trap) fn create_vm_with_admission(
+    admission: VmCreateAdmission,
+    custody: &std::sync::Arc<CarrierVmCustody>,
+) -> Result<
+    (
+        applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+        Option<HeldPermitGuard>,
+        PendingCarrierVmCreation,
+    ),
+    TrapError,
+> {
+    // Soft pre-throttle: acquire an admitted slot (bounded by GLOBAL_VCPU_CEILING)
+    // BEFORE creating; held across HV_NO_RESOURCES retries below. The acquire is
+    // bounded (ADMISSION_PERMIT_MAX_WAIT) — persistent exhaustion propagates as
+    // a typed error instead of parking here forever.
+    let permit = match admission.global_permit_budget() {
+        Some(budget) => Some(HeldPermitGuard::new(acquire_admission_permit(budget)?)),
+        None => None,
+    };
+    let generation = custody
+        .begin_create()
+        .map_err(|error| custody_transition_error("hv_vm_create", "begin_create", error))?;
+    let create_result = {
+        // Config is rebuilt per attempt inside the closure because
+        // `with_config` consumes it, so an HV_NO_RESOURCES retry needs a
+        // fresh one.
+        crate::probes::vm_lifecycle(0, admission.probe_code());
+        create_with_no_resources_backpressure("hv_vm_create", || {
+            let config = fresh_vm_config()?;
+            virtual_machine_with_private_signals_blocked(config)
+        })
+    };
+    match create_result {
+        Ok(vm) => {
+            // Publish "this carrier owns a VM" the instant `hv_vm_create`
+            // succeeds, which is what this flag has always DOCUMENTED ("set on
+            // the single create funnel's success"). It used to be published by
+            // `PendingCarrierVmCreation::commit`, far later in root setup, and
+            // `carrier_root_boot_gate` is released as soon as the create
+            // returns -- so a second root could take the gate, still read
+            // `carrier_vm_live() == false`, and issue its own `hv_vm_create`.
+            // HVF allows one VM per process, so that second create returned
+            // HV_BUSY and the container failed to start: the concurrent
+            // `conformance_container_gate` lane failed with alpha never
+            // reaching its rendezvous. A rolled-back creation clears the flag
+            // through `record_vm_released` once `hv_vm_destroy` succeeds, and
+            // if that destroy fails the flag correctly stays set -- a VM does
+            // still exist.
+            CARRIER_VM_LIVE.store(true, std::sync::atomic::Ordering::Release);
+            // Stand the pre-mapped root-slot pool up now, while no stage-1
+            // root slot is mapped yet. Created lazily at the first fork, its
+            // 128 MiB pre-map collided with an already-exec'd process's Owned
+            // root slot (`HV_ERROR`), the pool marked itself failed for the
+            // carrier's lifetime, and every fork paid a 2 MiB host
+            // `mmap`/`munmap` (`kernel.fork.stage1-image`,
+            // `host_mapping_allocations`).
+            let _ = custody.root_slot_pool();
+            Ok((
+                vm,
+                permit,
+                PendingCarrierVmCreation {
+                    custody: std::sync::Arc::clone(custody),
+                    generation,
+                    probe_code: admission.probe_code(),
+                    vcpu_id: None,
+                    armed: true,
+                },
+            ))
+        }
+        Err(error) => {
+            custody
+                .abort_create(generation)
+                .map_err(|abort| custody_transition_error("hv_vm_create", "abort_create", abort))?;
+            drop(permit);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn virtual_machine_with_private_signals_blocked(
+    config: applevisor::vm::VirtualMachineConfig,
+) -> applevisor::error::Result<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>
+{
+    let _guard = crate::host_signal::block_hvf_private_thread_signals();
+    applevisor::vm::VirtualMachine::with_config(config)
+}
+
+/// Enable EL0 direct reads of `CNTVCT_EL0`/`CNTFRQ_EL0` (`CNTKCTL_EL1.EL0VCTEN |
+/// EL0PCTEN`) on a freshly-created vCPU. Must run on EVERY vCPU — initial,
+/// per-thread and execve rebuild. If only some vCPUs have it, the others trap
+/// CNTVCT and fall back to the host-`Instant` emulation, which is a DIFFERENT
+/// clock basis (ns-since-process-start, not the hardware counter the vDSO
+/// assumes). That skews the monotonic clock between Go's worker threads, so a
+/// timer scheduled on one vCPU is checked against a wildly different time on
+/// another and never fires — deadlocking `time.After`/timer tests with absurd
+/// (e.g. "179h") waits. Best-effort.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn enable_el0_counter_access(vcpu_id: applevisor_sys::hv_vcpu_t) {
+    const CNTKCTL_EL1: applevisor_sys::hv_sys_reg_t = applevisor_sys::hv_sys_reg_t::CNTKCTL_EL1;
+    unsafe {
+        let _ = applevisor_sys::hv_vcpu_set_sys_reg(vcpu_id, CNTKCTL_EL1, (1 << 1) | (1 << 0));
+    }
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn vcpu_destroyed(vcpu_id: u64) {
+    release_admission_permit_for_vcpu(vcpu_id);
+    // A slot freed: wake a sibling thread blocked in the admission gate.
+    vcpu_gate::notify();
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn audit_hvpatch_executor_boundary(
+    state: &HvfVmState,
+    mailbox: &MailboxBinding,
+) -> Result<(), TrapError> {
+    if state.reclaim_authority == ReclaimParkAuthority::Live {
+        return Err(TrapError::Hypervisor(
+            "HVF executor boundary retained live vCPU authority".to_owned(),
+        ));
+    }
+    if !mailbox.is_released_for_executor_boundary() {
+        return Err(TrapError::Hypervisor(
+            "HVF executor boundary retained mailbox slot".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// V0–V31 SIMD/FP registers, saved/restored across signal delivery alongside
+/// the GPRs so a handler that uses SIMD (aarch64 `memcpy`/`memset`, the guest's
+/// own handler body) cannot corrupt the interrupted thread's vector state.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const SIMD_FP_TABLE: [applevisor::vcpu::SimdFpReg; 32] = {
+    use applevisor_sys::hv_simd_fp_reg_t::*;
+    [
+        Q0, Q1, Q2, Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q11, Q12, Q13, Q14, Q15, Q16, Q17, Q18, Q19,
+        Q20, Q21, Q22, Q23, Q24, Q25, Q26, Q27, Q28, Q29, Q30, Q31,
+    ]
+};
+
+/// Write a 128-bit value into a guest SIMD&FP (V) register.
+///
+/// Apple's `hv_simd_fp_uchar16_t` is `__attribute__((ext_vector_type(16)))
+/// uint8_t` — a 16-byte SIMD vector, which AAPCS64 passes BY VALUE in a vector
+/// (V) register. The `applevisor-sys` binding (without the nightly-only
+/// `simd-nightly` feature) mistypes the by-value `set` parameter as `u128`,
+/// which Rust passes in a general-purpose register PAIR (x2/x3). The kernel
+/// then reads the value from a V register and gets unrelated bytes — in
+/// practice zeroes — so `hv_vcpu_set_simd_fp_reg` silently corrupts the target
+/// register while returning `HV_SUCCESS`. (`get` is unaffected: it is
+/// pointer-based, so there is no register-class mismatch.)
+///
+/// This broke signal delivery: `restore_from_sigframe` could not restore the
+/// interrupted thread's V registers, so any signal taken while the guest was
+/// mid-SIMD (aarch64 `memmove`/`memequal`, FP math) resumed with zeroed vector
+/// state. Under Go that surfaced as the async-preemption (SIGURG) corruption —
+/// e.g. runtime `TestUserArena/largeScalar` comparing a buffer whose bytes are
+/// intact but whose compare loop returns the wrong answer.
+///
+/// Passing a 16-byte vector by value across `extern "C"` from Rust needs the
+/// nightly `simd_ffi` feature, so we route through a tiny C shim
+/// (`carrick_shim.c`) that takes the 16 bytes by pointer and reconstructs the
+/// `hv_simd_fp_uchar16_t` for the kernel call — C gets the vector ABI right on
+/// stable. Returns the raw `hv_return_t` (0 = `HV_SUCCESS`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn set_simd_fp_reg_v(
+    vcpu_id: u64,
+    reg: applevisor_sys::hv_simd_fp_reg_t,
+    value: u128,
+) -> i32 {
+    unsafe extern "C" {
+        fn carrick_set_simd_fp_reg(vcpu: u64, reg: u32, bytes: *const u8) -> i32;
+    }
+    // u128 -> 16 little-endian bytes, matching the byte order `get_simd_fp_reg`
+    // produces, so save/restore round-trips as identity.
+    let bytes = value.to_le_bytes();
+    unsafe { carrick_set_simd_fp_reg(vcpu_id, reg as u32, bytes.as_ptr()) }
+}
+
+/// Which privilege level a vCPU was executing at when carrick observed it. The
+/// Full-speed diagnostic counters (the dtrace consumer perturbs the
+/// SIGURG-vs-futex race away, so observe with cheap atomics instead). Dumped at
+/// process teardown when built with the `debug-stats` feature (the USDT probe
+/// fires always; only the stderr dump is gated).
+pub static EL1_KICK_RESUMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static INJECT_AT_EL1: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static KICK_PATH_INJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether to save/restore guest FP/SIMD across signal handlers (default on;
+/// `CARRICK_NO_FPSIMD` disables it for differential measurement). Cached after
+/// the first read so the signal hot path doesn't hit the environment.
+pub fn fpsimd_save_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static FLAG: AtomicU8 = AtomicU8::new(0);
+    match FLAG.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("CARRICK_NO_FPSIMD").is_none();
+            FLAG.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+pub fn dump_kick_stats() {
+    use std::sync::atomic::Ordering;
+    let (el1, inject, at_el1) = (
+        EL1_KICK_RESUMED.load(Ordering::Relaxed),
+        KICK_PATH_INJECT.load(Ordering::Relaxed),
+        INJECT_AT_EL1.load(Ordering::Relaxed),
+    );
+    // Surface the cumulative totals through one cheap USDT fire at exit, so a
+    // trace can read them without the per-event `kick-in-kernel` probe cost.
+    crate::probes::kick_stats(el1, inject, at_el1);
+    #[cfg(feature = "debug-stats")]
+    eprintln!(
+        "[kick_stats pid={}] el1_kick_resumed={el1} kick_path_inject={inject} inject_at_el1={at_el1}",
+        unsafe { libc::getpid() },
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct HvfVmState {
+    pub(crate) _vm:
+        std::mem::ManuallyDrop<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
+    pub(crate) task: HvfTaskState,
+    pub(crate) carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
+    /// VM-global Carrick control mappings owned by the persistent carrier.
+    /// This is executor-local authority: load/save swaps it with the worker,
+    /// while a logical task binding always carries `None`.
+    pub(crate) carrier_mappings: Option<std::sync::Arc<PersistentCarrierMappings>>,
+    /// Executor-local lifecycle only. Task registers are owned exclusively by
+    /// the Kernel's typed execution lease and never stashed in this backend.
+    pub(crate) reclaim_authority: ReclaimParkAuthority,
+    /// Carrick-owned logical mailbox slots shared by every vCPU in this VM.
+    /// Slot identity is deliberately independent of opaque/recycled HVF ids.
+    pub(crate) mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
+    /// Internal diagnostic transport selection, parsed once before first entry
+    /// and inherited by every sibling/rebuild. This is not public CLI policy.
+    pub(crate) syscall_transport: HvfSyscallTransport,
+    /// Raw worker-local vCPU identity used by teardown and exact kick audit.
+    pub(crate) vcpu_id: applevisor_sys::hv_vcpu_t,
+    /// Cloneable worker-local handle for `hv_vcpus_exit`.
+    pub(crate) vcpu_handle: applevisor::vcpu::VcpuHandle,
+    pub(crate) _vcpu_guard: Option<carrick_hal::VcpuLiveGuard>,
+    pub(crate) cached_fork_alias_snapshot: parking_lot::Mutex<Option<ForkAliasSnapshot>>,
+    /// Fresh host anonymous mappings the most recent `build_process_spec`
+    /// created for the child (`ProcessMappingHost::Owned`); pooled root slots
+    /// and borrowed parent frames do not count. Charged by the runtime as
+    /// `host_mapping_allocations`.
+    pub(crate) last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64,
+    /// Mapping and alias rows the most recent `fork_cow_ranges` visited
+    /// (`0` on a cached projection). Charged by the runtime as
+    /// `fork_projection_rows_visited`.
+    pub(crate) last_fork_projection_rows_visited: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
+pub(crate) struct ForkAliasSnapshot {
+    pub(crate) revision: u64,
+    pub(crate) mm_root_slot: Option<(u64, u64)>,
+    pub(crate) container_root: ContainerRootToken,
+    pub(crate) cow_ranges: Vec<carrick_aarch64::vmm::ForkCowRange>,
+    pub(crate) source_mappings: Vec<ThreadMappingDesc>,
+    pub(crate) all_aliases_covered: bool,
+    pub(crate) aliases: std::sync::Arc<Vec<AliasBacking>>,
+    pub(crate) alias_index: std::sync::Arc<ProcessAliasMap<AliasBacking>>,
+}
+
+/// Every backend field whose authority follows a logical HVPatch task rather
+/// than a Task4 worker. Keeping this as one value makes load/save a literal
+/// swap: the carrier VM, reclaim/mailbox transport, and live vCPU identity stay
+/// on the worker while MM mappings, stage-1, inventory, and per-thread COW
+/// authority move with the binding.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct HvfTaskState {
+    #[cfg(not(test))]
+    custody: std::sync::Arc<CarrierVmCustody>,
+    pub(crate) mappings: TaskMappingIndex,
+    /// Per-mm stage-1 root-table slot. It contains page-table/control backing
+    /// only; guest data frames live at stable global IPAs outside the slot.
+    /// Ordinary VMM engines leave this unset.
+    pub(crate) mm_root_slot: Option<(u64, u64)>,
+    /// Monotonic token identifying the container root this task belongs to,
+    /// used to scope private aliases across containers sharing the carrier.
+    pub(crate) container_root: ContainerRootToken,
+    pending_exec_mm_root_slot: Option<(u64, u64)>,
+    pending_exec_asid: Option<u16>,
+    pending_exec_predecessor_identity: Option<carrick_hal::ExecPredecessorIdentity>,
+    pending_exec_stage2_cleanup: Option<PendingExecStage2Cleanup>,
+    /// A distinct Linux process edge onto another process's live CLONE_VM MM.
+    /// Exit/exec drops this projection without retiring shared stage-2 state.
+    shared_process_mm: bool,
+    /// Exact MM-owned access authority. This is the only movable MM state:
+    /// sibling/CLONE_VM tasks clone this Arc, while copied forks allocate a
+    /// distinct value.
+    mm_access: std::sync::Arc<MmAccessState>,
+    /// The exception class of the most recent vCPU exit. We need to remember
+    /// whether the trap came in via EL0 `svc` (`EC = 0x15`) or the EL1 vector
+    /// stub's `hvc` (`EC = 0x16`) so `complete_syscall` knows whether to
+    /// advance PC past the HVC before resuming. Carried in the `VcpuSnapshot` so
+    /// fork/clone/reclaim round-trip it.
+    last_exit_class: u64,
+    /// ESR_EL1 of the most recent EL0 synchronous fault. The arm64 kernel puts
+    /// it in the signal frame's `esr_context`; Apple Rosetta's signal handler
+    /// requires that record. Captured at fault detection, consumed by
+    /// `inject_signal` when building a fault signal's ucontext. Only meaningful
+    /// between fault-detect and the immediately following delivery, so it is
+    /// reset to 0 across fork/clone/execve.
+    last_fault_esr: u64,
+    /// True iff this engine was produced by a `fork(2)` returning into a
+    /// child. The runtime checks this when the guest exits and calls
+    /// `_exit(2)` instead of running normal Rust drops — applevisor's
+    /// Vcpu Drop unwraps `hv_vcpu_destroy` and panics in the
+    /// post-fork child's HVF context (the new VM HVF tracks for the
+    /// child got swapped in by `fork()`; ordering of `_vm` vs `vcpu`
+    /// Drop trips a "no VM or vCPU available" assertion).
+    is_forked_child: bool,
+    /// Like `is_forked_child`, but RESET on execve: true only for a LIVE forked
+    /// child that has not yet exec'd. Drives the `forked=` diagnostic probes
+    /// (stale-stage2 reasoning); distinct from the sticky shutdown flag above,
+    /// which must stay set across execve to keep the `_exit`-without-JSON path.
+    forked_no_exec: bool,
+    /// Process-wide guest ranges currently mapped `PROT_NONE`.
+    /// Thread siblings share this metadata so syscall-path memory access checks
+    /// observe `mprotect(PROT_NONE)` changes made by any guest thread.
+    /// Lazily-built editor over the EL1 stage-1 page-table image, used to give
+    /// `mprotect`/`PROT_NONE`/`munmap` guest-visible semantics. Built from the
+    /// page-table region's host backing on first edit; reset to `None` on
+    /// fork/execve (fresh tables). SHARED across sibling vCPU threads (one HVF
+    /// VM ⇒ one set of stage-1 tables): the mutex serializes edits so the
+    /// spare-table allocator stays consistent, and `sync_to_host` orders the
+    /// descriptor stores so a concurrent sibling hardware walk stays safe
+    /// without quiescing.
+    /// The Linux syscall number (x8) and original arg0 (x0) of the most recent
+    /// `svc` trap, captured before the dispatcher overwrites x0 with the retval.
+    /// Used to restart an `EINTR`'d restartable syscall under SA_RESTART: the
+    /// handler-injection path rewinds PC to the `svc` and restores this x0.
+    last_syscall_nr: Option<u64>,
+    last_syscall_orig_x0: u64,
+    /// HvPatch owns one process-wide HVF VM across guest exec/fork lifecycle;
+    /// ordinary VMM preserves the mature destroy/recreate behavior.
+    pub(crate) persistent_vm_lifecycle: bool,
+    /// HVPatch-only exact sparse-extent inventory. Sibling vCPUs share this
+    /// ledger; VM/vCPU recreation reuses it and therefore emits no logical
+    /// mapping events.
+    /// Per-engine runtime authority. Sibling vCPUs bind their own Linux TID;
+    /// the underlying mm/frame inventory remains shared.
+    pub(crate) cow_authority: Option<std::sync::Arc<dyn carrick_hal::FrameCowAuthority>>,
+    pub(crate) cow_identity: Option<carrick_hal::FrameCowIdentity>,
+    pub(crate) pending_fork_frame_receipts: Vec<PendingForkFrameReceipt>,
+    /// Child aliases withheld until fresh-vCPU register restoration succeeds.
+    pending_process_aliases: Vec<AliasBacking>,
+    /// Test-only diagnostic arm owned by this executor projection. It must not
+    /// move into the shared MM access state or a sibling can consume it.
+    fail_next_begin_exec_inventory: bool,
+    /// Recycled buffer for the frame-COW rollback pre-image.
+    ///
+    /// `perform_frame_cow` snapshots the whole stage-1 manager before it edits,
+    /// so a failed publication can restore the exact pre-transaction image. That
+    /// snapshot is unchanged; only its allocation is reused. A fresh
+    /// `PageTableManager::clone()` costs an `mmap` of 1.75 MiB, a zero-fill
+    /// fault per page as the copy touches it, and a `munmap`/`madvise` on drop
+    /// — measured at ~6 COW faults per guest fork+wait round trip, which put
+    /// that whole host-VM churn on the COW path. Taken for the duration of one
+    /// COW and returned on success; a rollback consumes it (it becomes the live
+    /// manager) and the next COW allocates one again.
+    cow_rollback_scratch: Option<crate::page_table::PageTableManager>,
+    pub(crate) registration: Option<HvpatchTaskRegistration>,
+    /// The executor vCPU this task is loaded on right now. Kick handles
+    /// registered for the task follow this slot, so a kick reaches the vCPU
+    /// the task currently occupies rather than the one it was first loaded on.
+    live_vcpu: std::sync::Arc<crate::vcpu_kick::LiveVcpuSlot>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for HvfTaskState {
+    type Target = MmAccessState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.mm_access
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for HvfVmState {
+    type Target = HvfTaskState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.task
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::DerefMut for HvfVmState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.task
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn swap_hvpatch_task_state(live: &mut HvfTaskState, parked: &mut HvfTaskState) {
+    std::mem::swap(live, parked);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Copy, Clone)]
+pub(crate) struct HvfPageTableResolver<'a> {
+    task: &'a HvfTaskState,
+    manager_base: u64,
+    primary_host: Option<*mut u8>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> carrick_mem::page_table::HostArenaResolver for HvfPageTableResolver<'a> {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        self.primary_host
+            .filter(|_| base == self.manager_base)
+            // Extension arenas are published as structural owners keyed by
+            // exactly (base, 2 MiB): O(1). The mapping-row scan below is
+            // O(rows) and made every page-table edit of a process with
+            // thousands of mappings quadratic (pagetablegrow spent minutes
+            // in `live_pt_debug_walk`); it stays only as the last resort.
+            .or_else(|| {
+                self.task.mm_access.structural_owner_host_ptr(
+                    base,
+                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                )
+            })
+            .or_else(|| {
+                self.task
+                    .host_ptr_for_ipa(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+            })
+    }
+
+    fn record_populated_prefix(&self, base: u64, prefix: usize) {
+        self.task.record_stage1_populated_prefix(base, prefix);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfTaskState {
+    pub(crate) fn custody(&self) -> &CarrierVmCustody {
+        #[cfg(not(test))]
+        {
+            &self.custody
+        }
+        #[cfg(test)]
+        {
+            legacy_test_carrier_vm_custody()
+        }
+    }
+
+    fn custody_arc(&self) -> std::sync::Arc<CarrierVmCustody> {
+        #[cfg(not(test))]
+        {
+            std::sync::Arc::clone(&self.custody)
+        }
+        #[cfg(test)]
+        {
+            std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc())
+        }
+    }
+
+    pub(crate) fn mm_access_authority(&self) -> std::sync::Arc<MmAccessState> {
+        std::sync::Arc::clone(&self.mm_access)
+    }
+
+    fn take_exec_predecessor_identity(
+        &mut self,
+        predecessor_cow_identity: carrick_hal::FrameCowIdentity,
+    ) -> Result<carrick_hal::ExecPredecessorIdentity, TrapError> {
+        let predecessor_identity =
+            self.pending_exec_predecessor_identity
+                .take()
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "HVPatch exec predecessor cleanup lacks bound Kernel identity".to_owned(),
+                    )
+                })?;
+        if let Some(registration) = self.registration.as_ref() {
+            let registered = registration.expected_identity;
+            if predecessor_identity.task_serial != registered.task_serial
+                || predecessor_identity.linux_pid != registered.linux_pid
+            {
+                return Err(TrapError::Hypervisor(
+                    "HVPatch exec predecessor Kernel/registration identity mismatch".to_owned(),
+                ));
+            }
+            if registration.cow_identity != Some(predecessor_cow_identity) {
+                return Err(TrapError::Hypervisor(
+                    "HVPatch exec predecessor registration/COW identity mismatch".to_owned(),
+                ));
+            }
+        }
+        if predecessor_identity.linux_pid != predecessor_cow_identity.linux_pid
+            || predecessor_identity.mm != predecessor_cow_identity.mm
+            || predecessor_identity.asid != predecessor_cow_identity.asid
+        {
+            return Err(TrapError::Hypervisor(
+                "HVPatch exec predecessor Kernel/COW identity mismatch".to_owned(),
+            ));
+        }
+        Ok(predecessor_identity)
+    }
+
+    pub(crate) fn runtime_authorities_match(
+        &self,
+        mm_access: &std::sync::Arc<MmAccessState>,
+        page_tables: &carrick_aarch64::Stage1Authority,
+        protections: &std::sync::Arc<MemoryProtections>,
+    ) -> bool {
+        std::sync::Arc::ptr_eq(&self.mm_access, mm_access)
+            && carrick_aarch64::Aarch64TaskRuntimeProjection {
+                page_tables: page_tables.clone(),
+                protections: std::sync::Arc::clone(protections),
+                process_asid: None,
+            }
+            .shares_exact_mm_authority(&self.page_tables_authority(), &self.protections)
+    }
+
+    fn publish_pending_fork_frame_receipts_with(
+        &mut self,
+        publish: &mut dyn FnMut(carrick_observability::probes::HvpatchForkFrameShare),
+    ) {
+        // This task-local vector is the observation copy made by
+        // `runtime_task_state`. The MM authority retains its original receipts
+        // for exact retirement authentication, so draining here is publication
+        // exactly once without discharging the Kernel obligation.
+        if self.pending_fork_frame_receipts.is_empty() {
+            return;
+        }
+        let authority = self.cow_authority.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::cow_token",
+                "pending fork-frame receipt has no COW authority"
+            )
+        });
+        let identity = self.cow_identity.unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::cow_token",
+                "pending fork-frame receipt has no COW identity"
+            )
+        });
+        for receipt in std::mem::take(&mut self.pending_fork_frame_receipts) {
+            let length = carrick_hal::FrameLength::from_mapping_extent(
+                std::num::NonZeroU64::new(receipt.length).unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::fork_publication",
+                        "pending fork-frame receipt has zero length"
+                    )
+                }),
+            );
+            match authority.mapping_is_live(
+                receipt.child_mapping,
+                receipt.frame,
+                carrick_guest_mem::Gpa(receipt.ipa),
+                length,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    carrick_fatal!(
+                        "hvpatch::fork_publication",
+                        "fork-frame receipt child mapping {:?} is not live",
+                        receipt.child_mapping
+                    );
+                }
+                Err(error) => {
+                    carrick_fatal!(
+                        "hvpatch::cow_token",
+                        "authenticate fork-frame receipt mapping {:?}: {error}",
+                        receipt.child_mapping
+                    );
+                }
+            }
+            let event = carrick_observability::probes::HvpatchForkFrameShare::new(
+                carrick_observability::probes::HvpatchForkFrameShareArgs {
+                    pid: identity.linux_pid,
+                    tid: identity.linux_tid,
+                    mm: identity.mm,
+                    asid: u32::from(identity.asid),
+                    kind: receipt.kind,
+                    parent_mapping: receipt.parent_mapping.raw(),
+                    child_mapping: receipt.child_mapping.raw(),
+                    frame: receipt.frame.raw(),
+                    ipa: receipt.ipa,
+                    length: receipt.length,
+                },
+            )
+            .unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::fork_publication",
+                    "construct authenticated fork-frame receipt failed: {error}"
+                )
+            });
+            publish(event);
+        }
+    }
+
+    pub(crate) fn publish_pending_fork_frame_receipts(&mut self) {
+        self.publish_pending_fork_frame_receipts_with(&mut |event| {
+            crate::probes::hvpatch_fork_frame_share(event);
+        });
+    }
+
+    pub(crate) fn bind_frame_cow(
+        &mut self,
+        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        identity: carrick_hal::FrameCowIdentity,
+    ) {
+        self.cow_authority = Some(std::sync::Arc::clone(&authority));
+        self.cow_identity = Some(identity);
+        self.mm_access.bind_cow_runtime(MmCowRuntimeBinding {
+            authority: std::sync::Arc::clone(&authority),
+            identity,
+            mm_root_slot: self.mm_root_slot,
+            container_root: self.container_root,
+            persistent_vm_lifecycle: self.persistent_vm_lifecycle,
+        });
+        self.publish_pending_fork_frame_receipts();
+        if let Some(ref mut reg) = self.registration {
+            reg.cow_authority = Some(authority);
+            reg.cow_identity = Some(identity);
+            reg.cow_authority_identity = None;
+        }
+    }
+
+    fn neutral() -> Self {
+        let page_tables = carrick_aarch64::Stage1Authority::new();
+        let protections = std::sync::Arc::new(MemoryProtections::default());
+        let frame_inventory =
+            std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let cow_armed = std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
+        let cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        Self {
+            #[cfg(not(test))]
+            custody: std::sync::Arc::new(CarrierVmCustody::new()),
+            mappings: TaskMappingIndex::new(),
+            mm_root_slot: None,
+            container_root: ContainerRootToken(0),
+            pending_exec_mm_root_slot: None,
+            pending_exec_asid: None,
+            pending_exec_predecessor_identity: None,
+            pending_exec_stage2_cleanup: None,
+            shared_process_mm: false,
+            mm_access: MmAccessState::new(
+                page_tables,
+                protections,
+                frame_inventory,
+                cow_armed,
+                cow_deferred_publications,
+            ),
+            last_exit_class: 0,
+            last_fault_esr: 0,
+            is_forked_child: false,
+            forked_no_exec: false,
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
+            live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
+            persistent_vm_lifecycle: false,
+            cow_authority: None,
+            cow_identity: None,
+            pending_fork_frame_receipts: Vec::new(),
+            pending_process_aliases: Vec::new(),
+            fail_next_begin_exec_inventory: false,
+            cow_rollback_scratch: None,
+            registration: None,
+        }
+    }
+
+    fn audit_neutral(&self) -> Result<(), TrapError> {
+        let protections = self.protections.snapshot_all();
+        let inventory = self.frame_inventory.ledger.lock();
+        let frames = inventory.frames.lock();
+        let neutral = self.mappings.is_empty()
+            && self.mm_root_slot.is_none()
+            && self.container_root == ContainerRootToken(0)
+            && self.pending_exec_mm_root_slot.is_none()
+            && self.pending_exec_asid.is_none()
+            && self.pending_exec_stage2_cleanup.is_none()
+            && self.last_exit_class == 0
+            && self.last_fault_esr == 0
+            && !self.is_forked_child
+            && !self.forked_no_exec
+            && protections.no_access.is_empty()
+            && protections.unmapped.is_empty()
+            && protections.no_write.is_empty()
+            && protections.executable.is_empty()
+            && protections.bus_fault.is_empty()
+            && protections.mutable_shared_backing.is_empty()
+            && self.page_tables_authority().is_none()
+            && self.last_syscall_nr.is_none()
+            && self.last_syscall_orig_x0 == 0
+            && !self.persistent_vm_lifecycle
+            && !inventory.initialized
+            && inventory.extents.is_empty()
+            && frames.shared.is_empty()
+            && frames.references.is_empty()
+            && frames.extent_references.is_empty()
+            && frames.stage2_references.is_empty()
+            && frames.authority_retained_stage2.is_empty()
+            && inventory.alias_reservation.is_none()
+            && inventory.alias_commit.is_none()
+            && inventory.alias_staged.is_empty()
+            && inventory.process_reservation.is_none()
+            && inventory.process_commit.is_none()
+            && inventory.retired_reservation.is_none()
+            && inventory.replacement_reservation.is_none()
+            && inventory.exec_commits.is_none()
+            && inventory.retirement_reservation.is_none()
+            && inventory.retirement_commit.is_none()
+            && self.cow_authority.is_none()
+            && self.cow_identity.is_none()
+            && self.cow_armed.lock().ranges.is_empty()
+            && self.cow_deferred_publications.lock().is_empty()
+            && self.pending_fork_frame_receipts.is_empty()
+            && self.pending_process_aliases.is_empty()
+            && self.cow_rollback_scratch.is_none()
+            && self.registration.is_none();
+        drop(frames);
+        drop(inventory);
+        neutral.then_some(()).ok_or_else(|| {
+            TrapError::Hypervisor("idle HVPatch worker retained task authority".to_owned())
+        })
+    }
+
+    /// Whether an execve on this task retires the old mm's extents.
+    ///
+    /// A vfork / `CLONE_VM` child shares its mm with a live sharer that keeps
+    /// every mapping, so its exec retires nothing: the replacement gets a fresh
+    /// ledger and the old one stays whole. Callers must arm no retirement
+    /// transaction in that case — a reservation filled with zero events is
+    /// rejected by the Kernel authority, and the exec is already past its point
+    /// of no return by the time the commit is applied.
+    pub(crate) fn exec_retires_old_mm(&self) -> bool {
+        !self.shared_process_mm
+    }
+
+    /// Extents this task's execve will retire from the old mm: none when a
+    /// live sharer still owns it.
+    pub(crate) fn exec_retired_extent_count(&self) -> usize {
+        if self.exec_retires_old_mm() {
+            self.frame_inventory.lock().extents.len()
+        } else {
+            0
+        }
+    }
+
+    fn begin_exec_inventory(
+        &mut self,
+        retired: Option<carrick_hal::FrameInventoryReservation>,
+        replacement: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        if std::mem::take(&mut self.fail_next_begin_exec_inventory) {
+            return Err(TrapError::Hypervisor(
+                "injected HVPatch begin_exec_inventory failure".to_owned(),
+            ));
+        }
+        if self.shared_process_mm {
+            // The parent still owns this ledger. Exec starts a fresh backend
+            // ledger for the replacement MM so it cannot remove the parent's
+            // mappings. Nothing is retired, so `retired` is `None` here:
+            // reserving a retirement would stage zero events against the fresh
+            // ledger, and the Kernel authority rejects a zero-event commit.
+            let frames = self.frame_inventory.lock().frames.clone();
+            self.mm_access = MmAccessState::new(
+                self.page_tables_authority(),
+                std::sync::Arc::clone(&self.protections),
+                std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::with_frames(
+                    frames,
+                ))),
+                std::sync::Arc::clone(&self.cow_armed),
+                std::sync::Arc::clone(&self.cow_deferred_publications),
+            );
+        }
+        self.frame_inventory
+            .begin_exec_inventory(retired, replacement)
+    }
+
+    pub(crate) fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
+        self.persistent_vm_lifecycle = enabled;
+    }
+
+    pub(crate) fn sparse_mmap_arena_enabled(&self) -> bool {
+        self.persistent_vm_lifecycle
+    }
+
+    /// Retire the generic boot loader's hidden 32 GiB mmap backing after the
+    /// runtime selects HVPatch, but before initial frame inventory publication.
+    /// Mature VMM never enables the persistent lifecycle and keeps its existing
+    /// eager identity mapping unchanged.
+    ///
+    /// **Once per carrier VM, not once per container.** The unmap below is
+    /// `inventory_hv_vm_unmap` over the WHOLE arena extent, which is VM-wide
+    /// state, while this runs during each container's root bring-up. With one
+    /// VM per container that distinction did not exist. With a carrier VM
+    /// shared by several containers it is the difference between retiring an
+    /// eager mapping nobody is using yet and tearing out the sparse per-page
+    /// backing a SIBLING container has already faulted in inside that same
+    /// range — the sibling's next access then takes a level-1 translation
+    /// fault on an address it was legitimately handed, and its guest dies of
+    /// SIGSEGV within a few traps.
+    ///
+    /// The carrier's root boot gate serializes VM ownership and the first root
+    /// publishes the carrier bundle before any guest instruction runs, so the
+    /// first caller retires while no guest can yet hold sparse pages, and
+    /// every later container skips it. Absence remains tolerated for the same
+    /// reason it always was: a later container's plan omits the eager mapping.
+    /// What is NOT tolerated is a second unmap.
+    pub(crate) fn retire_initial_mmap_arena(&mut self) -> Result<(), TrapError> {
+        if !self.persistent_vm_lifecycle {
+            return Ok(());
+        }
+        if carrier_initial_arena_retired().swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(());
+        }
+        let Some(mapping) = self.mappings.get(&GuestVa(crate::memory::LINUX_MMAP_BASE)) else {
+            return Ok(());
+        };
+        if mapping.end
+            != crate::memory::LINUX_MMAP_BASE.saturating_add(crate::memory::mmap_arena_size())
+            || mapping.physical_ipa != crate::memory::LINUX_MMAP_BASE
+            || mapping.physical_size as u64 != crate::memory::mmap_arena_size()
+            || mapping.is_dynamic_alias
+            || mapping.stage2_lease.is_some()
+            || mapping.host_mapping.is_none()
+        {
+            return Err(TrapError::Hypervisor(
+                "HVPatch initial mmap arena backing has unexpected shape or ownership".to_owned(),
+            ));
+        }
+        let rc = unsafe { inventory_hv_vm_unmap(mapping.physical_ipa, mapping.physical_size) };
+        if rc != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "unmap HVPatch initial sparse mmap arena: 0x{rc:x}"
+            )));
+        }
+        self.mappings.remove_range(
+            GuestVa(crate::memory::LINUX_MMAP_BASE),
+            crate::memory::mmap_arena_size() as usize,
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn hvpatch_task_state_test_fixture(
+    mm_slot: u64,
+    mapping_start: u64,
+    linux_tid: i32,
+) -> HvfTaskState {
+    let cow_authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority> =
+        std::sync::Arc::new(task_only_carrier_directory_tests::TestCowAuthority);
+    let page_tables = carrick_aarch64::Stage1Authority::new();
+    let protections = std::sync::Arc::new(MemoryProtections::default());
+    let frame_inventory =
+        std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+    let cow_armed = std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
+    let cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    HvfTaskState {
+        mappings: TaskMappingIndex::from_region(HvfMappedRegion {
+            start: mapping_start,
+            end: mapping_start + 0x1000,
+            ipa: mapping_start + 0x10_0000,
+            physical_ipa: mapping_start + 0x10_0000,
+            host_addr: std::ptr::null_mut(),
+            size: 0x1000,
+            physical_size: 0x1000,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: None,
+            structural_owner: None,
+            stage2_lease: None,
+            is_dynamic_alias: false,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: mm_slot,
+        }),
+        mm_root_slot: Some((mm_slot << 20, 0x20_0000)),
+        container_root: ContainerRootToken::from_raw(1),
+        pending_exec_mm_root_slot: None,
+        pending_exec_asid: None,
+        pending_exec_predecessor_identity: None,
+        pending_exec_stage2_cleanup: None,
+        shared_process_mm: false,
+        mm_access: MmAccessState::new(
+            page_tables,
+            protections,
+            frame_inventory,
+            cow_armed,
+            cow_deferred_publications,
+        ),
+        last_exit_class: 0,
+        last_fault_esr: 0,
+        is_forked_child: false,
+        forked_no_exec: false,
+        last_syscall_nr: None,
+        last_syscall_orig_x0: 0,
+        live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
+        persistent_vm_lifecycle: true,
+        cow_authority: Some(cow_authority),
+        cow_identity: Some(carrick_hal::FrameCowIdentity {
+            linux_pid: 7,
+            linux_tid,
+            mm: mm_slot,
+            asid: u16::try_from(mm_slot).unwrap(),
+        }),
+        pending_fork_frame_receipts: Vec::new(),
+        pending_process_aliases: Vec::new(),
+        fail_next_begin_exec_inventory: false,
+        cow_rollback_scratch: None,
+        registration: None,
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HvpatchTaskStateTestIdentity {
+    mm_root_slot: Option<(u64, u64)>,
+    first_mapping: u64,
+    linux_tid: i32,
+    page_tables: usize,
+    frame_inventory: usize,
+    cow_authority: usize,
+    mm_access: usize,
+}
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn hvpatch_task_state_test_identity(
+    state: &HvfTaskState,
+) -> HvpatchTaskStateTestIdentity {
+    let authority = state
+        .cow_authority
+        .as_ref()
+        .map(|authority| std::sync::Arc::as_ptr(authority) as *const () as usize)
+        .unwrap_or_default();
+    HvpatchTaskStateTestIdentity {
+        mm_root_slot: state.mm_root_slot,
+        first_mapping: state.mappings.first().map_or(0, |mapping| mapping.start),
+        linux_tid: state.cow_identity.map_or(0, |identity| identity.linux_tid),
+        page_tables: state.page_tables_authority().authority_id() as usize,
+        frame_inventory: std::sync::Arc::as_ptr(&state.frame_inventory.ledger) as usize,
+        cow_authority: authority,
+        mm_access: std::sync::Arc::as_ptr(&state.mm_access) as usize,
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn hvpatch_neutral_task_state_for_test() -> HvfTaskState {
+    HvfTaskState::neutral()
+}
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn audit_hvpatch_neutral_task_state_for_test(
+    state: &HvfTaskState,
+) -> Result<(), TrapError> {
+    state.audit_neutral()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn bind_exec_predecessor_identity_slot(
+    pending: &mut Option<carrick_hal::ExecPredecessorIdentity>,
+    identity: carrick_hal::ExecPredecessorIdentity,
+) -> Result<(), TrapError> {
+    if identity.task_serial == 0
+        || identity.thread_serial == 0
+        || identity.linux_pid <= 0
+        || identity.linux_tid <= 0
+        || identity.mm == 0
+        || identity.asid == 0
+    {
+        return Err(TrapError::Hypervisor(
+            "invalid exact HVPatch exec predecessor identity".to_owned(),
+        ));
+    }
+    if pending.is_some() {
+        return Err(TrapError::Hypervisor(
+            "duplicate exact HVPatch exec predecessor identity".to_owned(),
+        ));
+    }
+    *pending = Some(identity);
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfVmState {
+    pub(crate) fn bind_deferred_anonymous_state(
+        &mut self,
+        state: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
+    ) {
+        let mm = carrick_hal::ForeignMmId::from_kernel_allocation(
+            self.cow_identity
+                .and_then(|identity| std::num::NonZeroU64::new(identity.mm))
+                .unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::deferred_materialization_binding",
+                        "local HVF state has no nonzero COW MM identity while binding deferred-memory authority"
+                    )
+                }),
+        );
+        let mut binding = self.mm_access.deferred_anonymous.write();
+        if let Some((bound_mm, bound_state)) = binding.as_ref()
+            && (*bound_mm != mm || !std::sync::Arc::ptr_eq(bound_state, &state))
+        {
+            carrick_fatal!(
+                "hvpatch::deferred_materialization_binding",
+                "local HVF state already holds a different MM or deferred-memory authority"
+            );
+        }
+        *binding = Some((mm, state));
+    }
+
+    pub(crate) fn deferred_anonymous_state(
+        &self,
+    ) -> Option<std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>> {
+        let mm = carrick_hal::ForeignMmId::from_kernel_allocation(std::num::NonZeroU64::new(
+            self.cow_identity?.mm,
+        )?);
+        self.mm_access
+            .deferred_anonymous
+            .read()
+            .as_ref()
+            .filter(|(bound_mm, _)| *bound_mm == mm)
+            .map(|(_, state)| std::sync::Arc::clone(state))
+    }
+
+    pub(crate) fn carrier_vm_custody(&self) -> std::sync::Arc<CarrierVmCustody> {
+        std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody)
+    }
+    pub(crate) fn foreign_mm_endpoint(&self) -> carrick_hal::ForeignMmEndpoint {
+        carrick_hal::ForeignMmEndpoint::for_carrier(self.carrier_foreign_mm_transport.clone())
+    }
+
+    pub(crate) fn fd_ceiling_publisher(
+        &self,
+    ) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
+        self.carrier_mappings
+            .as_ref()
+            .and_then(PersistentCarrierMappings::fd_ceiling_publisher)
+    }
+
+    pub(crate) fn bind_frame_cow(
+        &mut self,
+        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        identity: carrick_hal::FrameCowIdentity,
+    ) {
+        self.task.bind_frame_cow(authority, identity);
+        if let (Some(mm), Some(asid), Some((stage1_root, _))) = (
+            std::num::NonZeroU64::new(identity.mm),
+            std::num::NonZeroU16::new(identity.asid),
+            self.task.mm_root_slot,
+        ) {
+            self.carrier_foreign_mm_transport.register_identity(
+                carrick_hal::ForeignMmId::from_kernel_allocation(mm),
+                CarrierForeignMmBinding {
+                    asid: carrick_hal::ForeignAsid::from_kernel_allocation(asid),
+                    stage1_root: carrick_guest_mem::Gpa(stage1_root),
+                },
+                &self.task.mm_access,
+            );
+        }
+    }
+
+    pub(crate) fn prepare_exec_address_space(
+        &mut self,
+        root_slot_base: u64,
+        root_slot_size: u64,
+        asid: u16,
+    ) -> Result<(), TrapError> {
+        if !root_slot_base.is_multiple_of(HVF_PAGE_SIZE) || root_slot_size == 0 || asid == 0 {
+            return Err(TrapError::Hypervisor(
+                "invalid exact HVPatch exec MM lease".to_owned(),
+            ));
+        }
+        if self.pending_exec_mm_root_slot.is_some() || self.pending_exec_asid.is_some() {
+            return Err(TrapError::Hypervisor(
+                "duplicate exact HVPatch exec MM lease".to_owned(),
+            ));
+        }
+        self.pending_exec_mm_root_slot = Some((root_slot_base, root_slot_size));
+        self.pending_exec_asid = Some(asid);
+        Ok(())
+    }
+
+    pub(crate) fn bind_exec_predecessor_identity(
+        &mut self,
+        identity: carrick_hal::ExecPredecessorIdentity,
+    ) -> Result<(), TrapError> {
+        bind_exec_predecessor_identity_slot(&mut self.pending_exec_predecessor_identity, identity)
+    }
+
+    /// See `carrick_hal::ThreadedEngine::mark_exec_predecessor_shared`. The
+    /// flag drives `exec_retires_old_mm`, the fresh-ledger split in
+    /// `begin_exec_inventory`, and `execve_rebuild`'s `shared_projection`;
+    /// `execve_rebuild` clears it after capturing the projection.
+    pub(crate) fn mark_exec_predecessor_shared(&mut self, shared: bool) {
+        self.shared_process_mm = shared;
+    }
+
+    pub(crate) fn swap_persistent_executor_local(&mut self, other: &mut Self) {
+        if !std::sync::Arc::ptr_eq(
+            &self.carrier_foreign_mm_transport,
+            &other.carrier_foreign_mm_transport,
+        ) {
+            carrick_fatal!(
+                "hvpatch::executor_boundary",
+                "swapping persistent executor-local state across mismatched carrier foreign MM transport instances"
+            );
+        }
+        std::mem::swap(&mut self._vm, &mut other._vm);
+        std::mem::swap(&mut self.carrier_mappings, &mut other.carrier_mappings);
+        std::mem::swap(&mut self.reclaim_authority, &mut other.reclaim_authority);
+        std::mem::swap(&mut self.mailbox_slots, &mut other.mailbox_slots);
+        std::mem::swap(&mut self.syscall_transport, &mut other.syscall_transport);
+        std::mem::swap(&mut self.vcpu_id, &mut other.vcpu_id);
+        std::mem::swap(&mut self.vcpu_handle, &mut other.vcpu_handle);
+    }
+}
+
+/// Thread/process exit must LEAK the per-thread host backings, never `munmap`
+/// them. All sibling threads share ONE host address space, and the
+/// process-global [`alias_registry`] holds NON-OWNING raw `host_addr`s into
+/// these same buffers. A clone thread exiting (its `run_vcpu_until_exit` returns
+/// → this `Drop` runs on its `HvfVmState`) that `munmap`'d a buffer it happens
+/// to OWN — e.g. a `kind=SharedFile` `MAP_SHARED` semaphore alias it
+/// `add_alias`'d — would yank that buffer out from under every sibling thread
+/// AND leave a DANGLING registry entry that a later syscall (`read_futex_word`
+/// on the process-shared semaphore) resolves to a dead pointer → a carrick HOST
+/// SIGSEGV. That is the cpython multiprocessing FORKSERVER SyncManager crash:
+/// the Manager's pool teardown exits a clone thread whose `self.mappings` owned
+/// the live sem buffer. The kernel reclaims every mapping at process exit; the
+/// fork/execve rebuilds already `mem::forget` `self.mappings` for exactly this
+/// reason. (Restores the leak-until-exit discipline the pre-`Aarch64EngineCore`
+/// refactor's no-op engine `Drop` provided — see the `unregister_alias` doc.)
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for HvfVmState {
+    fn drop(&mut self) {
+        std::mem::forget(std::mem::take(&mut self.mappings));
+    }
+}
+
+/// Owns ONLY the three vCPU-touching associated functions the shared engine
+/// reaches through the `Aarch64Vcpu` trait — the native-exit decode
+/// (`run_to_exit`) and the snapshot/restore I/O — so they are free of
+/// `HvfVmState` (they take the bare `applevisor` vCPU). The name is kept so the
+/// new module's `HvfInner::snapshot_vcpu_from` / `restore_vcpu_into` /
+/// `run_to_exit` paths resolve unchanged.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct HvfInner;
+
+/// Overwrite `slot`'s VM in place WITHOUT running applevisor's `VirtualMachine`
+/// Drop on the old (already raw-destroyed) handle — the single no-drop VM
+/// replacement point (the fork/execve rebuilds). `mem::forget` the old (it was
+/// `hv_vm_destroy`'d via the raw API; running its wrapper Drop now would panic).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn replace_destroyed_vm(
+    slot: &mut HvfVmState,
+    new_vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+) {
+    let old = std::mem::replace(&mut slot._vm, std::mem::ManuallyDrop::new(new_vm));
+    std::mem::forget(std::mem::ManuallyDrop::into_inner(old));
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct HvfMappedRegion {
+    /// Guest VIRTUAL start (the syscall-path lookup key). Differs from `ipa`
+    /// only for the Rosetta high-VA alias.
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    /// IPA this region was `hv_vm_map`'d at — needed to re-map across fork(2).
+    /// Identity (== `start`) for every region but the Rosetta window.
+    pub(crate) ipa: u64,
+    /// Exact HVF stage-2 extent. `ipa`/`size` are the live semantic projection;
+    /// a partial 4 KiB Linux mapping can retain a 16 KiB physical owner whose
+    /// base precedes that projection. Lifetime decisions must use this tuple.
+    pub(crate) physical_ipa: u64,
+    pub(crate) physical_size: usize,
+    /// Which incarnation of the global-frame lease this row was published
+    /// against — see [`GlobalFrameHostOwner::generation`].
+    pub(crate) owner_generation: u64,
+    /// Host VA of the buffer backing this guest-physical mapping. We
+    /// record this explicitly so the fork(2) path can re-issue
+    /// `hv_vm_map` in the child against the same (COW'd) host pages
+    /// without going through `applevisor::Memory::new` (which would
+    /// allocate a fresh buffer).
+    pub(crate) host_addr: *mut u8,
+    /// Size of the mapping in bytes (matches the size HVF was given).
+    pub(crate) size: usize,
+    /// Stage-2 permissions used to map the region. Same value that
+    /// `hvf_perms` returned; the child rebuilds the mapping with these
+    /// exact permissions.
+    pub(crate) perms: applevisor::memory::MemPerms,
+    /// `Memory` owns the host allocation and the hv_vm_unmap that
+    /// fires on Drop. In a freshly-forked CHILD we replace this with
+    /// `None` (after `mem::forget` on the inherited inner) — the host
+    /// pages stay alive via COW; the unmap would target the parent's
+    /// HVF context which no longer exists in the child.
+    ///
+    /// `#[allow(dead_code)]`: these are RAII ownership holders, kept alive for
+    /// their `Drop` side effects (freeing host pages), not read. Every region
+    /// is now built by `map_region_raw` with `memory: None` +
+    /// `host_mapping: Some(..)`.
+    #[allow(dead_code)]
+    pub(crate) memory: Option<applevisor::memory::Memory>,
+    #[allow(dead_code)]
+    pub(crate) host_mapping: Option<crate::host_mapping::OwnedHostMapping>,
+    #[allow(dead_code)]
+    pub(crate) structural_owner: Option<std::sync::Arc<StructuralBackingOwner>>,
+    /// Owning rollback/retirement handle for a fresh HVPatch stage-2 extent.
+    /// Inherited mappings and dynamic aliases owned by the process-global
+    /// host-owner registry carry `None`.
+    pub(crate) stage2_lease: Option<GlobalFrameStage2Lease>,
+    /// True only for a post-boot alias published through `add_alias`. Retired
+    /// aliases deliberately remain in `mappings` to keep their host/stage-2
+    /// owners alive, but the live alias registry decides whether they enter a
+    /// fork child's address-space inventory.
+    pub(crate) is_dynamic_alias: bool,
+    /// Separates host/fork visibility from VM-global IPA and futex identity.
+    /// Both shared variants keep one host backing across guest fork, while only
+    /// `GlobalShared` participates in the historical global alias namespace.
+    pub(crate) sharing: GuestMappingSharing,
+    /// The guest's INTENDED writability (Linux PROT_WRITE), tracked separately
+    /// from `perms` — alias regions force `perms` to RWX for the HVF stage-2
+    /// translation quirk, so it cannot be used to detect a read-only mapping.
+    /// The syscall write-path (`write_guest_bytes_checked`) rejects a write into
+    /// a non-writable mapping with EFAULT instead of faulting the host (SIGBUS on
+    /// a PROT_READ MAP_SHARED file alias) or corrupting a carrick-owned
+    /// `write:false` region. (audit M1; probe `rosharedbus`)
+    pub(crate) guest_writable: bool,
+    pub(crate) shared_key_base: u64,
+    pub(crate) shared_key_offset: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfMappedRegion {
+    /// Whether this row still owns something whose `Drop` frees backing.
+    ///
+    /// A row holding any of these is a lifetime holder: dropping it releases
+    /// host pages, a stage-2 lease or a structural owner. A row holding none
+    /// of them is pure description -- which is NOT the same as "safe to
+    /// forget"; see [`TaskMappingIndex::displace_overlapping`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn holds_backing_handle(&self) -> bool {
+        self.memory.is_some()
+            || self.host_mapping.is_some()
+            || self.structural_owner.is_some()
+            || self.stage2_lease.is_some()
+    }
+}
+
+/// A copyable projection of the scalar fields of an [`HvfMappedRegion`] that the
+/// syscall-path accessors actually read (`start`/`end`/`ipa`/`host_addr`/`size`/
+/// `guest_writable`/sharing). [`HvfInner::mapping_for_range`] returns this
+/// by value instead of `&HvfMappedRegion` so a lookup that resolves through the
+/// PROCESS-SHARED `alias_registry` fallback (a high-VA alias another thread
+/// mapped, absent from THIS thread's per-thread `mappings`) can synthesize a view
+/// with no borrow into `self.mappings`. The copy loops compute
+/// `host_addr + (addr - start)`, so a synthetic view sets `start` to the alias VA
+/// base and `host_addr` to its backing base — identical offset math to a real
+/// region.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct MappingView {
+    start: u64,
+    end: u64,
+    ipa: u64,
+    host_addr: *mut u8,
+    guest_writable: bool,
+    sharing: GuestMappingSharing,
+    shared_key_base: u64,
+    shared_key_offset: u64,
+}
+
+/// Snapshot of vCPU register state used for reclaim and executor rebinding.
+///
+/// The architectural register file lives in the ISA-neutral
+/// [`Aarch64VcpuSnapshot`] `core` — the SAME type the shared engine and the KVM
+/// lane trade in — so the HVF lane no longer duplicates those 21 fields. The
+/// per-VMM HVF↔neutral mapping (CPSR ↔ `core.pstate` and the `*_EL1`
+/// sysreg names ↔ their neutral aliases) lives in
+/// `snapshot_vcpu_from`/`restore_vcpu*`; mailbox rebinding owns SP_EL1. The
+/// TTBR1_EL1 (Rosetta x86-64 high-half
+/// root) / ACTLR_EL1 (Rosetta EnTSO) / TPIDR*_EL0 (musl TLS, vDSO/rseq) capture
+/// rationales are documented on the neutral fields.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone)]
+pub(crate) struct VcpuSnapshot {
+    /// The ISA-neutral architectural register file (GPRs, EL1 sysregs, V-regs, FP
+    /// control) shared with the engine and the KVM lane.
+    pub(crate) core: Aarch64VcpuSnapshot,
+}
+
+// Off macOS/aarch64 the HVF backend is cfg'd out entirely (no `applevisor`, no
+// `HvfTrapEngine` alias, no register-access helpers), so there is no non-macOS
+// `HvfInner` marker to carry — `HvfInner` exists ONLY on the macOS/HVF lane.
+
+/// Factory authority for one Task4 worker. It deliberately carries only the
+/// carrier VM and executor-local mailbox transport configuration; no task MM,
+/// stage-1 editor, mapping descriptor, frame inventory, or COW authority can be
+/// retained by the factory or copied into an idle worker.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
+pub(crate) struct PersistentExecutorSpec {
+    vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    /// VM-global Carrick control mappings needed before any task projection is
+    /// loaded: entry trampoline, EL1 vectors/scratch path, maintenance code,
+    /// and the executor mailbox arena. The Arc is their exact carrier-wide
+    /// stage-2/backing owner; task mappings, page tables, MM/root, inventory,
+    /// and COW authority stay out of the factory.
+    carrier_mappings: std::sync::Arc<PersistentCarrierMappings>,
+    mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
+    syscall_transport: HvfSyscallTransport,
+    carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PersistentExecutorSpec {
+    pub(crate) fn fd_ceiling_publisher(
+        &self,
+    ) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
+        self.carrier_mappings.fd_ceiling_publisher()
+    }
+}
+
+// SAFETY: PersistentCarrierMappings owns immutable VM-global MAP_SHARED
+// buffers. Worker threads only resolve pointers while their Arc is live.
+unsafe impl Send for PersistentExecutorSpec {}
+unsafe impl Sync for PersistentExecutorSpec {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct ProcessMappingDesc {
+    pub(crate) start: u64,
+    pub(crate) ipa: u64,
+    pub(crate) end: u64,
+    // Drop the stage-2 authority before the host owner on every implicit
+    // prepare-error path. Named initializers make declaration order otherwise
+    // invisible, but Rust field destruction follows this order.
+    pub(crate) stage2_lease: Option<GlobalFrameStage2Lease>,
+    pub(crate) host: ProcessMappingHost,
+    pub(crate) size: usize,
+    pub(crate) physical_ipa: u64,
+    pub(crate) physical_host_addr: *mut u8,
+    pub(crate) physical_size: usize,
+    pub(crate) inventory_backing: InventoryBackingIdentity,
+    pub(crate) perms: applevisor::memory::MemPerms,
+    pub(crate) is_dynamic_alias: bool,
+    pub(crate) sharing: GuestMappingSharing,
+    pub(crate) guest_writable: bool,
+    pub(crate) inherited_frame: Option<carrick_hal::FrameId>,
+    pub(crate) shared_key_base: u64,
+    pub(crate) shared_key_offset: u64,
+    pub(crate) owner_generation: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum ProcessMappingHost {
+    Borrowed {
+        pointer: *mut u8,
+        structural_owner: Option<std::sync::Arc<StructuralBackingOwner>>,
+    },
+    Owned(crate::host_mapping::OwnedHostMapping),
+    PooledRootSlot {
+        handle: crate::frame_pool::PooledRootSlotHandle,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ProcessMappingHost {
+    #[allow(dead_code)]
+    fn ptr(&self) -> *mut u8 {
+        match self {
+            Self::Borrowed { pointer, .. } => *pointer,
+            Self::Owned(mapping) => mapping.as_ptr(),
+            Self::PooledRootSlot { handle } => handle.as_mut_ptr(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn into_owned(self) -> Option<crate::host_mapping::OwnedHostMapping> {
+        match self {
+            Self::Borrowed { .. } | Self::PooledRootSlot { .. } => None,
+            Self::Owned(mapping) => Some(mapping),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+struct ProcessInventoryDesc {
+    pub(crate) gpa: u64,
+    pub(crate) length: u64,
+    pub(crate) permissions: carrick_hal::MemPerms,
+    pub(crate) inherited_frame: Option<carrick_hal::FrameId>,
+    pub(crate) inherited_mapping: Option<carrick_hal::MappingId>,
+    pub(crate) backing: InventoryBackingIdentity,
+    pub(crate) stage2_lease: (u64, u64),
+    pub(crate) stage2_owner: InventoryStage2OwnerIdentity,
+    pub(crate) fork_frame_receipt_kind: Option<carrick_observability::probes::HvpatchForkFrameKind>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn process_mapping_needs_child_alias_authority(mapping: &ProcessMappingDesc) -> bool {
+    mapping.is_dynamic_alias
+        || (mapping.inherited_frame.is_some()
+            && mapping.sharing == GuestMappingSharing::Private
+            && !is_kernel_only_stage1_range(mapping.start, mapping.size))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn authenticated_structural_owner_record_in(
+    custody: &CarrierVmCustody,
+    owner: &std::sync::Arc<StructuralBackingOwner>,
+    physical_host_addr: *mut u8,
+    physical_ipa: u64,
+    physical_size: usize,
+    perms: applevisor::memory::MemPerms,
+    owner_generation: u64,
+) -> Option<CarrierStage2RecordIdentity> {
+    let owner_custody = owner.custody.upgrade()?;
+    if !std::ptr::eq(owner_custody.as_ref(), custody)
+        || owner.ptr() != physical_host_addr
+        || owner.len() != physical_size
+        || owner.physical_ipa != physical_ipa
+        || owner.physical_size != physical_size
+        || owner.epoch().raw() != owner_generation
+        || owner
+            .retained
+            .owner_retired
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return None;
+    }
+    let identity = *owner.retained.record_identity.lock();
+    if custody
+        .structural_backings
+        .lock()
+        .get(&identity.record_id)
+        .is_none_or(|retained| !std::sync::Arc::ptr_eq(retained, &owner.retained))
+    {
+        return None;
+    }
+    let snapshot = custody.stage2_record_snapshot(identity.record_id)?;
+    let logical_owner = CarrierLogicalOwner {
+        id: owner_generation,
+        generation: owner_generation,
+    };
+    (identity.vm_generation == snapshot.vm_generation
+        && identity.logical_owner == Some(logical_owner)
+        && custody.setup_generation() == Some(snapshot.vm_generation)
+        && snapshot.ipa == physical_ipa
+        && snapshot.len == physical_size
+        && snapshot.host_addr == physical_host_addr as usize
+        && snapshot.perms == u64::from(perms)
+        && snapshot.logical_owner == Some(logical_owner)
+        && snapshot.mapped
+        // A pooled root slot is backend-mapped once by the pool's own lease;
+        // its per-process record is pre-mapped (`mark_pre_mapped`) and custody
+        // skips the backend unmap for it, so the record authenticates on the
+        // pool's mapping rather than a per-record one.
+        && (snapshot.backend_map_installed || custody.is_pooled_ipa(physical_ipa))
+        && !snapshot.retirement_requested
+        && !snapshot.terminalized_by_vm_destroy)
+        .then_some(identity)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mapped_region_physical_host_addr(mapping: &HvfMappedRegion) -> Option<*mut u8> {
+    let offset = usize::try_from(mapping.ipa.checked_sub(mapping.physical_ipa)?).ok()?;
+    let semantic_size = usize::try_from(mapping.end.checked_sub(mapping.start)?).ok()?;
+    offset
+        .checked_add(semantic_size)
+        .filter(|end| *end <= mapping.physical_size)?;
+    (mapping.host_addr as usize)
+        .checked_sub(offset)
+        .map(|base| base as *mut u8)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn structural_fork_owner_identity_in(
+    custody: &CarrierVmCustody,
+    mapping: &ThreadMappingDesc,
+) -> Option<InventoryStage2OwnerIdentity> {
+    authenticated_structural_owner_record_in(
+        custody,
+        mapping.structural_owner.as_ref()?,
+        mapping.physical_host_addr,
+        mapping.physical_ipa,
+        mapping.physical_size,
+        mapping.perms,
+        mapping.owner_generation,
+    )?;
+    Some(InventoryStage2OwnerIdentity {
+        host_addr: mapping.physical_host_addr as usize,
+        generation: mapping.owner_generation,
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// The parent frame inventory grouped by the stage-2 extent an inherited
+/// mapping is matched on.
+///
+/// `inherited_fork_inventory_extents_in` selects rows whose
+/// `(stage2_base, stage2_length)` equals the mapping's physical extent, but it
+/// found them by walking the WHOLE inventory. It is called once per source
+/// mapping — twice, counting the overlay index — so a fork paid O(M * I).
+/// Grouping once per fork turns each of those into a lookup.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type ForkInventoryByStage2 =
+    std::collections::BTreeMap<(u64, u64), Vec<((u64, u64), InventoryExtent)>>;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn index_fork_inventory_by_stage2(
+    inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
+) -> ForkInventoryByStage2 {
+    let mut index = ForkInventoryByStage2::new();
+    for (&key, &extent) in inventory {
+        index
+            .entry((extent.stage2_base, extent.stage2_length))
+            .or_default()
+            .push((key, extent));
+    }
+    index
+}
+
+/// [`inherited_fork_inventory_extents_in`] against a pre-grouped inventory.
+/// The owner authentication is unchanged and still per-mapping; only the
+/// search for candidate rows is indexed.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn inherited_fork_inventory_extents_indexed(
+    custody: &CarrierVmCustody,
+    mapping: &ThreadMappingDesc,
+    index: &ForkInventoryByStage2,
+) -> Vec<((u64, u64), InventoryExtent)> {
+    let extent_key = (mapping.physical_ipa, mapping.physical_size as u64);
+    let Some(candidates) = index.get(&extent_key) else {
+        return Vec::new();
+    };
+    let expected_owner = (mapping.owner_generation != 0).then_some(InventoryStage2OwnerIdentity {
+        host_addr: mapping.physical_host_addr as usize,
+        generation: mapping.owner_generation,
+    });
+    let live_owner = if mapping.owner_generation == 0 {
+        None
+    } else if is_reusable_global_frame_extent(mapping.physical_ipa, mapping.physical_size as u64) {
+        global_frame_host_owner_identity_in(
+            custody,
+            mapping.physical_ipa,
+            mapping.physical_size as u64,
+        )
+        .map(|(host_addr, generation)| InventoryStage2OwnerIdentity {
+            host_addr,
+            generation,
+        })
+    } else {
+        structural_fork_owner_identity_in(custody, mapping)
+    };
+    candidates
+        .iter()
+        .filter(|(_, extent)| {
+            mapping.owner_generation == 0
+                || (expected_owner == Some(extent.stage2_owner)
+                    && live_owner == Some(extent.stage2_owner))
+        })
+        .copied()
+        .collect()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingForkFrameReceipt {
+    pub(crate) transaction: carrick_hal::KernelTransactionId,
+    pub(crate) kind: carrick_observability::probes::HvpatchForkFrameKind,
+    pub(crate) parent_mapping: carrick_hal::MappingId,
+    pub(crate) child_mapping: carrick_hal::MappingId,
+    pub(crate) frame: carrick_hal::FrameId,
+    pub(crate) ipa: u64,
+    pub(crate) length: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn authenticate_pending_fork_receipts(
+    receipts: &[PendingForkFrameReceipt],
+    receipt: &carrick_hal::FrameInventoryApplyReceipt,
+) -> bool {
+    receipts.iter().enumerate().all(|(index, pending)| {
+        pending.transaction == receipt.transaction()
+            && receipt.authorizes(pending.child_mapping, pending.frame)
+            && pending.length != 0
+            && pending.parent_mapping != pending.child_mapping
+            && !receipts[..index].iter().any(|prior| {
+                prior.child_mapping == pending.child_mapping
+                    || (prior.ipa, prior.length) == (pending.ipa, pending.length)
+            })
+    })
+}
+
+/// Why a retirement receipt did or did not authenticate, clause by clause.
+///
+/// The abort this feeds is unrecoverable, so it must name the failing clause: a
+/// receipt that leaves the mm non-empty, one that covers a different number of
+/// mappings, and one that omits a pending fork frame call for entirely different
+/// fixes, and a bare "malformed" verdict cannot tell them apart.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+struct PendingRetirementAudit {
+    mm_empty_at_revision: bool,
+    expected_non_empty: bool,
+    cardinality_matches: bool,
+    expected_authorized: bool,
+    pending_authorized: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PendingRetirementAudit {
+    const fn ok(self) -> bool {
+        self.mm_empty_at_revision
+            && self.expected_non_empty
+            && self.cardinality_matches
+            && self.expected_authorized
+            && self.pending_authorized
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn authenticate_pending_retirement(
+    expected: &[(carrick_hal::MappingId, carrick_hal::FrameId)],
+    pending: &[PendingForkFrameReceipt],
+    receipt: &carrick_hal::FrameInventoryRetirementReceipt,
+) -> PendingRetirementAudit {
+    PendingRetirementAudit {
+        mm_empty_at_revision: receipt.mm_empty_at_revision(),
+        expected_non_empty: !expected.is_empty(),
+        cardinality_matches: expected.len() == receipt.mapping_set().len(),
+        expected_authorized: expected
+            .iter()
+            .all(|&(mapping, frame)| receipt.authorizes(mapping, frame)),
+        // Only OUTSTANDING inheritances. A pending receipt records an
+        // obligation created at fork publication: "this child mapping holds a
+        // frame inherited from the parent". It is discharged either here, by the
+        // retirement unmapping that mapping with that frame, or EARLIER, when
+        // the mapping was superseded — `stage_cow_inventory_split` pushes its
+        // own `UnmapMapping` and `RetireFrame` for the old mapping and
+        // `commit_cow_inventory_split` drops the extent, all inside that
+        // transaction. Demanding that retirement account for an already-settled
+        // obligation is a category error, and it failed every forked child that
+        // wrote to an inherited page: the superseded mapping id is simply absent
+        // from the retirement's set. A mapping still live in `expected` must
+        // still retire under the frame it inherited.
+        pending_authorized: pending
+            .iter()
+            .filter(|pending| {
+                expected
+                    .iter()
+                    .any(|(mapping, _)| *mapping == pending.child_mapping)
+            })
+            .all(|pending| receipt.authorizes(pending.child_mapping, pending.frame)),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingFrameCowPublication {
+    va: u64,
+    len: usize,
+    expected_ipa: u64,
+}
+
+/// Name the stage-1 pool's own numbers on a sparse-mmap planning failure.
+/// A bare `OutOfTables` cannot distinguish a legitimately huge address
+/// space from a pool that was refused permission to sweep its reclaimable
+/// tables (`cpython-compile` reported fifteen bare refusals at 1 MiB anonymous
+/// maps); the child-clone and syscall edit paths already report this census.
+fn sparse_mmap_stage1_error(
+    manager: &carrick_mem::page_table::PageTableManager,
+    span: &str,
+    error: carrick_mem::page_table::PageTableError,
+    source: bool,
+) -> TrapError {
+    let (in_use, free, capacity, arenas) = manager.pool_stats();
+    let (multi_vcpu, exclusive, reclaim_pending) = manager.coalesce_policy();
+    TrapError::Hypervisor(format!(
+        "plan sparse HVPatch mmap {span} stage-1 output: {error:?} \
+         (in_use={in_use} free={free} capacity={capacity} arenas={arenas} source={source} \
+         multi_vcpu={multi_vcpu} exclusive={exclusive} reclaim_pending={reclaim_pending})"
+    ))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn next_deferred_cow_authentication_page(
+    walk: [u64; 4],
+    page: u64,
+    end: u64,
+    armed: &[carrick_aarch64::vmm::ForkCowRange],
+) -> u64 {
+    // Called only AFTER authenticating the live walk against the shadow and
+    // exact expected output while retaining the page-table authority. A valid
+    // block has one descriptor and linear outputs throughout its aligned span;
+    // an L3 table still requires every leaf to be read. Invalid retained leaves
+    // stay on the conservative page path. Never infer coverage from endpoints.
+    const PAGE: u64 = 4096;
+    let mut span = PAGE;
+    for (level, descriptor) in walk.into_iter().enumerate() {
+        if descriptor & 1 == 0 {
+            break;
+        }
+        if descriptor & 3 == 1 {
+            span = match level {
+                1 => 1 << 30,
+                2 => 1 << 21,
+                _ => PAGE,
+            };
+            break;
+        }
+    }
+    let mut next = (page & !(span - 1)).saturating_add(span).min(end);
+    // AP_RO is authentic for an armed page even when PROT_WRITE was requested.
+    // Stop at every arm boundary so an unarmed interior page cannot inherit
+    // that exception. Overlapping arms merely cause extra authentication.
+    for range in armed {
+        let Some(range_end) = range.va.checked_add(range.len as u64) else {
+            continue;
+        };
+        for boundary in [range.va, range_end] {
+            if boundary > page && boundary < next {
+                // The caller authenticates page starts; an unaligned arm
+                // boundary first changes that classification on the next page.
+                next = boundary.saturating_add(PAGE - 1) & !(PAGE - 1);
+            }
+        }
+    }
+    next.min(end)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn deferred_cow_leaf_authenticates(
+    leaf: u64,
+    translated: Option<u64>,
+    expected_ipa: u64,
+    expected_ap: u64,
+    must_be_valid: bool,
+    must_be_executable: bool,
+) -> bool {
+    const VALID: u64 = 1;
+    const AP_MASK: u64 = 0b11 << 6;
+    const NON_GLOBAL: u64 = 1 << 11;
+    const UXN: u64 = 1 << 54;
+
+    translated == Some(expected_ipa)
+        && leaf & NON_GLOBAL != 0
+        && (leaf & VALID != 0) == must_be_valid
+        // In an invalid descriptor AP and UXN do not grant guest access and
+        // are deliberately retained by `PtOp::Invalidate` along with the
+        // output address. Once revalidated they are semantic and must match
+        // the exact requested access, including execute permission.
+        && (!must_be_valid || leaf & AP_MASK == expected_ap)
+        && (!must_be_valid || (leaf & UXN == 0) == must_be_executable)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn process_mapping_needs_stage2_install(inherited_frame: Option<carrick_hal::FrameId>) -> bool {
+    inherited_frame.is_none()
+}
+
+/// A fork child address space waiting for vCPU materialization on its owning
+/// host thread. Private mappings initially retain the parent's FrameId/global
+/// IPA and are read-only in each mm's independent stage-1 graph; the first
+/// writer receives a new compound frame. A CLONE_VM child instead retains user
+/// frames writable while keeping its stage-1 tables and EL1 control state
+/// independent. Guest-shared mappings retain their existing IPA and frame
+/// without entering private COW. Shared-anonymous aliases remain mm-scoped; only
+/// shared-file mappings use the VM-global alias namespace.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct ProcessSpecPlan {
+    mappings: Vec<ProcessMappingDesc>,
+    inventory_mappings: Vec<ProcessInventoryDesc>,
+    protections: std::sync::Arc<MemoryProtections>,
+    mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
+    syscall_transport: HvfSyscallTransport,
+    persistent_vm_lifecycle: bool,
+    mm_root_slot: (u64, u64),
+    container_root: ContainerRootToken,
+    frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
+    carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct ProcessSpecPlanContext {
+    pub(crate) protections: std::sync::Arc<MemoryProtections>,
+    pub(crate) mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
+    pub(crate) syscall_transport: HvfSyscallTransport,
+    pub(crate) persistent_vm_lifecycle: bool,
+    pub(crate) mm_root_slot: (u64, u64),
+    pub(crate) container_root: ContainerRootToken,
+    pub(crate) frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    pub(crate) cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
+    pub(crate) carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ProcessSpecPlan {
+    fn new(
+        mappings: Vec<ProcessMappingDesc>,
+        inventory_mappings: Vec<ProcessInventoryDesc>,
+        context: ProcessSpecPlanContext,
+    ) -> Self {
+        Self {
+            mappings,
+            inventory_mappings,
+            protections: context.protections,
+            mailbox_slots: context.mailbox_slots,
+            syscall_transport: context.syscall_transport,
+            persistent_vm_lifecycle: context.persistent_vm_lifecycle,
+            mm_root_slot: context.mm_root_slot,
+            container_root: context.container_root,
+            frame_inventory: context.frame_inventory,
+            cow_armed: context.cow_armed,
+            carrier_foreign_mm_transport: context.carrier_foreign_mm_transport,
+        }
+    }
+    pub(crate) fn stage_with_reservation_factory(
+        &mut self,
+        mut reserve: impl FnMut(
+            usize,
+            usize,
+            carrick_hal::FrameEventCapacity,
+        ) -> Result<carrick_hal::FrameInventoryReservation, TrapError>,
+    ) -> Result<(), TrapError> {
+        let mapping_candidates = self.inventory_mappings.len();
+        let frame_candidates = self
+            .inventory_mappings
+            .iter()
+            .filter(|mapping| mapping.inherited_frame.is_none())
+            .count();
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(
+            carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
+        )
+        .map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "invalid HVPatch child frame inventory capacity: {error}"
+            ))
+        })?;
+        let reservation = reserve(frame_candidates, mapping_candidates, capacity)?;
+        self.frame_inventory.lock().process_reservation = Some(reservation);
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct ProcessSpec {
+    vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    mappings: Vec<ProcessMappingDesc>,
+    inventory_mappings: Vec<ProcessInventoryDesc>,
+    protections: std::sync::Arc<MemoryProtections>,
+    mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
+    syscall_transport: HvfSyscallTransport,
+    persistent_vm_lifecycle: bool,
+    mm_root_slot: (u64, u64),
+    container_root: ContainerRootToken,
+    frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
+    carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ProcessSpec {
+    pub(crate) fn new(
+        vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+        plan: ProcessSpecPlan,
+    ) -> Self {
+        Self {
+            vm,
+            mappings: plan.mappings,
+            inventory_mappings: plan.inventory_mappings,
+            protections: plan.protections,
+            mailbox_slots: plan.mailbox_slots,
+            syscall_transport: plan.syscall_transport,
+            persistent_vm_lifecycle: plan.persistent_vm_lifecycle,
+            mm_root_slot: plan.mm_root_slot,
+            container_root: plan.container_root,
+            frame_inventory: plan.frame_inventory,
+            cow_armed: plan.cow_armed,
+            carrier_foreign_mm_transport: plan.carrier_foreign_mm_transport,
+        }
+    }
+
+    pub(crate) fn into_plan(
+        self,
+    ) -> (
+        applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+        ProcessSpecPlan,
+    ) {
+        let plan = ProcessSpecPlan {
+            mappings: self.mappings,
+            inventory_mappings: self.inventory_mappings,
+            protections: self.protections,
+            mailbox_slots: self.mailbox_slots,
+            syscall_transport: self.syscall_transport,
+            persistent_vm_lifecycle: self.persistent_vm_lifecycle,
+            mm_root_slot: self.mm_root_slot,
+            container_root: self.container_root,
+            frame_inventory: self.frame_inventory,
+            cow_armed: self.cow_armed,
+            carrier_foreign_mm_transport: self.carrier_foreign_mm_transport,
+        };
+        (self.vm, plan)
+    }
+
+    pub(crate) fn stage_with_reservation_factory(
+        &mut self,
+        reserve: impl FnMut(
+            usize,
+            usize,
+            carrick_hal::FrameEventCapacity,
+        ) -> Result<carrick_hal::FrameInventoryReservation, TrapError>,
+    ) -> Result<(), TrapError> {
+        let mut plan = ProcessSpecPlan {
+            mappings: std::mem::take(&mut self.mappings),
+            inventory_mappings: std::mem::take(&mut self.inventory_mappings),
+            protections: std::sync::Arc::clone(&self.protections),
+            mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
+            syscall_transport: self.syscall_transport,
+            persistent_vm_lifecycle: self.persistent_vm_lifecycle,
+            mm_root_slot: self.mm_root_slot,
+            container_root: self.container_root,
+            frame_inventory: std::sync::Arc::clone(&self.frame_inventory),
+            cow_armed: std::sync::Arc::clone(&self.cow_armed),
+            carrier_foreign_mm_transport: std::sync::Arc::clone(&self.carrier_foreign_mm_transport),
+        };
+        let result = plan.stage_with_reservation_factory(reserve);
+        self.mappings = plan.mappings;
+        self.inventory_mappings = plan.inventory_mappings;
+        result
+    }
+}
+
+/// Deferred HVPatch task backend state. Its variants deliberately contain no
+/// vCPU, mailbox allocator/binding, vCPU handle/id, reclaim authority, or host
+/// owner identity; those belong exclusively to a Task4 worker pthread.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct HvpatchTaskOnlyBackendState {
+    registration: Option<HvpatchTaskRegistration>,
+}
+
+impl HvpatchTaskOnlyBackendState {
+    pub(crate) fn register_foreign_mm(&mut self, task: &HvfTaskState) -> Result<(), TrapError> {
+        self.registration
+            .as_mut()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .register_foreign_mm(task)
+    }
+
+    pub(crate) fn unregister_foreign_mm(&mut self) {
+        if let Some(registration) = self.registration.as_mut() {
+            registration.unregister_foreign_mm();
+        }
+    }
+
+    pub(crate) fn carrier_vm_custody(&self) -> Result<std::sync::Arc<CarrierVmCustody>, TrapError> {
+        let registration = self
+            .registration
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?;
+        #[cfg(not(test))]
+        {
+            Ok(std::sync::Arc::clone(&registration.custody))
+        }
+        #[cfg(test)]
+        {
+            let _ = registration;
+            Ok(std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc()))
+        }
+    }
+
+    pub(crate) fn take_registration(&mut self) -> Option<HvpatchTaskRegistration> {
+        self.registration.take()
+    }
+
+    pub(crate) fn runtime_task_state(
+        &self,
+        page_tables: carrick_aarch64::Stage1Authority,
+        protections: std::sync::Arc<MemoryProtections>,
+    ) -> Result<HvfTaskState, TrapError> {
+        self.registration
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .runtime_task_state(page_tables, protections)
+    }
+
+    pub(crate) fn apply_inventory(
+        &self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        self.registration
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .apply_inventory(apply)
+    }
+
+    pub(crate) fn shares_another_process_inventory(&self) -> bool {
+        self.registration
+            .as_ref()
+            .is_some_and(|registration| registration.shares_another_process_inventory())
+    }
+
+    pub(crate) fn prepare_inventory_retirement(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), TrapError> {
+        self.registration
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .prepare_inventory_retirement(commit)
+    }
+
+    pub(crate) fn apply_inventory_retirement(
+        &self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        self.registration
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .apply_inventory_retirement(apply)
+    }
+
+    pub(crate) fn bind_child_kernel(
+        &mut self,
+        binding: HvpatchChildKernelBinding,
+    ) -> Result<(), TrapError> {
+        self.registration
+            .as_mut()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .bind_child_kernel(binding)
+    }
+
+    pub(crate) fn activate(&self) -> Result<(), TrapError> {
+        self.registration
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .activate()
+    }
+
+    fn cleanup_exact(&mut self) {
+        let Some(registration) = self.registration.take() else {
+            return;
+        };
+        registration.cleanup().unwrap_or_else(|error| {
+            carrick_fatal!(
+                "hvpatch::task_backend_lifecycle",
+                "exact deferred HVPatch task cleanup: {error}"
+            );
+        });
+    }
+}
+
+impl Drop for HvpatchTaskOnlyBackendState {
+    fn drop(&mut self) {
+        self.cleanup_exact();
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct HvpatchCarrierTaskIdentity {
+    pub task_serial: u64,
+    pub thread_serial: u64,
+    pub execution_generation: u64,
+    pub linux_pid: i32,
+    pub linux_tid: i32,
+    pub asid: u16,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use carrick_hal::HvpatchChildKernelToken as HvpatchChildKernelBinding;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct HvpatchCarrierTaskStateKey {
+    directory_instance: std::num::NonZeroU64,
+    task_serial: u64,
+    thread_serial: u64,
+    execution_generation: u64,
+    nonce: std::num::NonZeroU64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(dead_code)]
+enum HvpatchCarrierTaskState {
+    Sibling {
+        vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    },
+    /// A distinct Linux process which retains an already-published MM.  The
+    /// existing carrier-MM row owns the VM/stage-2 lifecycle; this edge owns no
+    /// replacement carrier authority of its own.
+    SharedProcess {
+        vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    },
+    Process {
+        vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+        stage2_leases: Vec<GlobalFrameStage2Lease>,
+    },
+    #[cfg(test)]
+    Test {
+        rollbacks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
+    },
+    #[cfg(test)]
+    LeaseTest {
+        stage2_leases: Vec<GlobalFrameStage2Lease>,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum HvpatchCarrierMmAuthority {
+    Live {
+        stage2_logical_leases: Vec<CarrierStage2LogicalLease>,
+        custody: std::sync::Weak<CarrierVmCustody>,
+        frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+        _vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    },
+    #[cfg(test)]
+    Test {
+        order: std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>,
+    },
+    #[cfg(test)]
+    LeaseTest {
+        stage2_lease_keys: Vec<(u64, u64)>,
+        frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CarrierStage2LogicalLease {
+    key: (u64, u64),
+    logical_owner: Option<CarrierLogicalOwner>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn carrier_stage2_logical_leases(
+    custody: &CarrierVmCustody,
+    identities: &[CarrierStage2RecordIdentity],
+) -> Vec<CarrierStage2LogicalLease> {
+    identities
+        .iter()
+        .filter_map(|identity| {
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .map(|snapshot| CarrierStage2LogicalLease {
+                    key: (snapshot.ipa, snapshot.len as u64),
+                    logical_owner: identity.logical_owner,
+                })
+        })
+        .collect()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn request_carrier_stage2_record_retirements(
+    stage2_logical_leases: &mut Vec<CarrierStage2LogicalLease>,
+    custody: &std::sync::Weak<CarrierVmCustody>,
+    frames: &std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+) {
+    let Some(custody) = custody.upgrade() else {
+        stage2_logical_leases.clear();
+        return;
+    };
+    let mut frames = frames.lock();
+    for logical_lease in std::mem::take(stage2_logical_leases) {
+        let Some(identity) = custody
+            .carrier_stage2_records
+            .lock()
+            .get(&logical_lease.key)
+            .copied()
+            .filter(|identity| identity.logical_owner == logical_lease.logical_owner)
+        else {
+            continue;
+        };
+        let Some(snapshot) = custody.stage2_record_snapshot(identity.record_id) else {
+            continue;
+        };
+        let key = (snapshot.ipa, snapshot.len as u64);
+        let authority_retained = frames.authority_retained_stage2.remove(&key);
+        if frames.stage2_references.contains_key(&key) || authority_retained {
+            // Another MM still names this physical lease, or the Kernel reported
+            // a mapping outside the backend population. Consume the one-shot
+            // handoff and leave the process-global carrier registry as owner;
+            // a later exact retirement takes it through
+            // `retire_stage2_extent_from_mappings`.
+            continue;
+        }
+        let _ = custody.request_stage2_record_retirement(identity);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for HvpatchCarrierMmAuthority {
+    fn drop(&mut self) {
+        match self {
+            Self::Live {
+                stage2_logical_leases,
+                custody,
+                frames,
+                ..
+            } => {
+                request_carrier_stage2_record_retirements(stage2_logical_leases, custody, frames);
+            }
+            #[cfg(test)]
+            Self::Test { order } => {
+                order.lock().push("carrier");
+            }
+            #[cfg(test)]
+            Self::LeaseTest {
+                stage2_lease_keys,
+                frames,
+            } => {
+                let custody = legacy_test_carrier_vm_custody_arc();
+                let identities = stage2_lease_keys
+                    .drain(..)
+                    .filter_map(|key| custody.carrier_stage2_records.lock().get(&key).copied())
+                    .collect::<Vec<_>>();
+                let mut logical_leases = carrier_stage2_logical_leases(custody, &identities);
+                request_carrier_stage2_record_retirements(
+                    &mut logical_leases,
+                    &std::sync::Arc::downgrade(custody),
+                    frames,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct HvpatchCarrierTaskRow {
+    _mm: Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
+    #[cfg(test)]
+    rollbacks: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn rollback_failed_directory_publication(
+    task_mm: &std::sync::Arc<HvpatchTaskMmAuthority>,
+    row: HvpatchCarrierTaskRow,
+    carrier_mm: Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
+) -> Result<
+    (
+        HvpatchCarrierTaskRow,
+        Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
+    ),
+    TrapError,
+> {
+    #[cfg(test)]
+    if let Some(rollbacks) = &row.rollbacks {
+        rollbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    task_mm.rollback_unpublished_before_carrier_drop()?;
+    Ok((row, carrier_mm))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct HvpatchMmAuthorityKey {
+    task_serial: u64,
+    mm_root_slot: Option<(u64, u64)>,
+    shared_kernel_mm: Option<u64>,
+}
+
+/// Who holds the reusable global-frame owner row a task mapping names.
+///
+/// Reusable global frames are shared by IPA across processes: a forked child
+/// borrows the parent's private frames COW, a CLONE_VM sibling views every row
+/// of its process, and an exec rebind re-describes the process's own live rows.
+/// The `owner_generation` stamped on such a descriptor is ANOTHER authority's
+/// live generation, so it is never permission to retire the row. Only the
+/// preparation that registered a row may retire it when that preparation
+/// unwinds; reading the stamped generation as ownership retired live parent
+/// heap frames under a running process whenever a fork was abandoned after
+/// `prepare` (the go `os/exec` crash after a load-induced `fork(2) = EAGAIN`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlobalFrameOwnerRole {
+    /// Not a reusable global frame, or its owner row belongs to another
+    /// authority. Unwinding this task must leave the row alone.
+    Borrowed,
+    /// `prepare_task_only_plan` registered `owner_generation` for this task;
+    /// unwinding the preparation retires exactly that generation.
+    Registered,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(dead_code)] // consumed by the worker-side binding load transaction in the next slice
+struct HvpatchTaskMappingState {
+    start: u64,
+    ipa: u64,
+    physical_ipa: u64,
+    end: u64,
+    host_addr: *mut u8,
+    physical_host_addr: *mut u8,
+    size: usize,
+    physical_size: usize,
+    perms: applevisor::memory::MemPerms,
+    guest_writable: bool,
+    host_mapping: Option<crate::host_mapping::OwnedHostMapping>,
+    structural_owner: Option<std::sync::Arc<StructuralBackingOwner>>,
+    is_dynamic_alias: bool,
+    sharing: GuestMappingSharing,
+    shared_key_base: u64,
+    shared_key_offset: u64,
+    owner_generation: u64,
+    global_frame_owner_role: GlobalFrameOwnerRole,
+}
+unsafe impl Send for HvpatchTaskMappingState {}
+// SAFETY: these pointers are immutable address metadata naming MM-owned host
+// mappings. Access is authenticated through the stage-1/frame authority and
+// synchronized by the worker transaction; the descriptor never dereferences
+// them on its own.
+unsafe impl Sync for HvpatchTaskMappingState {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchTaskMappingState {
+    fn unowned_runtime_region(&self) -> HvfMappedRegion {
+        HvfMappedRegion {
+            start: self.start,
+            ipa: self.ipa,
+            physical_ipa: self.physical_ipa,
+            end: self.end,
+            host_addr: self.host_addr,
+            size: self.physical_size,
+            physical_size: self.physical_size,
+            perms: self.perms,
+            memory: None,
+            host_mapping: None,
+            structural_owner: self.structural_owner.clone(),
+            stage2_lease: None,
+            is_dynamic_alias: self.is_dynamic_alias,
+            sharing: self.sharing,
+            guest_writable: self.guest_writable,
+            shared_key_base: self.shared_key_base,
+            shared_key_offset: self.shared_key_offset,
+            owner_generation: self.owner_generation,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+#[allow(dead_code)] // retained task authority; worker-side load consumes these fields
+struct HvpatchPreparedTaskAuthority {
+    custody: Option<std::sync::Arc<CarrierVmCustody>>,
+    foreign_mm_transport: Option<std::sync::Arc<CarrierForeignMmTransport>>,
+    mappings: Vec<HvpatchTaskMappingState>,
+    mm_root_slot: Option<(u64, u64)>,
+    /// Exact structural root record captured while this process mapping is
+    /// published, before frame inventory selection can omit it.
+    mm_root_stage2: Option<MmRootStage2Authority>,
+    container_root: ContainerRootToken,
+    /// Shared processes use the Kernel's exact MM identity to intern one MM
+    /// projection even when the root parent has no task-only directory row.
+    shared_kernel_mm: Option<u64>,
+    inventory: HvpatchTaskInventoryAuthority,
+    cow_authority: Option<std::sync::Arc<dyn carrick_hal::FrameCowAuthority>>,
+    cow_identity: Option<carrick_hal::FrameCowIdentity>,
+    cow_armed: Option<std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>>,
+    cow_deferred_publications:
+        Option<std::sync::Arc<parking_lot::Mutex<Vec<PendingFrameCowPublication>>>>,
+    /// Exact MM state inherited by a sibling or CLONE_VM process projection.
+    ///
+    /// This must move as one Arc rather than being reconstructed from its
+    /// ledger/COW components: the Arc also owns the exact structural stage-2
+    /// authority for the reusable stage-1 root slot.
+    inherited_mm_access: Option<std::sync::Arc<MmAccessState>>,
+    pending_receipts: Vec<PendingForkFrameReceipt>,
+    pending_aliases: Vec<AliasBacking>,
+    #[cfg(test)]
+    drop_order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
+    #[cfg(test)]
+    abort_order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+#[allow(dead_code)] // publication/activation is consumed by the next runtime wiring slice
+enum HvpatchTaskInventoryAuthority {
+    #[default]
+    Absent,
+    SiblingShared {
+        ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    },
+    SharedProcess {
+        ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    },
+    ProcessPrepared {
+        ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+        staged: Vec<((u64, u64), InventoryExtent)>,
+        commit: Option<carrick_hal::FrameInventoryCommit<()>>,
+        challenge: Option<carrick_hal::FrameInventoryReceiptChallenge>,
+    },
+    InventoryPublished {
+        ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+        staged: Vec<((u64, u64), InventoryExtent)>,
+        receipt: carrick_hal::FrameInventoryApplyReceipt,
+    },
+    Active {
+        ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+        receipt: carrick_hal::FrameInventoryApplyReceipt,
+        retirement: Option<HvpatchPreparedInventoryRetirement>,
+    },
+    Retired,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct HvpatchPreparedInventoryRetirement {
+    commit: carrick_hal::FrameInventoryCommit<()>,
+    challenge: carrick_hal::FrameInventoryReceiptChallenge,
+    expected_mappings: Vec<(carrick_hal::MappingId, carrick_hal::FrameId)>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(dead_code)] // transitions are exposed to the next publication wiring slice
+impl HvpatchTaskInventoryAuthority {
+    fn shared_runtime_ledger(
+        &self,
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>> {
+        match self {
+            Self::SiblingShared { ledger }
+            | Self::SharedProcess { ledger }
+            | Self::ProcessPrepared { ledger, .. }
+            | Self::InventoryPublished { ledger, .. }
+            | Self::Active { ledger, .. } => Some(std::sync::Arc::clone(ledger)),
+            Self::Absent | Self::Retired => None,
+        }
+    }
+
+    fn shared_frame_registry(
+        &self,
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>> {
+        self.shared_runtime_ledger()
+            .map(|ledger| std::sync::Arc::clone(&ledger.lock().frames))
+    }
+
+    fn apply_process_inventory(
+        &mut self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+        expected_mm: std::num::NonZeroU64,
+    ) -> Result<(), TrapError> {
+        let current = std::mem::replace(self, Self::Retired);
+        match current {
+            Self::ProcessPrepared {
+                ledger,
+                staged,
+                mut commit,
+                mut challenge,
+            } => {
+                if let (Some(commit), Some(challenge)) = (commit.take(), challenge.take()) {
+                    match apply(commit) {
+                        Ok(receipt) if challenge.authenticate_apply(&receipt, expected_mm) => {
+                            *self = Self::InventoryPublished {
+                                ledger,
+                                staged,
+                                receipt,
+                            };
+                            Ok(())
+                        }
+                        Ok(_) => {
+                            carrick_fatal!(
+                                "hvpatch::frame_inventory",
+                                "Kernel returned a malformed successful HVPatch inventory receipt"
+                            );
+                        }
+                        Err(_) => {
+                            let mut inventory = ledger.lock();
+                            HvfVmState::rollback_unpublished_mappings(&mut inventory, &staged)?;
+                            Err(TrapError::Hypervisor(
+                                "kernel rejected or mis-authenticated HVPatch inventory apply"
+                                    .to_owned(),
+                            ))
+                        }
+                    }
+                } else {
+                    *self = Self::ProcessPrepared {
+                        ledger,
+                        staged,
+                        commit,
+                        challenge,
+                    };
+                    Err(TrapError::Hypervisor(
+                        "prepared HVPatch process inventory lost its commit".to_owned(),
+                    ))
+                }
+            }
+            other => {
+                *self = other;
+                Err(TrapError::Hypervisor(
+                    "only a prepared process owner may publish HVPatch inventory".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn activate(&mut self, pending_receipts: &[PendingForkFrameReceipt]) -> Result<(), TrapError> {
+        let current = std::mem::replace(self, Self::Retired);
+        match current {
+            Self::SiblingShared { ledger } => {
+                *self = Self::SiblingShared { ledger };
+                Ok(())
+            }
+            Self::SharedProcess { ledger } => {
+                *self = Self::SharedProcess { ledger };
+                Ok(())
+            }
+            Self::Active {
+                ledger,
+                receipt,
+                retirement,
+            } => {
+                *self = Self::Active {
+                    ledger,
+                    receipt,
+                    retirement,
+                };
+                Ok(())
+            }
+            Self::InventoryPublished {
+                ledger,
+                staged,
+                receipt,
+            } => {
+                if authenticate_pending_fork_receipts(pending_receipts, &receipt) {
+                    *self = Self::Active {
+                        ledger,
+                        receipt,
+                        retirement: None,
+                    };
+                    Ok(())
+                } else {
+                    *self = Self::InventoryPublished {
+                        ledger,
+                        staged,
+                        receipt,
+                    };
+                    Err(TrapError::Hypervisor(
+                        "HVPatch fork receipts failed inventory authentication".to_owned(),
+                    ))
+                }
+            }
+            other => {
+                let phase = other.phase_name();
+                *self = other;
+                Err(TrapError::Hypervisor(format!(
+                    "HVPatch inventory activation requires published inventory (phase={phase})"
+                )))
+            }
+        }
+    }
+
+    fn prepare_retirement(
+        &mut self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), TrapError> {
+        match self {
+            Self::Active {
+                ledger, retirement, ..
+            } if retirement.is_none() => {
+                // ONE invariant: the commit must cover exactly what this mm
+                // owned WHEN ITS RETIREMENT WAS STAGED.
+                //
+                // `stage_retirement` pushes an `UnmapMapping` per extent and
+                // then clears `extents` in the same critical section, so on the
+                // production path the live ledger is empty by construction and
+                // the snapshot it recorded there is the only faithful statement
+                // of that set. A caller that has not staged yet still has its
+                // set in `extents`. Taking the snapshot also makes a duplicate
+                // retirement fail closed instead of silently passing.
+                let mut expected_mappings = {
+                    let mut ledger = ledger.lock();
+                    let staged = std::mem::take(&mut ledger.retirement_expected);
+                    if staged.is_empty() {
+                        ledger
+                            .extents
+                            .values()
+                            .map(|extent| (extent.mapping, extent.frame))
+                            .collect()
+                    } else {
+                        staged
+                    }
+                };
+                expected_mappings.sort_unstable();
+                expected_mappings.dedup();
+                let mut committed_unmaps: Vec<_> = commit
+                    .batch()
+                    .events()
+                    .iter()
+                    .filter_map(|event| match *event {
+                        carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
+                            Some(mapping)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                committed_unmaps.sort_unstable();
+                committed_unmaps.dedup();
+                let expected_ids: Vec<_> = expected_mappings
+                    .iter()
+                    .map(|(mapping, _)| *mapping)
+                    .collect();
+                if expected_mappings.is_empty() || committed_unmaps != expected_ids {
+                    // Name the exact disagreement. "does not cover" alone cannot
+                    // distinguish an empty ledger from a commit that unmaps a
+                    // different set, and those call for opposite fixes.
+                    let ledger_only: Vec<_> = expected_ids
+                        .iter()
+                        .filter(|id| !committed_unmaps.contains(id))
+                        .take(8)
+                        .collect();
+                    let commit_only: Vec<_> = committed_unmaps
+                        .iter()
+                        .filter(|id| !expected_ids.contains(id))
+                        .take(8)
+                        .collect();
+                    return Err(TrapError::Hypervisor(format!(
+                        "retirement commit does not cover exact current HVPatch MM ledger                          (ledger={} commit={} ledger_only={ledger_only:?} commit_only={commit_only:?})",
+                        expected_ids.len(),
+                        committed_unmaps.len(),
+                    )));
+                }
+                let challenge = commit.receipt_challenge();
+                *retirement = Some(HvpatchPreparedInventoryRetirement {
+                    commit,
+                    challenge,
+                    expected_mappings,
+                });
+                Ok(())
+            }
+            // Name the phase. "duplicate or not active" covers six distinct
+            // states that call for different fixes: `retired` means a second
+            // retirement path reached the same authority, while `prepared` or
+            // `inventory_published` means retirement raced ahead of activation.
+            other => {
+                let phase = other.phase_name();
+                Err(TrapError::Hypervisor(format!(
+                    "HVPatch inventory retirement is duplicate or not active (phase={phase})"
+                )))
+            }
+        }
+    }
+
+    fn apply_retirement(
+        &mut self,
+        expected_mm: std::num::NonZeroU64,
+        pending_receipts: &[PendingForkFrameReceipt],
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        let current = std::mem::replace(self, Self::Retired);
+        match current {
+            Self::Active {
+                ledger,
+                receipt,
+                retirement: Some(retirement),
+            } => match apply(retirement.commit) {
+                Ok(retired) => {
+                    let challenge = retirement
+                        .challenge
+                        .authenticate_retirement(&retired, expected_mm);
+                    let revision_advanced = retired.revision() > receipt.revision();
+                    let transaction_distinct = retired.transaction() != receipt.transaction();
+                    let audit = authenticate_pending_retirement(
+                        &retirement.expected_mappings,
+                        pending_receipts,
+                        &retired,
+                    );
+                    if challenge && revision_advanced && transaction_distinct && audit.ok() {
+                        return Ok(());
+                    }
+                    // Abort is unrecoverable, so name the exact clause that
+                    // rejected the receipt rather than only its verdict.
+                    //
+                    // A rejected pending fork receipt has two very different
+                    // shapes: the child mapping is absent from the retirement
+                    // entirely (a superseded mapping id), or it is present under
+                    // a DIFFERENT frame (the child COW'd the inherited page).
+                    // Print which, because they call for opposite fixes.
+                    let unauthorized: Vec<String> = pending_receipts
+                        .iter()
+                        .filter(|pending| !retired.authorizes(pending.child_mapping, pending.frame))
+                        .take(6)
+                        .map(|pending| {
+                            let retired_frame = retired
+                                .mapping_set()
+                                .iter()
+                                .find(|(mapping, _)| *mapping == pending.child_mapping)
+                                .map(|(_, frame)| *frame);
+                            format!(
+                                "{{child={:?} receipt_frame={:?} retirement_frame={retired_frame:?} \
+                                 parent={:?} ipa={:#x} len={:#x} kind={:?}}}",
+                                pending.child_mapping,
+                                pending.frame,
+                                pending.parent_mapping,
+                                pending.ipa,
+                                pending.length,
+                                pending.kind,
+                            )
+                        })
+                        .collect();
+                    carrick_fatal!(
+                        "hvpatch::frame_inventory",
+                        "Kernel returned a malformed successful HVPatch retirement receipt\
+                         (challenge={challenge} revision_advanced={revision_advanced} \
+                         transaction_distinct={transaction_distinct} {audit:?} \
+                         receipt_revision={} retired_revision={} expected_mappings={} \
+                         receipt_mapping_set={} pending_receipts={} \
+                         unauthorized={unauthorized:?})",
+                        receipt.revision(),
+                        retired.revision(),
+                        retirement.expected_mappings.len(),
+                        retired.mapping_set().len(),
+                        pending_receipts.len(),
+                    );
+                }
+                Err(error) => {
+                    *self = Self::Active {
+                        ledger,
+                        receipt,
+                        retirement: None,
+                    };
+                    Err(error)
+                }
+            },
+            other => {
+                *self = other;
+                Err(TrapError::Hypervisor(
+                    "HVPatch inventory retirement lacks an owned prepared commit".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn rollback_unpublished(&mut self) -> Result<(), TrapError> {
+        let current = std::mem::replace(self, Self::Retired);
+        match current {
+            Self::Absent
+            | Self::SiblingShared { .. }
+            | Self::SharedProcess { .. }
+            | Self::Retired => Ok(()),
+            Self::ProcessPrepared {
+                ledger,
+                staged,
+                commit,
+                challenge: _,
+            } => {
+                let mut inventory = ledger.lock();
+                HvfVmState::rollback_unpublished_mappings(&mut inventory, &staged)?;
+                drop(commit);
+                Ok(())
+            }
+            Self::InventoryPublished { .. } | Self::Active { .. } => {
+                let phase = current.phase_name();
+                *self = current;
+                Err(TrapError::Hypervisor(format!(
+                    "published HVPatch inventory dropped before exact retirement (phase={phase})"
+                )))
+            }
+        }
+    }
+
+    fn retire_exec_predecessor(&mut self) {
+        let current = std::mem::replace(self, Self::Retired);
+        if let Self::ProcessPrepared {
+            ledger,
+            staged,
+            commit,
+            challenge: _,
+        } = current
+        {
+            if let Some(mut inventory) = ledger.try_lock() {
+                let _ = HvfVmState::rollback_unpublished_mappings(&mut inventory, &staged);
+            }
+            drop(commit);
+        }
+    }
+
+    /// Does this task merely SHARE another process's frame-inventory ledger?
+    ///
+    /// A vfork/`CLONE_VM` task is published `SharedProcess` (or `SiblingShared`)
+    /// because its kernel mm belongs to another process. `activate` and
+    /// `rollback_unpublished` already treat those phases as having nothing of
+    /// their own to publish or roll back, and retirement is the same: the OWNER
+    /// retires the ledger. Staging a retirement from a shared ledger would unmap
+    /// the owner's live mappings.
+    ///
+    /// `Retired` and `Absent` are deliberately NOT folded in here. A second
+    /// retirement of an OWNED ledger must keep being refused by
+    /// `prepare_retirement`, not silently skipped.
+    fn shares_another_process_inventory(&self) -> bool {
+        matches!(
+            self,
+            Self::SiblingShared { .. } | Self::SharedProcess { .. }
+        )
+    }
+
+    fn phase_name(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::SiblingShared { .. } => "sibling_shared",
+            Self::SharedProcess { .. } => "shared_process",
+            Self::ProcessPrepared { .. } => "prepared",
+            Self::InventoryPublished { .. } => "inventory_published",
+            Self::Active { .. } => "active",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HvpatchTaskMmHolder {
+    Registration,
+    RegistrationDrop,
+    RegistrationCleanup,
+    LiveExecutor,
+    CarrierDirectory,
+    DormantRetire,
+    ExecRebind,
+    FailpointRollback,
+    #[cfg(test)]
+    Test,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Display for HvpatchTaskMmHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Registration => write!(f, "registration"),
+            Self::RegistrationDrop => write!(f, "registration-drop"),
+            Self::RegistrationCleanup => write!(f, "registration-cleanup"),
+            Self::LiveExecutor => write!(f, "live-executor"),
+            Self::CarrierDirectory => write!(f, "carrier-directory"),
+            Self::DormantRetire => write!(f, "dormant-retire"),
+            Self::ExecRebind => write!(f, "exec-rebind"),
+            Self::FailpointRollback => write!(f, "failpoint-rollback"),
+            #[cfg(test)]
+            Self::Test => write!(f, "test"),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(dead_code)] // retained MM authority; worker-side load consumes these fields
+pub(crate) struct HvpatchTaskMmAuthority {
+    mappings: Vec<HvpatchTaskMappingState>,
+    foreign_mm_transport: Option<std::sync::Arc<CarrierForeignMmTransport>>,
+    mm_root_slot: Option<(u64, u64)>,
+    /// Publication-time root custody moves exactly once into the shared
+    /// `MmAccessState` when the first executor activates this MM.
+    mm_root_stage2: parking_lot::Mutex<Option<MmRootStage2Authority>>,
+    container_root: ContainerRootToken,
+    inventory: parking_lot::Mutex<HvpatchTaskInventoryAuthority>,
+    kernel_mm: parking_lot::Mutex<Option<std::num::NonZeroU64>>,
+    cow_armed: Option<std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>>,
+    cow_deferred_publications:
+        Option<std::sync::Arc<parking_lot::Mutex<Vec<PendingFrameCowPublication>>>>,
+    /// Lazily installed exact per-MM state. Repeated executor loads and
+    /// CLONE_VM projections receive this same Arc.
+    mm_access: parking_lot::Mutex<Option<std::sync::Arc<MmAccessState>>>,
+    /// One-shot observation copy. Retirement keeps `pending_receipts` for its
+    /// exact Kernel receipt challenge, but an executor reload must never
+    /// republish an older fork mapping after COW or munmap supersedes it.
+    pending_publication_receipts: parking_lot::Mutex<Vec<PendingForkFrameReceipt>>,
+    /// Outstanding fork-inheritance obligations the retirement challenge must
+    /// account for. They move with the inventory phase when an exec hands an
+    /// `Active` authority to a live CLONE_VM sharer.
+    pending_receipts: parking_lot::Mutex<Vec<PendingForkFrameReceipt>>,
+    alias_receipts: parking_lot::Mutex<Vec<AliasPublicationReceipt>>,
+    last_holder: parking_lot::Mutex<HvpatchTaskMmHolder>,
+    #[cfg(test)]
+    drop_order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(dead_code)] // next publication slice invokes these exact MM transitions
+impl HvpatchTaskMmAuthority {
+    fn from_prepared(
+        mut prepared: HvpatchPreparedTaskAuthority,
+        alias_receipt: AliasPublicationReceipt,
+    ) -> Self {
+        let pending_receipts = std::mem::take(&mut prepared.pending_receipts);
+        Self {
+            mappings: std::mem::take(&mut prepared.mappings),
+            foreign_mm_transport: prepared.foreign_mm_transport.take(),
+            mm_root_slot: prepared.mm_root_slot,
+            mm_root_stage2: parking_lot::Mutex::new(prepared.mm_root_stage2.take()),
+            container_root: prepared.container_root,
+            inventory: parking_lot::Mutex::new(std::mem::take(&mut prepared.inventory)),
+            kernel_mm: parking_lot::Mutex::new(None),
+            cow_armed: prepared.cow_armed.take(),
+            cow_deferred_publications: prepared.cow_deferred_publications.take(),
+            mm_access: parking_lot::Mutex::new(prepared.inherited_mm_access.take()),
+            pending_publication_receipts: parking_lot::Mutex::new(pending_receipts.clone()),
+            pending_receipts: parking_lot::Mutex::new(pending_receipts),
+            alias_receipts: parking_lot::Mutex::new(vec![alias_receipt]),
+            last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Registration),
+            #[cfg(test)]
+            drop_order: prepared.drop_order.take(),
+        }
+    }
+
+    pub(crate) fn record_holder(&self, holder: HvpatchTaskMmHolder) {
+        *self.last_holder.lock() = holder;
+    }
+
+    fn apply_inventory(
+        &self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        let mm = (*self.kernel_mm.lock()).ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch MM has no exact Kernel binding".to_owned())
+        })?;
+        self.inventory.lock().apply_process_inventory(apply, mm)
+    }
+
+    fn activate(&self) -> Result<(), TrapError> {
+        self.inventory
+            .lock()
+            .activate(&self.pending_receipts.lock())
+    }
+
+    fn shares_another_process_inventory(&self) -> bool {
+        self.inventory.lock().shares_another_process_inventory()
+    }
+
+    fn prepare_retirement(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), TrapError> {
+        self.inventory.lock().prepare_retirement(commit)
+    }
+
+    fn apply_retirement(
+        &self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        let mm = (*self.kernel_mm.lock()).ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch MM has no exact Kernel binding".to_owned())
+        })?;
+        let pending = self.pending_receipts.lock();
+        self.inventory.lock().apply_retirement(mm, &pending, apply)
+    }
+
+    fn retire_exec_predecessor(&self) {
+        self.inventory.lock().retire_exec_predecessor();
+    }
+
+    /// Is this authority the `Active` owner of a published inventory?
+    fn owns_active_inventory(&self) -> bool {
+        matches!(
+            &*self.inventory.lock(),
+            HvpatchTaskInventoryAuthority::Active { .. }
+        )
+    }
+
+    /// Move this `Active` inventory -- the Kernel apply receipt and every
+    /// outstanding fork-inheritance receipt -- to `sharer`, the CLONE_VM/vfork
+    /// process that keeps the mm after the owner execs (`RetainOldMm`).
+    ///
+    /// The Kernel names the sharer as the mm's surviving owner, so the sharer's
+    /// terminal path is where the exact retirement must be issued from; leaving
+    /// the receipt on the exec'ing owner's authority either discards it (last
+    /// holder, `retire_exec_predecessor`) or aborts the carrier when a sibling
+    /// thread's registration drops it still `Active`. After the hand-off the
+    /// owner's phase is `Retired`, so every remaining holder drops it inertly.
+    fn hand_off_inventory_to_sharer(&self, sharer: &Self) -> Result<(), TrapError> {
+        let mm = (*self.kernel_mm.lock()).ok_or_else(|| {
+            TrapError::Hypervisor(
+                "HVPatch exec predecessor hand-off has no exact Kernel binding".to_owned(),
+            )
+        })?;
+        sharer.bind_kernel_mm(mm)?;
+        let mut inventory = self.inventory.lock();
+        let mut sharer_inventory = sharer.inventory.lock();
+        let ledger = match &*inventory {
+            HvpatchTaskInventoryAuthority::Active {
+                ledger,
+                retirement: None,
+                ..
+            } => std::sync::Arc::clone(ledger),
+            other => {
+                return Err(TrapError::Hypervisor(format!(
+                    "HVPatch exec predecessor hand-off from phase={}",
+                    other.phase_name()
+                )));
+            }
+        };
+        match &*sharer_inventory {
+            HvpatchTaskInventoryAuthority::SharedProcess {
+                ledger: sharer_ledger,
+            } if std::sync::Arc::ptr_eq(sharer_ledger, &ledger) => {}
+            other => {
+                return Err(TrapError::Hypervisor(format!(
+                    "HVPatch exec predecessor hand-off to sharer phase={} on a foreign ledger",
+                    other.phase_name()
+                )));
+            }
+        }
+        *sharer_inventory =
+            std::mem::replace(&mut *inventory, HvpatchTaskInventoryAuthority::Retired);
+        sharer
+            .pending_receipts
+            .lock()
+            .extend(self.pending_receipts.lock().drain(..));
+        Ok(())
+    }
+
+    fn rollback_unpublished_before_carrier_drop(&self) -> Result<(), TrapError> {
+        self.inventory.lock().rollback_unpublished()
+    }
+
+    fn bind_kernel_mm(&self, mm: std::num::NonZeroU64) -> Result<(), TrapError> {
+        let mut bound = self.kernel_mm.lock();
+        match *bound {
+            None => {
+                *bound = Some(mm);
+                Ok(())
+            }
+            Some(existing) if existing == mm => Ok(()),
+            Some(_) => Err(TrapError::Hypervisor(
+                "HVPatch MM binding changed across sibling registrations".to_owned(),
+            )),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for HvpatchTaskMmAuthority {
+    fn drop(&mut self) {
+        for receipt in self.alias_receipts.get_mut().drain(..).rev() {
+            receipt.retire_exact();
+        }
+        let phase = self.inventory.get_mut().phase_name();
+        let mm_root_slot = self.mm_root_slot;
+        let kernel_mm = *self.kernel_mm.get_mut();
+        let holder = *self.last_holder.get_mut();
+        self.inventory
+            .get_mut()
+            .rollback_unpublished()
+            .unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "drop HVPatch MM authority \
+                     (phase={phase} mm_root_slot={mm_root_slot:?} kernel_mm={kernel_mm:?} holder={holder}): {error}"
+                );
+            });
+        #[cfg(test)]
+        if let Some(order) = &self.drop_order {
+            order.lock().push("task");
+        }
+        // `mappings` (and their host owners) drop only after the inventory is
+        // retired. The registration removes the carrier MM first: zero-reference
+        // stage-2 leases unmap there, while referenced leases stay parked in the
+        // process-global carrier registry for the later exact retirement.
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchPreparedTaskAuthority {
+    /// COW arming and COW deferred publication are ONE authority: a task that
+    /// can arm a COW range must also own the slot its deferred publications
+    /// land in. Publication is the last boundary that can still reject a task
+    /// cheaply — past it the child is live and a missing half aborts the
+    /// carrier when a worker activates it.
+    fn validate_cow_authority_pairing(&self) -> Result<(), TrapError> {
+        match (
+            self.cow_armed.is_some(),
+            self.cow_deferred_publications.is_some(),
+        ) {
+            (true, true) | (false, false) => Ok(()),
+            (true, false) => Err(TrapError::Hypervisor(
+                "HVPatch prepared task authority armed COW without publication state".to_owned(),
+            )),
+            (false, true) => Err(TrapError::Hypervisor(
+                "HVPatch prepared task authority holds COW publication state without arming"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    fn rollback_unpublished_inventory(&mut self) -> Result<(), TrapError> {
+        // Pending aliases have never touched either global registry.  The
+        // publication receipt owns exact preimages only after commit.
+        self.inventory.rollback_unpublished()?;
+        #[cfg(test)]
+        if let Some(order) = &self.abort_order {
+            order.lock().push("inventory");
+        }
+        Ok(())
+    }
+
+    fn abort(mut self) -> Result<(), TrapError> {
+        self.rollback_unpublished_inventory()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn abort_prepared_task_and_carrier(
+    mut task: HvpatchPreparedTaskAuthority,
+    state: HvpatchCarrierTaskState,
+) -> Result<(), TrapError> {
+    let custody = task.custody.as_ref().cloned();
+    // The backend ledger must forget every unpublished mapping BEFORE the
+    // carrier leases can return their IPAs to the allocator. Keep `task` alive
+    // until after carrier teardown so its host mappings still back any installed
+    // stage-2 entries while the leases unmap them.
+    task.rollback_unpublished_inventory()
+        .unwrap_or_else(|error| {
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "rollback prepared HVPatch inventory before carrier teardown: {error}"
+            );
+        });
+    let state_result = state.abort();
+    let mut owner_rollback_error = None;
+    if let Some(custody) = custody.as_ref() {
+        for mapping in &task.mappings {
+            // Retire only the owner rows THIS preparation registered. Borrowed
+            // rows (a forked child's COW view of its parent's frames, a
+            // CLONE_VM sibling's view of its process) stay live for their
+            // owner; retiring them here unmapped a running parent's heap.
+            if mapping.global_frame_owner_role == GlobalFrameOwnerRole::Registered {
+                let outcome = retire_global_frame_host_owner_if_generation_in(
+                    custody,
+                    mapping.physical_ipa,
+                    mapping.physical_size as u64,
+                    mapping.owner_generation,
+                );
+                if !outcome.is_retired() {
+                    owner_rollback_error = Some(TrapError::Hypervisor(format!(
+                        "prepared task global owner rollback deferred: {outcome:?}"
+                    )));
+                }
+            }
+        }
+    }
+    drop(task);
+    state_result?;
+    if let Some(custody) = custody.as_ref()
+        && let Err(error) = retry_structural_backing_retirements_in_using(
+            custody,
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+    {
+        owner_rollback_error = Some(error);
+    }
+    if let Some(error) = owner_rollback_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+struct AliasPublicationReceipt {
+    versions: Vec<(AliasOwnershipScope, AliasPublicationVersionId)>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct AliasPublicationVersionId {
+    pub(crate) owner: HvpatchCarrierTaskStateKey,
+    pub(crate) ordinal: u32,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnedAliasVersion {
+    pub(crate) id: AliasPublicationVersionId,
+    pub(crate) value: AliasBacking,
+    pub(crate) epoch: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AliasVersionChain {
+    // The `(start, ipa, scope)` tuple is the map key; it is deliberately not
+    // duplicated into the value, so the key and the row can never disagree.
+    pub(crate) base: Option<AliasBacking>,
+    pub(crate) versions: Vec<OwnedAliasVersion>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) type AliasVersionKey = (u64, u64, AliasOwnershipScope);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn alias_version_key(alias: &AliasBacking) -> AliasVersionKey {
+    (alias.start, alias.ipa, alias.ownership_scope)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnedReplayVersion {
+    pub(crate) id: AliasPublicationVersionId,
+    pub(crate) value: ReplayMappingKey,
+    pub(crate) epoch: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReplayVersionChain {
+    // `physical_ipa` is the map key; see `AliasVersionChain`.
+    pub(crate) base: Vec<ReplayMappingKey>,
+    pub(crate) versions: Vec<OwnedReplayVersion>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Per-scope alias/replay version state, keyed on every axis it is looked up by.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AliasVersionRegistry {
+    pub(crate) aliases: std::collections::BTreeMap<AliasVersionKey, AliasVersionChain>,
+    pub(crate) replays: std::collections::BTreeMap<u64, ReplayVersionChain>,
+    pub(crate) alias_epochs: std::collections::BTreeMap<AliasVersionKey, u64>,
+    pub(crate) replay_epochs: std::collections::BTreeMap<u64, u64>,
+    pub(crate) alias_version_owner:
+        std::collections::BTreeMap<AliasPublicationVersionId, AliasVersionKey>,
+    pub(crate) replay_version_owner: std::collections::BTreeMap<AliasPublicationVersionId, u64>,
+}
+
+/// Hot paths whose cost must be a function of the operation, not of the
+/// carrier. Each variant owns one per-thread visited-row counter.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HotPathScan {
+    /// Linear passes over the carrier-global alias registry, replay set and
+    /// alias version chains.
+    AliasState,
+    /// Passes over one forking process's source mappings.
+    ForkMappings,
+    /// Rows one task's [`TaskMappingIndex`] offered to a lookup. The ordered
+    /// views are meant to make this a function of the ANSWER -- the covering
+    /// row and its neighbours -- not of the table, so a per-fault count that
+    /// tracks the row population names a surviving full-table walk.
+    ///
+    /// Unlike the other two variants this is counted per ROW, not per pass:
+    /// the index's queries are lazy ordered walks whose length is not known
+    /// until the consumer stops pulling, so one thread-local `Cell` add per
+    /// visited row is the price of knowing the walk length at all.
+    TaskMappings,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+thread_local! {
+    static ALIAS_STATE_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FORK_MAPPING_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TASK_MAPPING_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Account one linear pass over the alias / replay / version state.
+///
+/// This exists so an algorithmic-complexity regression is a TEST FAILURE
+/// rather than a timing observation. Replay sets and alias version chains
+/// are partitioned per alias scope in `AliasScopeBucket`, while historical
+/// carrier-global alias containers held rows belonging to every live guest process.
+/// A per-process operation that scans foreign rows is O(all processes) — the
+/// `docs/identity-and-scope-domains.md` scope-domain defect. Measured on 2026-08-30,
+/// that made guest process exit cost 38.7 ms of globally serialized topology-lock hold
+/// with 1,000 children live, decaying monotonically to 5.3 ms as they drained: an O(N^2)
+/// exit path that `futexforkrequeue` could not reap inside its 40 s bound.
+///
+/// A wall-clock assertion for that shape is load-sensitive and would be
+/// excluded from CI within a week. A visited-row count is deterministic, so
+/// `retiring_one_owner_does_not_scan_foreign_alias_rows` can state the
+/// complexity contract directly.
+///
+/// Cost is one thread-local add per PASS (never per row), so this is always
+/// on: a counter nobody runs is a counter that lies. It is PER THREAD on
+/// purpose — a process-global counter is polluted by every other guest thread
+/// and by every concurrently running test, which made the first version of
+/// `retiring_one_owner_does_not_scan_foreign_alias_rows` report 1,539 rows
+/// under `cargo test`'s default parallelism and 513 in isolation for the same
+/// work. Per-thread also attributes the cost to the executor that paid it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn note_alias_state_rows_scanned(rows: usize) {
+    note_hot_path_rows(HotPathScan::AliasState, rows);
+}
+
+/// Account one pass over a hot-path container. See [`HotPathScan`].
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn note_hot_path_rows(scan: HotPathScan, rows: usize) {
+    let counter = match scan {
+        HotPathScan::AliasState => &ALIAS_STATE_ROWS_SCANNED,
+        HotPathScan::ForkMappings => &FORK_MAPPING_ROWS_SCANNED,
+        HotPathScan::TaskMappings => &TASK_MAPPING_ROWS_SCANNED,
+    };
+    counter.with(|cell| cell.set(cell.get().saturating_add(rows as u64)));
+}
+
+/// Account one row a [`TaskMappingIndex`] ordered query offered its consumer.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[inline]
+pub(crate) fn note_task_mapping_row_visited() {
+    TASK_MAPPING_ROWS_SCANNED.with(|cell| cell.set(cell.get().saturating_add(1)));
+}
+
+/// Visited rows for one hot path on the CALLING thread, readable by shipped
+/// code. Monotonic; callers difference two reads around the operation.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn hot_path_rows_scanned_live(scan: HotPathScan) -> u64 {
+    match scan {
+        HotPathScan::AliasState => ALIAS_STATE_ROWS_SCANNED.with(std::cell::Cell::get),
+        HotPathScan::ForkMappings => FORK_MAPPING_ROWS_SCANNED.with(std::cell::Cell::get),
+        HotPathScan::TaskMappings => TASK_MAPPING_ROWS_SCANNED.with(std::cell::Cell::get),
+    }
+}
+
+/// Visited rows for one hot path on the CALLING thread. Monotonic; callers
+/// compare two reads around the operation under test.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn hot_path_rows_scanned(scan: HotPathScan) -> u64 {
+    hot_path_rows_scanned_live(scan)
+}
+
+/// Total rows visited by linear passes over the carrier-global alias state.
+/// Monotonic; callers compare two reads around the operation under test.
+///
+/// The COUNTER is unconditional so the shipped code path and the measured one
+/// are the same instructions; only this reader is test-scoped, because the
+/// value has no production consumer yet.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn alias_state_rows_scanned() -> u64 {
+    hot_path_rows_scanned(HotPathScan::AliasState)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn bump_version_epoch<K: Copy + Ord>(
+    epochs: &mut std::collections::BTreeMap<K, u64>,
+    key: K,
+) -> Option<u64> {
+    let epoch = epochs.entry(key).or_insert(0);
+    *epoch = epoch.checked_add(1)?;
+    Some(*epoch)
+}
+
+/// Every replay row whose leading physical IPA is `physical_ipa`.
+///
+/// `ReplayMappingKey` sorts on that IPA first, so this is a range query, not a
+/// filter over the whole carrier-global set. The linear `filter` it replaces
+/// ran once per affected key per mutation and was part of the O(N^2) exit
+/// path.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn replay_rows_for_ipa(
+    replay: &std::collections::BTreeSet<ReplayMappingKey>,
+    physical_ipa: u64,
+) -> Vec<ReplayMappingKey> {
+    use std::ops::Bound;
+    let start = Bound::Included((physical_ipa, usize::MIN, usize::MIN, u64::MIN, u64::MIN));
+    let end = match physical_ipa.checked_add(1) {
+        Some(next) => Bound::Excluded((next, usize::MIN, usize::MIN, u64::MIN, u64::MIN)),
+        None => Bound::Unbounded,
+    };
+    replay.range((start, end)).copied().collect()
+}
+
+/// Re-base one alias version chain and report the version ids it orphaned.
+///
+/// Split out so the chain mutation and the version-index cleanup borrow
+/// disjoint `AliasVersionRegistry` fields in sequence rather than at once.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reset_alias_chain(
+    chains: &mut std::collections::BTreeMap<AliasVersionKey, AliasVersionChain>,
+    key: AliasVersionKey,
+    base: Option<AliasBacking>,
+) -> Vec<AliasPublicationVersionId> {
+    match chains.get_mut(&key) {
+        Some(chain) => {
+            chain.base = base;
+            chain.versions.drain(..).map(|version| version.id).collect()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Replay-side counterpart of [`reset_alias_chain`].
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reset_replay_chain(
+    chains: &mut std::collections::BTreeMap<u64, ReplayVersionChain>,
+    physical_ipa: u64,
+    base: Vec<ReplayMappingKey>,
+) -> Vec<AliasPublicationVersionId> {
+    match chains.get_mut(&physical_ipa) {
+        Some(chain) => {
+            chain.base = base;
+            chain.versions.drain(..).map(|version| version.id).collect()
+        }
+        None => Vec::new(),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Scoped fast path for the two per-COW-fault alias mutators. The general
+/// `mutate_external_alias_state` CLONES the whole replay set and alias
+/// registry and diffs them O(n^2) per mutation to discover the touched keys;
+/// on fork-storm workloads that made every COW fault O(aliases) and
+/// `futexforkrequeue` burned its whole 45s budget in the diff (sampled:
+/// register_shared_alias walking the BTreeMap under perform_frame_cow).
+/// The hot mutators KNOW their touched keys, so this bumps exactly those
+/// epochs with the same lock order and the same chain-reset semantics.
+fn scoped_alias_epoch_update(
+    versions: &mut AliasVersionRegistry,
+    alias_change: Option<(AliasVersionKey, Option<AliasBacking>)>,
+    replay_ipas: &[u64],
+    replay: &std::collections::BTreeSet<ReplayMappingKey>,
+) {
+    if let Some((key, after)) = alias_change {
+        bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "external alias mutation epoch exhausted"
+            );
+        });
+        for id in reset_alias_chain(&mut versions.aliases, key, after) {
+            versions.alias_version_owner.remove(&id);
+        }
+    }
+    for physical_ipa in replay_ipas {
+        bump_version_epoch(&mut versions.replay_epochs, *physical_ipa).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "external replay mutation epoch exhausted"
+            );
+        });
+        let base = replay_rows_for_ipa(replay, *physical_ipa);
+        for id in reset_replay_chain(&mut versions.replays, *physical_ipa, base) {
+            versions.replay_version_owner.remove(&id);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Drop every alias row a retiring guest process owns.
+///
+/// This is the process-exit counterpart of [`scoped_alias_epoch_update`]. Two
+/// things made the previous shape O(live processes) per exit, and therefore
+/// O(N^2) across an exiting process group:
+///
+/// - the generic [`mutate_external_alias_state`] path CLONED the whole replay
+///   set and alias registry and re-derived the touched keys by diffing them,
+///   even though the caller knows exactly which rows leave; and
+/// - the registry was a flat carrier-global `Vec`, so even a single `retain`
+///   pass visited every other live process's rows.
+///
+/// `alias_is_owned_by_process` selects exactly one [`AliasOwnershipScope`], and
+/// the registry is now partitioned on that axis, so the owned rows leave as a
+/// bucket removal. The only other rows a process may drop are `Global`
+/// shared-file aliases, whose population is bounded by open files rather than
+/// by live processes. Everything else is not visited at all.
+///
+/// Measured 2026-08-30: the single-pass version was 45.4% of all carrier user
+/// CPU under a 1,000-child fork/exit storm.
+fn retire_process_aliases(
+    mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
+    global_keep: impl FnMut(&AliasBacking) -> bool,
+) {
+    // Replay sets and version chains live in AliasScopeBucket; only the
+    // alias_registry() lock is held.
+    let mut registry = alias_registry().lock();
+    retire_process_aliases_in(&mut registry, mm_root_slot, container_root, global_keep);
+}
+
+/// The body of [`retire_process_aliases`], against explicitly supplied
+/// authorities rather than the process-global ones.
+///
+/// Taking the registry as a parameter is what makes the complexity contract
+/// testable: `retiring_one_owner_does_not_scan_foreign_alias_rows` measures
+/// visited rows, and driving the carrier-global registry made that measurement
+/// depend on whatever other tests happened to be running.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retire_process_aliases_in(
+    registry: &mut AliasRegistry,
+    mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
+    mut global_keep: impl FnMut(&AliasBacking) -> bool,
+) -> RetiredRows {
+    let owned_scope = AliasRegistry::owned_scope(mm_root_slot, container_root);
+    let mut dropped_global_first = std::collections::BTreeMap::new();
+    let mut dropped_global_order = Vec::new();
+    let mut seen_global_keys = std::collections::BTreeSet::new();
+
+    let removed_owned = registry.retire_scope(owned_scope).into_vec();
+    let removed_global = registry.retain_in_scope(AliasOwnershipScope::Global, |alias| {
+        let key = alias_version_key(alias);
+        let survives = global_keep(alias);
+        if seen_global_keys.insert(key) && !survives {
+            dropped_global_first.insert(key, *alias);
+            dropped_global_order.push(key);
+        }
+        survives
+    });
+    if !removed_global.is_empty() {
+        note_alias_state_rows_scanned(removed_global.len());
+        if let Some(global_bucket) = registry.by_scope.get_mut(&AliasOwnershipScope::Global) {
+            for key in dropped_global_order {
+                let before = dropped_global_first[&key];
+                let after = global_bucket
+                    .rows
+                    .iter()
+                    .find(|(_, a)| alias_version_key(a) == key)
+                    .map(|(_, a)| *a);
+                if after == Some(before) {
+                    continue;
+                }
+                bump_version_epoch(&mut global_bucket.versions.alias_epochs, key).unwrap_or_else(
+                    || {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "external alias mutation epoch exhausted"
+                        );
+                    },
+                );
+                for id in reset_alias_chain(&mut global_bucket.versions.aliases, key, after) {
+                    global_bucket.versions.alias_version_owner.remove(&id);
+                }
+                let physical_ipa = before.physical_ipa;
+                bump_version_epoch(&mut global_bucket.versions.replay_epochs, physical_ipa)
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "external replay mutation epoch exhausted"
+                        );
+                    });
+                let base = replay_rows_for_ipa(&global_bucket.replay, physical_ipa);
+                for id in
+                    reset_replay_chain(&mut global_bucket.versions.replays, physical_ipa, base)
+                {
+                    global_bucket.versions.replay_version_owner.remove(&id);
+                }
+            }
+        }
+    }
+    RetiredRows::new(removed_owned)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mutate_external_alias_state<R>(mutate: impl FnOnce(&mut AliasRegistry) -> R) -> R {
+    // Replay sets and version chains live in AliasScopeBucket; only the
+    // alias_registry() lock is held. A mutation becomes the new effective
+    // base and invalidates older receipt versions for touched keys.
+    let mut registry = alias_registry().lock();
+    mutate_external_alias_state_in(&mut registry, mutate)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mutate_external_alias_state_in<R>(
+    registry: &mut AliasRegistry,
+    mutate: impl FnOnce(&mut AliasRegistry) -> R,
+) -> R {
+    let registry_before = registry.clone();
+    let result = mutate(registry);
+
+    note_alias_state_rows_scanned(registry_before.len() + registry.len());
+    let mut before_by_key = std::collections::BTreeMap::new();
+    for alias in registry_before.iter() {
+        before_by_key
+            .entry(alias_version_key(alias))
+            .or_insert(*alias);
+    }
+    let mut after_by_key = std::collections::BTreeMap::new();
+    for alias in registry.iter() {
+        after_by_key
+            .entry(alias_version_key(alias))
+            .or_insert(*alias);
+    }
+    let mut alias_keys = Vec::new();
+    let mut seen_alias_keys = std::collections::BTreeSet::new();
+    note_alias_state_rows_scanned(registry_before.len() + registry.len());
+    for alias in registry_before.iter().chain(registry.iter()) {
+        let key = alias_version_key(alias);
+        if seen_alias_keys.insert(key) {
+            alias_keys.push(key);
+        }
+    }
+    let mut affected_physical_ipas_by_scope: std::collections::BTreeMap<
+        AliasOwnershipScope,
+        std::collections::BTreeSet<u64>,
+    > = std::collections::BTreeMap::new();
+    for key in alias_keys {
+        let before = before_by_key.get(&key).copied();
+        let after = after_by_key.get(&key).copied();
+        if before == after {
+            continue;
+        }
+        let scope = key.2;
+        for alias in before.into_iter().chain(after) {
+            affected_physical_ipas_by_scope
+                .entry(scope)
+                .or_default()
+                .insert(alias.physical_ipa);
+        }
+        let bucket = registry.by_scope.entry(scope).or_default();
+        bump_version_epoch(&mut bucket.versions.alias_epochs, key).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "external alias mutation epoch exhausted"
+            );
+        });
+        for id in reset_alias_chain(&mut bucket.versions.aliases, key, after) {
+            bucket.versions.alias_version_owner.remove(&id);
+        }
+    }
+    let all_scopes: std::collections::BTreeSet<_> = registry_before
+        .by_scope
+        .keys()
+        .chain(registry.by_scope.keys())
+        .copied()
+        .collect();
+    for scope in all_scopes {
+        let before_replay = registry_before.by_scope.get(&scope).map(|b| &b.replay);
+        let after_replay = registry.by_scope.get(&scope).map(|b| &b.replay);
+        let empty_set = std::collections::BTreeSet::new();
+        let before_set = before_replay.unwrap_or(&empty_set);
+        let after_set = after_replay.unwrap_or(&empty_set);
+        note_alias_state_rows_scanned(before_set.len() + after_set.len());
+        for row in before_set.iter().chain(after_set.iter()) {
+            let physical_ipa = row.0;
+            let before_rows = replay_rows_for_ipa(before_set, physical_ipa);
+            let after_rows = replay_rows_for_ipa(after_set, physical_ipa);
+            if before_rows != after_rows {
+                affected_physical_ipas_by_scope
+                    .entry(scope)
+                    .or_default()
+                    .insert(physical_ipa);
+            }
+        }
+    }
+    for (scope, physical_ipas) in affected_physical_ipas_by_scope {
+        let bucket = registry.by_scope.entry(scope).or_default();
+        for physical_ipa in physical_ipas {
+            let after_rows = replay_rows_for_ipa(&bucket.replay, physical_ipa);
+            bump_version_epoch(&mut bucket.versions.replay_epochs, physical_ipa).unwrap_or_else(
+                || {
+                    carrick_fatal!(
+                        "hvpatch::host_alias",
+                        "external replay mutation epoch exhausted"
+                    );
+                },
+            );
+            for id in reset_replay_chain(&mut bucket.versions.replays, physical_ipa, after_rows) {
+                bucket.versions.replay_version_owner.remove(&id);
+            }
+        }
+    }
+    result
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mutate_known_external_alias_state<R>(
+    affected: impl FnOnce(&AliasRegistry) -> (Vec<AliasVersionKey>, Vec<u64>),
+    mutate: impl FnOnce(&mut AliasRegistry) -> R,
+) -> R {
+    // Replay sets and version chains live in AliasScopeBucket; only the
+    // alias_registry() lock is held. Unlike the generic external mutator,
+    // the caller identifies the bounded keys it can change, so no carrier-wide
+    // registry clone or diff is required on COW/exec.
+    let mut registry = alias_registry().lock();
+    let (alias_keys, replay_ipas) = affected(&registry);
+    let alias_keys = alias_keys
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let replay_ipas = replay_ipas
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let alias_before = alias_keys
+        .iter()
+        .map(|&(start, ipa, scope)| ((start, ipa, scope), registry.find_by_key(start, ipa, scope)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut replay_before =
+        std::collections::BTreeMap::<(AliasOwnershipScope, u64), Vec<ReplayMappingKey>>::new();
+    for &ipa in &replay_ipas {
+        for (&scope, bucket) in &registry.by_scope {
+            let rows = replay_rows_for_ipa(&bucket.replay, ipa);
+            if !rows.is_empty() {
+                replay_before.insert((scope, ipa), rows);
+            }
+        }
+    }
+    let result = mutate(&mut registry);
+    for &(start, ipa, scope) in &alias_keys {
+        let key = (start, ipa, scope);
+        let after = registry.find_by_key(start, ipa, scope);
+        if alias_before.get(&key).copied().flatten() == after {
+            continue;
+        }
+        let bucket = registry.by_scope.entry(scope).or_default();
+        bump_version_epoch(&mut bucket.versions.alias_epochs, key).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "external alias mutation epoch exhausted"
+            );
+        });
+        for id in reset_alias_chain(&mut bucket.versions.aliases, key, after) {
+            bucket.versions.alias_version_owner.remove(&id);
+        }
+    }
+    for &physical_ipa in &replay_ipas {
+        for (&scope, bucket) in registry.by_scope.iter_mut() {
+            let after = replay_rows_for_ipa(&bucket.replay, physical_ipa);
+            let before = replay_before.get(&(scope, physical_ipa));
+            if before.is_none() && after.is_empty() {
+                continue;
+            }
+            if before.map(Vec::as_slice) == Some(&after) {
+                continue;
+            }
+            bump_version_epoch(&mut bucket.versions.replay_epochs, physical_ipa).unwrap_or_else(
+                || {
+                    carrick_fatal!(
+                        "hvpatch::host_alias",
+                        "external replay mutation epoch exhausted"
+                    );
+                },
+            );
+            for id in reset_replay_chain(&mut bucket.versions.replays, physical_ipa, after) {
+                bucket.versions.replay_version_owner.remove(&id);
+            }
+        }
+    }
+    result
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retired_projection_mutation_keys(
+    registry: &AliasRegistry,
+    retired: &[RetiredStage2Projection],
+    exact_aliases: &[AliasBacking],
+) -> (Vec<AliasVersionKey>, Vec<u64>) {
+    let mut alias_keys = exact_aliases
+        .iter()
+        .map(alias_version_key)
+        .collect::<Vec<_>>();
+    let mut replay_ipas = exact_aliases
+        .iter()
+        .map(|alias| alias.physical_ipa)
+        .collect::<Vec<_>>();
+    for retired in retired {
+        if retired.owner.host_addr == 0
+            || (retired.owner.generation == 0
+                && is_reusable_global_frame_extent(retired.physical_ipa, retired.physical_length))
+        {
+            continue;
+        }
+        replay_ipas.push(retired.physical_ipa);
+        alias_keys.extend(
+            registry
+                .physical_start_rows(retired.physical_ipa)
+                .iter()
+                .filter(|(_, alias)| {
+                    (alias.physical_size as u64 == retired.physical_length)
+                        && alias.physical_host_addr == retired.owner.host_addr
+                        && alias.owner_generation == retired.owner.generation
+                })
+                .map(|(_, alias)| alias_version_key(alias)),
+        );
+    }
+    (alias_keys, replay_ipas)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl AliasPublicationReceipt {
+    fn commit(
+        owner: HvpatchCarrierTaskStateKey,
+        aliases: &[AliasBacking],
+    ) -> Result<Self, TrapError> {
+        let mut registry = alias_registry().lock();
+        let mut alias_increments = std::collections::BTreeMap::<AliasVersionKey, u64>::new();
+        let mut replay_increments =
+            std::collections::BTreeMap::<(AliasOwnershipScope, u64), u64>::new();
+        for alias in aliases {
+            let count = alias_increments
+                .entry(alias_version_key(alias))
+                .or_insert(0);
+            *count = count.checked_add(1).unwrap_or(u64::MAX);
+            let count = replay_increments
+                .entry((alias.ownership_scope, alias.physical_ipa))
+                .or_insert(0);
+            *count = count.checked_add(1).unwrap_or(u64::MAX);
+        }
+        let alias_exhausted = alias_increments.iter().any(|(key, count)| {
+            let current = registry
+                .by_scope
+                .get(&key.2)
+                .and_then(|b| b.versions.alias_epochs.get(key).copied())
+                .unwrap_or(0);
+            current.checked_add(*count).is_none()
+        });
+        let replay_exhausted = replay_increments.iter().any(|((scope, ipa), count)| {
+            let current = registry
+                .by_scope
+                .get(scope)
+                .and_then(|b| b.versions.replay_epochs.get(ipa).copied())
+                .unwrap_or(0);
+            current.checked_add(*count).is_none()
+        });
+        if aliases.len() > u32::MAX as usize || alias_exhausted || replay_exhausted {
+            return Err(TrapError::Hypervisor(
+                "alias publication version identity exhausted".to_owned(),
+            ));
+        }
+        let mut receipt = Self::default();
+        for (ordinal, alias) in aliases.iter().enumerate() {
+            let ordinal = u32::try_from(ordinal).map_err(|_| {
+                TrapError::Hypervisor("alias publication ordinal exhausted".to_owned())
+            })?;
+            let id = AliasPublicationVersionId { owner, ordinal };
+            let scope = alias.ownership_scope;
+            let alias_key = alias_version_key(alias);
+            let alias_base = registry.find_by_key(alias.start, alias.ipa, alias.ownership_scope);
+            let replay_key = replay_mapping_key(*alias);
+            let replay_base = registry
+                .by_scope
+                .get(&scope)
+                .map(|b| replay_rows_for_ipa(&b.replay, alias.physical_ipa))
+                .unwrap_or_default();
+            let _ = registry.upsert_by_key(*alias);
+            let bucket = registry.by_scope.entry(scope).or_default();
+            let alias_epoch = bump_version_epoch(&mut bucket.versions.alias_epochs, alias_key)
+                .ok_or_else(|| TrapError::Hypervisor("alias version epoch exhausted".to_owned()))?;
+            let replay_epoch =
+                bump_version_epoch(&mut bucket.versions.replay_epochs, alias.physical_ipa)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor("replay version epoch exhausted".to_owned())
+                    })?;
+            bucket
+                .versions
+                .aliases
+                .entry(alias_key)
+                .or_insert_with(|| AliasVersionChain {
+                    base: alias_base,
+                    versions: Vec::new(),
+                })
+                .versions
+                .push(OwnedAliasVersion {
+                    id,
+                    value: *alias,
+                    epoch: alias_epoch,
+                });
+            bucket.versions.alias_version_owner.insert(id, alias_key);
+            bucket
+                .versions
+                .replays
+                .entry(alias.physical_ipa)
+                .or_insert_with(|| ReplayVersionChain {
+                    base: replay_base,
+                    versions: Vec::new(),
+                })
+                .versions
+                .push(OwnedReplayVersion {
+                    id,
+                    value: replay_key,
+                    epoch: replay_epoch,
+                });
+            bucket
+                .versions
+                .replay_version_owner
+                .insert(id, alias.physical_ipa);
+            for row in replay_rows_for_ipa(&bucket.replay, alias.physical_ipa) {
+                if row != replay_key {
+                    bucket.replay.remove(&row);
+                }
+            }
+            bucket.replay.insert(replay_key);
+            receipt.versions.push((scope, id));
+        }
+        Ok(receipt)
+    }
+
+    fn retire_exact(self) {
+        let mut registry = alias_registry().lock();
+        let mut pending_alias_values =
+            std::collections::BTreeMap::<AliasVersionKey, Option<AliasBacking>>::new();
+        let mut alias_mutations = Vec::<(AliasVersionKey, Option<AliasBacking>)>::new();
+        for (scope, id) in self.versions.into_iter().rev() {
+            let AliasRegistry {
+                by_scope,
+                exact_first_by_scope,
+                ..
+            } = &mut *registry;
+            let Some(bucket) = by_scope.get_mut(&scope) else {
+                continue;
+            };
+            if let Some(chain_key) = bucket.versions.alias_version_owner.remove(&id) {
+                let (start, ipa, key_scope) = chain_key;
+                let chain = bucket
+                    .versions
+                    .aliases
+                    .get_mut(&chain_key)
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "missing alias version chain for owned receipt version: key={chain_key:?} id={id:?}"
+                        );
+                    });
+                let version_index = chain
+                    .versions
+                    .iter()
+                    .position(|version| version.id == id)
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "missing alias receipt version in chain: key={chain_key:?} id={id:?}"
+                        );
+                    });
+                let was_top = version_index + 1 == chain.versions.len();
+                let removed = chain.versions.remove(version_index);
+                let base = chain.base;
+                let previous = chain.versions.last().map(|version| version.value);
+                let empty = chain.versions.is_empty();
+                let current_epoch = bucket.versions.alias_epochs.get(&chain_key).copied();
+                let current_value = pending_alias_values
+                    .get(&chain_key)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        exact_first_by_scope
+                            .get(&key_scope)
+                            .and_then(|exact| exact.get(&(start, ipa)))
+                            .map(|(_, entry)| *entry)
+                    });
+                if was_top
+                    && current_epoch == Some(removed.epoch)
+                    && current_value == Some(removed.value)
+                {
+                    let mm_root_slot = match key_scope {
+                        AliasOwnershipScope::MmRootSlot { base, size } => Some((base, size)),
+                        AliasOwnershipScope::Global | AliasOwnershipScope::ContainerRoot(_) => None,
+                    };
+                    record_cow_alias_lifecycle(
+                        CowDiagnosticLifecycleKind::AliasRemoved,
+                        CowDiagnosticLifecycleSite::ReceiptRetirement,
+                        None,
+                        None,
+                        mm_root_slot,
+                        removed.value,
+                    );
+                    let replacement = previous.or(base);
+                    pending_alias_values.insert(chain_key, replacement);
+                    alias_mutations.push((chain_key, replacement));
+                    if let Some(previous) = replacement {
+                        record_cow_alias_lifecycle(
+                            CowDiagnosticLifecycleKind::AliasPublished,
+                            CowDiagnosticLifecycleSite::ReceiptRetirement,
+                            None,
+                            None,
+                            mm_root_slot,
+                            previous,
+                        );
+                    }
+                    bump_version_epoch(&mut bucket.versions.alias_epochs, chain_key)
+                        .unwrap_or_else(|| {
+                            carrick_fatal!(
+                                "hvpatch::host_alias",
+                                "alias version epoch exhausted on receipt retirement: key={chain_key:?}"
+                            );
+                        });
+                }
+                if empty {
+                    bucket.versions.aliases.remove(&chain_key);
+                }
+            }
+            if let Some(physical_ipa) = bucket.versions.replay_version_owner.remove(&id) {
+                let chain = bucket
+                    .versions
+                    .replays
+                    .get_mut(&physical_ipa)
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "missing replay version chain for owned receipt version: ipa={physical_ipa:#x} id={id:?}"
+                        );
+                    });
+                let version_index = chain
+                    .versions
+                    .iter()
+                    .position(|version| version.id == id)
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "missing replay receipt version in chain: ipa={physical_ipa:#x} id={id:?}"
+                        );
+                    });
+                let was_top = version_index + 1 == chain.versions.len();
+                let removed = chain.versions.remove(version_index);
+                let base = chain.base.clone();
+                let previous = chain.versions.last().map(|version| version.value);
+                let empty = chain.versions.is_empty();
+                let current_epoch = bucket.versions.replay_epochs.get(&physical_ipa).copied();
+                let current = replay_rows_for_ipa(&bucket.replay, physical_ipa);
+                if was_top && current_epoch == Some(removed.epoch) && current == vec![removed.value]
+                {
+                    for row in current {
+                        bucket.replay.remove(&row);
+                    }
+                    if let Some(previous) = previous {
+                        bucket.replay.insert(previous);
+                    } else {
+                        bucket.replay.extend(base);
+                    }
+                    bump_version_epoch(&mut bucket.versions.replay_epochs, physical_ipa)
+                        .unwrap_or_else(|| {
+                            carrick_fatal!(
+                                "hvpatch::host_alias",
+                                "replay version epoch exhausted on receipt retirement: ipa={physical_ipa:#x}"
+                            );
+                        });
+                }
+                if empty {
+                    bucket.versions.replays.remove(&physical_ipa);
+                }
+            }
+        }
+        let mut final_alias_mutations =
+            std::collections::BTreeMap::<AliasVersionKey, (usize, Option<AliasBacking>)>::new();
+        for (order, (key, replacement)) in alias_mutations.into_iter().enumerate() {
+            final_alias_mutations.insert(key, (order, replacement));
+        }
+        let mut final_alias_mutations = final_alias_mutations
+            .into_iter()
+            .map(|(key, (order, replacement))| (order, key, replacement))
+            .collect::<Vec<_>>();
+        final_alias_mutations.sort_by_key(|(order, _, _)| *order);
+        let final_alias_mutations = final_alias_mutations
+            .into_iter()
+            .map(|(_, key, replacement)| (key, replacement))
+            .collect::<Vec<_>>();
+        registry.replace_exact_keys_in_batch(&final_alias_mutations);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct HvpatchCarrierTaskStateDirectory {
+    instance: std::num::NonZeroU64,
+    child_token_verifier: std::sync::Arc<carrick_hal::HvpatchChildTokenVerifier>,
+    next: std::sync::atomic::AtomicU64,
+    inner: parking_lot::Mutex<HvpatchCarrierTaskDirectoryInner>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+struct HvpatchCarrierTaskDirectoryInner {
+    states: std::collections::BTreeMap<HvpatchCarrierTaskStateKey, HvpatchCarrierTaskRow>,
+    carrier_mms: std::collections::BTreeMap<
+        HvpatchMmAuthorityKey,
+        std::sync::Weak<HvpatchCarrierMmAuthority>,
+    >,
+    task_mms:
+        std::collections::BTreeMap<HvpatchMmAuthorityKey, std::sync::Weak<HvpatchTaskMmAuthority>>,
+}
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Default for HvpatchCarrierTaskStateDirectory {
+    fn default() -> Self {
+        static NEXT_DIRECTORY_INSTANCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let instance = NEXT_DIRECTORY_INSTANCE
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |current| current.checked_add(1),
+            )
+            .unwrap_or_else(|_| {
+                carrick_fatal!(
+                    "hvpatch::task_directory",
+                    "HVPatch carrier directory identity exhausted"
+                );
+            });
+        let instance = std::num::NonZeroU64::new(instance).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::task_directory",
+                "zero HVPatch carrier directory identity"
+            );
+        });
+        let (_, verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
+        Self::new(instance, verifier)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchCarrierTaskStateDirectory {
+    pub fn new(
+        instance: std::num::NonZeroU64,
+        child_token_verifier: std::sync::Arc<carrick_hal::HvpatchChildTokenVerifier>,
+    ) -> Self {
+        Self {
+            instance,
+            child_token_verifier,
+            next: std::sync::atomic::AtomicU64::new(1),
+            inner: parking_lot::Mutex::new(HvpatchCarrierTaskDirectoryInner::default()),
+        }
+    }
+
+    pub(crate) fn rebind_exec_task_mm(
+        &self,
+        key: HvpatchCarrierTaskStateKey,
+        new_mm_key: HvpatchMmAuthorityKey,
+        task_mm: &std::sync::Arc<HvpatchTaskMmAuthority>,
+        stage2_record_identities: Vec<CarrierStage2RecordIdentity>,
+        custody: &std::sync::Arc<CarrierVmCustody>,
+    ) -> Result<(), TrapError> {
+        if key.directory_instance != self.instance {
+            return Err(TrapError::Hypervisor(
+                "cross-directory HVPatch carrier token rejected".to_owned(),
+            ));
+        }
+        let frames = task_mm
+            .inventory
+            .lock()
+            .shared_frame_registry()
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "exec replacement has no shared HVPatch frame registry".to_owned(),
+                )
+            })?;
+        let mut inner = self.inner.lock();
+        if inner
+            .task_mms
+            .get(&new_mm_key)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some()
+        {
+            return Err(TrapError::Hypervisor(
+                "duplicate HVPatch MM authority key for exec replacement".to_owned(),
+            ));
+        }
+        let existing_carrier_mm = inner.states.get(&key).and_then(|row| row._mm.clone());
+        let new_carrier_mm = match existing_carrier_mm.as_deref() {
+            Some(HvpatchCarrierMmAuthority::Live { _vm, .. }) => {
+                Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
+                    stage2_logical_leases: carrier_stage2_logical_leases(
+                        custody,
+                        &stage2_record_identities,
+                    ),
+                    custody: std::sync::Arc::downgrade(custody),
+                    frames,
+                    _vm: _vm.clone(),
+                }))
+            }
+            #[cfg(test)]
+            Some(HvpatchCarrierMmAuthority::Test { order }) => {
+                Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Test {
+                    order: std::sync::Arc::clone(order),
+                }))
+            }
+            #[cfg(test)]
+            Some(HvpatchCarrierMmAuthority::LeaseTest { .. }) => {
+                return Err(TrapError::Hypervisor(
+                    "test carrier lease authority cannot be exec-rebound".to_owned(),
+                ));
+            }
+            None => None,
+        };
+        if let Some(carrier_mm) = new_carrier_mm {
+            inner
+                .carrier_mms
+                .insert(new_mm_key, std::sync::Arc::downgrade(&carrier_mm));
+            if let Some(row) = inner.states.get_mut(&key) {
+                row._mm = Some(carrier_mm);
+            }
+        }
+        inner
+            .task_mms
+            .insert(new_mm_key, std::sync::Arc::downgrade(task_mm));
+        task_mm.record_holder(HvpatchTaskMmHolder::CarrierDirectory);
+        Ok(())
+    }
+
+    /// The live CLONE_VM/vfork sharer authority interned for `mm` on the
+    /// owner's `mm_root_slot`, if one is still registered. Sharers publish
+    /// under `{task_serial: 0, mm_root_slot, shared_kernel_mm: Some(mm)}`
+    /// (`shared_mm_projection`), distinct from the owner's
+    /// `{0, mm_root_slot, None}` row.
+    fn clone_vm_sharer_authority(
+        &self,
+        mm_root_slot: Option<(u64, u64)>,
+        mm: std::num::NonZeroU64,
+    ) -> Option<std::sync::Arc<HvpatchTaskMmAuthority>> {
+        self.inner
+            .lock()
+            .task_mms
+            .get(&HvpatchMmAuthorityKey {
+                task_serial: 0,
+                mm_root_slot,
+                shared_kernel_mm: Some(mm.get()),
+            })
+            .and_then(std::sync::Weak::upgrade)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct HvpatchTaskRegistration {
+    directory: std::sync::Arc<HvpatchCarrierTaskStateDirectory>,
+    key: HvpatchCarrierTaskStateKey,
+    expected_identity: HvpatchCarrierTaskIdentity,
+    foreign_mm_registration: Option<CarrierForeignMmRegistration>,
+    task_mm: Option<std::sync::Arc<HvpatchTaskMmAuthority>>,
+    cow_authority: Option<std::sync::Arc<dyn carrick_hal::FrameCowAuthority>>,
+    cow_identity: Option<carrick_hal::FrameCowIdentity>,
+    cow_authority_identity: Option<std::num::NonZeroU64>,
+    child_token_verifier: std::sync::Arc<carrick_hal::HvpatchChildTokenVerifier>,
+    #[cfg(not(test))]
+    custody: std::sync::Arc<CarrierVmCustody>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchTaskRegistration {
+    fn register_foreign_mm(&mut self, task: &HvfTaskState) -> Result<(), TrapError> {
+        if self.foreign_mm_registration.is_some() {
+            return Err(TrapError::Hypervisor(
+                "duplicate copied-child foreign-MM registration".to_owned(),
+            ));
+        }
+        let task_mm = self
+            .task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?;
+        let Some(transport) = task_mm.foreign_mm_transport.as_ref() else {
+            return Ok(());
+        };
+        let identity = self.cow_identity.ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch task lacks live COW identity".to_owned())
+        })?;
+        let (stage1_root, _) = task.mm_root_slot.ok_or_else(|| {
+            TrapError::Hypervisor("copied child lacks exact stage-1 root slot".to_owned())
+        })?;
+        let mm = std::num::NonZeroU64::new(identity.mm)
+            .map(carrick_hal::ForeignMmId::from_kernel_allocation)
+            .ok_or_else(|| TrapError::Hypervisor("copied child has zero MM identity".to_owned()))?;
+        let asid = std::num::NonZeroU16::new(identity.asid)
+            .map(carrick_hal::ForeignAsid::from_kernel_allocation)
+            .ok_or_else(|| TrapError::Hypervisor("copied child has zero ASID".to_owned()))?;
+        self.foreign_mm_registration = Some(transport.register_owned_identity(
+            mm,
+            CarrierForeignMmBinding {
+                asid,
+                stage1_root: carrick_guest_mem::Gpa(stage1_root),
+            },
+            &task.mm_access,
+        ));
+        Ok(())
+    }
+
+    fn unregister_foreign_mm(&mut self) {
+        drop(self.foreign_mm_registration.take());
+    }
+
+    fn runtime_task_state(
+        &self,
+        page_tables: carrick_aarch64::Stage1Authority,
+        protections: std::sync::Arc<MemoryProtections>,
+    ) -> Result<HvfTaskState, TrapError> {
+        let task_mm = self
+            .task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?;
+        task_mm.record_holder(HvpatchTaskMmHolder::LiveExecutor);
+        let inventory = task_mm.inventory.lock();
+        let shared_process_mm = matches!(
+            *inventory,
+            HvpatchTaskInventoryAuthority::SharedProcess { .. }
+        );
+        let ledger = inventory
+            .shared_runtime_ledger()
+            .ok_or_else(|| TrapError::Hypervisor("inactive HVPatch task inventory".to_owned()))?;
+        drop(inventory);
+        let cow_authority = self.cow_authority.clone().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch task lacks live COW authority".to_owned())
+        })?;
+        let cow_identity = self.cow_identity.ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch task lacks live COW identity".to_owned())
+        })?;
+        let cow_armed = task_mm.cow_armed.as_ref().cloned().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch task lacks COW armed state".to_owned())
+        })?;
+        let cow_deferred_publications = task_mm
+            .cow_deferred_publications
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch task lacks COW publication state".to_owned())
+            })?;
+        let mm_access = {
+            let mut slot = task_mm.mm_access.lock();
+            std::sync::Arc::clone(slot.get_or_insert_with(|| {
+                let access = MmAccessState::new(
+                    page_tables.clone(),
+                    std::sync::Arc::clone(&protections),
+                    std::sync::Arc::clone(&ledger),
+                    std::sync::Arc::clone(&cow_armed),
+                    std::sync::Arc::clone(&cow_deferred_publications),
+                );
+                if let Some(authority) = task_mm.mm_root_stage2.lock().take() {
+                    access
+                        .install_prepared_mm_root_stage2_authority(authority)
+                        .unwrap_or_else(|error| {
+                            carrick_fatal!(
+                                "hvpatch::mm_authority",
+                                "install published task-only root authority failed: {error}"
+                            );
+                        });
+                }
+                for mapping in &task_mm.mappings {
+                    if let Some(owner) = &mapping.structural_owner {
+                        access
+                            .install_structural_mapping_authority(
+                                task_mm.mm_root_slot,
+                                std::sync::Arc::clone(owner),
+                            )
+                            .unwrap_or_else(|error| {
+                                carrick_fatal!(
+                                    "hvpatch::mm_authority",
+                                    "install task-only structural MM authority failed: slot={:?} error={error}",
+                                    task_mm.mm_root_slot
+                                );
+                            });
+                    }
+                }
+                access
+            }))
+        };
+        mm_access.bind_page_tables_authority(page_tables.clone());
+        mm_access.bind_cow_runtime(MmCowRuntimeBinding {
+            authority: std::sync::Arc::clone(&cow_authority),
+            identity: cow_identity,
+            mm_root_slot: task_mm.mm_root_slot,
+            container_root: task_mm.container_root,
+            persistent_vm_lifecycle: true,
+        });
+        Ok(HvfTaskState {
+            #[cfg(not(test))]
+            custody: std::sync::Arc::clone(&self.custody),
+            mappings: task_mm
+                .mappings
+                .iter()
+                .map(HvpatchTaskMappingState::unowned_runtime_region)
+                .collect(),
+            mm_root_slot: task_mm.mm_root_slot,
+            container_root: task_mm.container_root,
+            pending_exec_mm_root_slot: None,
+            pending_exec_asid: None,
+            pending_exec_predecessor_identity: None,
+            pending_exec_stage2_cleanup: None,
+            shared_process_mm,
+            mm_access,
+            last_exit_class: 0,
+            last_fault_esr: 0,
+            is_forked_child: false,
+            forked_no_exec: false,
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
+            live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
+            persistent_vm_lifecycle: true,
+            cow_authority: Some(cow_authority),
+            cow_identity: Some(cow_identity),
+            pending_fork_frame_receipts: std::mem::take(
+                &mut *task_mm.pending_publication_receipts.lock(),
+            ),
+            pending_process_aliases: Vec::new(),
+            fail_next_begin_exec_inventory: false,
+            cow_rollback_scratch: None,
+            registration: None,
+        })
+    }
+
+    fn apply_inventory(
+        &self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        self.task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
+            .apply_inventory(apply)
+    }
+
+    pub(crate) fn shares_another_process_inventory(&self) -> bool {
+        self.task_mm
+            .as_ref()
+            .is_some_and(|task_mm| task_mm.shares_another_process_inventory())
+    }
+
+    pub(crate) fn prepare_inventory_retirement(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), TrapError> {
+        self.task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
+            .prepare_retirement(commit)
+    }
+
+    pub(crate) fn apply_inventory_retirement(
+        &self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        self.task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
+            .apply_retirement(apply)
+    }
+
+    fn bind_child_kernel(&mut self, binding: HvpatchChildKernelBinding) -> Result<(), TrapError> {
+        let binding = self
+            .child_token_verifier
+            .verify_and_open(binding)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "child Kernel token issuer does not match carrier verifier".to_owned(),
+                )
+            })?;
+        let cow_identity = binding.cow_identity();
+        if binding.task_serial() != self.key.task_serial
+            || binding.thread_serial() != self.key.thread_serial
+            || binding.execution_generation() != self.key.execution_generation
+            || cow_identity.linux_pid != self.expected_identity.linux_pid
+            || cow_identity.linux_tid != self.expected_identity.linux_tid
+            || cow_identity.asid != self.expected_identity.asid
+            || self.cow_authority.is_some()
+            || self.cow_identity.is_some()
+            || self.cow_authority_identity.is_some()
+        {
+            return Err(TrapError::Hypervisor(
+                "duplicate or mismatched exact child Kernel binding".to_owned(),
+            ));
+        }
+        let mm = std::num::NonZeroU64::new(cow_identity.mm).ok_or_else(|| {
+            TrapError::Hypervisor("child Kernel token contains zero MM".to_owned())
+        })?;
+        self.task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
+            .bind_kernel_mm(mm)?;
+        self.cow_authority_identity = Some(binding.authority_identity());
+        self.cow_identity = Some(cow_identity);
+        self.cow_authority = Some(binding.into_cow_authority());
+        Ok(())
+    }
+
+    fn bind_kernel_mm(&mut self, mm: std::num::NonZeroU64) -> Result<(), TrapError> {
+        self.task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
+            .bind_kernel_mm(mm)
+    }
+
+    fn rebind_exec_authority(
+        &mut self,
+        new_task_mm: std::sync::Arc<HvpatchTaskMmAuthority>,
+        replacement_mm_root_slot: (u64, u64),
+        stage2_record_identities: Vec<CarrierStage2RecordIdentity>,
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        retain_shared_predecessor_authority: bool,
+    ) -> Result<(), TrapError> {
+        let new_mm_key = HvpatchMmAuthorityKey {
+            task_serial: 0,
+            mm_root_slot: Some(replacement_mm_root_slot),
+            shared_kernel_mm: None,
+        };
+        self.directory.rebind_exec_task_mm(
+            self.key,
+            new_mm_key,
+            &new_task_mm,
+            stage2_record_identities,
+            custody,
+        )?;
+        if let Some(old_task_mm) = self.task_mm.take() {
+            old_task_mm.record_holder(HvpatchTaskMmHolder::ExecRebind);
+            if retain_shared_predecessor_authority && old_task_mm.owns_active_inventory() {
+                // The Kernel pinned `RetainOldMm`: a CLONE_VM/vfork process
+                // keeps this mm, and its exit is where the exact retirement
+                // will be issued. Move the `Active` receipt to that sharer now
+                // (`vforkexecthread`). Whether the vfork-suspended leader's
+                // registration has already dropped its Arc must not matter:
+                // before this, a sole holder silently discarded the receipt
+                // and a surviving sibling holder aborted the carrier at its
+                // own cleanup (`holder=registration-cleanup`).
+                let mm = (*old_task_mm.kernel_mm.lock()).ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "HVPatch exec retains a predecessor with no Kernel binding".to_owned(),
+                    )
+                })?;
+                match self
+                    .directory
+                    .clone_vm_sharer_authority(old_task_mm.mm_root_slot, mm)
+                {
+                    Some(sharer) => old_task_mm.hand_off_inventory_to_sharer(&sharer)?,
+                    None => {
+                        // The sharer the Kernel counted at reservation time
+                        // exited during the sibling drain and its registration
+                        // is gone. Its exit was not the final mm edge (this
+                        // task's lease still named the mm), so nobody retires
+                        // these rows: say so rather than aborting a legitimate
+                        // exec.
+                        tracing::error!(
+                            target: "carrick::hvpatch",
+                            mm = mm.get(),
+                            mm_root_slot = ?old_task_mm.mm_root_slot,
+                            "exec retained a shared predecessor mm whose CLONE_VM sharer is \
+                             gone; its frame-inventory rows are abandoned unretired"
+                        );
+                        old_task_mm.retire_exec_predecessor();
+                    }
+                }
+            } else if retain_shared_predecessor_authority {
+                // The predecessor is itself a projection of another process's
+                // inventory (a vfork child exec'ing). That process owns the
+                // retirement; only a LAST holder may retire the projection,
+                // and `Arc::into_inner` answers that atomically.
+                if let Some(sole) = std::sync::Arc::into_inner(old_task_mm) {
+                    sole.retire_exec_predecessor();
+                }
+            } else {
+                old_task_mm.retire_exec_predecessor();
+            }
+        }
+        self.task_mm = Some(new_task_mm);
+        Ok(())
+    }
+
+    pub(crate) fn retire_dormant_authority(&mut self) {
+        if let Some(task_mm) = &self.task_mm {
+            task_mm.record_holder(HvpatchTaskMmHolder::DormantRetire);
+            task_mm.retire_exec_predecessor();
+        }
+    }
+
+    fn activate(&self) -> Result<(), TrapError> {
+        if self.cow_authority.is_none() || self.cow_identity.is_none() {
+            return Err(TrapError::Hypervisor(
+                "HVPatch child activation requires exact tid/kicker/COW authority".to_owned(),
+            ));
+        }
+        self.task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
+            .activate()
+    }
+
+    pub(crate) fn cleanup(mut self) -> Result<(), TrapError> {
+        self.unregister_foreign_mm();
+        // Removing the carrier row drops this binding's carrier-MM reference.
+        // If it is the final MM binding, every stage-2 lease unmaps here, before
+        // the final task-MM Arc below releases any host mapping owner.
+        self.directory.retire(self.key)?;
+        if let Some(task_mm) = self.task_mm.take() {
+            task_mm.record_holder(HvpatchTaskMmHolder::RegistrationCleanup);
+            // NOTE (history, re-verified 2026-09-01): this drop is where the
+            // "published HVPatch inventory dropped before exact retirement"
+            // abort fired for `execthreads` and for a `clone(CLONE_VM|SIGCHLD)`
+            // child exiting under a live parent. The root cause was NOT here:
+            // `reserve_exec_inner` retired the predecessor mm at RESERVATION
+            // time, so an exec owner suspended in the sibling drain resumed
+            // into a `Retiring` mm (fixed by preparing that retirement inside
+            // `ExecMmReservation::commit`). Retiring the inventory from this
+            // drop instead was measured to HANG 2 runs in 3 and is not the fix.
+            //
+            // The register-time MM key still splits an mm's owner
+            // ({slot, None}) from its CLONE_VM/vfork sharer ({slot, Some(mm)}),
+            // so a sharer registers a second carrier MM authority over the
+            // same stage-2. That second authority is INERT by construction:
+            // the `SharedProcess` arm mints it with no stage-2 leases (its
+            // drop retires nothing) and a `SharedProcess` inventory rolls back
+            // as `Ok(())`. Measured at HEAD: 1,800 CLONE_VM sharer lifecycles
+            // (owner verifying a 64 MiB heap after, and concurrently with,
+            // every sharer exit) plus the callee-saved-register check, zero
+            // faults. A slot-only key that dedupes the sharer onto the owner
+            // was tried twice and showed no measurable effect (its gate
+            // destabilization was the stale kick-handle defect, see
+            // `HvfTaskState::live_vcpu`); collapse the key only with a red
+            // reproducer in hand.
+            drop(task_mm);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for HvpatchTaskRegistration {
+    fn drop(&mut self) {
+        if let Some(task_mm) = &self.task_mm {
+            task_mm.record_holder(HvpatchTaskMmHolder::RegistrationDrop);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct HvpatchPreparedCarrierTaskState {
+    identity: HvpatchCarrierTaskIdentity,
+    state: Option<HvpatchCarrierTaskState>,
+    task: Option<HvpatchPreparedTaskAuthority>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchPreparedCarrierTaskState {
+    fn new(
+        identity: HvpatchCarrierTaskIdentity,
+        state: HvpatchCarrierTaskState,
+        task: HvpatchPreparedTaskAuthority,
+    ) -> Self {
+        Self {
+            identity,
+            state: Some(state),
+            task: Some(task),
+        }
+    }
+
+    pub(crate) fn sibling(
+        identity: HvpatchCarrierTaskIdentity,
+        spec: ThreadSpec,
+    ) -> Result<Self, TrapError> {
+        Self::shared_mm_projection(identity, None, spec)
+    }
+
+    pub(crate) fn shared_process(
+        identity: HvpatchCarrierTaskIdentity,
+        shared_kernel_mm: u64,
+        spec: ThreadSpec,
+    ) -> Result<Self, TrapError> {
+        if shared_kernel_mm == 0 {
+            return Err(TrapError::Hypervisor(
+                "shared-process HVPatch MM identity is invalid".to_owned(),
+            ));
+        }
+        Self::shared_mm_projection(identity, Some(shared_kernel_mm), spec)
+    }
+
+    fn shared_mm_projection(
+        identity: HvpatchCarrierTaskIdentity,
+        shared_kernel_mm: Option<u64>,
+        spec: ThreadSpec,
+    ) -> Result<Self, TrapError> {
+        if !spec.persistent_vm_lifecycle {
+            return Err(TrapError::Hypervisor(
+                "task-only shared-MM projection requires persistent HVPatch VM".to_owned(),
+            ));
+        }
+        let ThreadSpec {
+            vm,
+            mappings,
+            mm_access,
+            carrier_foreign_mm_transport,
+            mailbox_slots: _,
+            syscall_transport: _,
+            persistent_vm_lifecycle: _,
+            mm_root_slot,
+            container_root,
+            cow_authority: _,
+            cow_identity: _,
+        } = spec;
+        let frame_inventory = mm_access.frame_inventory.shared_ledger();
+        let cow_armed = std::sync::Arc::clone(&mm_access.cow_armed);
+        let cow_deferred_publications = std::sync::Arc::clone(&mm_access.cow_deferred_publications);
+        let mappings = mappings
+            .into_iter()
+            .map(ThreadMappingDesc::into_shared_mm_task_mapping)
+            .collect();
+        Ok(Self::new(
+            identity,
+            if shared_kernel_mm.is_some() {
+                HvpatchCarrierTaskState::SharedProcess { vm }
+            } else {
+                HvpatchCarrierTaskState::Sibling { vm }
+            },
+            HvpatchPreparedTaskAuthority {
+                custody: Some(std::sync::Arc::clone(&carrier_foreign_mm_transport.custody)),
+                // The existing exact-MM owner already registered this shared
+                // state. A CLONE_VM edge must not own or retire that row.
+                foreign_mm_transport: None,
+                mappings,
+                mm_root_slot,
+                container_root,
+                shared_kernel_mm,
+                inventory: if shared_kernel_mm.is_some() {
+                    HvpatchTaskInventoryAuthority::SharedProcess {
+                        ledger: frame_inventory,
+                    }
+                } else {
+                    HvpatchTaskInventoryAuthority::SiblingShared {
+                        ledger: frame_inventory,
+                    }
+                },
+                cow_armed: Some(cow_armed),
+                cow_deferred_publications: Some(cow_deferred_publications),
+                inherited_mm_access: Some(mm_access),
+                ..HvpatchPreparedTaskAuthority::default()
+            },
+        ))
+    }
+
+    pub(crate) fn process(
+        identity: HvpatchCarrierTaskIdentity,
+        spec: ProcessSpec,
+    ) -> Result<Self, TrapError> {
+        if !spec.persistent_vm_lifecycle {
+            return Err(TrapError::Hypervisor(
+                "task-only process requires persistent HVPatch VM".to_owned(),
+            ));
+        }
+        let (state, task) = HvfVmState::prepare_task_only_process_spec(spec)?;
+        Ok(Self::new(identity, state, task))
+    }
+
+    pub(crate) fn commit(
+        mut self,
+        directory: std::sync::Arc<HvpatchCarrierTaskStateDirectory>,
+    ) -> Result<HvpatchTaskOnlyBackendState, TrapError> {
+        let state = self.state.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::task_backend_commit",
+                "carrier task state missing during prepared carrier commit: identity={:?}",
+                self.identity
+            );
+        });
+        let task = self.task.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::task_backend_commit",
+                "prepared task authority missing during prepared carrier commit: identity={:?}",
+                self.identity
+            );
+        });
+        directory.publish(self.identity, state, task)
+    }
+
+    pub(crate) fn abort(mut self) -> Result<(), TrapError> {
+        if let Some(state) = self.state.take() {
+            let task = self.task.take().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::task_backend_lifecycle",
+                    "prepared task authority missing during prepared carrier abort: identity={:?}",
+                    self.identity
+                );
+            });
+            abort_prepared_task_and_carrier(task, state)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for HvpatchPreparedCarrierTaskState {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            let task = self.task.take().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::task_backend_lifecycle",
+                    "prepared task authority missing during prepared carrier drop: identity={:?}",
+                    self.identity
+                );
+            });
+            abort_prepared_task_and_carrier(task, state).unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::task_backend_lifecycle",
+                    "abort deferred HVPatch task/carrier state during drop failed: identity={:?} error={error}",
+                    self.identity
+                );
+            });
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchCarrierTaskStateDirectory {
+    fn publish(
+        self: &std::sync::Arc<Self>,
+        identity: HvpatchCarrierTaskIdentity,
+        state: HvpatchCarrierTaskState,
+        task: HvpatchPreparedTaskAuthority,
+    ) -> Result<HvpatchTaskOnlyBackendState, TrapError> {
+        self.publish_inner(identity, state, task, 0)
+    }
+
+    fn publish_inner(
+        self: &std::sync::Arc<Self>,
+        identity: HvpatchCarrierTaskIdentity,
+        state: HvpatchCarrierTaskState,
+        task: HvpatchPreparedTaskAuthority,
+        failpoint: u8,
+    ) -> Result<HvpatchTaskOnlyBackendState, TrapError> {
+        #[cfg(not(test))]
+        let custody = match task.custody.as_ref() {
+            Some(custody) => std::sync::Arc::clone(custody),
+            None => {
+                abort_prepared_task_and_carrier(task, state)?;
+                return Err(TrapError::Hypervisor(
+                    "prepared HVPatch task has no carrier VM custody".to_owned(),
+                ));
+            }
+        };
+        if identity.task_serial == 0
+            || identity.thread_serial == 0
+            || identity.execution_generation == 0
+        {
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(TrapError::Hypervisor(
+                "deferred HVPatch task identity contains zero".to_owned(),
+            ));
+        }
+        if let Err(error) = task.validate_cow_authority_pairing() {
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(error);
+        }
+        let carrier_frames = match &state {
+            #[cfg(test)]
+            HvpatchCarrierTaskState::Test { .. } => None,
+            _ => match task.inventory.shared_frame_registry() {
+                Some(frames) => Some(frames),
+                None => {
+                    abort_prepared_task_and_carrier(task, state)?;
+                    return Err(TrapError::Hypervisor(
+                        "prepared HVPatch task has no shared frame registry".to_owned(),
+                    ));
+                }
+            },
+        };
+        let nonce = match self.next.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| current.checked_add(1),
+        ) {
+            Ok(nonce) => nonce,
+            Err(_) => {
+                abort_prepared_task_and_carrier(task, state)?;
+                return Err(TrapError::Hypervisor(
+                    "carrier task-state key exhausted".to_owned(),
+                ));
+            }
+        };
+        let Some(nonce) = std::num::NonZeroU64::new(nonce) else {
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(TrapError::Hypervisor(
+                "carrier task-state key exhausted".to_owned(),
+            ));
+        };
+        let key = HvpatchCarrierTaskStateKey {
+            directory_instance: self.instance,
+            task_serial: identity.task_serial,
+            thread_serial: identity.thread_serial,
+            execution_generation: identity.execution_generation,
+            nonce,
+        };
+        let mut inner = self.inner.lock();
+        if inner.states.keys().any(|key| {
+            (key.task_serial, key.thread_serial, key.execution_generation)
+                == (
+                    identity.task_serial,
+                    identity.thread_serial,
+                    identity.execution_generation,
+                )
+        }) {
+            drop(inner);
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(TrapError::Hypervisor(
+                "duplicate exact carrier task-state publication".to_owned(),
+            ));
+        }
+        let alias_receipt = match AliasPublicationReceipt::commit(key, &task.pending_aliases) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                drop(inner);
+                abort_prepared_task_and_carrier(task, state)?;
+                return Err(error);
+            }
+        };
+        if failpoint == 1 {
+            alias_receipt.retire_exact();
+            drop(inner);
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(TrapError::Hypervisor(
+                "injected carrier task-state failure after alias commit".to_owned(),
+            ));
+        }
+        let mm_key = HvpatchMmAuthorityKey {
+            // A concrete root slot is the exact MM identity and is shared by
+            // every thread binding. Root/no-slot tasks fall back to the task
+            // serial so unrelated roots never alias one MM authority.
+            task_serial: if task.shared_kernel_mm.is_some() {
+                0
+            } else {
+                task.mm_root_slot.map_or(identity.task_serial, |_| 0)
+            },
+            mm_root_slot: task.mm_root_slot,
+            shared_kernel_mm: task.shared_kernel_mm,
+        };
+        let process_owner = matches!(
+            task.inventory,
+            HvpatchTaskInventoryAuthority::ProcessPrepared { .. }
+        );
+        let existing_carrier_mm = inner
+            .carrier_mms
+            .get(&mm_key)
+            .and_then(std::sync::Weak::upgrade);
+        let existing_task_mm = inner
+            .task_mms
+            .get(&mm_key)
+            .and_then(std::sync::Weak::upgrade);
+        if process_owner && (existing_carrier_mm.is_some() || existing_task_mm.is_some()) {
+            alias_receipt.retire_exact();
+            drop(inner);
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(TrapError::Hypervisor(
+                "duplicate process owner for exact HVPatch MM".to_owned(),
+            ));
+        }
+        if task.cow_authority.is_some() || task.cow_identity.is_some() {
+            alias_receipt.retire_exact();
+            drop(inner);
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(TrapError::Hypervisor(
+                "prepared HVPatch child retained parent COW authority".to_owned(),
+            ));
+        }
+        let carrier_custody = task.custody.as_ref().cloned().ok_or_else(|| {
+            TrapError::Hypervisor("prepared HVPatch task has no carrier custody".to_owned())
+        })?;
+        let (carrier_mm, test_rollbacks): (
+            Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
+            Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+        ) = match state {
+            HvpatchCarrierTaskState::Sibling { vm } => (
+                existing_carrier_mm.or_else(|| {
+                    Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
+                        _vm: vm,
+                        stage2_logical_leases: Vec::new(),
+                        custody: std::sync::Arc::downgrade(&carrier_custody),
+                        frames: std::sync::Arc::clone(
+                            carrier_frames.as_ref().unwrap_or_else(|| {
+                                carrick_fatal!(
+                                    "hvpatch::frame_inventory",
+                                    "carrier frame inventory missing when constructing live carrier MM authority for sibling task: identity={:?}",
+                                    identity
+                                );
+                            }),
+                        ),
+                    }))
+                }),
+                None,
+            ),
+            HvpatchCarrierTaskState::SharedProcess { vm } => (
+                existing_carrier_mm.or_else(|| {
+                    Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
+                        _vm: vm,
+                        stage2_logical_leases: Vec::new(),
+                        custody: std::sync::Arc::downgrade(&carrier_custody),
+                        frames: std::sync::Arc::clone(
+                            carrier_frames.as_ref().unwrap_or_else(|| {
+                                carrick_fatal!(
+                                    "hvpatch::frame_inventory",
+                                    "carrier frame inventory missing when constructing live carrier MM authority for shared-process task: identity={:?}",
+                                    identity
+                                );
+                            }),
+                        ),
+                    }))
+                }),
+                None,
+            ),
+            HvpatchCarrierTaskState::Process {
+                vm,
+                mut stage2_leases,
+            } => {
+                let owner_hosts =
+                    match collect_carrier_stage2_owner_hosts(task.mappings.iter().map(|mapping| {
+                        (
+                            (mapping.physical_ipa, mapping.physical_size as u64),
+                            mapping.physical_host_addr as usize,
+                        )
+                    })) {
+                        Ok(owners) => owners,
+                        Err(error) => {
+                            abort_prepared_task_and_carrier(
+                                task,
+                                HvpatchCarrierTaskState::Process { vm, stage2_leases },
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                let stage2_record_identities = match register_carrier_stage2_leases(
+                    &carrier_custody,
+                    &mut stage2_leases,
+                    &owner_hosts,
+                ) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        abort_prepared_task_and_carrier(
+                            task,
+                            HvpatchCarrierTaskState::Process { vm, stage2_leases },
+                        )?;
+                        return Err(error);
+                    }
+                };
+                (
+                    Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
+                        _vm: vm,
+                        stage2_logical_leases: carrier_stage2_logical_leases(
+                            &carrier_custody,
+                            &stage2_record_identities,
+                        ),
+                        custody: std::sync::Arc::downgrade(&carrier_custody),
+                        frames: std::sync::Arc::clone(
+                            carrier_frames.as_ref().unwrap_or_else(|| {
+                                carrick_fatal!(
+                                    "hvpatch::frame_inventory",
+                                    "carrier frame inventory missing when constructing live carrier MM authority for process task: identity={:?}",
+                                    identity
+                                );
+                            }),
+                        ),
+                    })),
+                    None,
+                )
+            }
+            #[cfg(test)]
+            HvpatchCarrierTaskState::LeaseTest { mut stage2_leases } => {
+                let owner_hosts =
+                    match collect_carrier_stage2_owner_hosts(task.mappings.iter().map(|mapping| {
+                        (
+                            (mapping.physical_ipa, mapping.physical_size as u64),
+                            mapping.physical_host_addr as usize,
+                        )
+                    })) {
+                        Ok(owners) => owners,
+                        Err(error) => {
+                            abort_prepared_task_and_carrier(
+                                task,
+                                HvpatchCarrierTaskState::LeaseTest { stage2_leases },
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                let stage2_record_identities = match register_carrier_stage2_leases(
+                    &carrier_custody,
+                    &mut stage2_leases,
+                    &owner_hosts,
+                ) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        abort_prepared_task_and_carrier(
+                            task,
+                            HvpatchCarrierTaskState::LeaseTest { stage2_leases },
+                        )?;
+                        return Err(error);
+                    }
+                };
+                (
+                    Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::LeaseTest {
+                        stage2_lease_keys: stage2_record_identities
+                            .iter()
+                            .filter_map(|identity| {
+                                carrier_custody
+                                    .stage2_record_snapshot(identity.record_id)
+                                    .map(|snapshot| (snapshot.ipa, snapshot.len as u64))
+                            })
+                            .collect(),
+                        frames: std::sync::Arc::clone(
+                            carrier_frames
+                                .as_ref()
+                                .unwrap_or_else(|| std::process::abort()),
+                        ),
+                    })),
+                    None,
+                )
+            }
+            #[cfg(test)]
+            HvpatchCarrierTaskState::Test { rollbacks, order } => (
+                existing_carrier_mm.or_else(|| {
+                    order
+                        .map(|order| std::sync::Arc::new(HvpatchCarrierMmAuthority::Test { order }))
+                }),
+                Some(rollbacks),
+            ),
+        };
+        #[cfg(not(test))]
+        let _ = &test_rollbacks;
+        let mut task = task;
+        task.pending_aliases.clear();
+        let task_mm = if let Some(existing) = existing_task_mm {
+            task.abort()?;
+            existing.alias_receipts.lock().push(alias_receipt);
+            existing
+        } else {
+            std::sync::Arc::new(HvpatchTaskMmAuthority::from_prepared(task, alias_receipt))
+        };
+        if inner
+            .states
+            .insert(
+                key,
+                HvpatchCarrierTaskRow {
+                    _mm: carrier_mm.clone(),
+                    #[cfg(test)]
+                    rollbacks: test_rollbacks,
+                },
+            )
+            .is_some()
+        {
+            carrick_fatal!(
+                "hvpatch::task_backend_lifecycle",
+                "duplicate carrier task registration during publication: key={key:?}"
+            );
+        }
+        if failpoint == 2 {
+            let row = inner.states.remove(&key).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::task_backend_lifecycle",
+                    "carrier task state row missing immediately after insertion during failpoint rollback: key={key:?}"
+                );
+            });
+            drop(inner);
+            let (row, carrier_mm) = rollback_failed_directory_publication(
+                &task_mm, row, carrier_mm,
+            )
+            .unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::task_backend_lifecycle",
+                    "rollback failed HVPatch directory publication: {error}"
+                );
+            });
+            drop(row);
+            drop(carrier_mm);
+            task_mm.record_holder(HvpatchTaskMmHolder::FailpointRollback);
+            drop(task_mm);
+            return Err(TrapError::Hypervisor(
+                "injected carrier task-state failure after directory publication".to_owned(),
+            ));
+        }
+        if let Some(carrier_mm) = carrier_mm {
+            inner
+                .carrier_mms
+                .insert(mm_key, std::sync::Arc::downgrade(&carrier_mm));
+        }
+        inner
+            .task_mms
+            .insert(mm_key, std::sync::Arc::downgrade(&task_mm));
+        drop(inner);
+        Ok(HvpatchTaskOnlyBackendState {
+            registration: Some(HvpatchTaskRegistration {
+                directory: std::sync::Arc::clone(self),
+                key,
+                expected_identity: identity,
+                foreign_mm_registration: None,
+                task_mm: Some(task_mm),
+                cow_authority: None,
+                cow_identity: None,
+                cow_authority_identity: None,
+                child_token_verifier: std::sync::Arc::clone(&self.child_token_verifier),
+                #[cfg(not(test))]
+                custody,
+            }),
+        })
+    }
+
+    pub(crate) fn retire(&self, key: HvpatchCarrierTaskStateKey) -> Result<(), TrapError> {
+        if key.directory_instance != self.instance {
+            return Err(TrapError::Hypervisor(
+                "cross-directory HVPatch carrier token rejected".to_owned(),
+            ));
+        }
+        let row = self.inner.lock().states.remove(&key).ok_or_else(|| {
+            TrapError::Hypervisor("missing exact carrier task-state retirement".to_owned())
+        })?;
+        #[cfg(test)]
+        if let Some(rollbacks) = &row.rollbacks {
+            rollbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        drop(row);
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchCarrierTaskState {
+    fn abort(self) -> Result<(), TrapError> {
+        match self {
+            Self::Sibling { .. } | Self::SharedProcess { .. } => Ok(()),
+            Self::Process {
+                mut stage2_leases, ..
+            } => {
+                for lease in &mut stage2_leases {
+                    lease.try_retire()?;
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::LeaseTest { mut stage2_leases } => {
+                for lease in &mut stage2_leases {
+                    lease.try_retire()?;
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::Test { rollbacks, order } => {
+                rollbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(order) = order {
+                    order.lock().push("carrier");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn next_vdso_rng_generation() -> u64 {
+    // A host PID distinguished the historical one-guest-process-per-host-process
+    // VMM fork path, but HVPatch materializes many Linux processes inside one
+    // Carrick host process. A process-local monotonic generation distinguishes
+    // every such child; the vDSO uses it only as a reseed epoch, not as entropy.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for ProcessSpec {}
+
+/// Volatile copy out of guest-shared memory. Guest RAM is MAP_SHARED and the
+/// guest vCPU can mutate it concurrently on another host thread; a plain
+/// (non-volatile) read racing that write is UB in Rust's memory model (the
+/// optimizer may assume the bytes are stable and tear/hoist/elide the read).
+/// `read_volatile` forbids that. This does NOT make the data race semantically
+/// correct — the guest owns its own synchronization — it only removes the
+/// language-level UB on the host side.
+///
+/// Word-accelerated: the guest (`src`) side is read with aligned word-sized
+/// `read_volatile` (with byte-volatile head/tail around the unaligned edges),
+/// which preserves the UB guarantee while doing ~`size_of::<usize>()`× fewer
+/// guest accesses than a byte loop — this copy is on every guest→host transfer
+/// (sockets, pipes, file reads) and the byte loop was a measured hot spot
+/// (~33µs of a 59µs loopback `sendto`). The private host `dst` is not shared,
+/// so it uses plain unaligned writes.
+///
+/// SAFETY: `src` must be valid for reads of `len` bytes and `dst` valid for
+/// writes of `len` bytes; the two regions must not overlap.
+mod guest_memory;
+pub(crate) use guest_memory::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfVmState {
+    /// The process-wide PROT_NONE bookkeeping (the engine's EFAULT gate).
+    pub(crate) fn protections_ref(&self) -> &MemoryProtections {
+        &self.protections
+    }
+
+    /// A `Send`/`Sync` kick handle for THIS thread's live vCPU. The engine's
+    /// `ThreadedEngine::kick_handle` routes through the Vmm, which does not hold
+    /// the vCPU, so HVF stashes the handle on every vCPU create (see the
+    /// `vcpu_handle` field) and hands it out here.
+    pub(crate) fn vcpu_kick_handle(&self) -> crate::vcpu_kick::VcpuKickHandle {
+        crate::vcpu_kick::VcpuKickHandle::following(std::sync::Arc::clone(&self.task.live_vcpu))
+    }
+
+    /// Name this backend's live vCPU as the one the attached task occupies.
+    /// Called on every attach and whenever the vCPU is recreated underneath a
+    /// loaded task, so registered kick handles keep following the task.
+    pub(crate) fn publish_live_vcpu(&self) {
+        self.task.live_vcpu.publish(self.vcpu_handle.clone());
+    }
+
+    /// The task is leaving this vCPU; a kick registered for it now has nothing
+    /// in `hv_vcpu_run` to interrupt until the next attach republishes.
+    pub(crate) fn clear_live_vcpu(&self) {
+        self.task.live_vcpu.clear();
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod cow_engine;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use cow_engine::*;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfVmState {
+    fn prepare_task_only_process_spec(
+        spec: ProcessSpec,
+    ) -> Result<(HvpatchCarrierTaskState, HvpatchPreparedTaskAuthority), TrapError> {
+        let (vm, plan) = spec.into_plan();
+        let (stage2_leases, prepared_task) = Self::prepare_task_only_plan(plan)?;
+        Ok((
+            HvpatchCarrierTaskState::Process { vm, stage2_leases },
+            prepared_task,
+        ))
+    }
+
+    #[cfg(test)]
+    fn prepare_task_only_plan_for_test(
+        plan: ProcessSpecPlan,
+    ) -> Result<(HvpatchCarrierTaskState, HvpatchPreparedTaskAuthority), TrapError> {
+        let (stage2_leases, prepared_task) = Self::prepare_task_only_plan(plan)?;
+        Ok((
+            HvpatchCarrierTaskState::LeaseTest { stage2_leases },
+            prepared_task,
+        ))
+    }
+
+    fn prepare_task_only_plan(
+        plan: ProcessSpecPlan,
+    ) -> Result<(Vec<GlobalFrameStage2Lease>, HvpatchPreparedTaskAuthority), TrapError> {
+        let mut mapped = Vec::with_capacity(plan.mappings.len());
+        let mut stage2_leases = Vec::with_capacity(plan.mappings.len());
+        let mut structural_owners = std::collections::BTreeMap::new();
+        let mut structural_identities = Vec::new();
+        let mut registered_global_owners = Vec::new();
+        let inventory_mappings = plan.inventory_mappings;
+        let mut pending_aliases = Vec::new();
+        let mut pending_receipts = Vec::new();
+        let mut mm_root_stage2 = None;
+        for mut mapping in plan.mappings {
+            let semantic_physical_offset = mapping
+                .ipa
+                .checked_sub(mapping.physical_ipa)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .filter(|offset| {
+                    offset
+                        .checked_add(mapping.size)
+                        .is_some_and(|end| end <= mapping.physical_size)
+                })
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(format!(
+                        "task-only child alias IPA 0x{:x} escapes physical IPA 0x{:x}",
+                        mapping.ipa, mapping.physical_ipa
+                    ))
+                })?;
+            let host_addr = mapping
+                .physical_host_addr
+                .wrapping_add(semantic_physical_offset);
+            let needs_child_alias_authority = process_mapping_needs_child_alias_authority(&mapping);
+            if matches!(mapping.host, ProcessMappingHost::PooledRootSlot { .. }) {
+                if let Some(lease) = mapping.stage2_lease.as_mut() {
+                    lease.mark_pre_mapped();
+                }
+            } else if process_mapping_needs_stage2_install(mapping.inherited_frame) {
+                let rc = unsafe {
+                    inventory_hv_vm_map(
+                        mapping.physical_host_addr.cast(),
+                        mapping.physical_ipa,
+                        mapping.physical_size,
+                        u64::from(mapping.perms),
+                    )
+                };
+                if rc != 0 {
+                    drop(mapping.stage2_lease.take());
+                    drop(mapped);
+                    report_stage2_map_refusal(
+                        &plan.carrier_foreign_mm_transport.custody,
+                        mapping.physical_host_addr as usize,
+                        mapping.physical_ipa,
+                        mapping.physical_size,
+                        u64::from(mapping.perms),
+                        rc as u32,
+                    );
+                    let error = TrapError::ChildMapFailed {
+                        host_addr: mapping.physical_host_addr as u64,
+                        guest_start: mapping.physical_ipa,
+                        size: mapping.physical_size,
+                        code: rc as u32,
+                    };
+                    drop(mm_root_stage2.take());
+                    if let Err(rollback_error) = rollback_partial_process_stage2_authorities(
+                        &plan.carrier_foreign_mm_transport.custody,
+                        &mut stage2_leases,
+                        &registered_global_owners,
+                        &structural_identities,
+                        structural_owners,
+                    ) {
+                        fail_stop_partial_process_stage2_rollback(
+                            "task-only mapping composition",
+                            &TrapError::Hypervisor(format!(
+                                "{error}; exact rollback failed: {rollback_error}"
+                            )),
+                        );
+                    }
+                    return Err(error);
+                }
+                if let Some(lease) = mapping.stage2_lease.as_mut() {
+                    lease.mark_mapped();
+                }
+            }
+            let (host_mapping, structural_owner, stage2_lease, owner_generation, owner_role) =
+                if is_reusable_global_frame_extent(
+                    mapping.physical_ipa,
+                    mapping.physical_size as u64,
+                ) {
+                    match (mapping.stage2_lease.take(), mapping.host) {
+                        (Some(lease), ProcessMappingHost::Owned(host_mapping)) => {
+                            let owner_generation = register_global_frame_host_owner_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                lease,
+                                host_mapping,
+                                u64::from(mapping.perms),
+                            )?;
+                            registered_global_owners.push((
+                                mapping.physical_ipa,
+                                mapping.physical_size as u64,
+                                owner_generation,
+                            ));
+                            (
+                                None,
+                                None,
+                                None,
+                                owner_generation,
+                                GlobalFrameOwnerRole::Registered,
+                            )
+                        }
+                        (None, ProcessMappingHost::Borrowed { .. }) => {
+                            // A COW/shared reference to a frame whose owner row
+                            // another process registered (a forked child's view
+                            // of its parent's private frames). The parent's live
+                            // generation is preserved for authentication only;
+                            // unwinding this preparation must never retire it.
+                            (
+                                None,
+                                None,
+                                None,
+                                mapping.owner_generation,
+                                GlobalFrameOwnerRole::Borrowed,
+                            )
+                        }
+                        (Some(_), ProcessMappingHost::Borrowed { .. }) => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) has stage-2 lease without owned host backing",
+                                mapping.physical_ipa, mapping.physical_size
+                            )));
+                        }
+                        (None, ProcessMappingHost::Owned(_)) => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) has owned host backing without stage-2 lease",
+                                mapping.physical_ipa, mapping.physical_size
+                            )));
+                        }
+                        (_, ProcessMappingHost::PooledRootSlot { .. }) => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) cannot have pooled root backing",
+                                mapping.physical_ipa, mapping.physical_size
+                            )));
+                        }
+                    }
+                } else {
+                    match mapping.host {
+                        ProcessMappingHost::Owned(host) => {
+                            let epoch = next_structural_epoch()?;
+                            let lease = mapping.stage2_lease.take().ok_or_else(|| {
+                                TrapError::Hypervisor(format!(
+                                    "structural mapping at IPA 0x{:x} missing stage-2 lease",
+                                    mapping.physical_ipa
+                                ))
+                            })?;
+                            let owner = StructuralBackingOwner::new_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                host,
+                                lease,
+                                u64::from(mapping.perms),
+                                epoch,
+                                mapping.physical_ipa,
+                                mapping.physical_size,
+                            )?;
+                            let owner_generation = epoch.raw();
+                            structural_identities.push(owner.record_identity());
+                            structural_owners.insert(
+                                (mapping.physical_ipa, mapping.physical_size),
+                                std::sync::Arc::clone(&owner),
+                            );
+                            (
+                                None,
+                                Some(owner),
+                                None,
+                                owner_generation,
+                                GlobalFrameOwnerRole::Borrowed,
+                            )
+                        }
+                        ProcessMappingHost::PooledRootSlot { handle } => {
+                            let epoch = next_structural_epoch()?;
+                            let lease = mapping.stage2_lease.take().ok_or_else(|| {
+                                TrapError::Hypervisor(format!(
+                                    "structural mapping at IPA 0x{:x} missing stage-2 lease",
+                                    mapping.physical_ipa
+                                ))
+                            })?;
+                            let owner = StructuralBackingOwner::new_pooled_root_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                handle,
+                                lease,
+                                u64::from(mapping.perms),
+                                epoch,
+                                mapping.physical_ipa,
+                                mapping.physical_size,
+                            )?;
+                            let owner_generation = epoch.raw();
+                            structural_identities.push(owner.record_identity());
+                            structural_owners.insert(
+                                (mapping.physical_ipa, mapping.physical_size),
+                                std::sync::Arc::clone(&owner),
+                            );
+                            (
+                                None,
+                                Some(owner),
+                                None,
+                                owner_generation,
+                                GlobalFrameOwnerRole::Borrowed,
+                            )
+                        }
+                        ProcessMappingHost::Borrowed {
+                            pointer,
+                            structural_owner,
+                        } => {
+                            let structural_owner = structural_owner.ok_or_else(|| {
+                                TrapError::Hypervisor(format!(
+                                    "borrowed structural mapping at IPA 0x{:x} lost its owner",
+                                    mapping.physical_ipa
+                                ))
+                            })?;
+                            if structural_owner.ptr() != pointer
+                                || structural_owner.physical_ipa != mapping.physical_ipa
+                                || structural_owner.physical_size != mapping.physical_size
+                                || structural_owner.epoch().raw() != mapping.owner_generation
+                            {
+                                return Err(TrapError::Hypervisor(format!(
+                                    "borrowed structural mapping at IPA 0x{:x} mismatches its exact owner",
+                                    mapping.physical_ipa
+                                )));
+                            }
+                            structural_owners.insert(
+                                (mapping.physical_ipa, mapping.physical_size),
+                                std::sync::Arc::clone(&structural_owner),
+                            );
+                            (
+                                None,
+                                Some(structural_owner),
+                                mapping.stage2_lease,
+                                mapping.owner_generation,
+                                GlobalFrameOwnerRole::Borrowed,
+                            )
+                        }
+                    }
+                };
+            if needs_child_alias_authority {
+                let alias = AliasBacking {
+                    start: mapping.start,
+                    ipa: mapping.ipa,
+                    host_addr: host_addr as usize,
+                    size: mapping.size,
+                    physical_ipa: mapping.physical_ipa,
+                    physical_host_addr: mapping.physical_host_addr as usize,
+                    physical_size: mapping.physical_size,
+                    perms: u64::from(mapping.perms),
+                    guest_writable: mapping.guest_writable,
+                    sharing: mapping.sharing,
+                    ownership_scope: alias_ownership_scope(
+                        mapping.sharing,
+                        None,
+                        plan.container_root,
+                    ),
+                    inventory_backing: mapping.inventory_backing,
+                    shared_key_base: mapping.shared_key_base,
+                    shared_key_offset: mapping.shared_key_offset,
+                    owner_generation,
+                };
+                pending_aliases.push(if mapping.sharing.uses_global_ipa() {
+                    alias
+                } else {
+                    rebind_inherited_alias_to_process(alias, plan.mm_root_slot)
+                });
+            }
+            if let Some(lease) = stage2_lease {
+                stage2_leases.push(lease);
+            }
+            if mapping.physical_ipa == plan.mm_root_slot.0 {
+                let owner = structural_owner.as_ref().cloned().ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "task-only stage-1 root mapping has no structural owner".to_owned(),
+                    )
+                })?;
+                let candidate = MmRootStage2Authority::new(plan.mm_root_slot, owner)?;
+                if mm_root_stage2.replace(candidate).is_some() {
+                    return Err(TrapError::Hypervisor(
+                        "task-only process published duplicate stage-1 root mappings".to_owned(),
+                    ));
+                }
+            }
+            mapped.push(HvpatchTaskMappingState {
+                start: mapping.start,
+                ipa: mapping.ipa,
+                physical_ipa: mapping.physical_ipa,
+                end: mapping.end,
+                host_addr,
+                physical_host_addr: mapping.physical_host_addr,
+                size: mapping.physical_size,
+                physical_size: mapping.physical_size,
+                perms: mapping.perms,
+                guest_writable: mapping.guest_writable,
+                host_mapping,
+                structural_owner,
+                is_dynamic_alias: mapping.is_dynamic_alias,
+                sharing: mapping.sharing,
+                shared_key_base: mapping.shared_key_base,
+                shared_key_offset: mapping.shared_key_offset,
+                owner_generation,
+                global_frame_owner_role: owner_role,
+            });
+        }
+        let mut process_reservation = plan
+            .frame_inventory
+            .lock()
+            .process_reservation
+            .take()
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "task-only child has no frame inventory reservation".to_owned(),
+                )
+            })?;
+        let process_transaction = process_reservation.transaction();
+        let mut staged_inventory_mappings = Vec::with_capacity(inventory_mappings.len());
+        let process_commit;
+        {
+            let mut inventory = plan.frame_inventory.lock();
+            for mapping in inventory_mappings {
+                let stage2_owner = if is_reusable_global_frame_extent(mapping.gpa, mapping.length) {
+                    let generation = global_frame_host_owner_generation_in(
+                        &plan.carrier_foreign_mm_transport.custody,
+                        mapping.gpa,
+                        mapping.length,
+                    );
+                    InventoryStage2OwnerIdentity {
+                        host_addr: mapping.stage2_owner.host_addr,
+                        // If registered in `global_frame_host_owners()` above, use the authoritative
+                        // freshly registered owner generation. If generation is 0, this mapping represents
+                        // an unowned extent whose generation was already recorded on the descriptor
+                        // during preparation rather than a registration failure (which fails fast with Err).
+                        generation: if generation != 0 {
+                            generation
+                        } else {
+                            mapping.stage2_owner.generation
+                        },
+                    }
+                } else if let Ok(size) = usize::try_from(mapping.length)
+                    && let Some(owner) = structural_owners.get(&(mapping.gpa, size))
+                {
+                    InventoryStage2OwnerIdentity {
+                        host_addr: owner.ptr() as usize,
+                        generation: owner.epoch().raw(),
+                    }
+                } else {
+                    mapping.stage2_owner
+                };
+                let staged = match Self::stage_mapping_in(
+                    &plan.carrier_foreign_mm_transport.custody,
+                    &mut inventory,
+                    &mut process_reservation,
+                    InventoryMappingStage {
+                        gpa: mapping.gpa,
+                        length: mapping.length,
+                        permissions: mapping.permissions,
+                        backing: mapping.backing,
+                        inherited_frame: mapping.inherited_frame,
+                        stage2_lease: Some(mapping.stage2_lease),
+                        stage2_owner,
+                    },
+                ) {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        Self::rollback_unpublished_mappings(
+                            &mut inventory,
+                            &staged_inventory_mappings,
+                        )
+                        .unwrap_or_else(|rollback_error| {
+                            carrick_fatal!(
+                                "hvpatch::frame_inventory",
+                                "rollback task-only child inventory: {rollback_error}"
+                            )
+                        });
+                        drop(inventory);
+                        drop(mapped);
+                        drop(mm_root_stage2.take());
+                        let stage2_rollback_error = rollback_partial_process_stage2_authorities(
+                            &plan.carrier_foreign_mm_transport.custody,
+                            &mut stage2_leases,
+                            &registered_global_owners,
+                            &structural_identities,
+                            structural_owners,
+                        )
+                        .err();
+                        if let Some(rollback_error) = stage2_rollback_error {
+                            fail_stop_partial_process_stage2_rollback(
+                                "task-only inventory composition",
+                                &TrapError::Hypervisor(format!(
+                                    "{error}; exact rollback failed: {rollback_error}"
+                                )),
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
+                record_cow_inventory_lifecycle(
+                    CowDiagnosticLifecycleKind::InventoryPublished,
+                    CowDiagnosticLifecycleSite::ForkMaterialization,
+                    &CowInventoryLifecycleScope {
+                        custody: &plan.carrier_foreign_mm_transport.custody,
+                        identity: None,
+                        mm_root_slot: Some(plan.mm_root_slot),
+                        semantic_va: 0,
+                        semantic_length: 0,
+                    },
+                    (mapping.gpa, mapping.length),
+                    staged,
+                );
+                staged_inventory_mappings.push(((mapping.gpa, mapping.length), staged));
+                if let (Some(parent_mapping), Some(frame), Some(kind)) = (
+                    mapping.inherited_mapping,
+                    mapping.inherited_frame,
+                    mapping.fork_frame_receipt_kind,
+                ) {
+                    pending_receipts.push(PendingForkFrameReceipt {
+                        transaction: process_transaction,
+                        kind,
+                        parent_mapping,
+                        child_mapping: staged.mapping,
+                        frame,
+                        ipa: mapping.gpa,
+                        length: mapping.length,
+                    });
+                }
+            }
+            inventory.initialized = true;
+            process_commit = process_reservation.commit(());
+        }
+        let process_challenge = process_commit.receipt_challenge();
+        Ok((
+            stage2_leases,
+            HvpatchPreparedTaskAuthority {
+                custody: Some(std::sync::Arc::clone(
+                    &plan.carrier_foreign_mm_transport.custody,
+                )),
+                foreign_mm_transport: Some(std::sync::Arc::clone(
+                    &plan.carrier_foreign_mm_transport,
+                )),
+                mappings: mapped,
+                mm_root_slot: Some(plan.mm_root_slot),
+                mm_root_stage2,
+                container_root: plan.container_root,
+                inventory: HvpatchTaskInventoryAuthority::ProcessPrepared {
+                    ledger: plan.frame_inventory,
+                    staged: staged_inventory_mappings,
+                    commit: Some(process_commit),
+                    challenge: Some(process_challenge),
+                },
+                cow_armed: Some(plan.cow_armed),
+                // A freshly materialized process has no deferred COW
+                // publication yet, but it must own the slot they land in:
+                // `from_process_spec` gives the live state the same fresh
+                // vector, and arming without one is not a task authority.
+                cow_deferred_publications: Some(std::sync::Arc::new(parking_lot::Mutex::new(
+                    Vec::new(),
+                ))),
+                pending_receipts,
+                pending_aliases,
+                ..HvpatchPreparedTaskAuthority::default()
+            },
+        ))
+    }
+
+    pub(crate) fn from_process_spec(
+        spec: ProcessSpec,
+    ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
+        let (vm, plan) = spec.into_plan();
+        let vcpu = create_vcpu(&vm)?;
+        enable_el0_counter_access(vcpu.id());
+        let mut mapped = TaskMappingIndex::new();
+        let mut structural_owners = std::collections::BTreeMap::new();
+        let mut structural_identities = Vec::new();
+        let mut registered_global_owners = Vec::new();
+        let inventory_mappings = plan.inventory_mappings;
+        let mut aliases_to_publish = Vec::new();
+        let mut pending_fork_frame_receipts = Vec::new();
+        for mut mapping in plan.mappings {
+            let semantic_physical_offset = mapping
+                .ipa
+                .checked_sub(mapping.physical_ipa)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .filter(|offset| {
+                    offset
+                        .checked_add(mapping.size)
+                        .is_some_and(|end| end <= mapping.physical_size)
+                })
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(format!(
+                        "HVPatch semantic alias IPA 0x{:x} size {} escapes physical IPA 0x{:x} size {}",
+                        mapping.ipa, mapping.size, mapping.physical_ipa, mapping.physical_size
+                    ))
+                })?;
+            let host_addr = mapping
+                .physical_host_addr
+                .wrapping_add(semantic_physical_offset);
+            let needs_child_alias_authority = process_mapping_needs_child_alias_authority(&mapping);
+            if matches!(mapping.host, ProcessMappingHost::PooledRootSlot { .. }) {
+                if let Some(lease) = mapping.stage2_lease.as_mut() {
+                    lease.mark_pre_mapped();
+                }
+            } else if process_mapping_needs_stage2_install(mapping.inherited_frame) {
+                let rc = unsafe {
+                    inventory_hv_vm_map(
+                        mapping.physical_host_addr.cast(),
+                        mapping.physical_ipa,
+                        mapping.physical_size,
+                        u64::from(mapping.perms),
+                    )
+                };
+                if rc != 0 {
+                    report_stage2_map_refusal(
+                        &plan.carrier_foreign_mm_transport.custody,
+                        mapping.physical_host_addr as usize,
+                        mapping.physical_ipa,
+                        mapping.physical_size,
+                        u64::from(mapping.perms),
+                        rc as u32,
+                    );
+                    let error = TrapError::ChildMapFailed {
+                        host_addr: mapping.physical_host_addr as u64,
+                        guest_start: mapping.physical_ipa,
+                        size: mapping.physical_size,
+                        code: rc as u32,
+                    };
+                    drop(mapping.stage2_lease.take());
+                    let mut prior_stage2_leases = mapped
+                        .iter_mut()
+                        .filter_map(|mapping| mapping.stage2_lease.take())
+                        .collect::<Vec<_>>();
+                    drop(mapped);
+                    if let Err(rollback_error) = rollback_partial_process_stage2_authorities(
+                        &plan.carrier_foreign_mm_transport.custody,
+                        &mut prior_stage2_leases,
+                        &registered_global_owners,
+                        &structural_identities,
+                        structural_owners,
+                    ) {
+                        fail_stop_partial_process_stage2_rollback(
+                            "full-VM mapping composition",
+                            &TrapError::Hypervisor(format!(
+                                "{error}; exact rollback failed: {rollback_error}"
+                            )),
+                        );
+                    }
+                    return Err(error);
+                }
+                if let Some(lease) = mapping.stage2_lease.as_mut() {
+                    lease.mark_mapped();
+                }
+            }
+            let (host_mapping, structural_owner, stage2_lease, owner_generation) =
+                if is_reusable_global_frame_extent(
+                    mapping.physical_ipa,
+                    mapping.physical_size as u64,
+                ) {
+                    match (mapping.stage2_lease.take(), mapping.host) {
+                        (Some(lease), ProcessMappingHost::Owned(host_mapping)) => {
+                            let owner_generation = register_global_frame_host_owner_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                lease,
+                                host_mapping,
+                                u64::from(mapping.perms),
+                            )?;
+                            registered_global_owners.push((
+                                mapping.physical_ipa,
+                                mapping.physical_size as u64,
+                                owner_generation,
+                            ));
+                            (None, None, None, owner_generation)
+                        }
+                        (None, ProcessMappingHost::Borrowed { .. }) => {
+                            // An unowned reference to an already-registered global frame owner.
+                            // The owner_generation stamped on the mapping is preserved.
+                            (None, None, None, mapping.owner_generation)
+                        }
+                        (Some(_), ProcessMappingHost::Borrowed { .. }) => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) has stage-2 lease without owned host backing",
+                                mapping.physical_ipa, mapping.physical_size
+                            )));
+                        }
+                        (None, ProcessMappingHost::Owned(_)) => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) has owned host backing without stage-2 lease",
+                                mapping.physical_ipa, mapping.physical_size
+                            )));
+                        }
+                        (_, ProcessMappingHost::PooledRootSlot { .. }) => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) cannot have pooled root backing",
+                                mapping.physical_ipa, mapping.physical_size
+                            )));
+                        }
+                    }
+                } else {
+                    match mapping.host {
+                        ProcessMappingHost::Owned(host) => {
+                            let epoch = next_structural_epoch()?;
+                            let lease = mapping.stage2_lease.take().ok_or_else(|| {
+                                TrapError::Hypervisor(format!(
+                                    "structural mapping at IPA 0x{:x} missing stage-2 lease",
+                                    mapping.physical_ipa
+                                ))
+                            })?;
+                            let owner = StructuralBackingOwner::new_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                host,
+                                lease,
+                                u64::from(mapping.perms),
+                                epoch,
+                                mapping.physical_ipa,
+                                mapping.physical_size,
+                            )?;
+                            let owner_generation = epoch.raw();
+                            structural_identities.push(owner.record_identity());
+                            structural_owners.insert(
+                                (mapping.physical_ipa, mapping.physical_size),
+                                std::sync::Arc::clone(&owner),
+                            );
+                            (None, Some(owner), None, owner_generation)
+                        }
+                        ProcessMappingHost::PooledRootSlot { handle } => {
+                            let epoch = next_structural_epoch()?;
+                            let lease = mapping.stage2_lease.take().ok_or_else(|| {
+                                TrapError::Hypervisor(format!(
+                                    "structural mapping at IPA 0x{:x} missing stage-2 lease",
+                                    mapping.physical_ipa
+                                ))
+                            })?;
+                            let owner = StructuralBackingOwner::new_pooled_root_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                handle,
+                                lease,
+                                u64::from(mapping.perms),
+                                epoch,
+                                mapping.physical_ipa,
+                                mapping.physical_size,
+                            )?;
+                            let owner_generation = epoch.raw();
+                            structural_identities.push(owner.record_identity());
+                            structural_owners.insert(
+                                (mapping.physical_ipa, mapping.physical_size),
+                                std::sync::Arc::clone(&owner),
+                            );
+                            (None, Some(owner), None, owner_generation)
+                        }
+                        ProcessMappingHost::Borrowed {
+                            pointer,
+                            structural_owner,
+                        } => {
+                            let structural_owner = structural_owner.ok_or_else(|| {
+                                TrapError::Hypervisor(format!(
+                                    "borrowed structural mapping at IPA 0x{:x} lost its owner",
+                                    mapping.physical_ipa
+                                ))
+                            })?;
+                            if structural_owner.ptr() != pointer
+                                || structural_owner.physical_ipa != mapping.physical_ipa
+                                || structural_owner.physical_size != mapping.physical_size
+                                || structural_owner.epoch().raw() != mapping.owner_generation
+                            {
+                                return Err(TrapError::Hypervisor(format!(
+                                    "borrowed structural mapping at IPA 0x{:x} mismatches its exact owner",
+                                    mapping.physical_ipa
+                                )));
+                            }
+                            structural_owners.insert(
+                                (mapping.physical_ipa, mapping.physical_size),
+                                std::sync::Arc::clone(&structural_owner),
+                            );
+                            (
+                                None,
+                                Some(structural_owner),
+                                mapping.stage2_lease,
+                                mapping.owner_generation,
+                            )
+                        }
+                    }
+                };
+            if needs_child_alias_authority {
+                let alias = AliasBacking {
+                    start: mapping.start,
+                    ipa: mapping.ipa,
+                    host_addr: host_addr as usize,
+                    size: mapping.size,
+                    physical_ipa: mapping.physical_ipa,
+                    physical_host_addr: mapping.physical_host_addr as usize,
+                    physical_size: mapping.physical_size,
+                    perms: u64::from(mapping.perms),
+                    guest_writable: mapping.guest_writable,
+                    sharing: mapping.sharing,
+                    ownership_scope: alias_ownership_scope(
+                        mapping.sharing,
+                        None,
+                        plan.container_root,
+                    ),
+                    inventory_backing: mapping.inventory_backing,
+                    shared_key_base: mapping.shared_key_base,
+                    shared_key_offset: mapping.shared_key_offset,
+                    owner_generation,
+                };
+                aliases_to_publish.push(if mapping.sharing.uses_global_ipa() {
+                    alias
+                } else {
+                    rebind_inherited_alias_to_process(alias, plan.mm_root_slot)
+                });
+            }
+            mapped.insert(HvfMappedRegion {
+                start: mapping.start,
+                ipa: mapping.ipa,
+                physical_ipa: mapping.physical_ipa,
+                end: mapping.end,
+                host_addr,
+                size: mapping.physical_size,
+                physical_size: mapping.physical_size,
+                perms: mapping.perms,
+                guest_writable: mapping.guest_writable,
+                memory: None,
+                host_mapping,
+                structural_owner,
+                stage2_lease,
+                is_dynamic_alias: mapping.is_dynamic_alias,
+                sharing: mapping.sharing,
+                shared_key_base: mapping.shared_key_base,
+                shared_key_offset: mapping.shared_key_offset,
+                owner_generation,
+            });
+        }
+        let mut process_reservation = plan
+            .frame_inventory
+            .lock()
+            .process_reservation
+            .take()
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "HVPatch child materialized without frame inventory reservation".to_owned(),
+                )
+            })?;
+        let process_transaction = process_reservation.transaction();
+        let mm_access = MmAccessState::new(
+            carrick_aarch64::Stage1Authority::new(),
+            plan.protections,
+            plan.frame_inventory,
+            plan.cow_armed,
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        );
+        for mapping in &mapped {
+            if let Some(owner) = &mapping.structural_owner {
+                mm_access.install_structural_mapping_authority(
+                    Some(plan.mm_root_slot),
+                    std::sync::Arc::clone(owner),
+                )?;
+            }
+        }
+        #[cfg(not(test))]
+        let custody = std::sync::Arc::clone(&plan.carrier_foreign_mm_transport.custody);
+        let mut state = HvfVmState {
+            _vm: std::mem::ManuallyDrop::new(vm),
+            carrier_foreign_mm_transport: std::sync::Arc::clone(&plan.carrier_foreign_mm_transport),
+            task: HvfTaskState {
+                #[cfg(not(test))]
+                custody,
+                mappings: mapped,
+                mm_root_slot: Some(plan.mm_root_slot),
+                container_root: plan.container_root,
+                pending_exec_mm_root_slot: None,
+                pending_exec_asid: None,
+                pending_exec_predecessor_identity: None,
+                pending_exec_stage2_cleanup: None,
+                shared_process_mm: false,
+                // A copied process receives a fresh MM authority rather than
+                // retaining the parent's Arc.
+                mm_access,
+                last_exit_class: 0,
+                last_fault_esr: 0,
+                is_forked_child: false,
+                forked_no_exec: false,
+                last_syscall_nr: None,
+                last_syscall_orig_x0: 0,
+                live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
+                persistent_vm_lifecycle: plan.persistent_vm_lifecycle,
+                cow_authority: None,
+                cow_identity: None,
+                pending_fork_frame_receipts: Vec::new(),
+                pending_process_aliases: aliases_to_publish,
+                fail_next_begin_exec_inventory: false,
+                cow_rollback_scratch: None,
+                registration: None,
+            },
+            carrier_mappings: None,
+            reclaim_authority: ReclaimParkAuthority::Live,
+            mailbox_slots: plan.mailbox_slots,
+            syscall_transport: plan.syscall_transport,
+            vcpu_id: vcpu.id(),
+            vcpu_handle: vcpu.get_handle(),
+            _vcpu_guard: Some(vcpu_census().created()),
+            cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
+            last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
+            last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
+        };
+        state.publish_live_vcpu();
+        let mailbox = match state.allocate_mailbox_for_vcpu(&vcpu) {
+            Ok(mailbox) => mailbox,
+            Err(error) => {
+                // `HvfVmState::drop` intentionally leaks live process mappings.
+                // Materialization has not committed, so explicitly drop the
+                // fresh RAII leases and host owners instead.
+                drop(std::mem::take(&mut state.mappings));
+                return Err(error);
+            }
+        };
+        {
+            let mut inventory = state.frame_inventory.lock();
+            let mut staged_mappings = Vec::with_capacity(inventory_mappings.len());
+            for mapping in inventory_mappings {
+                let stage2_owner = if is_reusable_global_frame_extent(mapping.gpa, mapping.length) {
+                    let generation = global_frame_host_owner_generation_in(
+                        &plan.carrier_foreign_mm_transport.custody,
+                        mapping.gpa,
+                        mapping.length,
+                    );
+                    InventoryStage2OwnerIdentity {
+                        host_addr: mapping.stage2_owner.host_addr,
+                        // If registered in `global_frame_host_owners()` above, use the authoritative
+                        // freshly registered owner generation. If generation is 0, this mapping represents
+                        // an unowned extent whose generation was already recorded on the descriptor
+                        // during preparation rather than a registration failure (which fails fast with Err).
+                        generation: if generation != 0 {
+                            generation
+                        } else {
+                            mapping.stage2_owner.generation
+                        },
+                    }
+                } else if let Ok(size) = usize::try_from(mapping.length)
+                    && let Some(owner) = structural_owners.get(&(mapping.gpa, size))
+                {
+                    InventoryStage2OwnerIdentity {
+                        host_addr: owner.ptr() as usize,
+                        generation: owner.epoch().raw(),
+                    }
+                } else {
+                    mapping.stage2_owner
+                };
+                let staged = match Self::stage_mapping_in(
+                    &plan.carrier_foreign_mm_transport.custody,
+                    &mut inventory,
+                    &mut process_reservation,
+                    InventoryMappingStage {
+                        gpa: mapping.gpa,
+                        length: mapping.length,
+                        permissions: mapping.permissions,
+                        backing: mapping.backing,
+                        inherited_frame: mapping.inherited_frame,
+                        stage2_lease: Some(mapping.stage2_lease),
+                        stage2_owner,
+                    },
+                ) {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        Self::rollback_unpublished_mappings(&mut inventory, &staged_mappings)
+                            .unwrap_or_else(|rollback_error| {
+                                carrick_fatal!(
+                                    "hvpatch::frame_inventory",
+                                    "rollback HVPatch child inventory staging: {rollback_error}"
+                                )
+                            });
+                        drop(inventory);
+                        for mapping in &state.mappings {
+                            if is_reusable_global_frame_extent(
+                                mapping.physical_ipa,
+                                mapping.physical_size as u64,
+                            ) {
+                                plan.carrier_foreign_mm_transport
+                                    .custody
+                                    .global_frame_host_owners
+                                    .lock()
+                                    .remove(&(mapping.physical_ipa, mapping.physical_size as u64));
+                            }
+                        }
+                        drop(std::mem::take(&mut state.mappings));
+                        return Err(error);
+                    }
+                };
+                record_cow_inventory_lifecycle(
+                    CowDiagnosticLifecycleKind::InventoryPublished,
+                    CowDiagnosticLifecycleSite::ForkMaterialization,
+                    &CowInventoryLifecycleScope {
+                        custody: &plan.carrier_foreign_mm_transport.custody,
+                        identity: None,
+                        mm_root_slot: Some(plan.mm_root_slot),
+                        semantic_va: 0,
+                        semantic_length: 0,
+                    },
+                    (mapping.gpa, mapping.length),
+                    staged,
+                );
+                staged_mappings.push(((mapping.gpa, mapping.length), staged));
+                if let (Some(parent_mapping), Some(frame), Some(kind)) = (
+                    mapping.inherited_mapping,
+                    mapping.inherited_frame,
+                    mapping.fork_frame_receipt_kind,
+                ) {
+                    pending_fork_frame_receipts.push(PendingForkFrameReceipt {
+                        transaction: process_transaction,
+                        kind,
+                        parent_mapping,
+                        child_mapping: staged.mapping,
+                        frame,
+                        ipa: mapping.gpa,
+                        length: mapping.length,
+                    });
+                }
+            }
+            inventory.initialized = true;
+            inventory.process_commit = Some(process_reservation.commit(()));
+        }
+        state.pending_fork_frame_receipts = pending_fork_frame_receipts;
+        Ok((state, vcpu, mailbox))
+    }
+
+    fn global_frame_exec_plan(&self, plan: &GuestMappingPlan) -> Result<GlobalExecPlan, TrapError> {
+        let mm_root_slot = self.pending_exec_mm_root_slot.or(self.mm_root_slot);
+        let pool_backed_root = mm_root_slot.is_some_and(|(base, size)| {
+            size == crate::frame_pool::ROOT_SLOT_SIZE as u64
+                && self
+                    .carrier_foreign_mm_transport
+                    .custody
+                    .root_slot_pool()
+                    .is_some_and(|pool| pool.contains_ipa(base))
+        });
+        prepare_global_exec_plan_with_root_backing(plan, mm_root_slot, pool_backed_root)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfInner {
+    /// Snapshot every register the trap engine ever writes, reading from the
+    /// passed `vcpu`. Gated like the signal path on `fpsimd_save_enabled()`. The
+    /// shared engine's `Aarch64Vcpu::snapshot` calls this; `last_exit_class` is
+    /// owned by the engine, so the snapshot carries 0 for it.
+    pub(crate) fn snapshot_vcpu_from(
+        vcpu: &applevisor::vcpu::Vcpu,
+    ) -> Result<VcpuSnapshot, TrapError> {
+        use applevisor::prelude::*;
+        let mut gprs = [0u64; 31];
+        for (i, reg) in GPR_TABLE.iter().enumerate() {
+            gprs[i] = vcpu.get_reg(*reg).map_err(hvf_error)?;
+        }
+        // V0-V31 + FPSR/FPCR (audit M2): preserved across fork/clone so the
+        // vector file survives the vCPU rebuild. Gated like the signal path.
+        let mut vregs = [0u128; 32];
+        let (mut fpsr, mut fpcr) = (0u32, 0u32);
+        if fpsimd_save_enabled() {
+            for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
+                vregs[i] = vcpu.get_simd_fp_reg(*reg).map_err(hvf_error)?;
+            }
+            fpsr = vcpu.get_reg(Reg::FPSR).map_err(hvf_error)? as u32;
+            fpcr = vcpu.get_reg(Reg::FPCR).map_err(hvf_error)? as u32;
+        }
+        let sp_el0 = vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
+        let sp_el1 = vcpu.get_sys_reg(SysReg::SP_EL1).map_err(hvf_error)?;
+        Ok(VcpuSnapshot {
+            core: Aarch64VcpuSnapshot {
+                gprs,
+                pc: vcpu.get_reg(Reg::PC).map_err(hvf_error)?,
+                pstate: vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?,
+                sp_el0,
+                // SP_EL1 is the per-vCPU syscall-mailbox address. Rebuild paths
+                // refresh it from the binding after restoring this snapshot.
+                sp_el1,
+                elr_el1: vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
+                spsr_el1: vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?,
+                ttbr0: vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(hvf_error)?,
+                ttbr1: vcpu.get_sys_reg(SysReg::TTBR1_EL1).map_err(hvf_error)?,
+                tcr: vcpu.get_sys_reg(SysReg::TCR_EL1).map_err(hvf_error)?,
+                sctlr: vcpu.get_sys_reg(SysReg::SCTLR_EL1).map_err(hvf_error)?,
+                mair: vcpu.get_sys_reg(SysReg::MAIR_EL1).map_err(hvf_error)?,
+                vbar: vcpu.get_sys_reg(SysReg::VBAR_EL1).map_err(hvf_error)?,
+                cpacr: vcpu.get_sys_reg(SysReg::CPACR_EL1).map_err(hvf_error)?,
+                cntkctl_el1: vcpu.get_sys_reg(SysReg::CNTKCTL_EL1).map_err(hvf_error)?,
+                tpidr_el0: vcpu.get_sys_reg(SysReg::TPIDR_EL0).map_err(hvf_error)?,
+                tpidrro_el0: vcpu.get_sys_reg(SysReg::TPIDRRO_EL0).map_err(hvf_error)?,
+                tpidr_el1: vcpu.get_sys_reg(SysReg::TPIDR_EL1).map_err(hvf_error)?,
+                contextidr_el1: vcpu
+                    .get_sys_reg(SysReg::CONTEXTIDR_EL1)
+                    .map_err(hvf_error)?,
+                actlr_el1: vcpu.get_sys_reg(SysReg::ACTLR_EL1).map_err(hvf_error)?,
+                vregs,
+                fpsr,
+                fpcr,
+            },
+        })
+    }
+
+    /// Restore `snap` onto the passed `vcpu` for reclaim/executor rebinding.
+    pub(crate) fn restore_vcpu_into(
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        snap: &VcpuSnapshot,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        for (reg, value) in GPR_TABLE.iter().zip(snap.core.gprs.iter()) {
+            vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
+        }
+        vcpu.set_reg(Reg::PC, snap.core.pc).map_err(hvf_error)?;
+        vcpu.set_reg(Reg::CPSR, snap.core.pstate)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::SP_EL0, snap.core.sp_el0)
+            .map_err(hvf_error)?;
+        // Order matters: program TCR/MAIR/TTBR0 before flipping SCTLR.M.
+        vcpu.set_sys_reg(SysReg::MAIR_EL1, snap.core.mair)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TCR_EL1, snap.core.tcr)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TTBR0_EL1, snap.core.ttbr0)
+            .map_err(hvf_error)?;
+        // TTBR1 (upper-half, x86-64 high half under Rosetta) and ACTLR (EnTSO)
+        // are part of the guest's live state; the captured TCR enables TTBR1, so
+        // restoring TTBR0 alone would leave TTBR1 walking from base 0 and lose
+        // hardware TSO — both required for the post-fork/clone guest to run.
+        vcpu.set_sys_reg(SysReg::TTBR1_EL1, snap.core.ttbr1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::ACTLR_EL1, snap.core.actlr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::CPACR_EL1, snap.core.cpacr)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::CNTKCTL_EL1, snap.core.cntkctl_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::VBAR_EL1, snap.core.vbar)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::SPSR_EL1, snap.core.spsr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::ELR_EL1, snap.core.elr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TPIDR_EL0, snap.core.tpidr_el0)
+            .map_err(hvf_error)?;
+        // TPIDRRO_EL0 (guest-readable thread ptr), TPIDR_EL1 (the shim's x16
+        // scratch) and CONTEXTIDR_EL1 (carrick's fast-`gettid` tid stamp) are all
+        // zeroed by hv_vcpu_create, so a rebuilt vCPU (fork/clone or a
+        // destroy/recreate reclaim) must restore each. CONTEXTIDR_EL1 is the one
+        // that is guest-VISIBLE through `gettid`: miss it and the EL1 handler
+        // reads 0 and degrades to a host round trip for the rest of the thread's
+        // life. (The tid lived in TPIDR_EL1 before it was moved here to free that
+        // register as the scratch; restoring only TPIDR_EL1 preserved a value that
+        // means nothing across a park and dropped the one that does.)
+        vcpu.set_sys_reg(SysReg::TPIDRRO_EL0, snap.core.tpidrro_el0)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TPIDR_EL1, snap.core.tpidr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::CONTEXTIDR_EL1, snap.core.contextidr_el1)
+            .map_err(hvf_error)?;
+        // Apply SCTLR last so the MMU enable lands with the new tables.
+        vcpu.set_sys_reg(SysReg::SCTLR_EL1, snap.core.sctlr)
+            .map_err(hvf_error)?;
+        // Restore V0-V31 + FPSR/FPCR via the C shim (NOT applevisor's
+        // set_simd_fp_reg, which zeroes via the wrong register class). (audit M2)
+        if fpsimd_save_enabled() {
+            let vcpu_id = vcpu.id();
+            for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
+                let rc = set_simd_fp_reg_v(vcpu_id, *reg, snap.core.vregs[i]);
+                if rc != 0 {
+                    return Err(TrapError::Hypervisor(format!(
+                        "fork restore set_simd_fp_reg(q{i}) failed: rc={rc:#x}"
+                    )));
+                }
+            }
+            vcpu.set_reg(Reg::FPSR, u64::from(snap.core.fpsr))
+                .map_err(hvf_error)?;
+            vcpu.set_reg(Reg::FPCR, u64::from(snap.core.fpcr))
+                .map_err(hvf_error)?;
+        }
+        Ok(())
+    }
+
+    /// Seed a BRAND-NEW sibling vCPU (a `clone(CLONE_THREAD)` thread) so it enters
+    /// EL0 at the child's resume PC. Unlike [`restore_vcpu_into`] (used by fork,
+    /// whose vCPU had already done the boot trampoline `eret` into EL0 and merely
+    /// resumes), a freshly created vCPU has never transitioned to EL0. We therefore
+    /// start it at the EL0 trampoline page (in EL1h) with `SPSR_EL1=EL0t` and
+    /// `ELR_EL1=snap.core.pc`, so the trampoline's single `eret` drops the vCPU into EL0
+    /// at exactly the post-clone instruction — mirroring `map_plan`'s initial-boot
+    /// sequence but with thread-private PC/SP/TLS. (The engine's `restore_thread_start`
+    /// routes here for HVF; `last_exit_class` is engine-owned and not restored here.)
+    pub(crate) fn restore_vcpu_thread_start_into(
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        snap: &VcpuSnapshot,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        for (reg, value) in GPR_TABLE.iter().zip(snap.core.gprs.iter()) {
+            vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
+        }
+        // Start at the EL0 trampoline page in EL1h; the trampoline `eret`s into EL0t
+        // at ELR_EL1 with SPSR_EL1's PSTATE.
+        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+        const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
+        vcpu.set_reg(Reg::PC, crate::memory::LINUX_EL0_TRAMPOLINE_BASE)
+            .map_err(hvf_error)?;
+        vcpu.set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
+            .map_err(hvf_error)?;
+        // The child's EL0 resume PC (snap.core.pc == parent ELR_EL1 == post-svc).
+        vcpu.set_sys_reg(SysReg::ELR_EL1, snap.core.pc)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::SP_EL0, snap.core.sp_el0)
+            .map_err(hvf_error)?;
+        // Same translation regime as the parent (shared address space).
+        vcpu.set_sys_reg(SysReg::MAIR_EL1, snap.core.mair)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TCR_EL1, snap.core.tcr)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TTBR0_EL1, snap.core.ttbr0)
+            .map_err(hvf_error)?;
+        // TTBR1 (upper-half, x86-64 high half under Rosetta) and ACTLR (EnTSO) are
+        // part of the guest's live state; the captured TCR enables TTBR1, so restoring
+        // TTBR0 alone would leave TTBR1 walking from base 0 and lose hardware TSO —
+        // both required for the post-clone guest to run.
+        vcpu.set_sys_reg(SysReg::TTBR1_EL1, snap.core.ttbr1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::ACTLR_EL1, snap.core.actlr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::CPACR_EL1, snap.core.cpacr)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::CNTKCTL_EL1, snap.core.cntkctl_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::VBAR_EL1, snap.core.vbar)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TPIDR_EL0, snap.core.tpidr_el0)
+            .map_err(hvf_error)?;
+        // CONTEXTIDR_EL1 is deliberately LEFT ZERO here: a new thread must not
+        // inherit the parent's tid stamp. Zero is the fail-safe — the EL1
+        // `gettid` handler's degrade branch traps to the host and returns the
+        // correct tid — whereas a stale parent tid would be returned silently
+        // and WRONG if the caller's re-stamp ever failed to run.
+        // SP_EL1 was already set to this sibling's mailbox by materialization.
+        // The trampoline does not touch it before `eret` enters EL0.
+        // Enable the MMU last, identically to the parent.
+        vcpu.set_sys_reg(SysReg::SCTLR_EL1, snap.core.sctlr)
+            .map_err(hvf_error)?;
+        // A new fork/clone vCPU starts with zeroed SIMD/FP state. Preserve the
+        // captured V0-V31 + FPSR/FPCR just as the ordinary restore path does;
+        // otherwise a raw clone loses live vector state in the child.
+        if fpsimd_save_enabled() {
+            let vcpu_id = vcpu.id();
+            for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
+                let rc = set_simd_fp_reg_v(vcpu_id, *reg, snap.core.vregs[i]);
+                if rc != 0 {
+                    return Err(TrapError::Hypervisor(format!(
+                        "thread-start restore set_simd_fp_reg(q{i}) failed: rc={rc:#x}"
+                    )));
+                }
+            }
+            vcpu.set_reg(Reg::FPSR, u64::from(snap.core.fpsr))
+                .map_err(hvf_error)?;
+            vcpu.set_reg(Reg::FPCR, u64::from(snap.core.fpcr))
+                .map_err(hvf_error)?;
+        }
+        Ok(())
+    }
+
+    /// Run the passed `vcpu` to its next exit, decoding HVF's native trap surface
+    /// into the neutral [`carrick_aarch64::Aarch64Exit`]. The old
+    /// `run_until_syscall` exit decode, returning `Aarch64Exit` instead of an
+    /// `Option<Aarch64SyscallFrame>` — the shared engine owns the
+    /// pending-syscall/SA_RESTART state, the guest-CPU accounting and the
+    /// EL1-maintenance loop, so this surfaces
+    /// `Syscall`/`EL0Fault`/`MaintenanceDone`/`Kicked`, keeps the internal
+    /// kick-swallow + the bounded in-loop lazy alias re-map, and services the
+    /// sys64 MRS read inline (a loop `continue`).
+    pub(crate) fn run_to_exit(
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
+    ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
+        use applevisor::prelude::*;
+        use carrick_aarch64::Aarch64Exit;
+
+        // Lifecycle marker: the first entry here is the moment the guest first
+        // runs — i.e. INITIAL boot/setup is done. Fired once per process; since
+        // carrick forks via no-exec `libc::fork`, a forked child inherits the
+        // parent's already-completed Once and does NOT re-fire this.
+        static FIRST_RUN: std::sync::Once = std::sync::Once::new();
+        FIRST_RUN.call_once(|| crate::probes::lifecycle(crate::probes::phase::FIRST_VCPU_RUN));
+
+        // Bounds lazy re-mapping of dropped aliases so a
+        // genuinely-unmappable backing still terminates instead of spinning.
+        let mut alias_remap_limiter = AliasRemapLimiter::default();
+        loop {
+            // The engine accounts the guest CPU time via `guest_cpu::timed_run`
+            // around its `vcpu.run()` call, so do NOT double-account here.
+            vcpu.run().map_err(hvf_error)?;
+            let exit = vcpu.get_exit_info();
+            if exit.reason == ExitReason::CANCELED {
+                // A cross-thread `hv_vcpus_exit` (crate::vcpu_kick) forced this
+                // vCPU out of the guest so a pending signal can be delivered.
+                //
+                // But the kick can land while the vCPU is still inside carrick's
+                // EL1 trap trampoline — a guest EL0 `svc`/fault is mid-flight,
+                // between the vector entry (VBAR_EL1 = vectors_base, e.g. the
+                // sync-from-EL0 entry at +0x400) and the HVC that traps out to
+                // the host. PC there is an EL1 trampoline address, NOT a guest
+                // userspace PC. Reporting that as a deliverable kick overwrites
+                // the in-flight exception and wedges the thread — reproduced as a
+                // SIGURG storm corrupting a futex waiter (pc=vectors_base+0x404).
+                //
+                // Resume until the guest is back at EL0 so the trampoline
+                // completes its HVC and the real syscall is serviced; the
+                // pending signal is then delivered at that clean EL0 boundary.
+                let cpsr = vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?;
+                if !ExecLevel::from_pstate(cpsr).is_guest() {
+                    EL1_KICK_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::probes::kick_in_kernel(
+                        vcpu.get_reg(Reg::PC).unwrap_or(0),
+                        ((cpsr >> 2) & 0b11) as u32,
+                    );
+                    continue;
+                }
+                return Ok(Aarch64Exit::Kicked);
+            }
+            // A direct EL0 abort on a high-VA alias address that THIS vCPU's
+            // shared VM is missing: a `fork()` rebuilt the shared VM from only the
+            // forking thread's mappings, dropping an alias mapped by
+            // a sibling thread (the go-build telemetry counter). arm64 HVF has no
+            // stage-2 TLB shootdown, so re-running alone never fixes it — but the
+            // host backing is a MAP_SHARED mmap still live at the registered host
+            // address, so re-`hv_vm_map`'ing it into THIS (shared) VM restores the
+            // stage-2 entry for every thread, and the instruction re-executes
+            // cleanly. Only registered aliases are touched, so a genuine bad
+            // access to unregistered memory still faults. Bounded as a backstop.
+            // (Kept INSIDE run_to_exit, NOT surfaced as Aarch64Exit::Memory — the
+            // in-loop remap is the safe, behavior-identical choice.)
+            if exit.reason == ExitReason::EXCEPTION
+                && is_aarch64_el0_abort_exception(exit.exception.syndrome)
+                && crate::memory::is_high_va(exit.exception.virtual_address)
+            {
+                let backing = if exit.exception.physical_address != 0 {
+                    lookup_shared_alias(exit.exception.physical_address)
+                } else {
+                    lookup_live_alias_by_va_any_scope(exit.exception.virtual_address, 1)
+                };
+                if let Some(b) = backing
+                    && alias_remap_limiter.allow(b.physical_ipa)
+                {
+                    // SAFETY: `host_addr` is a live MAP_SHARED mmap registered
+                    // by add_alias. Only rc=0 proves replay installation.
+                    let rc = unsafe { inventory_hv_vm_map_replay(b) };
+                    crate::probes::hv_vm_map_alias(
+                        exit.exception.virtual_address,
+                        b.physical_ipa,
+                        b.physical_size as u64,
+                        rc as i32,
+                        0,
+                    );
+                    if rc != 0 {
+                        return Err(TrapError::Hypervisor(format!(
+                            "lazy alias replay hv_vm_map(ipa=0x{:x}, size={}) failed: 0x{rc:x}",
+                            b.physical_ipa, b.physical_size
+                        )));
+                    }
+                    // Diagnostic-only alias-remap counter+dump, gated behind
+                    // `debug-stats` (no other consumer reads the counter).
+                    #[cfg(feature = "debug-stats")]
+                    {
+                        let n =
+                            ALIAS_REMAP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n.is_multiple_of(256) {
+                            eprintln!("ALIAS_REMAP n={n} ipa=0x{:x}", b.physical_ipa);
+                        }
+                    }
+                    continue;
+                }
+            }
+            if exit.reason != ExitReason::EXCEPTION {
+                // WFI/halt or any non-EXCEPTION non-CANCELED exit that today
+                // errored: keep erroring.
+                return Err(TrapError::UnexpectedExit {
+                    reason: format!("{:?}", exit.reason),
+                });
+            }
+
+            let exception = exit.exception;
+            // A guest EL0 memory abort HVF couldn't satisfy (e.g. a stack overflow
+            // that ran SP off the mapped stack) surfaces DIRECTLY as an EXCEPTION
+            // exit with EC=0x20/0x24, NOT through our EL1 vector's HVC. Surface it
+            // as a DIRECT EL0Fault so the runtime delivers the right Linux signal
+            // (SIGSEGV) instead of fataling. ELR_EL1/FAR_EL1 are STALE here (the
+            // guest's EL1 vector never ran), so build the fault from HVF's
+            // authoritative PC (Reg::PC) + VA (exception.virtual_address).
+            if is_aarch64_el0_abort_exception(exception.syndrome) {
+                let true_pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
+                let far = exception.virtual_address;
+                let x16 = vcpu.get_reg(Reg::X16).unwrap_or(0);
+                let x17 = vcpu.get_reg(Reg::X17).unwrap_or(0);
+                let x29 = vcpu.get_reg(Reg::X29).unwrap_or(0);
+                let x30 = vcpu.get_reg(Reg::LR).unwrap_or(0);
+                let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+                crate::probes::vcpu_fault(exception.syndrome, true_pc, far, x30, sp, unsafe {
+                    libc::getpid()
+                });
+                return Ok(Aarch64Exit::EL0Fault {
+                    syndrome: exception.syndrome,
+                    elr: true_pc,
+                    far,
+                    x16,
+                    x17,
+                    x29,
+                    x30,
+                    sp,
+                    from_el0_direct: true,
+                });
+            }
+            // Fail loud on the EL1 vector's `hvc #3` (current-EL synchronous slot):
+            // carrick's guest took a synchronous exception WHILE AT EL1, which only
+            // happens when a guest resume left PSTATE at EL1 (e.g. a signal handler
+            // entered with SPSR_EL1=EL1h, whose PXN instruction fetch aborts). The
+            // bare-`eret` vectors used to spin on this forever at 100 % CPU with no
+            // host exit; the `hvc #3` trap surfaces it here. ESR_EL1/ELR_EL1/FAR_EL1
+            // still hold the ORIGINAL EL1 fault (the `hvc` left them untouched), so
+            // report them verbatim. This is a carrick bug, not a guest fault — do
+            // not deliver it to the guest as a signal; terminate loudly.
+            if is_aarch64_hvc_fault(exception.syndrome) {
+                let esr_el1 = vcpu.get_sys_reg(SysReg::ESR_EL1).unwrap_or(0);
+                let elr_el1 = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+                let far_el1 = vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
+                let spsr_el1 = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
+                if is_stage1_cow_write_fault(esr_el1) {
+                    vcpu.set_reg(Reg::PC, elr_el1).map_err(hvf_error)?;
+                    vcpu.set_reg(Reg::CPSR, spsr_el1).map_err(hvf_error)?;
+                    return Ok(Aarch64Exit::Stage1CowFault {
+                        syndrome: esr_el1,
+                        far: far_el1,
+                    });
+                }
+                let ec = (esr_el1 >> 26) & 0x3f;
+                let mailbox_diagnostics = mailbox.diagnostics();
+                eprintln!(
+                    "FAIL-LOUD pid={pid}: guest executed at EL1 and faulted \
+                     (current-EL sync vector) — carrick state corruption (a guest \
+                     resume left PSTATE at EL1, commonly a signal handler entered \
+                     with SPSR_EL1=EL1h). Was a silent 100% CPU spin before the \
+                     hvc #3 vector trap. esr_el1={esr_el1:#x} ec={ec:#x} \
+                     elr_el1={elr_el1:#x} far_el1={far_el1:#x} spsr_el1={spsr_el1:#x} \
+                     mailbox={mailbox_diagnostics:?}",
+                    pid = unsafe { libc::getpid() },
+                );
+                return Err(TrapError::GuestAtEl1 {
+                    esr_el1,
+                    elr_el1,
+                    far_el1,
+                    spsr_el1,
+                });
+            }
+            if !is_aarch64_syscall_exception(exception.syndrome) {
+                return Err(TrapError::UnexpectedException {
+                    syndrome: exception.syndrome,
+                    virtual_address: exception.virtual_address,
+                    physical_address: exception.physical_address,
+                });
+            }
+            // EC=0x16 (HVC) only means our EL1 vector trampoline fired — it catches
+            // ALL lower-EL synchronous exceptions, not just SVCs. Look at ESR_EL1
+            // to see what actually trapped to EL1; if it's not an SVC, either
+            // emulate it (sys64 MRS read → re-run) or surface it as an EL0Fault.
+            if is_aarch64_hvc_exception(exception.syndrome) {
+                // The maintenance HVC (`hvc #1`) is consumed by the engine's
+                // EL1-maintenance loop; if it ever reaches here, report it so the
+                // engine's loop can match on it.
+                if is_aarch64_hvc_maintenance(exception.syndrome) {
+                    return Ok(Aarch64Exit::MaintenanceDone);
+                }
+                let underlying = vcpu.get_sys_reg(SysReg::ESR_EL1).map_err(hvf_error)?;
+                if !is_aarch64_svc_exception(underlying) {
+                    if HvfVmState::emulate_el0_sys64_read_inner(vcpu, underlying)? {
+                        // Serviced (ELR_EL1 advanced, target GPR written) — re-run.
+                        continue;
+                    }
+                    let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+                    let far = vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
+                    let x16 = vcpu.get_reg(Reg::X16).unwrap_or(0);
+                    let x17 = vcpu.get_reg(Reg::X17).unwrap_or(0);
+                    let x29 = vcpu.get_reg(Reg::X29).unwrap_or(0);
+                    let x30 = vcpu.get_reg(Reg::LR).unwrap_or(0);
+                    let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+                    crate::probes::vcpu_fault(underlying, elr, far, x30, sp, unsafe {
+                        libc::getpid()
+                    });
+                    // HVC-trampoline path: the guest EL1 vector latched
+                    // ELR_EL1/FAR_EL1, so they are authoritative.
+                    return Ok(Aarch64Exit::EL0Fault {
+                        syndrome: underlying,
+                        elr,
+                        far,
+                        x16,
+                        x17,
+                        x29,
+                        x30,
+                        sp,
+                        from_el0_direct: false,
+                    });
+                }
+            }
+            // A genuine guest EL0 `svc`. HVC2 from the mailbox vector consumes
+            // the release-published frame without any register/sysreg API reads.
+            // The diagnostic legacy mode still validates that publication, then
+            // deliberately reads the live registers for an apples-to-apples
+            // transport comparison. A direct SVC exit (no EL1 HVC vehicle) keeps
+            // the historical register decode as a defensive compatibility path.
+            let mut register_reads = 0u32;
+            let mut sysreg_reads = 0u32;
+            let mut legacy_decode = || {
+                sysreg_reads += 1;
+                let resume_pc = vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(|error| {
+                    crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string())
+                })?;
+                let frame = carrick_hal::read_aarch64_syscall_frame(|r| {
+                    register_reads += 1;
+                    hvf_get_reg(vcpu, r)
+                })
+                .map_err(|error| {
+                    crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string())
+                })?;
+                sysreg_reads += 1;
+                let spsr = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
+                register_reads += 1;
+                let fp = vcpu.get_reg(Reg::X29).unwrap_or(0);
+                register_reads += 1;
+                let lr = vcpu.get_reg(Reg::LR).unwrap_or(0);
+                sysreg_reads += 1;
+                let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+                sysreg_reads += 1;
+                let esr = vcpu.get_sys_reg(SysReg::ESR_EL1).unwrap_or(0);
+                Ok(crate::syscall_mailbox::MailboxRequest {
+                    native_nr: frame.x8,
+                    frame,
+                    resume_pc,
+                    spsr,
+                    fp,
+                    lr,
+                    sp,
+                    esr,
+                })
+            };
+            let request = if is_aarch64_hvc_exception(exception.syndrome) {
+                mailbox.decode_request(legacy_decode)
+            } else {
+                legacy_decode()
+            }
+            .map_err(|error| {
+                let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
+                let sp_el1 = vcpu.get_sys_reg(SysReg::SP_EL1).unwrap_or(0);
+                let binding_address = mailbox.slot().guest_address();
+                let diagnostics = mailbox.diagnostics();
+                TrapError::Hypervisor(format!(
+                    "{error}; vcpu_pc={pc:#x}; sp_el1={sp_el1:#x}; binding_address={binding_address:#x}; mailbox={diagnostics:?}"
+                ))
+            })?;
+            crate::probes::hvf_syscall_transport(
+                mailbox.transport().raw(),
+                0,
+                register_reads,
+                sysreg_reads,
+                0,
+            );
+            let frame = request.frame;
+            let resume_pc = request.resume_pc;
+            // vcpu_trap probe parity: guest PC at the trap (= ELR_EL1) + the live
+            // FP/SP/LR so a DTrace consumer can walk the guest call chain. The
+            // stack-region bases require the per-thread mapping list (on
+            // HvfVmState, not reachable here), so report zero bases.
+            crate::probes::vcpu_trap(&crate::compat::GuestRegs {
+                pc: resume_pc,
+                sp: request.sp,
+                fp: request.fp,
+                lr: request.lr,
+                x8: frame.x8,
+                x0: frame.x0,
+                stack_guest_base: 0,
+                stack_host_base: 0,
+                stack_guest_end: 0,
+            });
+            return Ok(Aarch64Exit::Syscall {
+                frame,
+                resume_pc,
+                current_guest_sp: Some(request.sp),
+            });
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod stage2_backend;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use stage2_backend::*;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+pub(crate) mod frame_inventory_backend_tests {
+    pub(crate) static NEXT_TEST_PHYSICAL_IPA: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0x0000_00a1_0000_0000);
+
+    pub(crate) fn global_frame_allocator_test_lock() -> &'static parking_lot::Mutex<()> {
+        static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        &LOCK
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) mod thread_sibling_tests;
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod tag_strip_tests;

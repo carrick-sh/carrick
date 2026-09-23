@@ -1,0 +1,22 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.77s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-207122e8ce47be2c)
+
+running 1 test
+test kernel::guest_execution::tests::duplicate_admission_preserves_live_pause_endpoint ... FAILED
+
+failures:
+
+---- kernel::guest_execution::tests::duplicate_admission_preserves_live_pause_endpoint stdout ----
+
+thread 'kernel::guest_execution::tests::duplicate_admission_preserves_live_pause_endpoint' (4048753) panicked at crates/carrick-kernel/src/kernel/guest_execution.rs:393:17:
+rejected duplicate concealed the running owner
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    kernel::guest_execution::tests::duplicate_admission_preserves_live_pause_endpoint
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2196 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

@@ -1,0 +1,11 @@
+inventory 0
+registry 0
+clippy-final 0
+kernel 0
+runtime-memory 0
+runtime-quiesce 0
+memory-doctests 0
+elf-tests 0
+elf-clippy 0
+product-layering 0
+signed-foreign-mm 1

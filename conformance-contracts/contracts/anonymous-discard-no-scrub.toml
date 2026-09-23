@@ -1,0 +1,21 @@
+schema_version = 1
+id = "kernel.mm.anonymous-discard-no-scrub"
+title = "Successful anonymous backing discard performs no eager scrub"
+guest_surfaces = ["syscall:madvise"]
+semantic_authority = ["Linux private anonymous zero-fill and fork isolation"]
+fixture = "unit:anonymous-discard-no-scrub"
+scale_points = [1, 8, 32, 128]
+rationale = "A successful backend retirement must replace the fallback scrub, not precede another clear. Unsupported backends retain the authenticated scrub."
+[bindings]
+vm_free = "carrick-kernel::dispatch::mem::madvise::tests::anonymous_discard_avoids_scrub_contract"
+embed = "carrick-conformance-next::deferred_anonymous_pristine_scrub_semantics"
+[bindings.unresolved]
+embed_structural = "Production zero-byte census and failure injection pending."
+docker = "Fresh signed candidate differential and untraced paired workload acceptance pending."
+[[structural_budgets]]
+kind = "affine"
+metric = "host_backend_calls"
+base = 0
+per_unit = 0
+layers = ["vm-free"]
+rationale = "Actual fallback zero_backing callback count after a capable scripted discard. This is dispatch control evidence, not proof of physical retirement."

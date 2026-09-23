@@ -1,0 +1,24 @@
+{
+  "input": "target/lease-cost/native-islands/unsupported-control-input.json",
+  "limitation": "Decoder actions only, not current-MM emission, executable authority, native execution, branch linking, atomic ordering or measured coverage. Sensitive actions may require helpers or region fusion. No guest code is executed.",
+  "schema": "dsr-static-decoder-coverage-v1",
+  "symbols": [
+    {
+      "actions": {
+        "decode-error": 1
+      },
+      "instruction_sites": 1,
+      "rejected_sites": [
+        {
+          "reason": "DSR could not decode 0xffffffff at guest PC 0x1000: Unallocated(4096)",
+          "site": {
+            "address": "0x1000",
+            "word": "0xffffffff"
+          }
+        }
+      ],
+      "rejected_sites_count": 1,
+      "symbol": "deliberately_undefined_instruction"
+    }
+  ]
+}

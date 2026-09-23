@@ -1,0 +1,53 @@
+[
+  {
+    "name": "elf-clippy-final",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--manifest-path",
+      "experiments/native-syscall-slice/Cargo.toml",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "wall_s": 0.46623604200431146
+  },
+  {
+    "name": "runtime-clippy",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--no-deps",
+      "-p",
+      "carrick-runtime",
+      "-p",
+      "carrick-observability",
+      "--all-targets",
+      "--features",
+      "carrick-runtime/conformance-metrics",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "wall_s": 14.095278166001663
+  },
+  {
+    "name": "inventory-check",
+    "argv": [
+      "cargo",
+      "run",
+      "-p",
+      "carrick-conformance-contract",
+      "--bin",
+      "check-contracts",
+      "--",
+      "--root",
+      "."
+    ],
+    "exit_code": 1,
+    "wall_s": 0.36453804100165144
+  }
+]

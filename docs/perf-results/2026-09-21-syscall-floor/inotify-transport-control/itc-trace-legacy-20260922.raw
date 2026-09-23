@@ -1,0 +1,13 @@
+ITC1|seen=1|errors=0|root_exited=1
+ITC1|requests|transport=0|nr=27|count=169
+ITC1|requests|transport=0|nr=28|count=169
+ITC1|returns|transport=0|nr=27|count=169
+ITC1|returns|transport=0|nr=28|count=169
+ITC1|reads|transport=0|nr=27|count=1521
+ITC1|reads|transport=0|nr=28|count=1521
+ITC1|sysreads|transport=0|nr=27|count=676
+ITC1|sysreads|transport=0|nr=28|count=676
+ITC1|writes|transport=0|nr=27|count=169
+ITC1|writes|transport=0|nr=28|count=169
+ITC1|missing_decode|transport=0|nr=27|count=0
+ITC1|missing_decode|transport=0|nr=28|count=0

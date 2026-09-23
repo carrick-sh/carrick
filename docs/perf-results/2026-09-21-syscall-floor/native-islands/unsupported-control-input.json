@@ -1,0 +1,1 @@
+{"schema":"native-slice-static-text-coverage-v1","symbols":[{"symbol":"deliberately_undefined_instruction","instructions":[{"address":"0x1000","word":"0xffffffff"}]}]}

@@ -1,0 +1,85 @@
+[
+  {
+    "name": "census-final",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-kernel",
+      "--lib",
+      "kernel::guest_execution",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 40.838189125061035
+  },
+  {
+    "name": "kernel-suite",
+    "argv": [
+      "just",
+      "test-kernel"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 29.60136604309082
+  },
+  {
+    "name": "runtime-memory",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-runtime",
+      "--lib",
+      "vcpu_loop::memory::tests",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 25.857530117034912
+  },
+  {
+    "name": "runtime-quiesce",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-runtime",
+      "--lib",
+      "vcpu_loop::quiesce::",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.4351186752319336
+  },
+  {
+    "name": "native-experiment",
+    "argv": [
+      "cargo",
+      "test",
+      "--manifest-path",
+      "experiments/native-syscall-slice/Cargo.toml",
+      "--lib"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 6.719810962677002
+  },
+  {
+    "name": "clippy",
+    "argv": [
+      "cargo",
+      "clippy",
+      "-p",
+      "carrick-kernel",
+      "--lib",
+      "--tests",
+      "--no-deps",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 23.857939958572388
+  }
+]

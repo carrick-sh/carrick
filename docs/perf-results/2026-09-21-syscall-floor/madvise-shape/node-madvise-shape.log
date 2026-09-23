@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/workloads/node-madvise-shape.py", line 15, in <module>
+    assert code==0,code
+           ^^^^^^^
+AssertionError: 1

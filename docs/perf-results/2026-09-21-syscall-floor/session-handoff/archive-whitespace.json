@@ -1,0 +1,7 @@
+{
+  "unfiltered_diff_check_exit": 2,
+  "findings": 1398,
+  "outside_archive": [],
+  "source_diff_check_exit": 0,
+  "disposition": "Preserve historical raw logs and unified patches byte for byte; do not trim or rewrite immutable evidence."
+}

@@ -1,0 +1,12 @@
+{
+  "linux_s": [
+    0.049,
+    0.048,
+    0.049,
+    0.049
+  ],
+  "candidate_mean_s": 0.184,
+  "linux_mean_s": 0.04875,
+  "raw_candidate_linux_mean_ratio": 3.7743589743589743,
+  "io_adjusted": false
+}

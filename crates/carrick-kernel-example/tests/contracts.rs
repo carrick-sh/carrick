@@ -414,3 +414,17 @@ fn fork_stage1_image_structural_red_control() {
         other => panic!("expected ScalingViolation, got: {other:?}"),
     }
 }
+
+#[test]
+fn inotify_churn_preserves_unread_watch_identity() {
+    let registry = ContractRegistry::load(&repo_root()).expect("registry");
+    let observations = [1, 8, 32, 128]
+        .into_iter()
+        .map(|n| carrick_kernel_example::contracts::inotify_churn_contract(n).expect("observation"))
+        .collect::<Vec<_>>();
+    evaluate(
+        registry.require("kernel.inotify.watch-churn").unwrap(),
+        &observations,
+    )
+    .expect("watch-only semantics and bounded work");
+}

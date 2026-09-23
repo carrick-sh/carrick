@@ -1,0 +1,114 @@
+{
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "source_files_sha256": {
+    "experiments/native-syscall-slice/Cargo.toml": "37788f6db78dccabea6214b8e76cc4d6dd557e242e819fceb6c263ea891747db",
+    "experiments/native-syscall-slice/measure.py": "31f47c0addbe4669707bf7837f7fa91431d8f0f3e78377db62e6169b868e7246",
+    "experiments/native-syscall-slice/Cargo.lock": "a70475e51215b043381a64c77d91bf63228378b8b15bca7e92df9eeafbfd6dc1",
+    "experiments/native-syscall-slice/README.md": "73a19bdfa26fb11b399357e5d2dbceedf28b81601e6e5c1d7e0fd348cfaded0c",
+    "experiments/native-syscall-slice/fixtures/build.sh": "32d9d4cfd8f28b806475caea2cce9a15a26a3d77cb4379e46de42d2c8814935f",
+    "experiments/native-syscall-slice/fixtures/watch.S": "b9aaa5d952620e64c3538f7cb7e8fd428e87b3a8a3826bc69cc538c96c583f68",
+    "experiments/native-syscall-slice/fixtures/guest.ld": "887857d4cea5d0cbdc1ca98902125314763a475ab4c457e8d52c63fe344eeb62",
+    "experiments/native-syscall-slice/src/native.rs": "44fc139d54ce0d8895cc2dc295b51072d049a7fdc0a4153df66bdb9a66ab078f",
+    "experiments/native-syscall-slice/src/gateway.S": "0eb6e54da30ec124e288eee2bd6321efe3653f78587d448530424ee683a2a987",
+    "experiments/native-syscall-slice/src/lib.rs": "6c8e8f50db72cccbe3e0158e9a77792ac40f1f9616faba90d0ab17d4bef6ac67",
+    "experiments/native-syscall-slice/src/allocations.rs": "60d854c0662c2c3ffd5496f4548c27b86f76f91f6684f8d7249018c273ebfadf",
+    "experiments/native-syscall-slice/src/main.rs": "aa22c95e1b728ea077fece89366df8363de0deb13c2867437bf6ac48ebc66544",
+    "crates/carrick-kernel/src/kernel/mm_access.rs": "a3c9da90c2dd346902602f89b2db84836b40f7dc0a24d2407cd973a00ae9a87f",
+    "Cargo.lock": "6a7083ef251922d35685745be82882e45384515cdd3132d6eef75250a8d4a6c3",
+    "conformance-contracts/contracts/native-synchronous-syscall.toml": "0842e0301b00265665ac0581f9e9acf00d95ec2c394bb5d4ac4466ff52983efb"
+  },
+  "artifacts": {
+    "native": {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor",
+      "sha256": "9f05321d6b75403637c7d0123216ef82a54acf6786e8d654f91af624d22b83c9",
+      "codesign": {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "Executable=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor\nIdentifier=sh.carrick.native-slice\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=20496 flags=0x2(adhoc) hashes=635+2 location=embedded\nVersionPlatform=1\nVersionMin=720896\nVersionSDK=1769472\nHash type=sha256 size=32\nCandidateCDHash sha256=de101bf00648bf12268c135f02531f0bd775d9ef\nCandidateCDHashFull sha256=de101bf00648bf12268c135f02531f0bd775d9ef592c4a3126b882cfd0079928\nHash choices=sha256\nCMSDigest=de101bf00648bf12268c135f02531f0bd775d9ef592c4a3126b882cfd0079928\nCMSDigestType=2\nExecutable Segment base=0\nExecutable Segment limit=7094272\nExecutable Segment flags=0x1\nPage size=16384\nCDHash=de101bf00648bf12268c135f02531f0bd775d9ef\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements count=0 size=12\nTotal signatures=1\nChosen signature=1\n"
+      },
+      "uuid": {
+        "returncode": 1,
+        "stdout": "ERROR: invalid long option '--uuid'\ndwarfdump option error.\nTo see the options list: dwarfdump -h\n",
+        "stderr": ""
+      },
+      "entitlements": {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "Executable=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor\nwarning: Specifying ':' in the path is deprecated and will not work in a future release\n"
+      }
+    },
+    "allocation": {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-allocation-final-executor",
+      "sha256": "c55a4fa9405b4c7aa139189a65796dbbc45c8822390a6231fdc498cb61aa1cc8",
+      "codesign": {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "Executable=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-allocation-final-executor\nIdentifier=sh.carrick.native-slice-alloc\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=20438 flags=0x2(adhoc) hashes=633+2 location=embedded\nVersionPlatform=1\nVersionMin=720896\nVersionSDK=1769472\nHash type=sha256 size=32\nCandidateCDHash sha256=62850c1d354abec90357b8c1a114f99d880f22b5\nCandidateCDHashFull sha256=62850c1d354abec90357b8c1a114f99d880f22b53c72442deec7b76ddabe6bad\nHash choices=sha256\nCMSDigest=62850c1d354abec90357b8c1a114f99d880f22b53c72442deec7b76ddabe6bad\nCMSDigestType=2\nExecutable Segment base=0\nExecutable Segment limit=7094272\nExecutable Segment flags=0x1\nPage size=16384\nCDHash=62850c1d354abec90357b8c1a114f99d880f22b5\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements count=0 size=12\nTotal signatures=1\nChosen signature=1\n"
+      },
+      "uuid": {
+        "returncode": 1,
+        "stdout": "ERROR: invalid long option '--uuid'\ndwarfdump option error.\nTo see the options list: dwarfdump -h\n",
+        "stderr": ""
+      },
+      "entitlements": {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "Executable=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-allocation-final-executor\nwarning: Specifying ':' in the path is deprecated and will not work in a future release\n"
+      }
+    },
+    "hvf": {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/inotify-transport-control/carrick-control",
+      "sha256": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+      "codesign": {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "Executable=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/inotify-transport-control/carrick-control\nIdentifier=carrick.tmp.71219\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=68330 flags=0x2(adhoc) hashes=2125+7 location=embedded\nVersionPlatform=1\nVersionMin=720896\nVersionSDK=786432\nHash type=sha256 size=32\nCandidateCDHash sha256=3660ecc081e5f637d15deb09fd66f2951ed927c7\nCandidateCDHashFull sha256=3660ecc081e5f637d15deb09fd66f2951ed927c72f30f07d8d635ec805916433\nHash choices=sha256\nCMSDigest=3660ecc081e5f637d15deb09fd66f2951ed927c72f30f07d8d635ec805916433\nCMSDigestType=2\nExecutable Segment base=0\nExecutable Segment limit=24068096\nExecutable Segment flags=0x1\nPage size=16384\nCDHash=3660ecc081e5f637d15deb09fd66f2951ed927c7\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements count=0 size=12\nTotal signatures=1\nChosen signature=1\n"
+      },
+      "uuid": {
+        "returncode": 1,
+        "stdout": "ERROR: invalid long option '--uuid'\ndwarfdump option error.\nTo see the options list: dwarfdump -h\n",
+        "stderr": ""
+      },
+      "entitlements": {
+        "returncode": 0,
+        "stdout": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"https://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\n",
+        "stderr": "Executable=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/inotify-transport-control/carrick-control\nwarning: Specifying ':' in the path is deprecated and will not work in a future release\n"
+      },
+      "dof_present": true
+    }
+  },
+  "fixture_sha256": {
+    "watch-4-65536": "65816b9c54b2c2a8f374fc670e1f0fdfca7fb3f9eed2dc0867f9c92bec628669",
+    "watch-3-32": "65a70a4a83a2a78c0a344c318c1dc99a0792f590d05b102e444ad3ba268fba29",
+    "watch-2-65536": "2e6a2789d0be91fbb1f9d05ae9fd5550b6491b19d08dd15ed064c7aff05ea07c",
+    "watch-0-65536": "07deb13f32e1149a68b9da1c626bf68ba9d56dea889d8bd902c280ef4e4987e8",
+    "watch-3-8": "b687b8285d4cac83fe0b89dbdfd0264c1acb9a3cab0d5b4cd05a306a125a45bd",
+    "watch-3-1": "21c9de745dd40a9cfae5ff5cdeca1cbc00a77ff7cd12a0d1194b4e94972d64e6",
+    "watch-2-32": "f67f03597c78f0cf53206eb95fa1eeb198c1d58a76f6c7371ae2f67b560a2aa5",
+    "watch-1-65536": "fa6854c1bb771993c5d55beae096a968ffa7ebaf7e14b5693a477767bfa2fc04",
+    "watch-4-1": "d47b4c50091a5a007177b17dbe7c127f11397978c2a071058bcf8228b29268b3",
+    "watch-4-8": "f2e208320fae2ab1931f3c08749f65a68729587eedb0dd1e1247479fb0911c2a",
+    "watch-0-8": "924a4293b6a0ba851075858c541c6a8ce1fbe9cca2c95caa0e87ff67e406115b",
+    "watch-0-1": "da215fd2e52667f2385f545d7ad5dced5c4804435e4a5b1381b423611dc19773",
+    "watch-3-65536": "adf637224cbb17dedcd95c1c08d6237f202f06c6307ce07791101a70f9134862",
+    "watch-4-128": "4d3202c8eb0b37978294bb07090bf6f2cd903b269e7215700703c2c13e180864",
+    "watch-0-128": "0af6eb393e1e975d7689c18a90a301c7cb89a799f0134728b0c8792db8000130",
+    "watch-1-128": "7c3448491856f9bad5f2f119ab139092ce43dfe6035a277ae9377fb498f3de18",
+    "watch-1-1": "b73bc597cbd35843ca0b73e69efb59dcba4875e29bbbc98e2a36eecfd903ecbc",
+    "watch-3-128": "8ec5a78882b84a43cf473f81516f3c64dff5160d7fd2553620564cea076fc8f7",
+    "watch-1-8": "90f5f4e6474d06d93cb209b056d4acbe57a5e3d0926f02f63a4bc3d96f129a5b",
+    "watch-2-128": "d6274e782b3563282b152e04e6c162aec44cc6df96783db7ae54afb6a4943641",
+    "watch-1-32": "266528ce8dd75a3927092e74ef7da4a0d1da51ee93eb42c9a819ee9acb305e6e",
+    "watch-0-32": "f200e9046b07a5a4d97efac905cf7dac69b4b8fc534a0701d703dd2bbb90d0b8",
+    "watch-2-1": "43eeadd62b40a4ec92d414567a2e704ac476d4b11233cef2c405a049df0ee952",
+    "watch-2-8": "18ba1157aa6f3d6179bda53677c58dce03740274ce55a271672b98d577a260c4",
+    "watch-4-32": "1efbb7edaf985804db72ae53636fac910efd75bd14245e9a978d9c27eb245c4f"
+  },
+  "host": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2\n",
+  "native_linkage": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/native-final-executor:\n\t/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 5027.0.69)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.0.0)\n\t/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)\n",
+  "image": "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+  "final_invocations": 54,
+  "retained_samples": 486,
+  "promotion": "not accepted: incomplete native binding; pathological memory control"
+}

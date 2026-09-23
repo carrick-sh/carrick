@@ -1,0 +1,24 @@
+{
+  "go-build-cold": {
+    "control_s": [
+      1.329,
+      1.319
+    ],
+    "candidate_s": [
+      1.316,
+      1.331
+    ],
+    "candidate_control_mean_ratio": 0.9996223564954685
+  },
+  "python-os": {
+    "control_s": [
+      2.659,
+      2.551
+    ],
+    "candidate_s": [
+      2.548,
+      2.539
+    ],
+    "candidate_control_mean_ratio": 0.9763915547024952
+  }
+}

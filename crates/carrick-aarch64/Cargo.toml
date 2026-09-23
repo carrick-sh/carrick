@@ -34,3 +34,7 @@ bitflags.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+carrick-conformance-contract = { path = "../carrick-conformance-contract" }
+sha2.workspace = true

@@ -1,0 +1,31 @@
+schema_version = 1
+id = "kernel.mm.native-syscall-buffers"
+title = "Current-MM syscall copies use carrier authority without eager buffer work"
+guest_surfaces = ["kernel:current-mm", "syscall:inotify_add_watch", "syscall:inotify_rm_watch", "syscall:read", "syscall:write", "syscall:clock_gettime"]
+semantic_authority = ["Linux syscall buffer and EFAULT semantics", "Carrick exact execution lease and current-MM authority", "Carrick carrier COW ownership and live guest-leaf permissions"]
+fixture = "unit:native-syscall-buffers"
+scale_points = [1, 8, 32, 128]
+rationale = "The bounded native syscall adapter uses the authenticated carrier for input and output, never an ELF-private decoy. Copies authenticate the execution lease, validate live permissions, preserve COW source bytes, and chunk at guest-leaf boundaries. The copy-only research adapter refuses executable output and mapping operations. Invalid-descriptor add/remove pairs perform no speculative buffer preparation or heap allocation."
+
+[bindings]
+vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_buffers; current_buffer_invalid_fd_cost_contract requires conformance-metrics; semantic controls cover actual clock output, wrong execution lease, overflow and invalid ranges, permissions and revocation, repeated page and compound copies, and COW source isolation"
+
+[bindings.unresolved]
+embed_structural = "The opt-in carrier_buffer_elf_control composes unchanged ELF data and buffers with real carrier COW but private research code publication and mock stage-2. It is not signed native execution acceptance. Code publication, signals, scheduling and broader syscall memory semantics remain unbound."
+embed_timing = "Host-only release control timings are diagnostic. No product-native workload timing accepted."
+docker = "Identical ELF semantic controls have archived native ARM64 Linux output; carrier composition is a host-only fixture, not a Docker differential execution binding."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "host_heap_allocations"
+value = 0
+layers = ["vm-free"]
+rationale = "Measure real allocator calls on the executing thread after setup and warmup; a positive allocation control must fire. Invalid descriptors must not mint buffer snapshots."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 0
+per_unit = 2
+layers = ["vm-free"]
+rationale = "At most one dispatch per syscall; semantic assertions independently require exactly 2N requests and EBADF completions."

@@ -1,0 +1,992 @@
+[
+  {
+    "arm": "authenticate",
+    "iterations": 128,
+    "pair_ns": 88.8671875,
+    "runtime_conformance_metrics": false,
+    "sample": 0,
+    "warmup": true,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "adapter",
+    "iterations": 128,
+    "pair_ns": 208.3359375,
+    "runtime_conformance_metrics": false,
+    "sample": 0,
+    "warmup": true,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_activation",
+    "iterations": 128,
+    "pair_ns": 676.7578125,
+    "runtime_conformance_metrics": false,
+    "sample": 0,
+    "warmup": true,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "checkpoint_control",
+    "iterations": 128,
+    "pair_ns": 421.875,
+    "runtime_conformance_metrics": false,
+    "sample": 0,
+    "warmup": true,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_fresh_adapter",
+    "iterations": 128,
+    "pair_ns": 5254.2265625,
+    "runtime_conformance_metrics": false,
+    "sample": 0,
+    "warmup": true,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "whole_host_path",
+    "iterations": 128,
+    "pair_ns": 1418.9453125,
+    "runtime_conformance_metrics": false,
+    "sample": 0,
+    "warmup": true,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "prepare_policy",
+    "iterations": 128,
+    "pair_ns": 153.6484375,
+    "runtime_conformance_metrics": false,
+    "sample": 0,
+    "warmup": true,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "syscall_metadata",
+    "iterations": 128,
+    "pair_ns": 30.2734375,
+    "runtime_conformance_metrics": false,
+    "sample": 0,
+    "warmup": true,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_return_reporter",
+    "iterations": 128,
+    "pair_ns": 34.828125,
+    "runtime_conformance_metrics": false,
+    "sample": 0,
+    "warmup": true,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "capture_resources",
+    "iterations": 128,
+    "pair_ns": 259.4453125,
+    "runtime_conformance_metrics": false,
+    "sample": 0,
+    "warmup": true,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "capture_resources",
+    "iterations": 65536,
+    "pair_ns": 109.28282165527344,
+    "runtime_conformance_metrics": false,
+    "sample": 1,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_return_reporter",
+    "iterations": 65536,
+    "pair_ns": 38.204193115234375,
+    "runtime_conformance_metrics": false,
+    "sample": 1,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "syscall_metadata",
+    "iterations": 65536,
+    "pair_ns": 12.920379638671875,
+    "runtime_conformance_metrics": false,
+    "sample": 1,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "prepare_policy",
+    "iterations": 65536,
+    "pair_ns": 107.33604431152344,
+    "runtime_conformance_metrics": false,
+    "sample": 1,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "whole_host_path",
+    "iterations": 65536,
+    "pair_ns": 907.4351043701172,
+    "runtime_conformance_metrics": false,
+    "sample": 1,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_fresh_adapter",
+    "iterations": 65536,
+    "pair_ns": 320.47779846191406,
+    "runtime_conformance_metrics": false,
+    "sample": 1,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "checkpoint_control",
+    "iterations": 65536,
+    "pair_ns": 39.00654602050781,
+    "runtime_conformance_metrics": false,
+    "sample": 1,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_activation",
+    "iterations": 65536,
+    "pair_ns": 279.70123291015625,
+    "runtime_conformance_metrics": false,
+    "sample": 1,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "adapter",
+    "iterations": 65536,
+    "pair_ns": 39.0472412109375,
+    "runtime_conformance_metrics": false,
+    "sample": 1,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "authenticate",
+    "iterations": 65536,
+    "pair_ns": 38.70201110839844,
+    "runtime_conformance_metrics": false,
+    "sample": 1,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "authenticate",
+    "iterations": 65536,
+    "pair_ns": 38.78912353515625,
+    "runtime_conformance_metrics": false,
+    "sample": 2,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "adapter",
+    "iterations": 65536,
+    "pair_ns": 41.75885009765625,
+    "runtime_conformance_metrics": false,
+    "sample": 2,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_activation",
+    "iterations": 65536,
+    "pair_ns": 283.21266174316406,
+    "runtime_conformance_metrics": false,
+    "sample": 2,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "checkpoint_control",
+    "iterations": 65536,
+    "pair_ns": 39.881378173828125,
+    "runtime_conformance_metrics": false,
+    "sample": 2,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_fresh_adapter",
+    "iterations": 65536,
+    "pair_ns": 320.6488342285156,
+    "runtime_conformance_metrics": false,
+    "sample": 2,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "whole_host_path",
+    "iterations": 65536,
+    "pair_ns": 718.5020446777344,
+    "runtime_conformance_metrics": false,
+    "sample": 2,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "prepare_policy",
+    "iterations": 65536,
+    "pair_ns": 52.147552490234375,
+    "runtime_conformance_metrics": false,
+    "sample": 2,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "syscall_metadata",
+    "iterations": 65536,
+    "pair_ns": 5.77545166015625,
+    "runtime_conformance_metrics": false,
+    "sample": 2,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_return_reporter",
+    "iterations": 65536,
+    "pair_ns": 15.97149658203125,
+    "runtime_conformance_metrics": false,
+    "sample": 2,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "capture_resources",
+    "iterations": 65536,
+    "pair_ns": 46.14765930175781,
+    "runtime_conformance_metrics": false,
+    "sample": 2,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "capture_resources",
+    "iterations": 65536,
+    "pair_ns": 46.70269775390625,
+    "runtime_conformance_metrics": false,
+    "sample": 3,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_return_reporter",
+    "iterations": 65536,
+    "pair_ns": 15.7655029296875,
+    "runtime_conformance_metrics": false,
+    "sample": 3,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "syscall_metadata",
+    "iterations": 65536,
+    "pair_ns": 6.1480255126953125,
+    "runtime_conformance_metrics": false,
+    "sample": 3,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "prepare_policy",
+    "iterations": 65536,
+    "pair_ns": 53.246185302734375,
+    "runtime_conformance_metrics": false,
+    "sample": 3,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "whole_host_path",
+    "iterations": 65536,
+    "pair_ns": 718.420654296875,
+    "runtime_conformance_metrics": false,
+    "sample": 3,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_fresh_adapter",
+    "iterations": 65536,
+    "pair_ns": 326.51519775390625,
+    "runtime_conformance_metrics": false,
+    "sample": 3,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "checkpoint_control",
+    "iterations": 65536,
+    "pair_ns": 40.331512451171875,
+    "runtime_conformance_metrics": false,
+    "sample": 3,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_activation",
+    "iterations": 65536,
+    "pair_ns": 280.8812561035156,
+    "runtime_conformance_metrics": false,
+    "sample": 3,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "adapter",
+    "iterations": 65536,
+    "pair_ns": 41.29791259765625,
+    "runtime_conformance_metrics": false,
+    "sample": 3,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "authenticate",
+    "iterations": 65536,
+    "pair_ns": 39.46240234375,
+    "runtime_conformance_metrics": false,
+    "sample": 3,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "authenticate",
+    "iterations": 65536,
+    "pair_ns": 39.62644958496094,
+    "runtime_conformance_metrics": false,
+    "sample": 4,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "adapter",
+    "iterations": 65536,
+    "pair_ns": 41.78428649902344,
+    "runtime_conformance_metrics": false,
+    "sample": 4,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_activation",
+    "iterations": 65536,
+    "pair_ns": 276.35447692871094,
+    "runtime_conformance_metrics": false,
+    "sample": 4,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "checkpoint_control",
+    "iterations": 65536,
+    "pair_ns": 38.230255126953125,
+    "runtime_conformance_metrics": false,
+    "sample": 4,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_fresh_adapter",
+    "iterations": 65536,
+    "pair_ns": 321.57769775390625,
+    "runtime_conformance_metrics": false,
+    "sample": 4,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "whole_host_path",
+    "iterations": 65536,
+    "pair_ns": 725.1981048583984,
+    "runtime_conformance_metrics": false,
+    "sample": 4,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "prepare_policy",
+    "iterations": 65536,
+    "pair_ns": 52.25944519042969,
+    "runtime_conformance_metrics": false,
+    "sample": 4,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "syscall_metadata",
+    "iterations": 65536,
+    "pair_ns": 5.7576446533203125,
+    "runtime_conformance_metrics": false,
+    "sample": 4,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_return_reporter",
+    "iterations": 65536,
+    "pair_ns": 15.59130859375,
+    "runtime_conformance_metrics": false,
+    "sample": 4,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "capture_resources",
+    "iterations": 65536,
+    "pair_ns": 46.06500244140625,
+    "runtime_conformance_metrics": false,
+    "sample": 4,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "capture_resources",
+    "iterations": 65536,
+    "pair_ns": 46.31297302246094,
+    "runtime_conformance_metrics": false,
+    "sample": 5,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_return_reporter",
+    "iterations": 65536,
+    "pair_ns": 15.326812744140625,
+    "runtime_conformance_metrics": false,
+    "sample": 5,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "syscall_metadata",
+    "iterations": 65536,
+    "pair_ns": 5.580902099609375,
+    "runtime_conformance_metrics": false,
+    "sample": 5,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "prepare_policy",
+    "iterations": 65536,
+    "pair_ns": 51.30513000488281,
+    "runtime_conformance_metrics": false,
+    "sample": 5,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "whole_host_path",
+    "iterations": 65536,
+    "pair_ns": 734.5123291015625,
+    "runtime_conformance_metrics": false,
+    "sample": 5,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_fresh_adapter",
+    "iterations": 65536,
+    "pair_ns": 320.15101623535156,
+    "runtime_conformance_metrics": false,
+    "sample": 5,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "checkpoint_control",
+    "iterations": 65536,
+    "pair_ns": 38.69438171386719,
+    "runtime_conformance_metrics": false,
+    "sample": 5,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_activation",
+    "iterations": 65536,
+    "pair_ns": 277.5077819824219,
+    "runtime_conformance_metrics": false,
+    "sample": 5,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "adapter",
+    "iterations": 65536,
+    "pair_ns": 41.866302490234375,
+    "runtime_conformance_metrics": false,
+    "sample": 5,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "authenticate",
+    "iterations": 65536,
+    "pair_ns": 39.7764892578125,
+    "runtime_conformance_metrics": false,
+    "sample": 5,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "authenticate",
+    "iterations": 65536,
+    "pair_ns": 40.04795837402344,
+    "runtime_conformance_metrics": false,
+    "sample": 6,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "adapter",
+    "iterations": 65536,
+    "pair_ns": 41.92987060546875,
+    "runtime_conformance_metrics": false,
+    "sample": 6,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_activation",
+    "iterations": 65536,
+    "pair_ns": 286.11309814453125,
+    "runtime_conformance_metrics": false,
+    "sample": 6,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "checkpoint_control",
+    "iterations": 65536,
+    "pair_ns": 40.15476989746094,
+    "runtime_conformance_metrics": false,
+    "sample": 6,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_fresh_adapter",
+    "iterations": 65536,
+    "pair_ns": 327.4243621826172,
+    "runtime_conformance_metrics": false,
+    "sample": 6,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "whole_host_path",
+    "iterations": 65536,
+    "pair_ns": 722.1959381103516,
+    "runtime_conformance_metrics": false,
+    "sample": 6,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "prepare_policy",
+    "iterations": 65536,
+    "pair_ns": 53.863525390625,
+    "runtime_conformance_metrics": false,
+    "sample": 6,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "syscall_metadata",
+    "iterations": 65536,
+    "pair_ns": 5.98016357421875,
+    "runtime_conformance_metrics": false,
+    "sample": 6,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_return_reporter",
+    "iterations": 65536,
+    "pair_ns": 16.225189208984375,
+    "runtime_conformance_metrics": false,
+    "sample": 6,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "capture_resources",
+    "iterations": 65536,
+    "pair_ns": 47.104522705078125,
+    "runtime_conformance_metrics": false,
+    "sample": 6,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "capture_resources",
+    "iterations": 65536,
+    "pair_ns": 47.630950927734375,
+    "runtime_conformance_metrics": false,
+    "sample": 7,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_return_reporter",
+    "iterations": 65536,
+    "pair_ns": 16.178131103515625,
+    "runtime_conformance_metrics": false,
+    "sample": 7,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "syscall_metadata",
+    "iterations": 65536,
+    "pair_ns": 6.011962890625,
+    "runtime_conformance_metrics": false,
+    "sample": 7,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "prepare_policy",
+    "iterations": 65536,
+    "pair_ns": 53.87751770019531,
+    "runtime_conformance_metrics": false,
+    "sample": 7,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "whole_host_path",
+    "iterations": 65536,
+    "pair_ns": 733.7017059326172,
+    "runtime_conformance_metrics": false,
+    "sample": 7,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_fresh_adapter",
+    "iterations": 65536,
+    "pair_ns": 322.8136749267578,
+    "runtime_conformance_metrics": false,
+    "sample": 7,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "checkpoint_control",
+    "iterations": 65536,
+    "pair_ns": 40.146514892578125,
+    "runtime_conformance_metrics": false,
+    "sample": 7,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_activation",
+    "iterations": 65536,
+    "pair_ns": 288.8011932373047,
+    "runtime_conformance_metrics": false,
+    "sample": 7,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "adapter",
+    "iterations": 65536,
+    "pair_ns": 41.826873779296875,
+    "runtime_conformance_metrics": false,
+    "sample": 7,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "authenticate",
+    "iterations": 65536,
+    "pair_ns": 39.848968505859375,
+    "runtime_conformance_metrics": false,
+    "sample": 7,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "authenticate",
+    "iterations": 65536,
+    "pair_ns": 39.314910888671875,
+    "runtime_conformance_metrics": false,
+    "sample": 8,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "adapter",
+    "iterations": 65536,
+    "pair_ns": 41.8179931640625,
+    "runtime_conformance_metrics": false,
+    "sample": 8,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_activation",
+    "iterations": 65536,
+    "pair_ns": 279.6192169189453,
+    "runtime_conformance_metrics": false,
+    "sample": 8,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "checkpoint_control",
+    "iterations": 65536,
+    "pair_ns": 39.244964599609375,
+    "runtime_conformance_metrics": false,
+    "sample": 8,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_fresh_adapter",
+    "iterations": 65536,
+    "pair_ns": 324.6472625732422,
+    "runtime_conformance_metrics": false,
+    "sample": 8,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "whole_host_path",
+    "iterations": 65536,
+    "pair_ns": 731.2819213867188,
+    "runtime_conformance_metrics": false,
+    "sample": 8,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "prepare_policy",
+    "iterations": 65536,
+    "pair_ns": 50.42903137207031,
+    "runtime_conformance_metrics": false,
+    "sample": 8,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "syscall_metadata",
+    "iterations": 65536,
+    "pair_ns": 5.7614593505859375,
+    "runtime_conformance_metrics": false,
+    "sample": 8,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_return_reporter",
+    "iterations": 65536,
+    "pair_ns": 15.07568359375,
+    "runtime_conformance_metrics": false,
+    "sample": 8,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "capture_resources",
+    "iterations": 65536,
+    "pair_ns": 46.01924133300781,
+    "runtime_conformance_metrics": false,
+    "sample": 8,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "capture_resources",
+    "iterations": 65536,
+    "pair_ns": 46.271636962890625,
+    "runtime_conformance_metrics": false,
+    "sample": 9,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_return_reporter",
+    "iterations": 65536,
+    "pair_ns": 15.089035034179688,
+    "runtime_conformance_metrics": false,
+    "sample": 9,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "syscall_metadata",
+    "iterations": 65536,
+    "pair_ns": 5.7353973388671875,
+    "runtime_conformance_metrics": false,
+    "sample": 9,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "prepare_policy",
+    "iterations": 65536,
+    "pair_ns": 51.47552490234375,
+    "runtime_conformance_metrics": false,
+    "sample": 9,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "whole_host_path",
+    "iterations": 65536,
+    "pair_ns": 718.3812561035156,
+    "runtime_conformance_metrics": false,
+    "sample": 9,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_fresh_adapter",
+    "iterations": 65536,
+    "pair_ns": 320.6717071533203,
+    "runtime_conformance_metrics": false,
+    "sample": 9,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "checkpoint_control",
+    "iterations": 65536,
+    "pair_ns": 39.0625,
+    "runtime_conformance_metrics": false,
+    "sample": 9,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "entry_activation",
+    "iterations": 65536,
+    "pair_ns": 277.5382995605469,
+    "runtime_conformance_metrics": false,
+    "sample": 9,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "adapter",
+    "iterations": 65536,
+    "pair_ns": 41.85357666015625,
+    "runtime_conformance_metrics": false,
+    "sample": 9,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "authenticate",
+    "iterations": 65536,
+    "pair_ns": 39.809539794921875,
+    "runtime_conformance_metrics": false,
+    "sample": 9,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_reused_adapter",
+    "iterations": 128,
+    "pair_ns": 270.8359375,
+    "runtime_conformance_metrics": false,
+    "sample": 0,
+    "warmup": true,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_reused_adapter",
+    "iterations": 65536,
+    "pair_ns": 270.3717498779297,
+    "runtime_conformance_metrics": false,
+    "sample": 1,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_reused_adapter",
+    "iterations": 65536,
+    "pair_ns": 277.17462158203125,
+    "runtime_conformance_metrics": false,
+    "sample": 2,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_reused_adapter",
+    "iterations": 65536,
+    "pair_ns": 279.3464660644531,
+    "runtime_conformance_metrics": false,
+    "sample": 3,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_reused_adapter",
+    "iterations": 65536,
+    "pair_ns": 271.0857391357422,
+    "runtime_conformance_metrics": false,
+    "sample": 4,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_reused_adapter",
+    "iterations": 65536,
+    "pair_ns": 274.34857177734375,
+    "runtime_conformance_metrics": false,
+    "sample": 5,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_reused_adapter",
+    "iterations": 65536,
+    "pair_ns": 275.07972717285156,
+    "runtime_conformance_metrics": false,
+    "sample": 6,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_reused_adapter",
+    "iterations": 65536,
+    "pair_ns": 281.0719757080078,
+    "runtime_conformance_metrics": false,
+    "sample": 7,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_reused_adapter",
+    "iterations": 65536,
+    "pair_ns": 275.46055603027344,
+    "runtime_conformance_metrics": false,
+    "sample": 8,
+    "warmup": false,
+    "workload_timing_eligible": false
+  },
+  {
+    "arm": "dispatch_reused_adapter",
+    "iterations": 65536,
+    "pair_ns": 274.89598083496094,
+    "runtime_conformance_metrics": false,
+    "sample": 9,
+    "warmup": false,
+    "workload_timing_eligible": false
+  }
+]

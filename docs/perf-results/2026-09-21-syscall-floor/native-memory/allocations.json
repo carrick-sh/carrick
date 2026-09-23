@@ -1,0 +1,342 @@
+[
+  {
+    "scale": 1,
+    "run_id": "nslice-memory-alloc-1-20260922",
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 82,
+      "elapsed_ms": 1,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-0-1",
+      "errno_returns": 20,
+      "exit": 0,
+      "gateway_transitions": 83,
+      "host_signal_bridge": "null",
+      "requests": 83,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 10,
+        "28": 10,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    },
+    "metrics": {
+      "allocation_windows": [
+        [
+          2,
+          2,
+          0
+        ],
+        [
+          2,
+          2,
+          0
+        ],
+        [
+          2,
+          2,
+          0
+        ],
+        [
+          2,
+          2,
+          0
+        ],
+        [
+          2,
+          2,
+          0
+        ],
+        [
+          2,
+          2,
+          0
+        ],
+        [
+          2,
+          2,
+          0
+        ],
+        [
+          2,
+          2,
+          0
+        ],
+        [
+          2,
+          2,
+          0
+        ],
+        [
+          2,
+          2,
+          0
+        ]
+      ],
+      "positive_control": true,
+      "timing_eligible": false
+    },
+    "binary_sha256": "9f07ca98e8c54c22a61dc8534a8dafbe4fe7c7814819f157ef46e2fca78a8c16",
+    "elf_sha256": "da215fd2e52667f2385f545d7ad5dced5c4804435e4a5b1381b423611dc19773",
+    "observation": "observation-1.json"
+  },
+  {
+    "scale": 8,
+    "run_id": "nslice-memory-alloc-8-20260922",
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 222,
+      "elapsed_ms": 0,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-0-8",
+      "errno_returns": 160,
+      "exit": 0,
+      "gateway_transitions": 223,
+      "host_signal_bridge": "null",
+      "requests": 223,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 80,
+        "28": 80,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    },
+    "metrics": {
+      "allocation_windows": [
+        [
+          16,
+          16,
+          0
+        ],
+        [
+          16,
+          16,
+          0
+        ],
+        [
+          16,
+          16,
+          0
+        ],
+        [
+          16,
+          16,
+          0
+        ],
+        [
+          16,
+          16,
+          0
+        ],
+        [
+          16,
+          16,
+          0
+        ],
+        [
+          16,
+          16,
+          0
+        ],
+        [
+          16,
+          16,
+          0
+        ],
+        [
+          16,
+          16,
+          0
+        ],
+        [
+          16,
+          16,
+          0
+        ]
+      ],
+      "positive_control": true,
+      "timing_eligible": false
+    },
+    "binary_sha256": "9f07ca98e8c54c22a61dc8534a8dafbe4fe7c7814819f157ef46e2fca78a8c16",
+    "elf_sha256": "924a4293b6a0ba851075858c541c6a8ce1fbe9cca2c95caa0e87ff67e406115b",
+    "observation": "observation-8.json"
+  },
+  {
+    "scale": 32,
+    "run_id": "nslice-memory-alloc-32-20260922",
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 702,
+      "elapsed_ms": 0,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-0-32",
+      "errno_returns": 640,
+      "exit": 0,
+      "gateway_transitions": 703,
+      "host_signal_bridge": "null",
+      "requests": 703,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 320,
+        "28": 320,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    },
+    "metrics": {
+      "allocation_windows": [
+        [
+          64,
+          64,
+          0
+        ],
+        [
+          64,
+          64,
+          0
+        ],
+        [
+          64,
+          64,
+          0
+        ],
+        [
+          64,
+          64,
+          0
+        ],
+        [
+          64,
+          64,
+          0
+        ],
+        [
+          64,
+          64,
+          0
+        ],
+        [
+          64,
+          64,
+          0
+        ],
+        [
+          64,
+          64,
+          0
+        ],
+        [
+          64,
+          64,
+          0
+        ],
+        [
+          64,
+          64,
+          0
+        ]
+      ],
+      "positive_control": true,
+      "timing_eligible": false
+    },
+    "binary_sha256": "9f07ca98e8c54c22a61dc8534a8dafbe4fe7c7814819f157ef46e2fca78a8c16",
+    "elf_sha256": "f200e9046b07a5a4d97efac905cf7dac69b4b8fc534a0701d703dd2bbb90d0b8",
+    "observation": "observation-32.json"
+  },
+  {
+    "scale": 128,
+    "run_id": "nslice-memory-alloc-128-20260922",
+    "counts": {
+      "backend": "bounded-native-research",
+      "completions": 2622,
+      "elapsed_ms": 0,
+      "elf": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-0-128",
+      "errno_returns": 2560,
+      "exit": 0,
+      "gateway_transitions": 2623,
+      "host_signal_bridge": "null",
+      "requests": 2623,
+      "syscalls": {
+        "113": 20,
+        "26": 10,
+        "27": 1280,
+        "28": 1280,
+        "29": 10,
+        "56": 1,
+        "57": 11,
+        "64": 10,
+        "93": 1
+      }
+    },
+    "metrics": {
+      "allocation_windows": [
+        [
+          256,
+          256,
+          0
+        ],
+        [
+          256,
+          256,
+          0
+        ],
+        [
+          256,
+          256,
+          0
+        ],
+        [
+          256,
+          256,
+          0
+        ],
+        [
+          256,
+          256,
+          0
+        ],
+        [
+          256,
+          256,
+          0
+        ],
+        [
+          256,
+          256,
+          0
+        ],
+        [
+          256,
+          256,
+          0
+        ],
+        [
+          256,
+          256,
+          0
+        ],
+        [
+          256,
+          256,
+          0
+        ]
+      ],
+      "positive_control": true,
+      "timing_eligible": false
+    },
+    "binary_sha256": "9f07ca98e8c54c22a61dc8534a8dafbe4fe7c7814819f157ef46e2fca78a8c16",
+    "elf_sha256": "0af6eb393e1e975d7689c18a90a301c7cb89a799f0134728b0c8792db8000130",
+    "observation": "observation-128.json"
+  }
+]

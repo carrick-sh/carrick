@@ -1,0 +1,20 @@
+{
+  "basis": "before.tar.gz plus the preserved add-red.py; Cargo.lock differs from parent only by the runtime contract test dependency",
+  "source_sha256": {
+    "Cargo.lock": "f59f9a3974058143e0fb76ff2bf6b9d7771632ac55bed9cb3e9c8f056e608767",
+    "conformance-contracts/contracts/native-data-activation.toml": "b1c3a058158bccd71f4b8dab945d6ab6919f042c24ee76ee2bd8e22f185555b5",
+    "crates/carrick-aarch64/src/stage1_authority.rs": "1aa50d59b5fe88b1bccf13187e14d6393cf8c69e5d1ee320d1577300778580af",
+    "crates/carrick-hal/src/foreign_mm.rs": "6bf5203ad03bf48625b7a36064a96666be8098993105b3aad0c0179663a060f2",
+    "crates/carrick-kernel/src/kernel/address.rs": "1afd2f26ec8f0abc9060d93abb4822a97b813cbf11de1bd84f813ebfb762c386",
+    "crates/carrick-kernel/src/kernel/frame_inventory.rs": "70a07e0bf139470f080a5f21ea1a48993e0d329280dd5d9c041d871f66ce79d3",
+    "crates/carrick-kernel/src/kernel/mm_access.rs": "76df9e32539584ee763a52dd3e5059e48daa5262f2f33a5b62acc1fd93d3b66e",
+    "crates/carrick-kernel/src/kernel/mod.rs": "c6631a56129e575ed78e9354251e2e0c11ea8e7d8d9bdb9106448a662ce17a3a",
+    "crates/carrick-observability/src/work_meter.rs": "c28829aaf6a0153c9ff86ce3aa7823301d817b8da5c54ab7137fe6a64410a834",
+    "crates/carrick-runtime/Cargo.toml": "5ba59157863f56b5dc0fe9ede79723c9ecde4eea5e50f6f14d320badd31e4c80",
+    "crates/carrick-runtime/src/hvpatch/stage1_mm.rs": "26a449b328890d3dd02cede7ab3b1a7ede4f5879c058b980c41127be71dc781a",
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs": "ff92105049cfc6042d8260f37f462f9c79e2b380dc9555d7b75f7d7314cc5a66",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "a085054ad05341d25d31ea5b1d62956b6ffd271c37b1d38e86d21b7af5e5fd24"
+  },
+  "binary_sha256": "f87089e249f3fdcd1b8941fe328f3d9bcc896e03afe398b021274e5157266141",
+  "reconstructed_after_run": true
+}

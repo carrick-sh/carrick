@@ -1,0 +1,122 @@
+[
+  {
+    "contract_id": "kernel.mm.executor-admission",
+    "layer": "vm-free",
+    "implementation_revision": "sha256:120960de827776ce69d2cd0614826a936abf464d541ad94a59ef1c4de0bbf127",
+    "fixture_identity": "unit:duplicate-admission-live-endpoint",
+    "scale": 1,
+    "semantic_assertions": [
+      {
+        "name": "rejected_duplicate_preserves_running_owner",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "drain_kicks_only_original_owner",
+        "passed": true,
+        "detail": "original=1, rejected=0"
+      }
+    ],
+    "work": {
+      "values": {
+        "host_backend_calls": 1
+      },
+      "dropped_events": 0,
+      "unknown_metrics": []
+    },
+    "timing": null,
+    "completeness": {
+      "status": "complete"
+    }
+  },
+  {
+    "contract_id": "kernel.mm.executor-admission",
+    "layer": "vm-free",
+    "implementation_revision": "sha256:120960de827776ce69d2cd0614826a936abf464d541ad94a59ef1c4de0bbf127",
+    "fixture_identity": "unit:duplicate-admission-live-endpoint",
+    "scale": 8,
+    "semantic_assertions": [
+      {
+        "name": "rejected_duplicate_preserves_running_owner",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "drain_kicks_only_original_owner",
+        "passed": true,
+        "detail": "original=8, rejected=0"
+      }
+    ],
+    "work": {
+      "values": {
+        "host_backend_calls": 8
+      },
+      "dropped_events": 0,
+      "unknown_metrics": []
+    },
+    "timing": null,
+    "completeness": {
+      "status": "complete"
+    }
+  },
+  {
+    "contract_id": "kernel.mm.executor-admission",
+    "layer": "vm-free",
+    "implementation_revision": "sha256:120960de827776ce69d2cd0614826a936abf464d541ad94a59ef1c4de0bbf127",
+    "fixture_identity": "unit:duplicate-admission-live-endpoint",
+    "scale": 32,
+    "semantic_assertions": [
+      {
+        "name": "rejected_duplicate_preserves_running_owner",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "drain_kicks_only_original_owner",
+        "passed": true,
+        "detail": "original=32, rejected=0"
+      }
+    ],
+    "work": {
+      "values": {
+        "host_backend_calls": 32
+      },
+      "dropped_events": 0,
+      "unknown_metrics": []
+    },
+    "timing": null,
+    "completeness": {
+      "status": "complete"
+    }
+  },
+  {
+    "contract_id": "kernel.mm.executor-admission",
+    "layer": "vm-free",
+    "implementation_revision": "sha256:120960de827776ce69d2cd0614826a936abf464d541ad94a59ef1c4de0bbf127",
+    "fixture_identity": "unit:duplicate-admission-live-endpoint",
+    "scale": 128,
+    "semantic_assertions": [
+      {
+        "name": "rejected_duplicate_preserves_running_owner",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "drain_kicks_only_original_owner",
+        "passed": true,
+        "detail": "original=128, rejected=0"
+      }
+    ],
+    "work": {
+      "values": {
+        "host_backend_calls": 128
+      },
+      "dropped_events": 0,
+      "unknown_metrics": []
+    },
+    "timing": null,
+    "completeness": {
+      "status": "complete"
+    }
+  }
+]

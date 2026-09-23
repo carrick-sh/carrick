@@ -297,7 +297,7 @@ impl<'a> FsView<'a> {
             let (wd, is_virtual, is_rootfs) = if is_known_rootfs
                 && this.fs.rootfs_vfs.dispatch_events_complete()
             {
-                (state.add_virtual_watch(mask), true, true)
+                (state.add_virtual_watch(mask)?, true, true)
             } else if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
                 match m.vfs.watch_fds(&m.full_path) {
                     Ok(watch_fds) => match state.add_watch_fds(watch_fds, mask) {
@@ -310,7 +310,7 @@ impl<'a> FsView<'a> {
                         if !this.path_exists(&path) {
                             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOENT));
                         }
-                        (state.add_virtual_watch(mask), true, false)
+                        (state.add_virtual_watch(mask)?, true, false)
                     }
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
@@ -323,7 +323,7 @@ impl<'a> FsView<'a> {
                 if !this.rootfs_path_exists(&path) {
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOENT));
                 }
-                (state.add_virtual_watch(mask), true, true)
+                (state.add_virtual_watch(mask)?, true, true)
             } else {
                 match this.fs.rootfs_vfs.watch_fds(&path) {
                     Ok(watch_fds) => match state.add_watch_fds(watch_fds, mask) {
@@ -345,7 +345,7 @@ impl<'a> FsView<'a> {
                                 }
                             }
                             // No host vnode (in-memory overlay): dispatch-only.
-                            Ok(_) => (state.add_virtual_watch(mask), true, false),
+                            Ok(_) => (state.add_virtual_watch(mask)?, true, false),
                             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                         }
                     }

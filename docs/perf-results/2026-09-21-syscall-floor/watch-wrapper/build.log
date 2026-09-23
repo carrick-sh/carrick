@@ -1,0 +1,14 @@
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+warning: variable does not need to be mutable
+    --> crates/carrick-runtime/src/vcpu_loop/exec.rs:2916:13
+     |
+2916 |         let mut job =
+     |             ----^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `carrick-runtime` (lib test) generated 1 warning (run `cargo fix --lib -p carrick-runtime --tests` to apply 1 suggestion)
+    Finished `release` profile [optimized + debuginfo] target(s) in 58.89s
+  Executable unittests src/lib.rs (target/release/deps/carrick_runtime-f35e6b220553ee62)

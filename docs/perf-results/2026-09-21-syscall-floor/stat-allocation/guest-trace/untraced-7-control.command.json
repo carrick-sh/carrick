@@ -1,0 +1,22 @@
+{
+  "argv": [
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/carrick-retained-query-candidate",
+    "run",
+    "--max-traps",
+    "18446744073709551615",
+    "--fs",
+    "host",
+    "-v",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/io-floor/shared:/bench",
+    "--entrypoint",
+    "/bench/io-floor-profile-linux",
+    "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+    "/bench/floor-fstat-untraced-7-control.data",
+    "65536",
+    "9",
+    "fstat"
+  ],
+  "run_id": "floor-fstat-untraced-7-control",
+  "binary_sha256": "28d9082c0d53fee019cb88580357a1d66f31ab7d12e9ee9d4bf865077e22143c",
+  "fixture_sha256": "2bc66ca7453884a95257832664900cb7d04622f03f2a5aaa51ec81442e1962e7"
+}

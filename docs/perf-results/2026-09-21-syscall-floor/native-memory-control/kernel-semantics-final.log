@@ -1,0 +1,374 @@
+cargo test -p carrick-kernel-example --tests 
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.21s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel_example-59d30328e6c05743)
+
+running 1 test
+test memory::tests::alloc_bounds_overflow_does_not_advance_cursor ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/kernel-syscall-floor.rs (target/debug/deps/kernel_syscall_floor-38f6fc05864fb9f2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/write-seek-observation.rs (target/debug/deps/write_seek_observation-4f23899acb0c5db8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contracts.rs (target/debug/deps/contracts-173caa91935467f3)
+
+running 25 tests
+test fork_stage1_image_structural_red_control ... ok
+test fork_filetable_structural_red_control ... ok
+test fork_mappings_structural_red_control ... ok
+test futex_requeue_structural_red_control ... ok
+test futex_structural_red_control ... ok
+test inotify09_hotpath_structural_red_control ... ok
+test futex_zero_wake_visits_queue_head_without_waiter_inspections ... ok
+test futex_partial_wake_scales_with_target_wake_count ... ok
+test futex_requeue_partial_and_full ... ok
+test inotify_readiness_structural_red_control ... ok
+test fork_filetable_contract_is_semantically_exact_and_affine ... ok
+test inotify_watch_structural_red_control ... ok
+test fork_mappings_contract_is_semantically_exact_and_constant ... ok
+test inotify_churn_preserves_unread_watch_identity ... ok
+test inotify09_hotpath_is_semantically_exact_and_linear ... ok
+test scheduler_cost_contract_is_semantically_exact_and_constant ... ok
+test scheduler_lifecycle_contract_is_semantically_exact_and_constant ... ok
+test inotify_readiness_cost_does_not_grow_with_queue_depth ... ok
+test inotify_watch_contract_is_semantically_exact ... ok
+test inotify_readiness_contract_does_not_scan_the_queue ... ok
+test scheduler_progress_contract_is_semantically_exact_and_linear ... ok
+test unrelated_futex_population_does_not_increase_target_queue_visits ... ok
+test futex_requeue_contract_is_semantically_exact_and_linear ... ok
+test futex_contention_contract_is_semantically_exact_and_linear ... ok
+test fork_stage1_image_contract_admits_one_task_per_serial_fork ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/deferred_regressions.rs (target/debug/deps/deferred_regressions-4a4400ada1aa5e3a)
+
+running 7 tests
+test default_message_credentials_use_real_gid ... ok
+test ignored_sigchld_wakes_an_already_parked_parent ... ok
+test nocldwait_wakes_an_already_parked_parent ... ok
+test failed_copyout_does_not_leave_stale_sender_credentials ... ok
+test sender_credentials_survive_peek_partial_read_and_sender_exit ... ok
+test stream_receive_stops_at_a_sender_credential_boundary ... ok
+test blocked_socket_write_retains_sender_after_partial_progress ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/fd_admission.rs (target/debug/deps/fd_admission-2c37ad39310c3492)
+
+running 13 tests
+test test_failed_open_releases_admission_and_next_valid_open_uses_lowest_slot ... ok
+test test_close_frees_descriptor_slot_for_subsequent_open ... ok
+test test_fork_preserves_independent_rlimits_and_descriptor_tables ... ok
+test test_hostfs_open_rejected_by_rlimit_does_not_create_nonexistent_file ... ok
+test test_hostfs_open_full_table_returns_emfile_before_missing_path_resolution ... ok
+test test_memfs_open_full_table_returns_emfile_before_missing_path_resolution ... ok
+test test_memfs_open_rejected_by_rlimit_does_not_create_nonexistent_file ... ok
+test test_hostfs_open_rejected_by_rlimit_does_not_truncate_existing_file ... ok
+test test_memfs_open_rejected_by_rlimit_does_not_truncate_existing_file ... ok
+test test_fifo_open_cancellation_releases_reservation_exactly_once ... ok
+test test_dup3_ebusy_loser_preserves_target_and_epoll_registration ... ok
+test test_fork_during_pending_fifo_open_allows_child_to_allocate_uncommitted_slot ... ok
+test test_fifo_open_parks_with_reserved_slot_and_rejects_dup2_ebusy ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/fork_pipe_wait.rs (target/debug/deps/fork_pipe_wait-167cc03eb3df331b)
+
+running 29 tests
+test duplicate_capture_tags_in_one_syscall_rejects ... ok
+test exit_expectation_mismatch_fails ... ok
+test fork_pipe_wait_through_the_public_surface ... ok
+test a_blocked_read_is_dispatched_exactly_twice_when_the_writer_arrives ... ok
+test child_write_to_broken_pipe_terminates_with_sigpipe ... ok
+test layout_narrow_integer_overflow_rejects ... ok
+test a_forked_task_can_fork_again ... ok
+test layout_relocation_offset_overflow_rejects ... ok
+test layout_write_outside_layout_bounds_rejects ... ok
+test save_out_i32_out_of_bounds_rejects ... ok
+test blocking_write_over_pipe_capacity_completes_byte_exact ... ok
+test save_ret_on_failed_syscall_rejects ... ok
+test saved_return_reused_as_operand ... ok
+test layout_integer_signedness_is_checked_before_dispatch ... ok
+test sigkill_from_the_parent_terminates_the_child_and_wait4_reports_the_signal ... ok
+test sig_ign_drops_signal_without_terminating ... ok
+test sigprocmask_blocked_sigchld_received_by_signalfd4_with_pid ... ok
+test sigprocmask_blocked_signal_received_by_signalfd4 ... ok
+test sigprocmask_blocked_sigchld_received_by_sigtimedwait_with_pid_and_status ... ok
+test successful_errno_expectation_matches ... ok
+test sigprocmask_blocked_signal_received_by_sigtimedwait ... ok
+test wrong_errno_diagnostic_reports_label_pid_and_errnos ... ok
+test wrong_return_diagnostic_reports_label_pid_and_values ... ok
+test tagged_save_out_of_bounds_rejects ... ok
+test clock_nanosleep_completes_after_its_interval ... ok
+test nanosleep_completes_after_its_interval_with_zero_remaining ... ok
+test pselect6_timeout_zeroes_non_null_fd_set ... ok
+test a_timerfd_read_parks_until_the_timer_fires ... ok
+test a_lost_wake_fails_inside_the_bound ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+
+     Running tests/fork_threads_exit.rs (target/debug/deps/fork_threads_exit-9af115639aa4ee9c)
+
+running 2 tests
+test fork_from_a_threaded_process_retires_every_task ... ok
+test a_forked_child_that_threads_and_forks_again_retires_every_task ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/host_wait_cancellation.rs (target/debug/deps/host_wait_cancellation-774a40ca2be61a37)
+
+running 1 test
+test peer_exec_retires_host_wait_without_guest_return ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/native_execution_scope.rs (target/debug/deps/native_execution_scope-c2e2e25cf01813ed)
+
+running 1 test
+test native_execution_scope_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/ptrace_wait.rs (target/debug/deps/ptrace_wait-3fa1084fc624768a)
+
+running 16 tests
+test ptrace_fast_stop_before_wait_ancestor_root_wait4 ... ok
+test ptrace_fast_stop_before_wait_ancestor_root_waitid ... ok
+test control_unrelated_non_tracer_sees_echild ... ok
+test control_ordinary_non_ptrace_job_control_stop_waitid_reports_cld_stopped ... ok
+test control_non_tracer_echild_after_detach ... ok
+test ptrace_attach_and_wait_on_ancestor_root_continuation_waitid ... ok
+test control_normal_child_wait_continuation_succeeds ... ok
+test ptrace_attach_and_wait_on_ancestor_root_continuation_wait4 ... ok
+test ptrace_attach_and_wait_on_non_child_sibling_continuation_wait4 ... ok
+test ptrace_attach_and_wait_on_non_child_sibling_continuation_waitid ... ok
+test ptrace_fast_stop_before_wait_non_child_sibling_wait4 ... ok
+test ptrace_lost_wake_window_ancestor_root_wait4 ... ok
+test ptrace_lost_wake_window_ancestor_root_waitid ... ok
+test ptrace_fast_stop_before_wait_non_child_sibling_waitid ... ok
+test ptrace_lost_wake_window_non_child_sibling_waitid ... ok
+test ptrace_lost_wake_window_non_child_sibling_wait4 ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/scheduler_handoff.rs (target/debug/deps/scheduler_handoff-f455791e75215fb4)
+
+running 21 tests
+test host_wait_control_pokes_and_residency_flush_requests ... ok
+test host_wait_authentication_and_stale_unregister ... ok
+test host_wait_handoff_no_spare_vacant_and_resumes ... ok
+test host_wait_graceful_close_and_drain ... ok
+test host_wait_handoff_sibling_thread_progresses_on_spare ... ok
+test host_wait_handoff_affinity_pinned_placement ... ok
+test host_wait_handoff_separate_process_child_progresses_on_spare ... ok
+test host_wait_handoff_nested_lineage_and_ancestor_return ... ok
+test host_wait_dropped_token_unwinding_with_active_replacement ... ok
+test nested_host_wait_final_return_clears_stale_handoff_reason ... ok
+test host_wait_handoff_concurrent_returns ... ok
+test injected_stdio_writer_does_not_readmit_a_retired_thread ... ok
+test injected_host_sync_does_not_readmit_a_retired_thread ... ok
+test injected_stdio_short_write_then_error_preserves_writer_contract ... ok
+test injected_host_sync_allows_replacement_mm_mutation ... ok
+test injected_stdio_writer_allows_replacement_mm_mutation ... ok
+test redirected_stdio_writer_allows_replacement_mm_mutation ... ok
+test redirected_stdio_writer_does_not_readmit_a_retired_thread ... ok
+test retired_stdio_unwind_does_not_readmit_the_old_task ... ok
+test injected_stdio_unwind_restores_cpu_ownership ... ok
+test uncontended_host_wait_return_has_zero_spurious_preemptions ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/scheduler_preemption.rs (target/debug/deps/scheduler_preemption-ddb2155e3bf399de)
+
+running 20 tests
+test run_budget_constructor_bounds_and_defaults ... ok
+test default_fifo_policy_never_materializes_snapshots ... ok
+test sibling_threads_have_distinct_thread_ids_and_equal_process_ids ... ok
+test custom_quantum_policy_sets_10ms_deadline ... ok
+test pending_signal_plus_fairness_isolation ... ok
+test pick_next_callback_reentrancy_without_deadlock ... ok
+test distinct_processes_have_distinct_process_ids ... ok
+test queue_change_during_callback_and_stale_fallback_to_fifo ... ok
+test one_cpu_two_executors_independent_residencies ... ok
+test threaded_driver_wait_preemption_work_wakes_on_manual_clock_advance ... ok
+test timeline_a_starts_0_b_queues_20ms_immediately_eligible ... ok
+test timeline_affinity_constrained_contender_never_kicks_ineligible_cpu ... ok
+test timeline_a_starts_0_b_queues_1ms_due_at_4ms ... ok
+test timeline_b_claimed_by_idle_executor_cancels_unclaimed_deadline ... ok
+test timeline_demand_disappears_after_delivery_claim_at_most_one_extra_exit ... ok
+test timeline_more_wakes_do_not_extend_deadline ... ok
+test timeline_one_contender_several_busy_executors_selects_oldest ... ok
+test timeline_deadline_fires_after_exec_unbind_no_successor ... ok
+test uncontended_syscall_steps_retain_residency ... ok
+test cost_assertions_and_fifo_rotation ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/semantics.rs (target/debug/deps/semantics-4914b9d953f7bad1)
+
+running 83 tests
+test epoll::epoll_ctl_add_of_a_registered_fd_is_eexist_and_del_of_an_unregistered_fd_is_enoent ... ok
+test epoll::an_epoll_instance_is_shared_across_fork_and_a_write_in_the_child_wakes_the_parent ... ok
+test epoll::epollhup_is_reported_when_every_writer_closes ... ok
+test futex::futex_requeue_moves_waiters_without_waking_them ... ok
+test futex::futex_wait_parks_and_a_wake_from_the_sibling_thread_resumes_it ... ok
+test futex::futex_wait_with_a_stale_value_is_eagain ... ok
+test epoll::closing_a_duplicated_descriptor_in_the_same_process_keeps_the_epoll_registration_until_both_close ... ok
+test epoll::edge_triggered_reports_once_until_new_data_arrives ... ok
+test futex::futex_wake_returns_the_number_woken ... ok
+test epoll::closing_an_inherited_descriptor_keeps_the_epoll_registration_until_the_child_closes_it ... ok
+test epoll::reused_numeric_descriptor_does_not_trigger_or_mask_epoll_for_original_description ... ok
+test futex_contention::futex_cmp_requeue_with_stale_val3_returns_eagain ... ok
+test futex_contention::futex_pi_lock_unlock_deadlock_detection ... ok
+test futex_contention::futex_wait_zero_timeout_returns_etimedout_immediately ... ok
+test futex_contention::futex_requeue_durability_across_signal_broadcast ... ok
+test futex_contention::futex_wake_of_unshared_address_across_fork_is_zero ... ok
+test futex_contention::futex_cmp_requeue_moves_and_wakes_the_correct_counts ... ok
+test identity::getpid_and_getppid_for_init_process ... ok
+test identity::getppid_returns_parent_pid_after_fork ... ok
+test identity::gettid_differs_from_parent_tid_in_thread ... ok
+test identity::identity_and_credential_syscalls_are_consistent_across_fork ... ok
+test identity::getppid_updates_on_reparenting_to_init ... ok
+test fork_scaling::fork_with_32_parked_children_completes ... ok
+test inotify_watch::rejected_write_does_not_modify_or_consume_watch ... ok
+test fork_scaling::fork_children_receive_independent_futex_table_under_population ... ok
+test inotify_watch::inotify_watch_lifecycle_in_host_fs ... ok
+test inotify_watch::rejected_write_does_not_modify_or_consume_watch_in_memory ... ok
+test pgrp::kill_of_a_non_existent_pid_is_esrch ... ok
+test inotify_watch::partial_positive_write_notifies_on_both_backends ... ok
+test inotify_watch::repeated_host_writes_refresh_cached_size ... ok
+test pgrp::a_parent_may_move_a_child_into_the_parents_group_before_exec ... ok
+test pgrp::setsid_by_a_group_leader_is_eperm ... ok
+test pgrp::setpgid_on_a_child_in_another_session_is_eperm ... ok
+test pgrp::kill_signal_zero_probes_existence ... ok
+test pgrp::setpgid_zero_zero_makes_the_caller_a_group_leader ... ok
+test pipe::fionread_reports_queued_bytes_on_the_read_end_and_on_the_write_end ... ok
+test pidfd::waitid_p_pidfd_reaps_through_the_descriptor ... ok
+test pidfd::a_pidfd_becomes_readable_when_the_process_exits ... ok
+test pidfd::pidfd_open_on_a_reaped_pid_is_esrch ... ok
+test pidfd::pidfd_send_signal_kills_the_child ... ok
+test pipe::a_dup2d_write_end_keeps_the_pipe_open_until_both_descriptors_close ... ok
+test pipe::o_nonblock_read_on_an_empty_pipe_is_eagain_and_write_to_a_full_pipe_is_eagain ... ok
+test pipe::write_with_sigpipe_ignored_is_epipe ... ok
+test signal::ignored_signal_does_not_terminate_process ... ok
+test pipe::write_to_a_pipe_with_no_readers_dies_by_sigpipe ... ok
+test pgrp::kill_minus_pgid_reaches_every_member_and_kill_zero_reaches_the_callers_group ... ok
+test signal::kill_child_with_sigterm_produces_signal_death ... ok
+test pipe::writes_up_to_pipe_buf_are_atomic_across_two_writers ... ok
+test signal::sigchld_is_delivered_on_child_exit ... ok
+test signal::signal_mask_is_inherited_across_fork ... ok
+test signal::signalfd4_delivers_pending_signal_as_read ... ok
+test signal::tgkill_targets_specific_thread ... ok
+test threads::a_thread_exiting_alone_leaves_the_process_running ... ok
+test threads::clone_thread_shares_the_fd_table_and_memory_and_exit_group_ends_every_thread ... ok
+test threads::single_root_thread_exit_retires_process_with_exit_code ... ok
+test threads::leader_exits_first_and_final_sibling_exit_retires_process ... ok
+test threads::root_leader_parked_and_sibling_exit_group_terminates_with_exit_code ... ok
+test threads::tgkill_wakes_the_exact_sibling_signal_waiter ... ok
+test unix::scm_credentials_deferred_read_after_sender_exit_and_reap ... ok
+test unix::recv_on_a_stream_socket_whose_peer_closed_returns_zero ... ok
+test unix::a_descriptor_passed_over_scm_rights_reads_the_same_pipe ... ok
+test unix::recvmsg_control_truncation_sets_msg_ctrunc ... ok
+test unix::scm_credentials_carry_the_senders_pid_uid_gid ... ok
+test pipe::read_returns_zero_only_after_every_writer_closes ... ok
+test unix::scm_credentials_peek_does_not_consume ... ok
+test unix::scm_credentials_explicit_unprivileged_forgery_returns_eperm ... ok
+test unix::scm_credentials_synthesized_for_plain_write ... ok
+test unix::scm_credentials_stream_read_capping_across_multiple_senders ... ok
+test unix::scm_credentials_zero_length_datagram_and_subsequent_datagram ... ok
+test unix::send_after_peer_close_is_epipe_with_msg_nosignal ... ok
+test unix::so_peercred_names_the_peer_process ... ok
+test wait::a_zombie_is_reaped_exactly_once ... ok
+test unix::send_after_peer_close_without_msg_nosignal_terminates_with_sigpipe ... ok
+test unix::scm_credentials_tracks_multiple_forked_senders_and_preserves_so_peercred ... ok
+test wait::wait4_minus_one_reaps_any_child_and_echild_when_none_remain ... ok
+test wait::waitid_wnowait_leaves_the_zombie_and_a_second_waitid_consumes_it ... ok
+test wait::wnohang_returns_zero_while_the_child_lives_then_reaps_it ... ok
+test wait::sigchld_set_to_sig_ign_autoreaps_and_wait4_reports_echild ... ok
+test wait::an_orphan_is_reparented_to_init_which_can_reap_it ... ok
+test wait::prctl_set_child_subreaper_receives_the_grandchild ... ok
+test futex::a_private_futex_is_not_shared_across_fork ... ok
+test fork_scaling::fork_dispatch_count_does_not_grow_linearly_with_population ... ok
+test fork_scaling::fork_with_64_parked_children_completes ... ok
+
+test result: ok. 83 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/socket_close.rs (target/debug/deps/socket_close-3067863be36e11ff)
+
+running 8 tests
+test unix_socketpair_local_shut_rd_wakes_epoll_with_epollrdhup ... ok
+test tcp_local_shut_rd_with_in_and_rdhup_interest ... ok
+test tcp_local_shut_wr_negative_control_no_rdhup ... ok
+test tcp_local_shut_rd_wakes_epoll_with_epollrdhup ... ok
+test tcp_local_shut_rdwr_wakes_epoll_with_epollrdhup ... ok
+test tcp_local_shut_rd_dup_alias_lifecycle ... ok
+test tcp_peer_close_wakes_epoll_with_epollrdhup ... ok
+test tcp_peer_shut_wr_live_peer_handshake ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/socket_receive.rs (target/debug/deps/socket_receive-94029d3043ae2c22)
+
+running 22 tests
+test recvmsg_invalid_namelen_precedence_over_errqueue_returns_einval ... ok
+test recvfrom_queued_data_negative_addrlen_returns_einval_and_consumes_data ... ok
+test recvfrom_queued_data_null_addrlen_returns_efault_and_consumes_data ... ok
+test recvfrom_empty_socket_invalid_addrlen_returns_eagain ... ok
+test af_unix_recv_errqueue_on_eof_ignores_flag_and_returns_zero ... ok
+test af_unix_recv_errqueue_ignores_flag_and_returns_payload ... ok
+test sctp_connect_preserves_client_and_accepted_protocol_identity ... ok
+test sctp_recvfrom_preserves_source_address ... ok
+test recvfrom_unnamed_socketpair_updates_addrlen_to_zero ... ok
+test sctp_recvmsg_message_boundaries_and_eor ... ok
+test sctp_recvmsg_preserves_source_address ... ok
+test sctp_unread_close_preserves_peer_reset ... ok
+test tcp_recvfrom_ignores_source_pointer_for_payload_and_eof ... ok
+test tcp_recv_empty_errqueue_on_eof_returns_eagain_then_regular_recv_returns_zero ... ok
+test tcp_recvmsg_empty_errqueue_returns_eagain_and_preserves_stream_payload ... ok
+test tcp_recvfrom_queued_data_errqueue_with_invalid_addrlen_returns_eagain_and_preserves_data ... ok
+test tcp_recvmsg_bad_iovec_pointer_returns_efault_before_errqueue ... ok
+test tcp_recvmsg_cmsg_cloexec_echoes_in_msg_flags ... ok
+test tcp_recvmsg_ignores_source_pointer ... ok
+test tcp_recv_empty_errqueue_returns_eagain_and_preserves_stream_payload ... ok
+test tcp_recvmsg_long_ancillary_buffer_zeroes_msg_controllen_and_msg_flags ... ok
+test tcp_recvmsg_null_name_negative_namelen_errqueue_returns_eagain ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/stdio_host_wait_contention.rs (target/debug/deps/stdio_host_wait_contention-a3122db524cff505)
+
+running 1 test
+test stdio_writer_mutex_contention_allows_spare_progression_and_mm_mutation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/stdio_inherited_backpressure.rs (target/debug/deps/stdio_inherited_backpressure-3adc761f06cb9a76)
+
+running 1 test
+test inherited_stdio_backpressure_and_pinning_in_host_wait ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/unicode_paths.rs (target/debug/deps/unicode_paths-aa3eeea4c93684fd)
+
+running 6 tests
+test test_unicode_composed_vs_decomposed_alias_protection ... ok
+test test_unicode_file_create_write_read_reopen_unlink ... ok
+test test_unicode_hardlink_exact_name_retained ... ok
+test test_unicode_rename_and_replacement ... ok
+test test_unicode_symlink_and_directory_names ... ok
+test test_unicode_lookup_bounds_directory_entry_visits_with_siblings ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+

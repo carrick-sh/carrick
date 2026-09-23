@@ -1,0 +1,30 @@
+{
+  "1": {
+    "scope_ns": 41.941162109375,
+    "activated_ns": 1685.760498046875,
+    "activation_delta_ns": 1643.798828125,
+    "activated_min_ns": 1461.944580078125,
+    "activated_max_ns": 3689.117431640625
+  },
+  "8": {
+    "scope_ns": 35.822540283203125,
+    "activated_ns": 1463.4577331542969,
+    "activation_delta_ns": 1427.4508056640625,
+    "activated_min_ns": 1443.5335998535156,
+    "activated_max_ns": 1470.2707824707031
+  },
+  "32": {
+    "scope_ns": 36.03235626220703,
+    "activated_ns": 1460.1545333862305,
+    "activation_delta_ns": 1424.3450164794922,
+    "activated_min_ns": 1452.8236389160156,
+    "activated_max_ns": 1472.97509765625
+  },
+  "128": {
+    "scope_ns": 36.124229431152344,
+    "activated_ns": 1464.39186668396,
+    "activation_delta_ns": 1428.3265266418457,
+    "activated_min_ns": 1451.9178867340088,
+    "activated_max_ns": 1469.3140983581543
+  }
+}

@@ -1,0 +1,366 @@
+schema_version = 1
+
+[[surfaces]]
+path = "crates/carrick-observability/src/work_meter.rs"
+contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.execution.native-code-density"]
+
+[[surfaces]]
+path = "crates/carrick-mem/src/memory.rs"
+contracts = ["hvpatch.syscall.portal"]
+
+[[surfaces]]
+path = "crates/carrick-aarch64/src/mailbox.rs"
+contracts = ["hvpatch.syscall.portal"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/syscall_mailbox.rs"
+contracts = ["hvpatch.syscall.portal"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/futex.rs"
+contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/continuation.rs"
+contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
+
+[[surfaces]]
+path = "crates/carrick-thread/src/platform_futex.rs"
+contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
+
+[[surfaces]]
+path = "crates/carrick-thread/src/thread.rs"
+contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/semantics/futex_contention.rs"
+contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/shared_buffer_futex.rs"
+contracts = ["kernel.futex.contention"]
+
+[[surfaces]]
+path = "conformance-probes/src/bin/futexpingpong.rs"
+contracts = ["kernel.futex.contention"]
+
+[[surfaces]]
+path = "conformance-probes/src/bin/futexwakeexact.rs"
+contracts = ["kernel.futex.contention"]
+
+[[surfaces]]
+path = "conformance-probes/src/bin/futexrequeue.rs"
+contracts = ["kernel.futex.requeue"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/objects.rs"
+contracts = ["kernel.fork.filetable"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/objects/task.rs"
+contracts = ["kernel.fork.filetable"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/operations.rs"
+contracts = ["kernel.fork.filetable"]
+
+[[surfaces]]
+path = "conformance-probes/src/bin/forkfiletable.rs"
+contracts = ["kernel.fork.filetable"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/semantics/fork_scaling.rs"
+contracts = ["kernel.fork.filetable", "kernel.fork.mappings"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs"
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration"]
+
+[[surfaces]]
+path = "crates/carrick-mem/src/vdso.rs"
+contracts = ["kernel.time.realtime-calibration"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/realtime_calibration.rs"
+contracts = ["kernel.time.realtime-calibration"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/process_plan.rs"
+contracts = ["kernel.fork.mappings", "kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-aarch64/src/stage1_authority.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-aarch64/src/engine.rs"
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-mem/src/page_table.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/quiesce.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "conformance-probes/src/bin/forkserial.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/task_mapping_index.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/memory_protection.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs"
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/dispatcher.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/kernel_context.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/event.rs"
+contracts = ["kernel.inotify.watch"]
+
+[[surfaces]]
+path = "crates/carrick-host-bsd/src/multiplexer.rs"
+contracts = ["kernel.inotify.watch"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/inotify.rs"
+contracts = [
+  "kernel.inotify.watch",
+  "kernel.inotify.readiness",
+  "kernel.inotify.mark-race-hotpath",
+]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/notify.rs"
+contracts = [
+  "kernel.inotify.watch",
+  "kernel.inotify.readiness",
+  "kernel.inotify.mark-race-hotpath",
+]
+
+[[surfaces]]
+path = "crates/carrick-vfs/src/vfs/rootfs.rs"
+contracts = ["kernel.inotify.watch", "kernel.inotify.mark-race-hotpath"]
+
+[[surfaces]]
+path = "conformance-probes/src/bin/perf_inotify09_scale.rs"
+contracts = ["kernel.inotify.mark-race-hotpath"]
+
+[[surfaces]]
+path = "crates/carrick-embed/src/contracts/inotify_hotpath.rs"
+contracts = ["kernel.inotify.mark-race-hotpath"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/inotify_hotpath_contract.rs"
+contracts = ["kernel.inotify.mark-race-hotpath"]
+
+[[surfaces]]
+path = "conformance-probes/src/bin/inotifymatrix.rs"
+contracts = ["kernel.inotify.watch"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/semantics/inotify_watch.rs"
+contracts = ["kernel.inotify.watch"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fd_table.rs"
+contracts = ["kernel.inotify.readiness"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/scheduler/host_wait.rs"
+contracts = ["kernel.scheduler.host-wait-handoff", "kernel.scheduler.preemption-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/scheduler.rs"
+contracts = [
+  "kernel.scheduler.host-wait-handoff",
+  "kernel.scheduler.runnable-progress",
+  "kernel.scheduler.preemption-lifecycle",
+  "kernel.scheduler.preemption-cost",
+]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/scheduler/preemption.rs"
+contracts = [
+  "kernel.scheduler.runnable-progress",
+  "kernel.scheduler.preemption-lifecycle",
+  "kernel.scheduler.preemption-cost",
+]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/scheduler_preemption.rs"
+contracts = [
+  "kernel.scheduler.runnable-progress",
+  "kernel.scheduler.preemption-lifecycle",
+  "kernel.scheduler.preemption-cost",
+]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/host_io.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/net/epoll_ops/write_rearm.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/io_pipe.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/scheduler_handoff.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/host_wait_cancellation.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/stdio_host_wait_contention.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/stdio_inherited_backpressure.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/host_wait_policy.rs"
+contracts = ["kernel.scheduler.host-wait-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/scheduler_preemption.rs"
+contracts = [
+  "kernel.scheduler.runnable-progress",
+  "kernel.scheduler.preemption-lifecycle",
+  "kernel.scheduler.preemption-cost",
+]
+
+[[surfaces]]
+path = "fixtures/linux-aarch64-hello/src/scheduler_preemption.rs"
+contracts = [
+  "kernel.scheduler.runnable-progress",
+  "kernel.scheduler.preemption-lifecycle",
+  "kernel.scheduler.preemption-cost",
+]
+
+[[surfaces]]
+path = "experiments/native-syscall-slice/src/native.rs"
+contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.execution.native-synchronous-syscall"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs"
+contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.mm.native-execution-scope", "kernel.mm.native-data-activation"]
+
+[[surfaces]]
+path = "experiments/native-syscall-slice/src/native/compact.rs"
+contracts = ["kernel.execution.native-code-density", "kernel.execution.native-synchronous-syscall"]
+
+[[surfaces]]
+path = "experiments/native-syscall-slice/src/compact_tests.rs"
+contracts = ["kernel.execution.native-code-density", "kernel.execution.native-synchronous-syscall"]
+
+[[surfaces]]
+path = "experiments/native-syscall-slice/src/lib.rs"
+contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.execution.native-synchronous-syscall"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/code_content.rs"
+contracts = ["kernel.mm.native-code-content"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/global_frame.rs"
+contracts = ["kernel.mm.native-code-content"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs"
+contracts = ["kernel.mm.native-code-content"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/instruction_read.rs"
+contracts = ["kernel.mm.native-code-content"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs"
+contracts = ["kernel.mm.native-code-content"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/foreign_mm.rs"
+contracts = ["kernel.mm.native-code-content"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/mm_access.rs"
+contracts = ["kernel.mm.native-code-content"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/memory.rs"
+contracts = ["kernel.mm.native-code-content"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/host_writes.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/tests/integration/syscall_fs_rw.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-guest-mem/src/lib.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-aarch64/src/vmm.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/guest_memory.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/rw.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/tests.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/net/send_recv.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/runtime.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-conformance-next/tests/syscall_write_destinations.rs"
+contracts = ["kernel.mm.syscall-code-write"]
+
+[[surfaces]]
+path = "crates/carrick-conformance-next/tests/fixtures/syscall_write_destinations.py"
+contracts = ["kernel.mm.syscall-code-write"]

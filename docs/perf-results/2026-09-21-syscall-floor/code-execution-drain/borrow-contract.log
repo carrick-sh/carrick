@@ -1,0 +1,20 @@
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.66s
+   Doc-tests carrick_kernel
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+running 2 tests
+test crates/carrick-kernel/src/kernel/mm_access/instruction_content.rs - kernel::mm_access::instruction_content::ActiveInstructionContent (line 113) - compile fail ... ok
+test crates/carrick-kernel/src/kernel/mm_access/instruction_content.rs - kernel::mm_access::instruction_content::ActiveInstructionContent (line 105) - compile fail ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.10s
+
+all doctests ran in 0.35s; merged doctests compilation took 0.13s

@@ -1,0 +1,24 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+    Checking carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example)
+error: used `unwrap()` on a `Result` value
+   --> crates/carrick-kernel-example/src/contracts.rs:703:32
+    |
+703 |             i32::from_ne_bytes(event[..4].try_into().unwrap()) == (i + 1) as i32
+    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unwrap_used
+    = note: requested on the command line with `-D clippy::unwrap-used`
+
+error: used `unwrap()` on a `Result` value
+   --> crates/carrick-kernel-example/src/contracts.rs:704:39
+    |
+704 |                 && u32::from_ne_bytes(event[4..8].try_into().unwrap())
+    |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unwrap_used
+
+error: could not compile `carrick-kernel-example` (lib test) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `carrick-kernel-example` (lib) due to 2 previous errors

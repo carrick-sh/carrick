@@ -1,0 +1,45 @@
+[
+  {
+    "phase": "carrick",
+    "argv": [
+      "/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-discard-edges",
+      "run",
+      "--max-traps",
+      "18446744073709551615",
+      "--fs",
+      "host",
+      "--entrypoint",
+      "/usr/local/bin/python3",
+      "localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30",
+      "-c",
+      "# SPDX-License-Identifier: Apache-2.0 OR MIT\n# Independent public-ABI diagnostic, no LTP implementation code.\nimport ctypes as c, os, json, struct\nlib=c.CDLL(None,use_errno=True)\nlib.inotify_add_watch.argtypes=[c.c_int,c.c_char_p,c.c_uint]\npath=('/tmp/carrick-inotify-shape-'+str(os.getpid())).encode()\nf=os.open(path,os.O_CREAT|os.O_EXCL|os.O_RDWR,0o600)\nfor mode in ['churn','serial_full']:\n for n in [1,8,32,128]:\n  q=lib.inotify_init1(os.O_NONBLOCK|os.O_CLOEXEC); assert q>=0\n  ids=[]\n  for i in range(n):\n   wd=lib.inotify_add_watch(q,path,2);assert wd>=0;ids.append(wd)\n   if mode=='serial_full':assert os.write(f,b'x'*64)==64;assert os.lseek(f,0,0)==0\n   assert lib.inotify_rm_watch(q,wd)==0\n  available=c.c_int(-1);assert lib.ioctl(q,0x541b,c.byref(available))==0\n  events=[]\n  while True:\n   try:data=os.read(q,65536)\n   except BlockingIOError:break\n   assert data\n   pos=0\n   while pos<len(data):\n    wd,mask,cookie,length=struct.unpack_from('iIII',data,pos);events.append((wd,mask));pos+=16+length\n   assert pos==len(data)\n  print(json.dumps(dict(mode=mode,n=n,distinct_wds=len(set(ids)),first_wds=ids[:8],queued_bytes=available.value,events=len(events),ignored=sum(m==0x8000 for w,m in events),modify=sum(m==2 for w,m in events))),flush=True)\n  os.close(q)\nos.close(f);os.unlink(path);print('probe_complete=1',flush=True)\n"
+    ],
+    "run_id": "inotify-queue-shape-carrick-20260922",
+    "returncode": 0,
+    "source_sha256": "728fc2c536379ccd0ee0dabf275f917e884d55a3d9b1d6ed7847a35b724584d1",
+    "binary_sha256": "3e2521515cc0af0324dbd2f7639bd43ea27fc324dd84e1dbd69a4e508e780972",
+    "cleanup_returncode": 0
+  },
+  {
+    "phase": "docker",
+    "argv": [
+      "docker",
+      "run",
+      "--rm",
+      "--name",
+      "inotify-queue-shape-docker-20260922",
+      "--platform",
+      "linux/arm64",
+      "--entrypoint",
+      "/usr/local/bin/python3",
+      "localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30",
+      "-c",
+      "# SPDX-License-Identifier: Apache-2.0 OR MIT\n# Independent public-ABI diagnostic, no LTP implementation code.\nimport ctypes as c, os, json, struct\nlib=c.CDLL(None,use_errno=True)\nlib.inotify_add_watch.argtypes=[c.c_int,c.c_char_p,c.c_uint]\npath=('/tmp/carrick-inotify-shape-'+str(os.getpid())).encode()\nf=os.open(path,os.O_CREAT|os.O_EXCL|os.O_RDWR,0o600)\nfor mode in ['churn','serial_full']:\n for n in [1,8,32,128]:\n  q=lib.inotify_init1(os.O_NONBLOCK|os.O_CLOEXEC); assert q>=0\n  ids=[]\n  for i in range(n):\n   wd=lib.inotify_add_watch(q,path,2);assert wd>=0;ids.append(wd)\n   if mode=='serial_full':assert os.write(f,b'x'*64)==64;assert os.lseek(f,0,0)==0\n   assert lib.inotify_rm_watch(q,wd)==0\n  available=c.c_int(-1);assert lib.ioctl(q,0x541b,c.byref(available))==0\n  events=[]\n  while True:\n   try:data=os.read(q,65536)\n   except BlockingIOError:break\n   assert data\n   pos=0\n   while pos<len(data):\n    wd,mask,cookie,length=struct.unpack_from('iIII',data,pos);events.append((wd,mask));pos+=16+length\n   assert pos==len(data)\n  print(json.dumps(dict(mode=mode,n=n,distinct_wds=len(set(ids)),first_wds=ids[:8],queued_bytes=available.value,events=len(events),ignored=sum(m==0x8000 for w,m in events),modify=sum(m==2 for w,m in events))),flush=True)\n  os.close(q)\nos.close(f);os.unlink(path);print('probe_complete=1',flush=True)\n"
+    ],
+    "run_id": "inotify-queue-shape-docker-20260922",
+    "returncode": 0,
+    "source_sha256": "728fc2c536379ccd0ee0dabf275f917e884d55a3d9b1d6ed7847a35b724584d1",
+    "binary_sha256": null,
+    "cleanup_returncode": 0
+  }
+]

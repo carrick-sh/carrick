@@ -1,0 +1,131 @@
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.79s
+     Running unittests src/lib.rs (target/debug/deps/carrick_aarch64-48d6ab17930721f6)
+
+running 1 test
+[
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.sparse-scrub",
+        ),
+        layer: VmFree,
+        implementation_revision: "source-default-hasher:a18d7f78b7d6a7cd",
+        fixture_identity: "unit:sparse-scrub",
+        scale: 1,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "all_bytes_zero_and_provenance_preserved",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    GuestMemoryZeroBytes: 8192,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.sparse-scrub",
+        ),
+        layer: VmFree,
+        implementation_revision: "source-default-hasher:a18d7f78b7d6a7cd",
+        fixture_identity: "unit:sparse-scrub",
+        scale: 8,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "all_bytes_zero_and_provenance_preserved",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    GuestMemoryZeroBytes: 65536,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.sparse-scrub",
+        ),
+        layer: VmFree,
+        implementation_revision: "source-default-hasher:a18d7f78b7d6a7cd",
+        fixture_identity: "unit:sparse-scrub",
+        scale: 32,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "all_bytes_zero_and_provenance_preserved",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    GuestMemoryZeroBytes: 262144,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+    ContractObservation {
+        contract_id: ContractId(
+            "kernel.mm.sparse-scrub",
+        ),
+        layer: VmFree,
+        implementation_revision: "source-default-hasher:a18d7f78b7d6a7cd",
+        fixture_identity: "unit:sparse-scrub",
+        scale: 128,
+        semantic_assertions: [
+            SemanticAssertion {
+                name: "all_bytes_zero_and_provenance_preserved",
+                passed: true,
+                detail: None,
+            },
+        ],
+        work: Some(
+            WorkSnapshot {
+                values: {
+                    GuestMemoryZeroBytes: 1048576,
+                },
+                dropped_events: 0,
+                unknown_metrics: [],
+            },
+        ),
+        timing: None,
+        completeness: Complete,
+    },
+]
+
+thread 'engine::sparse_scrub::tests::sparse_scrub_contract' (3134206) panicked at crates/carrick-aarch64/src/sparse_scrub.rs:68:86:
+called `Result::unwrap()` on an `Err` value: ScalingViolation { contract: ContractId("kernel.mm.sparse-scrub"), metric: GuestMemoryZeroBytes, scale: 1, actual: 8192, maximum: 4096 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test engine::sparse_scrub::tests::sparse_scrub_contract ... FAILED
+
+failures:
+
+failures:
+    engine::sparse_scrub::tests::sparse_scrub_contract
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p carrick-aarch64 --lib`

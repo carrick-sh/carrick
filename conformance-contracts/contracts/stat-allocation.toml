@@ -1,0 +1,26 @@
+schema_version = 1
+id = "kernel.fs.stat-allocation"
+title = "Warm regular-file fstat avoids host heap allocation"
+guest_surfaces = ["syscall:fstat", "syscall:statx", "syscall:newfstatat"]
+semantic_authority = ["Linux inode identity, file mode, ownership, timestamps and device-node stat semantics"]
+fixture = "kernel-syscall-floor --allocation-check"
+scale_points = [1, 8, 32, 128]
+rationale = "Host-backed fstat needs scalar inode data, not copied path strings. Warm valid regular-file fstat must allocate zero host heap objects; cold inode-cache initialization and other fd kinds are outside this fixture. Metadata fallback values and description lock lifetime remain unchanged."
+
+[bindings]
+vm_free = "carrick-kernel-example::kernel-syscall-floor --features allocation-metrics --allocation-check"
+
+embed = "carrick-conformance-next::generic_probe_shard_{0,1,2}; CARRICK_PROBE_FILTER=fdstat,statfdino,fstatatflags,linkstat (semantic only)"
+docker = "cached probe oracles: fdstat,statfdino,fstatatflags,linkstat; musl and gnu; source-hash validated"
+
+[bindings.unresolved]
+embed_structural = "Signed stat semantics pass; production allocation ContractObservation remains open."
+promotion = "Uninstrumented paired syscall and workload performance acceptance pending."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "host_heap_allocations"
+base = 0
+per_unit = 0
+layers = ["vm-free"]
+rationale = "Warm regular-file fstat requires no host heap objects. Allocator events are observed only inside dispatch, with an independently verified positive control."

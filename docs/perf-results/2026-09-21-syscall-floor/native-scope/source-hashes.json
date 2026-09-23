@@ -1,0 +1,14 @@
+{
+  "conformance-contracts/contracts/native-execution-scope.toml": "455141738e29726f179346a08a7d376006801e69991fc0c8a7647d9a887895e3",
+  "conformance-contracts/contracts/native-synchronous-syscall.toml": "75203d63fc43a2e79421321054e7a484a396189fcd721fb072fe11aeb78a1bea",
+  "crates/carrick-kernel-example/src/contracts.rs": "89be01455534a1725c7f2e6dfbd555b569ec8672b465e51714cbc07ec193fb04",
+  "crates/carrick-kernel-example/tests/native_execution_scope.rs": "7a8d7bb15ef07962f938e2d0153eb6ea54e560266f9c67dbcf9d84ab5e14e0d1",
+  "crates/carrick-kernel/src/dispatch/mm_authority.rs": "f1f1fb007c6caf79ed1ff114fdc7b3030c1d00f74c2ddbcce3a2227ac00f63b3",
+  "crates/carrick-kernel/src/dispatch/mod.rs": "12cd13e624809e98bb355d0e11e79bba44b6d50056510a11c967e8d432913d20",
+  "crates/carrick-kernel/src/dispatch/native_execution.rs": "0787e842b8742a48890b8bbc7c7b093149f5b567cdf55e48a43ca77c35a20739",
+  "crates/carrick-kernel/src/dispatch/native_execution/tests.rs": "944db245558d51f2a6387027f132524a7b1fa670ebc1cdd9c32b431a4273f899",
+  "crates/carrick-kernel/src/kernel/guest_execution.rs": "79fb8f19c2ba3e26d4d4ca0e094282d397bfe2d535f91efc0c87073f5c22e6c8",
+  "experiments/native-syscall-slice/README.md": "79993a651f38c4f8fe938b35a54e389de8b7cefcb8d1367f3869a917cf642093",
+  "experiments/native-syscall-slice/src/main.rs": "a35de676977f6e59603cec10987ec1dc6c4c152b27d12954ddf66cb70744e895",
+  "experiments/native-syscall-slice/tests/scoped_execution.rs": "a28d3aae3f565d81edce73370a344a60c825bf973f4d3166f5b7ae8fe64ccc8c"
+}

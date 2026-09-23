@@ -1,0 +1,230 @@
+diff --git a/crates/carrick-conformance-next/tests/deferred_anonymous.rs b/crates/carrick-conformance-next/tests/deferred_anonymous.rs
+index 1f2edcd26..40fa58bdb 100644
+--- a/crates/carrick-conformance-next/tests/deferred_anonymous.rs
++++ b/crates/carrick-conformance-next/tests/deferred_anonymous.rs
+@@ -213,3 +213,25 @@ print('foreign_immutable_private_file_copyout=ok')
+     );
+     assert!(result.stderr.is_empty(), "{}", result.stderr_utf8());
+ }
++
++#[test]
++fn deferred_anonymous_pristine_scrub_semantics() {
++    let _guard = common::guest_lock();
++    let container = TestContainer::new("localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30")
++        .pull_policy(PullPolicy::Missing);
++    let (result, _) = common::run_or_fail(container.run_with_audit([
++        "/usr/local/bin/python3",
++        "-c",
++        include_str!("fixtures/pristine_scrub.py"),
++    ]));
++    result.assert_success();
++    result.assert_exit_code(0);
++    assert_eq!(result.signal, None);
++    assert!(!result.trap_limit_hit);
++    assert_eq!(result.terminal_reason, None);
++    assert_eq!(
++        result.stdout_utf8(),
++        "pristine_scrub_pages=1=ok\npristine_scrub_pages=8=ok\npristine_scrub_pages=32=ok\npristine_scrub_pages=128=ok\npartial_scrub_fork=ok\nmixed_scrub_private_shared=ok\n"
++    );
++    assert!(result.stderr.is_empty(), "{}", result.stderr_utf8());
++}
+diff --git a/crates/carrick-kernel/Cargo.toml b/crates/carrick-kernel/Cargo.toml
+index e839d4dea..36e4f1c00 100644
+--- a/crates/carrick-kernel/Cargo.toml
++++ b/crates/carrick-kernel/Cargo.toml
+@@ -92,6 +92,7 @@ carrick-host-bsd = { path = "../carrick-host-bsd" }
+ carrick-host-linux = { path = "../carrick-host-linux" }
+ 
+ [dev-dependencies]
++carrick-conformance-contract = { path = "../carrick-conformance-contract" }
+ # Self dev-dependency: enables `test-support` on this crate's own lib when it
+ # is built for an integration test (`tests/`), which sees no `cfg(test)`.
+ carrick-kernel = { path = ".", features = ["test-support"] }
+diff --git a/crates/carrick-kernel/src/dispatch/mem/madvise.rs b/crates/carrick-kernel/src/dispatch/mem/madvise.rs
+index 73bf8e69b..32928e0a8 100644
+--- a/crates/carrick-kernel/src/dispatch/mem/madvise.rs
++++ b/crates/carrick-kernel/src/dispatch/mem/madvise.rs
+@@ -15,7 +15,6 @@ use carrick_abi::{
+ pub struct MadviseRangeMeta {
+     pub(crate) fully_mapped: bool,
+     pub(crate) covered: Vec<MadviseCoveredSegment>,
+-    pub(crate) writable: bool,
+     pub(crate) shared: bool,
+     pub(crate) all_private_anon: bool,
+     pub(crate) any_special: bool,
+@@ -94,7 +93,6 @@ impl<'a> MemView<'a> {
+         let mut covered_to = start;
+         let mut covered: Vec<MadviseCoveredSegment> = Vec::new();
+         let mut fully_mapped = true;
+-        let mut writable = true;
+         let mut shared = false;
+         let mut all_private_anon = true;
+         let mut any_special = false;
+@@ -129,9 +127,6 @@ impl<'a> MemView<'a> {
+                         provenance: vma.provenance,
+                     }),
+                 }
+-                if !vma.write {
+-                    writable = false;
+-                }
+                 if matches!(
+                     vma.provenance,
+                     VmaBackingProvenance::SharedAnonymous | VmaBackingProvenance::SharedFile
+@@ -163,7 +158,6 @@ impl<'a> MemView<'a> {
+         MadviseRangeMeta {
+             fully_mapped,
+             covered,
+-            writable,
+             shared,
+             all_private_anon,
+             any_special,
+@@ -721,21 +715,13 @@ impl<'a> MemView<'a> {
+                     if meta.locked {
+                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                     }
+-                    // Drop the pages by zeroing the writable PRIVATE/anonymous
+-                    // backing — only such mappings get zero-fill-on-next-access.
+-                    // A read-only mapping must NOT be written (would SIGBUS the
+-                    // runtime); a MAP_SHARED mapping must NOT be written either —
+-                    // for a shared FILE mapping zero_backing writes straight
+-                    // through to the file and CORRUPTS it, and Linux
+-                    // MADV_DONTNEED on a shared mapping does not zero (the next
+-                    // access re-faults the original content from the file). In
+-                    // all those cases treat DONTNEED as a success no-op, matching
+-                    // Linux dropping clean cache pages. zero_backing writes the
+-                    // host backing directly (same call the MAP_FIXED/munmap-reuse
+-                    // scrub uses), bypassing the guest write-protection gate.
+-                    // The pages are dropped per mapped segment: the segments
+-                    // ahead of and past a hole are still discarded, and the
+-                    // hole itself is reported afterwards.
++                    // Private anonymous contents are discarded regardless of guest
++                    // write permission. Backing maintenance bypasses that permission
++                    // while retaining COW/owner authentication. Classify each segment:
++                    // neighboring shared or read-only VMAs must not suppress discard.
++                    // Shared backing is never zeroed; private files restore their
++                    // own source below. Covered segments on both sides of a hole
++                    // are processed before reporting the hole verdict.
+                     for segment in &meta.covered {
+                         let Ok(segment_len) = usize::try_from(segment.end - segment.start) else {
+                             return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+@@ -747,12 +733,12 @@ impl<'a> MemView<'a> {
+                             }
+                             continue;
+                         }
+-                        if meta.writable && !meta.shared {
++                        if segment.provenance.is_private_anonymous() {
+                             if cx.memory.zero_backing(segment.start, segment_len).is_err() {
+                                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                             }
+                         }
+-                        if meta.all_private_anon {
++                        if segment.provenance.is_private_anonymous() {
+                             this.mark_range_nonresident(segment.start, segment_len as u64);
+                             // Discarding the pages puts them back where a fresh
+                             // anonymous mapping starts: not resident, and resident
+diff --git a/crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs b/crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs
+index e764a1757..16b0bce9c 100644
+--- a/crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs
++++ b/crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs
+@@ -118,13 +118,13 @@ fn mincore_onfault_lock_is_not_resident_until_page_is_touched() {
+     );
+ }
+ 
+-#[test]
+-fn readonly_private_anonymous_dontneed_retires_populated_residency() {
++fn readonly_discard_observation(scale: u64) -> (bool, u64) {
++    let length = scale * LINUX_PAGE_SIZE;
+     const SYS_MMAP: u64 = 222;
+     const SYS_MADVISE: u64 = 233;
+ 
+     let mut dispatcher = SyscallDispatcher::new();
+-    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
++    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, length as usize);
+     let reporter = CompatReporter::default();
+     let context = dispatcher
+         .capture_one_task_context()
+@@ -137,7 +137,7 @@ fn readonly_private_anonymous_dontneed_retires_populated_residency() {
+                     SYS_MMAP,
+                     SyscallArgs([
+                         0,
+-                        LINUX_PAGE_SIZE,
++                        length,
+                         LINUX_PROT_READ,
+                         LINUX_MAP_PRIVATE
+                             | LINUX_MAP_ANONYMOUS
+@@ -157,13 +157,15 @@ fn readonly_private_anonymous_dontneed_retires_populated_residency() {
+         "MAP_POPULATE must begin resident"
+     );
+ 
++    let before = memory.zero_backing_calls.get();
++    memory.bytes.fill(0x31);
+     assert_eq!(
+         dispatcher
+             .dispatch(
+                 &context,
+                 SyscallRequest::new(
+                     SYS_MADVISE,
+-                    SyscallArgs([address, LINUX_PAGE_SIZE, LINUX_MADV_DONTNEED, 0, 0, 0]),
++                    SyscallArgs([address, length, LINUX_MADV_DONTNEED, 0, 0, 0]),
+                 ),
+                 &mut memory,
+                 &reporter,
+@@ -176,6 +178,58 @@ fn readonly_private_anonymous_dontneed_retires_populated_residency() {
+         Some(vec![0]),
+         "MADV_DONTNEED must retire synthetic residency even when the VMA is read-only"
+     );
++    (
++        memory.bytes.iter().all(|byte| *byte == 0),
++        (memory.zero_backing_calls.get() - before) as u64,
++    )
++}
++
++#[test]
++fn readonly_private_anonymous_dontneed_retires_populated_residency() {
++    use carrick_conformance_contract::{
++        Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
++        SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
++    };
++    use sha2::{Digest, Sha256};
++    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++        .parent()
++        .unwrap()
++        .parent()
++        .unwrap();
++    let registry = ContractRegistry::load(root).unwrap();
++    let revision = format!(
++        "madvise-sha256:{:x}",
++        Sha256::digest(include_bytes!("../madvise.rs"))
++    );
++    let observations: Vec<_> = [1, 8, 32, 128]
++        .into_iter()
++        .map(|scale| {
++            let (zeroed, calls) = readonly_discard_observation(scale);
++            let mut work = WorkSnapshot::new();
++            work.insert(WorkMetric::HostBackendCalls, calls).unwrap();
++            ContractObservation {
++                contract_id: ContractId::new("kernel.mm.anonymous-discard").unwrap(),
++                layer: ExecutionLayer::VmFree,
++                implementation_revision: revision.clone(),
++                fixture_identity: "unit:readonly-anonymous-discard".into(),
++                scale,
++                semantic_assertions: vec![SemanticAssertion {
++                    name: "readonly_discard_removes_old_contents".into(),
++                    passed: zeroed,
++                    detail: None,
++                }],
++                work: Some(work),
++                timing: None,
++                completeness: Completeness::Complete,
++            }
++        })
++        .collect();
++    println!("{observations:#?}");
++    evaluate(
++        registry.require("kernel.mm.anonymous-discard").unwrap(),
++        &observations,
++    )
++    .unwrap();
+ }
+ 
+ #[test]

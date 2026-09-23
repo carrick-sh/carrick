@@ -1,0 +1,19 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.87s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-0aaee9123b867d4d)
+
+running 1 test
+
+thread 'trap::code_content::execution_tests::native_code_drain_waits_for_active_content_before_writer_admission' (4851514) panicked at crates/carrick-vmm-hvf/src/trap/code_content.rs:432:9:
+writer was admitted while captured instructions were active
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test trap::code_content::execution_tests::native_code_drain_waits_for_active_content_before_writer_admission ... FAILED
+
+failures:
+
+failures:
+    trap::code_content::execution_tests::native_code_drain_waits_for_active_content_before_writer_admission
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 527 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`

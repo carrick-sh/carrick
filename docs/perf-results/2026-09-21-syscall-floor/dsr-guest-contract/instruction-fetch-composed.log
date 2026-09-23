@@ -1,0 +1,64 @@
+   Compiling log v0.4.29
+   Compiling errno v0.3.14
+   Compiling tracing-core v0.1.36
+   Compiling darling_core v0.20.11
+   Compiling regex-automata v0.4.14
+   Compiling clap_derive v4.6.1
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+   Compiling signal-hook v0.4.4
+   Compiling sharded-slab v0.1.7
+   Compiling thread_local v1.1.9
+   Compiling signal-hook-registry v1.4.8
+   Compiling rustix v1.1.4
+   Compiling goblin v0.10.5
+   Compiling tokio v1.52.3
+   Compiling tracing v0.1.44
+   Compiling tracing-log v0.2.0
+   Compiling hickory-proto v0.26.1
+   Compiling nu-ansi-term v0.50.3
+   Compiling tempfile v3.27.0
+   Compiling fd-lock v4.0.4
+   Compiling carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-signal-core)
+   Compiling rusty-fork v0.3.1
+   Compiling proptest v1.11.0
+   Compiling clap v4.6.1
+   Compiling darling_macro v0.20.11
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling regex v1.12.3
+   Compiling matchers v0.2.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling derive_builder_macro v0.20.2
+   Compiling dof v0.4.0
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+   Compiling derive_builder v0.20.2
+   Compiling oci-spec v0.8.4
+   Compiling usdt-impl v0.6.0
+   Compiling hyper v1.9.0
+   Compiling tokio-rustls v0.26.4
+   Compiling tower v0.5.3
+   Compiling usdt v0.6.0
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling tokio-util v0.7.18
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling hyper-util v0.1.20
+   Compiling tower-http v0.6.10
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+   Compiling oci-client v0.15.0
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-spec)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+   Compiling carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-image)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.48s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-48d4edbb97db71d0)
+
+running 1 test
+test vcpu_loop::memory::tests::instruction_fetch_composes_kernel_lease_and_production_carrier ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 600 filtered out; finished in 0.03s
+

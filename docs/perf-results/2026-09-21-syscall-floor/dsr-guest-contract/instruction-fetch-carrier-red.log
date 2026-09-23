@@ -1,0 +1,30 @@
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.62s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-3c2afd032626087b)
+
+running 2 tests
+test trap::foreign_mm::tests::instruction_fetch_carrier_reads_execute_only_deferred_bytes ... FAILED
+test trap::foreign_mm::tests::instruction_fetch_carrier_selects_exact_execute_only_mm ... ok
+
+failures:
+
+---- trap::foreign_mm::tests::instruction_fetch_carrier_reads_execute_only_deferred_bytes stdout ----
+
+thread 'trap::foreign_mm::tests::instruction_fetch_carrier_reads_execute_only_deferred_bytes' (3269531) panicked at crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs:2237:10:
+fetch executable sparse backing without granting readable permission: Translation(GuestVa(105553653153792))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    trap::foreign_mm::tests::instruction_fetch_carrier_reads_execute_only_deferred_bytes
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 506 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`

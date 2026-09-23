@@ -1,0 +1,48 @@
+    #[test]
+    fn native_data_activation_outlives_mutation_but_not_execution() {
+        use carrick_kernel::kernel::mm_access::MmAccessTarget;
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        let (kernel, root) = bootstrap(32_180);
+        let fixture = real_production_cow_fixture(&kernel, &root, 32_181,
+            0x9a00_6b00_0000, 0x9b00_6b00_0000, ThreadId::synthetic_for_tests(32_181));
+        let original = fixture.carrier.pin_original_data_for_test().unwrap();
+        let mut execution = execution_lease(&fixture.child, 32181);
+        let authority = carrick_kernel::kernel::MmAccessAuthority::new();
+        let current = fixture.child.current_mm(&execution).unwrap();
+        let range = current.access_token().write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
+        let mut prepared = authority.with_current_mutation(&current,
+            ThreadId::synthetic_for_tests(32_181), |mutation| {
+                let mut cow = authority.break_foreign_cow(mutation, &current, range).unwrap();
+                Ok(fixture.child.borrow_current_native_data(&execution, &mut cow).unwrap()
+                    .prepare_for_execution())
+            }).unwrap();
+        drop(current);
+        assert!(!fixture.dispatch_mm.pt_quiesce().is_quiescing());
+        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
+            fixture.dispatch_mm.clone());
+        let mut executor = dispatcher.admit_native_executor(&fixture.child, &execution).unwrap();
+        let scope = dispatcher.enter_native_execution(&mut executor, &fixture.child, &mut execution).unwrap();
+        let mut active = prepared.activate(&scope).unwrap();
+        assert_eq!(active.start(), GuestVa(TEST_VA));
+        assert_eq!(active.len(), 4);
+        // Bounded CPU access to the actual pinned carrier bytes, after mutation
+        // exclusion has ended. No syscall/dispatcher reentry or Rust aliases.
+        unsafe {
+            let ptr = active.as_mut_ptr();
+            std::arch::asm!("ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
+                ptr = in(reg) ptr, out("x9") _, options(nostack));
+        }
+        drop(active);
+        drop(scope);
+        drop(executor);
+        fixture.child.thread().yield_from_executor(execution).unwrap();
+        assert_eq!(original.prefix(), *b"same");
+        let root_execution = execution_lease(&root, 32180);
+        let current = foreign_mm(&kernel, &root, &root_execution, fixture.child.task().key());
+        let read = current.access_token().read_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
+        let mut bytes = [0; 4];
+        authority.read_foreign(&current, read, &mut bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes), u32::from_le_bytes(*b"same") + 1);
+        root.thread().yield_from_executor(root_execution).unwrap();
+    }
+

@@ -15,7 +15,6 @@ use carrick_abi::{
 pub struct MadviseRangeMeta {
     pub(crate) fully_mapped: bool,
     pub(crate) covered: Vec<MadviseCoveredSegment>,
-    pub(crate) writable: bool,
     pub(crate) shared: bool,
     pub(crate) all_private_anon: bool,
     pub(crate) any_special: bool,
@@ -94,7 +93,6 @@ impl<'a> MemView<'a> {
         let mut covered_to = start;
         let mut covered: Vec<MadviseCoveredSegment> = Vec::new();
         let mut fully_mapped = true;
-        let mut writable = true;
         let mut shared = false;
         let mut all_private_anon = true;
         let mut any_special = false;
@@ -129,9 +127,6 @@ impl<'a> MemView<'a> {
                         provenance: vma.provenance,
                     }),
                 }
-                if !vma.write {
-                    writable = false;
-                }
                 if matches!(
                     vma.provenance,
                     VmaBackingProvenance::SharedAnonymous | VmaBackingProvenance::SharedFile
@@ -163,7 +158,6 @@ impl<'a> MemView<'a> {
         MadviseRangeMeta {
             fully_mapped,
             covered,
-            writable,
             shared,
             all_private_anon,
             any_special,
@@ -721,21 +715,13 @@ impl<'a> MemView<'a> {
                     if meta.locked {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
-                    // Drop the pages by zeroing the writable PRIVATE/anonymous
-                    // backing — only such mappings get zero-fill-on-next-access.
-                    // A read-only mapping must NOT be written (would SIGBUS the
-                    // runtime); a MAP_SHARED mapping must NOT be written either —
-                    // for a shared FILE mapping zero_backing writes straight
-                    // through to the file and CORRUPTS it, and Linux
-                    // MADV_DONTNEED on a shared mapping does not zero (the next
-                    // access re-faults the original content from the file). In
-                    // all those cases treat DONTNEED as a success no-op, matching
-                    // Linux dropping clean cache pages. zero_backing writes the
-                    // host backing directly (same call the MAP_FIXED/munmap-reuse
-                    // scrub uses), bypassing the guest write-protection gate.
-                    // The pages are dropped per mapped segment: the segments
-                    // ahead of and past a hole are still discarded, and the
-                    // hole itself is reported afterwards.
+                    // Private anonymous contents are discarded regardless of guest
+                    // write permission. Backing maintenance bypasses that permission
+                    // while retaining COW/owner authentication. Classify each segment:
+                    // neighboring shared or read-only VMAs must not suppress discard.
+                    // Shared backing is never zeroed; private files restore their
+                    // own source below. Covered segments on both sides of a hole
+                    // are processed before reporting the hole verdict.
                     for segment in &meta.covered {
                         let Ok(segment_len) = usize::try_from(segment.end - segment.start) else {
                             return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -747,12 +733,23 @@ impl<'a> MemView<'a> {
                             }
                             continue;
                         }
-                        if meta.writable && !meta.shared {
-                            if cx.memory.zero_backing(segment.start, segment_len).is_err() {
+                        if segment.provenance.is_private_anonymous() {
+                            let discarded = match cx.memory.discard_private_anonymous(segment.start, segment_len) {
+                                Ok(discarded) => discarded,
+                                Err(carrick_guest_mem::RepointPrivateError::Clean(_)) => {
+                                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                                }
+                                Err(carrick_guest_mem::RepointPrivateError::Indeterminate(error)) => {
+                                    carrick_fatal!("dispatch::anonymous_discard",
+                                        "anonymous discard publication uncertain at {:#x}+{:#x}: {error}",
+                                        segment.start, segment_len);
+                                }
+                            };
+                            if !discarded && cx.memory.zero_backing(segment.start, segment_len).is_err() {
                                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                             }
                         }
-                        if meta.all_private_anon {
+                        if segment.provenance.is_private_anonymous() {
                             this.mark_range_nonresident(segment.start, segment_len as u64);
                             // Discarding the pages puts them back where a fresh
                             // anonymous mapping starts: not resident, and resident

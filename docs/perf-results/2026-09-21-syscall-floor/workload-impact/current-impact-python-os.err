@@ -1,0 +1,15 @@
+2026-09-22T03:31:46.630252Z  WARN carrick::commands: carrick trace: not root; re-executing under sudo
+TRACECHILD1|euid=501|egid=20|groups=12,20,33,61,79,80,81,98,100,204,250,395,398,399,400,701
+
+real	0m2.842s
+user	0m0.882s
+sys	0m1.629s
+
+real	0m2.394s
+user	0m0.606s
+sys	0m1.531s
+
+real	0m2.508s
+user	0m0.632s
+sys	0m1.586s
+HVPatch carrier low-rate CPU: samples=787, user_stacks=419, stack_count_closure=787, bundled_program_sha256=4411c42ae3bd1cca3b188ea86471817e82db0a7b372ba7f5f030e0a33bea77a2, image_text_base=0x100378000, raw_bytes=225779

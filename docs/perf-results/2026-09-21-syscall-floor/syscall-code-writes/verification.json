@@ -1,0 +1,146 @@
+{
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "source_revision": "sha256:475bc5fa32a0cbbaa1b818e4547f1cbb7ab690c5cbc7ee8c6f87c0eaa35c1a57",
+  "source_inputs": 2479,
+  "source_manifest_still_matches": true,
+  "performance": {
+    "new_original_inotify09_measurement": false,
+    "last_accepted_carrick_seconds": 21.885,
+    "last_accepted_linux_seconds": 5.98,
+    "raw_ratio": 3.6596989966555182,
+    "native_execution_enabled": false,
+    "macos_io_control": "separate matched control; never subtract unrelated medians"
+  },
+  "checks": [
+    {
+      "command": "RUSTC_WRAPPER= just test-kernel",
+      "result": "pass",
+      "test_binaries": 20,
+      "passed": 2377,
+      "ignored": 1,
+      "log": "test-kernel.log",
+      "qualification": "Recipe scope; not all workspace or serial-host tests. Final extra HVF test is in the separate focused run."
+    },
+    {
+      "command": "RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf --lib native_code_content -- --nocapture",
+      "result": "pass",
+      "passed": 11,
+      "log": "green-content-complete.log"
+    },
+    {
+      "command": "RUSTC_WRAPPER= cargo test -p carrick-vmm-hvf --lib syscall_code_write_cost_contract -- --nocapture",
+      "result": "pass",
+      "passed": 1,
+      "scales": [
+        1,
+        8,
+        32,
+        128
+      ],
+      "warm_heap_allocations": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "visited_pages": [
+        1,
+        8,
+        32,
+        128
+      ],
+      "log": "cost-contract-final.log"
+    },
+    {
+      "command": "RUSTC_WRAPPER= cargo test -p carrick-kernel --test integration syscall_fs_rw -- --nocapture",
+      "result": "pass",
+      "passed": 29,
+      "log": "kernel-file-tests.log"
+    },
+    {
+      "command": "RUSTC_WRAPPER= cargo clippy --no-deps -p carrick-guest-mem -p carrick-kernel -p carrick-vmm-hvf -p carrick-runtime -p carrick-conformance-next --lib --tests -- -D warnings",
+      "result": "pass",
+      "log": "clippy-final.log",
+      "qualification": "Scoped changed packages. Not workspace Clippy; known aarch64 dependency diagnostics remain."
+    },
+    {
+      "command": "RUSTC_WRAPPER= cargo run -p carrick-conformance-contract --bin check-contracts -- --root .",
+      "result": "pass",
+      "contracts": 35,
+      "claims": 15,
+      "surfaces": 84,
+      "log": "registry-final.log"
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true <changed Rust files except fs/tests.rs>",
+      "result": "pass",
+      "log": "fmt-touched.log",
+      "excluded": "Unrelated unformatted fs/tests.rs prefix was preserved byte-for-byte. No whole-workspace formatting claim."
+    },
+    {
+      "command": "git -c core.fsmonitor=false diff --check",
+      "result": "pass",
+      "log": "diff-check.log"
+    },
+    {
+      "command": "CARRICK_RUN_ID=syscall-code-writes-final-20260922 CARRICK_CONTRACT_ID=kernel.mm.syscall-code-write RUSTC_WRAPPER= scripts/test-signed.sh carrick-conformance-next syscall_write_destinations_preserve_bytes_permissions_and_cow --exact --nocapture",
+      "result": "fail",
+      "log": "signed-destinations-final.log",
+      "passing_subchecks": [
+        "readv_cross_page",
+        "preadv_offset",
+        "large_read",
+        "ordinary_copy_cross_page",
+        "recvfrom_cross_page",
+        "fork_cow_isolation"
+      ],
+      "failure": "read-only readv returns EFAULT but advances file offset from 8192 to 8196",
+      "entitlement_negative_control": "pass",
+      "remaining_scoped_processes": 0,
+      "artifact": "destinations-final-artifact.json"
+    },
+    {
+      "command": "before-step control with the initial exact new signed destination fixture",
+      "result": "same_failure",
+      "log": "signed-destinations-control.log",
+      "restoration": "control-restoration.json",
+      "artifact": "destinations-control-artifact.json",
+      "qualification": "Confirms the offset assertion failure predates this change; remaining cases were not reached by the initial fixture."
+    },
+    {
+      "command": "native ARM64 Docker exact final destination fixture; see oracle-final-receipt.json",
+      "result": "pass",
+      "subchecks": 7,
+      "log": "oracle-destinations-final.log",
+      "serialized_after_carrick": true
+    }
+  ],
+  "red_controls": [
+    {
+      "log": "red-copy.log",
+      "failure": "ordinary syscall copy left translated instructions current"
+    },
+    {
+      "log": "red-host-write.log",
+      "failure": "disabled production host-write admission did not revoke first page"
+    },
+    {
+      "log": "red-zero-generation.log",
+      "failure": "unstamped row downgraded an existing tracked global owner"
+    }
+  ],
+  "acceptance": "Not promoted: signed semantic gate remains red. No original native execution, performance, full probe/smoke/full or full CI acceptance.",
+  "older_failures_not_closed": [
+    "fresh publication maintenance budget: one invalidation instead of zero",
+    "intermittent signed anonymous foreign-copyout EFAULT, unattributed",
+    "existing aarch64 Clippy diagnostics",
+    "private-file Linux fixture alignment assumption"
+  ],
+  "remaining_native_integration": [
+    "remaining raw/internal/hardware writes",
+    "proven private RX admission",
+    "native block/direct-link publication, revocation and active drain",
+    "current-MM DSR lowering and exact native/HVF handoff",
+    "unchanged original inotify09 completed timing and native-residence observations"
+  ]
+}

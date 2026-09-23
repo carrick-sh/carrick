@@ -1,0 +1,124 @@
+{
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "source_revision": "sha256:a1ec48ecf837313427ae3bfba6e9256fa8e7ff0d8aadf4c1d69eeea2022c50de",
+  "source_inputs_unchanged_after_controls": true,
+  "release_cli_sha256_unchanged": "1142bb6dc6202ab3675dc6485b4f479e1d9425b2b75a293c948aef5e65db8918",
+  "checks": [
+    {
+      "log": "content-tests.log",
+      "status": "ok",
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "log": "green-native-write.log",
+      "status": "ok",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "log": "instruction-tests.log",
+      "status": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "log": "kernel-instruction-final.log",
+      "status": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "log": "runtime-instruction-final.log",
+      "status": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "log": "native-data-final.log",
+      "status": "ok",
+      "passed": 9,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "log": "foreign-mm-final.log",
+      "status": "FAILED",
+      "passed": 75,
+      "failed": 1,
+      "ignored": 1
+    }
+  ],
+  "contract_registry": {
+    "status": "passed",
+    "contracts": 34,
+    "claims": 15,
+    "surfaces": 72
+  },
+  "format_touched_files": "passed",
+  "clippy_scoped_no_deps": "passed",
+  "clippy_dependency_inclusive": "failed: six existing manual_is_multiple_of diagnostics in carrick-aarch64",
+  "signed_warm_text": {
+    "status": "passed",
+    "sha256": "a6dad799ab91f3577b2a0403bb7ccabb51f71eb56f18209d9b7ea3e26c2d0f30",
+    "cdhash": "36529299361355fb73be54420a44ad1756765b8d",
+    "lc_uuid": "6EFA3188-F322-39A8-9F66-FD228E1C083A",
+    "frozen_path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/code-content/poketext-final",
+    "negative_entitlement_control": "passed",
+    "scoped_cleanup_remaining": 0,
+    "new_code_marker_present": true
+  },
+  "signed_foreign_copyout": {
+    "status": "failed_attribution_unresolved",
+    "anonymous": "EFAULT 14, child status 1024",
+    "private_file": "passed",
+    "failed_artifact": "deferred-candidate-artifact.json",
+    "negative_entitlement_control": "passed",
+    "scoped_cleanup_remaining": 0,
+    "before_after_diagnostic": "fixed ABBA: all four passed; original failure remains unclosed"
+  },
+  "baseline_maintenance_failure": {
+    "sha256": "31020ca8a1d3980e80ad0e382281bd9f7b5e6b639569b3d4858132f0147e46f6",
+    "runs": [
+      {
+        "sample": 0,
+        "exit_code": 101,
+        "same_structural_failure": true
+      },
+      {
+        "sample": 1,
+        "exit_code": 101,
+        "same_structural_failure": true
+      }
+    ],
+    "metadata_restored": true,
+    "unqualified_setup_logs": [
+      "baseline-maintenance-0.log",
+      "baseline-maintenance-1.log"
+    ]
+  },
+  "linux_controls": {
+    "anonymous_immediate": "passed",
+    "anonymous_ready": "passed",
+    "poketext": "passed",
+    "private_file": "unqualified: exact existing fixture asserts 16 KiB mmap alignment; native Linux returned a 4 KiB-aligned address",
+    "identities": "oracle-image-identities.json",
+    "note": "Image tags resolve through separate local stores; these controls are not a new same-image performance acceptance."
+  },
+  "native_execution_enabled": false,
+  "original_inotify09_measured": false,
+  "promotion": "not accepted; native publication/drain/all-writer coverage and signed foreign-copyout failure remain open",
+  "gates_not_run": [
+    "full CI",
+    "full signed probe gate",
+    "smoke promotion",
+    "full conformance promotion",
+    "mixed native/HVF guest acceptance",
+    "original hybrid inotify09 timing"
+  ]
+}

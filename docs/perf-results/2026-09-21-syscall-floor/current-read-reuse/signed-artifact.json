@@ -1,0 +1,12 @@
+{
+  "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e",
+  "preserved_path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/current-read-reuse/signed-foreign-mm-runtime",
+  "sha256": "d9e8588df4701a6e87e8c6b16df80eb6ebcb36dce482f74888d17461639f08d8",
+  "cdhash": "3058dc83aad9bada70cbd6f42cddc96e90253420",
+  "lc_uuid": "71B19922-32F4-3B14-A39D-6FCB03929764",
+  "hypervisor_entitlement": true,
+  "dof_carrick": true,
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "source_revision": "sha256:9930b50afef5fce01e6523a2b8a45fd921e3d75fcd01447879ee1d6b679ecf38",
+  "successful_signed_receipt": false
+}

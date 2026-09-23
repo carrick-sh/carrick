@@ -1,0 +1,38 @@
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.79s
+     Running unittests src/lib.rs (experiments/native-syscall-slice/target/debug/deps/native_syscall_slice-4e8c9b42f6aa82f5)
+
+running 17 tests
+test compact_tests::adr_adrp_reserved_registers_and_tls_still_checkpoint ... FAILED
+test compact_tests::backward_edges_keep_exact_budget_and_live_x17 ... ok
+test compact_tests::every_guest_pc_entry_restores_x17_and_complete_state ... ok
+test compact_tests::forward_conditionals_preserve_both_join_states ... ok
+test tests::accepts_real_syscall_and_integer_instructions ... ok
+test tests::backward_edges_are_bounded_and_tls_is_virtual ... ok
+test tests::bounded_native_loop_does_not_call_rust_per_iteration ... ok
+test tests::executable_revocation_and_wrong_publication_stop_before_resume ... ok
+test tests::native_code_density_contract ... ok
+test tests::native_data_borrow_refresh_and_revocation_before_resume ... ok
+test tests::native_data_demand_covers_branches_cycles_and_checkpoint_barriers ... ok
+test tests::native_integer_syscalls_preserve_registers_vectors_and_flags ... ok
+test tests::native_memory_misses_preserve_fault_state_and_permissions ... ok
+test tests::native_memory_work_budget ... ok
+test tests::native_scalar_access_all_registers_matches_checked_memory ... ok
+test tests::rejects_host_register_stack_and_system_instructions ... ok
+test tests::same_va_isolation_permissions_and_revocation ... ok
+
+failures:
+
+---- compact_tests::adr_adrp_reserved_registers_and_tls_still_checkpoint stdout ----
+
+thread 'compact_tests::adr_adrp_reserved_registers_and_tls_still_checkpoint' (4488824) panicked at src/compact_tests.rs:35:61:
+called `Result::unwrap()` on an `Err` value: 0x400000: d53bd05f: unqualified system instruction
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    compact_tests::adr_adrp_reserved_registers_and_tls_still_checkpoint
+
+test result: FAILED. 16 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+error: test failed, to rerun pass `--lib`

@@ -1,0 +1,62 @@
+[
+  {
+    "phase": 0,
+    "scale": 65536,
+    "cache_off_ns": 838.6033477783203,
+    "cache_on_ns": 838.8989715576172,
+    "linux_ns": 249.47166442871094,
+    "raw_linux_ratio": 3.3627024274628234,
+    "speedup": 0.9996476050283528,
+    "reduction_percent": -0.03525191976399
+  },
+  {
+    "phase": 1,
+    "scale": 65536,
+    "cache_off_ns": 16213.049560546875,
+    "cache_on_ns": 1435.6778411865234,
+    "linux_ns": 518.0956573486328,
+    "raw_linux_ratio": 2.771067120179389,
+    "speedup": 11.292957998952966,
+    "reduction_percent": 91.14492411914827
+  },
+  {
+    "phase": 2,
+    "scale": 128,
+    "cache_off_ns": 8743.8125,
+    "cache_on_ns": 1411.1328125,
+    "linux_ns": 1219.078125,
+    "raw_linux_ratio": 1.1575409184706682,
+    "speedup": 6.196307266435986,
+    "reduction_percent": 83.86135552998192
+  },
+  {
+    "phase": 2,
+    "scale": 65536,
+    "cache_off_ns": 8691.66438293457,
+    "cache_on_ns": 1281.92138671875,
+    "linux_ns": 901.5496520996094,
+    "raw_linux_ratio": 1.4219088030629228,
+    "speedup": 6.780185175927248,
+    "reduction_percent": 85.25114028521735
+  },
+  {
+    "phase": 3,
+    "scale": 65536,
+    "cache_off_ns": 2.86102294921875,
+    "cache_on_ns": 2.849578857421875,
+    "linux_ns": 0.572845458984375,
+    "raw_linux_ratio": 4.9744286399232855,
+    "speedup": 1.0040160642570282,
+    "reduction_percent": 0.40000000000000036
+  },
+  {
+    "phase": 4,
+    "scale": 65536,
+    "cache_off_ns": 3.13568115234375,
+    "cache_on_ns": 3.1337738037109375,
+    "linux_ns": 1.1494903564453125,
+    "raw_linux_ratio": 2.7262288771189254,
+    "speedup": 1.0006086427267193,
+    "reduction_percent": 0.06082725060827521
+  }
+]

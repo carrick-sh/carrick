@@ -1,0 +1,12 @@
+./scripts/closure-assert-layering.sh
+layering: carrick-vfs ok
+layering: carrick-kernel ok
+layering: carrick-kernel-example ok
+layering: carrick-vmm-bhyve ok
+layering: carrick-vmm-hvf ok
+layering: carrick-vmm-kvm ok
+layering: carrick-vmm-nvmm ok
+layering: product selection (default-members) = carrick-cli
+layering: product selection enables no carrick-kernel test-support ok
+layering: product selection enables no carrick-hal test-support ok
+layering: product selection enables no carrick-vfs test-support ok

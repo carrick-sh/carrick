@@ -1,0 +1,24 @@
+schema_version = 1
+id = "kernel.execution.native-code-density"
+title = "Straight-line native arithmetic has no per-instruction spill or jump"
+guest_surfaces = ["execution:linux-aarch64"]
+semantic_authority = ["AArch64 integer, branch and complete register-state semantics"]
+fixture = "unit:native-code-density"
+scale_points = [1, 8, 32, 128]
+rationale = "A straight-line sequence of N add instructions followed by SVC emits one instruction per add, two words per guest-PC entry veneer, and fixed checkpoint code. Runtime state, exact-PC re-entry, conservative memory checks and the maximum 256 backward-edge checkpoint interval must remain intact. Research publication only; this does not authorize cached carrier text."
+
+[bindings]
+vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_floor::native_code_density_contract"
+
+[bindings.unresolved]
+embed_structural = "Carrier executable-byte revocation and signed native execution remain unbound."
+embed_timing = "Paired unchanged-ELF host controls are diagnostics, not signed product acceptance."
+docker = "The same ELF controls provide Linux comparisons; no product-native execution binding exists."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "native_code_words"
+base = 18
+per_unit = 3
+layers = ["vm-free"]
+rationale = "N original instructions, 2*(N+1) entry-veneer words, and two 8-word checkpoint stubs (SVC and terminal refusal). Count the actual emitted words, including cold code."

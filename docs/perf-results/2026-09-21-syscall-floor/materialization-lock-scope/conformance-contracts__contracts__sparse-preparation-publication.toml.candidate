@@ -1,0 +1,21 @@
+schema_version = 1
+id = "kernel.mm.sparse-preparation-publication"
+title = "Private backing preparation permits unrelated frame publication"
+guest_surfaces = ["syscall:mmap", "fault:private-first-touch"]
+semantic_authority = ["Linux private mapping contents, failure isolation and fork isolation"]
+fixture = "unit:local-sparse-preparation"
+scale_points = [1, 8, 32, 128]
+rationale = "Preparation of private backing must not hold the carrier-wide frame registry. Exact-MM exclusion and guarded inventory staging through publication remain required."
+[bindings]
+vm_free = "carrick-vmm-hvf::trap::foreign_mm::tests::local_sparse_preparation_allows_independent_registry_progress"
+[bindings.unresolved]
+embed = "Signed private first-touch and fork semantics acceptance pending."
+docker = "Paired original Node and concurrent Node timing acceptance pending."
+embed_structural = "No live-guest preparation versus publication phase binding yet."
+[[structural_budgets]]
+kind = "affine"
+metric = "host_backend_calls"
+base = 0
+per_unit = 0
+layers = ["vm-free"]
+rationale = "First backing-map backend calls made while an independent thread cannot enter the registry, measured in the production preparation path with the stage-2 test backend. Excludes later publication maps; not a total backend-call budget."

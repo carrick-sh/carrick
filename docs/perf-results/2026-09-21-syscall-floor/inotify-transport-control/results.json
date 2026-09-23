@@ -1,0 +1,129 @@
+{
+  "ltp": {
+    "mailbox": [
+      21.456768624993856,
+      21.59360066600493
+    ],
+    "legacy": [
+      23.89595541599556,
+      24.133778874995187
+    ],
+    "docker": [
+      5.772673792002024
+    ]
+  },
+  "mailbox_to_legacy": 0.8963274506199804,
+  "mailbox_to_linux": 3.728806688388022,
+  "micro": {
+    "watch_invalid_pair": {
+      "mailbox": [
+        3029,
+        3071,
+        3078,
+        3093
+      ],
+      "legacy": [
+        3425,
+        3426,
+        3471,
+        3453
+      ],
+      "docker": [
+        255,
+        256,
+        256
+      ],
+      "mailbox_to_legacy": 0.8938799244076174,
+      "mailbox_to_linux": 12.009765625
+    },
+    "watch_unchanged_pair": {
+      "mailbox": [
+        3529,
+        3503,
+        3528,
+        3579
+      ],
+      "legacy": [
+        3880,
+        3871,
+        3961,
+        3875
+      ],
+      "docker": [
+        559,
+        554,
+        552
+      ],
+      "mailbox_to_legacy": 0.9099935525467441,
+      "mailbox_to_linux": 6.36913357400722
+    },
+    "watch_empty_batch": {
+      "mailbox": [
+        3598,
+        3249,
+        3276,
+        3442
+      ],
+      "legacy": [
+        3610,
+        3589,
+        3657,
+        3561
+      ],
+      "docker": [
+        1184,
+        1212,
+        1229
+      ],
+      "mailbox_to_legacy": 0.9331851646061953,
+      "mailbox_to_linux": 2.7714521452145213
+    },
+    "watch_growing": {
+      "mailbox": [
+        3411,
+        3330,
+        3374,
+        3449
+      ],
+      "legacy": [
+        3702,
+        3729,
+        3780,
+        3725
+      ],
+      "docker": [
+        864,
+        861,
+        843
+      ],
+      "mailbox_to_legacy": 0.9102495304534478,
+      "mailbox_to_linux": 3.940185830429733
+    },
+    "watch_overflow": {
+      "mailbox": [
+        3453,
+        3402,
+        3406,
+        3458
+      ],
+      "legacy": [
+        3778,
+        3762,
+        3824,
+        3765
+      ],
+      "docker": [
+        921,
+        909,
+        900
+      ],
+      "mailbox_to_legacy": 0.9093198992443325,
+      "mailbox_to_linux": 3.7728272827282727
+    }
+  },
+  "independent_carrick_timing_invocations": 8,
+  "independent_linux_timing_invocations": 3,
+  "timed_sample_records": 1155,
+  "warmup_sample_records": 210,
+  "all_sample_records": 1365
+}

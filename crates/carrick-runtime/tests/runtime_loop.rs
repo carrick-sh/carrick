@@ -520,6 +520,7 @@ impl SyscallTrap for ScriptedTrap {
             .pop_front()
             .map(|f| {
                 Some(carrick_runtime::trap::RawSyscall {
+                    current_guest_sp: None,
                     number: carrick_runtime::linux_abi::CanonicalNr(f.x8),
                     args: [f.x0, f.x1, f.x2, f.x3, f.x4, f.x5],
                     guest_abi: carrick_runtime::linux_abi::LinuxGuestAbi::Aarch64,

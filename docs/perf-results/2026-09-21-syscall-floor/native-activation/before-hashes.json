@@ -1,0 +1,9 @@
+{
+  "crates/carrick-hal/src/foreign_mm.rs": "c9b758e11a4587193dafcfbc094c80353e8befb4733990b01a27109bb791578a",
+  "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "d4c48e01cd695587d077b0719b31b426b367f9397fd4a70de2bcc346311c7a35",
+  "crates/carrick-kernel/src/kernel/mm_access.rs": "908cb3327699ddabdb0db51325e69ee60e6a9adcda6dbff4dd291b0919f56fbd",
+  "crates/carrick-kernel/src/dispatch/native_execution.rs": "0787e842b8742a48890b8bbc7c7b093149f5b567cdf55e48a43ca77c35a20739",
+  "crates/carrick-kernel/src/dispatch/mm_mutation.rs": "46b34cef919b68f9ca161eb19c59991f63794578af7e23c5dbd6513d4627f1e0",
+  "crates/carrick-runtime/src/vcpu_loop/memory.rs": "0a7f0ae52eb956ce041fb4cd5b7c56e1ab47ff5b7ced81461cb482072ec3af76",
+  "conformance-contracts/contracts/native-synchronous-syscall.toml": "75203d63fc43a2e79421321054e7a484a396189fcd721fb072fe11aeb78a1bea"
+}

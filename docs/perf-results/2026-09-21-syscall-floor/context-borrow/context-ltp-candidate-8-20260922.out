@@ -1,0 +1,42 @@
+{
+  "command": [
+    "-c",
+    "/opt/ltp/testcases/bin/inotify09"
+  ],
+  "exit_code": 0,
+  "image": "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+  "report": {
+    "deferred_syscalls": [],
+    "partial_syscalls": [],
+    "proc_read_unimplemented": [],
+    "summary": {
+      "deferred_syscall_invocations": 0,
+      "distinct_deferred_syscalls": 0,
+      "distinct_partial_syscalls": 0,
+      "distinct_proc_read_unimplemented": 0,
+      "distinct_sys_read_unimplemented": 0,
+      "distinct_unhandled_ioctls": 0,
+      "distinct_unhandled_syscalls": 0,
+      "distinct_unknown_syscall_flags": 0,
+      "distinct_unsupported_signals": 0,
+      "fast_path_blind_spots": 0,
+      "partial_syscall_invocations": 0,
+      "syscall_invocations": 50,
+      "syscall_returns_errno": 3,
+      "syscall_returns_ok": 45,
+      "unhandled_ioctl_invocations": 0,
+      "unhandled_syscall_invocations": 0,
+      "unknown_syscall_flag_invocations": 0
+    },
+    "sys_read_unimplemented": [],
+    "unhandled_ioctls": [],
+    "unhandled_syscalls": [],
+    "unknown_syscall_flags": [],
+    "unsupported_signals": []
+  },
+  "stderr": "",
+  "stdout": "",
+  "store": "/Users/tjfontaine/.carrick",
+  "trap_limit_hit": false,
+  "traps": 59
+}

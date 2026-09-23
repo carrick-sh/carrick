@@ -1,0 +1,4 @@
+Live atos against the local shell on the same boot:
+0x192b36a70 = __bzero (libsystem_platform.dylib) + 64
+0x192ae80f8 = mach_absolute_time (libsystem_kernel.dylib) + 108
+0x1929c3100 = clock_gettime (libsystem_c.dylib) + 60

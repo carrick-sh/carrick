@@ -1,0 +1,17 @@
+{
+  "utc": "2026-09-22T17:43:47.280709+00:00",
+  "source_revision": "sha256:b702c0fab676db18559b428e8ec9dba244f205c39bf542c46d99677443cbd353",
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "baseline": "target/lease-cost/native-activation/native-activation-cost-release",
+  "baseline_sha256": "cde110d3f1aede9b1cebf23d01006dfcbe19119b81c9139ba73605808808bc5a",
+  "candidate": "target/lease-cost/native-activation-cache/native-activation-cache-cost-release",
+  "candidate_sha256": "a291effbbdffeea80226243f362f0f028d5c140240e4b0bab15efc51f3626a4c",
+  "order": [
+    "baseline-1",
+    "candidate-1",
+    "candidate-2",
+    "baseline-2"
+  ],
+  "host_fixture_only": true,
+  "runtime_conformance_metrics": false
+}

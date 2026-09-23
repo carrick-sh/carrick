@@ -1,0 +1,17 @@
+[
+  {
+    "run": 0,
+    "median_ns_per_pair": 304.2621612548828,
+    "binary_sha256": "66dd806eb1df42aadf0c0ebfd5f78ce5bc0cce59791edcb2447cc5592a6e7d89"
+  },
+  {
+    "run": 1,
+    "median_ns_per_pair": 302.5697021484375,
+    "binary_sha256": "66dd806eb1df42aadf0c0ebfd5f78ce5bc0cce59791edcb2447cc5592a6e7d89"
+  },
+  {
+    "run": 2,
+    "median_ns_per_pair": 303.314208984375,
+    "binary_sha256": "66dd806eb1df42aadf0c0ebfd5f78ce5bc0cce59791edcb2447cc5592a6e7d89"
+  }
+]

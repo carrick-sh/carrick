@@ -1,0 +1,9 @@
+{
+  "preexisting_files_checked": 9747,
+  "changed_preexisting_files": [
+    "docs/perf-results/2026-09-21-syscall-floor/assessment.md",
+    "docs/perf-results/2026-09-21-syscall-floor/investigation-strategy.md"
+  ],
+  "all_product_and_test_changes_from_experiment_removed": true,
+  "restored_binary_sha256": "1142bb6dc6202ab3675dc6485b4f479e1d9425b2b75a293c948aef5e65db8918"
+}

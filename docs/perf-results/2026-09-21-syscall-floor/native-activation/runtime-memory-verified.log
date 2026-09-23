@@ -1,0 +1,40 @@
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.48s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-48d4edbb97db71d0)
+
+running 26 tests
+test vcpu_loop::memory::tests::foreign_cow_proof_issuer_does_not_sign_transport_chosen_owner_generation ... ok
+test vcpu_loop::memory::tests::foreign_cow_rejects_wrong_mm_guard_range_and_backend_receipt_identity ... ok
+test vcpu_loop::memory::tests::foreign_cow_runtime_rejects_transport_owner_after_independent_proof_issuance ... ok
+test vcpu_loop::memory::tests::instruction_fetch_composes_kernel_lease_and_production_carrier ... ok
+test vcpu_loop::memory::tests::mandatory_child_contextidr_stamp_propagates_injected_failure ... ok
+test vcpu_loop::memory::tests::native_data_activation_outlives_mutation_but_not_execution ... ok
+test vcpu_loop::memory::tests::native_data_activation_rejects_changes_after_preparation ... ok
+test vcpu_loop::memory::tests::native_data_activation_requires_exact_authority_and_real_drain ... ok
+test vcpu_loop::memory::tests::native_data_borrow_composes_execution_lease_and_production_cow ... ok
+test vcpu_loop::memory::tests::native_data_borrow_isolates_same_va_and_accepts_private_identity ... ok
+test vcpu_loop::memory::tests::native_data_borrow_rechecks_all_vma_permissions_and_revision ... ok
+test vcpu_loop::memory::tests::native_data_borrow_refuses_denied_second_leaf_and_stale_owner ... ok
+test vcpu_loop::memory::tests::pre_dispatch_pt_pause_covers_madvise_dontneed ... ok
+test vcpu_loop::memory::tests::proc_maps_projects_linux_initial_stack_vma_not_full_rlimit_backing ... ok
+test vcpu_loop::memory::tests::production_carrier_active_target_services_publication_on_owner_entry_path ... ok
+test vcpu_loop::memory::tests::production_carrier_budget_one_full_occupancy_defers_caller_self_ack_to_entry ... 
+running 1 test
+test vcpu_loop::memory::tests::production_carrier_budget_one_full_occupancy_defers_caller_self_ack_to_entry ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 607 filtered out; finished in 0.01s
+
+ok
+test vcpu_loop::memory::tests::production_carrier_clone_vm_target_reuses_exact_cow_authority ... ok
+test vcpu_loop::memory::tests::production_carrier_foreign_cow_runs_end_to_end_through_runtime_facade ... ok
+test vcpu_loop::memory::tests::production_carrier_target_exec_and_retirement_race_foreign_acquisition ... ok
+test vcpu_loop::memory::tests::production_composition_committed_cow_ignores_final_snapshot_contention ... ok
+test vcpu_loop::memory::tests::production_composition_foreign_cow_does_not_reacquire_snapshot_under_alias ... ok
+test vcpu_loop::memory::tests::production_ptrace_text_carries_executable_authority_when_snapshot_is_writable_but_source_is_rx ... ok
+test vcpu_loop::memory::tests::production_rx_ptrace_text_commit_accepts_post_cow_inventory_revision ... ok
+test vcpu_loop::memory::tests::remap_file_pages_does_not_pause_stage1 ... ok
+test vcpu_loop::memory::tests::shmdt_validates_before_pausing_stage1 ... ok
+test vcpu_loop::memory::tests::stage1_editors_are_claimed_regardless_of_peers ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 582 filtered out; finished in 0.44s
+

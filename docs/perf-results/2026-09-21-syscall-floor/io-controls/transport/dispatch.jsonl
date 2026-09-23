@@ -1,0 +1,7 @@
+{"probe":"provenance","pid":68175,"loadavg1":4.61,"mode":"dispatch"}
+{"probe":"svc-exit","arm":"stage1-dispatch-regs","batch":1,"iters":20000,"unit":"ns","min":750,"p25":792,"p50":792,"p75":833,"p90":834,"p95":834,"p99":959,"p999":1042,"max":4875,"mean":812.4}
+{"probe":"svc-exit","arm":"stage1-dispatch-regs","batch":2,"iters":20000,"unit":"ns","min":750,"p25":792,"p50":792,"p75":833,"p90":834,"p95":834,"p99":917,"p999":1042,"max":8291,"mean":810.8}
+{"probe":"svc-exit","arm":"stage1-dispatch-regs","batch":3,"iters":20000,"unit":"ns","min":750,"p25":792,"p50":792,"p75":833,"p90":834,"p95":834,"p99":917,"p999":1042,"max":3000,"mean":810.7}
+{"probe":"svc-exit","arm":"stage1-dispatch-regs","batch":4,"iters":20000,"unit":"ns","min":750,"p25":792,"p50":792,"p75":833,"p90":834,"p95":834,"p99":875,"p999":1042,"max":2750,"mean":808.3}
+{"probe":"svc-exit","arm":"stage1-dispatch-regs","batch":5,"iters":20000,"unit":"ns","min":750,"p25":792,"p50":792,"p75":833,"p90":834,"p95":834,"p99":916,"p999":1000,"max":5541,"mean":808.5}
+{"probe":"svc-exit","arm":"stage1-dispatch-regs","mode":"aggregate","iters":20000,"unit":"ns","per_iter":796}

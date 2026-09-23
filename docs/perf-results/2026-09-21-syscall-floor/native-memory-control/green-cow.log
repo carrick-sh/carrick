@@ -1,0 +1,14 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.63s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-206a8f631e68fc3c)
+
+running 1 test
+native_carrier_cow scale=1 completed=1 hardware_ticket_retained=true
+native_carrier_cow scale=8 completed=8 hardware_ticket_retained=true
+native_carrier_cow scale=32 completed=32 hardware_ticket_retained=true
+native_carrier_cow scale=128 completed=128 hardware_ticket_retained=true
+test vcpu_loop::memory::tests::native_admission_allows_carrier_cow_without_hardware_ack ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 609 filtered out; finished in 0.09s
+

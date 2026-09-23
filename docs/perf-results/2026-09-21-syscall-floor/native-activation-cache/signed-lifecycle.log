@@ -1,0 +1,45 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.10s
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/initial_runner_handoff-432e62fd81ead0df.tmp.22390
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/initial_runner_handoff-432e62fd81ead0df.tmp.22390: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/initial_runner_handoff-432e62fd81ead0df
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_info_load_probe-9b39f95873f0d773.tmp.22390
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_info_load_probe-9b39f95873f0d773.tmp.22390: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_info_load_probe-9b39f95873f0d773
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_fork_probe-458c62b9625f6db1.tmp.22390
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_fork_probe-458c62b9625f6db1.tmp.22390: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_fork_probe-458c62b9625f6db1
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e.tmp.22390
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e.tmp.22390: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_kernel_memory_probe-2fd29e549b7c51e1.tmp.22390
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_kernel_memory_probe-2fd29e549b7c51e1.tmp.22390: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_kernel_memory_probe-2fd29e549b7c51e1
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_compute_baseline_probe-86d8959a9b6518f8.tmp.22390
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_compute_baseline_probe-86d8959a9b6518f8.tmp.22390: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_compute_baseline_probe-86d8959a9b6518f8
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_bl_exit_free_probe-96770ae00f4d4df3.tmp.22390
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_bl_exit_free_probe-96770ae00f4d4df3.tmp.22390: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_bl_exit_free_probe-96770ae00f4d4df3
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_svc_tax_probe-4dfefb4ce9012645.tmp.22390
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_svc_tax_probe-4dfefb4ce9012645.tmp.22390: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_svc_tax_probe-4dfefb4ce9012645
+test-signed: resolved exact filter trap::foreign_mm::tests::production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycle -> trap::foreign_mm::tests::production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycle
+test-signed: running /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e trap::foreign_mm::tests::production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycle --exact --ignored
+
+running 1 test
+test trap::foreign_mm::tests::production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 508 filtered out; finished in 0.00s
+
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e.noent.22390: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e.noent.22390
+
+running 1 test
+test trap::stage2_backend::unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 508 filtered out; finished in 0.00s
+
+remaining carrick procs (run-id native-activation-cache-signed-lifecycle-20260922) = 0
+remaining carrick procs (run-id native-activation-cache-signed-lifecycle-20260922-cli) = 0
+test-signed: receipt target/test-results/carrick-vmm-hvf-signed-artifacts.jsonl
+test-signed: OK (carrick-vmm-hvf: 1 invoked signed executable(s) passed, 8 signed, negative control passed)

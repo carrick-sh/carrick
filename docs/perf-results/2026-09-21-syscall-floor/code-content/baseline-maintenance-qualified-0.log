@@ -1,0 +1,15 @@
+
+running 1 test
+test trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance ... 
+thread 'trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance' (4750430) panicked at crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs:9242:6:
+called `Result::unwrap()` on an `Err` value: ScalingViolation { contract: ContractId("kernel.mm.fresh-publication-maintenance"), metric: PageTableInvalidations, scale: 1, actual: 1, maximum: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 508 filtered out; finished in 0.09s
+

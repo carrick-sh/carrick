@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-0aaee9123b867d4d)
+
+running 2 tests
+test trap::foreign_mm::tests::instruction_fetch_carrier_reads_execute_only_deferred_bytes ... ok
+test trap::foreign_mm::tests::instruction_fetch_carrier_selects_exact_execute_only_mm ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 516 filtered out; finished in 0.04s
+

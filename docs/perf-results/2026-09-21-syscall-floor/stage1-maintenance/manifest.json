@@ -1,0 +1,15 @@
+{
+  "trace8/script-used.d": "fdcfb54ddf5fc376a8bde374c03a947fe79947301b3ae522fc079c2b0e99e6f4",
+  "trace8/summary.json": "054c576e05fd9790863ee451634d6eebf93c1a54ce97ec564377f033e58da749",
+  "trace8/trace.raw": "354aa3c45b1f5ce59e112d0b24c3a73a7378c89f21e45e4f983e7cc8fb49dbf6",
+  "trace8/run.py": "6a87449d43456abf91df81ebe794c599ddc4a467a4e14bb698926d44acffd435",
+  "trace8/symbol-qualification.txt": "4ac7a983b55be75e5e61bf9c6482b3456cdb93a9fe1a8d1ea1cd2bbadfaedf0d",
+  "trace8/stdout": "b35250fc4ea71b343c0520407894f1319bc21308dd4d4bf75f7ee2551a558df4",
+  "trace8/stderr": "cff97ef4fda8564330528d1b90f2a9bfc9f9d70e519a83b913da7118a2b97466",
+  "trace8/codesign.txt": "57cdbab393629af14c4841815b9b1d82cc1b9115a51a3345997679a627e54368",
+  "trace8/uuid-dof.txt": "24c4102a5eaa65cc12a5b985cd651be19c472f6c21cf63543cb0717f1704d5ee",
+  "trace8/resolved-stacks.json": "46390cb5c0bf8589d557eaaac00ca908081219608416f390ca3ccdc6110bf8a9",
+  "trace8/cleanup.log": "096f24366a4e9fd8119a676dcc93457ef0dd3a55a0c913d5e87cdf03a08c3d70",
+  "trace8/inputs.json": "8f35bc2b863709abc0588a5e2f4a8d1d8b52b578bbd91f2ad6c19a7efecd15f6",
+  "trace8/status.json": "0010c447d55bdb0a96f22f75cef4e5fc6572e605fa4e0a268bbb29c20c918f25"
+}

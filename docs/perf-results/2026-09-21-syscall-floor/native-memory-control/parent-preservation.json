@@ -1,0 +1,51 @@
+{
+  "parent_source_count": 124,
+  "unchanged_count": 113,
+  "intentional_changes": {
+    "Cargo.lock": {
+      "before": "f59f9a3974058143e0fb76ff2bf6b9d7771632ac55bed9cb3e9c8f056e608767",
+      "after": "90ac0958e50d79cf464bc24a52c8c3a056e0014ed02bd4248acd02f3726db840"
+    },
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs": {
+      "before": "55eee540fff42001e00b2ad5ed7dbcb34348648cc0e07fee1aa44a14c44e639e",
+      "after": "c2a978bc08e116b95a8a77cac49c4d69d5e3557936b2a053c3315552472832f5"
+    },
+    "experiments/native-syscall-slice/src/main.rs": {
+      "before": "a35de676977f6e59603cec10987ec1dc6c4c152b27d12954ddf66cb70744e895",
+      "after": "5558985ccc32b1b76a5b11362fe146439540de110eec6a87e2d37f35581c6b9b"
+    },
+    "experiments/native-syscall-slice/src/native.rs": {
+      "before": "44c45485cd9163e7e651ac8c08f63ced0e899f2d494f0fa17af5c7c4c584d5cc",
+      "after": "797d3b7226006b278c8474c61a53efb86c872f6ff816fd1b476fe86ec5b4bc94"
+    },
+    "crates/carrick-kernel/src/kernel/guest_execution.rs": {
+      "before": "79fb8f19c2ba3e26d4d4ca0e094282d397bfe2d535f91efc0c87073f5c22e6c8",
+      "after": "ab97e63144e5e5413ab271ab8ff84f4458291a2c0acd09150576cc3eba6ef3c9"
+    },
+    "conformance-contracts/contracts/native-execution-scope.toml": {
+      "before": "455141738e29726f179346a08a7d376006801e69991fc0c8a7647d9a887895e3",
+      "after": "d2f4fdc5cec9dc9b36bf77e88643beac19464dcfcb09b445be670786042ee684"
+    },
+    "crates/carrick-kernel-example/tests/native_execution_scope.rs": {
+      "before": "7a8d7bb15ef07962f938e2d0153eb6ea54e560266f9c67dbcf9d84ab5e14e0d1",
+      "after": "76c0d5d7dec35f2e039c387a32a4ad3bf9b4e0343d8827b9d8bd6ecec49c47c4"
+    },
+    "crates/carrick-kernel/src/dispatch/native_execution.rs": {
+      "before": "f6fabbb4436205d9621f0363f4157941e769e433123e1c999d478b13565062b2",
+      "after": "e83155d8bab81b6ace1048f715b88d2012f76f698b94dd3986e92afa4c1bcd6e"
+    },
+    "crates/carrick-kernel/src/dispatch/native_execution/tests.rs": {
+      "before": "944db245558d51f2a6387027f132524a7b1fa670ebc1cdd9c32b431a4273f899",
+      "after": "243b847d98e06a9c46980b6f30200e1f9981f816ec6e2e999d6fb3ae13542343"
+    },
+    "conformance-contracts/contracts/native-data-activation.toml": {
+      "before": "b1c3a058158bccd71f4b8dab945d6ab6919f042c24ee76ee2bd8e22f185555b5",
+      "after": "b9dde84e2c8d70f29b6a146f35dc10d87f7156b0e0031b5be2dec7ca4cc9cbc5"
+    },
+    "crates/carrick-runtime/Cargo.toml": {
+      "before": "5ba59157863f56b5dc0fe9ede79723c9ecde4eea5e50f6f14d320badd31e4c80",
+      "after": "3ea66a9a2a008870b90436861d77d29cb556d8f37f36a51acde91f8ec62aecdb"
+    }
+  },
+  "unexpected": {}
+}

@@ -1,0 +1,66 @@
+{
+  "workload": "go-build-cold",
+  "total": 74313,
+  "top": [
+    {
+      "nr": 25,
+      "name": "fcntl",
+      "count": 12269
+    },
+    {
+      "nr": 134,
+      "name": "rt_sigaction",
+      "count": 12158
+    },
+    {
+      "nr": 98,
+      "name": "futex",
+      "count": 8587
+    },
+    {
+      "nr": 63,
+      "name": "read",
+      "count": 6235
+    },
+    {
+      "nr": 64,
+      "name": "write",
+      "count": 4794
+    },
+    {
+      "nr": 79,
+      "name": "newfstatat",
+      "count": 3967
+    },
+    {
+      "nr": 56,
+      "name": "openat",
+      "count": 3277
+    },
+    {
+      "nr": 57,
+      "name": "close",
+      "count": 3233
+    },
+    {
+      "nr": 21,
+      "name": "epoll_ctl",
+      "count": 3218
+    },
+    {
+      "nr": 101,
+      "name": "nanosleep",
+      "count": 3162
+    },
+    {
+      "nr": 222,
+      "name": "mmap",
+      "count": 2008
+    },
+    {
+      "nr": 233,
+      "name": "madvise",
+      "count": 1533
+    }
+  ]
+}

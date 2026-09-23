@@ -1,0 +1,4 @@
+error: the package 'carrick-vmm-hvf' does not contain this feature: conformance-metrics
+help: packages with the missing feature: carrick-observability, carrick-kernel, carrick-runtime, carrick-embed, carrick-kernel-example
+remaining carrick procs (run-id native-activation-broad-20260922) = 0
+remaining carrick procs (run-id native-activation-broad-20260922-cli) = 0

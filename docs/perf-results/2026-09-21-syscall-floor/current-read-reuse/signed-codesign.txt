@@ -1,0 +1,25 @@
+Executable=/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e
+Identifier=carrick_vmm_hvf-c46177425ba8821e.tmp.41337
+Format=Mach-O thin (arm64)
+CodeDirectory v=20400 size=33251 flags=0x2(adhoc) hashes=1028+7 location=embedded
+VersionPlatform=1
+VersionMin=720896
+VersionSDK=786432
+Hash type=sha256 size=32
+CandidateCDHash sha256=3058dc83aad9bada70cbd6f42cddc96e90253420
+CandidateCDHashFull sha256=3058dc83aad9bada70cbd6f42cddc96e902534207cc20bb68994137ff25515d5
+Hash choices=sha256
+CMSDigest=3058dc83aad9bada70cbd6f42cddc96e902534207cc20bb68994137ff25515d5
+CMSDigestType=2
+Executable Segment base=0
+Executable Segment limit=14450688
+Executable Segment flags=0x1
+Page size=16384
+CDHash=3058dc83aad9bada70cbd6f42cddc96e90253420
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=0 size=12
+Total signatures=1
+Chosen signature=1

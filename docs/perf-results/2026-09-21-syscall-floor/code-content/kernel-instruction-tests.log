@@ -1,0 +1,16 @@
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.51s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-207122e8ce47be2c)
+
+running 2 tests
+test kernel::mm_access::tests::instruction_fetch_borrows_exact_lease_and_detects_revision_changes ... ok
+test kernel::mm_access::tests::instruction_fetch_rejects_readable_non_executable_memory ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2206 filtered out; finished in 0.01s
+

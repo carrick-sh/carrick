@@ -1,0 +1,89 @@
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.46s
+     Running unittests src/lib.rs (target/debug/deps/carrick_conformance_contract-dfe069e75b30bace)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/check-contracts.rs (target/debug/deps/check_contracts-4ad1fc86de53b6f4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/generate-inventory.rs (target/debug/deps/generate_inventory-da0b327d2ae9b771)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/claims.rs (target/debug/deps/claims-1a8b40ac69dbce4c)
+
+running 6 tests
+test claim_id_rejects_invalid_format ... ok
+test claim_id_accepts_valid_format ... ok
+test claim_serialization_round_trip ... ok
+test violation_demonstrated_requires_known_bad_revision ... ok
+test registry_loads_claims_successfully ... ok
+test live_registry_loads_all_claims ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/evaluate.rs (target/debug/deps/evaluate-e34b5bf77b4f6d11)
+
+running 14 tests
+test instrumented_observation_cannot_supply_timing_evidence ... ok
+test dropped_events_fail_closed ... ok
+test uninstrumented_timing_observation_cannot_claim_structural_completeness ... ok
+test exact_budget_success_and_failure ... ok
+test native_syscall_contract_requires_measured_zero_counters ... ok
+test semantic_mismatch_fails_closed ... ok
+test missing_metric_fails_closed ... ok
+test timing_ratio_failure_fails_closed ... ok
+test fixture_mismatch_fails_closed ... ok
+test native_syscall_contract_rejects_unbound_execution_evidence ... ok
+test structural_budget_applies_only_to_named_layer ... ok
+test affine_failure_reports_smallest_scale_point ... ok
+test unresolved_signed_binding_is_not_execution_coverage ... ok
+test upper_bound_budget_failure ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/inventory.rs (target/debug/deps/inventory-76ec65679c37d685)
+
+running 2 tests
+test inventory_covers_entire_aarch64_table ... ok
+test inventory_serializes_to_valid_json ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/registry.rs (target/debug/deps/registry-7171c8ec86692658)
+
+running 10 tests
+test contract_ids_reject_empty_or_non_lowercase_segments ... ok
+test non_toml_contract_entries_are_rejected ... ok
+test unknown_binding_layers_are_rejected_as_toml ... ok
+test missing_budget_rationale_is_rejected ... ok
+test unknown_work_metrics_are_rejected_as_toml ... ok
+test affine_budgets_require_three_scale_points ... ok
+test fields_from_another_budget_kind_are_rejected_as_toml ... ok
+test surfaces_must_reference_registered_contracts ... ok
+test duplicate_contract_ids_are_rejected ... ok
+test futex_contract_has_structural_and_runtime_authority ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/write_seek_bindings.rs (target/debug/deps/write_seek_bindings-fbaae5e78cf867a6)
+
+running 1 test
+test write_seek_has_real_signed_and_docker_bindings ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests carrick_conformance_contract
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

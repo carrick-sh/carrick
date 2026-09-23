@@ -8,6 +8,10 @@ use std::ffi::CString;
 
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["lease-alias"] {
+        lease_alias();
+        return;
+    }
     let scale = args.first().map_or(Ok(8usize), |s| s.parse()).unwrap_or(0);
     if ![1, 8, 32, 128].contains(&scale) {
         std::process::exit(2);
@@ -64,5 +68,27 @@ fn main() {
             closed = closed,
             removed = removed
         );
+    }
+}
+
+/// A successful alias write advances the same open-file-description offset,
+/// including after another seek has attempted to reacquire an execution lease.
+fn lease_alias() {
+    let path = CString::new(format!("/tmp/carrick-lease-alias-{}", std::process::id())).unwrap();
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600);
+        assert!(fd >= 0);
+        assert_eq!(libc::lseek(fd, 0, libc::SEEK_SET), 0);
+        let alias = libc::dup(fd);
+        assert!(alias >= 0);
+        assert_eq!(libc::lseek(fd, 0, libc::SEEK_SET), 0);
+        let written = libc::write(alias, b"x".as_ptr().cast(), 1);
+        let offset = libc::lseek(fd, 0, libc::SEEK_CUR);
+        let mut byte = [0u8; 1];
+        let read = libc::pread(fd, byte.as_mut_ptr().cast(), 1, 0);
+        assert_eq!(libc::close(alias), 0);
+        assert_eq!(libc::close(fd), 0);
+        assert_eq!(libc::unlink(path.as_ptr()), 0);
+        report!(alias_write = written, shared_offset = offset, read = read, byte = byte[0]);
     }
 }

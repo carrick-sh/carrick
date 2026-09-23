@@ -1,0 +1,24 @@
+schema_version = 1
+id = "kernel.mm.native-code-content"
+title = "Carrier byte writes revoke physical instruction dependencies"
+guest_surfaces = ["execution:linux-aarch64", "kernel:current-mm", "syscall:process_vm_writev", "syscall:ptrace"]
+semantic_authority = ["Linux AArch64 instruction visibility and syscall memory writes", "Carrick physical backing ownership and exact current-MM authority"]
+fixture = "unit:native-code-content"
+scale_points = [1, 8, 32, 128]
+rationale = "A host write must invalidate every translation dependency on its physical pages even when the writing alias is not executable. COW source and disjoint pages remain valid. Native data pointer access invalidates before handing out the pointer and prevents observation until that access ends. Content dependency tracking is not yet an executable publication permit or proof of every writer being mediated."
+
+[bindings]
+vm_free = "carrick-vmm-hvf::trap::code_content::tests::native_code_content_invalidation_contract; trap::foreign_mm::tests::native_code_content_foreign_write_revokes_backing_dependencies; trap::foreign_mm::tests::native_code_content_raw_data_pointer_revokes_and_blocks_observation"
+
+[bindings.unresolved]
+embed_structural = "Active native execution drain, ordinary hardware/syscall-buffer writers, mapping/alias admission and linked-code publication remain unbound. No native entry is authorized by the content observation."
+embed_timing = "No original inotify09 hybrid timing accepted."
+docker = "Backing dependency invariant is internal; self-modifying-code and mixed native/HVF guest differentials remain required before publication."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "native_code_invalidation_pages"
+base = 0
+per_unit = 1
+layers = ["vm-free"]
+rationale = "N one-page writes visit N subscribed physical pages regardless of 128 other subscribed pages; unrelated translations are not scanned."

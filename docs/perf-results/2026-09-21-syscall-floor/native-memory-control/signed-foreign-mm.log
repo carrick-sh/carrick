@@ -1,0 +1,130 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.14s
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_fork_probe-458c62b9625f6db1.tmp.28238
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_fork_probe-458c62b9625f6db1.tmp.28238: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_fork_probe-458c62b9625f6db1
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_compute_baseline_probe-86d8959a9b6518f8.tmp.28238
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_compute_baseline_probe-86d8959a9b6518f8.tmp.28238: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_compute_baseline_probe-86d8959a9b6518f8
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_bl_exit_free_probe-96770ae00f4d4df3.tmp.28238
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_bl_exit_free_probe-96770ae00f4d4df3.tmp.28238: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_bl_exit_free_probe-96770ae00f4d4df3
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/initial_runner_handoff-432e62fd81ead0df.tmp.28238
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/initial_runner_handoff-432e62fd81ead0df.tmp.28238: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/initial_runner_handoff-432e62fd81ead0df
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e.tmp.28238
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e.tmp.28238: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_info_load_probe-9b39f95873f0d773.tmp.28238
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_info_load_probe-9b39f95873f0d773.tmp.28238: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_info_load_probe-9b39f95873f0d773
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_svc_tax_probe-4dfefb4ce9012645.tmp.28238
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_svc_tax_probe-4dfefb4ce9012645.tmp.28238: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_svc_tax_probe-4dfefb4ce9012645
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_kernel_memory_probe-2fd29e549b7c51e1.tmp.28238
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_kernel_memory_probe-2fd29e549b7c51e1.tmp.28238: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_kernel_memory_probe-2fd29e549b7c51e1
+test-signed: running /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e trap::foreign_mm::tests::
+
+running 75 tests
+test trap::foreign_mm::tests::abort_prepared_child_preserves_borrowed_parent_global_frame_owner ... ok
+test trap::foreign_mm::tests::all_foreign_mm_tests_acquire_test_lock_census_audit ... ok
+test trap::foreign_mm::tests::child_fork_replicates_multi_arena_stage1_page_tables ... ok
+test trap::foreign_mm::tests::concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit ... ok
+test trap::foreign_mm::tests::copied_fork_child_activation_publishes_exact_foreign_mm_binding ... ok
+test trap::foreign_mm::tests::copied_fork_child_retain_preserves_borrowed_structural_owner ... ok
+test trap::foreign_mm::tests::cow_refusal_history_is_bounded_and_selects_the_exact_carrier_extent ... ok
+test trap::foreign_mm::tests::cow_refusal_history_retains_exact_extent_across_unrelated_churn ... ok
+test trap::foreign_mm::tests::cow_source_falls_back_to_offset_logical_inventory_with_current_physical_owner ... ok
+test trap::foreign_mm::tests::cow_source_inventory_fallback_pins_backing_through_copy_window ... ok
+test trap::foreign_mm::tests::cow_source_inventory_fallback_rejects_absent_zero_mismatched_or_conflicting_owner ... ok
+test trap::foreign_mm::tests::current_generation_structural_owner_needs_no_replay_rebind ... ok
+test trap::foreign_mm::tests::foreign_cow_commit_cannot_be_reported_as_retryable_by_final_snapshot_contention ... ok
+test trap::foreign_mm::tests::foreign_cow_each_reversible_boundary_restores_exact_stage1_inventory_and_owner_set ... ok
+test trap::foreign_mm::tests::foreign_cow_failpoint_leaves_lease_at_sn_and_retry_succeeds ... ok
+test trap::foreign_mm::tests::foreign_cow_invalidation_failure_rolls_back_and_republishes_the_old_stage1 ... ok
+test trap::foreign_mm::tests::foreign_cow_one_compound_authorizes_distinct_subrange_writes ... ok
+test trap::foreign_mm::tests::foreign_cow_prepare_write_rejects_in_span_leaf_discontinuity ... ok
+test trap::foreign_mm::tests::foreign_cow_prepare_write_rejects_out_of_span_alias ... ok
+test trap::foreign_mm::tests::foreign_cow_prepare_write_rejects_semantic_span_end_plus_one ... ok
+test trap::foreign_mm::tests::foreign_cow_write_keeps_the_shared_parent_owner_unchanged ... ok
+test trap::foreign_mm::tests::foreign_mm_failure_injection_at_composition_boundaries ... ok
+test trap::foreign_mm::tests::foreign_mm_read_backed_page_without_stage1_or_recipe_reads_zeros ... ok
+test trap::foreign_mm::tests::foreign_mm_read_deadline_bounds_mutation_coordinator_contention ... ok
+test trap::foreign_mm::tests::foreign_mm_read_rejects_a_missing_descriptor_owner ... ok
+test trap::foreign_mm::tests::foreign_mm_read_rejects_reused_owner_generation ... ok
+test trap::foreign_mm::tests::foreign_mm_read_retries_each_stale_revision_domain ... ok
+test trap::foreign_mm::tests::foreign_mm_read_unmaterialized_remote_page_within_vma_reads_zeros_and_full_length ... ok
+test trap::foreign_mm::tests::foreign_mm_read_walks_the_target_root_not_the_caller_root ... ok
+test trap::foreign_mm::tests::foreign_mm_retain_deadline_bounds_directory_inventory_and_owner_contention ... ok
+test trap::foreign_mm::tests::foreign_mm_retain_pins_covering_owner_for_cow_split_inventory_fragment ... ok
+test trap::foreign_mm::tests::fork_overlay_owner_lookup_does_not_rescan_every_source_mapping ... ok
+test trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance ... FAILED
+test trap::foreign_mm::tests::full_vm_materializer_stamps_fresh_owner_before_alias_mapping_and_inventory ... ok
+test trap::foreign_mm::tests::full_vm_partial_map_failure_uses_exact_fail_stop_rollback_static_audit ... ok
+test trap::foreign_mm::tests::global_frame_host_owner_drop_does_no_hv_and_explicit_retirement_releases_backing ... ok
+test trap::foreign_mm::tests::initial_carrier_control_mapping_keeps_direct_unmap_owner ... ok
+test trap::foreign_mm::tests::initial_fixed_mapping_composes_through_first_fork_preparation ... ok
+test trap::foreign_mm::tests::initial_fixed_mapping_publishes_exact_structural_owner ... ok
+test trap::foreign_mm::tests::initial_structural_epoch_failure_does_not_publish_stage2 ... ok
+test trap::foreign_mm::tests::instruction_fetch_carrier_reads_execute_only_deferred_bytes ... ok
+test trap::foreign_mm::tests::instruction_fetch_carrier_selects_exact_execute_only_mm ... ok
+test trap::foreign_mm::tests::old_generation_structural_owner_still_requires_exact_replay ... ok
+test trap::foreign_mm::tests::owned_foreign_mm_registration_teardown_is_exact_and_stale_safe ... ok
+test trap::foreign_mm::tests::owned_global_frame_alias_uses_the_fresh_registered_owner_generation ... ok
+test trap::foreign_mm::tests::owner_structs_encode_their_required_retirement_authority_static_audit ... ok
+test trap::foreign_mm::tests::persistent_reusable_cow_alias_rejects_zero_owner_generation ... ok
+test trap::foreign_mm::tests::persistent_reusable_cow_mapping_rejects_zero_owner_generation ... ok
+test trap::foreign_mm::tests::private_overlay_publication_preserves_structural_owner_across_fork ... ok
+test trap::foreign_mm::tests::production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycle ... ignored, requires a signed HVF test executable
+test trap::foreign_mm::tests::production_fork_plan_retains_structural_vvar_semantic_authority ... ok
+test trap::foreign_mm::tests::production_manager_bound_through_runtime_task_state_grows_extension_arenas ... ok
+test trap::foreign_mm::tests::production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync ... ok
+test trap::foreign_mm::tests::ptrace_text_cow_accepts_unarmed_rx_mapping_and_preserves_peer_and_stage1_ap ... ok
+test trap::foreign_mm::tests::ptrace_text_cow_rejects_source_alias_shorter_than_authenticated_span ... ok
+test trap::foreign_mm::tests::ptrace_text_cow_uses_authenticated_span_when_preexisting_arm_differs ... ok
+test trap::foreign_mm::tests::releasable_stage2_lease_lifecycle_and_deterministic_allocator_reuse ... ok
+test trap::foreign_mm::tests::retained_foreign_lease_advances_across_two_compound_cow_commits ... ok
+test trap::foreign_mm::tests::retained_foreign_lease_rejects_unrelated_or_tampered_successor_snapshot ... ok
+test trap::foreign_mm::tests::retained_old_token_drop_only_enqueues_before_the_executor_safe_point ... ok
+test trap::foreign_mm::tests::semantic_lookup_enforces_exact_boundary_length_and_overflow_protection ... ok
+test trap::foreign_mm::tests::semantic_lookup_isolates_same_va_in_different_mm ... ok
+test trap::foreign_mm::tests::semantic_lookup_preserves_map_shared_and_maintenance_fallback ... ok
+test trap::foreign_mm::tests::semantic_lookup_rejects_foreign_va_alias_at_same_live_ipa ... ok
+test trap::foreign_mm::tests::semantic_lookup_rejects_overlapping_row_with_wrong_va_to_ipa_offset ... ok
+test trap::foreign_mm::tests::semantic_lookup_rejects_stale_owner_generation_and_accepts_current ... ok
+test trap::foreign_mm::tests::shared_extent_repoint_subpage_resolves_covering_owner_and_repoints_leaf ... ok
+test trap::foreign_mm::tests::sparse_replacement_failure_preserves_preimage_before_retirement ... ok
+test trap::foreign_mm::tests::structural_alias_rejects_forged_semantic_host_projection ... ok
+test trap::foreign_mm::tests::structural_backing_owner_invalid_arguments_and_exact_drop_order ... ok
+test trap::foreign_mm::tests::structural_backing_owner_lifecycle_and_retained_backing ... ok
+test trap::foreign_mm::tests::structural_vvar_fork_inheritance_requires_exact_live_custody ... ok
+test trap::foreign_mm::tests::task_only_partial_map_failure_retires_the_exact_structural_root ... ok
+test trap::foreign_mm::tests::task_only_partial_map_rollback_ignores_unrelated_retry_pending_record ... ok
+test trap::foreign_mm::tests::task_only_partial_map_unmap_failure_fail_stops_before_root_slot_reuse ... ok
+
+failures:
+
+---- trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance stdout ----
+
+thread 'trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance' (4274188) panicked at crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs:9242:6:
+called `Result::unwrap()` on an `Err` value: ScalingViolation { contract: ContractId("kernel.mm.fresh-publication-maintenance"), metric: PageTableInvalidations, scale: 1, actual: 1, maximum: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance
+
+test result: FAILED. 73 passed; 1 failed; 1 ignored; 0 measured; 434 filtered out; finished in 1.33s
+
+test-signed: FAIL /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e.noent.28238: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e.noent.28238
+
+running 1 test
+test trap::stage2_backend::unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 508 filtered out; finished in 0.00s
+
+test-signed: FAILED (carrick-vmm-hvf)
+remaining carrick procs (run-id native-memory-control-27978) = 0
+remaining carrick procs (run-id native-memory-control-27978-cli) = 0

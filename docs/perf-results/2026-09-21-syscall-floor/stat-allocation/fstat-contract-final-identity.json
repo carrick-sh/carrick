@@ -1,0 +1,17 @@
+{
+  "source_identity": "source-bundle-sha256:709eafb72f20e4c639c333de508b7fb6aea485a6fabd9fcc0526449d1f05e7de",
+  "binary_sha256": "64d1c0e1c6097295e1439565eb62bd14b530cc0e94d05e093f73c7782cccd278",
+  "sources": {
+    "crates/carrick-kernel/src/dispatch/rootfs_helpers.rs": "9f25a5ce7ad4c7261b1a5e43c6c0477e6f249637e48367fba6580d4de528e5e2",
+    "crates/carrick-kernel/src/dispatch/fd_table.rs": "9e60026af9559c361b38976ba11d4f3a38baa1caed2f5ee50af5eedc5bb862b2",
+    "crates/carrick-kernel/src/dispatch/fs/stat.rs": "7c3e9c8e10cd78209bc11e3f846a54b3ef36030d9fd825437f6babcfde069e40",
+    "crates/carrick-kernel/src/dispatch/fs/lookup.rs": "80075c0e81ebf7c02eed96f70e85509a0a149ec56fba1132e216aab335c9997a",
+    "crates/carrick-kernel/src/dispatch/format_stat.rs": "ccc8c586b1bed5ad8ba33333084f3f9101e69f09f9da4ce4445d33a1804febc4",
+    "crates/carrick-observability/src/work_meter.rs": "a5c7fbfe6a00b354a7d19027c80ee8490e85027a540308f6fb3ab17a5f7af399",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor.rs": "57655f4eca755065e307a7569ed8054a341abdd538015f045edd597c4b98b861",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/allocations.rs": "781a5a772c02fb398e06bee337b9e99c73c07afaf205e5f5460382f70b62a162",
+    "conformance-contracts/contracts/stat-allocation.toml": "8ba885e4bb998ead3ef158bf6b1037ea71be4e68c537b17812476a1745d0ce03",
+    "crates/carrick-kernel-example/Cargo.toml": "8a6d7752859d0b09fd941b05742dbfa18b6489b5c916455442d616b1519d1920",
+    "crates/carrick-kernel/src/dispatch/tests.rs": "9a82eba79d52db471554a35c49137fccc371a265d15b248fbb71ba1141258818"
+  }
+}

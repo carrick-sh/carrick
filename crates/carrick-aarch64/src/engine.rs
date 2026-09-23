@@ -862,7 +862,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 return None;
             }
             read_bytes
-        } else if let Some(host_ptr) = self.vm.host_ptr_for_write(buf_gva, count) {
+        } else if let Some(host_ptr) = self.host_ptr_for_write(buf_gva, count) {
+            let ranges = [carrick_guest_mem::HostWriteRange {
+                guest: GuestVa(buf_gva),
+                len: count,
+                host: carrick_guest_mem::HostVa(host_ptr as usize),
+            }];
+            let _host_write = carrick_guest_mem::HostWriteGuard::new(self, &ranges).ok()?;
             let read = unsafe {
                 libc::pread(
                     host_fd,
@@ -2013,6 +2019,16 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         self.vm.host_ptr_for_write(address, len)
     }
 
+    fn begin_host_write(
+        &mut self,
+        ranges: &[carrick_guest_mem::HostWriteRange],
+    ) -> Result<(), MemoryError> {
+        self.vm.begin_host_write(ranges)
+    }
+    fn finish_host_write(&mut self, ranges: &[carrick_guest_mem::HostWriteRange]) {
+        self.vm.finish_host_write(ranges);
+    }
+
     /// Record/clear a PROT_NONE range so syscall buffers there fault (EFAULT). This
     /// is the HOST-SIDE check only; the COMPLEMENTARY guest-side enforcement (so
     /// the guest's own EL0 access faults) is done by `protect_range`/`unmap_range`/
@@ -2072,6 +2088,68 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::BackingMaintenance)?;
         self.vm.zero_backing(address, len)
+    }
+
+    fn discard_private_anonymous(
+        &mut self,
+        address: u64,
+        len: usize,
+    ) -> Result<bool, carrick_guest_mem::RepointPrivateError> {
+        use carrick_guest_mem::RepointPrivateError;
+        let Some(end) = address.checked_add(len as u64) else {
+            return Err(RepointPrivateError::clean(MemoryError::OutOfBounds {
+                address,
+                length: len,
+            }));
+        };
+        let in_sparse_range = (address >= carrick_mem::memory::LINUX_MMAP_BASE
+            && end
+                <= carrick_mem::memory::LINUX_MMAP_BASE
+                    .saturating_add(carrick_mem::memory::mmap_arena_size()))
+            || (carrick_mem::memory::is_high_va(address) && end <= (1u64 << 48));
+        if len == 0
+            || address % 4096 != 0
+            || len % 4096 != 0
+            || !in_sparse_range
+            || !self.supports_lazy_anonymous_mmap()
+            || !carrick_hal::stage1_exclusive::current_thread_edits_exclusively()
+        {
+            return Ok(false);
+        }
+        let Some(deferred) = self.vm.deferred_anonymous_state() else {
+            return Ok(false);
+        };
+        if let Some(granule) = self.vm.anonymous_discard_granule()
+            && granule.is_power_of_two()
+            && granule >= 4096
+            && (address % granule != 0 || (len as u64) % granule != 0)
+        {
+            return crate::anonymous_discard::with_edges(self, address, len, granule);
+        }
+        let Some(prepared) = self
+            .vm
+            .prepare_anonymous_discard(address, len)
+            .map_err(|error| RepointPrivateError::clean(MemoryError::HostMap(error.to_string())))?
+        else {
+            return Ok(false);
+        };
+        // Keep semantic mapping/protection metadata intact. After editing starts,
+        // uncertain publication must fail stopped with old owners still retained.
+        self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
+            .map_err(RepointPrivateError::indeterminate)?;
+        self.vm
+            .commit_anonymous_discard(prepared)
+            .map_err(|error| {
+                RepointPrivateError::indeterminate(MemoryError::HostMap(error.to_string()))
+            })?;
+        // Publish fresh-zero provenance only after the old translation and this
+        // MM's authoritative aliases have been retired. Fork peers are untouched.
+        deferred
+            .reserve_fresh(carrick_guest_mem::GuestVa(address), len)
+            .map_err(|error| {
+                RepointPrivateError::indeterminate(MemoryError::HostMap(error.to_string()))
+            })?;
+        Ok(true)
     }
 
     fn zero_anonymous_reuse(
@@ -2560,7 +2638,11 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                 .value
                 .map_err(|error| self.vm.enrich_vcpu_run_error(&self.vcpu, error))?
             {
-                Aarch64Exit::Syscall { frame, resume_pc } => {
+                Aarch64Exit::Syscall {
+                    frame,
+                    resume_pc,
+                    current_guest_sp,
+                } => {
                     if frame.x8 == 64
                         && let Some(written) = self.try_fast_write(&frame)
                     {
@@ -2588,6 +2670,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                     let (number, args) = <Self as ThreadedEngine>::Arch::decode_syscall(&frame);
                     let guest_abi = <Self as ThreadedEngine>::Arch::linux_guest_abi();
                     return Ok(Some(RawSyscall {
+                        current_guest_sp,
                         number: carrick_abi::CanonicalNr(number),
                         args,
                         guest_abi,

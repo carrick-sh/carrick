@@ -1,0 +1,49 @@
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example)
+error[E0599]: no method named `admit_native_executor` found for struct `SyscallDispatcher` in the current scope
+  --> crates/carrick-kernel-example/tests/native_execution_scope.rs:43:35
+   |
+43 |     let mut executor = dispatcher.admit_native_executor(&context, &execution).unwrap();
+   |                                   ^^^^^^^^^^^^^^^^^^^^^ method not found in `SyscallDispatcher`
+
+error[E0599]: no method named `enter_native_execution` found for struct `SyscallDispatcher` in the current scope
+    --> crates/carrick-kernel-example/tests/native_execution_scope.rs:45:21
+     |
+  45 |     drop(dispatcher.enter_native_execution(&mut executor, &context, &mut execution).unwrap());
+     |                     ^^^^^^^^^^^^^^^^^^^^^^
+     |
+help: there is a method `enter_mm_executor` with a similar name, but with different arguments
+    --> crates/carrick-kernel/src/dispatch/mod.rs:1278:5
+     |
+1278 | /     pub fn enter_mm_executor(
+1279 | |         &self,
+1280 | |     ) -> Result<MmExecutorParticipation, crate::kernel::GuestExecutorCensusError> {
+     | |_________________________________________________________________________________^
+
+error[E0599]: no method named `enter_native_execution` found for struct `SyscallDispatcher` in the current scope
+    --> crates/carrick-kernel-example/tests/native_execution_scope.rs:52:36
+     |
+  52 |             let scope = dispatcher.enter_native_execution(&mut executor, &context, &mut execution).unwrap();
+     |                                    ^^^^^^^^^^^^^^^^^^^^^^
+     |
+help: there is a method `enter_mm_executor` with a similar name, but with different arguments
+    --> crates/carrick-kernel/src/dispatch/mod.rs:1278:5
+     |
+1278 | /     pub fn enter_mm_executor(
+1279 | |         &self,
+1280 | |     ) -> Result<MmExecutorParticipation, crate::kernel::GuestExecutorCensusError> {
+     | |_________________________________________________________________________________^
+
+error[E0599]: no method named `set` found for struct `WorkSnapshot` in the current scope
+   --> crates/carrick-kernel-example/tests/native_execution_scope.rs:63:14
+    |
+ 63 |         work.set(WorkMetric::HostHeapAllocations, allocations).unwrap();
+    |              ^^^
+    |
+help: there is a method `get` with a similar name, but with different arguments
+   --> crates/carrick-observability/src/work_meter.rs:156:5
+    |
+156 |     pub fn get(&self, metric: WorkMetric) -> Option<u64> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `carrick-kernel-example` (test "native_execution_scope") due to 4 previous errors

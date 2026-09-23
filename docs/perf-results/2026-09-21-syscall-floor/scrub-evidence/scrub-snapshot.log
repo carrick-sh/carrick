@@ -1,0 +1,1 @@
+carrick debug lldb-snapshot: run_id=floor-scrub-paired-4-A-python-subprocess processes=1 lldb_log=target/lease-cost/scrub-slow-control/floor-scrub-paired-4-A-python-subprocess.lldb.txt ps_log=target/lease-cost/scrub-slow-control/floor-scrub-paired-4-A-python-subprocess.ps.txt

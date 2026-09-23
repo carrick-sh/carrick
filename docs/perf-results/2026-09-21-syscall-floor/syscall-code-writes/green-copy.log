@@ -1,0 +1,39 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+warning: field `content` is never read
+   --> crates/carrick-vmm-hvf/src/trap/host_writes.rs:109:5
+    |
+103 | pub(crate) struct BackingWrite {
+    |                   ------------ field in this struct
+...
+109 |     content: Option<ContentWrite<WriteOwner>>,
+    |     ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `visited_pages` is never used
+   --> crates/carrick-vmm-hvf/src/trap/host_writes.rs:114:19
+    |
+112 | impl BackingWrite {
+    | ----------------- method in this implementation
+113 |     #[cfg(test)]
+114 |     pub(crate) fn visited_pages(&self) -> usize {
+    |                   ^^^^^^^^^^^^^
+
+warning: method `visited_pages` is never used
+   --> crates/carrick-vmm-hvf/src/trap/host_writes.rs:178:19
+    |
+126 | impl HostWrites {
+    | --------------- method in this implementation
+...
+178 |     pub(crate) fn visited_pages(&self) -> usize {
+    |                   ^^^^^^^^^^^^^
+
+warning: `carrick-vmm-hvf` (lib test) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.58s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-0aaee9123b867d4d)
+
+running 1 test
+test trap::foreign_mm::tests::native_code_content_syscall_copy_revokes_physical_dependencies ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 518 filtered out; finished in 0.03s
+

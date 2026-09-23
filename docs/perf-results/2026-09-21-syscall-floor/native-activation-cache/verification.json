@@ -1,0 +1,176 @@
+[
+  {
+    "name": "contract-final",
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-activation-cache/native-activation-cache-metrics-debug",
+      "vcpu_loop::memory::tests::native_data_activation_cost_contract",
+      "--exact",
+      "--nocapture"
+    ],
+    "exit_code": 0,
+    "run_id": null,
+    "finished_utc": "2026-09-22T17:45:39.763606+00:00"
+  },
+  {
+    "name": "release-memory",
+    "argv": [
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-activation-cache/native-activation-cache-cost-release",
+      "vcpu_loop::memory::tests::",
+      "--nocapture"
+    ],
+    "exit_code": 0,
+    "run_id": null,
+    "finished_utc": "2026-09-22T17:45:39.777023+00:00"
+  },
+  {
+    "name": "kernel",
+    "argv": [
+      "just",
+      "test-kernel"
+    ],
+    "exit_code": 0,
+    "run_id": null,
+    "finished_utc": "2026-09-22T17:46:54.029654+00:00"
+  },
+  {
+    "name": "runtime-stage1",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-runtime",
+      "--lib",
+      "hvpatch::stage1_mm::tests::"
+    ],
+    "exit_code": 0,
+    "run_id": null,
+    "finished_utc": "2026-09-22T17:47:18.655897+00:00"
+  },
+  {
+    "name": "runtime-quiesce",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-runtime",
+      "--lib",
+      "vcpu_loop::quiesce::tests::"
+    ],
+    "exit_code": 0,
+    "run_id": null,
+    "finished_utc": "2026-09-22T17:47:18.849207+00:00"
+  },
+  {
+    "name": "memory-doctests",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-kernel",
+      "--doc",
+      "kernel::mm_access"
+    ],
+    "exit_code": 0,
+    "run_id": null,
+    "finished_utc": "2026-09-22T17:47:20.467917+00:00"
+  },
+  {
+    "name": "hal",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-hal",
+      "--lib",
+      "foreign_mm::"
+    ],
+    "exit_code": 0,
+    "run_id": null,
+    "finished_utc": "2026-09-22T17:47:21.543879+00:00"
+  },
+  {
+    "name": "observability",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-observability",
+      "--lib",
+      "--features",
+      "conformance-metrics"
+    ],
+    "exit_code": 0,
+    "run_id": null,
+    "finished_utc": "2026-09-22T17:47:23.151687+00:00"
+  },
+  {
+    "name": "contracts",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-conformance-contract"
+    ],
+    "exit_code": 101,
+    "run_id": null,
+    "finished_utc": "2026-09-22T17:47:25.964444+00:00"
+  },
+  {
+    "name": "aarch64",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-aarch64",
+      "--lib"
+    ],
+    "exit_code": 0,
+    "run_id": null,
+    "finished_utc": "2026-09-22T17:47:26.337563+00:00"
+  },
+  {
+    "name": "aarch64-clippy",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--no-deps",
+      "-p",
+      "carrick-aarch64",
+      "-p",
+      "carrick-observability",
+      "-p",
+      "carrick-conformance-contract",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 101,
+    "run_id": null,
+    "finished_utc": "2026-09-22T17:47:29.627392+00:00"
+  },
+  {
+    "name": "signed-foreign-mm",
+    "argv": [
+      "scripts/test-signed.sh",
+      "carrick-vmm-hvf",
+      "trap::foreign_mm::tests::"
+    ],
+    "exit_code": 1,
+    "run_id": "native-activation-cache-signed-foreign-mm-20260922",
+    "finished_utc": "2026-09-22T17:48:03.028361+00:00"
+  },
+  {
+    "name": "signed-lifecycle",
+    "argv": [
+      "scripts/test-signed.sh",
+      "carrick-vmm-hvf",
+      "trap::foreign_mm::tests::production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycle",
+      "--exact",
+      "--ignored"
+    ],
+    "exit_code": 0,
+    "run_id": "native-activation-cache-signed-lifecycle-20260922",
+    "finished_utc": "2026-09-22T17:48:07.150269+00:00"
+  }
+]

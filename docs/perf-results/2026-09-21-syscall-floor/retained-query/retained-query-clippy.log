@@ -1,0 +1,59 @@
+    Checking serde_core v1.0.228
+   Compiling syn v2.0.117
+    Checking carrick-fatal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-fatal)
+    Checking once_cell v1.21.4
+    Checking smallvec v1.15.1
+    Checking carrick-kernel-arena v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-arena)
+    Checking carrick-portable v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-portable)
+    Checking digest v0.10.7
+    Checking utf8parse v0.2.2
+    Checking anstyle-parse v1.0.0
+    Checking anstyle v1.0.14
+    Checking anstyle-query v1.1.5
+    Checking tempfile v3.27.0
+    Checking parking_lot_core v0.9.12
+    Checking sha2 v0.10.9
+    Checking is_terminal_polyfill v1.70.2
+    Checking colorchoice v1.0.5
+    Checking carrick-host v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host)
+    Checking tracing-core v0.1.36
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+    Checking anstream v1.0.0
+    Checking strsim v0.11.1
+    Checking parking_lot v0.12.5
+    Checking clap_lex v1.1.0
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Checking applevisor-sys v1.0.0
+    Checking clap_builder v4.6.0
+    Checking applevisor v1.0.0
+    Checking serde_json v1.0.149
+   Compiling pest_generator v2.8.6
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling scroll_derive v0.13.1
+   Compiling tracing-attributes v0.1.31
+   Compiling clap_derive v4.6.1
+   Compiling pest_derive v2.8.6
+   Compiling dtrace-parser v0.3.0
+    Checking scroll v0.13.0
+    Checking tracing v0.1.44
+    Checking zerocopy v0.8.48
+    Checking goblin v0.10.5
+    Checking clap v4.6.1
+    Checking serde v1.0.228
+   Compiling usdt-impl v0.6.0
+   Compiling serde_tokenstream v0.2.3
+   Compiling usdt-attr-macro v0.6.0
+   Compiling usdt-macro v0.6.0
+    Checking carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-abi)
+    Checking carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+    Checking dof v0.4.0
+    Checking usdt v0.6.0
+    Checking carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-timer-core)
+    Checking carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+    Checking carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-signal-core)
+    Checking carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+    Checking carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+    Checking carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+    Checking carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.17s

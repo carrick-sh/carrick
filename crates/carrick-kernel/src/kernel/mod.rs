@@ -38,9 +38,9 @@ pub mod wait_set;
 mod tests;
 
 pub use address::{
-    Asid, MmBackend, MmBackendSnapshot, MmBinding, OwnedVmaSnapshot, SharedVmaSnapshotSource,
-    SnapshotError, SnapshotTable, Stage1Root, Stage1RootError, Ttbr0, VmaAccess, VmaRevision,
-    VmaSnapshotSource, VmaSummary,
+    Asid, MmBackend, MmBackendSnapshot, MmBackendStamp, MmBinding, OwnedVmaSnapshot,
+    SharedVmaSnapshotSource, SnapshotError, SnapshotTable, Stage1Root, Stage1RootError, Ttbr0,
+    VmaAccess, VmaRevision, VmaSnapshotSource, VmaSummary,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use builder::KernelBuilder;
@@ -60,8 +60,8 @@ pub use mm_access::MmAccessAuthority;
 #[cfg(test)]
 pub(crate) use mm_access::test_support::consumer_cow_fixture;
 pub use mm_access::{
-    CowBroken, CurrentMm, ForeignMm, ForeignWriteReceipt, MmAccessError, MmReadRange, MmRelation,
-    MmToken, MmWriteRange,
+    CowBroken, CurrentMm, ForeignMm, ForeignWriteReceipt, InstructionRead, MmAccessError,
+    MmReadRange, MmRelation, MmToken, MmWriteRange,
 };
 pub use mm_proof::KernelForeignCowProof;
 pub use mm_transaction::{MmTransaction, StagedMmOp};

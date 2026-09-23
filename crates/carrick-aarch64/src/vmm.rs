@@ -50,6 +50,8 @@ pub enum Aarch64Exit {
     Syscall {
         frame: Aarch64SyscallFrame,
         resume_pc: u64,
+        /// Exact SP captured with this syscall, if supplied by the transport.
+        current_guest_sp: Option<u64>,
     },
 
     /// An EL0 SYNCHRONOUS fault (data/instruction abort, alignment, undef, debug)
@@ -362,6 +364,9 @@ pub enum FrameCowWriteIntent {
 /// `carrick-x86`'s `X86Vmm`.
 pub trait Aarch64Vmm: Sized + GuestVmBackend {
     type Vcpu: Aarch64Vcpu;
+
+    /// Prepared exact-MM backing retirement; dropping it makes no changes.
+    type AnonymousDiscard;
 
     /// The per-backend vCPU-kick handle (`KvmKickHandle` / `HvfKickHandle`).
     type KickHandle: VcpuKick + 'static;
@@ -845,6 +850,33 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         backing: HostAliasBacking,
     ) -> Result<(u64, bool), TrapError>;
 
+    /// Minimum aligned unit accepted by anonymous retirement. This also opts
+    /// into retiring an aligned interior before authenticating partial edges.
+    fn anonymous_discard_granule(&self) -> Option<u64> {
+        None
+    }
+
+    /// Prepare private-anonymous backing retirement before any stage-1 edit.
+    /// `None` refuses without mutation. The caller owns MM mutation exclusion.
+    fn prepare_anonymous_discard(
+        &self,
+        _va: u64,
+        _len: usize,
+    ) -> Result<Option<Self::AnonymousDiscard>, TrapError> {
+        Ok(None)
+    }
+
+    /// Commit after stage-1 removal and TLBI. Failures are indeterminate to the
+    /// caller; a backend must preserve exact owner generations and fork peers.
+    fn commit_anonymous_discard(
+        &mut self,
+        _prepared: Self::AnonymousDiscard,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "anonymous discard unsupported".into(),
+        ))
+    }
+
     /// Called by the engine's `unmap_range`/`unmap_alias_range` only AFTER the
     /// checked stage-1 edit and TLBI complete, so an edit failure leaves a
     /// backend's process-shared alias index (HVF's `alias_registry`) intact and
@@ -936,6 +968,16 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     fn host_ptr_for_write(&mut self, _va: u64, _len: usize) -> Option<*mut u8> {
         None
     }
+
+    /// See GuestMemory's raw-destination bracket. Backends with content
+    /// dependencies retain exact backing and revoke before host writes start.
+    fn begin_host_write(
+        &mut self,
+        _ranges: &[carrick_guest_mem::HostWriteRange],
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
+    fn finish_host_write(&mut self, _ranges: &[carrick_guest_mem::HostWriteRange]) {}
 
     // ── vCPU lifecycle ──
 

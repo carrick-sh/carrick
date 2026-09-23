@@ -1,0 +1,101 @@
+   Compiling tokio v1.52.3
+   Compiling goblin v0.10.5
+   Compiling tracing-core v0.1.36
+   Compiling tempfile v3.27.0
+   Compiling regex-automata v0.4.14
+   Compiling fd-lock v4.0.4
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-signal-core)
+   Compiling tracing v0.1.44
+   Compiling hickory-proto v0.26.1
+   Compiling regex v1.12.3
+   Compiling oci-spec v0.8.4
+   Compiling hyper v1.9.0
+   Compiling dof v0.4.0
+   Compiling hyper-util v0.1.20
+   Compiling tokio-rustls v0.26.4
+   Compiling tower v0.5.3
+   Compiling tokio-util v0.7.18
+   Compiling usdt-impl v0.6.0
+   Compiling tower-http v0.6.10
+   Compiling usdt v0.6.0
+   Compiling hyper-rustls v0.27.9
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+   Compiling reqwest v0.12.28
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling oci-client v0.15.0
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-spec)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example)
+warning: variable does not need to be mutable
+  --> crates/carrick-kernel-example/src/contracts.rs:63:9
+   |
+63 |     let mut snapshot = report.work_snapshot().clone();
+   |         ----^^^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:203:9
+    |
+203 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:319:9
+    |
+319 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:405:9
+    |
+405 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:505:9
+    |
+505 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:605:9
+    |
+605 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:685:9
+    |
+685 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:752:9
+    |
+752 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: `carrick-kernel-example` (lib) generated 8 warnings (run `cargo fix --lib -p carrick-kernel-example` to apply 8 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1m 04s

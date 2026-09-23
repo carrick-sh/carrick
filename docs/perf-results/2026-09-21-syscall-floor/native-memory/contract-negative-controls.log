@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running tests/evaluate.rs (target/debug/deps/evaluate-e34b5bf77b4f6d11)
+
+running 2 tests
+test native_syscall_contract_rejects_unbound_execution_evidence ... ok
+test native_syscall_contract_requires_measured_zero_counters ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.01s
+

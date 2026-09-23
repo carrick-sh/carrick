@@ -1,0 +1,7 @@
+
+running 1 test
+{"carrier_data_and_buffers":true,"completions":1310792,"elapsed_ns":[1083649833,1083489958,1083578750,1086519500,1088249000,1087076417,1090924583,1090934666,1085566500,1088317708],"elf":"/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-slice/fixtures/watch-1-65536","elf_sha256":"fa6854c1bb771993c5d55beae096a968ffa7ebaf7e14b5693a477767bfa2fc04","errno_returns":0,"exit":0,"memory_checkpoints":0,"mock_stage2":true,"original_cow_unchanged":true,"phase":1,"private_code_publication":true,"private_data_unchanged":true,"product_acceptance":false,"read_window_reuse":false,"requests":1310793,"scale":65536,"transitions":1310793,"wall_ms":10870}
+test vcpu_loop::memory::tests::native_buffers::carrier_buffer_elf_control ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 620 filtered out; finished in 10.87s
+

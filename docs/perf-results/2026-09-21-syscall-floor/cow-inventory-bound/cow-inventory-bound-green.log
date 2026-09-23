@@ -1,0 +1,73 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.13s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-3c2afd032626087b)
+
+running 65 tests
+test hvf_aarch64_engine::task_only_materializer_tests::one_worker_swaps_every_distinct_task_mm_mapping_and_cow_authority ... ok
+test syscall_mailbox::tests::cow_relocation_follows_the_guest_published_replacement_without_reset ... ok
+test trap::cow_engine::tests::alias_registry_queries_never_authenticate_frame_owners_under_the_lock ... ok
+test trap::cow_engine::tests::alias_retirement_commit_takes_the_callers_registry_guard_and_never_locks_the_leaf ... ok
+test trap::cow_engine::tests::fork_exec_exit_and_unmap_sites_contain_no_carrier_topology_lock ... ok
+test trap::cow_engine::tests::frame_inventory_publication_and_retirement_sites_hold_registry_guard ... ok
+test trap::cow_engine::tests::frame_publication_sites_contain_no_carrier_topology_lock ... ok
+test trap::foreign_mm::tests::concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit ... ok
+test trap::foreign_mm::tests::cow_refusal_history_is_bounded_and_selects_the_exact_carrier_extent ... ok
+test trap::foreign_mm::tests::cow_refusal_history_retains_exact_extent_across_unrelated_churn ... ok
+test trap::foreign_mm::tests::cow_source_falls_back_to_offset_logical_inventory_with_current_physical_owner ... ok
+test trap::foreign_mm::tests::cow_source_inventory_fallback_pins_backing_through_copy_window ... ok
+test trap::foreign_mm::tests::cow_source_inventory_fallback_rejects_absent_zero_mismatched_or_conflicting_owner ... ok
+test trap::foreign_mm::tests::foreign_cow_commit_cannot_be_reported_as_retryable_by_final_snapshot_contention ... ok
+test trap::foreign_mm::tests::foreign_cow_each_reversible_boundary_restores_exact_stage1_inventory_and_owner_set ... ok
+test trap::foreign_mm::tests::foreign_cow_failpoint_leaves_lease_at_sn_and_retry_succeeds ... ok
+test trap::foreign_mm::tests::foreign_cow_invalidation_failure_rolls_back_and_republishes_the_old_stage1 ... ok
+test trap::foreign_mm::tests::foreign_cow_one_compound_authorizes_distinct_subrange_writes ... ok
+test trap::foreign_mm::tests::foreign_cow_prepare_write_rejects_in_span_leaf_discontinuity ... ok
+test trap::foreign_mm::tests::foreign_cow_prepare_write_rejects_out_of_span_alias ... ok
+test trap::foreign_mm::tests::foreign_cow_prepare_write_rejects_semantic_span_end_plus_one ... ok
+test trap::foreign_mm::tests::foreign_cow_write_keeps_the_shared_parent_owner_unchanged ... ok
+test trap::foreign_mm::tests::foreign_mm_retain_pins_covering_owner_for_cow_split_inventory_fragment ... ok
+test trap::foreign_mm::tests::persistent_reusable_cow_alias_rejects_zero_owner_generation ... ok
+test trap::foreign_mm::tests::persistent_reusable_cow_mapping_rejects_zero_owner_generation ... ok
+test trap::foreign_mm::tests::ptrace_text_cow_accepts_unarmed_rx_mapping_and_preserves_peer_and_stage1_ap ... ok
+test trap::foreign_mm::tests::ptrace_text_cow_rejects_source_alias_shorter_than_authenticated_span ... ok
+test trap::foreign_mm::tests::ptrace_text_cow_uses_authenticated_span_when_preexisting_arm_differs ... ok
+test trap::foreign_mm::tests::retained_foreign_lease_advances_across_two_compound_cow_commits ... ok
+test trap::frame_inventory::tests::concurrent_cow_loser_retries_only_an_exact_live_writable_winner ... ok
+test trap::frame_inventory::tests::cow_armed_ranges_disjoint_overlap_query_is_empty ... ok
+test trap::frame_inventory::tests::cow_armed_ranges_prefer_exact_alias_fragment_over_broad_arena ... ok
+test trap::frame_inventory::tests::cow_armed_ranges_split_one_compound_and_leave_peers_armed ... ok
+test trap::frame_inventory::tests::cow_collision_is_rejected_before_backend_inventory_mutation ... ok
+test trap::frame_inventory::tests::cow_fault_classifier_accepts_only_el0_write_permission_aborts ... ok
+test trap::frame_inventory::tests::cow_intents_preserve_guest_write_authority_while_internal_writes_bypass_it ... ok
+test trap::frame_inventory::tests::cow_inventory_owner_bound_skips_unrelated_extents ... ok
+test trap::frame_inventory::tests::cow_lane_reuse_requires_an_unpublished_exact_owner_lane ... ok
+test trap::frame_inventory::tests::cow_reuse_commit_keeps_destination_mapping_and_reference_counts ... ok
+test trap::frame_inventory::tests::cow_split_commit_preserves_old_owner_and_publishes_replacement_owner ... ok
+test trap::frame_inventory::tests::cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live ... ok
+test trap::frame_inventory::tests::cow_stage2_recycle_holds_the_publication_lock ... ok
+test trap::frame_inventory::tests::cow_then_fork_distant_alias_keeps_inventory_for_live_owner ... ok
+test trap::frame_inventory::tests::distant_live_alias_retains_the_shared_physical_cow_inventory ... ok
+test trap::frame_inventory::tests::exec_predecessor_rejects_registration_cow_backend_identity_mismatch ... ok
+test trap::frame_inventory::tests::fork_receipts_cover_read_only_user_cow_but_not_independent_kernel_frames ... ok
+test trap::frame_inventory::tests::partial_semantic_cow_retains_the_old_physical_compound ... ok
+test trap::frame_inventory::tests::retired_invalid_output_materializes_before_a_stale_cow_arm ... ok
+test trap::guest_memory::tests::scrub_remap_eligible_preserves_cow_query ... ok
+test trap::guest_memory::tests::scrub_remap_ineligible_needs_no_cow_query ... ok
+test trap::memory_protection::tests::alias_registry_tests::container_child_nonpersistent_cow_physical_source_lookup ... ok
+test trap::memory_protection::tests::alias_registry_tests::cow_physical_source_accepts_compound_prefix_before_an_offset_view ... ok
+test trap::memory_protection::tests::memory_protection_tests::deferred_cow_authentication_stops_at_cow_and_leaf_boundaries ... ok
+test trap::memory_protection::tests::memory_protection_tests::deferred_cow_block_authentication_visits_each_descriptor_once ... ok
+test trap::memory_protection::tests::memory_protection_tests::deferred_cow_block_step_preserves_overlapping_unaligned_arm_classification ... ok
+test trap::memory_protection::tests::memory_protection_tests::deferred_cow_walk_detects_interior_live_leaf_corruption ... ok
+test trap::tag_strip_tests::private_exec_file_artifact_reuses_bytes_but_each_mapping_is_cow ... ok
+test trap::task_only_carrier_directory_tests::a_private_repoint_supersedes_the_previous_cow_receipt_before_publication ... ok
+test trap::task_only_carrier_directory_tests::an_unmap_supersedes_the_cow_receipts_naming_its_range_first ... ok
+test trap::task_only_carrier_directory_tests::bind_frame_cow_authenticates_and_drains_pending_receipts ... ok
+test trap::task_only_carrier_directory_tests::committed_child_requires_fresh_exact_kernel_cow_binding ... ok
+test trap::task_only_carrier_directory_tests::cow_retention_physical_index_does_not_scan_foreign_alias_rows ... ok
+test trap::task_only_carrier_directory_tests::delayed_old_cow_alias_cleanup_cannot_remove_reused_generation ... ok
+test trap::task_only_carrier_directory_tests::prepared_task_authority_rejects_half_a_cow_authority ... ok
+test trap::task_only_carrier_directory_tests::private_cow_retention_query_ignores_global_and_removed_wide_rows ... ok
+
+test result: ok. 65 passed; 0 failed; 0 ignored; 0 measured; 444 filtered out; finished in 0.28s
+

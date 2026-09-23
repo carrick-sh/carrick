@@ -1,0 +1,16 @@
+{
+  "control_s": [
+    0.245,
+    0.245,
+    0.243,
+    0.241
+  ],
+  "candidate_s": [
+    0.185,
+    0.178,
+    0.185,
+    0.188
+  ],
+  "candidate_control_mean_ratio": 0.75564681724846,
+  "candidate_control_median_ratio": 0.7581967213114754
+}

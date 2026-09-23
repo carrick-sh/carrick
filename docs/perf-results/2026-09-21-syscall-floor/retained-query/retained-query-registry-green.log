@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running tests/registry.rs (target/debug/deps/registry-7171c8ec86692658)
+
+running 1 test
+test futex_contract_has_structural_and_runtime_authority ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s
+

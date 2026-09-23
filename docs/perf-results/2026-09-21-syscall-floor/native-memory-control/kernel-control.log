@@ -1,0 +1,21 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 38.49s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-207122e8ce47be2c)
+
+running 9 tests
+
+thread 'dispatch::native_execution::tests::unwind_clears_running_before_admission_is_removed' (4245387) panicked at crates/carrick-kernel/src/dispatch/native_execution/tests.rs:170:9:
+bounded unwind test
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test dispatch::native_execution::tests::replacing_dispatch_participation_cannot_detach_native_running_authority ... ok
+test dispatch::native_execution::tests::raised_pause_refuses_entry_and_rolls_back_running ... ok
+test dispatch::native_execution::tests::real_mutation_drain_cannot_pass_until_execution_scope_ends ... ok
+test dispatch::native_execution::tests::stop_request_does_not_acknowledge_running_and_entry_takes_no_census_lock ... ok
+test dispatch::native_execution::tests::unwind_clears_running_before_admission_is_removed ... ok
+test dispatch::native_execution::tests::memory_control_preserves_external_stops_and_rejects_wrong_lease ... ok
+test dispatch::native_execution::tests::wrong_context_and_transferred_lease_cannot_reuse_admission ... ok
+test dispatch::native_execution::tests::same_mm_readers_remain_simultaneously_admitted_at_all_scales ... ok
+test dispatch::native_execution::tests::native_memory_service_parks_until_the_exact_pause_ends ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 2199 filtered out; finished in 0.03s
+

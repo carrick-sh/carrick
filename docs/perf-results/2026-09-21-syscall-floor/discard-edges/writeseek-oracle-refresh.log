@@ -1,0 +1,72 @@
+   Compiling serde_core v1.0.228
+   Compiling darling_core v0.20.11
+   Compiling httpdate v1.0.3
+   Compiling tempfile v3.27.0
+   Compiling tokio-util v0.7.18
+   Compiling rand v0.10.1
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling predicates-core v1.0.10
+   Compiling float-cmp v0.10.0
+   Compiling serde_repr v0.1.20
+   Compiling hyper v1.9.0
+   Compiling hex v0.4.3
+   Compiling carrick-cli v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-cli)
+   Compiling assert_cmd v2.2.2
+   Compiling normalize-line-endings v0.3.0
+   Compiling termtree v0.5.1
+   Compiling difflib v0.4.0
+   Compiling predicates-tree v1.0.13
+   Compiling bstr v1.12.1
+   Compiling hickory-proto v0.26.1
+   Compiling predicates v3.1.4
+   Compiling hyper-util v0.1.20
+   Compiling darling_macro v0.20.11
+   Compiling darling v0.20.11
+   Compiling hyper-rustls v0.27.9
+   Compiling hyperlocal v0.9.1
+   Compiling derive_builder_core v0.20.2
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.149
+   Compiling camino v1.2.2
+   Compiling serde_with v3.20.0
+   Compiling derive_builder_macro v0.20.2
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+   Compiling serde_urlencoded v0.7.1
+   Compiling chrono v0.4.44
+   Compiling dof v0.4.0
+   Compiling jwt v0.16.0
+   Compiling olpc-cjson v0.1.4
+   Compiling reqwest v0.12.28
+   Compiling derive_builder v0.20.2
+   Compiling oci-spec v0.8.4
+   Compiling usdt-impl v0.6.0
+   Compiling bollard-stubs v1.47.1-rc.27.3.1
+   Compiling usdt v0.6.0
+   Compiling oci-client v0.15.0
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+   Compiling carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-signal-core)
+   Compiling carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-timer-core)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-spec)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-image)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+   Compiling bollard v0.18.1
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.49s
+     Running tests/conformance.rs (target/debug/deps/conformance-d0b56f2f3ea895c9)
+
+running 1 test
+BLESSED arm64:musl:writeseek
+BLESSED arm64:gnu:writeseek
+bless_probe_oracle: wrote 2 probe oracle(s)
+test bless_probe_oracle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 46 filtered out; finished in 0.42s
+

@@ -1,0 +1,6 @@
+{
+  "changed_after_release_timing": [
+    "conformance-contracts/inventory.json"
+  ],
+  "reason": "Regenerated deterministic contract inventory before final verification; no Rust, Cargo, fixture, or timing code changed."
+}

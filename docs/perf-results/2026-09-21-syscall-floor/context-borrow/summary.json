@@ -1,0 +1,121 @@
+{
+  "full": {
+    "baseline": {
+      "samples": [
+        21.88,
+        21.89,
+        21.91,
+        21.72
+      ],
+      "median": 21.884999999999998,
+      "min": 21.72,
+      "max": 21.91
+    },
+    "candidate": {
+      "samples": [
+        22.1,
+        22.29,
+        21.69,
+        21.93
+      ],
+      "median": 22.015,
+      "min": 21.69,
+      "max": 22.29
+    },
+    "docker": {
+      "samples": [
+        6.05,
+        5.98,
+        5.98
+      ],
+      "median": 5.98,
+      "min": 5.98,
+      "max": 6.05
+    }
+  },
+  "blocks": [
+    {
+      "baseline": 21.884999999999998,
+      "candidate": 22.195,
+      "change_percent": 1.4164953164267802
+    },
+    {
+      "baseline": 21.814999999999998,
+      "candidate": 21.810000000000002,
+      "change_percent": -0.022920009167981537
+    }
+  ],
+  "full_change_percent": 0.5940141649531716,
+  "raw_linux_ratios": {
+    "baseline": 3.659698996655518,
+    "candidate": 3.681438127090301
+  },
+  "micro": {
+    "watch_invalid_pair:65536": {
+      "baseline": [
+        3201,
+        3204
+      ],
+      "candidate": [
+        3189,
+        3213
+      ],
+      "median_baseline": 3202.5,
+      "median_candidate": 3201,
+      "change_percent": -0.04683840749414303
+    },
+    "watch_unchanged_pair:65536": {
+      "baseline": [
+        3694,
+        3685
+      ],
+      "candidate": [
+        3656,
+        3699
+      ],
+      "median_baseline": 3689.5,
+      "median_candidate": 3677.5,
+      "change_percent": -0.32524732348556684
+    },
+    "watch_empty_batch:128": {
+      "baseline": [
+        3546,
+        3540
+      ],
+      "candidate": [
+        3530,
+        3514
+      ],
+      "median_baseline": 3543,
+      "median_candidate": 3522,
+      "change_percent": -0.5927180355630779
+    },
+    "watch_growing:8192": {
+      "baseline": [
+        3545,
+        3540
+      ],
+      "candidate": [
+        3555,
+        3541
+      ],
+      "median_baseline": 3542.5,
+      "median_candidate": 3548,
+      "change_percent": 0.15525758645025256
+    },
+    "watch_overflow:65536": {
+      "baseline": [
+        3545,
+        3543
+      ],
+      "candidate": [
+        3565,
+        3522
+      ],
+      "median_baseline": 3544,
+      "median_candidate": 3543.5,
+      "change_percent": -0.014108352144470704
+    }
+  },
+  "accepted": false
+}

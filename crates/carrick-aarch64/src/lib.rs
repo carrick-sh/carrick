@@ -25,6 +25,7 @@
 // the same wide-argument shape appears on the sibling/builder seams.
 #![allow(clippy::too_many_arguments)]
 
+mod anonymous_discard;
 pub mod engine;
 pub mod esr;
 pub mod mailbox;

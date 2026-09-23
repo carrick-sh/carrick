@@ -1,0 +1,66 @@
+{
+  "workload": "python-subprocess",
+  "total": 16942439,
+  "top": [
+    {
+      "nr": 80,
+      "name": "fstat",
+      "count": 16785982
+    },
+    {
+      "nr": 134,
+      "name": "rt_sigaction",
+      "count": 43696
+    },
+    {
+      "nr": 260,
+      "name": "wait4",
+      "count": 15306
+    },
+    {
+      "nr": 79,
+      "name": "newfstatat",
+      "count": 15037
+    },
+    {
+      "nr": 56,
+      "name": "openat",
+      "count": 10276
+    },
+    {
+      "nr": 57,
+      "name": "close",
+      "count": 10118
+    },
+    {
+      "nr": 64,
+      "name": "write",
+      "count": 8453
+    },
+    {
+      "nr": 222,
+      "name": "mmap",
+      "count": 8192
+    },
+    {
+      "nr": 63,
+      "name": "read",
+      "count": 7272
+    },
+    {
+      "nr": 62,
+      "name": "lseek",
+      "count": 4940
+    },
+    {
+      "nr": 135,
+      "name": "rt_sigprocmask",
+      "count": 3739
+    },
+    {
+      "nr": 29,
+      "name": "ioctl",
+      "count": 3612
+    }
+  ]
+}

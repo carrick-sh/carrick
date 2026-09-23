@@ -1,0 +1,3 @@
+ERROR: invalid long option '--uuid'
+dwarfdump option error.
+To see the options list: dwarfdump -h

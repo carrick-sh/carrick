@@ -1,0 +1,255 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling libc v0.2.189
+   Compiling cfg-if v1.0.5
+   Compiling serde_core v1.0.229
+   Compiling find-msvc-tools v0.1.13
+   Compiling shlex v2.0.1
+   Compiling serde v1.0.229
+   Compiling thiserror v2.0.20
+   Compiling smallvec v1.16.1
+   Compiling memchr v2.8.3
+   Compiling zmij v1.0.23
+   Compiling portable-atomic v1.15.0
+   Compiling itoa v1.0.18
+   Compiling bitflags v2.13.2
+   Compiling critical-section v1.2.0
+   Compiling serde_json v1.0.151
+   Compiling stable_deref_trait v1.2.1
+   Compiling log v0.4.34
+   Compiling zerocopy v0.8.57
+   Compiling pin-project-lite v0.2.17
+   Compiling bytes v1.12.1
+   Compiling version_check v0.9.5
+   Compiling subtle v2.6.1
+   Compiling jobserver v0.1.35
+   Compiling ucd-trie v0.1.7
+   Compiling generic-array v0.14.7
+   Compiling futures-core v0.3.34
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+   Compiling cc v1.4.7
+   Compiling once_cell v1.21.4
+   Compiling pest v2.9.2
+   Compiling typenum v1.20.1
+   Compiling litemap v0.8.3
+   Compiling writeable v0.6.4
+   Compiling mio v1.2.3
+   Compiling socket2 v0.6.5
+   Compiling carrick-fatal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-fatal)
+   Compiling parking_lot_core v0.9.12
+   Compiling getrandom v0.4.3
+   Compiling icu_properties_data v2.3.0
+   Compiling utf8_iter v1.0.4
+   Compiling rand_core v0.10.1
+   Compiling icu_normalizer_data v2.3.0
+   Compiling pest_meta v2.9.2
+   Compiling plain v0.2.3
+   Compiling rustix v1.1.5
+   Compiling percent-encoding v2.3.2
+   Compiling scopeguard v1.2.0
+   Compiling ring v0.17.14
+   Compiling sha2-asm v0.6.4
+   Compiling lock_api v0.4.14
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling http v1.5.0
+   Compiling errno v0.3.14
+   Compiling zeroize v1.9.0
+   Compiling ident_case v1.0.1
+   Compiling fnv v1.0.7
+   Compiling strsim v0.11.1
+   Compiling rustls-pki-types v1.15.1
+   Compiling pest_generator v2.9.2
+   Compiling darling_core v0.20.11
+   Compiling synstructure v0.14.0
+   Compiling http-body v1.1.0
+   Compiling parking_lot v0.12.5
+   Compiling digest v0.10.7
+   Compiling getrandom v0.2.17
+   Compiling zerocopy-derive v0.8.57
+   Compiling pest_derive v2.9.2
+   Compiling byteorder v1.5.0
+   Compiling httparse v1.10.1
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.20
+   Compiling zerofrom-derive v0.1.8
+   Compiling yoke-derive v0.8.3
+   Compiling zerovec-derive v0.11.6
+   Compiling displaydoc v0.2.7
+   Compiling scroll_derive v0.13.2
+   Compiling tokio-macros v2.7.2
+   Compiling futures-macro v0.3.34
+   Compiling scroll v0.13.0
+   Compiling slab v0.4.12
+   Compiling tokio v1.53.1
+   Compiling untrusted v0.9.0
+   Compiling zerofrom v0.1.8
+   Compiling futures-task v0.3.34
+   Compiling darling_macro v0.20.11
+   Compiling goblin v0.10.7
+   Compiling yoke v0.8.3
+   Compiling tracing-attributes v0.1.31
+   Compiling futures-util v0.3.34
+   Compiling form_urlencoded v1.2.2
+   Compiling tracing-core v0.1.36
+   Compiling zerovec v0.11.8
+   Compiling zerotrie v0.2.5
+   Compiling cpufeatures v0.2.17
+   Compiling tinystr v0.8.4
+   Compiling potential_utf v0.1.6
+   Compiling icu_locale_core v2.3.0
+   Compiling icu_collections v2.3.0
+   Compiling tower-service v0.3.3
+   Compiling fastrand v2.5.0
+   Compiling usdt-impl v0.6.0
+   Compiling autocfg v1.5.1
+   Compiling try-lock v0.2.5
+   Compiling glob v0.3.4
+   Compiling mach2 v0.6.0
+   Compiling icu_provider v2.3.1
+   Compiling rustls v0.23.45
+   Compiling clang-sys v1.9.1
+   Compiling icu_normalizer v2.3.0
+   Compiling icu_properties v2.3.0
+   Compiling num-traits v0.2.19
+   Compiling want v0.3.1
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+   Compiling tempfile v3.27.0
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling tracing v0.1.44
+   Compiling sha2 v0.10.9
+   Compiling darling v0.20.11
+   Compiling dtrace-parser v0.3.0
+   Compiling futures-channel v0.3.34
+   Compiling carrick-kernel-arena v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-arena)
+   Compiling thread-id v5.1.0
+   Compiling atomic-waker v1.1.2
+   Compiling ipnet v2.12.2
+   Compiling prettyplease v0.2.37
+   Compiling rustls-webpki v0.103.15
+   Compiling hyper v1.11.1
+   Compiling carrick-host v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host)
+   Compiling derive_builder_core v0.20.2
+   Compiling url v2.5.8
+   Compiling serde_tokenstream v0.2.3
+   Compiling sync_wrapper v1.0.2
+   Compiling carrick-portable v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-portable)
+   Compiling aho-corasick v1.1.5
+   Compiling unicode-xid v0.2.6
+   Compiling konst_macro_rules v0.2.19
+   Compiling regex-syntax v0.8.11
+   Compiling tinyvec v1.13.3
+   Compiling base64 v0.22.1
+   Compiling pretty-hex v0.4.2
+   Compiling tower-layer v0.3.3
+   Compiling minimal-lexical v0.2.1
+   Compiling tower v0.5.3
+   Compiling nom v7.1.3
+   Compiling tokio-rustls v0.26.5
+   Compiling regex-automata v0.4.18
+   Compiling libloading v0.8.9
+   Compiling dof v0.4.0
+   Compiling hyper-util v0.1.20
+   Compiling konst v0.2.20
+   Compiling const_format_proc_macros v0.2.34
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+   Compiling derive_builder_macro v0.20.2
+   Compiling webpki-roots v1.0.9
+   Compiling memmap2 v0.9.11
+   Compiling futures-sink v0.3.34
+   Compiling either v1.18.0
+   Compiling heck v0.5.0
+   Compiling bindgen v0.72.1
+   Compiling core-foundation-sys v0.8.7
+   Compiling ryu v1.0.23
+   Compiling iana-time-zone v0.1.65
+   Compiling serde_urlencoded v0.7.1
+   Compiling regex v1.13.1
+   Compiling strum_macros v0.27.2
+   Compiling itertools v0.13.0
+   Compiling tokio-util v0.7.19
+   Compiling hyper-rustls v0.27.10
+   Compiling derive_builder v0.20.2
+   Compiling const_format v0.2.36
+   Compiling cexpr v0.6.0
+   Compiling tower-http v0.6.11
+   Compiling unicode-normalization v0.1.25
+   Compiling carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-timer-core)
+   Compiling usdt-macro v0.6.0
+   Compiling usdt-attr-macro v0.6.0
+   Compiling carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-signal-core)
+   Compiling getset v0.1.7
+   Compiling hmac v0.12.1
+   Compiling http-body-util v0.1.5
+   Compiling camino v1.2.6
+   Compiling crc32fast v1.5.2
+   Compiling base64 v0.13.1
+   Compiling shlex v1.3.0
+   Compiling rustc-hash v2.1.3
+   Compiling strum v0.27.2
+   Compiling oci-spec v0.8.4
+   Compiling jwt v0.16.0
+   Compiling reqwest v0.12.28
+   Compiling usdt v0.6.0
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling olpc-cjson v0.1.4
+   Compiling chrono v0.4.45
+   Compiling http-auth v0.1.10
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling unicase v2.9.0
+   Compiling adler2 v2.0.1
+   Compiling rustversion v1.0.23
+   Compiling lazy_static v1.5.0
+   Compiling simd-adler32 v0.3.10
+   Compiling miniz_oxide v0.9.1
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling oci-client v0.15.0
+   Compiling chacha20 v0.10.2
+   Compiling bad64-sys v0.10.0
+   Compiling proc-macro-error-attr3 v3.1.1
+   Compiling filetime v0.2.29
+   Compiling getrandom v0.3.4
+   Compiling anyhow v1.0.104
+   Compiling proc-macro-error3 v3.1.1
+   Compiling tar v0.4.46
+   Compiling rand v0.10.3
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-spec)
+   Compiling flate2 v1.1.10
+   Compiling fd-lock v4.0.4
+   Compiling data-encoding v2.11.1
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling cty v0.2.2
+   Compiling virtue v0.0.18
+   Compiling cstr_core v0.2.6
+   Compiling hickory-proto v0.26.3
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+   Compiling bincode_derive v2.0.1
+   Compiling dynasm v5.1.0
+   Compiling arc-swap v1.9.2
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling num-derive v0.4.2
+   Compiling carrick-dsr-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/dsr-reuse/carrick-dsr-aarch64)
+   Compiling unty v0.0.4
+   Compiling static_assertions v1.1.0
+   Compiling bincode v2.0.1
+   Compiling carrick-dsr v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/dsr-reuse/carrick-dsr)
+   Compiling dynasmrt v5.1.0
+   Compiling bad64 v0.12.0
+warning: unused return value of `set_realtime_off_ns` that must be used
+    --> carrick-dsr-aarch64/src/mapped_memory.rs:1586:13
+     |
+1586 |             carrick_mem::vdso::set_realtime_off_ns(realtime_off);
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+     |
+1586 |             let _ = carrick_mem::vdso::set_realtime_off_ns(realtime_off);
+     |             +++++++
+
+warning: `carrick-dsr-aarch64` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 1m 06s

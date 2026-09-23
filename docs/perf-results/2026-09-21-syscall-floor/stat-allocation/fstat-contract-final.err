@@ -1,0 +1,1 @@
+contract pass: kernel.fs.stat-allocation scales=[1, 8, 32, 128]

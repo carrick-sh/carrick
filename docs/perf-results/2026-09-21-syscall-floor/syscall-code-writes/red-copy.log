@@ -1,0 +1,19 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.54s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-0aaee9123b867d4d)
+
+running 1 test
+
+thread 'trap::foreign_mm::tests::native_code_content_syscall_copy_revokes_physical_dependencies' (4776429) panicked at crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs:9472:5:
+ordinary syscall copy left translated instructions current
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test trap::foreign_mm::tests::native_code_content_syscall_copy_revokes_physical_dependencies ... FAILED
+
+failures:
+
+failures:
+    trap::foreign_mm::tests::native_code_content_syscall_copy_revokes_physical_dependencies
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 518 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`

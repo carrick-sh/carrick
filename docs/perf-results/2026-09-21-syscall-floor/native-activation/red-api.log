@@ -1,0 +1,14 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+error[E0599]: no method named `prepare_for_execution` found for struct `CurrentNativeData<'execution, 'witness, 'mm, 'guard, 'authority>` in the current scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1191:22
+     |
+1190 |                   Ok(fixture.child.borrow_current_native_data(&execution, &mut cow).unwrap()
+     |  ____________________-
+1191 | |                     .prepare_for_execution())
+     | |                     -^^^^^^^^^^^^^^^^^^^^^ method not found in `CurrentNativeData<'_, '_, '_, '_, '_>`
+     | |_____________________|
+     |
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `carrick-runtime` (lib test) due to 1 previous error

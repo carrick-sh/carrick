@@ -1,0 +1,35 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+warning: variable does not need to be mutable
+  --> crates/carrick-kernel/src/dispatch/fs/tests/seek_header.rs:65:9
+   |
+65 |     let mut dispatcher = SyscallDispatcher::new();
+   |         ----^^^^^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `carrick-kernel` (lib test) generated 1 warning (run `cargo fix --lib -p carrick-kernel --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.57s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-65083421ed1ec98c)
+
+running 2 tests
+test dispatch::fs::tests::seek_header::seek_header_preserves_gate_fd_offset_and_read_failure ... ok
+SEEKHEADER1|{"contract_id":"kernel.fs.seek-header-input","layer":"vm-free","implementation_revision":"sha256:98155a1670fc429fc10ae7bbb7d6187897488b8836d26d5d9b0383ff5e5f39fa","fixture_identity":"unit:seek_header_one_read_without_input_allocation","scale":1,"semantic_assertions":[{"name":"host-owned SEEK_CUR returns the current offset","passed":true,"detail":null}],"work":{"values":{"guest_memory_read_bytes":16,"host_heap_allocations":3},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}
+SEEKHEADER1|{"contract_id":"kernel.fs.seek-header-input","layer":"vm-free","implementation_revision":"sha256:98155a1670fc429fc10ae7bbb7d6187897488b8836d26d5d9b0383ff5e5f39fa","fixture_identity":"unit:seek_header_one_read_without_input_allocation","scale":8,"semantic_assertions":[{"name":"host-owned SEEK_CUR returns the current offset","passed":true,"detail":null}],"work":{"values":{"guest_memory_read_bytes":128,"host_heap_allocations":24},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}
+SEEKHEADER1|{"contract_id":"kernel.fs.seek-header-input","layer":"vm-free","implementation_revision":"sha256:98155a1670fc429fc10ae7bbb7d6187897488b8836d26d5d9b0383ff5e5f39fa","fixture_identity":"unit:seek_header_one_read_without_input_allocation","scale":32,"semantic_assertions":[{"name":"host-owned SEEK_CUR returns the current offset","passed":true,"detail":null}],"work":{"values":{"guest_memory_read_bytes":512,"host_heap_allocations":96},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}
+SEEKHEADER1|{"contract_id":"kernel.fs.seek-header-input","layer":"vm-free","implementation_revision":"sha256:98155a1670fc429fc10ae7bbb7d6187897488b8836d26d5d9b0383ff5e5f39fa","fixture_identity":"unit:seek_header_one_read_without_input_allocation","scale":128,"semantic_assertions":[{"name":"host-owned SEEK_CUR returns the current offset","passed":true,"detail":null}],"work":{"values":{"guest_memory_read_bytes":2048,"host_heap_allocations":384},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}
+
+thread 'dispatch::fs::tests::seek_header::seek_header_one_read_without_input_allocation' (4531370) panicked at crates/carrick-kernel/src/dispatch/fs/tests/seek_header.rs:155:39:
+called `Result::unwrap()` on an `Err` value: WorkBudgetExceeded { contract: ContractId("kernel.fs.seek-header-input"), metric: HostHeapAllocations, actual: 3, maximum: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test dispatch::fs::tests::seek_header::seek_header_one_read_without_input_allocation ... FAILED
+
+failures:
+
+failures:
+    dispatch::fs::tests::seek_header::seek_header_one_read_without_input_allocation
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 2209 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

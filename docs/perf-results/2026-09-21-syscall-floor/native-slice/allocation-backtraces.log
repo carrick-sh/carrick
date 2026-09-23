@@ -1,0 +1,73 @@
+(lldb) target create "target/release/native-syscall-slice"
+Current executable set to '/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/native-syscall-slice' (arm64).
+(lldb) settings set -- target.run-args  "target/lease-cost/native-slice/fixtures/watch-0-1"
+(lldb) breakpoint set --name native_slice_active_allocation --ignore-count 1
+Breakpoint 1: where = native-syscall-slice`native_slice_active_allocation + 12 [inlined] core::hint::black_box::hf7a9e22c45181103 at hint.rs:491:5, address = 0x00000001000b9450
+(lldb) run
+warning: native-syscall-slice was compiled with optimization - stepping may behave oddly; variables may not be available.
+warning: This version of LLDB has no plugin for the language "rust". Inspection of frame variables will be limited.
+Process 86582 launched: '/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/native-syscall-slice' (arm64)
+Process 86582 stopped
+* thread #1, name = 'main', queue = 'com.apple.main-thread', stop reason = breakpoint 1.1
+       frame #0: 0x00000001000b9450 native-syscall-slice`core::hint::black_box::hf7a9e22c45181103 at hint.rs:491:5 [opt] [inlined]
+   488 	#[stable(feature = "bench_black_box", since = "1.66.0")]
+   489 	#[rustc_const_stable(feature = "const_black_box", since = "1.86.0")]
+   490 	pub const fn black_box<T>(dummy: T) -> T {
+-> 491 	    crate::intrinsics::black_box(dummy)
+    	    ^
+   492 	}
+   493 	
+   494 	/// An identity function that causes an `unused_must_use` warning to be
+Target 0: (native-syscall-slice) stopped.
+(lldb) bt 20
+* thread #1, name = 'main', queue = 'com.apple.main-thread', stop reason = breakpoint 1.1
+   * frame #0: 0x00000001000b9450 native-syscall-slice`core::hint::black_box::hf7a9e22c45181103 at hint.rs:491:5 [opt] [inlined]
+     frame #1: 0x00000001000b9450 native-syscall-slice`native_slice_active_allocation at allocations.rs:11:53 [opt]
+     frame #2: 0x00000001000b1978 native-syscall-slice`native_syscall_slice::allocations::note::_$u7b$$u7b$closure$u7d$$u7d$::h178199d45e82e651 at allocations.rs:7:79 [opt] [inlined]
+     frame #3: 0x00000001000b1958 native-syscall-slice`std::thread::local::LocalKey$LT$T$GT$::try_with::hcf38f610c31440fc at local.rs:462:12 [opt] [inlined]
+     frame #4: 0x00000001000b1948 native-syscall-slice`native_syscall_slice::allocations::note::h53062ad3865cd7fe at allocations.rs:7:24 [opt] [inlined]
+     frame #5: 0x00000001000b1948 native-syscall-slice`_$LT$native_syscall_slice..allocations..Counting$u20$as$u20$core..alloc..global..GlobalAlloc$GT$::alloc::h868c237ce26c11ba at allocations.rs:14:47 [opt] [inlined]
+     frame #6: 0x00000001000b1948 native-syscall-slice`__rustc::__rust_alloc at allocations.rs:6:18 [opt]
+     frame #7: 0x0000000100349a1c native-syscall-slice`std::sys::io::error::unix::decode_error_kind - 18446744069411136995 [opt] [inlined]
+     frame #8: 0x0000000100347290 native-syscall-slice`carrick_kernel::dispatch::mem::MemAuthority::snapshot_until::h9f5bb4e8f0babbea at mem.rs:309:20 [opt]
+     frame #9: 0x000000010030128c native-syscall-slice`_$LT$carrick_kernel..dispatch..mm_authority..DispatchMmAuthority$u20$as$u20$carrick_kernel..kernel..address..VmaSnapshotSource$GT$::snapshot::hea2ca51e96d74d44 at mm_authority.rs:1016:18 [opt]
+     frame #10: 0x00000001000ea008 native-syscall-slice`_$LT$carrick_kernel_example..process..ExampleMmBackend$u20$as$u20$carrick_kernel..kernel..address..MmBackend$GT$::snapshot::he84c69d0fb5a35b9 at process.rs:247:39 [opt]
+     frame #11: 0x000000010031bc18 native-syscall-slice`carrick_kernel::kernel::mm_access::snapshot_backend::hdae94dcdb5bbc1d6 at mm_access.rs:1459:32 [opt]
+     frame #12: 0x000000010031b300 native-syscall-slice`carrick_kernel::kernel::mm_access::snapshot_token::hdfff69cfedcef8b8 at mm_access.rs:1421:20 [opt]
+     frame #13: 0x000000010031fa2c native-syscall-slice`carrick_kernel::kernel::mm_access::_$LT$impl$u20$carrick_kernel..kernel..core..KernelContext$GT$::current_mm::hf1c02b76a6838d2f at mm_access.rs:1323:21 [opt]
+     frame #14: 0x00000001000d6958 native-syscall-slice`<u32 as core::fmt::Debug>::fmt at num.rs:87:25 [opt]
+(lldb) continue
+Process 86582 resuming
+Process 86582 stopped
+* thread #1, name = 'main', queue = 'com.apple.main-thread', stop reason = breakpoint 1.1
+       frame #0: 0x00000001000b9450 native-syscall-slice`core::hint::black_box::hf7a9e22c45181103 at hint.rs:491:5 [opt] [inlined]
+   488 	#[stable(feature = "bench_black_box", since = "1.66.0")]
+   489 	#[rustc_const_stable(feature = "const_black_box", since = "1.86.0")]
+   490 	pub const fn black_box<T>(dummy: T) -> T {
+-> 491 	    crate::intrinsics::black_box(dummy)
+    	    ^
+   492 	}
+   493 	
+   494 	/// An identity function that causes an `unused_must_use` warning to be
+Target 0: (native-syscall-slice) stopped.
+(lldb) bt 20
+* thread #1, name = 'main', queue = 'com.apple.main-thread', stop reason = breakpoint 1.1
+   * frame #0: 0x00000001000b9450 native-syscall-slice`core::hint::black_box::hf7a9e22c45181103 at hint.rs:491:5 [opt] [inlined]
+     frame #1: 0x00000001000b9450 native-syscall-slice`native_slice_active_allocation at allocations.rs:11:53 [opt]
+     frame #2: 0x00000001000b1978 native-syscall-slice`native_syscall_slice::allocations::note::_$u7b$$u7b$closure$u7d$$u7d$::h178199d45e82e651 at allocations.rs:7:79 [opt] [inlined]
+     frame #3: 0x00000001000b1958 native-syscall-slice`std::thread::local::LocalKey$LT$T$GT$::try_with::hcf38f610c31440fc at local.rs:462:12 [opt] [inlined]
+     frame #4: 0x00000001000b1948 native-syscall-slice`native_syscall_slice::allocations::note::h53062ad3865cd7fe at allocations.rs:7:24 [opt] [inlined]
+     frame #5: 0x00000001000b1948 native-syscall-slice`_$LT$native_syscall_slice..allocations..Counting$u20$as$u20$core..alloc..global..GlobalAlloc$GT$::alloc::h868c237ce26c11ba at allocations.rs:14:47 [opt] [inlined]
+     frame #6: 0x00000001000b1948 native-syscall-slice`__rustc::__rust_alloc at allocations.rs:6:18 [opt]
+     frame #7: 0x000000010031b98c native-syscall-slice`alloc::alloc::alloc at alloc.rs:101:9 [opt] [inlined]
+     frame #8: 0x000000010031b97c native-syscall-slice`<alloc::alloc::Global>::alloc_impl_runtime at alloc.rs:210:73 [opt] [inlined]
+     frame #9: 0x000000010031b97c native-syscall-slice`<alloc::alloc::Global>::alloc_impl at alloc.rs:332:9 [opt] [inlined]
+     frame #10: 0x000000010031b97c native-syscall-slice`<alloc::alloc::Global as core::alloc::Allocator>::allocate at alloc.rs:449:14 [opt] [inlined]
+     frame #11: 0x000000010031b97c native-syscall-slice`alloc::boxed::box_new_uninit at boxed.rs:248:18 [opt] [inlined]
+     frame #12: 0x000000010031b97c native-syscall-slice`alloc::boxed::Box$LT$T$GT$::new::hc7095f8b829b363b at boxed.rs:286:19 [opt] [inlined]
+     frame #13: 0x000000010031b97c native-syscall-slice`alloc::sync::Arc$LT$T$GT$::new::h044ca740ca80b3e9 at sync.rs:427:25 [opt] [inlined]
+     frame #14: 0x000000010031b978 native-syscall-slice`carrick_kernel::kernel::mm_access::snapshot_token::hdfff69cfedcef8b8 at mm_access.rs:1450:24 [opt]
+     frame #15: 0x000000010031fa2c native-syscall-slice`carrick_kernel::kernel::mm_access::_$LT$impl$u20$carrick_kernel..kernel..core..KernelContext$GT$::current_mm::hf1c02b76a6838d2f at mm_access.rs:1323:21 [opt]
+     frame #16: 0x00000001000d6958 native-syscall-slice`<u32 as core::fmt::Debug>::fmt at num.rs:87:25 [opt]
+(lldb) process kill
+Process 86582 exited with status = 9 (0x00000009) killed

@@ -1,0 +1,14 @@
+{
+  "scrub-census-observability-tests.log": "296de447b58320851752eb3246f9266cc803e1fab6474b97edf27251881764f2",
+  "node-scrub-census.log": "6b5fc29fc8006adf80907e68d618fc23d21bc890a82e8c2c3875bcc46596ce29",
+  "scrub-census-build.log": "c2a85bf2b8fd41b54b6c2fe84523a175f61033a46f0e37baaf1c4280be1f81f7",
+  "instrumentation.patch": "e8ebfb33e737e79c7642494ec0d63033a0215bca5f82260ec2ff9e8cecaa714f",
+  "node-scrub-census.py": "09fa7d581ac1a67d4689721b22021dfc03b86efcbcb3af89ad83ce2c90c2e247",
+  "node-scrub-census.raw": "d9b2ff27f9a52b2ac8902d9932186ff98960de304ffc601ad1b8b2306445c2cd",
+  "node-scrub-census.cleanup": "93f880db63edf5172b4be854c3cc662b177075bd2df11b8ba2845066be844ee0",
+  "node-scrub-census.out": "b1cfcd2b7a80b6b51e18521fdc19f5d4c29e677c08f21f236d0b505b1c6545eb",
+  "scrub-census-artifact.json": "b374ac07cf77dc209749b5f2856c99319c0e2b1868a7fbde6f7857862ce344c2",
+  "script.d": "33e17c4b58a69b992330ff2a7b0b7239c75f7fd819df0ccb83cacc126d6e47da",
+  "node-scrub-census.err": "5511c077cc48b52b2464f997e146b7189c021303c3cdb32d8bc839a5982e4a56",
+  "node-scrub-census.command.json": "23a0474940371513389bfcdfb279441f1d2b43ed5cfb54da4721bcf4c64f210b"
+}

@@ -1,0 +1,153 @@
+Diff in /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-next/tests/write_seek_lease.rs:7:
+ #[test]
+ fn write_seek_lease_alias_preserves_shared_offset() {
+     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+-        .ancestors().nth(2).unwrap();
+-    let binary = root.join("conformance-probes/target/aarch64-unknown-linux-musl/release/writeseek");
++        .ancestors()
++        .nth(2)
++        .unwrap();
++    let binary =
++        root.join("conformance-probes/target/aarch64-unknown-linux-musl/release/writeseek");
+     assert!(binary.is_file(), "fresh writeseek executable required");
+     let result = TestContainer::new(
+         "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b")
+Diff in /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-next/tests/write_seek_lease.rs:17:
+         .run(["/bin/sh", "-c", "/probe lease-alias"])
+         .expect("signed lease alias execution")
+         .ensure_success().expect("lease alias probe exit status");
+-    assert_eq!(result.stdout_utf8().trim(),
++    assert_eq!(
++        result.stdout_utf8().trim(),
+         "alias_write=1\nshared_offset=1\nread=1\nbyte=120",
+-        "Linux shared-offset authority; stderr={}", result.stderr_utf8());
++        "Linux shared-offset authority; stderr={}",
++        result.stderr_utf8()
++    );
+ }
+ 
+Diff in /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel/src/dispatch/fs/tests.rs:13:
+     use std::os::fd::IntoRawFd;
+ 
+     for duplication in [23, 24, 25] {
+-    let mut dispatcher = SyscallDispatcher::new();
+-    let fd = dispatcher.install_fd_at_or_above(3,
+-        OpenFile::from_open_description_with_status_flags(
+-            Arc::new(RwLock::new(OpenDescription::HostFile {
+-                host_fd: HostFdRef::new(tempfile::tempfile().unwrap().into_raw_fd()),
+-                metadata: RootFsMetadata {
+-                    path: "/lease-alias".into(), kind: RootFsEntryKind::File,
+-                    mode: 0o600, size: 0,
+-                },
+-                base: OpenDescriptionBase::new(LINUX_O_RDWR), writable: true,
+-            })), LINUX_O_RDWR, 0,
+-        )).unwrap();
+-    let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+-    let mut memory = LinearMemory::new(base, vec![0; 4096]);
+-    memory.write_bytes_raw(base + 256, b"x").unwrap();
+-    let context = dispatcher.capture_one_task_context().unwrap();
+-    let mut call = |number, args, memory: &mut LinearMemory| {
+-        dispatcher.dispatch(&context, SyscallRequest::new(number, SyscallArgs::from(args)),
+-            memory, &CompatReporter::default()).unwrap()
+-    };
+-    assert_eq!(call(62, [fd as u64, 0, 0, 0, 0, 0], &mut memory),
+-        DispatchOutcome::Returned { value: 0 });
+-    let duplicate_args = if duplication == 24 {
+-        [fd as u64, 99, 0, 0, 0, 0]
+-    } else {
+-        [fd as u64, 0, 0, 0, 0, 0]
+-    };
+-    let DispatchOutcome::Returned { value: alias } =
+-        call(duplication, duplicate_args, &mut memory) else { panic!("dup failed") };
+-    assert_eq!(call(62, [fd as u64, 0, 0, 0, 0, 0], &mut memory),
+-        DispatchOutcome::Returned { value: 0 });
+-    assert_eq!(call(64, [alias as u64, base + 256, 1, 0, 0, 0], &mut memory),
+-        DispatchOutcome::Returned { value: 1 });
+-    assert_eq!(call(62, [fd as u64, 0, 1, 0, 0, 0], &mut memory),
+-        DispatchOutcome::Returned { value: 1 }, "alias write must advance the leased descriptor's offset (duplication syscall {duplication})");
++        let mut dispatcher = SyscallDispatcher::new();
++        let fd = dispatcher
++            .install_fd_at_or_above(
++                3,
++                OpenFile::from_open_description_with_status_flags(
++                    Arc::new(RwLock::new(OpenDescription::HostFile {
++                        host_fd: HostFdRef::new(tempfile::tempfile().unwrap().into_raw_fd()),
++                        metadata: RootFsMetadata {
++                            path: "/lease-alias".into(),
++                            kind: RootFsEntryKind::File,
++                            mode: 0o600,
++                            size: 0,
++                        },
++                        base: OpenDescriptionBase::new(LINUX_O_RDWR),
++                        writable: true,
++                    })),
++                    LINUX_O_RDWR,
++                    0,
++                ),
++            )
++            .unwrap();
++        let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
++        let mut memory = LinearMemory::new(base, vec![0; 4096]);
++        memory.write_bytes_raw(base + 256, b"x").unwrap();
++        let context = dispatcher.capture_one_task_context().unwrap();
++        let mut call = |number, args, memory: &mut LinearMemory| {
++            dispatcher
++                .dispatch(
++                    &context,
++                    SyscallRequest::new(number, SyscallArgs::from(args)),
++                    memory,
++                    &CompatReporter::default(),
++                )
++                .unwrap()
++        };
++        assert_eq!(
++            call(62, [fd as u64, 0, 0, 0, 0, 0], &mut memory),
++            DispatchOutcome::Returned { value: 0 }
++        );
++        let duplicate_args = if duplication == 24 {
++            [fd as u64, 99, 0, 0, 0, 0]
++        } else {
++            [fd as u64, 0, 0, 0, 0, 0]
++        };
++        let DispatchOutcome::Returned { value: alias } =
++            call(duplication, duplicate_args, &mut memory)
++        else {
++            panic!("dup failed")
++        };
++        assert_eq!(
++            call(62, [fd as u64, 0, 0, 0, 0, 0], &mut memory),
++            DispatchOutcome::Returned { value: 0 }
++        );
++        assert_eq!(
++            call(64, [alias as u64, base + 256, 1, 0, 0, 0], &mut memory),
++            DispatchOutcome::Returned { value: 1 }
++        );
++        assert_eq!(
++            call(62, [fd as u64, 0, 1, 0, 0, 0], &mut memory),
++            DispatchOutcome::Returned { value: 1 },
++            "alias write must advance the leased descriptor's offset (duplication syscall {duplication})"
++        );
+     }
+ }
+ 
+Diff in /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel/src/dispatch/mem/tests.rs:178:
+         Ok(())
+     }
+ 
+-    fn discard_private_anonymous(&mut self, address: u64, len: usize)
+-        -> Result<bool, carrick_guest_mem::RepointPrivateError> {
+-        if !self.discard_anon { return Ok(false); }
+-        let offset = self.range_offset(address, len)
++    fn discard_private_anonymous(
++        &mut self,
++        address: u64,
++        len: usize,
++    ) -> Result<bool, carrick_guest_mem::RepointPrivateError> {
++        if !self.discard_anon {
++            return Ok(false);
++        }
++        let offset = self
++            .range_offset(address, len)
+             .map_err(carrick_guest_mem::RepointPrivateError::clean)?;
+         // Scripted discard models fresh backing; physical scrub callbacks are
+         // counted separately and must not be invoked after this succeeds.

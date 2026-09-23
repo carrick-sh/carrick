@@ -57,6 +57,12 @@ impl SyscallRequest {
         self
     }
 
+    /// Populate trap stack metadata from the backend when the transport did not
+    /// supply it. The fallback must not be evaluated for captured metadata.
+    pub fn with_guest_sp_fallback(self, read_sp: impl FnOnce() -> Option<u64>) -> Self {
+        self.with_current_guest_sp(self.current_guest_sp.or_else(read_sp))
+    }
+
     pub fn arg(&self, index: usize) -> u64 {
         self.args.0[index]
     }
@@ -75,7 +81,7 @@ impl SyscallRequest {
             // means no call site can forget it and mis-marshal the x86 path.
             guest_abi: raw.guest_abi,
             native_number: raw.native_number,
-            current_guest_sp: None,
+            current_guest_sp: raw.current_guest_sp,
         }
     }
 }
@@ -86,6 +92,52 @@ impl SyscallRequest {
 pub struct PreparedSyscall {
     pub original_args: SyscallArgs,
     pub request: SyscallRequest,
+}
+
+#[cfg(test)]
+mod captured_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn captured_stack_pointer_needs_no_backend_read() {
+        for scale in [1, 8, 32, 128] {
+            let mut reads = 0;
+            for index in 0..scale {
+                let sp = index * 16;
+                let raw = carrick_hal::RawSyscall {
+                    number: CanonicalNr(132), // sigaltstack consumes this metadata
+                    native_number: NativeNr(132),
+                    guest_abi: LinuxGuestAbi::Aarch64,
+                    args: [0; 6],
+                    current_guest_sp: Some(sp),
+                };
+                let request = SyscallRequest::from_raw(raw).with_guest_sp_fallback(|| {
+                    reads += 1;
+                    Some(sp)
+                });
+                assert_eq!(request.current_guest_sp, Some(sp));
+                assert_eq!(
+                    crate::observe::SyscallInfo::new(&request).current_guest_sp(),
+                    Some(sp)
+                );
+            }
+            assert_eq!(reads, 0, "captured metadata must not trigger backend reads");
+        }
+    }
+
+    #[test]
+    fn missing_stack_pointer_reads_backend_once_and_preserves_failure() {
+        for result in [Some(0), Some(0x9000), None] {
+            let mut reads = 0;
+            let request = SyscallRequest::new(132, SyscallArgs::new([0; 6]))
+                .with_guest_sp_fallback(|| {
+                    reads += 1;
+                    result
+                });
+            assert_eq!(request.current_guest_sp, result);
+            assert_eq!(reads, 1);
+        }
+    }
 }
 
 impl PreparedSyscall {

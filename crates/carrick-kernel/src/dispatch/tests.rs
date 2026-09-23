@@ -14,20 +14,20 @@ mod overlay_dispatch_tests {
     //! Keep these tests minimal — there's no need to exercise every
     //! flag combination here, just the four scenarios called out in the
     //! task spec.
-use carrick_vfs::ProcMapSharing;
-use super::*;
+    use super::*;
+    use carrick_vfs::ProcMapSharing;
 
-#[test]
-fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
-    for number in 0..=512 {
-        assert_eq!(
-            syscall_requires_mm_mutation(number, SyscallArgs::from([0; 6])),
-            resolve_mutation_handler::<LinearMemory>(number).is_some(),
-            "mutation classifier drift for syscall {number}"
-        );
+    #[test]
+    fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
+        for number in 0..=512 {
+            assert_eq!(
+                syscall_requires_mm_mutation(number, SyscallArgs::from([0; 6])),
+                resolve_mutation_handler::<LinearMemory>(number).is_some(),
+                "mutation classifier drift for syscall {number}"
+            );
+        }
+        assert_eq!(MM_MUTATION_SYSCALLS.len(), 15);
     }
-    assert_eq!(MM_MUTATION_SYSCALLS.len(), 15);
-}
     use crate::compat::CompatReporter;
     use carrick_vfs::rootfs::LayerSource;
     use tar::{Builder, EntryType, Header};
@@ -69,12 +69,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             DispatchOutcome::Returned { value: 8 }
         ));
         assert!(
-            crate::event_ring::contains_event(
-                EVENTFD_WRITE_EVENT,
-                -1,
-                0x0102_0304,
-                0x0102_030b,
-            ),
+            crate::event_ring::contains_event(EVENTFD_WRITE_EVENT, -1, 0x0102_0304, 0x0102_030b,),
             "the always-on ring must record the in-memory eventfd transition"
         );
     }
@@ -618,7 +613,10 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         assert!(!old_files.functional_refs_active());
         assert!(old_files.read_open_files().contains_key(&writer_fd));
         assert!(replacement.resources().files().slot_count() == 0);
-        assert!(matches!(writer.read().as_deref(), Some(OpenDescription::Closed { .. })));
+        assert!(matches!(
+            writer.read().as_deref(),
+            Some(OpenDescription::Closed { .. })
+        ));
 
         let mut pollfd = libc::pollfd {
             fd: read_host_fd,
@@ -714,6 +712,47 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         // Never zero — some tools treat st_ino == 0 as "no such entry".
         assert_ne!(inode_for_path(Path::new("/")), 0);
         assert_ne!(inode_for_path(Path::new("/tmp/d")), 0);
+    }
+
+    #[test]
+    fn inode_fast_path_matches_existing_raw_normalization() {
+        use std::os::unix::ffi::OsStrExt;
+        let names: &[&[u8]] = &[
+            b"",
+            b"/",
+            b"a",
+            b"/a/b",
+            b"//a///b/",
+            b"/a/./b",
+            b"/a/c/../b",
+            b"/..",
+            b"/a/../../b",
+            b"./a",
+            b"../a",
+            b"/a/\xff",
+            "café/文件".as_bytes(),
+        ];
+        for bytes in names {
+            let path = Path::new(std::ffi::OsStr::from_bytes(bytes));
+            let normalized = carrick_vfs::fs_backend::normalize_raw(path);
+            let expected_bytes = normalized
+                .as_ref()
+                .map(|p| p.as_os_str().as_bytes())
+                .unwrap_or(bytes);
+            let expected = expected_bytes
+                .iter()
+                .fold(0xcbf29ce484222325_u64, |h, b| {
+                    (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+                })
+                .max(1);
+            assert_eq!(inode_for_path(path), expected, "path={path:?}");
+            let encoded = carrick_vfs::pathcodec::encode_path(path);
+            assert_eq!(
+                inode_for_path(Path::new(&encoded)),
+                expected,
+                "escaped path identity"
+            );
+        }
     }
 
     /// 16 KiB scratch buffer at virtual base 0x4000_0000. Tests pack
@@ -930,15 +969,20 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                 shared_file_alias: None,
             }))
         });
-        assert!(matches!(result, Err(crate::run_result::RuntimeError::CarrierFailed(_))));
+        assert!(matches!(
+            result,
+            Err(crate::run_result::RuntimeError::CarrierFailed(_))
+        ));
     }
 
     #[test]
     fn try_set_credentials_and_cwd_succeed() {
         let dispatcher = SyscallDispatcher::new();
-        assert!(dispatcher
-            .try_set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000))
-            .is_ok());
+        assert!(
+            dispatcher
+                .try_set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000))
+                .is_ok()
+        );
         assert!(dispatcher.try_set_cwd("/test_dir").is_ok());
         assert_eq!(dispatcher.try_cwd().unwrap(), "/test_dir");
         assert!(dispatcher.try_mem_snapshot().is_ok());
@@ -966,10 +1010,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             }
             other => panic!("expected empty epoll wait, got {other:?}"),
         };
-        let context = h
-            .dispatcher
-            .capture_one_task_context()
-            .expect("context");
+        let context = h.dispatcher.capture_one_task_context().expect("context");
         let files = context.resources().files();
         let number = crate::kernel::FileSlotNumber::for_open_fd(epfd).expect("epfd slot");
         let ids = crate::kernel::ObjectIdRegistry::new();
@@ -992,9 +1033,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as i32;
         let out = h.reserve(16);
         let kqueue_fd = match h.call(22, [epfd as u64, out, 1, u64::MAX, 0, 0]) {
-            DispatchOutcome::WaitOnFds { fds, .. } => {
-                fds.first().expect("epoll mutation source").0
-            }
+            DispatchOutcome::WaitOnFds { fds, .. } => fds.first().expect("epoll mutation source").0,
             other => panic!("expected shared epoll source, got {other:?}"),
         };
         let ready = returned(h.call(19, [1, 0, 0, 0, 0, 0])) as i32;
@@ -1076,17 +1115,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
     fn blocked_sendfile_captures_input_and_output_before_input_reuse() {
         let mut h = Harness::new();
         let path = h.put_str("/sendfile-authority");
-        let input = returned(h.call(
-            56,
-            [
-                (-100i64) as u64,
-                path,
-                O_CREAT | 2,
-                0o600,
-                0,
-                0,
-            ],
-        )) as i32;
+        let input = returned(h.call(56, [(-100i64) as u64, path, O_CREAT | 2, 0o600, 0, 0])) as i32;
         let byte = h.put_bytes(b"x");
         assert_eq!(returned(h.call(64, [input as u64, byte, 1, 0, 0, 0])), 1);
         assert_eq!(returned(h.call(62, [input as u64, 0, 0, 0, 0, 0])), 0);
@@ -1111,10 +1140,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             }
             other => panic!("expected blocked sendfile, got {other:?}"),
         };
-        let context = h
-            .dispatcher
-            .capture_one_task_context()
-            .expect("context");
+        let context = h.dispatcher.capture_one_task_context().expect("context");
         let files = context.resources().files();
         let input_slot = crate::kernel::FileSlotNumber::for_open_fd(input).expect("input slot");
         let ids = crate::kernel::ObjectIdRegistry::new();
@@ -1372,7 +1398,10 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             .epoll_rearm_after_io(&read_request, &read_outcome);
         {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = epoll_open.description.read().expect("epoll open description");
+            let open = epoll_open
+                .description
+                .read()
+                .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -1576,13 +1605,21 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         sockaddr[2..4].copy_from_slice(&0u16.to_be_bytes());
         sockaddr[4..8].copy_from_slice(&[127, 0, 0, 1]);
         h.memory.write_bytes(bind_addr, &sockaddr).unwrap();
-        assert_eq!(returned(h.call(200, [listener as u64, bind_addr, 16, 0, 0, 0])), 0);
+        assert_eq!(
+            returned(h.call(200, [listener as u64, bind_addr, 16, 0, 0, 0])),
+            0
+        );
         assert_eq!(returned(h.call(201, [listener as u64, 128, 0, 0, 0, 0])), 0);
 
         let name_addr = h.reserve(16);
         let name_len_addr = h.reserve(4);
-        h.memory.write_bytes(name_len_addr, &(16u32).to_ne_bytes()).unwrap();
-        assert_eq!(returned(h.call(204, [listener as u64, name_addr, name_len_addr, 0, 0, 0])), 0);
+        h.memory
+            .write_bytes(name_len_addr, &(16u32).to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            returned(h.call(204, [listener as u64, name_addr, name_len_addr, 0, 0, 0])),
+            0
+        );
         let bound = h.memory.read_bytes(name_addr, 16).unwrap();
         let port = u16::from_be_bytes([bound[2], bound[3]]);
 
@@ -1591,7 +1628,13 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         event[0..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
         event[8..16].copy_from_slice(&(listener as u64).to_le_bytes());
         h.memory.write_bytes(event_addr, &event).unwrap();
-        assert_eq!(returned(h.call(21, [epfd, LINUX_EPOLL_CTL_ADD, listener as u64, event_addr, 0, 0])), 0);
+        assert_eq!(
+            returned(h.call(
+                21,
+                [epfd, LINUX_EPOLL_CTL_ADD, listener as u64, event_addr, 0, 0]
+            )),
+            0
+        );
 
         let connect_guest = |h: &mut Harness| {
             let client = returned(h.call(
@@ -1611,7 +1654,10 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             target[2..4].copy_from_slice(&port.to_be_bytes());
             target[4..8].copy_from_slice(&[127, 0, 0, 1]);
             h.memory.write_bytes(client_addr, &target).unwrap();
-            assert_eq!(errno(h.call(203, [client as u64, client_addr, 16, 0, 0, 0])), 115);
+            assert_eq!(
+                errno(h.call(203, [client as u64, client_addr, 16, 0, 0, 0])),
+                115
+            );
 
             let poll_addr = h.reserve(8);
             let timeout_addr = h.reserve(16);
@@ -1626,19 +1672,60 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                 DispatchOutcome::Returned { value } => assert_eq!(value, 1),
                 DispatchOutcome::WaitOnFds { fds, .. } => {
                     let (host_fd, events) = fds.first().expect("connect wait fd");
-                    let mut pfd = libc::pollfd { fd: host_fd, events, revents: 0 };
-                    assert_eq!(unsafe { libc::poll(&mut pfd, 1, 1000) }, 1, "connect completion");
-                    assert_eq!(returned(h.call(73, [poll_addr, 1, timeout_addr, 0, 0, 0])), 1);
+                    let mut pfd = libc::pollfd {
+                        fd: host_fd,
+                        events,
+                        revents: 0,
+                    };
+                    assert_eq!(
+                        unsafe { libc::poll(&mut pfd, 1, 1000) },
+                        1,
+                        "connect completion"
+                    );
+                    assert_eq!(
+                        returned(h.call(73, [poll_addr, 1, timeout_addr, 0, 0, 0])),
+                        1
+                    );
                 }
                 other => panic!("ppoll guest nonblocking connect: {other:?}"),
             }
-            let revents = i16::from_le_bytes(h.memory.read_bytes(poll_addr + 6, 2).unwrap().try_into().unwrap());
+            let revents = i16::from_le_bytes(
+                h.memory
+                    .read_bytes(poll_addr + 6, 2)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            );
             assert_ne!(revents & LINUX_POLLOUT, 0);
             let error_addr = h.reserve(4);
             let error_len_addr = h.reserve(4);
-            h.memory.write_bytes(error_len_addr, &4u32.to_le_bytes()).unwrap();
-            assert_eq!(returned(h.call(209, [client as u64, LINUX_SOL_SOCKET as u64, LINUX_SO_ERROR as u64, error_addr, error_len_addr, 0])), 0);
-            assert_eq!(i32::from_le_bytes(h.memory.read_bytes(error_addr, 4).unwrap().try_into().unwrap()), 0);
+            h.memory
+                .write_bytes(error_len_addr, &4u32.to_le_bytes())
+                .unwrap();
+            assert_eq!(
+                returned(h.call(
+                    209,
+                    [
+                        client as u64,
+                        LINUX_SOL_SOCKET as u64,
+                        LINUX_SO_ERROR as u64,
+                        error_addr,
+                        error_len_addr,
+                        0
+                    ]
+                )),
+                0
+            );
+            assert_eq!(
+                i32::from_le_bytes(
+                    h.memory
+                        .read_bytes(error_addr, 4)
+                        .unwrap()
+                        .try_into()
+                        .unwrap()
+                ),
+                0
+            );
             client
         };
 
@@ -1673,8 +1760,14 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             "arrival from the other source must produce a fresh edge"
         );
         let event = h.memory.read_bytes(out_addr, 16).unwrap();
-        assert_ne!(u32::from_le_bytes(event[0..4].try_into().unwrap()) & LINUX_EPOLLIN, 0);
-        assert_eq!(u64::from_le_bytes(event[8..16].try_into().unwrap()), listener as u64);
+        assert_ne!(
+            u32::from_le_bytes(event[0..4].try_into().unwrap()) & LINUX_EPOLLIN,
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(event[8..16].try_into().unwrap()),
+            listener as u64
+        );
         assert_eq!(
             returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])),
             0,
@@ -1823,7 +1916,10 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         };
         let listener_latch = |h: &Harness| {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = epoll_open.description.read().expect("epoll open description");
+            let open = epoll_open
+                .description
+                .read()
+                .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -1906,21 +2002,42 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let mut h = Harness::new();
         let epfd = returned(h.call(20, [0; 6])) as u64;
         let pair_addr = h.reserve(8);
-        assert_eq!(returned(h.call(199, [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK, 0, pair_addr, 0, 0])), 0);
+        assert_eq!(
+            returned(h.call(
+                199,
+                [
+                    LINUX_AF_UNIX as u64,
+                    LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                    0,
+                    pair_addr,
+                    0,
+                    0
+                ]
+            )),
+            0
+        );
         let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
         let writer = i32::from_le_bytes(pair[..4].try_into().unwrap());
         let mut event = [0u8; 16];
         event[..4].copy_from_slice(&(LINUX_EPOLLOUT | LINUX_EPOLLET).to_le_bytes());
         event[8..].copy_from_slice(&17u64.to_le_bytes());
         let event_addr = h.put_bytes(&event);
-        assert_eq!(returned(h.call(21, [epfd, LINUX_EPOLL_CTL_ADD, writer as u64, event_addr, 0, 0])), 0);
+        assert_eq!(
+            returned(h.call(
+                21,
+                [epfd, LINUX_EPOLL_CTL_ADD, writer as u64, event_addr, 0, 0]
+            )),
+            0
+        );
         set_write_latch(&h.dispatcher.open_file(epfd as i32).unwrap(), writer);
         (h, epfd, writer, event_addr)
     }
 
     fn set_epoll_latch(epoll: &OpenFile, target: i32, ready: u32, read_avail: u64) {
         let mut open = epoll.description.write().unwrap();
-        let OpenDescription::Epoll { interest, .. } = &mut *open else { panic!("epoll") };
+        let OpenDescription::Epoll { interest, .. } = &mut *open else {
+            panic!("epoll")
+        };
         let slot = interest.get_mut(&target).unwrap();
         slot.last_ready = ready;
         slot.last_read_avail = read_avail;
@@ -1932,9 +2049,18 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
 
     fn staged_slot_state(epoll: &OpenFile, target: i32) -> (u32, u64, bool, u64, u32, u64) {
         let open = epoll.description.read().unwrap();
-        let OpenDescription::Epoll { interest, .. } = &*open else { panic!("epoll") };
+        let OpenDescription::Epoll { interest, .. } = &*open else {
+            panic!("epoll")
+        };
         let slot = interest.get(&target).unwrap();
-        (slot.last_ready, slot.io_gen, slot.write_backpressured, slot.last_read_avail, slot.event.events, slot.event.data)
+        (
+            slot.last_ready,
+            slot.io_gen,
+            slot.write_backpressured,
+            slot.last_read_avail,
+            slot.event.events,
+            slot.event.data,
+        )
     }
 
     fn staged_write_state(epoll: &OpenFile, writer: i32) -> (u32, u64, bool, u32, u64) {
@@ -1948,26 +2074,54 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let epoll = h.dispatcher.open_file(epfd as i32).unwrap();
         let context = h.dispatcher.capture_one_task_context().unwrap();
         resources::with_captured_resources(&context, || {
-            let receipt = net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
+            let receipt =
+                net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
             resources::finish_files_for_host_wait(&context).unwrap();
             receipt.complete(&DispatchOutcome::Returned { value: 4 });
         });
-        assert_eq!(staged_write_state(&epoll, writer), (0, 1, false, LINUX_EPOLLOUT | LINUX_EPOLLET, 17));
+        assert_eq!(
+            staged_write_state(&epoll, writer),
+            (0, 1, false, LINUX_EPOLLOUT | LINUX_EPOLLET, 17)
+        );
     }
 
     fn staged_read_fixture() -> (Harness, u64, i32, u64) {
         let mut h = Harness::new();
         let epfd = returned(h.call(20, [0; 6])) as u64;
         let pair_addr = h.reserve(8);
-        assert_eq!(returned(h.call(199, [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK, 0, pair_addr, 0, 0])), 0);
+        assert_eq!(
+            returned(h.call(
+                199,
+                [
+                    LINUX_AF_UNIX as u64,
+                    LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                    0,
+                    pair_addr,
+                    0,
+                    0
+                ]
+            )),
+            0
+        );
         let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
         let reader = i32::from_le_bytes(pair[..4].try_into().unwrap());
         let mut event = [0u8; 16];
         event[..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
         event[8..].copy_from_slice(&19u64.to_le_bytes());
         let event_addr = h.put_bytes(&event);
-        assert_eq!(returned(h.call(21, [epfd, LINUX_EPOLL_CTL_ADD, reader as u64, event_addr, 0, 0])), 0);
-        set_epoll_latch(&h.dispatcher.open_file(epfd as i32).unwrap(), reader, LINUX_EPOLLIN, 4);
+        assert_eq!(
+            returned(h.call(
+                21,
+                [epfd, LINUX_EPOLL_CTL_ADD, reader as u64, event_addr, 0, 0]
+            )),
+            0
+        );
+        set_epoll_latch(
+            &h.dispatcher.open_file(epfd as i32).unwrap(),
+            reader,
+            LINUX_EPOLLIN,
+            4,
+        );
         (h, epfd, reader, event_addr)
     }
 
@@ -1977,63 +2131,127 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let epoll = h.dispatcher.open_file(epfd as i32).unwrap();
         let context = h.dispatcher.capture_one_task_context().unwrap();
         resources::with_captured_resources(&context, || {
-            let receipt = net::IoRearm::read(h.dispatcher.open_file(reader).map(|file| file.description));
+            let receipt =
+                net::IoRearm::read(h.dispatcher.open_file(reader).map(|file| file.description));
             resources::finish_files_for_host_wait(&context).unwrap();
             receipt.complete(&DispatchOutcome::Returned { value: 4 });
         });
-        assert_eq!(staged_slot_state(&epoll, reader), (0, 1, false, 0, LINUX_EPOLLIN | LINUX_EPOLLET, 19));
+        assert_eq!(
+            staged_slot_state(&epoll, reader),
+            (0, 1, false, 0, LINUX_EPOLLIN | LINUX_EPOLLET, 19)
+        );
     }
 
     #[test]
     fn staged_write_rearm_distinguishes_error_eagain_and_progress() {
         let (h, epfd, writer, _) = staged_write_fixture();
         let epoll = h.dispatcher.open_file(epfd as i32).unwrap();
-        for outcome in [DispatchOutcome::Returned { value: 0 }, DispatchOutcome::errno(carrick_abi::LINUX_EIO)] {
-            net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description)).complete(&outcome);
+        for outcome in [
+            DispatchOutcome::Returned { value: 0 },
+            DispatchOutcome::errno(carrick_abi::LINUX_EIO),
+        ] {
+            net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description))
+                .complete(&outcome);
             assert_eq!(staged_write_state(&epoll, writer).0, LINUX_EPOLLOUT);
             assert_eq!(staged_write_state(&epoll, writer).1, 0);
         }
-        net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description)).complete(&DispatchOutcome::errno(LINUX_EAGAIN));
-        assert_eq!(staged_write_state(&epoll, writer), (LINUX_EPOLLOUT, 0, true, LINUX_EPOLLOUT | LINUX_EPOLLET, 17));
-        net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description)).complete(&DispatchOutcome::Returned { value: 1 });
-        assert_eq!(staged_write_state(&epoll, writer), (0, 1, false, LINUX_EPOLLOUT | LINUX_EPOLLET, 17));
+        net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description))
+            .complete(&DispatchOutcome::errno(LINUX_EAGAIN));
+        assert_eq!(
+            staged_write_state(&epoll, writer),
+            (LINUX_EPOLLOUT, 0, true, LINUX_EPOLLOUT | LINUX_EPOLLET, 17)
+        );
+        net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description))
+            .complete(&DispatchOutcome::Returned { value: 1 });
+        assert_eq!(
+            staged_write_state(&epoll, writer),
+            (0, 1, false, LINUX_EPOLLOUT | LINUX_EPOLLET, 17)
+        );
     }
 
     #[test]
     fn staged_write_rearm_includes_a_registration_added_while_io_is_pending() {
         let (mut h, epfd, writer, event_addr) = staged_write_fixture();
-        let receipt = net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
-        assert_eq!(returned(h.call(21, [epfd, LINUX_EPOLL_CTL_DEL, writer as u64, 0, 0, 0])), 0);
-        assert_eq!(returned(h.call(21, [epfd, LINUX_EPOLL_CTL_ADD, writer as u64, event_addr, 0, 0])), 0);
+        let receipt =
+            net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
+        assert_eq!(
+            returned(h.call(21, [epfd, LINUX_EPOLL_CTL_DEL, writer as u64, 0, 0, 0])),
+            0
+        );
+        assert_eq!(
+            returned(h.call(
+                21,
+                [epfd, LINUX_EPOLL_CTL_ADD, writer as u64, event_addr, 0, 0]
+            )),
+            0
+        );
         let epoll = h.dispatcher.open_file(epfd as i32).unwrap();
         set_write_latch(&epoll, writer);
         receipt.complete(&DispatchOutcome::Returned { value: 4 });
-        assert_eq!(staged_write_state(&epoll, writer), (0, 1, false, LINUX_EPOLLOUT | LINUX_EPOLLET, 17));
+        assert_eq!(
+            staged_write_state(&epoll, writer),
+            (0, 1, false, LINUX_EPOLLOUT | LINUX_EPOLLET, 17)
+        );
     }
 
     #[test]
     fn staged_write_rearm_preserves_modified_events_and_data() {
         let (mut h, epfd, writer, event_addr) = staged_write_fixture();
-        let receipt = net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
-        h.memory.write_bytes(event_addr, &(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes()).unwrap();
-        h.memory.write_bytes(event_addr + 8, &99u64.to_le_bytes()).unwrap();
-        assert_eq!(returned(h.call(21, [epfd, carrick_abi::LINUX_EPOLL_CTL_MOD, writer as u64, event_addr, 0, 0])), 0);
+        let receipt =
+            net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
+        h.memory
+            .write_bytes(event_addr, &(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes())
+            .unwrap();
+        h.memory
+            .write_bytes(event_addr + 8, &99u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            returned(h.call(
+                21,
+                [
+                    epfd,
+                    carrick_abi::LINUX_EPOLL_CTL_MOD,
+                    writer as u64,
+                    event_addr,
+                    0,
+                    0
+                ]
+            )),
+            0
+        );
         receipt.complete(&DispatchOutcome::Returned { value: 4 });
         let epoll = h.dispatcher.open_file(epfd as i32).unwrap();
-        assert_eq!(staged_write_state(&epoll, writer), (0, 1, false, LINUX_EPOLLIN | LINUX_EPOLLET, 99));
+        assert_eq!(
+            staged_write_state(&epoll, writer),
+            (0, 1, false, LINUX_EPOLLIN | LINUX_EPOLLET, 99)
+        );
     }
 
     #[test]
     fn staged_write_rearm_includes_current_owners_of_the_same_description() {
         let (mut h, epfd, writer, event_addr) = staged_write_fixture();
         let old_epoll = h.dispatcher.open_file(epfd as i32).unwrap();
-        let receipt = net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
+        let receipt =
+            net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
         let alias = returned(h.call(23, [epfd, 0, 0, 0, 0, 0]));
         assert!(alias >= 0);
         assert_eq!(returned(h.call(57, [epfd, 0, 0, 0, 0, 0])), 0);
         let replacement = returned(h.call(20, [0; 6])) as u64;
         assert_eq!(replacement, epfd);
-        assert_eq!(returned(h.call(21, [replacement, LINUX_EPOLL_CTL_ADD, writer as u64, event_addr, 0, 0])), 0);
+        assert_eq!(
+            returned(h.call(
+                21,
+                [
+                    replacement,
+                    LINUX_EPOLL_CTL_ADD,
+                    writer as u64,
+                    event_addr,
+                    0,
+                    0
+                ]
+            )),
+            0
+        );
         let new_epoll = h.dispatcher.open_file(replacement as i32).unwrap();
         set_write_latch(&new_epoll, writer);
         receipt.complete(&DispatchOutcome::Returned { value: 4 });
@@ -2048,15 +2266,45 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let (mut h, epfd, writer, event_addr) = staged_write_fixture();
         let old_epoll = h.dispatcher.open_file(epfd as i32).unwrap();
         let alias = returned(h.call(23, [writer as u64, 0, 0, 0, 0, 0])) as u64;
-        let receipt = net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
+        let receipt =
+            net::WriteRearm::new(h.dispatcher.open_file(writer).map(|file| file.description));
         // A dup keeps the original open description registered after fd reuse.
         let pair_addr = h.reserve(8);
-        assert_eq!(returned(h.call(199, [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK, 0, pair_addr, 0, 0])), 0);
+        assert_eq!(
+            returned(h.call(
+                199,
+                [
+                    LINUX_AF_UNIX as u64,
+                    LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                    0,
+                    pair_addr,
+                    0,
+                    0
+                ]
+            )),
+            0
+        );
         let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
         let replacement = i32::from_le_bytes(pair[..4].try_into().unwrap()) as u64;
-        assert_eq!(returned(h.call(24, [replacement, writer as u64, 0, 0, 0, 0])), writer as i64);
+        assert_eq!(
+            returned(h.call(24, [replacement, writer as u64, 0, 0, 0, 0])),
+            writer as i64
+        );
         let new_epfd = returned(h.call(20, [0; 6])) as u64;
-        assert_eq!(returned(h.call(21, [new_epfd, LINUX_EPOLL_CTL_ADD, writer as u64, event_addr, 0, 0])), 0);
+        assert_eq!(
+            returned(h.call(
+                21,
+                [
+                    new_epfd,
+                    LINUX_EPOLL_CTL_ADD,
+                    writer as u64,
+                    event_addr,
+                    0,
+                    0
+                ]
+            )),
+            0
+        );
         let new_epoll = h.dispatcher.open_file(new_epfd as i32).unwrap();
         set_write_latch(&new_epoll, writer);
         receipt.complete(&DispatchOutcome::Returned { value: 4 });
@@ -2105,7 +2353,10 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
 
         let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
         {
-            let mut open = epoll_open.description.write().expect("epoll open description");
+            let mut open = epoll_open
+                .description
+                .write()
+                .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &mut *open else {
                 panic!("epfd should be an epoll description");
             };
@@ -2119,7 +2370,10 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         h.dispatcher
             .epoll_rearm_after_io(&write_request, &DispatchOutcome::Returned { value: 1 });
         {
-            let open = epoll_open.description.read().expect("epoll open description");
+            let open = epoll_open
+                .description
+                .read()
+                .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -2135,7 +2389,10 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             },
         );
         {
-            let open = epoll_open.description.read().expect("epoll open description");
+            let open = epoll_open
+                .description
+                .read()
+                .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -2200,7 +2457,10 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         assert_eq!(returned(h.call(57, [closing_dup as u64, 0, 0, 0, 0, 0])), 0);
         {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = epoll_open.description.read().expect("epoll open description");
+            let open = epoll_open
+                .description
+                .read()
+                .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -2243,7 +2503,10 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         );
         assert_eq!(returned(h.call(57, [survivor as u64, 0, 0, 0, 0, 0])), 0);
         let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-        let open = epoll_open.description.read().expect("epoll open description");
+        let open = epoll_open
+            .description
+            .read()
+            .expect("epoll open description");
         let OpenDescription::Epoll { interest, .. } = &*open else {
             panic!("epfd should be an epoll description");
         };
@@ -2455,7 +2718,8 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                                     libc::poll(&mut pfd, 1, ms);
                                 }
                             } else {
-                                let ms = timeout.map(|d| d.as_millis().min(50) as u64).unwrap_or(50);
+                                let ms =
+                                    timeout.map(|d| d.as_millis().min(50) as u64).unwrap_or(50);
                                 std::thread::sleep(Duration::from_millis(ms));
                             }
                         }
@@ -2658,7 +2922,8 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                                     libc::poll(&mut pfd, 1, ms);
                                 }
                             } else {
-                                let ms = timeout.map(|d| d.as_millis().min(50) as u64).unwrap_or(50);
+                                let ms =
+                                    timeout.map(|d| d.as_millis().min(50) as u64).unwrap_or(50);
                                 std::thread::sleep(Duration::from_millis(ms));
                             }
                         }
@@ -3069,8 +3334,8 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
     #[cfg(target_os = "macos")]
     #[test]
     fn host_syscall_result_translates_captured_host_errno() {
-        use carrick_vfs::errno::HostSyscallResult;
         use carrick_host_bsd::errno::linux_errno;
+        use carrick_vfs::errno::HostSyscallResult;
 
         carrick_portable::set_errno(libc::EINPROGRESS);
         let err = (-1i32).host_syscall_result().unwrap_err();
@@ -3124,7 +3389,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             }
         }
 
-    impl CurrentMmMemory for SharedOnly {}
+        impl CurrentMmMemory for SharedOnly {}
         // Software read fails, but the shared host pointer yields the word.
         let mem = SharedOnly { word: 0x00C0_FFEE };
         assert_eq!(read_futex_word(&mem, 0x0100_0160_0000), Ok(0x00C0_FFEE));
@@ -3319,7 +3584,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
             }
         }
 
-    impl CurrentMmMemory for SharedWord {}
+        impl CurrentMmMemory for SharedWord {}
         let mut memory = SharedWord { word: 0 };
         let location = carrick_guest_mem::SharedFutexLocation::Direct {
             word: HostVa(&memory.word as *const u32 as usize),
@@ -3775,7 +4040,10 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let description = &open_file.description;
 
         // The description answers without taking the backing lock...
-        assert_eq!(description.common().status_flags(), crate::linux_abi::LINUX_O_RDWR);
+        assert_eq!(
+            description.common().status_flags(),
+            crate::linux_abi::LINUX_O_RDWR
+        );
 
         description
             .common()
@@ -3795,12 +4063,19 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let description = std::sync::Arc::clone(&open_file.description);
 
         description.common().retain_fd_ref();
-        description.common().set_lease(crate::linux_abi::LINUX_F_WRLCK);
-        assert_eq!(description.common().lease(), crate::linux_abi::LINUX_F_WRLCK);
-        description.common().set_owner(crate::kernel::objects::AsyncIoOwner {
-            owner_type: 2,
-            owner_pid: 77,
-        });
+        description
+            .common()
+            .set_lease(crate::linux_abi::LINUX_F_WRLCK);
+        assert_eq!(
+            description.common().lease(),
+            crate::linux_abi::LINUX_F_WRLCK
+        );
+        description
+            .common()
+            .set_owner(crate::kernel::objects::AsyncIoOwner {
+                owner_type: 2,
+                owner_pid: 77,
+            });
         assert_eq!(
             description.common().owner(),
             crate::kernel::objects::AsyncIoOwner {
@@ -3808,7 +4083,9 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                 owner_pid: 77,
             }
         );
-        description.common().set_async_sig(carrick_abi::LINUX_SIGUSR2);
+        description
+            .common()
+            .set_async_sig(carrick_abi::LINUX_SIGUSR2);
         assert_eq!(description.common().async_sig(), carrick_abi::LINUX_SIGUSR2);
         description.common().set_seals(Some(0b0010));
         assert_eq!(description.common().seals(), Some(0b0010));
@@ -3817,10 +4094,14 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
 
         // Drain the backing to its Closed identity shell. Reaching this state used
         // to abort the process through OpenDescription::base().
-        *description.write().expect("open description write guard") = OpenDescription::Closed { was_epoll: false };
+        *description.write().expect("open description write guard") =
+            OpenDescription::Closed { was_epoll: false };
 
         assert_eq!(description.common().fd_refs(), 1);
-        assert_eq!(description.common().lease(), crate::linux_abi::LINUX_F_WRLCK);
+        assert_eq!(
+            description.common().lease(),
+            crate::linux_abi::LINUX_F_WRLCK
+        );
         assert_eq!(
             description.common().owner(),
             crate::kernel::objects::AsyncIoOwner {
@@ -3958,10 +4239,10 @@ mod hvpatch_in_process_fork_tests {
             })),
             crate::linux_abi::LINUX_O_RDWR,
         );
-        parent.captured_file_table().write_open_files().insert(
-            3,
-            OpenFile::new(Arc::clone(&description), 0),
-        );
+        parent
+            .captured_file_table()
+            .write_open_files()
+            .insert(3, OpenFile::new(Arc::clone(&description), 0));
         retain_open_file(&description);
         let parent_files = parent.captured_file_table();
         let parent_slot = parent_files
@@ -3990,7 +4271,14 @@ mod hvpatch_in_process_fork_tests {
                 &child_context,
                 SyscallRequest::new(
                     436,
-                    SyscallArgs::from([3, 3, carrick_abi::LINUX_CLOSE_RANGE_UNSHARE as u64, 0, 0, 0]),
+                    SyscallArgs::from([
+                        3,
+                        3,
+                        carrick_abi::LINUX_CLOSE_RANGE_UNSHARE as u64,
+                        0,
+                        0,
+                        0,
+                    ]),
                 ),
                 &mut memory,
                 &CompatReporter::default(),
@@ -3998,7 +4286,11 @@ mod hvpatch_in_process_fork_tests {
             .expect("close_range dispatch");
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
 
-        let child_successor = child.capture_one_task_context().unwrap().resources().files();
+        let child_successor = child
+            .capture_one_task_context()
+            .unwrap()
+            .resources()
+            .files();
         assert!(!Arc::ptr_eq(&parent_files, &child_successor));
         assert!(!child_successor.read_open_files().contains_key(&3));
         let parent_after = parent_files
@@ -4006,7 +4298,10 @@ mod hvpatch_in_process_fork_tests {
             .get(&3)
             .cloned()
             .expect("parent fd 3 retained");
-        assert!(Arc::ptr_eq(&parent_slot.description, &parent_after.description));
+        assert!(Arc::ptr_eq(
+            &parent_slot.description,
+            &parent_after.description
+        ));
         assert!(Arc::ptr_eq(&description, &parent_after.description));
         assert_eq!(parent_after.description.fd_ref_count(), 1);
     }
@@ -4125,14 +4420,7 @@ mod hvpatch_in_process_fork_tests {
                 &child_successor_context,
                 SyscallRequest::new(
                     25,
-                    SyscallArgs::from([
-                        read_fd,
-                        carrick_abi::LINUX_F_SETPIPE_SZ,
-                        131072,
-                        0,
-                        0,
-                        0,
-                    ]),
+                    SyscallArgs::from([read_fd, carrick_abi::LINUX_F_SETPIPE_SZ, 131072, 0, 0, 0]),
                 ),
                 &mut memory,
                 &reporter,
@@ -4146,14 +4434,7 @@ mod hvpatch_in_process_fork_tests {
                 &child_successor_context,
                 SyscallRequest::new(
                     25,
-                    SyscallArgs::from([
-                        read_fd,
-                        carrick_abi::LINUX_F_GETPIPE_SZ,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ]),
+                    SyscallArgs::from([read_fd, carrick_abi::LINUX_F_GETPIPE_SZ, 0, 0, 0, 0]),
                 ),
                 &mut memory,
                 &reporter,
@@ -4166,14 +4447,7 @@ mod hvpatch_in_process_fork_tests {
                 &child_successor_context,
                 SyscallRequest::new(
                     25,
-                    SyscallArgs::from([
-                        write_fd,
-                        carrick_abi::LINUX_F_GETPIPE_SZ,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ]),
+                    SyscallArgs::from([write_fd, carrick_abi::LINUX_F_GETPIPE_SZ, 0, 0, 0, 0]),
                 ),
                 &mut memory,
                 &reporter,
@@ -4215,11 +4489,7 @@ mod hvpatch_in_process_fork_tests {
                 ),
                 &mut memory,
                 &CompatReporter::default(),
-                ThreadCtx::new(
-                    transport_tid,
-                    &registry,
-                    &crate::thread::FutexTable::new(),
-                ),
+                ThreadCtx::new(transport_tid, &registry, &crate::thread::FutexTable::new()),
             )
             .unwrap();
 
@@ -4324,13 +4594,16 @@ mod hvpatch_in_process_fork_tests {
             crate::linux_abi::LINUX_O_RDWR,
         );
 
-        parent.captured_file_table().write_open_files().insert(
-            3,
-            OpenFile::new(Arc::clone(&desc_non_cloexec), 0),
-        );
+        parent
+            .captured_file_table()
+            .write_open_files()
+            .insert(3, OpenFile::new(Arc::clone(&desc_non_cloexec), 0));
         parent.captured_file_table().write_open_files().insert(
             4,
-            OpenFile::new(Arc::clone(&desc_cloexec), crate::linux_abi::LINUX_FD_CLOEXEC),
+            OpenFile::new(
+                Arc::clone(&desc_cloexec),
+                crate::linux_abi::LINUX_FD_CLOEXEC,
+            ),
         );
 
         let (child, _child_context) = fork_dispatcher(&parent, parent_tid, child_tid, 51, 52);
@@ -4567,7 +4840,11 @@ mod hvpatch_in_process_fork_tests {
         let fd = dispatcher
             .install_fd_at_or_above(
                 3,
-                OpenFile::from_open_description_with_status_flags(Arc::clone(&description), crate::linux_abi::LINUX_O_RDONLY, 0),
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::clone(&description),
+                    crate::linux_abi::LINUX_O_RDONLY,
+                    0,
+                ),
             )
             .unwrap();
         let parent_tid = crate::thread::ThreadId::synthetic_for_tests(5200);
@@ -5226,14 +5503,7 @@ mod tests {
             );
             assert_eq!(
                 observer.args.lock().as_slice(),
-                &[SyscallArgs::from([
-                    fd as u64,
-                    0x4000_0000,
-                    8,
-                    0,
-                    0,
-                    0
-                ])]
+                &[SyscallArgs::from([fd as u64, 0x4000_0000, 8, 0, 0, 0])]
             );
         }
     }
@@ -5321,8 +5591,8 @@ mod tests {
         );
     }
 
-#[test]
-fn dispatcher_fork_clone_splits_process_state_without_duping_descriptions() {
+    #[test]
+    fn dispatcher_fork_clone_splits_process_state_without_duping_descriptions() {
         super::hvpatch_in_process_fork_tests::dispatcher_fork_clone_splits_process_state_without_duping_descriptions();
     }
 }
@@ -5669,24 +5939,21 @@ mod container_policy_dispatch_tests {
         let dispatcher = SyscallDispatcher::new();
         let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
         let child_mm_id = crate::kernel::MmId::from_raw_u64(2).unwrap();
-        let prepared = dispatcher.prepare_fork_mm(
-            parent_mm_id,
-            child_mm_id,
-            crate::kernel::CloneObjectMode::Copy,
-        ).unwrap();
+        let prepared = dispatcher
+            .prepare_fork_mm(
+                parent_mm_id,
+                child_mm_id,
+                crate::kernel::CloneObjectMode::Copy,
+            )
+            .unwrap();
 
         let replacement = Arc::new(DispatchMmAuthority::new_for_test_with_revision(
             prepared.parent_revision,
         ));
         dispatcher.replace_current_mm_for_test(replacement);
 
-        let result = dispatcher.fork_clone_with_prepared_mm(
-            parent_mm_id,
-            child_mm_id,
-            100,
-            101,
-            prepared,
-        );
+        let result =
+            dispatcher.fork_clone_with_prepared_mm(parent_mm_id, child_mm_id, 100, 101, prepared);
         assert!(matches!(
             result,
             Err(crate::kernel::SnapshotError::ChangedDuringObservation)
@@ -5697,11 +5964,13 @@ mod container_policy_dispatch_tests {
     fn prepared_fork_mm_clone_vm_uses_exact_dispatch_mm_authority_arc() {
         let dispatcher = SyscallDispatcher::new();
         let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
-        let prepared = dispatcher.prepare_fork_mm(
-            parent_mm_id,
-            parent_mm_id,
-            crate::kernel::CloneObjectMode::Share,
-        ).unwrap();
+        let prepared = dispatcher
+            .prepare_fork_mm(
+                parent_mm_id,
+                parent_mm_id,
+                crate::kernel::CloneObjectMode::Share,
+            )
+            .unwrap();
 
         assert!(Arc::ptr_eq(&prepared.parent_mm, &prepared.child_mm));
         assert!(prepared.fork_projection_plan().is_shared());
@@ -5740,9 +6009,8 @@ mod container_policy_dispatch_tests {
         let mut child_executor = child_dispatcher
             .enter_mm_executor()
             .expect("admit child MM executor");
-        let registry = crate::thread::ThreadRegistry::new(
-            crate::thread::ThreadId::synthetic_for_tests(101),
-        );
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(101));
         let futex = crate::thread::FutexTable::new();
         let reporter = CompatReporter::default();
         let mut memory = LinearMemory::new(0x10000, vec![0; 0x1000]);
@@ -5792,7 +6060,9 @@ mod container_policy_dispatch_tests {
             peer
         });
         crate::dispatch::mm_quiesce::with_sole_mm_stage1(&mut sole_executor, |_authority| {
-            attempted_rx.recv().expect("peer attempts exact-MM admission");
+            attempted_rx
+                .recv()
+                .expect("peer attempts exact-MM admission");
             assert_eq!(
                 admitted_rx.recv_timeout(std::time::Duration::from_millis(25)),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout),
@@ -5811,11 +6081,13 @@ mod container_policy_dispatch_tests {
         let dispatcher = Arc::new(SyscallDispatcher::new());
         let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
         let child_mm_id = crate::kernel::MmId::from_raw_u64(2).unwrap();
-        let prepared = dispatcher.prepare_fork_mm(
-            parent_mm_id,
-            child_mm_id,
-            crate::kernel::CloneObjectMode::Copy,
-        ).unwrap();
+        let prepared = dispatcher
+            .prepare_fork_mm(
+                parent_mm_id,
+                child_mm_id,
+                crate::kernel::CloneObjectMode::Copy,
+            )
+            .unwrap();
         let install_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
@@ -5866,11 +6138,13 @@ mod container_policy_dispatch_tests {
         let parent_mm_id = crate::kernel::MmId::from_raw_u64(42).unwrap();
         let child_mm_id = crate::kernel::MmId::from_raw_u64(43).unwrap();
         let wrong_mm_id = crate::kernel::MmId::from_raw_u64(44).unwrap();
-        let prepared = dispatcher.prepare_fork_mm(
-            parent_mm_id,
-            child_mm_id,
-            crate::kernel::CloneObjectMode::Copy,
-        ).unwrap();
+        let prepared = dispatcher
+            .prepare_fork_mm(
+                parent_mm_id,
+                child_mm_id,
+                crate::kernel::CloneObjectMode::Copy,
+            )
+            .unwrap();
 
         assert_eq!(prepared.parent_mm_id, parent_mm_id);
         let request_plan = prepared.fork_projection_plan();
@@ -5880,13 +6154,8 @@ mod container_policy_dispatch_tests {
         assert_ne!(request_plan.parent_mm(), request_plan.child_mm());
         assert!(!Arc::ptr_eq(&prepared.parent_mm, &prepared.child_mm));
 
-        let result = dispatcher.fork_clone_with_prepared_mm(
-            wrong_mm_id,
-            child_mm_id,
-            100,
-            101,
-            prepared,
-        );
+        let result =
+            dispatcher.fork_clone_with_prepared_mm(wrong_mm_id, child_mm_id, 100, 101, prepared);
         assert!(matches!(
             result,
             Err(crate::kernel::SnapshotError::ChangedDuringObservation)
@@ -5946,24 +6215,24 @@ mod container_policy_dispatch_tests {
     #[test]
     fn prepared_fork_mm_copied_child_authority_is_independent_of_parent() {
         let dispatcher = SyscallDispatcher::new();
-        dispatcher.set_address_space_regions(vec![
-            carrick_vfs::ProcMapsEntry {
-                start: 0x10000,
-                end: 0x20000,
-                read: true,
-                write: true,
-                execute: false,
-                sharing: carrick_vfs::ProcMapSharing::Private,
-                path: "[anon]".to_string(),
-            },
-        ]);
+        dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
+            start: 0x10000,
+            end: 0x20000,
+            read: true,
+            write: true,
+            execute: false,
+            sharing: carrick_vfs::ProcMapSharing::Private,
+            path: "[anon]".to_string(),
+        }]);
         let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
         let child_mm_id = crate::kernel::MmId::from_raw_u64(2).unwrap();
-        let prepared = dispatcher.prepare_fork_mm(
-            parent_mm_id,
-            child_mm_id,
-            crate::kernel::CloneObjectMode::Copy,
-        ).unwrap();
+        let prepared = dispatcher
+            .prepare_fork_mm(
+                parent_mm_id,
+                child_mm_id,
+                crate::kernel::CloneObjectMode::Copy,
+            )
+            .unwrap();
         let child_dispatcher = dispatcher
             .fork_clone_with_prepared_mm(parent_mm_id, child_mm_id, 100, 101, prepared)
             .expect("install copied fork mm");
@@ -5994,23 +6263,44 @@ mod container_policy_dispatch_tests {
             "[anon]".to_string(),
         );
         let parent_state = Arc::clone(&dispatcher.mem().lock().deferred_anonymous);
-        parent_state.reserve_fresh(GuestVa(0x10000), 0x3000).unwrap();
+        parent_state
+            .reserve_fresh(GuestVa(0x10000), 0x3000)
+            .unwrap();
         for page in [0x10000, 0x11000, 0x12000] {
-            assert!(parent_state.copy_pristine_zero(GuestVa(page), &mut [1; 4]).unwrap());
+            assert!(
+                parent_state
+                    .copy_pristine_zero(GuestVa(page), &mut [1; 4])
+                    .unwrap()
+            );
         }
         let before = parent_state.snapshot();
         let parent_mm = crate::kernel::MmId::from_raw_u64(1).unwrap();
         let child_mm = crate::kernel::MmId::from_raw_u64(2).unwrap();
-        let prepared = dispatcher.prepare_fork_mm(parent_mm, child_mm, crate::kernel::CloneObjectMode::Copy).unwrap();
-        let child = dispatcher.fork_clone_with_prepared_mm(parent_mm, child_mm, 100, 101, prepared).unwrap();
+        let prepared = dispatcher
+            .prepare_fork_mm(parent_mm, child_mm, crate::kernel::CloneObjectMode::Copy)
+            .unwrap();
+        let child = dispatcher
+            .fork_clone_with_prepared_mm(parent_mm, child_mm, 100, 101, prepared)
+            .unwrap();
         let child_state = Arc::clone(&child.mem().lock().deferred_anonymous);
         assert!(!Arc::ptr_eq(&parent_state, &child_state));
         assert_eq!(child_state.snapshot(), before);
         child_state.retire(GuestVa(0x10000), 0x1000).unwrap();
         assert_eq!(parent_state.snapshot(), before);
-        parent_state.begin_materialization(GuestVa(0x12000), 0x1000).unwrap().commit();
-        assert!(child_state.copy_pristine_zero(GuestVa(0x12000), &mut [1; 4]).unwrap());
-        assert!(!parent_state.copy_pristine_zero(GuestVa(0x12000), &mut [1; 4]).unwrap());
+        parent_state
+            .begin_materialization(GuestVa(0x12000), 0x1000)
+            .unwrap()
+            .commit();
+        assert!(
+            child_state
+                .copy_pristine_zero(GuestVa(0x12000), &mut [1; 4])
+                .unwrap()
+        );
+        assert!(
+            !parent_state
+                .copy_pristine_zero(GuestVa(0x12000), &mut [1; 4])
+                .unwrap()
+        );
     }
 
     #[test]
@@ -6024,24 +6314,60 @@ mod container_policy_dispatch_tests {
             "[anon]".to_string(),
         );
         let parent_state = Arc::clone(&dispatcher.mem().lock().deferred_anonymous);
-        parent_state.reserve_fresh(GuestVa(0x10000), 0x3000).unwrap();
+        parent_state
+            .reserve_fresh(GuestVa(0x10000), 0x3000)
+            .unwrap();
         for page in [0x10000, 0x11000, 0x12000] {
-            assert!(parent_state.copy_pristine_zero(GuestVa(page), &mut [1; 4]).unwrap());
+            assert!(
+                parent_state
+                    .copy_pristine_zero(GuestVa(page), &mut [1; 4])
+                    .unwrap()
+            );
         }
-        dispatcher.update_madvise_vma_policy(0x10000, 0x1000, Some(carrick_abi::VmaForkCopyPolicy::Omit), None, None);
-        dispatcher.update_madvise_vma_policy(0x11000, 0x1000, None, Some(carrick_abi::VmaForkChildPolicy::ZeroInChild), None);
+        dispatcher.update_madvise_vma_policy(
+            0x10000,
+            0x1000,
+            Some(carrick_abi::VmaForkCopyPolicy::Omit),
+            None,
+            None,
+        );
+        dispatcher.update_madvise_vma_policy(
+            0x11000,
+            0x1000,
+            None,
+            Some(carrick_abi::VmaForkChildPolicy::ZeroInChild),
+            None,
+        );
         let before = parent_state.snapshot();
         let parent_mm = crate::kernel::MmId::from_raw_u64(1).unwrap();
         let child_mm = crate::kernel::MmId::from_raw_u64(2).unwrap();
-        let prepared = dispatcher.prepare_fork_mm(parent_mm, child_mm, crate::kernel::CloneObjectMode::Copy).unwrap();
-        let child = dispatcher.fork_clone_with_prepared_mm(parent_mm, child_mm, 100, 101, prepared).unwrap();
+        let prepared = dispatcher
+            .prepare_fork_mm(parent_mm, child_mm, crate::kernel::CloneObjectMode::Copy)
+            .unwrap();
+        let child = dispatcher
+            .fork_clone_with_prepared_mm(parent_mm, child_mm, 100, 101, prepared)
+            .unwrap();
         let child_state = Arc::clone(&child.mem().lock().deferred_anonymous);
-        assert_eq!(child_state.snapshot().pristine, vec![GuestVa(0x11000)..GuestVa(0x13000)]);
-        assert_eq!(child_state.snapshot().zero_read_resident, vec![GuestVa(0x12000)..GuestVa(0x13000)]);
+        assert_eq!(
+            child_state.snapshot().pristine,
+            vec![GuestVa(0x11000)..GuestVa(0x13000)]
+        );
+        assert_eq!(
+            child_state.snapshot().zero_read_resident,
+            vec![GuestVa(0x12000)..GuestVa(0x13000)]
+        );
         let mut bytes = [7; 4];
-        assert!(!child_state.copy_pristine_zero(GuestVa(0x10000), &mut bytes).unwrap());
+        assert!(
+            !child_state
+                .copy_pristine_zero(GuestVa(0x10000), &mut bytes)
+                .unwrap()
+        );
         assert_eq!(bytes, [7; 4]);
-        assert!(child_state.copy_pristine_zero(GuestVa(0x11000), &mut bytes).unwrap());
+        assert!(
+            child_state
+                .copy_pristine_zero(GuestVa(0x11000), &mut bytes)
+                .unwrap()
+        );
         assert_eq!(bytes, [0; 4]);
         assert_eq!(parent_state.snapshot(), before);
     }
@@ -6089,11 +6415,13 @@ mod container_policy_dispatch_tests {
 
         let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
         let child_mm_id = crate::kernel::MmId::from_raw_u64(2).unwrap();
-        let prepared = dispatcher.prepare_fork_mm(
-            parent_mm_id,
-            child_mm_id,
-            crate::kernel::CloneObjectMode::Copy,
-        ).unwrap();
+        let prepared = dispatcher
+            .prepare_fork_mm(
+                parent_mm_id,
+                child_mm_id,
+                crate::kernel::CloneObjectMode::Copy,
+            )
+            .unwrap();
         let plan = prepared.fork_projection_plan();
         let ranges = plan.ranges();
 
@@ -6116,14 +6444,8 @@ mod container_policy_dispatch_tests {
         );
 
         // Gap/hole between 0x14000 and 0x20000 must be absent (None, never defaulting to Preserve)
-        assert_eq!(
-            carrick_hal::lookup_fork_projection(ranges, 0x15000),
-            None
-        );
-        assert_eq!(
-            carrick_hal::lookup_fork_projection(ranges, 0x1f000),
-            None
-        );
+        assert_eq!(carrick_hal::lookup_fork_projection(ranges, 0x15000), None);
+        assert_eq!(carrick_hal::lookup_fork_projection(ranges, 0x1f000), None);
     }
 
     #[test]
@@ -6160,11 +6482,7 @@ mod container_policy_dispatch_tests {
         dispatcher.with_vma_dispatch_for_test(|_vma| {
             let authority = dispatcher.mem();
             let mut state = authority.lock();
-            mem::update_semantic_heap_pages(
-                &mut state,
-                heap_base + 0x3000,
-                heap_base + 0x1000,
-            );
+            mem::update_semantic_heap_pages(&mut state, heap_base + 0x3000, heap_base + 0x1000);
             state.brk_current = heap_base + 0x1000;
         });
         assert!(dispatcher.mem().vma_revision().raw() > grown_revision.raw());
@@ -6176,10 +6494,7 @@ mod container_policy_dispatch_tests {
             )
             .unwrap();
         assert_eq!(
-            carrick_hal::lookup_fork_projection(
-                shrunk.fork_projection_plan().ranges(),
-                heap_base,
-            ),
+            carrick_hal::lookup_fork_projection(shrunk.fork_projection_plan().ranges(), heap_base,),
             Some(carrick_hal::ForkLeafDisposition::Preserve)
         );
         assert_eq!(
@@ -6209,11 +6524,7 @@ mod container_policy_dispatch_tests {
         tail.fork_policy.child_contents = carrick_abi::VmaForkChildPolicy::ZeroInChild;
         tail.droppable = true;
 
-        mem::update_semantic_heap_pages(
-            &mut state,
-            heap_base + 0x1000,
-            heap_base + 0x3000,
-        );
+        mem::update_semantic_heap_pages(&mut state, heap_base + 0x1000, heap_base + 0x3000);
         let grown = state
             .semantic_vmas
             .iter()
@@ -6229,8 +6540,8 @@ mod container_policy_dispatch_tests {
     #[test]
     fn fork_projection_rejects_invalid_gapped_overflow_unaligned_overlapping_fail_closed() {
         use carrick_hal::{
-            validate_fork_projection, validate_total_fork_projection, ForkLeafDisposition,
-            ForkProjectionError, ForkProjectionRange,
+            ForkLeafDisposition, ForkProjectionError, ForkProjectionRange,
+            validate_fork_projection, validate_total_fork_projection,
         };
 
         // Zero length
@@ -6348,19 +6659,23 @@ mod container_policy_dispatch_tests {
     #[test]
     fn fork_projection_invalid_semantic_vma_is_rejected_by_prepare() {
         let dispatcher = SyscallDispatcher::new();
-        dispatcher.mem().lock().semantic_vmas.push(mem::SemanticVma {
-            start: 0x1001,
-            end: 0x2000,
-            read: true,
-            write: true,
-            execute: false,
-            provenance: mem::VmaBackingProvenance::PrivateAnonymous,
-            fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
-            dump_policy: carrick_abi::VmaDumpPolicy::Include,
-            droppable: false,
-            path: "[invalid]".to_owned(),
-            file_page_offset: None,
-        });
+        dispatcher
+            .mem()
+            .lock()
+            .semantic_vmas
+            .push(mem::SemanticVma {
+                start: 0x1001,
+                end: 0x2000,
+                read: true,
+                write: true,
+                execute: false,
+                provenance: mem::VmaBackingProvenance::PrivateAnonymous,
+                fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+                dump_policy: carrick_abi::VmaDumpPolicy::Include,
+                droppable: false,
+                path: "[invalid]".to_owned(),
+                file_page_offset: None,
+            });
         let parent_mm_id = crate::kernel::MmId::from_raw_u64(1).unwrap();
         assert!(matches!(
             dispatcher.prepare_fork_mm(
@@ -6382,8 +6697,8 @@ mod container_clock_tests {
     //! task and therefore its own `Container`; the clock a handler reads must
     //! be that container's `ClockDomain`, never a process static.
     use super::*;
-    use carrick_abi::*;
     use crate::compat::CompatReporter;
+    use carrick_abi::*;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     const SYS_TIMERFD_CREATE: u64 = 85;
@@ -6414,7 +6729,10 @@ mod container_clock_tests {
         );
     }
 
-    fn realtime_via_syscall(dispatcher: &mut SyscallDispatcher, memory: &mut LinearMemory) -> Duration {
+    fn realtime_via_syscall(
+        dispatcher: &mut SyscallDispatcher,
+        memory: &mut LinearMemory,
+    ) -> Duration {
         let reporter = CompatReporter::default();
         let outcome = dispatcher
             .dispatch(
@@ -6428,7 +6746,9 @@ mod container_clock_tests {
             )
             .expect("dispatch clock_gettime");
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
-        let bytes = memory.read_bytes(TIMESPEC_ADDR, 16).expect("timespec bytes");
+        let bytes = memory
+            .read_bytes(TIMESPEC_ADDR, 16)
+            .expect("timespec bytes");
         let secs = i64::from_le_bytes(bytes[0..8].try_into().expect("tv_sec"));
         let nanos = i64::from_le_bytes(bytes[8..16].try_into().expect("tv_nsec"));
         Duration::new(secs as u64, nanos as u32)
@@ -6454,9 +6774,21 @@ mod container_clock_tests {
             .clock()
             .set_realtime_offset_ns(OFFSET.as_nanos() as i64);
 
-        assert_within(realtime_via_syscall(&mut a, &mut memory), wall_now(), "A follows the wall clock");
-        assert_within(realtime_via_syscall(&mut b, &mut memory), wall_now() + OFFSET, "B is shifted by its own domain");
-        assert_within(realtime_via_syscall(&mut a, &mut memory), wall_now(), "A is untouched by B's offset");
+        assert_within(
+            realtime_via_syscall(&mut a, &mut memory),
+            wall_now(),
+            "A follows the wall clock",
+        );
+        assert_within(
+            realtime_via_syscall(&mut b, &mut memory),
+            wall_now() + OFFSET,
+            "B is shifted by its own domain",
+        );
+        assert_within(
+            realtime_via_syscall(&mut a, &mut memory),
+            wall_now(),
+            "A is untouched by B's offset",
+        );
     }
 
     #[test]
@@ -6485,8 +6817,16 @@ mod container_clock_tests {
             .expect("dispatch clock_settime");
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
 
-        assert_within(realtime_via_syscall(&mut a, &mut memory), wall_now() + AHEAD, "A moved");
-        assert_within(realtime_via_syscall(&mut b, &mut memory), wall_now(), "B did not move");
+        assert_within(
+            realtime_via_syscall(&mut a, &mut memory),
+            wall_now() + AHEAD,
+            "A moved",
+        );
+        assert_within(
+            realtime_via_syscall(&mut b, &mut memory),
+            wall_now(),
+            "B did not move",
+        );
         assert_eq!(
             b.capture_one_task_context()
                 .expect("b context")
@@ -6590,7 +6930,12 @@ mod container_clock_tests {
             )
             .expect("dispatch clock_adjtime");
 
-        assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_OK });
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: LINUX_TIME_OK
+            }
+        );
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).expect("read timex");
         assert_eq!({ read.offset }, 0);
         assert_eq!({ read.freq }, 0);
@@ -6630,7 +6975,12 @@ mod container_clock_tests {
                 &reporter,
             )
             .expect("dispatch clock_adjtime");
-        assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_ERROR });
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: LINUX_TIME_ERROR
+            }
+        );
 
         // Subsequent read-only call must now report TIME_ERROR because STA_UNSYNC is set
         timex.modes = 0;
@@ -6648,7 +6998,12 @@ mod container_clock_tests {
                 &reporter,
             )
             .expect("dispatch clock_adjtime");
-        assert_eq!(read_outcome, DispatchOutcome::Returned { value: LINUX_TIME_ERROR });
+        assert_eq!(
+            read_outcome,
+            DispatchOutcome::Returned {
+                value: LINUX_TIME_ERROR
+            }
+        );
     }
 
     #[test]
@@ -6713,7 +7068,15 @@ mod container_clock_tests {
         timex.offset = 42_000;
         memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
         dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
             .unwrap();
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
         assert_eq!({ read.offset }, 42_000);
@@ -6723,7 +7086,15 @@ mod container_clock_tests {
         timex.freq = 12_345;
         memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
         dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
             .unwrap();
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
         assert_eq!({ read.freq }, 12_345);
@@ -6733,7 +7104,15 @@ mod container_clock_tests {
         timex.maxerror = 500_000;
         memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
         dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
             .unwrap();
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
         assert_eq!({ read.maxerror }, 500_000);
@@ -6743,7 +7122,15 @@ mod container_clock_tests {
         timex.esterror = 250_000;
         memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
         dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
             .unwrap();
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
         assert_eq!({ read.esterror }, 250_000);
@@ -6753,7 +7140,15 @@ mod container_clock_tests {
         timex.constant = 8;
         memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
         dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
             .unwrap();
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
         assert_eq!({ read.constant }, 8);
@@ -6763,7 +7158,15 @@ mod container_clock_tests {
         timex.constant = 37;
         memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
         dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
             .unwrap();
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
         assert_eq!({ read.tai }, 37);
@@ -6773,7 +7176,15 @@ mod container_clock_tests {
         timex.tick = 10_500;
         memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
         dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
             .unwrap();
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
         assert_eq!({ read.tick }, 10_500);
@@ -6783,16 +7194,35 @@ mod container_clock_tests {
         timex.status = LINUX_STA_PLL | LINUX_STA_PPSFREQ;
         memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
         dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
             .unwrap();
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
-        assert_eq!({ read.status } & (LINUX_STA_PLL | LINUX_STA_PPSFREQ), LINUX_STA_PLL | LINUX_STA_PPSFREQ);
+        assert_eq!(
+            { read.status } & (LINUX_STA_PLL | LINUX_STA_PPSFREQ),
+            LINUX_STA_PLL | LINUX_STA_PPSFREQ
+        );
 
         // 9. ADJ_NANO
         timex.modes = LINUX_ADJ_NANO;
         memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
         dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
             .unwrap();
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
         assert_ne!({ read.status } & LINUX_STA_NANO, 0);
@@ -6801,7 +7231,15 @@ mod container_clock_tests {
         timex.modes = LINUX_ADJ_MICRO;
         memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
         dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
             .unwrap();
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
         assert_eq!({ read.status } & LINUX_STA_NANO, 0);
@@ -6832,7 +7270,12 @@ mod container_clock_tests {
                 &reporter,
             )
             .expect("dispatch clock_adjtime");
-        assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_OK });
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: LINUX_TIME_OK
+            }
+        );
 
         let offset_ns = context.task().container().clock().realtime_offset_ns();
         assert_eq!(offset_ns, 100 * 1_000_000_000 + 500_000 * 1_000);
@@ -6864,7 +7307,12 @@ mod container_clock_tests {
                 &reporter,
             )
             .expect("dispatch clock_adjtime");
-        assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_OK });
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: LINUX_TIME_OK
+            }
+        );
 
         let offset_ns = context.task().container().clock().realtime_offset_ns();
         assert_eq!(offset_ns, 50_000 * 1_000);
@@ -6884,7 +7332,12 @@ mod container_clock_tests {
                 &reporter,
             )
             .expect("dispatch clock_adjtime");
-        assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_OK });
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: LINUX_TIME_OK
+            }
+        );
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
         assert_eq!({ read.offset }, 0);
     }
@@ -6907,12 +7360,23 @@ mod container_clock_tests {
             timex.freq = bad_freq;
             memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
             let outcome = dispatcher
-                .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        SYS_CLOCK_ADJTIME,
+                        SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
                 .unwrap();
             assert_ne!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
             let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
             let read_freq = { read.freq };
-            assert_eq!(read_freq, clamped, "freq {bad_freq} must clamp to {clamped}");
+            assert_eq!(
+                read_freq, clamped,
+                "freq {bad_freq} must clamp to {clamped}"
+            );
         }
 
         // Out-of-range singleshot offset
@@ -6922,7 +7386,15 @@ mod container_clock_tests {
             timex.offset = bad_offset;
             memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
             let outcome = dispatcher
-                .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        SYS_CLOCK_ADJTIME,
+                        SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
                 .unwrap();
             assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
         }
@@ -6934,12 +7406,24 @@ mod container_clock_tests {
         timex.status = 1 << 20;
         memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
         let outcome = dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
             .unwrap();
         assert_ne!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
         let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
         let read_status = { read.status };
-        assert_eq!(read_status & (1 << 20), 0, "undefined status bit must be dropped");
+        assert_eq!(
+            read_status & (1 << 20),
+            0,
+            "undefined status bit must be dropped"
+        );
 
         // Invalid SETOFFSET tv_usec
         for bad_usec in [-1, 1_000_000] {
@@ -6947,21 +7431,44 @@ mod container_clock_tests {
             timex.modes = LINUX_ADJ_SETOFFSET;
             memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
             let outcome = dispatcher
-                .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        SYS_CLOCK_ADJTIME,
+                        SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
                 .unwrap();
             assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
         }
 
         // MICRO|NANO together and TAI|TIMECONST together are accepted
         // (oracle); neither is EINVAL.
-        for modes in [LINUX_ADJ_MICRO | LINUX_ADJ_NANO, LINUX_ADJ_TAI | LINUX_ADJ_TIMECONST] {
+        for modes in [
+            LINUX_ADJ_MICRO | LINUX_ADJ_NANO,
+            LINUX_ADJ_TAI | LINUX_ADJ_TIMECONST,
+        ] {
             let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
             timex.modes = modes;
             memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
             let outcome = dispatcher
-                .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        SYS_CLOCK_ADJTIME,
+                        SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
                 .unwrap();
-            assert_ne!(outcome, DispatchOutcome::errno(LINUX_EINVAL), "modes {modes:#x}");
+            assert_ne!(
+                outcome,
+                DispatchOutcome::errno(LINUX_EINVAL),
+                "modes {modes:#x}"
+            );
         }
 
         // Singleshot flag without OFFSET
@@ -6969,7 +7476,15 @@ mod container_clock_tests {
         timex.modes = LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY;
         memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
         let outcome = dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
             .unwrap();
         assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
     }
@@ -6994,7 +7509,10 @@ mod container_clock_tests {
         let fd = match dispatcher
             .dispatch(
                 &context,
-                SyscallRequest::new(SYS_TIMERFD_CREATE, SyscallArgs([LINUX_CLOCK_REALTIME, flags, 0, 0, 0, 0])),
+                SyscallRequest::new(
+                    SYS_TIMERFD_CREATE,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, flags, 0, 0, 0, 0]),
+                ),
                 memory,
                 &reporter,
             )
@@ -7007,14 +7525,23 @@ mod container_clock_tests {
         let mut spec = [0u8; 32];
         spec[16..24].copy_from_slice(&(deadline.as_secs() as i64).to_le_bytes());
         spec[24..32].copy_from_slice(&i64::from(deadline.subsec_nanos()).to_le_bytes());
-        memory.write_bytes(ITIMERSPEC_ADDR, &spec).expect("write itimerspec");
+        memory
+            .write_bytes(ITIMERSPEC_ADDR, &spec)
+            .expect("write itimerspec");
         assert_eq!(
             dispatcher
                 .dispatch(
                     &context,
                     SyscallRequest::new(
                         SYS_TIMERFD_SETTIME,
-                        SyscallArgs([fd, LinuxTfdFlags::TIMER_ABSTIME.bits(), ITIMERSPEC_ADDR, 0, 0, 0]),
+                        SyscallArgs([
+                            fd,
+                            LinuxTfdFlags::TIMER_ABSTIME.bits(),
+                            ITIMERSPEC_ADDR,
+                            0,
+                            0,
+                            0
+                        ]),
                     ),
                     memory,
                     &reporter,
@@ -7052,8 +7579,16 @@ mod container_clock_tests {
             .clock()
             .set_realtime_offset_ns(Duration::from_secs(7200).as_nanos() as i64);
 
-        assert_eq!(timerfd_ready_count(&timer_a), 1, "A's timerfd follows A's clock");
-        assert_eq!(timerfd_ready_count(&timer_b), 0, "B's timerfd is bound to B's clock");
+        assert_eq!(
+            timerfd_ready_count(&timer_a),
+            1,
+            "A's timerfd follows A's clock"
+        );
+        assert_eq!(
+            timerfd_ready_count(&timer_b),
+            0,
+            "B's timerfd is bound to B's clock"
+        );
     }
 
     #[test]
@@ -7143,7 +7678,10 @@ mod container_clock_tests {
             second_deadline,
             LINUX_TFD_NONBLOCK,
         );
-        assert_eq!(reused_fd, fd, "timerfd slot must be reused for this regression");
+        assert_eq!(
+            reused_fd, fd,
+            "timerfd slot must be reused for this regression"
+        );
         assert!(
             !Arc::ptr_eq(&old_description, &new_description),
             "the reused slot must name a different file description"
@@ -7154,13 +7692,19 @@ mod container_clock_tests {
             .container()
             .clock()
             .set_realtime_offset_ns(Duration::from_secs(7200).as_nanos() as i64);
-        assert_eq!(timerfd_ready_count(&new_state), 0, "new timer must remain unready");
+        assert_eq!(
+            timerfd_ready_count(&new_state),
+            0,
+            "new timer must remain unready"
+        );
 
         match blocked_read.complete(&mut memory) {
             super::format_time::TimerFdReadStep::Done(DispatchOutcome::Returned { value }) => {
                 assert_eq!(value, 8)
             }
-            other => panic!("old timerfd continuation did not complete from its own timer: {other:?}"),
+            other => {
+                panic!("old timerfd continuation did not complete from its own timer: {other:?}")
+            }
         }
         let expirations = u64::from_le_bytes(
             memory
@@ -7175,7 +7719,10 @@ mod container_clock_tests {
             dispatcher
                 .dispatch(
                     &context,
-                    SyscallRequest::new(SYS_READ, SyscallArgs([reused_fd, TIMESPEC_ADDR, 8, 0, 0, 0])),
+                    SyscallRequest::new(
+                        SYS_READ,
+                        SyscallArgs([reused_fd, TIMESPEC_ADDR, 8, 0, 0, 0])
+                    ),
                     &mut memory,
                     &reporter,
                 )
@@ -7230,7 +7777,9 @@ fn synthetic_proc_snapshot_and_in_process_fork_do_not_deadlock() {
         let acquirer_dispatcher = Arc::clone(&dispatcher);
         proc_acquirer = Some(std::thread::spawn(move || {
             let _proc = acquirer_dispatcher.proc.lock();
-            acquired.send(()).expect("announce process lock acquisition");
+            acquired
+                .send(())
+                .expect("announce process lock acquisition");
         }));
 
         let acquired_while_alias_held = acquisition
@@ -7326,7 +7875,10 @@ mod container_caps_tests {
             "the container's own CAP_SYS_ADMIN lifts the denial"
         );
         let bit = 1u64 << CAP_SYS_ADMIN;
-        assert_ne!(container_with(&["SYS_ADMIN"]).granted_caps().effective & bit, 0);
+        assert_ne!(
+            container_with(&["SYS_ADMIN"]).granted_caps().effective & bit,
+            0
+        );
         assert_eq!(container_with(&[]).granted_caps().effective & bit, 0);
     }
 }
@@ -7344,9 +7896,7 @@ fn a_backing_with_no_open_description_answers_generic_questions_without_aborting
             false
         }
 
-        fn epoll_targets(
-            &self,
-        ) -> Option<Vec<std::sync::Arc<crate::kernel::FileDescription>>> {
+        fn epoll_targets(&self) -> Option<Vec<std::sync::Arc<crate::kernel::FileDescription>>> {
             None
         }
 
@@ -7483,7 +8033,10 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
         .expect("install pipe pair");
 
     let read_description = parent.open_file(read_fd).expect("read file").description();
-    let write_description = parent.open_file(write_fd).expect("write file").description();
+    let write_description = parent
+        .open_file(write_fd)
+        .expect("write file")
+        .description();
 
     let read_poll_fd = pipe.read_poll_fd().expect("read poll fd").raw();
     let write_poll_fd = pipe.write_poll_fd().expect("write poll fd").raw();
@@ -7510,7 +8063,8 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
     // without duplicating backing pipe endpoints or perturbing readiness.
     let parent_tid = crate::thread::ThreadId::synthetic_for_tests(6000);
     let child_tid = crate::thread::ThreadId::synthetic_for_tests(6001);
-    let (child, _) = hvpatch_in_process_fork_tests::fork_dispatcher(&parent, parent_tid, child_tid, 71, 72);
+    let (child, _) =
+        hvpatch_in_process_fork_tests::fork_dispatcher(&parent, parent_tid, child_tid, 71, 72);
 
     assert_eq!(read_description.common().fd_refs(), 2);
     assert_eq!(write_description.common().fd_refs(), 2);
@@ -7710,8 +8264,13 @@ mod scm_rights_tests {
         }
 
         fn received_fds(&self) -> Vec<i32> {
-            let controllen =
-                u64::from_ne_bytes(self.mem.read_bytes(MSGHDR + 40, 8).unwrap().try_into().unwrap());
+            let controllen = u64::from_ne_bytes(
+                self.mem
+                    .read_bytes(MSGHDR + 40, 8)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            );
             let control = self.mem.read_bytes(CONTROL, controllen as usize).unwrap();
             super::net::support::parse_linux_scm_rights_fds(&control)
         }
@@ -7737,18 +8296,27 @@ mod scm_rights_tests {
         let got = g.received_fds();
         assert_eq!(got.len(), 2, "two fds must arrive, got {got:?}");
         let (recv_r, recv_w) = (got[0], got[1]);
-        assert!(recv_r != pipe_r && recv_w != pipe_w, "received fds are NEW fds");
+        assert!(
+            recv_r != pipe_r && recv_w != pipe_w,
+            "received fds are NEW fds"
+        );
 
         // The received ends share the pipe with the originals in both
         // directions: write through the received writer, read from the
         // original reader, and vice versa.
         g.mem.write_bytes(DATA, b"hello").unwrap();
         assert_eq!(g.ok(SYS_WRITE, [recv_w as u64, DATA, 5, 0, 0, 0]), 5);
-        assert_eq!(g.ok(SYS_READ, [pipe_r as u64, DATA + 0x100, 16, 0, 0, 0]), 5);
+        assert_eq!(
+            g.ok(SYS_READ, [pipe_r as u64, DATA + 0x100, 16, 0, 0, 0]),
+            5
+        );
         assert_eq!(&g.mem.read_bytes(DATA + 0x100, 5).unwrap(), b"hello");
         g.mem.write_bytes(DATA, b"world").unwrap();
         assert_eq!(g.ok(SYS_WRITE, [pipe_w as u64, DATA, 5, 0, 0, 0]), 5);
-        assert_eq!(g.ok(SYS_READ, [recv_r as u64, DATA + 0x100, 16, 0, 0, 0]), 5);
+        assert_eq!(
+            g.ok(SYS_READ, [recv_r as u64, DATA + 0x100, 16, 0, 0, 0]),
+            5
+        );
         assert_eq!(&g.mem.read_bytes(DATA + 0x100, 5).unwrap(), b"world");
 
         // Closing the ORIGINAL writer must not EOF the pipe while the
@@ -7777,8 +8345,8 @@ mod scm_rights_tests {
         // (O_RDWR), identical path, writable. Re-wrapping the raw host fd as a
         // fresh read-only description made that mmap EACCES.
         use crate::dispatch::fd_table::{HostFdRef, OpenDescriptionBase, OpenFile};
-        use carrick_vfs::rootfs::{RootFsEntryKind, RootFsMetadata};
         use carrick_abi::LINUX_O_RDWR;
+        use carrick_vfs::rootfs::{RootFsEntryKind, RootFsMetadata};
         use std::os::fd::IntoRawFd;
         const SYS_FCNTL: u64 = 25;
         const SYS_READLINKAT: u64 = 78;
@@ -7964,16 +8532,20 @@ mod scm_rights_tests {
         assert_eq!(
             g.ok(
                 SYS_EPOLL_CTL,
-                [epfd as u64, carrick_abi::LINUX_EPOLL_CTL_ADD, pipe_r as u64, event_addr, 0, 0]
+                [
+                    epfd as u64,
+                    carrick_abi::LINUX_EPOLL_CTL_ADD,
+                    pipe_r as u64,
+                    event_addr,
+                    0,
+                    0
+                ]
             ),
             0
         );
 
         let events_out = MEM_BASE + 0x620;
-        let epoll_outcome = g.call(
-            SYS_EPOLL_PWAIT,
-            [epfd as u64, events_out, 1, 50, 0, 0],
-        );
+        let epoll_outcome = g.call(SYS_EPOLL_PWAIT, [epfd as u64, events_out, 1, 50, 0, 0]);
         match &epoll_outcome {
             DispatchOutcome::WaitOnFds {
                 fds,
@@ -8030,7 +8602,11 @@ mod scm_rights_tests {
             base: OpenDescriptionBase::new(0),
         }));
         let common = Arc::new(crate::kernel::DescriptionCommon::new(0));
-        let slot = crate::kernel::FileSlot::from_open_description_with_common(desc, Arc::clone(&common), 42);
+        let slot = crate::kernel::FileSlot::from_open_description_with_common(
+            desc,
+            Arc::clone(&common),
+            42,
+        );
         assert_eq!(slot.fd_flags, 42);
         assert!(std::ptr::eq(slot.description.common(), &*common));
     }
@@ -8042,8 +8618,8 @@ mod inzone_tcp {
     use crate::compat::CompatReporter;
     use carrick_abi::{
         LINUX_AF_INET, LINUX_AF_UNSPEC, LINUX_ECONNRESET, LINUX_EFAULT, LINUX_EINVAL,
-        LINUX_EISCONN, LINUX_ENOTSOCK, LINUX_MSG_OOB, LINUX_POLLIN, LINUX_SOCK_STREAM,
-        LINUX_SOL_SOCKET, LINUX_SO_ERROR,
+        LINUX_EISCONN, LINUX_ENOTSOCK, LINUX_MSG_OOB, LINUX_POLLIN, LINUX_SO_ERROR,
+        LINUX_SOCK_STREAM, LINUX_SOL_SOCKET,
     };
 
     const POLLPRI: i16 = 2;
@@ -8133,12 +8709,11 @@ mod inzone_tcp {
             g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
+        assert_eq!(g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]), 0);
 
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETSOCKNAME,
@@ -8172,7 +8747,9 @@ mod inzone_tcp {
         drop(client_guard);
 
         // Accept connection
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         let accepted_fd = g.ok(
             SYS_ACCEPT,
             [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
@@ -8196,24 +8773,15 @@ mod inzone_tcp {
             DispatchOutcome::errno(LINUX_EFAULT)
         );
         assert_eq!(
-            g.call(
-                SYS_CONNECT,
-                [client_fd as u64, ADDR_SCRATCH, 1, 0, 0, 0]
-            ),
+            g.call(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 1, 0, 0, 0]),
             DispatchOutcome::errno(LINUX_EINVAL)
         );
         assert_eq!(
-            g.call(
-                SYS_CONNECT,
-                [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]
-            ),
+            g.call(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             DispatchOutcome::errno(LINUX_EISCONN)
         );
         assert_eq!(
-            g.call(
-                SYS_CONNECT,
-                [accepted_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]
-            ),
+            g.call(SYS_CONNECT, [accepted_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             DispatchOutcome::errno(LINUX_EISCONN)
         );
         // Data round trip
@@ -8235,7 +8803,9 @@ mod inzone_tcp {
         // getpeername(accepted) == getsockname(client)
         let addr_accepted_peer = ADDR_SCRATCH;
         let len_accepted_peer = ADDRLEN_SCRATCH;
-        g.mem.write_bytes(len_accepted_peer, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(len_accepted_peer, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETPEERNAME,
@@ -8254,7 +8824,9 @@ mod inzone_tcp {
 
         let addr_client_local = ADDR_SCRATCH + 0x20;
         let len_client_local = ADDRLEN_SCRATCH + 0x10;
-        g.mem.write_bytes(len_client_local, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(len_client_local, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETSOCKNAME,
@@ -8284,7 +8856,10 @@ mod inzone_tcp {
                 revents: 0,
             };
             let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-            assert_eq!(rc, 0, "host listener must have no connections on host queue");
+            assert_eq!(
+                rc, 0,
+                "host listener must have no connections on host queue"
+            );
         }
         drop(listen_guard);
 
@@ -8292,7 +8867,10 @@ mod inzone_tcp {
         // the local endpoint and open-description identity for reconnect.
         let description_before_disconnect = Arc::clone(&client_desc);
         g.mem.write_bytes(DATA_SCRATCH, b"queued").unwrap();
-        assert_eq!(g.ok(SYS_WRITE, [client_fd as u64, DATA_SCRATCH, 6, 0, 0, 0]), 6);
+        assert_eq!(
+            g.ok(SYS_WRITE, [client_fd as u64, DATA_SCRATCH, 6, 0, 0, 0]),
+            6
+        );
         g.mem
             .write_bytes(ADDR_SCRATCH, &(LINUX_AF_UNSPEC as u16).to_ne_bytes())
             .unwrap();
@@ -8304,19 +8882,35 @@ mod inzone_tcp {
             &description_before_disconnect,
             &g.dispatcher.open_file(client_fd).unwrap().description()
         ));
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
-            g.call(SYS_GETPEERNAME, [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0]),
+            g.call(
+                SYS_GETPEERNAME,
+                [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0]
+            ),
             DispatchOutcome::errno(carrick_abi::LINUX_ENOTCONN)
         );
-        assert_eq!(g.ok(SYS_READ, [accepted_fd as u64, DATA_SCRATCH, 6, 0, 0, 0]), 6);
+        assert_eq!(
+            g.ok(SYS_READ, [accepted_fd as u64, DATA_SCRATCH, 6, 0, 0, 0]),
+            6
+        );
         assert_eq!(&g.mem.read_bytes(DATA_SCRATCH, 6).unwrap(), b"queued");
         assert_eq!(
             g.call(SYS_READ, [accepted_fd as u64, DATA_SCRATCH, 1, 0, 0, 0]),
             DispatchOutcome::errno(LINUX_ECONNRESET)
         );
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
-        assert_eq!(g.ok(SYS_GETSOCKNAME, [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0]), 0);
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0]
+            ),
+            0
+        );
         assert_eq!(g.read_sockaddr_in(ADDR_SCRATCH).0, client_port);
         g.make_sockaddr_in(ADDR_SCRATCH, 1, [127, 0, 0, 1]);
         assert_eq!(
@@ -8345,12 +8939,24 @@ mod inzone_tcp {
         );
         assert_eq!(g.read_sockaddr_in(ADDR_SCRATCH).0, client_port);
         g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
-        assert_eq!(g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]), 0);
+        assert_eq!(
+            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
         let reaccepted_fd = g.ok(SYS_ACCEPT, [listen_fd as u64, 0, 0, 0, 0, 0]) as i32;
         assert_eq!(g.ok(SYS_CLOSE, [accepted_fd as u64, 0, 0, 0, 0, 0]), 0);
         g.mem.write_bytes(DATA_SCRATCH, b"r").unwrap();
-        assert_eq!(g.ok(SYS_WRITE, [client_fd as u64, DATA_SCRATCH, 1, 0, 0, 0]), 1);
-        assert_eq!(g.ok(SYS_READ, [reaccepted_fd as u64, DATA_SCRATCH + 1, 1, 0, 0, 0]), 1);
+        assert_eq!(
+            g.ok(SYS_WRITE, [client_fd as u64, DATA_SCRATCH, 1, 0, 0, 0]),
+            1
+        );
+        assert_eq!(
+            g.ok(
+                SYS_READ,
+                [reaccepted_fd as u64, DATA_SCRATCH + 1, 1, 0, 0, 0]
+            ),
+            1
+        );
     }
 
     #[test]
@@ -8366,12 +8972,11 @@ mod inzone_tcp {
             g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
+        assert_eq!(g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]), 0);
 
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETSOCKNAME,
@@ -8435,11 +9040,10 @@ mod inzone_tcp {
             g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]), 0);
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETSOCKNAME,
@@ -8498,12 +9102,11 @@ mod inzone_tcp {
             g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
+        assert_eq!(g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]), 0);
 
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETSOCKNAME,
@@ -8560,8 +9163,7 @@ mod inzone_tcp {
             0
         );
         let err_bytes2 = g.mem.read_bytes(optval, 4).unwrap();
-        let err2 =
-            i32::from_ne_bytes([err_bytes2[0], err_bytes2[1], err_bytes2[2], err_bytes2[3]]);
+        let err2 = i32::from_ne_bytes([err_bytes2[0], err_bytes2[1], err_bytes2[2], err_bytes2[3]]);
         assert_eq!(err2, 0, "SO_ERROR second read must be 0");
     }
 
@@ -8585,11 +9187,10 @@ mod inzone_tcp {
             g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]), 0);
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETSOCKNAME,
@@ -8607,7 +9208,9 @@ mod inzone_tcp {
             g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         let server_fd = g.ok(
             SYS_ACCEPT,
             [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
@@ -8632,7 +9235,10 @@ mod inzone_tcp {
         // The peer writes: the same read now returns the bytes.
         g.mem.write_bytes(DATA_SCRATCH + 0x100, b"late").unwrap();
         assert_eq!(
-            g.ok(SYS_WRITE, [client_fd as u64, DATA_SCRATCH + 0x100, 4, 0, 0, 0]),
+            g.ok(
+                SYS_WRITE,
+                [client_fd as u64, DATA_SCRATCH + 0x100, 4, 0, 0, 0]
+            ),
             4
         );
         assert_eq!(
@@ -8644,7 +9250,14 @@ mod inzone_tcp {
         assert_eq!(
             g.ok(
                 SYS_FCNTL,
-                [server_fd as u64, F_SETFL, carrick_abi::LINUX_O_NONBLOCK, 0, 0, 0],
+                [
+                    server_fd as u64,
+                    F_SETFL,
+                    carrick_abi::LINUX_O_NONBLOCK,
+                    0,
+                    0,
+                    0
+                ],
             ),
             0
         );
@@ -8672,11 +9285,10 @@ mod inzone_tcp {
             g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]), 0);
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETSOCKNAME,
@@ -8694,7 +9306,9 @@ mod inzone_tcp {
             g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         let server_fd = g.ok(
             SYS_ACCEPT,
             [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
@@ -8718,16 +9332,26 @@ mod inzone_tcp {
             DispatchOutcome::errno(carrick_abi::LINUX_EINVAL)
         );
         assert_eq!(
-            g.call(SYS_SENDTO, [client_fd as u64, DATA_SCRATCH, 7, 0, unmapped, 16]),
+            g.call(
+                SYS_SENDTO,
+                [client_fd as u64, DATA_SCRATCH, 7, 0, unmapped, 16]
+            ),
             DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
         );
         // Nothing was delivered by the rejected calls.
         let poll_in = g.dispatcher.poll_ready_events(server_fd, LINUX_POLLIN);
-        assert_eq!(poll_in & LINUX_POLLIN, 0, "rejected sendto must not deliver");
+        assert_eq!(
+            poll_in & LINUX_POLLIN,
+            0,
+            "rejected sendto must not deliver"
+        );
         // An unreadable address with addrlen 0, a NULL address with a positive
         // addrlen, and a valid ignored destination all deliver.
         assert_eq!(
-            g.ok(SYS_SENDTO, [client_fd as u64, DATA_SCRATCH, 7, 0, unmapped, 0]),
+            g.ok(
+                SYS_SENDTO,
+                [client_fd as u64, DATA_SCRATCH, 7, 0, unmapped, 0]
+            ),
             7
         );
         assert_eq!(
@@ -8735,7 +9359,10 @@ mod inzone_tcp {
             7
         );
         assert_eq!(
-            g.ok(SYS_SENDTO, [client_fd as u64, DATA_SCRATCH, 7, 0, ADDR_SCRATCH, 16]),
+            g.ok(
+                SYS_SENDTO,
+                [client_fd as u64, DATA_SCRATCH, 7, 0, ADDR_SCRATCH, 16]
+            ),
             7
         );
     }
@@ -8756,12 +9383,11 @@ mod inzone_tcp {
             g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
+        assert_eq!(g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]), 0);
 
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETSOCKNAME,
@@ -8781,7 +9407,9 @@ mod inzone_tcp {
             0
         );
 
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         let server_fd = g.ok(
             SYS_ACCEPT,
             [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
@@ -8794,7 +9422,8 @@ mod inzone_tcp {
             0
         );
         assert_eq!(
-            g.dispatcher.epoll_ready_events(client_fd, carrick_abi::LINUX_EPOLLPRI)
+            g.dispatcher
+                .epoll_ready_events(client_fd, carrick_abi::LINUX_EPOLLPRI)
                 & carrick_abi::LINUX_EPOLLPRI,
             0
         );
@@ -8804,7 +9433,14 @@ mod inzone_tcp {
         assert_eq!(
             g.ok(
                 SYS_SENDTO,
-                [server_fd as u64, DATA_SCRATCH, 1, LINUX_MSG_OOB as u64, 0, 0],
+                [
+                    server_fd as u64,
+                    DATA_SCRATCH,
+                    1,
+                    LINUX_MSG_OOB as u64,
+                    0,
+                    0
+                ],
             ),
             1
         );
@@ -8816,7 +9452,8 @@ mod inzone_tcp {
             "poll_ready_events must report POLLPRI for pending OOB"
         );
         assert_eq!(
-            g.dispatcher.epoll_ready_events(client_fd, carrick_abi::LINUX_EPOLLPRI)
+            g.dispatcher
+                .epoll_ready_events(client_fd, carrick_abi::LINUX_EPOLLPRI)
                 & carrick_abi::LINUX_EPOLLPRI,
             carrick_abi::LINUX_EPOLLPRI,
             "epoll_ready_events must report EPOLLPRI for pending OOB"
@@ -8827,7 +9464,14 @@ mod inzone_tcp {
         assert_eq!(
             g.ok(
                 SYS_RECVFROM,
-                [client_fd as u64, recv_scratch, 1, LINUX_MSG_OOB as u64, 0, 0],
+                [
+                    client_fd as u64,
+                    recv_scratch,
+                    1,
+                    LINUX_MSG_OOB as u64,
+                    0,
+                    0
+                ],
             ),
             1
         );
@@ -8841,7 +9485,8 @@ mod inzone_tcp {
             "poll_ready_events must clear POLLPRI after OOB read"
         );
         assert_eq!(
-            g.dispatcher.epoll_ready_events(client_fd, carrick_abi::LINUX_EPOLLPRI)
+            g.dispatcher
+                .epoll_ready_events(client_fd, carrick_abi::LINUX_EPOLLPRI)
                 & carrick_abi::LINUX_EPOLLPRI,
             0,
             "epoll_ready_events must clear EPOLLPRI after OOB read"
@@ -8861,12 +9506,11 @@ mod inzone_tcp {
             g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
+        assert_eq!(g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]), 0);
 
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETSOCKNAME,
@@ -8886,7 +9530,9 @@ mod inzone_tcp {
             0
         );
 
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         let server_fd = g.ok(
             SYS_ACCEPT,
             [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
@@ -8894,10 +9540,7 @@ mod inzone_tcp {
         assert!(server_fd >= 3);
 
         let pipe_scratch = DATA_SCRATCH + 0x100;
-        assert_eq!(
-            g.ok(SYS_PIPE2, [pipe_scratch, 0, 0, 0, 0, 0]),
-            0
-        );
+        assert_eq!(g.ok(SYS_PIPE2, [pipe_scratch, 0, 0, 0, 0, 0]), 0);
         let pipe_fds = g.mem.read_bytes(pipe_scratch, 8).unwrap();
         let pipe_r = i32::from_ne_bytes([pipe_fds[0], pipe_fds[1], pipe_fds[2], pipe_fds[3]]);
         let pipe_w = i32::from_ne_bytes([pipe_fds[4], pipe_fds[5], pipe_fds[6], pipe_fds[7]]);
@@ -8911,19 +9554,13 @@ mod inzone_tcp {
 
         // Splice from client_fd into pipe_w
         assert_eq!(
-            g.ok(
-                SYS_SPLICE,
-                [client_fd as u64, 0, pipe_w as u64, 0, 12, 0],
-            ),
+            g.ok(SYS_SPLICE, [client_fd as u64, 0, pipe_w as u64, 0, 12, 0],),
             12
         );
 
         // Splice from pipe_r into server_fd
         assert_eq!(
-            g.ok(
-                SYS_SPLICE,
-                [pipe_r as u64, 0, server_fd as u64, 0, 12, 0],
-            ),
+            g.ok(SYS_SPLICE, [pipe_r as u64, 0, server_fd as u64, 0, 12, 0],),
             12
         );
 
@@ -8950,11 +9587,10 @@ mod inzone_tcp {
             g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]), 0);
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETSOCKNAME,
@@ -9005,10 +9641,15 @@ mod inzone_tcp {
         );
         match ready_outcome {
             DispatchOutcome::Returned { value: 1 } => {}
-            other => panic!("expected Returned {{ value: 1 }} for in-zone listener with pending connect, got {other:?}"),
+            other => panic!(
+                "expected Returned {{ value: 1 }} for in-zone listener with pending connect, got {other:?}"
+            ),
         }
         let out_fdset = g.mem.read_bytes(readfds_addr, 128).unwrap();
-        assert_eq!(out_fdset[(listen_fd / 8) as usize] & (1 << (listen_fd % 8)), 1 << (listen_fd % 8));
+        assert_eq!(
+            out_fdset[(listen_fd / 8) as usize] & (1 << (listen_fd % 8)),
+            1 << (listen_fd % 8)
+        );
     }
 
     /// The ONE wait source a single-fd `ppoll`/`pselect6` park registered.
@@ -9052,11 +9693,10 @@ mod inzone_tcp {
             g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]), 0);
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETSOCKNAME,
@@ -9074,7 +9714,9 @@ mod inzone_tcp {
             g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         let accepted_fd = g.ok(
             SYS_ACCEPT,
             [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
@@ -9161,10 +9803,7 @@ mod inzone_tcp {
             g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
             0
         );
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
+        assert_eq!(g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]), 0);
         (g, listen_fd)
     }
 
@@ -9277,7 +9916,9 @@ mod inzone_tcp {
             0
         );
 
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         assert_eq!(
             g.ok(
                 SYS_GETSOCKNAME,
@@ -9296,7 +9937,14 @@ mod inzone_tcp {
         assert_eq!(
             g.ok(
                 SYS_FCNTL,
-                [client_fd as u64, F_SETFL, carrick_abi::LINUX_O_NONBLOCK, 0, 0, 0],
+                [
+                    client_fd as u64,
+                    F_SETFL,
+                    carrick_abi::LINUX_O_NONBLOCK,
+                    0,
+                    0,
+                    0
+                ],
             ),
             0
         );
@@ -9309,10 +9957,7 @@ mod inzone_tcp {
         );
 
         // 4. Listener transitions to listen
-        assert_eq!(
-            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
-            0
-        );
+        assert_eq!(g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]), 0);
 
         // 5. Connect 2 reports consumed pending error -> ECONNREFUSED
         assert_eq!(
@@ -9342,7 +9987,10 @@ mod inzone_tcp {
         );
         let out = g.mem.read_bytes(pollfd_addr, 8).unwrap();
         let revents = i16::from_ne_bytes([out[6], out[7]]);
-        assert_eq!(revents & carrick_abi::LINUX_POLLOUT, carrick_abi::LINUX_POLLOUT);
+        assert_eq!(
+            revents & carrick_abi::LINUX_POLLOUT,
+            carrick_abi::LINUX_POLLOUT
+        );
 
         // 8. SO_ERROR reads 0
         let optval = ADDR_SCRATCH;
@@ -9367,7 +10015,9 @@ mod inzone_tcp {
         assert_eq!(so_err, 0, "SO_ERROR after connect must be 0");
 
         // 9. Accept succeeds
-        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        g.mem
+            .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+            .unwrap();
         let accepted_fd = g.ok(
             SYS_ACCEPT,
             [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
@@ -9393,11 +10043,10 @@ mod inzone_tcp {
                 g.ok(SYS_BIND, [listen1_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
                 0
             );
-            assert_eq!(
-                g.ok(SYS_LISTEN, [listen1_fd as u64, 16, 0, 0, 0, 0]),
-                0
-            );
-            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            assert_eq!(g.ok(SYS_LISTEN, [listen1_fd as u64, 16, 0, 0, 0, 0]), 0);
+            g.mem
+                .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+                .unwrap();
             assert_eq!(
                 g.ok(
                     SYS_GETSOCKNAME,
@@ -9419,7 +10068,9 @@ mod inzone_tcp {
             );
 
             // Accept on server
-            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            g.mem
+                .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+                .unwrap();
             let server1_fd = g.ok(
                 SYS_ACCEPT,
                 [listen1_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
@@ -9427,7 +10078,9 @@ mod inzone_tcp {
             assert!(server1_fd >= 0);
 
             // Record client's initial ephemeral port
-            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            g.mem
+                .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+                .unwrap();
             assert_eq!(
                 g.ok(
                     SYS_GETSOCKNAME,
@@ -9459,7 +10112,9 @@ mod inzone_tcp {
             );
 
             // Check getsockname on client: leased new port, not retained
-            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            g.mem
+                .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+                .unwrap();
             assert_eq!(
                 g.ok(
                     SYS_GETSOCKNAME,
@@ -9469,11 +10124,16 @@ mod inzone_tcp {
             );
             let (client_port_after, client_ip_after) = g.read_sockaddr_in(ADDR_SCRATCH);
             assert_ne!(client_port_after, 0);
-            assert_ne!(client_port_after, client_port_before, "port should not be retained");
+            assert_ne!(
+                client_port_after, client_port_before,
+                "port should not be retained"
+            );
             assert_eq!(client_ip_after, [0, 0, 0, 0], "bound to wildcard");
 
             // Dup alias observes the new local address
-            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            g.mem
+                .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+                .unwrap();
             assert_eq!(
                 g.ok(
                     SYS_GETSOCKNAME,
@@ -9506,10 +10166,7 @@ mod inzone_tcp {
             assert_eq!(g.ok(SYS_CLOSE, [probe_fd as u64, 0, 0, 0, 0, 0]), 0);
 
             // 5. Subsequent listen on re-bound client_fd
-            assert_eq!(
-                g.ok(SYS_LISTEN, [client_fd as u64, 16, 0, 0, 0, 0]),
-                0
-            );
+            assert_eq!(g.ok(SYS_LISTEN, [client_fd as u64, 16, 0, 0, 0, 0]), 0);
 
             // Connect a new peer to client_fd (which is now listening on client_port_after)
             let peer_fd = g.ok(
@@ -9523,7 +10180,9 @@ mod inzone_tcp {
             );
 
             // Accept on client_fd
-            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            g.mem
+                .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+                .unwrap();
             let accepted2_fd = g.ok(
                 SYS_ACCEPT,
                 [client_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
@@ -9566,11 +10225,10 @@ mod inzone_tcp {
                 g.ok(SYS_BIND, [listen1_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
                 0
             );
-            assert_eq!(
-                g.ok(SYS_LISTEN, [listen1_fd as u64, 16, 0, 0, 0, 0]),
-                0
-            );
-            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            assert_eq!(g.ok(SYS_LISTEN, [listen1_fd as u64, 16, 0, 0, 0, 0]), 0);
+            g.mem
+                .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+                .unwrap();
             assert_eq!(
                 g.ok(
                     SYS_GETSOCKNAME,
@@ -9619,7 +10277,9 @@ mod inzone_tcp {
             );
 
             // Accept second connection on listener 1
-            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            g.mem
+                .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+                .unwrap();
             let server2_fd = g.ok(
                 SYS_ACCEPT,
                 [listen1_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
@@ -9667,12 +10327,11 @@ mod inzone_tcp {
             );
 
             // Listen on accepted_fd
-            assert_eq!(
-                g.ok(SYS_LISTEN, [accepted_fd as u64, 16, 0, 0, 0, 0]),
-                0
-            );
+            assert_eq!(g.ok(SYS_LISTEN, [accepted_fd as u64, 16, 0, 0, 0, 0]), 0);
 
-            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            g.mem
+                .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+                .unwrap();
             assert_eq!(
                 g.ok(
                     SYS_GETSOCKNAME,
@@ -9694,7 +10353,9 @@ mod inzone_tcp {
             );
 
             // Accept
-            g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+            g.mem
+                .write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes())
+                .unwrap();
             let new_server = g.ok(
                 SYS_ACCEPT,
                 [accepted_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],

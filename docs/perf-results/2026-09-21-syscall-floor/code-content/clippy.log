@@ -1,0 +1,73 @@
+    Checking carrick-fatal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-fatal)
+    Checking carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-abi)
+    Checking carrick-kernel-arena v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-arena)
+    Checking carrick-portable v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-portable)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+    Checking carrick-test-support v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-test-support)
+    Checking carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-guest-mem)
+    Checking carrick-host v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host)
+    Checking carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-signal-core)
+    Checking carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-mem)
+    Checking carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-timer-core)
+    Checking carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+    Checking carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-spec)
+    Checking carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-image)
+    Checking carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+    Checking carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+    Checking carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+    Checking carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+    Checking carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+error: manual implementation of `.is_multiple_of()`
+  --> crates/carrick-aarch64/src/anonymous_discard.rs:17:56
+   |
+17 |     if !granule.is_power_of_two() || granule < 4096 || address % 4096 != 0 || len % 4096 != 0 {
+   |                                                        ^^^^^^^^^^^^^^^^^^^ help: replace with: `!address.is_multiple_of(4096)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+   = note: `-D clippy::manual-is-multiple-of` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::manual_is_multiple_of)]`
+
+error: manual implementation of `.is_multiple_of()`
+  --> crates/carrick-aarch64/src/anonymous_discard.rs:17:79
+   |
+17 |     if !granule.is_power_of_two() || granule < 4096 || address % 4096 != 0 || len % 4096 != 0 {
+   |                                                                               ^^^^^^^^^^^^^^^ help: replace with: `!len.is_multiple_of(4096)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+error: manual implementation of `.is_multiple_of()`
+    --> crates/carrick-aarch64/src/engine.rs:2095:16
+     |
+2095 |             || address % 4096 != 0
+     |                ^^^^^^^^^^^^^^^^^^^ help: replace with: `!address.is_multiple_of(4096)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+error: manual implementation of `.is_multiple_of()`
+    --> crates/carrick-aarch64/src/engine.rs:2096:16
+     |
+2096 |             || len % 4096 != 0
+     |                ^^^^^^^^^^^^^^^ help: replace with: `!len.is_multiple_of(4096)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+error: manual implementation of `.is_multiple_of()`
+    --> crates/carrick-aarch64/src/engine.rs:2109:17
+     |
+2109 |             && (address % granule != 0 || (len as u64) % granule != 0)
+     |                 ^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `!address.is_multiple_of(granule)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+error: manual implementation of `.is_multiple_of()`
+    --> crates/carrick-aarch64/src/engine.rs:2109:43
+     |
+2109 |             && (address % granule != 0 || (len as u64) % granule != 0)
+     |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `!(len as u64).is_multiple_of(granule)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+error: could not compile `carrick-aarch64` (lib) due to 6 previous errors
+warning: build failed, waiting for other jobs to finish...

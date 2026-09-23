@@ -1,0 +1,16 @@
+phase=watch_churn scale=1 samples=21 p50_ns_per_iter=1000 complete=1
+phase=watch_invalid_pair scale=1 samples=21 p50_ns_per_iter=291 complete=1
+phase=watch_existing_pair scale=1 samples=21 p50_ns_per_iter=875 complete=1
+phase=watch_churn scale=32 samples=21 p50_ns_per_iter=1376 complete=1
+phase=watch_invalid_pair scale=32 samples=21 p50_ns_per_iter=278 complete=1
+phase=watch_existing_pair scale=32 samples=21 p50_ns_per_iter=604 complete=1
+phase=watch_churn scale=1024 samples=21 p50_ns_per_iter=964 complete=1
+phase=watch_invalid_pair scale=1024 samples=21 p50_ns_per_iter=248 complete=1
+phase=watch_existing_pair scale=1024 samples=21 p50_ns_per_iter=555 complete=1
+phase=watch_churn scale=8192 samples=21 p50_ns_per_iter=898 complete=1
+phase=watch_invalid_pair scale=8192 samples=21 p50_ns_per_iter=246 complete=1
+phase=watch_existing_pair scale=8192 samples=21 p50_ns_per_iter=562 complete=1
+phase=watch_churn scale=65536 samples=21 p50_ns_per_iter=948 complete=1
+phase=watch_invalid_pair scale=65536 samples=21 p50_ns_per_iter=247 complete=1
+phase=watch_existing_pair scale=65536 samples=21 p50_ns_per_iter=555 complete=1
+probe_complete=1

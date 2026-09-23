@@ -1,0 +1,24 @@
+schema_version = 1
+id = "kernel.syscall.captured-stack"
+title = "Captured syscall stack metadata needs no backend reread"
+guest_surfaces = ["syscall:sigaltstack", "kernel:syscall-observation"]
+semantic_authority = ["man 2 sigaltstack", "Carrick observer and interceptor metadata contract"]
+fixture = "unit:captured_stack_pointer_needs_no_backend_read"
+scale_points = [1, 8, 32, 128]
+rationale = "The stack pointer travels with its exact syscall request, including a valid zero value. A transport that captured it must not trigger another backend register read. Transports without captured metadata retain one fallible read. This removes duplicated work without caching task state or narrowing observer metadata."
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::request::captured_metadata_tests"
+docker = "probe:siglongjmpaltstack"
+
+[bindings.unresolved]
+embed_structural = "Signed generic shard 2 alternate-stack semantics pass for musl and glibc. Production-envelope register-read counting remains pending; the unit callback count alone does not attest that structural budget in a guest run."
+observation = "The unit binding asserts exact fallback invocation counts directly; a versioned WorkObservation emission is pending."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "host_backend_calls"
+base = 0
+per_unit = 0
+layers = ["vm-free"]
+rationale = "For this metadata-only fixture, the sole backend operation is the fallback SP reader. Captured metadata must invoke it zero times at every scale. Missing-metadata fallback is tested separately and must invoke it exactly once, preserving read failure."

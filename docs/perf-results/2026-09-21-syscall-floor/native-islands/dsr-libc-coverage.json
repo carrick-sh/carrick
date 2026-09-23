@@ -1,0 +1,83 @@
+{
+  "input": "target/lease-cost/native-islands/libc-coverage.json",
+  "limitation": "Decoder actions only, not current-MM emission, executable authority, native execution, branch linking, atomic ordering or measured coverage. Sensitive actions may require helpers or region fusion. No guest code is executed.",
+  "schema": "dsr-static-decoder-coverage-v1",
+  "symbols": [
+    {
+      "actions": {
+        "Copy": 10,
+        "Syscall": 1,
+        "direct.Branch": 2,
+        "direct.Conditional": 1,
+        "indirect.Return": 1
+      },
+      "instruction_sites": 15,
+      "rejected_sites": [],
+      "rejected_sites_count": 0,
+      "symbol": "syscall"
+    },
+    {
+      "actions": {
+        "Copy": 3,
+        "Syscall": 1,
+        "direct.Branch": 1,
+        "direct.Conditional": 1,
+        "indirect.Return": 1
+      },
+      "instruction_sites": 7,
+      "rejected_sites": [],
+      "rejected_sites_count": 0,
+      "symbol": "inotify_add_watch"
+    },
+    {
+      "actions": {
+        "Copy": 3,
+        "Syscall": 1,
+        "direct.Branch": 1,
+        "direct.Conditional": 1,
+        "indirect.Return": 1
+      },
+      "instruction_sites": 7,
+      "rejected_sites": [],
+      "rejected_sites_count": 0,
+      "symbol": "inotify_rm_watch"
+    },
+    {
+      "actions": {
+        "Copy": 11,
+        "PcRelative": 3,
+        "Syscall": 2,
+        "VirtualizedReserved": 11,
+        "direct.Branch": 2,
+        "direct.Call": 2,
+        "direct.CompareZero { nonzero: false }": 1,
+        "direct.Conditional": 2,
+        "indirect.Return": 2,
+        "memory.Pair.None": 3,
+        "memory.Pair.Reserved": 3,
+        "memory.Scalar.None": 7,
+        "sensitive.ReadTpidr": 2
+      },
+      "instruction_sites": 51,
+      "rejected_sites": [],
+      "rejected_sites_count": 0,
+      "symbol": "write"
+    },
+    {
+      "actions": {
+        "Copy": 7,
+        "PcRelative": 1,
+        "Syscall": 1,
+        "direct.Conditional": 1,
+        "indirect.Return": 2,
+        "memory.Pair.None": 3,
+        "memory.Scalar.None": 2,
+        "sensitive.ReadTpidr": 1
+      },
+      "instruction_sites": 18,
+      "rejected_sites": [],
+      "rejected_sites_count": 0,
+      "symbol": "lseek"
+    }
+  ]
+}

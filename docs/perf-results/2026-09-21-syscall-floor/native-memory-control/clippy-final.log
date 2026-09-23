@@ -1,0 +1,5 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+    Checking carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example)
+    Checking carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+    Checking native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/experiments/native-syscall-slice)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 21.23s

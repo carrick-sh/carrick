@@ -1,0 +1,69 @@
+warning: variable does not need to be mutable
+  --> crates/carrick-kernel-example/src/contracts.rs:63:9
+   |
+63 |     let mut snapshot = report.work_snapshot().clone();
+   |         ----^^^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:203:9
+    |
+203 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:319:9
+    |
+319 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:405:9
+    |
+405 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:505:9
+    |
+505 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:605:9
+    |
+605 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:685:9
+    |
+685 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/carrick-kernel-example/src/contracts.rs:752:9
+    |
+752 |     let mut snapshot = report.work_snapshot().clone();
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: `carrick-kernel-example` (lib) generated 8 warnings (run `cargo fix --lib -p carrick-kernel-example` to apply 8 suggestions)
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example)
+    Finished `release` profile [optimized + debuginfo] target(s) in 11.39s

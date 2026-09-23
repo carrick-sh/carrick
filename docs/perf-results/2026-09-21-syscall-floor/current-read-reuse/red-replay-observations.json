@@ -1,0 +1,130 @@
+[
+  {
+    "contract_id": "kernel.mm.current-read-reuse",
+    "layer": "vm-free",
+    "implementation_revision": "sha256:4ef740106e381803585e8866ba0564fe115dfa567bf3a2f42e66abc11c8679bb",
+    "fixture_identity": "unit:current-read-reuse",
+    "scale": 1,
+    "semantic_assertions": [
+      {
+        "name": "sixteen_exact_live_256_byte_reads",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "allocator_positive_control_fired",
+        "passed": true,
+        "detail": null
+      }
+    ],
+    "work": {
+      "values": {
+        "host_heap_allocations": 1536,
+        "mm_snapshot_collections": 96,
+        "foreign_owner_pins": 32
+      },
+      "dropped_events": 0,
+      "unknown_metrics": []
+    },
+    "timing": null,
+    "completeness": {
+      "status": "complete"
+    }
+  },
+  {
+    "contract_id": "kernel.mm.current-read-reuse",
+    "layer": "vm-free",
+    "implementation_revision": "sha256:4ef740106e381803585e8866ba0564fe115dfa567bf3a2f42e66abc11c8679bb",
+    "fixture_identity": "unit:current-read-reuse",
+    "scale": 8,
+    "semantic_assertions": [
+      {
+        "name": "sixteen_exact_live_256_byte_reads",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "allocator_positive_control_fired",
+        "passed": true,
+        "detail": null
+      }
+    ],
+    "work": {
+      "values": {
+        "host_heap_allocations": 2240,
+        "mm_snapshot_collections": 96,
+        "foreign_owner_pins": 144
+      },
+      "dropped_events": 0,
+      "unknown_metrics": []
+    },
+    "timing": null,
+    "completeness": {
+      "status": "complete"
+    }
+  },
+  {
+    "contract_id": "kernel.mm.current-read-reuse",
+    "layer": "vm-free",
+    "implementation_revision": "sha256:4ef740106e381803585e8866ba0564fe115dfa567bf3a2f42e66abc11c8679bb",
+    "fixture_identity": "unit:current-read-reuse",
+    "scale": 32,
+    "semantic_assertions": [
+      {
+        "name": "sixteen_exact_live_256_byte_reads",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "allocator_positive_control_fired",
+        "passed": true,
+        "detail": null
+      }
+    ],
+    "work": {
+      "values": {
+        "host_heap_allocations": 4624,
+        "mm_snapshot_collections": 96,
+        "foreign_owner_pins": 528
+      },
+      "dropped_events": 0,
+      "unknown_metrics": []
+    },
+    "timing": null,
+    "completeness": {
+      "status": "complete"
+    }
+  },
+  {
+    "contract_id": "kernel.mm.current-read-reuse",
+    "layer": "vm-free",
+    "implementation_revision": "sha256:4ef740106e381803585e8866ba0564fe115dfa567bf3a2f42e66abc11c8679bb",
+    "fixture_identity": "unit:current-read-reuse",
+    "scale": 128,
+    "semantic_assertions": [
+      {
+        "name": "sixteen_exact_live_256_byte_reads",
+        "passed": true,
+        "detail": null
+      },
+      {
+        "name": "allocator_positive_control_fired",
+        "passed": true,
+        "detail": null
+      }
+    ],
+    "work": {
+      "values": {
+        "host_heap_allocations": 14000,
+        "mm_snapshot_collections": 96,
+        "foreign_owner_pins": 2064
+      },
+      "dropped_events": 0,
+      "unknown_metrics": []
+    },
+    "timing": null,
+    "completeness": {
+      "status": "complete"
+    }
+  }
+]

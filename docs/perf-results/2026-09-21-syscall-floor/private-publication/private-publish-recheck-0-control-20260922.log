@@ -1,0 +1,9 @@
+
+running 4 tests
+test deferred_anonymous_epoll_copyout ... ok
+test deferred_anonymous_foreign_copyout ... ok
+test deferred_anonymous_pristine_scrub_semantics ... ok
+test deferred_anonymous_unaligned_discard ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.44s
+

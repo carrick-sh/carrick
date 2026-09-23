@@ -1,0 +1,458 @@
+[
+  {
+    "run_id": "compact-native-matrix-0-0-1-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-0-1-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-0-1-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-0-1-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-0-8-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-0-8-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-0-8-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-0-8-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-0-32-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-0-32-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-0-32-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-0-32-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-0-128-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-0-128-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-0-128-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-0-128-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-1-1-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-1-1-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-1-1-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-1-1-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-1-8-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-1-8-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-1-8-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-1-8-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-1-32-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-1-32-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-1-32-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-1-32-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-1-128-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-1-128-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-1-128-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-1-128-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-2-1-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-2-1-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-2-1-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-2-1-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-2-8-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-2-8-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-2-8-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-2-8-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-2-32-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-2-32-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-2-32-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-2-32-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-2-128-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-2-128-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-2-128-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-2-128-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-3-1-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-3-1-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-3-1-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-3-1-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-3-8-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-3-8-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-3-8-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-3-8-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-3-32-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-3-32-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-3-32-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-3-32-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-3-128-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-3-128-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-3-128-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-3-128-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-4-1-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-4-1-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-4-1-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-4-1-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-4-8-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-4-8-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-4-8-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-4-8-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-4-32-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-4-32-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-4-32-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-4-32-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-4-128-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-4-128-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-matrix-0-4-128-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-matrix-0-4-128-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-0-0-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-0-0-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-0-0-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-0-0-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-0-1-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-0-1-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-0-1-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-0-1-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-0-2-128-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-0-2-128-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-0-2-128-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-0-2-128-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-0-2-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-0-2-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-0-2-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-0-2-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-0-3-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-0-3-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-0-3-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-0-3-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-0-4-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-0-4-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-0-4-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-0-4-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-1-0-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-1-0-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-1-0-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-1-0-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-1-1-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-1-1-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-1-1-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-1-1-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-1-2-128-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-1-2-128-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-1-2-128-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-1-2-128-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-1-2-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-1-2-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-1-2-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-1-2-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-1-3-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-1-3-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-1-3-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-1-3-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-1-4-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-1-4-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-1-4-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-1-4-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-2-0-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-2-0-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-2-0-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-2-0-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-2-1-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-2-1-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-2-1-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-2-1-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-2-2-128-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-2-2-128-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-2-2-128-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-2-2-128-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-2-2-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-2-2-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-2-2-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-2-2-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-2-3-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-2-3-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-2-3-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-2-3-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-2-4-65536-layout1-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-2-4-65536-layout1-20260922) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "compact-native-paired-2-4-65536-layout0-20260922",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id compact-native-paired-2-4-65536-layout0-20260922) = 0\n",
+    "stderr": ""
+  }
+]

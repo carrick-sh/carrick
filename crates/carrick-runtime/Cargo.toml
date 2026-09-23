@@ -158,6 +158,7 @@ applevisor-sys.workspace = true
 mach2.workspace = true
 
 [dev-dependencies]
+carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 # Self dev-dependency: enables `test-support` on this crate's own lib when it
 # is built for an integration test (`tests/`), which sees no `cfg(test)`.
 # `default-features = false` so it adds ONLY that feature: with the default
@@ -176,3 +177,8 @@ static_assertions = "1"
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
 carrick-vmm-hvf = { path = "../carrick-vmm-hvf", features = ["foreign-cow-test-support"] }
+
+# Bounded native translator is a macOS-only test instrument, never a runtime
+# dependency or product executor. It exercises carrier data grants with an ELF.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies.native-syscall-slice]
+path = "../../experiments/native-syscall-slice"

@@ -1,0 +1,16 @@
+
+running 1 test
+current_read_reuse_observations [{"contract_id":"kernel.mm.current-read-reuse","layer":"vm-free","implementation_revision":"sha256:4ef740106e381803585e8866ba0564fe115dfa567bf3a2f42e66abc11c8679bb","fixture_identity":"unit:current-read-reuse","scale":1,"semantic_assertions":[{"name":"sixteen_exact_live_256_byte_reads","passed":true,"detail":null},{"name":"allocator_positive_control_fired","passed":true,"detail":null}],"work":{"values":{"host_heap_allocations":1536,"mm_snapshot_collections":96,"foreign_owner_pins":32},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.mm.current-read-reuse","layer":"vm-free","implementation_revision":"sha256:4ef740106e381803585e8866ba0564fe115dfa567bf3a2f42e66abc11c8679bb","fixture_identity":"unit:current-read-reuse","scale":8,"semantic_assertions":[{"name":"sixteen_exact_live_256_byte_reads","passed":true,"detail":null},{"name":"allocator_positive_control_fired","passed":true,"detail":null}],"work":{"values":{"host_heap_allocations":2240,"mm_snapshot_collections":96,"foreign_owner_pins":144},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.mm.current-read-reuse","layer":"vm-free","implementation_revision":"sha256:4ef740106e381803585e8866ba0564fe115dfa567bf3a2f42e66abc11c8679bb","fixture_identity":"unit:current-read-reuse","scale":32,"semantic_assertions":[{"name":"sixteen_exact_live_256_byte_reads","passed":true,"detail":null},{"name":"allocator_positive_control_fired","passed":true,"detail":null}],"work":{"values":{"host_heap_allocations":4624,"mm_snapshot_collections":96,"foreign_owner_pins":528},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.mm.current-read-reuse","layer":"vm-free","implementation_revision":"sha256:4ef740106e381803585e8866ba0564fe115dfa567bf3a2f42e66abc11c8679bb","fixture_identity":"unit:current-read-reuse","scale":128,"semantic_assertions":[{"name":"sixteen_exact_live_256_byte_reads","passed":true,"detail":null},{"name":"allocator_positive_control_fired","passed":true,"detail":null}],"work":{"values":{"host_heap_allocations":14000,"mm_snapshot_collections":96,"foreign_owner_pins":2064},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}]
+
+thread 'vcpu_loop::memory::tests::native_buffers::current_read_reuse_cost_contract' (4397480) panicked at crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs:774:6:
+called `Result::unwrap()` on an `Err` value: WorkBudgetExceeded { contract: ContractId("kernel.mm.current-read-reuse"), metric: HostHeapAllocations, actual: 1536, maximum: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test vcpu_loop::memory::tests::native_buffers::current_read_reuse_cost_contract ... FAILED
+
+failures:
+
+failures:
+    vcpu_loop::memory::tests::native_buffers::current_read_reuse_cost_contract
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 620 filtered out; finished in 0.20s
+

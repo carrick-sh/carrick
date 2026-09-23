@@ -1,0 +1,27 @@
+
+running 1 test
+test vcpu_loop::exec::tests::invalid_inotify_resident_poll_cost ... resident_poll sample=0 ns_per_pair=983.3990783691406
+resident_poll sample=1 ns_per_pair=982.5242309570313
+resident_poll sample=2 ns_per_pair=982.7086029052734
+resident_poll sample=3 ns_per_pair=986.9085845947266
+resident_poll sample=4 ns_per_pair=986.1195983886719
+resident_poll sample=5 ns_per_pair=984.9967956542969
+resident_poll sample=6 ns_per_pair=983.1288604736328
+resident_poll sample=7 ns_per_pair=983.3717346191406
+resident_poll sample=8 ns_per_pair=986.1056060791016
+resident_poll sample=9 ns_per_pair=994.8266296386719
+resident_poll sample=10 ns_per_pair=986.0388336181641
+resident_poll sample=11 ns_per_pair=984.6655578613281
+resident_poll sample=12 ns_per_pair=985.1252288818359
+resident_poll sample=13 ns_per_pair=985.9549255371094
+resident_poll sample=14 ns_per_pair=986.572265625
+resident_poll sample=15 ns_per_pair=983.8396606445313
+resident_poll sample=16 ns_per_pair=985.3973388671875
+resident_poll sample=17 ns_per_pair=986.7394866943359
+resident_poll sample=18 ns_per_pair=986.7261199951172
+resident_poll sample=19 ns_per_pair=984.7831726074219
+resident_poll sample=20 ns_per_pair=986.4921569824219
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 597 filtered out; finished in 1.45s
+

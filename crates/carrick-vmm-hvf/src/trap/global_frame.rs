@@ -386,17 +386,48 @@ impl GlobalFrameBacking {
     }
 }
 
+/// A content writer retains the existing physical owner rather than allocating
+/// a second shared tracker or keeping a self-reference inside a data span.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct OwnedCodeContent(std::sync::Arc<GlobalFrameSharedMapping>);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for OwnedCodeContent {
+    type Target = super::code_content::CodeContent;
+    fn deref(&self) -> &Self::Target {
+        &self.0.code_content
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) struct GlobalFrameSharedMapping {
+    pub(crate) code_content: super::code_content::CodeContent,
     backing: GlobalFrameBacking,
     logical_pin_count: parking_lot::Mutex<u64>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl GlobalFrameSharedMapping {
+    pub(crate) fn begin_content_write(
+        self: &std::sync::Arc<Self>,
+        offset: usize,
+        len: usize,
+    ) -> Result<
+        super::code_content::ContentWrite<OwnedCodeContent>,
+        super::code_content::ContentError,
+    > {
+        super::code_content::ContentWrite::new(
+            OwnedCodeContent(std::sync::Arc::clone(self)),
+            offset,
+            len,
+        )
+    }
+
     fn new(mapping: crate::host_mapping::OwnedHostMapping) -> Self {
         Self {
+            code_content: super::code_content::CodeContent::new(mapping.len()),
             backing: GlobalFrameBacking::Owned(mapping),
             logical_pin_count: parking_lot::Mutex::new(0),
         }
@@ -404,6 +435,7 @@ impl GlobalFrameSharedMapping {
 
     fn from_pooled(handle: crate::frame_pool::PooledFrameHandle) -> Self {
         Self {
+            code_content: super::code_content::CodeContent::new(handle.len()),
             backing: GlobalFrameBacking::Pooled(handle),
             logical_pin_count: parking_lot::Mutex::new(0),
         }
@@ -411,6 +443,7 @@ impl GlobalFrameSharedMapping {
 
     fn from_pooled_root(handle: crate::frame_pool::PooledRootSlotHandle) -> Self {
         Self {
+            code_content: super::code_content::CodeContent::new(handle.len()),
             backing: GlobalFrameBacking::PooledRoot(handle),
             logical_pin_count: parking_lot::Mutex::new(0),
         }

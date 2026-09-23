@@ -579,7 +579,7 @@ impl FrameCowExactMmGuard {
         let (inner, expected) = match &_guard._lease._kind {
             ExactMmStage1LeaseKind::Paused {
                 _inner, _census, ..
-            } => (_inner, _census.pause_endpoint_tids()),
+            } => (_inner, _census.hardware_invalidation_tids()),
             ExactMmStage1LeaseKind::Sole { .. } => {
                 return Err(ForeignCowInvalidationError::MissingPause);
             }

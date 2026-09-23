@@ -1,0 +1,16 @@
+{
+  "completed_rows": 756,
+  "unique_rows": 756,
+  "panics": [
+    [
+      "generic_probe_shard_2",
+      "stale cached probe oracle for writeseek (musl) at /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-cli/tests/probe-oracle/arm64-musl/writeseek: expected hash 5ea5d0648c951954, found 2678ab322bd8b6d0"
+    ]
+  ],
+  "completed_by_shard": {
+    "0": 304,
+    "1": 302,
+    "2": 150
+  },
+  "overall_pass": false
+}

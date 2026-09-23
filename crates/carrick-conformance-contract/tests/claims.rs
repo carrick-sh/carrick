@@ -143,6 +143,18 @@ fn live_registry_loads_all_claims() {
         .unwrap();
     let registry = carrick_conformance_contract::ContractRegistry::load(repo_root)
         .expect("live registry should load");
-    assert_eq!(registry.contracts().len(), 15);
+    assert_eq!(registry.contracts().len(), 33);
+    for id in [
+        "kernel.execution.native-synchronous-syscall",
+        "kernel.execution.native-data-demand",
+        "kernel.mm.native-execution-scope",
+        "kernel.mm.native-data-activation",
+        "kernel.mm.native-syscall-buffers",
+        "kernel.mm.current-read-reuse",
+    ] {
+        registry
+            .require(id)
+            .expect("native contract must be registered");
+    }
     assert_eq!(registry.claims().len(), 15);
 }

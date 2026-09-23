@@ -1,0 +1,573 @@
+{
+  "created_utc": "2026-09-22T18:28:30.238662+00:00",
+  "worktree": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick",
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "local_uncommitted": true,
+  "parent_checkpoint": "../native-activation-cache/manifest.json",
+  "source_sha256": {
+    "crates/carrick-kernel/src/kernel/guest_execution.rs": "ab97e63144e5e5413ab271ab8ff84f4458291a2c0acd09150576cc3eba6ef3c9",
+    "crates/carrick-kernel/src/dispatch/mm_quiesce.rs": "10e3cc39472f3b57522da49e1bcb8c62f88a28c70ddfa95d425a7adaa02aa907",
+    "crates/carrick-kernel/src/dispatch/native_execution.rs": "e83155d8bab81b6ace1048f715b88d2012f76f698b94dd3986e92afa4c1bcd6e",
+    "crates/carrick-kernel/src/dispatch/native_execution/tests.rs": "243b847d98e06a9c46980b6f30200e1f9981f816ec6e2e999d6fb3ae13542343",
+    "crates/carrick-kernel-example/tests/native_execution_scope.rs": "76c0d5d7dec35f2e039c387a32a4ad3bf9b4e0343d8827b9d8bd6ecec49c47c4",
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs": "c2a978bc08e116b95a8a77cac49c4d69d5e3557936b2a053c3315552472832f5",
+    "crates/carrick-runtime/Cargo.toml": "3ea66a9a2a008870b90436861d77d29cb556d8f37f36a51acde91f8ec62aecdb",
+    "Cargo.lock": "90ac0958e50d79cf464bc24a52c8c3a056e0014ed02bd4248acd02f3726db840",
+    "conformance-contracts/contracts/native-execution-scope.toml": "d2f4fdc5cec9dc9b36bf77e88643beac19464dcfcb09b445be670786042ee684",
+    "conformance-contracts/contracts/native-data-activation.toml": "b9dde84e2c8d70f29b6a146f35dc10d87f7156b0e0031b5be2dec7ca4cc9cbc5",
+    "experiments/native-syscall-slice/src/native.rs": "797d3b7226006b278c8474c61a53efb86c872f6ff816fd1b476fe86ec5b4bc94",
+    "experiments/native-syscall-slice/src/main.rs": "5558985ccc32b1b76a5b11362fe146439540de110eec6a87e2d37f35581c6b9b",
+    "Cargo.toml": "e53212107184126bd23383c352cce6a203cc0ec4ee0d0814ea8f4a3fef258685"
+  },
+  "source_revision": "sha256:8375bd73642bca6e4dd0cd6e018412b696508ed5ed40f07cd3c5dcf77bf167e2",
+  "files_changed": [
+    "crates/carrick-kernel/src/kernel/guest_execution.rs",
+    "crates/carrick-kernel/src/dispatch/mm_quiesce.rs",
+    "crates/carrick-kernel/src/dispatch/native_execution.rs",
+    "crates/carrick-kernel/src/dispatch/native_execution/tests.rs",
+    "crates/carrick-kernel-example/tests/native_execution_scope.rs",
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+    "crates/carrick-runtime/Cargo.toml",
+    "Cargo.lock",
+    "conformance-contracts/contracts/native-execution-scope.toml",
+    "conformance-contracts/contracts/native-data-activation.toml",
+    "experiments/native-syscall-slice/src/native.rs",
+    "experiments/native-syscall-slice/src/main.rs",
+    "Cargo.toml"
+  ],
+  "parent_preservation": {
+    "parent_source_count": 124,
+    "unchanged_count": 113,
+    "intentional_changes": {
+      "Cargo.lock": {
+        "before": "f59f9a3974058143e0fb76ff2bf6b9d7771632ac55bed9cb3e9c8f056e608767",
+        "after": "90ac0958e50d79cf464bc24a52c8c3a056e0014ed02bd4248acd02f3726db840"
+      },
+      "crates/carrick-runtime/src/vcpu_loop/memory.rs": {
+        "before": "55eee540fff42001e00b2ad5ed7dbcb34348648cc0e07fee1aa44a14c44e639e",
+        "after": "c2a978bc08e116b95a8a77cac49c4d69d5e3557936b2a053c3315552472832f5"
+      },
+      "experiments/native-syscall-slice/src/main.rs": {
+        "before": "a35de676977f6e59603cec10987ec1dc6c4c152b27d12954ddf66cb70744e895",
+        "after": "5558985ccc32b1b76a5b11362fe146439540de110eec6a87e2d37f35581c6b9b"
+      },
+      "experiments/native-syscall-slice/src/native.rs": {
+        "before": "44c45485cd9163e7e651ac8c08f63ced0e899f2d494f0fa17af5c7c4c584d5cc",
+        "after": "797d3b7226006b278c8474c61a53efb86c872f6ff816fd1b476fe86ec5b4bc94"
+      },
+      "crates/carrick-kernel/src/kernel/guest_execution.rs": {
+        "before": "79fb8f19c2ba3e26d4d4ca0e094282d397bfe2d535f91efc0c87073f5c22e6c8",
+        "after": "ab97e63144e5e5413ab271ab8ff84f4458291a2c0acd09150576cc3eba6ef3c9"
+      },
+      "conformance-contracts/contracts/native-execution-scope.toml": {
+        "before": "455141738e29726f179346a08a7d376006801e69991fc0c8a7647d9a887895e3",
+        "after": "d2f4fdc5cec9dc9b36bf77e88643beac19464dcfcb09b445be670786042ee684"
+      },
+      "crates/carrick-kernel-example/tests/native_execution_scope.rs": {
+        "before": "7a8d7bb15ef07962f938e2d0153eb6ea54e560266f9c67dbcf9d84ab5e14e0d1",
+        "after": "76c0d5d7dec35f2e039c387a32a4ad3bf9b4e0343d8827b9d8bd6ecec49c47c4"
+      },
+      "crates/carrick-kernel/src/dispatch/native_execution.rs": {
+        "before": "f6fabbb4436205d9621f0363f4157941e769e433123e1c999d478b13565062b2",
+        "after": "e83155d8bab81b6ace1048f715b88d2012f76f698b94dd3986e92afa4c1bcd6e"
+      },
+      "crates/carrick-kernel/src/dispatch/native_execution/tests.rs": {
+        "before": "944db245558d51f2a6387027f132524a7b1fa670ebc1cdd9c32b431a4273f899",
+        "after": "243b847d98e06a9c46980b6f30200e1f9981f816ec6e2e999d6fb3ae13542343"
+      },
+      "conformance-contracts/contracts/native-data-activation.toml": {
+        "before": "b1c3a058158bccd71f4b8dab945d6ab6919f042c24ee76ee2bd8e22f185555b5",
+        "after": "b9dde84e2c8d70f29b6a146f35dc10d87f7156b0e0031b5be2dec7ca4cc9cbc5"
+      },
+      "crates/carrick-runtime/Cargo.toml": {
+        "before": "5ba59157863f56b5dc0fe9ede79723c9ecde4eea5e50f6f14d320badd31e4c80",
+        "after": "3ea66a9a2a008870b90436861d77d29cb556d8f37f36a51acde91f8ec62aecdb"
+      }
+    },
+    "unexpected": {}
+  },
+  "frozen_controls_unchanged": {
+    "target/release/carrick": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+    "target/lease-cost/inotify-transport-control/carrick-control": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+    "target/release/native-syscall-slice": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65",
+    "target/lease-cost/native-memory/native-guarded-executor": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65"
+  },
+  "diagnostic_binaries": {
+    "red-runtime": {
+      "path": "target/lease-cost/native-memory-control/red-runtime",
+      "sha256": "e11546c3eca113c0a647adf09aa10cb5779727c70a557419fec32051355e4f33"
+    },
+    "red-elf-runtime": {
+      "path": "target/lease-cost/native-memory-control/red-elf-runtime",
+      "sha256": "dceb124b53dbfb0242a5975f5af93228cdb4812cabade5bf8cf5fd4678fee2d2"
+    },
+    "red-scope-runtime": {
+      "path": "target/lease-cost/native-memory-control/red-scope-runtime",
+      "sha256": "1dad6f7cefee3a38f8ffb71b42d5f7f9bf5e524605d5f8fa2aa66ab3f94673ea"
+    },
+    "runtime-final-metrics": {
+      "path": "target/lease-cost/native-memory-control/runtime-final-metrics",
+      "sha256": "dd6ed4d6af2ed000276db27ab88b96eb553e5f71ccc188add8df86bec6fdfdf7"
+    },
+    "scope-final-executable": {
+      "path": "target/lease-cost/native-memory-control/scope-final-executable",
+      "sha256": "5cc8dd311c368fc938e8bd84853fa3328849a9c0006db01a3247b55298cdeb80"
+    },
+    "native-elf-final-debug": {
+      "path": "target/lease-cost/native-memory-control/native-elf-final-debug",
+      "sha256": "8d6b8c987ca25b8f1d354e4c6d9cb48d5e3b2d6a205b9b64f334e79f108980cf"
+    },
+    "kernel-final-executable": {
+      "path": "target/lease-cost/native-memory-control/kernel-final-executable",
+      "sha256": "ddc8b850d16009532e34a627c92271c9e4e5cffa921f9556c9d7d43474ab2ca3"
+    },
+    "signed-foreign-mm-executable": {
+      "path": "target/lease-cost/native-memory-control/signed-foreign-mm-executable",
+      "sha256": "c768b84a753a0cf86e4d8aa48836cbad0df9affe4e9328e12fbf6dd737ca6cb2"
+    }
+  },
+  "native_elf": {
+    "path": "final-receipts/native-carrier.elf",
+    "sha256": "c2e4ee23eb2ee09bf3bd3fac04325442fa069bf85c706da7330a12917b04f8eb",
+    "completed_memory_control_syscall_round_trips": 169,
+    "backing": "production carrier COW data; mocked stage-2; private immutable code publication",
+    "syscall": "close(-1)",
+    "errno": 9,
+    "signed_native_execution": false
+  },
+  "new_workload_speedup_claim": false,
+  "new_timing_measurements": false,
+  "scope_allocations_by_scale": {
+    "1": {
+      "host_heap_allocations": 0
+    },
+    "8": {
+      "host_heap_allocations": 0
+    },
+    "32": {
+      "host_heap_allocations": 0
+    },
+    "128": {
+      "host_heap_allocations": 0
+    }
+  },
+  "activation_work_by_scale": {
+    "1": {
+      "host_heap_allocations": 0,
+      "native_activation_leaf_checks": 0
+    },
+    "8": {
+      "host_heap_allocations": 0,
+      "native_activation_leaf_checks": 0
+    },
+    "32": {
+      "host_heap_allocations": 0,
+      "native_activation_leaf_checks": 0
+    },
+    "128": {
+      "host_heap_allocations": 0,
+      "native_activation_leaf_checks": 0
+    }
+  },
+  "verification_initial": [
+    {
+      "name": "clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--no-deps",
+        "-p",
+        "carrick-kernel",
+        "-p",
+        "carrick-runtime",
+        "--all-targets",
+        "--features",
+        "carrick-runtime/conformance-metrics",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 101
+    },
+    {
+      "name": "kernel",
+      "argv": [
+        "just",
+        "test-kernel"
+      ],
+      "exit_code": 101
+    },
+    {
+      "name": "runtime-quiesce",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "quiesce",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "layering",
+      "argv": [
+        "just",
+        "check-layering"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "contracts",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-conformance-contract"
+      ],
+      "exit_code": 0
+    }
+  ],
+  "verification_final": [
+    {
+      "name": "clippy-final",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--no-deps",
+        "-p",
+        "carrick-kernel",
+        "-p",
+        "carrick-runtime",
+        "--all-targets",
+        "--features",
+        "carrick-runtime/conformance-metrics",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "kernel-final",
+      "argv": [
+        "just",
+        "test-kernel"
+      ],
+      "exit_code": 101
+    },
+    {
+      "name": "runtime-memory-final",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-runtime",
+        "--features",
+        "conformance-metrics",
+        "--lib",
+        "vcpu_loop::memory::tests::",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "runtime-quiesce-final",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-runtime",
+        "--features",
+        "conformance-metrics",
+        "--lib",
+        "quiesce",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "memory-doctests",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-kernel",
+        "--doc",
+        "mm_access"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "scope-doctests",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-kernel",
+        "--doc",
+        "native_execution"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "elf-private-controls",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "experiments/native-syscall-slice/Cargo.toml",
+        "--tests"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "elf-clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--manifest-path",
+        "experiments/native-syscall-slice/Cargo.toml",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0
+    }
+  ],
+  "verification_supplementary": [
+    {
+      "name": "kernel-admission-isolated",
+      "argv": [
+        "target/lease-cost/native-memory-control/kernel-final-executable",
+        "kernel::control::tests::exec_table_capacity_refuses_new_admission",
+        "--exact",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "run_id": null
+    },
+    {
+      "name": "kernel-semantics-final",
+      "argv": [
+        "just",
+        "test-kernel-semantics"
+      ],
+      "exit_code": 0,
+      "run_id": null
+    },
+    {
+      "name": "signed-foreign-mm",
+      "argv": [
+        "scripts/test-signed.sh",
+        "carrick-vmm-hvf",
+        "trap::foreign_mm::tests::"
+      ],
+      "exit_code": 1,
+      "run_id": "native-memory-control-27978"
+    }
+  ],
+  "full_kernel_gate": "FAILED: existing exec admission 50 ms deadline; exact test passes in isolation, not closure",
+  "signed_gate": "FAILED: fresh publication PageTableInvalidations 1 > 0; negative control and scoped cleanup pass; no success receipt",
+  "signed_post_run_identities": {
+    "kind": "post-run identity snapshot; failed gate; no success receipt",
+    "executables": [
+      {
+        "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_fork_probe-458c62b9625f6db1",
+        "sha256": "2fc8c14d254437c4bb89f17d92e0378b80d89789f0a91011bf31f4cda2eed224",
+        "cdhash": "4977fc123e6d7a1ba7ec339cd56ce1d262cebddd",
+        "lc_uuid": "94346AC8-C82B-320A-AAE6-D4EC1ED93268",
+        "hypervisor_entitlement": true,
+        "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+        "dof_carrick": false,
+        "selected_for_execution": false
+      },
+      {
+        "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_compute_baseline_probe-86d8959a9b6518f8",
+        "sha256": "fccf3d497319979c0ae2dcdc54c0c29c491bc36772cb1a7bf1421e7208cc67e7",
+        "cdhash": "e73d16bfef70a5ccc907891471bbd5eba6fbc442",
+        "lc_uuid": "4E0AA49F-AFDC-36BC-AD8C-8D1DE1354971",
+        "hypervisor_entitlement": true,
+        "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+        "dof_carrick": false,
+        "selected_for_execution": false
+      },
+      {
+        "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_bl_exit_free_probe-96770ae00f4d4df3",
+        "sha256": "39b868b9fd06d77a7b1baf1396db05f4fb0d7bdaf12dd14517b21b986ae71baf",
+        "cdhash": "138ba4588c8b4fb429007db4a1c25459fe8be29c",
+        "lc_uuid": "1F5A8B55-8DB5-3EA8-ACC9-3FD55748A29C",
+        "hypervisor_entitlement": true,
+        "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+        "dof_carrick": false,
+        "selected_for_execution": false
+      },
+      {
+        "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/initial_runner_handoff-432e62fd81ead0df",
+        "sha256": "1882e15fb49e93929f500dd4ce8fba4136d767bd47c77ca83ac5f1ca366a7d86",
+        "cdhash": "5e0695319fd885ff68c972033116733dd6979ffe",
+        "lc_uuid": "577B4E50-5321-3FBC-B916-B2C436A9D305",
+        "hypervisor_entitlement": true,
+        "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+        "dof_carrick": true,
+        "selected_for_execution": false
+      },
+      {
+        "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_vmm_hvf-c46177425ba8821e",
+        "sha256": "c768b84a753a0cf86e4d8aa48836cbad0df9affe4e9328e12fbf6dd737ca6cb2",
+        "cdhash": "ab616f6025ff431ff7ff16618375822e0de2399d",
+        "lc_uuid": "4AFC9D09-2394-3514-AECB-D4675ACE1AAD",
+        "hypervisor_entitlement": true,
+        "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+        "dof_carrick": true,
+        "selected_for_execution": true
+      },
+      {
+        "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_info_load_probe-9b39f95873f0d773",
+        "sha256": "dac53a5345b7df704133360adb7bfc2252224c8df2e9a75087ac0ad5cdaefa7a",
+        "cdhash": "f70c67856f34b0a9216a2e204f43b9668f4ee1b9",
+        "lc_uuid": "066AA6EE-F805-3211-9808-C9125C0CB620",
+        "hypervisor_entitlement": true,
+        "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+        "dof_carrick": false,
+        "selected_for_execution": false
+      },
+      {
+        "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_svc_tax_probe-4dfefb4ce9012645",
+        "sha256": "2bfb0fbe86df6d304ed220a14f1d35192f7b12f5372f930eb819e33f16a751ec",
+        "cdhash": "54ca4289fa20eb519f3b04dceed5e33409486467",
+        "lc_uuid": "A9020DC0-12D0-3326-8B31-1AFB230FC27D",
+        "hypervisor_entitlement": true,
+        "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+        "dof_carrick": false,
+        "selected_for_execution": false
+      },
+      {
+        "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/hvf_kernel_memory_probe-2fd29e549b7c51e1",
+        "sha256": "d61f79101a63f57b1d3ab479d22b2075ed0645c28975b29cf224a7b2fad2eeb3",
+        "cdhash": "4dc976d7416a4c484dc772926577d794fc553eb6",
+        "lc_uuid": "411E701B-1BA3-3A78-A042-458C9DAA382F",
+        "hypervisor_entitlement": true,
+        "entitlements_sha256": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+        "dof_carrick": false,
+        "selected_for_execution": false
+      }
+    ]
+  },
+  "uncompleted": [
+    "full CI",
+    "product probes",
+    "smoke/full conformance",
+    "carrier-backed syscall buffers in workload controls",
+    "carrier code publication/revocation",
+    "signal/cancellation/fork service",
+    "native scheduler integration",
+    "signed native execution",
+    "1x common-workload goal"
+  ],
+  "evidence_sha256": {
+    "README.md": "7cb4732cee48cef47705ed0922bf5cd24deb165bcc411c2f92252c47de6802bd",
+    "activation-observations.json": "0d788ab61dcd1e3b8e011a64cf1aba570d87aee72b84be18f3d358aee605dae4",
+    "before-extra.tar.gz": "915070dbf2b78400a37a176679caa18cede3adc698755e2078395b2de0a8294d",
+    "before-hashes.json": "4fa90ab04b1b86c7354ccffefd29f390d5fb62242f2f36a53f4552bc9407c6be",
+    "before-status.txt": "2f1a89ef7818a1fde5d41a0021b3e3d7448cbc383f283dd95ee3d0147d14527b",
+    "before.tar.gz": "6a417e16aa03a77ae5fd57dbbff0fd847b011b377054907698046dbd1d7f6ae7",
+    "clippy-final.log": "f968f44902c7ccf43eed8178b25d66a976449762bbfa109768bdf8f135122447",
+    "clippy.log": "71eabf34615ccb8b5c6870098fd71f215cb631c641194e5946cfd7f06ca774d8",
+    "contracts.log": "f66fcbbb99fee1b792a1a4ce8196b781ba53919de41989c175958fb674abe843",
+    "elf-clippy.log": "bb04738e508e7ac3897566a16a893aa3fcc68d232a6c578207b6656c73ec0cff",
+    "elf-private-controls.log": "a5b1e81ec194d5f4493c11cc756a03c31faecb6d9e68ae71efe2895301c99458",
+    "final-receipts/native-carrier.elf": "c2e4ee23eb2ee09bf3bd3fac04325442fa069bf85c706da7330a12917b04f8eb",
+    "final-receipts/observations.json": "a086c326657fe778cc59d38f4a100f8ec70b56447180e4dd651d79438aba044c",
+    "final-source-hashes.json": "b4923a4e8fc779236b91eaccf523ca15d35cd5cb3c493473808f17c1a975995a",
+    "final-source.tar.gz": "e0431029ec04633fa1ea795c4006f13e65bca2ce4255288bfdbc3d10e02eb546",
+    "final-verification-status.json": "99044c78da2a5a31029e7fb4cb2ebf5ce52452e4f2f479c980afbd118e2f8e60",
+    "format-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "frozen-hashes.json": "52c621d13c1b1ecc608155cb6f3ec4c282dea1df3bc82126f96470706ed72388",
+    "green-cow.log": "ca5e958d354c86440b729e92170535201b3ac6736e86e7ea8e41f5cf52257bff",
+    "green-elf.log": "a8907bea3d19d1d3a8651a4fd4dbd3ed6ba2d3a2d1a356e9ac2a97da87d8c26d",
+    "green-scope.log": "80365864c12c1080c0af86545fdff4d2c87e2efa3fa513cd881c36a43418cc4b",
+    "implementation.patch": "1219c5a9fbdae9d958135ff28b9e1b9ff0ae0595c6a73add57a7016e0bec07da",
+    "kernel-admission-attribution.json": "ceab59bac2f42669410a5e058d3f811896d6c2e289038497f739b731dffda7ad",
+    "kernel-admission-isolated.log": "1d349737bf37e6f2e1949d77787b8b407aa83ff9fae10af3ae964f376b33cd9b",
+    "kernel-control.log": "0d445a1e47dc58f9b456408e19e0873312b296c62bcffa179ed0fc3326a7f6eb",
+    "kernel-final.log": "210f6af53d7cc2e9a3e3a42190abccad451e13b6498247031f994ed92545d4b9",
+    "kernel-semantics-final.log": "da7c38c78381cb4afc97656f5940de94a62c3111f7ff4e2deaaca2a5b1e99038",
+    "kernel.log": "f541b2d9ce7381329aa240b709f4b192cbf689d33d6d1f35870acf5e694525af",
+    "layering.log": "c7579171ce55ed5b7697d12bf8a04b4a1d1255c3d02143d97ca8666d07e1168c",
+    "memory-doctests.log": "2828cf01be79241eeabd7ce5227e146b5c070f9df0cd159558869d2334f8ce53",
+    "parent-preservation.json": "d1ceef7a90398bf47c6dd70cc068bdec7fa0f51c8e43db100140067ab8583894",
+    "pre-signed-processes.json": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+    "private-elf-receipts/elf-functional.json": "3ee2386c38fe5cb6ac1553d6ca7b8d0ac3d873e320037840d78f6050083e100b",
+    "private-elf-receipts/native-scope-functional-0-1-27817.err": "006ebb44640667ce6ef828b3d12bec92b55946199174e1035fa9785ff9a2232c",
+    "private-elf-receipts/native-scope-functional-0-1-27817.out": "c737518582cf39b0ac4c2afb9453172f126f69fd639de7dfb9a92f5baadc5237",
+    "private-elf-receipts/native-scope-functional-0-128-27817.err": "5dd5abf0ad39a971f7715bd14cb73aa15a20425431c2f6aad9dc9b7d3e9d7de0",
+    "private-elf-receipts/native-scope-functional-0-128-27817.out": "a4b0d23de2cf9d2bc465afc5046adf6f3079ce9dd186224f43f9a53a76bd57de",
+    "private-elf-receipts/native-scope-functional-0-32-27817.err": "9520f5cf33d2baccb0ba30a56b11540fc60cef984e868b34ab324a7e911fb1bc",
+    "private-elf-receipts/native-scope-functional-0-32-27817.out": "b25a57bd689daea9f296fc86966cbce95db698493c9cc3b036c9a15534aeda64",
+    "private-elf-receipts/native-scope-functional-0-8-27817.err": "923af1e6cecfc25777ea6acc07b8312a4b6218c6f0f6b560e894707c831d5f9f",
+    "private-elf-receipts/native-scope-functional-0-8-27817.out": "9d137614d85137eb9329844ccaeece362767ba846dbda00c6db22f5bbe8208b6",
+    "private-elf-receipts/native-scope-functional-1-1-27817.err": "35e6b5fc11b36ec0cbadebcac54674d1413175d941ef573f1ad0eaafa7d6c021",
+    "private-elf-receipts/native-scope-functional-1-1-27817.out": "79f0015df53c9f0a71ecee32b5be2ea01cd4591bbf57e21a9ad458c810cd4ee4",
+    "private-elf-receipts/native-scope-functional-1-128-27817.err": "c68bfa88783ab87f5514e3870d4abdf8657565e044851849994c52b391821869",
+    "private-elf-receipts/native-scope-functional-1-128-27817.out": "6fc10cfad60992f09dbf1e9ea2c7004adf6ceef0d198db2f4440376cde1fbb2b",
+    "private-elf-receipts/native-scope-functional-1-32-27817.err": "b44244e1ccbe5a2a235c7abb3d9d298b4635ab68b45e2d6f928d838d7efa3dea",
+    "private-elf-receipts/native-scope-functional-1-32-27817.out": "0a470bedae03f24c3af3a0b5e76e39d3a3cafdc1601e3f6a041dcdd9925e876b",
+    "private-elf-receipts/native-scope-functional-1-8-27817.err": "ea5b1d206dba4240445245d8f0581defe148a8126facdcf91fac6dd75ae4e5fe",
+    "private-elf-receipts/native-scope-functional-1-8-27817.out": "7fdb39861e250d46dab3eac382d1a7e254fa51420b830b8e0fe81d8b5cc670a5",
+    "private-elf-receipts/native-scope-functional-2-1-27817.err": "f5192655c0d20055362564a946ac4a5c927483d5f3494894e35e15adf805595d",
+    "private-elf-receipts/native-scope-functional-2-1-27817.out": "14bccf3475349b7cd132cd4e6288628f7a48b068399c0cb16c4b2adb6cb4487d",
+    "private-elf-receipts/native-scope-functional-2-128-27817.err": "41bcaeb2370d1e9f02abf2ff8641b699472c29fbd2e5efd01684fd72d0371964",
+    "private-elf-receipts/native-scope-functional-2-128-27817.out": "64c156e966926199651bbbfc9887befe3148f46d3f8e123b328f89509520d4c0",
+    "private-elf-receipts/native-scope-functional-2-32-27817.err": "7bd52ade84487b974e357354f34a504bf3d7b2e68fae41bc09a3ce8015708211",
+    "private-elf-receipts/native-scope-functional-2-32-27817.out": "01e772950b27114087eaa51bdc381ac0a44fdbcda07c3fbba6a622c9e27bfa20",
+    "private-elf-receipts/native-scope-functional-2-8-27817.err": "79803ecf60301e0c474d7222ec18d0c9d92d9eb3ae317aec61ef9c58ea7ebdef",
+    "private-elf-receipts/native-scope-functional-2-8-27817.out": "ba10fe85daf9c456d9c5791e77c121b5437a841bb2c1a8b39aa03b3698b0236c",
+    "private-elf-receipts/native-scope-functional-3-1-27817.err": "437a2cd771c651d232cacc45553d7333c8871c6a3ad3525e65598540bbee6a08",
+    "private-elf-receipts/native-scope-functional-3-1-27817.out": "3e9a50383d16e24976d15c4f02c4c04d98abb576064b92ebea0abc64c53881ea",
+    "private-elf-receipts/native-scope-functional-3-128-27817.err": "d8284ef1181c8d69d4c7ec94d219307058760b8fec8bc966093808881bc1a558",
+    "private-elf-receipts/native-scope-functional-3-128-27817.out": "64724b1ddbfc0a4a2312353043b34ff71692fa757067ba0720214852914c688f",
+    "private-elf-receipts/native-scope-functional-3-32-27817.err": "256d8763563b41658ffbf92e2a5d0e3b117f12ab4bde4b5f13ab61bf041f0fb4",
+    "private-elf-receipts/native-scope-functional-3-32-27817.out": "03d211e26ba3f16404eeaed861311f7bfadc2ab4aa5d506c6246019f7744bf76",
+    "private-elf-receipts/native-scope-functional-3-8-27817.err": "cf8c2627fa54ddf5e84ef5bd0ea78f1985a0cb04bb7271fb2474f3c3aef9c5ba",
+    "private-elf-receipts/native-scope-functional-3-8-27817.out": "fc7ba2a3edc95e0a4a0c725687ef7421c2cf3dcd67d8372242e3b273a0cf7d93",
+    "private-elf-receipts/native-scope-functional-4-1-27817.err": "e97965a9d40642b2b4ae67b9fc496332ac1b050978998b2de9e44d9e1663aeca",
+    "private-elf-receipts/native-scope-functional-4-1-27817.out": "3e22dc79da2d12119da1e9e749d02a93223145553b52ca07bc5d9c8614788d49",
+    "private-elf-receipts/native-scope-functional-4-128-27817.err": "1ad3a98e4dd83e11c8680b3d7ef67d3836b7036865d8ac892b416783eb522ae7",
+    "private-elf-receipts/native-scope-functional-4-128-27817.out": "54f11a63f2ffd081a5db1c5aec1c41ed67c9cc07d9000cbc049d169c8f3af2a5",
+    "private-elf-receipts/native-scope-functional-4-32-27817.err": "f3c1e03bdc76741a7e9b923c25e32af816fa05000bea04f412ad1cd15f60cb58",
+    "private-elf-receipts/native-scope-functional-4-32-27817.out": "64e6af3d1a9a55c3133479901c6ff3248378928b6115292d900c5ff0f5e39e42",
+    "private-elf-receipts/native-scope-functional-4-8-27817.err": "8d8ea8268174fc58badb6e8642adc2fa253e73f4a0dfbde6f5c342d2edc7aca2",
+    "private-elf-receipts/native-scope-functional-4-8-27817.out": "789d4fc62c3f4ff758dd41a5c9b011674b604b1db4832dd18c1369d7a951a7ae",
+    "red-cow-execution.log": "61b4dfc89a7b4fd43a5aff95fdd0945a30707450b6e49df58faf3fe7f16fef1f",
+    "red-cow.log": "9756d14ab6ce0ac37acc7bbe746a1b87cb05eb6b2a98638dcf614de91863e570",
+    "red-elf-build.log": "05e26de852d9fa1ddb2d2148fb0d0fa66188be0fcc82ddd7e42e8b3e7e8a31a7",
+    "red-elf-execution.log": "5668efcc0fb47c1463a3f641331f735015e4e9d3a096979b832f17cf0af05b0a",
+    "red-elf-identity.json": "c67a7e9fcd19db1c13f7c2aeba5e452d4fe20d0c726a422d36c5070c40c0dc38",
+    "red-elf-memory.rs": "807f83d9ad19512c039843202dfdd46596b61663e940e68e95f9736f48c724a5",
+    "red-elf.log": "188f6a542c239b7f3dfe499761e46834bb94e5ab6a45d013609edf5aeb8ec9d3",
+    "red-identity.json": "9188f2404a6ad0690ef780d501a35d7edc2b8796a3ebfe3d66afacc6e55ec575",
+    "red-memory.rs": "16cf983d1ffa9ac00fa327842bc7506322b73e19357a2b3453090299fb1dd0e3",
+    "red-scope-identity.json": "d4d705d389fab3757aedf8cbaadcf91a916fadb575f564e92cd94a48fe41fd1d",
+    "red-scope-receipts/observations.json": "91ec7463438a8e80381bb0e5107693a7bc9a38f0a08834ed1c3dc3d3e35d4b87",
+    "red-scope.log": "d476e7d011131405494b949aa3b6b67f49525244df342fc523e48f4e5bf2f924",
+    "red-service.rs": "891c7583698be8111951dd12530ba04de726072f9d5f542bf122551591d2bec0",
+    "registry-final.log": "057fe65f72962ab071a492e56ba44663995599ea7fb6f088445d41895f6b6e0a",
+    "runtime-memory-final.log": "f33ee684eb498d4bb7250dcfd9b51071e2f86e201a4effbd4b8f0214f99b5ec2",
+    "runtime-memory.log": "35957d36b46bd452a2722286be9d7a6b6a42d668d9d788fb1d79ef73401c7e89",
+    "runtime-quiesce-final.log": "5aee1fc9a20aa60a65afe9ca360a757c03e092fe12f3d1660864961234c059e1",
+    "runtime-quiesce.log": "e7dbe50b09c12305522e6704905c8a00928fe0bff17fa1a5a5d05606fb530bfa",
+    "scope-doctests.log": "1adf7963cf52cc6589f90dde633a9baa1c8c171dc5a402b005cb6f56270aa8ce",
+    "signed-foreign-mm.log": "c4b68a4e7a23bd093400fe0d003d5a111016de6871c0069fe701befc7f9b48c0",
+    "signed-post-run-identities.json": "ee8397e882a28fe6c3a28cf1c36485ca1a0bc216e8ae32889095d44aa405f4b2",
+    "source-revision.txt": "ec339153a2453aaa9f651025ec5ea1840bb8caa6e5500a84097c3d185bef2579",
+    "supplementary-status.json": "91252761fa9f58c94f8aa04b5c54a58ded02e81d727d98c9160d0d93cc7a6212",
+    "verification-status.json": "4b03d5bc0dbb475537c84d1c37a1dbda2ff1232471ada094590573744f036073"
+  },
+  "red_source_scope": "Captured red binaries are exact. Red source files preserve the regression fixtures and service before correction; these are not claimed as full red source-tree manifests."
+}

@@ -4,6 +4,14 @@
 
 use super::*;
 
+/// COW provenance matters only when all other anonymous-remap guards pass.
+fn scrub_remap_eligible(
+    eligible_without_cow: bool,
+    cow_source_exists: impl FnOnce() -> bool,
+) -> bool {
+    eligible_without_cow && !cow_source_exists()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum MissingMappingResolution<T> {
     Pristine,
@@ -478,28 +486,20 @@ impl HvfVmState {
             // lands in the PRIVATE overlay backing the guest reads, not the shared
             // aperture. Identity otherwise; PROT_NONE already gated on the VA.
             let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
-            let (mapping_start, mapping_end, mapping_ipa, host_addr) = {
-                let Some(mapping) = self.mapping_for_range_mut(lookup_address, chunk_len) else {
-                    return Err(MemoryError::OutOfBounds { address, length });
-                };
-                (mapping.start, mapping.end, mapping.ipa, mapping.host_addr)
-            };
+            let mapping = self.task.copy_guest_mapping_in(
+                &self.carrier_vm_custody(),
+                lookup_address,
+                chunk_address,
+                &bytes[copied..copied + chunk_len],
+            )?;
             self.emit_guest_mem_copy_decision(
                 crate::probes::guest_mem_dir::WRITE_GUEST,
                 chunk_address,
                 chunk_len,
-                mapping_start,
-                mapping_end,
-                mapping_ipa,
+                mapping.start,
+                mapping.end,
+                mapping.ipa,
             );
-            let chunk_offset = (chunk_address - mapping_start) as usize;
-            unsafe {
-                volatile_copy_to_guest(
-                    bytes.as_ptr().add(copied),
-                    host_addr.add(chunk_offset),
-                    chunk_len,
-                );
-            }
             copied += chunk_len;
         }
         crate::probes::guest_mem_bytes(
@@ -669,14 +669,16 @@ impl HvfVmState {
                         .and_then(|mapping| {
                             let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
                             let target = unsafe { mapping.host_addr.add(offset) };
-                            let cow_source = self.physical_cow_source(chunk_va, ipa).is_some();
                             let is_alias = is_reusable_global_frame_extent(mapping.ipa, 1);
-                            let eligible = mapping.sharing == GuestMappingSharing::Private
+                            let eligible_without_cow = mapping.sharing
+                                == GuestMappingSharing::Private
                                 && mapping.shared_key_base == 0
-                                && !cow_source
                                 && !is_alias
                                 && retained_fragment.is_none()
                                 && zero_anonymous_remap_enabled();
+                            let eligible = scrub_remap_eligible(eligible_without_cow, || {
+                                self.physical_cow_source(chunk_va, ipa).is_some()
+                            });
                             Some((target, eligible))
                         })
                 })
@@ -700,13 +702,14 @@ impl HvfVmState {
                             let offset =
                                 usize::try_from(chunk_va.checked_sub(mapping.start)?).ok()?;
                             let target = unsafe { mapping.host_addr.add(offset) };
-                            let cow_source =
-                                self.physical_cow_source(chunk_va, mapping.ipa).is_some();
-                            let eligible = mapping.sharing == GuestMappingSharing::Private
+                            let eligible_without_cow = mapping.sharing
+                                == GuestMappingSharing::Private
                                 && mapping.shared_key_base == 0
-                                && !cow_source
                                 && retained_fragment.is_none()
                                 && zero_anonymous_remap_enabled();
+                            let eligible = scrub_remap_eligible(eligible_without_cow, || {
+                                self.physical_cow_source(chunk_va, mapping.ipa).is_some()
+                            });
                             Some((target, eligible))
                         })
                 });
@@ -785,28 +788,20 @@ impl HvfVmState {
             // `repoint_private` overlay VAs resolve region+offset via the translated
             // overlay IPA (see `syscall_buffer_lookup_addr`); identity otherwise.
             let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
-            let (mapping_start, mapping_end, mapping_ipa, host_addr) = {
-                let Some(mapping) = self.mapping_for_range_mut(lookup_address, chunk_len) else {
-                    return Err(MemoryError::OutOfBounds { address, length });
-                };
-                (mapping.start, mapping.end, mapping.ipa, mapping.host_addr)
-            };
+            let mapping = self.task.copy_guest_mapping_in(
+                &self.carrier_vm_custody(),
+                lookup_address,
+                lookup_address,
+                &bytes[copied..copied + chunk_len],
+            )?;
             self.emit_guest_mem_copy_decision(
                 crate::probes::guest_mem_dir::WRITE_GUEST_CHECKED,
                 chunk_address,
                 chunk_len,
-                mapping_start,
-                mapping_end,
-                mapping_ipa,
+                mapping.start,
+                mapping.end,
+                mapping.ipa,
             );
-            let chunk_offset = (lookup_address - mapping_start) as usize;
-            unsafe {
-                volatile_copy_to_guest(
-                    bytes.as_ptr().add(copied),
-                    host_addr.add(chunk_offset),
-                    chunk_len,
-                );
-            }
             copied += chunk_len;
         }
         crate::probes::guest_mem_bytes(
@@ -1032,6 +1027,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scrub_remap_ineligible_needs_no_cow_query() {
+        for scale in [1, 8, 32, 128] {
+            let mut queries = 0;
+            for _ in 0..scale {
+                assert!(!scrub_remap_eligible(false, || {
+                    queries += 1;
+                    false
+                }));
+            }
+            assert_eq!(queries, 0, "ineligible remaps at scale {scale}");
+        }
+    }
+
+    #[test]
+    fn scrub_remap_eligible_preserves_cow_query() {
+        for has_cow in [false, true] {
+            let mut queries = 0;
+            let eligible = scrub_remap_eligible(true, || {
+                queries += 1;
+                has_cow
+            });
+            assert_eq!(queries, 1);
+            assert_eq!(eligible, !has_cow);
+        }
+    }
+
+    #[test]
     fn missing_mapping_is_rechecked_after_pristine_publication_commits() {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, mpsc};
@@ -1077,5 +1099,33 @@ mod tests {
             MissingMappingResolution::Published(41),
         );
         publisher.join().unwrap();
+    }
+}
+
+// Shared by the checked syscall copier and privileged internal copier. Keeping
+// the resolved fragment here also permits VM-free tests of the production copy.
+impl HvfTaskState {
+    pub(crate) fn copy_guest_mapping_in(
+        &self,
+        custody: &CarrierVmCustody,
+        lookup_address: u64,
+        copy_address: u64,
+        bytes: &[u8],
+    ) -> Result<MappingView, MemoryError> {
+        let error = || MemoryError::OutOfBounds {
+            address: copy_address,
+            length: bytes.len(),
+        };
+        let write = self
+            .with_mapping_for_range_in(custody, lookup_address, bytes.len(), |source| {
+                source.begin_write(self, custody, copy_address, bytes.len(), None)
+            })
+            .ok_or_else(error)??;
+        // SAFETY: the selected live mapping contains this complete fragment;
+        // its exact physical owner and content admission outlive the copy.
+        unsafe {
+            volatile_copy_to_guest(bytes.as_ptr(), write.pointer, bytes.len());
+        }
+        Ok(write.view)
     }
 }

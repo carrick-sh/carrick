@@ -1,0 +1,9 @@
+{
+  "failure": "exec_table_capacity_refuses_new_admission: Unavailable instead of Rejected",
+  "deadline_ms": 50,
+  "binary_sha256": "ddc8b850d16009532e34a627c92271c9e4e5cffa921f9556c9d7d43474ab2ca3",
+  "source_sha256": "8c5c996d7accd40a845637eb7227b50643645622e17ae174bf94b7d9afd14295",
+  "head_source_sha256": "8c5c996d7accd40a845637eb7227b50643645622e17ae174bf94b7d9afd14295",
+  "unchanged_from_head": true,
+  "full_gate_remains_failed": true
+}

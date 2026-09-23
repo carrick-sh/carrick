@@ -1,0 +1,31 @@
+     Locking 1 package to latest compatible version
+      Adding native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/experiments/native-syscall-slice)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/experiments/native-syscall-slice)
+error[E0599]: no associated function or constant named `EBADF` found for struct `LinuxErrno` in the current scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1267:113
+     |
+1267 |                 assert!(matches!(outcome, DispatchOutcome::Errno { errno } if errno == carrick_abi::LinuxErrno::EBADF));
+     |                                                                                                                 ^^^^^ associated function or constant not found in `LinuxErrno`
+
+error[E0308]: mismatched types
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1272:40
+     |
+1272 |                 authority.read_foreign(&current, read, &mut actual).unwrap();
+     |                           ------------ ^^^^^^^^ expected `&ForeignMm`, found `&CurrentMm<'_>`
+     |                           |
+     |                           arguments to this method are incorrect
+     |
+     = note: expected reference `&ForeignMm`
+                found reference `&CurrentMm<'_>`
+note: method defined here
+    --> crates/carrick-kernel/src/kernel/mm_access.rs:564:12
+     |
+ 564 |     pub fn read_foreign(
+     |            ^^^^^^^^^^^^
+
+Some errors have detailed explanations: E0308, E0599.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `carrick-runtime` (lib test) due to 2 previous errors

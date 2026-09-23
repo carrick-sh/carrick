@@ -1,0 +1,66 @@
+{
+  "workload": "node-app",
+  "total": 2137,
+  "top": [
+    {
+      "nr": 215,
+      "name": "munmap",
+      "count": 257
+    },
+    {
+      "nr": 98,
+      "name": "futex",
+      "count": 232
+    },
+    {
+      "nr": 222,
+      "name": "mmap",
+      "count": 199
+    },
+    {
+      "nr": 134,
+      "name": "rt_sigaction",
+      "count": 165
+    },
+    {
+      "nr": 233,
+      "name": "madvise",
+      "count": 126
+    },
+    {
+      "nr": 135,
+      "name": "rt_sigprocmask",
+      "count": 105
+    },
+    {
+      "nr": 226,
+      "name": "mprotect",
+      "count": 97
+    },
+    {
+      "nr": 57,
+      "name": "close",
+      "count": 78
+    },
+    {
+      "nr": 172,
+      "name": "getpid",
+      "count": 74
+    },
+    {
+      "nr": 63,
+      "name": "read",
+      "count": 72
+    },
+    {
+      "nr": 25,
+      "name": "fcntl",
+      "count": 61
+    },
+    {
+      "nr": 80,
+      "name": "fstat",
+      "count": 49
+    }
+  ]
+}

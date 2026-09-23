@@ -1206,7 +1206,8 @@ impl Stage1MmBackend {
     }
 
     pub(crate) fn bind_vma_source(&self, source: SharedVmaSnapshotSource) {
-        *self.vma_source.write() = Some(source);
+        let mut slot = self.vma_source.write();
+        *slot = Some(source);
         self.bump_revision();
     }
 
@@ -1319,8 +1320,8 @@ impl PreparedVmaFreeze {
                 .take()
                 .ok_or(SnapshotError::ChangedDuringObservation)?;
             *slot = Some(Arc::new(frozen));
-            drop(slot);
             backend.bump_revision();
+            drop(slot);
             Ok(())
         })
     }
@@ -1335,6 +1336,47 @@ fn deadline_error(deadline: Instant) -> SnapshotError {
 }
 
 impl MmBackend for Stage1MmBackend {
+    fn snapshot_stamp(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<carrick_kernel::kernel::MmBackendStamp>, SnapshotError> {
+        let before = self.revision.load(Ordering::Acquire);
+        let binding = *self
+            .binding
+            .try_read_until(deadline)
+            .ok_or_else(|| deadline_error(deadline))?;
+        let source = self
+            .vma_source
+            .try_read_until(deadline)
+            .ok_or_else(|| deadline_error(deadline))?
+            .clone()
+            .ok_or(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas))?;
+        let kernel = {
+            let slot = self
+                .inventory
+                .try_read_until(deadline)
+                .ok_or_else(|| deadline_error(deadline))?;
+            slot.as_ref()
+                .and_then(|inventory| inventory.kernel.upgrade())
+                .ok_or(SnapshotError::AuthorityUnavailable(SnapshotTable::Mappings))?
+        };
+        // Never hold a backend lock across an independent authority's read.
+        let vma_revision = source.revision();
+        let frame_inventory_revision = kernel
+            .frame_inventory()
+            .revision_until(deadline)
+            .ok_or_else(|| deadline_error(deadline))?;
+        if before != self.revision.load(Ordering::Acquire) || vma_revision != source.revision() {
+            return Err(SnapshotError::ChangedDuringObservation);
+        }
+        Ok(Some(carrick_kernel::kernel::MmBackendStamp {
+            revision: before,
+            binding,
+            vma_revision,
+            frame_inventory_revision,
+        }))
+    }
+
     fn snapshot(&self, deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
         let before = self.revision.load(Ordering::Acquire);
         let binding = {

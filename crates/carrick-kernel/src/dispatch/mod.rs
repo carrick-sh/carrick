@@ -808,6 +808,7 @@ pub mod io_buffers;
 pub(in crate::dispatch) use io_buffers::*;
 pub mod mm_authority;
 pub mod mm_quiesce;
+pub mod native_execution;
 #[cfg(test)]
 pub(crate) use carrick_abi::LINUX_FUTEX_PRIVATE_FLAG;
 #[allow(unused_imports)]

@@ -1,0 +1,969 @@
+--- before/crates/carrick-hal/src/foreign_mm.rs
++++ after/crates/carrick-hal/src/foreign_mm.rs
+@@ -495,14 +495,17 @@
+     fn receipt(&self) -> &dyn ForeignMmWriteReceipt;
+ }
+ 
+-/// Resident data pinned to one exact carrier owner. MM exclusion and Linux
+-/// permission authority are supplied by the kernel's borrowing wrapper.
+-/// This is not code publication or an ordinary concurrent execution grant.
++/// Resident data pinned to one exact carrier owner. The kernel supplies either
++/// exact COW mutation exclusion or a live-validated native execution scope.
++/// This never authorizes executable code publication.
+ ///
+ /// # Safety
+ /// Implementors must pin the authenticated complete range for this object's
+ /// lifetime, return its real backing pointer, and attest exact snapshot/COW
+ /// identity. No copied buffer or unpinned address may implement this capability.
++/// An implementation enabling native activation must check the live mapping,
++/// owner generation, protection tracker and every crossed user-RW leaf. A saved
++/// snapshot match alone cannot attest permissions after fork has rearmed COW.
+ pub unsafe trait ForeignNativeDataSpan: Debug {
+     fn authenticates(
+         &self,
+@@ -512,10 +515,24 @@
+         len: usize,
+     ) -> bool;
+ 
++    /// Called only after the kernel has entered the exact-MM running handshake.
++    /// The caller retains that scope until every pointer use has ended. The
++    /// default refuses activation, even for an otherwise valid pinned span.
++    fn validate_native_activation(
++        &self,
++        authority: &dyn ForeignMmLiveAuthority,
++        snapshot: &dyn ForeignMmSnapshot,
++        deadline: Instant,
++    ) -> Result<(), ForeignMmTransportError> {
++        let _ = (authority, snapshot, deadline);
++        Err(ForeignMmTransportError::AuthorityUnavailable)
++    }
++
+     /// # Safety
+-    /// Retain exact MM exclusion and the COW witness; access only the granted
+-    /// range, never use the pointer after this span drops, and do not re-enter
+-    /// kernel mutation/dispatch while using it.
++    /// Retain either exact MM exclusion plus the COW witness, or an exact-MM
++    /// native execution scope with successful live activation in that scope.
++    /// Access only the granted range, never after this span or authority drops,
++    /// and do not re-enter kernel mutation/dispatch while using the pointer.
+     unsafe fn as_mut_ptr(&mut self) -> *mut u8;
+ }
+ 
+--- before/crates/carrick-vmm-hvf/src/trap/foreign_mm.rs
++++ after/crates/carrick-vmm-hvf/src/trap/foreign_mm.rs
+@@ -2308,6 +2308,8 @@
+ }
+ 
+ struct CarrierPinnedCowRange {
++    extent: (u64, u64),
++    initial_physical: u64,
+     _owner_pin: GlobalFrameOwnerPin,
+     ptr: *mut u8,
+     snapshot: CarrierForeignMmSnapshot,
+@@ -2328,9 +2330,24 @@
+     }
+ }
+ 
++/// Only native grants retain carrier revalidation state. Ordinary prepared
++/// copies keep the original pin/receipt path without additional Arc operations.
++struct CarrierNativeDataSpan {
++    range: CarrierPinnedCowRange,
++    custody: std::sync::Arc<CarrierVmCustody>,
++    state: std::sync::Arc<MmAccessState>,
++}
++impl std::fmt::Debug for CarrierNativeDataSpan {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_tuple("CarrierNativeDataSpan")
++            .field(&self.range)
++            .finish()
++    }
++}
++
+ // SAFETY: pin_cow_range authenticates every crossed leaf and the exact live
+ // owner before construction; the owner pin covers this object's full lifetime.
+-unsafe impl carrick_hal::ForeignNativeDataSpan for CarrierPinnedCowRange {
++unsafe impl carrick_hal::ForeignNativeDataSpan for CarrierNativeDataSpan {
+     fn authenticates(
+         &self,
+         snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+@@ -2338,19 +2355,123 @@
+         start: carrick_guest_mem::GuestVa,
+         len: usize,
+     ) -> bool {
+-        self.snapshot.matches(snapshot)
+-            && self.start == start
+-            && self.len == len
++        self.range.snapshot.matches(snapshot)
++            && self.range.start == start
++            && self.range.len == len
+             && cow.mm() == snapshot.mm()
+             && cow.backend_revision() == snapshot.backend_revision()
+             && cow.vma_revision() == snapshot.vma_revision()
+             && cow.frame_inventory_revision() == snapshot.frame_inventory_revision()
+-            && self.mapping == cow.mapping()
+-            && self.frame == cow.frame()
+-            && self.owner_generation == cow.owner_generation()
++            && self.range.mapping == cow.mapping()
++            && self.range.frame == cow.frame()
++            && self.range.owner_generation == cow.owner_generation()
++    }
++    fn validate_native_activation(
++        &self,
++        authority: &dyn carrick_hal::ForeignMmLiveAuthority,
++        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
++        deadline: std::time::Instant,
++    ) -> Result<(), carrick_hal::ForeignMmTransportError> {
++        use carrick_hal::ForeignMmTransportError as Error;
++        if !self.range.snapshot.matches(snapshot)
++            || !live_snapshot_matches(authority, &self.range.snapshot, deadline)?
++        {
++            return Err(Error::LeaseStale);
++        }
++        if self
++            .state
++            .identity
++            .try_read_until(deadline)
++            .ok_or(Error::TimedOut)?
++            .as_ref()
++            != Some(&(self.range.snapshot.mm, self.range.snapshot.binding))
++        {
++            return Err(Error::MissingBinding);
++        }
++        let expected_generation = self.range.owner_generation.raw_for_probe();
++        let host_addr = self.range._owner_pin.owner().host_addr();
++        {
++            let inventory = self
++                .state
++                .frame_inventory
++                .ledger
++                .try_lock_until(deadline)
++                .ok_or(Error::TimedOut)?;
++            if !inventory
++                .extents
++                .get(&self.range.extent)
++                .is_some_and(|extent| {
++                    extent.mapping == self.range.mapping
++                        && extent.frame == self.range.frame
++                        && extent.stage2_base == self.range.extent.0
++                        && extent.stage2_length == self.range.extent.1
++                        && extent.stage2_owner.generation == expected_generation
++                        && extent.stage2_owner.host_addr == host_addr
++                })
++            {
++                return Err(Error::OwnerStale);
++            }
++        }
++        if !global_frame_host_owner_matches_in(
++            &self.custody,
++            self.range.extent.0,
++            self.range.extent.1,
++            host_addr,
++            expected_generation,
++        ) {
++            return Err(Error::OwnerStale);
++        }
++        if self
++            .state
++            .protections
++            .range_write_denied(self.range.start.raw(), self.range.len)
++        {
++            return Err(Error::MutationFailed);
++        }
++        let end = self
++            .range
++            .start
++            .raw()
++            .checked_add(self.range.len as u64)
++            .ok_or(Error::MutationFailed)?;
++        // Walk the LIVE page-table authority, never the retained COW snapshot.
++        // Fork can rearm read-only leaves without changing the VMA revision.
++        self.state.page_tables_authority().try_with_manager_until(
++            deadline,
++            Error::TimedOut,
++            Error::AuthorityUnavailable,
++            |tables| {
++                let mut cursor = self.range.start.raw();
++                while cursor < end {
++                    let leaf =
++                        carrick_mem::page_table::terminal_descriptor(tables.debug_walk(cursor));
++                    let expected = self
++                        .range
++                        .initial_physical
++                        .checked_add(cursor - self.range.start.raw())
++                        .ok_or(Error::MutationFailed)?;
++                    if leaf & 1 == 0
++                        || leaf & (0b11 << 6) != (0b01 << 6)
++                        || tables.translate_retained_output(cursor) != Some(expected)
++                    {
++                        return Err(Error::MutationFailed);
++                    }
++                    cursor = end.min(
++                        (cursor & !0xfff)
++                            .checked_add(0x1000)
++                            .ok_or(Error::MutationFailed)?,
++                    );
++                }
++                Ok(())
++            },
++        )?;
++        if !live_snapshot_matches(authority, &self.range.snapshot, deadline)? {
++            return Err(Error::LeaseStale);
++        }
++        Ok(())
+     }
+     unsafe fn as_mut_ptr(&mut self) -> *mut u8 {
+-        self.ptr
++        self.range.ptr
+     }
+ }
+ 
+@@ -2496,6 +2617,8 @@
+             .map_err(|_| carrick_hal::ForeignMmTransportError::Retry)?;
+         let dst_ptr = unsafe { owner_pin.owner().as_ptr().add(offset) };
+         Ok(CarrierPinnedCowRange {
++            extent: extent_key,
++            initial_physical,
+             _owner_pin: owner_pin,
+             ptr: dst_ptr,
+             snapshot: requested,
+@@ -2782,7 +2905,13 @@
+             },
+         )?;
+         self.pin_cow_range(authority, snapshot, cow, start, len, deadline)
+-            .map(|range| Box::new(range) as Box<dyn carrick_hal::ForeignNativeDataSpan>)
++            .map(|range| {
++                Box::new(CarrierNativeDataSpan {
++                    range,
++                    custody: std::sync::Arc::clone(&self.custody),
++                    state: std::sync::Arc::clone(&self.state),
++                }) as Box<dyn carrick_hal::ForeignNativeDataSpan>
++            })
+     }
+ }
+ 
+--- before/crates/carrick-kernel/src/kernel/mm_access.rs
++++ after/crates/carrick-kernel/src/kernel/mm_access.rs
+@@ -1229,6 +1229,10 @@
+     SourceLengthMismatch { range: usize, source_len: usize },
+     #[error("native data grant intersects executable memory at {address:?}")]
+     NativeDataExecutable { address: GuestVa },
++    #[error("native data activation requires a host control safe point")]
++    NativeDataControlPending,
++    #[error("prepared native data no longer names the exact live MM snapshot")]
++    StaleNativeData,
+     #[error("foreign COW witness no longer matches the three live MM revisions")]
+     StaleCowBroken,
+     #[error("foreign MM write exceeded its overall deadline budget")]
+@@ -1264,6 +1268,7 @@
+ /// ```
+ pub struct CurrentNativeData<'execution, 'witness, 'mm, 'guard, 'authority> {
+     transport: Box<dyn carrick_hal::ForeignNativeDataSpan>,
++    snapshot: ProjectedForeignMmSnapshot,
+     start: GuestVa,
+     len: NonZeroUsize,
+     _context: &'execution KernelContext,
+@@ -1281,6 +1286,20 @@
+     }
+     pub fn is_empty(&self) -> bool {
+         false
++    }
++
++    /// Retain an opaque pin beyond this COW transaction. This consumes the
++    /// mutation-scoped pointer grant; only activation under a new execution
++    /// scope can restore pointer access. Preparation itself grants no access.
++    pub fn prepare_for_execution(self) -> PreparedNativeData {
++        PreparedNativeData {
++            transport: self.transport,
++            token: self._witness.range.token.clone(),
++            snapshot: self.snapshot,
++            start: self.start,
++            len: self.len,
++            _thread: PhantomData,
++        }
+     }
+ 
+     /// # Safety
+@@ -1396,6 +1415,7 @@
+         }
+         Ok(CurrentNativeData {
+             transport,
++            snapshot,
+             start: range.start,
+             len: range.len,
+             _context: self,
+@@ -1406,9 +1426,116 @@
+     }
+ }
+ 
++/// Opaque, pinned carrier backing prepared by an authenticated COW transaction.
++/// Keeping this value alive does not retain mutation exclusion or permit access.
++/// Activation checks the live MM snapshot and transport authority on every scope.
++pub struct PreparedNativeData {
++    transport: Box<dyn carrick_hal::ForeignNativeDataSpan>,
++    token: MmToken,
++    snapshot: ProjectedForeignMmSnapshot,
++    start: GuestVa,
++    len: NonZeroUsize,
++    _thread: PhantomData<std::rc::Rc<()>>,
++}
++
++impl PreparedNativeData {
++    pub fn activate<'active, 'scope>(
++        &'active mut self,
++        scope: &'active crate::dispatch::native_execution::NativeExecution<'scope>,
++    ) -> Result<ActiveNativeData<'active, 'scope>, MmAccessError> {
++        let mutation = self.token.foreign_mutation.as_ref().ok_or(
++            MmAccessError::MissingForeignMutationAuthority(self.token.mm.id()),
++        )?;
++        let context = scope.data_context(mutation)?;
++        if !Arc::ptr_eq(&context.kernel, &self.token.kernel)
++            || context.task.key() != self.token.task
++            || !Arc::ptr_eq(&context.shared.mm(), &self.token.mm)
++        {
++            return Err(MmAccessError::ForeignRangeAuthorityMismatch);
++        }
++        let deadline = Instant::now() + MM_SNAPSHOT_TIMEOUT;
++        let before = snapshot_backend(&self.token.mm, deadline)?;
++        validate_snapshot_vmas(&before)?;
++        validate_range_in_snapshot(&before, self.start, self.len, RangeAccess::KernelRead)?;
++        validate_range_in_snapshot(&before, self.start, self.len, RangeAccess::Write)?;
++        let live_snapshot = ProjectedForeignMmSnapshot::from_backend(self.token.mm.id(), &before)?;
++        // Exact equality includes executable ranges, so a permission change and
++        // restoration cannot revive this preparation's old VMA revision.
++        if live_snapshot != self.snapshot {
++            return Err(MmAccessError::StaleNativeData);
++        }
++        let live = RetainedMmLiveAuthority {
++            mm: Arc::clone(&self.token.mm),
++        };
++        self.transport
++            .validate_native_activation(&live, &live_snapshot, deadline)
++            .map_err(MmAccessError::ForeignTransport)?;
++        let after = ProjectedForeignMmSnapshot::from_backend(
++            self.token.mm.id(),
++            &snapshot_backend(&self.token.mm, deadline)?,
++        )?;
++        if after != live_snapshot {
++            return Err(MmAccessError::StaleNativeData);
++        }
++        scope.data_context(mutation)?;
++        Ok(ActiveNativeData {
++            prepared: self,
++            _scope: scope,
++        })
++    }
++}
++
++/// Data access borrowed from the exact native running scope. Dropping this grant
++/// releases access; dropping the scope afterward acknowledges the safe point.
++///
++/// ```compile_fail,E0505
++/// use carrick_kernel::{kernel::mm_access::PreparedNativeData, dispatch::native_execution::NativeExecution};
++/// fn end_scope(mut p: PreparedNativeData, scope: NativeExecution<'_>) {
++///     let mut active = p.activate(&scope).unwrap();
++///     drop(scope);
++///     unsafe { active.as_mut_ptr(); }
++/// }
++/// ```
++/// ```compile_fail,E0499
++/// use carrick_kernel::{kernel::mm_access::PreparedNativeData, dispatch::native_execution::NativeExecution};
++/// fn duplicate(p: &mut PreparedNativeData, scope: &NativeExecution<'_>) {
++///     let a = p.activate(scope).unwrap();
++///     let b = p.activate(scope).unwrap();
++///     drop((a, b));
++/// }
++/// ```
++pub struct ActiveNativeData<'active, 'scope> {
++    prepared: &'active mut PreparedNativeData,
++    _scope: &'active crate::dispatch::native_execution::NativeExecution<'scope>,
++}
++impl ActiveNativeData<'_, '_> {
++    pub fn start(&self) -> GuestVa {
++        self.prepared.start
++    }
++    pub fn len(&self) -> usize {
++        self.prepared.len.get()
++    }
++    pub fn is_empty(&self) -> bool {
++        false
++    }
++    /// # Safety
++    /// Only access this grant's bounded range while both grant and execution
++    /// scope remain live. Do not manufacture incompatible Rust references,
++    /// publish executable code, re-enter dispatch/mutation or escape the pointer.
++    /// The native executor must return at bounded control checkpoints.
++    pub unsafe fn as_mut_ptr(&mut self) -> *mut u8 {
++        // SAFETY: activation validated the live carrier state after entering the
++        // exact running handshake. The retained scope prevents mutation passing
++        // its drain until this grant and all bounded pointer accesses have ended.
++        unsafe { self.prepared.transport.as_mut_ptr() }
++    }
++}
++
+ #[cfg(test)]
+ mod native_data_type_tests {
+-    use super::CurrentNativeData;
++    use super::{ActiveNativeData, CurrentNativeData, PreparedNativeData};
++    static_assertions::assert_not_impl_any!(PreparedNativeData: Send, Sync, Clone, Copy);
++    static_assertions::assert_not_impl_any!(ActiveNativeData<'static, 'static>: Send, Sync, Clone, Copy);
+     static_assertions::assert_not_impl_any!(CurrentNativeData<'static, 'static, 'static, 'static, 'static>: Send, Sync, Clone, Copy);
+ }
+ 
+--- before/crates/carrick-kernel/src/dispatch/native_execution.rs
++++ after/crates/carrick-kernel/src/dispatch/native_execution.rs
+@@ -132,6 +132,22 @@
+     _lease: &'scope mut ThreadExecutionLease,
+ }
+ impl NativeExecution<'_> {
++    /// Authenticate the mutation authority that originally prepared a data pin
++    /// against this scope's actual pause/census/coordinator objects, not MM IDs.
++    pub(crate) fn data_context(
++        &self,
++        mutation: &super::mm_mutation::ForeignMmMutationAuthority,
++    ) -> Result<&KernelContext, MmAccessError> {
++        if !mutation.matches_native_authority(&self.executor.participant.authority) {
++            return Err(MmAccessError::ForeignMutationAuthorityMismatch);
++        }
++        self.context.validate_current_execution_mm(self._lease)?;
++        if self.stop_requested() {
++            return Err(MmAccessError::NativeDataControlPending);
++        }
++        Ok(self.context)
++    }
++
+     /// The translator must reach a bounded checkpoint and end this scope when
+     /// true. This only observes control; it never clears running or a request.
+     pub fn stop_requested(&self) -> bool {
+@@ -176,6 +192,15 @@
+ }
+ 
+ impl SyscallDispatcher {
++    /// Test-only adapter to the production carrier fixture's exact authority.
++    /// The normal authentication and census admission path remains unchanged.
++    #[cfg(any(test, feature = "test-support"))]
++    pub fn with_native_mm_for_test(authority: Arc<super::DispatchMmAuthority>) -> Self {
++        let dispatcher = Self::new();
++        dispatcher.mm_binding.current.store(authority);
++        dispatcher
++    }
++
+     pub fn admit_native_executor(
+         &self,
+         context: &KernelContext,
+--- before/crates/carrick-kernel/src/dispatch/mm_mutation.rs
++++ after/crates/carrick-kernel/src/dispatch/mm_mutation.rs
+@@ -233,6 +233,16 @@
+             stage1,
+             pt_quiesce,
+         }
++    }
++
++    pub(in crate::dispatch) fn matches_native_authority(
++        &self,
++        authority: &super::DispatchMmAuthority,
++    ) -> bool {
++        self.mm == authority.mm_id
++            && Arc::ptr_eq(&self.coordinator, &authority.mutation_coordinator)
++            && Arc::ptr_eq(&self.census, &authority.guest_executors)
++            && Arc::ptr_eq(&self.pt_quiesce, &authority.pt_quiesce)
+     }
+ 
+     pub(crate) fn authorizes(&self, guard: &MmMutationGuard<'_>) -> bool {
+--- before/crates/carrick-runtime/src/vcpu_loop/memory.rs
++++ after/crates/carrick-runtime/src/vcpu_loop/memory.rs
+@@ -1170,6 +1170,482 @@
+                 .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4),
+             Err(MmAccessError::ExecuteDenied { .. })
+         ));
++    }
++
++    #[test]
++    fn native_data_activation_outlives_mutation_but_not_execution() {
++        use carrick_kernel::kernel::mm_access::MmAccessTarget;
++        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
++        let (kernel, root) = bootstrap(32_180);
++        let fixture = real_production_cow_fixture(
++            &kernel,
++            &root,
++            32_181,
++            0x9a00_6b00_0000,
++            0x9b00_6b00_0000,
++            ThreadId::synthetic_for_tests(32_181),
++        );
++        let original = fixture.carrier.pin_original_data_for_test().unwrap();
++        let mut execution = execution_lease(&fixture.child, 32181);
++        let authority = carrick_kernel::kernel::MmAccessAuthority::new();
++        let current = fixture.child.current_mm(&execution).unwrap();
++        let range = current
++            .access_token()
++            .write_range(GuestVa(TEST_VA), 4)
++            .unwrap()
++            .unwrap();
++        let mut prepared = authority
++            .with_current_mutation(
++                &current,
++                ThreadId::synthetic_for_tests(32_181),
++                |mutation| {
++                    let mut cow = authority
++                        .break_foreign_cow(mutation, &current, range)
++                        .unwrap();
++                    Ok(fixture
++                        .child
++                        .borrow_current_native_data(&execution, &mut cow)
++                        .unwrap()
++                        .prepare_for_execution())
++                },
++            )
++            .unwrap();
++        drop(current);
++        assert!(!fixture.dispatch_mm.pt_quiesce().is_quiescing());
++        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
++            fixture.dispatch_mm.clone(),
++        );
++        let mut executor = dispatcher
++            .admit_native_executor(&fixture.child, &execution)
++            .unwrap();
++        let mut completed = 0u32;
++        for scale in [1, 8, 32, 128] {
++            for _ in 0..scale {
++                let scope = dispatcher
++                    .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                    .unwrap();
++                {
++                    let mut active = prepared.activate(&scope).unwrap();
++                    assert_eq!(active.start(), GuestVa(TEST_VA));
++                    assert_eq!(active.len(), 4);
++                    // Bounded CPU access to the actual pinned carrier bytes, after mutation
++                    // exclusion has ended. No syscall/dispatcher reentry or Rust aliases.
++                    unsafe {
++                        let ptr = active.as_mut_ptr();
++                        std::arch::asm!("ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
++                ptr = in(reg) ptr, out("x9") _, options(nostack));
++                    }
++                }
++                drop(scope);
++                completed += 1;
++            }
++        }
++        assert_eq!(completed, 169);
++        drop(executor);
++        fixture
++            .child
++            .thread()
++            .yield_from_executor(execution)
++            .unwrap();
++        assert_eq!(original.prefix(), *b"same");
++        let root_execution = execution_lease(&root, 32180);
++        let current = foreign_mm(&kernel, &root, &root_execution, fixture.child.task().key());
++        let read = current
++            .access_token()
++            .read_range(GuestVa(TEST_VA), 4)
++            .unwrap()
++            .unwrap();
++        let mut bytes = [0; 4];
++        authority.read_foreign(&current, read, &mut bytes).unwrap();
++        assert_eq!(
++            u32::from_le_bytes(bytes),
++            u32::from_le_bytes(*b"same") + completed
++        );
++        root.thread().yield_from_executor(root_execution).unwrap();
++    }
++
++    #[test]
++    fn native_data_activation_rejects_changes_after_preparation() {
++        use carrick_kernel::kernel::mm_access::MmAccessTarget;
++        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
++        // Each case starts with a successfully activated real COW span, then
++        // changes only one authority under the actual mutation/drain protocol.
++        for mode in 0..7 {
++            let id = 32_200 + mode;
++            let (kernel, root) = bootstrap(id);
++            let fixture = real_production_cow_fixture(
++                &kernel,
++                &root,
++                id + 100,
++                0x9a00_7000_0000 + mode as u64 * 0x100_0000,
++                0x9b00_7000_0000 + mode as u64 * 0x100_0000,
++                ThreadId::synthetic_for_tests(id + 100),
++            );
++            let mut execution = execution_lease(&fixture.child, id as u64);
++            let authority = carrick_kernel::kernel::MmAccessAuthority::new();
++            let current = fixture.child.current_mm(&execution).unwrap();
++            let range = current
++                .access_token()
++                .write_range(GuestVa(TEST_VA), 8192)
++                .unwrap()
++                .unwrap();
++            let mut prepared = authority
++                .with_current_mutation(
++                    &current,
++                    ThreadId::synthetic_for_tests(id + 100),
++                    |mutation| {
++                        let mut cow = authority
++                            .break_foreign_cow(mutation, &current, range)
++                            .unwrap();
++                        Ok(fixture
++                            .child
++                            .borrow_current_native_data(&execution, &mut cow)
++                            .unwrap()
++                            .prepare_for_execution())
++                    },
++                )
++                .unwrap();
++            drop(current);
++            let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
++                fixture.dispatch_mm.clone(),
++            );
++            let mut executor = dispatcher
++                .admit_native_executor(&fixture.child, &execution)
++                .unwrap();
++            {
++                let scope = dispatcher
++                    .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                    .unwrap();
++                let _active = prepared.activate(&scope).unwrap();
++            }
++            let current = fixture.child.current_mm(&execution).unwrap();
++            authority
++                .with_current_mutation(
++                    &current,
++                    ThreadId::synthetic_for_tests(id + 100),
++                    |_mutation| {
++                        match mode {
++                            // The second page alone loses leaf write permission, tracker
++                            // permission, mapping, or exact owner generation. These do
++                            // not change kernel VMA revisions in this fixture.
++                            0..=3 => fixture
++                                .carrier
++                                .deny_native_data_for_test(TEST_VA + 4096, mode as u8)
++                                .unwrap(),
++                            4 | 5 => {
++                                fixture.dispatch_mm.set_foreign_cow_vma_access_for_test(
++                                    carrick_kernel::kernel::VmaAccess {
++                                        readable: true,
++                                        writable: false,
++                                        executable: false,
++                                        kernel_visible: true,
++                                    },
++                                );
++                                if mode == 5 {
++                                    fixture.dispatch_mm.set_foreign_cow_vma_access_for_test(
++                                        carrick_kernel::kernel::VmaAccess {
++                                            readable: true,
++                                            writable: true,
++                                            executable: false,
++                                            kernel_visible: true,
++                                        },
++                                    );
++                                }
++                            }
++                            6 => fixture.dispatch_mm.set_foreign_cow_vma_access_for_test(
++                                carrick_kernel::kernel::VmaAccess {
++                                    readable: true,
++                                    writable: true,
++                                    executable: true,
++                                    kernel_visible: true,
++                                },
++                            ),
++                            _ => unreachable!(),
++                        }
++                        Ok(())
++                    },
++                )
++                .unwrap();
++            drop(current);
++            let scope = dispatcher
++                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                .unwrap();
++            assert!(
++                prepared.activate(&scope).is_err(),
++                "stale preparation accepted mode {mode}"
++            );
++            drop(scope);
++            drop(executor);
++            fixture
++                .child
++                .thread()
++                .yield_from_executor(execution)
++                .unwrap();
++        }
++    }
++
++    #[test]
++    fn native_data_activation_requires_exact_authority_and_real_drain() {
++        use carrick_kernel::{
++            dispatch::mm_quiesce::{PtPauseBudget, PtPauseError, acquire_mutation_pause_for_test},
++            kernel::mm_access::{MmAccessError, MmAccessTarget},
++        };
++        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
++        let (kernel, root) = bootstrap(32_400);
++        let fixture = real_production_cow_fixture(
++            &kernel,
++            &root,
++            32_401,
++            0x9a00_8000_0000,
++            0x9b00_8000_0000,
++            ThreadId::synthetic_for_tests(32_401),
++        );
++        let mut execution = execution_lease(&fixture.child, 32401);
++        let authority = carrick_kernel::kernel::MmAccessAuthority::new();
++        let current = fixture.child.current_mm(&execution).unwrap();
++        let range = current
++            .access_token()
++            .write_range(GuestVa(TEST_VA), 4)
++            .unwrap()
++            .unwrap();
++        let mut prepared = authority
++            .with_current_mutation(
++                &current,
++                ThreadId::synthetic_for_tests(32_401),
++                |mutation| {
++                    let mut cow = authority
++                        .break_foreign_cow(mutation, &current, range)
++                        .unwrap();
++                    Ok(fixture
++                        .child
++                        .borrow_current_native_data(&execution, &mut cow)
++                        .unwrap()
++                        .prepare_for_execution())
++                },
++            )
++            .unwrap();
++        drop(current);
++        let mm = fixture.child.shared().mm().id();
++        // Equal MM number and stage-1 projection, different real census/barrier.
++        let (impostor, _) =
++            carrick_kernel::dispatch::DispatchMmAuthority::foreign_cow_composition_for_test(
++                mm,
++                fixture.stage1.clone(),
++                TEST_VA,
++                TEST_VA + 8192,
++            );
++        let wrong = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(impostor);
++        let mut wrong_executor = wrong
++            .admit_native_executor(&fixture.child, &execution)
++            .unwrap();
++        let wrong_scope = wrong
++            .enter_native_execution(&mut wrong_executor, &fixture.child, &mut execution)
++            .unwrap();
++        assert!(matches!(
++            prepared.activate(&wrong_scope),
++            Err(MmAccessError::ForeignMutationAuthorityMismatch)
++        ));
++        drop(wrong_scope);
++        drop(wrong_executor);
++
++        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
++            fixture.dispatch_mm.clone(),
++        );
++        let mut executor = dispatcher
++            .admit_native_executor(&fixture.child, &execution)
++            .unwrap();
++        let census = dispatcher.mm_executor_census();
++        let mutator_tid = ThreadId::synthetic_for_tests(32_402);
++        let mut mutator = census
++            .enter_with_pause_endpoint(
++                None,
++                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
++                mutator_tid,
++            )
++            .unwrap();
++        let barrier = fixture.dispatch_mm.pt_quiesce();
++        let scope = dispatcher
++            .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++            .unwrap();
++        {
++            let active = prepared.activate(&scope).unwrap();
++            let result = acquire_mutation_pause_for_test(
++                barrier,
++                &mut mutator,
++                mutator_tid,
++                mm,
++                dispatcher.mm_mutation_coordinator(),
++                PtPauseBudget {
++                    election: std::time::Duration::ZERO,
++                    drain: std::time::Duration::ZERO,
++                },
++            );
++            assert!(matches!(result, Err(PtPauseError::TimedOut)));
++            drop(result);
++            assert!(scope.stop_requested());
++            assert_eq!(active.len(), 4);
++        }
++        assert!(matches!(
++            prepared.activate(&scope),
++            Err(MmAccessError::NativeDataControlPending)
++        ));
++        drop(scope);
++        let pause = acquire_mutation_pause_for_test(
++            barrier,
++            &mut mutator,
++            mutator_tid,
++            mm,
++            dispatcher.mm_mutation_coordinator(),
++            PtPauseBudget::DEFAULT,
++        )
++        .unwrap();
++        assert!(barrier.is_quiescing());
++        drop(pause);
++        assert!(executor.take_stop_request());
++        // A new exact execution lease can activate the retained pin again; the
++        // prior scope/lease themselves cannot survive scheduler migration.
++        drop(executor);
++        fixture
++            .child
++            .thread()
++            .yield_from_executor(execution)
++            .unwrap();
++        let mut successor = fixture
++            .child
++            .thread()
++            .claim_runnable(
++                carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(
++                    ThreadId::synthetic_for_tests(32403),
++                )
++                .unwrap(),
++            )
++            .unwrap();
++        let mut executor = dispatcher
++            .admit_native_executor(&fixture.child, &successor)
++            .unwrap();
++        let scope = dispatcher
++            .enter_native_execution(&mut executor, &fixture.child, &mut successor)
++            .unwrap();
++        {
++            let _active = prepared.activate(&scope).unwrap();
++        }
++        drop(scope);
++        drop(executor);
++        drop(mutator);
++        assert_eq!(census.participant_count_for_probe(), 0);
++        fixture
++            .child
++            .thread()
++            .yield_from_executor(successor)
++            .unwrap();
++    }
++
++    /// Same-binary diagnostic for the incremental cost of activating a retained
++    /// data pin at entry. No Linux ratio, guest ELF or workload speedup claim.
++    #[test]
++    #[ignore = "release-only native activation cost diagnostic"]
++    #[expect(
++        clippy::assertions_on_constants,
++        reason = "The ignored diagnostic must compile in debug and refuse only when run; a const assertion would break unrelated debug tests"
++    )]
++    fn native_data_activation_entry_cost() {
++        use carrick_kernel::kernel::mm_access::MmAccessTarget;
++        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
++        assert!(
++            !cfg!(debug_assertions),
++            "run this diagnostic with --release"
++        );
++        // A resident COW grant is bounded to one 16 KiB compound. Keep one
++        // valid page fixed and scale actual activation count, not an invalid
++        // synthetic range extending beyond the fixture's mapping.
++        const ITERATIONS: u32 = 4096;
++        for scale in [1u32, 8, 32, 128] {
++            let id = 33_000 + scale as i32;
++            let (kernel, root) = bootstrap(id);
++            let fixture = real_production_cow_fixture(
++                &kernel,
++                &root,
++                id + 200,
++                0x9a00_a000_0000 + scale as u64 * 0x100_0000,
++                0x9b00_a000_0000 + scale as u64 * 0x100_0000,
++                ThreadId::synthetic_for_tests(id + 200),
++            );
++            let mut execution = execution_lease(&fixture.child, id as u64);
++            let authority = carrick_kernel::kernel::MmAccessAuthority::new();
++            let current = fixture.child.current_mm(&execution).unwrap();
++            let range = current
++                .access_token()
++                .write_range(GuestVa(TEST_VA), 4096)
++                .unwrap()
++                .unwrap();
++            let mut prepared = authority
++                .with_current_mutation(
++                    &current,
++                    ThreadId::synthetic_for_tests(id + 200),
++                    |mutation| {
++                        let mut cow = authority
++                            .break_foreign_cow(mutation, &current, range)
++                            .unwrap();
++                        Ok(fixture
++                            .child
++                            .borrow_current_native_data(&execution, &mut cow)
++                            .unwrap()
++                            .prepare_for_execution())
++                    },
++                )
++                .unwrap();
++            drop(current);
++            let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
++                fixture.dispatch_mm.clone(),
++            );
++            let mut executor = dispatcher
++                .admit_native_executor(&fixture.child, &execution)
++                .unwrap();
++            // Alternate paired arms. Preparation, COW and output stay outside
++            // both timed windows. Every requested activation must succeed.
++            let mut run = |activate: bool, count: u32| {
++                let start = std::time::Instant::now();
++                for _ in 0..count {
++                    let scope = dispatcher
++                        .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                        .unwrap();
++                    if activate {
++                        let active = prepared.activate(&scope).unwrap();
++                        std::hint::black_box(active.len());
++                    } else {
++                        std::hint::black_box(&scope);
++                    }
++                }
++                start.elapsed().as_nanos() as f64 / f64::from(count)
++            };
++            run(false, 128);
++            run(true, 128);
++            for sample in 0..9 {
++                let (scope_ns, activated_ns) = if sample % 2 == 0 {
++                    let base = run(false, ITERATIONS * scale);
++                    (base, run(true, ITERATIONS * scale))
++                } else {
++                    let active = run(true, ITERATIONS * scale);
++                    (run(false, ITERATIONS * scale), active)
++                };
++                println!(
++                    "native_activation_cost {}",
++                    serde_json::json!({
++                        "scale": scale, "pages": 1, "sample": sample, "iterations": ITERATIONS * scale,
++                        "scope_ns": scope_ns, "activated_ns": activated_ns,
++                        "activation_delta_ns": activated_ns - scope_ns,
++                        "runtime_conformance_metrics": cfg!(feature = "conformance-metrics"),
++                        "workload_timing_eligible": false,
++                    })
++                );
++            }
++            drop(executor);
++            fixture
++                .child
++                .thread()
++                .yield_from_executor(execution)
++                .unwrap();
++        }
+     }
+ 
+     #[test]
+--- before/conformance-contracts/contracts/native-synchronous-syscall.toml
++++ after/conformance-contracts/contracts/native-synchronous-syscall.toml
+@@ -8,8 +8,8 @@
+ rationale = "The native adapter must execute real guest instructions through current unified-kernel policy and completion paths. Matching errno output alone does not prove executable permission, frame ownership, signal delivery, TLS, or translation revocation. The existing host callback gateway is not a binding for this contract."
+ 
+ [bindings.unresolved]
+-vm_free = "Authenticated instruction fetch and a mutation-scoped carrier native-data grant now have focused tests for exact execution/MM authority, permissions, revisions and COW backing. The separate kernel.mm.native-execution-scope contract now proves scoped admission and exact-MM draining without mutation exclusion. Carrier pointer activation, revocation and generation-bound translation publication remain unbound. CurrentMmMemory remains a marker. No VM-free execution binding is registered. See docs/perf-results/2026-09-21-syscall-floor/native-carrier."
+-embed_structural = "A bounded non-product executor now runs real ELF instructions against the public kernel and emits partial observations; it is not an embed binding. Carrier COW and pinned data access are now composed under existing exact-MM mutation exclusion in a separate fixture; the ELF executor still uses private backing. The private-backing ELF controls now enter/leave the scoped native census capability at existing checkpoints. Carrier pointer activation, foreign-write invalidation, guest signals/cancellation and scheduling remain unproved. Require actual register/TLS behavior, two-MM isolation, revocation and measured dispatch/completion/transition counts. See docs/perf-results/2026-09-21-syscall-floor/native-slice."
++vm_free = "Authenticated instruction fetch and a mutation-scoped carrier native-data grant now have focused tests for exact execution/MM authority, permissions, revisions and COW backing. The separate kernel.mm.native-execution-scope contract now proves scoped admission and exact-MM draining without mutation exclusion. Opaque preparation and execution-scoped carrier data activation now have runtime composition tests for live owner/leaf validation and actual drain refusal until scope exit; this is a bounded host CPU fixture, not an execution binding. Generation-bound translation publication and full carrier control integration remain unbound. CurrentMmMemory remains a marker. No VM-free execution binding is registered. See docs/perf-results/2026-09-21-syscall-floor/native-carrier."
++embed_structural = "A bounded non-product executor now runs real ELF instructions against the public kernel and emits partial observations; it is not an embed binding. Carrier COW and pinned data access are now composed under existing exact-MM mutation exclusion in a separate fixture; the ELF executor still uses private backing. The private-backing ELF controls now enter/leave the scoped native census capability at existing checkpoints. Carrier data activation is now composed in a separate bounded CPU fixture after COW mutation exclusion ends. The ELF executor still uses private backing. Carrier control-ticket integration, executable foreign-write invalidation, guest signals/cancellation and scheduling remain unproved. Require actual register/TLS behavior, two-MM isolation, revocation and measured dispatch/completion/transition counts. See docs/perf-results/2026-09-21-syscall-floor/native-slice."
+ embed_timing = "No native adapter timing accepted. Same-ELF diagnostic native/HVF/Linux measurements exist. Native scalar lowering reduced the private-backing memory control from 151.92 ns to 2.12 ns (1.53x Linux), but is not a current-carrier memory grant. Compute, COW, JIT, signals and full current-runtime controls remain acceptance requirements. See docs/perf-results/2026-09-21-syscall-floor/native-memory."
+ docker = "Exact errno control matches native ARM64 Docker at all scales; versioned observation emission and remaining register/TLS/signal/memory fixtures are not yet bound. Evidence: docs/perf-results/2026-09-21-syscall-floor/dsr-guest-contract."
+ 

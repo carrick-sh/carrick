@@ -1,0 +1,35 @@
+{
+  "image": "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+  "shared": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/io-floor/shared",
+  "identities": {
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/io-floor/shared/io-floor-macos": "2f574e9a1097b710bf392a90bbe6b9156828d5c56248399f7767f5e86f678cb7",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/io-floor/shared/io-floor-linux": "4e6b0dccf82e528b404aa5e04370170f454fab4742f156ab493ec98b308cb96c",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/carrick-lease-gap": "15217a034e2f3286420e9464b1fb2fcf1f576f0b44c2c58f458a2b9a95f96efc",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/scripts/perf/io_floor.py": "563188933caad6c187957f719fda88f41add0dccb997924dc5e1d13483955360",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/scripts/perf/io-floor.c": "469019727a4bbd50e5af6fdbe3f12b04c2844b408f8b2b5169dcc5a8e8875d29"
+  },
+  "iterations": 16384,
+  "samples": 9,
+  "phases_serialized": true,
+  "fsync": false,
+  "uname": {
+    "returncode": 0,
+    "stdout": "Darwin Timothys-MacBook-Air-2.local 27.2.0 Darwin Kernel Version 27.2.0: Fri Sep  4 23:26:57 PDT 2026; root:xnu-13432.40.144.0.1~53/RELEASE_ARM64_T8132 arm64\n",
+    "stderr": ""
+  },
+  "filesystem": {
+    "returncode": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  "native_compiler": {
+    "returncode": 0,
+    "stdout": "Apple clang version 21.0.0 (clang-2100.3.33.1)\nTarget: arm64-apple-darwin27.2.0\nThread model: posix\nInstalledDir: /Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin\n",
+    "stderr": ""
+  },
+  "linux_compiler": {
+    "returncode": 0,
+    "stdout": "aarch64-linux-gnu-gcc (GCC) 15.2.0\nCopyright (C) 2025 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+    "stderr": ""
+  }
+}

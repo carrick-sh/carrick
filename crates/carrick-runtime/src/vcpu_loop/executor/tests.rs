@@ -6664,6 +6664,7 @@ fn scripted_guest_execve_engine(path: &str) -> crate::vcpu_loop::tests::CrashCap
     .into();
     crate::vcpu_loop::tests::CrashCaptureTestEngine {
         next_syscall: Some(carrick_hal::RawSyscall {
+            current_guest_sp: None,
             number: carrick_abi::CanonicalNr(221),
             args: [PATH, ARGV, 0, 0, 0, 0],
             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,

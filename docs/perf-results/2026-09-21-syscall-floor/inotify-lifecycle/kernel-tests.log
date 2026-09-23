@@ -1,0 +1,16 @@
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.34s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-207122e8ce47be2c)
+
+running 4 tests
+test inotify::tests::mask_translation_round_trips_common_events ... ok
+test inotify::tests::removed_watch_does_not_name_its_successor ... ok
+test inotify::tests::vnode_watch_reports_file_modification_as_in_modify ... ok
+test inotify::tests::watch_descriptor_wrap_skips_live_watches ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 2190 filtered out; finished in 0.00s
+

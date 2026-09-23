@@ -1,0 +1,208 @@
+{
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "preexisting_source_files_verified": 3041,
+  "preexisting_source_mismatches": [],
+  "release_binary_restored_sha256": "dcb0e51088f176b8e28dc71bc004b2d1dd024bd35fcdc8cbf563f50f47ac2955",
+  "all_32_invocations_verified": [
+    {
+      "run_id": "seek-ltp-base-warm-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-ltp-candidate-warm-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-ltp-base-0-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-ltp-candidate-1-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-ltp-candidate-2-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-ltp-base-3-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-ltp-candidate-4-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-ltp-base-5-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-ltp-base-6-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-ltp-candidate-7-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-micro-base-0-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-micro-candidate-1-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-micro-candidate-2-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-micro-base-3-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-io-base-0-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-io-candidate-1-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-io-candidate-2-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-io-base-3-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-io-macos-4-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-io-macos-5-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-ltp-docker-0-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-ltp-docker-1-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-ltp-docker-2-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-micro-docker-0-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-micro-docker-1-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-io-linux-local-0-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-io-linux-bind-1-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-io-linux-bind-2-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-io-linux-local-3-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-trace-base-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-trace-candidate-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    },
+    {
+      "run_id": "seek-trace-full-base-20260922",
+      "exit": 0,
+      "cleanup_verified": true
+    }
+  ],
+  "external_artifacts": {
+    "carrick-base": {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/seek-header/carrick-base",
+      "sha256": "dcb0e51088f176b8e28dc71bc004b2d1dd024bd35fcdc8cbf563f50f47ac2955",
+      "bytes": 34923808,
+      "codesign_verify_strict_exit": 0
+    },
+    "carrick-candidate": {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/seek-header/carrick-candidate",
+      "sha256": "ec641d2c438fa42957cc30b464de92adc47ea3b458954ccc76c1c9a3bd71fd11",
+      "bytes": 34923808,
+      "codesign_verify_strict_exit": 0
+    },
+    "io/io-floor-macos": {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/seek-header/io/io-floor-macos",
+      "sha256": "eb55675895e166c0fd19b28a7e4c48647a3ee4a77e958857741842a9ba6be56b",
+      "bytes": 34976
+    },
+    "io/io-floor-linux": {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/seek-header/io/io-floor-linux",
+      "sha256": "2bc66ca7453884a95257832664900cb7d04622f03f2a5aaa51ec81442e1962e7",
+      "bytes": 2686744
+    },
+    "source-before.tar.gz": {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/seek-header/source-before.tar.gz",
+      "sha256": "e6fd445bfcb1c33b6a79144547433e83400c847bbf4ddcdb267ce296e3569294",
+      "bytes": 7255327
+    },
+    "kernel-red": {
+      "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/seek-header/kernel-red",
+      "sha256": "bf0e07aede37be888b55b706bd6143d4e4bedce6cdeb224d05358c2de33a7e7c",
+      "bytes": 113329536
+    }
+  },
+  "original_transport_control_preserved": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+  "trace_body_unchanged": true,
+  "live_trace_sha256": "b81b028b36488d1b276e852cd54d6a20eb3f7f330b9d799be35120c8ea75776f",
+  "candidate_product_change_retained": false,
+  "signed_promotion_complete": false,
+  "stage": "after seek candidate removal, before trace-profile registration"
+}

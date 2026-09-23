@@ -1,0 +1,9 @@
+{
+  "conformance-contracts/inventory.json": "2228190e2d5ec28934909cc2f614000024411ac74d078e47dfa9c96c6dfc5bc6",
+  "conformance-contracts/surfaces.toml": "6c0b3db3cea953616e5ef661b0227b18081a1f40d475131999ddd080c4489635",
+  "crates/carrick-kernel/src/kernel/core.rs": "551db7f6dea3aa6a64d29ecdb37c9375534cfb723e45062427dc1507be9e0686",
+  "crates/carrick-observability/src/work_meter.rs": "b433918ceede84b126456a541b9c67f737f20c9ece6321dffd8943f79a2829b9",
+  "crates/carrick-runtime/Cargo.toml": "485db16cab6be173950d952bcc3ea8b78c7991691ad24a74e400fc68505f71cb",
+  "crates/carrick-runtime/src/vcpu_loop/exec.rs": "20da2bb14442fe3d94e08e0728c6b2628efd0df92bcac8a46010b8f7b0127c96",
+  "crates/carrick-runtime/src/vcpu_loop/mod.rs": "3795db790357a3a424e080e7506bf67e9fdcaf236b0f63f3dbbd3ec3353f1d67"
+}

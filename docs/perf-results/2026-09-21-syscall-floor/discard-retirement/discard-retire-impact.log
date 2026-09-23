@@ -1,0 +1,77 @@
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.370495374998427, "guest_timing": [[0.314, 0.064, 0.207]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.518491584007279, "guest_timing": [[1.447, 2.048, 0.684]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.726707082998473, "guest_timing": [[2.653, 0.799, 1.551]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.30967979101114906, "guest_timing": [[0.251, 0.077, 0.137]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.4289415829989593, "guest_timing": [[1.36, 1.918, 0.57]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.620718083999236, "guest_timing": [[2.556, 0.778, 1.525]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.3825756669975817, "guest_timing": [[0.318, 0.063, 0.209]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.3968460839969339, "guest_timing": [[1.33, 1.976, 0.658]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.6356277919985587, "guest_timing": [[2.573, 0.783, 1.53]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.30220587499206886, "guest_timing": [[0.239, 0.066, 0.126]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.3865185000031488, "guest_timing": [[1.322, 2.006, 0.648]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.62848329199187, "guest_timing": [[2.563, 0.781, 1.524]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.31854979100171477, "guest_timing": [[0.257, 0.083, 0.146]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.4203097499994328, "guest_timing": [[1.354, 2.092, 0.658]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.629822333008633, "guest_timing": [[2.565, 0.783, 1.525]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.3896193749969825, "guest_timing": [[0.328, 0.072, 0.21]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.3745717910060193, "guest_timing": [[1.308, 1.983, 0.634]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.6524051659944234, "guest_timing": [[2.584, 0.786, 1.536]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.40105345800111536, "guest_timing": [[0.336, 0.082, 0.215]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.437135041996953, "guest_timing": [[1.369, 2.114, 0.661]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.648313416997553, "guest_timing": [[2.585, 0.781, 1.53]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.30079416700755246, "guest_timing": [[0.24, 0.064, 0.126]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.4006629579962464, "guest_timing": [[1.332, 2.004, 0.656]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.622190041001886, "guest_timing": [[2.559, 0.78, 1.521]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.3111136249935953, "guest_timing": [[0.246, 0.07, 0.136]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.3931089169927873, "guest_timing": [[1.326, 1.949, 0.636]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.636072166991653, "guest_timing": [[2.572, 0.786, 1.526]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.4010970829986036, "guest_timing": [[0.337, 0.077, 0.216]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.3933617080037948, "guest_timing": [[1.324, 1.992, 0.648]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.6300235000089742, "guest_timing": [[2.565, 0.782, 1.521]]}
+{
+  "node-app": {
+    "control_s": [
+      0.318,
+      0.328,
+      0.336,
+      0.337
+    ],
+    "candidate_s": [
+      0.239,
+      0.257,
+      0.24,
+      0.246
+    ],
+    "candidate_control_mean_ratio": 0.7445034116755118
+  },
+  "go-build-cold": {
+    "control_s": [
+      1.33,
+      1.308,
+      1.369,
+      1.324
+    ],
+    "candidate_s": [
+      1.322,
+      1.354,
+      1.332,
+      1.326
+    ],
+    "candidate_control_mean_ratio": 1.0005627462014632
+  },
+  "python-os": {
+    "control_s": [
+      2.573,
+      2.584,
+      2.585,
+      2.565
+    ],
+    "candidate_s": [
+      2.563,
+      2.565,
+      2.559,
+      2.572
+    ],
+    "candidate_control_mean_ratio": 0.995342970796546
+  }
+}

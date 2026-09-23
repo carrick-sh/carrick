@@ -1,0 +1,5 @@
+scale=1 add_ret=-1 add_errno=9 remove_ret=-1 remove_errno=9 stable=1
+scale=8 add_ret=-1 add_errno=9 remove_ret=-1 remove_errno=9 stable=1
+scale=32 add_ret=-1 add_errno=9 remove_ret=-1 remove_errno=9 stable=1
+scale=128 add_ret=-1 add_errno=9 remove_ret=-1 remove_errno=9 stable=1
+probe_complete=1

@@ -1,0 +1,921 @@
+--- before/crates/carrick-kernel/src/kernel/guest_execution.rs
++++ after/crates/carrick-kernel/src/kernel/guest_execution.rs
+@@ -251,7 +251,7 @@
+             }
+             Self::Native(state) => {
+                 if state.is_running() {
+-                    state.request_stop();
++                    state.request_memory_pause();
+                 }
+             }
+         }
+@@ -282,12 +282,29 @@
+         self.state.participants.values().all(Option::is_some)
+     }
+ 
++    #[cfg(test)]
+     pub(crate) fn pause_endpoint_tids(&self) -> Vec<carrick_hal::ThreadId> {
+         self.state
+             .participants
+             .values()
+             .flatten()
+             .map(GuestExecutorPauseEndpoint::tid)
++            .collect()
++    }
++
++    /// Endpoints that can acknowledge the published hardware ASID phase.
++    /// Native endpoints still participate in the running drain, but have no
++    /// hardware translation cache. Historical hardware residency remains a
++    /// pending stage-1 ticket for the next actual hardware entry.
++    pub(crate) fn hardware_invalidation_tids(&self) -> Vec<carrick_hal::ThreadId> {
++        self.state
++            .participants
++            .values()
++            .flatten()
++            .filter_map(|endpoint| match endpoint {
++                GuestExecutorPauseEndpoint::Registered { tid, .. } => Some(*tid),
++                GuestExecutorPauseEndpoint::Native(_) => None,
++            })
+             .collect()
+     }
+ 
+--- before/crates/carrick-kernel/src/dispatch/mm_quiesce.rs
++++ after/crates/carrick-kernel/src/dispatch/mm_quiesce.rs
+@@ -579,7 +579,7 @@
+         let (inner, expected) = match &_guard._lease._kind {
+             ExactMmStage1LeaseKind::Paused {
+                 _inner, _census, ..
+-            } => (_inner, _census.pause_endpoint_tids()),
++            } => (_inner, _census.hardware_invalidation_tids()),
+             ExactMmStage1LeaseKind::Sole { .. } => {
+                 return Err(ForeignCowInvalidationError::MissingPause);
+             }
+--- before/crates/carrick-kernel/src/dispatch/native_execution.rs
++++ after/crates/carrick-kernel/src/dispatch/native_execution.rs
+@@ -15,23 +15,26 @@
+     rc::Rc,
+     sync::{
+         Arc,
+-        atomic::{AtomicBool, Ordering},
++        atomic::{AtomicU8, Ordering},
+     },
+ };
++
++const EXTERNAL_STOP: u8 = 1;
++const MEMORY_PAUSE: u8 = 2;
+ 
+ /// The census owns this exact state directly. Registry replacement/removal can
+ /// neither conceal its running flag nor redirect a page-table drain's request.
+ pub(crate) struct NativeExecutorState {
+     tid: ThreadId,
+     running: InGuestFlag,
+-    stop: AtomicBool,
++    requests: AtomicU8,
+ }
+ impl NativeExecutorState {
+     fn new(tid: ThreadId) -> Self {
+         Self {
+             tid,
+             running: InGuestFlag::for_guest_thread(),
+-            stop: AtomicBool::new(false),
++            requests: AtomicU8::new(0),
+         }
+     }
+     pub(crate) fn tid(&self) -> ThreadId {
+@@ -40,8 +43,11 @@
+     pub(crate) fn is_running(&self) -> bool {
+         self.running.is_in_guest()
+     }
++    pub(crate) fn request_memory_pause(&self) {
++        self.requests.fetch_or(MEMORY_PAUSE, Ordering::SeqCst);
++    }
+     pub(crate) fn request_stop(&self) {
+-        self.stop.store(true, Ordering::SeqCst);
++        self.requests.fetch_or(EXTERNAL_STOP, Ordering::SeqCst);
+     }
+ }
+ 
+@@ -97,7 +103,13 @@
+     /// acknowledging it while an execution scope still exists. A subsequent
+     /// concurrent request remains sticky for the next entry check.
+     pub fn take_stop_request(&mut self) -> bool {
+-        self.state.stop.swap(false, Ordering::SeqCst)
++        self.state.requests.swap(0, Ordering::SeqCst) != 0
++    }
++    /// Cheap host checkpoint query; admission still authenticates the exact
++    /// lease and rechecks the barrier before publishing guest execution.
++    pub fn memory_pause_pending(&self) -> bool {
++        self.state.requests.load(Ordering::SeqCst) & MEMORY_PAUSE != 0
++            || self.participant.authority.pt_quiesce().is_quiescing()
+     }
+     /// Ordinary dispatch may borrow the admitted executor only outside native
+     /// execution. This preserves the existing exact-MM dispatch/mutation path.
+@@ -151,7 +163,7 @@
+     /// The translator must reach a bounded checkpoint and end this scope when
+     /// true. This only observes control; it never clears running or a request.
+     pub fn stop_requested(&self) -> bool {
+-        self.executor.state.stop.load(Ordering::SeqCst)
++        self.executor.state.requests.load(Ordering::SeqCst) != 0
+             || self
+                 .executor
+                 .participant
+@@ -231,28 +243,71 @@
+         })
+     }
+ 
++    fn validate_native_executor(
++        &self,
++        executor: &NativeExecutor,
++        context: &KernelContext,
++        execution: &ThreadExecutionLease,
++    ) -> Result<(), NativeExecutionError> {
++        if !matches!(&executor.participant.admission,
++            MmExecutorAdmissionRecipe::NativeThread { state, .. } if Arc::ptr_eq(state, &executor.state))
++        {
++            return Err(NativeExecutionError::EndpointMismatch);
++        }
++        if executor.state.is_running() {
++            return Err(NativeExecutionError::AlreadyRunning);
++        }
++        if executor.lease != LeaseIdentity::of(execution) {
++            return Err(NativeExecutionError::ChangedExecutionLease);
++        }
++        self.validate_current_mm_executor(&executor.participant, context, execution)?;
++        context.validate_current_execution_mm(execution)?;
++        if executor.participant.participation.is_none() {
++            return Err(DispatchError::MmExecutorParticipationUnavailable.into());
++        }
++        Ok(())
++    }
++
++    /// Wait at the host safe point for the exact-MM memory pause to end.
++    /// This borrows admission exclusively: no native scope/data pointer can
++    /// survive into the wait. The caller must hold no mutation or dispatch
++    /// serializer while parking. Uses the shared condition variable, not polling.
++    ///
++    /// Native execution has no hardware TLB. This neither consumes a hardware
++    /// COW ticket nor acknowledges one. Only memory-pause requests are cleared;
++    /// external stops, signals and fork control remain their owners' work.
++    /// Success is not permission to run: entry authenticates and checks again.
++    pub fn service_native_memory_control(
++        &self,
++        executor: &mut NativeExecutor,
++        context: &KernelContext,
++        execution: &ThreadExecutionLease,
++    ) -> Result<(), NativeExecutionError> {
++        self.validate_native_executor(executor, context, execution)?;
++        let barrier = executor.participant.authority.pt_quiesce();
++        // No-work service needs no wait-state lock (including its lazy host
++        // allocation). If a new pause starts after this observation, entry's
++        // publish-before-check handshake still prevents crossing the mutation.
++        if barrier.is_quiescing() {
++            barrier.park();
++        }
++        self.validate_native_executor(executor, context, execution)?;
++        executor
++            .state
++            .requests
++            .fetch_and(!MEMORY_PAUSE, Ordering::SeqCst);
++        // A later pause cannot be hidden by clearing its request here: the
++        // publish-before-check entry handshake still observes the live barrier.
++        Ok(())
++    }
++
+     pub fn enter_native_execution<'scope>(
+         &self,
+         executor: &'scope mut NativeExecutor,
+         context: &'scope KernelContext,
+         execution: &'scope mut ThreadExecutionLease,
+     ) -> Result<NativeExecution<'scope>, NativeExecutionError> {
+-        if !matches!(&executor.participant.admission,
+-            MmExecutorAdmissionRecipe::NativeThread { state, .. } if Arc::ptr_eq(state, &executor.state))
+-        {
+-            return Err(NativeExecutionError::EndpointMismatch);
+-        }
+-        if executor.state.is_running() {
+-            return Err(NativeExecutionError::AlreadyRunning);
+-        }
+-        if executor.lease != LeaseIdentity::of(execution) {
+-            return Err(NativeExecutionError::ChangedExecutionLease);
+-        }
+-        self.validate_current_mm_executor(&executor.participant, context, execution)?;
+-        context.validate_current_execution_mm(execution)?;
+-        if executor.participant.participation.is_none() {
+-            return Err(DispatchError::MmExecutorParticipationUnavailable.into());
+-        }
++        self.validate_native_executor(executor, context, execution)?;
+         // SeqCst publish-before-check is the existing page-table entry
+         // handshake: either we see the barrier or the drain sees us. Nothing
+         // here holds the census lock, so simultaneous readers remain possible.
+--- before/crates/carrick-kernel/src/dispatch/native_execution/tests.rs
++++ after/crates/carrick-kernel/src/dispatch/native_execution/tests.rs
+@@ -251,6 +251,7 @@
+         let held = census.lock_for_frame_cow();
+         assert_eq!(held.participant_count(), scale as usize);
+         assert_eq!(held.pause_endpoint_tids().len(), scale as usize);
++        assert!(held.hardware_invalidation_tids().is_empty());
+         assert!(held.any_in_guest());
+         held.kick_all_in_guest();
+         assert!(scopes.iter().all(NativeExecution::stop_requested));
+@@ -264,3 +265,88 @@
+         root.thread().yield_from_executor(root_lease).unwrap();
+     }
+ }
++
++#[test]
++fn memory_control_preserves_external_stops_and_rejects_wrong_lease() {
++    let (dispatcher, context, mut lease) = fixture(22_000);
++    let mut executor = dispatcher.admit_native_executor(&context, &lease).unwrap();
++    for scale in [1, 8, 32, 128] {
++        for _ in 0..scale {
++            let scope = dispatcher
++                .enter_native_execution(&mut executor, &context, &mut lease)
++                .unwrap();
++            dispatcher
++                .mm_executor_census()
++                .lock_for_frame_cow()
++                .kick_all_in_guest();
++            assert!(scope.stop_requested());
++            drop(scope);
++            assert!(executor.memory_pause_pending());
++            // A memory pause may finish (or roll back) before its owner returns.
++            // Service still clears the sticky memory request at that safe point.
++            executor.interrupt_handle().request_stop();
++            dispatcher
++                .service_native_memory_control(&mut executor, &context, &lease)
++                .unwrap();
++            assert!(!executor.memory_pause_pending());
++            assert!(matches!(
++                dispatcher.enter_native_execution(&mut executor, &context, &mut lease),
++                Err(NativeExecutionError::ControlPending)
++            ));
++            assert!(executor.take_stop_request(), "external stop was swallowed");
++        }
++    }
++    context.thread().yield_from_executor(lease).unwrap();
++    let successor = context
++        .thread()
++        .claim_runnable(ExecutorId::synthetic_for_tests(22001))
++        .unwrap();
++    executor.state.request_memory_pause();
++    assert!(matches!(
++        dispatcher.service_native_memory_control(&mut executor, &context, &successor),
++        Err(NativeExecutionError::ChangedExecutionLease)
++    ));
++    assert!(
++        executor.memory_pause_pending(),
++        "wrong lease cleared a request"
++    );
++    settle(&context, executor, successor);
++}
++
++#[test]
++fn native_memory_service_parks_until_the_exact_pause_ends() {
++    use std::sync::mpsc;
++    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
++    let (start_tx, start_rx) = mpsc::sync_channel(0);
++    let (done_tx, done_rx) = mpsc::sync_channel(0);
++    let worker = std::thread::spawn(move || {
++        let (dispatcher, context, lease) = fixture(22_002);
++        let mut executor = dispatcher.admit_native_executor(&context, &lease).unwrap();
++        let barrier = executor.participant.pt_quiesce().clone();
++        ready_tx.send(barrier.clone()).unwrap();
++        start_rx.recv().unwrap();
++        dispatcher
++            .service_native_memory_control(&mut executor, &context, &lease)
++            .unwrap();
++        assert!(
++            !barrier.is_quiescing(),
++            "native service escaped a live memory pause"
++        );
++        assert!(!executor.state.is_running());
++        done_tx.send(()).unwrap();
++        settle(&context, executor, lease);
++    });
++    let barrier = ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
++    assert!(barrier.try_become_coordinator());
++    barrier.set_quiescing();
++    // RAII releases the worker even if the bounded negative assertion fails.
++    let pause = barrier.pause_guard(ThreadId::synthetic_for_tests(22003));
++    start_tx.send(()).unwrap();
++    assert!(matches!(
++        done_rx.recv_timeout(Duration::from_millis(10)),
++        Err(mpsc::RecvTimeoutError::Timeout)
++    ));
++    drop(pause);
++    done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
++    worker.join().unwrap();
++}
+--- before/crates/carrick-kernel-example/tests/native_execution_scope.rs
++++ after/crates/carrick-kernel-example/tests/native_execution_scope.rs
+@@ -101,6 +101,9 @@
+             exact &= scope.stop_requested();
+             // Requesting a stop never drops membership or acknowledges running.
+             drop(scope);
++            dispatcher
++                .service_native_memory_control(&mut executor, &context, &execution)
++                .unwrap();
+             exact &= executor.take_stop_request();
+             completed += 1;
+         }
+--- before/crates/carrick-runtime/src/vcpu_loop/memory.rs
++++ after/crates/carrick-runtime/src/vcpu_loop/memory.rs
+@@ -1170,6 +1170,393 @@
+                 .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4),
+             Err(MmAccessError::ExecuteDenied { .. })
+         ));
++    }
++
++    fn native_carrier_elf(words: &[u32], data_va: u64) -> Vec<u8> {
++        let mut bytes = vec![0u8; 0x3000];
++        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
++        for (at, v) in [(16, 2u16), (18, 183), (52, 64), (54, 56), (56, 2)] {
++            bytes[at..at + 2].copy_from_slice(&v.to_le_bytes());
++        }
++        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
++        for (at, v) in [(24, 0x400000u64), (32, 64)] {
++            bytes[at..at + 8].copy_from_slice(&v.to_le_bytes());
++        }
++        for (i, base, len, flags) in [(0, 0x400000u64, words.len() * 4, 5u32), (1, data_va, 8, 6)] {
++            let h = 64 + i * 56;
++            bytes[h..h + 4].copy_from_slice(&1u32.to_le_bytes());
++            bytes[h + 4..h + 8].copy_from_slice(&flags.to_le_bytes());
++            for (offset, value) in [
++                (8, 0x1000u64 * (i as u64 + 1)),
++                (16, base),
++                (32, len as u64),
++                (40, len as u64),
++                (48, 4096),
++            ] {
++                bytes[h + offset..h + offset + 8].copy_from_slice(&value.to_le_bytes());
++            }
++        }
++        for (i, w) in words.iter().enumerate() {
++            bytes[0x1000 + i * 4..0x1004 + i * 4].copy_from_slice(&w.to_le_bytes());
++        }
++        bytes
++    }
++
++    #[test]
++    fn native_carrier_elf_memory_control_round_trip() {
++        use carrick_kernel::{
++            compat::{CompatReporter, SyscallArgs},
++            dispatch::{
++                DispatchOutcome, SyscallRequest, ThreadCtx,
++                mm_quiesce::{PtPauseBudget, PtPauseError, acquire_mutation_pause_for_test},
++            },
++            kernel::mm_access::MmAccessTarget,
++            thread::{FutexTable, ThreadRegistry},
++        };
++        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
++        use native_syscall_slice::{
++            Memory,
++            native::{Code, State},
++        };
++        let (kernel, root) = bootstrap(37_000);
++        let root_execution = execution_lease(&root, 37000);
++        let tid = ThreadId::synthetic_for_tests(37_001);
++        let fixture = real_production_cow_fixture(
++            &kernel,
++            &root,
++            37_001,
++            0x9a00_c000_0000,
++            0x9b00_c000_0000,
++            tid,
++        );
++        let original = fixture.carrier.pin_original_data_for_test().unwrap();
++        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
++            fixture.dispatch_mm.clone(),
++        );
++        let mut execution = execution_lease(&fixture.child, 37001);
++        let mut executor = dispatcher
++            .admit_native_executor(&fixture.child, &execution)
++            .unwrap();
++        let authority = carrick_kernel::kernel::MmAccessAuthority::new();
++        let current = fixture.child.current_mm(&execution).unwrap();
++        let range = current
++            .access_token()
++            .write_range(GuestVa(TEST_VA), 8)
++            .unwrap()
++            .unwrap();
++        let mut prepared = authority
++            .with_current_mutation(&current, tid, |mutation| {
++                let mut cow = authority.break_foreign_cow(mutation, &current, range)?;
++                Ok(fixture
++                    .child
++                    .borrow_current_native_data(&execution, &mut cow)?
++                    .prepare_for_execution())
++            })
++            .unwrap();
++        drop(current);
++        // ldr w9,[x2]; add w9,w9,#1; str w9,[x2]; svc #0.
++        // Text remains a private, immutable research publication. Only this
++        // declared data segment uses carrier backing; close(-1) has no buffer.
++        let elf = native_carrier_elf(&[0xb9400049, 0x11000529, 0xb9000049, 0xd4000001], TEST_VA);
++        if let Some(dir) = std::env::var_os("CARRICK_NATIVE_SCOPE_RECEIPT_DIR") {
++            std::fs::create_dir_all(&dir).unwrap();
++            std::fs::write(std::path::Path::new(&dir).join("native-carrier.elf"), &elf).unwrap();
++        }
++        let (mut memory, image) = Memory::load_elf(&elf).unwrap();
++        let code = Code::publish(&image, &memory).unwrap();
++        let mut state = State::new(image.entry());
++        let registry = ThreadRegistry::new(tid);
++        let futex = FutexTable::new();
++        let reporter = CompatReporter::default();
++        let mut mutator = dispatcher
++            .mm_executor_census()
++            .enter_with_pause_endpoint(
++                None,
++                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
++                ThreadId::synthetic_for_tests(37002),
++            )
++            .unwrap();
++        let mut completed = 0;
++        for scale in [1, 8, 32, 128] {
++            for _ in 0..scale {
++                state.pc = image.entry();
++                state.x[2] = TEST_VA;
++                state.x[0] = u64::MAX;
++                state.x[8] = 57;
++                let scope = dispatcher
++                    .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                    .unwrap();
++                {
++                    let mut active = prepared.activate(&scope).unwrap();
++                    // Request a real memory drain while code owns the grant. It
++                    // must refuse until the code reaches its checkpoint and exits.
++                    let refusal = acquire_mutation_pause_for_test(
++                        fixture.dispatch_mm.pt_quiesce(),
++                        &mut mutator,
++                        ThreadId::synthetic_for_tests(37002),
++                        fixture.child.shared().mm().id(),
++                        dispatcher.mm_mutation_coordinator(),
++                        PtPauseBudget {
++                            election: std::time::Duration::ZERO,
++                            drain: std::time::Duration::ZERO,
++                        },
++                    );
++                    assert!(matches!(refusal, Err(PtPauseError::TimedOut)));
++                    drop(refusal);
++                    assert!(scope.stop_requested());
++                    code.run_carrier_until_checkpoint(&image, &memory, &mut active, &mut state)
++                        .unwrap();
++                }
++                drop(scope);
++                assert_eq!(state.pc, image.entry() + 12);
++                assert!(executor.memory_pause_pending());
++                dispatcher
++                    .service_native_memory_control(&mut executor, &fixture.child, &execution)
++                    .unwrap();
++                assert!(!executor.take_stop_request());
++                let outcome = dispatcher
++                    .dispatch_threaded_with_mm_executor(
++                        executor.dispatch_participation(),
++                        &fixture.child,
++                        SyscallRequest::new(
++                            state.x[8],
++                            SyscallArgs::from([state.x[0], 0, 0, 0, 0, 0]),
++                        ),
++                        &mut memory,
++                        &reporter,
++                        ThreadCtx::new(tid, &registry, &futex),
++                    )
++                    .unwrap();
++                assert!(
++                    matches!(outcome, DispatchOutcome::Errno { errno } if errno == carrick_abi::LINUX_EBADF)
++                );
++                completed += 1;
++                let current = fixture.child.current_mm(&execution).unwrap();
++                let foreign =
++                    foreign_mm(&kernel, &root, &root_execution, fixture.child.task().key());
++                let read = foreign
++                    .access_token()
++                    .read_range(GuestVa(TEST_VA), 4)
++                    .unwrap()
++                    .unwrap();
++                let mut actual = [0; 4];
++                authority.read_foreign(&foreign, read, &mut actual).unwrap();
++                drop(foreign);
++                assert_eq!(
++                    u32::from_le_bytes(actual),
++                    u32::from_le_bytes(*b"same") + completed,
++                    "ELF store did not reach carrier backing"
++                );
++                authority
++                    .with_current_mutation(&current, tid, |_mutation| {
++                        fixture
++                            .carrier
++                            .deny_native_data_for_test(TEST_VA, 6)
++                            .unwrap();
++                        Ok(())
++                    })
++                    .unwrap();
++            }
++            println!(
++                "native_carrier_elf scale={scale} completed_total={completed} close_errno=9 pause_requests_serviced={scale}"
++            );
++        }
++        assert_eq!(completed, 169);
++        assert_eq!(original.prefix(), *b"same");
++        // The private ELF data segment is a decoy: carrier writes must never
++        // fall back into it, even when the translated access misses its grant.
++        let mut private_bytes = [0u8; 8];
++        carrick_guest_mem::GuestMemory::read_into(&memory, TEST_VA, &mut private_bytes).unwrap();
++        assert_eq!(private_bytes, [0; 8]);
++        let (other_memory, _) = Memory::load_elf(&elf).unwrap();
++        {
++            let scope = dispatcher
++                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                .unwrap();
++            let mut active = prepared.activate(&scope).unwrap();
++            for address in [TEST_VA + 5, TEST_VA + 8, u64::MAX] {
++                state.pc = image.entry();
++                state.x[2] = address;
++                state.x[9] = 0x12345678;
++                code.run_carrier_until_checkpoint(&image, &memory, &mut active, &mut state)
++                    .unwrap();
++                assert_eq!(
++                    state.pc,
++                    image.entry(),
++                    "out-of-grant load did not checkpoint"
++                );
++                assert_eq!(
++                    state.x[9], 0x12345678,
++                    "out-of-grant load changed destination"
++                );
++            }
++            assert!(
++                code.run_carrier_until_checkpoint(&image, &other_memory, &mut active, &mut state)
++                    .is_err()
++            );
++            memory.protect(image.base(), 4).unwrap();
++            assert!(
++                code.run_carrier_until_checkpoint(&image, &memory, &mut active, &mut state)
++                    .is_err()
++            );
++        }
++        let current = fixture.child.current_mm(&execution).unwrap();
++        authority
++            .with_current_mutation(&current, tid, |_mutation| {
++                fixture
++                    .carrier
++                    .deny_native_data_for_test(TEST_VA, 0)
++                    .unwrap();
++                Ok(())
++            })
++            .unwrap();
++        drop(current);
++        let scope = dispatcher
++            .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++            .unwrap();
++        assert!(
++            prepared.activate(&scope).is_err(),
++            "revoked carrier data was executable"
++        );
++        drop(scope);
++        drop(mutator);
++        drop(executor);
++        fixture
++            .child
++            .thread()
++            .yield_from_executor(execution)
++            .unwrap();
++        assert_eq!(
++            dispatcher
++                .mm_executor_census()
++                .participant_count_for_probe(),
++            0
++        );
++        root.thread().yield_from_executor(root_execution).unwrap();
++    }
++
++    /// Native membership must drain, but cannot acknowledge a hardware ASID.
++    /// Historical hardware residency on the same executor stays pending until
++    /// the actual hardware entry path services it.
++    #[test]
++    fn native_admission_allows_carrier_cow_without_hardware_ack() {
++        use carrick_kernel::kernel::mm_access::MmAccessTarget;
++        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
++        for scale in [1, 8, 32, 128] {
++            let (kernel, root) = bootstrap(35_000 + scale);
++            let fixture = real_production_cow_fixture(
++                &kernel,
++                &root,
++                35_200 + scale,
++                0x9a00_b000_0000,
++                0x9b00_b000_0000,
++                ThreadId::synthetic_for_tests(35_200 + scale),
++            );
++            let original = fixture.carrier.pin_original_data_for_test().unwrap();
++            let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
++                fixture.dispatch_mm.clone(),
++            );
++            let mut peers = Vec::new();
++            for index in 1..scale {
++                let plan = carrick_kernel::kernel::ClonePlan::from_flags(
++                    carrick_abi::LinuxCloneFlags::THREAD
++                        | carrick_abi::LinuxCloneFlags::VM
++                        | carrick_abi::LinuxCloneFlags::SIGHAND,
++                )
++                .unwrap();
++                peers.push(
++                    kernel
++                        .reserve_thread_clone(&fixture.child, plan, None)
++                        .unwrap()
++                        .prepare(ThreadId::synthetic_for_tests(36_000 + index))
++                        .unwrap()
++                        .commit()
++                        .unwrap()
++                        .into_context()
++                        .unwrap(),
++                );
++            }
++            let contexts: Vec<_> = std::iter::once(&fixture.child)
++                .chain(peers.iter())
++                .collect();
++            let mut leases: Vec<_> = contexts
++                .iter()
++                .enumerate()
++                .map(|(i, c)| execution_lease(c, 36000 + i as u64))
++                .collect();
++            let mut executors: Vec<_> = contexts
++                .iter()
++                .zip(&leases)
++                .map(|(c, e)| dispatcher.admit_native_executor(c, e).unwrap())
++                .collect();
++            // Model a previous hardware quantum on the current executor. Native
++            // execution must neither load this ASID nor consume its ticket.
++            let resident = leases[0].executor();
++            fixture
++                .stage1
++                .begin_asid_load(resident)
++                .unwrap()
++                .mark_resident()
++                .unwrap();
++            let authority = carrick_kernel::kernel::MmAccessAuthority::new();
++            let current = fixture.child.current_mm(&leases[0]).unwrap();
++            let range = current
++                .access_token()
++                .write_range(GuestVa(TEST_VA), 8)
++                .unwrap()
++                .unwrap();
++            let result = authority.with_current_mutation(
++                &current,
++                fixture.child.thread().registry_id(),
++                |mutation| {
++                    let mut cow = authority.break_foreign_cow(mutation, &current, range)?;
++                    Ok(fixture
++                        .child
++                        .borrow_current_native_data(&leases[0], &mut cow)?
++                        .prepare_for_execution())
++                },
++            );
++            assert!(
++                result.is_ok(),
++                "native census scale {scale} blocked real carrier COW: {:?}",
++                result.as_ref().err()
++            );
++            let mut prepared = result.unwrap();
++            drop(current);
++            assert!(fixture.stage1.pending_cow_invalidation(resident).is_some());
++            for ((executor, context), lease) in executors.iter_mut().zip(&contexts).zip(&mut leases)
++            {
++                let scope = dispatcher
++                    .enter_native_execution(executor, context, lease)
++                    .unwrap();
++                {
++                    let mut data = prepared.activate(&scope).unwrap();
++                    // SAFETY: one exclusive activated carrier span, eight valid
++                    // bytes, and no Rust alias or dispatch while native code runs.
++                    unsafe {
++                        let ptr = data.as_mut_ptr();
++                        std::arch::asm!("ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
++                        ptr = in(reg) ptr, out("x9") _, options(nostack));
++                    }
++                }
++                drop(scope);
++                assert!(fixture.stage1.pending_cow_invalidation(resident).is_some());
++            }
++            assert_eq!(original.prefix(), *b"same");
++            for ((context, executor), lease) in contexts.iter().zip(executors).zip(leases) {
++                drop(executor);
++                context.thread().yield_from_executor(lease).unwrap();
++            }
++            assert_eq!(
++                dispatcher
++                    .mm_executor_census()
++                    .participant_count_for_probe(),
++                0
++            );
++            println!(
++                "native_carrier_cow scale={scale} completed={scale} hardware_ticket_retained=true"
++            );
++        }
+     }
+ 
+     #[test]
+@@ -2486,6 +2873,16 @@
+             0x9b00_3200_0000,
+             caller_tid,
+         );
++        // Mixed execution modes share the drain, but only the hardware owner
++        // below services this phase's ASID invalidation.
++        let native_dispatcher =
++            carrick_kernel::dispatch::SyscallDispatcher::with_native_mm_for_test(
++                fixture.dispatch_mm.clone(),
++            );
++        let native_lease = execution_lease(&fixture.child, 31115);
++        let native_executor = native_dispatcher
++            .admit_native_executor(&fixture.child, &native_lease)
++            .unwrap();
+         let mm = fixture.child.shared().mm().id();
+         let active_tid = ThreadId::synthetic_for_tests(31_116);
+         let active_executor = ExecutorId::for_transitional_thread(active_tid)
+@@ -2578,6 +2975,18 @@
+                 .is_none()
+         );
+         registry.unregister(active_tid);
++        drop(native_executor);
++        fixture
++            .child
++            .thread()
++            .yield_from_executor(native_lease)
++            .unwrap();
++        assert_eq!(
++            native_dispatcher
++                .mm_executor_census()
++                .participant_count_for_probe(),
++            0
++        );
+     }
+ 
+     #[test]
+--- before/crates/carrick-runtime/Cargo.toml
++++ after/crates/carrick-runtime/Cargo.toml
+@@ -177,3 +177,8 @@
+ 
+ [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
+ carrick-vmm-hvf = { path = "../carrick-vmm-hvf", features = ["foreign-cow-test-support"] }
++
++# Bounded native translator is a macOS-only test instrument, never a runtime
++# dependency or product executor. It exercises carrier data grants with an ELF.
++[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies.native-syscall-slice]
++path = "../../experiments/native-syscall-slice"
+--- before/Cargo.lock
++++ after/Cargo.lock
+@@ -731,6 +731,7 @@
+  "hickory-proto",
+  "libc",
+  "mach2",
++ "native-syscall-slice",
+  "oci-client",
+  "parking_lot",
+  "parking_lot_core",
+@@ -2099,6 +2100,24 @@
+ ]
+ 
+ [[package]]
++name = "native-syscall-slice"
++version = "0.1.0"
++dependencies = [
++ "anyhow",
++ "carrick-abi",
++ "carrick-conformance-contract",
++ "carrick-guest-mem",
++ "carrick-hal",
++ "carrick-kernel",
++ "carrick-kernel-example",
++ "carrick-vfs",
++ "goblin",
++ "libc",
++ "serde_json",
++ "tempfile",
++]
++
++[[package]]
+ name = "normalize-line-endings"
+ version = "0.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+--- before/conformance-contracts/contracts/native-execution-scope.toml
++++ after/conformance-contracts/contracts/native-execution-scope.toml
+@@ -5,13 +5,13 @@
+ semantic_authority = ["Carrick exact task execution lease", "Carrick exact-MM pause-modify-resume protocol", "man 2 mprotect", "man 2 munmap"]
+ fixture = "unit:native-execution-scope"
+ scale_points = [1, 8, 32, 128]
+-rationale = "Normal native execution must retain exact census membership and a private running handshake without holding mutation exclusion. An interrupt requests a safe point; only scope exit acknowledges it. Repeated entry after setup must allocate no host memory. This scope grants no memory pointers or executable publication."
++rationale = "Normal native execution must retain exact census membership and a private running handshake without holding mutation exclusion. An interrupt requests a safe point; only scope exit acknowledges it. Repeated entry and host memory-control service after setup must allocate no host memory. Native endpoints join the exact-MM drain but never acknowledge hardware ASID tickets; memory service preserves external stops and authenticates the current lease. This scope grants no memory pointers or executable publication."
+ 
+ [bindings]
+-vm_free = "carrick-kernel-example::native_execution_scope::native_execution_scope_contract"
++vm_free = "carrick-kernel-example::native_execution_scope::native_execution_scope_contract; kernel native_execution tests; runtime native_admission_allows_carrier_cow_without_hardware_ack and mixed hardware-owner COW composition"
+ 
+ [bindings.unresolved]
+-embed_structural = "The lifecycle and allocation contract is VM-free. Carrier pointer activation, native code publication, signals, cancellation and scheduling require signed execution composition."
++embed_structural = "The lifecycle and allocation contract is VM-free. Host carrier data and bounded ELF composition are exercised separately; native code publication, signals, cancellation and scheduling still require signed execution composition."
+ embed_timing = "No new performance measurement or native workload acceptance."
+ docker = "Internal admission invariant; Linux mapping semantics remain the external obligation. No corresponding differential guest race is registered."
+ 
+--- before/conformance-contracts/contracts/native-data-activation.toml
++++ after/conformance-contracts/contracts/native-data-activation.toml
+@@ -8,10 +8,10 @@
+ rationale = "After full validation and before any mutation, repeated native data activation must allocate nothing and walk no leaves. Reuse must revoke after changes in exact stage-1 authority, backend, VMA, inventory, mapping, owner or protection. This host CPU fixture uses production carrier COW and a real scope but executes no guest ELF."
+ 
+ [bindings]
+-vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_data_activation_cost_contract (conformance-metrics)"
++vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_data_activation_cost_contract (conformance-metrics); native_carrier_elf_memory_control_round_trip supplies supplemental host execution semantics"
+ 
+ [bindings.unresolved]
+-embed_structural = "Carrier-backed ELF, control tickets, code publication and revocation are not integrated."
++embed_structural = "A bounded host ELF data/control round trip is covered; signed native execution, carrier code publication, signal/cancellation service and scheduling remain unintegrated."
+ embed_timing = "Host fixture cost is diagnostic only; no native workload acceptance."
+ docker = "Internal activation invariant. Guest mapping, fork and common-workload differentials remain required."
+ 
+--- before/experiments/native-syscall-slice/src/native.rs
++++ after/experiments/native-syscall-slice/src/native.rs
+@@ -345,6 +345,57 @@
+         }
+         Ok(())
+     }
++    /// Execute one bounded interval using the exact active carrier data grant.
++    /// Every SVC, slow operation or backward-edge checkpoint returns to the
++    /// caller; there is no private-memory fallback or in-scope host dispatch.
++    /// Text still belongs to this research executor's private immutable ELF
++    /// publication. This is not carrier-backed code publication authority.
++    pub fn run_carrier_until_checkpoint(
++        &self,
++        image: &Image,
++        memory: &Memory,
++        data: &mut carrick_kernel::kernel::mm_access::ActiveNativeData<'_, '_>,
++        state: &mut State,
++    ) -> Result<()> {
++        ensure!(state.user.is_null(), "native State is already executing");
++        memory.validate(image)?;
++        ensure!(
++            std::sync::Arc::ptr_eq(&self.identity, &image.identity) && self.epoch == image.epoch,
++            "wrong executable publication"
++        );
++        let (_, base, length) = self
++            .data_region
++            .ok_or_else(|| anyhow::anyhow!("ELF has no bounded writable data region"))?;
++        ensure!(
++            data.start().raw() == base && data.len() == length && length >= 8,
++            "carrier grant does not match the complete ELF data region"
++        );
++        let entry = self.address(state.pc)?;
++        unsafe extern "C" fn checkpoint(s: *mut State, _: *mut c_void) -> usize {
++            // SAFETY: slice_enter receives the exclusively borrowed live State.
++            // No guest pointers or invocation payload are dereferenced here.
++            let state = unsafe { &mut *s };
++            state.backedge_budget = 256;
++            state.data_host_base = std::ptr::null_mut();
++            0
++        }
++        let mut invocation = 0u8;
++        state.user = std::ptr::from_mut(&mut invocation).cast();
++        state.callback = checkpoint;
++        state.gateway = slice_gateway as *const () as usize;
++        state.data_guest_base = base;
++        state.data_last_eight = (length - 8) as u64;
++        // SAFETY: the exclusive grant and its execution scope outlive this
++        // entire invocation. Emitted scalar accesses check their full width
++        // against this exact range. A miss only returns to the caller. No Rust
++        // alias, pointer escape, dispatcher entry or executable write occurs.
++        state.data_host_base = unsafe { data.as_mut_ptr() };
++        unsafe { slice_enter(state, entry) };
++        state.data_host_base = std::ptr::null_mut();
++        state.user = std::ptr::null_mut();
++        Ok(())
++    }
++
+     /// Exclusive Memory borrow remains live throughout native code and callbacks.
+     /// The callback receives that exact backing; no other owner can mutate it.
+     pub fn run<F>(
+--- before/experiments/native-syscall-slice/src/main.rs
++++ after/experiments/native-syscall-slice/src/main.rs
+@@ -190,11 +190,14 @@
+                 reached_checkpoint,
+                 "native execution returned without a checkpoint"
+             );
++            if executor.memory_pause_pending() {
++                dispatcher.service_native_memory_control(&mut executor, &context, &execution)?;
++            }
+             // Control requests cannot be silently acknowledged as delivered
+             // signals/cancellation: this research runner has no such service.
+             ensure!(
+                 !executor.take_stop_request(),
+-                "native execution requires carrier control service"
++                "native execution requires signal/cancellation control service"
+             );
+             if !service(&mut state, &mut memory, &mut executor, &execution)? {
+                 break;
+--- before/Cargo.toml
++++ after/Cargo.toml
+@@ -4,7 +4,7 @@
+ # conformance-probes is a STANDALONE crate (its own Cargo.lock) built as static
+ # Linux/musl ELFs in a container by scripts/build-probes.sh, never as part of
+ # the host workspace — exclude it so host `cargo` commands don't try to absorb it.
+-exclude = ["fixtures/*", "crates/*/fixtures/*", "conformance-probes"]
++exclude = ["fixtures/*", "crates/*/fixtures/*", "conformance-probes", "experiments/native-syscall-slice"]
+ # The product is the `carrick` binary, so an argument-less cargo command --
+ # the signed release build in scripts/build-signed.sh, a bare
+ # `cargo build --release`, `cargo build --bin carrick` -- selects carrick-cli

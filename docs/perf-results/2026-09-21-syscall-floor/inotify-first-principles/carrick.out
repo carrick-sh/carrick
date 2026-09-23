@@ -1,0 +1,9 @@
+{"mode": "churn", "n": 1, "distinct_wds": 1, "first_wds": [1], "queued_bytes": 16, "events": 1, "ignored": 1, "modify": 0}
+{"mode": "churn", "n": 8, "distinct_wds": 1, "first_wds": [1, 1, 1, 1, 1, 1, 1, 1], "queued_bytes": 16, "events": 1, "ignored": 1, "modify": 0}
+{"mode": "churn", "n": 32, "distinct_wds": 1, "first_wds": [1, 1, 1, 1, 1, 1, 1, 1], "queued_bytes": 16, "events": 1, "ignored": 1, "modify": 0}
+{"mode": "churn", "n": 128, "distinct_wds": 1, "first_wds": [1, 1, 1, 1, 1, 1, 1, 1], "queued_bytes": 16, "events": 1, "ignored": 1, "modify": 0}
+{"mode": "serial_full", "n": 1, "distinct_wds": 1, "first_wds": [1], "queued_bytes": 32, "events": 2, "ignored": 1, "modify": 1}
+{"mode": "serial_full", "n": 8, "distinct_wds": 1, "first_wds": [1, 1, 1, 1, 1, 1, 1, 1], "queued_bytes": 256, "events": 16, "ignored": 8, "modify": 8}
+{"mode": "serial_full", "n": 32, "distinct_wds": 1, "first_wds": [1, 1, 1, 1, 1, 1, 1, 1], "queued_bytes": 1024, "events": 64, "ignored": 32, "modify": 32}
+{"mode": "serial_full", "n": 128, "distinct_wds": 1, "first_wds": [1, 1, 1, 1, 1, 1, 1, 1], "queued_bytes": 4096, "events": 256, "ignored": 128, "modify": 128}
+probe_complete=1

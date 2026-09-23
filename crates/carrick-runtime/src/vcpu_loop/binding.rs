@@ -7395,6 +7395,7 @@ mod tests {
         assert!(
             !HvpatchProductionPhase::ResumeBlocked {
                 frame: carrick_hal::RawSyscall {
+                    current_guest_sp: None,
                     number: carrick_abi::CanonicalNr(0),
                     args: [0; 6],
                     guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
@@ -7408,6 +7409,7 @@ mod tests {
 
     fn deferred_frame() -> carrick_hal::RawSyscall {
         carrick_hal::RawSyscall {
+            current_guest_sp: None,
             number: carrick_abi::CanonicalNr(101),
             args: [1, 2, 3, 4, 5, 6],
             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,

@@ -1,0 +1,24 @@
+/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-discard-edges:
+(__TEXT,__text) section
+__ZN21carrick_observability6probes4real24hvpatch_tlb_invalidation17h49d5de03a33db1ddE:
+0000000100d500f0	stp	x22, x21, [sp, #-0x30]!
+0000000100d500f4	stp	x20, x19, [sp, #0x10]
+0000000100d500f8	stp	x29, x30, [sp, #0x20]
+0000000100d500fc	add	x29, sp, #0x20
+0000000100d50100	mov	x20, x2
+0000000100d50104	mov	x19, x1
+0000000100d50108	mov	x21, x0
+0000000100d5010c	mov	x0, #0x0
+0000000100d50110	cbz	w0, 0x100d50128
+0000000100d50114	mov	w0, w21
+0000000100d50118	mov	w2, w20
+0000000100d5011c	mov	x1, x19
+0000000100d50120	nop
+0000000100d50124	b	0x100d50128
+0000000100d50128	ldp	x29, x30, [sp, #0x20]
+0000000100d5012c	ldp	x20, x19, [sp, #0x10]
+0000000100d50130	ldp	x22, x21, [sp], #0x30
+0000000100d50134	ret
+__ZN21carrick_observability6probes4real24native_fork_lifecycle_as17h5a8d0cff8b84de6bE:
+0000000100d50138	stp	x24, x23, [sp, #-0x40]!
+0000000100d5013c	stp	x22, x21, [sp, #0x10]

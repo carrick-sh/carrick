@@ -425,6 +425,16 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
   have mislabeled fork-quiesce deadlocks as lost-wakeups — don't trust them.
   If the process aborted via `carrick_fatal!`, inspect the static `CARRICK_LAST_FATAL`
   record from lldb (`memory read` or `p CARRICK_LAST_FATAL`) to read the fatal domain and message.
+- **Qualify the completed workload before optimizing a handler.** Kernel
+  service probes omit EL1/engine fast paths; a shell's CLI JSON counters may
+  describe only the wrapper. In the completed inotify09 census, 3 million
+  add-watch and 3 million remove-watch services coexisted with only one
+  host-service seek. Require live request/argument/completion closure for the
+  actual workload before selecting a repeated-path optimization. Counts prove
+  reachability and population, not the critical path; retain uninstrumented
+  end-to-end A/B timing and separate native-I/O controls. Use the strict
+  `carrick trace --profile hvpatch-inotify09-population` receipt for the pinned
+  LTP case; its fixed 3-million-pair check does not generalize to other fixtures.
 - **Verify diagnoses empirically.** A "race / coherence / Heisenbug" label is the
   easiest place to be wrong. Instrument the exact failure point and read the real
   values before changing code; treat memory notes and prior diagnoses as

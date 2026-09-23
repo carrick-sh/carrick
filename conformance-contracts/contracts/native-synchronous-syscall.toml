@@ -1,0 +1,36 @@
+schema_version = 1
+id = "kernel.execution.native-synchronous-syscall"
+title = "Native synchronous execution retains exact task and memory authority"
+guest_surfaces = ["execution:linux-aarch64", "syscall:inotify_add_watch", "syscall:inotify_rm_watch", "kernel:syscall-observation", "kernel:current-mm"]
+semantic_authority = ["Linux AArch64 syscall ABI", "man 2 inotify_add_watch", "man 2 inotify_rm_watch", "man 2 mprotect", "Carrick exact execution lease and current-MM authority"]
+fixture = "probe:perf_inotify09_scale invalid-contract"
+scale_points = [1, 8, 32, 128]
+rationale = "The native adapter must execute real guest instructions through current unified-kernel policy and completion paths. Matching errno output alone does not prove executable permission, frame ownership, signal delivery, TLS, or translation revocation. The existing host callback gateway is not a binding for this contract."
+
+[bindings.unresolved]
+vm_free = "Authenticated instruction fetch and a mutation-scoped carrier native-data grant now have focused tests for exact execution/MM authority, permissions, revisions and COW backing. The separate kernel.mm.native-execution-scope contract now proves scoped admission and exact-MM draining without mutation exclusion. Opaque preparation and execution-scoped carrier data activation now have runtime composition tests for live owner/leaf validation and actual drain refusal until scope exit; this is a bounded host CPU fixture, not an execution binding. Generation-bound translation publication and full carrier control integration remain unbound. CurrentMmMemory remains a marker. No VM-free execution binding is registered. See docs/perf-results/2026-09-21-syscall-floor/native-carrier."
+embed_structural = "The bounded research executor now composes unchanged ELF data and syscall input/output with authenticated carrier copies and scoped data activation. Twenty host-only controls cover invalid, unchanged-watch, churn, integer and memory loops at scales 1/8/32/128. The separate kernel.mm.native-syscall-buffers contract checks carrier copy authority and zero warmed invalid-fd allocations. Text publication remains private research backing and stage-2 is mocked; this is not an embed execution binding. Carrier code publication, executable invalidation, signals/cancellation, TLS and scheduling remain unproved. See docs/perf-results/2026-09-21-syscall-floor/native-syscall-buffers."
+embed_timing = "No native adapter timing accepted. Same-ELF diagnostic native/HVF/Linux measurements exist. Native scalar lowering reduced the private-backing memory control from 151.92 ns to 2.12 ns (1.53x Linux), but is not a current-carrier memory grant. Compute, COW, JIT, signals and full current-runtime controls remain acceptance requirements. See docs/perf-results/2026-09-21-syscall-floor/native-memory."
+docker = "Exact errno control matches native ARM64 Docker at all scales; versioned observation emission and remaining register/TLS/signal/memory fixtures are not yet bound. Evidence: docs/perf-results/2026-09-21-syscall-floor/dsr-guest-contract."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "hvf_syscall_exits"
+value = 0
+layers = ["embed-structural"]
+rationale = "A synchronous native guest syscall must not cross HVF. Count actual exits in the operation window; absent instrumentation is not a measured zero."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "host_heap_allocations"
+value = 0
+layers = ["embed-structural"]
+rationale = "After setup and warmup, invalid-descriptor add/remove pairs require no per-call host allocation. Measure allocator calls on the executing thread."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 0
+per_unit = 2
+layers = ["embed-structural"]
+rationale = "Each pair contains two syscalls with at most one semantic dispatch each. Semantic assertions must separately establish exactly two requests and completions per pair, all returning the oracle errno; a zero-work run cannot qualify."

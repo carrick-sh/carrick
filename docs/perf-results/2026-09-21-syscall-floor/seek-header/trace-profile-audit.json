@@ -1,0 +1,333 @@
+{
+  "stage": "final signed trace profile; performance candidate removed",
+  "modified_preexisting_source_files": [
+    "crates/carrick-cli/src/commands.rs",
+    "crates/carrick-cli/src/main.rs",
+    "crates/carrick-cli/src/trace_profile.rs",
+    "crates/carrick-cli/tests/trace_profile.rs"
+  ],
+  "all_other_recorded_source_files_unchanged": 3037,
+  "new_source_files": [
+    "crates/carrick-cli/src/hvpatch_inotify_population_profile.rs",
+    "crates/carrick-cli/tests/fixtures/inotify09-population-complete.raw"
+  ],
+  "candidate_seek_files_restored": true,
+  "current_release_sha256": "1142bb6dc6202ab3675dc6485b4f479e1d9425b2b75a293c948aef5e65db8918",
+  "profile_program_sha256": "5c9089df891d028a55357d461eb7fd2be994bf80557d58a9bd98d6aae15a47bb",
+  "live_profile_run": {
+    "run_id": "inotify09-profile-20260922",
+    "argv": [
+      "/Volumes/CaseSensitive/carrick/target/syscall-floor/carrick-inotify-population",
+      "trace",
+      "--profile",
+      "hvpatch-inotify09-population",
+      "--trace-out",
+      "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/seek-header/trace-profile/inotify09-profile-20260922.raw",
+      "--",
+      "run",
+      "--max-traps",
+      "18446744073709551615",
+      "--fs",
+      "host",
+      "--entrypoint",
+      "/bin/sh",
+      "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+      "-c",
+      "/opt/ltp/testcases/bin/inotify09"
+    ],
+    "exit_code": 0,
+    "timeout": false,
+    "cleanup_exit_code": 0,
+    "passed": true,
+    "loop_completed": true,
+    "profile_accepted": true
+  },
+  "live_service_counts": {
+    "nr=24": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=26": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=29": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=34": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=43": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=46": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=49": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=54": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=59": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=62": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=93": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=98": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=113": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=123": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=154": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=160": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=227": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=233": {
+      "begin": 1,
+      "args": 1,
+      "end": 1
+    },
+    "nr=53": {
+      "begin": 2,
+      "args": 2,
+      "end": 2
+    },
+    "nr=61": {
+      "begin": 2,
+      "args": 2,
+      "end": 2
+    },
+    "nr=17": {
+      "begin": 3,
+      "args": 3,
+      "end": 3
+    },
+    "nr=35": {
+      "begin": 3,
+      "args": 3,
+      "end": 3
+    },
+    "nr=129": {
+      "begin": 3,
+      "args": 3,
+      "end": 3
+    },
+    "nr=174": {
+      "begin": 3,
+      "args": 3,
+      "end": 3
+    },
+    "nr=177": {
+      "begin": 3,
+      "args": 3,
+      "end": 3
+    },
+    "nr=176": {
+      "begin": 4,
+      "args": 4,
+      "end": 4
+    },
+    "nr=25": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "nr=94": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "nr=96": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "nr=103": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "nr=139": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "nr=220": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "nr=278": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "nr=293": {
+      "begin": 5,
+      "args": 5,
+      "end": 5
+    },
+    "nr=175": {
+      "begin": 6,
+      "args": 6,
+      "end": 6
+    },
+    "nr=99": {
+      "begin": 7,
+      "args": 7,
+      "end": 7
+    },
+    "nr=261": {
+      "begin": 7,
+      "args": 7,
+      "end": 7
+    },
+    "nr=221": {
+      "begin": 8,
+      "args": 8,
+      "end": 8
+    },
+    "nr=173": {
+      "begin": 9,
+      "args": 9,
+      "end": 9
+    },
+    "nr=79": {
+      "begin": 11,
+      "args": 11,
+      "end": 11
+    },
+    "nr=48": {
+      "begin": 12,
+      "args": 12,
+      "end": 12
+    },
+    "nr=135": {
+      "begin": 15,
+      "args": 15,
+      "end": 15
+    },
+    "nr=214": {
+      "begin": 15,
+      "args": 15,
+      "end": 15
+    },
+    "nr=260": {
+      "begin": 16,
+      "args": 16,
+      "end": 16
+    },
+    "nr=215": {
+      "begin": 17,
+      "args": 17,
+      "end": 17
+    },
+    "nr=63": {
+      "begin": 18,
+      "args": 18,
+      "end": 18
+    },
+    "nr=80": {
+      "begin": 20,
+      "args": 20,
+      "end": 20
+    },
+    "nr=226": {
+      "begin": 21,
+      "args": 21,
+      "end": 21
+    },
+    "nr=56": {
+      "begin": 26,
+      "args": 26,
+      "end": 26
+    },
+    "nr=57": {
+      "begin": 28,
+      "args": 28,
+      "end": 28
+    },
+    "nr=64": {
+      "begin": 32,
+      "args": 32,
+      "end": 32
+    },
+    "nr=222": {
+      "begin": 33,
+      "args": 33,
+      "end": 33
+    },
+    "nr=134": {
+      "begin": 108,
+      "args": 108,
+      "end": 108
+    },
+    "nr=27": {
+      "begin": 3000000,
+      "args": 3000000,
+      "end": 3000000
+    },
+    "nr=28": {
+      "begin": 3000000,
+      "args": 3000000,
+      "end": 3000000
+    }
+  },
+  "preexisting_lint_failure_files": {
+    "crates/carrick-aarch64/src/anonymous_discard.rs": "c6268ba7c12b49268b21b66e55f0cd3f91c559029a68263aa6f09c89aafa1c17",
+    "crates/carrick-aarch64/src/engine.rs": "7895af4a4ff779afc2dc4c86c08c0dee71128728c2055dda0145e432737fcfa9"
+  },
+  "validation": {
+    "profile_tests": 26,
+    "scoped_clippy": "pass",
+    "broader_clippy": "failed: six existing manual_is_multiple_of diagnostics",
+    "signed_profile": "pass",
+    "smoke_full_ci": "not run"
+  }
+}

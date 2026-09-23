@@ -1,0 +1,10 @@
+{"schema":1,"phase":"fstat","sample":1,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":139688292}
+{"schema":1,"phase":"fstat","sample":2,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":141605084}
+{"schema":1,"phase":"fstat","sample":3,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":142979208}
+{"schema":1,"phase":"fstat","sample":4,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":141779667}
+{"schema":1,"phase":"fstat","sample":5,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":141714958}
+{"schema":1,"phase":"fstat","sample":6,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":141515875}
+{"schema":1,"phase":"fstat","sample":7,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":141243958}
+{"schema":1,"phase":"fstat","sample":8,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":140253583}
+{"schema":1,"phase":"fstat","sample":9,"iterations":65536,"calls_per_iteration":1,"elapsed_ns":140602875}
+{"schema":1,"verified":true,"bytes":64,"offset":0,"removed":true}

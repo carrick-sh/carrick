@@ -1,0 +1,79 @@
+[
+  {
+    "name": "inventory-check-final",
+    "argv": [
+      "cargo",
+      "run",
+      "-p",
+      "carrick-conformance-contract",
+      "--bin",
+      "check-contracts",
+      "--",
+      "--root",
+      "."
+    ],
+    "exit_code": 0,
+    "wall_s": 0.24024470802396536
+  },
+  {
+    "name": "runtime-memory-final",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-runtime",
+      "--features",
+      "conformance-metrics",
+      "--lib",
+      "vcpu_loop::memory::tests::",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "wall_s": 12.002337290992728
+  },
+  {
+    "name": "elf-clippy-complete",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--manifest-path",
+      "experiments/native-syscall-slice/Cargo.toml",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "wall_s": 0.4745724579843227
+  },
+  {
+    "name": "runtime-clippy-complete",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--no-deps",
+      "-p",
+      "carrick-runtime",
+      "-p",
+      "carrick-observability",
+      "--all-targets",
+      "--features",
+      "carrick-runtime/conformance-metrics",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "wall_s": 4.759555333002936
+  },
+  {
+    "name": "layering",
+    "argv": [
+      "bash",
+      "scripts/closure-assert-layering.sh"
+    ],
+    "exit_code": 0,
+    "wall_s": 1.176239207998151
+  }
+]

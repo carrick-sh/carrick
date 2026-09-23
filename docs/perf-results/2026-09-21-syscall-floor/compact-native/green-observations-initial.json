@@ -1,0 +1,102 @@
+[
+  {
+    "contract_id": "kernel.execution.native-code-density",
+    "layer": "vm-free",
+    "implementation_revision": "sha256:5fb4ecd8cda853cc532ab4137fc0a474eed4cf73b1815d0d4de0b92006daea6c",
+    "fixture_identity": "unit:native-code-density",
+    "scale": 1,
+    "semantic_assertions": [
+      {
+        "name": "exact_adds_and_checkpoint_with_complete_state_preserved",
+        "passed": true,
+        "detail": null
+      }
+    ],
+    "work": {
+      "values": {
+        "native_code_words": 21
+      },
+      "dropped_events": 0,
+      "unknown_metrics": []
+    },
+    "timing": null,
+    "completeness": {
+      "status": "complete"
+    }
+  },
+  {
+    "contract_id": "kernel.execution.native-code-density",
+    "layer": "vm-free",
+    "implementation_revision": "sha256:5fb4ecd8cda853cc532ab4137fc0a474eed4cf73b1815d0d4de0b92006daea6c",
+    "fixture_identity": "unit:native-code-density",
+    "scale": 8,
+    "semantic_assertions": [
+      {
+        "name": "exact_adds_and_checkpoint_with_complete_state_preserved",
+        "passed": true,
+        "detail": null
+      }
+    ],
+    "work": {
+      "values": {
+        "native_code_words": 42
+      },
+      "dropped_events": 0,
+      "unknown_metrics": []
+    },
+    "timing": null,
+    "completeness": {
+      "status": "complete"
+    }
+  },
+  {
+    "contract_id": "kernel.execution.native-code-density",
+    "layer": "vm-free",
+    "implementation_revision": "sha256:5fb4ecd8cda853cc532ab4137fc0a474eed4cf73b1815d0d4de0b92006daea6c",
+    "fixture_identity": "unit:native-code-density",
+    "scale": 32,
+    "semantic_assertions": [
+      {
+        "name": "exact_adds_and_checkpoint_with_complete_state_preserved",
+        "passed": true,
+        "detail": null
+      }
+    ],
+    "work": {
+      "values": {
+        "native_code_words": 114
+      },
+      "dropped_events": 0,
+      "unknown_metrics": []
+    },
+    "timing": null,
+    "completeness": {
+      "status": "complete"
+    }
+  },
+  {
+    "contract_id": "kernel.execution.native-code-density",
+    "layer": "vm-free",
+    "implementation_revision": "sha256:5fb4ecd8cda853cc532ab4137fc0a474eed4cf73b1815d0d4de0b92006daea6c",
+    "fixture_identity": "unit:native-code-density",
+    "scale": 128,
+    "semantic_assertions": [
+      {
+        "name": "exact_adds_and_checkpoint_with_complete_state_preserved",
+        "passed": true,
+        "detail": null
+      }
+    ],
+    "work": {
+      "values": {
+        "native_code_words": 402
+      },
+      "dropped_events": 0,
+      "unknown_metrics": []
+    },
+    "timing": null,
+    "completeness": {
+      "status": "complete"
+    }
+  }
+]

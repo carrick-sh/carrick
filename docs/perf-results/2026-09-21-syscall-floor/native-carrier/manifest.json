@@ -1,0 +1,543 @@
+{
+  "created_utc": "2026-09-22T15:21:39.757346+00:00",
+  "source_head": "9bb2392396b8531e93f5262657bf3aa9c5767488",
+  "worktree": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick",
+  "local_uncommitted": true,
+  "contract_id": "kernel.execution.native-synchronous-syscall",
+  "contract_bindings": "unresolved; no execution or performance acceptance",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2\n",
+  "host": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2\nBuildVersion:\t\t26B5086k\n",
+  "dirty_source_sha256": {
+    "Cargo.lock": "6a7083ef251922d35685745be82882e45384515cdd3132d6eef75250a8d4a6c3",
+    "conformance-contracts/contracts/anonymous-discard-edges.toml": "333db27774b05d2a7dce1e52feb9406e66c9f61e6006f8c27bce635575a1b6af",
+    "conformance-contracts/contracts/anonymous-discard-no-scrub.toml": "7814b14e2ccc341037075e254a15658b1973c9e8aeb31c1b226a0cfeef941e23",
+    "conformance-contracts/contracts/anonymous-discard.toml": "032e1dee5f252d072bd7c6dd7a5b850e302a85ad303f7497d12fc557c18a59a7",
+    "conformance-contracts/contracts/fresh-publication-maintenance.toml": "4f5025c588ee9b896438b9331a86ec61b54e4973a50527e0f4b183161bf8b7fe",
+    "conformance-contracts/contracts/inotify-watch-churn.toml": "899ce071068b918b5b631e2f1af2e848643b4f50adc94c0ddaa904444fb9bb9f",
+    "conformance-contracts/contracts/native-synchronous-syscall.toml": "ed32f6cfe8e5930f4f8fd265dcd6d08cb19fa5bdf90f4befae98341548c65a19",
+    "conformance-contracts/contracts/retained-fragment-query.toml": "a08765ad0fe538e132ec9c10bb787028c9dec2acab480093c07ff42e0e147277",
+    "conformance-contracts/contracts/scrub-remap-query.toml": "316545654fa0b8fc6e14cdd37de9752165f0c63bb8dbbf2b04c4c0e07e3485aa",
+    "conformance-contracts/contracts/signal-lease-gap.toml": "d309146c434cd0c031577f80b8e021ccb89a18db4f850741818bd696bef676c7",
+    "conformance-contracts/contracts/stat-allocation.toml": "d4ab398f04a9b5f7ad8349cd3323d728ff893939da6ea6caed9c7636bbdc3938",
+    "conformance-contracts/contracts/syscall-captured-stack.toml": "348e49667b21dd5bf3dae3c5da2dbc8485bcd939f6645f6633c8dc36820ae6ab",
+    "conformance-probes/src/bin/perf_inotify09_scale.rs": "7f37827a8a804c88831a0c4b0a5f34cc243f4044d32cbdc8cf4f7f6e0a998b93",
+    "conformance-probes/src/bin/writeseek.rs": "e55936ec7788b3241304d4ebb69ee8c8932568dd150a093fa1eb6e32aaa6f3e0",
+    "crates/carrick-aarch64/Cargo.toml": "b666014436db50bb35df8058f25bf56fd104eace68d9b67fbe44c684c21498e1",
+    "crates/carrick-aarch64/src/anonymous_discard.rs": "c6268ba7c12b49268b21b66e55f0cd3f91c559029a68263aa6f09c89aafa1c17",
+    "crates/carrick-aarch64/src/engine.rs": "7895af4a4ff779afc2dc4c86c08c0dee71128728c2055dda0145e432737fcfa9",
+    "crates/carrick-aarch64/src/lib.rs": "22c19b993f015439c3883685d976a5415fb18569e4e1fdd385e25431ea5b74e1",
+    "crates/carrick-aarch64/src/vmm.rs": "166652f45d69cfaa96884f7308ae5b5732f55a7b9061a1ca8cf71b9ed9f97603",
+    "crates/carrick-cli/tests/probe-oracle/arm64-gnu/writeseek": "1c8fcb4bbf2ab63dac41a7d6ba614b1b34c09d66766a2c7c00971d6ba4ef79d4",
+    "crates/carrick-cli/tests/probe-oracle/arm64-musl/writeseek": "1c8fcb4bbf2ab63dac41a7d6ba614b1b34c09d66766a2c7c00971d6ba4ef79d4",
+    "crates/carrick-conformance-contract/tests/claims.rs": "e0733d48c05b3c46bb201fbe004562edf3b68978aef671a6857c9b7a595840d7",
+    "crates/carrick-conformance-contract/tests/evaluate.rs": "94c18dc8a92123a97b92a7bfbe2397f51d828a8913ed666645a4b176f05eae28",
+    "crates/carrick-conformance-next/tests/deferred_anonymous.rs": "3cf00df12b1f49d372e000b87f2b45327d8b758984b80c53f1f8c003de734208",
+    "crates/carrick-conformance-next/tests/fixtures/inotify_lifecycle.py": "9906d6d685292adaa986f408c1b05f1e5bfeaeb4c78e24f69d7022ba2940013f",
+    "crates/carrick-conformance-next/tests/fixtures/pristine_scrub.py": "2b8b2187c9b92e9696d6f07fd5337a4979d9ba5de87289b2ce6587f4bae15897",
+    "crates/carrick-conformance-next/tests/fixtures/subprocess_kill_compute.py": "83b89dfdb49db0bd306743e00d774ce1bace32e298e37852503ee3f28e0083f5",
+    "crates/carrick-conformance-next/tests/fixtures/unaligned_discard.py": "fd2165d4860b6ff2e0015a07c96dc624ab0bdebb4d5fbd3df81bbd8838957572",
+    "crates/carrick-conformance-next/tests/inotify_lifecycle.rs": "a6eb8d2da7fbeee4bd4a1f26d39910e505cf358ceb37c9005e0f88ccc1ad763f",
+    "crates/carrick-conformance-next/tests/signal_lease_gap.rs": "69d758b548c0349496dabbc425da803cddc24a924f55d3473a4e1d12991091b8",
+    "crates/carrick-conformance-next/tests/write_seek_lease.rs": "5d6c5ecc7d8e7298e3c01304a5c1fcf616404d4847c2d41eadd4cd1a9ca0c9f2",
+    "crates/carrick-guest-mem/src/lib.rs": "f1e1d098161b301e0ac41096dc6e022e1038746a0d8e8e754a0bac0da106653e",
+    "crates/carrick-hal/src/foreign_mm.rs": "c9b758e11a4587193dafcfbc094c80353e8befb4733990b01a27109bb791578a",
+    "crates/carrick-hal/src/lib.rs": "d5e9e2ec98c9afd2dde9f40e387df4376a0da89bb77d5701bae6b7c0c178f727",
+    "crates/carrick-hal/src/threaded.rs": "3b8aed28eb2b6538811bc3f8a96c8ecd16f7b2af58c4ab3729211cdd6c7b0b50",
+    "crates/carrick-hal/src/trap.rs": "52b8dfd68dbc3272e249fb482bebf9a07e5d0ed6410ae6ca362f37125ac55df4",
+    "crates/carrick-hal/src/x8664_arch.rs": "e6ec074a85fb82ffa5011c70befa0c2942f01a6e15837a6a28a0ff8b87805d63",
+    "crates/carrick-kernel/Cargo.toml": "4c2d63f45840035fe9c50846955a20b4545ee89e1fd833f932ddbedc4f845e42",
+    "crates/carrick-kernel/src/dispatch/fd_table.rs": "9e60026af9559c361b38976ba11d4f3a38baa1caed2f5ee50af5eedc5bb862b2",
+    "crates/carrick-kernel/src/dispatch/format_stat.rs": "ccc8c586b1bed5ad8ba33333084f3f9101e69f09f9da4ce4445d33a1804febc4",
+    "crates/carrick-kernel/src/dispatch/fs/locks.rs": "3693a1f2d124c8cb54c21d27ffa1aada688333361ce36bf4136788156d98a0c5",
+    "crates/carrick-kernel/src/dispatch/fs/lookup.rs": "80075c0e81ebf7c02eed96f70e85509a0a149ec56fba1132e216aab335c9997a",
+    "crates/carrick-kernel/src/dispatch/fs/notify.rs": "b2a3c0e6c7f366faa646523f397dec6a0b6b000ad19894bfbb91d1b73bff253f",
+    "crates/carrick-kernel/src/dispatch/fs/rw.rs": "98155a1670fc429fc10ae7bbb7d6187897488b8836d26d5d9b0383ff5e5f39fa",
+    "crates/carrick-kernel/src/dispatch/fs/stat.rs": "7c3e9c8e10cd78209bc11e3f846a54b3ef36030d9fd825437f6babcfde069e40",
+    "crates/carrick-kernel/src/dispatch/fs/tests.rs": "6e6b687616313d32d82e993fc2c7838a874374069bd163750be4761bdebe61f7",
+    "crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs": "e916fc12233a1ad568e936417db65cf5f92ac08b1407ee26ca1c44edc4819b94",
+    "crates/carrick-kernel/src/dispatch/mem/madvise.rs": "131f410c34a48490bde8b29cf4785e57d77ca20f2fdf553ecc470e5f88a14c20",
+    "crates/carrick-kernel/src/dispatch/mem/tests.rs": "0a732219d6b7d1fc2551ffd7ea83aace7766aa422b02b8ff56437a246a3138d2",
+    "crates/carrick-kernel/src/dispatch/net.rs": "0977e21c7fc69deeed653e31b09b4dab77054c7c404365dc2042df8e129be08a",
+    "crates/carrick-kernel/src/dispatch/request.rs": "d870034c3ea563ada58b8e7028b647c8c41dbdd167fba968b9f344e745751083",
+    "crates/carrick-kernel/src/dispatch/rootfs_helpers.rs": "9f25a5ce7ad4c7261b1a5e43c6c0477e6f249637e48367fba6580d4de528e5e2",
+    "crates/carrick-kernel/src/dispatch/tests.rs": "9a82eba79d52db471554a35c49137fccc371a265d15b248fbb71ba1141258818",
+    "crates/carrick-kernel/src/inotify.rs": "69f7b2d4c4ce914adea4b1a4193ce0f5117319413e092fb6d0374b0b9292bee6",
+    "crates/carrick-kernel/src/kernel/mm_access.rs": "908cb3327699ddabdb0db51325e69ee60e6a9adcda6dbff4dd291b0919f56fbd",
+    "crates/carrick-kernel/src/kernel/mod.rs": "c6631a56129e575ed78e9354251e2e0c11ea8e7d8d9bdb9106448a662ce17a3a",
+    "crates/carrick-kernel-example/Cargo.toml": "8a6d7752859d0b09fd941b05742dbfa18b6489b5c916455442d616b1519d1920",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/allocations.rs": "781a5a772c02fb398e06bee337b9e99c73c07afaf205e5f5460382f70b62a162",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.S": "3bd151f4a3279a372d9aca1de25f05a4995b824f7ea4be290337fc707c4c0b95",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.rs": "03b036e38906d612ed6deb6831040e5a9fad5e2912bacdf205ab8de56cf78635",
+    "crates/carrick-kernel-example/src/bin/kernel-syscall-floor.rs": "746731da5b8da21086cade071ffca5b5156855323a710860697d63603b4fe995",
+    "crates/carrick-kernel-example/src/contracts.rs": "feb2c6a245bd6d0060ab6f50e5695bbc5a179294bd775c54570628626d77fb57",
+    "crates/carrick-kernel-example/tests/contracts.rs": "0a2cf7fdd316e6c17b52fb98f76fa6d800b5b22b5caac2dff9f5d9134ace773a",
+    "crates/carrick-observability/src/probes.rs": "287a3220b432de2cea4b2f1ba70c7cf10fbc10657cb0cc87c86f12266d30c180",
+    "crates/carrick-observability/src/work_meter.rs": "a5c7fbfe6a00b354a7d19027c80ee8490e85027a540308f6fb3ab17a5f7af399",
+    "crates/carrick-runtime/src/runtime.rs": "1a2645a45e9554af6c86f810a5b75c05897223887680893c1a734a21694e32c1",
+    "crates/carrick-runtime/src/vcpu_loop/binding.rs": "5cbd6af11d487cc88b490e54b197224b76477d49eae53d6307d72be29b91d421",
+    "crates/carrick-runtime/src/vcpu_loop/exec.rs": "3d668eeefcf1d4f305b0ef48b6e0e8405cee6471416c7af871c1369057dd9f8a",
+    "crates/carrick-runtime/src/vcpu_loop/executor/tests.rs": "eab149cba4707fb640d20b7aaeccbef134517f0fc802f2ea31b5025c258de41a",
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs": "0a7f0ae52eb956ce041fb4cd5b7c56e1ab47ff5b7ced81461cb482072ec3af76",
+    "crates/carrick-runtime/src/vcpu_loop/mod.rs": "9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e",
+    "crates/carrick-runtime/tests/runtime_loop.rs": "afc588c91902f25cccef16df02b8d563e1e81101d4b1d355df939b4408e2dbbc",
+    "crates/carrick-runtime/tests/syscall_process.rs": "2bdefac9ace07e3194fae25816e66a530c7dff3ef069c2a610f411ec3f90bea0",
+    "crates/carrick-vmm-hvf/Cargo.toml": "212f1e713b736faca8ac4c549ba7cfc332bcbe6fa293dafb6ad948f13d13d638",
+    "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs": "8e486381663c841436cc51c11dfa8a90924b09602195c32bc711766f5dfd7e0e",
+    "crates/carrick-vmm-hvf/src/trap/cow_engine.rs": "d504fcb43c48e6708a2b99c76303575d5e1b984273ddf1189686927893b7ca9c",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs": "a88a83bbf3d9c94bb20c51225ae76e7c7a1398d2b5ed6403da062775c4d33179",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "d4c48e01cd695587d077b0719b31b426b367f9397fd4a70de2bcc346311c7a35",
+    "crates/carrick-vmm-hvf/src/trap/guest_memory.rs": "6ed1b48bdb88004df125531f5adf482a0bed711c985df907b010097fc4011895",
+    "crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs": "2c3b9c7c5aee0b1dc45a0bed090ff963c4fd4785e5a3401ed10e5263933f03cb",
+    "crates/carrick-vmm-hvf/src/trap/memory_protection.rs": "1f304a012a8616d191a90b87ea979700181114e6900b06f776bc9bac753468c9",
+    "crates/carrick-vmm-hvf/src/trap.rs": "8bda92f14883fb2f222be0004ac000f82b1037c3772ab0c574b47927dbab04c4",
+    "crates/carrick-vmm-kvm/src/kvm_aarch64_engine.rs": "c7633cc37149c0685021b96ff4460cc98868f141a269083b84777979957e4a16",
+    "experiments/native-syscall-slice/Cargo.lock": "a70475e51215b043381a64c77d91bf63228378b8b15bca7e92df9eeafbfd6dc1",
+    "experiments/native-syscall-slice/Cargo.toml": "37788f6db78dccabea6214b8e76cc4d6dd557e242e819fceb6c263ea891747db",
+    "experiments/native-syscall-slice/README.md": "4b40913b38171d35aca58e09cba6a243b35851513214bcb476d989a2201683e3",
+    "experiments/native-syscall-slice/fixtures/build.sh": "32d9d4cfd8f28b806475caea2cce9a15a26a3d77cb4379e46de42d2c8814935f",
+    "experiments/native-syscall-slice/fixtures/guest.ld": "887857d4cea5d0cbdc1ca98902125314763a475ab4c457e8d52c63fe344eeb62",
+    "experiments/native-syscall-slice/fixtures/watch.S": "b9aaa5d952620e64c3538f7cb7e8fd428e87b3a8a3826bc69cc538c96c583f68",
+    "experiments/native-syscall-slice/measure.py": "455bea04fd0d7e0fd730faaf46728efcc24d37500509ebae41c3d2b3bca0c85e",
+    "experiments/native-syscall-slice/src/allocations.rs": "60d854c0662c2c3ffd5496f4548c27b86f76f91f6684f8d7249018c273ebfadf",
+    "experiments/native-syscall-slice/src/gateway.S": "0eb6e54da30ec124e288eee2bd6321efe3653f78587d448530424ee683a2a987",
+    "experiments/native-syscall-slice/src/lib.rs": "5fd0ec2b94fca32d8c3ad3831167be07e18c62b43eea00c1c3e703e3833d3d72",
+    "experiments/native-syscall-slice/src/main.rs": "aa22c95e1b728ea077fece89366df8363de0deb13c2867437bf6ac48ebc66544",
+    "experiments/native-syscall-slice/src/native.rs": "44c45485cd9163e7e651ac8c08f63ced0e899f2d494f0fa17af5c7c4c584d5cc",
+    "scripts/bpftrace/oracle-syscall-mix.bt": "efb6d97cf3a02e263f6fe16e7e108eba1d8e3308aafdb38c61a55f07131512b1",
+    "scripts/dtrace/hvpatch-inotify-transport-control.d": "f469839538fc044dad9ec0c902049566a52ccd3407094b0237aaabc1820fbfbf",
+    "scripts/dtrace/hvpatch-madvise-discard-outcomes.d": "d14574346089a34f69360372c61aaed9d09f949ccc4a8e18c52f6dec88a5a19e",
+    "scripts/dtrace/hvpatch-madvise-shape.d": "33e17c4b58a69b992330ff2a7b0b7239c75f7fd819df0ccb83cacc126d6e47da",
+    "scripts/dtrace/hvpatch-node-child-stages.d": "da432e1c4ebacf64cb594c98dd3d9612bb49b54f2e4c4ea95e133f1fc13d3525",
+    "scripts/dtrace/hvpatch-stage1-maintenance-callers.d": "48b92080ff65df7ce7d454b9395f08d11d2b493de7215b1dd08db34161ce332e",
+    "scripts/dtrace/hvpatch-syscall-population.d": "60d75b0e596697a122e28742895b4b1f6923b241c4ea1cd9b6f95b0952c6d75e",
+    "scripts/dtrace/hvpatch-syscall-service-budget.d": "a7d2c4a04f5ee57f38ced0a6f0e57a38b31dbc3b4b98c5ddd97bde982cc3e288",
+    "scripts/dtrace/hvpatch-topology-caller-budget.d": "442d3a58df56f1fbd55e02d5643c9f400c2e5157fb521bbaa59e83087bcfc8ff",
+    "scripts/dtrace/hvpatch-topology-operation-budget.d": "664f6a052a9c501f0b53b4b6061b4c68a40f309587c7447ac18d374f7f4ffad0",
+    "scripts/perf/io-floor.c": "d77ec34dbc25793dd4befff9b8b89fa3e56ce01e5c64346e905bdbf6746b037d",
+    "scripts/perf/io_floor.py": "7217702024bccebbee54e743b3092052e8c4e5260b0a5d82b8d205cd8c917a30"
+  },
+  "approved_delta_files": [
+    "crates/carrick-hal/src/foreign_mm.rs",
+    "crates/carrick-hal/src/lib.rs",
+    "crates/carrick-kernel/src/kernel/mm_access.rs",
+    "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+    "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs"
+  ],
+  "unchanged_executables": {
+    "target/release/carrick": {
+      "sha256": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+      "size": 34872912,
+      "unchanged": true
+    },
+    "target/lease-cost/inotify-transport-control/carrick-control": {
+      "sha256": "c3fb9fd30706f6f657531084df5a072f7c130b68096e60a9bb22df4213ac50b0",
+      "size": 34872912,
+      "unchanged": true
+    },
+    "target/release/native-syscall-slice": {
+      "sha256": "2440ad8f103e016dd6d859cec061a6065cb9708dd55e6559dbb182d28433ea65",
+      "size": 10412336,
+      "unchanged": true
+    }
+  },
+  "validation": [
+    {
+      "name": "runtime-memory",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "vcpu_loop::memory::tests",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 25.336246967315674
+    },
+    {
+      "name": "kernel-mm",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-kernel",
+        "--lib",
+        "kernel::mm_access",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 41.468589067459106
+    },
+    {
+      "name": "native-lifetimes",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-kernel",
+        "--doc",
+        "CurrentNativeData"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 1.9731030464172363
+    },
+    {
+      "name": "hal-mm",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-hal",
+        "--lib",
+        "foreign_mm"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 1.9044439792633057
+    },
+    {
+      "name": "hvf-signed",
+      "argv": [
+        "bash",
+        "scripts/test-signed.sh",
+        "carrick-vmm-hvf",
+        "trap::foreign_mm::tests",
+        "--include-ignored"
+      ],
+      "exit_code": 1,
+      "elapsed_seconds": 34.480345249176025
+    },
+    {
+      "name": "hvf-lifecycle-signed",
+      "argv": [
+        "bash",
+        "scripts/test-signed.sh",
+        "carrick-vmm-hvf",
+        "trap::foreign_mm::tests::production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycle",
+        "--exact",
+        "--ignored"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 29.335810899734497
+    },
+    {
+      "name": "kernel-suite",
+      "argv": [
+        "just",
+        "test-kernel"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 73.90033984184265
+    },
+    {
+      "name": "native-experiment",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "experiments/native-syscall-slice/Cargo.toml",
+        "--lib"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 18.902549028396606
+    },
+    {
+      "name": "clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "-p",
+        "carrick-hal",
+        "-p",
+        "carrick-kernel",
+        "-p",
+        "carrick-vmm-hvf",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "--tests",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 27.642112016677856
+    },
+    {
+      "name": "contracts",
+      "argv": [
+        "cargo",
+        "run",
+        "-p",
+        "carrick-conformance-contract",
+        "--bin",
+        "check-contracts",
+        "--",
+        "--root",
+        "."
+      ],
+      "exit_code": 1,
+      "elapsed_seconds": 0.32454395294189453
+    },
+    {
+      "name": "runtime-memory-final",
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "vcpu_loop::memory::tests",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 27.402162075042725
+    },
+    {
+      "name": "clippy-runtime-final",
+      "argv": [
+        "cargo",
+        "clippy",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "--tests",
+        "--no-deps",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 13.94072699546814
+    }
+  ],
+  "sparse_attribution": [
+    {
+      "arm": "approved",
+      "iteration": 1,
+      "exit_code": 101,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-vmm-hvf",
+        "--release",
+        "--lib",
+        "trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ],
+      "source_sha256": {
+        "crates/carrick-hal/src/foreign_mm.rs": "c9b758e11a4587193dafcfbc094c80353e8befb4733990b01a27109bb791578a",
+        "crates/carrick-hal/src/lib.rs": "d5e9e2ec98c9afd2dde9f40e387df4376a0da89bb77d5701bae6b7c0c178f727",
+        "crates/carrick-kernel/src/kernel/mm_access.rs": "908cb3327699ddabdb0db51325e69ee60e6a9adcda6dbff4dd291b0919f56fbd",
+        "crates/carrick-runtime/src/vcpu_loop/memory.rs": "95006d47914964f32b101f91ba93170df658dae0cc362b171b9407915287cff7",
+        "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "d4c48e01cd695587d077b0719b31b426b367f9397fd4a70de2bcc346311c7a35"
+      }
+    },
+    {
+      "arm": "approved",
+      "iteration": 2,
+      "exit_code": 101,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-vmm-hvf",
+        "--release",
+        "--lib",
+        "trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ],
+      "source_sha256": {
+        "crates/carrick-hal/src/foreign_mm.rs": "c9b758e11a4587193dafcfbc094c80353e8befb4733990b01a27109bb791578a",
+        "crates/carrick-hal/src/lib.rs": "d5e9e2ec98c9afd2dde9f40e387df4376a0da89bb77d5701bae6b7c0c178f727",
+        "crates/carrick-kernel/src/kernel/mm_access.rs": "908cb3327699ddabdb0db51325e69ee60e6a9adcda6dbff4dd291b0919f56fbd",
+        "crates/carrick-runtime/src/vcpu_loop/memory.rs": "95006d47914964f32b101f91ba93170df658dae0cc362b171b9407915287cff7",
+        "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "d4c48e01cd695587d077b0719b31b426b367f9397fd4a70de2bcc346311c7a35"
+      }
+    },
+    {
+      "arm": "before-approved",
+      "iteration": 1,
+      "exit_code": 101,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-vmm-hvf",
+        "--release",
+        "--lib",
+        "trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ],
+      "source_sha256": {
+        "crates/carrick-hal/src/foreign_mm.rs": "62b3d65de07fcf39273418d416b33e2aa804566e3c64d1aae9b843c43441688b",
+        "crates/carrick-hal/src/lib.rs": "25e5561ad53e0823c8886c4f881c0011096cbd3d4d66ed37755dc51c83f31a0a",
+        "crates/carrick-kernel/src/kernel/mm_access.rs": "a3c9da90c2dd346902602f89b2db84836b40f7dc0a24d2407cd973a00ae9a87f",
+        "crates/carrick-runtime/src/vcpu_loop/memory.rs": "de7b59168d2e4ed59f3d001c447aff8ff0d502416479b2e9dadb689d87057da2",
+        "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "522c10881aa0984dba3e886b87cb80c439a0ac16fa300e04485a72d15a3dbc40"
+      }
+    },
+    {
+      "arm": "before-approved",
+      "iteration": 2,
+      "exit_code": 101,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-vmm-hvf",
+        "--release",
+        "--lib",
+        "trap::foreign_mm::tests::fresh_sparse_publication_avoids_stage1_maintenance",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ],
+      "source_sha256": {
+        "crates/carrick-hal/src/foreign_mm.rs": "62b3d65de07fcf39273418d416b33e2aa804566e3c64d1aae9b843c43441688b",
+        "crates/carrick-hal/src/lib.rs": "25e5561ad53e0823c8886c4f881c0011096cbd3d4d66ed37755dc51c83f31a0a",
+        "crates/carrick-kernel/src/kernel/mm_access.rs": "a3c9da90c2dd346902602f89b2db84836b40f7dc0a24d2407cd973a00ae9a87f",
+        "crates/carrick-runtime/src/vcpu_loop/memory.rs": "de7b59168d2e4ed59f3d001c447aff8ff0d502416479b2e9dadb689d87057da2",
+        "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs": "522c10881aa0984dba3e886b87cb80c439a0ac16fa300e04485a72d15a3dbc40"
+      }
+    }
+  ],
+  "inventory_attribution": {
+    "current_equals_before_metadata_update": true,
+    "generated_sha256": "d5d3981c9b04c6e6c95682709d2bf6328d4dce9f83b7010f80c895a564dc5ee5",
+    "existing_inventory_sha256": "ed45e53cde1603a08d26766a3c4688528b92f0bdf10297a82fc264dce176653b",
+    "changed_entries": [
+      {
+        "syscall": "inotify_add_watch",
+        "different_fields": [
+          "contracts"
+        ]
+      },
+      {
+        "syscall": "inotify_rm_watch",
+        "different_fields": [
+          "contracts"
+        ]
+      },
+      {
+        "syscall": "read",
+        "different_fields": [
+          "contracts"
+        ]
+      },
+      {
+        "syscall": "newfstatat",
+        "different_fields": [
+          "contracts"
+        ]
+      },
+      {
+        "syscall": "fstat",
+        "different_fields": [
+          "contracts"
+        ]
+      },
+      {
+        "syscall": "kill",
+        "different_fields": [
+          "contracts"
+        ]
+      },
+      {
+        "syscall": "sigaltstack",
+        "different_fields": [
+          "contracts"
+        ]
+      },
+      {
+        "syscall": "munmap",
+        "different_fields": [
+          "contracts"
+        ]
+      },
+      {
+        "syscall": "mmap",
+        "different_fields": [
+          "contracts"
+        ]
+      },
+      {
+        "syscall": "madvise",
+        "different_fields": [
+          "contracts"
+        ]
+      },
+      {
+        "syscall": "wait4",
+        "different_fields": [
+          "contracts"
+        ]
+      },
+      {
+        "syscall": "statx",
+        "different_fields": [
+          "contracts"
+        ]
+      }
+    ],
+    "checked_in_inventory_modified": false
+  },
+  "new_performance_measurements": false,
+  "automatic_review_rejection": {
+    "experiment": "temporarily remove native leaf permission guard",
+    "executed": false,
+    "permission_guard_preserved": true
+  },
+  "evidence_sha256": {
+    "README.md": "aa197b62d289e098631cd88f85ef20f68c99df5f266286152bcb54a91321a20e",
+    "clippy-runtime-final.log": "4be65fed860835b92a8410b16c5697453840c190ed54f7ab61a0863e54b3f59b",
+    "clippy.log": "900d654177f2990fdace3142e9b9c31c6b9778554ba1fb7f086a848019bf1cd4",
+    "contract-status.patch": "9c85302c9b1eff89438c6e7f4a357e60cc33c5a08ee6190bdc8638e789c7fed4",
+    "contracts.log": "9d5fa69a2e400e7180c4438d8b499ddb0d420f928a9e6330d54eaf7e5c55d6e9",
+    "diff-check.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "dirty-source.tar.gz": "233e825c5f8bc176216fc0ec096bfa157ad44e7a9ced3d1c770ac1f10813854d",
+    "fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "hal-mm.log": "3c9237acc2094c9d616d7adc1da157aba6164fd264417f61656da5292a9ea98a",
+    "hvf-lifecycle-signed-artifacts.jsonl": "61b8531ecc8420d1baca2ae73354d5f7cf5be5521ec373441dff9f787a319000",
+    "hvf-lifecycle-signed.log": "f87d420a0dd7e903ac2811a84845413b3a57a7b1e034e0a3e6f941e8dd0dbd6f",
+    "hvf-signed.log": "63de8a064ada63092787a81644c40cb9fc24c195bdba77f4e2b54a4cee08439a",
+    "implementation.patch": "ae137247d3b45deea5cb08612eae30a097d5da550db4eaf7e14f5c2af093af47",
+    "inventory-approved.log": "b5c9d2583f3ae8b4d7317cf0e3077fb5cdada2463a32d8176a778a2302cc7df8",
+    "inventory-attribution.json": "ea587c188ca8c2bc4583378a4dd65756554973999491ef512954fe1f826c1283",
+    "inventory-before-metadata-update.log": "a934ae8f8beec2d0354d4826997607a8506dfaead61baeaba1e68de4068d03eb",
+    "kernel-mm.log": "9123c49ef75f9908e97a66013a82ff12f183648f0d3007b53c5bcd2a5a4c3527",
+    "kernel-suite.log": "bbd303313836974f2bf694e7c102d4caa1324babddce1591773db4fc2c7cfef5",
+    "lifetime-negative-1.log": "f7bc3e79b12a101f43c6c026350ead26dc3dd55373ccd8ce001d760206293e99",
+    "lifetime-negative-1.rs": "bd024962643e4cc241c30f3b23843d2368a4bf21e9d5f1068257c9378219ac3a",
+    "lifetime-negative-2.log": "de0bb7371817fb33c3a8e3981f5b925bf5274aca409223ea84707c3256cd494c",
+    "lifetime-negative-2.rs": "3ed840cbaa12f588d8a2b0042bd064f45701a414734f39a738e398611eb2fbba",
+    "lifetime-negatives.json": "b3ede4ad20f2d6adda41b7046f0e390b085e626351f40cb9ba30440c4f0e3713",
+    "native-experiment.log": "de6114f407cedeb8eb09de7ca87749d7f33ad8bd38afb7307664aa403440e88f",
+    "native-lifetimes.log": "2ebbbd37c32e23dea0ab906bdb4017dcdc36b48f92aa18aaa0f4be693ac7c105",
+    "red-api-clean.log": "8a8903e34837f3c285f29a643d361d1c216507c13fd7d6cf901cf1102d2e539e",
+    "red-api.log": "817608ff782a9454577ab14c7099e829dd4e9c67a6611d17f1c2725d7dab0a46",
+    "runtime-memory-final.log": "5dde4db702bcf643fe5492f148669ce20615ec42dbaba601ceb6c48d0ec8ce43",
+    "runtime-memory-fixture-failure.log": "84483156d7a2dc52529d4fa8f7d25f83b972bbf6c477aade6baec52ca110f5ed",
+    "runtime-memory.log": "b6cd19fefc770c86a0f0dc464e209dae829a833f6e92ea2fb40f683e5c503fa3",
+    "sparse-attribution-approved-1.log": "db4842651c4ec1831e3835c93b6c356652d8d2641874aecd70aa6ed3e8adfaf4",
+    "sparse-attribution-approved-2.log": "b777c0f0421219de7359628bc7677fc2332c2730924d2abd44769dc36c8d5c0e",
+    "sparse-attribution-before-approved-1.log": "1e2a4021af6937bbfe87a8ae6a652cfa718333e445973fd2ce59082d8ef94a5a",
+    "sparse-attribution-before-approved-2.log": "5192b466dc85751302be20089bd0779dc889b23da4dc7adf0c0470d8f4782b79",
+    "sparse-attribution.json": "ca39d6796a8491c5695669b6803c766fd0bcb21d0a5b8b1879e8d8b8dc9b1c41",
+    "tracked-source.patch": "c6ad33dee5da0ac5dc8580149e5d814ce40b1ca38667c9b4b754f35e290f66dd",
+    "validation.json": "cc263d4d225176a678824a47295f3fbd419c4efbf6d86f9b35a9335586034cfe",
+    "worktree-status.txt": "8a7ee75bd6ffa09b911ad0be548bb14a1c078360a9701f822e1898e7eebcaf08"
+  },
+  "unrelated_implementation_drift_since_previous_archive": []
+}

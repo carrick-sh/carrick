@@ -1,0 +1,21 @@
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+error[E0599]: no method named `clone` found for struct `KernelContext` in the current scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1193:51
+     |
+1193 |             let mut contexts = vec![fixture.child.clone()];
+     |                                                   ^^^^^ method not found in `KernelContext`
+
+error[E0624]: method `needs_service` is private
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1223:30
+     |
+1223 |             assert!(observer.needs_service());
+     |                              ^^^^^^^^^^^^^ private method
+     |
+    ::: crates/carrick-runtime/src/hvpatch/stage1_mm.rs:156:5
+     |
+ 156 |     fn needs_service(&self) -> bool {
+     |     ------------------------------- private method defined here
+
+Some errors have detailed explanations: E0599, E0624.
+For more information about an error, try `rustc --explain E0599`.
+error: could not compile `carrick-runtime` (lib test) due to 2 previous errors

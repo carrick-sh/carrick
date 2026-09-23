@@ -1,0 +1,632 @@
+--- a/crates/carrick-kernel/src/dispatch/fs/notify.rs
++++ b/crates/carrick-kernel/src/dispatch/fs/notify.rs
+@@ -297,7 +297,7 @@
+             let (wd, is_virtual, is_rootfs) = if is_known_rootfs
+                 && this.fs.rootfs_vfs.dispatch_events_complete()
+             {
+-                (state.add_virtual_watch(mask), true, true)
++                (state.add_virtual_watch(mask)?, true, true)
+             } else if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
+                 match m.vfs.watch_fds(&m.full_path) {
+                     Ok(watch_fds) => match state.add_watch_fds(watch_fds, mask) {
+@@ -310,7 +310,7 @@
+                         if !this.path_exists(&path) {
+                             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOENT));
+                         }
+-                        (state.add_virtual_watch(mask), true, false)
++                        (state.add_virtual_watch(mask)?, true, false)
+                     }
+                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                 }
+@@ -323,7 +323,7 @@
+                 if !this.rootfs_path_exists(&path) {
+                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOENT));
+                 }
+-                (state.add_virtual_watch(mask), true, true)
++                (state.add_virtual_watch(mask)?, true, true)
+             } else {
+                 match this.fs.rootfs_vfs.watch_fds(&path) {
+                     Ok(watch_fds) => match state.add_watch_fds(watch_fds, mask) {
+@@ -345,7 +345,7 @@
+                                 }
+                             }
+                             // No host vnode (in-memory overlay): dispatch-only.
+-                            Ok(_) => (state.add_virtual_watch(mask), true, false),
++                            Ok(_) => (state.add_virtual_watch(mask)?, true, false),
+                             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                         }
+                     }
+--- a/crates/carrick-kernel-example/src/contracts.rs
++++ b/crates/carrick-kernel-example/src/contracts.rs
+@@ -660,6 +660,75 @@
+ 
+ pub fn inotify_hotpath_contract(scale: usize) -> Result<ContractObservation, ExampleError> {
+     inotify_hotpath_scenario(scale)
++}
++
++/// Watch-only churn must preserve the identity of every unread removal event.
++pub fn inotify_churn_contract(iterations: usize) -> Result<ContractObservation, ExampleError> {
++    assert!((1..=128).contains(&iterations));
++    let scratch = tempfile::TempDir::new().map_err(|e| ExampleError::Script(e.to_string()))?;
++    let host =
++        HostFsBackend::new_in(scratch.path()).map_err(|e| ExampleError::Script(e.to_string()))?;
++    let mut script = vec![
++        Step::Sys(
++            sys::openat(
++                LINUX_AT_FDCWD,
++                "/churn",
++                (LINUX_O_CREAT | LINUX_O_RDWR) as i32,
++                0o600,
++            )
++            .save(0),
++        ),
++        Step::Sys(sys::inotify_init1(LINUX_O_NONBLOCK as i32).save(1)),
++    ];
++    for _ in 0..iterations {
++        script.extend([
++            Step::Sys(sys::inotify_add_watch(slot(1), "/churn", LINUX_IN_MODIFY).save(2)),
++            Step::Sys(sys::inotify_rm_watch(slot(1), slot(2)).ret(0)),
++        ]);
++    }
++    script.extend([
++        Step::Sys(sys::ioctl_fionread_labeled("queued_bytes", slot(1)).ret(0)),
++        Step::Sys(sys::read_tagged(slot(1), iterations * 16, "ignored")),
++        Step::Sys(sys::close(slot(0)).ret(0)),
++        Step::Sys(sys::close(slot(1)).ret(0)),
++        Step::Sys(sys::exit_group(0)),
++    ]);
++    let report = ScriptedBackend::new()
++        .with_fs_backend(Box::new(host))
++        .run_root(script)?;
++    let bytes = report.output_tagged("ignored");
++    let exact = report.ret("read") == (iterations * 16) as i64
++        && bytes.len() == iterations * 16
++        && bytes.chunks_exact(16).enumerate().all(|(i, event)| {
++            i32::from_ne_bytes(event[..4].try_into().unwrap()) == (i + 1) as i32
++                && u32::from_ne_bytes(event[4..8].try_into().unwrap())
++                    == carrick_abi::LINUX_IN_IGNORED
++                && event[8..].iter().all(|&v| v == 0)
++        });
++    let assertion = if exact {
++        SemanticAssertion::pass("each_removed_watch_keeps_its_unread_event")
++    } else {
++        SemanticAssertion::fail(
++            "each_removed_watch_keeps_its_unread_event",
++            format!(
++                "{} iterations: read={} bytes",
++                iterations,
++                report.ret("read")
++            ),
++        )
++    };
++    Ok(ContractObservation {
++        contract_id: ContractId::new("kernel.inotify.watch-churn")
++            .map_err(|e| ExampleError::Script(e.to_string()))?,
++        layer: ExecutionLayer::VmFree,
++        implementation_revision: env!("CARGO_PKG_VERSION").into(),
++        fixture_identity: "inotify-watch-churn".into(),
++        scale: iterations as u64,
++        semantic_assertions: vec![assertion],
++        work: Some(report.work_snapshot().clone()),
++        timing: None,
++        completeness: Completeness::Complete,
++    })
+ }
+ 
+ /// Run a fork memory mappings scenario with `mappings` anonymous unpopulated mappings in the parent.
+--- a/crates/carrick-kernel-example/tests/contracts.rs
++++ b/crates/carrick-kernel-example/tests/contracts.rs
+@@ -414,3 +414,17 @@
+         other => panic!("expected ScalingViolation, got: {other:?}"),
+     }
+ }
++
++#[test]
++fn inotify_churn_preserves_unread_watch_identity() {
++    let registry = ContractRegistry::load(&repo_root()).expect("registry");
++    let observations = [1, 8, 32, 128]
++        .into_iter()
++        .map(|n| carrick_kernel_example::contracts::inotify_churn_contract(n).expect("observation"))
++        .collect::<Vec<_>>();
++    evaluate(
++        registry.require("kernel.inotify.watch-churn").unwrap(),
++        &observations,
++    )
++    .expect("watch-only semantics and bounded work");
++}
+--- a/crates/carrick-conformance-contract/tests/claims.rs
++++ b/crates/carrick-conformance-contract/tests/claims.rs
+@@ -143,6 +143,6 @@
+         .unwrap();
+     let registry = carrick_conformance_contract::ContractRegistry::load(repo_root)
+         .expect("live registry should load");
+-    assert_eq!(registry.contracts().len(), 24);
++    assert_eq!(registry.contracts().len(), 26);
+     assert_eq!(registry.claims().len(), 15);
+ }
+--- a/crates/carrick-kernel/src/inotify.rs
++++ b/crates/carrick-kernel/src/inotify.rs
+@@ -21,8 +21,7 @@
+ //! Linux-style basename events. That dir-diff is macOS-only.
+ 
+ use crate::linux_abi::{LINUX_EINVAL, LINUX_ENOSPC, LinuxErrno};
+-use std::cmp::Reverse;
+-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
++use std::collections::{HashMap, HashSet, VecDeque};
+ use std::os::fd::RawFd;
+ 
+ use parking_lot::Mutex;
+@@ -228,7 +227,6 @@
+ #[derive(Debug)]
+ struct Inner {
+     next_wd: i32,
+-    free_wds: BinaryHeap<Reverse<i32>>,
+     watches: HashMap<i32, Watch>,
+     wd_by_fd: HashMap<RawFd, WatchedFd>,
+     /// Encoded `inotify_event` records observed but not yet handed to the guest
+@@ -277,7 +275,6 @@
+     fn new() -> Self {
+         Inner {
+             next_wd: 1,
+-            free_wds: BinaryHeap::new(),
+             watches: HashMap::new(),
+             wd_by_fd: HashMap::new(),
+             pending: VecDeque::new(),
+@@ -291,25 +288,23 @@
+         }
+     }
+ 
+-    /// Allocate the lowest available watch descriptor.
+-    fn alloc_wd(&mut self) -> i32 {
+-        if let Some(Reverse(wd)) = self.free_wds.pop() {
+-            wd
+-        } else {
++    /// Advance through positive descriptors without reusing removed watches
++    /// until wraparound, matching inotify(7). Pending events retain their wd;
++    /// eagerly recycling it can coalesce distinct IN_IGNORED notifications.
++    /// Only live descriptors are consulted, never the pending event queue.
++    fn alloc_wd(&mut self) -> Result<i32, LinuxErrno> {
++        if self.watches.len() >= i32::MAX as usize {
++            return Err(LINUX_ENOSPC);
++        }
++        // At most live-count collisions precede a free slot, including wrap.
++        for _ in 0..=self.watches.len() {
+             let wd = self.next_wd;
+-            self.next_wd += 1;
+-            wd
+-        }
+-    }
+-
+-    /// Return a watch descriptor to the pool, resetting the pool if empty.
+-    fn free_wd(&mut self, wd: i32) {
+-        if self.watches.is_empty() {
+-            self.next_wd = 1;
+-            self.free_wds.clear();
+-        } else {
+-            self.free_wds.push(Reverse(wd));
+-        }
++            self.next_wd = wd.checked_add(1).unwrap_or(1);
++            if !self.watches.contains_key(&wd) {
++                return Ok(wd);
++            }
++        }
++        Err(LINUX_ENOSPC)
+     }
+ 
+     /// Append one already-encoded `inotify_event` record, enforcing the bounded
+@@ -483,7 +478,20 @@
+             unsafe { libc::close(watch_fds[0].host_fd) };
+             return Ok(wd);
+         }
+-        let wd = inner.alloc_wd();
++        let wd = match inner.alloc_wd() {
++            Ok(wd) => wd,
++            Err(error) => {
++                for native_wd in native_wds {
++                    if !inner.native_wd_to_guest.contains_key(&native_wd) {
++                        unsafe { libc::inotify_rm_watch(self.inotify_fd, native_wd) };
++                    }
++                }
++                for fd in host_fds {
++                    unsafe { libc::close(fd) };
++                }
++                return Err(error);
++            }
++        };
+         for (watch_fd, native_wd) in watch_fds.iter().zip(native_wds) {
+             inner.wd_by_fd.insert(watch_fd.host_fd, WatchedFd { wd });
+             inner.native_wd_to_guest.insert(native_wd, wd);
+@@ -696,7 +704,16 @@
+             unsafe { libc::close(fd) };
+             return Ok(wd);
+         }
+-        let wd = inner.alloc_wd();
++        let wd = match inner.alloc_wd() {
++            Ok(wd) => wd,
++            Err(error) => {
++                // Closing these owned descriptors also removes their kqueue filters.
++                for watch_fd in &watch_fds {
++                    unsafe { libc::close(watch_fd.host_fd) };
++                }
++                return Err(error);
++            }
++        };
+         for watch_fd in &watch_fds {
+             let scan_dir = watch_fd.scan_dir.as_ref().and_then(|path| {
+                 scan_dir_entries(path).ok().map(|entries| ScannedDir {
+@@ -1057,9 +1074,9 @@
+     /// guest is entitled to a wd. Same-process events still flow via the
+     /// dispatch-layer registry; cross-process directory wakeups (which need a
+     /// real shared vnode) are simply unavailable for such a watch.
+-    pub(crate) fn add_virtual_watch(&self, mask: u32) -> i32 {
++    pub(crate) fn add_virtual_watch(&self, mask: u32) -> Result<i32, LinuxErrno> {
+         let mut inner = self.inner.lock();
+-        let wd = inner.alloc_wd();
++        let wd = inner.alloc_wd()?;
+         inner.watches.insert(
+             wd,
+             Watch {
+@@ -1071,7 +1088,7 @@
+         {
+             inner.dispatch_authoritative = true;
+         }
+-        wd
++        Ok(wd)
+     }
+ 
+     /// Replace or extend an existing watch mask while preserving its wd.
+@@ -1130,7 +1147,6 @@
+         let Some(watch) = inner.watches.remove(&wd) else {
+             return Err(LINUX_EINVAL);
+         };
+-        inner.free_wd(wd);
+         for host_fd in &watch.host_fds {
+             inner.wd_by_fd.remove(host_fd);
+         }
+@@ -2075,7 +2091,9 @@
+     #[test]
+     fn dispatch_enqueue_makes_the_inotify_poll_fd_readable() {
+         let state = InotifyState::new().expect("inotify backend");
+-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
++        let wd = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .expect("virtual watch");
+ 
+         let poll_readable = || {
+             let mut pfd = libc::pollfd {
+@@ -2098,7 +2116,9 @@
+     #[test]
+     fn short_read_rearms_dispatch_queue_level_readiness() {
+         let state = InotifyState::new().expect("inotify backend");
+-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS);
++        let wd = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS)
++            .expect("virtual watch");
+         state.enqueue(wd, carrick_abi::LINUX_IN_MODIFY, 0, None);
+         state.enqueue(wd, carrick_abi::LINUX_IN_ATTRIB, 0, None);
+ 
+@@ -2132,6 +2152,50 @@
+ mod tests {
+     use super::*;
+     use std::io::Write;
++
++    #[test]
++    fn watch_descriptor_wrap_skips_live_watches() {
++        let state = InotifyState::new().expect("inotify");
++        let first = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .unwrap();
++        assert_eq!(first, 1);
++        state.inner.lock().next_wd = i32::MAX;
++        let last = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .unwrap();
++        assert_eq!(last, i32::MAX);
++        assert_eq!(
++            state
++                .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++                .unwrap(),
++            2
++        );
++        state.rm_watch(first).unwrap();
++        state.inner.lock().next_wd = i32::MAX;
++        assert_eq!(
++            state
++                .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++                .unwrap(),
++            1
++        );
++        assert!(state.inner.lock().watches.contains_key(&last));
++    }
++
++    #[test]
++    fn removed_watch_does_not_name_its_successor() {
++        let state = InotifyState::new().expect("inotify");
++        let first = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .unwrap();
++        state.rm_watch(first).unwrap();
++        let second = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .unwrap();
++        assert_ne!(first, second);
++        assert_eq!(state.rm_watch(first), Err(LINUX_EINVAL));
++        assert!(state.inner.lock().watches.contains_key(&second));
++    }
+ 
+     #[test]
+     fn vnode_watch_reports_file_modification_as_in_modify() {
+@@ -2441,7 +2505,9 @@
+         let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
+         let reg = InotifyRegistry::default();
+         // Watch the directory "/w" with all events.
+-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS);
++        let wd = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS)
++            .expect("virtual watch");
+         reg.register("/w", &state, wd, carrick_abi::LINUX_IN_ALL_EVENTS);
+         state.mark_dispatch_authoritative();
+         assert!(!reg.is_empty());
+@@ -2481,7 +2547,9 @@
+         // An event the watch did not request is filtered out (empty → EAGAIN at
+         // the dispatcher). Re-register with only IN_MODIFY.
+         reg.unregister(&state, wd);
+-        let wd2 = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
++        let wd2 = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .expect("virtual watch");
+         reg.register("/w", &state, wd2, carrick_abi::LINUX_IN_MODIFY);
+         reg.notify_self("/w", carrick_abi::LINUX_IN_ATTRIB, true); // not requested
+         assert!(state.read_records(4096).expect("read").is_empty());
+@@ -2493,7 +2561,9 @@
+         let parent = InotifyRegistry::default();
+         let child = parent.clone();
+ 
+-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
++        let wd = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .expect("virtual watch");
+         parent.register("/shared", &state, wd, carrick_abi::LINUX_IN_MODIFY);
+         child.notify_self("/shared", carrick_abi::LINUX_IN_MODIFY, false);
+         assert!(
+@@ -2515,7 +2585,9 @@
+     fn registry_unregister_and_rename_path_update_routing() {
+         let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
+         let reg = InotifyRegistry::default();
+-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS);
++        let wd = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_ALL_EVENTS)
++            .expect("virtual watch");
+         reg.register("/old", &state, wd, carrick_abi::LINUX_IN_ALL_EVENTS);
+ 
+         // rename_path moves the watch's key; a self event now routes via the new
+@@ -2535,7 +2607,9 @@
+     fn registry_rename_replacement_removes_displaced_reverse_entries() {
+         let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
+         let reg = InotifyRegistry::default();
+-        let original = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
++        let original = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .expect("virtual watch");
+         reg.register(
+             "/destination",
+             &state,
+@@ -2543,7 +2617,9 @@
+             carrick_abi::LINUX_IN_MODIFY,
+         );
+         for _ in 0..32 {
+-            let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
++            let wd = state
++                .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++                .expect("virtual watch");
+             reg.register("/source", &state, wd, carrick_abi::LINUX_IN_MODIFY);
+             reg.rename_path("/source", "/destination");
+             let inner = reg.inner.read();
+@@ -2562,7 +2638,9 @@
+     fn registry_unregister_removes_all_alias_paths() {
+         let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
+         let reg = InotifyRegistry::default();
+-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
++        let wd = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .expect("virtual watch");
+         reg.register("/first", &state, wd, carrick_abi::LINUX_IN_MODIFY);
+         reg.register("/alias", &state, wd, carrick_abi::LINUX_IN_MODIFY);
+         reg.unregister(&state, wd);
+@@ -2577,7 +2655,9 @@
+     fn registry_path_removal_preserves_other_watch_aliases() {
+         let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
+         let reg = InotifyRegistry::default();
+-        let wd = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
++        let wd = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .expect("virtual watch");
+         for path in ["/first", "/second", "/third"] {
+             reg.register(path, &state, wd, carrick_abi::LINUX_IN_MODIFY);
+         }
+@@ -2593,8 +2673,12 @@
+     fn registry_notify_fd_event_delivers_to_both_parent_and_self() {
+         let state = std::sync::Arc::new(InotifyState::new().expect("inotify backend"));
+         let reg = InotifyRegistry::default();
+-        let wd_parent = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
+-        let wd_file = state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
++        let wd_parent = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .expect("virtual watch");
++        let wd_file = state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .expect("virtual watch");
+         reg.register("/dir", &state, wd_parent, carrick_abi::LINUX_IN_MODIFY);
+         reg.register(
+             "/dir/file.txt",
+--- a/conformance-probes/src/bin/perf_inotify09_scale.rs
++++ b/conformance-probes/src/bin/perf_inotify09_scale.rs
+@@ -200,6 +200,11 @@
+ }
+ 
+ fn main() {
++    #[cfg(target_os = "linux")]
++    if std::env::args().skip(1).eq(["watch-states"]) {
++        watch_states();
++        return;
++    }
+     // Untimed semantic control for transport experiments. Report actual Linux
+     // errno values so the native oracle supplies the answer independently.
+     #[cfg(target_os = "linux")]
+@@ -215,15 +220,23 @@
+                 let remove = raw_inotify_rm_watch(-1, 0);
+                 let remove_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                 if index > 0 {
+-                    stable &= add_result == (add, add_errno)
+-                        && remove_result == (remove, remove_errno);
++                    stable &=
++                        add_result == (add, add_errno) && remove_result == (remove, remove_errno);
+                 }
+                 add_result = (add, add_errno);
+                 remove_result = (remove, remove_errno);
+             }
+-            println!("scale={scale} add_ret={} add_errno={} remove_ret={} remove_errno={} stable={}",
+-                add_result.0, add_result.1, remove_result.0, remove_result.1, u8::from(stable));
+-            if !stable { std::process::exit(1); }
++            println!(
++                "scale={scale} add_ret={} add_errno={} remove_ret={} remove_errno={} stable={}",
++                add_result.0,
++                add_result.1,
++                remove_result.0,
++                remove_result.1,
++                u8::from(stable)
++            );
++            if !stable {
++                std::process::exit(1);
++            }
+         }
+         println!("probe_complete=1");
+         return;
+@@ -357,10 +370,14 @@
+             complete &= report_phase(
+                 "watch_invalid_pair",
+                 scale,
+-                (0..SAMPLES).map(|_| measure(scale, || {
+-                    raw_inotify_add_watch(-1, &path, IN_MODIFY) == -1
+-                        && raw_inotify_rm_watch(-1, 0) == -1
+-                })).collect(),
++                (0..SAMPLES)
++                    .map(|_| {
++                        measure(scale, || {
++                            raw_inotify_add_watch(-1, &path, IN_MODIFY) == -1
++                                && raw_inotify_rm_watch(-1, 0) == -1
++                        })
++                    })
++                    .collect(),
+                 freq,
+             );
+             let wd = raw_inotify_add_watch(ifd, &path, IN_MODIFY);
+@@ -368,10 +385,14 @@
+             complete &= report_phase(
+                 "watch_existing_pair",
+                 scale,
+-                (0..SAMPLES).map(|_| measure(scale, || {
+-                    raw_inotify_add_watch(ifd, &path, IN_MODIFY) == wd
+-                        && raw_inotify_add_watch(ifd, &path, IN_MODIFY) == wd
+-                })).collect(),
++                (0..SAMPLES)
++                    .map(|_| {
++                        measure(scale, || {
++                            raw_inotify_add_watch(ifd, &path, IN_MODIFY) == wd
++                                && raw_inotify_add_watch(ifd, &path, IN_MODIFY) == wd
++                        })
++                    })
++                    .collect(),
+                 freq,
+             );
+             if wd >= 0 {
+@@ -438,3 +459,76 @@
+         std::process::exit(1);
+     }
+ }
++
++/// Every sample owns a fresh queue. Setup, observation and draining are untimed.
++#[cfg(target_os = "linux")]
++fn watch_states() {
++    unsafe { arm_alarm_ms(90_000) };
++    let limit: usize = std::fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
++        .unwrap()
++        .trim()
++        .parse()
++        .unwrap();
++    assert!((8192..=65536).contains(&limit));
++    let path = CString::new(format!("/tmp/carrick-watch-states-{}", std::process::id())).unwrap();
++    let fd = unsafe {
++        libc::open(
++            path.as_ptr(),
++            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
++            0o600,
++        )
++    };
++    assert!(fd >= 0);
++    let freq = frequency();
++    for (phase, scale, overflow) in [
++        ("watch_empty_batch", 128, false),
++        ("watch_growing", 8192, false),
++        ("watch_overflow", 65536, true),
++    ] {
++        let mut samples = Vec::new();
++        for sample in 0..SAMPLES {
++            let q = raw_inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
++            assert!(q >= 0);
++            if overflow {
++                for _ in 0..limit + 1 {
++                    assert!(watch_cycle(q, &path));
++                }
++            }
++            let queued = |q| {
++                let mut count: libc::c_int = -1;
++                assert_eq!(unsafe { libc::ioctl(q, libc::FIONREAD, &mut count) }, 0);
++                count as usize
++            };
++            assert_eq!(queued(q), if overflow { (limit + 1) * 16 } else { 0 });
++            let ticks = measure(scale, || watch_cycle(q, &path)).expect("complete watch sample");
++            let expected = if overflow { limit + 1 } else { scale };
++            assert_eq!(queued(q), expected * 16, "unequal queue work in {phase}");
++            let mut buffer = vec![0u8; (limit + 1) * 16];
++            let read = unsafe { libc::read(q, buffer.as_mut_ptr().cast(), buffer.len()) };
++            assert_eq!(read, (expected * 16) as isize);
++            let mut overflow_events = 0;
++            for event in buffer[..read as usize].chunks_exact(16) {
++                let wd = i32::from_ne_bytes(event[..4].try_into().unwrap());
++                let mask = u32::from_ne_bytes(event[4..8].try_into().unwrap());
++                if mask == 0x4000 {
++                    assert_eq!(wd, -1);
++                    overflow_events += 1;
++                } else {
++                    assert!(wd > 0);
++                    assert_eq!(mask, 0x8000);
++                }
++                assert!(event[8..].iter().all(|&v| v == 0));
++            }
++            assert_eq!(overflow_events, usize::from(overflow));
++            assert_eq!(queued(q), 0);
++            assert_eq!(unsafe { libc::close(q) }, 0);
++            println!("sample_phase={phase} sample={sample} scale={scale} ticks={ticks} frequency={freq} queued_events={expected}");
++            samples.push(Some(ticks));
++        }
++        assert!(report_phase(phase, scale, samples, freq));
++    }
++    assert_eq!(unsafe { libc::close(fd) }, 0);
++    assert_eq!(unsafe { libc::unlink(path.as_ptr()) }, 0);
++    unsafe { disarm_alarm() };
++    println!("probe_complete=1");
++}
+--- a/crates/carrick-kernel/src/dispatch/net.rs
++++ b/crates/carrick-kernel/src/dispatch/net.rs
+@@ -1546,7 +1546,9 @@
+             "an empty inotify instance is not readable"
+         );
+ 
+-        let wd = inotify_state.add_virtual_watch(carrick_abi::LINUX_IN_MODIFY);
++        let wd = inotify_state
++            .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
++            .expect("virtual watch");
+         inotify_state.enqueue(wd, carrick_abi::LINUX_IN_MODIFY, 0, None);
+ 
+         assert_eq!(

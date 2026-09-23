@@ -1,3 +1,5 @@
+> Continuation: [2026-09-22 handoff](handoff-inotify09-2026-09-22.md) supersedes this historical checkpoint.
+
 # Carrick conformance handoff — 2026-09-21
 
 User requested wrapping up so another session can finish. The thread goal is

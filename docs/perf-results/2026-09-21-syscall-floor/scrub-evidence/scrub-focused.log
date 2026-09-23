@@ -1,0 +1,71 @@
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.5865442079957575, "guest_timing": [[0.495, 0.086, 0.314]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.5025707090098877, "guest_timing": [[1.433, 2.025, 0.679]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.746643791993847, "guest_timing": [[2.678, 0.825, 1.541]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.39576825000403915, "guest_timing": [[0.305, 0.064, 0.187]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.483927000008407, "guest_timing": [[1.421, 2.172, 0.649]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.7161100420053117, "guest_timing": [[2.649, 0.812, 1.546]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.3531365829985589, "guest_timing": [[0.301, 0.064, 0.187]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.4061630829964997, "guest_timing": [[1.343, 2.038, 0.657]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.6913552909973077, "guest_timing": [[2.621, 0.797, 1.526]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.49961458299367223, "guest_timing": [[0.436, 0.066, 0.321]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.4101220410084352, "guest_timing": [[1.345, 2.048, 0.647]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.710895417010761, "guest_timing": [[2.649, 0.809, 1.56]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.4804896249988815, "guest_timing": [[0.427, 0.059, 0.317]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.4514702500018757, "guest_timing": [[1.386, 2.148, 0.678]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.6494063749996712, "guest_timing": [[2.586, 0.794, 1.524]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.3541653749998659, "guest_timing": [[0.3, 0.062, 0.185]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.3799624589883024, "guest_timing": [[1.316, 1.969, 0.65]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.654935333004687, "guest_timing": [[2.593, 0.793, 1.514]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.3661796249944018, "guest_timing": [[0.31, 0.069, 0.192]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.4146878750034375, "guest_timing": [[1.349, 2.028, 0.651]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.624093458012794, "guest_timing": [[2.563, 0.788, 1.51]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.48567470800480805, "guest_timing": [[0.431, 0.06, 0.321]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.4039121660025558, "guest_timing": [[1.338, 1.982, 0.673]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.6362554590014042, "guest_timing": [[2.575, 0.794, 1.521]]}
+{
+  "node-app": {
+    "control_s": [
+      0.495,
+      0.436,
+      0.427,
+      0.431
+    ],
+    "candidate_s": [
+      0.305,
+      0.301,
+      0.3,
+      0.31
+    ],
+    "candidate_control_mean_ratio": 0.679709334823924
+  },
+  "go-build-cold": {
+    "control_s": [
+      1.433,
+      1.345,
+      1.386,
+      1.338
+    ],
+    "candidate_s": [
+      1.421,
+      1.343,
+      1.316,
+      1.349
+    ],
+    "candidate_control_mean_ratio": 0.9867320974191204
+  },
+  "python-os": {
+    "control_s": [
+      2.678,
+      2.649,
+      2.586,
+      2.575
+    ],
+    "candidate_s": [
+      2.649,
+      2.621,
+      2.593,
+      2.563
+    ],
+    "candidate_control_mean_ratio": 0.9940884820747522
+  }
+}

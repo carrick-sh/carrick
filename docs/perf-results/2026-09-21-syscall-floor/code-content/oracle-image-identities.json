@@ -1,0 +1,16 @@
+{
+  "python:3.12-slim": {
+    "id": "sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a",
+    "architecture": "arm64",
+    "repo_digests": [
+      "python@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a"
+    ]
+  },
+  "ubuntu:24.04": {
+    "id": "sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517",
+    "architecture": "arm64",
+    "repo_digests": [
+      "ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517"
+    ]
+  }
+}

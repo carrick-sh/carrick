@@ -1,0 +1,28 @@
+[package]
+name = "native-syscall-slice"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[features]
+allocation-metrics = []
+
+[dependencies]
+carrick-abi = { path = "../../crates/carrick-abi" }
+carrick-guest-mem = { path = "../../crates/carrick-guest-mem" }
+carrick-hal = { path = "../../crates/carrick-hal", features = ["test-support"] }
+carrick-kernel = { path = "../../crates/carrick-kernel" }
+carrick-kernel-example = { path = "../../crates/carrick-kernel-example" }
+carrick-vfs = { path = "../../crates/carrick-vfs" }
+carrick-conformance-contract = { path = "../../crates/carrick-conformance-contract" }
+anyhow = "1"
+goblin = "0.10.5"
+libc = "0.2"
+serde_json = "1"
+tempfile = "3"
+
+[profile.release]
+debug = 1

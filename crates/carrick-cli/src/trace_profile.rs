@@ -238,6 +238,7 @@ impl V2ProfileAuthority {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum TraceProfileKind {
     HvpatchCarrierCpuLowRate,
+    HvpatchInotify09Population,
     HvpatchFrameCow,
     HvpatchExecRuntimeStages,
     HvpatchCoreLifecycle,
@@ -250,6 +251,7 @@ impl TraceProfileKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::HvpatchCarrierCpuLowRate => "hvpatch-carrier-cpu-low-rate",
+            Self::HvpatchInotify09Population => "hvpatch-inotify09-population",
             Self::HvpatchFrameCow => "hvpatch-frame-cow",
             Self::HvpatchExecRuntimeStages => "hvpatch-exec-runtime-stages",
             Self::HvpatchCoreLifecycle => "hvpatch-core-lifecycle",
@@ -268,6 +270,7 @@ impl TraceProfileKind {
         match self {
             Self::NativeAmplification => Some(AMP1_BOUND_PLACEHOLDER),
             Self::HvpatchCarrierCpuLowRate
+            | Self::HvpatchInotify09Population
             | Self::HvpatchFrameCow
             | Self::HvpatchExecRuntimeStages
             | Self::HvpatchCoreLifecycle
@@ -281,6 +284,9 @@ impl TraceProfileKind {
         match self {
             Self::HvpatchCarrierCpuLowRate => {
                 carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_CARRIER_CPU_LOW_RATE_D
+            }
+            Self::HvpatchInotify09Population => {
+                crate::hvpatch_inotify_population_profile::BUNDLED_PROGRAM
             }
             Self::HvpatchFrameCow => carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_FRAME_COW_D,
             Self::HvpatchExecRuntimeStages => {
@@ -305,6 +311,7 @@ impl TraceProfileKind {
     fn parse_protocol(value: &str) -> Result<Self> {
         match value {
             "hvpatch-carrier-cpu-low-rate" => Ok(Self::HvpatchCarrierCpuLowRate),
+            "hvpatch-inotify09-population" => Ok(Self::HvpatchInotify09Population),
             "hvpatch-frame-cow" => Ok(Self::HvpatchFrameCow),
             "hvpatch-exec-runtime-stages" => Ok(Self::HvpatchExecRuntimeStages),
             "hvpatch-core-lifecycle" => Ok(Self::HvpatchCoreLifecycle),

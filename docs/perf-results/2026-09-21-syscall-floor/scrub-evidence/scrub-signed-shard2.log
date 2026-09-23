@@ -1,0 +1,78 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.32s
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/carrick_conformance_next-9234e4efd4470348
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/core_mount-5209bae7925f5bfa
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_container_topologies-370a5162e4a527bf
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_0-379cc9702e1e6ef4
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/workload_cases-d8b43f7ef81e47e7
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/deferred_anonymous-270834789a7cee42
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_bridge_single-052deb2f46d5aa0a
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/dedicated_service_groups-4d78eb16bdb3c3c4
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/futex_contract-77c2e3f96a17836e
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ptrace_poketext_signed-f8989b98c8143831
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/private_file_cow_lanes-3cf92ceb61b4b36d
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/immutable_private_file-e616b51c04cb989a
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_1-70618f69f2183dd4
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/ecosystem_reducers-e1619c9d1bf4fc5a
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/write_seek_lease-b8cc48b195aab05a
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda.tmp.59963
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda.tmp.59963: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/conformance_cases-cd0e86ed33b43dda
+test-signed: running /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/probes_shard_2-195c339bf0981892 generic_probe_shard_2 --nocapture
+
+running 1 test
+test generic_probe_shard_2 ... RUN generic probe shard 2 aarch64-unknown-linux-musl:memflagmatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-musl:memflagmatrix elapsed_ms=51
+RUN generic probe shard 2 aarch64-unknown-linux-gnu:memflagmatrix
+PROBE ELAPSED generic probe shard 2 aarch64-unknown-linux-gnu:memflagmatrix elapsed_ms=26
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.08s
+
+/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.noent.59963: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/release/deps/entitlement_negative-63eefbc71cd095f7.noent.59963
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.06s
+
+remaining carrick procs (run-id scrub-memory-shard2) = 0
+remaining carrick procs (run-id scrub-memory-shard2-cli) = 0
+test-signed: receipt target/test-results/carrick-conformance-next-signed-artifacts.jsonl
+test-signed: OK (carrick-conformance-next: 1 invoked signed executable(s) passed, 18 signed, negative control passed)

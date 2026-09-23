@@ -1,0 +1,47 @@
+{
+  "node-app": {
+    "control_s": [
+      0.365,
+      0.302,
+      0.3,
+      0.304
+    ],
+    "candidate_s": [
+      0.261,
+      0.256,
+      0.266,
+      0.263
+    ],
+    "candidate_control_mean_ratio": 0.822974036191975
+  },
+  "go-build-cold": {
+    "control_s": [
+      1.407,
+      1.327,
+      1.342,
+      1.323
+    ],
+    "candidate_s": [
+      1.32,
+      1.318,
+      1.321,
+      1.307
+    ],
+    "candidate_control_mean_ratio": 0.9753658084830524
+  },
+  "python-os": {
+    "control_s": [
+      2.627,
+      2.552,
+      2.55,
+      2.546
+    ],
+    "candidate_s": [
+      2.55,
+      2.563,
+      2.553,
+      2.549
+    ],
+    "candidate_control_mean_ratio": 0.994160583941606
+  }
+}

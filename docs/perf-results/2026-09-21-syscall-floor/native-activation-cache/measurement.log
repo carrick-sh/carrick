@@ -1,0 +1,59 @@
+baseline sha cde110d3f1aede9b1cebf23d01006dfcbe19119b81c9139ba73605808808bc5a new sha a291effbbdffeea80226243f362f0f028d5c140240e4b0bab15efc51f3626a4c
+baseline-1 {1: 1471.57, 8: 1426.23, 32: 1423.58, 128: 1428.51}
+candidate-1 {1: 283.21, 8: 156.02, 32: 138.33, 128: 138.31}
+candidate-2 {1: 137.94, 8: 138.43, 32: 138.4, 128: 138.46}
+baseline-2 {1: 1463.21, 8: 1412.84, 32: 1401.84, 128: 1412.65}
+{
+  "1": {
+    "baseline": {
+      "scope_ns": 36.0107421875,
+      "activated_ns": 1463.9332275390625,
+      "activation_delta_ns": 1428.7210693359375
+    },
+    "candidate": {
+      "scope_ns": 52.9072265625,
+      "activated_ns": 200.74462890625,
+      "activation_delta_ns": 149.3427734375
+    },
+    "activation_reduction_pct": 89.54710078525588
+  },
+  "8": {
+    "baseline": {
+      "scope_ns": 36.098480224609375,
+      "activated_ns": 1418.5377807617188,
+      "activation_delta_ns": 1382.32421875
+    },
+    "candidate": {
+      "scope_ns": 37.485137939453125,
+      "activated_ns": 140.343994140625,
+      "activation_delta_ns": 104.13934326171875
+    },
+    "activation_reduction_pct": 92.46635906040268
+  },
+  "32": {
+    "baseline": {
+      "scope_ns": 36.0565185546875,
+      "activated_ns": 1413.4209938049316,
+      "activation_delta_ns": 1377.41597366333
+    },
+    "candidate": {
+      "scope_ns": 36.059696197509766,
+      "activated_ns": 138.3681297302246,
+      "activation_delta_ns": 102.33465957641602
+    },
+    "activation_reduction_pct": 92.57053340943548
+  },
+  "128": {
+    "baseline": {
+      "scope_ns": 36.05747318267822,
+      "activated_ns": 1421.8393964767456,
+      "activation_delta_ns": 1385.6426877975464
+    },
+    "candidate": {
+      "scope_ns": 36.1265344619751,
+      "activated_ns": 138.38406372070312,
+      "activation_delta_ns": 102.2116346359253
+    },
+    "activation_reduction_pct": 92.62352152282571
+  }
+}

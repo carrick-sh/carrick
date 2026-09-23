@@ -1069,6 +1069,9 @@ struct HostPtrPayloadMemory {
     watched_writes: std::cell::Cell<usize>,
     host_ptr_hits: std::cell::Cell<usize>,
     host_write_ptr_hits: std::cell::Cell<usize>,
+    reject_host_write: bool,
+    host_write_begins: usize,
+    host_write_finishes: usize,
 }
 
 #[cfg(target_os = "macos")]
@@ -1086,6 +1089,9 @@ impl HostPtrPayloadMemory {
             watched_writes: std::cell::Cell::new(0),
             host_ptr_hits: std::cell::Cell::new(0),
             host_write_ptr_hits: std::cell::Cell::new(0),
+            reject_host_write: false,
+            host_write_begins: 0,
+            host_write_finishes: 0,
         }
     }
 
@@ -1215,6 +1221,26 @@ impl GuestMemory for HostPtrPayloadMemory {
         let offset = self.offset(address, len).ok()?;
         self.host_ptr_hits.set(self.host_ptr_hits.get() + 1);
         Some(unsafe { self.bytes.as_ptr().add(offset) })
+    }
+
+    fn begin_host_write(
+        &mut self,
+        ranges: &[carrick_guest_mem::HostWriteRange],
+    ) -> Result<(), carrick_kernel::dispatch::MemoryError> {
+        self.host_write_begins += 1;
+        for range in ranges {
+            let offset = self.offset(range.guest.raw(), range.len)?;
+            if self.reject_host_write || self.bytes.as_ptr() as usize + offset != range.host.raw() {
+                return Err(carrick_kernel::dispatch::MemoryError::OutOfBounds {
+                    address: range.guest.raw(),
+                    length: range.len,
+                });
+            }
+        }
+        Ok(())
+    }
+    fn finish_host_write(&mut self, _: &[carrick_guest_mem::HostWriteRange]) {
+        self.host_write_finishes += 1;
     }
 
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
@@ -2146,5 +2172,58 @@ fn f_getfl_strips_creation_only_open_flags() {
         flags & O_NONBLOCK,
         O_NONBLOCK,
         "F_GETFL must keep O_NONBLOCK"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn readv_host_write_admission_failure_does_not_consume_file_input() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::write(scratch.path().join("in.bin"), b"original-data").unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let reporter = CompatReporter::default();
+    let mut memory = HostPtrPayloadMemory::new(0x4000, vec![0; 0x900]);
+    memory.write_bytes(0x4000, b"/in.bin\0").unwrap();
+    memory.expose_host_write_ptr(0x4200, 4);
+    memory.expose_host_write_ptr(0x4300, 4);
+    write_iovecs(
+        &mut memory,
+        0x4100,
+        [LinuxIovec::new(0x4200, 4), LinuxIovec::new(0x4300, 4)],
+    );
+    open_host_file_at_path(&mut dispatcher, &mut memory, &reporter, 0x4000, 0);
+    memory.reject_host_write = true;
+    let result = dispatcher
+        .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
+            SyscallRequest::new(65, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(result, DispatchOutcome::errno(LINUX_EFAULT));
+    assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), [0; 4]);
+    assert_eq!(memory.read_bytes(0x4300, 4).unwrap(), [0; 4]);
+    assert_eq!(
+        (memory.host_write_begins, memory.host_write_finishes),
+        (1, 1)
+    );
+    memory.reject_host_write = false;
+    let result = dispatcher
+        .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
+            SyscallRequest::new(65, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(result, DispatchOutcome::Returned { value: 8 });
+    assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), b"orig");
+    assert_eq!(memory.read_bytes(0x4300, 4).unwrap(), b"inal");
+    assert_eq!(
+        (memory.host_write_begins, memory.host_write_finishes),
+        (2, 2)
     );
 }

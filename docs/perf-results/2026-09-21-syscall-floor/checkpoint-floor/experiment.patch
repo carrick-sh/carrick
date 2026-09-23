@@ -1,0 +1,908 @@
+--- a/conformance-contracts/contracts/native-data-demand.toml
++++ b/conformance-contracts/contracts/native-data-demand.toml
+@@ -0,0 +1,23 @@
++schema_version = 1
++id = "kernel.execution.native-data-demand"
++title = "Register-only native intervals do not activate unused data authority"
++guest_surfaces = ["execution:linux-aarch64", "kernel:current-mm", "scheduler:execution-admission"]
++semantic_authority = ["Linux AArch64 register and branch semantics", "Carrick exact native execution scope and authenticated carrier data authority"]
++fixture = "unit:native-data-demand"
++scale_points = [1, 8, 32, 128]
++rationale = "A bounded research interval which cannot reach a native memory access before a checkpoint needs execution authority but no data grant. Conservative control-flow analysis must include both conditional successors and backward edges, terminate at host checkpoints, reject invalid targets, and retain the existing backedge bound. Any interval that may access memory uses the unchanged activation path. This is private research code publication with mock stage-2, not product execution acceptance."
++
++[bindings]
++vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_floor::native_data_demand_contract; native-syscall-slice control-flow and register tests"
++
++[bindings.unresolved]
++embed_structural = "Carrier code publication, signed native execution, signal/cancellation and scheduling composition remain unbound."
++embed_timing = "Paired unchanged-ELF host controls are diagnostic, not signed native acceptance."
++docker = "Same ELF controls must retain identical Linux semantics; no product-native differential binding exists."
++
++[[structural_budgets]]
++kind = "exact"
++metric = "native_data_activations"
++value = 0
++layers = ["vm-free"]
++rationale = "Count successful activation calls made by the research runner during N register-only intervals. A native memory interval is the positive control and must activate exactly once."
+--- a/conformance-contracts/surfaces.toml
++++ b/conformance-contracts/surfaces.toml
+@@ -264,3 +264,11 @@
+   "kernel.scheduler.preemption-lifecycle",
+   "kernel.scheduler.preemption-cost",
+ ]
++
++[[surfaces]]
++path = "experiments/native-syscall-slice/src/native.rs"
++contracts = ["kernel.execution.native-data-demand", "kernel.execution.native-synchronous-syscall"]
++
++[[surfaces]]
++path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs"
++contracts = ["kernel.execution.native-data-demand", "kernel.mm.native-execution-scope", "kernel.mm.native-data-activation"]
+--- a/crates/carrick-conformance-contract/tests/claims.rs
++++ b/crates/carrick-conformance-contract/tests/claims.rs
+@@ -143,9 +143,10 @@
+         .unwrap();
+     let registry = carrick_conformance_contract::ContractRegistry::load(repo_root)
+         .expect("live registry should load");
+-    assert_eq!(registry.contracts().len(), 31);
++    assert_eq!(registry.contracts().len(), 32);
+     for id in [
+         "kernel.execution.native-synchronous-syscall",
++        "kernel.execution.native-data-demand",
+         "kernel.mm.native-execution-scope",
+         "kernel.mm.native-data-activation",
+         "kernel.mm.native-syscall-buffers",
+--- a/crates/carrick-observability/src/work_meter.rs
++++ b/crates/carrick-observability/src/work_meter.rs
+@@ -74,6 +74,8 @@
+     HostHeapAllocations,
+     /// Terminal leaves validated while activating a retained native data span.
+     NativeActivationLeafChecks,
++    /// Successful data-grant activations during native execution intervals.
++    NativeDataActivations,
+     /// Full kernel MM snapshots collected in the operation window.
+     MmSnapshotCollections,
+     /// Physical backing owner pins acquired in the operation window.
+@@ -81,7 +83,7 @@
+ }
+ 
+ impl WorkMetric {
+-    pub const COUNT: usize = 37;
++    pub const COUNT: usize = 38;
+     pub const ALL: [WorkMetric; Self::COUNT] = [
+         Self::KernelDispatches,
+         Self::KernelRedispatches,
+@@ -118,6 +120,7 @@
+         Self::PortalStaleRejects,
+         Self::HostHeapAllocations,
+         Self::NativeActivationLeafChecks,
++        Self::NativeDataActivations,
+         Self::MmSnapshotCollections,
+         Self::ForeignOwnerPins,
+     ];
+--- a/crates/carrick-runtime/src/vcpu_loop/memory.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/memory.rs
+@@ -633,6 +633,7 @@
+ #[cfg(test)]
+ mod tests {
+     mod native_buffers;
++    mod native_floor;
+     use super::*;
+ 
+     #[test]
+--- a/crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs
+@@ -171,6 +171,8 @@
+     let mut errors = 0u64;
+     let mut transitions = 0u64;
+     let mut memory_checkpoints = 0u64;
++    let mut data_activations = 0u64;
++    let force_data = std::env::var("CARRICK_NATIVE_DATA_DEMAND").as_deref() == Ok("0");
+     let read_cache =
+         std::cell::RefCell::new(carrick_kernel::kernel::mm_access::CurrentReadCache::default());
+     let reuse_reads = std::env::var("CARRICK_NATIVE_BUFFER_READ_CACHE").as_deref() != Ok("0");
+@@ -184,11 +186,17 @@
+         let scope = dispatcher
+             .enter_native_execution(&mut executor, &fixture.child, &mut execution)
+             .unwrap();
+-        {
+-            let mut active = prepared.activate(&scope).unwrap();
+-            code.run_carrier_until_checkpoint(&image, &private, &mut active, &mut state)
+-                .unwrap();
+-        }
++        data_activations += u64::from(
++            code.run_scoped_carrier_until_checkpoint(
++                &image,
++                &private,
++                &mut prepared,
++                &scope,
++                &mut state,
++                force_data,
++            )
++            .unwrap(),
++        );
+         drop(scope);
+         if executor.memory_pause_pending() {
+             dispatcher
+@@ -313,6 +321,7 @@
+         "errno_returns":errors,"transitions":transitions,"memory_checkpoints":memory_checkpoints,
+         "elapsed_ns":elapsed_ns,"wall_ms":started.elapsed().as_millis(),
+         "read_window_reuse":reuse_reads,
++        "data_demand_enabled":!force_data,"data_activations":data_activations,
+         "carrier_data_and_buffers":true,"private_data_unchanged":true,"original_cow_unchanged":true,
+         "private_code_publication":true,"mock_stage2":true,"product_acceptance":false,
+     });
+--- a/crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs
+@@ -0,0 +1,475 @@
++//! Release-only attribution of the actual carrier-backed syscall entry path.
++//! These are independent host controls, not additive wall-time samples or a
++//! substitute for the unchanged Linux ELF and signed carrier gates.
++use super::*;
++use carrick_kernel::{
++    compat::{CompatEvent, CompatReporter, SyscallArgs},
++    dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest, ThreadCtx},
++    kernel::mm_access::MmAccessTarget,
++    thread::{FutexTable, ThreadRegistry},
++};
++use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
++use native_syscall_slice::carrier_memory::CarrierCopyMemory;
++
++#[test]
++#[ignore = "release-only carrier syscall floor attribution"]
++#[expect(
++    clippy::assertions_on_constants,
++    reason = "ignored diagnostic refuses debug execution"
++)]
++fn carrier_checkpoint_component_cost() {
++    assert!(!cfg!(debug_assertions));
++    const COUNT: u32 = 65536;
++    let (kernel, root) = bootstrap(39_000);
++    let tid = ThreadId::synthetic_for_tests(39_001);
++    let fixture = real_production_cow_fixture(
++        &kernel,
++        &root,
++        39_001,
++        0x9a00_f000_0000,
++        0x9b00_f000_0000,
++        tid,
++    );
++    let mut execution = execution_lease(&fixture.child, 39001);
++    let authority = carrick_kernel::kernel::MmAccessAuthority::new();
++    let current = fixture.child.current_mm(&execution).unwrap();
++    let range = current
++        .access_token()
++        .write_range(GuestVa(TEST_VA), 4096)
++        .unwrap()
++        .unwrap();
++    let mut prepared = authority
++        .with_current_mutation(&current, tid, |mutation| {
++            let mut cow = authority.break_foreign_cow(mutation, &current, range)?;
++            Ok(fixture
++                .child
++                .borrow_current_native_data(&execution, &mut cow)?
++                .prepare_for_execution())
++        })
++        .unwrap();
++    drop(current);
++    let dispatcher = SyscallDispatcher::with_native_mm_for_test(fixture.dispatch_mm.clone());
++    let mut executor = dispatcher
++        .admit_native_executor(&fixture.child, &execution)
++        .unwrap();
++    let registry = ThreadRegistry::new(tid);
++    let futex = FutexTable::new();
++    let reporter = CompatReporter::default();
++    let names = [
++        "authenticate",
++        "adapter",
++        "entry_activation",
++        "checkpoint_control",
++        "dispatch_reused_adapter",
++        "dispatch_fresh_adapter",
++        "whole_host_path",
++        "prepare_policy",
++        "syscall_metadata",
++        "entry_return_reporter",
++        "capture_resources",
++    ];
++    let mut run = |arm: usize, count: u32| {
++        let start = Instant::now();
++        for _ in 0..count {
++            for number in [27, 28] {
++                if arm == 10 {
++                    carrick_kernel::dispatch::resources::with_dirty_captured_resources_for_executor_test(&fixture.child, || std::hint::black_box(()));
++                    continue;
++                }
++                if arm == 7 {
++                    std::hint::black_box(
++                        dispatcher
++                            .prepare_syscall(
++                                &fixture.child,
++                                SyscallRequest::new(
++                                    std::hint::black_box(number),
++                                    SyscallArgs::from([u64::MAX, TEST_VA, 2, 0, 0, 0]),
++                                ),
++                                &reporter,
++                            )
++                            .unwrap(),
++                    );
++                    continue;
++                }
++                if arm == 8 {
++                    std::hint::black_box(
++                        carrick_abi::syscall::lookup_aarch64(std::hint::black_box(number)).unwrap(),
++                    );
++                    continue;
++                }
++                if arm == 9 {
++                    reporter.record(CompatEvent::SyscallEntry {
++                        number,
++                        name: "diagnostic".into(),
++                        args: SyscallArgs::from([u64::MAX, TEST_VA, 2, 0, 0, 0]),
++                    });
++                    reporter.record(CompatEvent::SyscallReturn {
++                        number,
++                        name: "diagnostic".into(),
++                        retval: -9,
++                        errno: Some(9),
++                    });
++                    continue;
++                }
++                if arm == 0 {
++                    fixture
++                        .child
++                        .validate_current_execution_mm(std::hint::black_box(&execution))
++                        .unwrap();
++                    continue;
++                }
++                if arm == 2 || arm == 6 {
++                    let scope = dispatcher
++                        .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                        .unwrap();
++                    let active = prepared.activate(&scope).unwrap();
++                    std::hint::black_box(active.len());
++                }
++                if arm == 3 || arm == 6 {
++                    assert!(!executor.memory_pause_pending());
++                    assert!(!executor.take_stop_request());
++                    assert!(
++                        dispatcher
++                            .take_deliverable_pending_from(&fixture.child, tid)
++                            .is_none()
++                    );
++                }
++                if arm == 1 || arm == 5 || arm == 6 {
++                    let mut memory = CarrierCopyMemory::new(&fixture.child, &execution).unwrap();
++                    std::hint::black_box(&memory);
++                    if arm != 1 {
++                        dispatch_invalid(
++                            number,
++                            &dispatcher,
++                            &fixture.child,
++                            executor.dispatch_participation(),
++                            &mut memory,
++                            &reporter,
++                            ThreadCtx::new(tid, &registry, &futex),
++                        );
++                    }
++                }
++                if arm == 4 {
++                    // Constructor deliberately excluded; dispatch itself cannot
++                    // read a buffer because this valid syscall has an invalid fd.
++                    // A separate arm below keeps one adapter across the batch.
++                    unreachable!();
++                }
++            }
++        }
++        start.elapsed().as_nanos() as f64 / f64::from(count)
++    };
++    let mut rows = Vec::new();
++    for sample in 0..10 {
++        let order: Vec<_> = if sample % 2 == 0 {
++            (0..names.len()).collect()
++        } else {
++            (0..names.len()).rev().collect()
++        };
++        for arm in order.into_iter().filter(|n| *n != 4) {
++            rows.push((sample, arm, run(arm, if sample == 0 { 128 } else { COUNT })));
++        }
++    }
++    // Same requests, reporter and exact carrier identity, but the adapter is
++    // prepared once so this control exposes dispatch without admission work.
++    let mut memory = CarrierCopyMemory::new(&fixture.child, &execution).unwrap();
++    for sample in 0..10 {
++        let count = if sample == 0 { 128 } else { COUNT };
++        let start = Instant::now();
++        for _ in 0..count {
++            for number in [27, 28] {
++                dispatch_invalid(
++                    number,
++                    &dispatcher,
++                    &fixture.child,
++                    executor.dispatch_participation(),
++                    &mut memory,
++                    &reporter,
++                    ThreadCtx::new(tid, &registry, &futex),
++                );
++            }
++        }
++        rows.push((
++            sample,
++            4,
++            start.elapsed().as_nanos() as f64 / f64::from(count),
++        ));
++    }
++    for (sample, arm, ns) in rows {
++        println!(
++            "native_checkpoint_cost {}",
++            serde_json::json!({
++                "arm": names[arm], "sample": sample, "warmup": sample == 0,
++                "pair_ns": ns, "iterations": if sample == 0 {128} else {COUNT},
++                "runtime_conformance_metrics": cfg!(feature = "conformance-metrics"),
++                "workload_timing_eligible": false,
++            })
++        );
++    }
++    drop(executor);
++    fixture
++        .child
++        .thread()
++        .yield_from_executor(execution)
++        .unwrap();
++}
++
++fn dispatch_invalid(
++    number: u64,
++    dispatcher: &SyscallDispatcher,
++    context: &carrick_kernel::kernel::KernelContext,
++    executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
++    memory: &mut CarrierCopyMemory<'_>,
++    reporter: &CompatReporter,
++    thread: ThreadCtx<'_>,
++) {
++    let outcome = dispatcher
++        .dispatch_threaded_with_mm_executor(
++            executor,
++            context,
++            SyscallRequest::new(number, SyscallArgs::from([u64::MAX, TEST_VA, 2, 0, 0, 0])),
++            memory,
++            reporter,
++            thread,
++        )
++        .unwrap();
++    assert!(matches!(outcome, DispatchOutcome::Errno { errno } if errno.guest_retval() == -9));
++    reporter.record(CompatEvent::SyscallReturn {
++        number,
++        name: carrick_abi::syscall::lookup_aarch64(number)
++            .unwrap()
++            .name
++            .into(),
++        retval: -9,
++        errno: Some(9),
++    });
++}
++
++#[test]
++fn native_data_demand_contract() {
++    use carrick_conformance_contract::{
++        Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
++        SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
++    };
++    use native_syscall_slice::{
++        Memory,
++        native::{Code, State},
++    };
++    let (kernel, root) = bootstrap(39_100);
++    let tid = ThreadId::synthetic_for_tests(39_101);
++    let fixture = real_production_cow_fixture(
++        &kernel,
++        &root,
++        39_101,
++        0x9a00_f100_0000,
++        0x9b00_f100_0000,
++        tid,
++    );
++    let mut execution = execution_lease(&fixture.child, 39101);
++    let authority = carrick_kernel::kernel::MmAccessAuthority::new();
++    let current = fixture.child.current_mm(&execution).unwrap();
++    let range = current
++        .access_token()
++        .write_range(GuestVa(TEST_VA), 8)
++        .unwrap()
++        .unwrap();
++    let mut prepared = authority
++        .with_current_mutation(&current, tid, |mutation| {
++            let mut cow = authority.break_foreign_cow(mutation, &current, range)?;
++            Ok(fixture
++                .child
++                .borrow_current_native_data(&execution, &mut cow)?
++                .prepare_for_execution())
++        })
++        .unwrap();
++    drop(current);
++    let dispatcher = SyscallDispatcher::with_native_mm_for_test(fixture.dispatch_mm.clone());
++    let mut executor = dispatcher
++        .admit_native_executor(&fixture.child, &execution)
++        .unwrap();
++    let (memory, image) =
++        Memory::load_elf(&native_carrier_elf(&[0x91000400, 0xd4000001], TEST_VA)).unwrap();
++    let code = Code::publish(&image, &memory).unwrap();
++    let mut observations = Vec::new();
++    for scale in [1, 8, 32, 128] {
++        let mut state = State::new(image.entry());
++        state.x[17] = 0x1234_5678;
++        state.nzcv = 0xa0000000;
++        state.vectors = std::array::from_fn(|n| ((n as u128) + 1) << 64);
++        let vectors = state.vectors;
++        let mut activations = 0;
++        for _ in 0..scale {
++            state.pc = image.entry();
++            let scope = dispatcher
++                .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++                .unwrap();
++            activations += u64::from(
++                code.run_scoped_carrier_until_checkpoint(
++                    &image,
++                    &memory,
++                    &mut prepared,
++                    &scope,
++                    &mut state,
++                    false,
++                )
++                .unwrap(),
++            );
++            assert_eq!(state.pc, image.entry() + 4);
++        }
++        assert_eq!(state.x[0], scale);
++        assert_eq!(state.x[17], 0x1234_5678);
++        assert_eq!(state.nzcv, 0xa0000000);
++        assert_eq!(state.vectors, vectors);
++        let mut work = WorkSnapshot::new();
++        work.insert(WorkMetric::NativeDataActivations, activations)
++            .unwrap();
++        observations.push(ContractObservation {
++            contract_id: ContractId::new("kernel.execution.native-data-demand").unwrap(),
++            layer: ExecutionLayer::VmFree,
++            implementation_revision: std::env::var("CARRICK_NATIVE_SCOPE_REVISION")
++                .unwrap_or_else(|_| "unarchived-working-tree".into()),
++            fixture_identity: "unit:native-data-demand".into(),
++            scale,
++            semantic_assertions: vec![SemanticAssertion::pass(
++                "completed_all_intervals_with_registers_flags_vectors_preserved",
++            )],
++            work: Some(work),
++            timing: None,
++            completeness: Completeness::Complete,
++        });
++    }
++    // Real native load: data demand must perform exactly one activation.
++    let (memory, image) =
++        Memory::load_elf(&native_carrier_elf(&[0xf9400020, 0xd4000001], TEST_VA)).unwrap();
++    let code = Code::publish(&image, &memory).unwrap();
++    let mut state = State::new(image.entry());
++    state.x[1] = TEST_VA;
++    let scope = dispatcher
++        .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++        .unwrap();
++    assert!(
++        code.run_scoped_carrier_until_checkpoint(
++            &image,
++            &memory,
++            &mut prepared,
++            &scope,
++            &mut state,
++            false
++        )
++        .unwrap()
++    );
++    assert_eq!(state.x[0] as u32, u32::from_le_bytes(*b"same"));
++    drop(scope);
++    // Revocation still rejects an interval that may read data, before executing
++    // its first instruction. A proven register interval has no such authority.
++    fixture
++        .dispatch_mm
++        .set_foreign_cow_vma_access_for_test(VmaAccess {
++            readable: false,
++            writable: false,
++            executable: false,
++            kernel_visible: true,
++        });
++    let scope = dispatcher
++        .enter_native_execution(&mut executor, &fixture.child, &mut execution)
++        .unwrap();
++    state.pc = image.entry();
++    let before = state.x;
++    assert!(
++        code.run_scoped_carrier_until_checkpoint(
++            &image,
++            &memory,
++            &mut prepared,
++            &scope,
++            &mut state,
++            false
++        )
++        .is_err()
++    );
++    assert_eq!(state.x, before);
++    let (mut registers, ri) =
++        Memory::load_elf(&native_carrier_elf(&[0x91000400, 0xd4000001], TEST_VA)).unwrap();
++    let rc = Code::publish(&ri, &registers).unwrap();
++    let mut rs = State::new(ri.entry());
++    assert!(
++        !rc.run_scoped_carrier_until_checkpoint(
++            &ri,
++            &registers,
++            &mut prepared,
++            &scope,
++            &mut rs,
++            false
++        )
++        .unwrap()
++    );
++    assert_eq!(rs.x[0], 1);
++    rs.pc = ri.entry();
++    assert!(
++        rc.run_scoped_carrier_until_checkpoint(
++            &ri,
++            &registers,
++            &mut prepared,
++            &scope,
++            &mut rs,
++            true
++        )
++        .is_err()
++    );
++    assert!(
++        rc.run_scoped_carrier_until_checkpoint(
++            &image,
++            &memory,
++            &mut prepared,
++            &scope,
++            &mut rs,
++            false
++        )
++        .is_err()
++    );
++    registers.protect(ri.base(), 6).unwrap();
++    assert!(
++        rc.run_scoped_carrier_until_checkpoint(
++            &ri,
++            &registers,
++            &mut prepared,
++            &scope,
++            &mut rs,
++            false
++        )
++        .is_err()
++    );
++    drop(scope);
++    for observation in &mut observations {
++        observation
++            .semantic_assertions
++            .push(SemanticAssertion::pass(
++                "native_memory_positive_control_activated_and_read_carrier",
++            ));
++    }
++    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++        .parent()
++        .unwrap()
++        .parent()
++        .unwrap();
++    let registry = ContractRegistry::load(root).unwrap();
++    println!(
++        "native_data_demand_observations {}",
++        serde_json::to_string(&observations).unwrap()
++    );
++    if let Ok(path) = std::env::var("CARRICK_NATIVE_DATA_DEMAND_OBSERVATIONS") {
++        std::fs::write(path, serde_json::to_vec_pretty(&observations).unwrap()).unwrap();
++    }
++    evaluate(
++        registry
++            .require("kernel.execution.native-data-demand")
++            .unwrap(),
++        &observations,
++    )
++    .unwrap();
++    drop(executor);
++    fixture
++        .child
++        .thread()
++        .yield_from_executor(execution)
++        .unwrap();
++}
+--- a/experiments/native-syscall-slice/fixtures/host-compute-floor.c
++++ b/experiments/native-syscall-slice/fixtures/host-compute-floor.c
+@@ -0,0 +1,68 @@
++// Independently authored macOS/AArch64 compute attribution, MIT OR Apache-2.0.
++// Host-only control: no guest, translator, carrier, syscall or acceptance claim.
++// Mirrors the timed arithmetic and scalar load/increment/store loop shapes.
++// It cannot isolate CPU placement/frequency differences across host and Linux VM.
++#include <inttypes.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <time.h>
++
++static uint64_t now(void) {
++    struct timespec t;
++    if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) __builtin_trap();
++    return (uint64_t)t.tv_sec * 1000000000 + (uint64_t)t.tv_nsec;
++}
++
++static void *measure(void *argument) {
++    const uint64_t n = *(const uint64_t *)argument;
++    for (unsigned sample = 0; sample < 10; ++sample) {
++        for (unsigned order = 0; order < 2; ++order) {
++            const unsigned memory = order ^ (sample & 1);
++            uint64_t count = n, value = 0, data = 0;
++            const uint64_t start = now();
++            if (!memory) {
++                __asm__ volatile(
++                    "2: add %x[value], %x[value], #7\n"
++                    "sub %x[value], %x[value], #6\n"
++                    "sub %x[count], %x[count], #1\n"
++                    "cbnz %x[count], 2b\n"
++                    : [value] "+&r"(value), [count] "+&r"(count)
++                    : : "cc", "memory");
++            } else {
++                uintptr_t base;
++                __asm__ volatile(
++                    // One address-producing instruction per iteration, like ADR
++                    // in the ELF. This is a register copy of a host stack address.
++                    "2: mov %x[base], %x[data]\n"
++                    "ldr %x[value], [%x[base]]\n"
++                    "add %x[value], %x[value], #1\n"
++                    "str %x[value], [%x[base]]\n"
++                    "sub %x[count], %x[count], #1\n"
++                    "cbnz %x[count], 2b\n"
++                    : [value] "=&r"(value), [count] "+&r"(count), [base] "=&r"(base)
++                    : [data] "r"(&data) : "cc", "memory");
++            }
++            const uint64_t elapsed = now() - start;
++            if (count != 0 || value != n || (memory && data != n)) __builtin_trap();
++            printf("{\"phase\":%u,\"sample\":%u,\"iterations\":%" PRIu64
++                   ",\"elapsed_ns\":%" PRIu64 ",\"verified\":true}\n",
++                   memory ? 4 : 3, sample, n, elapsed);
++        }
++    }
++    return NULL;
++}
++
++int main(int argc, char **argv) {
++    uint64_t n = 65536;
++    if (argc == 2) {
++        char *end;
++        n = strtoull(argv[1], &end, 10);
++        if (*end || (n != 65536 && n != 4194304)) return 3;
++    } else if (argc != 1) return 4;
++    pthread_t worker;
++    if (pthread_create(&worker, NULL, measure, &n) != 0) return 1;
++    if (pthread_join(worker, NULL) != 0) return 2;
++    return 0;
++}
+--- a/experiments/native-syscall-slice/src/lib.rs
++++ b/experiments/native-syscall-slice/src/lib.rs
+@@ -457,6 +457,57 @@
+         b.unmap(0x400000).unwrap();
+         assert!(b.validate(&bi).is_err());
+     }
++    #[test]
++    fn native_data_demand_covers_branches_cycles_and_checkpoint_barriers() {
++        use native::Code;
++        // Explicit control-flow cases: a false result must exclude *every*
++        // native memory path, not merely the most likely or fallthrough path.
++        let cases: &[(&[u32], &[bool])] = &[
++            (
++                &[0x91000400, 0xd4000001, 0xf9400020, 0xd4000001],
++                &[false, false, true, false],
++            ),
++            (
++                &[0xb4000040, 0xd4000001, 0xf9400020, 0xd4000001],
++                &[true, false, true, false],
++            ),
++            (&[0x14000002, 0xf9400020, 0xd4000001], &[false, true, false]),
++            (&[0xd4000001, 0xf9400020, 0x17ffffff], &[false, true, true]),
++            (
++                &[0xd1000400, 0xb5ffffe0, 0xd4000001, 0xf9400020, 0xd4000001],
++                &[false, false, false, true, false],
++            ),
++            (
++                &[0xd1000400, 0xb5ffffe0, 0xf9400020, 0xd4000001],
++                &[true, true, true, false],
++            ),
++            (&[0xd51bd040, 0xf9400020, 0xd4000001], &[false, true, false]),
++            (&[0x10000012, 0xf9400020, 0xd4000001], &[false, true, false]),
++        ];
++        for &(words, expected) in cases {
++            let (memory, image) = Memory::load_elf(&elf(words)).unwrap();
++            let code = Code::publish(&image, &memory).unwrap();
++            for (index, &demand) in expected.iter().enumerate() {
++                assert_eq!(
++                    code.requires_native_data(image.base + index as u64 * 4)
++                        .unwrap(),
++                    demand,
++                    "{words:x?} at {index}"
++                );
++            }
++            assert!(code.requires_native_data(image.base - 4).is_err());
++            assert!(code.requires_native_data(image.base + 1).is_err());
++            assert!(
++                code.requires_native_data(image.base + words.len() as u64 * 4)
++                    .is_err()
++            );
++        }
++        for word in [0x14000002, 0x17ffffff, 0xb4000040] {
++            let (memory, image) = Memory::load_elf(&elf(&[word, 0xd4000001])).unwrap();
++            assert!(Code::publish(&image, &memory).is_err());
++        }
++    }
++
+     #[test]
+     fn native_integer_syscalls_preserve_registers_vectors_and_flags() {
+         use native::{Code, State};
+--- a/experiments/native-syscall-slice/src/native.rs
++++ b/experiments/native-syscall-slice/src/native.rs
+@@ -139,11 +139,56 @@
+     restore_memory_scratch(words);
+     words.push(branch(words.len(), slow));
+ }
++/// Least fixed point of memory reachability before a carrier checkpoint.
++/// Both conditional successors count, including backedges. Barriers are exactly
++/// the instructions which unconditionally return from the carrier invocation;
++/// an unknown instruction or branch target is an error, never a data-free proof.
++fn data_demand(image: &Image) -> Result<Vec<bool>> {
++    let count = image.words.len();
++    let mut predecessors = vec![Vec::new(); count + 1];
++    let mut required = vec![false; count + 1];
++    let mut pending = Vec::new();
++    for (i, &word) in image.words.iter().enumerate() {
++        match classify(word).map_err(anyhow::Error::msg)? {
++            Instruction::Memory => {
++                required[i] = true;
++                pending.push(i);
++            }
++            Instruction::Syscall | Instruction::Tls => {}
++            Instruction::Address if matches!(word & 31, 18 | 28) => {}
++            Instruction::Branch => {
++                let target = branch_target(word, image.base + i as u64 * 4);
++                ensure!(
++                    target >= image.base
++                        && target < image.base + count as u64 * 4
++                        && target.is_multiple_of(4),
++                    "branch outside executable authority"
++                );
++                predecessors[((target - image.base) / 4) as usize].push(i);
++                if word & 0x7c000000 != 0x14000000 {
++                    predecessors[i + 1].push(i);
++                }
++            }
++            Instruction::Integer | Instruction::Address => predecessors[i + 1].push(i),
++        }
++    }
++    while let Some(i) = pending.pop() {
++        for &predecessor in &predecessors[i] {
++            if !required[predecessor] {
++                required[predecessor] = true;
++                pending.push(predecessor);
++            }
++        }
++    }
++    Ok(required)
++}
++
+ pub struct Code {
+     ptr: *mut u8,
+     length: usize,
+     base: u64,
+     count: usize,
++    data_demand: Vec<bool>,
+     identity: std::sync::Arc<()>,
+     epoch: u64,
+     // Index and shape only: Code never retains a backing pointer across runs.
+@@ -155,6 +200,7 @@
+     pub fn publish(image: &Image, memory: &Memory) -> Result<Self> {
+         memory.validate(image)?;
+         ensure!(image.words.len() <= 4096, "bounded executor code limit");
++        let data_demand = data_demand(image)?;
+         // One bounded data-region cache. Other mappings use checked emulation.
+         // Former executable backing cannot bypass write-generation revocation.
+         let data_region = memory.segments.iter().enumerate().find_map(|(n, s)| {
+@@ -308,12 +354,56 @@
+             length,
+             base: image.base,
+             count: image.words.len(),
++            data_demand,
+             identity: image.identity.clone(),
+             epoch: image.epoch,
+             data_region,
+             _thread: PhantomData,
+         })
+     }
++    /// Research adapter. The returned count records an actual successful data
++    /// activation, allowing the interval's demand contract to observe real work.
++    pub fn run_scoped_carrier_until_checkpoint(
++        &self,
++        image: &Image,
++        memory: &Memory,
++        prepared: &mut carrick_kernel::kernel::mm_access::PreparedNativeData,
++        scope: &carrick_kernel::dispatch::native_execution::NativeExecution<'_>,
++        state: &mut State,
++        force_data: bool,
++    ) -> Result<bool> {
++        if force_data || self.requires_native_data(state.pc)? {
++            let mut data = prepared.activate(scope)?;
++            self.run_carrier_until_checkpoint(image, memory, &mut data, state)?;
++            return Ok(true);
++        }
++        ensure!(!scope.stop_requested(), "native control pending");
++        ensure!(state.user.is_null(), "native State is already executing");
++        memory.validate(image)?;
++        ensure!(
++            std::sync::Arc::ptr_eq(&self.identity, &image.identity) && self.epoch == image.epoch,
++            "wrong executable publication"
++        );
++        let entry = self.address(state.pc)?;
++        // No carrier or ELF data pointer is installed. The immutable publication
++        // proves every path from this PC reaches a checkpoint before memory.
++        state.data_host_base = std::ptr::null_mut();
++        state.data_guest_base = 0;
++        state.data_last_eight = 0;
++        // SAFETY: the exact running scope outlives entry; the private executable
++        // publication is current; its conservative graph excludes all native
++        // memory accesses until return. Existing bounded backedges are unchanged.
++        unsafe { self.enter_carrier_checkpoint(state, entry) };
++        Ok(false)
++    }
++
++    /// This fact belongs to this immutable code publication, never to caller
++    /// metadata. A new PC, image, or code generation must be validated afresh.
++    pub fn requires_native_data(&self, pc: u64) -> Result<bool> {
++        self.address(pc)?;
++        Ok(self.data_demand[((pc - self.base) / 4) as usize])
++    }
++
+     pub fn address(&self, pc: u64) -> Result<usize> {
+         ensure!(
+             pc >= self.base && pc.is_multiple_of(4),
+@@ -378,6 +468,22 @@
+             "carrier grant is outside the ELF data region"
+         );
+         let entry = self.address(state.pc)?;
++        state.data_guest_base = data.start().raw();
++        state.data_last_eight = (data.len() - 8) as u64;
++        // SAFETY: the exclusive grant and its execution scope outlive this
++        // entire invocation. Emitted scalar accesses check their full width
++        // against this exact range. A miss only returns to the caller. No Rust
++        // alias, pointer escape, dispatcher entry or executable write occurs.
++        state.data_host_base = unsafe { data.as_mut_ptr() };
++        // SAFETY: validation above and the borrowed active grant protect code,
++        // running scope, and every pointer for the entire native invocation.
++        unsafe { self.enter_carrier_checkpoint(state, entry) };
++        Ok(())
++    }
++
++    /// Caller retains the exact running scope and proves either an active data
++    /// grant or absence of reachable memory instructions through this interval.
++    unsafe fn enter_carrier_checkpoint(&self, state: &mut State, entry: usize) {
+         unsafe extern "C" fn checkpoint(s: *mut State, _: *mut c_void) -> usize {
+             // SAFETY: slice_enter receives the exclusively borrowed live State.
+             // No guest pointers or invocation payload are dereferenced here.
+@@ -390,17 +496,9 @@
+         state.user = std::ptr::from_mut(&mut invocation).cast();
+         state.callback = checkpoint;
+         state.gateway = slice_gateway as *const () as usize;
+-        state.data_guest_base = data.start().raw();
+-        state.data_last_eight = (data.len() - 8) as u64;
+-        // SAFETY: the exclusive grant and its execution scope outlive this
+-        // entire invocation. Emitted scalar accesses check their full width
+-        // against this exact range. A miss only returns to the caller. No Rust
+-        // alias, pointer escape, dispatcher entry or executable write occurs.
+-        state.data_host_base = unsafe { data.as_mut_ptr() };
+         unsafe { slice_enter(state, entry) };
+         state.data_host_base = std::ptr::null_mut();
+         state.user = std::ptr::null_mut();
+-        Ok(())
+     }
+ 
+     /// Exclusive Memory borrow remains live throughout native code and callbacks.

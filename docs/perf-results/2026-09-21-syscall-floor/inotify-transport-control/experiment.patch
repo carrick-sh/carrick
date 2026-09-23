@@ -1,0 +1,93 @@
+--- a/conformance-probes/src/bin/perf_inotify09_scale.rs
++++ b/conformance-probes/src/bin/perf_inotify09_scale.rs
+@@ -200,6 +200,11 @@
+ }
+ 
+ fn main() {
++    #[cfg(target_os = "linux")]
++    if std::env::args().skip(1).eq(["watch-controls"]) {
++        watch_controls();
++        return;
++    }
+     #[cfg(target_os = "linux")]
+     if std::env::args().skip(1).eq(["watch-states"]) {
+         watch_states();
+@@ -461,6 +466,78 @@
+ }
+ 
+ /// Every sample owns a fresh queue. Setup, observation and draining are untimed.
++#[cfg(target_os = "linux")]
++fn watch_controls() {
++    unsafe { arm_alarm_ms(90_000) };
++    let path = CString::new(format!(
++        "/tmp/carrick-watch-controls-{}",
++        std::process::id()
++    ))
++    .unwrap();
++    let fd = unsafe {
++        libc::open(
++            path.as_ptr(),
++            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
++            0o600,
++        )
++    };
++    assert!(fd >= 0);
++    let freq = frequency();
++    let scale = 65536;
++    for phase in ["watch_invalid_pair", "watch_unchanged_pair"] {
++        let mut samples = Vec::new();
++        for sample in 0..SAMPLES {
++            let q = raw_inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
++            assert!(q >= 0);
++            let wd = raw_inotify_add_watch(q, &path, IN_MODIFY);
++            assert!(wd > 0);
++            let ticks = measure(scale, || {
++                if phase == "watch_invalid_pair" {
++                    // Read errno immediately after each operation, before the
++                    // following call can overwrite it. Both arms do this work.
++                    let add = raw_inotify_add_watch(-1, &path, IN_MODIFY);
++                    let add_errno = unsafe { *libc::__errno_location() };
++                    let remove = raw_inotify_rm_watch(-1, 0);
++                    let remove_errno = unsafe { *libc::__errno_location() };
++                    add == -1
++                        && add_errno == libc::EBADF
++                        && remove == -1
++                        && remove_errno == libc::EBADF
++                } else {
++                    raw_inotify_add_watch(q, &path, IN_MODIFY) == wd
++                        && raw_inotify_add_watch(q, &path, IN_MODIFY) == wd
++                }
++            })
++            .expect("complete watch control sample");
++            let mut queued: libc::c_int = -1;
++            assert_eq!(unsafe { libc::ioctl(q, libc::FIONREAD, &mut queued) }, 0);
++            assert_eq!(queued, 0, "control unexpectedly mutated queue");
++            assert_eq!(raw_inotify_rm_watch(q, wd), 0);
++            let mut ignored = [0u8; 16];
++            assert_eq!(
++                unsafe { libc::read(q, ignored.as_mut_ptr().cast(), ignored.len()) },
++                16
++            );
++            assert_eq!(i32::from_ne_bytes(ignored[..4].try_into().unwrap()), wd);
++            assert_eq!(
++                u32::from_ne_bytes(ignored[4..8].try_into().unwrap()),
++                0x8000
++            );
++            assert!(ignored[8..].iter().all(|&v| v == 0));
++            assert_eq!(unsafe { libc::ioctl(q, libc::FIONREAD, &mut queued) }, 0);
++            assert_eq!(queued, 0);
++            assert_eq!(unsafe { libc::close(q) }, 0);
++            println!("sample_phase={phase} sample={sample} scale={scale} ticks={ticks} frequency={freq} queued_events=0");
++            samples.push(Some(ticks));
++        }
++        assert!(report_phase(phase, scale, samples, freq));
++    }
++    assert_eq!(unsafe { libc::close(fd) }, 0);
++    assert_eq!(unsafe { libc::unlink(path.as_ptr()) }, 0);
++    unsafe { disarm_alarm() };
++    println!("probe_complete=1");
++}
++
+ #[cfg(target_os = "linux")]
+ fn watch_states() {
+     unsafe { arm_alarm_ms(90_000) };

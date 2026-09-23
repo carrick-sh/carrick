@@ -1,0 +1,18 @@
+schema_version = 1
+id = "kernel.signal.lease-gap"
+title = "Signal wake debt survives temporary vCPU lease absence"
+guest_surfaces = ["syscall:kill", "syscall:wait4", "scheduler:guest-entry"]
+semantic_authority = ["Linux SIGKILL terminates an unblocked computing child", "man 2 kill", "man 2 waitpid"]
+fixture = "unit:kernel_wake_published_during_lease_gap_survives_rebind"
+scale_points = [1, 8, 32, 128]
+structural_budgets = []
+rationale = "Temporary physical vCPU unregistration does not retire a logical thread. Wake publication during the gap must be remembered and serviced before guest re-entry; acknowledgement and retirement retain exact identity rules. No additional polling or periodic scans are allowed as a fix."
+
+[bindings]
+embed = "carrick-conformance-next::signal_lease_gap::subprocess_kill_compute_child_survives_lease_migration"
+vm_free = "carrick-hal::threaded::generic_registry_tests::kernel_wake_published_during_lease_gap_survives_rebind"
+
+[bindings.unresolved]
+docker = "Pinned Linux reducer passed all 50 cycles; durable source-hash-validated oracle binding remains pending."
+embed_structural = "Signed embed regression failed without the fix and passes all 50 cycles with it. Guest work-counter binding remains pending."
+observation = "Unit assertions cover exact debt preservation, one live record through 1/8/32/128 lease cycles, and zero records after retirement. Versioned WorkObservation and descriptor storage/work budgets remain pending. Empty structural budgets are not structural acceptance."

@@ -80,6 +80,7 @@ fn syscall_request_can_be_built_from_a_raw_syscall() {
     // (covered by carrick-hal's aarch64 tests); the dispatcher consumes the
     // ISA-neutral `RawSyscall`.
     let raw = carrick_hal::RawSyscall {
+        current_guest_sp: None,
         number: carrick_abi::CanonicalNr(64),
         args: [1, 0x4000, 17, 0, 0, 0],
         guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,

@@ -1,0 +1,30 @@
+schema_version = 1
+id = "kernel.mm.native-data-activation"
+title = "Unchanged native carrier data activation reuses authenticated validation"
+guest_surfaces = ["kernel:current-mm", "execution:linux-aarch64", "syscall:mprotect", "syscall:munmap", "syscall:fork"]
+semantic_authority = ["Carrick exact-MM execution and COW authority", "man 2 mprotect", "man 2 munmap", "man 2 fork"]
+fixture = "unit:native-data-activation"
+scale_points = [1, 8, 32, 128]
+rationale = "After full validation and before any mutation, repeated native data activation must allocate nothing and walk no leaves. Reuse must revoke after changes in exact stage-1 authority, backend, VMA, inventory, mapping, owner or protection. This host CPU fixture uses production carrier COW and a real scope but executes no guest ELF."
+
+[bindings]
+vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_data_activation_cost_contract (conformance-metrics); native_carrier_elf_memory_control_round_trip supplies supplemental host execution semantics"
+
+[bindings.unresolved]
+embed_structural = "A bounded host ELF data/control round trip is covered; signed native execution, carrier code publication, signal/cancellation service and scheduling remain unintegrated."
+embed_timing = "Host fixture cost is diagnostic only; no native workload acceptance."
+docker = "Internal activation invariant. Guest mapping, fork and common-workload differentials remain required."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "host_heap_allocations"
+value = 0
+layers = ["vm-free"]
+rationale = "Counts real allocator calls on the executing thread, with a positive control."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "native_activation_leaf_checks"
+value = 0
+layers = ["vm-free"]
+rationale = "Counts actual terminal-leaf validations in production activation. Initial validation must fire the instrument; unchanged re-entry reuses its proof."

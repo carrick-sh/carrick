@@ -1,0 +1,50 @@
+{
+  "source_entries_checked": 9747,
+  "changed_preexisting_entries": [],
+  "baseline_restored_sha256": "1142bb6dc6202ab3675dc6485b4f479e1d9425b2b75a293c948aef5e65db8918",
+  "signature_verify": "passed",
+  "archived_candidate_files": [
+    {
+      "path": "conformance-contracts/surfaces.toml",
+      "before_sha256": "83714907d9472299c1b2ea9ff83ac385d0c3cc889cd816375e6cb4295923b5dc",
+      "candidate_sha256": "6c0b3db3cea953616e5ef661b0227b18081a1f40d475131999ddd080c4489635"
+    },
+    {
+      "path": "conformance-contracts/inventory.json",
+      "before_sha256": "ddad1312aaaa89cb6bd44b64d4df4f15be6b4b0bf30d8948f668d83cc198ae5a",
+      "candidate_sha256": "2228190e2d5ec28934909cc2f614000024411ac74d078e47dfa9c96c6dfc5bc6"
+    },
+    {
+      "path": "crates/carrick-runtime/Cargo.toml",
+      "before_sha256": "3ea66a9a2a008870b90436861d77d29cb556d8f37f36a51acde91f8ec62aecdb",
+      "candidate_sha256": "485db16cab6be173950d952bcc3ea8b78c7991691ad24a74e400fc68505f71cb"
+    },
+    {
+      "path": "crates/carrick-observability/src/work_meter.rs",
+      "before_sha256": "5cb8e55b68f12edb098b68920604fbe71b5d368e0f3e87e89b1623fd7729224c",
+      "candidate_sha256": "b433918ceede84b126456a541b9c67f737f20c9ece6321dffd8943f79a2829b9"
+    },
+    {
+      "path": "crates/carrick-kernel/src/kernel/core.rs",
+      "before_sha256": "9b00a1a3126f091d88a0c5466bb5a8744ce5ed67c3ce96f77b88a21b85fa38d7",
+      "candidate_sha256": "551db7f6dea3aa6a64d29ecdb37c9375534cfb723e45062427dc1507be9e0686"
+    },
+    {
+      "path": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
+      "before_sha256": "3d668eeefcf1d4f305b0ef48b6e0e8405cee6471416c7af871c1369057dd9f8a",
+      "candidate_sha256": "20da2bb14442fe3d94e08e0728c6b2628efd0df92bcac8a46010b8f7b0127c96"
+    },
+    {
+      "path": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "before_sha256": "9060eaf0601d829bf38716b93be36b8964e223e55b7ac637f6291b987542706e",
+      "candidate_sha256": "3795db790357a3a424e080e7506bf67e9fdcaf236b0f63f3dbbd3ec3353f1d67"
+    },
+    {
+      "path": "conformance-contracts/contracts/syscall-context-retention.toml",
+      "before_sha256": null,
+      "candidate_sha256": "517200f5aed237b9278c0459433125c52f1652fb34a125423be73408235bc6d3"
+    }
+  ],
+  "red_test_sha256": "b6b6d0d289d2b17115ec1a6cd61a35121bf0ebcc79ef7259b866a26d42099f42",
+  "green_test_sha256": "e48bb0911bf89462f48d45aac66e4c7d44d8382cc4c464b9bb40a6c9661d0f90"
+}

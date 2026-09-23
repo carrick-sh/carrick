@@ -1,0 +1,994 @@
+diff --git a/conformance-probes/src/bin/perf_inotify09_scale.rs b/conformance-probes/src/bin/perf_inotify09_scale.rs
+index 2f9ca1c72..c10f72ad7 100644
+--- a/conformance-probes/src/bin/perf_inotify09_scale.rs
++++ b/conformance-probes/src/bin/perf_inotify09_scale.rs
+@@ -147,6 +147,7 @@ fn contract_scale() -> Result<Option<usize>, ()> {
+     if args.is_empty()
+         || args.as_slice() == ["write-seek-only"]
+         || args.as_slice() == ["pwrite-only"]
++        || args.as_slice() == ["watch-only"]
+     {
+         return Ok(None);
+     }
+@@ -201,6 +202,7 @@ fn concurrent_sample(ifd: i32, fd: i32, path: &CString, scale: usize) -> Option<
+ fn main() {
+     let write_seek_only = std::env::args().skip(1).eq(["write-seek-only"]);
+     let pwrite_only = std::env::args().skip(1).eq(["pwrite-only"]);
++    let watch_only = std::env::args().skip(1).eq(["watch-only"]);
+     #[cfg(not(target_os = "linux"))]
+     if !write_seek_only && !pwrite_only {
+         eprintln!(
+@@ -213,7 +215,7 @@ fn main() {
+         Ok(scale) => scale,
+         Err(()) => {
+             eprintln!(
+-                "usage: perf_inotify09_scale [write-seek-only | pwrite-only | contract-scale <1|8|32|128>]"
++                "usage: perf_inotify09_scale [write-seek-only | pwrite-only | watch-only | contract-scale <1|8|32|128>]"
+             );
+             std::process::exit(2);
+         }
+@@ -320,6 +322,35 @@ fn main() {
+                 .collect(),
+             freq,
+         );
++        if watch_only {
++            // Same two syscall numbers, no valid descriptor and therefore no
++            // path lookup or watch mutation. This is a low-work control, not
++            // a measurement of irreducible VM transition cost.
++            complete &= report_phase(
++                "watch_invalid_pair",
++                scale,
++                (0..SAMPLES).map(|_| measure(scale, || {
++                    raw_inotify_add_watch(-1, &path, IN_MODIFY) == -1
++                        && raw_inotify_rm_watch(-1, 0) == -1
++                })).collect(),
++                freq,
++            );
++            let wd = raw_inotify_add_watch(ifd, &path, IN_MODIFY);
++            complete &= wd >= 0;
++            complete &= report_phase(
++                "watch_existing_pair",
++                scale,
++                (0..SAMPLES).map(|_| measure(scale, || {
++                    raw_inotify_add_watch(ifd, &path, IN_MODIFY) == wd
++                        && raw_inotify_add_watch(ifd, &path, IN_MODIFY) == wd
++                })).collect(),
++                freq,
++            );
++            if wd >= 0 {
++                complete &= raw_inotify_rm_watch(ifd, wd) == 0;
++            }
++            continue;
++        }
+         complete &= report_phase(
+             "write_seek",
+             scale,
+diff --git a/conformance-probes/src/bin/writeseek.rs b/conformance-probes/src/bin/writeseek.rs
+index 7671a9314..b35f57da5 100644
+--- a/conformance-probes/src/bin/writeseek.rs
++++ b/conformance-probes/src/bin/writeseek.rs
+@@ -8,6 +8,10 @@ use std::ffi::CString;
+ 
+ fn main() {
+     let args: Vec<_> = std::env::args().skip(1).collect();
++    if args.as_slice() == ["lease-alias"] {
++        lease_alias();
++        return;
++    }
+     let scale = args.first().map_or(Ok(8usize), |s| s.parse()).unwrap_or(0);
+     if ![1, 8, 32, 128].contains(&scale) {
+         std::process::exit(2);
+@@ -66,3 +70,25 @@ fn main() {
+         );
+     }
+ }
++
++/// A successful alias write advances the same open-file-description offset,
++/// including after another seek has attempted to reacquire an execution lease.
++fn lease_alias() {
++    let path = CString::new(format!("/tmp/carrick-lease-alias-{}", std::process::id())).unwrap();
++    unsafe {
++        let fd = libc::open(path.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600);
++        assert!(fd >= 0);
++        assert_eq!(libc::lseek(fd, 0, libc::SEEK_SET), 0);
++        let alias = libc::dup(fd);
++        assert!(alias >= 0);
++        assert_eq!(libc::lseek(fd, 0, libc::SEEK_SET), 0);
++        let written = libc::write(alias, b"x".as_ptr().cast(), 1);
++        let offset = libc::lseek(fd, 0, libc::SEEK_CUR);
++        let mut byte = [0u8; 1];
++        let read = libc::pread(fd, byte.as_mut_ptr().cast(), 1, 0);
++        assert_eq!(libc::close(alias), 0);
++        assert_eq!(libc::close(fd), 0);
++        assert_eq!(libc::unlink(path.as_ptr()), 0);
++        report!(alias_write = written, shared_offset = offset, read = read, byte = byte[0]);
++    }
++}
+diff --git a/crates/carrick-aarch64/src/engine.rs b/crates/carrick-aarch64/src/engine.rs
+index cd78852b6..563e2e8c7 100644
+--- a/crates/carrick-aarch64/src/engine.rs
++++ b/crates/carrick-aarch64/src/engine.rs
+@@ -2560,7 +2560,11 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
+                 .value
+                 .map_err(|error| self.vm.enrich_vcpu_run_error(&self.vcpu, error))?
+             {
+-                Aarch64Exit::Syscall { frame, resume_pc } => {
++                Aarch64Exit::Syscall {
++                    frame,
++                    resume_pc,
++                    current_guest_sp,
++                } => {
+                     if frame.x8 == 64
+                         && let Some(written) = self.try_fast_write(&frame)
+                     {
+@@ -2588,6 +2592,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
+                     let (number, args) = <Self as ThreadedEngine>::Arch::decode_syscall(&frame);
+                     let guest_abi = <Self as ThreadedEngine>::Arch::linux_guest_abi();
+                     return Ok(Some(RawSyscall {
++                        current_guest_sp,
+                         number: carrick_abi::CanonicalNr(number),
+                         args,
+                         guest_abi,
+diff --git a/crates/carrick-aarch64/src/vmm.rs b/crates/carrick-aarch64/src/vmm.rs
+index 3dba03400..7d21b1397 100644
+--- a/crates/carrick-aarch64/src/vmm.rs
++++ b/crates/carrick-aarch64/src/vmm.rs
+@@ -50,6 +50,8 @@ pub enum Aarch64Exit {
+     Syscall {
+         frame: Aarch64SyscallFrame,
+         resume_pc: u64,
++        /// Exact SP captured with this syscall, if supplied by the transport.
++        current_guest_sp: Option<u64>,
+     },
+ 
+     /// An EL0 SYNCHRONOUS fault (data/instruction abort, alignment, undef, debug)
+diff --git a/crates/carrick-hal/src/threaded.rs b/crates/carrick-hal/src/threaded.rs
+index f841b6ad0..30fdc898b 100644
+--- a/crates/carrick-hal/src/threaded.rs
++++ b/crates/carrick-hal/src/threaded.rs
+@@ -351,7 +351,10 @@ struct VcpuRegistryState {
+     next_freeze_generation: u64,
+     next_enrollment: u64,
+     next_kernel_wake_generation: u64,
+-    kernel_wake_debts: HashMap<ThreadId, u64>,
++    // Logical membership outlives temporary physical lease unregistration.
++    // None means acknowledged, not retired; publication during a lease gap
++    // must still leave debt for this exact thread's next registration.
++    kernel_wake_debts: HashMap<ThreadId, Option<u64>>,
+ }
+ 
+ impl Default for VcpuRegistryState {
+@@ -592,7 +595,7 @@ impl VcpuRegistry for GenericVcpuRegistry {
+                     },
+                 };
+             }
+-            let inherited_kernel_wake = state.kernel_wake_debts.get(&tid).copied();
++            let inherited_kernel_wake = *state.kernel_wake_debts.entry(tid).or_default();
+             let enrollment = state.next_enrollment;
+             state.next_enrollment = state.next_enrollment.checked_add(1).unwrap_or_else(|| {
+                 carrick_fatal!("hal::kernel_wake", "vCPU enrollment generation exhausted")
+@@ -703,9 +706,8 @@ impl VcpuRegistry for GenericVcpuRegistry {
+         for entry in state.vcpus.values_mut() {
+             entry.kernel_wake_generation = Some(generation);
+         }
+-        let tids: Vec<_> = state.vcpus.keys().copied().collect();
+-        for tid in tids {
+-            state.kernel_wake_debts.insert(tid, generation);
++        for debt in state.kernel_wake_debts.values_mut() {
++            *debt = Some(generation);
+         }
+     }
+ 
+@@ -742,8 +744,10 @@ impl VcpuRegistry for GenericVcpuRegistry {
+             && entry.kernel_wake_generation == Some(debt.generation)
+         {
+             entry.kernel_wake_generation = None;
+-            if state.kernel_wake_debts.get(&tid) == Some(&debt.generation) {
+-                state.kernel_wake_debts.remove(&tid);
++            if let Some(pending) = state.kernel_wake_debts.get_mut(&tid)
++                && *pending == Some(debt.generation)
++            {
++                *pending = None;
+             }
+         }
+     }
+@@ -1135,6 +1139,44 @@ mod generic_registry_tests {
+         );
+     }
+ 
++    #[test]
++    fn kernel_wake_published_during_lease_gap_survives_rebind() {
++        for scale in [1, 8, 32, 128] {
++            let r = GenericVcpuRegistry::new();
++            let a = t(1);
++            let flag = InGuestFlag::for_guest_thread();
++            register_for_test(&r, a, noop(), &flag);
++            for _ in 0..scale {
++                r.unregister(a);
++                r.publish_kernel_wake_debt();
++                register_for_test(&r, a, noop(), &flag);
++                let debt = r
++                    .kernel_wake_debt_for(a)
++                    .expect("a live thread must retain wakes published without a physical lease");
++                r.acknowledge_kernel_wake_debt(a, debt);
++                assert_eq!(r.kernel_wake_debt_for(a), None);
++                assert_eq!(
++                    r.lock().kernel_wake_debts.len(),
++                    1,
++                    "lease cycling retains one record per logical thread"
++                );
++            }
++            r.unregister(a);
++            r.retire_kernel_wake_debt(a);
++            assert!(
++                r.lock().kernel_wake_debts.is_empty(),
++                "logical retirement must release its wake record"
++            );
++            r.publish_kernel_wake_debt();
++            register_for_test(&r, a, noop(), &flag);
++            assert_eq!(
++                r.kernel_wake_debt_for(a),
++                None,
++                "retired identities must not collect future wake debt"
++            );
++        }
++    }
++
+     #[test]
+     fn kernel_wake_debt_survives_exact_tid_rebind_only() {
+         let r = GenericVcpuRegistry::new();
+diff --git a/crates/carrick-hal/src/trap.rs b/crates/carrick-hal/src/trap.rs
+index 4804cd3d4..61aa61385 100644
+--- a/crates/carrick-hal/src/trap.rs
++++ b/crates/carrick-hal/src/trap.rs
+@@ -29,6 +29,9 @@ use crate::error::OsError;
+ /// moved into the backend (Phase 1, Task 3 of the x86_64 guest-ISA seam).
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct RawSyscall {
++    /// Stack pointer captured by the trap transport for this exact request.
++    /// Backends that do not capture it leave it absent for a lazy register read.
++    pub current_guest_sp: Option<u64>,
+     /// The CANONICAL (asm-generic/aarch64) syscall number the dispatcher
+     /// switches on. Typed [`CanonicalNr`] so it cannot be swapped with
+     /// [`native_number`](Self::native_number) at a constructor.
+diff --git a/crates/carrick-hal/src/x8664_arch.rs b/crates/carrick-hal/src/x8664_arch.rs
+index 34b05e2c3..4d3355053 100644
+--- a/crates/carrick-hal/src/x8664_arch.rs
++++ b/crates/carrick-hal/src/x8664_arch.rs
+@@ -1113,6 +1113,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_FORK {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_CLONE),
+@@ -1121,6 +1122,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_VFORK {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_CLONE),
+@@ -1140,6 +1142,7 @@ impl X8664GuestArch {
+             // sigmask. Folding into ppoll(73) mis-read timeout_ms=0 as a NULL
+             // timeout pointer → infinite wait (musl startup wedge).
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_POLL),
+@@ -1151,6 +1154,7 @@ impl X8664GuestArch {
+             // handler reads arg4 as a *timeval (tv_usec, not tv_nsec) and uses
+             // no sigmask. pselect6(72) keeps the *timespec + sigmask decode.
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_SELECT),
+@@ -1167,6 +1171,7 @@ impl X8664GuestArch {
+             // be canonical ppoll(73), NOT the poll shim (whose arg2=0 is an INT
+             // timeout_ms = return-now, which would re-introduce the spin).
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_PPOLL),
+@@ -1181,6 +1186,7 @@ impl X8664GuestArch {
+             // unchanged (same shape); only the two trailing sigmask args are
+             // synthesised as NULL/0.
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_EPOLL_PWAIT),
+@@ -1194,6 +1200,7 @@ impl X8664GuestArch {
+             // creating the instance — folding straight to epoll_create1(0) would
+             // lose that check (epoll-ltp / epoll_create02).
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_EPOLL_CREATE),
+@@ -1203,6 +1210,7 @@ impl X8664GuestArch {
+         if x86_number == X86_NR_INOTIFY_INIT {
+             // inotify_init() takes no args → inotify_init1(flags=0).
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_INOTIFY_INIT1),
+@@ -1212,6 +1220,7 @@ impl X8664GuestArch {
+         if x86_number == X86_NR_SIGNALFD {
+             // signalfd(fd, mask, sizemask) → signalfd4(fd, mask, sizemask, 0).
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_SIGNALFD4),
+@@ -1221,6 +1230,7 @@ impl X8664GuestArch {
+         if x86_number == X86_NR_EVENTFD {
+             // eventfd(initval) → eventfd2(initval, flags=0).
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_EVENTFD2),
+@@ -1232,6 +1242,7 @@ impl X8664GuestArch {
+             // it to canonical getpgid with pid=0 so the guest reads its own
+             // process-group id instead of ENOSYS (-1).
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_GETPGID),
+@@ -1240,6 +1251,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_DUP2 {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_DUP2),
+@@ -1248,6 +1260,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_ALARM {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_ALARM),
+@@ -1256,6 +1269,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_TIME {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_TIME),
+@@ -1264,6 +1278,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_ACCESS {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_FACCESSAT),
+@@ -1272,6 +1287,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_STAT {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_STAT),
+@@ -1280,6 +1296,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_FSTAT {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_FSTAT),
+@@ -1288,6 +1305,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_LSTAT {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_LSTAT),
+@@ -1296,6 +1314,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_NEWFSTATAT {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT),
+@@ -1304,6 +1323,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_PIPE {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_PIPE2),
+@@ -1323,6 +1343,7 @@ impl X8664GuestArch {
+                 flags |= CANON_O_DIRECT;
+             }
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_PIPE2),
+@@ -1331,6 +1352,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_READLINK {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_READLINKAT),
+@@ -1339,6 +1361,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_MKDIR {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_MKDIRAT),
+@@ -1353,6 +1376,7 @@ impl X8664GuestArch {
+         if x86_number == X86_NR_OPEN {
+             // open(path, flags, mode) → openat(AT_FDCWD, path, flags, mode).
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_OPENAT),
+@@ -1370,6 +1394,7 @@ impl X8664GuestArch {
+             // openat(dirfd, path, flags, mode) — same shape as canonical openat,
+             // but the x86 flags word needs the O_* bit translation.
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_OPENAT),
+@@ -1388,6 +1413,7 @@ impl X8664GuestArch {
+             // mode). The flags word is SYNTHESIZED (creat has no flags arg); mode
+             // (args[1]) lands in the openat MODE slot (a3), not the flags slot.
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_OPENAT),
+@@ -1406,6 +1432,7 @@ impl X8664GuestArch {
+         // unlink/rmdir → unlinkat(35), distinguished only by the flags slot.
+         if x86_number == X86_NR_UNLINK {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_UNLINKAT),
+@@ -1414,6 +1441,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_RMDIR {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_UNLINKAT),
+@@ -1430,6 +1458,7 @@ impl X8664GuestArch {
+         // rename/link → two-dirfd *at variants (AT_FDCWD in BOTH dirfd slots).
+         if x86_number == X86_NR_RENAME {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_RENAMEAT),
+@@ -1446,6 +1475,7 @@ impl X8664GuestArch {
+         if x86_number == X86_NR_LINK {
+             // flags=0 mirrors link(2) (no AT_SYMLINK_FOLLOW).
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_LINKAT),
+@@ -1463,6 +1493,7 @@ impl X8664GuestArch {
+         if x86_number == X86_NR_SYMLINK {
+             // symlink(target, linkpath) → symlinkat(target, AT_FDCWD, linkpath).
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_SYMLINKAT),
+@@ -1472,6 +1503,7 @@ impl X8664GuestArch {
+         // mknod → mknodat(33): NO flags arg (4 args).
+         if x86_number == X86_NR_MKNOD {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_MKNODAT),
+@@ -1481,6 +1513,7 @@ impl X8664GuestArch {
+         // chmod → fchmodat(53), flags=0 (chmod always follows symlinks).
+         if x86_number == X86_NR_CHMOD {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_FCHMODAT),
+@@ -1491,6 +1524,7 @@ impl X8664GuestArch {
+         if x86_number == X86_NR_CHOWN {
+             // flags=0: chown FOLLOWS symlinks. owner/group -1 sentinel passes through.
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_FCHOWNAT),
+@@ -1499,6 +1533,7 @@ impl X8664GuestArch {
+         }
+         if x86_number == X86_NR_LCHOWN {
+             return SyscallNorm::Plain(RawSyscall {
++                current_guest_sp: None,
+                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                 native_number: NativeNr(x86_number),
+                 number: CanonicalNr(CANONICAL_FCHOWNAT),
+@@ -1531,6 +1566,7 @@ impl X8664GuestArch {
+             args.swap(3, 4);
+         }
+         SyscallNorm::Plain(RawSyscall {
++            current_guest_sp: None,
+             guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+             native_number: NativeNr(x86_number),
+             number: CanonicalNr(canonical),
+diff --git a/crates/carrick-kernel/src/dispatch/fs/locks.rs b/crates/carrick-kernel/src/dispatch/fs/locks.rs
+index 91bc4ace9..8008d101d 100644
+--- a/crates/carrick-kernel/src/dispatch/fs/locks.rs
++++ b/crates/carrick-kernel/src/dispatch/fs/locks.rs
+@@ -1412,6 +1412,15 @@ impl<'a> FsView<'a> {
+         mm_mutation fn fcntl(this, cx, fd: Fd, cmd: u64, arg: u64) {
+             let fd: Fd = fd;
+             let command = cmd;
++            if matches!(command, LINUX_F_DUPFD | LINUX_F_DUPFD_CLOEXEC) {
++                // fcntl can introduce another OFD owner just as dup can.
++                // Publish the leased offset before duplicating it; a
++                // subsequent grant rechecks logical ownership.
++                crate::kernel::identity_page::revoke_seek_authority_and_write_lease(
++                    &mut *cx.memory,
++                    crate::memory::LINUX_IDENTITY_PAGE_BASE,
++                )?;
++            }
+             // A stdio fd the guest explicitly closed (and did not reopen) is a
+             // genuinely closed descriptor: every fcntl on it is EBADF, NOT the
+             // implicit-stdio fallbacks below (F_GETFL/F_GETFD/F_SETFL on bare
+diff --git a/crates/carrick-kernel/src/dispatch/fs/rw.rs b/crates/carrick-kernel/src/dispatch/fs/rw.rs
+index b8227122d..0b719d4c9 100644
+--- a/crates/carrick-kernel/src/dispatch/fs/rw.rs
++++ b/crates/carrick-kernel/src/dispatch/fs/rw.rs
+@@ -506,7 +506,12 @@ impl<'a> FsView<'a> {
+                         open_file.description.common().status_flags(),
+                     )
+                     .contains(LinuxOpenFlags::APPEND);
+-                    if writable && !is_append {
++                    // The identity-page offset is private to this execution
++                    // binding. An alias (including one inherited by fork) uses
++                    // the same Linux open file description, so a later seek
++                    // must not re-grant private authority after dup/fork revoked
++                    // it. Count logical descriptor owners, never Arc clones.
++                    if writable && !is_append && open_file.description.fd_ref_count() == 1 {
+                         let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+                         let _ = crate::kernel::identity_page::stamp_seek_authority(
+                             &mut *cx.memory,
+diff --git a/crates/carrick-kernel/src/dispatch/fs/tests.rs b/crates/carrick-kernel/src/dispatch/fs/tests.rs
+index 4dbc664cc..c9b9c3d43 100644
+--- a/crates/carrick-kernel/src/dispatch/fs/tests.rs
++++ b/crates/carrick-kernel/src/dispatch/fs/tests.rs
+@@ -5,6 +5,52 @@ use crate::dispatch::ThreadCtx;
+ use crate::dispatch::dispatcher::FsCrossSubsystem;
+ use std::sync::Arc;
+ 
++/// Exercise the production lease grant with an actual identity-page mapping.
++/// An alias write must advance the same Linux open-file-description offset.
++#[cfg(feature = "syscall-shim")]
++#[test]
++fn seek_lease_regrant_after_dup_preserves_shared_offset() {
++    use std::os::fd::IntoRawFd;
++
++    for duplication in [23, 24, 25] {
++    let mut dispatcher = SyscallDispatcher::new();
++    let fd = dispatcher.install_fd_at_or_above(3,
++        OpenFile::from_open_description_with_status_flags(
++            Arc::new(RwLock::new(OpenDescription::HostFile {
++                host_fd: HostFdRef::new(tempfile::tempfile().unwrap().into_raw_fd()),
++                metadata: RootFsMetadata {
++                    path: "/lease-alias".into(), kind: RootFsEntryKind::File,
++                    mode: 0o600, size: 0,
++                },
++                base: OpenDescriptionBase::new(LINUX_O_RDWR), writable: true,
++            })), LINUX_O_RDWR, 0,
++        )).unwrap();
++    let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
++    let mut memory = LinearMemory::new(base, vec![0; 4096]);
++    memory.write_bytes_raw(base + 256, b"x").unwrap();
++    let context = dispatcher.capture_one_task_context().unwrap();
++    let mut call = |number, args, memory: &mut LinearMemory| {
++        dispatcher.dispatch(&context, SyscallRequest::new(number, SyscallArgs::from(args)),
++            memory, &CompatReporter::default()).unwrap()
++    };
++    assert_eq!(call(62, [fd as u64, 0, 0, 0, 0, 0], &mut memory),
++        DispatchOutcome::Returned { value: 0 });
++    let duplicate_args = if duplication == 24 {
++        [fd as u64, 99, 0, 0, 0, 0]
++    } else {
++        [fd as u64, 0, 0, 0, 0, 0]
++    };
++    let DispatchOutcome::Returned { value: alias } =
++        call(duplication, duplicate_args, &mut memory) else { panic!("dup failed") };
++    assert_eq!(call(62, [fd as u64, 0, 0, 0, 0, 0], &mut memory),
++        DispatchOutcome::Returned { value: 0 });
++    assert_eq!(call(64, [alias as u64, base + 256, 1, 0, 0, 0], &mut memory),
++        DispatchOutcome::Returned { value: 1 });
++    assert_eq!(call(62, [fd as u64, 0, 1, 0, 0, 0], &mut memory),
++        DispatchOutcome::Returned { value: 1 }, "alias write must advance the leased descriptor's offset (duplication syscall {duplication})");
++    }
++}
++
+ #[test]
+ fn host_file_lseek_does_not_publish_description_mutation() {
+     use std::os::fd::IntoRawFd;
+diff --git a/crates/carrick-kernel/src/dispatch/request.rs b/crates/carrick-kernel/src/dispatch/request.rs
+index 320a469b7..e72dc5572 100644
+--- a/crates/carrick-kernel/src/dispatch/request.rs
++++ b/crates/carrick-kernel/src/dispatch/request.rs
+@@ -57,6 +57,12 @@ impl SyscallRequest {
+         self
+     }
+ 
++    /// Populate trap stack metadata from the backend when the transport did not
++    /// supply it. The fallback must not be evaluated for captured metadata.
++    pub fn with_guest_sp_fallback(self, read_sp: impl FnOnce() -> Option<u64>) -> Self {
++        self.with_current_guest_sp(self.current_guest_sp.or_else(read_sp))
++    }
++
+     pub fn arg(&self, index: usize) -> u64 {
+         self.args.0[index]
+     }
+@@ -75,7 +81,7 @@ impl SyscallRequest {
+             // means no call site can forget it and mis-marshal the x86 path.
+             guest_abi: raw.guest_abi,
+             native_number: raw.native_number,
+-            current_guest_sp: None,
++            current_guest_sp: raw.current_guest_sp,
+         }
+     }
+ }
+@@ -88,6 +94,52 @@ pub struct PreparedSyscall {
+     pub request: SyscallRequest,
+ }
+ 
++#[cfg(test)]
++mod captured_metadata_tests {
++    use super::*;
++
++    #[test]
++    fn captured_stack_pointer_needs_no_backend_read() {
++        for scale in [1, 8, 32, 128] {
++            let mut reads = 0;
++            for index in 0..scale {
++                let sp = index * 16;
++                let raw = carrick_hal::RawSyscall {
++                    number: CanonicalNr(132), // sigaltstack consumes this metadata
++                    native_number: NativeNr(132),
++                    guest_abi: LinuxGuestAbi::Aarch64,
++                    args: [0; 6],
++                    current_guest_sp: Some(sp),
++                };
++                let request = SyscallRequest::from_raw(raw).with_guest_sp_fallback(|| {
++                    reads += 1;
++                    Some(sp)
++                });
++                assert_eq!(request.current_guest_sp, Some(sp));
++                assert_eq!(
++                    crate::observe::SyscallInfo::new(&request).current_guest_sp(),
++                    Some(sp)
++                );
++            }
++            assert_eq!(reads, 0, "captured metadata must not trigger backend reads");
++        }
++    }
++
++    #[test]
++    fn missing_stack_pointer_reads_backend_once_and_preserves_failure() {
++        for result in [Some(0), Some(0x9000), None] {
++            let mut reads = 0;
++            let request = SyscallRequest::new(132, SyscallArgs::new([0; 6]))
++                .with_guest_sp_fallback(|| {
++                    reads += 1;
++                    result
++                });
++            assert_eq!(request.current_guest_sp, result);
++            assert_eq!(reads, 1);
++        }
++    }
++}
++
+ impl PreparedSyscall {
+     pub(crate) fn effective_info(&self) -> crate::observe::SyscallInfo<'_> {
+         crate::observe::SyscallInfo::new_effective(&self.request, self.original_args)
+diff --git a/crates/carrick-runtime/src/runtime.rs b/crates/carrick-runtime/src/runtime.rs
+index c16ab9485..b98367534 100644
+--- a/crates/carrick-runtime/src/runtime.rs
++++ b/crates/carrick-runtime/src/runtime.rs
+@@ -2617,6 +2617,7 @@ mod tests {
+ 
+     fn scripted_syscall(number: u64, args: [u64; 6]) -> carrick_hal::RawSyscall {
+         carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(number),
+             args,
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+diff --git a/crates/carrick-runtime/src/vcpu_loop/binding.rs b/crates/carrick-runtime/src/vcpu_loop/binding.rs
+index 21c8d5249..aa0924844 100644
+--- a/crates/carrick-runtime/src/vcpu_loop/binding.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/binding.rs
+@@ -7395,6 +7395,7 @@ mod tests {
+         assert!(
+             !HvpatchProductionPhase::ResumeBlocked {
+                 frame: carrick_hal::RawSyscall {
++                    current_guest_sp: None,
+                     number: carrick_abi::CanonicalNr(0),
+                     args: [0; 6],
+                     guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -7408,6 +7409,7 @@ mod tests {
+ 
+     fn deferred_frame() -> carrick_hal::RawSyscall {
+         carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(101),
+             args: [1, 2, 3, 4, 5, 6],
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+diff --git a/crates/carrick-runtime/src/vcpu_loop/exec.rs b/crates/carrick-runtime/src/vcpu_loop/exec.rs
+index 378802ddf..3b99bd801 100644
+--- a/crates/carrick-runtime/src/vcpu_loop/exec.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/exec.rs
+@@ -2819,6 +2819,7 @@ pub(crate) mod tests {
+             .expect("parent MM executor participation");
+         state.guest_execution = Some(mm_executor);
+         let frame = carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(220),
+             args: [0; 6],
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -3074,6 +3075,7 @@ pub(crate) mod tests {
+             | carrick_abi::LinuxCloneFlags::VM)
+             .bits();
+         let frame = carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(220),
+             args: [flags, 0x9000, 0, 0, 0, 0],
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -3350,6 +3352,7 @@ pub(crate) mod tests {
+             timespec.extend_from_slice(&(duration.as_secs() as i64).to_le_bytes());
+             timespec.extend_from_slice(&(i64::from(duration.subsec_nanos())).to_le_bytes());
+             let frame = carrick_hal::RawSyscall {
++                current_guest_sp: None,
+                 number: carrick_abi::CanonicalNr(101),
+                 args: [request_address, 0, 0, 0, 0, 0],
+                 guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -3598,6 +3601,7 @@ pub(crate) mod tests {
+             timespec.extend_from_slice(&(duration.as_secs() as i64).to_le_bytes());
+             timespec.extend_from_slice(&(i64::from(duration.subsec_nanos())).to_le_bytes());
+             let frame = carrick_hal::RawSyscall {
++                current_guest_sp: None,
+                 number: carrick_abi::CanonicalNr(101),
+                 args: [request_address, 0, 0, 0, 0, 0],
+                 guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -3835,6 +3839,7 @@ pub(crate) mod tests {
+                 .expect("root MM executor participation"),
+         );
+         let frame = carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(92),
+             args: [0; 6],
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -4313,6 +4318,7 @@ pub(crate) mod tests {
+ 
+     fn execve_test_frame() -> carrick_hal::RawSyscall {
+         carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(221),
+             args: [0; 6],
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -4334,6 +4340,7 @@ pub(crate) mod tests {
+         .into();
+         CrashCaptureTestEngine {
+             next_syscall: Some(carrick_hal::RawSyscall {
++                current_guest_sp: None,
+                 number: carrick_abi::CanonicalNr(221),
+                 args: [PATH, ARGV, 0, 0, 0, 0],
+                 guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+@@ -5913,6 +5920,7 @@ pub(crate) mod tests {
+         };
+         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+         let frame = carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(221),
+             args: [0; 6],
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+diff --git a/crates/carrick-runtime/src/vcpu_loop/executor/tests.rs b/crates/carrick-runtime/src/vcpu_loop/executor/tests.rs
+index 6ab7a62d3..cb35f9720 100644
+--- a/crates/carrick-runtime/src/vcpu_loop/executor/tests.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/executor/tests.rs
+@@ -6664,6 +6664,7 @@ fn scripted_guest_execve_engine(path: &str) -> crate::vcpu_loop::tests::CrashCap
+     .into();
+     crate::vcpu_loop::tests::CrashCaptureTestEngine {
+         next_syscall: Some(carrick_hal::RawSyscall {
++            current_guest_sp: None,
+             number: carrick_abi::CanonicalNr(221),
+             args: [PATH, ARGV, 0, 0, 0, 0],
+             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+diff --git a/crates/carrick-runtime/src/vcpu_loop/mod.rs b/crates/carrick-runtime/src/vcpu_loop/mod.rs
+index 094e65a5a..f2729cb38 100644
+--- a/crates/carrick-runtime/src/vcpu_loop/mod.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/mod.rs
+@@ -1443,7 +1443,7 @@ where
+         self.service_kernel_context = Some(kernel_context.retain_exact());
+         let request = SyscallRequest::from_raw(frame)
+             .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
+-            .with_current_guest_sp(engine.get_reg(carrick_hal::Reg::Sp).ok());
++            .with_guest_sp_fallback(|| engine.get_reg(carrick_hal::Reg::Sp).ok());
+         let (syscall, prepared_outcome) =
+             match kernel
+                 .dispatcher
+diff --git a/crates/carrick-runtime/tests/runtime_loop.rs b/crates/carrick-runtime/tests/runtime_loop.rs
+index 1bbad75dc..ec2503392 100644
+--- a/crates/carrick-runtime/tests/runtime_loop.rs
++++ b/crates/carrick-runtime/tests/runtime_loop.rs
+@@ -520,6 +520,7 @@ impl SyscallTrap for ScriptedTrap {
+             .pop_front()
+             .map(|f| {
+                 Some(carrick_runtime::trap::RawSyscall {
++                    current_guest_sp: None,
+                     number: carrick_runtime::linux_abi::CanonicalNr(f.x8),
+                     args: [f.x0, f.x1, f.x2, f.x3, f.x4, f.x5],
+                     guest_abi: carrick_runtime::linux_abi::LinuxGuestAbi::Aarch64,
+diff --git a/crates/carrick-runtime/tests/syscall_process.rs b/crates/carrick-runtime/tests/syscall_process.rs
+index b4c8046d3..0e2e05f5e 100644
+--- a/crates/carrick-runtime/tests/syscall_process.rs
++++ b/crates/carrick-runtime/tests/syscall_process.rs
+@@ -80,6 +80,7 @@ fn syscall_request_can_be_built_from_a_raw_syscall() {
+     // (covered by carrick-hal's aarch64 tests); the dispatcher consumes the
+     // ISA-neutral `RawSyscall`.
+     let raw = carrick_hal::RawSyscall {
++        current_guest_sp: None,
+         number: carrick_abi::CanonicalNr(64),
+         args: [1, 0x4000, 17, 0, 0, 0],
+         guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+diff --git a/crates/carrick-vmm-hvf/src/trap.rs b/crates/carrick-vmm-hvf/src/trap.rs
+index 6302277f9..8a19eb414 100644
+--- a/crates/carrick-vmm-hvf/src/trap.rs
++++ b/crates/carrick-vmm-hvf/src/trap.rs
+@@ -7569,7 +7569,11 @@ impl HvfInner {
+                 stack_host_base: 0,
+                 stack_guest_end: 0,
+             });
+-            return Ok(Aarch64Exit::Syscall { frame, resume_pc });
++            return Ok(Aarch64Exit::Syscall {
++                frame,
++                resume_pc,
++                current_guest_sp: Some(request.sp),
++            });
+         }
+     }
+ }
+diff --git a/crates/carrick-vmm-hvf/src/trap/guest_memory.rs b/crates/carrick-vmm-hvf/src/trap/guest_memory.rs
+index 1fe23c746..11563684a 100644
+--- a/crates/carrick-vmm-hvf/src/trap/guest_memory.rs
++++ b/crates/carrick-vmm-hvf/src/trap/guest_memory.rs
+@@ -4,6 +4,14 @@
+ 
+ use super::*;
+ 
++/// COW provenance matters only when all other anonymous-remap guards pass.
++fn scrub_remap_eligible(
++    eligible_without_cow: bool,
++    cow_source_exists: impl FnOnce() -> bool,
++) -> bool {
++    eligible_without_cow && !cow_source_exists()
++}
++
+ #[derive(Debug, PartialEq, Eq)]
+ enum MissingMappingResolution<T> {
+     Pristine,
+@@ -669,14 +677,16 @@ impl HvfVmState {
+                         .and_then(|mapping| {
+                             let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
+                             let target = unsafe { mapping.host_addr.add(offset) };
+-                            let cow_source = self.physical_cow_source(chunk_va, ipa).is_some();
+                             let is_alias = is_reusable_global_frame_extent(mapping.ipa, 1);
+-                            let eligible = mapping.sharing == GuestMappingSharing::Private
++                            let eligible_without_cow = mapping.sharing
++                                == GuestMappingSharing::Private
+                                 && mapping.shared_key_base == 0
+-                                && !cow_source
+                                 && !is_alias
+                                 && retained_fragment.is_none()
+                                 && zero_anonymous_remap_enabled();
++                            let eligible = scrub_remap_eligible(eligible_without_cow, || {
++                                self.physical_cow_source(chunk_va, ipa).is_some()
++                            });
+                             Some((target, eligible))
+                         })
+                 })
+@@ -700,13 +710,14 @@ impl HvfVmState {
+                             let offset =
+                                 usize::try_from(chunk_va.checked_sub(mapping.start)?).ok()?;
+                             let target = unsafe { mapping.host_addr.add(offset) };
+-                            let cow_source =
+-                                self.physical_cow_source(chunk_va, mapping.ipa).is_some();
+-                            let eligible = mapping.sharing == GuestMappingSharing::Private
++                            let eligible_without_cow = mapping.sharing
++                                == GuestMappingSharing::Private
+                                 && mapping.shared_key_base == 0
+-                                && !cow_source
+                                 && retained_fragment.is_none()
+                                 && zero_anonymous_remap_enabled();
++                            let eligible = scrub_remap_eligible(eligible_without_cow, || {
++                                self.physical_cow_source(chunk_va, mapping.ipa).is_some()
++                            });
+                             Some((target, eligible))
+                         })
+                 });
+@@ -1031,6 +1042,33 @@ impl HvfVmState {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn scrub_remap_ineligible_needs_no_cow_query() {
++        for scale in [1, 8, 32, 128] {
++            let mut queries = 0;
++            for _ in 0..scale {
++                assert!(!scrub_remap_eligible(false, || {
++                    queries += 1;
++                    false
++                }));
++            }
++            assert_eq!(queries, 0, "ineligible remaps at scale {scale}");
++        }
++    }
++
++    #[test]
++    fn scrub_remap_eligible_preserves_cow_query() {
++        for has_cow in [false, true] {
++            let mut queries = 0;
++            let eligible = scrub_remap_eligible(true, || {
++                queries += 1;
++                has_cow
++            });
++            assert_eq!(queries, 1);
++            assert_eq!(eligible, !has_cow);
++        }
++    }
++
+     #[test]
+     fn missing_mapping_is_rechecked_after_pristine_publication_commits() {
+         use std::sync::atomic::{AtomicU64, Ordering};
+diff --git a/crates/carrick-vmm-kvm/src/kvm_aarch64_engine.rs b/crates/carrick-vmm-kvm/src/kvm_aarch64_engine.rs
+index 9808b6acc..9d08ecce4 100644
+--- a/crates/carrick-vmm-kvm/src/kvm_aarch64_engine.rs
++++ b/crates/carrick-vmm-kvm/src/kvm_aarch64_engine.rs
+@@ -153,7 +153,11 @@ impl Aarch64Vcpu for KvmVcpu {
+                     carrick_hal::read_aarch64_syscall_frame(|r| <Self as HvVcpu>::reg(self, r))
+                         .map_err(os_to_trap)?;
+                 let resume_pc = <Self as HvVcpu>::reg(self, Reg::ElrEl1).map_err(os_to_trap)?;
+-                Ok(Aarch64Exit::Syscall { frame, resume_pc })
++                Ok(Aarch64Exit::Syscall {
++                    frame,
++                    resume_pc,
++                    current_guest_sp: None,
++                })
+             }
+             VcpuExit::MmioWrite { gpa, .. } if gpa == FAULT_SENTINEL_GPA => {
+                 // An EL0 SYNCHRONOUS FAULT (data/instruction abort, alignment)

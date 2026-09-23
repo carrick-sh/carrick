@@ -1,0 +1,6 @@
+{
+  "path": "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/target/lease-cost/native-activation/native-activation-cost-release",
+  "sha256": "cf7369351a0dfe3053748e0c5c1cc8fcacde4a6cba853456ff228c4b1131aede",
+  "source_sha256": "460ee107a3bb70f2c1ba1587bde0d7f7602df9598c702f8abce0e71a805c1736",
+  "kind": "host-only release test diagnostic; no HVF guest"
+}

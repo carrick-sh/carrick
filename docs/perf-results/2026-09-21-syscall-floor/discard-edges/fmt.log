@@ -1,0 +1,23 @@
+Diff in /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-next/tests/deferred_anonymous.rs:242:
+     let container = TestContainer::new("localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30")
+         .pull_policy(PullPolicy::Missing);
+     let (result, _) = common::run_or_fail(container.run_with_audit([
+-        "/usr/local/bin/python3", "-c", include_str!("fixtures/unaligned_discard.py"),
++        "/usr/local/bin/python3",
++        "-c",
++        include_str!("fixtures/unaligned_discard.py"),
+     ]));
+     result.assert_success();
+     result.assert_exit_code(0);
+Diff in /Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-next/tests/deferred_anonymous.rs:249:
+     assert_eq!(result.signal, None);
+     assert!(!result.trap_limit_hit);
+     assert_eq!(result.terminal_reason, None);
+-    assert_eq!(result.stdout_utf8(), "unaligned_discard_pages=1=ok\nunaligned_discard_pages=8=ok\nunaligned_discard_pages=32=ok\nunaligned_discard_pages=128=ok\n");
++    assert_eq!(
++        result.stdout_utf8(),
++        "unaligned_discard_pages=1=ok\nunaligned_discard_pages=8=ok\nunaligned_discard_pages=32=ok\nunaligned_discard_pages=128=ok\n"
++    );
+     assert!(result.stderr.is_empty(), "{}", result.stderr_utf8());
+ }
+ 

@@ -1,0 +1,77 @@
+[
+  {
+    "name": "runtime-memory",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-runtime",
+      "--features",
+      "conformance-metrics",
+      "--lib",
+      "vcpu_loop::memory::tests::",
+      "--",
+      "--nocapture"
+    ],
+    "exit_code": 0,
+    "wall_s": 10.33430133300135
+  },
+  {
+    "name": "registry",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-conformance-contract"
+    ],
+    "exit_code": 0,
+    "wall_s": 0.282248541014269
+  },
+  {
+    "name": "observability",
+    "argv": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-observability",
+      "--lib"
+    ],
+    "exit_code": 0,
+    "wall_s": 0.1385284579882864
+  },
+  {
+    "name": "elf-clippy",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--manifest-path",
+      "experiments/native-syscall-slice/Cargo.toml",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "wall_s": 0.5259898329968564
+  },
+  {
+    "name": "runtime-clippy",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--no-deps",
+      "-p",
+      "carrick-runtime",
+      "-p",
+      "carrick-observability",
+      "--all-targets",
+      "--features",
+      "carrick-runtime/conformance-metrics",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "wall_s": 14.65436895901803
+  }
+]

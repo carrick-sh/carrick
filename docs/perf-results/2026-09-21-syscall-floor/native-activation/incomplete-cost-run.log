@@ -1,0 +1,24 @@
+
+running 1 test
+test vcpu_loop::memory::tests::native_data_activation_entry_cost ... native_activation_cost {"activated_ns":2660.5224609375,"activation_delta_ns":2624.470947265625,"iterations":4096,"pages":1,"runtime_conformance_metrics":false,"sample":0,"scope_ns":36.051513671875,"workload_timing_eligible":false}
+native_activation_cost {"activated_ns":2332.438232421875,"activation_delta_ns":2281.57568359375,"iterations":4096,"pages":1,"runtime_conformance_metrics":false,"sample":1,"scope_ns":50.862548828125,"workload_timing_eligible":false}
+native_activation_cost {"activated_ns":2066.85400390625,"activation_delta_ns":2015.991455078125,"iterations":4096,"pages":1,"runtime_conformance_metrics":false,"sample":2,"scope_ns":50.862548828125,"workload_timing_eligible":false}
+native_activation_cost {"activated_ns":1898.732421875,"activation_delta_ns":1854.583740234375,"iterations":4096,"pages":1,"runtime_conformance_metrics":false,"sample":3,"scope_ns":44.148681640625,"workload_timing_eligible":false}
+native_activation_cost {"activated_ns":1760.365966796875,"activation_delta_ns":1716.217041015625,"iterations":4096,"pages":1,"runtime_conformance_metrics":false,"sample":4,"scope_ns":44.14892578125,"workload_timing_eligible":false}
+native_activation_cost {"activated_ns":1678.47705078125,"activation_delta_ns":1639.678955078125,"iterations":4096,"pages":1,"runtime_conformance_metrics":false,"sample":5,"scope_ns":38.798095703125,"workload_timing_eligible":false}
+native_activation_cost {"activated_ns":1598.03271484375,"activation_delta_ns":1559.234619140625,"iterations":4096,"pages":1,"runtime_conformance_metrics":false,"sample":6,"scope_ns":38.798095703125,"workload_timing_eligible":false}
+native_activation_cost {"activated_ns":1547.576904296875,"activation_delta_ns":1511.5458984375,"iterations":4096,"pages":1,"runtime_conformance_metrics":false,"sample":7,"scope_ns":36.031005859375,"workload_timing_eligible":false}
+native_activation_cost {"activated_ns":1515.330078125,"activation_delta_ns":1479.309326171875,"iterations":4096,"pages":1,"runtime_conformance_metrics":false,"sample":8,"scope_ns":36.020751953125,"workload_timing_eligible":false}
+
+thread 'vcpu_loop::memory::tests::native_data_activation_entry_cost' (4156455) panicked at crates/carrick-runtime/src/vcpu_loop/memory.rs:1572:18:
+called `Result::unwrap()` on an `Err` value: Unmapped { address: GuestVa(105553653153792) }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    vcpu_loop::memory::tests::native_data_activation_entry_cost
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 608 filtered out; finished in 0.08s
+

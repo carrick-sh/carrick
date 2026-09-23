@@ -8,6 +8,10 @@
 
 use super::*;
 
+mod current_read;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod instruction_read;
+
 /// Carrier-owned index of live HVPatch address spaces available to foreign-MM
 /// operations. Entries retain only weak references: the kernel token keeps the
 /// MM alive, while backend teardown remains the owner of its access state.
@@ -61,6 +65,20 @@ impl CarrierForeignMmSnapshot {
             .iter()
             .copied()
             .find(|range| range.contains(va))
+    }
+
+    // This transport resolves backing for kernel-authorized data reads and
+    // instruction fetches. The kernel separately checks the requested access;
+    // executable permission here must never become guest-readable permission.
+    fn deferred_backing_remaining(&self, va: carrick_guest_mem::GuestVa) -> Option<usize> {
+        self.readable_range(va)
+            .map(|range| (range.end().raw() - va.raw()) as usize)
+            .or_else(|| {
+                self.executable_ranges
+                    .iter()
+                    .find(|range| range.start().raw() <= va.raw() && va.raw() < range.end().raw())
+                    .map(|range| (range.end().raw() - va.raw()) as usize)
+            })
     }
 
     pub(crate) fn is_readable(&self, va: carrick_guest_mem::GuestVa) -> bool {
@@ -299,6 +317,10 @@ pub(crate) struct RetiredMmRootStage2 {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct MmAccessState {
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
+    native_activation_leaf_checks: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
+    copy_owner_pins: std::sync::atomic::AtomicU64,
     pub(crate) deferred_anonymous: parking_lot::RwLock<
         Option<(
             carrick_hal::ForeignMmId,
@@ -347,6 +369,10 @@ impl MmAccessState {
         >,
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
+            #[cfg(any(test, feature = "foreign-cow-test-support"))]
+            native_activation_leaf_checks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "foreign-cow-test-support"))]
+            copy_owner_pins: std::sync::atomic::AtomicU64::new(0),
             identity: parking_lot::RwLock::new(None),
             page_tables: parking_lot::RwLock::new(page_tables),
             protections,
@@ -712,6 +738,9 @@ impl MmAccessState {
             } else {
                 return Err(carrick_hal::ForeignMmTransportError::OwnerStale);
             };
+            #[cfg(any(test, feature = "foreign-cow-test-support"))]
+            self.copy_owner_pins
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             extents.push(RetainedForeignExtent {
                 key: owner_key,
                 owner,
@@ -1005,6 +1034,28 @@ impl std::fmt::Debug for CarrierForeignPreparedWrite<'_> {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_hal::ForeignMmPreparedWrite for CarrierForeignPreparedWrite<'_> {
     fn commit(self: Box<Self>) {
+        let owner = self._owner_pin.owner();
+        let offset = (self.dst_ptr as usize)
+            .checked_sub(owner.ptr() as usize)
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvf::code_content",
+                    "prepared copy precedes its authenticated owner"
+                )
+            });
+        // Backing-wide tracking deliberately ignores publish_instruction:
+        // a non-executable writable alias can change bytes translated via RX.
+        // Keep writer admission through copy and instruction-cache publication.
+        let _content_write = owner
+            .mapping
+            .code_content
+            .begin_write(offset, self.src.len())
+            .unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvf::code_content",
+                    "prepared copy left its authenticated owner: {error:?}"
+                )
+            });
         unsafe {
             std::ptr::copy(self.src.as_ptr(), self.dst_ptr, self.src.len());
             if self.publish_instruction {
@@ -1158,7 +1209,9 @@ pub(crate) fn attest_foreign_identity_write_receipt(
             const AP_MASK: u64 = 0b11 << 6;
             const AP_USER_RW: u64 = 0b01 << 6;
             let leaf = tables.debug_walk(page_va)[3];
-            Ok((ipa, leaf & AP_MASK == AP_USER_RW))
+            // A retained output can outlive a valid mapping. AP bits alone
+            // do not authenticate a present guest leaf after unmap.
+            Ok((ipa, leaf & 1 != 0 && leaf & AP_MASK == AP_USER_RW))
         },
     )?;
     if !guest_writable
@@ -2293,8 +2346,412 @@ pub(crate) fn perform_foreign_cow_transaction(
     })
 }
 
+struct CarrierPinnedCowRange {
+    extent: (u64, u64),
+    initial_physical: u64,
+    _owner_pin: GlobalFrameOwnerPin,
+    ptr: *mut u8,
+    snapshot: CarrierForeignMmSnapshot,
+    start: carrick_guest_mem::GuestVa,
+    len: usize,
+    mapping: carrick_hal::MappingId,
+    frame: carrick_hal::FrameId,
+    owner_generation: carrick_hal::ForeignOwnerGeneration,
+}
+
+impl std::fmt::Debug for CarrierPinnedCowRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CarrierPinnedCowRange")
+            .field("start", &self.start)
+            .field("len", &self.len)
+            .field("owner_generation", &self.owner_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Only native grants retain carrier revalidation state. Ordinary prepared
+/// copies keep the original pin/receipt path without additional Arc operations.
+struct CarrierNativeDataSpan {
+    content_write: Option<super::code_content::ContentWrite<super::global_frame::OwnedCodeContent>>,
+    range: CarrierPinnedCowRange,
+    custody: std::sync::Arc<CarrierVmCustody>,
+    state: std::sync::Arc<MmAccessState>,
+    validated_stage1: Option<(carrick_aarch64::Stage1Authority, std::num::NonZeroU64)>,
+}
+impl std::fmt::Debug for CarrierNativeDataSpan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CarrierNativeDataSpan")
+            .field(&self.range)
+            .finish()
+    }
+}
+
+// SAFETY: pin_cow_range authenticates every crossed leaf and the exact live
+// owner before construction; the owner pin covers this object's full lifetime.
+unsafe impl carrick_hal::ForeignNativeDataSpan for CarrierNativeDataSpan {
+    fn authenticates(
+        &self,
+        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+        cow: &dyn carrick_hal::ForeignCowReceipt,
+        start: carrick_guest_mem::GuestVa,
+        len: usize,
+    ) -> bool {
+        self.range.snapshot.matches(snapshot)
+            && self.range.start == start
+            && self.range.len == len
+            && cow.mm() == snapshot.mm()
+            && cow.backend_revision() == snapshot.backend_revision()
+            && cow.vma_revision() == snapshot.vma_revision()
+            && cow.frame_inventory_revision() == snapshot.frame_inventory_revision()
+            && self.range.mapping == cow.mapping()
+            && self.range.frame == cow.frame()
+            && self.range.owner_generation == cow.owner_generation()
+    }
+    fn validate_native_activation(
+        &mut self,
+        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+        deadline: std::time::Instant,
+    ) -> Result<(), carrick_hal::ForeignMmTransportError> {
+        use carrick_hal::ForeignMmTransportError as Error;
+        // The kernel already authenticated the contents when it accepted this
+        // span's COW receipt, and checks its own retained snapshot before/after
+        // activation. Compare all authority revisions here without rescanning
+        // every VMA or mapping. This comparison cannot authenticate new contents.
+        if self.range.snapshot.mm != snapshot.mm()
+            || carrick_hal::ForeignMmSnapshot::binding(&self.range.snapshot) != snapshot.binding()
+            || self.range.snapshot.backend_revision != snapshot.backend_revision()
+            || self.range.snapshot.vma_revision != snapshot.vma_revision()
+            || self.range.snapshot.frame_inventory_revision != snapshot.frame_inventory_revision()
+        {
+            return Err(Error::LeaseStale);
+        }
+        if self
+            .state
+            .identity
+            .try_read_until(deadline)
+            .ok_or(Error::TimedOut)?
+            .as_ref()
+            != Some(&(self.range.snapshot.mm, self.range.snapshot.binding))
+        {
+            return Err(Error::MissingBinding);
+        }
+        let expected_generation = self.range.owner_generation.raw_for_probe();
+        let host_addr = self.range._owner_pin.owner().host_addr();
+        {
+            let inventory = self
+                .state
+                .frame_inventory
+                .ledger
+                .try_lock_until(deadline)
+                .ok_or(Error::TimedOut)?;
+            if !inventory
+                .extents
+                .get(&self.range.extent)
+                .is_some_and(|extent| {
+                    extent.mapping == self.range.mapping
+                        && extent.frame == self.range.frame
+                        && extent.stage2_base == self.range.extent.0
+                        && extent.stage2_length == self.range.extent.1
+                        && extent.stage2_owner.generation == expected_generation
+                        && extent.stage2_owner.host_addr == host_addr
+                })
+            {
+                return Err(Error::OwnerStale);
+            }
+        }
+        if !global_frame_host_owner_matches_in(
+            &self.custody,
+            self.range.extent.0,
+            self.range.extent.1,
+            host_addr,
+            expected_generation,
+        ) {
+            return Err(Error::OwnerStale);
+        }
+        if self
+            .state
+            .protections
+            .range_write_denied(self.range.start.raw(), self.range.len)
+        {
+            return Err(Error::MutationFailed);
+        }
+        let end = self
+            .range
+            .start
+            .raw()
+            .checked_add(self.range.len as u64)
+            .ok_or(Error::MutationFailed)?;
+        // Walk the LIVE page-table authority, never the retained COW snapshot.
+        // Fork can rearm read-only leaves without changing the VMA revision.
+        let page_tables = self
+            .state
+            .page_tables
+            .try_read_until(deadline)
+            .ok_or(Error::TimedOut)?;
+        let validated_generation = page_tables.try_with_manager_generation_until(
+            deadline,
+            Error::TimedOut,
+            Error::AuthorityUnavailable,
+            |tables, generation| {
+                if generation.is_some_and(|current| {
+                    self.validated_stage1
+                        .as_ref()
+                        .is_some_and(|(authority, saved)| {
+                            authority.shares_exact_authority(&page_tables) && *saved == current
+                        })
+                }) {
+                    return Ok(generation);
+                }
+                let mut cursor = self.range.start.raw();
+                while cursor < end {
+                    #[cfg(any(test, feature = "foreign-cow-test-support"))]
+                    self.state
+                        .native_activation_leaf_checks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let leaf =
+                        carrick_mem::page_table::terminal_descriptor(tables.debug_walk(cursor));
+                    let expected = self
+                        .range
+                        .initial_physical
+                        .checked_add(cursor - self.range.start.raw())
+                        .ok_or(Error::MutationFailed)?;
+                    if leaf & 1 == 0
+                        || leaf & (0b11 << 6) != (0b01 << 6)
+                        || tables.translate_retained_output(cursor) != Some(expected)
+                    {
+                        return Err(Error::MutationFailed);
+                    }
+                    cursor = end.min(
+                        (cursor & !0xfff)
+                            .checked_add(0x1000)
+                            .ok_or(Error::MutationFailed)?,
+                    );
+                }
+                Ok(generation)
+            },
+        )?;
+        if let Some(generation) = validated_generation {
+            if !self.validated_stage1.as_ref().is_some_and(|(saved, old)| {
+                saved.shares_exact_authority(&page_tables) && *old == generation
+            }) {
+                self.validated_stage1 = Some((page_tables.clone(), generation));
+            }
+        } else {
+            self.validated_stage1 = None;
+        }
+        Ok(())
+    }
+    fn finish_native_access(&mut self) {
+        self.content_write = None;
+    }
+    unsafe fn as_mut_ptr(&mut self) -> *mut u8 {
+        if self.content_write.is_none() {
+            let owner = self.range._owner_pin.owner();
+            let offset = (self.range.ptr as usize)
+                .checked_sub(owner.ptr() as usize)
+                .unwrap_or_else(|| {
+                    carrick_fatal!("hvf::code_content", "native pointer precedes pinned owner")
+                });
+            self.content_write = Some(
+                owner
+                    .mapping
+                    .begin_content_write(offset, self.range.len)
+                    .unwrap_or_else(|error| {
+                        carrick_fatal!(
+                            "hvf::code_content",
+                            "native pointer left pinned owner: {error:?}"
+                        )
+                    }),
+            );
+        }
+        self.range.ptr
+    }
+}
+
+impl CarrierForeignMmReadLease {
+    /// Shared by prepared copies and the scoped native data grant. This
+    /// authenticates the complete span and pins its exact resident owner.
+    fn pin_cow_range(
+        &self,
+        authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+        cow: &dyn carrick_hal::ForeignCowReceipt,
+        va: carrick_guest_mem::GuestVa,
+        len: usize,
+        deadline: std::time::Instant,
+    ) -> Result<CarrierPinnedCowRange, carrick_hal::ForeignMmTransportError> {
+        let requested = CarrierForeignMmSnapshot::capture(snapshot);
+        let inner = self
+            .inner
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        if requested != inner.retained {
+            return Err(carrick_hal::ForeignMmTransportError::LeaseStale);
+        }
+        if !live_snapshot_matches(authority, &requested, deadline)?
+            || cow.mm() != requested.mm
+            || cow.backend_revision() != requested.backend_revision
+            || cow.vma_revision() != requested.vma_revision
+            || cow.frame_inventory_revision() != requested.frame_inventory_revision
+            || !requested.mapping_ids.contains(&cow.mapping())
+            // A COPIED compound is always compound-sized; an IDENTITY receipt
+            // names the extent that already contains the page, whatever its
+            // size. Both shapes are pinned exactly by the ledger and owner
+            // lookups below, so the only degenerate shape to reject here is
+            // an empty extent.
+            || cow.physical_len() == 0
+        {
+            return Err(carrick_hal::ForeignMmTransportError::Retry);
+        }
+        if len == 0 {
+            return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+        }
+        let va_end = va
+            .raw()
+            .checked_add(len as u64)
+            .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+        let span_end = cow
+            .range_start()
+            .raw()
+            .checked_add(cow.range_len() as u64)
+            .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+        if va.raw() < cow.range_start().raw() || va_end > span_end {
+            return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+        }
+        let extent_key = (cow.physical_base().raw(), cow.physical_len());
+        let expected_generation = cow.owner_generation().raw_for_probe();
+        let inventory_extent = {
+            let inventory = self
+                .state
+                .frame_inventory
+                .ledger
+                .try_lock_until(deadline)
+                .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+            inventory
+                .extents
+                .get(&extent_key)
+                .copied()
+                .filter(|extent| {
+                    extent.mapping == cow.mapping()
+                        && extent.frame == cow.frame()
+                        && extent.stage2_base == extent_key.0
+                        && extent.stage2_length == extent_key.1
+                        && extent.stage2_owner.generation == expected_generation
+                })
+                .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?
+        };
+        let owner = self
+            .custody
+            .global_frame_host_owners
+            .try_lock_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?
+            .get(&extent_key)
+            .and_then(GlobalFrameOwnerEntry::live_owner)
+            .filter(|owner| {
+                owner.generation() == expected_generation
+                    && owner.host_addr() == inventory_extent.stage2_owner.host_addr
+                    && owner.length() == extent_key.1
+            })
+            .cloned()
+            .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+
+        let mut owner_generations = Vec::new();
+        let initial_physical = foreign_stage1_translate(
+            &inner.backing,
+            requested.binding.stage1_root,
+            va,
+            &mut owner_generations,
+        )?;
+        let mut cursor = va.raw();
+        let mut expected_physical = initial_physical;
+        while cursor < va_end {
+            let current_va = carrick_guest_mem::GuestVa(cursor);
+            let leaf_physical = foreign_stage1_translate(
+                &inner.backing,
+                requested.binding.stage1_root,
+                current_va,
+                &mut owner_generations,
+            )?;
+            if leaf_physical != expected_physical {
+                return Err(carrick_hal::ForeignMmTransportError::OwnerStale);
+            }
+            let bytes_in_page = 0x1000_u64 - (cursor & 0xfff);
+            let step = bytes_in_page.min(va_end - cursor);
+            cursor = cursor
+                .checked_add(step)
+                .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+            expected_physical = expected_physical
+                .checked_add(step)
+                .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+        }
+
+        let offset = initial_physical
+            .checked_sub(extent_key.0)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|offset| {
+                offset
+                    .checked_add(len)
+                    .is_some_and(|end| end <= owner.len())
+            })
+            .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+        if !live_snapshot_matches(authority, &requested, deadline)?
+            || !global_frame_host_owner_matches_in(
+                &self.custody,
+                extent_key.0,
+                extent_key.1,
+                owner.host_addr(),
+                expected_generation,
+            )
+        {
+            return Err(carrick_hal::ForeignMmTransportError::Retry);
+        }
+        let owner_pin = owner
+            .pin()
+            .map_err(|_| carrick_hal::ForeignMmTransportError::Retry)?;
+        let dst_ptr = unsafe { owner_pin.owner().as_ptr().add(offset) };
+        Ok(CarrierPinnedCowRange {
+            extent: extent_key,
+            initial_physical,
+            _owner_pin: owner_pin,
+            ptr: dst_ptr,
+            snapshot: requested,
+            start: va,
+            len,
+            mapping: cow.mapping(),
+            frame: cow.frame(),
+            owner_generation: cow.owner_generation(),
+        })
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
+    fn read_instructions(
+        &self,
+        invocation: &carrick_hal::ForeignMmInvocation,
+        authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+        va: carrick_guest_mem::GuestVa,
+        dst: &mut [u8],
+        deadline: std::time::Instant,
+    ) -> Result<Box<dyn carrick_hal::ForeignMmReadReceipt>, carrick_hal::ForeignMmTransportError>
+    {
+        instruction_read::read(self, invocation, authority, snapshot, va, dst, deadline)
+    }
+
+    fn prepare_read_window(
+        &self,
+        _invocation: &carrick_hal::ForeignMmInvocation,
+        authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+        start: carrick_guest_mem::GuestVa,
+        len: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Box<dyn carrick_hal::ForeignMmReadWindow>, carrick_hal::ForeignMmTransportError>
+    {
+        current_read::prepare(self, authority, snapshot, start, len, deadline)
+    }
+
     fn read(
         &self,
         _invocation: &carrick_hal::ForeignMmInvocation,
@@ -2351,7 +2808,7 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             ) {
                 Ok(ipa) => Some(ipa),
                 Err(carrick_hal::ForeignMmTransportError::Translation(failed_va)) => {
-                    if requested.is_readable(current_va) {
+                    if requested.deferred_backing_remaining(current_va).is_some() {
                         None
                     } else {
                         return Err(carrick_hal::ForeignMmTransportError::Translation(failed_va));
@@ -2371,12 +2828,12 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
                     chunk
                 }
                 None => {
-                    let readable_remaining = requested
-                        .readable_range(current_va)
-                        .map(|range| (range.end().raw() - current_va.raw()) as usize)
-                        .unwrap_or(page_remaining);
+                    let backing_remaining =
+                        requested.deferred_backing_remaining(current_va).ok_or(
+                            carrick_hal::ForeignMmTransportError::Translation(current_va),
+                        )?;
                     let chunk = page_remaining
-                        .min(readable_remaining)
+                        .min(backing_remaining)
                         .min(dst.len() - completed);
                     let deferred = self
                         .state
@@ -2397,6 +2854,14 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
                                 .unwrap_or(false)
                     });
                     if !copied_from_deferred {
+                        // Execute-only fetches require actual backing or an
+                        // explicit retained recipe. Do not infer code bytes
+                        // from the data-read anonymous fault-window rule.
+                        if !requested.is_readable(current_va) {
+                            return Err(carrick_hal::ForeignMmTransportError::Translation(
+                                current_va,
+                            ));
+                        }
                         // Reaching here means: inside a readable VMA, no
                         // stage-1 translation, and no pristine recipe. That
                         // combination is NOT a hole. The anonymous fault
@@ -2498,150 +2963,76 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
         }
         let publish_instruction = publication.is_required();
-        let inner = self
-            .inner
-            .try_lock_until(deadline)
-            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
-        if requested != inner.retained {
-            return Err(carrick_hal::ForeignMmTransportError::LeaseStale);
-        }
-        if !live_snapshot_matches(authority, &requested, deadline)?
-            || cow.mm() != requested.mm
-            || cow.backend_revision() != requested.backend_revision
-            || cow.vma_revision() != requested.vma_revision
-            || cow.frame_inventory_revision() != requested.frame_inventory_revision
-            || !requested.mapping_ids.contains(&cow.mapping())
-            // A COPIED compound is always compound-sized; an IDENTITY receipt
-            // names the extent that already contains the page, whatever its
-            // size. Both shapes are pinned exactly by the ledger and owner
-            // lookups below, so the only degenerate shape to reject here is
-            // an empty extent.
-            || cow.physical_len() == 0
-        {
-            return Err(carrick_hal::ForeignMmTransportError::Retry);
-        }
-        if src.is_empty() {
-            return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
-        }
-        let va_end = va
-            .raw()
-            .checked_add(src.len() as u64)
-            .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
-        let span_end = cow
-            .range_start()
-            .raw()
-            .checked_add(cow.range_len() as u64)
-            .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
-        if va.raw() < cow.range_start().raw() || va_end > span_end {
-            return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
-        }
-        let extent_key = (cow.physical_base().raw(), cow.physical_len());
-        let expected_generation = cow.owner_generation().raw_for_probe();
-        let inventory_extent = {
-            let inventory = self
-                .state
-                .frame_inventory
-                .ledger
-                .try_lock_until(deadline)
-                .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
-            inventory
-                .extents
-                .get(&extent_key)
-                .copied()
-                .filter(|extent| {
-                    extent.mapping == cow.mapping()
-                        && extent.frame == cow.frame()
-                        && extent.stage2_base == extent_key.0
-                        && extent.stage2_length == extent_key.1
-                        && extent.stage2_owner.generation == expected_generation
-                })
-                .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?
-        };
-        let owner = self
-            .custody
-            .global_frame_host_owners
-            .try_lock_until(deadline)
-            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?
-            .get(&extent_key)
-            .and_then(GlobalFrameOwnerEntry::live_owner)
-            .filter(|owner| {
-                owner.generation() == expected_generation
-                    && owner.host_addr() == inventory_extent.stage2_owner.host_addr
-                    && owner.length() == extent_key.1
-            })
-            .cloned()
-            .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
-
-        let mut owner_generations = Vec::new();
-        let initial_physical = foreign_stage1_translate(
-            &inner.backing,
-            requested.binding.stage1_root,
-            va,
-            &mut owner_generations,
-        )?;
-        let mut cursor = va.raw();
-        let mut expected_physical = initial_physical;
-        while cursor < va_end {
-            let current_va = carrick_guest_mem::GuestVa(cursor);
-            let leaf_physical = foreign_stage1_translate(
-                &inner.backing,
-                requested.binding.stage1_root,
-                current_va,
-                &mut owner_generations,
-            )?;
-            if leaf_physical != expected_physical {
-                return Err(carrick_hal::ForeignMmTransportError::OwnerStale);
-            }
-            let bytes_in_page = 0x1000_u64 - (cursor & 0xfff);
-            let step = bytes_in_page.min(va_end - cursor);
-            cursor = cursor
-                .checked_add(step)
-                .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
-            expected_physical = expected_physical
-                .checked_add(step)
-                .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
-        }
-
-        let offset = initial_physical
-            .checked_sub(extent_key.0)
-            .and_then(|offset| usize::try_from(offset).ok())
-            .filter(|offset| {
-                offset
-                    .checked_add(src.len())
-                    .is_some_and(|end| end <= owner.len())
-            })
-            .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
-        if !live_snapshot_matches(authority, &requested, deadline)?
-            || !global_frame_host_owner_matches_in(
-                &self.custody,
-                extent_key.0,
-                extent_key.1,
-                owner.host_addr(),
-                expected_generation,
-            )
-        {
-            return Err(carrick_hal::ForeignMmTransportError::Retry);
-        }
-        let owner_pin = owner
-            .pin()
-            .map_err(|_| carrick_hal::ForeignMmTransportError::Retry)?;
-        let dst_ptr = unsafe { owner_pin.owner().as_ptr().add(offset) };
+        let range = self.pin_cow_range(authority, snapshot, cow, va, src.len(), deadline)?;
         let receipt = Box::new(CarrierForeignWriteReceipt {
-            snapshot: requested,
+            snapshot: range.snapshot,
             start: va,
             len: src.len(),
-            mapping: cow.mapping(),
-            frame: cow.frame(),
-            owner_generation: cow.owner_generation(),
+            mapping: range.mapping,
+            frame: range.frame,
+            owner_generation: range.owner_generation,
             bytes_written: src.len(),
         });
         Ok(Box::new(CarrierForeignPreparedWrite {
-            _owner_pin: owner_pin,
-            dst_ptr,
+            _owner_pin: range._owner_pin,
+            dst_ptr: range.ptr,
             src,
             receipt,
             publish_instruction,
         }))
+    }
+
+    fn borrow_native_data(
+        &self,
+        _invocation: &carrick_hal::ForeignMmInvocation,
+        authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+        snapshot: &dyn carrick_hal::ForeignMmSnapshot,
+        cow: &dyn carrick_hal::ForeignCowReceipt,
+        start: carrick_guest_mem::GuestVa,
+        len: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Box<dyn carrick_hal::ForeignNativeDataSpan>, carrick_hal::ForeignMmTransportError>
+    {
+        let end = start
+            .raw()
+            .checked_add(len as u64)
+            .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+        if len == 0 || self.state.protections.range_write_denied(start.raw(), len) {
+            return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+        }
+        // A foreign-write COW receipt does not imply guest-store permission.
+        // Validate every live terminal leaf before granting a native pointer.
+        self.state.page_tables_authority().try_with_manager_until(
+            deadline,
+            carrick_hal::ForeignMmTransportError::TimedOut,
+            carrick_hal::ForeignMmTransportError::AuthorityUnavailable,
+            |tables| {
+                let mut cursor = start.raw();
+                while cursor < end {
+                    let leaf =
+                        carrick_mem::page_table::terminal_descriptor(tables.debug_walk(cursor));
+                    if leaf & 1 == 0 || leaf & (0b11 << 6) != (0b01 << 6) {
+                        return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+                    }
+                    cursor = end.min(
+                        (cursor & !0xfff)
+                            .checked_add(0x1000)
+                            .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?,
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        self.pin_cow_range(authority, snapshot, cow, start, len, deadline)
+            .map(|range| {
+                Box::new(CarrierNativeDataSpan {
+                    content_write: None,
+                    validated_stage1: None,
+                    range,
+                    custody: std::sync::Arc::clone(&self.custody),
+                    state: std::sync::Arc::clone(&self.state),
+                }) as Box<dyn carrick_hal::ForeignNativeDataSpan>
+            })
     }
 }
 
@@ -2720,6 +3111,7 @@ pub mod foreign_cow_test_support {
         pub stage1_root: carrick_guest_mem::Gpa,
         pub page_table_len: u64,
         pub data_ipa: carrick_guest_mem::Gpa,
+        pub data_va: u64,
         pub data_len: u64,
     }
 
@@ -2728,12 +3120,32 @@ pub mod foreign_cow_test_support {
             stage1_root: carrick_guest_mem::Gpa,
             data_ipa: carrick_guest_mem::Gpa,
         ) -> Result<Self, String> {
-            let tables = make_page_tables(stage1_root, data_ipa)?;
+            Self::with_data(stage1_root, data_ipa, TEST_VA, OWNER_LEN)
+        }
+
+        /// Bounded, compound-aligned physical data aperture for real ELF
+        /// fixtures. Semantic VMAs may expose only a subrange of this backing.
+        pub fn with_data(
+            stage1_root: carrick_guest_mem::Gpa,
+            data_ipa: carrick_guest_mem::Gpa,
+            data_va: u64,
+            data_len: u64,
+        ) -> Result<Self, String> {
+            if data_len == 0
+                || data_len > 2 * 1024 * 1024
+                || !data_va.is_multiple_of(OWNER_LEN)
+                || !data_len.is_multiple_of(OWNER_LEN)
+                || data_va.checked_add(data_len).is_none()
+            {
+                return Err("invalid bounded carrier fixture aperture".into());
+            }
+            let tables = make_page_tables(stage1_root, data_ipa, data_va, data_len)?;
             Ok(Self {
                 stage1_root,
                 page_table_len: tables.as_bytes().len() as u64,
                 data_ipa,
-                data_len: OWNER_LEN,
+                data_va,
+                data_len,
             })
         }
     }
@@ -2747,10 +3159,39 @@ pub mod foreign_cow_test_support {
         pub initial_bytes: [u8; 4],
     }
 
+    /// Retains the original physical owner so tests can verify COW divergence.
+    pub struct ProductionCarrierSourcePin(GlobalFrameOwnerPin);
+    impl ProductionCarrierSourcePin {
+        /// Test-only alias writer over the production backing/content guard.
+        /// This does not mint kernel mapping or executable authority.
+        pub fn write_prefix_for_test(&self, bytes: [u8; 4]) -> Result<(), String> {
+            let owner = self.0.owner();
+            let _write = owner
+                .mapping
+                .begin_content_write(0, bytes.len())
+                .map_err(|error| format!("fixture content write: {error:?}"))?;
+            // SAFETY: the exact pin and write scope retain this four-byte range.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), owner.ptr(), bytes.len());
+            }
+            Ok(())
+        }
+
+        pub fn prefix(&self) -> [u8; 4] {
+            let mut bytes = [0; 4];
+            // SAFETY: fixture data owners contain OWNER_LEN bytes and the pin
+            // retains the original owner independently of COW replacement.
+            unsafe { std::ptr::copy_nonoverlapping(self.0.owner().ptr(), bytes.as_mut_ptr(), 4) };
+            bytes
+        }
+    }
+
     pub struct ProductionCarrierForeignCowHarness {
         transport: CarrierForeignMmTransport,
         state: std::sync::Arc<MmAccessState>,
         original_extents: Vec<(u64, u64)>,
+        data_va: u64,
+        data_len: u64,
     }
 
     impl ProductionCarrierForeignCowHarness {
@@ -2776,7 +3217,12 @@ pub mod foreign_cow_test_support {
             {
                 return Err("carrier fixture rejected mismatched kernel snapshot identity".into());
             }
-            let tables = make_page_tables(shape.stage1_root, shape.data_ipa)?;
+            let tables = make_page_tables(
+                shape.stage1_root,
+                shape.data_ipa,
+                shape.data_va,
+                shape.data_len,
+            )?;
             if tables.as_bytes().len() as u64 != shape.page_table_len {
                 return Err("carrier fixture page-table shape changed".into());
             }
@@ -2857,7 +3303,7 @@ pub mod foreign_cow_test_support {
             };
             transport.register(snapshot, &state);
             register_shared_alias(AliasBacking {
-                start: TEST_VA,
+                start: shape.data_va,
                 ipa: data_key.0,
                 host_addr: data_host,
                 size: shape.data_len as usize,
@@ -2881,7 +3327,7 @@ pub mod foreign_cow_test_support {
                 .cow_armed
                 .lock()
                 .arm(&[carrick_aarch64::vmm::ForkCowRange {
-                    va: TEST_VA,
+                    va: shape.data_va,
                     len: shape.data_len as usize,
                     executable: false,
                     kernel_only: false,
@@ -2898,6 +3344,8 @@ pub mod foreign_cow_test_support {
                 transport,
                 state,
                 original_extents: vec![root_key, data_key],
+                data_va: shape.data_va,
+                data_len: shape.data_len,
             })
         }
 
@@ -2905,12 +3353,138 @@ pub mod foreign_cow_test_support {
             carrick_hal::ForeignMmEndpoint::for_carrier(std::sync::Arc::new(self.transport.clone()))
         }
 
+        pub fn pin_original_data_for_test(&self) -> Result<ProductionCarrierSourcePin, String> {
+            let owners = self.transport.custody.global_frame_host_owners.lock();
+            let owner = owners
+                .get(&self.original_extents[1])
+                .and_then(GlobalFrameOwnerEntry::live_owner)
+                .ok_or_else(|| "original data owner absent".to_owned())?;
+            owner
+                .pin()
+                .map(ProductionCarrierSourcePin)
+                .map_err(|e| format!("source owner pin: {e:?}"))
+        }
+
+        pub fn copy_owner_pins_for_test(&self) -> u64 {
+            self.state
+                .copy_owner_pins
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Counts actual terminal-leaf validations performed during activation.
+        pub fn native_activation_leaf_checks_for_test(&self) -> u64 {
+            self.state
+                .native_activation_leaf_checks
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Change the live carrier authority independently of kernel VMA revisions.
+        pub fn deny_native_data_for_test(&self, start: u64, kind: u8) -> Result<(), String> {
+            if !(self.data_va..self.data_va + self.data_len).contains(&start) {
+                return Err("fixture address outside data range".into());
+            }
+            match kind {
+                0 => self.state.page_tables_authority().edit(
+                    || Err("fixture page tables absent".to_owned()),
+                    |editor| {
+                        editor
+                            .set_readonly(start, 0x1000, false)
+                            .map(|_| ())
+                            .map_err(|e| format!("fixture readonly leaf: {e:?}"))
+                    },
+                ),
+                1 => {
+                    self.state.protections.set_no_write(start, 0x1000, true);
+                    Ok(())
+                }
+                2 => self.state.page_tables_authority().edit(
+                    || Err("fixture page tables absent".to_owned()),
+                    |editor| {
+                        editor
+                            .unmap_aliased(start, 0x1000)
+                            .map(|_| ())
+                            .map_err(|e| format!("fixture unmapped leaf: {e:?}"))
+                    },
+                ),
+                3 => {
+                    let ipa = self
+                        .state
+                        .page_tables_authority()
+                        .with_manager(|tables| tables.translate_retained_output(start))
+                        .flatten()
+                        .ok_or_else(|| "fixture data translation absent".to_owned())?;
+                    let mut ledger = self.state.frame_inventory.ledger.lock();
+                    let extent = ledger
+                        .extents
+                        .values_mut()
+                        .find(|e| e.stage2_base <= ipa && ipa - e.stage2_base < e.stage2_length)
+                        .ok_or_else(|| "fixture data extent absent".to_owned())?;
+                    extent.stage2_owner.generation = extent
+                        .stage2_owner
+                        .generation
+                        .checked_add(1)
+                        .ok_or_else(|| "fixture owner generation exhausted".to_owned())?;
+                    Ok(())
+                }
+                4 => {
+                    let old = self.state.page_tables_authority();
+                    let generation = old
+                        .try_with_manager_generation_until(
+                            std::time::Instant::now() + std::time::Duration::from_secs(1),
+                            "busy",
+                            "absent",
+                            |_, g| Ok(g),
+                        )
+                        .map_err(str::to_owned)?
+                        .ok_or("exhausted")?;
+                    let mut image = old.snapshot_image().ok_or("absent")?;
+                    image
+                        .set_readonly(start, 0x1000, false, None)
+                        .map_err(|e| format!("readonly: {e:?}"))?;
+                    let replacement =
+                        carrick_aarch64::Stage1Authority::new_with_manager(Some(image));
+                    // Deliberately collide numeric generations of DIFFERENT authorities.
+                    for _ in 1..generation.get() {
+                        replacement
+                            .edit(|| Err("absent"), |_| Ok(()))
+                            .map_err(str::to_owned)?;
+                    }
+                    *self.state.page_tables.write() = replacement;
+                    Ok(())
+                }
+                5 => self.state.page_tables_authority().edit(
+                    || Err("absent".to_owned()),
+                    |editor| {
+                        let old = editor.translate_retained_output(start).ok_or("absent")?;
+                        editor
+                            .unmap_aliased(start, 0x1000)
+                            .map_err(|e| format!("unmap: {e:?}"))?;
+                        editor
+                            .map_aliased(start, old + 0x1000, 0x1000, true)
+                            .map_err(|e| format!("remap: {e:?}"))?;
+                        Ok(())
+                    },
+                ),
+                6 => {
+                    let authority = self.state.page_tables_authority();
+                    let image = authority.snapshot_image().ok_or("absent")?;
+                    authority.restore_image(image, 0);
+                    Ok(())
+                }
+                7 => {
+                    self.state.protections.set_no_access(start, 0x1000, true);
+                    Ok(())
+                }
+                _ => Err("unknown fixture denial".into()),
+            }
+        }
+
         pub fn set_source_guest_writable_for_test(&self, writable: bool) -> Result<(), String> {
             let data_key = self.original_extents[1];
             let mut aliases = alias_registry().lock();
             let updated = aliases.update_newest_matching(
                 |alias| {
-                    alias.start == TEST_VA
+                    alias.start == self.data_va
                         && (alias.physical_ipa, alias.physical_size as u64) == data_key
                 },
                 |alias| {
@@ -2933,7 +3507,7 @@ pub mod foreign_cow_test_support {
                 || Err("production carrier page tables are absent".to_owned()),
                 |editor| {
                     editor
-                        .set_writable_preserving_attributes(TEST_VA, 0x1000)
+                        .set_writable_preserving_attributes(self.data_va, 0x1000)
                         .map_err(|error| {
                             format!("make production carrier source leaf writable: {error:?}")
                         })
@@ -2949,7 +3523,7 @@ pub mod foreign_cow_test_support {
                 .state
                 .page_tables_authority()
                 .with_manager(|tables| {
-                    carrick_mem::page_table::terminal_descriptor(tables.debug_walk(TEST_VA))
+                    carrick_mem::page_table::terminal_descriptor(tables.debug_walk(self.data_va))
                 })
                 .ok_or_else(|| "production carrier page tables are absent".to_owned())?;
             Ok(leaf & AP_MASK != AP_USER_RW)
@@ -2958,7 +3532,7 @@ pub mod foreign_cow_test_support {
         pub fn source_guest_writable_for_test(&self) -> Result<bool, String> {
             let aliases = alias_registry().lock();
             aliases
-                .newest_containing_va(TEST_VA, |alias| alias.start == TEST_VA)
+                .newest_containing_va(self.data_va, |alias| alias.start == self.data_va)
                 .map(|alias| alias.guest_writable)
                 .ok_or_else(|| "production carrier source alias is absent".to_owned())
         }
@@ -2991,6 +3565,8 @@ pub mod foreign_cow_test_support {
     fn make_page_tables(
         stage1_root: carrick_guest_mem::Gpa,
         data_ipa: carrick_guest_mem::Gpa,
+        data_va: u64,
+        data_len: u64,
     ) -> Result<crate::page_table::PageTableManager, String> {
         let mut tables = carrick_mem::page_table::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
@@ -2999,9 +3575,19 @@ pub mod foreign_cow_test_support {
         tables
             .rebase(stage1_root.0, None)
             .map_err(|error| format!("rebase carrier fixture page tables: {error:?}"))?;
-        tables
-            .map_aliased(TEST_VA, data_ipa.0, OWNER_LEN, false, None)
-            .map_err(|error| format!("map carrier fixture COW leaf: {error:?}"))?;
+        // Keep this fixture at leaf granularity even when the aperture reaches
+        // 2 MiB. Its COW setup tests independent 16 KiB compounds, not blocks.
+        for offset in (0..data_len).step_by(OWNER_LEN as usize) {
+            tables
+                .map_aliased(
+                    data_va + offset,
+                    data_ipa.0 + offset,
+                    OWNER_LEN,
+                    false,
+                    None,
+                )
+                .map_err(|error| format!("map carrier fixture COW leaf: {error:?}"))?;
+        }
         Ok(tables)
     }
 

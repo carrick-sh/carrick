@@ -1,0 +1,24 @@
+{
+  "manifest_sha256": "3cea9bd04d4c16bbf7f5f1d29bd20c839566557f3d8c917c4fda37f8143f6b5b",
+  "verified_files": [
+    "plasma-umass--coz--LICENSE.md",
+    "plasma-umass--coz--README.md",
+    "google--gvisor--LICENSE",
+    "google--gvisor--pkg--sentry--vfs--g3doc--inotify.md",
+    "DynamoRIO--dynamorio--License.txt",
+    "DynamoRIO--dynamorio--api--docs--intro.dox",
+    "DynamoRIO--dynamorio--core--arch--aarch64--emit_utils.c",
+    "google--benchmark--LICENSE",
+    "google--benchmark--docs--random_interleaving.md",
+    "google--benchmark--docs--reducing_variance.md",
+    "google--gvisor--g3doc--architecture_guide--performance.md"
+  ],
+  "preserved_failed_fetches": [
+    {
+      "repo": "google/gvisor",
+      "commit": "164b166ce347fdb6790603318db3e4cbbe76c0b0",
+      "path": "website/_docs/architecture_guide/performance.md",
+      "error": "HTTP Error 404: Not Found"
+    }
+  ]
+}

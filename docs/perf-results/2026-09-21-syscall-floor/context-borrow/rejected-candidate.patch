@@ -1,0 +1,366 @@
+--- a/conformance-contracts/surfaces.toml
++++ b/conformance-contracts/surfaces.toml
+@@ -2,7 +2,7 @@
+ 
+ [[surfaces]]
+ path = "crates/carrick-observability/src/work_meter.rs"
+-contracts = ["hvpatch.syscall.portal", "kernel.execution.native-code-density"]
++contracts = ["hvpatch.syscall.portal", "kernel.execution.native-code-density", "kernel.syscall.context-retention"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-mem/src/memory.rs"
+@@ -284,3 +284,11 @@
+ [[surfaces]]
+ path = "experiments/native-syscall-slice/src/lib.rs"
+ contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.execution.native-synchronous-syscall"]
++
++[[surfaces]]
++path = "crates/carrick-kernel/src/kernel/core.rs"
++contracts = ["kernel.syscall.context-retention"]
++
++[[surfaces]]
++path = "crates/carrick-runtime/src/vcpu_loop/mod.rs"
++contracts = ["kernel.syscall.context-retention"]
+--- a/conformance-contracts/inventory.json
++++ b/conformance-contracts/inventory.json
+@@ -404,7 +404,8 @@
+         "kernel.inotify.mark-race-hotpath",
+         "kernel.inotify.watch",
+         "kernel.inotify.watch-churn",
+-        "kernel.mm.native-syscall-buffers"
++        "kernel.mm.native-syscall-buffers",
++        "kernel.syscall.context-retention"
+       ],
+       "claims": [
+         "hvpatch.syscall.portal.scalar-boundary",
+--- a/crates/carrick-runtime/Cargo.toml
++++ b/crates/carrick-runtime/Cargo.toml
+@@ -159,12 +159,12 @@
+ 
+ [dev-dependencies]
+ carrick-conformance-contract = { path = "../carrick-conformance-contract" }
+-# Self dev-dependency: enables `test-support` on this crate's own lib when it
++# Self dev-dependency: enables test support and structural counters when it
+ # is built for an integration test (`tests/`), which sees no `cfg(test)`.
+-# `default-features = false` so it adds ONLY that feature: with the default
++# `default-features = false` so it adds ONLY those features: with the default
+ # on, a `--no-default-features --features platform-<other>` cross-check would
+ # get `platform-macos` (and carrick-vmm-hvf) re-enabled through this edge.
+-carrick-runtime = { path = ".", default-features = false, features = ["test-support"] }
++carrick-runtime = { path = ".", default-features = false, features = ["test-support", "conformance-metrics"] }
+ carrick-test-support = { path = "../carrick-test-support" }
+ # The host-open/stat/xattr amplification counters live on carrick-vfs's hot
+ # path and are compiled out of a normal build; the fs tests here assert on them.
+--- a/crates/carrick-observability/src/work_meter.rs
++++ b/crates/carrick-observability/src/work_meter.rs
+@@ -82,10 +82,12 @@
+     MmSnapshotCollections,
+     /// Physical backing owner pins acquired in the operation window.
+     ForeignOwnerPins,
++    /// Exact syscall-context snapshots retained for an ownership handoff.
++    KernelContextRetains,
+ }
+ 
+ impl WorkMetric {
+-    pub const COUNT: usize = 39;
++    pub const COUNT: usize = 40;
+     pub const ALL: [WorkMetric; Self::COUNT] = [
+         Self::KernelDispatches,
+         Self::KernelRedispatches,
+@@ -126,6 +128,7 @@
+         Self::NativeCodeWords,
+         Self::MmSnapshotCollections,
+         Self::ForeignOwnerPins,
++        Self::KernelContextRetains,
+     ];
+ }
+ 
+--- a/crates/carrick-kernel/src/kernel/core.rs
++++ b/crates/carrick-kernel/src/kernel/core.rs
+@@ -131,6 +131,13 @@
+     /// deliberately distinct from registry capture: every Arc and revision is
+     /// preserved byte-for-byte, so no newer association can be substituted.
+     pub fn retain_exact(&self) -> Self {
++        #[cfg(feature = "conformance-metrics")]
++        if let Some(scope) = self.kernel.work_scope() {
++            let _ = scope.add(
++                carrick_observability::work_meter::WorkMetric::KernelContextRetains,
++                1,
++            );
++        }
+         Self {
+             kernel: Arc::clone(&self.kernel),
+             task: Arc::clone(&self.task),
+--- a/crates/carrick-runtime/src/vcpu_loop/exec.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/exec.rs
+@@ -2549,6 +2549,159 @@
+     use std::sync::Arc;
+     use std::time::Instant;
+ 
++    #[test]
++    fn syscall_context_retention_contract() {
++        use carrick_conformance_contract::{
++            Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
++            SemanticAssertion, evaluate,
++        };
++        use carrick_observability::work_meter::WorkMeter;
++        use sha2::{Digest, Sha256};
++
++        let mut all_observations = Vec::new();
++        for redispatch in [false, true] {
++            let mut observations = Vec::new();
++            for scale in [1u64, 8, 32, 128] {
++                let events = Arc::new(Mutex::new(Vec::new()));
++                let identities = Arc::new(Mutex::new(Vec::new()));
++                let entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++                let mut dispatcher = SyscallDispatcher::new();
++                dispatcher.install_observer(Arc::new(CountingEntryObserver {
++                    entries: Arc::clone(&entries),
++                    events: Arc::clone(&events),
++                }));
++                dispatcher.install_observer(Arc::new(CompletionIdentityObserver(Arc::clone(
++                    &identities,
++                ))));
++                let pid = 72_480;
++                let (_runtime, _scheduler, kernel, root, process, _generation) =
++                    test_carrier_graph_with_dispatcher!(pid, dispatcher);
++                let this_tid = ThreadId::synthetic_for_tests(pid);
++                let kicker: Arc<dyn VcpuRegistry> =
++                    Arc::new(carrick_hal::GenericVcpuRegistry::new());
++                let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
++                let platform_factory: PlatformFutexFactory =
++                    Arc::new(|_| Arc::new(NoopPlatformFutex));
++                let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
++                    Arc::new(ThreadRegistry::new(this_tid)),
++                    Arc::new(FutexTable::new()),
++                    platform,
++                    platform_factory,
++                    kernel.process_fork_barrier.clone(),
++                    kernel.crash_capture.clone(),
++                    Some(Arc::clone(root.thread())),
++                    Some(process.pid()),
++                    root.thread().key().tid,
++                    kernel.fatal_signal.current_generation(),
++                    this_tid,
++                    Arc::new(Mutex::new(Vec::new())),
++                    Arc::clone(&kicker),
++                    carrick_hal::InGuestFlag::for_guest_thread(),
++                    1_000,
++                );
++                state.guest_execution = Some(
++                    kernel
++                        .dispatcher
++                        .enter_mm_executor_for_thread(
++                            Some(Arc::clone(root.thread())),
++                            kicker,
++                            this_tid,
++                        )
++                        .unwrap(),
++                );
++                let mut engine = CrashCaptureTestEngine::default();
++                let meter = WorkMeter::default();
++                let scope = meter.new_scope();
++                kernel.dispatcher.set_work_scope(scope.clone());
++                for _ in 0..scale {
++                    let frame = carrick_hal::RawSyscall {
++                        current_guest_sp: Some(0),
++                        number: carrick_abi::CanonicalNr(28),
++                        args: [u64::MAX, 0, 0, 0, 0, 0],
++                        guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
++                        native_number: carrick_abi::NativeNr(28),
++                    };
++                    let outcome = state
++                        .service_threaded_syscall(&kernel, &mut engine, frame, None)
++                        .unwrap();
++                    assert!(matches!(
++                        outcome,
++                        DispatchOutcome::Errno { errno }
++                            if errno == crate::linux_abi::LINUX_EBADF
++                    ));
++                    if redispatch {
++                        let outcome = state
++                            .redispatch_threaded_syscall(&kernel, &mut engine, None)
++                            .unwrap();
++                        assert!(matches!(
++                            outcome,
++                            DispatchOutcome::Errno { errno }
++                                if errno == crate::linux_abi::LINUX_EBADF
++                        ));
++                    }
++                    state
++                        .complete_errno(
++                            &mut engine,
++                            &kernel.reporter,
++                            crate::linux_abi::LINUX_EBADF,
++                        )
++                        .unwrap();
++                }
++                assert_eq!(
++                    entries.load(std::sync::atomic::Ordering::SeqCst),
++                    scale as usize
++                );
++                assert_eq!(engine.completed_syscalls, vec![-9; scale as usize]);
++                assert_eq!(
++                    *identities.lock(),
++                    vec![
++                        ObservedCompletionIdentity {
++                            pid: process.pid(),
++                            tid: root.thread().key().tid.raw(),
++                            task: root.task().key(),
++                            container: root.container().id(),
++                            value: -9,
++                        };
++                        scale as usize
++                    ],
++                );
++                observations.push(ContractObservation {
++                    contract_id: ContractId::new("kernel.syscall.context-retention").unwrap(),
++                    layer: ExecutionLayer::VmFree,
++                    implementation_revision: format!(
++                        "sha256:{:x}",
++                        Sha256::digest(include_bytes!("mod.rs"))
++                    ),
++                    fixture_identity: "unit:syscall-context-retention".into(),
++                    scale,
++                    semantic_assertions: vec![SemanticAssertion::pass(
++                        "exact_completion_identity_and_errno_with_once_only_observers",
++                    )],
++                    work: Some(scope.snapshot().unwrap()),
++                    timing: None,
++                    completeness: Completeness::Complete,
++                });
++            }
++            println!(
++                "context_retention_observations redispatch={redispatch} {}",
++                serde_json::to_string(&observations).unwrap()
++            );
++            all_observations.push(observations);
++        }
++        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++            .parent()
++            .unwrap()
++            .parent()
++            .unwrap();
++        let registry = ContractRegistry::load(repository).unwrap();
++        let contract = registry
++            .require("kernel.syscall.context-retention")
++            .unwrap();
++        for observations in all_observations {
++            evaluate(contract, &observations).unwrap();
++        }
++    }
++
+     struct CompletionOrderObserver {
+         events: Arc<Mutex<Vec<&'static str>>>,
+         returns: Arc<Mutex<Vec<i64>>>,
+--- a/crates/carrick-runtime/src/vcpu_loop/mod.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/mod.rs
+@@ -1440,14 +1440,16 @@
+                     "capture mandatory syscall kernel context: {error}"
+                 ))
+             })?;
+-        self.service_kernel_context = Some(kernel_context.retain_exact());
++        // Keep the captured entry generation in the service owner. Dispatch
++        // borrows it; only the completion handoff needs a retained snapshot.
++        let kernel_context = self.service_kernel_context.insert(kernel_context);
+         let request = SyscallRequest::from_raw(frame)
+             .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
+             .with_guest_sp_fallback(|| engine.get_reg(carrick_hal::Reg::Sp).ok());
+         let (syscall, prepared_outcome) =
+             match kernel
+                 .dispatcher
+-                .prepare_syscall(&kernel_context, request, &kernel.reporter)?
++                .prepare_syscall(kernel_context, request, &kernel.reporter)?
+             {
+                 PreparedDispatch::Invoke(syscall) => (syscall, None),
+                 PreparedDispatch::Complete { syscall, outcome } => (syscall, Some(outcome)),
+@@ -1510,8 +1512,7 @@
+                 RuntimeError::Configuration(
+                     "syscall redispatch lost exact Kernel context".to_owned(),
+                 )
+-            })?
+-            .retain_exact();
++            })?;
+         if let Some(scope) = kernel.dispatcher.work_scope() {
+             let _ = scope.add(
+                 carrick_observability::work_meter::WorkMetric::KernelRedispatches,
+@@ -1652,7 +1653,7 @@
+                                 kernel
+                                     .dispatcher
+                                     .dispatch_threaded_prepared_mutation_with_lease(
+-                                        &kernel_context,
++                                        kernel_context,
+                                         syscall,
+                                         engine,
+                                         &kernel.reporter,
+@@ -1669,7 +1670,7 @@
+                                 kernel
+                                     .dispatcher
+                                     .dispatch_threaded_prepared_mutation_with_lease(
+-                                        &kernel_context,
++                                        kernel_context,
+                                         syscall,
+                                         engine,
+                                         &kernel.reporter,
+@@ -1697,7 +1698,7 @@
+                         kernel
+                             .dispatcher
+                             .dispatch_threaded_prepared_with_mm_executor_and_lease(
+-                                &kernel_context,
++                                kernel_context,
+                                 syscall,
+                                 engine,
+                                 &kernel.reporter,
+@@ -1830,7 +1831,7 @@
+                             let refuse = |site: Site, error: String, frame| {
+                                 refuse_alias_install(
+                                     kernel,
+-                                    &kernel_context,
++                                    kernel_context,
+                                     RefuseAliasInstallSpec {
+                                         site,
+                                         guest_pid,
+@@ -1868,7 +1869,7 @@
+                             // staging order, as the registry reuse relies on. Lock order
+                             // is unchanged: the authority mutex is a leaf
+                             // (`frame_inventory.rs` never calls out while holding it).
+-                            let published = apply_alias_frame_inventory(&kernel_context, commit);
++                            let published = apply_alias_frame_inventory(kernel_context, commit);
+                             drop(registry);
+                             if let Err(error) = published {
+                                 return Err(refuse(
+--- /dev/null
++++ b/conformance-contracts/contracts/syscall-context-retention.toml
+@@ -0,0 +1,32 @@
++schema_version = 1
++id = "kernel.syscall.context-retention"
++title = "Syscall service borrows its exact entry context"
++guest_surfaces = ["kernel:syscall-completion", "syscall:inotify_rm_watch"]
++semantic_authority = ["Carrick exact task and resource generation contract", "Linux inotify_rm_watch EBADF semantics", "Carrick exactly-once syscall observer contract"]
++fixture = "unit:syscall-context-retention"
++scale_points = [1, 8, 32, 128]
++rationale = "Capture one fresh context per syscall. Service and redispatch borrow it; the completion token retains one exact snapshot for its ownership handoff. No context is cached across calls or recaptured from a newer resource generation during redispatch."
++
++[bindings]
++vm_free = "carrick-runtime::vcpu_loop::exec::tests::syscall_context_retention_contract"
++
++[bindings.unresolved]
++docker = "Fresh native ARM64 Linux full inotify09 comparison pending for this candidate; VM-free fixture asserts the documented invalid-fd result."
++embed_structural = "Full signed inotify09 and watch-lifecycle semantics qualify workload behavior, but do not directly measure context-retain counts. Focused signed validation pending for this candidate."
++embed_timing = "Uninstrumented full inotify09 paired comparison is required before retaining this optimization."
++
++[[structural_budgets]]
++kind = "affine"
++metric = "kernel_context_retains"
++base = 0
++per_unit = 1
++layers = ["vm-free"]
++rationale = "One owned exact snapshot per completion token; initial dispatch and any redispatch add no copies."
++
++[[structural_budgets]]
++kind = "affine"
++metric = "kernel_dispatches"
++base = 0
++per_unit = 1
++layers = ["vm-free"]
++rationale = "Each logical syscall is prepared and observed once even when its handler is redispatched."

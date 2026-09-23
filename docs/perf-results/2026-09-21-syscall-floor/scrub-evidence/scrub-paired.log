@@ -1,0 +1,21 @@
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.9597037920029834, "guest_timing": [[0.502, 0.084, 0.321]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.496241208005813, "guest_timing": [[1.42, 1.992, 0.676]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.7251227499946253, "guest_timing": [[2.656, 0.813, 1.541]]}
+{"name": "python-subprocess", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 26.022328542007017, "guest_timing": [[23.183, 8.891, 3.825]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.7395923750009388, "guest_timing": [[0.294, 0.06, 0.181]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.451672041992424, "guest_timing": [[1.385, 2.088, 0.699]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.818987874998129, "guest_timing": [[2.757, 0.837, 1.6]]}
+{"name": "python-subprocess", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 26.102860832994338, "guest_timing": [[23.236, 8.971, 3.782]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.3646202079980867, "guest_timing": [[0.303, 0.072, 0.189]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.3954703750059707, "guest_timing": [[1.332, 2.015, 0.645]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.843393917006324, "guest_timing": [[2.782, 0.856, 1.596]]}
+{"name": "python-subprocess", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 26.05669774999842, "guest_timing": [[23.195, 8.96, 3.763]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.49461041699396446, "guest_timing": [[0.435, 0.06, 0.321]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.4215700420027133, "guest_timing": [[1.359, 2.105, 0.648]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.723580417004996, "guest_timing": [[2.663, 0.818, 1.568]]}
+{"name": "python-subprocess", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 25.946508458000608, "guest_timing": [[23.018, 8.874, 3.661]]}
+{"name": "node-app", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 0.49019704200327396, "guest_timing": [[0.429, 0.059, 0.318]]}
+{"name": "go-build-cold", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 1.4136987079982646, "guest_timing": [[1.35, 2.056, 0.647]]}
+{"name": "python-os", "phase": "carrick", "returncode": 0, "timed_out": false, "outer_wall_s": 2.780911209003534, "guest_timing": [[2.72, 0.82, 1.592]]}
+{"name": "python-subprocess", "phase": "carrick", "returncode": -9, "timed_out": true, "outer_wall_s": 301.1490751669917, "guest_timing": []}
+Timed-out workload retained; inspect cleanup before continuing.

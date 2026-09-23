@@ -1,0 +1,43 @@
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-query v1.1.5
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling colorchoice v1.0.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstyle v1.0.14
+   Compiling clap_lex v1.1.0
+   Compiling strsim v0.11.1
+   Compiling clap_derive v4.6.1
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-vmm-hvf)
+   Compiling anstyle-parse v1.0.0
+   Compiling applevisor-sys v1.0.0
+   Compiling anstream v1.0.0
+   Compiling applevisor v1.0.0
+   Compiling clap_builder v4.6.0
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-thread)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-host-bsd)
+   Compiling clap v4.6.1
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.30s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-3c2afd032626087b)
+
+running 2 tests
+test trap::guest_memory::tests::scrub_remap_eligible_preserves_cow_query ... ok
+test trap::guest_memory::tests::scrub_remap_ineligible_needs_no_cow_query ... FAILED
+
+failures:
+
+---- trap::guest_memory::tests::scrub_remap_ineligible_needs_no_cow_query stdout ----
+
+thread 'trap::guest_memory::tests::scrub_remap_ineligible_needs_no_cow_query' (2871444) panicked at crates/carrick-vmm-hvf/src/trap/guest_memory.rs:1055:13:
+assertion `left == right` failed: ineligible remaps at scale 1
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    trap::guest_memory::tests::scrub_remap_ineligible_needs_no_cow_query
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 503 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`

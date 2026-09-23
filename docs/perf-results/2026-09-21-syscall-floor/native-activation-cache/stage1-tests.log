@@ -1,0 +1,22 @@
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-observability)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-hal)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-aarch64)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.36s
+     Running unittests src/lib.rs (target/debug/deps/carrick_aarch64-ba2877fc7054433f)
+
+running 11 tests
+test stage1_authority::tests::image_generation_exhaustion_never_reenables_reuse ... ok
+test stage1_authority::tests::stage1_authority_undo_journal_commit_and_rollback ... ok
+test stage1_authority::tests::retiring_child_authority_returns_its_image_to_the_shared_pool ... ok
+test stage1_authority::tests::exec_replacement_drops_the_retired_source_so_the_replacement_lease_installs ... ok
+test stage1_authority::tests::vfork_shares_prevents_exclusive_path_even_if_called_as_first_or_only_child ... ok
+test stage1_authority::tests::rollback_retirement_failure_quarantines_arena_address ... ok
+test stage1_authority::tests::rollback_retires_backing_before_returning_arena_to_source ... ok
+test stage1_authority::tests::rollback_returns_allocated_extension_arena_to_source ... ok
+test stage1_authority::tests::concurrent_vfork_children_share_authority_and_detach_independently ... ok
+test stage1_authority::tests::image_pool_is_bounded_and_exec_recycles_the_retired_image ... ok
+test stage1_authority::tests::image_generation_invalidates_edits_errors_restore_and_replacement ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 55 filtered out; finished in 0.05s
+

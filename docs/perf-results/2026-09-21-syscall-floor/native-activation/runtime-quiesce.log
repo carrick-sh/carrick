@@ -1,0 +1,34 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-48d4edbb97db71d0)
+
+running 27 tests
+test vcpu_loop::binding::tests::process_quiesce_callback_wakes_on_any_barrier_event ... ok
+test vcpu_loop::quiesce::pt_pause_tests::deferred_process_fork_parks_on_the_admission_epoch ... ok
+test vcpu_loop::quiesce::pt_pause_tests::exact_mm_pause_drains_distinct_dispatcher_registries_and_blocks_admission ... ok
+test vcpu_loop::quiesce::pt_pause_tests::foreign_cow_active_target_acks_then_inactive_caller_resident_defers_to_reentry ... ok
+test vcpu_loop::quiesce::pt_pause_tests::foreign_cow_vcpu_budget_one_full_occupancy_never_waits_on_caller_worker_self_ack ... ok
+test vcpu_loop::quiesce::pt_pause_tests::fork_lease_wait_wakes_on_terminal_unregister_without_barrier_progress ... ok
+test vcpu_loop::quiesce::pt_pause_tests::fork_owner_can_retry_while_its_barrier_remains_raised ... ok
+test vcpu_loop::quiesce::pt_pause_tests::fork_release_lowers_barriers_before_thaw_callback ... ok
+test vcpu_loop::quiesce::pt_pause_tests::fork_reservation_task_busy_is_retried_on_the_reservation_epoch ... ok
+test vcpu_loop::quiesce::pt_pause_tests::inventory_guard_abandons_unpublished_runtime_reservation ... ok
+test vcpu_loop::quiesce::pt_pause_tests::losing_hvpatch_fork_does_not_enroll_clone_admission ... ok
+test vcpu_loop::quiesce::pt_pause_tests::mm_mutation_alias_waiter_cannot_enter_inner_before_real_pt_pause ... ok
+test vcpu_loop::quiesce::pt_pause_tests::nested_frame_cow_borrows_exact_mm_lease_and_extends_real_pause ... ok
+test vcpu_loop::quiesce::pt_pause_tests::process_fork_behind_a_sibling_fork_close_is_deferred_with_the_barrier_released ... ok
+test vcpu_loop::quiesce::pt_pause_tests::process_fork_close_retry_parks_on_the_admission_epoch ... ok
+test vcpu_loop::quiesce::pt_pause_tests::process_fork_install_pauses_peer_executors_instead_of_eagain ... ok
+test vcpu_loop::quiesce::pt_pause_tests::process_fork_loser_waits_on_the_fork_token_not_the_quiesce ... ok
+test vcpu_loop::quiesce::pt_pause_tests::process_fork_uses_identity_lease_subscription ... ok
+test vcpu_loop::quiesce::pt_pause_tests::pt_pause_drain_sees_a_sibling_that_reregistered_after_a_block ... ok
+test vcpu_loop::quiesce::pt_pause_tests::pt_pause_election_timeout_gives_up_without_disturbing_the_coordinator ... ok
+test vcpu_loop::quiesce::pt_pause_tests::pt_pause_exact_drain_returns_guard_and_allows_backend ... ok
+test vcpu_loop::quiesce::pt_pause_tests::pt_pause_probe_abi_and_dtrace_contract ... ok
+test vcpu_loop::quiesce::pt_pause_tests::pt_pause_timeout_skips_backend_and_resumes_parked_sibling ... ok
+test vcpu_loop::quiesce::pt_pause_tests::raised_pt_pause_denies_guest_reentry_until_guard_releases ... ok
+test vcpu_loop::quiesce::pt_pause_tests::shared_mm_fork_admits_against_exec_reservations_before_kernel_publication ... ok
+test vcpu_loop::quiesce::pt_pause_tests::standalone_frame_cow_sole_witness_blocks_exact_mm_admission ... ok
+test vcpu_loop::quiesce::pt_pause_tests::two_parents_fork_concurrently ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 581 filtered out; finished in 0.25s
+

@@ -1,0 +1,69 @@
+[package]
+name = "carrick-vmm-hvf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_vmm_hvf"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+# Debug-only tracing / stat dumps (compile-gated, default OFF). A stock build
+# compiles these out entirely; build with the feature for the stderr output.
+# HVF trap-handler dumps: guest regs (REGS), stage-2 maps (MAPS), EL0 faults.
+trace-hvf = []
+# Verbose per-syscall stderr line from the always-on compat reporter.
+trace-syscalls = []
+# Alias-remap + signal-kick stat dumps to stderr. The atomic counters and the
+# USDT probes stay always-on; only the stderr dump is gated.
+debug-stats = []
+# Narrow host-test seam for composing the real carrier foreign-MM transport
+# with carrick-runtime's private kernel authority. It exports no production
+# constructors and is enabled only by the runtime's dev-dependency.
+foreign-cow-test-support = []
+
+[dependencies]
+carrick-abi = { path = "../carrick-abi" }
+carrick-aarch64 = { path = "../carrick-aarch64" }
+carrick-hal = { path = "../carrick-hal" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-host = { path = "../carrick-host" }
+carrick-kernel-arena = { path = "../carrick-kernel-arena" }
+carrick-mem = { path = "../carrick-mem" }
+carrick-observability = { path = "../carrick-observability" }
+carrick-signal-core = { path = "../carrick-signal-core" }
+carrick-timer-core = { path = "../carrick-timer-core" }
+carrick-thread = { path = "../carrick-thread" }
+carrick-fatal.workspace = true
+clap.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+parking_lot_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Deferred-COW receipt bookkeeping reports which repointer voided which
+# receipt; a stale receipt failing its authentication is only ever visible to
+# the guest as `mmap` -> MAP_FAILED, so the backend has to say so itself.
+tracing.workspace = true
+usdt.workspace = true
+zerocopy.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+applevisor.workspace = true
+applevisor-sys.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
+carrick-host-bsd = { path = "../carrick-host-bsd" }
+
+# Unconditional on purpose: build scripts compile on the HOST, so a
+# target-cfg'd build-dep vanishes when cross-CHECKING the darwin lane from a
+# non-mac box (the FreeBSD native-lane rig validates macOS Rust via
+# `cargo check --target aarch64-apple-darwin`). build.rs still gates the
+# actual C compile on the macos/aarch64 target.
+[build-dependencies]
+cc = "1"

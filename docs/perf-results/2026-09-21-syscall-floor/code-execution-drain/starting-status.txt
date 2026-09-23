@@ -1,0 +1,137 @@
+ M AGENTS.md
+ M Cargo.lock
+ M Cargo.toml
+ M conformance-contracts/inventory.json
+ M conformance-contracts/surfaces.toml
+ M conformance-probes/src/bin/perf_inotify09_scale.rs
+ M conformance-probes/src/bin/writeseek.rs
+ M crates/carrick-aarch64/Cargo.toml
+ M crates/carrick-aarch64/src/engine.rs
+ M crates/carrick-aarch64/src/lib.rs
+ M crates/carrick-aarch64/src/stage1_authority.rs
+ M crates/carrick-aarch64/src/vmm.rs
+ M crates/carrick-cli/src/commands.rs
+ M crates/carrick-cli/src/main.rs
+ M crates/carrick-cli/src/trace_profile.rs
+ M crates/carrick-cli/tests/probe-oracle/arm64-gnu/writeseek
+ M crates/carrick-cli/tests/probe-oracle/arm64-musl/writeseek
+ M crates/carrick-cli/tests/trace_profile.rs
+ M crates/carrick-conformance-contract/tests/claims.rs
+ M crates/carrick-conformance-contract/tests/evaluate.rs
+ M crates/carrick-conformance-next/tests/deferred_anonymous.rs
+ M crates/carrick-guest-mem/src/lib.rs
+ M crates/carrick-hal/src/foreign_mm.rs
+ M crates/carrick-hal/src/lib.rs
+ M crates/carrick-hal/src/threaded.rs
+ M crates/carrick-hal/src/trap.rs
+ M crates/carrick-hal/src/x8664_arch.rs
+ M crates/carrick-kernel-example/Cargo.toml
+ M crates/carrick-kernel-example/src/contracts.rs
+ M crates/carrick-kernel-example/tests/contracts.rs
+ M crates/carrick-kernel/Cargo.toml
+ M crates/carrick-kernel/src/dispatch/fd_table.rs
+ M crates/carrick-kernel/src/dispatch/format_stat.rs
+ M crates/carrick-kernel/src/dispatch/fs/locks.rs
+ M crates/carrick-kernel/src/dispatch/fs/lookup.rs
+ M crates/carrick-kernel/src/dispatch/fs/notify.rs
+ M crates/carrick-kernel/src/dispatch/fs/rw.rs
+ M crates/carrick-kernel/src/dispatch/fs/stat.rs
+ M crates/carrick-kernel/src/dispatch/fs/tests.rs
+ M crates/carrick-kernel/src/dispatch/mem/madvise.rs
+ M crates/carrick-kernel/src/dispatch/mem/madvise/tests.rs
+ M crates/carrick-kernel/src/dispatch/mem/tests.rs
+ M crates/carrick-kernel/src/dispatch/mm_authority.rs
+ M crates/carrick-kernel/src/dispatch/mm_mutation.rs
+ M crates/carrick-kernel/src/dispatch/mm_quiesce.rs
+ M crates/carrick-kernel/src/dispatch/mod.rs
+ M crates/carrick-kernel/src/dispatch/net.rs
+ M crates/carrick-kernel/src/dispatch/net/send_recv.rs
+ M crates/carrick-kernel/src/dispatch/request.rs
+ M crates/carrick-kernel/src/dispatch/rootfs_helpers.rs
+ M crates/carrick-kernel/src/dispatch/tests.rs
+ M crates/carrick-kernel/src/inotify.rs
+ M crates/carrick-kernel/src/kernel/address.rs
+ M crates/carrick-kernel/src/kernel/frame_inventory.rs
+ M crates/carrick-kernel/src/kernel/guest_execution.rs
+ M crates/carrick-kernel/src/kernel/mm_access.rs
+ M crates/carrick-kernel/src/kernel/mod.rs
+ M crates/carrick-kernel/tests/integration/syscall_fs_rw.rs
+ M crates/carrick-observability/src/probes.rs
+ M crates/carrick-observability/src/work_meter.rs
+ M crates/carrick-runtime/Cargo.toml
+ M crates/carrick-runtime/src/hvpatch/stage1_mm.rs
+ M crates/carrick-runtime/src/runtime.rs
+ M crates/carrick-runtime/src/vcpu_loop/binding.rs
+ M crates/carrick-runtime/src/vcpu_loop/exec.rs
+ M crates/carrick-runtime/src/vcpu_loop/executor/tests.rs
+ M crates/carrick-runtime/src/vcpu_loop/memory.rs
+ M crates/carrick-runtime/src/vcpu_loop/mod.rs
+ M crates/carrick-runtime/tests/runtime_loop.rs
+ M crates/carrick-runtime/tests/syscall_process.rs
+ M crates/carrick-vmm-hvf/Cargo.toml
+ M crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs
+ M crates/carrick-vmm-hvf/src/trap.rs
+ M crates/carrick-vmm-hvf/src/trap/cow_engine.rs
+ M crates/carrick-vmm-hvf/src/trap/foreign_mm.rs
+ M crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs
+ M crates/carrick-vmm-hvf/src/trap/global_frame.rs
+ M crates/carrick-vmm-hvf/src/trap/guest_memory.rs
+ M crates/carrick-vmm-hvf/src/trap/memory_protection.rs
+ M crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs
+ M crates/carrick-vmm-kvm/src/kvm_aarch64_engine.rs
+ M docs/diagnostics-and-debugging.md
+?? conformance-contracts/contracts/anonymous-discard-edges.toml
+?? conformance-contracts/contracts/anonymous-discard-no-scrub.toml
+?? conformance-contracts/contracts/anonymous-discard.toml
+?? conformance-contracts/contracts/current-read-reuse.toml
+?? conformance-contracts/contracts/executor-admission.toml
+?? conformance-contracts/contracts/fresh-publication-maintenance.toml
+?? conformance-contracts/contracts/inotify-watch-churn.toml
+?? conformance-contracts/contracts/native-code-content.toml
+?? conformance-contracts/contracts/native-code-density.toml
+?? conformance-contracts/contracts/native-data-activation.toml
+?? conformance-contracts/contracts/native-data-demand.toml
+?? conformance-contracts/contracts/native-execution-scope.toml
+?? conformance-contracts/contracts/native-synchronous-syscall.toml
+?? conformance-contracts/contracts/native-syscall-buffers.toml
+?? conformance-contracts/contracts/retained-fragment-query.toml
+?? conformance-contracts/contracts/scrub-remap-query.toml
+?? conformance-contracts/contracts/signal-lease-gap.toml
+?? conformance-contracts/contracts/stat-allocation.toml
+?? conformance-contracts/contracts/syscall-captured-stack.toml
+?? conformance-contracts/contracts/syscall-code-write.toml
+?? crates/carrick-aarch64/src/anonymous_discard.rs
+?? crates/carrick-cli/src/hvpatch_inotify_population_profile.rs
+?? crates/carrick-cli/tests/fixtures/inotify09-population-complete.raw
+?? crates/carrick-conformance-next/tests/fixtures/
+?? crates/carrick-conformance-next/tests/inotify_lifecycle.rs
+?? crates/carrick-conformance-next/tests/signal_lease_gap.rs
+?? crates/carrick-conformance-next/tests/syscall_write_destinations.rs
+?? crates/carrick-conformance-next/tests/write_seek_lease.rs
+?? crates/carrick-kernel-example/src/bin/kernel-syscall-floor.rs
+?? crates/carrick-kernel-example/src/bin/kernel-syscall-floor/
+?? crates/carrick-kernel-example/tests/native_execution_scope.rs
+?? crates/carrick-kernel/src/dispatch/native_execution.rs
+?? crates/carrick-kernel/src/dispatch/native_execution/
+?? crates/carrick-kernel/src/kernel/mm_access/current_read.rs
+?? crates/carrick-runtime/src/vcpu_loop/memory/
+?? crates/carrick-vmm-hvf/src/trap/code_content.rs
+?? crates/carrick-vmm-hvf/src/trap/foreign_mm/current_read.rs
+?? crates/carrick-vmm-hvf/src/trap/foreign_mm/instruction_read.rs
+?? crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/
+?? crates/carrick-vmm-hvf/src/trap/host_writes.rs
+?? docs/perf-results/2026-09-21-syscall-floor/
+?? experiments/
+?? scripts/bpftrace/oracle-syscall-mix.bt
+?? scripts/dtrace/hvpatch-inotify-transport-control.d
+?? scripts/dtrace/hvpatch-inotify09-completed-population.d
+?? scripts/dtrace/hvpatch-madvise-discard-outcomes.d
+?? scripts/dtrace/hvpatch-madvise-shape.d
+?? scripts/dtrace/hvpatch-node-child-stages.d
+?? scripts/dtrace/hvpatch-stage1-maintenance-callers.d
+?? scripts/dtrace/hvpatch-syscall-population.d
+?? scripts/dtrace/hvpatch-syscall-service-budget.d
+?? scripts/dtrace/hvpatch-topology-caller-budget.d
+?? scripts/dtrace/hvpatch-topology-operation-budget.d
+?? scripts/perf/io-floor.c
+?? scripts/perf/io_floor.py

@@ -1,0 +1,43 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-kernel)
+error[E0599]: no method named `fetch_instruction_bytes` found for struct `kernel::core::KernelContext` in the current scope
+    --> crates/carrick-kernel/src/kernel/mm_access.rs:1880:31
+     |
+1880 |         assert!(matches!(root.fetch_instruction_bytes(&execution, GuestVa(0x1000), 4),
+     |                               ^^^^^^^^^^^^^^^^^^^^^^^ method not found in `kernel::core::KernelContext`
+     |
+    ::: crates/carrick-kernel/src/kernel/core.rs:31:1
+     |
+  31 | pub struct KernelContext {
+     | ------------------------ method `fetch_instruction_bytes` not found for this struct
+
+error[E0599]: no variant named `ExecuteDenied` found for enum `MmAccessError`
+    --> crates/carrick-kernel/src/kernel/mm_access.rs:1881:32
+     |
+1162 | pub enum MmAccessError {
+     | ---------------------- variant `ExecuteDenied` not found here
+...
+1881 |             Err(MmAccessError::ExecuteDenied { address: GuestVa(0x1000) })));
+     |                                ^^^^^^^^^^^^^ variant not found in `MmAccessError`
+
+error[E0599]: no method named `fetch_instruction_bytes` found for struct `kernel::core::KernelContext` in the current scope
+    --> crates/carrick-kernel/src/kernel/mm_access.rs:1897:26
+     |
+1897 |         let read = child.fetch_instruction_bytes(&execution, GuestVa(0x3000), 4).unwrap();
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^ method not found in `kernel::core::KernelContext`
+     |
+    ::: crates/carrick-kernel/src/kernel/core.rs:31:1
+     |
+  31 | pub struct KernelContext {
+     | ------------------------ method `fetch_instruction_bytes` not found for this struct
+
+error[E0599]: no variant, associated function, or constant named `StaleInstructionRead` found for enum `MmAccessError` in the current scope
+    --> crates/carrick-kernel/src/kernel/mm_access.rs:1901:70
+     |
+1162 | pub enum MmAccessError {
+     | ---------------------- variant, associated function, or constant `StaleInstructionRead` not found for this enum
+...
+1901 |         assert!(matches!(read.validate_mapping(), Err(MmAccessError::StaleInstructionRead)));
+     |                                                                      ^^^^^^^^^^^^^^^^^^^^ variant, associated function, or constant not found in `MmAccessError`
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `carrick-kernel` (lib test) due to 4 previous errors

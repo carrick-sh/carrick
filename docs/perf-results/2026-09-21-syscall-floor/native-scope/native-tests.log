@@ -1,0 +1,32 @@
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.42s
+     Running unittests src/lib.rs (target/debug/deps/native_syscall_slice-4e8c9b42f6aa82f5)
+
+running 11 tests
+test tests::accepts_real_syscall_and_integer_instructions ... ok
+test tests::rejects_host_register_stack_and_system_instructions ... ok
+test tests::bounded_native_loop_does_not_call_rust_per_iteration ... ok
+test tests::backward_edges_are_bounded_and_tls_is_virtual ... ok
+test tests::native_integer_syscalls_preserve_registers_vectors_and_flags ... ok
+test tests::same_va_isolation_permissions_and_revocation ... ok
+test tests::executable_revocation_and_wrong_publication_stop_before_resume ... ok
+test tests::native_memory_work_budget ... ok
+test tests::native_data_borrow_refresh_and_revocation_before_resume ... ok
+test tests::native_memory_misses_preserve_fault_state_and_permissions ... ok
+test tests::native_scalar_access_all_registers_matches_checked_memory ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running unittests src/main.rs (target/debug/deps/native_syscall_slice-8e869796f7e9e668)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/scoped_execution.rs (target/debug/deps/scoped_execution-970860897887a6fc)
+
+running 1 test
+test scoped_execution_preserves_all_five_elf_controls ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+

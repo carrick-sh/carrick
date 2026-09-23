@@ -1,0 +1,1826 @@
+--- a/conformance-contracts/inventory.json
++++ b/conformance-contracts/inventory.json
+@@ -871,6 +871,7 @@
+         "kernel.inotify.readiness",
+         "kernel.inotify.watch-churn",
+         "kernel.mm.native-syscall-buffers",
++        "kernel.mm.syscall-code-write",
+         "kernel.scheduler.host-wait-handoff"
+       ],
+       "claims": [
+@@ -908,7 +909,9 @@
+       "support": "bring_up",
+       "handler": "filesystem",
+       "authority": "host",
+-      "contracts": [],
++      "contracts": [
++        "kernel.mm.syscall-code-write"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"
+@@ -930,6 +933,21 @@
+     {
+       "number": 67,
+       "name": "pread64",
++      "group": "fs",
++      "support": "bring_up",
++      "handler": "filesystem",
++      "authority": "host",
++      "contracts": [
++        "kernel.mm.syscall-code-write",
++        "kernel.scheduler.host-wait-handoff"
++      ],
++      "claims": [
++        "kernel.scheduler.host-wait-handoff.zero-migration"
++      ]
++    },
++    {
++      "number": 68,
++      "name": "pwrite64",
+       "group": "fs",
+       "support": "bring_up",
+       "handler": "filesystem",
+@@ -942,27 +960,15 @@
+       ]
+     },
+     {
+-      "number": 68,
+-      "name": "pwrite64",
+-      "group": "fs",
+-      "support": "bring_up",
+-      "handler": "filesystem",
+-      "authority": "host",
+-      "contracts": [
+-        "kernel.scheduler.host-wait-handoff"
+-      ],
+-      "claims": [
+-        "kernel.scheduler.host-wait-handoff.zero-migration"
+-      ]
+-    },
+-    {
+       "number": 69,
+       "name": "preadv",
+       "group": "fs",
+       "support": "bring_up",
+       "handler": "filesystem",
+       "authority": "host",
+-      "contracts": [],
++      "contracts": [
++        "kernel.mm.syscall-code-write"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"
+@@ -2776,7 +2782,9 @@
+       "support": "bring_up",
+       "handler": "network",
+       "authority": "host",
+-      "contracts": [],
++      "contracts": [
++        "kernel.mm.syscall-code-write"
++      ],
+       "claims": [],
+       "uncovered_behaviors": [
+         "emulated in bring-up without explicit contract claim"
+--- a/conformance-contracts/surfaces.toml
++++ b/conformance-contracts/surfaces.toml
+@@ -74,7 +74,7 @@
+ 
+ [[surfaces]]
+ path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs"
+-contracts = ["kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration"]
++contracts = ["kernel.mm.syscall-code-write", "kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-mem/src/vdso.rs"
+@@ -94,7 +94,7 @@
+ 
+ [[surfaces]]
+ path = "crates/carrick-aarch64/src/engine.rs"
+-contracts = ["kernel.fork.stage1-image"]
++contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-mem/src/page_table.rs"
+@@ -122,7 +122,7 @@
+ 
+ [[surfaces]]
+ path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs"
+-contracts = ["kernel.fork.stage1-image"]
++contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image"]
+ 
+ [[surfaces]]
+ path = "crates/carrick-vmm-hvf/src/trap.rs"
+@@ -316,3 +316,51 @@
+ [[surfaces]]
+ path = "crates/carrick-runtime/src/vcpu_loop/memory.rs"
+ contracts = ["kernel.mm.native-code-content"]
++
++[[surfaces]]
++path = "crates/carrick-vmm-hvf/src/trap/host_writes.rs"
++contracts = ["kernel.mm.syscall-code-write"]
++
++[[surfaces]]
++path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs"
++contracts = ["kernel.mm.syscall-code-write"]
++
++[[surfaces]]
++path = "crates/carrick-kernel/tests/integration/syscall_fs_rw.rs"
++contracts = ["kernel.mm.syscall-code-write"]
++
++[[surfaces]]
++path = "crates/carrick-guest-mem/src/lib.rs"
++contracts = ["kernel.mm.syscall-code-write"]
++
++[[surfaces]]
++path = "crates/carrick-aarch64/src/vmm.rs"
++contracts = ["kernel.mm.syscall-code-write"]
++
++[[surfaces]]
++path = "crates/carrick-vmm-hvf/src/trap/guest_memory.rs"
++contracts = ["kernel.mm.syscall-code-write"]
++
++[[surfaces]]
++path = "crates/carrick-kernel/src/dispatch/fs/rw.rs"
++contracts = ["kernel.mm.syscall-code-write"]
++
++[[surfaces]]
++path = "crates/carrick-kernel/src/dispatch/fs/tests.rs"
++contracts = ["kernel.mm.syscall-code-write"]
++
++[[surfaces]]
++path = "crates/carrick-kernel/src/dispatch/net/send_recv.rs"
++contracts = ["kernel.mm.syscall-code-write"]
++
++[[surfaces]]
++path = "crates/carrick-runtime/src/runtime.rs"
++contracts = ["kernel.mm.syscall-code-write"]
++
++[[surfaces]]
++path = "crates/carrick-conformance-next/tests/syscall_write_destinations.rs"
++contracts = ["kernel.mm.syscall-code-write"]
++
++[[surfaces]]
++path = "crates/carrick-conformance-next/tests/fixtures/syscall_write_destinations.py"
++contracts = ["kernel.mm.syscall-code-write"]
+--- a/crates/carrick-aarch64/src/engine.rs
++++ b/crates/carrick-aarch64/src/engine.rs
+@@ -862,7 +862,13 @@
+                 return None;
+             }
+             read_bytes
+-        } else if let Some(host_ptr) = self.vm.host_ptr_for_write(buf_gva, count) {
++        } else if let Some(host_ptr) = self.host_ptr_for_write(buf_gva, count) {
++            let ranges = [carrick_guest_mem::HostWriteRange {
++                guest: GuestVa(buf_gva),
++                len: count,
++                host: carrick_guest_mem::HostVa(host_ptr as usize),
++            }];
++            let _host_write = carrick_guest_mem::HostWriteGuard::new(self, &ranges).ok()?;
+             let read = unsafe {
+                 libc::pread(
+                     host_fd,
+@@ -2011,6 +2017,16 @@
+         self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::GuestVisible)
+             .ok()?;
+         self.vm.host_ptr_for_write(address, len)
++    }
++
++    fn begin_host_write(
++        &mut self,
++        ranges: &[carrick_guest_mem::HostWriteRange],
++    ) -> Result<(), MemoryError> {
++        self.vm.begin_host_write(ranges)
++    }
++    fn finish_host_write(&mut self, ranges: &[carrick_guest_mem::HostWriteRange]) {
++        self.vm.finish_host_write(ranges);
+     }
+ 
+     /// Record/clear a PROT_NONE range so syscall buffers there fault (EFAULT). This
+--- a/crates/carrick-aarch64/src/vmm.rs
++++ b/crates/carrick-aarch64/src/vmm.rs
+@@ -969,6 +969,16 @@
+         None
+     }
+ 
++    /// See GuestMemory's raw-destination bracket. Backends with content
++    /// dependencies retain exact backing and revoke before host writes start.
++    fn begin_host_write(
++        &mut self,
++        _ranges: &[carrick_guest_mem::HostWriteRange],
++    ) -> Result<(), MemoryError> {
++        Ok(())
++    }
++    fn finish_host_write(&mut self, _ranges: &[carrick_guest_mem::HostWriteRange]) {}
++
+     // ── vCPU lifecycle ──
+ 
+     /// Create a fresh vCPU bound to this VM.
+--- a/crates/carrick-guest-mem/src/lib.rs
++++ b/crates/carrick-guest-mem/src/lib.rs
+@@ -948,13 +948,15 @@
+         None
+     }
+ 
+-    /// Begin/end a kernel-write bracket for mutable guest ranges whose raw host
+-    /// pointers are about to be passed to one host syscall. Native translation
+-    /// backends use an odd/even generation protocol so an exclusive reservation
+-    /// cannot be created or committed while the kernel may be mutating memory.
+-    /// Callers must use [`HostWriteGuard`] rather than pairing these manually.
+-    fn begin_host_write(&mut self, _ranges: &[(u64, usize)]) {}
+-    fn finish_host_write(&mut self, _ranges: &[(u64, usize)]) {}
++    /// Retain and admit the exact raw destinations passed to one host syscall.
++    /// Backends authenticate both the guest range and selected host address;
++    /// stale pointers must fail before the host syscall can consume input.
++    /// Callers must use [`HostWriteGuard`]. Finish must undo partial admission
++    /// too: the guard calls it on error and unwind from begin.
++    fn begin_host_write(&mut self, _ranges: &[HostWriteRange]) -> Result<(), MemoryError> {
++        Ok(())
++    }
++    fn finish_host_write(&mut self, _ranges: &[HostWriteRange]) {}
+ }
+ 
+ /// Marker trait for guest memory views that genuinely represent the currently
+@@ -966,18 +968,28 @@
+ /// explicitly.
+ pub trait CurrentMmMemory: GuestMemory {}
+ 
++/// One already-resolved zero-copy destination. This is a request, not a grant;
++/// constructing it does not authorize a write or retain its backing.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct HostWriteRange {
++    pub guest: GuestVa,
++    pub len: usize,
++    pub host: HostVa,
++}
++
+ /// Panic-safe lifetime bracket for a host syscall that may write through raw
+ /// guest-memory pointers. Construction marks every exposed range in progress;
+ /// Drop always closes the bracket, including `?`, early return, and unwind paths.
+ pub struct HostWriteGuard<'a, M: GuestMemory + ?Sized> {
+     memory: &'a mut M,
+-    ranges: &'a [(u64, usize)],
++    ranges: &'a [HostWriteRange],
+ }
+ 
+ impl<'a, M: GuestMemory + ?Sized> HostWriteGuard<'a, M> {
+-    pub fn new(memory: &'a mut M, ranges: &'a [(u64, usize)]) -> Self {
+-        memory.begin_host_write(ranges);
+-        Self { memory, ranges }
++    pub fn new(memory: &'a mut M, ranges: &'a [HostWriteRange]) -> Result<Self, MemoryError> {
++        let guard = Self { memory, ranges };
++        guard.memory.begin_host_write(ranges)?;
++        Ok(guard)
+     }
+ }
+ 
+--- a/crates/carrick-kernel/src/dispatch/fs/rw.rs
++++ b/crates/carrick-kernel/src/dispatch/fs/rw.rs
+@@ -93,7 +93,7 @@
+ 
+ struct PreparedReadvTargets {
+     host_iovecs: Vec<libc::iovec>,
+-    guest_ranges: Vec<(u64, usize)>,
++    guest_ranges: Vec<carrick_guest_mem::HostWriteRange>,
+ }
+ 
+ fn prepare_readv_targets(
+@@ -114,7 +114,11 @@
+             iov_base: ptr as *mut libc::c_void,
+             iov_len,
+         });
+-        guest_ranges.push((iovec.iov_base, iov_len));
++        guest_ranges.push(carrick_guest_mem::HostWriteRange {
++            guest: carrick_guest_mem::GuestVa(iovec.iov_base),
++            len: iov_len,
++            host: carrick_guest_mem::HostVa(ptr as usize),
++        });
+     }
+     Ok(Some(PreparedReadvTargets {
+         host_iovecs: borrowed_iovecs,
+@@ -1492,7 +1496,7 @@
+                             let _host_write = carrick_guest_mem::HostWriteGuard::new(
+                                 memory,
+                                 &targets.guest_ranges,
+-                            );
++                            ).map_err(|_| LINUX_EFAULT)?;
+                             unsafe { libc::readv(hfd, targets.host_iovecs.as_ptr(), iovcnt) }
+                         };
+                         let n = n.host_syscall_errno()?;
+@@ -1985,7 +1989,7 @@
+                             let _host_write = carrick_guest_mem::HostWriteGuard::new(
+                                 memory,
+                                 &targets.guest_ranges,
+-                            );
++                            ).map_err(|_| LINUX_EFAULT)?;
+                             unsafe {
+                                 if read_at_current {
+                                     libc::readv(hfd, targets.host_iovecs.as_ptr(), iovcnt)
+--- a/crates/carrick-kernel/src/dispatch/fs/tests.rs
++++ b/crates/carrick-kernel/src/dispatch/fs/tests.rs
+@@ -1236,8 +1236,8 @@
+ 
+ #[derive(Default)]
+ struct HostWriteEvents {
+-    begins: Vec<Vec<(u64, usize)>>,
+-    finishes: Vec<Vec<(u64, usize)>>,
++    begins: Vec<Vec<carrick_guest_mem::HostWriteRange>>,
++    finishes: Vec<Vec<carrick_guest_mem::HostWriteRange>>,
+ }
+ 
+ impl GuestMemory for HostWriteEvents {
+@@ -1252,18 +1252,23 @@
+         })
+     }
+ 
+-    fn begin_host_write(&mut self, ranges: &[(u64, usize)]) {
++    fn begin_host_write(
++        &mut self,
++        ranges: &[carrick_guest_mem::HostWriteRange],
++    ) -> Result<(), MemoryError> {
+         self.begins.push(ranges.to_vec());
++        Ok(())
+     }
+ 
+-    fn finish_host_write(&mut self, ranges: &[(u64, usize)]) {
++    fn finish_host_write(&mut self, ranges: &[carrick_guest_mem::HostWriteRange]) {
+         self.finishes.push(ranges.to_vec());
+     }
+ }
+ 
+ fn fail_with_readv_host_write_guard(memory: &mut HostWriteEvents) -> Result<(), LinuxErrno> {
+-    let ranges = [(0x1000, 0x1000), (0x5000, 0x1000)];
+-    let _guard = carrick_guest_mem::HostWriteGuard::new(memory, &ranges);
++    let ranges = test_host_write_ranges();
++    let _guard =
++        carrick_guest_mem::HostWriteGuard::new(memory, &ranges).map_err(|_| LINUX_EFAULT)?;
+     Err(LINUX_EINVAL)
+ }
+ 
+@@ -1276,7 +1281,7 @@
+         Err(LINUX_EINVAL)
+     );
+ 
+-    let expected = vec![(0x1000, 0x1000), (0x5000, 0x1000)];
++    let expected = test_host_write_ranges().to_vec();
+     assert_eq!(events.begins.as_slice(), std::slice::from_ref(&expected));
+     assert_eq!(events.finishes.as_slice(), std::slice::from_ref(&expected));
+ }
+@@ -10087,3 +10092,11 @@
+         "unallocated high fd must return EBADF",
+     );
+ }
++
++fn test_host_write_ranges() -> [carrick_guest_mem::HostWriteRange; 2] {
++    [0x1000, 0x5000].map(|address| carrick_guest_mem::HostWriteRange {
++        guest: carrick_guest_mem::GuestVa(address),
++        len: 0x1000,
++        host: carrick_guest_mem::HostVa(address as usize),
++    })
++}
+--- a/crates/carrick-kernel/src/dispatch/net/send_recv.rs
++++ b/crates/carrick-kernel/src/dispatch/net/send_recv.rs
+@@ -971,10 +971,14 @@
+                 .chain(reuseport::steal_targets(host_fd.get()))
+                 .collect();
+             let outcome = this.blocking_io(fd, host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
+-                let host_write_ranges = [(buf_addr, len)];
++                let host_write_ranges = [carrick_guest_mem::HostWriteRange {
++                    guest: carrick_guest_mem::GuestVa(buf_addr),
++                    len,
++                    host: carrick_guest_mem::HostVa(dst_ptr as usize),
++                }];
+                 let host_write = zero_copy.then(|| {
+                     carrick_guest_mem::HostWriteGuard::new(memory, &host_write_ranges)
+-                });
++                }).transpose().map_err(|_| LINUX_EFAULT)?;
+                 let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+                 let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
+                 let used_addr = src_addr != 0;
+@@ -1067,7 +1071,7 @@
+                     }
+                     None => n,
+                 };
+-                // Close the odd-generation bracket before interpreting any
++                // Close the backing-write bracket before interpreting any
+                 // result or touching `memory` again. Drop also runs on unwind.
+                 drop(host_write);
+                 let n = n.host_syscall_errno()?;
+--- a/crates/carrick-kernel/tests/integration/syscall_fs_rw.rs
++++ b/crates/carrick-kernel/tests/integration/syscall_fs_rw.rs
+@@ -1069,6 +1069,9 @@
+     watched_writes: std::cell::Cell<usize>,
+     host_ptr_hits: std::cell::Cell<usize>,
+     host_write_ptr_hits: std::cell::Cell<usize>,
++    reject_host_write: bool,
++    host_write_begins: usize,
++    host_write_finishes: usize,
+ }
+ 
+ #[cfg(target_os = "macos")]
+@@ -1086,6 +1089,9 @@
+             watched_writes: std::cell::Cell::new(0),
+             host_ptr_hits: std::cell::Cell::new(0),
+             host_write_ptr_hits: std::cell::Cell::new(0),
++            reject_host_write: false,
++            host_write_begins: 0,
++            host_write_finishes: 0,
+         }
+     }
+ 
+@@ -1217,6 +1223,26 @@
+         Some(unsafe { self.bytes.as_ptr().add(offset) })
+     }
+ 
++    fn begin_host_write(
++        &mut self,
++        ranges: &[carrick_guest_mem::HostWriteRange],
++    ) -> Result<(), carrick_kernel::dispatch::MemoryError> {
++        self.host_write_begins += 1;
++        for range in ranges {
++            let offset = self.offset(range.guest.raw(), range.len)?;
++            if self.reject_host_write || self.bytes.as_ptr() as usize + offset != range.host.raw() {
++                return Err(carrick_kernel::dispatch::MemoryError::OutOfBounds {
++                    address: range.guest.raw(),
++                    length: range.len,
++                });
++            }
++        }
++        Ok(())
++    }
++    fn finish_host_write(&mut self, _: &[carrick_guest_mem::HostWriteRange]) {
++        self.host_write_finishes += 1;
++    }
++
+     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
+         if !self
+             .host_write_ptr_ranges
+@@ -2148,3 +2174,56 @@
+         "F_GETFL must keep O_NONBLOCK"
+     );
+ }
++
++#[cfg(target_os = "macos")]
++#[test]
++fn readv_host_write_admission_failure_does_not_consume_file_input() {
++    let scratch = tempfile::TempDir::new().unwrap();
++    std::fs::write(scratch.path().join("in.bin"), b"original-data").unwrap();
++    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
++    let mut dispatcher = SyscallDispatcher::new();
++    dispatcher.set_fs_backend(Box::new(backend));
++    let reporter = CompatReporter::default();
++    let mut memory = HostPtrPayloadMemory::new(0x4000, vec![0; 0x900]);
++    memory.write_bytes(0x4000, b"/in.bin\0").unwrap();
++    memory.expose_host_write_ptr(0x4200, 4);
++    memory.expose_host_write_ptr(0x4300, 4);
++    write_iovecs(
++        &mut memory,
++        0x4100,
++        [LinuxIovec::new(0x4200, 4), LinuxIovec::new(0x4300, 4)],
++    );
++    open_host_file_at_path(&mut dispatcher, &mut memory, &reporter, 0x4000, 0);
++    memory.reject_host_write = true;
++    let result = dispatcher
++        .dispatch(
++            &dispatcher.capture_one_task_context().unwrap(),
++            SyscallRequest::new(65, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
++            &mut memory,
++            &reporter,
++        )
++        .unwrap();
++    assert_eq!(result, DispatchOutcome::errno(LINUX_EFAULT));
++    assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), [0; 4]);
++    assert_eq!(memory.read_bytes(0x4300, 4).unwrap(), [0; 4]);
++    assert_eq!(
++        (memory.host_write_begins, memory.host_write_finishes),
++        (1, 1)
++    );
++    memory.reject_host_write = false;
++    let result = dispatcher
++        .dispatch(
++            &dispatcher.capture_one_task_context().unwrap(),
++            SyscallRequest::new(65, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
++            &mut memory,
++            &reporter,
++        )
++        .unwrap();
++    assert_eq!(result, DispatchOutcome::Returned { value: 8 });
++    assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), b"orig");
++    assert_eq!(memory.read_bytes(0x4300, 4).unwrap(), b"inal");
++    assert_eq!(
++        (memory.host_write_begins, memory.host_write_finishes),
++        (2, 2)
++    );
++}
+--- a/crates/carrick-runtime/src/runtime.rs
++++ b/crates/carrick-runtime/src/runtime.rs
+@@ -2364,10 +2364,13 @@
+     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
+         self.mem.host_ptr_for_write(address, len)
+     }
+-    fn begin_host_write(&mut self, ranges: &[(u64, usize)]) {
+-        self.mem.begin_host_write(ranges);
+-    }
+-    fn finish_host_write(&mut self, ranges: &[(u64, usize)]) {
++    fn begin_host_write(
++        &mut self,
++        ranges: &[carrick_guest_mem::HostWriteRange],
++    ) -> Result<(), MemoryError> {
++        self.mem.begin_host_write(ranges)
++    }
++    fn finish_host_write(&mut self, ranges: &[carrick_guest_mem::HostWriteRange]) {
+         self.mem.finish_host_write(ranges);
+     }
+     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+--- a/crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs
++++ b/crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs
+@@ -102,7 +102,10 @@
+ pub fn bring_up(image: &AddressSpace) -> Result<HvfAarch64Engine, TrapError> {
+     let plan = GuestMappingPlan::from_address_space(image)?;
+     let (state, vcpu, mailbox) = HvfVmState::new_with_plan(&plan)?;
+-    let vmm = HvfAarch64Vmm { state };
++    let vmm = HvfAarch64Vmm {
++        state,
++        host_writes: Default::default(),
++    };
+     Ok(Aarch64EngineCore::from_parts(
+         vmm,
+         HvfAarch64Vcpu::new(vcpu, mailbox),
+@@ -440,6 +443,9 @@
+ /// the vCPU, which now lives in [`HvfAarch64Vcpu`]).
+ pub struct HvfAarch64Vmm {
+     pub(crate) state: HvfVmState,
++    // Executor-local scratch. A HostWriteGuard closes every admission before
++    // dispatch returns, so no raw destination survives a task switch.
++    host_writes: crate::trap::host_writes::HostWrites,
+ }
+ 
+ #[derive(Clone)]
+@@ -1211,7 +1217,13 @@
+ 
+     pub fn create_executor_parts(&self) -> Result<(HvfAarch64Vmm, HvfAarch64Vcpu), TrapError> {
+         let (state, vcpu, mailbox) = HvfVmState::from_persistent_executor_spec(&self.spec)?;
+-        Ok((HvfAarch64Vmm { state }, HvfAarch64Vcpu::new(vcpu, mailbox)))
++        Ok((
++            HvfAarch64Vmm {
++                state,
++                host_writes: Default::default(),
++            },
++            HvfAarch64Vcpu::new(vcpu, mailbox),
++        ))
+     }
+ }
+ 
+@@ -1777,6 +1789,18 @@
+         self.state.host_ptr_for_write(va, len)
+     }
+ 
++    fn begin_host_write(
++        &mut self,
++        ranges: &[carrick_guest_mem::HostWriteRange],
++    ) -> Result<(), MemoryError> {
++        let custody = self.state.carrier_vm_custody();
++        self.host_writes.begin(&self.state.task, &custody, ranges)
++    }
++
++    fn finish_host_write(&mut self, _ranges: &[carrick_guest_mem::HostWriteRange]) {
++        self.host_writes.finish();
++    }
++
+     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+         self.state.set_no_access(address, len, no_access);
+     }
+@@ -1995,7 +2019,13 @@
+         // pair; the engine restores the seeded snapshot via `restore_thread_start`
+         // (HVF's EL0-trampoline thread-start for a brand-new vCPU).
+         let (state, vcpu, mailbox) = HvfVmState::from_thread_spec(builder)?;
+-        Ok((Self { state }, HvfAarch64Vcpu::new(vcpu, mailbox)))
++        Ok((
++            Self {
++                state,
++                host_writes: Default::default(),
++            },
++            HvfAarch64Vcpu::new(vcpu, mailbox),
++        ))
+     }
+ 
+     fn build_process_builder(
+@@ -2010,7 +2040,13 @@
+ 
+     fn materialize_process(builder: Self::ProcessBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
+         let (state, vcpu, mailbox) = HvfVmState::from_process_spec(builder)?;
+-        Ok((Self { state }, HvfAarch64Vcpu::new(vcpu, mailbox)))
++        Ok((
++            Self {
++                state,
++                host_writes: Default::default(),
++            },
++            HvfAarch64Vcpu::new(vcpu, mailbox),
++        ))
+     }
+ 
+     fn commit_process_materialization(&mut self) -> Result<(), TrapError> {
+--- a/crates/carrick-vmm-hvf/src/trap/cow_engine.rs
++++ b/crates/carrick-vmm-hvf/src/trap/cow_engine.rs
+@@ -5399,6 +5399,20 @@
+         address: u64,
+         length: usize,
+     ) -> Option<MappingView> {
++        self.with_mapping_for_range_in(custody, address, length, |source| source.view())
++    }
++
++    /// Select exactly the same live mapping for read and write projections.
++    /// The writer can retain its owner before the temporary alias row expires;
++    /// the read projection remains a scalar value with no new Arc or pin.
++    pub(crate) fn with_mapping_for_range_in<T>(
++        &self,
++        custody: &CarrierVmCustody,
++        address: u64,
++        length: usize,
++        project: impl FnOnce(super::host_writes::MappingSource<'_>) -> T,
++    ) -> Option<T> {
++        use super::host_writes::MappingSource;
+         let address = strip_pointer_tag(address);
+         let stage1_ipa = self.translate_va_for_cow(address);
+         let region_is_live = |mapping: &HvfMappedRegion| {
+@@ -5432,7 +5446,7 @@
+                         && region_is_live(mapping)
+                 })
+             {
+-                return Some(mapping.view());
++                return Some(project(MappingSource::Region(mapping)));
+             }
+             // Geometry under the registry lock; `alias_is_live` (the
+             // carrier's owners map) only on the released candidates.
+@@ -5463,7 +5477,7 @@
+                 .into_iter()
+                 .find(|alias| alias_is_live(alias))
+             {
+-                return Some(MappingView::from_alias(&alias));
++                return Some(project(MappingSource::Alias(&alias)));
+             }
+             return None;
+         }
+@@ -5523,7 +5537,7 @@
+                     && row_projection_is_current(mapping)
+             })
+         {
+-            return Some(mapping.view());
++            return Some(project(MappingSource::Region(mapping)));
+         }
+         if !self.protections.range_no_access(address, length) {
+             let alias_candidates = alias_registry()
+@@ -5545,7 +5559,7 @@
+                 .into_iter()
+                 .find(|alias| alias_is_live(alias))
+             {
+-                return Some(MappingView::from_alias(&alias));
++                return Some(project(MappingSource::Alias(&alias)));
+             }
+         }
+         None
+--- a/crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs
++++ b/crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs
+@@ -9450,3 +9450,52 @@
+             .is_current()
+     );
+ }
++
++#[test]
++fn native_code_content_syscall_copy_revokes_physical_dependencies() {
++    let _guard = FOREIGN_MM_TEST_LOCK.lock();
++    let transport = CarrierForeignMmTransport::new();
++    let installed = install_mm(
++        &transport,
++        200,
++        0x9a00_6500_0000,
++        0x9b00_6500_0000,
++        *b"old!",
++    );
++    let key = installed.owners.0[1];
++    let owner = global_frame_host_owners().lock()[&key].owner().clone();
++    let mut task = hvpatch_neutral_task_state_for_test();
++    task.mm_access = Arc::clone(&installed.state);
++    task.persistent_vm_lifecycle = true;
++    let mut row = super::super::thread_sibling_tests::mapped_region(
++        TEST_VA,
++        TEST_VA + OWNER_LEN as u64,
++        key.0,
++    );
++    row.host_addr = owner.ptr();
++    row.owner_generation = owner.generation();
++    task.mappings = TaskMappingIndex::from_region(row);
++    let dependent = owner.mapping.code_content.observe(0, 4).unwrap();
++    let unrelated = owner.mapping.code_content.observe(4096, 4).unwrap();
++    task.copy_guest_mapping_in(legacy_test_carrier_vm_custody(), TEST_VA, TEST_VA, b"new!")
++        .unwrap();
++    assert_eq!(
++        unsafe { std::slice::from_raw_parts(owner.ptr(), 4) },
++        b"new!"
++    );
++    assert!(
++        !dependent.is_current(),
++        "ordinary syscall copy left translated instructions current"
++    );
++    assert!(unrelated.is_current());
++    assert!(
++        owner
++            .mapping
++            .code_content
++            .observe(0, 4)
++            .unwrap()
++            .is_current()
++    );
++}
++
++mod syscall_writes;
+--- a/crates/carrick-vmm-hvf/src/trap/guest_memory.rs
++++ b/crates/carrick-vmm-hvf/src/trap/guest_memory.rs
+@@ -486,28 +486,20 @@
+             // lands in the PRIVATE overlay backing the guest reads, not the shared
+             // aperture. Identity otherwise; PROT_NONE already gated on the VA.
+             let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
+-            let (mapping_start, mapping_end, mapping_ipa, host_addr) = {
+-                let Some(mapping) = self.mapping_for_range_mut(lookup_address, chunk_len) else {
+-                    return Err(MemoryError::OutOfBounds { address, length });
+-                };
+-                (mapping.start, mapping.end, mapping.ipa, mapping.host_addr)
+-            };
++            let mapping = self.task.copy_guest_mapping_in(
++                &self.carrier_vm_custody(),
++                lookup_address,
++                chunk_address,
++                &bytes[copied..copied + chunk_len],
++            )?;
+             self.emit_guest_mem_copy_decision(
+                 crate::probes::guest_mem_dir::WRITE_GUEST,
+                 chunk_address,
+                 chunk_len,
+-                mapping_start,
+-                mapping_end,
+-                mapping_ipa,
++                mapping.start,
++                mapping.end,
++                mapping.ipa,
+             );
+-            let chunk_offset = (chunk_address - mapping_start) as usize;
+-            unsafe {
+-                volatile_copy_to_guest(
+-                    bytes.as_ptr().add(copied),
+-                    host_addr.add(chunk_offset),
+-                    chunk_len,
+-                );
+-            }
+             copied += chunk_len;
+         }
+         crate::probes::guest_mem_bytes(
+@@ -796,28 +788,20 @@
+             // `repoint_private` overlay VAs resolve region+offset via the translated
+             // overlay IPA (see `syscall_buffer_lookup_addr`); identity otherwise.
+             let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
+-            let (mapping_start, mapping_end, mapping_ipa, host_addr) = {
+-                let Some(mapping) = self.mapping_for_range_mut(lookup_address, chunk_len) else {
+-                    return Err(MemoryError::OutOfBounds { address, length });
+-                };
+-                (mapping.start, mapping.end, mapping.ipa, mapping.host_addr)
+-            };
++            let mapping = self.task.copy_guest_mapping_in(
++                &self.carrier_vm_custody(),
++                lookup_address,
++                lookup_address,
++                &bytes[copied..copied + chunk_len],
++            )?;
+             self.emit_guest_mem_copy_decision(
+                 crate::probes::guest_mem_dir::WRITE_GUEST_CHECKED,
+                 chunk_address,
+                 chunk_len,
+-                mapping_start,
+-                mapping_end,
+-                mapping_ipa,
++                mapping.start,
++                mapping.end,
++                mapping.ipa,
+             );
+-            let chunk_offset = (lookup_address - mapping_start) as usize;
+-            unsafe {
+-                volatile_copy_to_guest(
+-                    bytes.as_ptr().add(copied),
+-                    host_addr.add(chunk_offset),
+-                    chunk_len,
+-                );
+-            }
+             copied += chunk_len;
+         }
+         crate::probes::guest_mem_bytes(
+@@ -1117,3 +1101,31 @@
+         publisher.join().unwrap();
+     }
+ }
++
++// Shared by the checked syscall copier and privileged internal copier. Keeping
++// the resolved fragment here also permits VM-free tests of the production copy.
++impl HvfTaskState {
++    pub(crate) fn copy_guest_mapping_in(
++        &self,
++        custody: &CarrierVmCustody,
++        lookup_address: u64,
++        copy_address: u64,
++        bytes: &[u8],
++    ) -> Result<MappingView, MemoryError> {
++        let error = || MemoryError::OutOfBounds {
++            address: copy_address,
++            length: bytes.len(),
++        };
++        let write = self
++            .with_mapping_for_range_in(custody, lookup_address, bytes.len(), |source| {
++                source.begin_write(self, custody, copy_address, bytes.len(), None)
++            })
++            .ok_or_else(error)??;
++        // SAFETY: the selected live mapping contains this complete fragment;
++        // its exact physical owner and content admission outlive the copy.
++        unsafe {
++            volatile_copy_to_guest(bytes.as_ptr(), write.pointer, bytes.len());
++        }
++        Ok(write.view)
++    }
++}
+--- a/crates/carrick-vmm-hvf/src/trap.rs
++++ b/crates/carrick-vmm-hvf/src/trap.rs
+@@ -184,6 +184,8 @@
+ mod code_content;
+ #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+ mod global_frame;
++#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
++pub(crate) mod host_writes;
+ #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+ pub(crate) use global_frame::*;
+ #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+--- /dev/null
++++ b/conformance-contracts/contracts/syscall-code-write.toml
+@@ -0,0 +1,31 @@
++schema_version = 1
++id = "kernel.mm.syscall-code-write"
++title = "Ordinary syscall destinations retain and revoke exact physical backing"
++guest_surfaces = ["kernel:current-mm", "syscall:read", "syscall:readv", "syscall:pread64", "syscall:preadv", "syscall:recvfrom"]
++semantic_authority = ["Linux read, readv, preadv and recvfrom destination and EFAULT semantics", "Carrick exact physical owner and instruction dependency authority"]
++fixture = "unit:syscall-code-write"
++scale_points = [1, 8, 32, 128]
++rationale = "Copied and zero-copy host writes invalidate physical code dependencies before bytes can change. Zero-copy admission authenticates the exact selected host pointer and retains every destination through the host call, including partial failure and unwind. The current-MM read projection stays scalar. These byte-write observations do not authorize native execution."
++
++[bindings]
++vm_free = "carrick-vmm-hvf::trap::foreign_mm::tests::syscall_writes::syscall_code_write_cost_contract; native_code_content_syscall_copy_revokes_physical_dependencies; syscall_writes semantic controls for fragment crossings, stale pointers, owner generations, permissions, structural backing, alias fallback and error/unwind cleanup"
++
++[bindings.unresolved]
++embed_structural = "The signed syscall_write_destinations fixture checks copies, zero-copy destinations and COW, but its read-only readv offset assertion is still red on the before-step runtime and candidate. It does not observe native code revocation. Active native drain, remaining raw/hardware writes and private RX admission remain unbound."
++embed_timing = "No new original inotify09 timing or mixed native/HVF performance acceptance."
++docker = "The exact syscall_write_destinations.py fixture passes on native ARM64 Docker; the Carrick read-only readv offset differential remains open. Backing invalidation is internal and executable publication still needs mixed-engine differentials."
++
++[[structural_budgets]]
++kind = "exact"
++metric = "host_heap_allocations"
++value = 0
++layers = ["vm-free"]
++rationale = "After warming per-executor scratch, ordinary one-page host-write admissions allocate nothing. Instruction capture is measured outside the write path; a positive allocator control must fire."
++
++[[structural_budgets]]
++kind = "affine"
++metric = "native_code_invalidation_pages"
++base = 0
++per_unit = 1
++layers = ["vm-free"]
++rationale = "N one-page admissions visit exactly N subscribed physical pages; unrelated dependencies stay valid. The existing native-code-content contract separately scales unrelated subscriber population."
+--- /dev/null
++++ b/crates/carrick-vmm-hvf/src/trap/host_writes.rs
+@@ -0,0 +1,269 @@
++//! Writer-only projection of ordinary syscall destinations. Read lookups keep
++//! their scalar MappingView. These admissions track bytes, not executable entry.
++use super::code_content::{CodeContent, ContentWrite};
++use super::*;
++use carrick_guest_mem::HostWriteRange;
++use std::{ops::Deref, sync::Arc};
++
++pub(crate) enum MappingSource<'a> {
++    Region(&'a HvfMappedRegion),
++    Alias(&'a AliasBacking),
++}
++
++impl MappingSource<'_> {
++    pub(crate) fn view(&self) -> MappingView {
++        match self {
++            Self::Region(row) => row.view(),
++            Self::Alias(alias) => MappingView::from_alias(alias),
++        }
++    }
++
++    pub(crate) fn begin_write(
++        &self,
++        task: &HvfTaskState,
++        custody: &CarrierVmCustody,
++        address: u64,
++        len: usize,
++        expected_host: Option<usize>,
++    ) -> Result<BackingWrite, MemoryError> {
++        let error = || MemoryError::OutOfBounds {
++            address,
++            length: len,
++        };
++        let view = self.view();
++        let offset = address.checked_sub(view.start).ok_or_else(error)?;
++        let end = address.checked_add(len as u64).ok_or_else(error)?;
++        if len == 0 || end > view.end {
++            return Err(error());
++        }
++        let pointer = (view.host_addr as usize)
++            .checked_add(offset as usize)
++            .ok_or_else(error)?;
++        if expected_host.is_some_and(|expected| expected != pointer) {
++            return Err(error());
++        }
++        let (physical_ipa, physical_size, physical_host, generation, direct_structural) = match self
++        {
++            Self::Region(row) => {
++                let projection_offset = row.ipa.checked_sub(row.physical_ipa).ok_or_else(error)?;
++                let host = (row.host_addr as usize)
++                    .checked_sub(projection_offset as usize)
++                    .ok_or_else(error)?;
++                (
++                    row.physical_ipa,
++                    row.physical_size,
++                    host,
++                    row.owner_generation,
++                    row.structural_owner.as_ref(),
++                )
++            }
++            Self::Alias(alias) => (
++                alias.physical_ipa,
++                alias.physical_size,
++                alias.physical_host_addr,
++                alias.owner_generation,
++                None,
++            ),
++        };
++        let physical_offset = view
++            .ipa
++            .checked_sub(physical_ipa)
++            .and_then(|value| value.checked_add(offset))
++            .and_then(|value| usize::try_from(value).ok())
++            .ok_or_else(error)?;
++        if physical_offset
++            .checked_add(len)
++            .is_none_or(|end| end > physical_size)
++            || physical_host.checked_add(physical_offset) != Some(pointer)
++        {
++            return Err(error());
++        }
++        let owner = if let Some(pin) = pin_exact_live_global_frame_owner_in(
++            custody,
++            physical_ipa,
++            physical_size as u64,
++            physical_host,
++            generation,
++        ) {
++            Some(WriteOwner::Global(pin))
++        } else {
++            let structural = direct_structural.cloned().or_else(|| {
++                task.mm_access
++                    .structural_owners
++                    .read()
++                    .get(&(physical_ipa, physical_size))
++                    .cloned()
++            });
++            if let Some(owner) = structural {
++                let owner_custody = owner.custody.upgrade().ok_or_else(error)?;
++                if !std::ptr::eq(Arc::as_ptr(&owner_custody), custody)
++                    || owner.physical_ipa != physical_ipa
++                    || owner.len() != physical_size
++                    || owner.ptr() as usize != physical_host
++                    || (generation != 0 && generation != owner.epoch.raw())
++                {
++                    return Err(error());
++                }
++                let pin = owner_custody
++                    .pin_stage2_record(owner.record_identity())
++                    .map_err(|_| error())?;
++                Some(WriteOwner::Structural { owner, _pin: pin })
++            } else if generation == 0
++                && !is_reusable_global_frame_extent(physical_ipa, physical_size as u64)
++                && !custody
++                    .global_frame_host_owners
++                    .lock()
++                    .contains_key(&(physical_ipa, physical_size as u64))
++            {
++                // Legacy/VM-control mappings have no tracked backing owner.
++                // An unstamped row must not downgrade an existing tracked owner
++                // (including retirement-pending ownership) to this path.
++                // These mappings cannot supply a tracked instruction receipt. Preserve
++                // their existing dispatch-lifetime access, without claiming
++                // content or executable-publication coverage for them.
++                None
++            } else {
++                return Err(error());
++            }
++        };
++        let content = owner
++            .map(|owner| ContentWrite::new(owner, physical_offset, len).map_err(|_| error()))
++            .transpose()?;
++        Ok(BackingWrite {
++            view,
++            pointer: pointer as *mut u8,
++            content,
++        })
++    }
++}
++
++#[derive(Debug)]
++enum WriteOwner {
++    Global(GlobalFrameOwnerPin),
++    Structural {
++        owner: Arc<StructuralBackingOwner>,
++        _pin: CarrierStage2Pin,
++    },
++}
++
++impl Deref for WriteOwner {
++    type Target = CodeContent;
++    fn deref(&self) -> &Self::Target {
++        match self {
++            Self::Global(pin) => &pin.owner().mapping.code_content,
++            Self::Structural { owner, .. } => &owner.retained.mapping.code_content,
++        }
++    }
++}
++
++pub(crate) struct BackingWrite {
++    pub(crate) view: MappingView,
++    pub(crate) pointer: *mut u8,
++    // Kept through the copy/host call. Drop ends content admission before
++    // releasing the exact stage-2/backing owner inside ContentWrite.
++    #[cfg_attr(not(test), allow(dead_code))]
++    content: Option<ContentWrite<WriteOwner>>,
++}
++
++impl BackingWrite {
++    #[cfg(test)]
++    pub(crate) fn visited_pages(&self) -> usize {
++        self.content.as_ref().map_or(0, ContentWrite::visited_pages)
++    }
++}
++
++/// Scratch belongs to one executor, never to the shared MM. Capacity is reused
++/// across host calls; finish drops admissions, not the allocation.
++#[derive(Default)]
++pub(crate) struct HostWrites {
++    writes: Vec<BackingWrite>,
++}
++
++impl HostWrites {
++    pub(crate) fn begin(
++        &mut self,
++        task: &HvfTaskState,
++        custody: &CarrierVmCustody,
++        ranges: &[HostWriteRange],
++    ) -> Result<(), MemoryError> {
++        debug_assert!(self.writes.is_empty(), "nested host write admission");
++        let result = self.admit(task, custody, ranges);
++        if result.is_err() {
++            self.finish();
++        }
++        result
++    }
++
++    fn admit(
++        &mut self,
++        task: &HvfTaskState,
++        custody: &CarrierVmCustody,
++        ranges: &[HostWriteRange],
++    ) -> Result<(), MemoryError> {
++        for range in ranges {
++            let address = strip_pointer_tag(range.guest.raw());
++            let error = || MemoryError::OutOfBounds {
++                address,
++                length: range.len,
++            };
++            if task.protections.range_write_denied(address, range.len) {
++                return Err(error());
++            }
++            if range.len == 0 {
++                continue;
++            }
++            let lookup = if crate::memory::needs_stage1_translation(address, range.len as u64) {
++                task.translate_va(address).unwrap_or(address)
++            } else {
++                address
++            };
++            // A zero-copy range is one contiguous mapping. Retain that owner
++            // once, rather than growing a pin/vector entry for every 4 KiB.
++            let write = task
++                .with_mapping_for_range_in(custody, lookup, range.len, |source| {
++                    if !source.view().guest_writable {
++                        return Err(error());
++                    }
++                    source.begin_write(task, custody, lookup, range.len, Some(range.host.raw()))
++                })
++                .ok_or_else(error)??;
++            let first_ipa = write
++                .view
++                .ipa
++                .checked_add(lookup.checked_sub(write.view.start).ok_or_else(error)?)
++                .ok_or_else(error)?;
++            let mut checked = 0;
++            while checked < range.len {
++                let (va, len) = HvfVmState::guest_copy_chunk(address, checked, range.len)?;
++                let lookup = if crate::memory::needs_stage1_translation(va, len as u64) {
++                    task.translate_va(va).unwrap_or(va)
++                } else {
++                    va
++                };
++                let view = task
++                    .mapping_for_range_in(custody, lookup, len)
++                    .ok_or_else(error)?;
++                let offset = lookup.checked_sub(view.start).ok_or_else(error)?;
++                if !view.guest_writable
++                    || (view.host_addr as usize).checked_add(offset as usize)
++                        != range.host.raw().checked_add(checked)
++                    || view.ipa.checked_add(offset) != first_ipa.checked_add(checked as u64)
++                {
++                    return Err(error());
++                }
++                checked += len;
++            }
++            self.writes.push(write);
++        }
++        Ok(())
++    }
++
++    pub(crate) fn finish(&mut self) {
++        self.writes.clear();
++    }
++
++    #[cfg(test)]
++    pub(crate) fn visited_pages(&self) -> usize {
++        self.writes.iter().map(BackingWrite::visited_pages).sum()
++    }
++}
+--- /dev/null
++++ b/crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs
+@@ -0,0 +1,517 @@
++use super::*;
++use crate::trap::host_writes::HostWrites;
++use carrick_guest_mem::{GuestMemory, HostVa, HostWriteGuard, HostWriteRange, MemoryError};
++
++struct WriteFixture {
++    task: HvfTaskState,
++    writes: HostWrites,
++    installed: InstalledMm,
++}
++
++impl WriteFixture {
++    fn new() -> Self {
++        let transport = CarrierForeignMmTransport::new();
++        let installed = install_mm(
++            &transport,
++            201,
++            0x9a00_6700_0000,
++            0x9b00_6700_0000,
++            *b"old!",
++        );
++        let owner = global_frame_host_owners().lock()[&installed.owners.0[1]]
++            .owner()
++            .clone();
++        let mut task = hvpatch_neutral_task_state_for_test();
++        task.mm_access = Arc::clone(&installed.state);
++        task.persistent_vm_lifecycle = true;
++        task.mm_root_slot = Some(installed.owners.0[0]);
++        let mut row = crate::trap::thread_sibling_tests::mapped_region(
++            TEST_VA,
++            TEST_VA + OWNER_LEN as u64,
++            installed.owners.0[1].0,
++        );
++        row.host_addr = owner.ptr();
++        row.owner_generation = owner.generation();
++        task.mappings = TaskMappingIndex::from_region(row);
++        Self {
++            task,
++            writes: HostWrites::default(),
++            installed,
++        }
++    }
++
++    fn owner(&self) -> Arc<GlobalFrameHostOwner> {
++        global_frame_host_owners().lock()[&self.installed.owners.0[1]]
++            .owner()
++            .clone()
++    }
++
++    fn range(&self, offset: usize, len: usize) -> HostWriteRange {
++        HostWriteRange {
++            guest: GuestVa(TEST_VA + offset as u64),
++            len,
++            host: HostVa(self.owner().ptr() as usize + offset),
++        }
++    }
++}
++
++// The production HostWrites is VM-free; this adapter supplies only the
++// GuestMemory callback wiring so the public guard's failure/unwind lifecycle
++// can be exercised with real carrier owners, translations and dependencies.
++impl GuestMemory for WriteFixture {
++    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
++        Err(MemoryError::OutOfBounds { address, length })
++    }
++    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
++        self.task
++            .copy_guest_mapping_in(legacy_test_carrier_vm_custody(), address, address, bytes)
++            .map(|_| ())
++    }
++    fn begin_host_write(&mut self, ranges: &[HostWriteRange]) -> Result<(), MemoryError> {
++        self.writes
++            .begin(&self.task, legacy_test_carrier_vm_custody(), ranges)
++    }
++    fn finish_host_write(&mut self, _: &[HostWriteRange]) {
++        self.writes.finish();
++    }
++}
++
++#[test]
++fn native_code_content_host_write_guard_retains_and_revokes_all_fragments() {
++    let _lock = FOREIGN_MM_TEST_LOCK.lock();
++    let mut fixture = WriteFixture::new();
++    let owner = fixture.owner();
++    let content = &owner.mapping.code_content;
++    let a = content.observe(0, 4).unwrap();
++    let b = content.observe(4096, 4).unwrap();
++    let untouched = content.observe(8192, 4).unwrap();
++    let ranges = [fixture.range(4095, 2)];
++    let original_pins = owner.mapping.pin_count();
++    let guard = HostWriteGuard::new(&mut fixture, &ranges).unwrap();
++    assert!(
++        !a.is_current(),
++        "zero-copy admission did not revoke first page"
++    );
++    assert!(
++        !b.is_current(),
++        "zero-copy admission did not revoke second page"
++    );
++    assert!(untouched.is_current());
++    assert_eq!(owner.mapping.pin_count(), original_pins + 1);
++    assert!(matches!(
++        content.observe(0, 4),
++        Err(crate::trap::code_content::ContentError::WriteInProgress)
++    ));
++    // SAFETY: exact two-byte destination, both physical fragments retained by guard.
++    unsafe {
++        std::ptr::copy_nonoverlapping(b"AB".as_ptr(), ranges[0].host.raw() as *mut u8, 2);
++    }
++    drop(guard);
++    assert_eq!(owner.mapping.pin_count(), original_pins);
++    assert_eq!(
++        unsafe { std::slice::from_raw_parts(ranges[0].host.raw() as *const u8, 2) },
++        b"AB"
++    );
++    let fresh = content.observe(0, 4).unwrap();
++    let guard = HostWriteGuard::new(&mut fixture, &ranges).unwrap();
++    assert!(
++        !fresh.is_current(),
++        "reused scratch skipped new write admission"
++    );
++    drop(guard);
++    assert!(content.observe(0, 4).unwrap().is_current());
++}
++
++#[test]
++fn native_code_content_partial_host_write_admission_rolls_back_on_error_and_unwind() {
++    let _lock = FOREIGN_MM_TEST_LOCK.lock();
++    let mut fixture = WriteFixture::new();
++    let owner = fixture.owner();
++    let before = owner.mapping.pin_count();
++    let first = fixture.range(0, 4);
++    let mut stale = fixture.range(4096, 4);
++    stale.host = HostVa(stale.host.raw() + 1);
++    assert!(HostWriteGuard::new(&mut fixture, &[first, stale]).is_err());
++    assert_eq!(
++        owner.mapping.pin_count(),
++        before,
++        "partially admitted owner leaked"
++    );
++    let fresh = owner.mapping.code_content.observe(0, 4).unwrap();
++    assert_eq!(
++        unsafe { std::slice::from_raw_parts(owner.ptr(), 4) },
++        b"old!"
++    );
++    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        let ranges = [first];
++        let _guard = HostWriteGuard::new(&mut fixture, &ranges).unwrap();
++        panic!("exercise host-call unwind cleanup");
++    }));
++    assert!(result.is_err());
++    assert!(!fresh.is_current());
++    assert_eq!(owner.mapping.pin_count(), before);
++    assert!(
++        owner
++            .mapping
++            .code_content
++            .observe(0, 4)
++            .unwrap()
++            .is_current()
++    );
++}
++
++#[test]
++fn native_code_content_host_write_rejects_stale_owner_permissions_and_bounds() {
++    let _lock = FOREIGN_MM_TEST_LOCK.lock();
++    let mut fixture = WriteFixture::new();
++    let owner = fixture.owner();
++    let observed = owner.mapping.code_content.observe(0, 4).unwrap();
++    let valid = fixture.range(0, 4);
++    fixture.task.protections.set_no_write(TEST_VA, 4096, true);
++    assert!(HostWriteGuard::new(&mut fixture, &[valid]).is_err());
++    fixture.task.protections.set_no_write(TEST_VA, 4096, false);
++    fixture.task.protections.set_no_access(TEST_VA, 4096, true);
++    assert!(HostWriteGuard::new(&mut fixture, &[valid]).is_err());
++    fixture.task.protections.set_no_access(TEST_VA, 4096, false);
++    let overflow = HostWriteRange {
++        guest: GuestVa(u64::MAX),
++        len: 2,
++        host: valid.host,
++    };
++    assert!(HostWriteGuard::new(&mut fixture, &[overflow]).is_err());
++    let past_end = fixture.range(OWNER_LEN - 1, 2);
++    assert!(HostWriteGuard::new(&mut fixture, &[past_end]).is_err());
++    for generation in [owner.generation() + 1, 0] {
++        let mut row = crate::trap::thread_sibling_tests::mapped_region(
++            TEST_VA,
++            TEST_VA + OWNER_LEN as u64,
++            fixture.installed.owners.0[1].0,
++        );
++        row.host_addr = owner.ptr();
++        row.owner_generation = generation;
++        fixture.task.mappings = TaskMappingIndex::from_region(row);
++        assert!(HostWriteGuard::new(&mut fixture, &[valid]).is_err());
++        assert!(fixture.write_bytes_raw(TEST_VA, b"bad!").is_err());
++    }
++    assert!(observed.is_current());
++    assert_eq!(
++        unsafe { std::slice::from_raw_parts(owner.ptr(), 4) },
++        b"old!"
++    );
++}
++
++#[test]
++fn native_code_content_host_write_rejects_changed_second_leaf_and_releases_pin() {
++    let _lock = FOREIGN_MM_TEST_LOCK.lock();
++    let mut fixture = WriteFixture::new();
++    let owner = fixture.owner();
++    let pins = owner.mapping.pin_count();
++    let range = fixture.range(4095, 2);
++    let authority = fixture.task.page_tables_authority();
++    let mut tables = authority.snapshot_image().unwrap();
++    // The original task row and selected host pointer remain contiguous, but
++    // the live second leaf now aliases the first physical page.
++    tables
++        .map_aliased(
++            TEST_VA + 4096,
++            fixture.installed.owners.0[1].0,
++            4096,
++            true,
++            None,
++        )
++        .unwrap();
++    authority.set_manager(tables);
++    assert!(HostWriteGuard::new(&mut fixture, &[range]).is_err());
++    assert_eq!(owner.mapping.pin_count(), pins);
++    assert!(
++        owner
++            .mapping
++            .code_content
++            .observe(0, 4)
++            .unwrap()
++            .is_current()
++    );
++    assert_eq!(
++        unsafe { std::slice::from_raw_parts(owner.ptr(), 4) },
++        b"old!"
++    );
++}
++
++#[test]
++fn native_code_content_syscall_alias_fallback_revokes_original_instruction_read() {
++    use carrick_hal::foreign_mm::ForeignInstructionContentStatus;
++    let _lock = FOREIGN_MM_TEST_LOCK.lock();
++    let _aliases = ExternalAliasStateRestore::capture();
++    let mut fixture = WriteFixture::new();
++    let owner = fixture.owner();
++    let transport = CarrierForeignMmTransport::new();
++    transport.register(&fixture.installed.snapshot, &fixture.installed.state);
++    let mut bytes = [0; 4];
++    let receipt = read_instructions_installed(&transport, &fixture.installed, &mut bytes).unwrap();
++    assert_eq!(
++        receipt.instruction_content_status(),
++        ForeignInstructionContentStatus::UnchangedTrackedWrites
++    );
++    let alias_va = TEST_VA + 0x40000;
++    let key = fixture.installed.owners.0[1];
++    let authority = fixture.task.page_tables_authority();
++    let mut tables = authority.snapshot_image().unwrap();
++    tables
++        .map_aliased(alias_va, key.0, OWNER_LEN as u64, false, None)
++        .unwrap();
++    authority.set_manager(tables);
++    register_shared_alias(AliasBacking {
++        start: alias_va,
++        ipa: key.0,
++        host_addr: owner.ptr() as usize,
++        size: OWNER_LEN,
++        physical_ipa: key.0,
++        physical_host_addr: owner.ptr() as usize,
++        physical_size: OWNER_LEN,
++        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
++        guest_writable: true,
++        sharing: GuestMappingSharing::Private,
++        ownership_scope: alias_ownership_scope(
++            GuestMappingSharing::Private,
++            fixture.task.mm_root_slot,
++            fixture.task.container_root,
++        ),
++        inventory_backing: InventoryBackingIdentity::Private(2010),
++        shared_key_base: 0,
++        shared_key_offset: 0,
++        owner_generation: owner.generation(),
++    });
++    // No task row for the writable alias: production lookup must use the
++    // process-scoped registry and still invalidate the original physical page.
++    fixture.write_bytes_raw(alias_va, b"new!").unwrap();
++    assert_eq!(
++        receipt.instruction_content_status(),
++        ForeignInstructionContentStatus::Changed
++    );
++    assert_eq!(
++        unsafe { std::slice::from_raw_parts(owner.ptr(), 4) },
++        b"new!"
++    );
++}
++
++#[test]
++fn native_code_content_structural_syscall_write_uses_owner_offset_and_pin() {
++    let _lock = FOREIGN_MM_TEST_LOCK.lock();
++    let size = 0x4000;
++    let ipa = 0x8800_7100_0000;
++    let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
++        size,
++        crate::host_mapping::HostMappingKind::PerMmKernelState,
++    )
++    .unwrap();
++    let epoch = next_structural_epoch().unwrap();
++    let owner = StructuralBackingOwner::new(
++        mapping,
++        GlobalFrameStage2Lease::fixed(ipa, size as u64),
++        epoch,
++        ipa,
++        size,
++    )
++    .unwrap();
++    let identity = owner.record_identity();
++    let custody = legacy_test_carrier_vm_custody();
++    let mut task = hvpatch_neutral_task_state_for_test();
++    let mut row = crate::trap::thread_sibling_tests::mapped_region(0x400000, 0x401000, ipa + 4096);
++    row.physical_ipa = ipa;
++    row.physical_size = size;
++    row.host_addr = unsafe { owner.ptr().add(4096) };
++    row.structural_owner = Some(Arc::clone(&owner));
++    row.owner_generation = epoch.raw();
++    task.mappings = TaskMappingIndex::from_region(row);
++    let outside = owner.retained.mapping.code_content.observe(0, 4).unwrap();
++    let dependent = owner
++        .retained
++        .mapping
++        .code_content
++        .observe(4096, 4)
++        .unwrap();
++    task.copy_guest_mapping_in(custody, 0x400000, 0x400000, b"new!")
++        .unwrap();
++    assert!(!dependent.is_current());
++    assert!(outside.is_current());
++    let mut writes = HostWrites::default();
++    let range = HostWriteRange {
++        guest: GuestVa(0x400000),
++        len: 4,
++        host: HostVa(owner.ptr() as usize + 4096),
++    };
++    writes.begin(&task, custody, &[range]).unwrap();
++    assert_eq!(
++        custody
++            .stage2_record_snapshot(identity.record_id)
++            .unwrap()
++            .pin_count,
++        1
++    );
++    writes.finish();
++    assert_eq!(
++        custody
++            .stage2_record_snapshot(identity.record_id)
++            .unwrap()
++            .pin_count,
++        0
++    );
++    drop(task);
++    drop(owner);
++    retry_structural_backing_identities_in_using(
++        custody,
++        &[identity],
++        &mut unmap_global_frame_stage2_record,
++        &mut release_retired_stage2_ipa,
++    )
++    .unwrap();
++}
++
++mod allocations {
++    use std::{
++        alloc::{GlobalAlloc, Layout, System},
++        cell::Cell,
++    };
++    thread_local! { pub(super) static COUNT: Cell<Option<u64>> = const { Cell::new(None) }; }
++    struct Allocator;
++    #[global_allocator]
++    static ALLOCATOR: Allocator = Allocator;
++    fn count() {
++        let _ = COUNT.try_with(|count| {
++            if let Some(n) = count.get() {
++                count.set(Some(n + 1));
++            }
++        });
++    }
++    // SAFETY: all allocation arguments pass unchanged to System. TLS records
++    // only the measured thread and does not allocate.
++    unsafe impl GlobalAlloc for Allocator {
++        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++            count();
++            unsafe { System.alloc(layout) }
++        }
++        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++            count();
++            unsafe { System.alloc_zeroed(layout) }
++        }
++        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
++            count();
++            unsafe { System.realloc(ptr, layout, size) }
++        }
++        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++            unsafe { System.dealloc(ptr, layout) }
++        }
++    }
++}
++
++#[test]
++fn syscall_code_write_cost_contract() {
++    use carrick_conformance_contract::{
++        Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
++        SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
++    };
++    use sha2::{Digest, Sha256};
++    let _lock = FOREIGN_MM_TEST_LOCK.lock();
++    let mut fixture = WriteFixture::new();
++    let owner = fixture.owner();
++    let range = fixture.range(0, 4);
++    // Warm the reusable vector once; captures are translation setup, excluded
++    // from the per-syscall writer measurement.
++    fixture.begin_host_write(&[range]).unwrap();
++    fixture.finish_host_write(&[range]);
++    allocations::COUNT.set(Some(0));
++    let control = std::hint::black_box(vec![std::hint::black_box(42u8); 64]);
++    assert!(allocations::COUNT.replace(None).unwrap() > 0);
++    drop(control);
++    let unrelated = owner.mapping.code_content.observe(4096, 4).unwrap();
++    let mut observations = Vec::new();
++    for scale in [1, 8, 32, 128] {
++        let mut visits = 0;
++        let mut allocations = 0;
++        for _ in 0..scale {
++            let dependency = owner.mapping.code_content.observe(0, 4).unwrap();
++            allocations::COUNT.set(Some(0));
++            fixture.begin_host_write(&[range]).unwrap();
++            visits += fixture.writes.visited_pages() as u64;
++            unsafe {
++                std::ptr::write_volatile(range.host.raw() as *mut u8, b'!');
++            }
++            fixture.finish_host_write(&[range]);
++            allocations += allocations::COUNT.replace(None).unwrap();
++            assert!(!dependency.is_current());
++            assert!(unrelated.is_current());
++        }
++        assert_eq!(visits, scale);
++        assert_eq!(allocations, 0);
++        let mut work = WorkSnapshot::new();
++        work.insert(WorkMetric::NativeCodeInvalidationPages, visits)
++            .unwrap();
++        work.insert(WorkMetric::HostHeapAllocations, allocations)
++            .unwrap();
++        observations.push(ContractObservation {
++            contract_id: ContractId::new("kernel.mm.syscall-code-write").unwrap(),
++            layer: ExecutionLayer::VmFree,
++            implementation_revision: format!(
++                "sha256:{:x}",
++                Sha256::digest(include_bytes!("../../host_writes.rs"))
++            ),
++            fixture_identity: "unit:syscall-code-write".into(),
++            scale,
++            semantic_assertions: vec![SemanticAssertion::pass(
++                "host_write_revokes_exact_backing_and_releases_every_admission",
++            )],
++            work: Some(work),
++            timing: None,
++            completeness: Completeness::Complete,
++        });
++    }
++    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++        .parent()
++        .unwrap()
++        .parent()
++        .unwrap();
++    let registry = ContractRegistry::load(root).unwrap();
++    println!(
++        "syscall_code_write_observations {}",
++        serde_json::to_string(&observations).unwrap()
++    );
++    evaluate(
++        registry.require("kernel.mm.syscall-code-write").unwrap(),
++        &observations,
++    )
++    .unwrap();
++}
++
++#[test]
++fn native_code_content_syscall_copy_after_cow_preserves_source_dependency() {
++    let _lock = FOREIGN_MM_TEST_LOCK.lock();
++    let _aliases = ExternalAliasStateRestore::capture();
++    let mut fixture = WriteFixture::new();
++    let old_owner = fixture.owner();
++    let unchanged = old_owner.mapping.code_content.observe(0, 4).unwrap();
++    let (_authority, lease, mut invalidator) = prepare_foreign_cow(&fixture.installed);
++    let cow = lease
++        .break_cow(
++            &mut invalidator,
++            &fixture.installed.snapshot,
++            GuestVa(TEST_VA),
++            4,
++            Instant::now() + Duration::from_secs(1),
++        )
++        .unwrap();
++    let key = (cow.physical_base().raw(), cow.physical_len());
++    fixture.installed.owners.0.push(key);
++    let owner = global_frame_host_owners().lock()[&key].owner().clone();
++    let changed = owner.mapping.code_content.observe(0, 4).unwrap();
++    fixture.write_bytes_raw(TEST_VA, b"new!").unwrap();
++    assert!(!changed.is_current());
++    assert!(unchanged.is_current());
++    assert_eq!(
++        unsafe { std::slice::from_raw_parts(old_owner.ptr(), 4) },
++        b"old!"
++    );
++    assert_eq!(
++        unsafe { std::slice::from_raw_parts(owner.ptr(), 4) },
++        b"new!"
++    );
++}
+--- /dev/null
++++ b/crates/carrick-conformance-next/tests/syscall_write_destinations.rs
+@@ -0,0 +1,45 @@
++//! Guest execution regression for the carrier's ordinary and raw destinations.
++//! Native-code publication is tested separately; this runs the HVF engine.
++#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
++mod common;
++use carrick_conformance_next::{PullPolicy, TestContainer};
++
++#[test]
++fn syscall_write_destinations_preserve_bytes_permissions_and_cow() {
++    let _lock = common::guest_lock();
++    let directory = tempfile::TempDir::new().unwrap();
++    std::fs::write(
++        directory.path().join("data"),
++        b"0123456789abcdef".repeat(2048),
++    )
++    .unwrap();
++    let script = include_str!("fixtures/syscall_write_destinations.py");
++    let container = TestContainer::new("python:3.12-slim")
++        .pull_policy(PullPolicy::Missing)
++        .mount_readonly(directory.path().display().to_string(), "/input");
++    let (result, _) =
++        common::run_or_fail(container.run_with_audit(["python3", "-c", script, "/input/data"]));
++    assert_eq!(
++        result.exit_code,
++        0,
++        "stdout:\n{}\nstderr:\n{}",
++        result.stdout_utf8(),
++        result.stderr_utf8()
++    );
++    assert_eq!(result.signal, None);
++    assert!(!result.trap_limit_hit);
++    assert_eq!(result.terminal_reason, None);
++    assert_eq!(
++        result.stdout_utf8(),
++        concat!(
++            "readv_cross_page=ok\n",
++            "preadv_offset=ok\n",
++            "large_read=ok\n",
++            "ordinary_copy_cross_page=ok\n",
++            "readonly_efault=ok\n",
++            "recvfrom_cross_page=ok\n",
++            "fork_cow_isolation=ok\n",
++        )
++    );
++    assert!(result.stderr.is_empty(), "{}", result.stderr_utf8());
++}
+--- /dev/null
++++ b/crates/carrick-conformance-next/tests/fixtures/syscall_write_destinations.py
+@@ -0,0 +1,91 @@
++import ctypes as c
++import os
++import select
++import socket
++import sys
++
++lib = c.CDLL(None, use_errno=True)
++
++class Iov(c.Structure):
++    _fields_ = [("base", c.c_void_p), ("length", c.c_size_t)]
++
++lib.mmap.restype = c.c_void_p
++lib.mmap.argtypes = [c.c_void_p, c.c_size_t, c.c_int, c.c_int, c.c_int, c.c_long]
++lib.mprotect.argtypes = [c.c_void_p, c.c_size_t, c.c_int]
++lib.munmap.argtypes = [c.c_void_p, c.c_size_t]
++lib.readv.restype = c.c_ssize_t
++lib.readv.argtypes = [c.c_int, c.POINTER(Iov), c.c_int]
++lib.preadv.restype = c.c_ssize_t
++lib.preadv.argtypes = [c.c_int, c.POINTER(Iov), c.c_int, c.c_long]
++lib.read.restype = c.c_ssize_t
++lib.read.argtypes = [c.c_int, c.c_void_p, c.c_size_t]
++lib.recvfrom.restype = c.c_ssize_t
++lib.recvfrom.argtypes = [c.c_int, c.c_void_p, c.c_size_t, c.c_int, c.c_void_p, c.c_void_p]
++lib.clock_gettime.argtypes = [c.c_int, c.c_void_p]
++
++failures = []
++source = b"0123456789abcdef" * 2048
++fd = os.open(sys.argv[1], os.O_RDONLY)
++p = lib.mmap(None, 16384, 3, 0x22, -1, 0)
++assert p is not None and p != c.c_void_p(-1).value
++# No assumption about Linux mmap returning a 16 KiB-aligned address.
++c.memset(p, 0x33, 16384)
++vec = (Iov * 2)(Iov(p + 4095, 3), Iov(p + 8191, 5))
++assert lib.readv(fd, vec, 2) == 8, c.get_errno()
++assert c.string_at(p + 4095, 3) + c.string_at(p + 8191, 5) == source[:8]
++print("readv_cross_page=ok", flush=True)
++
++assert lib.preadv(fd, vec, 2, 7) == 8, c.get_errno()
++assert c.string_at(p + 4095, 3) + c.string_at(p + 8191, 5) == source[7:15]
++assert os.lseek(fd, 0, os.SEEK_CUR) == 8
++print("preadv_offset=ok", flush=True)
++
++os.lseek(fd, 0, os.SEEK_SET)
++assert lib.read(fd, p, 8192) == 8192, c.get_errno()
++assert c.string_at(p, 8192) == source[:8192]
++print("large_read=ok", flush=True)
++
++assert lib.clock_gettime(1, p + 4096 - 8) == 0, c.get_errno()
++nanoseconds = c.c_long.from_address(p + 4096).value
++assert 0 <= nanoseconds < 1000000000
++print("ordinary_copy_cross_page=ok", flush=True)
++
++assert lib.mprotect(p + 8192, 4096, 1) == 0
++denied = (Iov * 1)(Iov(p + 8192, 4))
++c.set_errno(0)
++assert (lib.readv(fd, denied, 1), c.get_errno()) == (-1, 14)
++offset_after_fault = os.lseek(fd, 0, os.SEEK_CUR)
++if offset_after_fault != 8192:
++    failures.append("readv EFAULT advanced offset from 8192 to " + str(offset_after_fault))
++assert lib.mprotect(p + 8192, 4096, 3) == 0
++print("readonly_efault=" + ("ok" if offset_after_fault == 8192 else "FAIL offset=" + str(offset_after_fault)), flush=True)
++
++receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++receiver.bind(("127.0.0.1", 0))
++sender.sendto(b"socket-data", receiver.getsockname())
++assert select.select([receiver], [], [], 5)[0], "UDP readiness timeout"
++assert lib.recvfrom(receiver.fileno(), p + 4092, 11, socket.MSG_DONTWAIT, None, None) == 11, c.get_errno()
++assert c.string_at(p + 4092, 11) == b"socket-data"
++sender.close()
++receiver.close()
++print("recvfrom_cross_page=ok", flush=True)
++
++c.memset(p, 0x5a, 16384)
++pid = os.fork()
++if pid == 0:
++    try:
++        os.lseek(fd, 0, os.SEEK_SET)
++        assert lib.readv(fd, vec, 2) == 8, c.get_errno()
++        assert c.string_at(p + 4095, 3) + c.string_at(p + 8191, 5) == source[:8]
++        os._exit(0)
++    except BaseException:
++        os._exit(9)
++_, status = os.waitpid(pid, 0)
++assert status == 0, status
++assert c.string_at(p, 16384) == b"Z" * 16384
++print("fork_cow_isolation=ok", flush=True)
++assert lib.munmap(p, 16384) == 0
++os.close(fd)
++
++assert not failures, failures

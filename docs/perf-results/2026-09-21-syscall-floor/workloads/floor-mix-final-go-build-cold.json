@@ -1,0 +1,376 @@
+{
+  "workload": "go-build-cold",
+  "image": "localhost:5005/carrick-go-conformance@sha256:357a08793e683c6a174d3955c704a5194e825f38fcdcb91d1d4ee2bccd6b188b",
+  "tracer_image": "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+  "target_argv": [
+    "docker",
+    "run",
+    "-d",
+    "--name",
+    "floor-mix-final-go-build-cold-work",
+    "--platform",
+    "linux/arm64",
+    "--entrypoint",
+    "/bin/bash",
+    "localhost:5005/carrick-go-conformance@sha256:357a08793e683c6a174d3955c704a5194e825f38fcdcb91d1d4ee2bccd6b188b",
+    "-c",
+    "/bin/bash -c 'kill -STOP $$; set -eu; TIMEFORMAT='\"'\"'WORKLOAD_TIMING real_s=%R user_s=%U sys_s=%S'\"'\"'; cd /tmp; printf '\"'\"'package main\\nfunc main(){println(\"ok\")}\\n'\"'\"' > floor.go; export GOCACHE=$(mktemp -d); time /usr/local/go/bin/go build -o /tmp/floor ./floor.go; /tmp/floor; echo BUILD_OK'; exit $?"
+  ],
+  "trace_argv": [
+    "docker",
+    "run",
+    "--rm",
+    "--name",
+    "floor-mix-final-go-build-cold-trace",
+    "--privileged",
+    "--pid=host",
+    "--entrypoint",
+    "/bin/sh",
+    "-v",
+    "/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/scripts/bpftrace/oracle-syscall-mix.bt:/mix.bt:ro",
+    "localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b",
+    "-c",
+    "mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true; exec bpftrace -B line /mix.bt \"$1\" \"$2\"",
+    "sh",
+    "34468",
+    "120"
+  ],
+  "root_pid": 34468,
+  "total": 74313,
+  "script_sha256": "efb6d97cf3a02e263f6fe16e7e108eba1d8e3308aafdb38c61a55f07131512b1",
+  "returncode": 0,
+  "workload_returncode": 0,
+  "calls": [
+    {
+      "nr": 25,
+      "name": "fcntl",
+      "count": 12269
+    },
+    {
+      "nr": 134,
+      "name": "rt_sigaction",
+      "count": 12158
+    },
+    {
+      "nr": 98,
+      "name": "futex",
+      "count": 8587
+    },
+    {
+      "nr": 63,
+      "name": "read",
+      "count": 6235
+    },
+    {
+      "nr": 64,
+      "name": "write",
+      "count": 4794
+    },
+    {
+      "nr": 79,
+      "name": "newfstatat",
+      "count": 3967
+    },
+    {
+      "nr": 56,
+      "name": "openat",
+      "count": 3277
+    },
+    {
+      "nr": 57,
+      "name": "close",
+      "count": 3233
+    },
+    {
+      "nr": 21,
+      "name": "epoll_ctl",
+      "count": 3218
+    },
+    {
+      "nr": 101,
+      "name": "nanosleep",
+      "count": 3162
+    },
+    {
+      "nr": 222,
+      "name": "mmap",
+      "count": 2008
+    },
+    {
+      "nr": 233,
+      "name": "madvise",
+      "count": 1533
+    },
+    {
+      "nr": 135,
+      "name": "rt_sigprocmask",
+      "count": 1470
+    },
+    {
+      "nr": 62,
+      "name": "lseek",
+      "count": 1033
+    },
+    {
+      "nr": 132,
+      "name": "sigaltstack",
+      "count": 820
+    },
+    {
+      "nr": 178,
+      "name": "gettid",
+      "count": 748
+    },
+    {
+      "nr": 124,
+      "name": "sched_yield",
+      "count": 666
+    },
+    {
+      "nr": 61,
+      "name": "getdents64",
+      "count": 664
+    },
+    {
+      "nr": 172,
+      "name": "getpid",
+      "count": 526
+    },
+    {
+      "nr": 139,
+      "name": "rt_sigreturn",
+      "count": 522
+    },
+    {
+      "nr": 131,
+      "name": "tgkill",
+      "count": 451
+    },
+    {
+      "nr": 220,
+      "name": "clone",
+      "count": 412
+    },
+    {
+      "nr": 80,
+      "name": "fstat",
+      "count": 358
+    },
+    {
+      "nr": 22,
+      "name": "epoll_pwait",
+      "count": 339
+    },
+    {
+      "nr": 34,
+      "name": "mkdirat",
+      "count": 282
+    },
+    {
+      "nr": 24,
+      "name": "dup3",
+      "count": 216
+    },
+    {
+      "nr": 88,
+      "name": "utimensat",
+      "count": 162
+    },
+    {
+      "nr": 35,
+      "name": "unlinkat",
+      "count": 155
+    },
+    {
+      "nr": 59,
+      "name": "pipe2",
+      "count": 152
+    },
+    {
+      "nr": 67,
+      "name": "pread64",
+      "count": 105
+    },
+    {
+      "nr": 46,
+      "name": "ftruncate",
+      "count": 96
+    },
+    {
+      "nr": 95,
+      "name": "waitid",
+      "count": 75
+    },
+    {
+      "nr": 94,
+      "name": "exit_group",
+      "count": 75
+    },
+    {
+      "nr": 221,
+      "name": "execve",
+      "count": 73
+    },
+    {
+      "nr": 261,
+      "name": "prlimit64",
+      "count": 72
+    },
+    {
+      "nr": 123,
+      "name": "sched_getaffinity",
+      "count": 72
+    },
+    {
+      "nr": 19,
+      "name": "eventfd2",
+      "count": 71
+    },
+    {
+      "nr": 20,
+      "name": "epoll_create1",
+      "count": 71
+    },
+    {
+      "nr": 68,
+      "name": "pwrite64",
+      "count": 61
+    },
+    {
+      "nr": 49,
+      "name": "chdir",
+      "count": 58
+    },
+    {
+      "nr": 215,
+      "name": "munmap",
+      "count": 8
+    },
+    {
+      "nr": 260,
+      "name": "wait4",
+      "count": 6
+    },
+    {
+      "nr": 439,
+      "name": "faccessat2",
+      "count": 5
+    },
+    {
+      "nr": 226,
+      "name": "mprotect",
+      "count": 4
+    },
+    {
+      "nr": 99,
+      "name": "set_robust_list",
+      "count": 4
+    },
+    {
+      "nr": 165,
+      "name": "getrusage",
+      "count": 4
+    },
+    {
+      "nr": 78,
+      "name": "readlinkat",
+      "count": 3
+    },
+    {
+      "nr": 214,
+      "name": "brk",
+      "count": 3
+    },
+    {
+      "nr": 48,
+      "name": "faccessat",
+      "count": 3
+    },
+    {
+      "nr": 174,
+      "name": "getuid",
+      "count": 2
+    },
+    {
+      "nr": 47,
+      "name": "fallocate",
+      "count": 2
+    },
+    {
+      "nr": 285,
+      "name": "copy_file_range",
+      "count": 2
+    },
+    {
+      "nr": 32,
+      "name": "flock",
+      "count": 2
+    },
+    {
+      "nr": 29,
+      "name": "ioctl",
+      "count": 2
+    },
+    {
+      "nr": 175,
+      "name": "geteuid",
+      "count": 2
+    },
+    {
+      "nr": 160,
+      "name": "uname",
+      "count": 2
+    },
+    {
+      "nr": 176,
+      "name": "getgid",
+      "count": 2
+    },
+    {
+      "nr": 177,
+      "name": "getegid",
+      "count": 2
+    },
+    {
+      "nr": 278,
+      "name": "getrandom",
+      "count": 2
+    },
+    {
+      "nr": 38,
+      "name": "renameat",
+      "count": 1
+    },
+    {
+      "nr": 157,
+      "name": "setsid",
+      "count": 1
+    },
+    {
+      "nr": 96,
+      "name": "set_tid_address",
+      "count": 1
+    },
+    {
+      "nr": 424,
+      "name": "pidfd_send_signal",
+      "count": 1
+    },
+    {
+      "nr": 53,
+      "name": "fchmodat",
+      "count": 1
+    },
+    {
+      "nr": 434,
+      "name": "pidfd_open",
+      "count": 1
+    },
+    {
+      "nr": 293,
+      "name": "rseq",
+      "count": 1
+    }
+  ],
+  "scope": "Stopped inner bash and every descendant TID after tracer readiness; includes timed command plus wrapper body; instrumented times are not performance evidence."
+}

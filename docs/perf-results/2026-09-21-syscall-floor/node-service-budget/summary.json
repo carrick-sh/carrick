@@ -1,0 +1,495 @@
+{
+  "requests": 10922,
+  "iterations": 5,
+  "overlapping_instrumented_service_time_not_latency_attribution": true,
+  "rank": [
+    {
+      "nr": 233,
+      "name": "madvise",
+      "calls": 633,
+      "summed_service_ms": 367.844072,
+      "mean_us": 581.1122780410743,
+      "max_ms": 27.815834
+    },
+    {
+      "nr": 215,
+      "name": "munmap",
+      "calls": 1321,
+      "summed_service_ms": 84.26584,
+      "mean_us": 63.78943224829675,
+      "max_ms": 3.690625
+    },
+    {
+      "nr": 22,
+      "name": "epoll_pwait",
+      "calls": 368,
+      "summed_service_ms": 54.146425,
+      "mean_us": 147.13702445652171,
+      "max_ms": 17.912084
+    },
+    {
+      "nr": 98,
+      "name": "futex",
+      "calls": 1375,
+      "summed_service_ms": 50.131196,
+      "mean_us": 36.45905163636363,
+      "max_ms": 0.328083
+    },
+    {
+      "nr": 222,
+      "name": "mmap",
+      "calls": 956,
+      "summed_service_ms": 24.796874,
+      "mean_us": 25.938152719665272,
+      "max_ms": 0.449542
+    },
+    {
+      "nr": 226,
+      "name": "mprotect",
+      "calls": 482,
+      "summed_service_ms": 17.195661,
+      "mean_us": 35.67564522821577,
+      "max_ms": 0.640667
+    },
+    {
+      "nr": 214,
+      "name": "brk",
+      "calls": 243,
+      "summed_service_ms": 14.613968,
+      "mean_us": 60.13978600823045,
+      "max_ms": 0.610916
+    },
+    {
+      "nr": 135,
+      "name": "rt_sigprocmask",
+      "calls": 465,
+      "summed_service_ms": 10.243079,
+      "mean_us": 22.02812688172043,
+      "max_ms": 0.630584
+    },
+    {
+      "nr": 56,
+      "name": "openat",
+      "calls": 234,
+      "summed_service_ms": 8.651574,
+      "mean_us": 36.97253846153846,
+      "max_ms": 0.262667
+    },
+    {
+      "nr": 113,
+      "name": null,
+      "calls": 520,
+      "summed_service_ms": 6.984596,
+      "mean_us": 13.431915384615383,
+      "max_ms": 0.144334
+    },
+    {
+      "nr": 64,
+      "name": "write",
+      "calls": 145,
+      "summed_service_ms": 5.323125,
+      "mean_us": 36.71120689655172,
+      "max_ms": 0.300833
+    },
+    {
+      "nr": 57,
+      "name": "close",
+      "calls": 354,
+      "summed_service_ms": 5.118961,
+      "mean_us": 14.460341807909604,
+      "max_ms": 0.423208
+    },
+    {
+      "nr": 99,
+      "name": "set_robust_list",
+      "calls": 81,
+      "summed_service_ms": 4.906753,
+      "mean_us": 60.5771975308642,
+      "max_ms": 0.3385
+    },
+    {
+      "nr": 63,
+      "name": "read",
+      "calls": 305,
+      "summed_service_ms": 4.521614,
+      "mean_us": 14.82496393442623,
+      "max_ms": 0.220666
+    },
+    {
+      "nr": 90,
+      "name": "capget",
+      "calls": 185,
+      "summed_service_ms": 2.46071,
+      "mean_us": 13.301135135135135,
+      "max_ms": 0.116084
+    },
+    {
+      "nr": 93,
+      "name": "exit",
+      "calls": 55,
+      "summed_service_ms": 1.446794,
+      "mean_us": 26.305345454545456,
+      "max_ms": 0.135792
+    },
+    {
+      "nr": 21,
+      "name": "epoll_ctl",
+      "calls": 163,
+      "summed_service_ms": 1.381249,
+      "mean_us": 8.473920245398773,
+      "max_ms": 0.1075
+    },
+    {
+      "nr": 261,
+      "name": "prlimit64",
+      "calls": 121,
+      "summed_service_ms": 1.205919,
+      "mean_us": 9.966272727272727,
+      "max_ms": 0.126541
+    },
+    {
+      "nr": 167,
+      "name": "prctl",
+      "calls": 110,
+      "summed_service_ms": 1.026459,
+      "mean_us": 9.331445454545454,
+      "max_ms": 0.121792
+    },
+    {
+      "nr": 134,
+      "name": "rt_sigaction",
+      "calls": 792,
+      "summed_service_ms": 1.000815,
+      "mean_us": 1.263655303030303,
+      "max_ms": 0.120541
+    },
+    {
+      "nr": 17,
+      "name": "getcwd",
+      "calls": 11,
+      "summed_service_ms": 0.979083,
+      "mean_us": 89.00754545454545,
+      "max_ms": 0.237333
+    },
+    {
+      "nr": 29,
+      "name": "ioctl",
+      "calls": 70,
+      "summed_service_ms": 0.921918,
+      "mean_us": 13.170257142857142,
+      "max_ms": 0.107042
+    },
+    {
+      "nr": 80,
+      "name": "fstat",
+      "calls": 232,
+      "summed_service_ms": 0.77892,
+      "mean_us": 3.3574137931034485,
+      "max_ms": 0.11075
+    },
+    {
+      "nr": 34,
+      "name": "mkdirat",
+      "calls": 5,
+      "summed_service_ms": 0.744916,
+      "mean_us": 148.9832,
+      "max_ms": 0.17375
+    },
+    {
+      "nr": 78,
+      "name": "readlinkat",
+      "calls": 15,
+      "summed_service_ms": 0.66771,
+      "mean_us": 44.514,
+      "max_ms": 0.110833
+    },
+    {
+      "nr": 221,
+      "name": "execve",
+      "calls": 10,
+      "summed_service_ms": 0.653875,
+      "mean_us": 65.3875,
+      "max_ms": 0.186708
+    },
+    {
+      "nr": 198,
+      "name": "socket",
+      "calls": 10,
+      "summed_service_ms": 0.639583,
+      "mean_us": 63.9583,
+      "max_ms": 0.122875
+    },
+    {
+      "nr": 291,
+      "name": "statx",
+      "calls": 25,
+      "summed_service_ms": 0.590794,
+      "mean_us": 23.63176,
+      "max_ms": 0.194334
+    },
+    {
+      "nr": 260,
+      "name": "wait4",
+      "calls": 20,
+      "summed_service_ms": 0.535999,
+      "mean_us": 26.79995,
+      "max_ms": 0.233083
+    },
+    {
+      "nr": 160,
+      "name": "uname",
+      "calls": 15,
+      "summed_service_ms": 0.501333,
+      "mean_us": 33.4222,
+      "max_ms": 0.099458
+    },
+    {
+      "nr": 139,
+      "name": "rt_sigreturn",
+      "calls": 10,
+      "summed_service_ms": 0.433958,
+      "mean_us": 43.3958,
+      "max_ms": 0.117208
+    },
+    {
+      "nr": 25,
+      "name": "fcntl",
+      "calls": 285,
+      "summed_service_ms": 0.371992,
+      "mean_us": 1.3052350877192982,
+      "max_ms": 0.117958
+    },
+    {
+      "nr": 210,
+      "name": "shutdown",
+      "calls": 15,
+      "summed_service_ms": 0.370627,
+      "mean_us": 24.708466666666666,
+      "max_ms": 0.111125
+    },
+    {
+      "nr": 19,
+      "name": "eventfd2",
+      "calls": 40,
+      "summed_service_ms": 0.347332,
+      "mean_us": 8.6833,
+      "max_ms": 0.117209
+    },
+    {
+      "nr": 174,
+      "name": "getuid",
+      "calls": 186,
+      "summed_service_ms": 0.337129,
+      "mean_us": 1.8125215053763442,
+      "max_ms": 0.110417
+    },
+    {
+      "nr": 278,
+      "name": "getrandom",
+      "calls": 31,
+      "summed_service_ms": 0.316043,
+      "mean_us": 10.194935483870967,
+      "max_ms": 0.112458
+    },
+    {
+      "nr": 199,
+      "name": "socketpair",
+      "calls": 15,
+      "summed_service_ms": 0.23825,
+      "mean_us": 15.883333333333335,
+      "max_ms": 0.137625
+    },
+    {
+      "nr": 20,
+      "name": "epoll_create1",
+      "calls": 40,
+      "summed_service_ms": 0.200623,
+      "mean_us": 5.015575,
+      "max_ms": 0.010208
+    },
+    {
+      "nr": 220,
+      "name": "clone",
+      "calls": 75,
+      "summed_service_ms": 0.184752,
+      "mean_us": 2.46336,
+      "max_ms": 0.117667
+    },
+    {
+      "nr": 59,
+      "name": "pipe2",
+      "calls": 60,
+      "summed_service_ms": 0.155671,
+      "mean_us": 2.594516666666667,
+      "max_ms": 0.007291
+    },
+    {
+      "nr": 48,
+      "name": "faccessat",
+      "calls": 11,
+      "summed_service_ms": 0.134251,
+      "mean_us": 12.204636363636364,
+      "max_ms": 0.050125
+    },
+    {
+      "nr": 96,
+      "name": "set_tid_address",
+      "calls": 11,
+      "summed_service_ms": 0.121668,
+      "mean_us": 11.060727272727272,
+      "max_ms": 0.110541
+    },
+    {
+      "nr": 175,
+      "name": "geteuid",
+      "calls": 187,
+      "summed_service_ms": 0.120909,
+      "mean_us": 0.6465721925133691,
+      "max_ms": 0.001
+    },
+    {
+      "nr": 176,
+      "name": "getgid",
+      "calls": 186,
+      "summed_service_ms": 0.117699,
+      "mean_us": 0.6327903225806452,
+      "max_ms": 0.001208
+    },
+    {
+      "nr": 177,
+      "name": "getegid",
+      "calls": 186,
+      "summed_service_ms": 0.11717,
+      "mean_us": 0.6299462365591398,
+      "max_ms": 0.000917
+    },
+    {
+      "nr": 208,
+      "name": "setsockopt",
+      "calls": 65,
+      "summed_service_ms": 0.100497,
+      "mean_us": 1.5461076923076924,
+      "max_ms": 0.005125
+    },
+    {
+      "nr": 204,
+      "name": "getsockname",
+      "calls": 30,
+      "summed_service_ms": 0.09379,
+      "mean_us": 3.1263333333333336,
+      "max_ms": 0.006208
+    },
+    {
+      "nr": 200,
+      "name": "bind",
+      "calls": 5,
+      "summed_service_ms": 0.077958,
+      "mean_us": 15.5916,
+      "max_ms": 0.017417
+    },
+    {
+      "nr": 203,
+      "name": "connect",
+      "calls": 5,
+      "summed_service_ms": 0.076333,
+      "mean_us": 15.2666,
+      "max_ms": 0.018792
+    },
+    {
+      "nr": 123,
+      "name": "sched_getaffinity",
+      "calls": 17,
+      "summed_service_ms": 0.051376,
+      "mean_us": 3.0221176470588236,
+      "max_ms": 0.006583
+    },
+    {
+      "nr": 209,
+      "name": "getsockopt",
+      "calls": 30,
+      "summed_service_ms": 0.048502,
+      "mean_us": 1.6167333333333334,
+      "max_ms": 0.004167
+    },
+    {
+      "nr": 24,
+      "name": "dup3",
+      "calls": 15,
+      "summed_service_ms": 0.039875,
+      "mean_us": 2.6583333333333337,
+      "max_ms": 0.006
+    },
+    {
+      "nr": 201,
+      "name": "listen",
+      "calls": 5,
+      "summed_service_ms": 0.038041,
+      "mean_us": 7.6082,
+      "max_ms": 0.008916
+    },
+    {
+      "nr": 178,
+      "name": "gettid",
+      "calls": 39,
+      "summed_service_ms": 0.037953,
+      "mean_us": 0.9731538461538461,
+      "max_ms": 0.001583
+    },
+    {
+      "nr": 62,
+      "name": "lseek",
+      "calls": 20,
+      "summed_service_ms": 0.031207,
+      "mean_us": 1.56035,
+      "max_ms": 0.003041
+    },
+    {
+      "nr": 242,
+      "name": "accept4",
+      "calls": 5,
+      "summed_service_ms": 0.026916,
+      "mean_us": 5.3831999999999995,
+      "max_ms": 0.006458
+    },
+    {
+      "nr": 94,
+      "name": "exit_group",
+      "calls": 11,
+      "summed_service_ms": 0.019543,
+      "mean_us": 1.7766363636363638,
+      "max_ms": 0.002542
+    },
+    {
+      "nr": 293,
+      "name": "rseq",
+      "calls": 11,
+      "summed_service_ms": 0.011082,
+      "mean_us": 1.0074545454545456,
+      "max_ms": 0.001917
+    },
+    {
+      "nr": 121,
+      "name": null,
+      "calls": 2,
+      "summed_service_ms": 0.003584,
+      "mean_us": 1.792,
+      "max_ms": 0.001875
+    },
+    {
+      "nr": 120,
+      "name": null,
+      "calls": 2,
+      "summed_service_ms": 0.001541,
+      "mean_us": 0.7705,
+      "max_ms": 0.000791
+    },
+    {
+      "nr": 173,
+      "name": null,
+      "calls": 1,
+      "summed_service_ms": 0.000958,
+      "mean_us": 0.958,
+      "max_ms": 0.000958
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+error[E0599]: no method named `borrow_current_native_data` found for struct `KernelContext` in the current scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1191:35
+     |
+1191 |             assert!(fixture.child.borrow_current_native_data(&wrong, &mut cow).is_err());
+     |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `KernelContext`
+
+error[E0599]: no method named `borrow_current_native_data` found for struct `KernelContext` in the current scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1192:42
+     |
+1192 |             let mut data = fixture.child.borrow_current_native_data(&execution, &mut cow)
+     |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `KernelContext`
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `carrick-runtime` (lib test) due to 2 previous errors

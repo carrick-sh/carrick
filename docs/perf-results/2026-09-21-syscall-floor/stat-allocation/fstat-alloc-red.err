@@ -1,0 +1,1 @@
+Error: "warm valid-file fstat must allocate zero host heap objects"

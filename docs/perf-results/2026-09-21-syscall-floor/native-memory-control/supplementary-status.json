@@ -1,0 +1,32 @@
+[
+  {
+    "name": "kernel-admission-isolated",
+    "argv": [
+      "target/lease-cost/native-memory-control/kernel-final-executable",
+      "kernel::control::tests::exec_table_capacity_refuses_new_admission",
+      "--exact",
+      "--nocapture"
+    ],
+    "exit_code": 0,
+    "run_id": null
+  },
+  {
+    "name": "kernel-semantics-final",
+    "argv": [
+      "just",
+      "test-kernel-semantics"
+    ],
+    "exit_code": 0,
+    "run_id": null
+  },
+  {
+    "name": "signed-foreign-mm",
+    "argv": [
+      "scripts/test-signed.sh",
+      "carrick-vmm-hvf",
+      "trap::foreign_mm::tests::"
+    ],
+    "exit_code": 1,
+    "run_id": "native-memory-control-27978"
+  }
+]

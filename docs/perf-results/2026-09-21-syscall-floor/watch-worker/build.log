@@ -1,0 +1,3 @@
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+    Finished `release` profile [optimized + debuginfo] target(s) in 58.64s
+  Executable unittests src/lib.rs (target/release/deps/carrick_runtime-f35e6b220553ee62)

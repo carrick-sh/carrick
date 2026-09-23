@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-3c2afd032626087b)
+
+running 7 tests
+test trap::foreign_mm::tests::foreign_mm_read_backed_page_without_stage1_or_recipe_reads_zeros ... ok
+test trap::foreign_mm::tests::foreign_mm_read_deadline_bounds_mutation_coordinator_contention ... ok
+test trap::foreign_mm::tests::foreign_mm_read_rejects_a_missing_descriptor_owner ... ok
+test trap::foreign_mm::tests::foreign_mm_read_rejects_reused_owner_generation ... ok
+test trap::foreign_mm::tests::foreign_mm_read_retries_each_stale_revision_domain ... ok
+test trap::foreign_mm::tests::foreign_mm_read_unmaterialized_remote_page_within_vma_reads_zeros_and_full_length ... ok
+test trap::foreign_mm::tests::foreign_mm_read_walks_the_target_root_not_the_caller_root ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 501 filtered out; finished in 0.38s
+

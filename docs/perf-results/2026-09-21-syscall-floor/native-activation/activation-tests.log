@@ -1,0 +1,25 @@
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick/crates/carrick-runtime)
+error[E0624]: method `lock_for_frame_cow` is private
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1484:24
+     |
+1484 |         assert!(census.lock_for_frame_cow().any_in_guest());
+     |                        ^^^^^^^^^^^^^^^^^^ private method
+     |
+    ::: crates/carrick-kernel/src/kernel/guest_execution.rs:343:5
+     |
+ 343 |     pub(crate) fn lock_for_frame_cow(&self) -> ExactMmCensusGuard {
+     |     ------------------------------------------------------------- private method defined here
+
+error[E0624]: associated function `synthetic_for_tests` is private
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:1514:74
+     |
+1514 |             .claim_runnable(carrick_kernel::kernel::objects::ExecutorId::synthetic_for_tests(32403))
+     |                                                                          ^^^^^^^^^^^^^^^^^^^ private associated function
+     |
+    ::: crates/carrick-kernel/src/kernel/objects/thread.rs:300:5
+     |
+ 300 |     pub(crate) fn synthetic_for_tests(raw: u32) -> Self {
+     |     --------------------------------------------------- private associated function defined here
+
+For more information about this error, try `rustc --explain E0624`.
+error: could not compile `carrick-runtime` (lib test) due to 2 previous errors
