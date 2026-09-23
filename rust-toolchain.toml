@@ -8,7 +8,7 @@
 # 1.9.0) is now identical across every build/format environment.
 [toolchain]
 channel = "1.96.0"
-components = ["rustfmt", "clippy"]
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
 # Cross-compile targets the gates need, declared on the PINNED toolchain (not
 # just added to CI's moving @stable). The host-integration suite builds a static
 # aarch64-unknown-linux-musl fixture ELF (scripts/build-linux-fixtures.sh), and
@@ -17,4 +17,4 @@ components = ["rustfmt", "clippy"]
 # 1.96.0 in every environment, so the targets land on the toolchain cargo
 # actually uses — not a sibling `stable` toolchain that this file then overrides
 # (which is exactly how a fresh CI runner ended up missing them).
-targets = ["aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl", "x86_64-unknown-freebsd", "x86_64-unknown-netbsd", "aarch64-unknown-none"]
+targets = ["aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl", "x86_64-unknown-freebsd", "x86_64-unknown-netbsd", "aarch64-unknown-none-softfloat"]

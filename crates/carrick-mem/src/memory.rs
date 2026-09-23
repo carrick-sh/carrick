@@ -359,6 +359,28 @@ const _: () = assert!(
     LINUX_SYSCALL_MAILBOX_SLOT_SIZE * LINUX_SYSCALL_MAILBOX_SLOTS as u64
         == LINUX_SYSCALL_MAILBOX_ARENA_SIZE
 );
+const _: () = assert!(LINUX_SYSCALL_MAILBOX_SLOT_SIZE == 256);
+const _: () = assert!(carrick_el1_abi::EL1_STACK_SIZE == 16 * 1024);
+const _: () = assert!(
+    (LINUX_SYSCALL_MAILBOX_SLOTS as u64) * carrick_el1_abi::EL1_STACK_SIZE
+        <= carrick_el1_abi::EL1_STACKS_SIZE
+);
+const _: () = assert!(
+    carrick_el1_abi::EL1_IMAGE_OFFSET + carrick_el1_abi::EL1_IMAGE_SIZE
+        <= carrick_el1_abi::EL1_COUNTERS_OFFSET
+);
+const _: () = assert!(
+    carrick_el1_abi::EL1_COUNTERS_OFFSET + carrick_el1_abi::EL1_COUNTERS_SIZE
+        <= carrick_el1_abi::EL1_STACKS_OFFSET
+);
+const _: () = assert!(
+    carrick_el1_abi::EL1_STACKS_OFFSET + carrick_el1_abi::EL1_STACKS_SIZE
+        <= carrick_el1_abi::EL1_HEAP_OFFSET
+);
+const _: () = assert!(
+    carrick_el1_abi::EL1_HEAP_OFFSET + carrick_el1_abi::EL1_HEAP_SIZE
+        <= carrick_el1_abi::EL1_REGION_SIZE
+);
 const _: () = assert!(
     (LINUX_SYSCALL_MAILBOX_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_SYSCALL_MAILBOX_ARENA_SIZE
         == 0x1F_8000
@@ -1985,7 +2007,7 @@ impl AddressSpace {
                 write: true,
                 execute: true,
             },
-            shared: false,
+            shared: true,
             bytes: carrick_el1_image::IMAGE.to_vec().into(),
         };
 
