@@ -155,6 +155,10 @@ impl HvfAarch64Vcpu {
             tidstamp_debug: None,
         }
     }
+
+    pub fn mailbox_slot(&self) -> usize {
+        self.mailbox.slot().raw() as usize
+    }
 }
 
 impl Drop for HvfAarch64Vcpu {

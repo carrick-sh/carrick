@@ -69,7 +69,7 @@ pub mod vcpu_kick;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf_aarch64_engine;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use trap::{read_el1_counters, reset_el1_counters};
+pub use trap::{read_el1_counters, read_el1_region_host_ptr, reset_el1_counters};
 /// Serializes tests that fork REAL child processes. The test binary is one
 /// process, so any-child wait paths under test (`wait4(-1)`,
 /// `waitid(P_ALL)`, `child_status_ready(-1)`) see EVERY test's children:
