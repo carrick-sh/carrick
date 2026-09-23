@@ -359,7 +359,7 @@ impl<'a> FsView<'a> {
                 open_file,
                 self.captured_file_table().id(),
                 fd,
-                &self.fs,
+                self.fs,
                 Some(&self.task_rlimits()),
             );
         }
@@ -438,7 +438,7 @@ impl<'a> FsView<'a> {
                         &open_file,
                         this.captured_file_table().id(),
                         fd.0,
-                        &this.fs,
+                        this.fs,
                         Some(&this.task_rlimits()),
                     );
                 }
@@ -759,7 +759,7 @@ impl<'a> FsView<'a> {
                     &open_file,
                     this.captured_file_table().id(),
                     fd.0,
-                    &this.fs,
+                    this.fs,
                     Some(&this.task_rlimits()),
                 );
             }
@@ -1303,7 +1303,7 @@ impl<'a> FsView<'a> {
                             &open_file,
                             files.id(),
                             fd.0,
-                            &this.fs,
+                            this.fs,
                             Some(&this.task_rlimits()),
                         );
                     }
@@ -1318,7 +1318,7 @@ impl<'a> FsView<'a> {
                     &open_file,
                     files.id(),
                     fd.0,
-                    &this.fs,
+                    this.fs,
                     Some(&this.task_rlimits()),
                 );
             }
@@ -1723,7 +1723,7 @@ impl<'a> FsView<'a> {
                         &open_file,
                         this.captured_file_table().id(),
                         fd.0,
-                        &this.fs,
+                        this.fs,
                         Some(&this.task_rlimits()),
                     );
                 }
@@ -1812,7 +1812,7 @@ impl<'a> FsView<'a> {
                     &open_file,
                     this.captured_file_table().id(),
                     fd.0,
-                    &this.fs,
+                    this.fs,
                     Some(&this.task_rlimits()),
                 );
             }
@@ -2151,7 +2151,7 @@ impl<'a> FsView<'a> {
                         &open_file,
                         this.captured_file_table().id(),
                         fd.0,
-                        &this.fs,
+                        this.fs,
                         Some(&this.task_rlimits()),
                     );
                 }
@@ -2249,7 +2249,7 @@ impl<'a> FsView<'a> {
                             &open_file,
                             this.captured_file_table().id(),
                             fd.0,
-                            &this.fs,
+                            this.fs,
                             Some(&this.task_rlimits()),
                         );
                     }
@@ -3242,7 +3242,7 @@ impl<'a> FsView<'a> {
                         &open_file,
                         this.captured_file_table().id(),
                         fd,
-                        &this.fs,
+                        this.fs,
                         Some(&this.task_rlimits()),
                     );
                 }

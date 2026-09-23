@@ -40,6 +40,25 @@ impl<'a> FsView<'a> {
     ) {
     }
 
+    pub(in crate::dispatch) fn maybe_delegate_opened_file(&self, outcome: &DispatchOutcome) {
+        if let DispatchOutcome::Returned { value, .. } = *outcome {
+            let fd = value as i32;
+            if fd >= 0 {
+                let file_table = self.captured_file_table();
+                let open_files = file_table.read_open_files();
+                if let Some(open_file) = open_files.get(&fd) {
+                    let _ = crate::el1_delegation::delegate(
+                        open_file,
+                        file_table.id(),
+                        fd,
+                        self.fs,
+                        Some(&self.task_rlimits()),
+                    );
+                }
+            }
+        }
+    }
+
     fn open_at_path<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<'_, M>,
@@ -61,6 +80,7 @@ impl<'a> FsView<'a> {
             cx.reporter,
         )?;
         self.maybe_grant_seek_authority(cx, &outcome);
+        self.maybe_delegate_opened_file(&outcome);
         Ok(outcome)
     }
 
@@ -2146,6 +2166,7 @@ impl<'a> FsView<'a> {
                 cx.reporter,
             )?;
             this.maybe_grant_seek_authority(cx, &outcome);
+            this.maybe_delegate_opened_file(&outcome);
             Ok(outcome)
 
         }

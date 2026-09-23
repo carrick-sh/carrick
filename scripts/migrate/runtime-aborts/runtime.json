@@ -2449,6 +2449,17 @@
       "rationale": "Host wait entered counter overflowed on begin_host_wait.",
       "sink": "fatal",
       "domain": "scheduler::host_wait"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "lock_delegated_file",
+      "ordinal_in_function": 1,
+      "fingerprint": "2027658207bdac8885db2961e44e2bdfac0e2925f40e4ffc8b31f8e8525e8b6e",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Host timed out spinning on delegated file lock held by EL1, indicating guest corruption, protocol violation, or deadlock.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
     }
   ]
 }
