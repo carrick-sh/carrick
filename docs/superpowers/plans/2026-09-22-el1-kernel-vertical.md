@@ -9,13 +9,13 @@
 exits, behind a default-on `CARRICK_EL1=0` hatch, with Linux semantics intact.
 
 **Architecture:** A `no_std` `carrick-el1` image, built for
-`aarch64-unknown-none` and embedded in the host binary, is loaded into a
+`aarch64-unknown-none-softfloat` and embedded in the host binary, is loaded into a
 kernel-only guest region. The existing mailbox EL1 vector calls it on every
 EL0 SVC; it returns SERVED (eret with x0) or FORWARD (fall through to the
 existing `hvc #2` mailbox capture). Kernel objects are delegated whole (typed
 `Delegated` state on the host, recall to take them back), never by field.
 
-**Tech Stack:** Rust 1.96.0, `no_std` + `aarch64-unknown-none`, `rust-lld`,
+**Tech Stack:** Rust 1.96.0, `no_std` + `aarch64-unknown-none-softfloat`, `rust-lld`,
 `rust-objcopy`, applevisor/HVF, existing `carrick-conformance-contract`.
 
 **Spec:** `docs/superpowers/specs/2026-09-22-el1-kernel-design.md`
@@ -62,6 +62,7 @@ if needed), `rust-toolchain.toml` (add `aarch64-unknown-none`),
 - `carrick_el1_image::IMAGE: &'static [u8]`
 
 Steps:
+- [x] Task 1 landed on main at c1dac9055 (softfloat image, atomic counters, shared region, one kernel-only range predicate).
 - [ ] Pick `EL1_REGION_BASE` in an unused VA/IPA range (verify against every `LINUX_*` constant in `memory.rs`; add a `const _: () = assert!` non-overlap check). Size 64 MiB.
 - [ ] Red test in `carrick-mem`: memory image built with EL1 enabled contains a region at `EL1_REGION_BASE` whose first bytes are the image header, and stage-1 walk of that VA from EL0 permission is denied, from EL1 permitted. Run `cargo test -p carrick-mem --lib el1_region` → FAIL.
 - [ ] Implement abi crate, image crate (`build.rs` runs `cargo build -p carrick-el1 --target aarch64-unknown-none --release` into `OUT_DIR/el1-target`, then `rust-objcopy -O binary`; fail the build loudly if the target is missing), region mapping through the same generic region list the identity page uses. Test → PASS.

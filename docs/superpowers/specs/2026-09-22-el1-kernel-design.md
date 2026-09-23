@@ -30,7 +30,9 @@ differential and contracts as today; no widened budgets, no retries.
 
 ## 3. Shape
 
-New crate `crates/carrick-el1`: `no_std`, target `aarch64-unknown-none`,
+New crate `crates/carrick-el1`: `no_std`, target `aarch64-unknown-none-softfloat`
+(the vector hook saves only GPRs; the image build rejects any FP/SIMD
+instruction),
 position-independent image linked for a fixed guest region
 (`LINUX_EL1_KERNEL_BASE`, 64 MiB, kernel-only stage-1 AP=00, never EL0
 mapped). The host loads the image at boot the way it installs the EL1
@@ -57,8 +59,9 @@ the ownership-bug class and are retired by this design.
   `recall(handle) -> HostState`, which stops guest access (per-object
   generation word; guest checks it under its object lock), copies state back
   and republishes it as `Host`. After recall the guest entry is dead.
-- Delegation is decided at creation from a static eligibility rule (private
-  rootfs file, no host observer, no `--fs host` mount).
+- Delegation is decided from a static eligibility rule: a regular file on the
+  container's private rootfs (both the memory rootfs and the per-run
+  `--fs host` seed are private), not a `-v` bind mount, no host observer.
 - Recall points, each with a contract: fork (object shared across the fork —
   the guest table is per-carrier, so fork keeps delegation and bumps a share
   count), exec (close-on-exec), dup/close, `/proc/self/fd` readlink, fanotify
@@ -85,7 +88,7 @@ the ownership-bug class and are retired by this design.
 4. Anonymous mmap/munmap/madvise/brk over a guest-owned frame pool with
    in-guest stage-1 edits and TLBI; foreign-MM transport retires as it goes.
 
-Host-side forever: host files under `--fs host`, non-loopback sockets, tty
+Host-side forever: bind-mounted host paths (`-v`), non-loopback sockets, tty
 and pty, exec image loading.
 
 ## 6. Runtime inside the guest
