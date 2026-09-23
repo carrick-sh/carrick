@@ -1,0 +1,13 @@
+error: authority census profile macos-cli-default failed with exit 101; captured stderr: error: failed to get `native-syscall-slice` as a dependency of package `carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/target/host-authority-census/snapshots/source-zus1o83_/crates/carrick-runtime)`
+
+Caused by:
+  failed to load source for dependency `native-syscall-slice`
+
+Caused by:
+  unable to update /Volumes/CaseSensitive/carrick/target/host-authority-census/snapshots/source-zus1o83_/experiments/native-syscall-slice
+
+Caused by:
+  failed to read `/Volumes/CaseSensitive/carrick/target/host-authority-census/snapshots/source-zus1o83_/experiments/native-syscall-slice/Cargo.toml`
+
+Caused by:
+  No such file or directory (os error 2)

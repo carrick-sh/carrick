@@ -1,0 +1,24 @@
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-mem)
+   Compiling carrick-observability v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-observability)
+   Compiling carrick-spec v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-spec)
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-kernel)
+   Compiling carrick-image v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-image)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-thread)
+   Compiling carrick-conformance-contract v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel-example v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Volumes/CaseSensitive/carrick/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.73s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-050671fbc3b0cb8c)
+
+running 1 test
+native_code_drain_observations [{"contract_id":"kernel.mm.native-code-drain","layer":"vm-free","implementation_revision":"sha256:473478a8367df9d927cb38bab36ae2e617c4d112db29bb481b32139f5dc3b23b","fixture_identity":"unit:native-code-drain","scale":1,"semantic_assertions":[{"name":"exact_carrier_content_scope_reuses_without_allocation","passed":true,"detail":null}],"work":{"values":{"host_heap_allocations":0},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.mm.native-code-drain","layer":"vm-free","implementation_revision":"sha256:473478a8367df9d927cb38bab36ae2e617c4d112db29bb481b32139f5dc3b23b","fixture_identity":"unit:native-code-drain","scale":8,"semantic_assertions":[{"name":"exact_carrier_content_scope_reuses_without_allocation","passed":true,"detail":null}],"work":{"values":{"host_heap_allocations":0},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.mm.native-code-drain","layer":"vm-free","implementation_revision":"sha256:473478a8367df9d927cb38bab36ae2e617c4d112db29bb481b32139f5dc3b23b","fixture_identity":"unit:native-code-drain","scale":32,"semantic_assertions":[{"name":"exact_carrier_content_scope_reuses_without_allocation","passed":true,"detail":null}],"work":{"values":{"host_heap_allocations":0},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.mm.native-code-drain","layer":"vm-free","implementation_revision":"sha256:473478a8367df9d927cb38bab36ae2e617c4d112db29bb481b32139f5dc3b23b","fixture_identity":"unit:native-code-drain","scale":128,"semantic_assertions":[{"name":"exact_carrier_content_scope_reuses_without_allocation","passed":true,"detail":null}],"work":{"values":{"host_heap_allocations":0},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}]
+test vcpu_loop::memory::tests::native_instruction_content_scope_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 627 filtered out; finished in 0.06s
+

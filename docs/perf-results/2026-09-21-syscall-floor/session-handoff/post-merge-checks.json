@@ -1,18 +1,6 @@
 {
-  "status": "local_checkpoint_integrated_not_promoted",
-  "recorded_utc": "2026-09-23T03:04:38.808633+00:00",
-  "campaign_base": "9bb2392396b8531e93f5262657bf3aa9c5767488",
-  "checkpoint_commit": "a553b814129da95960a34fea7409a90a36601ddf",
-  "code_and_inventory_head_at_checks": "b9728213de2c1f7d6ab1f7570b1972517559947b",
-  "integration": "Local main fast-forwarded to campaign checkpoint, followed by seven position-only inventory updates. Handoff finalization contains documentation/evidence only; concurrent source work is preserved separately.",
-  "main_unrelated_files_preserved": {
-    "docs/superpowers/plans/2026-09-13-loopback-tcp-correctness.md": "07234cbedaf0221bba76a1db260d3985e81cbd71ea8883a04fe25a9948fc786e",
-    "docs/superpowers/plans/2026-09-13-partial-dontfork.md": "f921c25afe7f258d992b59ef0dfe907c2b586cfdd394bc81bcd9f7424b5c0f8f",
-    "docs/superpowers/plans/2026-09-13-user-resolution-startup.md": "683953fedecf848bc2afc364244fe79a34284d21a57a6cdc4aaaf27a74525e1b"
-  },
-  "kernel_recipe_passed": 2377,
-  "kernel_recipe_ignored": 1,
-  "post_merge_checks": [
+  "source_head": "b9728213de2c1f7d6ab1f7570b1972517559947b",
+  "checks": [
     {
       "name": "host-authority-diagnostic",
       "command": [
@@ -205,49 +193,5 @@
       "test_summaries": [],
       "log": "fmt-final.log"
     }
-  ],
-  "reconciliation": {
-    "command": "python3 scripts/migrate/reconcile-line-pinned-inventories.py",
-    "exit_code": 1,
-    "elapsed_seconds": 10.438
-  },
-  "governance_failures": [
-    "Host-authority temporary source snapshot omits experiments/native-syscall-slice, so the runtime dev-dependency cannot resolve.",
-    "New madvise abort site requires review.",
-    "K1 category counts changed: mapping 1109 to 1117, description_guard 210 to 203, epoll 419 to 421.",
-    "just lint-domains stops at six unreviewed inline-assembly findings in the gateway test instrument and runtime memory tests; later gate steps did not execute."
-  ],
-  "post_step_source_delta": {
-    "files": [
-      "crates/carrick-conformance-next/tests/write_seek_lease.rs",
-      "crates/carrick-kernel/src/dispatch/fs/tests.rs",
-      "crates/carrick-kernel/src/dispatch/mem/tests.rs"
-    ],
-    "kind": "formatting only",
-    "patch": "formatting-only.patch"
-  },
-  "prior_archived_sha256sum_manifests": {
-    "manifests": 3,
-    "files": 150,
-    "mismatches": 0
-  },
-  "frozen_baseline_sha256": "1142bb6dc6202ab3675dc6485b4f479e1d9425b2b75a293c948aef5e65db8918",
-  "not_run": [
-    "new signed guest execution",
-    "new original inotify09 comparison",
-    "full CI",
-    "signed probe/smoke/full promotion"
-  ],
-  "ongoing_performance_work": "stopped for user-requested handoff; near-1x goal remains incomplete",
-  "push_performed": false,
-  "concurrent_work_observed_after_checks": {
-    "observed_utc": "2026-09-23T03:07:09.612629+00:00",
-    "head": "eca5f7302e2b12a7f1cac3e67be8701022a9289b",
-    "commit_scope": "handoff documentation only",
-    "uncommitted_source_sha256": {
-      "crates/carrick-aarch64/src/anonymous_discard.rs": "f8e9cb7733b51649ed04a2c23b28ad22cfc857071737ae6fccae75019350c5c8",
-      "crates/carrick-aarch64/src/engine.rs": "2943082766a3d751d9d78d0aa6f5ed65e6449184b78e61339c59f9933f3e3884"
-    },
-    "disposition": "Preserved without editing or staging. These later source edits are outside the recorded test receipt."
-  }
+  ]
 }

@@ -132,6 +132,11 @@ Do not quietly replace these failures with a later passing focused test:
    omits `experiments/native-syscall-slice` from its temporary source snapshot,
    so resolving the runtime dev-dependency fails before a census candidate
    exists. Preserve snapshot completeness and authority when fixing this.
+   The actual `just lint-domains` run stops earlier at six unreviewed inline-
+   assembly findings: two in the syscall-floor gateway instrument and four
+   in runtime memory tests. Add reviewed authority/catalog coverage or move
+   them behind the established typed boundary; do not disable the rule. Later
+   steps of that gate did not run.
 7. Full signed probes, smoke/full promotion, cross-engine state/atomics/signals,
    private RX authority and original mixed-engine timing remain open. The latest
    drain step has **no signed binding yet**. A normal HVF ptrace text-patching
@@ -235,3 +240,32 @@ DOF; freeze a tested artifact before another runner re-signs it. Stamp
 `CARRICK_RUN_ID` and use scoped cleanup. Never build over a live guest and never
 run Carrick and Docker phases concurrently. The current handoff intentionally
 does not launch another performance experiment or pretend a failed gate passed.
+
+## Local integration receipt
+
+Campaign checkpoint `a553b814129da95960a34fea7409a90a36601ddf` was fast-forwarded
+from the base into local `main`. Inventory commit
+`b9728213de2c1f7d6ab1f7570b1972517559947b` changes seven line numbers only.
+The post-merge implementation checks ran at that second commit. Subsequent
+commits in this handoff only finish documentation and its evidence archive.
+
+Fresh results: `just test-kernel` passes 2,377 tests with one existing ignore;
+content tests 22/22; syscall cost and real-carrier scope contracts 1/1 each;
+lifetime compile-fail tests 2/2; registry, scoped Clippy and formatting pass.
+Inventory reconciliation and domain lint remain red for the exact reasons above.
+This is a resumable checkpoint, not a green full gate. Full commands, logs,
+source-input manifest and results are in
+[the integration receipt](docs/perf-results/2026-09-21-syscall-floor/session-handoff/verification.json).
+
+Three pre-existing untracked plans on main were hash-checked before and after
+integration and left untouched: `2026-09-13-loopback-tcp-correctness.md`,
+`2026-09-13-partial-dontfork.md`, and `2026-09-13-user-resolution-startup.md`
+under `docs/superpowers/plans/`. No remote push or new guest/performance run was
+performed during handoff. Preserve the campaign worktree's ignored artifacts.
+
+Concurrent work appeared while finalizing the handoff: documentation commit
+`eca5f7302e2b12a7f1cac3e67be8701022a9289b` and then uncommitted edits to
+`crates/carrick-aarch64/src/anonymous_discard.rs` and `src/engine.rs`. Those
+source edits were preserved and excluded from the handoff commits and test
+claims. Inspect current `git status` before starting work; the recorded test
+receipt attests the earlier code revision, not any later concurrent edits.
