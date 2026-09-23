@@ -842,7 +842,10 @@ impl<'a> MemView<'a> {
                 && !map_flags.contains(LinuxMmapFlags::FIXED)
                 && offset.is_multiple_of(hvf_page)
             {
-                let mut alias_description: Option<Arc<crate::kernel::FileDescription>> = None;
+                let mut alias_description: Option<(
+                    Arc<crate::kernel::FileDescription>,
+                    Option<Arc<crate::kernel::objects::MappedFileReference>>,
+                )> = None;
                 // Sealing bookkeeping for a memfd alias, computed exactly as the
                 // snapshot path below computes it: a mapping of a memfd sealed
                 // F_SEAL_WRITE/F_SEAL_FUTURE_WRITE is read-only and must refuse
@@ -912,8 +915,11 @@ impl<'a> MemView<'a> {
                                     // the runtime's and is closed right after
                                     // mapping, so this is the only way a later
                                     // `mremap` can ask where the file ends.
-                                    alias_description =
-                                        Some(std::sync::Arc::clone(&open_file.description));
+                                    let mapping = open_file.description.retain_mapping();
+                                    alias_description = Some((
+                                        std::sync::Arc::clone(&open_file.description),
+                                        mapping,
+                                    ));
                                     let seals = open_file
                                         .description
                                         .common()
@@ -1036,9 +1042,10 @@ impl<'a> MemView<'a> {
                                 secretmem: false,
                                 writable_memfd: alias_writable_memfd,
                                 private_file: None,
-                                shared_file_alias: alias_description.map(|description| {
+                                shared_file_alias: alias_description.map(|(description, mapping)| {
                                     SharedFileAliasCommit {
                                         description,
+                                        mapping,
                                         extent_base: Gpa(ipa.saturating_sub(offset)),
                                         row_file_offset: offset,
                                     }
@@ -1591,6 +1598,7 @@ impl<'a> MemView<'a> {
                         LINUX_EBADF,
                     ));
                 };
+                let _ = crate::el1_delegation::recall_if_delegated(&open_file.description);
                 // Independently opened in-memory descriptions are snapshots of
                 // one shared overlay inode. Another process can extend/write
                 // that inode after this description was opened (Go telemetry
@@ -2593,6 +2601,7 @@ impl<'a> MemView<'a> {
                  bus_fault: Option<(u64, u64)>,
                  read_only_shared_file: bool,
                  description: Arc<crate::kernel::FileDescription>,
+                 mapping: Option<Arc<crate::kernel::objects::MappedFileReference>>,
                  dup_fd: i32|
                  -> DispatchOutcome {
                     let transaction =
@@ -2615,6 +2624,7 @@ impl<'a> MemView<'a> {
                             private_file: None,
                             shared_file_alias: Some(SharedFileAliasCommit {
                                 description,
+                                mapping,
                                 extent_base: Gpa(ipa.saturating_sub(file_offset)),
                                 row_file_offset: file_offset,
                             }),
@@ -2811,6 +2821,7 @@ impl<'a> MemView<'a> {
                 let new_alias_entry = SharedFileAliasEntry {
                     range: dest_range,
                     description: Arc::clone(&alias_entry.description),
+                    mapping: alias_entry.mapping.clone(),
                     extent_base: carrick_guest_mem::Gpa(
                         destination_leaf_ipa.saturating_sub(source_file_offset),
                     ),
@@ -3073,11 +3084,13 @@ impl<'a> MemView<'a> {
                     && shared_aperture_alloc.is_none()
                     && shared_file_bus_offset(file_len, file_offset, new_size, page_size).is_none()
                 {
-                    let Some(description) =
-                        this.shared_file_alias_description(old_address.0, old_size)
+                    let Some(alias_entry) =
+                        this.shared_file_alias_entry(old_address.0, old_size)
                     else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
+                    let description = alias_entry.description;
+                    let mapping = alias_entry.mapping;
                     let dup_fd = {
                         let open = description.read();
                         match open.as_deref().and_then(OpenDescription::shared_alias_host_fd) {
@@ -3153,6 +3166,7 @@ impl<'a> MemView<'a> {
                         None,
                         read_only_shared_file,
                         Arc::clone(&description),
+                        mapping,
                         dup_fd,
                     ));
                 }

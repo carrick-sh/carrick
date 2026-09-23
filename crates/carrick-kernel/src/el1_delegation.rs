@@ -73,6 +73,9 @@ static DELEGATED_HANDLE_INODES: Mutex<[Option<InodeIdentity>; MAX_DELEGATED_FILE
     Mutex::new([const { None }; MAX_DELEGATED_FILES]);
 static DELEGATED_ROOTFS: Mutex<[Option<Weak<carrick_vfs::RootFsVfs>>; MAX_DELEGATED_FILES]> =
     Mutex::new([const { None }; MAX_DELEGATED_FILES]);
+static DELEGATED_SPARSE: Mutex<
+    [Option<crate::dispatch::fs::HostSparseExtentsRegistry>; MAX_DELEGATED_FILES],
+> = Mutex::new([const { None }; MAX_DELEGATED_FILES]);
 static HOOK_INIT: std::sync::Once = std::sync::Once::new();
 
 pub(crate) fn init_delegation_hooks() {
@@ -172,6 +175,8 @@ fn free_handle(handle: u32) {
         descs[idx] = None;
         let mut rootfs = DELEGATED_ROOTFS.lock();
         rootfs[idx] = None;
+        let mut sparse = DELEGATED_SPARSE.lock();
+        sparse[idx] = None;
         let inode = {
             let mut handle_inodes = DELEGATED_HANDLE_INODES.lock();
             handle_inodes[idx].take()
@@ -489,6 +494,8 @@ pub(crate) fn delegate_locked(
         handle_inodes[(handle - 1) as usize] = Some(inode);
         let mut rootfs = DELEGATED_ROOTFS.lock();
         rootfs[(handle - 1) as usize] = Some(Arc::downgrade(&fs.rootfs_vfs));
+        let mut sparse = DELEGATED_SPARSE.lock();
+        sparse[(handle - 1) as usize] = Some(fs.host_sparse_extents_registry().clone());
         HAS_DELEGATED_FILES.store(true, Ordering::Release);
     }
 
@@ -642,6 +649,7 @@ pub(crate) fn recall_locked(
     let rootfs_vfs = DELEGATED_ROOTFS.lock()[(handle - 1) as usize]
         .as_ref()
         .and_then(|w| w.upgrade());
+    let sparse_registry = DELEGATED_SPARSE.lock()[(handle - 1) as usize].clone();
 
     let file_ptr = (region_ptr
         + EL1_OBJECT_TABLE_OFFSET as usize
@@ -679,6 +687,14 @@ pub(crate) fn recall_locked(
                         if write_error.is_none() {
                             write_error = Some(err);
                         }
+                    } else if let OpenDescription::HostFile { host_fd, .. } = open {
+                        if let Some(sparse) = &sparse_registry {
+                            sparse.record_host_sparse_write_raw(
+                                host_fd.raw(),
+                                page_offset,
+                                page_len,
+                            );
+                        }
                     }
                 }
             }
@@ -693,6 +709,9 @@ pub(crate) fn recall_locked(
             ..
         } => {
             if *writable && metadata.size != guest_size as usize {
+                if let Some(sparse) = &sparse_registry {
+                    sparse.truncate_host_sparse_extents(host_fd.raw(), guest_size);
+                }
                 let trunc_res =
                     unsafe { libc::ftruncate(host_fd.raw(), guest_size as libc::off_t) };
                 if trunc_res != 0 {

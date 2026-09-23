@@ -1564,6 +1564,14 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "DELEGATED_SPARSE",
+      "fingerprint": "a533dacaef064267e82fd21569fc5f686039bd8e142e22f8e9f0512ef25435d2",
+      "classification": "carrier_infra",
+      "rationale": "Sparse extents registry tracking dirty ranges committed back from EL1 delegation."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "symbol": "HAS_DELEGATED_FILES",
       "fingerprint": "ed871e2665b9e1bfb44f46d116ec87dd8874a4ccc5f963b5e8d7f97c31c39a85",
       "classification": "carrier_infra",

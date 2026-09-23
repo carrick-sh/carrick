@@ -1297,24 +1297,26 @@ pub(crate) fn install_host_file_fd_with_source(
         },
         payload.len() as isize
     );
-    dispatcher.captured_file_table().write_open_files().insert(
-        fd,
-        OpenFile::from_open_description_with_status_flags(
-            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
-                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
-                host_fd: HostFdRef::with_private_file_source(host_file.into_raw_fd(), source),
-                metadata: RootFsMetadata {
-                    path: std::path::PathBuf::from("/host-private-map"),
-                    kind: RootFsEntryKind::File,
-                    mode: 0o644,
-                    size: payload.len(),
-                },
-                writable: false,
-            })),
-            crate::linux_abi::LINUX_O_RDONLY,
-            0,
-        ),
+    let open_file = OpenFile::from_open_description_with_status_flags(
+        std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
+            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+            host_fd: HostFdRef::with_private_file_source(host_file.into_raw_fd(), source),
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from("/host-private-map"),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: payload.len(),
+            },
+            writable: false,
+        })),
+        crate::linux_abi::LINUX_O_RDONLY,
+        0,
     );
+    open_file.description.retain_fd_ref();
+    dispatcher
+        .captured_file_table()
+        .write_open_files()
+        .insert(fd, open_file);
 }
 
 #[test]
@@ -5186,6 +5188,7 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
         0,
     )
     .description();
+    description.retain_fd_ref();
 
     dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
         start: base,
@@ -5206,6 +5209,7 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
         private_file: None,
         shared_file_alias: Some(SharedFileAliasCommit {
             description: Arc::clone(&description),
+            mapping: description.retain_mapping(),
             extent_base: carrick_guest_mem::Gpa(base),
             row_file_offset: 0,
         }),
@@ -5373,6 +5377,7 @@ fn shared_file_fixed_mremap_repoint_failure_lowers_to_enomem() {
         0,
     )
     .description();
+    description.retain_fd_ref();
 
     dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
         start: base,
@@ -5393,6 +5398,7 @@ fn shared_file_fixed_mremap_repoint_failure_lowers_to_enomem() {
         private_file: None,
         shared_file_alias: Some(SharedFileAliasCommit {
             description: Arc::clone(&description),
+            mapping: description.retain_mapping(),
             extent_base: carrick_guest_mem::Gpa(base),
             row_file_offset: 0,
         }),
@@ -5451,6 +5457,7 @@ fn shared_file_fixed_mremap_rejects_missing_maymove_or_overlapping_ranges() {
         0,
     )
     .description();
+    description.retain_fd_ref();
 
     dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
         start: base,
@@ -5471,6 +5478,7 @@ fn shared_file_fixed_mremap_rejects_missing_maymove_or_overlapping_ranges() {
         private_file: None,
         shared_file_alias: Some(SharedFileAliasCommit {
             description: Arc::clone(&description),
+            mapping: description.retain_mapping(),
             extent_base: carrick_guest_mem::Gpa(base),
             row_file_offset: 0,
         }),

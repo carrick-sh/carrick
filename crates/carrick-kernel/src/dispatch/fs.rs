@@ -249,10 +249,10 @@ pub(crate) use super::dispatcher::FsView;
 pub(in crate::dispatch) use lookup::{LookupIntent, LookupTarget};
 pub(crate) use open::OpenAtArgs;
 pub(crate) use pipe::*;
-pub(crate) use state::FsState;
 pub use state::MountRetirement;
 pub use state::StdioSink;
 use state::*;
+pub(crate) use state::{FsState, HostSparseExtentsRegistry};
 pub(crate) use state::{LegacyAioContextId, SplicePushback};
 pub(super) use state::{RuntimeIo, host_fd_offset};
 

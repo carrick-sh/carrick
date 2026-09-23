@@ -248,6 +248,7 @@ pub(crate) fn trim_private_file_maps(maps: &mut Vec<PrivateFileMapEntry>, start:
 #[derive(Clone)]
 pub struct SharedFileAliasCommit {
     pub(crate) description: Arc<crate::kernel::FileDescription>,
+    pub(crate) mapping: Option<Arc<crate::kernel::objects::MappedFileReference>>,
     pub(crate) extent_base: carrick_guest_mem::Gpa,
     pub(crate) row_file_offset: u64,
 }
@@ -256,6 +257,7 @@ pub struct SharedFileAliasCommit {
 pub struct SharedFileAliasEntry {
     pub(crate) range: carrick_vfs::GuestMemoryRange,
     pub(crate) description: Arc<crate::kernel::FileDescription>,
+    pub(crate) mapping: Option<Arc<crate::kernel::objects::MappedFileReference>>,
     pub(crate) extent_base: carrick_guest_mem::Gpa,
     pub(crate) row_file_offset: u64,
 }
@@ -294,6 +296,7 @@ pub(crate) fn trim_shared_file_alias_maps_for_range(
             retained.push(SharedFileAliasEntry {
                 range: prefix,
                 description: Arc::clone(&entry.description),
+                mapping: entry.mapping.clone(),
                 extent_base: entry.extent_base,
                 row_file_offset: entry.row_file_offset,
             });
@@ -311,6 +314,7 @@ pub(crate) fn trim_shared_file_alias_maps_for_range(
             retained.push(SharedFileAliasEntry {
                 range: suffix,
                 description: entry.description,
+                mapping: entry.mapping,
                 extent_base: entry.extent_base,
                 row_file_offset: suffix_offset,
             });
@@ -810,6 +814,7 @@ impl<'a> MemView<'a> {
             mem.shared_file_alias_maps.push(SharedFileAliasEntry {
                 range: replacement,
                 description: shared_alias.description,
+                mapping: shared_alias.mapping,
                 extent_base: shared_alias.extent_base,
                 row_file_offset: shared_alias.row_file_offset,
             });
