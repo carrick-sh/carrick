@@ -1,0 +1,47 @@
+   Compiling carrick-guest-mem v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-guest-mem)
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling toml_edit v0.22.27
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-mem)
+   Compiling carrick-observability v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-observability)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-hal)
+   Compiling toml v0.8.23
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-thread)
+   Compiling carrick-conformance-contract v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-aarch64)
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.95s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-0aaee9123b867d4d)
+
+running 22 tests
+test trap::code_content::execution_tests::native_code_drain_partial_entry_rolls_back_and_unrelated_scope_stays_live ... ok
+test trap::code_content::tests::partial_page_crossings_and_invalid_ranges ... ok
+test trap::code_content::execution_tests::native_code_drain_last_active_observer_releases_registry_entry ... ok
+test trap::code_content::tests::overlapping_writes_prevent_observation_until_both_finish ... ok
+test trap::code_content::tests::retirement_and_equal_offsets_in_another_owner_do_not_revive_dependencies ... ok
+test trap::code_content::tests::cold_writer_prevents_first_observer_and_dropped_observers_leave_no_history ... ok
+test trap::code_content::execution_tests::native_code_drain_entry_write_race_leaves_no_active_count ... ok
+test trap::code_content::tests::racing_first_observation_cannot_survive_an_admitted_write ... ok
+test trap::code_content::tests::simultaneous_final_observers_leave_no_history ... ok
+test trap::foreign_mm::tests::native_code_content_foreign_write_revokes_backing_dependencies ... ok
+native_code_content_observations [{"contract_id":"kernel.mm.native-code-content","layer":"vm-free","implementation_revision":"sha256:df4364fcdba980239d5146d492847bcc0452b309d33fdcf2b2e19fb5b8a994ba","fixture_identity":"unit:native-code-content","scale":1,"semantic_assertions":[{"name":"affected_pages_revoke_without_touching_unrelated_dependencies","passed":true,"detail":null}],"work":{"values":{"native_code_invalidation_pages":1},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.mm.native-code-content","layer":"vm-free","implementation_revision":"sha256:df4364fcdba980239d5146d492847bcc0452b309d33fdcf2b2e19fb5b8a994ba","fixture_identity":"unit:native-code-content","scale":8,"semantic_assertions":[{"name":"affected_pages_revoke_without_touching_unrelated_dependencies","passed":true,"detail":null}],"work":{"values":{"native_code_invalidation_pages":8},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.mm.native-code-content","layer":"vm-free","implementation_revision":"sha256:df4364fcdba980239d5146d492847bcc0452b309d33fdcf2b2e19fb5b8a994ba","fixture_identity":"unit:native-code-content","scale":32,"semantic_assertions":[{"name":"affected_pages_revoke_without_touching_unrelated_dependencies","passed":true,"detail":null}],"work":{"values":{"native_code_invalidation_pages":32},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}},{"contract_id":"kernel.mm.native-code-content","layer":"vm-free","implementation_revision":"sha256:df4364fcdba980239d5146d492847bcc0452b309d33fdcf2b2e19fb5b8a994ba","fixture_identity":"unit:native-code-content","scale":128,"semantic_assertions":[{"name":"affected_pages_revoke_without_touching_unrelated_dependencies","passed":true,"detail":null}],"work":{"values":{"native_code_invalidation_pages":128},"dropped_events":0,"unknown_metrics":[]},"timing":null,"completeness":{"status":"complete"}}]
+test trap::code_content::tests::native_code_content_invalidation_contract ... ok
+test trap::foreign_mm::tests::native_code_content_syscall_copy_revokes_physical_dependencies ... ok
+test trap::foreign_mm::tests::native_code_content_raw_data_pointer_revokes_and_blocks_observation ... ok
+test trap::code_content::execution_tests::native_code_drain_waits_for_active_content_before_writer_admission ... ok
+test trap::foreign_mm::tests::syscall_writes::native_code_content_host_write_guard_retains_and_revokes_all_fragments ... ok
+test trap::foreign_mm::tests::syscall_writes::native_code_content_host_write_rejects_changed_second_leaf_and_releases_pin ... ok
+test trap::foreign_mm::tests::syscall_writes::native_code_content_host_write_rejects_stale_owner_permissions_and_bounds ... ok
+
+thread 'trap::foreign_mm::tests::syscall_writes::native_code_content_partial_host_write_admission_rolls_back_on_error_and_unwind' (4915516) panicked at crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs:148:9:
+exercise host-call unwind cleanup
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test trap::foreign_mm::tests::syscall_writes::native_code_content_partial_host_write_admission_rolls_back_on_error_and_unwind ... ok
+test trap::foreign_mm::tests::syscall_writes::native_code_content_structural_syscall_write_uses_owner_offset_and_pin ... ok
+test trap::code_content::execution_tests::native_code_drain_waits_for_last_reader_and_cleans_pending_reference ... ok
+test trap::foreign_mm::tests::syscall_writes::native_code_content_syscall_alias_fallback_revokes_original_instruction_read ... ok
+test trap::foreign_mm::tests::syscall_writes::native_code_content_syscall_copy_after_cow_preserves_source_dependency ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 510 filtered out; finished in 0.13s
+

@@ -1,0 +1,9 @@
+review required before these inventories can be re-blessed:
+  - host-authority: --refresh-candidate produced no candidate
+  - runtime-aborts/runtime.json: abort sites added=[('crates/carrick-kernel/src/dispatch/mem/madvise.rs', "MemView<'a>::madvise", 1)] removed=[]
+  - k1 inventory: per-category counts changed {'mapping': 1109, 'stream': 175, 'description_guard': 210, 'epoll': 419, 'description_backing': 18, 'table_guard': 153, 'lifecycle': 28} -> {'mapping': 1117, 'stream': 175, 'description_guard': 203, 'epoll': 421, 'description_backing': 18, 'table_guard': 153, 'lifecycle': 28}; classify first
+host-authority positions: REFUSED (host-authority: --refresh-candidate produced no candidate)
+runtime-aborts fingerprints: REFUSED (runtime-aborts/runtime.json: abort sites added=[('crates/carrick-kernel/src/dispatch/mem/madvise.rs', "MemView<'a>::madvise", 1)] removed=[])
+dispatch-lock-authority lines: 7 rebound
+k1 operation inventory: REFUSED (k1 inventory: per-category counts changed {'mapping': 1109, 'stream': 175, 'description_guard': 210, 'epoll': 419, 'description_backing': 18, 'table_guard': 153, 'lifecycle': 28} -> {'mapping': 1117, 'stream': 175, 'description_guard': 203, 'epoll': 421, 'description_backing': 18, 'table_guard': 153, 'lifecycle': 28}; classify first)
+k1 callsite taxonomy: 0 rebound

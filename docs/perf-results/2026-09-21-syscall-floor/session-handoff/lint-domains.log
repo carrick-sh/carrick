@@ -1,0 +1,45 @@
+python3 scripts/conformance/check-next-strategy.py
+conformance-next strategy: enforced
+python3 scripts/conformance/regen-next-shards.py --check
+491 generic probes; shards [164, 164, 163]; cached [152, 151, 152]
+./scripts/lint-domains.sh
+                   
+                   
+┌─────────────────┐
+│ 6 Code Findings │
+└─────────────────┘
+                                                                         
+    crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.rs
+   ❯❯❱ semgrep.carrick-no-unreviewed-inline-assembly
+          ❰❰ Blocking ❱❱
+          Inline assembly bypasses resolved-operation review. Add the host operation to the compiler host-
+          authority catalog or isolate it behind the typed host-capability facade in a reviewed boundary  
+          module.                                                                                         
+                                                                                                          
+            3┆ std::arch::global_asm!(include_str!("gateway.S"));
+            ⋮┆----------------------------------------
+           72┆ self.invoke(true, &mut || { unsafe { std::arch::asm!("mov {}, sp", out(reg) observed,
+               options(nomem, nostack, preserves_flags)); } 0 });                                   
+                                                  
+    crates/carrick-runtime/src/vcpu_loop/memory.rs
+   ❯❯❱ semgrep.carrick-no-unreviewed-inline-assembly
+          ❰❰ Blocking ❱❱
+          Inline assembly bypasses resolved-operation review. Add the host operation to the compiler host-
+          authority catalog or isolate it behind the typed host-capability facade in a reviewed boundary  
+          module.                                                                                         
+                                                                                                          
+          1746┆ std::arch::asm!("ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
+          1747┆ ptr = in(reg) ptr, out("x9") _, options(nostack));
+            ⋮┆----------------------------------------
+          1830┆         std::arch::asm!("ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
+          1831┆ ptr = in(reg) ptr, out("x9") _, options(nostack));
+            ⋮┆----------------------------------------
+          2013┆         std::arch::asm!("ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
+          2014┆ ptr = in(reg) ptr, out("x9") _, options(nostack));
+            ⋮┆----------------------------------------
+          2552┆ std::arch::asm!(
+          2553┆     "ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
+          2554┆     ptr = in(reg) ptr, out("x9") _, options(nostack)
+          2555┆ );
+
+error: recipe `lint-domains` failed on line 133 with exit code 1

@@ -1,0 +1,5 @@
+{
+  "command": "python3 scripts/migrate/reconcile-line-pinned-inventories.py",
+  "exit_code": 1,
+  "elapsed_seconds": 10.438
+}
