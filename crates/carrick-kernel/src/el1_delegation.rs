@@ -53,13 +53,99 @@ pub fn clear_current_task(slot: usize) {
     current_task.clear();
 }
 
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
+
+use carrick_vfs::InodeIdentity;
 
 static NEXT_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static ALLOCATED_HANDLES: Mutex<[bool; MAX_DELEGATED_FILES]> =
     Mutex::new([false; MAX_DELEGATED_FILES]);
 static DELEGATED_DESCRIPTIONS: Mutex<[Option<Weak<FileDescription>>; MAX_DELEGATED_FILES]> =
     Mutex::new([const { None }; MAX_DELEGATED_FILES]);
+
+static HAS_DELEGATED_FILES: AtomicBool = AtomicBool::new(false);
+static DELEGATED_INODES: Mutex<Option<HashMap<InodeIdentity, (u32, Weak<FileDescription>)>>> =
+    Mutex::new(None);
+static DELEGATED_HANDLE_INODES: Mutex<[Option<InodeIdentity>; MAX_DELEGATED_FILES]> =
+    Mutex::new([const { None }; MAX_DELEGATED_FILES]);
+static HOOK_INIT: std::sync::Once = std::sync::Once::new();
+
+pub(crate) fn init_delegation_hooks() {
+    HOOK_INIT.call_once(|| {
+        carrick_vfs::dentry::set_inode_recall_hook(recall_by_inode);
+    });
+}
+
+#[inline]
+pub(crate) fn has_delegated_files() -> bool {
+    HAS_DELEGATED_FILES.load(Ordering::Relaxed)
+}
+
+pub(crate) fn is_inode_delegated(inode: InodeIdentity) -> bool {
+    if !has_delegated_files() {
+        return false;
+    }
+    let map = DELEGATED_INODES.lock();
+    if let Some(map) = map.as_ref() {
+        if map.contains_key(&inode) {
+            return true;
+        }
+        if inode.dev == 0 {
+            return map.keys().any(|k| k.ino == inode.ino);
+        }
+    }
+    false
+}
+
+pub(crate) fn is_inode_delegated_by_other(inode: InodeIdentity, my_handle: u32) -> bool {
+    if !has_delegated_files() {
+        return false;
+    }
+    let map = DELEGATED_INODES.lock();
+    if let Some(map) = map.as_ref() {
+        if let Some((handle, _)) = map.get(&inode) {
+            return *handle != my_handle;
+        }
+        if inode.dev == 0 {
+            for (k, (handle, _)) in map.iter() {
+                if k.ino == inode.ino {
+                    return *handle != my_handle;
+                }
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn recall_by_inode(inode: InodeIdentity) -> bool {
+    if !has_delegated_files() {
+        return false;
+    }
+    let desc = {
+        let map = DELEGATED_INODES.lock();
+        if let Some(map) = map.as_ref() {
+            if let Some((_, weak)) = map.get(&inode) {
+                weak.upgrade()
+            } else if inode.dev == 0 {
+                map.iter()
+                    .find(|(k, _)| k.ino == inode.ino)
+                    .and_then(|(_, (_, weak))| weak.upgrade())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(desc) = desc {
+        recall(&desc);
+        true
+    } else {
+        false
+    }
+}
 
 fn allocate_handle(description: &Arc<FileDescription>) -> Option<u32> {
     let mut handles = ALLOCATED_HANDLES.lock();
@@ -76,10 +162,24 @@ fn allocate_handle(description: &Arc<FileDescription>) -> Option<u32> {
 
 fn free_handle(handle: u32) {
     if handle >= 1 && (handle as usize) <= MAX_DELEGATED_FILES {
+        let idx = handle as usize - 1;
         let mut handles = ALLOCATED_HANDLES.lock();
-        handles[handle as usize - 1] = false;
+        handles[idx] = false;
         let mut descs = DELEGATED_DESCRIPTIONS.lock();
-        descs[handle as usize - 1] = None;
+        descs[idx] = None;
+        let inode = {
+            let mut handle_inodes = DELEGATED_HANDLE_INODES.lock();
+            handle_inodes[idx].take()
+        };
+        if let Some(inode) = inode {
+            let mut map = DELEGATED_INODES.lock();
+            if let Some(map) = map.as_mut() {
+                map.remove(&inode);
+                if map.is_empty() {
+                    HAS_DELEGATED_FILES.store(false, Ordering::Release);
+                }
+            }
+        }
     }
 }
 
@@ -223,7 +323,7 @@ pub(crate) fn delegate_locked(
     let readable = acc == LINUX_O_RDONLY || acc == LINUX_O_RDWR;
     let writable_flag = acc == LINUX_O_WRONLY || acc == LINUX_O_RDWR;
 
-    let (_path_str, size, offset, writable) = match &*open {
+    let (_path_str, size, offset, writable, inode) = match &*open {
         OpenDescription::HostFile {
             host_fd,
             metadata,
@@ -248,11 +348,13 @@ pub(crate) fn delegate_locked(
             if cur_offset < 0 {
                 return Err(NotEligible::IoError);
             }
+            let inode = InodeIdentity::new(st.st_dev as u64, st.st_ino as u64);
             (
                 path,
                 st.st_size as u64,
                 cur_offset as u64,
                 *w && writable_flag,
+                inode,
             )
         }
         OpenDescription::File {
@@ -274,12 +376,43 @@ pub(crate) fn delegate_locked(
             if cur_len > DELEGATED_FILE_MAX_SIZE {
                 return Err(NotEligible::FileTooLarge);
             }
-            (path.as_str(), cur_len, *offset as u64, *w && writable_flag)
+            let inode = InodeIdentity::new(
+                0,
+                crate::dispatch::inode_for_path(std::path::Path::new(path)),
+            );
+            (
+                path.as_str(),
+                cur_len,
+                *offset as u64,
+                *w && writable_flag,
+                inode,
+            )
         }
         _ => return Err(NotEligible::NotRegularFile),
     };
 
+    init_delegation_hooks();
+
+    {
+        let mut map = DELEGATED_INODES.lock();
+        let map_ref = map.get_or_insert_with(HashMap::new);
+        if map_ref.contains_key(&inode) {
+            return Err(NotEligible::AlreadyDelegated);
+        }
+    }
+
     let handle = allocate_handle(&open_file.description).ok_or(NotEligible::TableFull)?;
+
+    {
+        let mut map = DELEGATED_INODES.lock();
+        let map_ref = map.get_or_insert_with(HashMap::new);
+        map_ref.insert(inode, (handle, Arc::downgrade(&open_file.description)));
+        let mut handle_inodes = DELEGATED_HANDLE_INODES.lock();
+        handle_inodes[(handle - 1) as usize] = Some(inode);
+        HAS_DELEGATED_FILES.store(true, Ordering::Release);
+    }
+
+    fs.rootfs_vfs.dentry_cache.invalidate_inode(inode);
 
     let cache_ptr = (region_ptr
         + EL1_CACHE_OFFSET as usize
@@ -910,5 +1043,186 @@ mod tests {
         let n = unsafe { libc::pread(host_fd.raw(), buf.as_mut_ptr() as *mut libc::c_void, 12, 0) };
         assert_eq!(n, 12, "thread 2 bytes were lost/truncated!");
         assert_eq!(&buf, b"thread2 data");
+    }
+
+    fn open_path_for_test(
+        dispatcher: &crate::dispatch::SyscallDispatcher,
+        ctx: &crate::kernel::KernelContext,
+        path: &str,
+        flags: u64,
+    ) -> i32 {
+        let reporter = carrick_observability::compat::CompatReporter::default();
+        let outcome = dispatcher
+            .open_at_path_string(
+                ctx,
+                None,
+                crate::dispatch::fs::OpenAtArgs {
+                    dirfd: carrick_abi::LINUX_AT_FDCWD as u64,
+                    path,
+                    flags,
+                    mode: 0o644,
+                },
+                &reporter,
+            )
+            .expect("open_at_path_string");
+        match outcome {
+            crate::dispatch::DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("expected returned fd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_open_while_delegated_sees_current_bytes() {
+        let _region = TestEl1Region::new();
+        let scratch = tempfile::tempdir().unwrap();
+        let file_path = scratch.path().join("test_b3_open.txt");
+        std::fs::write(&file_path, b"initial bytes").unwrap();
+
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            1,
+            crate::thread::ThreadId::synthetic_for_tests(1),
+            "test-open-delegated".to_owned(),
+        )
+        .expect("root bootstrap");
+        let ctx = crate::kernel::Kernel::bootstrap_root(bootstrap)
+            .expect("root kernel")
+            .1;
+        let table = ctx.task().leader_file_table().unwrap();
+        let table_id = table.id();
+
+        let fd_a = open_path_for_test(
+            &dispatcher,
+            &ctx,
+            "/test_b3_open.txt",
+            carrick_abi::LINUX_O_RDWR,
+        );
+
+        let open_file_a = dispatcher.open_file(fd_a).expect("open_file A");
+        let handle =
+            delegate(&open_file_a, table_id, fd_a, dispatcher.fs(), None).expect("delegate A");
+        assert_eq!(open_file_a.description.delegation_handle(), handle);
+
+        // Simulate EL1 modifying the file in the EL1 cache:
+        let region_ptr = get_el1_region_host_ptr();
+        let cache_ptr = (region_ptr
+            + EL1_CACHE_OFFSET as usize
+            + (handle as usize - 1) * DELEGATED_FILE_MAX_SIZE as usize)
+            as *mut u8;
+        let file_ptr = (region_ptr
+            + EL1_OBJECT_TABLE_OFFSET as usize
+            + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
+            as *const DelegatedFile;
+        let file = unsafe { &*file_ptr };
+
+        let updated_data = b"updated content in el1";
+        unsafe {
+            std::ptr::copy_nonoverlapping(updated_data.as_ptr(), cache_ptr, updated_data.len());
+        }
+        file.size
+            .store(updated_data.len() as u64, Ordering::Release);
+        file.dirty_mask.store(1, Ordering::Release);
+
+        // Process B opens the same path
+        let fd_b = open_path_for_test(
+            &dispatcher,
+            &ctx,
+            "/test_b3_open.txt",
+            carrick_abi::LINUX_O_RDONLY,
+        );
+
+        // Process A must be recalled by Process B's open!
+        assert_eq!(
+            open_file_a.description.delegation_handle(),
+            0,
+            "Process A must be recalled when Process B opens the file"
+        );
+
+        // Process B reads the file and sees updated content
+        let open_file_b = dispatcher.open_file(fd_b).expect("open_file B");
+        let guard_b = open_file_b.description.read().expect("read guard B");
+        let OpenDescription::HostFile {
+            host_fd, metadata, ..
+        } = &*guard_b
+        else {
+            panic!("expected HostFile for B");
+        };
+        assert_eq!(metadata.size, updated_data.len());
+        let mut buf = vec![0u8; updated_data.len()];
+        let n = unsafe {
+            libc::pread(
+                host_fd.raw(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+            )
+        };
+        assert_eq!(n, updated_data.len() as isize);
+        assert_eq!(&buf, updated_data);
+    }
+
+    #[test]
+    fn test_stat_while_delegated_sees_current_size() {
+        let _region = TestEl1Region::new();
+        let scratch = tempfile::tempdir().unwrap();
+        let file_path = scratch.path().join("test_b3_stat.txt");
+        std::fs::write(&file_path, b"1234567890").unwrap();
+
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            1,
+            crate::thread::ThreadId::synthetic_for_tests(1),
+            "test-stat-delegated".to_owned(),
+        )
+        .expect("root bootstrap");
+        let ctx = crate::kernel::Kernel::bootstrap_root(bootstrap)
+            .expect("root kernel")
+            .1;
+        let table = ctx.task().leader_file_table().unwrap();
+        let table_id = table.id();
+
+        let fd_a = open_path_for_test(
+            &dispatcher,
+            &ctx,
+            "/test_b3_stat.txt",
+            carrick_abi::LINUX_O_RDWR,
+        );
+
+        let open_file_a = dispatcher.open_file(fd_a).expect("open_file A");
+        let handle =
+            delegate(&open_file_a, table_id, fd_a, dispatcher.fs(), None).expect("delegate A");
+
+        // Simulate EL1 extending the file size to 1000 bytes
+        let region_ptr = get_el1_region_host_ptr();
+        let file_ptr = (region_ptr
+            + EL1_OBJECT_TABLE_OFFSET as usize
+            + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
+            as *const DelegatedFile;
+        let file = unsafe { &*file_ptr };
+        file.size.store(1000, Ordering::Release);
+        file.dirty_mask.store(1, Ordering::Release);
+
+        // Process B stats the file by path
+        let stat_rec = dispatcher
+            .path_stat_record(
+                &ctx,
+                carrick_abi::LINUX_AT_FDCWD as u64,
+                "/test_b3_stat.txt",
+                0,
+            )
+            .expect("path_stat_record");
+
+        assert_eq!(
+            open_file_a.description.delegation_handle(),
+            0,
+            "Process A must be recalled when Process B stats the file"
+        );
+        assert_eq!(stat_rec.size, 1000, "stat must see extended size from EL1");
     }
 }

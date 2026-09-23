@@ -87,7 +87,7 @@ pub struct SyscallDispatcher {
     /// Owned filesystem subsystem state (unified VFS mount table plus
     /// the `/` rootfs + writable overlay). See [`fs::FsState`]. Handlers
     /// that touch only fs state borrow `self.fs` narrowly.
-    pub(in crate::dispatch) fs: fs::FsState,
+    pub(crate) fs: fs::FsState,
     /// Installed seccomp(2) cBPF filters, checked before every syscall once
     /// active. Internally locked; `libc::fork` inherits the filters via the
     /// process memory copy and sibling threads share them (process-wide), which
@@ -2313,5 +2313,11 @@ impl SyscallDispatcher {
             fs: &self.fs,
             cross: self,
         }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn fs(&self) -> &fs::FsState {
+        &self.fs
     }
 }

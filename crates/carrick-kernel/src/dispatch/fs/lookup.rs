@@ -267,11 +267,16 @@ impl<'a> FsView<'a> {
                 && self.dac_overrides_permissions()
                 && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(path)
             {
-                return Ok(PathLookup {
-                    resolved_path: path.to_string(),
-                    fast_path: FastPathKind::StatCache,
-                    target: LookupTarget::Stat(self.stat_record_with_device(path, &real)),
-                });
+                let inode = carrick_vfs::InodeIdentity::new(0, real.ino);
+                if crate::el1_delegation::is_inode_delegated(inode) {
+                    crate::el1_delegation::recall_by_inode(inode);
+                } else {
+                    return Ok(PathLookup {
+                        resolved_path: path.to_string(),
+                        fast_path: FastPathKind::StatCache,
+                        target: LookupTarget::Stat(self.stat_record_with_device(path, &real)),
+                    });
+                }
             }
         }
 
@@ -370,11 +375,16 @@ impl<'a> FsView<'a> {
                 && self.dac_overrides_permissions()
                 && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(&resolved)
             {
-                return Ok(PathLookup {
-                    resolved_path: resolved.clone(),
-                    fast_path: FastPathKind::StatCache,
-                    target: LookupTarget::Stat(self.stat_record_with_device(&resolved, &real)),
-                });
+                let inode = carrick_vfs::InodeIdentity::new(0, real.ino);
+                if crate::el1_delegation::is_inode_delegated(inode) {
+                    crate::el1_delegation::recall_by_inode(inode);
+                } else {
+                    return Ok(PathLookup {
+                        resolved_path: resolved.clone(),
+                        fast_path: FastPathKind::StatCache,
+                        target: LookupTarget::Stat(self.stat_record_with_device(&resolved, &real)),
+                    });
+                }
             }
         } else if let LookupIntent::Open {
             open_flags,

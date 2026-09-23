@@ -240,3 +240,51 @@ print "blocking_ok\n";
         );
     }
 }
+
+/// Two processes on the same file: writer delegated at EL1, reader opens and reads while writer is still alive.
+/// Inode-level exclusivity (B3) ensures writer is recalled and reader sees current bytes.
+#[test]
+fn el1_files_inode_exclusivity_two_processes() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command([
+                "/usr/bin/perl",
+                "-e",
+                r#"
+open(my $wfh, "+>", "/tmp/shared_excl.txt") or die "open writer: $!";
+# Warm up and delegate:
+for (my $i = 0; $i < 50; $i++) {
+    syswrite($wfh, "x") or die "write: $!";
+    sysseek($wfh, 0, 0) or die "seek: $!";
+}
+syswrite($wfh, "writer_payload_abcde\n") or die "write: $!";
+
+my $pid = fork();
+if (!defined $pid) { die "fork: $!"; }
+if ($pid == 0) {
+    # Child opens the same file while parent still has it open:
+    open(my $rfh, "<", "/tmp/shared_excl.txt") or die "child open: $!";
+    my $buf;
+    sysread($rfh, $buf, 100) or die "child read: $!";
+    close($rfh);
+    print "child_got: $buf";
+    exit(0);
+} else {
+    waitpid($pid, 0);
+    close($wfh);
+}
+"#,
+            ])
+            .run_blocking(),
+    );
+
+    assert!(result.success(), "exit_code={}", result.exit_code);
+    assert_eq!(
+        result.stdout_utf8().trim(),
+        "child_got: writer_payload_abcde"
+    );
+}

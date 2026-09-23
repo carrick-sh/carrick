@@ -2957,51 +2957,82 @@ impl crate::kernel::FileDescription {
         let d = self.open_description()?;
         loop {
             let guard = d.read();
-            if self.delegation_handle() == 0 {
-                return Some(guard);
+            if self.delegation_handle() != 0 {
+                drop(guard);
+                let mut write_guard = d.write();
+                let handle = self.delegation_handle();
+                if handle != 0 {
+                    crate::el1_delegation::recall_locked(self, &mut write_guard, handle);
+                }
+                drop(write_guard);
+                continue;
             }
-            drop(guard);
-            let mut write_guard = d.write();
-            let handle = self.delegation_handle();
-            if handle != 0 {
-                crate::el1_delegation::recall_locked(self, &mut write_guard, handle);
+            if crate::el1_delegation::has_delegated_files() {
+                if let Some(inode) = guard.inode_identity_fast() {
+                    if crate::el1_delegation::is_inode_delegated_by_other(inode, 0) {
+                        drop(guard);
+                        crate::el1_delegation::recall_by_inode(inode);
+                        continue;
+                    }
+                }
             }
-            drop(write_guard);
+            return Some(guard);
         }
     }
 
     pub(crate) fn try_read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
         let d = self.open_description()?;
         let guard = d.try_read()?;
-        if self.delegation_handle() == 0 {
-            return Some(guard);
-        }
-        drop(guard);
-        let mut write_guard = d.try_write()?;
-        let handle = self.delegation_handle();
-        if handle != 0 {
-            crate::el1_delegation::recall_locked(self, &mut write_guard, handle);
-        }
-        drop(write_guard);
-        let guard = d.try_read()?;
-        if self.delegation_handle() == 0 {
-            Some(guard)
+        if self.delegation_handle() != 0 {
+            drop(guard);
+            let mut write_guard = d.try_write()?;
+            let handle = self.delegation_handle();
+            if handle != 0 {
+                crate::el1_delegation::recall_locked(self, &mut write_guard, handle);
+            }
+            drop(write_guard);
+            let guard = d.try_read()?;
+            if self.delegation_handle() == 0 {
+                Some(guard)
+            } else {
+                None
+            }
         } else {
-            None
+            if crate::el1_delegation::has_delegated_files() {
+                if let Some(inode) = guard.inode_identity_fast() {
+                    if crate::el1_delegation::is_inode_delegated_by_other(inode, 0) {
+                        drop(guard);
+                        crate::el1_delegation::recall_by_inode(inode);
+                        return d.try_read();
+                    }
+                }
+            }
+            Some(guard)
         }
     }
 
     pub(crate) fn write(&self) -> Option<FileDescriptionWriteGuard<'_>> {
         let d = self.open_description()?;
-        let mut guard = d.write();
-        let handle = self.delegation_handle();
-        if handle != 0 {
-            crate::el1_delegation::recall_locked(self, &mut guard, handle);
+        loop {
+            let mut guard = d.write();
+            let handle = self.delegation_handle();
+            if handle != 0 {
+                crate::el1_delegation::recall_locked(self, &mut guard, handle);
+            }
+            if crate::el1_delegation::has_delegated_files() {
+                if let Some(inode) = guard.inode_identity_fast() {
+                    if crate::el1_delegation::is_inode_delegated_by_other(inode, 0) {
+                        drop(guard);
+                        crate::el1_delegation::recall_by_inode(inode);
+                        continue;
+                    }
+                }
+            }
+            return Some(FileDescriptionWriteGuard {
+                guard,
+                description: self,
+            });
         }
-        Some(FileDescriptionWriteGuard {
-            guard,
-            description: self,
-        })
     }
 
     #[cfg(test)]
@@ -3063,22 +3094,22 @@ pub(super) enum XattrTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct StatRecord {
-    pub(super) ino: u64,
-    pub(super) mode: u32,
-    pub(super) nlink: u32,
-    pub(super) uid: carrick_abi::NsUid,
-    pub(super) gid: carrick_abi::NsGid,
+pub(crate) struct StatRecord {
+    pub(crate) ino: u64,
+    pub(crate) mode: u32,
+    pub(crate) nlink: u32,
+    pub(crate) uid: carrick_abi::NsUid,
+    pub(crate) gid: carrick_abi::NsGid,
     /// Device id this entry REPRESENTS (`st_rdev`) — non-zero only for a
     /// character/block device node materialised by `mknod(2)` (see
     /// `FsBackend::create_device`). Zero for every ordinary file/dir/etc.
-    pub(super) rdev: u64,
-    pub(super) size: u64,
-    pub(super) blocks: Option<u64>,
-    pub(super) atime: (i64, i64),
-    pub(super) mtime: (i64, i64),
-    pub(super) ctime: (i64, i64),
-    pub(super) fs_identity: carrick_vfs::FsIdentity,
+    pub(crate) rdev: u64,
+    pub(crate) size: u64,
+    pub(crate) blocks: Option<u64>,
+    pub(crate) atime: (i64, i64),
+    pub(crate) mtime: (i64, i64),
+    pub(crate) ctime: (i64, i64),
+    pub(crate) fs_identity: carrick_vfs::FsIdentity,
 }
 
 impl StatRecord {
@@ -3278,6 +3309,27 @@ impl OpenDescription {
                 .unwrap_or(carrick_vfs::FsIdentity::Overlay),
             Self::ProcExecutable { .. } => carrick_vfs::FsIdentity::Overlay,
             _ => carrick_vfs::FsIdentity::AnonInode,
+        }
+    }
+
+    pub(crate) fn inode_identity_fast(&self) -> Option<carrick_vfs::InodeIdentity> {
+        match self {
+            OpenDescription::HostFile { host_fd, .. } => {
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0 {
+                    Some(carrick_vfs::InodeIdentity::new(
+                        st.st_dev as u64,
+                        st.st_ino as u64,
+                    ))
+                } else {
+                    None
+                }
+            }
+            OpenDescription::File { path, .. } => Some(carrick_vfs::InodeIdentity::new(
+                0,
+                super::inode_for_path(std::path::Path::new(path)),
+            )),
+            _ => None,
         }
     }
 

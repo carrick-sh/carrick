@@ -452,6 +452,23 @@ impl<'a> FsView<'a> {
             // be opened), real device: exact slow path.
             return None;
         }
+        if typ == libc::S_IFREG as u32 {
+            let inode = carrick_vfs::InodeIdentity::new(st.st_dev as u64, st.st_ino as u64);
+            if crate::el1_delegation::is_inode_delegated(inode) {
+                crate::el1_delegation::recall_by_inode(inode);
+                if unsafe {
+                    libc::fstatat(
+                        host_dir.fd.raw(),
+                        name_c.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } != 0
+                {
+                    return None;
+                }
+            }
+        }
         // Carrick metadata (mode/owner/socket) via one flistxattr-gated pass
         // on a no-atime fd — the same fill pattern (and the same benign
         // fstatat→openat window) as the stat cache's
