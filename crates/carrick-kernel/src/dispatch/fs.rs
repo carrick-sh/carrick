@@ -2622,7 +2622,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(in crate::dispatch) fn open_at_path_string(
+    pub(crate) fn open_at_path_string(
         &self,
         context: &crate::kernel::KernelContext,
         registry: Option<&crate::thread::ThreadRegistry>,
@@ -2813,7 +2813,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(in crate::dispatch) fn path_stat_record(
+    pub(crate) fn path_stat_record(
         &self,
         context: &crate::kernel::KernelContext,
         dirfd: u64,

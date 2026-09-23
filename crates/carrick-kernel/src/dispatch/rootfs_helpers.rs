@@ -200,7 +200,7 @@ pub(super) fn align_to(value: usize, alignment: usize) -> usize {
     value.div_ceil(alignment) * alignment
 }
 
-pub(super) fn inode_for_path(path: &Path) -> u64 {
+pub(crate) fn inode_for_path(path: &Path) -> u64 {
     // Inode numbers must reflect file *identity*, not the textual path used to
     // reach the file. stat("/a/b") and stat(".") from inside /a/b must agree,
     // or TOCTOU identity checks abort — dpkg-preconfigure stats a directory,
