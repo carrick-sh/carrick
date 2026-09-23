@@ -175,7 +175,7 @@ pub struct CurrentTask {
     pub fixup_pc: AtomicU64,
     /// Return-to-user work pending flag set by the host before kicks/signals/teardown.
     pub pending_host_work: AtomicU32,
-    /// Flag indicating this syscall completed at EL1 with return value in x0/args[0].
+    /// Flag indicating this syscall completed at EL1 with return value in `x0`/`args[0]`.
     pub served_with_work: AtomicU32,
 }
 
