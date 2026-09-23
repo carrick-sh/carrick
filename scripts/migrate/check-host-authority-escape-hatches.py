@@ -45,6 +45,8 @@ RAW_SYSCALL_BOUNDARIES = frozenset(
 
 ASSEMBLY_BOUNDARIES = frozenset(
     {
+        PurePosixPath("crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.rs"),
+        PurePosixPath("crates/carrick-runtime/src/vcpu_loop/native_probe.rs"),
         PurePosixPath("crates/carrick-runtime/tools/vdso_getrandom_blob.rs"),
         PurePosixPath("crates/carrick-vmm-bhyve/fixtures/bhyve-fpsignal/src/main.rs"),
         PurePosixPath("crates/carrick-vmm-bhyve/fixtures/bhyve-sigfpe/src/main.rs"),
