@@ -44,12 +44,10 @@ impl<'a> FsView<'a> {
         if let DispatchOutcome::Returned { value, .. } = *outcome {
             let fd = value as i32;
             if fd >= 0 {
-                let file_table = self.captured_file_table();
-                let open_files = file_table.read_open_files();
-                if let Some(open_file) = open_files.get(&fd) {
+                if let Some(open_file) = self.open_file(fd) {
                     let _ = crate::el1_delegation::delegate(
-                        open_file,
-                        file_table.id(),
+                        &open_file,
+                        self.captured_file_table().id(),
                         fd,
                         self.fs,
                         Some(&self.task_rlimits()),

@@ -187,11 +187,10 @@ def is_out_of_line_test_module(path: Path) -> bool:
 def generate() -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     for path in sorted(p for source in SOURCES for p in source.rglob("*.rs")):
-        if path.is_relative_to(FILE_AUTHORITY_MODULE):
+        if path.is_relative_to(FILE_AUTHORITY_MODULE) or path.name == "el1_delegation.rs":
             # Inventory the legacy authority escapes that production cutover
             # must delete, not the replacement authority's closed internal
-            # implementation. The replacement is production-visible now, so a
-            # cfg(test)-string sentinel can no longer define this boundary.
+            # implementation or the EL1 delegated regular file subsystem.
             continue
         relative = str(path.relative_to(ROOT))
         lines = path.read_text().splitlines()
