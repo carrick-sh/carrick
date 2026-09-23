@@ -51,6 +51,7 @@ impl<'a> FsView<'a> {
                         fd,
                         self.fs,
                         Some(&self.task_rlimits()),
+                        Some(self.delegation_policy()),
                     );
                 }
             }

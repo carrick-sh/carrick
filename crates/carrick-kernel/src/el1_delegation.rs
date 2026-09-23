@@ -222,6 +222,43 @@ pub(crate) fn recall_all_watched(fs: &FsState) {
     }
 }
 
+/// Recall all currently delegated files across all tables back to host authority.
+///
+/// Returns the first writeback error encountered, if any.
+pub(crate) fn recall_all_delegated() -> Result<(), carrick_abi::LinuxErrno> {
+    let candidates: Vec<Arc<FileDescription>> = {
+        let descs = DELEGATED_DESCRIPTIONS.lock();
+        descs.iter().filter_map(|w| w.as_ref()?.upgrade()).collect()
+    };
+    let mut first_err = None;
+    for desc in candidates {
+        if desc.delegation_handle() == 0 {
+            continue;
+        }
+        if let Err(err) = recall(&desc) {
+            if first_err.is_none() {
+                first_err = Some(err);
+            }
+        }
+    }
+    if let Some(err) = first_err {
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
+/// AArch64 canonical syscall numbers served at EL1 on delegated regular files.
+pub const DELEGATED_SYSCALL_NUMBERS: &[u64] = &[62, 63, 64, 67, 68, 80];
+
+/// Snapshot of active security and observability policies during delegation eligibility checks.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct DelegationPolicy<'a> {
+    pub seccomp: Option<&'a crate::seccomp::SeccompState>,
+    pub observers: Option<&'a crate::observe::ObserverChain>,
+    pub interceptors_active: bool,
+}
+
 /// Reasons why a file description cannot be delegated to EL1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotEligible {
@@ -239,6 +276,9 @@ pub enum NotEligible {
     TableFull,
     AlreadyDelegated,
     IoError,
+    Sealed,
+    SeccompFiltered,
+    Observed,
 }
 
 fn lock_delegated_file(file: &DelegatedFile, handle: u32) {
@@ -267,12 +307,13 @@ pub(crate) fn delegate(
     fd: i32,
     fs: &FsState,
     rlimits: Option<&RlimitSet>,
+    policy: Option<DelegationPolicy<'_>>,
 ) -> Result<u32, NotEligible> {
     let Some(d) = open_file.description.open_description() else {
         return Err(NotEligible::NotRegularFile);
     };
     let mut open = d.write();
-    delegate_locked(open_file, &mut open, file_table, fd, fs, rlimits)
+    delegate_locked(open_file, &mut open, file_table, fd, fs, rlimits, policy)
 }
 
 pub(crate) fn delegate_locked(
@@ -282,6 +323,7 @@ pub(crate) fn delegate_locked(
     fd: i32,
     fs: &FsState,
     rlimits: Option<&RlimitSet>,
+    policy: Option<DelegationPolicy<'_>>,
 ) -> Result<u32, NotEligible> {
     if std::env::var_os("CARRICK_EL1").is_some_and(|val| val == "0") {
         return Err(NotEligible::Disabled);
@@ -303,6 +345,20 @@ pub(crate) fn delegate_locked(
         let lim = limits.get(LinuxResource::Fsize);
         if lim.rlim_cur != LINUX_RLIM_INFINITY {
             return Err(NotEligible::FsizeLimited);
+        }
+    }
+    if let Some(pol) = policy {
+        if pol.seccomp.is_some_and(|s| s.is_active()) {
+            return Err(NotEligible::SeccompFiltered);
+        }
+        if pol.interceptors_active {
+            return Err(NotEligible::Observed);
+        }
+        if pol
+            .observers
+            .is_some_and(|o| o.observes_any_syscall(DELEGATED_SYSCALL_NUMBERS))
+        {
+            return Err(NotEligible::Observed);
         }
     }
     if !fs.classic_record_locks.is_empty() {
@@ -394,6 +450,19 @@ pub(crate) fn delegate_locked(
         }
         _ => return Err(NotEligible::NotRegularFile),
     };
+
+    if let Some(seals_raw) = open_file.description.common().seals() {
+        let seals = carrick_abi::LinuxMemfdSeals::from_bits_truncate(seals_raw);
+        if writable
+            && seals.intersects(
+                carrick_abi::LinuxMemfdSeals::WRITE
+                    | carrick_abi::LinuxMemfdSeals::FUTURE_WRITE
+                    | carrick_abi::LinuxMemfdSeals::GROW,
+            )
+        {
+            return Err(NotEligible::Sealed);
+        }
+    }
 
     init_delegation_hooks();
 
@@ -510,7 +579,18 @@ pub fn delegate_for_test(
     fd: i32,
 ) -> Result<u32, NotEligible> {
     let fs = FsState::new_with_host_resolver(None);
-    delegate(open_file, file_table, fd, &fs, None)
+    delegate(open_file, file_table, fd, &fs, None, None)
+}
+
+#[cfg(test)]
+pub(crate) fn delegate_for_test_with_policy(
+    open_file: &OpenFile,
+    file_table: FileTableId,
+    fd: i32,
+    policy: DelegationPolicy<'_>,
+) -> Result<u32, NotEligible> {
+    let fs = FsState::new_with_host_resolver(None);
+    delegate(open_file, file_table, fd, &fs, None, Some(policy))
 }
 
 /// Recall a delegated file description back to host authority.
@@ -602,18 +682,24 @@ pub(crate) fn recall_locked(
 
     match open {
         OpenDescription::HostFile {
-            host_fd, metadata, ..
+            host_fd,
+            metadata,
+            writable,
+            ..
         } => {
-            let trunc_res = unsafe { libc::ftruncate(host_fd.raw(), guest_size as libc::off_t) };
-            if trunc_res != 0 {
-                let err = crate::host_to_linux_errno(
-                    std::io::Error::last_os_error()
-                        .raw_os_error()
-                        .unwrap_or(libc::EIO),
-                );
-                description.common().record_writeback_error(err);
-                if write_error.is_none() {
-                    write_error = Some(err);
+            if *writable && metadata.size != guest_size as usize {
+                let trunc_res =
+                    unsafe { libc::ftruncate(host_fd.raw(), guest_size as libc::off_t) };
+                if trunc_res != 0 {
+                    let err = crate::host_to_linux_errno(
+                        std::io::Error::last_os_error()
+                            .raw_os_error()
+                            .unwrap_or(libc::EIO),
+                    );
+                    description.common().record_writeback_error(err);
+                    if write_error.is_none() {
+                        write_error = Some(err);
+                    }
                 }
             }
             let seek_res =
@@ -636,38 +722,41 @@ pub(crate) fn recall_locked(
             contents,
             offset,
             metadata,
+            writable,
             ..
         } => {
-            if let Err(err) = contents.resize(guest_size) {
-                description.common().record_writeback_error(err);
-                if write_error.is_none() {
-                    write_error = Some(err);
+            if *writable && metadata.size != guest_size as usize {
+                if let Err(err) = contents.resize(guest_size) {
+                    description.common().record_writeback_error(err);
+                    if write_error.is_none() {
+                        write_error = Some(err);
+                    }
+                }
+                if let Some(vfs) = rootfs_vfs.as_deref() {
+                    if !crate::dispatch::fd_table::is_anon_overlay_path(path) {
+                        if let Err(e) = vfs.write_file_range(path, 0, &[], guest_size as usize) {
+                            let err = match e {
+                                carrick_vfs::fs_backend::BackendError::Host(err)
+                                | carrick_vfs::fs_backend::BackendError::Namespace(err) => err,
+                                carrick_vfs::fs_backend::BackendError::Invalid => {
+                                    carrick_abi::LINUX_EINVAL
+                                }
+                                carrick_vfs::fs_backend::BackendError::Unsupported => {
+                                    carrick_abi::LINUX_ENOTSUP
+                                }
+                                carrick_vfs::fs_backend::BackendError::Io => carrick_abi::LINUX_EIO,
+                            };
+                            description.common().record_writeback_error(err);
+                            if write_error.is_none() {
+                                write_error = Some(err);
+                            }
+                        }
+                        vfs.notify_inode_changed(path, None);
+                    }
                 }
             }
             *offset = guest_offset as usize;
             metadata.size = guest_size as usize;
-            if let Some(vfs) = rootfs_vfs.as_deref() {
-                if !crate::dispatch::fd_table::is_anon_overlay_path(path) {
-                    if let Err(e) = vfs.write_file_range(path, 0, &[], guest_size as usize) {
-                        let err = match e {
-                            carrick_vfs::fs_backend::BackendError::Host(err)
-                            | carrick_vfs::fs_backend::BackendError::Namespace(err) => err,
-                            carrick_vfs::fs_backend::BackendError::Invalid => {
-                                carrick_abi::LINUX_EINVAL
-                            }
-                            carrick_vfs::fs_backend::BackendError::Unsupported => {
-                                carrick_abi::LINUX_ENOTSUP
-                            }
-                            carrick_vfs::fs_backend::BackendError::Io => carrick_abi::LINUX_EIO,
-                        };
-                        description.common().record_writeback_error(err);
-                        if write_error.is_none() {
-                            write_error = Some(err);
-                        }
-                    }
-                    vfs.notify_inode_changed(path, None);
-                }
-            }
         }
         _ => {}
     }
@@ -699,6 +788,7 @@ mod tests {
     use super::*;
     use crate::dispatch::fd_table::{FileContents, HostFdRef, OpenDescriptionBase};
     use crate::kernel::objects::{FileSlot, FileTable};
+    use carrick_guest_mem::GuestMemory;
     use carrick_vfs::rootfs::RootFsMetadata;
     use std::io::Write;
     use std::os::fd::AsRawFd;
@@ -847,6 +937,97 @@ mod tests {
             Err(NotEligible::Mapped)
         );
         drop(mapping);
+
+        // 7. Active seccomp filter
+        let (_tmp, seccomp_file) = create_test_host_file(b"seccomp");
+        let seccomp_state = crate::seccomp::SeccompState::default();
+        seccomp_state.install_strict();
+        assert_eq!(
+            delegate_for_test_with_policy(
+                &seccomp_file,
+                table_id,
+                9,
+                DelegationPolicy {
+                    seccomp: Some(&seccomp_state),
+                    observers: None,
+                    interceptors_active: false,
+                }
+            ),
+            Err(NotEligible::SeccompFiltered)
+        );
+
+        // 8. Observer monitoring write (64)
+        let (_tmp, obs_file) = create_test_host_file(b"observer");
+        let policy_obs = Arc::new(
+            crate::observe::PolicyObserver::new()
+                .deny(carrick_abi::CanonicalNr(64), carrick_abi::LINUX_EPERM),
+        );
+        let chain = crate::observe::ObserverChain::new(None, vec![policy_obs]);
+        assert_eq!(
+            delegate_for_test_with_policy(
+                &obs_file,
+                table_id,
+                10,
+                DelegationPolicy {
+                    seccomp: None,
+                    observers: Some(&chain),
+                    interceptors_active: false,
+                }
+            ),
+            Err(NotEligible::Observed)
+        );
+
+        // 9. Docker default ContainerPolicy allows delegation
+        let (_tmp, docker_file) = create_test_host_file(b"docker");
+        let docker_policy = crate::container_policy::ContainerPolicy::docker_default_model();
+        let docker_chain = crate::observe::ObserverChain::new(Some(docker_policy), vec![]);
+        let docker_res = delegate_for_test_with_policy(
+            &docker_file,
+            table_id,
+            11,
+            DelegationPolicy {
+                seccomp: None,
+                observers: Some(&docker_chain),
+                interceptors_active: false,
+            },
+        );
+        assert!(
+            docker_res.is_ok(),
+            "Docker default ContainerPolicy should allow delegation: {docker_res:?}"
+        );
+        let _ = recall(&docker_file.description);
+
+        // 10. Memfd with F_SEAL_WRITE
+        let (_tmp, sealed_write_file) = create_test_host_file(b"sealed_write");
+        sealed_write_file
+            .description
+            .common()
+            .set_seals(Some(carrick_abi::LinuxMemfdSeals::WRITE.bits()));
+        assert_eq!(
+            delegate_for_test(&sealed_write_file, table_id, 12),
+            Err(NotEligible::Sealed)
+        );
+
+        // 11. Memfd with F_SEAL_GROW
+        let (_tmp, sealed_grow_file) = create_test_host_file(b"sealed_grow");
+        sealed_grow_file
+            .description
+            .common()
+            .set_seals(Some(carrick_abi::LinuxMemfdSeals::GROW.bits()));
+        assert_eq!(
+            delegate_for_test(&sealed_grow_file, table_id, 13),
+            Err(NotEligible::Sealed)
+        );
+
+        // 12. Unsealed memfd (ALLOW_SEALING with empty seal set)
+        let (_tmp, unsealed_file) = create_test_host_file(b"unsealed");
+        unsealed_file.description.common().set_seals(Some(0));
+        let unsealed_res = delegate_for_test(&unsealed_file, table_id, 14);
+        assert!(
+            unsealed_res.is_ok(),
+            "Unsealed memfd should delegate: {unsealed_res:?}"
+        );
+        let _ = recall(&unsealed_file.description);
     }
 
     #[test]
@@ -1175,8 +1356,8 @@ mod tests {
         );
 
         let open_file_a = dispatcher.open_file(fd_a).expect("open_file A");
-        let handle =
-            delegate(&open_file_a, table_id, fd_a, dispatcher.fs(), None).expect("delegate A");
+        let handle = delegate(&open_file_a, table_id, fd_a, dispatcher.fs(), None, None)
+            .expect("delegate A");
         assert_eq!(open_file_a.description.delegation_handle(), handle);
 
         // Simulate EL1 modifying the file in the EL1 cache:
@@ -1268,8 +1449,8 @@ mod tests {
         );
 
         let open_file_a = dispatcher.open_file(fd_a).expect("open_file A");
-        let handle =
-            delegate(&open_file_a, table_id, fd_a, dispatcher.fs(), None).expect("delegate A");
+        let handle = delegate(&open_file_a, table_id, fd_a, dispatcher.fs(), None, None)
+            .expect("delegate A");
 
         // Simulate EL1 extending the file size to 1000 bytes
         let region_ptr = get_el1_region_host_ptr();
@@ -1327,7 +1508,7 @@ mod tests {
 
         let fd_p = open_path_for_test(&dispatcher, &ctx, "/file_p.txt", carrick_abi::LINUX_O_RDWR);
         let open_p = dispatcher.open_file(fd_p).unwrap();
-        let handle_p = delegate(&open_p, table_id, fd_p, dispatcher.fs(), None).unwrap();
+        let handle_p = delegate(&open_p, table_id, fd_p, dispatcher.fs(), None, None).unwrap();
         assert_eq!(handle_p, 1);
 
         // Recall P -> frees handle 1
@@ -1341,7 +1522,7 @@ mod tests {
 
         let fd_q = open_path_for_test(&dispatcher, &ctx, "/file_q.txt", carrick_abi::LINUX_O_RDWR);
         let open_q = dispatcher.open_file(fd_q).unwrap();
-        let handle_q = delegate(&open_q, table_id, fd_q, dispatcher.fs(), None).unwrap();
+        let handle_q = delegate(&open_q, table_id, fd_q, dispatcher.fs(), None, None).unwrap();
         assert_eq!(handle_q, 1, "Handle 1 should be reused");
 
         let region_ptr = get_el1_region_host_ptr();
@@ -1433,7 +1614,7 @@ mod tests {
             carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_RDWR,
         );
         let open_file = dispatcher.open_file(fd).unwrap();
-        let handle = delegate(&open_file, table_id, fd, dispatcher.fs(), None).unwrap();
+        let handle = delegate(&open_file, table_id, fd, dispatcher.fs(), None, None).unwrap();
         assert_eq!(handle, 1);
 
         // Simulate EL1 write
@@ -1500,5 +1681,191 @@ mod tests {
             .record_writeback_error(carrick_abi::LINUX_ENOSPC);
         let sync_res = fsync_for_test(&mut dispatcher, fd_reopened);
         assert_eq!(sync_res, Err(carrick_abi::LINUX_ENOSPC));
+    }
+
+    #[test]
+    fn test_recall_on_f_add_seals_and_f_setfl() {
+        let _region = TestEl1Region::new();
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let ctx = dispatcher.capture_one_task_context().unwrap();
+        let table = ctx.task().leader_file_table().unwrap();
+        let table_id = table.id();
+
+        // 1. Memfd delegation and recall on F_ADD_SEALS
+        let fd = open_path_for_test(
+            &dispatcher,
+            &ctx,
+            "/test_memfd_seal.txt",
+            carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_RDWR,
+        );
+        let open_file = dispatcher.open_file(fd).unwrap();
+        open_file.description.common().set_seals(Some(0)); // sealable
+        let handle = delegate(&open_file, table_id, fd, dispatcher.fs(), None, None).unwrap();
+        assert_eq!(handle, 1);
+        assert_eq!(open_file.description.delegation_handle(), 1);
+
+        // Call F_ADD_SEALS (via fcntl)
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 0x2000]);
+        let reporter = carrick_observability::compat::CompatReporter::default();
+        let outcome = dispatcher
+            .dispatch(
+                &ctx,
+                crate::dispatch::request::SyscallRequest::new(
+                    carrick_abi::syscall::nr::FCNTL.0,
+                    carrick_observability::compat::SyscallArgs([
+                        fd as u64,
+                        carrick_abi::LINUX_F_ADD_SEALS as u64,
+                        carrick_abi::LinuxMemfdSeals::WRITE.bits() as u64,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::dispatch::DispatchOutcome::Returned { value: 0 }
+        ));
+        assert_eq!(
+            open_file.description.delegation_handle(),
+            0,
+            "F_ADD_SEALS must recall delegated file"
+        );
+
+        // 2. File delegation and recall on F_SETFL
+        let fd2 = open_path_for_test(
+            &dispatcher,
+            &ctx,
+            "/test_fsetfl.txt",
+            carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_RDWR,
+        );
+        let open_file2 = dispatcher.open_file(fd2).unwrap();
+        let handle2 = delegate(&open_file2, table_id, fd2, dispatcher.fs(), None, None).unwrap();
+        assert_eq!(handle2, 1);
+        assert_eq!(open_file2.description.delegation_handle(), 1);
+
+        let outcome2 = dispatcher
+            .dispatch(
+                &ctx,
+                crate::dispatch::request::SyscallRequest::new(
+                    carrick_abi::syscall::nr::FCNTL.0,
+                    carrick_observability::compat::SyscallArgs([
+                        fd2 as u64,
+                        carrick_abi::LINUX_F_SETFL as u64,
+                        carrick_abi::LINUX_O_APPEND as u64,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome2,
+            crate::dispatch::DispatchOutcome::Returned { value: 0 }
+        ));
+        assert_eq!(
+            open_file2.description.delegation_handle(),
+            0,
+            "F_SETFL must recall delegated file"
+        );
+    }
+
+    #[test]
+    fn test_recall_on_rlimit_fsize_and_seccomp() {
+        let _region = TestEl1Region::new();
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let ctx = dispatcher.capture_one_task_context().unwrap();
+        let table = ctx.task().leader_file_table().unwrap();
+        let table_id = table.id();
+
+        // 1. File delegated, then prlimit64(RLIMIT_FSIZE)
+        let fd = open_path_for_test(
+            &dispatcher,
+            &ctx,
+            "/test_rlimit.txt",
+            carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_RDWR,
+        );
+        let open_file = dispatcher.open_file(fd).unwrap();
+        let handle = delegate(&open_file, table_id, fd, dispatcher.fs(), None, None).unwrap();
+        assert_eq!(handle, 1);
+
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 0x2000]);
+        let reporter = carrick_observability::compat::CompatReporter::default();
+        // new limit at 0x1000: rlim_cur = 500, rlim_max = 500
+        let rlimit_bytes = [500u64.to_le_bytes(), 500u64.to_le_bytes()].concat();
+        memory.write_bytes(0x1000, &rlimit_bytes).unwrap();
+
+        let outcome = dispatcher
+            .dispatch(
+                &ctx,
+                crate::dispatch::request::SyscallRequest::new(
+                    carrick_abi::syscall::nr::PRLIMIT64.0,
+                    carrick_observability::compat::SyscallArgs([
+                        0, // self
+                        carrick_abi::LinuxResource::Fsize as u64,
+                        0x1000,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::dispatch::DispatchOutcome::Returned { value: 0 }
+        ));
+        assert_eq!(
+            open_file.description.delegation_handle(),
+            0,
+            "RLIMIT_FSIZE must recall delegated file"
+        );
+
+        // 2. File delegated, then seccomp STRICT
+        let fd2 = open_path_for_test(
+            &dispatcher,
+            &ctx,
+            "/test_seccomp_strict.txt",
+            carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_RDWR,
+        );
+        let open_file2 = dispatcher.open_file(fd2).unwrap();
+        let handle2 = delegate(&open_file2, table_id, fd2, dispatcher.fs(), None, None).unwrap();
+        assert_eq!(handle2, 1);
+
+        let outcome2 = dispatcher
+            .dispatch(
+                &ctx,
+                crate::dispatch::request::SyscallRequest::new(
+                    carrick_abi::syscall::nr::SECCOMP.0,
+                    carrick_observability::compat::SyscallArgs([
+                        crate::seccomp::SECCOMP_SET_MODE_STRICT as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome2,
+            crate::dispatch::DispatchOutcome::Returned { value: 0 }
+        ));
+        assert_eq!(
+            open_file2.description.delegation_handle(),
+            0,
+            "seccomp must recall delegated file"
+        );
     }
 }

@@ -442,4 +442,13 @@ impl SyscallDispatcher {
             Some(self.seccomp.identity_fast_path_word())
         }
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn delegation_policy(&self) -> crate::el1_delegation::DelegationPolicy<'_> {
+        crate::el1_delegation::DelegationPolicy {
+            seccomp: Some(&self.seccomp),
+            observers: self.observers.as_deref(),
+            interceptors_active: self.interceptors.is_some(),
+        }
+    }
 }
