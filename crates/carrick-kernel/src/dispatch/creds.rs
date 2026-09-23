@@ -864,7 +864,6 @@ impl SyscallDispatcher {
                 credentials.set_uid_triple(ruid, euid, suid);
             })?;
             this.publish_external_credential_projection(cx.kernel, &updated);
-            let _ = crate::kernel::identity_page::stamp_info_page(&mut *cx.memory, cx.kernel);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -883,7 +882,6 @@ impl SyscallDispatcher {
             this.update_credentials(cx.kernel, |credentials| {
                 credentials.set_gid_triple(rgid, egid, sgid);
             })?;
-            let _ = crate::kernel::identity_page::stamp_info_page(&mut *cx.memory, cx.kernel);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -902,7 +900,6 @@ impl SyscallDispatcher {
                 credentials.set_uid_triple(ruid, euid, suid);
             })?;
             this.publish_external_credential_projection(cx.kernel, &updated);
-            let _ = crate::kernel::identity_page::stamp_info_page(&mut *cx.memory, cx.kernel);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -920,7 +917,6 @@ impl SyscallDispatcher {
             this.update_credentials(cx.kernel, |credentials| {
                 credentials.set_gid_triple(rgid, egid, sgid);
             })?;
-            let _ = crate::kernel::identity_page::stamp_info_page(&mut *cx.memory, cx.kernel);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -938,7 +934,6 @@ impl SyscallDispatcher {
                 credentials.set_uid_triple(ruid, euid, suid);
             })?;
             this.publish_external_credential_projection(cx.kernel, &updated);
-            let _ = crate::kernel::identity_page::stamp_info_page(&mut *cx.memory, cx.kernel);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -955,7 +950,6 @@ impl SyscallDispatcher {
             this.update_credentials(cx.kernel, |credentials| {
                 credentials.set_gid_triple(rgid, egid, sgid);
             })?;
-            let _ = crate::kernel::identity_page::stamp_info_page(&mut *cx.memory, cx.kernel);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 

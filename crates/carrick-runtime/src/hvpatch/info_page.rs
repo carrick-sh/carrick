@@ -5,11 +5,6 @@ pub(crate) const INFO_PAGE_SIZE: usize = 4096;
 pub(crate) const INFO_PAGE_OFF_PID: u64 = carrick_mem::memory::INFO_PAGE_OFF_PID;
 #[allow(dead_code)]
 pub(crate) const INFO_PAGE_OFF_TID: u64 = carrick_mem::memory::INFO_PAGE_OFF_TID;
-pub(crate) const INFO_PAGE_OFF_UID: u64 = carrick_mem::memory::INFO_PAGE_OFF_UID;
-pub(crate) const INFO_PAGE_OFF_GID: u64 = carrick_mem::memory::INFO_PAGE_OFF_GID;
-pub(crate) const INFO_PAGE_OFF_EUID: u64 = carrick_mem::memory::INFO_PAGE_OFF_EUID;
-pub(crate) const INFO_PAGE_OFF_EGID: u64 = carrick_mem::memory::INFO_PAGE_OFF_EGID;
-pub(crate) const INFO_PAGE_OFF_PPID: u64 = carrick_mem::memory::INFO_PAGE_OFF_PPID;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
