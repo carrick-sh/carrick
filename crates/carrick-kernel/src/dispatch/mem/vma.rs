@@ -797,6 +797,7 @@ pub(crate) fn data_va_bytes(mem: &MemState) -> u64 {
         .address_space_regions
         .iter()
         .flatten()
+        .filter(|map| !boot_region_is_carrick_kernel_hole(map))
         .filter(|map| !boot_region_is_hidden_reservation(map, mem.layout))
         .chain(mem.dynamic_maps.iter())
         .filter(|map| map.start < map.end)

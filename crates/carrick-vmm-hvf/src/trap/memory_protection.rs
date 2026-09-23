@@ -167,15 +167,7 @@ pub(crate) fn split_local_mapping_rows_for_unmap(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn is_kernel_only_stage1_range(start: u64, len: usize) -> bool {
-    let end = start.saturating_add(len as u64);
-    (start >= crate::memory::LINUX_KERNEL_REGION_BASE
-        && end
-            <= crate::memory::LINUX_KERNEL_REGION_BASE
-                .saturating_add(carrick_mem::memory::LINUX_KERNEL_REGION_SIZE))
-        || (start >= carrick_mem::memory::LINUX_EL1_KERNEL_BASE
-            && end
-                <= carrick_mem::memory::LINUX_EL1_KERNEL_BASE
-                    .saturating_add(carrick_mem::memory::LINUX_EL1_KERNEL_SIZE))
+    carrick_mem::memory::is_carrick_kernel_only_range(start, start.saturating_add(len as u64))
 }
 
 /// The carrier-global alias registry, partitioned by owning scope.
