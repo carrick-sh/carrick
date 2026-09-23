@@ -55,11 +55,20 @@ pub fn is_aarch64_hvc_fault(syndrome: u64) -> bool {
     is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == AARCH64_HVC_FAULT_IMM
 }
 
+/// HVC immediate reserved for the EL1 vector's lower-EL IRQ kick boundary trap (`hvc #4`).
+pub const AARCH64_HVC_KICK_IMM: u64 = 4;
+
+/// True for the EL1 vector's `hvc #4` kick boundary trap.
+pub fn is_aarch64_hvc_kick(syndrome: u64) -> bool {
+    is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == AARCH64_HVC_KICK_IMM
+}
+
 /// True for syscall-shaped traps a host can dispatch identically: EL0 `svc #0`
 /// (`EC = 0x15`) and an EL1 vector's `hvc #2` re-trap (`EC = 0x16`). Both
 /// deliver the syscall ABI registers unchanged.
 pub fn is_aarch64_syscall_exception(syndrome: u64) -> bool {
-    is_aarch64_svc_exception(syndrome) || is_aarch64_hvc_exception(syndrome)
+    is_aarch64_svc_exception(syndrome)
+        || (is_aarch64_hvc_exception(syndrome) && !is_aarch64_hvc_kick(syndrome))
 }
 
 /// Whether a captured vCPU PC is genuine guest userspace (EL0) or inside

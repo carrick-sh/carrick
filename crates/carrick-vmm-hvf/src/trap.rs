@@ -256,8 +256,8 @@ use carrick_hal::aarch64::ExecLevel;
 // (E0603/E0432 in tests/trap_hvf.rs).
 pub use carrick_hal::aarch64::{
     AARCH64_HVC_EXCEPTION_CLASS, AARCH64_SVC_EXCEPTION_CLASS, aarch64_exception_class,
-    is_aarch64_hvc_exception, is_aarch64_hvc_fault, is_aarch64_hvc_maintenance,
-    is_aarch64_svc_exception, is_aarch64_syscall_exception,
+    is_aarch64_hvc_exception, is_aarch64_hvc_fault, is_aarch64_hvc_kick,
+    is_aarch64_hvc_maintenance, is_aarch64_svc_exception, is_aarch64_syscall_exception,
 };
 use carrick_hal::trap::{HostAliasBacking, HostAliasSharing};
 pub use carrick_hal::trap::{RawSyscall, SyscallTrap, TrapError};
@@ -7325,6 +7325,8 @@ impl HvfInner {
                         exit.reason,
                     );
                 }
+                vcpu.set_pending_interrupt(InterruptType::IRQ, true)
+                    .map_err(hvf_error)?;
                 EL1_KICK_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::probes::kick_in_kernel(pc, ((cpsr >> 2) & 0b11) as u32);
                 continue;
@@ -7480,6 +7482,15 @@ impl HvfInner {
             // to see what actually trapped to EL1; if it's not an SVC, either
             // emulate it (sys64 MRS read → re-run) or surface it as an EL0Fault.
             if is_aarch64_hvc_exception(exception.syndrome) {
+                if is_aarch64_hvc_kick(exception.syndrome) {
+                    vcpu.set_pending_interrupt(InterruptType::IRQ, false)
+                        .map_err(hvf_error)?;
+                    let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+                    let spsr = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
+                    vcpu.set_reg(Reg::PC, elr).map_err(hvf_error)?;
+                    vcpu.set_reg(Reg::CPSR, spsr).map_err(hvf_error)?;
+                    return Ok(Aarch64Exit::Kicked);
+                }
                 let mut overhead = SyscallTransportOverhead::default();
                 match decode_hvc_syscall_exit(exception.syndrome, vcpu, mailbox, &mut overhead)? {
                     HvcExitOutcome::Syscall(exit) => {

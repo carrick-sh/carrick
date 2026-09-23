@@ -433,6 +433,12 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         Ok(())
     }
 
+    fn set_pending_irq(&mut self, pending: bool) -> Result<(), TrapError> {
+        self.inner
+            .set_pending_interrupt(applevisor::prelude::InterruptType::IRQ, pending)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+    }
+
     fn set_hardware_tso(&mut self, tso: bool) -> Result<(), TrapError> {
         const EN_TSO: u64 = 1 << 1;
         let actlr = self

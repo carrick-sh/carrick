@@ -2561,6 +2561,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                         // cross host dispatch before delivering the kick.
                         let normalized = self.vcpu.force_clock_host_boundary()?;
                         if in_vector || in_el1_image || normalized {
+                            self.vcpu.set_pending_irq(true)?;
                             continue;
                         }
                     }

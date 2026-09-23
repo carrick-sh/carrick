@@ -303,6 +303,11 @@ pub trait Aarch64Vcpu {
     /// KVM `pthread_kill(SIGRTMIN)`).
     fn kick(&self) -> Result<(), TrapError>;
 
+    /// Assert or clear a pending virtual IRQ on this vCPU.
+    fn set_pending_irq(&mut self, _pending: bool) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     /// Set the hardware TSO (total-store-order) memory model. HVF sets
     /// `ACTLR_EL1.EnTSO` for Rosetta; KVM keeps the no-op default. Carried
     /// separately from [`Self::set_memory_model`] so a backend that needs both a
