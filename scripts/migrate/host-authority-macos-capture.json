@@ -2882,15 +2882,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 24905,
-        "byte_start": 24882,
+        "byte_end": 24782,
+        "byte_start": 24759,
         "column": 25,
         "column_end": 48,
         "column_start": 25,
         "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-        "line": 640,
-        "line_end": 640,
-        "line_start": 640
+        "line": 638,
+        "line_end": 638,
+        "line_start": 638
       }
     },
     {
@@ -6324,15 +6324,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 25435,
-        "byte_start": 25411,
+        "byte_end": 25312,
+        "byte_start": 25288,
         "column": 21,
         "column_end": 45,
         "column_start": 21,
         "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-        "line": 648,
-        "line_end": 648,
-        "line_start": 648
+        "line": 646,
+        "line_end": 646,
+        "line_start": 646
       }
     },
     {
@@ -8116,15 +8116,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 24852,
-        "byte_start": 24836,
+        "byte_end": 24729,
+        "byte_start": 24713,
         "column": 73,
         "column_end": 89,
         "column_start": 73,
         "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-        "line": 639,
-        "line_end": 639,
-        "line_start": 639
+        "line": 637,
+        "line_end": 637,
+        "line_start": 637
       }
     },
     {
@@ -11626,9 +11626,9 @@
       }
     }
   ],
-  "rows_sha256": "28b64115e69292fd7bf0b78bc335056d9aa551c9c173cc19a076e067ddcf24ca",
+  "rows_sha256": "04d8f65c2836f67dbc71e02483c293205c8cc418a5043cc8c7b4eaca08cd494b",
   "schema": 1,
-  "source_head": "4932cd5c9a58065f989e7c6d640669ca9d816812",
+  "source_head": "2c8e0cdd3174b6b68dc21166c49e5ad75ecd0c14",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
