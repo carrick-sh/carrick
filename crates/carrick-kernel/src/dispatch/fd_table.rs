@@ -64,7 +64,7 @@ use super::{EpollKqueue, Fd, GuestPtr, HostFd, inode_for_path, linux_mode, linux
 pub(crate) use crate::kernel::SocketPeerCred;
 
 #[derive(Debug, Clone)]
-pub(super) struct EpollInterest {
+pub(crate) struct EpollInterest {
     /// The open-file description named by `fd` when EPOLL_CTL_ADD succeeded.
     /// This identity is load-bearing once forked processes have private fd
     /// tables: the same numeric fd can later name a different description in a
@@ -149,7 +149,7 @@ pub(super) struct EpollInterest {
 use crate::kernel::objects::ListenerReadinessSample;
 
 #[derive(Debug)]
-pub(super) struct EventFdState {
+pub(crate) struct EventFdState {
     /// Slot in the cross-process counter slab (`crate::eventfd_shm`) — the
     /// counter must be FORK-COHERENT (carrick forks real host processes;
     /// LTP eventfd2_03's children semaphore-ping-pong across the fork), so it
@@ -226,7 +226,7 @@ pub(crate) fn make_readiness_pipe() -> Option<(HostFdRef, HostFdRef)> {
 }
 
 #[derive(Debug)]
-pub(super) struct TimerFdState {
+pub(crate) struct TimerFdState {
     pub(super) inner: Mutex<TimerFdInner>,
     pub(super) changed: Condvar,
     /// The time authority of the container that created this timerfd. Linux
@@ -361,7 +361,7 @@ pub(super) struct TimerFdInner {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct OpenDescriptionBase {
+pub(crate) struct OpenDescriptionBase {
     fs_identity: Option<carrick_vfs::FsIdentity>,
     /// SO_RCVTIMEO: bounds a blocking recv on this socket. None = block forever.
     recv_timeout: Option<Duration>,
@@ -448,14 +448,14 @@ pub trait InZoneCleanup: std::fmt::Debug + Send + Sync {}
 impl<T: std::fmt::Debug + Send + Sync> InZoneCleanup for T {}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(super) struct SocketMulticastMembership {
+pub(crate) struct SocketMulticastMembership {
     pub(super) level: i32,
     pub(super) source_specific: bool,
     pub(super) optval: Vec<u8>,
 }
 
 impl OpenDescriptionBase {
-    pub(super) fn new(#[allow(unused)] status_flags: u64) -> Self {
+    pub(crate) fn new(#[allow(unused)] status_flags: u64) -> Self {
         Self {
             fs_identity: None,
             so_reuseaddr: false,
@@ -675,14 +675,14 @@ impl HostWriteKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RootFsBackedData {
+pub(crate) struct RootFsBackedData {
     pub(super) base: Arc<[u8]>,
     pub(super) dirty: BTreeMap<usize, Vec<u8>>,
     pub(super) len: usize,
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum FileContents {
+pub(crate) enum FileContents {
     Dense(Arc<parking_lot::RwLock<Vec<u8>>>),
     RootFsBacked(Arc<parking_lot::RwLock<RootFsBackedData>>),
     /// An unlinked host regular file owns the bytes (`memfd_create`). The
@@ -729,7 +729,7 @@ pub(super) fn create_unlinked_host_file(prefix: &str) -> Option<std::os::fd::Own
 }
 
 impl FileContents {
-    pub(super) fn dense(bytes: Vec<u8>) -> Self {
+    pub(crate) fn dense(bytes: Vec<u8>) -> Self {
         Self::Dense(Arc::new(parking_lot::RwLock::new(bytes)))
     }
 
@@ -769,7 +769,7 @@ impl FileContents {
         })))
     }
 
-    pub(super) fn len(&self) -> Result<u64, LinuxErrno> {
+    pub(crate) fn len(&self) -> Result<u64, LinuxErrno> {
         match self {
             Self::Dense(bytes) => Ok(bytes.read().len() as u64),
             Self::RootFsBacked(data) => Ok(data.read().len as u64),
@@ -791,7 +791,7 @@ impl FileContents {
         }
     }
 
-    pub(super) fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, LinuxErrno> {
+    pub(crate) fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, LinuxErrno> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -872,7 +872,7 @@ impl FileContents {
         }
     }
 
-    pub(super) fn resize(&mut self, new_len: u64) -> Result<(), LinuxErrno> {
+    pub(crate) fn resize(&mut self, new_len: u64) -> Result<(), LinuxErrno> {
         let new_len_usize = usize::try_from(new_len).map_err(|_| LINUX_EFBIG)?;
         if !self.accepts_len(new_len) {
             return Err(LINUX_EFBIG);
@@ -903,7 +903,7 @@ impl FileContents {
         }
     }
 
-    pub(super) fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, LinuxErrno> {
+    pub(crate) fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, LinuxErrno> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -1106,7 +1106,7 @@ impl std::fmt::Debug for PidfdWatch {
 /// pidfd now always names a task in the kernel graph, so the type can no
 /// longer spell the 1:1 identification it was introduced to prevent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum PidfdTarget {
+pub(crate) enum PidfdTarget {
     Hvpatch(crate::kernel::TaskKey),
 }
 
@@ -1122,7 +1122,7 @@ pub(super) enum PidfdTarget {
 /// description clone) and `O_CLOEXEC` host-side, and — like every host fd —
 /// survives `libc::fork` (the fd table is per-process already).
 #[derive(Debug, Clone)]
-pub(super) struct TrustedHostDir {
+pub(crate) struct TrustedHostDir {
     pub(super) fd: HostFdRef,
     /// Which layer the fd anchors, and therefore what it may answer.
     pub(super) anchor: TrustedAnchor,
@@ -1193,7 +1193,7 @@ impl TrustedHostDir {
 /// enumeration — LTP `creat05` opened a 4,000-file directory that way and
 /// paid an O(n) per-child stat pass on EVERY open until this was made lazy.
 #[derive(Debug, Clone)]
-pub(super) enum DirListing {
+pub(crate) enum DirListing {
     /// Not yet read: the first `getdents64` (or an `lseek(SEEK_END)`) lists
     /// the directory from its live state.
     Pending,
@@ -1217,7 +1217,7 @@ impl DirListing {
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub(super) enum OpenDescription {
+pub(crate) enum OpenDescription {
     /// Observable identity shell retained after the last fd slot and mapping
     /// reference close. All host descriptors and subsystem resources have already been
     /// dropped; only immutable snapshot classification remains.
@@ -1578,7 +1578,7 @@ impl std::os::fd::AsFd for HostFdRef {
 }
 
 impl HostFdRef {
-    pub(super) fn new(fd: i32) -> Self {
+    pub(crate) fn new(fd: i32) -> Self {
         Self::with_private_file_source(fd, carrick_guest_mem::PrivateFileSource::Mutable)
     }
 
@@ -1751,7 +1751,7 @@ impl OpenFile {
     }
 }
 
-pub(super) fn kernel_file_description(
+pub(crate) fn kernel_file_description(
     description: OpenDescriptionRef,
     status_flags: u64,
 ) -> Arc<crate::kernel::FileDescription> {
@@ -2909,19 +2909,22 @@ impl crate::kernel::FileDescription {
         self.read()?.retained_executable().cloned()
     }
 
-    pub(in crate::dispatch) fn open_description(&self) -> Option<&RwLock<OpenDescription>> {
+    pub(crate) fn open_description(&self) -> Option<&RwLock<OpenDescription>> {
         self.concrete_backing::<RwLock<OpenDescription>>()
     }
 
-    pub(super) fn read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
+    pub(crate) fn read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
+        crate::el1_delegation::recall_if_delegated(self);
         self.open_description().map(|d| d.read())
     }
 
-    pub(super) fn try_read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
+    pub(crate) fn try_read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
+        crate::el1_delegation::recall_if_delegated(self);
         self.open_description().and_then(|d| d.try_read())
     }
 
-    pub(super) fn write(&self) -> Option<FileDescriptionWriteGuard<'_>> {
+    pub(crate) fn write(&self) -> Option<FileDescriptionWriteGuard<'_>> {
+        crate::el1_delegation::recall_if_delegated(self);
         self.open_description()
             .map(|guard| FileDescriptionWriteGuard {
                 guard: guard.write(),
@@ -2930,7 +2933,8 @@ impl crate::kernel::FileDescription {
     }
 
     #[cfg(test)]
-    pub(super) fn try_write_for_test(&self) -> Option<FileDescriptionWriteGuard<'_>> {
+    pub(crate) fn try_write_for_test(&self) -> Option<FileDescriptionWriteGuard<'_>> {
+        crate::el1_delegation::recall_if_delegated(self);
         self.open_description()
             .and_then(|guard| guard.try_write())
             .map(|guard| FileDescriptionWriteGuard {
@@ -2940,7 +2944,7 @@ impl crate::kernel::FileDescription {
     }
 }
 
-pub(super) struct FileDescriptionWriteGuard<'a> {
+pub(crate) struct FileDescriptionWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, OpenDescription>,
     description: &'a crate::kernel::FileDescription,
 }

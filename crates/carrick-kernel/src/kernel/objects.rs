@@ -1049,6 +1049,7 @@ pub struct FileDescription {
     lifecycle_transition: Mutex<DescriptionLifecycle>,
     epoll_registrations: Mutex<BTreeMap<(FileDescriptionId, i32), Weak<FileDescription>>>,
     revision: ObjectRevision,
+    delegation_handle: std::sync::atomic::AtomicU32,
 }
 
 impl FileDescription {
@@ -1075,6 +1076,7 @@ impl FileDescription {
             lifecycle_transition: Mutex::new(DescriptionLifecycle::default()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
+            delegation_handle: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -1105,6 +1107,7 @@ impl FileDescription {
             lifecycle_transition: Mutex::new(DescriptionLifecycle::default()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
+            delegation_handle: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -1132,6 +1135,7 @@ impl FileDescription {
             lifecycle_transition: Mutex::new(DescriptionLifecycle::default()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
+            delegation_handle: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -1143,7 +1147,22 @@ impl FileDescription {
             lifecycle_transition: Mutex::new(DescriptionLifecycle::default()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
+            delegation_handle: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    pub fn delegation_handle(&self) -> u32 {
+        self.delegation_handle
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_delegation_handle(&self, handle: u32) {
+        self.delegation_handle
+            .store(handle, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn has_active_mappings(&self) -> bool {
+        self.lifecycle_transition.lock().mapping_refs > 0
     }
 
     pub const fn id(&self) -> FileDescriptionId {
@@ -1288,6 +1307,7 @@ impl FileDescription {
     }
 
     pub(crate) fn retain_fd_ref(&self) {
+        crate::el1_delegation::recall_if_delegated(self);
         let _guard = self.lifecycle_transition.lock();
         let count = self.common.retain_fd_ref();
         if count == 1 {
@@ -1342,6 +1362,7 @@ impl FileDescription {
     }
 
     pub(crate) fn release_fd_ref(&self) {
+        crate::el1_delegation::recall_if_delegated(self);
         let terminal_finalizers = {
             let mut lifecycle = self.lifecycle_transition.lock();
             let count = self.common.release_fd_ref();
@@ -1368,6 +1389,7 @@ impl FileDescription {
 
     /// Acquire while an fd still owns the backing, serialized with final close.
     pub(crate) fn retain_mapping(self: &Arc<Self>) -> Option<Arc<MappedFileReference>> {
+        crate::el1_delegation::recall_if_delegated(self);
         let mut lifecycle = self.lifecycle_transition.lock();
         if self.common.fd_refs() == 0 {
             return None;
@@ -1959,9 +1981,10 @@ impl FileTable {
         }
     }
 
-    pub(super) fn for_fork_copy(id: FileTableId, parent: &Self) -> Self {
+    pub(crate) fn for_fork_copy(id: FileTableId, parent: &Self) -> Self {
         let open_files = parent.open_files.read().clone();
         for slot in open_files.values() {
+            crate::el1_delegation::recall_if_delegated(&slot.description);
             slot.description.retain_fd_ref();
         }
         let epoll_wake_registry = Arc::clone(&parent.epoll_wake_registry);
