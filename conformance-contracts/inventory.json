@@ -1313,7 +1313,9 @@
       "support": "bring_up",
       "handler": "process",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.wait.process-group"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -3292,7 +3294,8 @@
       "authority": "guest",
       "contracts": [
         "kernel.fork.stage1-image",
-        "kernel.signal.lease-gap"
+        "kernel.signal.lease-gap",
+        "kernel.wait.process-group"
       ],
       "claims": [
         "kernel.fork.stage1-image.image-pool-bound"

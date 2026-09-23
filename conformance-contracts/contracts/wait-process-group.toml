@@ -1,0 +1,34 @@
+schema_version = 1
+id = "kernel.wait.process-group"
+title = "Wait by process group and zombie process-group membership"
+guest_surfaces = [
+  "syscall:wait4",
+  "syscall:waitid",
+  "kernel:process_group",
+  "kernel:zombie",
+]
+semantic_authority = [
+  "man 2 waitpid",
+  "man 2 wait4",
+  "man 2 waitid",
+]
+fixture = "pgrp"
+scale_points = [1, 2, 4]
+rationale = "A zombie process remains a member of its process group until reaped, allowing waitpid/wait4 with negative PID to reap it; waiting on a nonexistent process group returns ECHILD."
+
+[bindings]
+vm_free = "carrick-kernel-example::semantics::pgrp::zombie_keeps_process_group_membership_until_reaped"
+embed = "carrick-embed::wait_process_group"
+docker = "probe:kernelidentity"
+ecosystem = ["ltp:waitpid04", "ltp:wait401"]
+
+[[structural_budgets]]
+kind = "exact"
+metric = "task_admissions"
+value = 1
+rationale = "Each fork admits exactly one child task into the kernel."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

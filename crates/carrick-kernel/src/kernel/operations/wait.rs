@@ -7,6 +7,7 @@
 use carrick_abi::{LinuxWaitOptions, NsUid};
 use carrick_fatal::carrick_fatal;
 
+use super::session::remove_group_member;
 use super::{KernelOperationError, ensure_task_unreserved, next_revision};
 use crate::kernel::core::{Kernel, RegistryState};
 use crate::kernel::ids::{ChildExitSignal, LinuxSignal, ProcessGroupId, TaskId};
@@ -495,6 +496,7 @@ impl Kernel {
                     .transpose()?
                     .ok_or(KernelOperationError::UnknownTask(parent_id))?;
                 state.zombies.remove(&id);
+                remove_group_member(&mut state, zombie.process_group, zombie.session, zombie.key);
                 if let Some(parent_record) = state.tasks.get_mut(&parent_id) {
                     parent_record.task.remove_child(zombie.key);
                     // Reaping is the moment Linux moves a child's CPU into the
