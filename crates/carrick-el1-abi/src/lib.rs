@@ -168,6 +168,10 @@ pub struct CurrentTask {
     pub generation: AtomicU64,
     /// Raw FileTableId of the currently loaded task (0 = none/unbound).
     pub file_table: AtomicU64,
+    /// Per-vCPU fixup PC for EL1 user copies (0 = unarmed).
+    pub fixup_pc: AtomicU64,
+    /// Reserved padding to 32 bytes for clean power-of-two indexing.
+    pub _reserved: u64,
 }
 
 impl CurrentTask {
@@ -175,6 +179,8 @@ impl CurrentTask {
         Self {
             generation: AtomicU64::new(0),
             file_table: AtomicU64::new(0),
+            fixup_pc: AtomicU64::new(0),
+            _reserved: 0,
         }
     }
 
@@ -182,6 +188,7 @@ impl CurrentTask {
     pub fn clear(&self) {
         self.file_table.store(0, Ordering::Release);
         self.generation.store(0, Ordering::Release);
+        self.fixup_pc.store(0, Ordering::Relaxed);
     }
 
     #[inline]
@@ -284,15 +291,21 @@ impl DelegatedFile {
         self.lock.load(Ordering::Relaxed) != 0
     }
 
-    /// Host spin-waits until the lock is acquired.
-    pub fn host_lock(&self) {
-        while self
-            .lock
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+    /// Host spin-waits until the lock is acquired, up to a bounded spin limit.
+    /// Returns true if locked, false if timed out / exceeded max spins.
+    pub fn host_lock_bounded(&self, max_spins: u64) -> bool {
+        for _ in 0..max_spins {
+            if self.try_lock() {
+                return true;
+            }
             core::hint::spin_loop();
         }
+        false
+    }
+
+    /// Host spin-waits until the lock is acquired (up to default 10,000,000 spins).
+    pub fn host_lock(&self) -> bool {
+        self.host_lock_bounded(10_000_000)
     }
 }
 

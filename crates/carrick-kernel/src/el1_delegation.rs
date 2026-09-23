@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use carrick_abi::*;
 use carrick_el1_abi::*;
+use carrick_fatal::carrick_fatal;
 
 use crate::dispatch::fd_table::{OpenDescription, OpenFile};
 use crate::dispatch::fs::FsState;
@@ -94,6 +95,21 @@ pub enum NotEligible {
     TableFull,
     AlreadyDelegated,
     IoError,
+}
+
+fn lock_delegated_file(file: &mut DelegatedFile, handle: u32) {
+    const MAX_SPINS: u64 = 10_000_000;
+    if !file.host_lock_bounded(MAX_SPINS) {
+        let state = file.state.load(Ordering::Relaxed);
+        let generation = file.generation.load(Ordering::Relaxed);
+        carrick_fatal!(
+            "el1_delegation",
+            "DelegatedFile::host_lock timed out spinning for handle={}, state={}, generation={}",
+            handle,
+            state,
+            generation
+        );
+    }
 }
 
 /// Delegate an open file to EL1 if all eligibility rules pass.
@@ -248,7 +264,7 @@ pub(crate) fn delegate(
         + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
         as *mut DelegatedFile;
     let file = unsafe { &mut *file_ptr };
-    file.host_lock();
+    lock_delegated_file(file, handle);
     file.generation.store(1, Ordering::Relaxed);
     file.offset.store(offset, Ordering::Relaxed);
     file.size.store(size, Ordering::Relaxed);
@@ -278,7 +294,7 @@ pub(crate) fn delegate(
     }
 
     if !slot_found {
-        file.host_lock();
+        lock_delegated_file(file, handle);
         file.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
         file.unlock();
         free_handle(handle);
@@ -336,7 +352,7 @@ fn recall_locked(description: &FileDescription, open: &mut OpenDescription, hand
         + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
         as *mut DelegatedFile;
     let file = unsafe { &mut *file_ptr };
-    file.host_lock();
+    lock_delegated_file(file, handle);
     file.state
         .store(DELEGATED_STATE_RECALLING, Ordering::Release);
 
