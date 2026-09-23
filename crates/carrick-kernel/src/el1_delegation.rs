@@ -297,7 +297,7 @@ fn lock_delegated_file(file: &DelegatedFile, handle: u32) {
                 generation
             );
         }
-        std::thread::yield_now();
+        core::hint::spin_loop();
     }
 }
 

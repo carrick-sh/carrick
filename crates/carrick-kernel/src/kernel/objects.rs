@@ -2678,6 +2678,9 @@ impl FileTable {
     }
 
     pub(crate) fn drain_functional_refs(&self) -> Vec<(i32, FileSlot)> {
+        for slot in self.open_files.read().values() {
+            let _ = crate::el1_delegation::recall_if_delegated(&slot.description);
+        }
         self.functional_refs_active.store(false, Ordering::Release);
         if !self.functional_gate.retire() {
             return Vec::new();

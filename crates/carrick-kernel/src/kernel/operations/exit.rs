@@ -190,9 +190,6 @@ impl Kernel {
         if self.file_table_is_live_excluding(target, exiting) {
             return;
         }
-        for slot in target.read_open_files().values() {
-            let _ = crate::el1_delegation::recall_if_delegated(&slot.description);
-        }
         let events = target.drain_functional_refs();
         if events.is_empty() {
             return;
