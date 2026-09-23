@@ -758,6 +758,136 @@ pub const LINUX_HIGH_VA_THRESHOLD: u64 = 0x100_0000_0000; // 1 TiB (2^40)
 pub const LINUX_ALIAS_IPA_BASE: u64 = 0x18_0000_0000; // 96 GiB
 pub const LINUX_ALIAS_IPA_SIZE: u64 = 0x10_0000_0000; // 64 GiB of alias space
 
+pub const LINUX_EL1_KERNEL_BASE: u64 = carrick_el1_abi::EL1_REGION_BASE;
+pub const LINUX_EL1_KERNEL_SIZE: u64 = carrick_el1_abi::EL1_REGION_SIZE;
+
+const fn ranges_do_not_overlap(a_base: u64, a_size: u64, b_base: u64, b_size: u64) -> bool {
+    a_base + a_size <= b_base || b_base + b_size <= a_base
+}
+
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_KERNEL_REGION_BASE,
+        LINUX_KERNEL_REGION_SIZE,
+    ),
+    "EL1 kernel region overlaps kernel region (trampoline/vectors/page tables)",
+);
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_INFO_PAGE_BASE,
+        0x1_0000,
+    ),
+    "EL1 kernel region overlaps info page",
+);
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_SIGRETURN_TRAMPOLINE_BASE,
+        LINUX_SIGRETURN_TRAMPOLINE_SIZE,
+    ),
+    "EL1 kernel region overlaps sigreturn trampoline",
+);
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_HEAP_BASE,
+        LINUX_HEAP_SIZE,
+    ),
+    "EL1 kernel region overlaps heap",
+);
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_MMAP_BASE,
+        LINUX_MMAP_SIZE,
+    ),
+    "EL1 kernel region overlaps mmap arena",
+);
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_INTERPRETER_BASE,
+        0x4_0000_0000,
+    ),
+    "EL1 kernel region overlaps interpreter window",
+);
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_SHARED_FILE_BASE,
+        LINUX_SHARED_FILE_SIZE,
+    ),
+    "EL1 kernel region overlaps shared file region",
+);
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_PRIVATE_OVERLAY_BASE,
+        LINUX_PRIVATE_OVERLAY_SIZE,
+    ),
+    "EL1 kernel region overlaps private overlay",
+);
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_HVPATCH_ROOT_SLOT_BASE,
+        LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE,
+    ),
+    "EL1 kernel region overlaps hvpatch root slot arena",
+);
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_HVPATCH_GLOBAL_FRAME_BASE,
+        LINUX_HVPATCH_GLOBAL_FRAME_SIZE,
+    ),
+    "EL1 kernel region overlaps hvpatch global frames",
+);
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_STACK_TOP - LINUX_STACK_SIZE,
+        LINUX_STACK_SIZE,
+    ),
+    "EL1 kernel region overlaps stack",
+);
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_ROSETTA_IPA_BASE,
+        LINUX_ROSETTA_WINDOW_SIZE,
+    ),
+    "EL1 kernel region overlaps Rosetta IPA window",
+);
+const _: () = assert!(
+    ranges_do_not_overlap(
+        LINUX_EL1_KERNEL_BASE,
+        LINUX_EL1_KERNEL_SIZE,
+        LINUX_ALIAS_IPA_BASE,
+        LINUX_ALIAS_IPA_SIZE,
+    ),
+    "EL1 kernel region overlaps alias IPA arena",
+);
+
+/// True if the in-guest EL1 kernel is enabled (default true, disabled by `CARRICK_EL1=0`).
+pub fn el1_kernel_enabled() -> bool {
+    std::env::var("CARRICK_EL1").as_deref() != Ok("0")
+}
+
 // ---- Fork-shared, monotonic alias-IPA allocator ----
 //
 // carrick shares ONE `hv_vm` across the whole guest process tree (`SharedVm`),
@@ -1766,7 +1896,13 @@ impl AddressSpace {
         self,
         identity_fast_path: bool,
     ) -> Result<Self, AddressSpaceError> {
-        self.with_el1_vectors_from_bytes(el1_vectors_bytes_mailbox(identity_fast_path))
+        let image =
+            self.with_el1_vectors_from_bytes(el1_vectors_bytes_mailbox(identity_fast_path))?;
+        if el1_kernel_enabled() {
+            image.with_el1_region()
+        } else {
+            Ok(image)
+        }
     }
 
     /// Install mailbox vectors with the opt-in carrier descriptor-ceiling
@@ -1776,7 +1912,14 @@ impl AddressSpace {
         self,
         identity_fast_path: bool,
     ) -> Result<Self, AddressSpaceError> {
-        self.with_el1_vectors_from_bytes(el1_vectors_bytes_mailbox_fd_ceiling(identity_fast_path))
+        let image = self.with_el1_vectors_from_bytes(el1_vectors_bytes_mailbox_fd_ceiling(
+            identity_fast_path,
+        ))?;
+        if el1_kernel_enabled() {
+            image.with_el1_region()
+        } else {
+            Ok(image)
+        }
     }
 
     /// Construct the mailbox-vector image with the dormant raw-clock transport.
@@ -1821,6 +1964,53 @@ impl AddressSpace {
             image.regions.push(region);
             image.regions.sort_by_key(|r| r.start);
         }
+        if el1_kernel_enabled() {
+            image = image.with_el1_region()?;
+        }
+        Ok(image)
+    }
+
+    /// Install the in-guest EL1 kernel image region.
+    pub fn with_el1_region(self) -> Result<Self, AddressSpaceError> {
+        let start = LINUX_EL1_KERNEL_BASE;
+        let size = LINUX_EL1_KERNEL_SIZE;
+        let end = start
+            .checked_add(size)
+            .ok_or(AddressSpaceError::RegionOverflow { start, size })?;
+        let region = MemoryRegion {
+            start,
+            end,
+            perms: SegmentPerms {
+                read: true,
+                write: true,
+                execute: true,
+            },
+            shared: false,
+            bytes: carrick_el1_image::IMAGE.to_vec().into(),
+        };
+
+        let AddressSpace {
+            entry,
+            regions,
+            initial_stack_pointer,
+            linux_auxv,
+            linux_auxv_image,
+            el0_trampoline_entry,
+            el1_vectors_base,
+            stage1_page_tables_base,
+            ro_spans,
+            file_mappings,
+            ..
+        } = self;
+        let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.initial_stack_pointer = initial_stack_pointer;
+        image.linux_auxv = linux_auxv;
+        image.linux_auxv_image = linux_auxv_image;
+        image.el0_trampoline_entry = el0_trampoline_entry;
+        image.el1_vectors_base = el1_vectors_base;
+        image.stage1_page_tables_base = stage1_page_tables_base;
+        image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
         Ok(image)
     }
 
@@ -3122,7 +3312,9 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     let l2_b_base_pa = kernel_l1_index << 30;
     for index in 0..512_u64 {
         let pa = l2_b_base_pa + (index << 21);
-        let flags = if pa == kernel_block_pa {
+        let flags = if pa == kernel_block_pa
+            || (LINUX_EL1_KERNEL_BASE..LINUX_EL1_KERNEL_BASE + LINUX_EL1_KERNEL_SIZE).contains(&pa)
+        {
             KERNEL_BLOCK_FLAGS
         } else {
             USER_BLOCK_FLAGS
@@ -4089,7 +4281,237 @@ pub fn el1_vectors_bytes_shim_fd_ceiling() -> Vec<u8> {
 const MAILBOX_HANDLER_OFFSET: usize = 0xA00;
 const MAILBOX_HANDLER_SIZE: usize = 0x200;
 
+const EL1_VECTOR_HOOK_OFFSET: usize = 0x1000;
+
+fn write_el1_vector_hook(bytes: &mut [u8], hook_offset: usize, mailbox_capture: usize) {
+    let put = |bytes: &mut [u8], off: usize, op: u32| {
+        bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
+    };
+    let mut cursor = hook_offset;
+    let emit = |bytes: &mut [u8], cursor: &mut usize, opcode: u32| {
+        put(bytes, *cursor, opcode);
+        *cursor += 4;
+    };
+
+    // 1. Save x16 and x17 into mailbox slot using SP_EL1
+    emit(
+        bytes,
+        &mut cursor,
+        enc_str_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_str_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17),
+    );
+
+    // 2. Compute slot index in x17: slot = (SP_EL1 - LINUX_SYSCALL_MAILBOX_BASE) >> 8
+    emit(bytes, &mut cursor, 0x9100_03F0); // mov x16, sp
+    let mb_base = LINUX_SYSCALL_MAILBOX_BASE;
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(17, (mb_base & 0xFFFF) as u16, 0),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(17, ((mb_base >> 16) & 0xFFFF) as u16, 1),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(17, ((mb_base >> 32) & 0xFFFF) as u16, 2),
+    );
+    emit(bytes, &mut cursor, 0xCB11_0211); // sub x17, x16, x17 (x17 = slot * 256)
+    emit(bytes, &mut cursor, 0xD348_FE31); // lsr x17, x17, #8  (x17 = slot)
+
+    // 3. Compute per-vCPU stack top and TrapFrame pointer in x16:
+    //    stack_top = EL1_STACKS_BASE + 0x4000 + (slot << 14)
+    //    frame_ptr = stack_top - 0x120 (size_of::<TrapFrame>() = 280, aligned to 288 = 0x120)
+    let stack_first_top = carrick_el1_abi::EL1_STACKS_BASE + carrick_el1_abi::EL1_STACK_SIZE;
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(16, (stack_first_top & 0xFFFF) as u16, 0),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(16, ((stack_first_top >> 16) & 0xFFFF) as u16, 1),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(16, ((stack_first_top >> 32) & 0xFFFF) as u16, 2),
+    );
+    emit(bytes, &mut cursor, 0x8B11_3A10); // add x16, x16, x17, lsl #14
+    emit(bytes, &mut cursor, 0xD104_8210); // sub x16, x16, #0x120 (TrapFrame pointer)
+
+    // 4. Save x0..x15, x18..x30 to TrapFrame [x16, #(r * 8)]
+    for r in 0..=15 {
+        emit(bytes, &mut cursor, enc_str_xt_xn(r, 16, (r * 8) as u64));
+    }
+    for r in 18..=30 {
+        emit(bytes, &mut cursor, enc_str_xt_xn(r, 16, (r * 8) as u64));
+    }
+    // Original x16, x17 from mailbox:
+    emit(
+        bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+    );
+    emit(bytes, &mut cursor, enc_str_xt_xn(0, 16, 128)); // x[16]
+    emit(
+        bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17),
+    );
+    emit(bytes, &mut cursor, enc_str_xt_xn(0, 16, 136)); // x[17]
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(0, 16, 0)); // restore x0
+
+    // 5. Save slot, elr, spsr, esr
+    emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 272)); // slot at offset 272
+    emit(bytes, &mut cursor, 0xD538_4031); // mrs x17, elr_el1
+    emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 248)); // elr at offset 248
+    emit(bytes, &mut cursor, 0xD538_4011); // mrs x17, spsr_el1
+    emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 256)); // spsr at offset 256
+    emit(bytes, &mut cursor, 0xD538_5211); // mrs x17, esr_el1
+    emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 264)); // esr at offset 264
+
+    // 6. Switch SP to TrapFrame and prepare x0 as frame argument
+    emit(bytes, &mut cursor, 0x9100_021F); // mov sp, x16
+    emit(bytes, &mut cursor, 0x9100_03E0); // mov x0, sp
+
+    // 7. Load entry address from image header at EL1_IMAGE_BASE + 8 and call carrick_el1_syscall
+    let entry_ptr = carrick_el1_abi::EL1_REGION_BASE + carrick_el1_abi::EL1_IMAGE_OFFSET + 8;
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(16, (entry_ptr & 0xFFFF) as u16, 0),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(16, ((entry_ptr >> 16) & 0xFFFF) as u16, 1),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(16, ((entry_ptr >> 32) & 0xFFFF) as u16, 2),
+    );
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 0)); // ldr x17, [x16] (entry_offset)
+    emit(bytes, &mut cursor, 0xD100_2210); // sub x16, x16, #8 (EL1_IMAGE_BASE)
+    emit(bytes, &mut cursor, 0x8B11_0210); // add x16, x16, x17
+    emit(bytes, &mut cursor, 0xD63F_0200); // blr x16
+
+    // 8. Check return value (x0 == Action::Served == 0)
+    emit(bytes, &mut cursor, 0xF100_001F); // cmp x0, #0
+    let forward_branch = cursor;
+    emit(bytes, &mut cursor, 0); // b.ne forward_label (placeholder)
+
+    // ===== SERVED PATH (x0 == 0) =====
+    emit(bytes, &mut cursor, 0x9100_03F0); // mov x16, sp (TrapFrame pointer)
+    // Restore SP_EL1 to mailbox pointer
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 272)); // ldr x17, [x16, #272] (slot)
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(1, (mb_base & 0xFFFF) as u16, 0),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(1, ((mb_base >> 16) & 0xFFFF) as u16, 1),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(1, ((mb_base >> 32) & 0xFFFF) as u16, 2),
+    );
+    emit(bytes, &mut cursor, 0x8B11_2031); // add x17, x1, x17, lsl #8
+    emit(bytes, &mut cursor, 0x9100_023F); // mov sp, x17 (restores SP_EL1)
+    // Restore ELR and SPSR
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 248)); // elr
+    emit(bytes, &mut cursor, 0xD518_4031); // msr elr_el1, x17
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 256)); // spsr
+    emit(bytes, &mut cursor, 0xD518_4011); // msr spsr_el1, x17
+    // Restore x1..x15, x18..x30
+    for r in 1..=15 {
+        emit(bytes, &mut cursor, enc_ldr_xt_xn(r, 16, (r * 8) as u64));
+    }
+    for r in 18..=30 {
+        emit(bytes, &mut cursor, enc_ldr_xt_xn(r, 16, (r * 8) as u64));
+    }
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 136)); // x17
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(0, 16, 0)); // x0 (return value from frame.x[0])
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(16, 16, 128)); // x16
+    emit(bytes, &mut cursor, 0xD69F_03E0); // eret
+
+    // ===== FORWARD PATH (x0 == 1) =====
+    let forward_target = cursor;
+    put(
+        bytes,
+        forward_branch,
+        enc_bne(forward_branch as u64, forward_target as u64),
+    );
+
+    emit(bytes, &mut cursor, 0x9100_03F0); // mov x16, sp (TrapFrame pointer)
+    // Restore SP_EL1 to mailbox pointer
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 272)); // ldr x17, [x16, #272] (slot)
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(1, (mb_base & 0xFFFF) as u16, 0),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(1, ((mb_base >> 16) & 0xFFFF) as u16, 1),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(1, ((mb_base >> 32) & 0xFFFF) as u16, 2),
+    );
+    emit(bytes, &mut cursor, 0x8B11_2031); // add x17, x1, x17, lsl #8
+    emit(bytes, &mut cursor, 0x9100_023F); // mov sp, x17 (restores SP_EL1)
+    // Restore ELR and SPSR
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 248)); // elr
+    emit(bytes, &mut cursor, 0xD518_4031); // msr elr_el1, x17
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 256)); // spsr
+    emit(bytes, &mut cursor, 0xD518_4011); // msr spsr_el1, x17
+    // Restore x0..x15, x18..x30
+    for r in 0..=15 {
+        emit(bytes, &mut cursor, enc_ldr_xt_xn(r, 16, (r * 8) as u64));
+    }
+    for r in 18..=30 {
+        emit(bytes, &mut cursor, enc_ldr_xt_xn(r, 16, (r * 8) as u64));
+    }
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 136)); // x17
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(16, 16, 128)); // x16
+    let branch_to_capture = cursor;
+    emit(
+        bytes,
+        &mut cursor,
+        enc_b(branch_to_capture as u64, mailbox_capture as u64),
+    );
+
+    debug_assert!(
+        cursor <= LINUX_EL1_VECTORS_SIZE as usize,
+        "EL1 vector hook overruns vector page"
+    );
+}
+
 fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -> Vec<u8> {
+    el1_vectors_bytes_mailbox_configured(identity_fast_path, fd_ceiling, el1_kernel_enabled())
+}
+
+pub fn el1_vectors_bytes_mailbox_configured(
+    identity_fast_path: bool,
+    fd_ceiling: bool,
+    el1_enabled: bool,
+) -> Vec<u8> {
     let mut bytes = if identity_fast_path {
         el1_vectors_bytes_shim_inner(fd_ceiling)
     } else if fd_ceiling {
@@ -4148,6 +4570,14 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
             &mut bytes,
             &mut cursor,
             enc_beq(branch_pc2 as u64, handler as u64),
+        );
+    }
+    if el1_enabled {
+        let hook_branch = cursor;
+        emit(
+            &mut bytes,
+            &mut cursor,
+            enc_b(hook_branch as u64, EL1_VECTOR_HOOK_OFFSET as u64),
         );
     }
     let mailbox_capture = cursor;
@@ -4561,6 +4991,9 @@ fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -
     );
 
     debug_assert!(cursor <= MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE);
+    if el1_enabled {
+        write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, mailbox_capture);
+    }
     bytes
 }
 
@@ -5798,25 +6231,25 @@ mod loader_tests {
 mod stage1_tests {
     use super::*;
 
-    fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
+    pub(super) fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
         let mut arr = [0u8; 8];
         arr.copy_from_slice(&buf[offset..offset + 8]);
         u64::from_le_bytes(arr)
     }
 
-    fn ap(desc: u64) -> u64 {
+    pub(super) fn ap(desc: u64) -> u64 {
         (desc >> 6) & 0x3
     }
-    fn pxn(desc: u64) -> u64 {
+    pub(super) fn pxn(desc: u64) -> u64 {
         (desc >> 53) & 0x1
     }
-    fn uxn(desc: u64) -> u64 {
+    pub(super) fn uxn(desc: u64) -> u64 {
         (desc >> 54) & 0x1
     }
-    fn valid_block(desc: u64) -> bool {
+    pub(super) fn valid_block(desc: u64) -> bool {
         (desc & 0x1) == 1 && ((desc >> 1) & 0x1) == 0
     }
-    fn valid_table(desc: u64) -> bool {
+    pub(super) fn valid_table(desc: u64) -> bool {
         (desc & 0x3) == 0b11
     }
 
@@ -5959,7 +6392,13 @@ mod stage1_tests {
         for index in 1..512usize {
             let d = read_u64_le(&bytes, 0x4000 + index * 8);
             assert!(valid_block(d), "L2_B[{}] must be a block", index);
-            assert_eq!(ap(d), 0b01);
+            if (32..64).contains(&index) {
+                assert_eq!(ap(d), 0b00, "L2_B[{}] EL1 block must use AP=00", index);
+                assert_eq!(pxn(d), 0, "L2_B[{}] PXN must be 0", index);
+                assert_eq!(uxn(d), 1, "L2_B[{}] UXN must be 1", index);
+            } else {
+                assert_eq!(ap(d), 0b01);
+            }
         }
 
         // L3_A (base+0x5000): VA 0..0x10000 (16 pages) UNMAPPED (null guard);
@@ -6665,7 +7104,11 @@ mod el1_shim_tests {
                 if mailbox_handler != MAILBOX_HANDLER_OFFSET {
                     el1_clock::tests::assert_fstat_host_fallback(bytes, mailbox_handler);
                 }
-                MAILBOX_HANDLER_OFFSET + 24
+                if el1_kernel_enabled() {
+                    MAILBOX_HANDLER_OFFSET + 28
+                } else {
+                    MAILBOX_HANDLER_OFFSET + 24
+                }
             } else {
                 fallback_target
             };
@@ -7263,5 +7706,86 @@ mod el1_shim_tests {
             "identity page is per-process (private snapshot on fork)"
         );
         assert_eq!(region.bytes().len(), LINUX_IDENTITY_PAGE_SIZE as usize);
+    }
+
+    #[test]
+    fn el1_region_presence_and_stage1_permissions() {
+        use stage1_tests::{ap, pxn, read_u64_le, uxn, valid_block};
+
+        let image = minimal_image()
+            .with_el1_vectors_mailbox(true)
+            .expect("image with mailbox vectors");
+        let region = image
+            .regions()
+            .iter()
+            .find(|r| r.start == carrick_el1_abi::EL1_REGION_BASE)
+            .expect("EL1 region must be present in image");
+        assert_eq!(region.len(), carrick_el1_abi::EL1_REGION_SIZE);
+        let header = carrick_el1_abi::ImageHeader::read_from_prefix(region.bytes())
+            .expect("valid ImageHeader at start of EL1 region");
+        assert_eq!(header.magic, carrick_el1_abi::IMAGE_MAGIC);
+        assert_eq!(header.version, carrick_el1_abi::IMAGE_VERSION);
+
+        let pt_bytes = stage1_identity_page_tables();
+        let block_idx = (carrick_el1_abi::EL1_REGION_BASE >> 21) & 0x1ff; // block 32
+        let l2b_entry = read_u64_le(&pt_bytes, 0x4000 + (block_idx as usize) * 8);
+        assert!(valid_block(l2b_entry));
+        assert_eq!(
+            ap(l2b_entry),
+            0b00,
+            "EL1 region must be AP=00 (EL0 denied, EL1 permitted)"
+        );
+        assert_eq!(
+            pxn(l2b_entry),
+            0,
+            "EL1 region must be PXN=0 (EL1 execute permitted)"
+        );
+        assert_eq!(
+            uxn(l2b_entry),
+            1,
+            "EL1 region must be UXN=1 (EL0 execute denied)"
+        );
+    }
+
+    #[test]
+    fn el1_vector_hook_behavior_and_hatch() {
+        let vectors_disabled = el1_vectors_bytes_mailbox_configured(true, false, false);
+        let vectors_enabled = el1_vectors_bytes_mailbox_configured(true, false, true);
+
+        assert_ne!(
+            vectors_disabled, vectors_enabled,
+            "enabled EL1 vectors must differ from disabled (CARRICK_EL1=0)"
+        );
+
+        // Before 0x984 (fstat fallback branch), bytes must be identical
+        assert_eq!(
+            vectors_disabled[..0x984],
+            vectors_enabled[..0x984],
+            "vectors before fstat fallback branch must be identical"
+        );
+        // At 0x984, both branch to mailbox_capture (0xA18 vs 0xA1C)
+        assert_eq!(
+            vectors_disabled[0x988..0xA14],
+            vectors_enabled[0x988..0xA14],
+            "vectors between fstat fallback and non_svc_branch must be identical"
+        );
+        // At 0xA18, enabled vectors branch to 0x1000 (EL1 hook)
+        assert_eq!(
+            rd_u32(&vectors_enabled, 0xA18),
+            enc_b(0xA18, 0x1000),
+            "hook branch must branch to 0x1000"
+        );
+        // The mailbox capture code is identical, shifted by 4 bytes (the hook branch at 0xA18)
+        assert_eq!(
+            vectors_disabled[0xA18..0xC00],
+            vectors_enabled[0xA1C..0xC04],
+            "mailbox capture code must be identical (modulo 4-byte hook branch shift)"
+        );
+        // Hook is installed at 0x1000
+        assert_ne!(
+            &vectors_enabled[0x1000..0x1100],
+            &vec![0u8; 0x100][..],
+            "hook must be written at 0x1000"
+        );
     }
 }

@@ -46,6 +46,7 @@ conformance-metrics = [
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
+carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-engine = { path = "../carrick-engine", default-features = false }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-hal = { path = "../carrick-hal" }

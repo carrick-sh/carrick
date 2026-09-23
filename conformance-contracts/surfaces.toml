@@ -6,7 +6,11 @@ contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.
 
 [[surfaces]]
 path = "crates/carrick-mem/src/memory.rs"
-contracts = ["hvpatch.syscall.portal"]
+contracts = ["hvpatch.syscall.portal", "kernel.el1.transparent"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/el1_transparent.rs"
+contracts = ["kernel.el1.transparent"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/mailbox.rs"

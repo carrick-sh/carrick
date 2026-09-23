@@ -114,6 +114,7 @@ pub use vfs::{
 };
 
 pub use carrick_abi::{CanonicalNr, LinuxErrno};
+pub use carrick_el1_abi::Counters as El1Counters;
 pub use carrick_engine::{ResolveWarning, RunRequest};
 pub use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, HostVa, MemoryError, SharedFutexLocation};
 pub use carrick_hal::{
@@ -144,6 +145,7 @@ pub use carrick_kernel::observe::{
 };
 pub use carrick_kernel::run_result::{RunResult, RuntimeError, TerminalReason};
 pub use carrick_runtime::compat::CompatReport;
+pub use carrick_runtime::{read_el1_counters, reset_el1_counters};
 pub use carrick_spec::{
     Mount, MountSpec, NetworkSpec, Platform, ProcessSpec, ResourceSpec, RunSpec, SecuritySpec,
     StdioMode,

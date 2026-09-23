@@ -18,6 +18,8 @@ trace-elf = []
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
+carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-el1-image = { path = "../carrick-el1-image" }
 carrick-fatal.workspace = true
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 goblin.workspace = true

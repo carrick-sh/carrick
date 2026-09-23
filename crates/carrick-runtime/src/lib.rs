@@ -222,6 +222,17 @@ pub use prepare::{
     ExecutionPlan, PreparedRun, Runtime, RuntimeExtensions, prepare_on, resolve_plan,
 };
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use carrick_vmm_hvf::{read_el1_counters, reset_el1_counters};
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn read_el1_counters() -> Option<carrick_el1_abi::Counters> {
+    None
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn reset_el1_counters() {}
+
 /// Absolute host path to Apple's Rosetta 2 Linux interpreter that carrick probes
 /// (and, on macOS, redirects x86_64 ELF loads to). Resolution order, so the same
 /// probe is correct on every Apple-Silicon host regardless of OS:
