@@ -376,3 +376,24 @@ fn el1_files_kick_delivery_spin_loop() {
         );
     }
 }
+
+/// Multi-threaded kick delivery via signal: Thread 1 opens a file, does one EL1-served write/seek,
+/// then enters an EL0 spin loop. Sibling thread sends SIGUSR1 via tgkill.
+/// Watchdog bounds at 2 s. Assert handler runs within 1 s and process exits 0; run 20 iterations.
+#[test]
+fn el1_files_kick_delivery_spin_loop_signal() {
+    let _guard = common::guest_lock();
+
+    for iteration in 1..=20 {
+        let watchdog = Watchdog::start(std::time::Duration::from_secs(2));
+        let builder = common::interceptor_probe_builder("spin-loop-signal");
+        let result = common::run_or_fail(builder.run_blocking());
+        watchdog.disarm();
+        assert!(
+            result.success(),
+            "iteration {iteration} failed with exit_code={}, stderr: {}",
+            result.exit_code,
+            result.stderr_utf8()
+        );
+    }
+}
