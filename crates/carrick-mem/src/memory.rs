@@ -4648,11 +4648,13 @@ fn write_el1_vector_hook(bytes: &mut [u8], hook_offset: usize, mailbox_capture: 
     );
     emit(bytes, &mut cursor, 0x8B11_2031); // add x17, x1, x17, lsl #8
     emit(bytes, &mut cursor, 0x9100_023F); // mov sp, x17 (restores SP_EL1)
-    // Restore ELR and SPSR
+    // Restore ELR, SPSR, and ESR
     emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 248)); // elr
     emit(bytes, &mut cursor, 0xD518_4031); // msr elr_el1, x17
     emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 256)); // spsr
     emit(bytes, &mut cursor, 0xD518_4011); // msr spsr_el1, x17
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 264)); // esr
+    emit(bytes, &mut cursor, 0xD518_5211); // msr esr_el1, x17
     // Restore x0..x15, x18..x30
     for r in 0..=15 {
         emit(bytes, &mut cursor, enc_ldr_xt_xn(r, 16, (r * 8) as u64));
