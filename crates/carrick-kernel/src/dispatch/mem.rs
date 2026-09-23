@@ -944,7 +944,8 @@ pub(super) fn boot_region_is_hidden_private_overlay(map: &ProcMapsEntry) -> bool
                 .saturating_add(crate::memory::LINUX_PRIVATE_OVERLAY_SIZE)
 }
 
-/// Is `map` one of carrick's own EL1-only pages in the kernel hole?
+/// Is `map` one of carrick's own EL1-only pages: the kernel hole or the
+/// in-guest EL1 kernel region (see `is_carrick_kernel_only_range`)?
 ///
 /// The 2 MiB block at [`LINUX_KERNEL_REGION_BASE`](crate::memory::LINUX_KERNEL_REGION_BASE)
 /// holds the EL0 entry trampoline, the EL1 vector table, the stage-1 page
@@ -955,9 +956,7 @@ pub(super) fn boot_region_is_hidden_private_overlay(map: &ProcMapsEntry) -> bool
 /// reservations, Linux has no such VMA, and a real Linux core has no such
 /// `PT_LOAD`.
 pub(super) fn boot_region_is_carrick_kernel_hole(map: &ProcMapsEntry) -> bool {
-    let base = crate::memory::LINUX_KERNEL_REGION_BASE;
-    let end = base.saturating_add(crate::memory::LINUX_KERNEL_REGION_SIZE);
-    map.start >= base && map.end <= end && map.start < map.end
+    crate::memory::is_carrick_kernel_only_range(map.start, map.end)
 }
 
 pub(super) fn boot_region_is_hidden_reservation(map: &ProcMapsEntry, layout: MemoryLayout) -> bool {

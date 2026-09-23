@@ -490,6 +490,21 @@ const _: () = assert!(
 // arenas so normal guest mappings never collide.
 pub const LINUX_SIGRETURN_TRAMPOLINE_BASE: u64 = 0x30_0000_0000;
 pub const LINUX_SIGRETURN_TRAMPOLINE_SIZE: u64 = 0x4000;
+/// Is `[start, end)` wholly inside memory carrick's kernel owns and guest EL0
+/// can never reach: the 2 MiB kernel hole (vectors, trampolines, page tables,
+/// identity page, mailboxes) or the in-guest EL1 kernel region. Linux has no
+/// VMA for either, so `/proc/*/maps`, core dumps, RLIMIT_AS/DATA accounting
+/// and fork topology must all treat them as absent. This is the single
+/// definition every such filter uses.
+pub const fn is_carrick_kernel_only_range(start: u64, end: u64) -> bool {
+    if start >= end {
+        return false;
+    }
+    let hole_end = LINUX_KERNEL_REGION_BASE + LINUX_KERNEL_REGION_SIZE;
+    let el1_end = LINUX_EL1_KERNEL_BASE + LINUX_EL1_KERNEL_SIZE;
+    (start >= LINUX_KERNEL_REGION_BASE && end <= hole_end)
+        || (start >= LINUX_EL1_KERNEL_BASE && end <= el1_end)
+}
 
 /// Is `va` inside carrick's EL1 trap trampoline (the VBAR_EL1 vector table)?
 /// Code there runs at EL1 and is NEVER guest userspace — a guest *resume* PC
@@ -7809,5 +7824,38 @@ mod el1_shim_tests {
             &vec![0u8; 0x100][..],
             "hook must be written at 0x1000"
         );
+    }
+}
+
+#[cfg(test)]
+mod kernel_only_range_tests {
+    use super::*;
+
+    #[test]
+    fn kernel_hole_and_el1_region_are_kernel_only_and_guest_ranges_are_not() {
+        let hole_end = LINUX_KERNEL_REGION_BASE + LINUX_KERNEL_REGION_SIZE;
+        let el1_end = LINUX_EL1_KERNEL_BASE + LINUX_EL1_KERNEL_SIZE;
+        assert!(is_carrick_kernel_only_range(
+            LINUX_KERNEL_REGION_BASE,
+            hole_end
+        ));
+        assert!(is_carrick_kernel_only_range(LINUX_EL1_KERNEL_BASE, el1_end));
+        assert!(is_carrick_kernel_only_range(
+            LINUX_EL1_KERNEL_BASE + 0x4000,
+            LINUX_EL1_KERNEL_BASE + 0x8000
+        ));
+        // Straddling out of either region, empty ranges and guest memory are not.
+        assert!(!is_carrick_kernel_only_range(
+            LINUX_EL1_KERNEL_BASE,
+            el1_end + 0x4000
+        ));
+        assert!(!is_carrick_kernel_only_range(
+            LINUX_EL1_KERNEL_BASE,
+            LINUX_EL1_KERNEL_BASE
+        ));
+        assert!(!is_carrick_kernel_only_range(
+            LINUX_HEAP_BASE,
+            LINUX_HEAP_BASE + 0x4000
+        ));
     }
 }
