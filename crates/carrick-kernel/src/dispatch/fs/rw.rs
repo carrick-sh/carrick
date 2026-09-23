@@ -2337,8 +2337,9 @@ impl<'a> FsView<'a> {
                     };
                     let outcome = DispatchOutcome::returned_len_or_errno(written);
                     if matches!(outcome, DispatchOutcome::Returned { .. }) {
-                        let _ = crate::el1_delegation::delegate(
+                        let _ = crate::el1_delegation::delegate_locked(
                             &open_file,
+                            &mut open,
                             this.captured_file_table().id(),
                             fd.0,
                             this.fs,
