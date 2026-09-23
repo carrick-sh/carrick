@@ -106,7 +106,7 @@
       "file": "crates/carrick-hal/src/threaded.rs",
       "function": "<GenericVcpuRegistry as VcpuRegistry>::subscribe_register",
       "ordinal_in_function": 1,
-      "fingerprint": "3ac1a54a6034e83458eb22997caaecb006121172acd0775595e63c846ae8640e",
+      "fingerprint": "b4bf724e12ccdb06062759cca517d2ad495c8c26be329330ac57db4522357c03",
       "verdict": "carrier_fault",
       "failure_domain": "hal::kernel_wake",
       "rationale": "vCPU enrollment generation overflowed, so a new registration could no longer be distinguished from a stale wake-debt acknowledgment.",
