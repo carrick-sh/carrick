@@ -1412,15 +1412,6 @@ impl<'a> FsView<'a> {
         mm_mutation fn fcntl(this, cx, fd: Fd, cmd: u64, arg: u64) {
             let fd: Fd = fd;
             let command = cmd;
-            if matches!(command, LINUX_F_DUPFD | LINUX_F_DUPFD_CLOEXEC) {
-                // fcntl can introduce another OFD owner just as dup can.
-                // Publish the leased offset before duplicating it; a
-                // subsequent grant rechecks logical ownership.
-                crate::kernel::identity_page::revoke_seek_authority_and_write_lease(
-                    &mut *cx.memory,
-                    crate::memory::LINUX_IDENTITY_PAGE_BASE,
-                )?;
-            }
             // A stdio fd the guest explicitly closed (and did not reopen) is a
             // genuinely closed descriptor: every fcntl on it is EBADF, NOT the
             // implicit-stdio fallbacks below (F_GETFL/F_GETFD/F_SETFL on bare

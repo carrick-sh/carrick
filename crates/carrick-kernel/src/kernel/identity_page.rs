@@ -198,26 +198,6 @@ pub fn stamp_identity_values<M: CurrentMmMemory>(
         base + crate::memory::IDENTITY_OFF_SEEK_OFFSET,
         &0_i64.to_le_bytes(),
     )?;
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_WRITE_LEASE_GATE,
-        &0_u32.to_le_bytes(),
-    )?;
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_WRITE_LEASE_HOST_FD,
-        &(-1_i32).to_le_bytes(),
-    )?;
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_WRITE_LEASE_OFFSET,
-        &0_u64.to_le_bytes(),
-    )?;
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_WRITE_LEASE_GUEST_FD,
-        &(-1_i32).to_le_bytes(),
-    )?;
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_WRITE_LEASE_DIRTY,
-        &0_u32.to_le_bytes(),
-    )?;
     // RELEASE the identity before opening the gate.
     //
     // Ordering the stores in program order is necessary but NOT sufficient.
@@ -235,106 +215,6 @@ pub fn stamp_identity_values<M: CurrentMmMemory>(
         base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
         &shim_enabled.to_le_bytes(),
     )?;
-    Ok(())
-}
-
-pub fn stamp_seek_authority<M: CurrentMmMemory>(
-    memory: &mut M,
-    base: u64,
-    fd: i32,
-    offset: i64,
-    enabled: bool,
-) -> Result<(), carrick_guest_mem::MemoryError> {
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_SEEK_GATE,
-        &0_u32.to_le_bytes(),
-    )?;
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_SEEK_FD,
-        &fd.to_le_bytes(),
-    )?;
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_SEEK_OFFSET,
-        &offset.to_le_bytes(),
-    )?;
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    if enabled {
-        memory.write_bytes(
-            base + crate::memory::IDENTITY_OFF_SEEK_GATE,
-            &1_u32.to_le_bytes(),
-        )?;
-    } else {
-        let _ = memory.write_bytes(
-            base + crate::memory::IDENTITY_OFF_WRITE_LEASE_GATE,
-            &0_u32.to_le_bytes(),
-        );
-    }
-    Ok(())
-}
-
-pub fn stamp_write_lease<M: CurrentMmMemory>(
-    memory: &mut M,
-    base: u64,
-    guest_fd: i32,
-    host_fd: i32,
-    offset: u64,
-    enabled: bool,
-) -> Result<(), carrick_guest_mem::MemoryError> {
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_WRITE_LEASE_GATE,
-        &0_u32.to_le_bytes(),
-    )?;
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    if enabled {
-        memory.write_bytes(
-            base + crate::memory::IDENTITY_OFF_WRITE_LEASE_HOST_FD,
-            &host_fd.to_le_bytes(),
-        )?;
-        memory.write_bytes(
-            base + crate::memory::IDENTITY_OFF_WRITE_LEASE_OFFSET,
-            &offset.to_le_bytes(),
-        )?;
-        memory.write_bytes(
-            base + crate::memory::IDENTITY_OFF_WRITE_LEASE_GUEST_FD,
-            &guest_fd.to_le_bytes(),
-        )?;
-        memory.write_bytes(
-            base + crate::memory::IDENTITY_OFF_WRITE_LEASE_DIRTY,
-            &0_u32.to_le_bytes(),
-        )?;
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        memory.write_bytes(
-            base + crate::memory::IDENTITY_OFF_WRITE_LEASE_GATE,
-            &1_u32.to_le_bytes(),
-        )?;
-    }
-    Ok(())
-}
-
-pub fn revoke_seek_authority_and_write_lease<M: CurrentMmMemory>(
-    memory: &mut M,
-    base: u64,
-) -> Result<(), carrick_guest_mem::MemoryError> {
-    if !crate::syscall_shim_enabled() {
-        return Ok(());
-    }
-    let mut chunk = [0u8; 44];
-    if memory
-        .read_into(base + crate::memory::IDENTITY_OFF_SEEK_GATE, &mut chunk)
-        .is_ok()
-    {
-        let seek_gate = u32::from_le_bytes(chunk[0..4].try_into().unwrap_or([0; 4]));
-        let cur_seek_off = i64::from_le_bytes(chunk[12..20].try_into().unwrap_or([0; 8]));
-        let write_gate = u32::from_le_bytes(chunk[20..24].try_into().unwrap_or([0; 4]));
-        let host_fd = i32::from_le_bytes(chunk[24..28].try_into().unwrap_or([u8::MAX; 4]));
-
-        if seek_gate == 1 && cur_seek_off >= 0 && write_gate == 1 && host_fd >= 0 {
-            unsafe { libc::lseek(host_fd, cur_seek_off as libc::off_t, libc::SEEK_SET) };
-        }
-    }
-    let _ = stamp_seek_authority(memory, base, -1, 0, false);
-    let _ = stamp_write_lease(memory, base, -1, -1, 0, false);
     Ok(())
 }
 
