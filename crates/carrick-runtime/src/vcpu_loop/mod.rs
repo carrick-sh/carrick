@@ -92,6 +92,8 @@ pub(crate) fn vcpu_reclaim_census() -> (u64, u64, u64) {
 }
 
 pub(crate) mod memory;
+#[cfg(test)]
+pub(crate) mod native_probe;
 pub(crate) use memory::{
     KernelFrameCowAuthority, RefuseAliasInstallSpec, apply_alias_frame_inventory,
     apply_exec_image_proc_state, apply_image_proc_state, refuse_alias_install,

@@ -1743,8 +1743,7 @@ mod tests {
                     // bytes, and no Rust alias or dispatch while native code runs.
                     unsafe {
                         let ptr = data.as_mut_ptr();
-                        std::arch::asm!("ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
-                        ptr = in(reg) ptr, out("x9") _, options(nostack));
+                        crate::vcpu_loop::native_probe::increment_u32(ptr);
                     }
                 }
                 drop(scope);
@@ -1827,8 +1826,7 @@ mod tests {
                     // exclusion has ended. No syscall/dispatcher reentry or Rust aliases.
                     unsafe {
                         let ptr = active.as_mut_ptr();
-                        std::arch::asm!("ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
-                ptr = in(reg) ptr, out("x9") _, options(nostack));
+                        crate::vcpu_loop::native_probe::increment_u32(ptr);
                     }
                 }
                 drop(scope);
@@ -2010,8 +2008,7 @@ mod tests {
                     // exclusion has ended. No syscall/dispatcher reentry or Rust aliases.
                     unsafe {
                         let ptr = active.as_mut_ptr();
-                        std::arch::asm!("ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
-                ptr = in(reg) ptr, out("x9") _, options(nostack));
+                        crate::vcpu_loop::native_probe::increment_u32(ptr);
                     }
                 }
                 drop(scope);
@@ -2549,10 +2546,7 @@ mod tests {
                     // It does not publish translated code or call the syscall dispatcher.
                     unsafe {
                         let ptr = data.as_mut_ptr();
-                        std::arch::asm!(
-                            "ldr w9, [{ptr}]", "add w9, w9, #1", "str w9, [{ptr}]",
-                            ptr = in(reg) ptr, out("x9") _, options(nostack)
-                        );
+                        crate::vcpu_loop::native_probe::increment_u32(ptr);
                     }
                     Ok(())
                 },
