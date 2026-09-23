@@ -9,7 +9,7 @@ use core::sync::atomic::Ordering;
 #[cfg(test)]
 std::thread_local! {
     pub static SIMULATE_COPY_FAULT: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
+        const { core::sync::atomic::AtomicBool::new(false) };
 }
 
 /// Copy `len` bytes from `src` to `dest` (user virtual address), guarded by EL1 exception fixup.
@@ -840,8 +840,8 @@ mod tests {
         assert_eq!(file.size.load(Ordering::Relaxed), 8001);
 
         // Gap [10, 8000) must be zero-filled!
-        for i in 10..8000 {
-            assert_eq!(cache[i], 0, "byte at offset {i} was not zeroed");
+        for (i, &byte) in cache[10..8000].iter().enumerate() {
+            assert_eq!(byte, 0, "byte at offset {} was not zeroed", 10 + i);
         }
         assert_eq!(cache[8000], b'x');
     }
