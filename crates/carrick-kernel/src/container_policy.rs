@@ -328,6 +328,10 @@ impl crate::observe::SyscallObserver for ContainerPolicy {
             crate::observe::FastPathVisibility::Blind
         }
     }
+
+    fn observes_syscall(&self, nr: u64) -> bool {
+        self.denied_errno_for_args(nr, 0).is_some()
+    }
 }
 
 #[cfg(test)]

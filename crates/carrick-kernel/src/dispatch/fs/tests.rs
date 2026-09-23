@@ -9809,6 +9809,7 @@ struct FsViewFixture {
     network: Arc<crate::network::RuntimeNetwork>,
     page_geometry: crate::page_profile::PageGeometry,
     task_context: crate::kernel::KernelContext,
+    seccomp: crate::seccomp::SeccompState,
 }
 
 impl FsViewFixture {
@@ -9836,6 +9837,7 @@ impl FsViewFixture {
                 native_profile: None,
             },
             task_context,
+            seccomp: crate::seccomp::SeccompState::default(),
         }
     }
 
@@ -9852,6 +9854,9 @@ impl FsViewFixture {
             sysv: None,
             exec_host_fs_fallback: false,
             cross: self,
+            seccomp: &self.seccomp,
+            observers: None,
+            interceptors_active: false,
         }
     }
 }

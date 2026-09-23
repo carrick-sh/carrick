@@ -1383,6 +1383,21 @@ pub struct FsView<'a> {
     pub(in crate::dispatch) sysv: Option<&'a Arc<sysv::SysvIpcNamespace>>,
     pub(in crate::dispatch) exec_host_fs_fallback: bool,
     pub(in crate::dispatch) cross: &'a (dyn FsCrossSubsystem + 'a),
+    pub(in crate::dispatch) seccomp: &'a crate::seccomp::SeccompState,
+    pub(in crate::dispatch) observers: Option<&'a Arc<crate::observe::ObserverChain>>,
+    pub(in crate::dispatch) interceptors_active: bool,
+}
+
+impl<'a> FsView<'a> {
+    pub(in crate::dispatch) fn delegation_policy(
+        &self,
+    ) -> crate::el1_delegation::DelegationPolicy<'_> {
+        crate::el1_delegation::DelegationPolicy {
+            seccomp: Some(self.seccomp),
+            observers: self.observers.map(|a| &**a),
+            interceptors_active: self.interceptors_active,
+        }
+    }
 }
 
 /// Subsystem view for network operations.
@@ -2250,6 +2265,9 @@ impl SyscallDispatcher {
             sysv: Some(&self.sysv),
             exec_host_fs_fallback: self.exec_host_fs_fallback,
             cross: self,
+            seccomp: &self.seccomp,
+            observers: self.observers.as_ref(),
+            interceptors_active: self.interceptors.is_some(),
         }
     }
 

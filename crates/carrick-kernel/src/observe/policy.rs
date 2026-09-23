@@ -204,4 +204,15 @@ impl SyscallObserver for PolicyObserver {
         }
         FastPathVisibility::Blind
     }
+
+    fn observes_syscall(&self, nr: u64) -> bool {
+        if self.default_action != SyscallAction::Allow {
+            return true;
+        }
+        self.rules.iter().any(|r| {
+            r.action != SyscallAction::Allow
+                && (r.canonical_nr.is_none()
+                    || r.canonical_nr == Some(carrick_abi::CanonicalNr(nr)))
+        })
+    }
 }

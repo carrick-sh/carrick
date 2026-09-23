@@ -299,6 +299,10 @@ pub trait SyscallObserver: Send + Sync {
     fn wants_fast_path_visibility(&self) -> FastPathVisibility {
         FastPathVisibility::Blind
     }
+    /// Returns true if this observer cares about the specified syscall number.
+    fn observes_syscall(&self, _nr: u64) -> bool {
+        true
+    }
 }
 
 impl SyscallObserver for carrick_observability::compat::CompatReporter {
@@ -369,6 +373,24 @@ impl ObserverChain {
 
     pub fn user_observers(&self) -> &[Arc<dyn SyscallObserver>] {
         &self.observers
+    }
+
+    /// Returns true if policy or any observer monitors or denies any of the given syscalls.
+    pub fn observes_any_syscall(&self, syscalls: &[u64]) -> bool {
+        if self.wants_fast_path_visibility() == FastPathVisibility::Required {
+            return true;
+        }
+        if let Some(ref pol) = self.policy {
+            if syscalls.iter().any(|&nr| pol.observes_syscall(nr)) {
+                return true;
+            }
+        }
+        for obs in &self.observers {
+            if syscalls.iter().any(|&nr| obs.observes_syscall(nr)) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn on_user_syscall(&self, p: &ProcessInfo<'_>, s: &SyscallInfo<'_>) -> SyscallAction {

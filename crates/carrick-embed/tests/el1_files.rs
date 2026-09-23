@@ -288,3 +288,70 @@ if ($pid == 0) {
         "child_got: writer_payload_abcde"
     );
 }
+
+/// Memfd sealing recall test: guest creates an unsealed memfd (with MFD_ALLOW_SEALING),
+/// performs repeated write+lseek operations (served at EL1), then seals it with
+/// F_ADD_SEALS (F_SEAL_WRITE). Subsequent write must be rejected with EPERM,
+/// proving EL1 delegation was recalled and subsequent operations trap to Carrick host.
+#[test]
+fn el1_files_memfd_seal_recall() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command([
+                "/usr/bin/perl",
+                "-e",
+                r#"
+my $name = "test_memfd\0";
+my $fd = syscall(279, $name, 2); # memfd_create("test_memfd", MFD_ALLOW_SEALING=2)
+if ($fd < 0) { die "memfd_create failed: $!"; }
+
+open(my $fh, "+<&=", $fd) or die "open fd: $!";
+
+# Warm up and delegate to EL1:
+syswrite($fh, "x") or die "warmup write: $!";
+sysseek($fh, 0, 0) or die "warmup seek: $!";
+for (my $i = 0; $i < 50; $i++) {
+    syswrite($fh, "x") or die "write $i: $!";
+    sysseek($fh, 0, 0) or die "seek $i: $!";
+}
+
+# Seal the memfd against writes: fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE)
+# On aarch64 Linux, fcntl syscall is 25:
+my $ret = syscall(25, $fd, 1033, 8);
+if ($ret < 0) { die "fcntl F_ADD_SEALS failed: $!"; }
+
+# Attempt write after sealing: must fail with EPERM (errno 1)
+my $w = syswrite($fh, "y");
+if (defined $w) {
+    die "write succeeded after F_SEAL_WRITE!";
+}
+if ($! != 1) {
+    die "expected EPERM (1), got errno: " . int($!);
+}
+
+close($fh);
+print "memfd_seal_ok\n";
+"#,
+            ])
+            .run_blocking(),
+    );
+
+    assert!(
+        result.success(),
+        "exit_code={}, stderr={}",
+        result.exit_code,
+        result.stderr_utf8()
+    );
+    assert_eq!(result.stdout_utf8().trim(), "memfd_seal_ok");
+
+    let counters = read_el1_counters().expect("EL1 counters should be populated");
+    let served_writes = counters.served[64].load(Ordering::Relaxed);
+    assert!(
+        served_writes >= 50,
+        "expected at least 50 writes served at EL1 before seal, got {served_writes}"
+    );
+}

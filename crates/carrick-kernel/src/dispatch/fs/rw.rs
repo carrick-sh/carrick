@@ -453,6 +453,7 @@ impl<'a> FsView<'a> {
                 fd,
                 self.fs,
                 Some(&self.task_rlimits()),
+                Some(self.delegation_policy()),
             );
         }
         Ok(out)
@@ -547,6 +548,7 @@ impl<'a> FsView<'a> {
                         fd.0,
                         this.fs,
                         Some(&this.task_rlimits()),
+                        Some(this.delegation_policy()),
                     );
                 }
                 return Ok(outcome);
@@ -862,6 +864,7 @@ impl<'a> FsView<'a> {
                     fd.0,
                     this.fs,
                     Some(&this.task_rlimits()),
+                    Some(this.delegation_policy()),
                 );
             }
             Ok(outcome)
@@ -1408,6 +1411,7 @@ impl<'a> FsView<'a> {
                             fd.0,
                             this.fs,
                             Some(&this.task_rlimits()),
+                            Some(this.delegation_policy()),
                         );
                     }
                     return outcome;
@@ -1422,6 +1426,7 @@ impl<'a> FsView<'a> {
                     fd.0,
                     this.fs,
                     Some(&this.task_rlimits()),
+                    Some(this.delegation_policy()),
                 );
             }
             drop(open);
@@ -1828,6 +1833,7 @@ impl<'a> FsView<'a> {
                         fd.0,
                         this.fs,
                         Some(&this.task_rlimits()),
+                        Some(this.delegation_policy()),
                     );
                 }
                 return Ok(outcome);
@@ -1917,6 +1923,7 @@ impl<'a> FsView<'a> {
                     fd.0,
                     this.fs,
                     Some(&this.task_rlimits()),
+                    Some(this.delegation_policy()),
                 );
             }
             Ok(outcome)
@@ -2257,6 +2264,7 @@ impl<'a> FsView<'a> {
                         fd.0,
                         this.fs,
                         Some(&this.task_rlimits()),
+                        Some(this.delegation_policy()),
                     );
                 }
                 return Ok(outcome);
@@ -2335,6 +2343,7 @@ impl<'a> FsView<'a> {
                             fd.0,
                             this.fs,
                             Some(&this.task_rlimits()),
+                            Some(this.delegation_policy()),
                         );
                     }
                     return Ok(outcome);
@@ -2624,6 +2633,7 @@ impl<'a> FsView<'a> {
                                 fd.0,
                                 this.fs,
                                 Some(&this.task_rlimits()),
+                                Some(this.delegation_policy()),
                             );
                         }
                         return Ok(DispatchOutcome::returned_isize_or_errno(n));
@@ -2692,6 +2702,7 @@ impl<'a> FsView<'a> {
                         fd.0,
                         this.fs,
                         Some(&this.task_rlimits()),
+                        Some(this.delegation_policy()),
                     );
                 }
                 return Ok(DispatchOutcome::Returned { value: total });
@@ -3340,6 +3351,7 @@ impl<'a> FsView<'a> {
                         fd,
                         this.fs,
                         Some(&this.task_rlimits()),
+                        Some(this.delegation_policy()),
                     );
                 }
                 return Ok(outcome);
