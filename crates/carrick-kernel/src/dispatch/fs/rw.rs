@@ -466,79 +466,8 @@ impl<'a> FsView<'a> {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            if let Some((host_fd, writable)) = open_file.host_file_info() {
-                let mut seek_authority_active = false;
-                if crate::syscall_shim_enabled() {
-                    let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
-                    if let (Ok(gate_b), Ok(fd_b), Ok(off_b)) = (
-                        cx.memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_GATE, 4),
-                        cx.memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_FD, 4),
-                        cx.memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_OFFSET, 8),
-                    ) {
-                        let gate = u32::from_le_bytes(gate_b.as_slice().try_into().unwrap_or([0; 4]));
-                        let s_fd = i32::from_le_bytes(fd_b.as_slice().try_into().unwrap_or([u8::MAX; 4]));
-                        let cur_off = i64::from_le_bytes(off_b.as_slice().try_into().unwrap_or([0; 8]));
-                        if gate == 1 && s_fd == fd.0 && cur_off >= 0 {
-                            seek_authority_active = true;
-                            unsafe { libc::lseek(host_fd.raw(), cur_off as libc::off_t, libc::SEEK_SET) };
-                        }
-                    }
-                }
+            if let Some((host_fd, _writable)) = open_file.host_file_info() {
                 let outcome = this.lseek_host_file(&host_fd, offset, whence);
-                if seek_authority_active {
-                    let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
-                    if let DispatchOutcome::Returned { value } = outcome {
-                        let _ = cx.memory.write_bytes(
-                            base + crate::memory::IDENTITY_OFF_SEEK_OFFSET,
-                            &(value as i64).to_le_bytes(),
-                        );
-                    } else {
-                        let _ = crate::kernel::identity_page::stamp_seek_authority(
-                            &mut *cx.memory,
-                            base,
-                            -1,
-                            0,
-                            false,
-                        );
-                    }
-                } else if crate::syscall_shim_enabled()
-                    && offset == 0
-                    && whence as i32 == libc::SEEK_SET
-                    && matches!(outcome, DispatchOutcome::Returned { value: 0 })
-                {
-                    let is_append = LinuxOpenFlags::from_bits_truncate(
-                        open_file.description.common().status_flags(),
-                    )
-                    .contains(LinuxOpenFlags::APPEND);
-                    // The identity-page offset is private to this execution
-                    // binding. An alias (including one inherited by fork) uses
-                    // the same Linux open file description, so a later seek
-                    // must not re-grant private authority after dup/fork revoked
-                    // it. Count logical descriptor owners, never Arc clones.
-                    if writable && !is_append && open_file.description.fd_ref_count() == 1 {
-                        let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
-                        let _ = crate::kernel::identity_page::stamp_seek_authority(
-                            &mut *cx.memory,
-                            base,
-                            fd.0,
-                            0,
-                            true,
-                        );
-                        let rlim_fsize = this
-                            .effective_resource_limit(carrick_abi::LINUX_RLIMIT_FSIZE)
-                            .rlim_cur;
-                        if rlim_fsize == carrick_abi::LINUX_RLIM_INFINITY {
-                            let _ = crate::kernel::identity_page::stamp_write_lease(
-                                &mut *cx.memory,
-                                base,
-                                fd.0,
-                                host_fd.raw(),
-                                0,
-                                true,
-                            );
-                        }
-                    }
-                }
                 return Ok(outcome);
             }
             let Some(mut open) = open_file.description.write() else {
@@ -1367,28 +1296,6 @@ impl<'a> FsView<'a> {
                 // memory-into-guest read(2) wrapper.
                 OpenDescription::HostFile { host_fd, .. } => {
                     let host_fd_raw = host_fd.raw();
-                    if crate::syscall_shim_enabled() {
-                        let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
-                        if let (Ok(gate_b), Ok(fd_b), Ok(off_b)) = (
-                            memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_GATE, 4),
-                            memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_FD, 4),
-                            memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_OFFSET, 8),
-                        ) {
-                            let gate = u32::from_le_bytes(gate_b.as_slice().try_into().unwrap_or([0; 4]));
-                            let s_fd = i32::from_le_bytes(fd_b.as_slice().try_into().unwrap_or([u8::MAX; 4]));
-                            let cur_off = i64::from_le_bytes(off_b.as_slice().try_into().unwrap_or([0; 8]));
-                            if gate == 1 && s_fd == fd.0 && cur_off >= 0 {
-                                unsafe { libc::lseek(host_fd_raw, cur_off as libc::off_t, libc::SEEK_SET) };
-                                let _ = crate::kernel::identity_page::stamp_seek_authority(
-                                    &mut *memory,
-                                    base,
-                                    -1,
-                                    0,
-                                    false,
-                                );
-                            }
-                        }
-                    }
                     let host_fd_owner = host_fd.clone();
                     host_fd_owner.record_sequential_io();
                     drop(open);
@@ -1461,28 +1368,6 @@ impl<'a> FsView<'a> {
             // offset). Fill each iovec sequentially.
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
                 let hfd = host_fd.raw();
-                if crate::syscall_shim_enabled() {
-                    let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
-                    if let (Ok(gate_b), Ok(fd_b), Ok(off_b)) = (
-                        memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_GATE, 4),
-                        memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_FD, 4),
-                        memory.read_bytes(base + crate::memory::IDENTITY_OFF_SEEK_OFFSET, 8),
-                    ) {
-                        let gate = u32::from_le_bytes(gate_b.as_slice().try_into().unwrap_or([0; 4]));
-                        let s_fd = i32::from_le_bytes(fd_b.as_slice().try_into().unwrap_or([u8::MAX; 4]));
-                        let cur_off = i64::from_le_bytes(off_b.as_slice().try_into().unwrap_or([0; 8]));
-                        if gate == 1 && s_fd == fd.0 && cur_off >= 0 {
-                            unsafe { libc::lseek(hfd, cur_off as libc::off_t, libc::SEEK_SET) };
-                            let _ = crate::kernel::identity_page::stamp_seek_authority(
-                                &mut *memory,
-                                base,
-                                -1,
-                                0,
-                                false,
-                            );
-                        }
-                    }
-                }
                 let owner = Some(host_fd.clone());
                 host_fd.record_sequential_io();
                 if host_wait_ref.is_none() {

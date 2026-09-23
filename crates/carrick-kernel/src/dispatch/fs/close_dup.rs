@@ -223,20 +223,6 @@ impl<'a> FsView<'a> {
             // return a freed fd >= 3 instead of 0, so libuv's
             // uv_pipe_open(loop, 0) wrapped a dead fd 0 and uv_run crashed
             // (test pipe_close_stdout_read_stdin). dup3/F_DUPFD already use 0.
-            if crate::syscall_shim_enabled() {
-                let fd_addr = crate::memory::LINUX_IDENTITY_PAGE_BASE
-                    + crate::memory::IDENTITY_OFF_SEEK_FD;
-                if let Ok(bytes) = cx.memory.read_bytes(fd_addr, 4) {
-                    let current_seek_fd =
-                        i32::from_le_bytes(bytes.as_slice().try_into().unwrap_or([u8::MAX; 4]));
-                    if current_seek_fd == old_fd.0 {
-                        let _ = crate::kernel::identity_page::revoke_seek_authority_and_write_lease(
-                            &mut *cx.memory,
-                            crate::memory::LINUX_IDENTITY_PAGE_BASE,
-                        );
-                    }
-                }
-            }
             Ok(this.duplicate_fd(old_fd.0, 0, 0))
 
         }
@@ -260,20 +246,6 @@ impl<'a> FsView<'a> {
             if old_fd.0 == new_fd.0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if crate::syscall_shim_enabled() {
-                let fd_addr = crate::memory::LINUX_IDENTITY_PAGE_BASE
-                    + crate::memory::IDENTITY_OFF_SEEK_FD;
-                if let Ok(bytes) = cx.memory.read_bytes(fd_addr, 4) {
-                    let current_seek_fd =
-                        i32::from_le_bytes(bytes.as_slice().try_into().unwrap_or([u8::MAX; 4]));
-                    if current_seek_fd == old_fd.0 || current_seek_fd == new_fd.0 {
-                        let _ = crate::kernel::identity_page::revoke_seek_authority_and_write_lease(
-                            &mut *cx.memory,
-                            crate::memory::LINUX_IDENTITY_PAGE_BASE,
-                        );
-                    }
-                }
-            }
             Ok(this.duplicate_fd_to(
                 cx.kernel.task().key(),
                 old_fd.0,
@@ -288,20 +260,6 @@ impl<'a> FsView<'a> {
 
             let old_fd: Fd = oldfd;
             let new_fd: Fd = newfd;
-            if crate::syscall_shim_enabled() {
-                let fd_addr = crate::memory::LINUX_IDENTITY_PAGE_BASE
-                    + crate::memory::IDENTITY_OFF_SEEK_FD;
-                if let Ok(bytes) = cx.memory.read_bytes(fd_addr, 4) {
-                    let current_seek_fd =
-                        i32::from_le_bytes(bytes.as_slice().try_into().unwrap_or([u8::MAX; 4]));
-                    if current_seek_fd == old_fd.0 || current_seek_fd == new_fd.0 {
-                        let _ = crate::kernel::identity_page::revoke_seek_authority_and_write_lease(
-                            &mut *cx.memory,
-                            crate::memory::LINUX_IDENTITY_PAGE_BASE,
-                        );
-                    }
-                }
-            }
             Ok(this.duplicate_fd_to(
                 cx.kernel.task().key(),
                 old_fd.0,
@@ -342,20 +300,6 @@ impl<'a> FsView<'a> {
             // removal to THIS registration. detach takes only a read lock, so it
             // does not deadlock with the separate write below.
             this.detach_fd_from_epolls(fd.0);
-            if crate::syscall_shim_enabled() {
-                let fd_addr = crate::memory::LINUX_IDENTITY_PAGE_BASE
-                    + crate::memory::IDENTITY_OFF_SEEK_FD;
-                if let Ok(bytes) = cx.memory.read_bytes(fd_addr, 4) {
-                    let current_seek_fd =
-                        i32::from_le_bytes(bytes.as_slice().try_into().unwrap_or([u8::MAX; 4]));
-                    if current_seek_fd == fd.0 {
-                        let _ = crate::kernel::identity_page::revoke_seek_authority_and_write_lease(
-                            &mut *cx.memory,
-                            crate::memory::LINUX_IDENTITY_PAGE_BASE,
-                        );
-                    }
-                }
-            }
             let files = this.captured_file_table();
             let removed = files.write_open_files().remove(&fd.0);
             Ok(
@@ -488,24 +432,6 @@ impl<'a> FsView<'a> {
                 );
                 this.with_kernel_resources(unshared.context(), close_selected)
             };
-
-            if !cloexec_only && crate::syscall_shim_enabled() {
-                let fd_addr = crate::memory::LINUX_IDENTITY_PAGE_BASE
-                    + crate::memory::IDENTITY_OFF_SEEK_FD;
-                if let Ok(bytes) = cx.memory.read_bytes(fd_addr, 4) {
-                    let current_seek_fd =
-                        i32::from_le_bytes(bytes.as_slice().try_into().unwrap_or([u8::MAX; 4]));
-                    if current_seek_fd >= 0
-                        && (current_seek_fd as u64) >= first
-                        && (current_seek_fd as u64) <= last
-                    {
-                        let _ = crate::kernel::identity_page::revoke_seek_authority_and_write_lease(
-                            &mut *cx.memory,
-                            crate::memory::LINUX_IDENTITY_PAGE_BASE,
-                        );
-                    }
-                }
-            }
             outcome
 
         }

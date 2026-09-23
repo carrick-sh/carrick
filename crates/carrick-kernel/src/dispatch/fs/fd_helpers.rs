@@ -58,52 +58,6 @@ impl<'a> FsView<'a> {
         }
     }
 
-    pub(crate) fn drain_write_lease_dirty<M: CurrentMmMemory>(
-        &self,
-        cx: &mut crate::dispatch::SyscallCtx<'_, M>,
-    ) {
-        if !crate::syscall_shim_enabled() {
-            return;
-        }
-        if self.fs.inotify_registry.is_empty() && self.fs.fanotify_registry.is_empty() {
-            return;
-        }
-        let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
-        let mut dirty_buf = [0u8; 4];
-        if cx
-            .memory
-            .read_into(
-                base + crate::memory::IDENTITY_OFF_WRITE_LEASE_DIRTY,
-                &mut dirty_buf,
-            )
-            .is_ok()
-            && dirty_buf != [0; 4]
-        {
-            let _ = cx.memory.write_bytes(
-                base + crate::memory::IDENTITY_OFF_WRITE_LEASE_DIRTY,
-                &0_u32.to_le_bytes(),
-            );
-            let mut guest_fd_buf = [0u8; 4];
-            if cx
-                .memory
-                .read_into(
-                    base + crate::memory::IDENTITY_OFF_WRITE_LEASE_GUEST_FD,
-                    &mut guest_fd_buf,
-                )
-                .is_ok()
-            {
-                let leased_fd = i32::from_le_bytes(guest_fd_buf);
-                if let Some(open_file) = self.open_file(leased_fd) {
-                    self.notify_host_file_write_result(
-                        cx.kernel,
-                        &open_file,
-                        &DispatchOutcome::Returned { value: 64 },
-                    );
-                }
-            }
-        }
-    }
-
     /// Failed and empty writes do not modify contents and must not consume an
     /// IN_ONESHOT watch. Positive partial writes do generate a modification.
     pub(super) fn notify_file_write_result(

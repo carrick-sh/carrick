@@ -26,8 +26,8 @@ use std::sync::Arc;
 use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{
-    Aarch64SyscallFrame, CurrentMmMemory, Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError,
-    RepointPrivateError, SharedFutexLocation,
+    CurrentMmMemory, Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError, RepointPrivateError,
+    SharedFutexLocation,
 };
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
@@ -712,192 +712,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         self.last_fault_esr = state.last_fault_esr;
         self.last_exit_class = state.last_exit_class;
         self.is_forked_child = state.is_forked_child;
-    }
-
-    fn try_fast_write(&mut self, frame: &Aarch64SyscallFrame) -> Option<usize> {
-        let base = carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE;
-        // The seek authority and write lease fields form a contiguous 44-byte span:
-        // 0x14: SEEK_GATE (4 bytes)
-        // 0x18: SEEK_FD (4 bytes)
-        // 0x1C: padding (4 bytes)
-        // 0x20: SEEK_OFFSET (8 bytes)
-        // 0x28: WRITE_LEASE_GATE (4 bytes)
-        // 0x2C: WRITE_LEASE_HOST_FD (4 bytes)
-        // 0x30: WRITE_LEASE_OFFSET (8 bytes)
-        // 0x38: WRITE_LEASE_GUEST_FD (4 bytes)
-        // 0x3C: WRITE_LEASE_DIRTY (4 bytes)
-        let mut chunk = [0u8; 44];
-        if self
-            .read_into_raw(
-                base + carrick_mem::memory::IDENTITY_OFF_SEEK_GATE,
-                &mut chunk,
-            )
-            .is_err()
-        {
-            return None;
-        }
-
-        let seek_gate = u32::from_le_bytes(chunk[0..4].try_into().ok()?);
-        let seek_fd = i32::from_le_bytes(chunk[4..8].try_into().ok()?);
-        let cur_seek_off = i64::from_le_bytes(chunk[12..20].try_into().ok()?);
-        let write_gate = u32::from_le_bytes(chunk[20..24].try_into().ok()?);
-        let host_fd = i32::from_le_bytes(chunk[24..28].try_into().ok()?);
-        let write_guest_fd = i32::from_le_bytes(chunk[36..40].try_into().ok()?);
-
-        let guest_fd = frame.x0 as i32;
-        if seek_gate != 1
-            || write_gate != 1
-            || seek_fd != guest_fd
-            || write_guest_fd != guest_fd
-            || host_fd < 0
-            || cur_seek_off < 0
-        {
-            return None;
-        }
-
-        let offset = cur_seek_off as u64;
-        let buf_gva = frame.x1;
-        let count = frame.x2 as usize;
-        let written = if count <= 4096 {
-            let mut stack_buf = [0u8; 4096];
-            if self
-                .read_into_raw(buf_gva, &mut stack_buf[..count])
-                .is_err()
-            {
-                return None;
-            }
-            unsafe {
-                libc::pwrite(
-                    host_fd,
-                    stack_buf.as_ptr() as *const libc::c_void,
-                    count,
-                    offset as libc::off_t,
-                )
-            }
-        } else if let Some(host_ptr) = self.vm.host_ptr_for_read(buf_gva, count) {
-            unsafe {
-                libc::pwrite(
-                    host_fd,
-                    host_ptr as *const libc::c_void,
-                    count,
-                    offset as libc::off_t,
-                )
-            }
-        } else {
-            return None;
-        };
-        if written < 0 {
-            return None;
-        }
-
-        let new_offset = offset.saturating_add(written as u64);
-        let _ = self.write_bytes(
-            base + carrick_mem::memory::IDENTITY_OFF_SEEK_OFFSET,
-            &(new_offset as i64).to_le_bytes(),
-        );
-        let mut lease_update = [0u8; 16];
-        lease_update[0..8].copy_from_slice(&new_offset.to_le_bytes());
-        lease_update[8..12].copy_from_slice(&chunk[36..40]); // preserve guest_fd
-        lease_update[12..16].copy_from_slice(&1_u32.to_le_bytes()); // dirty = 1
-        let _ = self.write_bytes(
-            base + carrick_mem::memory::IDENTITY_OFF_WRITE_LEASE_OFFSET,
-            &lease_update,
-        );
-        Some(written as usize)
-    }
-
-    fn try_fast_read(&mut self, frame: &Aarch64SyscallFrame) -> Option<usize> {
-        let base = carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE;
-        let mut chunk = [0u8; 44];
-        if self
-            .read_into_raw(
-                base + carrick_mem::memory::IDENTITY_OFF_SEEK_GATE,
-                &mut chunk,
-            )
-            .is_err()
-        {
-            return None;
-        }
-
-        let seek_gate = u32::from_le_bytes(chunk[0..4].try_into().ok()?);
-        let seek_fd = i32::from_le_bytes(chunk[4..8].try_into().ok()?);
-        let cur_seek_off = i64::from_le_bytes(chunk[12..20].try_into().ok()?);
-        let write_gate = u32::from_le_bytes(chunk[20..24].try_into().ok()?);
-        let host_fd = i32::from_le_bytes(chunk[24..28].try_into().ok()?);
-        let write_guest_fd = i32::from_le_bytes(chunk[36..40].try_into().ok()?);
-
-        let guest_fd = frame.x0 as i32;
-        if seek_gate != 1
-            || write_gate != 1
-            || seek_fd != guest_fd
-            || write_guest_fd != guest_fd
-            || host_fd < 0
-            || cur_seek_off < 0
-        {
-            return None;
-        }
-
-        let offset = cur_seek_off as u64;
-        let buf_gva = frame.x1;
-        let count = frame.x2 as usize;
-        if count == 0 {
-            return Some(0);
-        }
-
-        let nread = if count <= 4096 {
-            let mut stack_buf = [0u8; 4096];
-            let read = unsafe {
-                libc::pread(
-                    host_fd,
-                    stack_buf.as_mut_ptr() as *mut libc::c_void,
-                    count,
-                    offset as libc::off_t,
-                )
-            };
-            if read < 0 {
-                return None;
-            }
-            let read_bytes = read as usize;
-            if self.write_bytes(buf_gva, &stack_buf[..read_bytes]).is_err() {
-                return None;
-            }
-            read_bytes
-        } else if let Some(host_ptr) = self.host_ptr_for_write(buf_gva, count) {
-            let ranges = [carrick_guest_mem::HostWriteRange {
-                guest: GuestVa(buf_gva),
-                len: count,
-                host: carrick_guest_mem::HostVa(host_ptr as usize),
-            }];
-            let _host_write = carrick_guest_mem::HostWriteGuard::new(self, &ranges).ok()?;
-            let read = unsafe {
-                libc::pread(
-                    host_fd,
-                    host_ptr as *mut libc::c_void,
-                    count,
-                    offset as libc::off_t,
-                )
-            };
-            if read < 0 {
-                return None;
-            }
-            read as usize
-        } else {
-            return None;
-        };
-
-        let new_offset = offset.saturating_add(nread as u64);
-        let _ = self.write_bytes(
-            base + carrick_mem::memory::IDENTITY_OFF_SEEK_OFFSET,
-            &(new_offset as i64).to_le_bytes(),
-        );
-        let mut lease_update = [0u8; 12];
-        lease_update[0..8].copy_from_slice(&new_offset.to_le_bytes());
-        lease_update[8..12].copy_from_slice(&chunk[36..40]); // preserve guest_fd
-        let _ = self.write_bytes(
-            base + carrick_mem::memory::IDENTITY_OFF_WRITE_LEASE_OFFSET,
-            &lease_update,
-        );
-        Some(nread)
     }
 
     /// Build an engine around an already-constructed VM + vCPU (the backend's
@@ -2643,18 +2457,6 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                     resume_pc,
                     current_guest_sp,
                 } => {
-                    if frame.x8 == 64
-                        && let Some(written) = self.try_fast_write(&frame)
-                    {
-                        self.complete_syscall(written as i64)?;
-                        continue;
-                    }
-                    if frame.x8 == 63
-                        && let Some(read) = self.try_fast_read(&frame)
-                    {
-                        self.complete_syscall(read as i64)?;
-                        continue;
-                    }
                     // The EL0 `svc` re-entered EL1 and hit the sentinel store. The
                     // hardware already set ELR_EL1 = (svc addr + 4); the EL1
                     // vector's own `eret` (after the sentinel store) consumes it —

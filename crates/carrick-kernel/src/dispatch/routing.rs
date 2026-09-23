@@ -166,7 +166,6 @@ impl SyscallDispatcher {
         &self,
         mut ctx: SyscallCtx<'_, M>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        self.drain_write_lease_dirty(&mut ctx);
         let handler = resolve_handler(ctx.request.number.raw())?;
         let canonical_nr = ctx.request.number.raw();
         let outcome = resources::with_captured_resources(ctx.kernel, || handler(self, &mut ctx));
