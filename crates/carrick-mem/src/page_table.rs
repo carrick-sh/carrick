@@ -4821,4 +4821,19 @@ mod tests {
             "16 TiB reclaim steps must be hierarchically bounded: {steps_populated} < 5000 (old linear sweep = 8,388,608)"
         );
     }
+
+    #[test]
+    fn test_el1_stack_walk_after_rebase() {
+        let bytes = stage1_hvpatch_page_tables();
+        let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
+        let stack_va = 0x2d04213ee0;
+        let leaf_before = terminal_descriptor(mgr.debug_walk(stack_va));
+
+        let child_root = 0x9a_0000_0000;
+        mgr.rebase(child_root, None).expect("rebase");
+        let leaf_after = terminal_descriptor(mgr.debug_walk(stack_va));
+        assert_eq!(leaf_before & VALID, 1);
+        assert_eq!(leaf_after & VALID, 1);
+        assert_eq!(leaf_after & AP_MASK, leaf_before & AP_MASK);
+    }
 }

@@ -633,25 +633,23 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
         .iter()
         .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
     {
-        let remap = if (crate::memory::LINUX_KERNEL_REGION_BASE
-            ..crate::memory::LINUX_KERNEL_REGION_BASE + TWO_MIB)
-            .contains(&mapping.guest_start)
-        {
-            page_tables.map_kernel_aliased(
-                mapping.guest_start,
-                mapping.ipa_start,
-                mapping.mapped_size,
-                None,
-            )
-        } else {
-            page_tables.map_aliased(
-                mapping.guest_start,
-                mapping.ipa_start,
-                mapping.mapped_size,
-                mapping.perms.write,
-                None,
-            )
-        };
+        let remap =
+            if is_kernel_only_stage1_range(mapping.guest_start, mapping.mapped_size as usize) {
+                page_tables.map_kernel_aliased(
+                    mapping.guest_start,
+                    mapping.ipa_start,
+                    mapping.mapped_size,
+                    None,
+                )
+            } else {
+                page_tables.map_aliased(
+                    mapping.guest_start,
+                    mapping.ipa_start,
+                    mapping.mapped_size,
+                    mapping.perms.write,
+                    None,
+                )
+            };
         remap.map_err(|error| {
             TrapError::Hypervisor(format!(
                 "plan global-frame HVPatch exec VA 0x{:x}: {error:?}",

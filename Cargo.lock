@@ -454,6 +454,7 @@ dependencies = [
  "camino",
  "carrick-abi",
  "carrick-conformance-contract",
+ "carrick-el1-abi",
  "carrick-engine",
  "carrick-guest-mem",
  "carrick-hal",
@@ -671,6 +672,8 @@ name = "carrick-mem"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
+ "carrick-el1-abi",
+ "carrick-el1-image",
  "carrick-fatal",
  "carrick-guest-mem",
  "goblin",
@@ -719,6 +722,7 @@ dependencies = [
  "carrick-aarch64",
  "carrick-abi",
  "carrick-conformance-contract",
+ "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-mem",
  "carrick-hal",
@@ -876,6 +880,7 @@ dependencies = [
  "carrick-aarch64",
  "carrick-abi",
  "carrick-conformance-contract",
+ "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-mem",
  "carrick-hal",

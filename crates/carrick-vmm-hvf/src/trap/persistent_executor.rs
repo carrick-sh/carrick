@@ -337,9 +337,14 @@ pub(crate) fn audit_plan_against_installed_carrier(
             }
         }
     }
-    if seen != 6 {
+    let has_el1 = carrier
+        .mappings
+        .iter()
+        .any(|m| m.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE);
+    let expected = if has_el1 { 7 } else { 6 };
+    if seen != expected {
         return Err(TrapError::Hypervisor(format!(
-            "root image carries {seen} carrier control mappings, expected 6"
+            "root image carries {seen} carrier control mappings, expected {expected}"
         )));
     }
     Ok(())
@@ -373,6 +378,7 @@ pub(crate) fn is_persistent_executor_carrier_address(address: u64) -> bool {
             | carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE
             | carrick_mem::memory::LINUX_CARRIER_MAINT_ROOT_BASE
             | carrick_mem::memory::LINUX_FD_CEILING_CONTROL_BASE
+            | carrick_mem::memory::LINUX_EL1_KERNEL_BASE
     )
 }
 
@@ -422,9 +428,14 @@ impl PersistentCarrierMappings {
             fd_ceiling_publisher: parking_lot::Mutex::new(None),
         };
         authority.audit()?;
-        if authority.mappings.len() != 6 {
+        let has_el1 = authority
+            .mappings
+            .iter()
+            .any(|m| m.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE);
+        let expected = if has_el1 { 7 } else { 6 };
+        if authority.mappings.len() != expected {
             return Err(TrapError::Hypervisor(format!(
-                "persistent executor carrier owns {} mappings, expected 6",
+                "persistent executor carrier owns {} mappings, expected {expected}",
                 authority.mappings.len()
             )));
         }
@@ -591,6 +602,7 @@ unsafe impl Sync for PersistentCarrierMappings {}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for PersistentCarrierMappings {
     fn drop(&mut self) {
+        crate::trap::stage2_backend::snapshot_and_clear_el1_counters();
         let vm_destroyed = self
             .vm_destroyed_after_custody_commit
             .load(std::sync::atomic::Ordering::Acquire);
@@ -707,6 +719,25 @@ pub(crate) fn audit_persistent_executor_carrier_mappings(
                         .to_owned(),
                 ));
             }
+        }
+    }
+    if mappings
+        .iter()
+        .any(|m| m.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE)
+    {
+        let size = usize::try_from(carrick_mem::memory::LINUX_EL1_KERNEL_SIZE).map_err(|_| {
+            TrapError::Hypervisor("persistent executor EL1 kernel extent is too large".to_owned())
+        })?;
+        if persistent_carrier_host_pointer(
+            mappings,
+            carrick_mem::memory::LINUX_EL1_KERNEL_BASE,
+            size,
+        )
+        .is_none()
+        {
+            return Err(TrapError::Hypervisor(
+                "persistent executor carrier EL1 kernel mapping is absent".to_owned(),
+            ));
         }
     }
     Ok(())

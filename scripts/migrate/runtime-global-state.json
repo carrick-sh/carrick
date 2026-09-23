@@ -2571,6 +2571,22 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
+      "symbol": "EL1_COUNTERS_HOST_PTR",
+      "fingerprint": "74269fd071612aacbfa59305659478ad55c83dcf4d13580c553606ce1913b8f4",
+      "classification": "carrier_infra",
+      "rationale": "Process-global atomic pointer to the active carrier's EL1 kernel counters region in host virtual memory, allowing host verification and observability of in-guest EL1 dispatch counters."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
+      "symbol": "LAST_EL1_COUNTERS",
+      "fingerprint": "e3120da1b6508ed08b7a735e96b8ed120f583ca66e96c2191e641abe382e19ef",
+      "classification": "carrier_infra",
+      "rationale": "Process-global snapshot of EL1 counters captured upon carrier teardown, enabling post-execution assertions in embed tests and observability tools after the VM carrier is destroyed."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap/sysreg.rs",
       "symbol": "guest_counter_ticks::START",
       "fingerprint": "70b7dbc3d0ba6b0aee53fa1f30b331629bfff43ce1f777ce658be289ff197b95",

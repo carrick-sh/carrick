@@ -912,7 +912,42 @@ pub(crate) fn map_exclusive_region(
             );
         }
     }
+    if mapping.guest_start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE {
+        let counters_ptr = unsafe { host.add(carrick_el1_abi::EL1_COUNTERS_OFFSET as usize) };
+        record_el1_counters_host_ptr(counters_ptr as usize);
+    }
     Ok((host, size, host_mapping))
+}
+
+static EL1_COUNTERS_HOST_PTR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static LAST_EL1_COUNTERS: parking_lot::Mutex<Option<carrick_el1_abi::Counters>> =
+    parking_lot::Mutex::new(None);
+
+pub(crate) fn record_el1_counters_host_ptr(ptr: usize) {
+    EL1_COUNTERS_HOST_PTR.store(ptr, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn snapshot_and_clear_el1_counters() {
+    let ptr = EL1_COUNTERS_HOST_PTR.swap(0, std::sync::atomic::Ordering::AcqRel);
+    if ptr != 0 {
+        let counters = unsafe { std::ptr::read_volatile(ptr as *const carrick_el1_abi::Counters) };
+        *LAST_EL1_COUNTERS.lock() = Some(counters);
+    }
+}
+
+pub fn reset_el1_counters() {
+    EL1_COUNTERS_HOST_PTR.store(0, std::sync::atomic::Ordering::Release);
+    *LAST_EL1_COUNTERS.lock() = None;
+}
+
+pub fn read_el1_counters() -> Option<carrick_el1_abi::Counters> {
+    let ptr = EL1_COUNTERS_HOST_PTR.load(std::sync::atomic::Ordering::Acquire);
+    if ptr != 0 {
+        Some(unsafe { std::ptr::read_volatile(ptr as *const carrick_el1_abi::Counters) })
+    } else {
+        *LAST_EL1_COUNTERS.lock()
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

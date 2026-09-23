@@ -7719,10 +7719,11 @@ pub(crate) fn decode_direct_svc_exit<V: VcpuTrapContext>(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod stage2_backend;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use stage2_backend::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use stage2_backend::{read_el1_counters, reset_el1_counters};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(test)]

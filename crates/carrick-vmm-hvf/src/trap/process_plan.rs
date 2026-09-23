@@ -1090,10 +1090,10 @@ impl HvfTaskState {
                 .ok_or_else(|| {
                     TrapError::Hypervisor("hvpatch child alias IPA overflow".to_owned())
                 })?;
-            let mapped = if (crate::memory::LINUX_KERNEL_REGION_BASE
-                ..crate::memory::LINUX_KERNEL_REGION_BASE + TWO_MIB)
-                .contains(&mapping.start)
-            {
+            let mapped = if is_kernel_only_stage1_range(
+                mapping.start,
+                mapping.end.saturating_sub(mapping.start) as usize,
+            ) {
                 page_tables.map_kernel_aliased(
                     mapping.start,
                     ipa,
