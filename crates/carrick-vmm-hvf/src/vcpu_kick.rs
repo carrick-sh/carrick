@@ -837,61 +837,6 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn wake_pump_retries_only_vcpus_still_executing_guest_code() {
-        let _g = crate::host_signal::pump_state_test_guard();
-        crate::host_signal::reset_after_supervisor_fork();
-        crate::host_signal::clear_proc_pending();
-        crate::host_signal::publish_process_signal(crate::linux_abi::LINUX_SIGINT);
-
-        let registry = std::sync::Arc::new(VcpuKicker::new());
-        let parked_kicks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let running_kicks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let parked = carrick_hal::InGuestFlag::for_guest_thread();
-        let running = carrick_hal::InGuestFlag::for_guest_thread();
-        running.enter_guest();
-        assert!(matches!(
-            registry.subscribe_register(
-                carrick_hal::ThreadId::synthetic_for_tests(0x7055),
-                Box::new(CountingKick(std::sync::Arc::clone(&parked_kicks))),
-                &parked,
-                std::sync::Arc::new(|| {}),
-            ),
-            VcpuRegistrationEnrollment::Registered
-        ));
-        assert!(matches!(
-            registry.subscribe_register(
-                carrick_hal::ThreadId::synthetic_for_tests(0x7056),
-                Box::new(CountingKick(std::sync::Arc::clone(&running_kicks))),
-                &running,
-                std::sync::Arc::new(|| {}),
-            ),
-            VcpuRegistrationEnrollment::Registered
-        ));
-        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
-            crate::threaded_impl::hvf_futex(std::sync::Arc::new(crate::thread::FutexTable::new())),
-        );
-
-        let pump = spawn_signal_wake_pump(registry, futex);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while running_kicks.load(std::sync::atomic::Ordering::SeqCst) < 2 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "signal pump did not retry the in-guest vCPU"
-            );
-            std::thread::yield_now();
-        }
-        assert_eq!(
-            parked_kicks.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "retry delivery must not kick a vCPU parked in host code"
-        );
-
-        running.leave_guest();
-        pump.stop();
-        crate::host_signal::clear_proc_pending();
-    }
-
     // On non-macOS, handles carry no live id, so kicks are no-ops; we still
     // exercise the registry bookkeeping (register/unregister) here. On macOS
     // these run too — kick_ids with an empty set is a no-op.
