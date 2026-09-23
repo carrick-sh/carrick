@@ -7273,10 +7273,9 @@ impl HvfInner {
         if !is_el1 {
             return false;
         }
-        let in_el1_image = pc >= carrick_mem::memory::LINUX_EL1_KERNEL_BASE
-            && pc < carrick_mem::memory::LINUX_EL1_KERNEL_BASE + carrick_el1_abi::EL1_IMAGE_SIZE;
-        let in_vector = carrick_mem::memory::is_carrick_el1_vector_va(pc);
-        in_el1_image || in_vector
+        (carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+            ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE + carrick_el1_abi::EL1_IMAGE_SIZE)
+            .contains(&pc)
     }
 
     /// Run the passed `vcpu` to its next exit, decoding HVF's native trap surface
@@ -7324,7 +7323,9 @@ impl HvfInner {
                 if consecutive_el1_resumes > 1000 {
                     carrick_fatal!(
                         "trap::run_to_exit",
-                        "EL1 critical section exceeded 1000 consecutive resumes at PC {pc:#x}"
+                        "EL1 critical section exceeded 1000 consecutive resumes at PC {pc:#x} (reason={:?}, syndrome={:#x})",
+                        exit.reason,
+                        exit.exception.syndrome,
                     );
                 }
                 EL1_KICK_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

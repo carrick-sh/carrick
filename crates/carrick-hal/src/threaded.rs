@@ -2507,6 +2507,11 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         ))
     }
 
+    /// Associated mailbox/vCPU slot for EL1 delegation, if available.
+    fn mailbox_slot(&self) -> Option<usize> {
+        None
+    }
+
     /// Bind the exact Kernel MM and ASID allocation generations that authorize
     /// scheduler snapshots produced by this engine.
     fn bind_task_snapshot_identity(&mut self, _mm_generation: u64, _asid_generation: u64) {}

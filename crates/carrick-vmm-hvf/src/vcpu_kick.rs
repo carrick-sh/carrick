@@ -32,6 +32,14 @@
 impl carrick_hal::VcpuKick for VcpuKickHandle {
     #[inline]
     fn kick(&self) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if let Some(slot) = self.mailbox_slot {
+                carrick_el1_abi::mark_pending_host_work(slot);
+            } else {
+                carrick_el1_abi::mark_pending_host_work_all();
+            }
+        }
         let Some(id) = valid_id(self) else {
             crate::probes::vcpu_kick(0, 0, 0);
             return;
@@ -101,6 +109,8 @@ impl LiveVcpuSlot {
 pub struct VcpuKickHandle {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     slot: std::sync::Arc<LiveVcpuSlot>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    mailbox_slot: Option<usize>,
 }
 
 impl VcpuKickHandle {
@@ -109,13 +119,26 @@ impl VcpuKickHandle {
     pub fn new(inner: applevisor::vcpu::VcpuHandle) -> Self {
         Self {
             slot: LiveVcpuSlot::holding(inner),
+            mailbox_slot: None,
+        }
+    }
+
+    /// A handle pinned to one vCPU with an associated mailbox slot.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn with_mailbox_slot(inner: applevisor::vcpu::VcpuHandle, mailbox_slot: usize) -> Self {
+        Self {
+            slot: LiveVcpuSlot::holding(inner),
+            mailbox_slot: Some(mailbox_slot),
         }
     }
 
     /// A handle that kicks whatever vCPU `slot` names at kick time.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn following(slot: std::sync::Arc<LiveVcpuSlot>) -> Self {
-        Self { slot }
+        Self {
+            slot,
+            mailbox_slot: None,
+        }
     }
 
     /// Placeholder constructor for platforms without HVF; the threaded vCPU

@@ -76,7 +76,8 @@ pub fn persistent_vcpu_hardware_kick(
     vcpu: &HvfAarch64Vcpu,
 ) -> (crate::vcpu_kick::VcpuKickHandle, u64, u32) {
     let raw_vcpu_id = vcpu.inner.id();
-    let handle = crate::vcpu_kick::VcpuKickHandle::new(vcpu.inner.get_handle());
+    let slot = vcpu.mailbox_slot();
+    let handle = crate::vcpu_kick::VcpuKickHandle::with_mailbox_slot(vcpu.inner.get_handle(), slot);
     let owner_thread_port = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
     (handle, raw_vcpu_id, owner_thread_port)
 }
@@ -176,6 +177,10 @@ fn needs_clock_entry_latch(native_nr: u64, esr: u64) -> bool {
 }
 
 impl Aarch64Vcpu for HvfAarch64Vcpu {
+    fn mailbox_slot(&self) -> Option<usize> {
+        Some(self.mailbox_slot())
+    }
+
     fn force_clock_host_boundary(&mut self) -> Result<bool, TrapError> {
         let pc = self.get_reg(Reg::Pc)?;
         if !carrick_mem::memory::is_carrick_el1_clock_handler_va(pc)

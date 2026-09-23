@@ -932,6 +932,7 @@ pub(crate) fn record_el1_counters_host_ptr(ptr: usize) {
 
 pub(crate) fn record_el1_region_host_ptr(ptr: usize) {
     EL1_REGION_HOST_PTR.store(ptr, std::sync::atomic::Ordering::Release);
+    carrick_el1_abi::record_el1_region_host_ptr(ptr);
 }
 
 pub fn read_el1_region_host_ptr() -> usize {
@@ -950,6 +951,7 @@ pub fn reset_el1_counters() {
     EL1_COUNTERS_HOST_PTR.store(0, std::sync::atomic::Ordering::Release);
     *LAST_EL1_COUNTERS.lock() = None;
     EL1_REGION_HOST_PTR.store(0, std::sync::atomic::Ordering::Release);
+    carrick_el1_abi::record_el1_region_host_ptr(0);
 }
 
 pub fn read_el1_counters() -> Option<carrick_el1_abi::Counters> {

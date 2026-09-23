@@ -189,6 +189,11 @@ pub trait Aarch64Vcpu {
         Ok(false)
     }
 
+    /// Associated mailbox/vCPU slot for EL1 delegation, if available.
+    fn mailbox_slot(&self) -> Option<usize> {
+        None
+    }
+
     // ── GPR / sysreg access ──
     fn get_reg(&self, r: Reg) -> Result<u64, TrapError>;
     fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), TrapError>;
