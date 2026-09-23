@@ -1,0 +1,28 @@
+schema_version = 1
+id = "kernel.transport.exit-overhead"
+title = "Forwarded HVF syscall transport imposes zero host register accesses"
+guest_surfaces = [
+  "vmm:hvf",
+  "execution:transport",
+]
+semantic_authority = [
+  "Linux AArch64 syscall ABI",
+  "Carrick HVPatch mailbox syscall transport protocol",
+]
+fixture = "unit:transport_exit_overhead"
+scale_points = [1, 8, 32, 128]
+rationale = "Forwarded mailbox syscalls deliver arguments, PC, and return values entirely via shared guest-host memory. The host exit path must perform zero vCPU register or system register reads/writes."
+
+[bindings]
+vm_free = "carrick-vmm-hvf::trap::transport_test::transport_exit_overhead_contract"
+
+[bindings.unresolved]
+embed_structural = "Signed guest contract for exact exit and boundary counts pending"
+docker = "Host hypervisor transport protocol is host-internal; differential is satisfied by syscall suites"
+
+[[structural_budgets]]
+kind = "exact"
+metric = "host_backend_calls"
+value = 0
+layers = ["vm-free"]
+rationale = "A forwarded mailbox syscall exit and resume must require exactly zero host register or sysreg accesses."

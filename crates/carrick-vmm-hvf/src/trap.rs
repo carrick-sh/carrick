@@ -7457,11 +7457,18 @@ impl HvfInner {
             // to see what actually trapped to EL1; if it's not an SVC, either
             // emulate it (sys64 MRS read → re-run) or surface it as an EL0Fault.
             if is_aarch64_hvc_exception(exception.syndrome) {
-                // The maintenance HVC (`hvc #1`) is consumed by the engine's
-                // EL1-maintenance loop; if it ever reaches here, report it so the
-                // engine's loop can match on it.
-                if is_aarch64_hvc_maintenance(exception.syndrome) {
-                    return Ok(Aarch64Exit::MaintenanceDone);
+                let mut overhead = SyscallTransportOverhead::default();
+                if let Some(exit) =
+                    decode_hvc_syscall_exit(exception.syndrome, vcpu, mailbox, &mut overhead)?
+                {
+                    crate::probes::hvf_syscall_transport(
+                        mailbox.transport().raw(),
+                        0,
+                        overhead.register_reads,
+                        overhead.sysreg_reads,
+                        0,
+                    );
+                    return Ok(exit);
                 }
                 let underlying = vcpu.get_sys_reg(SysReg::ESR_EL1).map_err(hvf_error)?;
                 if !is_aarch64_svc_exception(underlying) {
@@ -7582,6 +7589,140 @@ impl HvfInner {
     }
 }
 
+pub(crate) trait VcpuTrapContext {
+    fn get_sys_reg(
+        &self,
+        reg: applevisor::prelude::SysReg,
+    ) -> std::result::Result<u64, applevisor::prelude::HypervisorError>;
+    fn get_reg(
+        &self,
+        reg: applevisor::prelude::Reg,
+    ) -> std::result::Result<u64, applevisor::prelude::HypervisorError>;
+}
+
+impl VcpuTrapContext for applevisor::prelude::Vcpu {
+    #[inline(always)]
+    fn get_sys_reg(
+        &self,
+        reg: applevisor::prelude::SysReg,
+    ) -> std::result::Result<u64, applevisor::prelude::HypervisorError> {
+        self.get_sys_reg(reg)
+    }
+    #[inline(always)]
+    fn get_reg(
+        &self,
+        reg: applevisor::prelude::Reg,
+    ) -> std::result::Result<u64, applevisor::prelude::HypervisorError> {
+        self.get_reg(reg)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SyscallTransportOverhead {
+    pub register_reads: u32,
+    pub sysreg_reads: u32,
+    pub register_writes: u32,
+}
+
+impl SyscallTransportOverhead {
+    #[inline(always)]
+    pub fn total_host_accesses(&self) -> u32 {
+        self.register_reads + self.sysreg_reads + self.register_writes
+    }
+}
+
+pub(crate) fn decode_hvc_syscall_exit<V: VcpuTrapContext>(
+    syndrome: u64,
+    vcpu: &V,
+    mailbox: &mut MailboxBinding,
+    overhead: &mut SyscallTransportOverhead,
+) -> Result<Option<carrick_aarch64::Aarch64Exit>, TrapError> {
+    use applevisor::prelude::*;
+    use carrick_aarch64::Aarch64Exit;
+
+    if !is_aarch64_hvc_exception(syndrome) {
+        return Ok(None);
+    }
+    if is_aarch64_hvc_maintenance(syndrome) {
+        return Ok(Some(Aarch64Exit::MaintenanceDone));
+    }
+    overhead.sysreg_reads += 1;
+    let underlying = vcpu.get_sys_reg(SysReg::ESR_EL1).map_err(hvf_error)?;
+    if !is_aarch64_svc_exception(underlying) {
+        return Ok(None);
+    }
+    let legacy_decode = || {
+        overhead.sysreg_reads += 1;
+        let resume_pc = vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(|error| {
+            crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string())
+        })?;
+        let frame = carrick_hal::read_aarch64_syscall_frame(|r| {
+            overhead.register_reads += 1;
+            match r {
+                carrick_hal::Reg::X(n) => match GPR_TABLE.get(n as usize) {
+                    Some(&reg) => vcpu.get_reg(reg).map_err(hvf_os_error),
+                    None => Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
+                },
+                carrick_hal::Reg::Sp => vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_os_error),
+                carrick_hal::Reg::Pc => vcpu.get_reg(Reg::PC).map_err(hvf_os_error),
+                carrick_hal::Reg::Pstate => vcpu.get_reg(Reg::CPSR).map_err(hvf_os_error),
+                carrick_hal::Reg::SpEl1 => vcpu.get_sys_reg(SysReg::SP_EL1).map_err(hvf_os_error),
+                _ => Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
+            }
+        })
+        .map_err(|error| crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string()))?;
+        overhead.sysreg_reads += 1;
+        let spsr = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
+        overhead.register_reads += 1;
+        let fp = vcpu.get_reg(Reg::X29).unwrap_or(0);
+        overhead.register_reads += 1;
+        let lr = vcpu.get_reg(Reg::LR).unwrap_or(0);
+        overhead.sysreg_reads += 1;
+        let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+        overhead.sysreg_reads += 1;
+        let esr = vcpu.get_sys_reg(SysReg::ESR_EL1).unwrap_or(0);
+        Ok(crate::syscall_mailbox::MailboxRequest {
+            native_nr: frame.x8,
+            frame,
+            resume_pc,
+            spsr,
+            fp,
+            lr,
+            sp,
+            esr,
+        })
+    };
+    let request = mailbox
+        .decode_request(legacy_decode)
+        .map_err(|error| {
+            let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
+            let sp_el1 = vcpu.get_sys_reg(SysReg::SP_EL1).unwrap_or(0);
+            let binding_address = mailbox.slot().guest_address();
+            let diagnostics = mailbox.diagnostics();
+            TrapError::Hypervisor(format!(
+                "{error}; vcpu_pc={pc:#x}; sp_el1={sp_el1:#x}; binding_address={binding_address:#x}; mailbox={diagnostics:?}"
+            ))
+        })?;
+    let frame = request.frame;
+    let resume_pc = request.resume_pc;
+    crate::probes::vcpu_trap(&crate::compat::GuestRegs {
+        pc: resume_pc,
+        sp: request.sp,
+        fp: request.fp,
+        lr: request.lr,
+        x8: frame.x8,
+        x0: frame.x0,
+        stack_guest_base: 0,
+        stack_host_base: 0,
+        stack_guest_end: 0,
+    });
+    Ok(Some(Aarch64Exit::Syscall {
+        frame,
+        resume_pc,
+        current_guest_sp: Some(request.sp),
+    }))
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod stage2_backend;
@@ -7607,3 +7748,7 @@ pub(crate) mod thread_sibling_tests;
 #[cfg(test)]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod tag_strip_tests;
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod transport_test;

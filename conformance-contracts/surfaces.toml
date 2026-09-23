@@ -122,11 +122,11 @@ contracts = ["kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.transport.exit-overhead"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap.rs"
-contracts = ["kernel.fork.stage1-image"]
+contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/dispatcher.rs"
