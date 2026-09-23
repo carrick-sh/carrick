@@ -7254,19 +7254,14 @@ impl HvfInner {
         Ok(())
     }
 
-    /// Check whether a vCPU exit must be resumed because the vCPU is executing
-    /// an uninterruptible EL1 kernel critical section.
+    /// Check whether a vCPU exit must be resumed because the vCPU was interrupted
+    /// while executing an uninterruptible EL1 kernel critical section.
     ///
-    /// An exit that is NOT a guest-initiated syscall HVC and that lands with the vCPU at EL1
-    /// with PC inside the EL1 kernel image or the EL1 vector trampoline must be resumed on the
-    /// same vCPU until it leaves EL1 (reaches EL0 via eret or the forward path).
-    pub(crate) fn should_resume_mid_el1(
-        is_guest_hvc: bool,
-        is_hvc_fault: bool,
-        pstate: u64,
-        pc: u64,
-    ) -> bool {
-        if is_guest_hvc || is_hvc_fault {
+    /// Only kick/cancel exits that land with the vCPU at EL1 with PC inside the
+    /// EL1 kernel image are resumed on the same vCPU until leaving EL1. Vector
+    /// trampoline kicks are handled separately in the engine.
+    pub(crate) fn should_resume_mid_el1(is_canceled: bool, pstate: u64, pc: u64) -> bool {
+        if !is_canceled {
             return false;
         }
         let is_el1 = !ExecLevel::from_pstate(pstate).is_guest();
@@ -7304,35 +7299,38 @@ impl HvfInner {
         // Bounds lazy re-mapping of dropped aliases so a
         // genuinely-unmappable backing still terminates instead of spinning.
         let mut alias_remap_limiter = AliasRemapLimiter::default();
-        let mut consecutive_el1_resumes: u32 = 0;
+        let mut last_el1_resume_pc: Option<u64> = None;
+        let mut consecutive_el1_resumes_without_progress: u32 = 0;
         loop {
             // The engine accounts the guest CPU time via `guest_cpu::timed_run`
             // around its `vcpu.run()` call, so do NOT double-account here.
             vcpu.run().map_err(hvf_error)?;
             let exit = vcpu.get_exit_info();
 
-            let is_guest_hvc = exit.reason == ExitReason::EXCEPTION
-                && is_aarch64_syscall_exception(exit.exception.syndrome);
-            let is_hvc_fault = exit.reason == ExitReason::EXCEPTION
-                && is_aarch64_hvc_fault(exit.exception.syndrome);
+            let is_canceled = exit.reason == ExitReason::CANCELED;
             let cpsr = vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?;
             let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
 
-            if Self::should_resume_mid_el1(is_guest_hvc, is_hvc_fault, cpsr, pc) {
-                consecutive_el1_resumes += 1;
-                if consecutive_el1_resumes > 1000 {
+            if Self::should_resume_mid_el1(is_canceled, cpsr, pc) {
+                if last_el1_resume_pc == Some(pc) {
+                    consecutive_el1_resumes_without_progress += 1;
+                } else {
+                    last_el1_resume_pc = Some(pc);
+                    consecutive_el1_resumes_without_progress = 1;
+                }
+                if consecutive_el1_resumes_without_progress > 1000 {
                     carrick_fatal!(
                         "trap::run_to_exit",
-                        "EL1 critical section exceeded 1000 consecutive resumes at PC {pc:#x} (reason={:?}, syndrome={:#x})",
+                        "EL1 critical section exceeded 1000 consecutive resumes without PC progress at PC {pc:#x} (reason={:?})",
                         exit.reason,
-                        exit.exception.syndrome,
                     );
                 }
                 EL1_KICK_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::probes::kick_in_kernel(pc, ((cpsr >> 2) & 0b11) as u32);
                 continue;
             }
-            consecutive_el1_resumes = 0;
+            last_el1_resume_pc = None;
+            consecutive_el1_resumes_without_progress = 0;
 
             if exit.reason == ExitReason::CANCELED {
                 return Ok(Aarch64Exit::Kicked);
@@ -7789,53 +7787,80 @@ mod el1_resume_tests {
         let el1_past_img = el1_img_base + carrick_el1_abi::EL1_IMAGE_SIZE;
         let user_pc = 0x40_0000;
 
-        // 1. Guest-initiated HVC must NEVER be resumed as a mid-EL1 critical section
+        // 1. Non-canceled exits (stage-2 aborts, syscall HVCs, faults) must NEVER
+        // be resumed mid-EL1 ahead of ordinary abort handling.
         assert!(!HvfInner::should_resume_mid_el1(
-            true,
-            false,
-            el1_pstate,
-            el1_img_mid
-        ));
-
-        // 2. HVC fault (hvc #3) must NEVER be resumed
-        assert!(!HvfInner::should_resume_mid_el1(
-            false,
-            true,
-            el1_pstate,
-            el1_img_mid
-        ));
-
-        // 3. Normal EL0 user exit must NOT be resumed
-        assert!(!HvfInner::should_resume_mid_el1(
-            false, false, el0_pstate, user_pc
-        ));
-
-        // 4. EL1 execution inside the EL1 image MUST be resumed
-        assert!(HvfInner::should_resume_mid_el1(
-            false,
             false,
             el1_pstate,
             el1_img_base
         ));
-        assert!(HvfInner::should_resume_mid_el1(
-            false,
+        assert!(!HvfInner::should_resume_mid_el1(
             false,
             el1_pstate,
             el1_img_mid
         ));
-        assert!(HvfInner::should_resume_mid_el1(
-            false,
+        assert!(!HvfInner::should_resume_mid_el1(
             false,
             el1_pstate,
             el1_img_end
         ));
 
-        // 5. EL1 execution past the EL1 image (and not in vector) must NOT be resumed
+        // 2. Normal EL0 user exit that was canceled must NOT be resumed mid-EL1
+        assert!(!HvfInner::should_resume_mid_el1(true, el0_pstate, user_pc));
+
+        // 3. Canceled (kicked) execution inside the EL1 image MUST be resumed
+        assert!(HvfInner::should_resume_mid_el1(
+            true,
+            el1_pstate,
+            el1_img_base
+        ));
+        assert!(HvfInner::should_resume_mid_el1(
+            true,
+            el1_pstate,
+            el1_img_mid
+        ));
+        assert!(HvfInner::should_resume_mid_el1(
+            true,
+            el1_pstate,
+            el1_img_end
+        ));
+
+        // 4. EL1 execution past the EL1 image (and not in vector) must NOT be resumed
         assert!(!HvfInner::should_resume_mid_el1(
-            false,
-            false,
+            true,
             el1_pstate,
             el1_past_img
         ));
+    }
+
+    #[test]
+    fn test_el1_resumes_without_progress_tracking() {
+        let mut last_pc: Option<u64> = None;
+        let mut consecutive_without_progress: u32 = 0;
+
+        let simulate_resume = |pc: u64, last_pc: &mut Option<u64>, count: &mut u32| {
+            if *last_pc == Some(pc) {
+                *count += 1;
+            } else {
+                *last_pc = Some(pc);
+                *count = 1;
+            }
+        };
+
+        // Resumes with PC advancing do not accumulate unbounded consecutive count
+        for pc in (0x1000..0x2000).step_by(4) {
+            simulate_resume(pc, &mut last_pc, &mut consecutive_without_progress);
+            assert_eq!(consecutive_without_progress, 1);
+        }
+
+        // Resumes at the exact same PC accumulate
+        for expected in 2..=50 {
+            simulate_resume(0x1ffc, &mut last_pc, &mut consecutive_without_progress);
+            assert_eq!(consecutive_without_progress, expected);
+        }
+
+        // Stepping to a new PC resets the count to 1
+        simulate_resume(0x2000, &mut last_pc, &mut consecutive_without_progress);
+        assert_eq!(consecutive_without_progress, 1);
     }
 }
