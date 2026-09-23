@@ -7569,7 +7569,7 @@ impl HvfInner {
             // FP/SP/LR so a DTrace consumer can walk the guest call chain. The
             // stack-region bases require the per-thread mapping list (on
             // HvfVmState, not reachable here), so report zero bases.
-            crate::probes::vcpu_trap(&crate::compat::GuestRegs {
+            crate::probes::vcpu_trap_with(|| crate::compat::GuestRegs {
                 pc: resume_pc,
                 sp: request.sp,
                 fp: request.fp,
@@ -7740,7 +7740,7 @@ pub(crate) fn decode_hvc_syscall_exit<V: VcpuTrapContext>(
     };
     let frame = request.frame;
     let resume_pc = request.resume_pc;
-    crate::probes::vcpu_trap(&crate::compat::GuestRegs {
+    crate::probes::vcpu_trap_with(|| crate::compat::GuestRegs {
         pc: resume_pc,
         sp: request.sp,
         fp: request.fp,

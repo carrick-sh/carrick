@@ -7851,6 +7851,17 @@ mod real {
         carrick_usdt::vcpu__trap!(|| ptr);
     }
 
+    /// [`vcpu_trap`] with the registers produced lazily: `make_regs` runs
+    /// only when a DTrace consumer is attached to `vcpu-trap`.
+    #[inline(never)]
+    pub fn vcpu_trap_with(make_regs: impl FnOnce() -> crate::compat::GuestRegs) {
+        let mut storage = None;
+        carrick_usdt::vcpu__trap!(|| {
+            let regs = storage.get_or_insert_with(make_regs);
+            regs as *const crate::compat::GuestRegs as u64
+        });
+    }
+
     pub fn execve_loaded(path: &str, entry: u64, initial_sp: u64, mapping_count: u64) {
         carrick_usdt::execve__loaded!(|| (path, entry, initial_sp, mapping_count));
     }
@@ -8578,6 +8589,8 @@ mod stub {
     }
     stub!(guest_mem_bytes(direction: u32, address: u64, bytes: &[u8]));
     stub!(vcpu_trap(regs: &crate::compat::GuestRegs));
+    #[inline(always)]
+    pub fn vcpu_trap_with<F: FnOnce() -> crate::compat::GuestRegs>(_make_regs: F) {}
     stub!(execve_loaded(path: &str, entry: u64, initial_sp: u64, mapping_count: u64));
     stub!(execve_sysregs(sctlr: u64, ttbr0: u64, mair: u64));
     stub!(vcpu_fault(esr: u64, elr: u64, far: u64, x30: u64, sp: u64, tid: i32));
