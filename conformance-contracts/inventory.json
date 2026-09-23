@@ -851,6 +851,7 @@
       "authority": "host",
       "contracts": [
         "hvpatch.syscall.portal",
+        "kernel.el1.files",
         "kernel.fs.write-seek",
         "kernel.inotify.mark-race-hotpath"
       ],
@@ -868,6 +869,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.files",
         "kernel.inotify.readiness",
         "kernel.inotify.watch-churn",
         "kernel.mm.native-syscall-buffers",
@@ -887,6 +889,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.files",
         "kernel.el1.transparent",
         "kernel.fs.write-seek",
         "kernel.inotify.mark-race-hotpath",
@@ -939,6 +942,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.files",
         "kernel.mm.syscall-code-write",
         "kernel.scheduler.host-wait-handoff"
       ],
@@ -954,6 +958,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.files",
         "kernel.scheduler.host-wait-handoff"
       ],
       "claims": [
@@ -1115,6 +1120,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.files",
         "kernel.fs.stat-allocation"
       ],
       "claims": [],

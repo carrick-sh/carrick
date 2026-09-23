@@ -179,6 +179,52 @@ fn futex_pingpong(shm_path: &str, rounds: u32) -> i32 {
     0
 }
 
+fn exit_group_stress(file_path: &str) -> i32 {
+    let path_c = match std::ffi::CString::new(file_path) {
+        Ok(c) => c,
+        Err(_) => return 10,
+    };
+    let fd = unsafe {
+        libc::open(
+            path_c.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+            0o666,
+        )
+    };
+    if fd < 0 {
+        return 11;
+    }
+
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut handles = Vec::new();
+
+    for _ in 0..4 {
+        let running_clone = running.clone();
+        let handle = std::thread::spawn(move || {
+            let buf = b"hammering-el1-file-operations-with-write-and-lseek\n";
+            while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_write,
+                        fd,
+                        buf.as_ptr() as *const libc::c_void,
+                        buf.len(),
+                    );
+                    libc::syscall(libc::SYS_lseek, fd, 0, libc::SEEK_SET);
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    unsafe {
+        libc::syscall(libc::SYS_exit_group, 0);
+    }
+    0
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -191,6 +237,10 @@ fn main() {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("/dev/carrick/shm/bench");
             let rounds = args.get(3).and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
             futex_pingpong(path, rounds)
+        }
+        "exit-group-stress" => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("/tmp/stress.txt");
+            exit_group_stress(path)
         }
         _ => 64,
     };
