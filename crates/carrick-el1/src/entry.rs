@@ -28,7 +28,7 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
     }
     let frame_ref = unsafe { &mut *frame };
     let counters_ref =
-        unsafe { &mut *(carrick_el1_abi::EL1_COUNTERS_BASE as *mut carrick_el1_abi::Counters) };
+        unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
     carrick_el1::dispatch_syscall(frame_ref, counters_ref) as u64
 }
 
@@ -46,13 +46,16 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
 #[cfg(target_os = "none")]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    let counters_ptr = carrick_el1_abi::EL1_COUNTERS_BASE as *mut carrick_el1_abi::Counters;
-    unsafe {
-        (*counters_ptr).served[carrick_el1_abi::PANIC_SENTINEL_SYSCALL_NR] =
-            carrick_el1_abi::PANIC_SENTINEL;
-        (*counters_ptr).forwarded[carrick_el1_abi::PANIC_SENTINEL_SYSCALL_NR] =
-            carrick_el1_abi::PANIC_SENTINEL;
-    }
+    let counters =
+        unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
+    counters.served[carrick_el1_abi::PANIC_SENTINEL_SYSCALL_NR].store(
+        carrick_el1_abi::PANIC_SENTINEL,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    counters.forwarded[carrick_el1_abi::PANIC_SENTINEL_SYSCALL_NR].store(
+        carrick_el1_abi::PANIC_SENTINEL,
+        core::sync::atomic::Ordering::Relaxed,
+    );
     loop {
         core::hint::spin_loop();
     }
