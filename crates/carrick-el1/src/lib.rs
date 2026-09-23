@@ -131,14 +131,23 @@ where
         62 => file::el1_lseek(file, frame.x[1] as i64, frame.x[2] as u32),
         63 => file::el1_read(
             file,
+            cur_task,
             cache_ptr as *const u8,
             frame.x[1],
             frame.x[2] as usize,
             &validator,
         ),
-        64 => file::el1_write(file, cache_ptr, frame.x[1], frame.x[2] as usize, &validator),
+        64 => file::el1_write(
+            file,
+            cur_task,
+            cache_ptr,
+            frame.x[1],
+            frame.x[2] as usize,
+            &validator,
+        ),
         67 => file::el1_pread64(
             file,
+            cur_task,
             cache_ptr as *const u8,
             frame.x[1],
             frame.x[2] as usize,
@@ -147,6 +156,7 @@ where
         ),
         68 => file::el1_pwrite64(
             file,
+            cur_task,
             cache_ptr,
             frame.x[1],
             frame.x[2] as usize,

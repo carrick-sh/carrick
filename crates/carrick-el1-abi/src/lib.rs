@@ -496,8 +496,11 @@ mod tests {
 
     #[test]
     fn test_current_task_layout() {
-        assert_eq!(core::mem::size_of::<CurrentTask>(), 16);
+        assert_eq!(core::mem::size_of::<CurrentTask>(), 32);
         assert_eq!(core::mem::align_of::<CurrentTask>(), 8);
+        assert_eq!(core::mem::offset_of!(CurrentTask, generation), 0);
+        assert_eq!(core::mem::offset_of!(CurrentTask, file_table), 8);
+        assert_eq!(core::mem::offset_of!(CurrentTask, fixup_pc), 16);
     }
 
     #[test]
