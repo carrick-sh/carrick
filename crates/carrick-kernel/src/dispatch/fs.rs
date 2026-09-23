@@ -249,11 +249,12 @@ pub(crate) use super::dispatcher::FsView;
 pub(in crate::dispatch) use lookup::{LookupIntent, LookupTarget};
 pub(crate) use open::OpenAtArgs;
 pub(crate) use pipe::*;
+pub(crate) use state::FsState;
 pub use state::MountRetirement;
 pub use state::StdioSink;
 use state::*;
-pub(super) use state::{FsState, RuntimeIo, host_fd_offset};
 pub(crate) use state::{LegacyAioContextId, SplicePushback};
+pub(super) use state::{RuntimeIo, host_fd_offset};
 
 pub(super) fn vfs_md_to_rootfs_md_helper(path: &str, md: &carrick_vfs::Metadata) -> RootFsMetadata {
     vfs_md_to_rootfs_md(path, md)

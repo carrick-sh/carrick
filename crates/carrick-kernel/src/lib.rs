@@ -83,6 +83,7 @@ pub mod core_dump;
 pub mod cred_ipc;
 pub mod deadlock_watchdog;
 pub mod dispatch;
+pub mod el1_delegation;
 pub mod event_mux;
 pub mod event_ring;
 pub(crate) mod eventfd_shm;

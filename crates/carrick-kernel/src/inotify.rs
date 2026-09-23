@@ -1443,6 +1443,24 @@ impl std::fmt::Debug for InotifyRegistry {
 }
 
 impl InotifyRegistry {
+    pub fn has_watches_covering(&self, path: &str) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let key = normalize_watch_path(path);
+        let inner = self.inner.read();
+        if inner.by_path.contains_key(key) {
+            return true;
+        }
+        if let Some((parent, _)) = key.rsplit_once('/') {
+            let parent_key = if parent.is_empty() { "/" } else { parent };
+            if inner.by_path.contains_key(parent_key) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Existing wd for this exact path and inotify instance, if any.
     #[allow(dead_code)]
     pub(crate) fn watch_descriptor(

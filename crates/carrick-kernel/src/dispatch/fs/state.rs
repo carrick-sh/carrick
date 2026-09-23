@@ -125,7 +125,7 @@ enum PushbackEnd {
 /// the fs handlers borrow only the VFS state they touch instead of the
 /// whole dispatcher. Field semantics are unchanged from the former loose
 /// fields (`vfs_mounts`/`rootfs_vfs`).
-pub(in crate::dispatch) struct FsState {
+pub(crate) struct FsState {
     pub host_io: std::sync::Arc<dyn crate::dispatch::HostIo>,
     /// Unified VFS mount table. Holds DevVfs at /dev, ProcVfs at
     /// /proc, SysVfs at /sys. The dispatcher consults it first; any
@@ -159,7 +159,7 @@ pub(in crate::dispatch) struct FsState {
     /// handlers' notify calls are a single `is_empty` read and return. Shared
     /// across guest fork because inherited inotify instances keep one watch
     /// set in Linux, and every HVPatch task mutates through one kernel graph.
-    pub(in crate::dispatch) inotify_registry: crate::inotify::InotifyRegistry,
+    pub(crate) inotify_registry: crate::inotify::InotifyRegistry,
 
     /// Dispatch-layer fanotify mark table. Same seam as `inotify_registry`, but
     /// SHARED by `Arc` across guest fork rather than deep-copied: a fanotify
@@ -167,7 +167,7 @@ pub(in crate::dispatch) struct FsState {
     /// child must keep generating events into the group its parent reads even
     /// after the child closes its own inherited fd (LTP `fanotify12`). Empty in
     /// the common case → the fs hooks cost one uncontended read lock.
-    pub(in crate::dispatch) fanotify_registry: crate::fanotify::FanotifyRegistry,
+    pub(crate) fanotify_registry: crate::fanotify::FanotifyRegistry,
 
     /// Dnotify (`F_NOTIFY`) directory watches. Linux delivers `SIGIO` to the
     /// fd's async owner on matching directory changes. Carrick implements the
@@ -194,7 +194,7 @@ pub(in crate::dispatch) struct FsState {
     /// Classic POSIX record locks for backends that multiplex multiple Linux
     /// processes inside one host process. HVPatch task generations are the
     /// owners; host-process-backed lanes continue using the host fcntl table.
-    pub(in crate::dispatch) classic_record_locks: std::sync::Arc<super::LogicalRecordLocks>,
+    pub(crate) classic_record_locks: std::sync::Arc<super::LogicalRecordLocks>,
 
     /// Linux-visible sparse extents for host files whose layout Carrick has
     /// created from an empty file. Darwin/APFS may allocate a much larger
@@ -574,7 +574,7 @@ impl FsState {
             .expect("rootfs cannot be reconfigured after guest fork")
     }
 
-    pub(in crate::dispatch) fn new_with_host_resolver(
+    pub(crate) fn new_with_host_resolver(
         snapshot: Option<&carrick_vfs::HostResolverSnapshot>,
     ) -> Self {
         let pty_table = std::sync::Arc::new(parking_lot::Mutex::new(crate::vfs::PtyTable::new()));

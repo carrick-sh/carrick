@@ -276,38 +276,8 @@ impl<'a> FsView<'a> {
                 .contains(LinuxOpenFlags::APPEND);
         let file_limit = self.fsize_soft_limit();
         let offset_may_be_nonzero = host_fd.offset_may_be_nonzero();
-        let mut seek_authority_active = false;
-        let mut current_seek_offset = 0i64;
-        if !is_append && crate::syscall_shim_enabled() {
-            let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
-            let mut seek_buf = [0u8; 20];
-            if cx
-                .memory
-                .read_into(base + crate::memory::IDENTITY_OFF_SEEK_GATE, &mut seek_buf)
-                .is_ok()
-            {
-                let gate = u32::from_le_bytes([seek_buf[0], seek_buf[1], seek_buf[2], seek_buf[3]]);
-                let s_fd = i32::from_le_bytes([seek_buf[4], seek_buf[5], seek_buf[6], seek_buf[7]]);
-                let off = i64::from_le_bytes([
-                    seek_buf[12],
-                    seek_buf[13],
-                    seek_buf[14],
-                    seek_buf[15],
-                    seek_buf[16],
-                    seek_buf[17],
-                    seek_buf[18],
-                    seek_buf[19],
-                ]);
-                if gate == 1 && s_fd == fd && off >= 0 {
-                    seek_authority_active = true;
-                    current_seek_offset = off;
-                }
-            }
-        }
         let pos = if is_append {
             unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) }
-        } else if seek_authority_active {
-            current_seek_offset
         } else if offset_may_be_nonzero || file_limit.is_some() {
             #[cfg(feature = "conformance-metrics")]
             if let Some(scope) = cx.kernel.kernel().work_scope() {
@@ -353,7 +323,7 @@ impl<'a> FsView<'a> {
         let host_wait_ref = host_wait_runner
             .as_ref()
             .map(|runner| runner as &dyn HostWaitRunner);
-        let mut target = HostPipeWriteTarget::new(
+        let target = HostPipeWriteTarget::new(
             raw_fd,
             Some(host_fd.clone()),
             nonblocking,
@@ -363,24 +333,10 @@ impl<'a> FsView<'a> {
             self.cross.host_signal(),
         )
         .with_host_wait(host_wait_ref);
-        if seek_authority_active {
-            target = target.with_offset(current_seek_offset);
-        }
         let out = write_host_pipe(bytes, target)?;
         if let DispatchOutcome::Returned { value } = out
             && value > 0
         {
-            if seek_authority_active {
-                let new_offset = current_seek_offset.saturating_add(value as i64);
-                unsafe {
-                    libc::lseek(raw_fd, new_offset as libc::off_t, libc::SEEK_SET);
-                }
-                let _ = cx.memory.write_bytes(
-                    crate::memory::LINUX_IDENTITY_PAGE_BASE
-                        + crate::memory::IDENTITY_OFF_SEEK_OFFSET,
-                    &new_offset.to_le_bytes(),
-                );
-            }
             if self.fs.rootfs_vfs.dentry_cache.has_cached_inodes()
                 && let Some(identity) = host_fd.inode_identity()
             {
@@ -397,6 +353,15 @@ impl<'a> FsView<'a> {
             }
             self.notify_host_file_write_result(cx.kernel, open_file, &out);
             punch_result?;
+        }
+        if matches!(out, DispatchOutcome::Returned { .. }) {
+            let _ = crate::el1_delegation::delegate(
+                open_file,
+                self.captured_file_table().id(),
+                fd,
+                &self.fs,
+                Some(&self.task_rlimits()),
+            );
         }
         Ok(out)
     }
@@ -468,6 +433,15 @@ impl<'a> FsView<'a> {
             };
             if let Some((host_fd, _writable)) = open_file.host_file_info() {
                 let outcome = this.lseek_host_file(&host_fd, offset, whence);
+                if matches!(outcome, DispatchOutcome::Returned { .. }) {
+                    let _ = crate::el1_delegation::delegate(
+                        &open_file,
+                        this.captured_file_table().id(),
+                        fd.0,
+                        &this.fs,
+                        Some(&this.task_rlimits()),
+                    );
+                }
                 return Ok(outcome);
             }
             let Some(mut open) = open_file.description.write() else {
@@ -778,7 +752,18 @@ impl<'a> FsView<'a> {
             {
                 *listing = DirListing::Pending;
             }
-            Ok(DispatchOutcome::returned_offset_or_errno(next))
+            drop(open);
+            let outcome = DispatchOutcome::returned_offset_or_errno(next);
+            if matches!(outcome, DispatchOutcome::Returned { .. }) {
+                let _ = crate::el1_delegation::delegate(
+                    &open_file,
+                    this.captured_file_table().id(),
+                    fd.0,
+                    &this.fs,
+                    Some(&this.task_rlimits()),
+                );
+            }
+            Ok(outcome)
 
         }
 
@@ -1299,7 +1284,7 @@ impl<'a> FsView<'a> {
                     let host_fd_owner = host_fd.clone();
                     host_fd_owner.record_sequential_io();
                     drop(open);
-                    return read_host_pipe(
+                    let outcome = read_host_pipe(
                         memory,
                         address,
                         length,
@@ -1313,10 +1298,31 @@ impl<'a> FsView<'a> {
                         )
                         .with_host_wait(host_wait_ref),
                     );
+                    if let Ok(DispatchOutcome::Returned { .. }) = &outcome {
+                        let _ = crate::el1_delegation::delegate(
+                            &open_file,
+                            files.id(),
+                            fd.0,
+                            &this.fs,
+                            Some(&this.task_rlimits()),
+                        );
+                    }
+                    return outcome;
                 }
             };
+            drop(open);
             memory.write_bytes(address, &bytes)?;
-            Ok(DispatchOutcome::returned_len_or_errno(read_len))
+            let outcome = DispatchOutcome::returned_len_or_errno(read_len);
+            if matches!(outcome, DispatchOutcome::Returned { .. }) {
+                let _ = crate::el1_delegation::delegate(
+                    &open_file,
+                    files.id(),
+                    fd.0,
+                    &this.fs,
+                    Some(&this.task_rlimits()),
+                );
+            }
+            Ok(outcome)
 
         }
 
@@ -1712,6 +1718,15 @@ impl<'a> FsView<'a> {
                     )
                     .with_host_wait(host_wait_ref),
                 )?;
+                if matches!(outcome, DispatchOutcome::Returned { .. }) {
+                    let _ = crate::el1_delegation::delegate(
+                        &open_file,
+                        this.captured_file_table().id(),
+                        fd.0,
+                        &this.fs,
+                        Some(&this.task_rlimits()),
+                    );
+                }
                 return Ok(outcome);
             }
             let bytes = match &*open {
@@ -1786,11 +1801,22 @@ impl<'a> FsView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
                 }
             };
+            drop(open);
             let read_len = bytes.len();
             if read_len > 0 {
                 memory.write_bytes(buffer, &bytes)?;
             }
-            Ok(DispatchOutcome::returned_len_or_errno(read_len))
+            let outcome = DispatchOutcome::returned_len_or_errno(read_len);
+            if matches!(outcome, DispatchOutcome::Returned { .. }) {
+                let _ = crate::el1_delegation::delegate(
+                    &open_file,
+                    this.captured_file_table().id(),
+                    fd.0,
+                    &this.fs,
+                    Some(&this.task_rlimits()),
+                );
+            }
+            Ok(outcome)
 
         }
 
@@ -2120,6 +2146,15 @@ impl<'a> FsView<'a> {
                     this.fs
                         .record_host_sparse_write(&host_fd_owner, write_offset, value as usize);
                 }
+                if matches!(outcome, DispatchOutcome::Returned { .. }) {
+                    let _ = crate::el1_delegation::delegate(
+                        &open_file,
+                        this.captured_file_table().id(),
+                        fd.0,
+                        &this.fs,
+                        Some(&this.task_rlimits()),
+                    );
+                }
                 return Ok(outcome);
             }
             // In-memory File (memfd / O_TMPFILE fallback): positional write into
@@ -2208,7 +2243,17 @@ impl<'a> FsView<'a> {
                             .rootfs_vfs
                             .write_file_range(&path, write_at, &bytes[..written], final_size);
                     }
-                    return Ok(DispatchOutcome::returned_len_or_errno(written));
+                    let outcome = DispatchOutcome::returned_len_or_errno(written);
+                    if matches!(outcome, DispatchOutcome::Returned { .. }) {
+                        let _ = crate::el1_delegation::delegate(
+                            &open_file,
+                            this.captured_file_table().id(),
+                            fd.0,
+                            &this.fs,
+                            Some(&this.task_rlimits()),
+                        );
+                    }
+                    return Ok(outcome);
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
@@ -3192,6 +3237,15 @@ impl<'a> FsView<'a> {
                         .write_file_range(&path, offset, &bytes, final_size);
                 }
                 this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &outcome);
+                if matches!(outcome, DispatchOutcome::Returned { .. }) {
+                    let _ = crate::el1_delegation::delegate(
+                        &open_file,
+                        this.captured_file_table().id(),
+                        fd,
+                        &this.fs,
+                        Some(&this.task_rlimits()),
+                    );
+                }
                 return Ok(outcome);
             }
             // A stdio fd the guest explicitly closed (and did not reopen) is

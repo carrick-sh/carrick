@@ -175,7 +175,7 @@ struct PerfCounterInner {
 /// `dup(2)` and fork share the counter the way an open file description is
 /// shared.
 #[derive(Debug)]
-pub(super) struct PerfEventState {
+pub(crate) struct PerfEventState {
     event: PerfSwEvent,
     id: u64,
     read_format: PerfEventReadFormat,
