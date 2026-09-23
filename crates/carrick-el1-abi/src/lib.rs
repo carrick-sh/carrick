@@ -149,10 +149,9 @@ pub struct Counters {
 
 impl Counters {
     pub const fn new() -> Self {
-        const ZERO: AtomicU64 = AtomicU64::new(0);
         Self {
-            served: [ZERO; 512],
-            forwarded: [ZERO; 512],
+            served: [const { AtomicU64::new(0) }; 512],
+            forwarded: [const { AtomicU64::new(0) }; 512],
         }
     }
 

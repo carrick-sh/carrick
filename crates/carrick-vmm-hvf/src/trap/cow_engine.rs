@@ -5706,9 +5706,11 @@ pub(crate) fn fork_mapping_disposition(
     mapping: &ThreadMappingDesc,
     shares_mm: bool,
 ) -> ForkMappingDisposition {
-    if mapping.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE {
-        ForkMappingDisposition::SharedFrameWritable
-    } else if mapping.sharing.shares_across_fork() {
+    // The EL1 kernel region is the kernel's own memory: one carrier-wide
+    // backing that every process maps, never a per-process copy.
+    if mapping.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+        || mapping.sharing.shares_across_fork()
+    {
         ForkMappingDisposition::SharedFrameWritable
     } else if mapping.start == crate::memory::LINUX_PAGE_TABLES_BASE {
         ForkMappingDisposition::IndependentPageTables
