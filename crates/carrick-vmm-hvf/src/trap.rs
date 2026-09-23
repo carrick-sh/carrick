@@ -7350,7 +7350,7 @@ impl HvfInner {
             // (Kept INSIDE run_to_exit, NOT surfaced as Aarch64Exit::Memory — the
             // in-loop remap is the safe, behavior-identical choice.)
             if exit.reason == ExitReason::EXCEPTION
-                && is_aarch64_el0_abort_exception(exit.exception.syndrome)
+                && is_aarch64_abort_exception(exit.exception.syndrome)
                 && crate::memory::is_high_va(exit.exception.virtual_address)
             {
                 let backing = if exit.exception.physical_address != 0 {
@@ -7406,7 +7406,7 @@ impl HvfInner {
             // (SIGSEGV) instead of fataling. ELR_EL1/FAR_EL1 are STALE here (the
             // guest's EL1 vector never ran), so build the fault from HVF's
             // authoritative PC (Reg::PC) + VA (exception.virtual_address).
-            if is_aarch64_el0_abort_exception(exception.syndrome) {
+            if is_aarch64_el0_abort_exception(exception.syndrome, cpsr) {
                 let true_pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
                 let far = exception.virtual_address;
                 let x16 = vcpu.get_reg(Reg::X16).unwrap_or(0);
@@ -7428,6 +7428,24 @@ impl HvfInner {
                     sp,
                     from_el0_direct: true,
                 });
+            }
+
+            // An unresolvable stage-2 abort taken from EL1 inside the kernel image
+            // must terminate cleanly with carrick_fatal!, never be delivered to the
+            // guest as an EL0 signal (which would leave EL1 locks unreleased).
+            let in_el1_image = (carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+                ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE + carrick_el1_abi::EL1_IMAGE_SIZE)
+                .contains(&pc);
+            if !ExecLevel::from_pstate(cpsr).is_guest()
+                && in_el1_image
+                && is_aarch64_abort_exception(exception.syndrome)
+            {
+                carrick_fatal!(
+                    "trap::run_to_exit",
+                    "unresolvable stage-2 abort taken from EL1 inside kernel image: pc={pc:#x} esr={:#x} far={:#x}",
+                    exception.syndrome,
+                    exception.virtual_address
+                );
             }
             // Fail loud on the EL1 vector's `hvc #3` (current-EL synchronous slot):
             // carrick's guest took a synchronous exception WHILE AT EL1, which only
