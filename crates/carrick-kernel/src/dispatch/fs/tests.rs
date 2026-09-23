@@ -7536,6 +7536,52 @@ fn memfd_proc_self_fd_reopen_trunc_shares_inode() {
 }
 
 #[test]
+fn pwrite64_to_memfd_returns_without_deadlock() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+    let reporter = CompatReporter::default();
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            &d.capture_one_task_context().unwrap(),
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    const SYS_MEMFD_CREATE: u64 = 279;
+    #[cfg(target_arch = "x86_64")]
+    const SYS_MEMFD_CREATE: u64 = 319;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    const SYS_MEMFD_CREATE: u64 = 279;
+    const SYS_PWRITE64: u64 = 68;
+
+    memory.write_bytes(0x4000, b"pwrite_memfd\0").unwrap();
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_MEMFD_CREATE,
+        [0x4000, 0, 0, 0, 0, 0],
+    );
+    let fd = match outcome {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("memfd_create failed: {other:?}"),
+    };
+    assert!(fd >= 0);
+
+    memory.write_bytes(0x5000, b"hello memfd pwrite64").unwrap();
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_PWRITE64,
+        [fd as u64, 0x5000, 20, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 20 });
+}
+
+#[test]
 fn proc_self_fd_reopen_overlay_file_write_after_reopen_visible_in_reopened() {
     let scratch = tempfile::tempdir().unwrap();
     let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
