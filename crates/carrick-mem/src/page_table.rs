@@ -604,6 +604,18 @@ struct UndoJournal {
     /// Length of `dirty` when the journal opened, so a rollback can drop
     /// exactly the entries the failed transaction appended.
     dirty_len: usize,
+    /// Whether any walker-visible descriptor word held a VALID descriptor
+    /// when this transaction FIRST wrote it. Only the pre-transaction word
+    /// matters: `sync_to_host` stores each dirty location's final shadow word,
+    /// so a word that went valid and then invalid inside one transaction never
+    /// reaches hardware as valid. Table pages being zeroed for reuse are
+    /// excluded: they are unlinked, so no walk can cache them. A transaction
+    /// that only turned invalid words valid needs publication ordering but no
+    /// stage-1 TLB maintenance.
+    replaced_valid: bool,
+    /// Locations already journalled by this transaction, so only the first
+    /// pre-image of each word decides `replaced_valid`.
+    first_written: std::collections::HashSet<(usize, usize)>,
 }
 
 impl Clone for PageTableManager {
@@ -906,7 +918,7 @@ impl PageTableManager {
             // unrecoverable rollback.
             if self.undo.is_some() {
                 for off in (loc.offset..loc.offset + PT_PAGE as usize).step_by(8) {
-                    self.note_undo(TableLocation::new(loc.arena, off));
+                    self.note_undo_unlinked(TableLocation::new(loc.arena, off));
                 }
             }
             for b in &mut self.arenas[loc.arena].bytes[loc.offset..loc.offset + PT_PAGE as usize] {
@@ -947,8 +959,24 @@ impl PageTableManager {
         self.dirty.push((loc, false));
     }
 
-    /// Record one descriptor word's pre-image while a journal is open.
+    /// Record one walker-visible descriptor word's pre-image while a journal
+    /// is open, noting whether it replaced a VALID descriptor.
     fn note_undo(&mut self, loc: TableLocation) {
+        if self.undo.is_some() {
+            let previous = self.read_desc(loc);
+            if let Some(journal) = self.undo.as_mut() {
+                journal.words.push((loc, previous));
+                if journal.first_written.insert((loc.arena, loc.offset)) {
+                    journal.replaced_valid |= previous & 1 != 0;
+                }
+            }
+        }
+    }
+
+    /// Record a pre-image for a word in an unlinked table page being zeroed
+    /// for reuse. Rollback needs the word; TLB maintenance accounting does not,
+    /// because nothing reachable from the live tree points at that page.
+    fn note_undo_unlinked(&mut self, loc: TableLocation) {
         if self.undo.is_some() {
             let previous = self.read_desc(loc);
             if let Some(journal) = self.undo.as_mut() {
@@ -1044,8 +1072,18 @@ impl PageTableManager {
                 free_tables: self.free_tables.clone(),
                 reclaim_pending: self.reclaim_pending,
                 dirty_len: self.dirty.len(),
+                replaced_valid: false,
+                first_written: std::collections::HashSet::new(),
             });
         }
+    }
+
+    /// Whether the open undo transaction has overwritten a walker-visible
+    /// VALID descriptor. `false` while no journal is open.
+    pub fn undo_replaced_valid_descriptor(&self) -> bool {
+        self.undo
+            .as_ref()
+            .is_some_and(|journal| journal.replaced_valid)
     }
 
     /// Whether a journal is currently open.
@@ -2706,6 +2744,60 @@ mod tests {
                 "prefix of {length} edit(s): host backing was not restored to the pre-image"
             );
         }
+    }
+
+    /// Stage-1 TLB maintenance accounting: a transaction that only turns
+    /// invalid words valid (a fresh hole mapped, then made inaccessible before
+    /// any host sync) replaced nothing a walker could have cached, while a
+    /// transaction that overwrites a live VALID word did. Only the first
+    /// pre-image of each word decides, because `sync_to_host` publishes final
+    /// shadow words, never the transient intermediate state.
+    #[test]
+    fn undo_journal_reports_replaced_valid_only_for_pre_transaction_words() {
+        let mut fresh = manager();
+        fresh.set_multi_vcpu(false);
+        fresh.set_stage1_exclusive(true);
+        // Carve a page-granular hole before the transaction so the mapping
+        // below rewrites invalid leaf words rather than splitting a live block.
+        fresh
+            .invalidate(LINUX_MMAP_BASE, 0x4000, None)
+            .expect("carve hole");
+        for page in 0..4 {
+            assert_eq!(fresh.translate(LINUX_MMAP_BASE + page * 0x1000), None);
+        }
+        assert!(!fresh.undo_replaced_valid_descriptor(), "closed journal");
+        fresh.begin_undo();
+        fresh
+            .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, false, None)
+            .expect("map fresh hole");
+        fresh
+            .set_prot_none(LINUX_MMAP_BASE, 0x4000, None)
+            .expect("make inaccessible");
+        assert!(
+            !fresh.undo_replaced_valid_descriptor(),
+            "valid words written and unwritten inside one transaction are not replacements"
+        );
+        fresh.commit_undo();
+
+        let mut replacing = manager();
+        replacing.set_multi_vcpu(false);
+        replacing.set_stage1_exclusive(true);
+        replacing
+            .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, false, None)
+            .expect("map before the transaction");
+        replacing.begin_undo();
+        replacing
+            .set_prot_none(LINUX_MMAP_BASE, 0x4000, None)
+            .expect("replace a live valid word");
+        assert!(
+            replacing.undo_replaced_valid_descriptor(),
+            "overwriting a pre-transaction VALID word needs maintenance"
+        );
+        replacing.commit_undo();
+        assert!(
+            !replacing.undo_replaced_valid_descriptor(),
+            "commit closes the journal"
+        );
     }
 
     /// Committing must leave the edits in place and close the journal.

@@ -687,6 +687,11 @@ pub(super) fn publish_replacing(
         )?
     };
     let inventory_entry = ((physical_ipa, physical_len), inventory_mapping);
+    // A fresh local extent replaces only invalid descriptors: the walker
+    // caches nothing for them, so the publication needs ordering (sync before
+    // commit) but no stage-1 TLB maintenance. Any transaction that overwrote a
+    // live VALID descriptor, and every foreign publication, keeps the flush.
+    let mut replaced_valid_descriptor = true;
     // Journal this transaction's descriptor pre-images rather than
     // cloning the whole 1.75 MiB table region (see `begin_undo`).
     let publication = {
@@ -762,6 +767,7 @@ pub(super) fn publish_replacing(
                             "sparse HVPatch mmap sync_to_host failed: {e:?}"
                         ))
                     })?;
+                    replaced_valid_descriptor = editor.manager.undo_replaced_valid_descriptor();
                     #[cfg(test)]
                     if STAGE2_AUDIT_STATE.with(|state| state.borrow().fail_sparse_publication_after_sync) {
                         return Err(TrapError::Hypervisor(
@@ -859,7 +865,9 @@ pub(super) fn publish_replacing(
             Ok::<(), ()>(())
         },
     );
-    if let Err(error) = flush_stage1() {
+    if (replaced_valid_descriptor || context.foreign.is_some())
+        && let Err(error) = flush_stage1()
+    {
         carrick_fatal!(
             "hvpatch::sparse_materialization_tlbi",
             "sparse page-table stage-1 TLBI failed after publication: start=0x{start:x} end=0x{end:x} error={error}"

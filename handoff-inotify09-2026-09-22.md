@@ -118,8 +118,15 @@ Do not quietly replace these failures with a later passing focused test:
    undelivered bytes stay consumed. Original evidence:
    [syscall-code-writes](docs/perf-results/2026-09-21-syscall-floor/syscall-code-writes/README.md).
 2. **Fresh-publication maintenance budget:** one page-table invalidation where
-   zero is allowed. Qualified before-step controls reproduced it twice. The
-   budget remains unchanged.
+   zero is allowed. Qualified before-step controls reproduced it twice. FIXED
+   without touching the budget: `publish_replacing` flushed stage-1
+   unconditionally after commit; the undo journal now records whether any
+   walker-visible word was VALID before the transaction, and a local
+   publication that only turned invalid words valid (fresh hole, then
+   inaccessible) skips the flush. Foreign publications and any transaction
+   that overwrote a live valid word keep it. `carrick-mem` unit test
+   `undo_journal_reports_replaced_valid_only_for_pre_transaction_words` pins
+   the rule; the contract test passes at 1/8/32/128.
 3. **Intermittent signed anonymous foreign-copyout EFAULT 14**, child status
    1024, remains unattributed. A later fixed ABBA population passing all four
    runs did not repair or waive the original failure.
