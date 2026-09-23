@@ -88,15 +88,20 @@ impl MappingView {
     }
 }
 
+/// True for a memory abort exception (instruction abort `EC = 0x20` or data abort `EC = 0x24`).
+pub fn is_aarch64_abort_exception(syndrome: u64) -> bool {
+    matches!(aarch64_exception_class(syndrome), 0x20 | 0x24)
+}
+
 /// True for a memory abort taken from a LOWER exception level (EL0 guest code):
-/// instruction abort (`EC = 0x20`) or data abort (`EC = 0x24`). HVF normally
-/// funnels guest EL0 faults through our EL1 vector trampoline (an HVC), but a
+/// instruction abort (`EC = 0x20`) or data abort (`EC = 0x24`) with PSTATE at EL0.
+/// HVF normally funnels guest EL0 faults through our EL1 vector trampoline (an HVC), but a
 /// fault HVF itself can't satisfy (e.g. a stack overflow whose SP ran off the
 /// mapped guest stack) surfaces DIRECTLY as an EXCEPTION exit with this EC. It
 /// must be delivered to the guest as SIGSEGV (faulthandler._stack_overflow,
 /// Go's sigpanic), not treated as a fatal "unexpected exception".
-pub fn is_aarch64_el0_abort_exception(syndrome: u64) -> bool {
-    matches!(aarch64_exception_class(syndrome), 0x20 | 0x24)
+pub fn is_aarch64_el0_abort_exception(syndrome: u64, pstate: u64) -> bool {
+    is_aarch64_abort_exception(syndrome) && ExecLevel::from_pstate(pstate).is_guest()
 }
 
 pub(crate) fn align_down(value: u64, alignment: u64) -> u64 {
@@ -1162,4 +1167,49 @@ pub(crate) fn hvf_set_sys_reg(
         _ => return Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
     };
     vcpu.set_sys_reg(hvf_reg, v).map_err(hvf_os_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stage2_abort_classifier() {
+        let el0_pstate = 0b0000;
+        let el1_pstate = 0b0101; // EL1h
+
+        let data_abort_syndrome = 0x24 << 26;
+        let inst_abort_syndrome = 0x20 << 26;
+        let svc_syndrome = 0x15 << 26;
+        let hvc_syndrome = 0x16 << 26;
+
+        assert!(is_aarch64_abort_exception(data_abort_syndrome));
+        assert!(is_aarch64_abort_exception(inst_abort_syndrome));
+        assert!(!is_aarch64_abort_exception(svc_syndrome));
+        assert!(!is_aarch64_abort_exception(hvc_syndrome));
+
+        // When taken from EL0: classified as EL0 abort
+        assert!(is_aarch64_el0_abort_exception(
+            data_abort_syndrome,
+            el0_pstate
+        ));
+        assert!(is_aarch64_el0_abort_exception(
+            inst_abort_syndrome,
+            el0_pstate
+        ));
+
+        // When taken from EL1: MUST NOT be classified as EL0 abort
+        assert!(!is_aarch64_el0_abort_exception(
+            data_abort_syndrome,
+            el1_pstate
+        ));
+        assert!(!is_aarch64_el0_abort_exception(
+            inst_abort_syndrome,
+            el1_pstate
+        ));
+
+        // Non-abort exceptions at EL0 must not be classified as EL0 abort
+        assert!(!is_aarch64_el0_abort_exception(svc_syndrome, el0_pstate));
+        assert!(!is_aarch64_el0_abort_exception(hvc_syndrome, el0_pstate));
+    }
 }
