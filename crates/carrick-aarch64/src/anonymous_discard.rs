@@ -14,7 +14,11 @@ pub(crate) fn with_edges(
             length: len,
         })
     };
-    if !granule.is_power_of_two() || granule < 4096 || address % 4096 != 0 || len % 4096 != 0 {
+    if !granule.is_power_of_two()
+        || granule < 4096
+        || !address.is_multiple_of(4096)
+        || !len.is_multiple_of(4096)
+    {
         return Ok(false);
     }
     let end = address.checked_add(len as u64).ok_or_else(invalid)?;
@@ -83,7 +87,7 @@ mod tests {
                 self.events.push("retire_failed");
                 return Err(error);
             }
-            if self.refuse || address % 16384 != 0 || len % 16384 != 0 {
+            if self.refuse || !address.is_multiple_of(16384) || !len.is_multiple_of(16384) {
                 return Ok(false);
             }
             self.events.push("retire");
