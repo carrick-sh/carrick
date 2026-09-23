@@ -158,7 +158,7 @@
 use crate::elf::SegmentPerms;
 use crate::memory::AddressSpace;
 use crate::syscall_mailbox::{
-    HvfSyscallTransport, MailboxBinding, MailboxSlotAllocator, MailboxSlotId,
+    HvfSyscallTransport, MailboxBinding, MailboxRequest, MailboxSlotAllocator, MailboxSlotId,
 };
 use carrick_aarch64::Aarch64VcpuSnapshot;
 use carrick_guest_mem::{GuestVa, MemoryError};
@@ -7458,133 +7458,62 @@ impl HvfInner {
             // emulate it (sys64 MRS read → re-run) or surface it as an EL0Fault.
             if is_aarch64_hvc_exception(exception.syndrome) {
                 let mut overhead = SyscallTransportOverhead::default();
-                if let Some(exit) =
-                    decode_hvc_syscall_exit(exception.syndrome, vcpu, mailbox, &mut overhead)?
-                {
-                    crate::probes::hvf_syscall_transport(
-                        mailbox.transport().raw(),
-                        0,
-                        overhead.register_reads,
-                        overhead.sysreg_reads,
-                        0,
-                    );
-                    return Ok(exit);
-                }
-                let underlying = vcpu.get_sys_reg(SysReg::ESR_EL1).map_err(hvf_error)?;
-                if !is_aarch64_svc_exception(underlying) {
-                    if HvfVmState::emulate_el0_sys64_read_inner(vcpu, underlying)? {
-                        // Serviced (ELR_EL1 advanced, target GPR written) — re-run.
-                        continue;
+                match decode_hvc_syscall_exit(exception.syndrome, vcpu, mailbox, &mut overhead)? {
+                    HvcExitOutcome::Syscall(exit) => {
+                        crate::probes::hvf_syscall_transport(
+                            mailbox.transport().raw(),
+                            0,
+                            overhead.register_reads,
+                            overhead.sysreg_reads,
+                            0,
+                        );
+                        return Ok(exit);
                     }
-                    let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
-                    let far = vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
-                    let x16 = vcpu.get_reg(Reg::X16).unwrap_or(0);
-                    let x17 = vcpu.get_reg(Reg::X17).unwrap_or(0);
-                    let x29 = vcpu.get_reg(Reg::X29).unwrap_or(0);
-                    let x30 = vcpu.get_reg(Reg::LR).unwrap_or(0);
-                    let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
-                    crate::probes::vcpu_fault(underlying, elr, far, x30, sp, unsafe {
-                        libc::getpid()
-                    });
-                    // HVC-trampoline path: the guest EL1 vector latched
-                    // ELR_EL1/FAR_EL1, so they are authoritative.
-                    return Ok(Aarch64Exit::EL0Fault {
-                        syndrome: underlying,
-                        elr,
-                        far,
-                        x16,
-                        x17,
-                        x29,
-                        x30,
-                        sp,
-                        from_el0_direct: false,
-                    });
+                    HvcExitOutcome::Maintenance => {
+                        return Ok(Aarch64Exit::MaintenanceDone);
+                    }
+                    HvcExitOutcome::NotSvc { esr } => {
+                        if HvfVmState::emulate_el0_sys64_read_inner(vcpu, esr)? {
+                            // Serviced (ELR_EL1 advanced, target GPR written) — re-run.
+                            continue;
+                        }
+                        let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+                        let far = vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
+                        let x16 = vcpu.get_reg(Reg::X16).unwrap_or(0);
+                        let x17 = vcpu.get_reg(Reg::X17).unwrap_or(0);
+                        let x29 = vcpu.get_reg(Reg::X29).unwrap_or(0);
+                        let x30 = vcpu.get_reg(Reg::LR).unwrap_or(0);
+                        let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+                        crate::probes::vcpu_fault(esr, elr, far, x30, sp, unsafe {
+                            libc::getpid()
+                        });
+                        // HVC-trampoline path: the guest EL1 vector latched
+                        // ELR_EL1/FAR_EL1, so they are authoritative.
+                        return Ok(Aarch64Exit::EL0Fault {
+                            syndrome: esr,
+                            elr,
+                            far,
+                            x16,
+                            x17,
+                            x29,
+                            x30,
+                            sp,
+                            from_el0_direct: false,
+                        });
+                    }
                 }
             }
-            // A genuine guest EL0 `svc`. HVC2 from the mailbox vector consumes
-            // the release-published frame without any register/sysreg API reads.
-            // The diagnostic legacy mode still validates that publication, then
-            // deliberately reads the live registers for an apples-to-apples
-            // transport comparison. A direct SVC exit (no EL1 HVC vehicle) keeps
-            // the historical register decode as a defensive compatibility path.
-            let mut register_reads = 0u32;
-            let mut sysreg_reads = 0u32;
-            let mut legacy_decode = || {
-                sysreg_reads += 1;
-                let resume_pc = vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(|error| {
-                    crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string())
-                })?;
-                let frame = carrick_hal::read_aarch64_syscall_frame(|r| {
-                    register_reads += 1;
-                    hvf_get_reg(vcpu, r)
-                })
-                .map_err(|error| {
-                    crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string())
-                })?;
-                sysreg_reads += 1;
-                let spsr = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
-                register_reads += 1;
-                let fp = vcpu.get_reg(Reg::X29).unwrap_or(0);
-                register_reads += 1;
-                let lr = vcpu.get_reg(Reg::LR).unwrap_or(0);
-                sysreg_reads += 1;
-                let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
-                sysreg_reads += 1;
-                let esr = vcpu.get_sys_reg(SysReg::ESR_EL1).unwrap_or(0);
-                Ok(crate::syscall_mailbox::MailboxRequest {
-                    native_nr: frame.x8,
-                    frame,
-                    resume_pc,
-                    spsr,
-                    fp,
-                    lr,
-                    sp,
-                    esr,
-                })
-            };
-            let request = if is_aarch64_hvc_exception(exception.syndrome) {
-                mailbox.decode_request(legacy_decode)
-            } else {
-                legacy_decode()
-            }
-            .map_err(|error| {
-                let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
-                let sp_el1 = vcpu.get_sys_reg(SysReg::SP_EL1).unwrap_or(0);
-                let binding_address = mailbox.slot().guest_address();
-                let diagnostics = mailbox.diagnostics();
-                TrapError::Hypervisor(format!(
-                    "{error}; vcpu_pc={pc:#x}; sp_el1={sp_el1:#x}; binding_address={binding_address:#x}; mailbox={diagnostics:?}"
-                ))
-            })?;
+            // Direct SVC exit (no EL1 HVC vehicle) compatibility path.
+            let mut overhead = SyscallTransportOverhead::default();
+            let exit = decode_direct_svc_exit(exception.syndrome, vcpu, &mut overhead)?;
             crate::probes::hvf_syscall_transport(
                 mailbox.transport().raw(),
                 0,
-                register_reads,
-                sysreg_reads,
+                overhead.register_reads,
+                overhead.sysreg_reads,
                 0,
             );
-            let frame = request.frame;
-            let resume_pc = request.resume_pc;
-            // vcpu_trap probe parity: guest PC at the trap (= ELR_EL1) + the live
-            // FP/SP/LR so a DTrace consumer can walk the guest call chain. The
-            // stack-region bases require the per-thread mapping list (on
-            // HvfVmState, not reachable here), so report zero bases.
-            crate::probes::vcpu_trap_with(|| crate::compat::GuestRegs {
-                pc: resume_pc,
-                sp: request.sp,
-                fp: request.fp,
-                lr: request.lr,
-                x8: frame.x8,
-                x0: frame.x0,
-                stack_guest_base: 0,
-                stack_host_base: 0,
-                stack_guest_end: 0,
-            });
-            return Ok(Aarch64Exit::Syscall {
-                frame,
-                resume_pc,
-                current_guest_sp: Some(request.sp),
-            });
+            return Ok(exit);
         }
     }
 }
@@ -7632,20 +7561,92 @@ impl SyscallTransportOverhead {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum HvcExitOutcome {
+    Syscall(carrick_aarch64::Aarch64Exit),
+    Maintenance,
+    NotSvc { esr: u64 },
+}
+
+fn read_legacy_vcpu_request<V: VcpuTrapContext>(
+    esr: u64,
+    vcpu: &V,
+    overhead: &mut SyscallTransportOverhead,
+) -> Result<MailboxRequest, TrapError> {
+    use applevisor::prelude::*;
+    overhead.sysreg_reads += 1;
+    let resume_pc = vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
+    let frame = carrick_hal::read_aarch64_syscall_frame(|r| {
+        overhead.register_reads += 1;
+        match r {
+            carrick_hal::Reg::X(n) => match GPR_TABLE.get(n as usize) {
+                Some(&reg) => vcpu.get_reg(reg).map_err(hvf_os_error),
+                None => Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
+            },
+            carrick_hal::Reg::Sp => vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_os_error),
+            carrick_hal::Reg::Pc => vcpu.get_reg(Reg::PC).map_err(hvf_os_error),
+            carrick_hal::Reg::Pstate => vcpu.get_reg(Reg::CPSR).map_err(hvf_os_error),
+            carrick_hal::Reg::SpEl1 => vcpu.get_sys_reg(SysReg::SP_EL1).map_err(hvf_os_error),
+            _ => Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
+        }
+    })
+    .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+    overhead.sysreg_reads += 1;
+    let spsr = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
+    overhead.register_reads += 1;
+    let fp = vcpu.get_reg(Reg::X29).unwrap_or(0);
+    overhead.register_reads += 1;
+    let lr = vcpu.get_reg(Reg::LR).unwrap_or(0);
+    overhead.sysreg_reads += 1;
+    let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+    Ok(MailboxRequest {
+        native_nr: frame.x8,
+        frame,
+        resume_pc,
+        spsr,
+        fp,
+        lr,
+        sp,
+        esr,
+    })
+}
+
+fn finish_syscall_exit(request: MailboxRequest) -> carrick_aarch64::Aarch64Exit {
+    let frame = request.frame;
+    let resume_pc = request.resume_pc;
+    crate::probes::vcpu_trap_with(|| crate::compat::GuestRegs {
+        pc: resume_pc,
+        sp: request.sp,
+        fp: request.fp,
+        lr: request.lr,
+        x8: frame.x8,
+        x0: frame.x0,
+        stack_guest_base: 0,
+        stack_host_base: 0,
+        stack_guest_end: 0,
+    });
+    carrick_aarch64::Aarch64Exit::Syscall {
+        frame,
+        resume_pc,
+        current_guest_sp: Some(request.sp),
+    }
+}
+
 pub(crate) fn decode_hvc_syscall_exit<V: VcpuTrapContext>(
     syndrome: u64,
     vcpu: &V,
     mailbox: &mut MailboxBinding,
     overhead: &mut SyscallTransportOverhead,
-) -> Result<Option<carrick_aarch64::Aarch64Exit>, TrapError> {
+) -> Result<HvcExitOutcome, TrapError> {
     use applevisor::prelude::*;
-    use carrick_aarch64::Aarch64Exit;
 
     if !is_aarch64_hvc_exception(syndrome) {
-        return Ok(None);
+        return Err(TrapError::Hypervisor(format!(
+            "decode_hvc_syscall_exit called with non-HVC syndrome {syndrome:#x}"
+        )));
     }
     if is_aarch64_hvc_maintenance(syndrome) {
-        return Ok(Some(Aarch64Exit::MaintenanceDone));
+        return Ok(HvcExitOutcome::Maintenance);
     }
     // Fast path: for mailbox transport, if the guest published an SVC request into the
     // shared mailbox before issuing HVC2, the frame is already validated in shared memory
@@ -7661,69 +7662,36 @@ pub(crate) fn decode_hvc_syscall_exit<V: VcpuTrapContext>(
                 "{error}; vcpu_pc={pc:#x}; sp_el1={sp_el1:#x}; binding_address={binding_address:#x}; mailbox={diagnostics:?}"
             ))
         })? {
+            // A request taken from the mailbox must be serviced or reported as a typed error.
             if !is_aarch64_svc_exception(req.esr) {
-                return Ok(None);
+                return Err(TrapError::Hypervisor(format!(
+                    "mailbox request published non-SVC exception {:#x}",
+                    req.esr
+                )));
             }
             req
         } else {
             // Mailbox was Idle: guest took a non-SVC exception that branched to legacy_hvc.
+            // Exactly ONE ESR_EL1 read is performed across this exit path.
             overhead.sysreg_reads += 1;
             let underlying = vcpu.get_sys_reg(SysReg::ESR_EL1).map_err(hvf_error)?;
             if !is_aarch64_svc_exception(underlying) {
-                return Ok(None);
+                return Ok(HvcExitOutcome::NotSvc { esr: underlying });
             }
-            return Ok(None);
+            return Err(TrapError::Hypervisor(
+                "HVC2 exit with idle mailbox but ESR_EL1 is SVC".to_string(),
+            ));
         }
     } else {
         // Diagnostic Legacy transport: deliberately inspect vCPU registers
         overhead.sysreg_reads += 1;
         let underlying = vcpu.get_sys_reg(SysReg::ESR_EL1).map_err(hvf_error)?;
         if !is_aarch64_svc_exception(underlying) {
-            return Ok(None);
+            return Ok(HvcExitOutcome::NotSvc { esr: underlying });
         }
         let legacy_decode = || {
-            overhead.sysreg_reads += 1;
-            let resume_pc = vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(|error| {
+            read_legacy_vcpu_request(underlying, vcpu, overhead).map_err(|error| {
                 crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string())
-            })?;
-            let frame = carrick_hal::read_aarch64_syscall_frame(|r| {
-                overhead.register_reads += 1;
-                match r {
-                    carrick_hal::Reg::X(n) => match GPR_TABLE.get(n as usize) {
-                        Some(&reg) => vcpu.get_reg(reg).map_err(hvf_os_error),
-                        None => Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
-                    },
-                    carrick_hal::Reg::Sp => vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_os_error),
-                    carrick_hal::Reg::Pc => vcpu.get_reg(Reg::PC).map_err(hvf_os_error),
-                    carrick_hal::Reg::Pstate => vcpu.get_reg(Reg::CPSR).map_err(hvf_os_error),
-                    carrick_hal::Reg::SpEl1 => {
-                        vcpu.get_sys_reg(SysReg::SP_EL1).map_err(hvf_os_error)
-                    }
-                    _ => Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
-                }
-            })
-            .map_err(|error| {
-                crate::syscall_mailbox::MailboxConsumeError::Legacy(error.to_string())
-            })?;
-            overhead.sysreg_reads += 1;
-            let spsr = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
-            overhead.register_reads += 1;
-            let fp = vcpu.get_reg(Reg::X29).unwrap_or(0);
-            overhead.register_reads += 1;
-            let lr = vcpu.get_reg(Reg::LR).unwrap_or(0);
-            overhead.sysreg_reads += 1;
-            let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
-            overhead.sysreg_reads += 1;
-            let esr = vcpu.get_sys_reg(SysReg::ESR_EL1).unwrap_or(0);
-            Ok(crate::syscall_mailbox::MailboxRequest {
-                native_nr: frame.x8,
-                frame,
-                resume_pc,
-                spsr,
-                fp,
-                lr,
-                sp,
-                esr,
             })
         };
         mailbox
@@ -7738,24 +7706,16 @@ pub(crate) fn decode_hvc_syscall_exit<V: VcpuTrapContext>(
                 ))
             })?
     };
-    let frame = request.frame;
-    let resume_pc = request.resume_pc;
-    crate::probes::vcpu_trap_with(|| crate::compat::GuestRegs {
-        pc: resume_pc,
-        sp: request.sp,
-        fp: request.fp,
-        lr: request.lr,
-        x8: frame.x8,
-        x0: frame.x0,
-        stack_guest_base: 0,
-        stack_host_base: 0,
-        stack_guest_end: 0,
-    });
-    Ok(Some(Aarch64Exit::Syscall {
-        frame,
-        resume_pc,
-        current_guest_sp: Some(request.sp),
-    }))
+    Ok(HvcExitOutcome::Syscall(finish_syscall_exit(request)))
+}
+
+pub(crate) fn decode_direct_svc_exit<V: VcpuTrapContext>(
+    syndrome: u64,
+    vcpu: &V,
+    overhead: &mut SyscallTransportOverhead,
+) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
+    let request = read_legacy_vcpu_request(syndrome, vcpu, overhead)?;
+    Ok(finish_syscall_exit(request))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
