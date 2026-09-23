@@ -107,11 +107,16 @@ wall-time gains. All raw logs, including failed test setup attempts, are archive
 
 Do not quietly replace these failures with a later passing focused test:
 
-1. **Read-only readv consumes input on EFAULT.** The signed destination fixture
-   returns EFAULT but advances a source offset from 8192 to 8196. The identical
-   new fixture reproduced it on the exact before-step source. Native ARM64
-   Linux passes all seven final subchecks; Carrick passes six and fails globally.
-   Evidence: [syscall-code-writes](docs/perf-results/2026-09-21-syscall-floor/syscall-code-writes/README.md).
+1. **Read-only readv consumes input on EFAULT.** FIXED in `dbf360ebb`
+   (`read_host_pipe_into` issued the host `read` before the copy-out could
+   fail; it now delivers the writable page prefix and hands undelivered bytes
+   back to the regular-file offset). Red-first VM-free tests
+   `dispatch::fs::tests::readonly_destination_offsets`; the signed
+   `syscall_write_destinations` fixture passes all seven subchecks on that
+   artifact (SHA-256 `0f657b02…`), as does the same script through
+   `carrick run`. Residual: host pipes/sockets/ttys cannot rewind, so their
+   undelivered bytes stay consumed. Original evidence:
+   [syscall-code-writes](docs/perf-results/2026-09-21-syscall-floor/syscall-code-writes/README.md).
 2. **Fresh-publication maintenance budget:** one page-table invalidation where
    zero is allowed. Qualified before-step controls reproduced it twice. The
    budget remains unchanged.
