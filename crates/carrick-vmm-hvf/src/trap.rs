@@ -7254,6 +7254,31 @@ impl HvfInner {
         Ok(())
     }
 
+    /// Check whether a vCPU exit must be resumed because the vCPU is executing
+    /// an uninterruptible EL1 kernel critical section.
+    ///
+    /// An exit that is NOT a guest-initiated syscall HVC and that lands with the vCPU at EL1
+    /// with PC inside the EL1 kernel image or the EL1 vector trampoline must be resumed on the
+    /// same vCPU until it leaves EL1 (reaches EL0 via eret or the forward path).
+    pub(crate) fn should_resume_mid_el1(
+        is_guest_hvc: bool,
+        is_hvc_fault: bool,
+        pstate: u64,
+        pc: u64,
+    ) -> bool {
+        if is_guest_hvc || is_hvc_fault {
+            return false;
+        }
+        let is_el1 = !ExecLevel::from_pstate(pstate).is_guest();
+        if !is_el1 {
+            return false;
+        }
+        let in_el1_image = pc >= carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+            && pc < carrick_mem::memory::LINUX_EL1_KERNEL_BASE + carrick_el1_abi::EL1_IMAGE_SIZE;
+        let in_vector = carrick_mem::memory::is_carrick_el1_vector_va(pc);
+        in_el1_image || in_vector
+    }
+
     /// Run the passed `vcpu` to its next exit, decoding HVF's native trap surface
     /// into the neutral [`carrick_aarch64::Aarch64Exit`]. The old
     /// `run_until_syscall` exit decode, returning `Aarch64Exit` instead of an
@@ -7280,36 +7305,35 @@ impl HvfInner {
         // Bounds lazy re-mapping of dropped aliases so a
         // genuinely-unmappable backing still terminates instead of spinning.
         let mut alias_remap_limiter = AliasRemapLimiter::default();
+        let mut consecutive_el1_resumes: u32 = 0;
         loop {
             // The engine accounts the guest CPU time via `guest_cpu::timed_run`
             // around its `vcpu.run()` call, so do NOT double-account here.
             vcpu.run().map_err(hvf_error)?;
             let exit = vcpu.get_exit_info();
-            if exit.reason == ExitReason::CANCELED {
-                // A cross-thread `hv_vcpus_exit` (crate::vcpu_kick) forced this
-                // vCPU out of the guest so a pending signal can be delivered.
-                //
-                // But the kick can land while the vCPU is still inside carrick's
-                // EL1 trap trampoline — a guest EL0 `svc`/fault is mid-flight,
-                // between the vector entry (VBAR_EL1 = vectors_base, e.g. the
-                // sync-from-EL0 entry at +0x400) and the HVC that traps out to
-                // the host. PC there is an EL1 trampoline address, NOT a guest
-                // userspace PC. Reporting that as a deliverable kick overwrites
-                // the in-flight exception and wedges the thread — reproduced as a
-                // SIGURG storm corrupting a futex waiter (pc=vectors_base+0x404).
-                //
-                // Resume until the guest is back at EL0 so the trampoline
-                // completes its HVC and the real syscall is serviced; the
-                // pending signal is then delivered at that clean EL0 boundary.
-                let cpsr = vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?;
-                if !ExecLevel::from_pstate(cpsr).is_guest() {
-                    EL1_KICK_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    crate::probes::kick_in_kernel(
-                        vcpu.get_reg(Reg::PC).unwrap_or(0),
-                        ((cpsr >> 2) & 0b11) as u32,
+
+            let is_guest_hvc = exit.reason == ExitReason::EXCEPTION
+                && is_aarch64_syscall_exception(exit.exception.syndrome);
+            let is_hvc_fault = exit.reason == ExitReason::EXCEPTION
+                && is_aarch64_hvc_fault(exit.exception.syndrome);
+            let cpsr = vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?;
+            let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
+
+            if Self::should_resume_mid_el1(is_guest_hvc, is_hvc_fault, cpsr, pc) {
+                consecutive_el1_resumes += 1;
+                if consecutive_el1_resumes > 1000 {
+                    carrick_fatal!(
+                        "trap::run_to_exit",
+                        "EL1 critical section exceeded 1000 consecutive resumes at PC {pc:#x}"
                     );
-                    continue;
                 }
+                EL1_KICK_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::probes::kick_in_kernel(pc, ((cpsr >> 2) & 0b11) as u32);
+                continue;
+            }
+            consecutive_el1_resumes = 0;
+
+            if exit.reason == ExitReason::CANCELED {
                 return Ok(Aarch64Exit::Kicked);
             }
             // A direct EL0 abort on a high-VA alias address that THIS vCPU's
@@ -7748,3 +7772,69 @@ mod tag_strip_tests;
 #[cfg(test)]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod transport_test;
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod el1_resume_tests {
+    use super::HvfInner;
+
+    #[test]
+    fn test_should_resume_mid_el1_classification() {
+        let el1_pstate = 0b0100; // EL1t
+        let el0_pstate = 0b0000; // EL0t
+        let el1_img_base = carrick_mem::memory::LINUX_EL1_KERNEL_BASE;
+        let el1_img_mid = el1_img_base + 0x4000;
+        let el1_img_end = el1_img_base + carrick_el1_abi::EL1_IMAGE_SIZE - 4;
+        let el1_past_img = el1_img_base + carrick_el1_abi::EL1_IMAGE_SIZE;
+        let user_pc = 0x40_0000;
+
+        // 1. Guest-initiated HVC must NEVER be resumed as a mid-EL1 critical section
+        assert!(!HvfInner::should_resume_mid_el1(
+            true,
+            false,
+            el1_pstate,
+            el1_img_mid
+        ));
+
+        // 2. HVC fault (hvc #3) must NEVER be resumed
+        assert!(!HvfInner::should_resume_mid_el1(
+            false,
+            true,
+            el1_pstate,
+            el1_img_mid
+        ));
+
+        // 3. Normal EL0 user exit must NOT be resumed
+        assert!(!HvfInner::should_resume_mid_el1(
+            false, false, el0_pstate, user_pc
+        ));
+
+        // 4. EL1 execution inside the EL1 image MUST be resumed
+        assert!(HvfInner::should_resume_mid_el1(
+            false,
+            false,
+            el1_pstate,
+            el1_img_base
+        ));
+        assert!(HvfInner::should_resume_mid_el1(
+            false,
+            false,
+            el1_pstate,
+            el1_img_mid
+        ));
+        assert!(HvfInner::should_resume_mid_el1(
+            false,
+            false,
+            el1_pstate,
+            el1_img_end
+        ));
+
+        // 5. EL1 execution past the EL1 image (and not in vector) must NOT be resumed
+        assert!(!HvfInner::should_resume_mid_el1(
+            false,
+            false,
+            el1_pstate,
+            el1_past_img
+        ));
+    }
+}

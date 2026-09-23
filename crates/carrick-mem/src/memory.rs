@@ -792,6 +792,7 @@ pub const LINUX_ALIAS_IPA_SIZE: u64 = 0x10_0000_0000; // 64 GiB of alias space
 
 pub const LINUX_EL1_KERNEL_BASE: u64 = carrick_el1_abi::EL1_REGION_BASE;
 pub const LINUX_EL1_KERNEL_SIZE: u64 = carrick_el1_abi::EL1_REGION_SIZE;
+pub const LINUX_EL1_IMAGE_SIZE: u64 = carrick_el1_abi::EL1_IMAGE_SIZE;
 
 const fn ranges_do_not_overlap(a_base: u64, a_size: u64, b_base: u64, b_size: u64) -> bool {
     a_base + a_size <= b_base || b_base + b_size <= a_base
