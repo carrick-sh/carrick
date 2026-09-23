@@ -2108,8 +2108,8 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                     .saturating_add(carrick_mem::memory::mmap_arena_size()))
             || (carrick_mem::memory::is_high_va(address) && end <= (1u64 << 48));
         if len == 0
-            || address % 4096 != 0
-            || len % 4096 != 0
+            || !address.is_multiple_of(4096)
+            || !len.is_multiple_of(4096)
             || !in_sparse_range
             || !self.supports_lazy_anonymous_mmap()
             || !carrick_hal::stage1_exclusive::current_thread_edits_exclusively()
@@ -2122,7 +2122,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         if let Some(granule) = self.vm.anonymous_discard_granule()
             && granule.is_power_of_two()
             && granule >= 4096
-            && (address % granule != 0 || (len as u64) % granule != 0)
+            && (!address.is_multiple_of(granule) || !(len as u64).is_multiple_of(granule))
         {
             return crate::anonymous_discard::with_edges(self, address, len, granule);
         }
