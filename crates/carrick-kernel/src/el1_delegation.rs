@@ -1841,6 +1841,49 @@ mod tests {
                 "RLIMIT_FSIZE must recall delegated file"
             );
 
+            // Verify that subsequent write at or past the new RLIMIT_FSIZE is enforced by host
+            let lseek_outcome = dispatcher
+                .dispatch(
+                    &ctx,
+                    crate::dispatch::request::SyscallRequest::new(
+                        carrick_abi::syscall::nr::LSEEK.0,
+                        carrick_observability::compat::SyscallArgs([
+                            fd as u64,
+                            500,
+                            carrick_abi::LINUX_SEEK_SET as u64,
+                            0,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap();
+            assert!(matches!(
+                lseek_outcome,
+                crate::dispatch::DispatchOutcome::Returned { value: 500 }
+            ));
+
+            let write_outcome = dispatcher
+                .dispatch(
+                    &ctx,
+                    crate::dispatch::request::SyscallRequest::new(
+                        carrick_abi::syscall::nr::WRITE.0,
+                        carrick_observability::compat::SyscallArgs([
+                            fd as u64, 0x1000, 10, 0, 0, 0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap();
+            assert_eq!(
+                write_outcome,
+                crate::dispatch::DispatchOutcome::errno(carrick_abi::LINUX_EFBIG),
+                "write at or past RLIMIT_FSIZE must return EFBIG after recall"
+            );
+
             // 2. File delegated, then seccomp STRICT
             let fd2 = open_path_for_test(
                 &dispatcher,
