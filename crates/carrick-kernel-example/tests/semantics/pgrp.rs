@@ -254,3 +254,37 @@ fn kill_signal_zero_probes_existence() {
     ]);
     assert_eq!(run.exit_code(), 0);
 }
+
+/// A zombie keeps its process-group membership until it is reaped;
+/// `wait4(-pgid, ...)` reaps the zombie child in that process group.
+///
+/// Authority: `man 2 waitpid`, `man 2 wait` (zombie remains in process group until reaped; waitpid(-pgid) waits for child in pgid).
+#[test]
+fn zombie_keeps_process_group_membership_until_reaped() {
+    let run = run(vec![
+        Step::Sys(sys::fork().save(0)), // Child (PID saved in slot 0)
+        Step::ChildMarker(vec![
+            Step::Sys(setpgid(0, 0).ret(0)), // child becomes leader of its own process group
+            Step::Sys(sys::exit_group(42)),
+        ]),
+        // Wait until the child is a zombie without consuming it.
+        Step::Sys(waitid(LINUX_P_PID, slot(0), LINUX_WEXITED | LINUX_WNOWAIT).ret(0)),
+        // Child is now a zombie. Waiting on -pgid (-slot(0)) must return the child with exit status 42.
+        Step::Sys(wait4_labeled("wait4_group", carrick_kernel_example::negated(0), 0).ret(2)),
+        Step::Sys(sys::exit_group(0)),
+    ]);
+    assert_eq!(wexitstatus(wait_status(&run, "wait4_group")), 42);
+    assert_eq!(run.exit_code(), 0);
+}
+
+/// `wait4(-pgid, ...)` for a nonexistent process group returns `ECHILD`.
+///
+/// Authority: `man 2 waitpid`, `man 2 wait` (waitpid returns ECHILD when no matching child/group exists, never ESRCH).
+#[test]
+fn wait4_minus_nonexistent_pgid_returns_echild() {
+    let run = run(vec![
+        Step::Sys(sys::wait4(-99999, 0).errno(LINUX_ECHILD)),
+        Step::Sys(sys::exit_group(0)),
+    ]);
+    assert_eq!(run.exit_code(), 0);
+}

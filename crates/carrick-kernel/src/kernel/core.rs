@@ -1807,6 +1807,12 @@ impl Kernel {
                             "removed zombie did not match retiring task generation and container"
                         );
                     }
+                    super::operations::session::remove_group_member(
+                        &mut state,
+                        record.zombie.process_group,
+                        record.zombie.session,
+                        record.zombie.key,
+                    );
                     record
                 })
                 .count();
@@ -2165,13 +2171,20 @@ impl Kernel {
                 return Err(RegistryInvariantError::ProcessGroupBacklink);
             }
             for member in &group.members {
-                let Some(task) = state.tasks.get(&member.id) else {
+                let (task_group, task_container) = if let Some(task) = state.tasks.get(&member.id) {
+                    if task.task.key() != *member {
+                        return Err(RegistryInvariantError::ProcessGroupBacklink);
+                    }
+                    (task.task.process_group(), task.task.container().id())
+                } else if let Some(zombie) = state.zombies.get(&member.id) {
+                    if zombie.zombie.key != *member {
+                        return Err(RegistryInvariantError::ProcessGroupBacklink);
+                    }
+                    (zombie.zombie.process_group, zombie.zombie.container)
+                } else {
                     return Err(RegistryInvariantError::MissingGroupMember);
                 };
-                if task.task.key() != *member
-                    || task.task.process_group() != *group_id
-                    || task.task.container().id() != group.container
-                {
+                if task_group != *group_id || task_container != group.container {
                     return Err(RegistryInvariantError::ProcessGroupBacklink);
                 }
             }
@@ -2211,6 +2224,25 @@ impl Kernel {
         for zombie in state.zombies.values() {
             if !self.ids.is_reserved_number(zombie.zombie.key.id.raw()) {
                 return Err(RegistryInvariantError::ZombieClaim);
+            }
+            let group_id = zombie.zombie.process_group;
+            let session_id = zombie.zombie.session;
+            let Some(group) = state.process_groups.get(&group_id) else {
+                return Err(RegistryInvariantError::MissingProcessGroup);
+            };
+            if group.object.session() != session_id
+                || group.container != zombie.zombie.container
+                || !group.members.contains(&zombie.zombie.key)
+            {
+                return Err(RegistryInvariantError::ProcessGroupBacklink);
+            }
+            let Some(session) = state.sessions.get(&session_id) else {
+                return Err(RegistryInvariantError::MissingSession);
+            };
+            if session.container != zombie.zombie.container
+                || !session.process_groups.contains(&group_id)
+            {
+                return Err(RegistryInvariantError::SessionBacklink);
             }
             if let Some(parent) = zombie.zombie.parent {
                 let Some(parent_record) = state.tasks.get(&parent.id) else {

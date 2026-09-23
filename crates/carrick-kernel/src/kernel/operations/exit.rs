@@ -792,9 +792,9 @@ impl Kernel {
 
         let process_group = task.process_group();
         let session = task.session();
-        remove_group_member(&mut state, process_group, session, prepared.task);
-
-        if prepared.autoreap_parent.is_none() {
+        if prepared.autoreap_parent.is_some() {
+            remove_group_member(&mut state, process_group, session, prepared.task);
+        } else {
             state.zombies.insert(
                 prepared.task.id,
                 ZombieRecord {

@@ -1259,4 +1259,67 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn orphaned_process_group_check_ignores_zombie_members() {
+        let (kernel, root) = bootstrap(100);
+        let child1 = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(101),
+                "child1".to_string(),
+                None,
+            )
+            .expect("child1");
+        let group1 = kernel
+            .create_process_group(child1.task.key().id, None)
+            .expect("create group1");
+        assert_eq!(child1.task.process_group(), group1);
+
+        // child1's parent is root (different group, same session) -> not orphaned.
+        assert!(!kernel.caller_process_group_is_orphaned(&child1));
+
+        let child2 = kernel
+            .fork_task(
+                &child1,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(102),
+                "child2".to_string(),
+                None,
+            )
+            .expect("child2");
+        assert_eq!(child2.task.process_group(), group1);
+
+        // child1 exits and becomes a zombie. It stays in group1 until reaped.
+        kernel
+            .prepare_task_exit(
+                child1.task.key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("prepare exit")
+            .commit()
+            .expect("commit exit");
+
+        // Group1 now contains zombie child1 and live child2.
+        let members = kernel.registry().process_group_members(group1);
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&child1.task.key()));
+        assert!(members.contains(&child2.task.key()));
+
+        // child2 was reparented to root (same session, different group) -> group1 is still not orphaned.
+        assert!(!kernel.caller_process_group_is_orphaned(&child2));
+
+        // When child1 is reaped, it is removed from the process group.
+        kernel
+            .wait_child(
+                root.task().key().id,
+                Some(child1.task().key().id),
+                WaitMode::Consume,
+            )
+            .expect("reap child1");
+        let members_after_reap = kernel.registry().process_group_members(group1);
+        assert_eq!(members_after_reap, vec![child2.task.key()]);
+    }
 }

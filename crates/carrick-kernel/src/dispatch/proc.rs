@@ -3165,26 +3165,23 @@ impl<'a> ProcView<'a> {
                         ),
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     },
-                    value => match value.checked_abs().and_then(|value| {
-                        u32::try_from(value)
-                            .ok()
-                            .and_then(|value| {
-                                crate::namespace::pid::ns_to_process_group_for(cx.kernel, value)
-                            })
-                            .map(crate::kernel::ProcessGroupId::raw)
-                    })
-                    {
-                        Some(group) => process.wait_child_in_process_group_with_job_control(
-                            group,
-                            class,
-                            false,
-                            include_stopped,
-                            include_continued,
-                        ),
-                        None => {
+                    value => {
+                        let Some(pgid) = value.checked_abs().and_then(|v| u32::try_from(v).ok()) else {
                             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ESRCH));
+                        };
+                        match crate::namespace::pid::ns_to_process_group_for(cx.kernel, pgid) {
+                            Some(group) => process.wait_child_in_process_group_with_job_control(
+                                group.raw(),
+                                class,
+                                false,
+                                include_stopped,
+                                include_continued,
+                            ),
+                            None => {
+                                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
+                            }
                         }
-                    },
+                    }
                 };
                 let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
                 match waited {

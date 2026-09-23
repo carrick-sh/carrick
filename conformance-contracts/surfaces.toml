@@ -376,3 +376,8 @@ contracts = ["kernel.mm.native-code-drain"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/native_execution.rs"
 contracts = ["kernel.mm.native-code-drain"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/semantics/pgrp.rs"
+contracts = ["kernel.wait.process-group"]
+
