@@ -302,10 +302,13 @@ impl<'a> MemView<'a> {
                     LINUX_EINVAL,
                 ));
             };
-            let private_file_description = if map_sharing == MmapSharing::Private
-                && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
-            {
+            let file_mapping_reference = if !map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                 this.open_file(fd.0).and_then(|open| open.description.retain_mapping())
+            } else {
+                None
+            };
+            let private_file_description = if map_sharing == MmapSharing::Private {
+                file_mapping_reference.clone()
             } else {
                 None
             };
@@ -915,7 +918,7 @@ impl<'a> MemView<'a> {
                                     // the runtime's and is closed right after
                                     // mapping, so this is the only way a later
                                     // `mremap` can ask where the file ends.
-                                    let mapping = open_file.description.retain_mapping();
+                                    let mapping = file_mapping_reference.clone();
                                     alias_description = Some((
                                         std::sync::Arc::clone(&open_file.description),
                                         mapping,
@@ -1915,7 +1918,18 @@ impl<'a> MemView<'a> {
                             private_file: PrivateFileMapEntry::for_mapping(
                                 &private_file_description, address, length, offset,
                             ),
-                            shared_file_alias: None,
+                            shared_file_alias: if map_sharing == MmapSharing::Shared
+                                && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                            {
+                                this.open_file(fd.0).map(|open| SharedFileAliasCommit {
+                                    description: Arc::clone(&open.description),
+                                    mapping: file_mapping_reference.clone(),
+                                    extent_base: Gpa(ipa.saturating_sub(offset)),
+                                    row_file_offset: offset,
+                                })
+                            } else {
+                                None
+                            },
                         },
                     ))
                     .map_err(|_| DispatchError::Errno(linux_errno::ENOMEM))?;

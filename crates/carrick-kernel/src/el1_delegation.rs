@@ -77,7 +77,48 @@ static DELEGATED_SPARSE: Mutex<
     [Option<crate::dispatch::fs::HostSparseExtentsRegistry>; MAX_DELEGATED_FILES],
 > = Mutex::new([const { None }; MAX_DELEGATED_FILES]);
 static FD_MAP_LOCK: Mutex<()> = Mutex::new(());
+static MAPPED_INODES: Mutex<Option<HashMap<InodeIdentity, usize>>> = Mutex::new(None);
 static HOOK_INIT: std::sync::Once = std::sync::Once::new();
+
+pub(crate) fn register_mapped_inode(inode: InodeIdentity) {
+    recall_by_inode(inode);
+    let mut map = MAPPED_INODES.lock();
+    let map = map.get_or_insert_with(HashMap::new);
+    *map.entry(inode).or_insert(0) += 1;
+}
+
+pub(crate) fn unregister_mapped_inode(inode: InodeIdentity) {
+    let mut map = MAPPED_INODES.lock();
+    if let Some(map) = map.as_mut() {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = map.entry(inode) {
+            let count = entry.get_mut();
+            if *count <= 1 {
+                entry.remove();
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+}
+
+pub(crate) fn is_inode_mapped(inode: InodeIdentity) -> bool {
+    let map = MAPPED_INODES.lock();
+    if let Some(map) = map.as_ref() {
+        if map.get(&inode).copied().unwrap_or(0) > 0 {
+            return true;
+        }
+        for (k, v) in map.iter() {
+            if *v > 0
+                && (k == &inode
+                    || (k.dev == 0 && k.ino == inode.ino)
+                    || (inode.dev == 0 && k.ino == inode.ino))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 pub(crate) fn init_delegation_hooks() {
     HOOK_INIT.call_once(|| {
@@ -167,17 +208,9 @@ fn allocate_handle(description: &Arc<FileDescription>) -> Option<u32> {
     None
 }
 
-fn free_handle(handle: u32) {
+fn unregister_delegated_inode(handle: u32) {
     if handle >= 1 && (handle as usize) <= MAX_DELEGATED_FILES {
         let idx = handle as usize - 1;
-        let mut handles = ALLOCATED_HANDLES.lock();
-        handles[idx] = false;
-        let mut descs = DELEGATED_DESCRIPTIONS.lock();
-        descs[idx] = None;
-        let mut rootfs = DELEGATED_ROOTFS.lock();
-        rootfs[idx] = None;
-        let mut sparse = DELEGATED_SPARSE.lock();
-        sparse[idx] = None;
         let inode = {
             let mut handle_inodes = DELEGATED_HANDLE_INODES.lock();
             handle_inodes[idx].take()
@@ -195,6 +228,21 @@ fn free_handle(handle: u32) {
                 }
             }
         }
+    }
+}
+
+fn free_handle(handle: u32) {
+    if handle >= 1 && (handle as usize) <= MAX_DELEGATED_FILES {
+        let idx = handle as usize - 1;
+        unregister_delegated_inode(handle);
+        let mut handles = ALLOCATED_HANDLES.lock();
+        handles[idx] = false;
+        let mut descs = DELEGATED_DESCRIPTIONS.lock();
+        descs[idx] = None;
+        let mut rootfs = DELEGATED_ROOTFS.lock();
+        rootfs[idx] = None;
+        let mut sparse = DELEGATED_SPARSE.lock();
+        sparse[idx] = None;
     }
 }
 
@@ -466,6 +514,10 @@ pub(crate) fn delegate_locked(
         _ => return Err(NotEligible::NotRegularFile),
     };
 
+    if is_inode_mapped(inode) {
+        return Err(NotEligible::Mapped);
+    }
+
     if let Some(seals_raw) = open_file.description.common().seals() {
         let seals = carrick_abi::LinuxMemfdSeals::from_bits_truncate(seals_raw);
         if writable
@@ -666,6 +718,7 @@ pub(crate) fn recall_locked(
     lock_delegated_file(file, handle);
     file.state
         .store(DELEGATED_STATE_RECALLING, Ordering::Release);
+    unregister_delegated_inode(handle);
 
     let guest_offset = file.offset.load(Ordering::Acquire);
     let guest_size = file.size.load(Ordering::Acquire);
@@ -2122,6 +2175,56 @@ mod tests {
 
             // Freeing h1 removes it cleanly
             free_handle(h1);
+        }
+
+        #[test]
+        fn test_inode_level_mapping_blocks_delegation_and_recalls() {
+            let _region = TestEl1Region::new();
+            let dispatcher = crate::dispatch::SyscallDispatcher::new();
+            let ctx = dispatcher.capture_one_task_context().unwrap();
+            let table = ctx.task().leader_file_table().unwrap();
+            let table_id = table.id();
+
+            let fd1 = open_path_for_test(
+                &dispatcher,
+                &ctx,
+                "/test_map_shared_inode.txt",
+                carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_RDWR,
+            );
+            let fd2 = open_path_for_test(
+                &dispatcher,
+                &ctx,
+                "/test_map_shared_inode.txt",
+                carrick_abi::LINUX_O_RDWR,
+            );
+
+            let open1 = dispatcher.open_file(fd1).unwrap();
+            let open2 = dispatcher.open_file(fd2).unwrap();
+
+            // Sibling open1 retains a mapping
+            let mapping = open1.description.retain_mapping().unwrap();
+
+            // open2 delegation must be rejected because inode has active mapping
+            let err = delegate(&open2, table_id, fd2, dispatcher.fs(), None, None).unwrap_err();
+            assert!(
+                matches!(err, NotEligible::Mapped),
+                "expected NotEligible::Mapped, got {:?}",
+                err
+            );
+
+            drop(mapping);
+
+            // Now that mapping is dropped, delegation should succeed
+            let h = delegate(&open2, table_id, fd2, dispatcher.fs(), None, None).unwrap();
+            assert_eq!(h, 1);
+
+            // A new mapping on open1 must recall the delegated inode
+            let _mapping2 = open1.description.retain_mapping().unwrap();
+            assert_eq!(
+                open2.description.delegation_handle(),
+                0,
+                "retaining mapping on sibling must recall delegated inode"
+            );
         }
     }
 }
