@@ -555,6 +555,21 @@ pub fn mark_pending_host_work_for_task(tid: u64) {
     }
 }
 
+/// Update the file table for any vCPU slot running the given task identity (tid).
+pub fn update_current_task_file_table_for_task(tid: u64, file_table: u64) {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return;
+    }
+    for slot in 0..EL1_STACK_SLOTS as usize {
+        let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+        let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+        if current_task.task_id.load(Ordering::Relaxed) == tid {
+            current_task.file_table.store(file_table, Ordering::Release);
+        }
+    }
+}
+
 /// Check and atomically clear the `served_with_work` flag for an executor slot.
 pub fn take_served_with_work(slot: usize) -> bool {
     let ptr = get_el1_region_host_ptr();
@@ -732,6 +747,11 @@ mod tests {
         mark_pending_host_work_for_task(42);
         assert!(task_5.has_pending_host_work());
         assert!(!task_6.has_pending_host_work()); // sibling task remains untouched
+
+        task_5.file_table.store(100, Ordering::Relaxed);
+        update_current_task_file_table_for_task(42, 200);
+        assert_eq!(task_5.file_table.load(Ordering::Acquire), 200);
+        assert_eq!(task_6.file_table.load(Ordering::Acquire), 0);
 
         task_5.served_with_work.store(1, Ordering::Relaxed);
         assert!(take_served_with_work(5));

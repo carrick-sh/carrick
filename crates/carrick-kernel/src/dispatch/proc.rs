@@ -740,6 +740,18 @@ impl<'a> ProcView<'a> {
     }
 
     #[inline]
+    pub(in crate::dispatch) fn close_draining_file_table(
+        &self,
+        kernel: &Arc<crate::kernel::Kernel>,
+        files: &Arc<crate::kernel::FileTable>,
+        owner: Option<crate::kernel::TaskKey>,
+        exec_successor: Option<&Arc<crate::kernel::FileTable>>,
+    ) {
+        self.cross
+            .close_draining_file_table(kernel, files, owner, exec_successor);
+    }
+
+    #[inline]
     pub(in crate::dispatch) fn resolve_at_path(
         &self,
         dirfd: u64,
@@ -1817,7 +1829,35 @@ impl<'a> ProcView<'a> {
             if !privileged_namespaces.is_empty() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            // The non-namespace flags (CLONE_FILES / FS / SIGHAND / SYSVSEM)
+            if parsed.contains(LinuxCloneFlags::FILES) {
+                let unshared: crate::kernel::CloseRangeUnshare = match cx
+                    .kernel
+                    .kernel()
+                    .unshare_file_table_for_close_range(cx.kernel)
+                {
+                    Ok(unshared) => unshared,
+                    Err(
+                        crate::kernel::KernelOperationError::StaleContext
+                        | crate::kernel::KernelOperationError::ParentExited
+                        | crate::kernel::KernelOperationError::UnknownThread(_),
+                    ) => return Ok(DispatchOutcome::errno(LINUX_EINTR)),
+                    Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
+                        return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "unshare CLONE_FILES publication failed");
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    }
+                };
+                let successor = unshared.context().resources().files();
+                this.close_draining_file_table(
+                    cx.kernel.kernel(),
+                    unshared.old_file_table(),
+                    Some(cx.kernel.task().key()),
+                    Some(&successor),
+                );
+            }
+            // The non-namespace flags (CLONE_FS / SIGHAND / SYSVSEM)
             // need no capability and are accepted. Unknown bits are tolerated
             // (truncated above).
             Ok(DispatchOutcome::Returned { value: 0 })

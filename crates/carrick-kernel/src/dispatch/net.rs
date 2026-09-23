@@ -3489,6 +3489,14 @@ impl SyscallDispatcher {
     }
 
     #[inline]
+    pub(crate) fn epoll_rearm_is_candidate(nr: u64) -> bool {
+        matches!(
+            nr,
+            63..=71 | 76 | 77 | 202 | 206 | 207 | 211 | 212 | 242 | 243 | 269 | 285 | 286 | 287
+        )
+    }
+
+    #[inline]
     pub(crate) fn epoll_rearm_after_io(&self, request: &SyscallRequest, outcome: &DispatchOutcome) {
         self.net_view().epoll_rearm_after_io(request, outcome);
     }
