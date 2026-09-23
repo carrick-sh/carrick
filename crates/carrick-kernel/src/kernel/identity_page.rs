@@ -186,18 +186,7 @@ pub fn stamp_identity_values<M: CurrentMmMemory>(
         base + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS,
         &0_u64.to_le_bytes(),
     )?;
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_SEEK_GATE,
-        &0_u32.to_le_bytes(),
-    )?;
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_SEEK_FD,
-        &(-1_i32).to_le_bytes(),
-    )?;
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_SEEK_OFFSET,
-        &0_i64.to_le_bytes(),
-    )?;
+
     // RELEASE the identity before opening the gate.
     //
     // Ordering the stores in program order is necessary but NOT sufficient.

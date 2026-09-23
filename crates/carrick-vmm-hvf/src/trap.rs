@@ -7451,6 +7451,13 @@ impl HvfInner {
                         far: far_el1,
                     });
                 }
+                let x0 = vcpu.get_reg(Reg::X0).unwrap_or(0);
+                if x0 == carrick_el1_abi::PANIC_SENTINEL {
+                    carrick_fatal!(
+                        "el1",
+                        "EL1 panic handler invoked: panic sentinel {x0:#x} at elr_el1={elr_el1:#x}"
+                    );
+                }
                 let ec = (esr_el1 >> 26) & 0x3f;
                 let mailbox_diagnostics = mailbox.diagnostics();
                 eprintln!(

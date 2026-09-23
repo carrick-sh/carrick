@@ -468,10 +468,6 @@ pub const IDENTITY_SYSCALLS: &[(u16, u64)] = &[(172, IDENTITY_OFF_PID)];
 /// identity page. (`CONTEXTIDR_EL1` is otherwise unused by carrick; the guest
 /// uses `TPIDR_EL0` for TLS.)
 pub const GETTID_NR: u16 = 178;
-pub const LSEEK_NR: u16 = 62;
-pub const IDENTITY_OFF_SEEK_GATE: u64 = 0x14;
-pub const IDENTITY_OFF_SEEK_FD: u64 = 0x18;
-pub const IDENTITY_OFF_SEEK_OFFSET: u64 = 0x20;
 // The identity page must stay inside the kernel hole's first 2 MiB block so it
 // inherits the kernel-only (AP=00) block mapping from `stage1_identity_page_tables`.
 const _: () = assert!(
@@ -3745,10 +3741,7 @@ fn enc_cbz_xn(reg: u32, pc: u64, target: u64) -> u32 {
 fn enc_cbz_x0(pc: u64, target: u64) -> u32 {
     enc_cbz_xn(0, pc, target)
 }
-fn enc_cbnz_xn(reg: u32, pc: u64, target: u64) -> u32 {
-    let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
-    0xB500_0000 | (imm19 << 5) | (reg & 0x1F)
-}
+
 fn enc_cbz_wn(reg: u32, pc: u64, target: u64) -> u32 {
     let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
     0x3400_0000 | (imm19 << 5) | (reg & 0x1F)
@@ -4173,7 +4166,6 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
     const HANDLER_BASE: usize = 16 * AARCH64_VECTOR_SLOT_SIZE; // 0x800
     const PAGE_HANDLER_LEN: usize = 14 * 4;
     const GETTID_HANDLER_LEN: usize = 15 * 4;
-    const LSEEK_HANDLER_LEN: usize = 33 * 4;
     const FSTAT_CEILING_COUNTED_HANDLER_LEN: usize = 26 * 4;
     let base = LINUX_IDENTITY_PAGE_BASE;
     let (lo, mid, hi) = (
@@ -4192,7 +4184,7 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
     const ESR_GUARD_LEN: usize = 6 * 4;
     let ceiling_syscalls = if fd_ceiling { 2 } else { 0 };
     let fallthrough =
-        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 2 + ceiling_syscalls) * 8;
+        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1 + ceiling_syscalls) * 8;
     put(&mut bytes, cursor, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
     put(&mut bytes, cursor + 4, AARCH64_MRS_ESR_EL1_X16_OPCODE);
     put(&mut bytes, cursor + 8, AARCH64_LSR_X16_X16_26_OPCODE);
@@ -4262,17 +4254,7 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
     );
     cursor += 8;
 
-    // lseek (62): seek-to-zero authority fast path
-    let lseek_handler = gettid_handler + GETTID_HANDLER_LEN;
-    put(&mut bytes, cursor, enc_cmp_x8_imm(LSEEK_NR));
-    put(
-        &mut bytes,
-        cursor + 4,
-        enc_beq((cursor + 4) as u64, lseek_handler as u64),
-    );
-    cursor += 8;
-
-    let fstat_handler = lseek_handler + LSEEK_HANDLER_LEN;
+    let fstat_handler = gettid_handler + GETTID_HANDLER_LEN;
     if fd_ceiling {
         // fstat(80) and close(57) are argument-bearing, so they have their own guard that preserves
         // x0..x5 on every host-dispatch fallback.  Unlike the identity entries they
@@ -4351,89 +4333,6 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
     );
     put(&mut bytes, gettid_handler + 56, AARCH64_ERET_OPCODE);
 
-    // lseek handler:
-    let h = lseek_handler;
-    let fallback = h + 31 * 4;
-    put(&mut bytes, h, enc_cbnz_xn(1, h as u64, fallback as u64));
-    put(
-        &mut bytes,
-        h + 4,
-        enc_cbnz_xn(2, (h + 4) as u64, fallback as u64),
-    );
-    put(&mut bytes, h + 8, enc_movz_xn(16, lo, 0));
-    put(&mut bytes, h + 12, enc_movk_xn(16, mid, 1));
-    put(&mut bytes, h + 16, enc_movk_xn(16, hi, 2));
-    put(
-        &mut bytes,
-        h + 20,
-        enc_ldr_wt_xn(16, 16, IDENTITY_OFF_SHIM_ENABLED),
-    );
-    put(
-        &mut bytes,
-        h + 24,
-        enc_cbz_wn(16, (h + 24) as u64, fallback as u64),
-    );
-    put(&mut bytes, h + 28, enc_movz_xn(16, lo, 0));
-    put(&mut bytes, h + 32, enc_movk_xn(16, mid, 1));
-    put(&mut bytes, h + 36, enc_movk_xn(16, hi, 2));
-    put(
-        &mut bytes,
-        h + 40,
-        enc_ldr_wt_xn(16, 16, IDENTITY_OFF_SEEK_GATE),
-    );
-    put(
-        &mut bytes,
-        h + 44,
-        enc_cbz_wn(16, (h + 44) as u64, fallback as u64),
-    );
-    put(&mut bytes, h + 48, enc_movz_xn(16, lo, 0));
-    put(&mut bytes, h + 52, enc_movk_xn(16, mid, 1));
-    put(&mut bytes, h + 56, enc_movk_xn(16, hi, 2));
-    put(
-        &mut bytes,
-        h + 60,
-        enc_ldr_wt_xn(16, 16, IDENTITY_OFF_SEEK_FD),
-    );
-    put(&mut bytes, h + 64, enc_cmp_w0_w16());
-    put(
-        &mut bytes,
-        h + 68,
-        enc_bne((h + 68) as u64, fallback as u64),
-    );
-
-    put(&mut bytes, h + 72, enc_movz_xn(16, lo, 0));
-    put(&mut bytes, h + 76, enc_movk_xn(16, mid, 1));
-    put(&mut bytes, h + 80, enc_movk_xn(16, hi, 2));
-    put(
-        &mut bytes,
-        h + 84,
-        enc_str_xt_xn(1, 16, IDENTITY_OFF_SEEK_OFFSET),
-    );
-    put(
-        &mut bytes,
-        h + 88,
-        enc_ldr_xt_xn(16, 16, IDENTITY_OFF_SHIM_SYSCALLS),
-    );
-    put(&mut bytes, h + 92, enc_add_xd_xn_imm(16, 16, 1));
-    put(&mut bytes, h + 96, enc_movz_xn(0, lo, 0));
-    put(&mut bytes, h + 100, enc_movk_xn(0, mid, 1));
-    put(&mut bytes, h + 104, enc_movk_xn(0, hi, 2));
-    put(
-        &mut bytes,
-        h + 108,
-        enc_str_xt_xn(16, 0, IDENTITY_OFF_SHIM_SYSCALLS),
-    );
-    put(&mut bytes, h + 112, enc_movz_x0(0, 0));
-    put(&mut bytes, h + 116, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
-    put(&mut bytes, h + 120, AARCH64_ERET_OPCODE);
-
-    put(&mut bytes, fallback, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
-    put(
-        &mut bytes,
-        fallback + 4,
-        enc_b((fallback + 4) as u64, fallthrough as u64),
-    );
-
     if fd_ceiling {
         write_fstat_ceiling_handler(&mut bytes, fstat_handler, fallthrough, true);
     }
@@ -4448,7 +4347,7 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
         if fd_ceiling {
             fstat_handler + FSTAT_CEILING_COUNTED_HANDLER_LEN
         } else {
-            lseek_handler + LSEEK_HANDLER_LEN
+            gettid_handler + GETTID_HANDLER_LEN
         } <= MAILBOX_HANDLER_OFFSET,
         "shim handlers overrun into the mailbox handler region"
     );
@@ -4753,7 +4652,7 @@ pub fn el1_vectors_bytes_mailbox_configured(
     let mailbox_entry = if identity_fast_path {
         const ESR_GUARD_LEN: usize = 6 * 4;
         let ceiling_syscalls = if fd_ceiling { 2 } else { 0 };
-        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 2 + ceiling_syscalls) * 8
+        dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1 + ceiling_syscalls) * 8
     } else {
         dispatch
     };
@@ -5241,7 +5140,7 @@ pub fn el1_vectors_bytes_mailbox_clock(identity_fast_path: bool, fd_ceiling: boo
         const ESR_GUARD_LEN: usize = 6 * 4;
         let ceiling_syscalls = if fd_ceiling { 2 } else { 0 };
         let mailbox_entry =
-            dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 2 + ceiling_syscalls) * 8;
+            dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 1 + ceiling_syscalls) * 8;
         el1_clock::install(&mut bytes, mailbox_entry);
     }
     bytes
@@ -7575,7 +7474,6 @@ mod el1_shim_tests {
         );
         let esr_fallthrough = decode_bne(rd_u32(&bytes, pc + 20), pc + 20).expect("ESR guard b.ne");
         pc += 24;
-        let mut lseek_seen = false;
         loop {
             let op = rd_u32(&bytes, pc);
             if op == HVC2 {
@@ -7594,11 +7492,6 @@ mod el1_shim_tests {
                 .unwrap_or_else(|| panic!("expected `cmp x8,#n` at {pc:#x}, got {op:#010x}"));
             let target = decode_beq(rd_u32(&bytes, pc + 4), pc + 4)
                 .unwrap_or_else(|| panic!("expected `b.eq` at {:#x}", pc + 4));
-            if nr == LSEEK_NR {
-                lseek_seen = true;
-                pc += 8;
-                continue;
-            }
             // Each handler starts with the enabled guard, using x0 only after
             // the syscall number has matched. This keeps the non-intercepted
             // path from perturbing any guest register.
@@ -7703,10 +7596,6 @@ mod el1_shim_tests {
             sysreg_seen,
             vec![GETTID_NR],
             "gettid must be serviced via a CONTEXTIDR_EL1 read"
-        );
-        assert!(
-            lseek_seen,
-            "lseek must be intercepted in the shim dispatcher"
         );
     }
 

@@ -33,13 +33,6 @@ pub struct OpenAtArgs<'a> {
 }
 
 impl<'a> FsView<'a> {
-    pub(in crate::dispatch) fn maybe_grant_seek_authority<M: CurrentMmMemory>(
-        &self,
-        _cx: &mut SyscallCtx<'_, M>,
-        _outcome: &DispatchOutcome,
-    ) {
-    }
-
     pub(in crate::dispatch) fn maybe_delegate_opened_file(&self, outcome: &DispatchOutcome) {
         if let DispatchOutcome::Returned { value, .. } = *outcome {
             let fd = value as i32;
@@ -78,7 +71,6 @@ impl<'a> FsView<'a> {
             },
             cx.reporter,
         )?;
-        self.maybe_grant_seek_authority(cx, &outcome);
         self.maybe_delegate_opened_file(&outcome);
         Ok(outcome)
     }
@@ -2164,7 +2156,6 @@ impl<'a> FsView<'a> {
                 },
                 cx.reporter,
             )?;
-            this.maybe_grant_seek_authority(cx, &outcome);
             this.maybe_delegate_opened_file(&outcome);
             Ok(outcome)
 
