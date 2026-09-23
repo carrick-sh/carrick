@@ -2454,10 +2454,32 @@
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "function": "lock_delegated_file",
       "ordinal_in_function": 1,
-      "fingerprint": "2027658207bdac8885db2961e44e2bdfac0e2925f40e4ffc8b31f8e8525e8b6e",
+      "fingerprint": "486384996373a73b9350c42907e2707ac5ac46535a8f8a7f8606d40434bf6112",
       "verdict": "carrier_fault",
       "failure_domain": "el1_delegation",
       "rationale": "Host timed out spinning on delegated file lock held by EL1, indicating guest corruption, protocol violation, or deadlock.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/resources.rs",
+      "function": "update_captured_file_table",
+      "ordinal_in_function": 1,
+      "fingerprint": "400279a0f79d7d18c01d13c56c561eca43fde528fa88552b93c47ed1dfcfeafb",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::file_table_lease",
+      "rationale": "Attempt to update captured file table outside an active resource scope.",
+      "sink": "fatal",
+      "domain": "dispatch::file_table_lease"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "recall_locked",
+      "ordinal_in_function": 1,
+      "fingerprint": "90e9532a772ad823a17f30b269cf69017619fdda4e0f83320919fc5f7b628a2d",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Recall called with null EL1 region pointer indicating uninitialized or dropped region.",
       "sink": "fatal",
       "domain": "el1_delegation"
     }

@@ -58,6 +58,7 @@ ASSEMBLY_BOUNDARIES = frozenset(
         PurePosixPath("crates/carrick-vmm-kvm/src/guest_setup.rs"),
         PurePosixPath("crates/carrick-vmm-kvm/src/kvm.rs"),
         PurePosixPath("crates/carrick-el1/src/file.rs"),
+        PurePosixPath("crates/carrick-el1/src/entry.rs"),
     }
 )
 

@@ -740,7 +740,7 @@
     {
       "kind": "env_var_os",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "delegate::CARRICK_EL1",
+      "symbol": "delegate_locked::CARRICK_EL1",
       "fingerprint": "579801ddcfcc6665984c1e49d675aad4d9096e8ef461f019f0de8ac034b5da76",
       "classification": "config_debug",
       "rationale": "Operator environment override to disable in-guest EL1 regular file delegation."
@@ -1540,6 +1540,54 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "DELEGATED_HANDLE_INODES",
+      "fingerprint": "dfd33358b1c280b6d5346d0783450791db8cd7839c1e50855b9e3b252dfdf532",
+      "classification": "carrier_infra",
+      "rationale": "Mapping from allocated EL1 delegation handle to inode number for targeted recall."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "DELEGATED_INODES",
+      "fingerprint": "32051133e34a16992b329c334e1db82ffbe35ffe90a3898e41ab33f96112ed74",
+      "classification": "carrier_infra",
+      "rationale": "Registry of active delegated inode numbers used for fast O(1) recall checks."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "DELEGATED_ROOTFS",
+      "fingerprint": "6342d41ccbbb3aa5dd65eed4d44c6420928e9be1ea2b305c09248879edb0f96b",
+      "classification": "carrier_infra",
+      "rationale": "Weak rootfs reference used to resolve paths for delegated file eligibility checks."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "HAS_DELEGATED_FILES",
+      "fingerprint": "ed871e2665b9e1bfb44f46d116ec87dd8874a4ccc5f963b5e8d7f97c31c39a85",
+      "classification": "carrier_infra",
+      "rationale": "Atomic boolean flag indicating if any files are currently delegated to EL1."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "HOOK_INIT",
+      "fingerprint": "0c8710e299e4f7f9d830c6634e494ce636a5aae4610b9bddbc09c28cd503468e",
+      "classification": "carrier_infra",
+      "rationale": "Once cell ensuring one-time registration of the VFS inode recall hook."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "NEXT_INCARNATION",
+      "fingerprint": "d61fa36f4ea30df3c347972b3d7041a2f1df505a9b50fa254c7cb47195314b8c",
+      "classification": "monotonic_allocator",
+      "rationale": "Monotonic counter allocating generation numbers for delegated file incarnations."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "symbol": "tests::TEST_LOCK",
       "fingerprint": "b45f2e0792f4c7c840555bdf52882bf567b1f7f35998d77b3e2084e080d8479d",
       "classification": "test_only",
@@ -2256,6 +2304,14 @@
       "fingerprint": "be74cb5b68663042ef31d41c120e4754c786d129fd9d3a7eafd4dbea60560ea6",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static reflink_or_copy_file::FALLBACK_FLAGGED in crates/carrick-runtime/src/layer_cache.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vfs/src/vfs/dentry.rs",
+      "symbol": "INODE_RECALL_HOOK",
+      "fingerprint": "3c401f770c60cb149ca0f6943ec323e6a8fd8843c8521e36c603c5582d702ec6",
+      "classification": "carrier_infra",
+      "rationale": "Hook callback invoked by VFS dentry/inode mutation to recall active EL1 delegations."
     },
     {
       "kind": "static",

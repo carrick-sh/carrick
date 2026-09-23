@@ -1460,6 +1460,8 @@ where
             if let Some(slot) = engine.mailbox_slot() {
                 original_args.0[0] = carrick_kernel::el1_delegation::get_orig_arg0(slot);
             }
+            let mut request = request;
+            request.args = original_args;
             let syscall = PreparedSyscall {
                 original_args,
                 request,

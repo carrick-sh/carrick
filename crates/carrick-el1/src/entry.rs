@@ -56,6 +56,13 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
         carrick_el1_abi::PANIC_SENTINEL,
         core::sync::atomic::Ordering::Relaxed,
     );
+    unsafe {
+        core::arch::asm!(
+            "mov x0, {code}",
+            "hvc #3",
+            code = in(reg) carrick_el1_abi::PANIC_SENTINEL,
+        );
+    }
     loop {
         core::hint::spin_loop();
     }

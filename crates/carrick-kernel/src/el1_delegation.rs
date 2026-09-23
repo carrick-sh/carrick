@@ -402,6 +402,9 @@ pub(crate) fn delegate_locked(
             if unsafe { libc::fstat(host_fd.raw(), &mut st) } != 0 {
                 return Err(NotEligible::IoError);
             }
+            if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+                return Err(NotEligible::NotRegularFile);
+            }
             if st.st_size < 0 || (st.st_size as u64) > DELEGATED_FILE_MAX_SIZE {
                 return Err(NotEligible::FileTooLarge);
             }
