@@ -375,7 +375,8 @@ pub(crate) fn delegate_locked(
         LinuxOpenFlags::APPEND
             | LinuxOpenFlags::DIRECT
             | LinuxOpenFlags::SYNC
-            | LinuxOpenFlags::DSYNC,
+            | LinuxOpenFlags::DSYNC
+            | LinuxOpenFlags::PATH,
     ) {
         return Err(NotEligible::UnsupportedFlags);
     }
@@ -2031,6 +2032,25 @@ mod tests {
             assert!(file.is_locked());
             file.unlock();
             handle.join().unwrap();
+        }
+
+        #[test]
+        fn test_delegate_rejects_o_path() {
+            let _region = TestEl1Region::new();
+            let dispatcher = crate::dispatch::SyscallDispatcher::new();
+            let ctx = dispatcher.capture_one_task_context().unwrap();
+            let table = ctx.task().leader_file_table().unwrap();
+            let table_id = table.id();
+
+            let fd = open_path_for_test(
+                &dispatcher,
+                &ctx,
+                "/test_o_path.txt",
+                carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_RDWR | carrick_abi::LINUX_O_PATH,
+            );
+            let open_file = dispatcher.open_file(fd).unwrap();
+            let err = delegate(&open_file, table_id, fd, dispatcher.fs(), None, None).unwrap_err();
+            assert!(matches!(err, NotEligible::UnsupportedFlags));
         }
     }
 }
