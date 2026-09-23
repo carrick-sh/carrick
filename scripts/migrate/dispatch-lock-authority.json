@@ -157,7 +157,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/fs/open.rs::FsView::open_at_path_string::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/fs/open.rs",
-      "line": 190,
+      "line": 188,
       "item": "FsView::open_at_path_string",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -166,7 +166,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/fs/open.rs::FsView::try_vfs_open::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/fs/open.rs",
-      "line": 1406,
+      "line": 1404,
       "item": "FsView::try_vfs_open",
       "category": "proc",
       "expression": ".proc.lock()",
