@@ -418,6 +418,11 @@ pub(crate) fn delegate_locked(
         + EL1_CACHE_OFFSET as usize
         + (handle as usize - 1) * DELEGATED_FILE_MAX_SIZE as usize) as *mut u8;
 
+    // B4: Zero-fill the entire cache slot so handle reuse never leaks a previous file's bytes.
+    unsafe {
+        std::ptr::write_bytes(cache_ptr, 0, DELEGATED_FILE_MAX_SIZE as usize);
+    }
+
     if size > 0 {
         match &*open {
             OpenDescription::HostFile { host_fd, .. } => {
@@ -1224,5 +1229,66 @@ mod tests {
             "Process A must be recalled when Process B stats the file"
         );
         assert_eq!(stat_rec.size, 1000, "stat must see extended size from EL1");
+    }
+
+    #[test]
+    fn test_pq_handle_reuse_cache_pages_zeroed() {
+        let _region = TestEl1Region::new();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            1,
+            crate::thread::ThreadId::synthetic_for_tests(1),
+            "test-pq-zero".to_owned(),
+        )
+        .expect("root bootstrap");
+        let ctx = crate::kernel::Kernel::bootstrap_root(bootstrap)
+            .expect("root kernel")
+            .1;
+        let table = ctx.task().leader_file_table().unwrap();
+        let table_id = table.id();
+
+        // 1. Create file P (100 KiB) with 0xAA
+        let file_p_path = scratch.path().join("file_p.txt");
+        let p_data = vec![0xAAu8; 100 * 1024];
+        std::fs::write(&file_p_path, &p_data).unwrap();
+
+        let fd_p = open_path_for_test(&dispatcher, &ctx, "/file_p.txt", carrick_abi::LINUX_O_RDWR);
+        let open_p = dispatcher.open_file(fd_p).unwrap();
+        let handle_p = delegate(&open_p, table_id, fd_p, dispatcher.fs(), None).unwrap();
+        assert_eq!(handle_p, 1);
+
+        // Recall P -> frees handle 1
+        recall(&open_p.description);
+        assert_eq!(open_p.description.delegation_handle(), 0);
+
+        // 2. Create file Q (10 bytes) with 0xBB
+        let file_q_path = scratch.path().join("file_q.txt");
+        let q_data = vec![0xBBu8; 10];
+        std::fs::write(&file_q_path, &q_data).unwrap();
+
+        let fd_q = open_path_for_test(&dispatcher, &ctx, "/file_q.txt", carrick_abi::LINUX_O_RDWR);
+        let open_q = dispatcher.open_file(fd_q).unwrap();
+        let handle_q = delegate(&open_q, table_id, fd_q, dispatcher.fs(), None).unwrap();
+        assert_eq!(handle_q, 1, "Handle 1 should be reused");
+
+        let region_ptr = get_el1_region_host_ptr();
+        let cache_ptr = (region_ptr
+            + EL1_CACHE_OFFSET as usize
+            + (handle_q as usize - 1) * DELEGATED_FILE_MAX_SIZE as usize)
+            as *mut u8;
+
+        // Verify cache beyond 10 bytes is zeroed!
+        for i in 10..8000 {
+            assert_eq!(
+                unsafe { *cache_ptr.add(i) },
+                0,
+                "offset {i} in reused handle cache was not zeroed upon delegate"
+            );
+        }
     }
 }
