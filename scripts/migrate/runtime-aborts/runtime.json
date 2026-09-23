@@ -4,6 +4,17 @@
   "typed_error_debt_ceiling": 5,
   "rows": [
     {
+      "file": "crates/carrick-kernel/src/dispatch/mem/madvise.rs",
+      "function": "MemView<'a>::madvise",
+      "ordinal_in_function": 1,
+      "fingerprint": "ea27d2f7ad99bf3d51c1875e26bfc550ee06bed965de2515d75a62a440555b94",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::anonymous_discard",
+      "rationale": "MADV_DONTNEED on a private anonymous segment asked the backing to discard and repoint pages and the backing reported an indeterminate publication state: it can no longer say whether the stage-1, stage-2 and frame-inventory transaction rolled back or committed. Returning ENOMEM would let the guest keep running on pages whose residency and owner generation are unknown, so the carrier stops rather than serve either a stale or a zeroed page as if the discard had a definite outcome.",
+      "sink": "fatal",
+      "domain": "dispatch::anonymous_discard"
+    },
+    {
       "file": "crates/carrick-runtime/src/carrier.rs",
       "function": "CarrierKernelActivation::commit_with_services",
       "ordinal_in_function": 1,
@@ -62,7 +73,7 @@
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
       "function": "OpenDescription::stat_source",
       "ordinal_in_function": 1,
-      "fingerprint": "0ef8b864ddfaca9eb8078b65aab8f5c13ca97793c5f173ea00d4a147fe5c3cb7",
+      "fingerprint": "f0d9164d551c945910f97ed47fa7b1728ba395e37be2cfab8aec8901ad13b2f3",
       "verdict": "typed_error_debt",
       "failure_domain": "dispatch::fd_table",
       "rationale": "Closed file description encountered in stat_source represents a normal close observation and should lower to EBADF instead of aborting.",
