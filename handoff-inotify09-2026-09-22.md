@@ -126,9 +126,19 @@ Do not quietly replace these failures with a later passing focused test:
 4. The private-file Linux fixture's unqualified 16-KiB mmap alignment assumption
    is still a fixture problem. It is not passing differential evidence.
 5. Earlier broad Clippy found six `manual_is_multiple_of` diagnostics in
-   `carrick-aarch64`; subsequent scoped checks used `--no-deps`. Whole-workspace
-   CI is not green by implication.
-6. **Post-merge governance is not green.** The position reconciler updated only
+   `carrick-aarch64`; subsequent scoped checks used `--no-deps`. FIXED in
+   `9c6daa54a` (seven sites); whole-workspace `cargo clippy --all-targets
+   -D warnings` is clean and nothing was masked behind them.
+6. **Post-merge governance is not green.** RESOLVED by hand review, not a
+   re-bless, in `64a9259b2`..`9a34a1cba`: the four test `asm!` copies moved
+   behind `vcpu_loop/native_probe.rs` and the gateway instrument was added to
+   both assembly allowlists; the `madvise` abort and eight `hvf::code_content`
+   fatals were classified carrier faults; twenty test-only global-state rows
+   and the K1 site diff were reviewed; the census snapshot now derives its
+   paths from `cargo metadata` so the experiment dev-dependency resolves;
+   positions were reconciled on the clean tree and the K1 taxonomy rebound
+   (nine rustfmt-split rows are census artefacts). Original finding follows.
+   The position reconciler updated only
    seven existing dispatch-lock line numbers. It refused the new `madvise`
    abort site and K1 category-count changes (mapping 1109→1117,
    description_guard 210→203, epoll 419→421); these need review, not a blind
