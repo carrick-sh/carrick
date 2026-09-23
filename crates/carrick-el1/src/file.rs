@@ -7,8 +7,10 @@ use carrick_el1_abi::{
 use core::sync::atomic::Ordering;
 
 #[cfg(test)]
-pub static SIMULATE_COPY_FAULT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+std::thread_local! {
+    pub static SIMULATE_COPY_FAULT: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+}
 
 /// Copy `len` bytes from `src` to `dest` (user virtual address), guarded by EL1 exception fixup.
 /// Returns `true` if copy succeeded, `false` if a fault occurred and was intercepted by fixup.
@@ -61,7 +63,7 @@ pub(crate) unsafe fn copy_to_user_guarded(
     {
         let _ = cur_task;
         #[cfg(test)]
-        if SIMULATE_COPY_FAULT.load(Ordering::Relaxed) {
+        if SIMULATE_COPY_FAULT.with(|f| f.load(Ordering::Relaxed)) {
             return false;
         }
         unsafe {
@@ -122,7 +124,7 @@ pub(crate) unsafe fn copy_from_user_guarded(
     {
         let _ = cur_task;
         #[cfg(test)]
-        if SIMULATE_COPY_FAULT.load(Ordering::Relaxed) {
+        if SIMULATE_COPY_FAULT.with(|f| f.load(Ordering::Relaxed)) {
             return false;
         }
         unsafe {
@@ -743,7 +745,7 @@ mod tests {
         };
 
         // When SIMULATE_COPY_FAULT is set (simulating concurrent unmap during copy):
-        SIMULATE_COPY_FAULT.store(true, Ordering::Relaxed);
+        SIMULATE_COPY_FAULT.with(|f| f.store(true, Ordering::Relaxed));
 
         // Read must return Err(Action::Forward) and leave offset unchanged at 0
         assert_eq!(
@@ -778,7 +780,7 @@ mod tests {
         assert_eq!(file.dirty_mask.load(Ordering::Relaxed), 0);
 
         // Clear fault simulation
-        SIMULATE_COPY_FAULT.store(false, Ordering::Relaxed);
+        SIMULATE_COPY_FAULT.with(|f| f.store(false, Ordering::Relaxed));
 
         // Now read and write succeed
         let n = el1_read(&file, &task, cache.as_ptr(), user_va, 50, &oracle).unwrap();

@@ -3923,7 +3923,7 @@ fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
     emit(bytes, &mut cursor, 0xD34E_FE10); // lsr x16, x16, #14 (slot index 0..255)
 
     // 5. Load fixup_pc from CurrentTask[slot]:
-    //    task_addr = EL1_CURRENT_TASKS_BASE + (slot << 5)
+    //    task_addr = EL1_CURRENT_TASKS_BASE + (slot << 6)
     let tasks_base = carrick_el1_abi::EL1_CURRENT_TASKS_BASE;
     emit(
         bytes,
@@ -3935,13 +3935,13 @@ fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
         &mut cursor,
         enc_movk_xn(17, ((tasks_base >> 32) & 0xFFFF) as u16, 2),
     );
-    emit(bytes, &mut cursor, 0x8B10_1631); // add x17, x17, x16, lsl #5
-    emit(bytes, &mut cursor, enc_ldr_xt_xn(16, 17, 16)); // ldr x16, [x17, #16] (fixup_pc)
+    emit(bytes, &mut cursor, 0x8B10_1A31); // add x17, x17, x16, lsl #6 (CurrentTask[slot])
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(16, 17, 24)); // ldr x16, [x17, #24] (fixup_pc)
     let cbz_fail = cursor;
     emit(bytes, &mut cursor, 0); // cbz x16, fail_loud
 
     // 6. Fixup armed: clear fixup_pc and redirect ELR_EL1
-    emit(bytes, &mut cursor, enc_str_xt_xn(31, 17, 16)); // str xzr, [x17, #16]
+    emit(bytes, &mut cursor, enc_str_xt_xn(31, 17, 24)); // str xzr, [x17, #24]
     emit(bytes, &mut cursor, 0xD518_4030); // msr elr_el1, x16
 
     // 7. Restore scratch registers and resume at fixup_pc via eret
@@ -4603,8 +4603,8 @@ fn write_el1_vector_hook(bytes: &mut [u8], hook_offset: usize, mailbox_capture: 
         &mut cursor,
         enc_movk_xn(1, ((tasks_base >> 32) & 0xFFFF) as u16, 2),
     );
-    emit(bytes, &mut cursor, 0x8B11_1421); // add x1, x1, x17, lsl #5 (CurrentTask[slot])
-    emit(bytes, &mut cursor, 0x9100_6021); // add x1, x1, #24 (&pending_host_work)
+    emit(bytes, &mut cursor, 0x8B11_1821); // add x1, x1, x17, lsl #6 (CurrentTask[slot])
+    emit(bytes, &mut cursor, 0x9100_A021); // add x1, x1, #40 (&pending_host_work)
     emit(bytes, &mut cursor, enc_ldar_wt_xn(2, 1)); // ldar w2, [x1]
     let cbz_skip = cursor;
     emit(bytes, &mut cursor, 0); // cbz w2, skip_label (placeholder)

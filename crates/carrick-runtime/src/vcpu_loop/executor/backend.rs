@@ -709,10 +709,12 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost barrier engine".into()))?
             .complete_task_load_barrier()?;
+        let task_id = task.thread_key().tid.raw() as u64;
         let generation = task.generation().raw();
         let file_table = task.lease().file_table_id().map_or(0, |id| id.raw());
         carrick_kernel::el1_delegation::publish_current_task(
             self.mailbox_slot,
+            task_id,
             generation,
             file_table,
         );

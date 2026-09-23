@@ -77,6 +77,7 @@ where
     let nr = frame.x[8] as usize;
     match nr {
         62 | 63 | 64 | 67 | 68 => {
+            let orig_x0 = frame.x[0];
             if let Some(res) = try_serve_file_syscall(
                 frame,
                 nr,
@@ -89,12 +90,12 @@ where
                 if nr < 512 {
                     counters.served[nr].fetch_add(1, Ordering::Relaxed);
                 }
-                // Exit check: before returning to user, check pending_host_work.
-                if let Some(task) = cur_task
-                    && task.has_pending_host_work()
-                {
-                    task.served_with_work.store(1, Ordering::Release);
-                    return Action::ServedWithWork;
+                if let Some(task) = cur_task {
+                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                    if task.has_pending_host_work() {
+                        task.served_with_work.store(1, Ordering::Release);
+                        return Action::ServedWithWork;
+                    }
                 }
                 return Action::Served;
             }
@@ -126,7 +127,7 @@ where
         return None;
     }
     let fd = frame.x[0] as i32;
-    let handle = fd_map_lookup(fd_map, file_table, fd)?;
+    let (handle, slot_idx) = fd_map_lookup(fd_map, file_table, fd)?;
     if handle == 0 || handle as usize > MAX_DELEGATED_FILES {
         return None;
     }
@@ -137,11 +138,21 @@ where
     if !file.try_lock() {
         return None;
     }
-    if file.state.load(Ordering::Relaxed) != DELEGATED_STATE_GUEST {
-        file.unlock();
-        return None;
-    }
-    if file.generation.load(Ordering::Relaxed) != cur_task.generation.load(Ordering::Relaxed) {
+    // Re-validate fd_map slot and object incarnation after taking the lock
+    let map_slot = fd_map.get(slot_idx)?;
+    let slot_handle = map_slot.handle.load(Ordering::Acquire);
+    let slot_fd = map_slot.fd.load(Ordering::Relaxed);
+    let slot_file_table = map_slot.file_table.load(Ordering::Relaxed);
+    let slot_incarnation = map_slot.incarnation.load(Ordering::Relaxed);
+    let file_incarnation = file.generation.load(Ordering::Acquire);
+    let file_state = file.state.load(Ordering::Acquire);
+
+    if slot_handle != handle
+        || slot_fd != fd as u32
+        || slot_file_table != file_table
+        || slot_incarnation != file_incarnation
+        || file_state != DELEGATED_STATE_GUEST
+    {
         file.unlock();
         return None;
     }
@@ -242,16 +253,16 @@ mod tests {
     fn test_dispatch_syscall_with_regions_served() {
         let counters = Counters::default();
         let tasks = [CurrentTask::new()];
-        tasks[0].set(1, 100); // slot 0: generation 1, file_table 100
+        tasks[0].set(1, 1, 100); // slot 0: task_id 1, generation 1, file_table 100
 
         let fd_map = [FdMapSlot::new()];
-        fd_map[0].set(100, 3, 1); // file_table 100, fd 3 -> handle 1
+        fd_map[0].set(100, 3, 1, 42); // file_table 100, fd 3 -> handle 1, incarnation 42
 
         let object_table = [DelegatedFile::new()];
         object_table[0]
             .state
             .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        object_table[0].generation.store(1, Ordering::Relaxed);
+        object_table[0].generation.store(42, Ordering::Relaxed);
         object_table[0].size.store(100, Ordering::Relaxed);
         object_table[0].offset.store(10, Ordering::Relaxed);
         object_table[0]
@@ -283,17 +294,17 @@ mod tests {
     fn test_dispatch_syscall_with_regions_entry_pending_work() {
         let counters = Counters::default();
         let tasks = [CurrentTask::new()];
-        tasks[0].set(1, 100);
+        tasks[0].set(1, 1, 100);
         tasks[0].mark_pending_host_work(); // pending host work set at entry
 
         let fd_map = [FdMapSlot::new()];
-        fd_map[0].set(100, 3, 1);
+        fd_map[0].set(100, 3, 1, 42);
 
         let object_table = [DelegatedFile::new()];
         object_table[0]
             .state
             .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        object_table[0].generation.store(1, Ordering::Relaxed);
+        object_table[0].generation.store(42, Ordering::Relaxed);
         object_table[0].size.store(100, Ordering::Relaxed);
         object_table[0].offset.store(10, Ordering::Relaxed);
 
@@ -323,16 +334,16 @@ mod tests {
     fn test_dispatch_syscall_with_regions_exit_pending_work() {
         let counters = Counters::default();
         let tasks = [CurrentTask::new()];
-        tasks[0].set(1, 100);
+        tasks[0].set(1, 1, 100);
 
         let fd_map = [FdMapSlot::new()];
-        fd_map[0].set(100, 3, 1);
+        fd_map[0].set(100, 3, 1, 42);
 
         let object_table = [DelegatedFile::new()];
         object_table[0]
             .state
             .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        object_table[0].generation.store(1, Ordering::Relaxed);
+        object_table[0].generation.store(42, Ordering::Relaxed);
         object_table[0].size.store(100, Ordering::Relaxed);
         object_table[0].offset.store(10, Ordering::Relaxed);
         object_table[0]
@@ -348,9 +359,7 @@ mod tests {
         // Simulate host marking pending work while/right before syscall exit
         tasks[0].mark_pending_host_work();
 
-        // Note: entry check would forward if pending_host_work is already set, so
-        // to test the exit check specifically, we test that when an operation completes
-        // and pending_host_work is set, ServedWithWork is returned:
+        // At entry, pending_host_work is already set, so it forwards
         let action = dispatch_syscall_with_regions(
             &mut frame,
             &counters,
@@ -359,7 +368,6 @@ mod tests {
             &object_table,
             |_| core::ptr::null_mut(),
         );
-        // At entry, pending_host_work is already set, so it forwards
         assert_eq!(action, Action::Forward);
 
         // Now test exit check: pending_host_work starts clear, then gets set during operation
@@ -376,17 +384,12 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
-            |_| {
-                // If this were a read/write cache lookup, host work could be marked here:
-                core::ptr::null_mut()
-            },
+            |_| core::ptr::null_mut(),
         );
-        // Without work pending, it is served normally
         assert_eq!(action2, Action::Served);
         assert_eq!(frame2.x[0], 50);
 
         // Exit check test: operation succeeds, but host marked pending work during the operation.
-        // We simulate this by having cache_lookup mark pending host work before try_serve completes.
         tasks[0].clear_pending_host_work();
         tasks[0].served_with_work.store(0, Ordering::Relaxed);
         let mut buf = [0u8; 16];
@@ -421,5 +424,91 @@ mod tests {
         assert_eq!(frame_write.x[0], 16);
         assert_eq!(tasks[0].served_with_work.load(Ordering::Relaxed), 1);
         assert_eq!(counters.served[64].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_stale_handle_interleaving_forwards() {
+        let counters = Counters::default();
+        let tasks = [CurrentTask::new()];
+        tasks[0].set(1, 1, 100); // task_id 1, generation 1, file_table 100
+
+        let fd_map = [FdMapSlot::new()];
+        // Initially: table 100, fd 3 -> handle 1, incarnation 10
+        fd_map[0].set(100, 3, 1, 10);
+
+        let object_table = [DelegatedFile::new()];
+        // Suppose between fd_map_lookup and try_lock / re-validation,
+        // the handle is recalled, freed, and re-delegated to another file with incarnation 11!
+        object_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        object_table[0].generation.store(11, Ordering::Relaxed); // new incarnation!
+        object_table[0].size.store(100, Ordering::Relaxed);
+        object_table[0].offset.store(10, Ordering::Relaxed);
+        object_table[0]
+            .flags
+            .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
+
+        let mut frame = TrapFrame::default();
+        frame.x[0] = 3; // fd 3
+        frame.x[1] = 50;
+        frame.x[2] = 0;
+        frame.x[8] = 62; // lseek
+
+        let action = dispatch_syscall_with_regions(
+            &mut frame,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            |_| core::ptr::null_mut(),
+        );
+
+        // Must detect incarnation mismatch and FORWARD, not serve against the new object!
+        assert_eq!(action, Action::Forward);
+        assert_eq!(counters.served[62].load(Ordering::Relaxed), 0);
+        assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_thread_sleep_survives_task_generation_bump() {
+        let counters = Counters::default();
+        let tasks = [CurrentTask::new()];
+        // Task has been switched out multiple times, so its scheduling generation is 5
+        tasks[0].set(1, 5, 100);
+
+        let fd_map = [FdMapSlot::new()];
+        fd_map[0].set(100, 3, 1, 42); // incarnation 42
+
+        let object_table = [DelegatedFile::new()];
+        object_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        object_table[0].generation.store(42, Ordering::Relaxed); // object incarnation 42
+        object_table[0].size.store(100, Ordering::Relaxed);
+        object_table[0].offset.store(10, Ordering::Relaxed);
+        object_table[0]
+            .flags
+            .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
+
+        let mut frame = TrapFrame::default();
+        frame.x[0] = 3;
+        frame.x[1] = 50;
+        frame.x[2] = 0;
+        frame.x[8] = 62; // lseek
+
+        // Syscall must succeed even though task.generation (5) != object.generation (42)
+        let action = dispatch_syscall_with_regions(
+            &mut frame,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            |_| core::ptr::null_mut(),
+        );
+
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame.x[0], 50);
+        assert_eq!(counters.served[62].load(Ordering::Relaxed), 1);
     }
 }
