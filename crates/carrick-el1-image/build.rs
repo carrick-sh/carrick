@@ -78,7 +78,7 @@ fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) {
         }
         let mnemonic = parts[0];
         let operands = if parts.len() > 1 {
-            &code_part[mnemonic.len()..].trim()
+            code_part[mnemonic.len()..].trim()
         } else {
             ""
         };
@@ -119,13 +119,12 @@ fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) {
             // Check if reg_base is q0..q31, v0..v31, d0..d31, s0..s31, h0..h31, b0..b31
             if reg_base.len() >= 2 && reg_base.len() <= 3 {
                 let first = reg_base.as_bytes()[0].to_ascii_lowercase();
-                if matches!(first, b'q' | b'v' | b'd' | b's' | b'h' | b'b') {
-                    if let Ok(reg_num) = reg_base[1..].parse::<u32>() {
-                        if reg_num <= 31 {
-                            is_violation = true;
-                            break;
-                        }
-                    }
+                if matches!(first, b'q' | b'v' | b'd' | b's' | b'h' | b'b')
+                    && let Ok(reg_num) = reg_base[1..].parse::<u32>()
+                    && reg_num <= 31
+                {
+                    is_violation = true;
+                    break;
                 }
             }
         }

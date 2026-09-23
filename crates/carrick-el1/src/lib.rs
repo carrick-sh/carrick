@@ -53,25 +53,19 @@ mod tests {
     #[test]
     fn test_concurrent_dispatch_increments() {
         extern crate std;
-        use std::sync::Arc;
-        let counters = Arc::new(Counters::default());
-        let mut handles = std::vec::Vec::new();
-
-        for _ in 0..8 {
-            let counters_clone = Arc::clone(&counters);
-            handles.push(std::thread::spawn(move || {
-                let mut frame = TrapFrame::default();
-                frame.x[8] = 64; // write
-                for _ in 0..1000 {
-                    let action = dispatch_syscall(&mut frame, &counters_clone);
-                    assert_eq!(action, Action::Forward);
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
+        let counters = Counters::default();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let mut frame = TrapFrame::default();
+                    frame.x[8] = 64; // write
+                    for _ in 0..1000 {
+                        let action = dispatch_syscall(&mut frame, &counters);
+                        assert_eq!(action, Action::Forward);
+                    }
+                });
+            }
+        });
 
         assert_eq!(counters.forwarded[64].load(Ordering::Relaxed), 8000);
     }
