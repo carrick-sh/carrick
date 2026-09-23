@@ -824,6 +824,7 @@ pub struct DescriptionCommon {
     peer_cred: Mutex<Option<SocketPeerCred>>,
     socket_flows: Mutex<Option<SocketFlows>>,
     cork: Mutex<SocketCork>,
+    writeback_err: AtomicI32,
 }
 
 impl DescriptionCommon {
@@ -841,6 +842,7 @@ impl DescriptionCommon {
             peer_cred: Mutex::new(None),
             socket_flows: Mutex::new(None),
             cork: Mutex::new(SocketCork::default()),
+            writeback_err: AtomicI32::new(0),
         }
     }
 
@@ -858,6 +860,7 @@ impl DescriptionCommon {
             peer_cred: Mutex::new(None),
             socket_flows: Mutex::new(None),
             cork: Mutex::new(SocketCork::default()),
+            writeback_err: AtomicI32::new(0),
         }
     }
 
@@ -1001,6 +1004,21 @@ impl DescriptionCommon {
 
     pub(crate) fn cork(&self) -> MutexGuard<'_, SocketCork> {
         self.cork.lock()
+    }
+
+    pub(crate) fn record_writeback_error(&self, err: carrick_abi::LinuxErrno) {
+        let _ =
+            self.writeback_err
+                .compare_exchange(0, err.get(), Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_writeback_error(&self) -> Option<carrick_abi::LinuxErrno> {
+        let err = self.writeback_err.swap(0, Ordering::SeqCst);
+        if err != 0 {
+            Some(carrick_abi::LinuxErrno::new(err))
+        } else {
+            None
+        }
     }
 }
 
@@ -1307,7 +1325,7 @@ impl FileDescription {
     }
 
     pub(crate) fn retain_fd_ref(&self) {
-        crate::el1_delegation::recall_if_delegated(self);
+        let _ = crate::el1_delegation::recall_if_delegated(self);
         let _guard = self.lifecycle_transition.lock();
         let count = self.common.retain_fd_ref();
         if count == 1 {
@@ -1362,7 +1380,7 @@ impl FileDescription {
     }
 
     pub(crate) fn release_fd_ref(&self) {
-        crate::el1_delegation::recall_if_delegated(self);
+        let _ = crate::el1_delegation::recall_if_delegated(self);
         let terminal_finalizers = {
             let mut lifecycle = self.lifecycle_transition.lock();
             let count = self.common.release_fd_ref();
@@ -1389,7 +1407,7 @@ impl FileDescription {
 
     /// Acquire while an fd still owns the backing, serialized with final close.
     pub(crate) fn retain_mapping(self: &Arc<Self>) -> Option<Arc<MappedFileReference>> {
-        crate::el1_delegation::recall_if_delegated(self);
+        let _ = crate::el1_delegation::recall_if_delegated(self);
         let mut lifecycle = self.lifecycle_transition.lock();
         if self.common.fd_refs() == 0 {
             return None;
@@ -1984,7 +2002,7 @@ impl FileTable {
     pub(crate) fn for_fork_copy(id: FileTableId, parent: &Self) -> Self {
         let open_files = parent.open_files.read().clone();
         for slot in open_files.values() {
-            crate::el1_delegation::recall_if_delegated(&slot.description);
+            let _ = crate::el1_delegation::recall_if_delegated(&slot.description);
             slot.description.retain_fd_ref();
         }
         let epoll_wake_registry = Arc::clone(&parent.epoll_wake_registry);

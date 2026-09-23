@@ -323,7 +323,11 @@ impl<'a> FsView<'a> {
                     // stays in sync.
                     this.close_open_file_and_free_pty(&open_file);
                     this.note_fd_closed(fd.0);
-                    DispatchOutcome::Returned { value: 0 }
+                    if let Some(err) = open_file.description.common().take_writeback_error() {
+                        DispatchOutcome::errno(err)
+                    } else {
+                        DispatchOutcome::Returned { value: 0 }
+                    }
                 } else if is_stdio_fd(fd.0) {
                     // Guest closing its own stdio at exit: there's nothing for
                     // us to do (host fd stays open under StdioSink::Inherit so

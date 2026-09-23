@@ -1842,7 +1842,7 @@ impl crate::kernel::FileSlot {
 /// entry: `linkat(/proc/self/fd/<n>, AT_SYMLINK_FOLLOW)` must MATERIALIZE it
 /// at the target rather than hard-link a nonexistent source path, writes never
 /// sync it to the overlay, and `fstat` answers from the description itself.
-pub(super) fn is_anon_overlay_path(path: &str) -> bool {
+pub(crate) fn is_anon_overlay_path(path: &str) -> bool {
     path == "/__carrick_o_tmpfile" || path.starts_with("/memfd:")
 }
 
@@ -2962,7 +2962,7 @@ impl crate::kernel::FileDescription {
                 let mut write_guard = d.write();
                 let handle = self.delegation_handle();
                 if handle != 0 {
-                    crate::el1_delegation::recall_locked(self, &mut write_guard, handle);
+                    let _ = crate::el1_delegation::recall_locked(self, &mut write_guard, handle);
                 }
                 drop(write_guard);
                 continue;
@@ -2988,7 +2988,7 @@ impl crate::kernel::FileDescription {
             let mut write_guard = d.try_write()?;
             let handle = self.delegation_handle();
             if handle != 0 {
-                crate::el1_delegation::recall_locked(self, &mut write_guard, handle);
+                let _ = crate::el1_delegation::recall_locked(self, &mut write_guard, handle);
             }
             drop(write_guard);
             let guard = d.try_read()?;
@@ -3017,7 +3017,7 @@ impl crate::kernel::FileDescription {
             let mut guard = d.write();
             let handle = self.delegation_handle();
             if handle != 0 {
-                crate::el1_delegation::recall_locked(self, &mut guard, handle);
+                let _ = crate::el1_delegation::recall_locked(self, &mut guard, handle);
             }
             if crate::el1_delegation::has_delegated_files() {
                 if let Some(inode) = guard.inode_identity_fast() {
@@ -3041,7 +3041,7 @@ impl crate::kernel::FileDescription {
         let mut guard = d.try_write()?;
         let handle = self.delegation_handle();
         if handle != 0 {
-            crate::el1_delegation::recall_locked(self, &mut guard, handle);
+            let _ = crate::el1_delegation::recall_locked(self, &mut guard, handle);
         }
         Some(FileDescriptionWriteGuard {
             guard,

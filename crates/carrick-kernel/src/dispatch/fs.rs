@@ -2202,6 +2202,12 @@ impl<'a> FsView<'a> {
         fn fsync(this, cx, fd: Fd) {
 
             let fd: Fd = fd;
+            if let Some(open_file) = this.open_file(fd.0) {
+                let _ = crate::el1_delegation::recall_if_delegated(&open_file.description);
+                if let Some(err) = open_file.description.common().take_writeback_error() {
+                    return Ok(DispatchOutcome::errno(err));
+                }
+            }
             match this.host_file_fd_for_flush(fd.0) {
                 Ok(Some(host_fd)) => {
                     if let Err(errno) = this.with_host_wait(cx, || this.fs.host_io.flush(std::os::fd::AsFd::as_fd(&host_fd)))? {
@@ -2342,6 +2348,12 @@ impl<'a> FsView<'a> {
         fn fdatasync(this, cx, fd: Fd) {
 
             let fd: Fd = fd;
+            if let Some(open_file) = this.open_file(fd.0) {
+                let _ = crate::el1_delegation::recall_if_delegated(&open_file.description);
+                if let Some(err) = open_file.description.common().take_writeback_error() {
+                    return Ok(DispatchOutcome::errno(err));
+                }
+            }
             match this.host_file_fd_for_flush(fd.0) {
                 Ok(Some(host_fd)) => {
                     if let Err(errno) = this.with_host_wait(cx, || this.fs.host_io.flush(std::os::fd::AsFd::as_fd(&host_fd)))? {
