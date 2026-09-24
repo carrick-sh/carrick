@@ -433,11 +433,15 @@ name = "carrick-el1"
 version = "0.1.0"
 dependencies = [
  "carrick-el1-abi",
+ "carrick-inotify-core",
 ]
 
 [[package]]
 name = "carrick-el1-abi"
 version = "0.1.0"
+dependencies = [
+ "carrick-inotify-core",
+]
 
 [[package]]
 name = "carrick-el1-image"
@@ -581,6 +585,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-inotify-core"
+version = "0.1.0"
+
+[[package]]
 name = "carrick-investigation"
 version = "0.1.0"
 dependencies = [
@@ -611,6 +619,7 @@ dependencies = [
  "carrick-host",
  "carrick-host-bsd",
  "carrick-host-linux",
+ "carrick-inotify-core",
  "carrick-kernel",
  "carrick-kernel-arena",
  "carrick-mem",

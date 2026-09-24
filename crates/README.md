@@ -43,6 +43,7 @@ Platform code is selected by Cargo features. The default feature is
 | `carrick-thread` | Thread registry, private-futex park table, and fork/page-table quiesce barriers. |
 | `carrick-signal-core` | Platform-neutral pending-signal bookkeeping. |
 | `carrick-timer-core` | Platform-neutral interval/POSIX timer slot bookkeeping and timer due-time decisions. |
+| `carrick-inotify-core` | Platform-neutral inotify queue ring buffer, coalescing, and watch descriptor bookkeeping. |
 | `carrick-observability` | Platform-neutral compat-reporting support. |
 
 ## Host Primitive Layers
