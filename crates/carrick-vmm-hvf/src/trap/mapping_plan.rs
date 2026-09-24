@@ -810,10 +810,6 @@ impl HvfVmState {
             vcpu.set_sys_reg(SysReg::SP_EL0, stack_pointer)
                 .map_err(hvf_error)?;
         }
-        // Fill the vDSO vvar page so __kernel_clock_gettime can derive time from
-        // CNTVCT_EL0 in userspace. Best-effort: if the page isn't mapped (a load
-        // path without with_vdso) just skip — the guest falls back to syscalls.
-        state.populate_vdso_data_page();
         let mailbox = match &carrier {
             // Shared arena, shared allocator: the slot is unique across every
             // container's vCPUs in this VM.
@@ -823,6 +819,10 @@ impl HvfVmState {
         if pending_creation.is_some() {
             commit_pending_creation_before_vcpu_handoff(pending_creation)?;
         }
+        // Fill the vDSO vvar page so __kernel_clock_gettime can derive time from
+        // CNTVCT_EL0 in userspace. After the creation commits: host writes are
+        // admitted only against committed backing owners.
+        state.populate_vdso_data_page();
         Ok((state, vcpu.into_inner(), mailbox))
     }
 }
