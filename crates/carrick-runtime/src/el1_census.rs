@@ -357,6 +357,51 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
     out
 }
 
+/// One run's census, summarised.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RunSummary {
+    pub host_syscall_ns: u64,
+    pub process_cpu_ns: u64,
+    pub wall_ns: u64,
+    pub el1_served: u64,
+    pub host_services: u64,
+    /// The forwarded class with the most host CPU, with its CPU.
+    pub top_class: Option<(String, u64)>,
+}
+
+impl RunSummary {
+    /// Host syscall CPU as a share of carrier CPU, when carrier CPU is known.
+    pub fn syscall_share(&self) -> Option<f64> {
+        (self.process_cpu_ns > 0)
+            .then(|| self.host_syscall_ns as f64 * 100.0 / self.process_cpu_ns as f64)
+    }
+}
+
+/// Summarise one census.
+pub fn summarize(census: &Census) -> RunSummary {
+    let mut top: Option<(String, u64)> = None;
+    let mut host = 0u64;
+    let mut served = 0u64;
+    let mut services = 0u64;
+    for row in &census.rows {
+        let cpu = row.host_cpu_ns.saturating_add(row.redispatch_cpu_ns);
+        host = host.saturating_add(cpu);
+        served = served.saturating_add(row.el1_served);
+        services = services.saturating_add(row.host_services);
+        if top.as_ref().is_none_or(|(_, best)| cpu > *best) {
+            top = Some((row.name.clone(), cpu));
+        }
+    }
+    RunSummary {
+        host_syscall_ns: host,
+        process_cpu_ns: census.process_user_ns + census.process_sys_ns,
+        wall_ns: census.wall_ns,
+        el1_served: served,
+        host_services: services,
+        top_class: top,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +447,14 @@ mod tests {
         assert_eq!(agg.rows[1].host_cpu_ns, 3_000);
         let table = render_table(&agg, 10);
         assert!(table.contains("| s79 | 79 | 5 | 0.0 | 75.0% |"), "{table}");
+    }
+
+    #[test]
+    fn summarize_names_the_top_class_and_the_syscall_share() {
+        let summary = summarize(&census(vec![row(56, 10, 1_000), row(79, 5, 9_000)]));
+        assert_eq!(summary.host_syscall_ns, 10_000);
+        assert_eq!(summary.top_class, Some(("s79".to_owned(), 9_000)));
+        assert_eq!(summary.syscall_share(), Some(10_000.0 * 100.0 / 24_000.0));
     }
 
     #[test]
