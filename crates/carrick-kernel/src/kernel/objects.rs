@@ -2957,7 +2957,11 @@ impl Drop for FileTableWriteGuard<'_> {
         if !changed.is_empty() {
             // EL1 must stop serving an fd number the moment it stops referring
             // to the object it was published for.
-            crate::el1_delegation::fd_map_forget(self.table, &changed);
+            let now: Vec<(i32, Option<FileDescriptionId>)> = changed
+                .iter()
+                .map(|fd| (*fd, self.guard.get(fd).map(|slot| slot.description.id())))
+                .collect();
+            crate::el1_delegation::fd_map_forget(self.table, &now);
             self.subscriptions
                 .publish_changes(self.table, &self.guard, &changed);
         }

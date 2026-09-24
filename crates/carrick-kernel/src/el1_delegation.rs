@@ -120,7 +120,8 @@ static ACTIVE_DELEGATIONS: AtomicUsize = AtomicUsize::new(0);
 /// without scanning the map. Tied to the region it indexes.
 struct FdMapIndex {
     region: usize,
-    by_fd: HashMap<(u64, u32), usize>,
+    /// (table, fd) -> (slot, the description it was published for).
+    by_fd: HashMap<(u64, u32), (usize, crate::kernel::FileDescriptionId)>,
     by_handle: HashMap<u32, Vec<usize>>,
     free: Vec<usize>,
 }
@@ -177,12 +178,13 @@ pub(crate) fn fd_map_publish(
     region_ptr: usize,
     table: u64,
     fd: i32,
+    description: crate::kernel::FileDescriptionId,
     handle_word: u32,
     incarnation: u64,
 ) -> bool {
     with_fd_map(region_ptr, |index, slots| {
         let key = (table, fd as u32);
-        if let Some(old) = index.by_fd.remove(&key) {
+        if let Some((old, _)) = index.by_fd.remove(&key) {
             let old_handle = slots[old].handle.load(Ordering::Relaxed);
             if let Some(list) = index.by_handle.get_mut(&old_handle) {
                 list.retain(|slot| *slot != old);
@@ -193,7 +195,7 @@ pub(crate) fn fd_map_publish(
             return false;
         };
         slots[slot].set(table, fd as u32, handle_word, incarnation);
-        index.by_fd.insert(key, slot);
+        index.by_fd.insert(key, (slot, description));
         index.by_handle.entry(handle_word).or_default().push(slot);
         FD_MAP_PUBLISHED.fetch_add(1, Ordering::AcqRel);
         true
@@ -232,10 +234,16 @@ pub(crate) fn fd_map_tables_for(region_ptr: usize, handle_word: u32) -> Vec<u64>
     })
 }
 
-/// The file table changed what these fd numbers refer to: EL1 must stop
-/// serving them. One atomic load when nothing is published.
-pub(crate) fn fd_map_forget(table: FileTableId, fds: &[i32]) {
-    if FD_MAP_PUBLISHED.load(Ordering::Acquire) == 0 || fds.is_empty() {
+/// The file table mutated these fd numbers; each entry carries the
+/// description the number refers to now (`None`: closed). EL1 stops serving
+/// a number that no longer refers to the description it was published for;
+/// a flag update or re-insert of the same description keeps the entry. One
+/// atomic load when nothing is published.
+pub(crate) fn fd_map_forget(
+    table: FileTableId,
+    changes: &[(i32, Option<crate::kernel::FileDescriptionId>)],
+) {
+    if FD_MAP_PUBLISHED.load(Ordering::Acquire) == 0 || changes.is_empty() {
         return;
     }
     let region_ptr = get_el1_region_host_ptr();
@@ -243,14 +251,20 @@ pub(crate) fn fd_map_forget(table: FileTableId, fds: &[i32]) {
         return;
     }
     with_fd_map(region_ptr, |index, slots| {
-        for fd in fds {
-            if let Some(slot) = index.by_fd.remove(&(table.raw(), *fd as u32)) {
-                let handle_word = slots[slot].handle.load(Ordering::Relaxed);
-                if let Some(list) = index.by_handle.get_mut(&handle_word) {
-                    list.retain(|s| *s != slot);
-                }
-                fd_map_release(index, slots, slot);
+        for (fd, now) in changes {
+            let key = (table.raw(), *fd as u32);
+            let Some((slot, published)) = index.by_fd.get(&key).copied() else {
+                continue;
+            };
+            if *now == Some(published) {
+                continue;
             }
+            index.by_fd.remove(&key);
+            let handle_word = slots[slot].handle.load(Ordering::Relaxed);
+            if let Some(list) = index.by_handle.get_mut(&handle_word) {
+                list.retain(|s| *s != slot);
+            }
+            fd_map_release(index, slots, slot);
         }
     });
 }
@@ -276,6 +290,9 @@ struct GuestBinding {
     description: Weak<FileDescription>,
     rootfs: Weak<carrick_vfs::RootFsVfs>,
     sparse: crate::dispatch::fs::HostSparseExtentsRegistry,
+    /// Where the file's in-guest watches go if it leaves the zone.
+    registry: crate::inotify::InotifyRegistry,
+    path: String,
 }
 
 impl OwnerState {
@@ -518,6 +535,46 @@ pub(crate) fn delegated_file_by_inode(
     }
 }
 
+/// Recall every delegated file that carries a mark of inotify instance
+/// `inotify_handle` (used when that instance leaves the zone): each recall
+/// turns the file's in-guest watches into host watches on its path.
+pub(crate) fn recall_files_marked_by(inotify_handle: u32) {
+    let region_ptr = get_el1_region_host_ptr();
+    if region_ptr == 0 || no_active_delegations() {
+        return;
+    }
+    let descriptions: Vec<Arc<FileDescription>> = {
+        let owners = OWNERS.lock();
+        owners
+            .as_ref()
+            .map(|map| {
+                map.values()
+                    .filter_map(|owner| match &owner.state {
+                        OwnerState::Guest(binding) => {
+                            let file = delegated_file_object(region_ptr, binding.handle);
+                            let mut marked = false;
+                            lock_delegated_file(file, binding.handle);
+                            file.for_each_mark(|mark| {
+                                marked |= mark.inotify_handle == inotify_handle
+                            });
+                            file.unlock();
+                            if marked {
+                                binding.description.upgrade()
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for description in descriptions {
+        let _ = recall(&description);
+    }
+}
+
 /// Detach every mark of inotify instance `inotify_handle` from every delegated
 /// file. `held_file_handle` names a file whose EL1 lock the caller already
 /// holds (lock order: file, then instance).
@@ -545,6 +602,56 @@ pub(crate) fn remove_inotify_marks_from_all_files(
             file.unlock();
         }
     }
+}
+
+/// Attach watch `wd` of in-zone instance `inotify_handle` to delegated file
+/// `file_handle` (file lock, then instance lock). False when either table is
+/// full; the caller then keeps the watch on the host path.
+pub(crate) fn attach_zone_watch(
+    file_handle: u32,
+    inotify_handle: u32,
+    instance: &DelegatedInotify,
+    wd: i32,
+    mask: u32,
+) -> bool {
+    let region_ptr = get_el1_region_host_ptr();
+    if region_ptr == 0 || file_handle == 0 || file_handle as usize > MAX_DELEGATED_FILES {
+        return false;
+    }
+    let file = delegated_file_object(region_ptr, file_handle);
+    lock_delegated_file(file, file_handle);
+    if file.state.load(Ordering::Acquire) != DELEGATED_STATE_GUEST {
+        file.unlock();
+        return false;
+    }
+    let marked = file.add_mark(DelegatedMark {
+        inotify_handle,
+        wd,
+        mask,
+        _pad: 0,
+    });
+    let attached = marked && {
+        let _lock = crate::el1_inotify::InstanceLock::acquire(instance);
+        instance.attach_watch_file(wd, file_handle, mask)
+    };
+    if marked && !attached {
+        let _ = file.remove_mark(inotify_handle, wd);
+    }
+    file.unlock();
+    attached
+}
+
+/// Detach watch `wd` of instance `inotify_handle` from delegated file
+/// `file_handle` (lock order: file, then instance; the caller holds neither).
+pub(crate) fn remove_mark(file_handle: u32, inotify_handle: u32, wd: i32) {
+    let region_ptr = get_el1_region_host_ptr();
+    if region_ptr == 0 || file_handle == 0 || file_handle as usize > MAX_DELEGATED_FILES {
+        return;
+    }
+    let file = delegated_file_object(region_ptr, file_handle);
+    lock_delegated_file(file, file_handle);
+    let _ = file.remove_mark(inotify_handle, wd);
+    file.unlock();
 }
 
 fn delegated_file_object(region_ptr: usize, handle: u32) -> &'static DelegatedFile {
@@ -995,7 +1102,14 @@ fn delegate_transaction(
     file.clear_marks();
     file.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
     file.unlock();
-    let published = fd_map_publish(region_ptr, file_table.raw(), fd, handle, incarnation);
+    let published = fd_map_publish(
+        region_ptr,
+        file_table.raw(),
+        fd,
+        description.id(),
+        handle,
+        incarnation,
+    );
     if !published {
         lock_delegated_file(file, handle);
         file.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
@@ -1009,6 +1123,8 @@ fn delegate_transaction(
         description: Arc::downgrade(&open_file.description),
         rootfs: Arc::downgrade(&fs.rootfs_vfs),
         sparse: fs.host_sparse_extents_registry().clone(),
+        registry: fs.inotify_registry.clone(),
+        path: path.to_owned(),
     });
     OWNERS_CHANGED.notify_all();
     Ok(handle)
@@ -1151,9 +1267,6 @@ pub(crate) fn recall_locked(
     open: &mut OpenDescription,
     handle: u32,
 ) -> Result<(), carrick_abi::LinuxErrno> {
-    if matches!(open, OpenDescription::Inotify { .. }) {
-        return crate::el1_inotify::recall_inotify(description);
-    }
     let Some(identity) = description.el1_identity() else {
         carrick_fatal!(
             "el1_delegation",
@@ -1193,19 +1306,21 @@ pub(crate) fn recall_locked(
     description
         .common()
         .record_delegation_window(file.served_ops.load(Ordering::Acquire));
-    // Instances that mark this file come back first (lock order: file, then
-    // instance), so their queues and wd state return to the host model with
-    // the file's final events.
-    let mut marking = [0u32; MAX_DELEGATED_MARKS_PER_FILE];
-    let mut marking_len = 0;
+    // In-guest watches on this file become host watches on its path: the
+    // instances stay in the zone, and the host write path now produces their
+    // events into the same zone queue.
+    let mut marks = Vec::new();
     file.for_each_mark(|mark| {
-        if mark.inotify_handle != 0 && !marking[..marking_len].contains(&mark.inotify_handle) {
-            marking[marking_len] = mark.inotify_handle;
-            marking_len += 1;
+        if mark.inotify_handle != 0 {
+            marks.push((mark.inotify_handle, mark.wd, mark.mask));
         }
     });
-    for &instance in &marking[..marking_len] {
-        let _ = crate::el1_inotify::recall_inotify_by_handle(instance, Some(handle));
+    for (instance, wd, mask) in marks {
+        if let Some(state) = crate::el1_inotify::state_for_handle(instance)
+            && state.is_watch_live(wd)
+        {
+            binding.registry.register(&binding.path, &state, wd, mask);
+        }
     }
     file.clear_marks();
     crate::el1_inotify::invalidate_name_cache_file(handle);
@@ -1683,9 +1798,10 @@ mod tests {
             let _region = Region::new();
             let region = get_el1_region_host_ptr();
             let table = table();
-            assert!(fd_map_publish(region, table.raw(), 5, 7, 11));
-            assert!(fd_map_publish(region, table.raw(), 6, 7, 11));
-            assert!(fd_map_publish(region, table.raw(), 9, 8, 12));
+            let d = |raw: u64| crate::kernel::ids::restore_file_description_id(raw).unwrap();
+            assert!(fd_map_publish(region, table.raw(), 5, d(100), 7, 11));
+            assert!(fd_map_publish(region, table.raw(), 6, d(100), 7, 11));
+            assert!(fd_map_publish(region, table.raw(), 9, d(200), 8, 12));
             let slots = fd_map_slots(region);
             let live = |fd: u32| {
                 slots.iter().any(|slot| {
@@ -1694,14 +1810,20 @@ mod tests {
                         && slot.fd.load(Ordering::Relaxed) == fd
                 })
             };
+            // A flag update or re-insert of the same description keeps fd 5.
+            fd_map_forget(table, &[(5, Some(d(100)))]);
+            assert!(live(5));
             // close(5) or dup2(x, 5): EL1 must stop serving fd 5 only.
-            fd_map_forget(table, &[5]);
+            fd_map_forget(table, &[(5, None)]);
             assert!(!live(5) && live(6) && live(9));
+            fd_map_forget(table, &[(6, Some(d(300)))]);
+            assert!(!live(6));
             // Clearing a handle removes its remaining fds and reports the table.
+            assert!(fd_map_publish(region, table.raw(), 6, d(100), 7, 11));
             assert_eq!(fd_map_clear_handle(region, 7), vec![table.raw()]);
             assert!(!live(6) && live(9));
             // Re-publishing an fd number replaces, never duplicates.
-            assert!(fd_map_publish(region, table.raw(), 9, 8, 13));
+            assert!(fd_map_publish(region, table.raw(), 9, d(200), 8, 13));
             assert_eq!(
                 slots
                     .iter()

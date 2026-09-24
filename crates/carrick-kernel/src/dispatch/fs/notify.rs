@@ -242,29 +242,11 @@ impl<'a> FsView<'a> {
         if mask & crate::inotify::UNSUPPORTED_INOTIFY_MASK_FLAGS != 0 {
             return false;
         }
-        let inotify_open_file = self.open_file(fd);
+        let _ = fd;
         let file_table_id = self.captured_file_table().id();
-        let mut inotify_handle = inotify_open_file
-            .as_ref()
-            .map(|of| of.description.delegation_handle())
-            .unwrap_or(0);
-        if inotify_handle == 0 {
-            if let Some(ino_of) = &inotify_open_file {
-                let flags = ino_of.description.common().status_flags();
-                if let Ok(h) = crate::el1_inotify::delegate_inotify(
-                    ino_of,
-                    file_table_id,
-                    fd,
-                    state,
-                    flags as u32,
-                ) {
-                    inotify_handle = h;
-                }
-            }
-        }
-        if inotify_handle == 0 {
+        let Some(inotify_handle) = state.zone_handle() else {
             return false;
-        }
+        };
 
         // The watched file's exact host identity; a path with none is not a
         // delegatable host regular file.
@@ -303,28 +285,23 @@ impl<'a> FsView<'a> {
         if let Some(file_handle) = file_handle_opt {
             let region_ptr = carrick_el1_abi::get_el1_region_host_ptr();
             if region_ptr != 0 {
-                let file_ptr = (region_ptr
-                    + carrick_el1_abi::EL1_OBJECT_TABLE_OFFSET as usize
-                    + (file_handle as usize - 1)
-                        * core::mem::size_of::<carrick_el1_abi::DelegatedFile>())
-                    as *const carrick_el1_abi::DelegatedFile;
-                let file = unsafe { &*file_ptr };
-                if !file.add_mark(carrick_el1_abi::DelegatedMark {
-                    inotify_handle,
-                    wd,
-                    mask,
-                    _pad: 0,
-                }) {
-                    return false;
-                }
-
                 let inotify_ptr = (region_ptr
                     + carrick_el1_abi::EL1_INOTIFY_TABLE_OFFSET as usize
                     + (inotify_handle as usize - 1)
                         * core::mem::size_of::<carrick_el1_abi::DelegatedInotify>())
                     as *const carrick_el1_abi::DelegatedInotify;
+                // SAFETY: the inotify table lives in the EL1 region for the
+                // carrier's lifetime; `inotify_handle` is a live zone handle.
                 let inotify = unsafe { &*inotify_ptr };
-                inotify.add_watch(wd, file_handle, mask);
+                if !crate::el1_delegation::attach_zone_watch(
+                    file_handle,
+                    inotify_handle,
+                    inotify,
+                    wd,
+                    mask,
+                ) {
+                    return false;
+                }
 
                 if let Ok(raw_path) = read_guest_c_string(memory, pathname) {
                     crate::el1_inotify::populate_name_cache(
@@ -346,39 +323,6 @@ impl<'a> FsView<'a> {
         false
     }
 
-    fn cleanup_delegated_inotify_watch(&self, fd: i32, wd: i32) {
-        let inotify_open_file = self.open_file(fd);
-        if let Some(ino_of) = inotify_open_file {
-            let inotify_handle = ino_of.description.delegation_handle();
-            if inotify_handle != 0 {
-                let region_ptr = carrick_el1_abi::get_el1_region_host_ptr();
-                if region_ptr != 0 {
-                    let inotify_ptr = (region_ptr
-                        + carrick_el1_abi::EL1_INOTIFY_TABLE_OFFSET as usize
-                        + (inotify_handle as usize - 1)
-                            * core::mem::size_of::<carrick_el1_abi::DelegatedInotify>())
-                        as *const carrick_el1_abi::DelegatedInotify;
-                    let inotify = unsafe { &*inotify_ptr };
-                    if let Some((_, watch)) = inotify.find_watch(wd) {
-                        let file_handle = watch.file_handle;
-                        inotify.remove_watch(wd);
-                        if file_handle != 0
-                            && (file_handle as usize) <= carrick_el1_abi::MAX_DELEGATED_FILES
-                        {
-                            let file_ptr = (region_ptr
-                                + carrick_el1_abi::EL1_OBJECT_TABLE_OFFSET as usize
-                                + (file_handle as usize - 1)
-                                    * core::mem::size_of::<carrick_el1_abi::DelegatedFile>())
-                                as *const carrick_el1_abi::DelegatedFile;
-                            let file = unsafe { &*file_ptr };
-                            file.remove_mark(inotify_handle, wd);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     define_syscall! {
         fn inotify_init1(this, cx, flags: u64) {
             let known = crate::inotify::IN_NONBLOCK as u64 | crate::inotify::IN_CLOEXEC as u64;
@@ -391,15 +335,31 @@ impl<'a> FsView<'a> {
             if let Some(scope) = cx.kernel.kernel().work_scope() {
                 state.set_work_scope(scope);
             }
+            let state = Arc::new(state);
+            // Born in the zone: the instance lives in the EL1 aperture for its
+            // whole life, fronted by this state.
+            crate::el1_inotify::create_instance(&state, (flags & LINUX_O_NONBLOCK) as u32);
             let description = OpenDescription::Inotify {
                 base: OpenDescriptionBase::new(flags & LINUX_O_NONBLOCK),
-                state: Arc::new(state),
+                state: Arc::clone(&state),
             };
-            Ok(this.install_fd_with_status_flags(
+            let outcome = this.install_fd_with_status_flags(
                 description,
                 flags & LINUX_O_NONBLOCK,
                 linux_fd_flags_from_open_flags(flags),
-            ))
+            );
+            if let DispatchOutcome::Returned { value } = outcome
+                && value >= 0
+                && let Some(installed) = this.open_file(value as i32)
+            {
+                crate::el1_inotify::publish_instance_fd(
+                    &state,
+                    this.captured_file_table().id(),
+                    value as i32,
+                    installed.description.id(),
+                );
+            }
+            Ok(outcome)
         }
 
         fn inotify_add_watch(this, cx, fd: Fd, pathname: GuestPtr, mask: u64) {
@@ -425,6 +385,16 @@ impl<'a> FsView<'a> {
                 .fs
                 .inotify_registry
                 .lookup_watch_and_rootfs(&path, &state, current_gen);
+            // A registry entry whose wd was removed in-guest is stale; an inode
+            // already watched in-guest keeps its descriptor (inotify(7)).
+            let existing = existing
+                .filter(|(wd, _)| state.is_watch_live(*wd))
+                .or_else(|| {
+                    let identity = this.fs.rootfs_vfs.path_inode_identity(&path)?;
+                    let (file_handle, _) =
+                        crate::el1_delegation::delegated_file_by_inode(identity)?;
+                    crate::el1_inotify::zone_watch_for_file(&state, file_handle)
+                });
             if let Some((wd, old_mask)) = existing {
                 let add = mask & carrick_abi::LINUX_IN_MASK_ADD != 0;
                 let req = mask & !carrick_abi::LINUX_IN_MASK_ADD;
@@ -562,9 +532,6 @@ impl<'a> FsView<'a> {
             // Drop the dispatch-registry entry to match.
             let result = state.rm_watch(wd);
             this.fs.inotify_registry.unregister(&state, wd);
-            if result.is_ok() {
-                this.cleanup_delegated_inotify_watch(fd.0, wd);
-            }
             Ok(match result {
                 Ok(()) => DispatchOutcome::Returned { value: 0 },
                 Err(errno) => DispatchOutcome::errno(errno),

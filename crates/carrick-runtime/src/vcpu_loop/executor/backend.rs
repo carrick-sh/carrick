@@ -790,7 +790,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             ));
         }
         self.validate_loaded_hardware_identity()?;
-        carrick_kernel::el1_delegation::clear_current_task(self.mailbox_slot);
+        // Exec keeps the thread (and its tid) loaded on this vCPU: the record
+        // stays published, and the kernel updates its file table when exec
+        // installs the close-on-exec successor (`replace_resources`).
         self.binding = Some(binding);
         Ok(())
     }

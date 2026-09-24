@@ -276,6 +276,27 @@ struct Inner {
     /// deadlock hazard.
     #[cfg(target_os = "linux")]
     native_wd_to_guest: HashMap<i32, i32>,
+    /// The in-zone instance this state fronts, while bound: its descriptor
+    /// allocator, watch table and queue are authoritative, and `pending`
+    /// holds only the ordered spill of records the zone queue could not hold.
+    zone: Option<ZonePtr>,
+}
+
+/// A bound in-zone instance (the EL1 region lives for the carrier).
+#[derive(Clone, Copy)]
+struct ZonePtr(&'static carrick_el1_abi::DelegatedInotify);
+
+impl std::ops::Deref for ZonePtr {
+    type Target = carrick_el1_abi::DelegatedInotify;
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ZonePtr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ZonePtr")
+    }
 }
 
 impl Inner {
@@ -293,6 +314,7 @@ impl Inner {
             dispatch_authoritative: false,
             #[cfg(target_os = "linux")]
             native_wd_to_guest: HashMap::new(),
+            zone: None,
         }
     }
 
@@ -301,6 +323,11 @@ impl Inner {
     /// eagerly recycling it can coalesce distinct IN_IGNORED notifications.
     /// Only live descriptors are consulted, never the pending event queue.
     fn alloc_wd(&mut self) -> Result<i32, LinuxErrno> {
+        if let Some(zone) = self.zone {
+            // One allocator for the instance, whichever side adds the watch.
+            let _lock = crate::el1_inotify::InstanceLock::acquire(zone.0);
+            return zone.alloc_wd().map_err(|e| LinuxErrno::new(e.0));
+        }
         if self.watches.len() >= i32::MAX as usize {
             return Err(LINUX_ENOSPC);
         }
@@ -988,6 +1015,8 @@ pub struct InotifyState {
     inner: Mutex<Inner>,
     work_scope: parking_lot::RwLock<Option<carrick_observability::work_meter::WorkScope>>,
     has_work_scope: std::sync::atomic::AtomicBool,
+    /// Handle of the in-zone instance this state fronts (0 = host model).
+    zone_handle: std::sync::atomic::AtomicU32,
 }
 
 impl std::fmt::Debug for InotifyState {
@@ -1009,7 +1038,141 @@ impl InotifyState {
             inner: Mutex::new(Inner::new()),
             work_scope: parking_lot::RwLock::new(None),
             has_work_scope: std::sync::atomic::AtomicBool::new(false),
+            zone_handle: std::sync::atomic::AtomicU32::new(0),
         })
+    }
+
+    /// Front the in-zone instance `handle` from now on (at creation, before
+    /// any watch exists). Host event producers enqueue into its queue, host
+    /// syscalls serve against it, and it is never recalled.
+    /// Terminal demotion: the instance outgrew the zone (watch-table
+    /// capacity). Files it watches in-guest are recalled first, which turns
+    /// those watches into host watches on their paths; then the zone's
+    /// watches, queue and descriptor allocator move into this host model, and
+    /// the zone instance is released. Never re-promoted.
+    fn demote_zone(&self) {
+        let Some(handle) = self.zone_handle() else {
+            return;
+        };
+        crate::el1_delegation::recall_files_marked_by(handle);
+        {
+            let mut inner = self.inner.lock();
+            let Some(zone) = inner.zone else {
+                return;
+            };
+            let _lock = crate::el1_inotify::InstanceLock::acquire(&zone);
+            // SAFETY: the watch table is only touched under the instance lock.
+            for watch in unsafe { &*zone.watches.get() }.iter() {
+                if watch.alive != 0 {
+                    inner.watches.entry(watch.wd).or_insert(Watch {
+                        host_fds: Vec::new(),
+                        mask: watch.mask,
+                    });
+                }
+            }
+            // Zone records are older than any spilled ones.
+            let mut records = vec![0u8; carrick_el1_abi::INOTIFY_QUEUE_BYTES];
+            let n = zone.drain_into(&mut records).unwrap_or(0);
+            let spill: Vec<PendingRecord> = inner.pending.drain(..).collect();
+            inner.queued_bytes = 0;
+            let mut at = 0;
+            while at + INOTIFY_EVENT_HEADER_SIZE <= n {
+                let len = u32::from_ne_bytes([
+                    records[at + 12],
+                    records[at + 13],
+                    records[at + 14],
+                    records[at + 15],
+                ]) as usize;
+                inner.push_record(records[at..at + INOTIFY_EVENT_HEADER_SIZE + len].to_vec());
+                at += INOTIFY_EVENT_HEADER_SIZE + len;
+            }
+            for record in spill {
+                inner.push_record(record);
+            }
+            inner.next_wd = zone.next_wd.load(std::sync::atomic::Ordering::Acquire);
+            inner.zone = None;
+        }
+        self.zone_handle
+            .store(0, std::sync::atomic::Ordering::Release);
+        crate::el1_inotify::release_instance(handle);
+    }
+
+    /// Whether `wd` names a live watch of this instance.
+    pub(crate) fn is_watch_live(&self, wd: i32) -> bool {
+        let inner = self.inner.lock();
+        self.watch_is_live(&inner, wd)
+    }
+
+    pub(crate) fn bind_zone(&self, handle: u32, zone: &'static carrick_el1_abi::DelegatedInotify) {
+        let mut inner = self.inner.lock();
+        inner.zone = Some(ZonePtr(zone));
+        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+        {
+            inner.dispatch_authoritative = true;
+        }
+        self.zone_handle
+            .store(handle, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The in-zone instance handle, if bound.
+    pub(crate) fn zone_handle(&self) -> Option<u32> {
+        match self.zone_handle.load(std::sync::atomic::Ordering::Acquire) {
+            0 => None,
+            handle => Some(handle),
+        }
+    }
+
+    /// Stop fronting the zone (terminal demotion, or teardown). The caller has
+    /// already moved the zone's watches and records into the host model.
+    pub(crate) fn unbind_zone(&self) -> Option<u32> {
+        let mut inner = self.inner.lock();
+        inner.zone = None;
+        match self
+            .zone_handle
+            .swap(0, std::sync::atomic::Ordering::AcqRel)
+        {
+            0 => None,
+            handle => Some(handle),
+        }
+    }
+
+    /// Whether `wd` names a live watch. While bound, the zone table decides
+    /// (an in-guest rm_watch removes it there); events for a dead wd are
+    /// dropped, as Linux never reports a removed watch after IN_IGNORED.
+    fn watch_is_live(&self, inner: &Inner, wd: i32) -> bool {
+        match inner.zone {
+            Some(zone) => {
+                let _lock = crate::el1_inotify::InstanceLock::acquire(&zone);
+                zone.find_watch(wd).is_some()
+            }
+            None => inner.watches.contains_key(&wd),
+        }
+    }
+
+    /// Push one record into the fronted zone queue, keeping FIFO order with
+    /// the host spill: once anything is spilled, everything spills until the
+    /// spill drains. Returns true on an empty-to-non-empty transition.
+    fn push_zone(
+        inner: &mut Inner,
+        zone: &carrick_el1_abi::DelegatedInotify,
+        wd: i32,
+        mask: u32,
+        cookie: u32,
+        name: Option<&[u8]>,
+    ) -> bool {
+        let _lock = crate::el1_inotify::InstanceLock::acquire(&zone);
+        let was_empty = !zone.has_records() && inner.pending.is_empty();
+        if zone.spilled.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            match zone.push_record(wd, mask, cookie, name) {
+                carrick_el1_abi::QueuePush::NoSpace => {}
+                carrick_el1_abi::QueuePush::Appended { .. }
+                | carrick_el1_abi::QueuePush::Overflowed { .. } => return was_empty,
+                _ => return false,
+            }
+            zone.spilled.store(1, std::sync::atomic::Ordering::Release);
+        }
+        inner.push_record(encode_event_record(wd, mask, cookie, name));
+        was_empty
     }
 
     pub(crate) fn set_work_scope(&self, scope: carrick_observability::work_meter::WorkScope) {
@@ -1085,6 +1248,19 @@ impl InotifyState {
     pub(crate) fn add_virtual_watch(&self, mask: u32) -> Result<i32, LinuxErrno> {
         let mut inner = self.inner.lock();
         let wd = inner.alloc_wd()?;
+        if let Some(zone) = inner.zone {
+            let added = {
+                let _lock = crate::el1_inotify::InstanceLock::acquire(&zone);
+                zone.add_watch(wd, 0, mask)
+            };
+            if !added {
+                // The zone's watch table is full: leave the zone, then record
+                // the watch in the host model like any other.
+                drop(inner);
+                self.demote_zone();
+                inner = self.inner.lock();
+            }
+        }
         inner.watches.insert(
             wd,
             Watch {
@@ -1097,22 +1273,6 @@ impl InotifyState {
             inner.dispatch_authoritative = true;
         }
         Ok(wd)
-    }
-
-    /// Restore a watch from a delegated EL1 inotify instance during recall.
-    pub(crate) fn restore_watch(&self, wd: i32, mask: u32) {
-        let mut inner = self.inner.lock();
-        inner.watches.insert(
-            wd,
-            Watch {
-                host_fds: Vec::new(),
-                mask,
-            },
-        );
-        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
-        {
-            inner.dispatch_authoritative = true;
-        }
     }
 
     /// Replace or extend an existing watch mask while preserving its wd.
@@ -1149,11 +1309,21 @@ impl InotifyState {
     /// Encoded bytes a `read(2)` could return right now, for `ioctl(FIONREAD)`.
     /// Maintained, not summed: see [`Inner::queued_bytes`].
     pub(crate) fn queued_bytes(&self) -> usize {
-        self.inner.lock().queued_bytes()
+        let inner = self.inner.lock();
+        let zone = inner.zone.map_or(0, |zone| {
+            zone.queued_bytes.load(std::sync::atomic::Ordering::Acquire)
+        });
+        zone + inner.queued_bytes()
     }
 
     pub(crate) fn has_queued_records(&self) -> bool {
-        let ready = !self.inner.lock().pending.is_empty();
+        let ready = {
+            let inner = self.inner.lock();
+            !inner.pending.is_empty()
+                || inner.zone.is_some_and(|zone| {
+                    zone.queued_bytes.load(std::sync::atomic::Ordering::Acquire) != 0
+                })
+        };
         if let Some(scope) = self.work_scope() {
             // Zero, always: the answer inspected no record. The counter exists
             // so a future scan cannot creep back in unnoticed.
@@ -1168,6 +1338,48 @@ impl InotifyState {
     /// Remove a watch by descriptor; closes its fd. Unknown wd → EINVAL.
     pub(crate) fn rm_watch(&self, wd: i32) -> Result<(), LinuxErrno> {
         let mut inner = self.inner.lock();
+        if let Some(zone) = inner.zone {
+            // The zone table decides existence; the file mark (if the watch is
+            // on an in-zone file) goes first (lock order: file, then instance).
+            let file_handle = {
+                let _lock = crate::el1_inotify::InstanceLock::acquire(&zone);
+                match zone.remove_watch(wd) {
+                    Some(file_handle) => file_handle,
+                    None => return Err(LINUX_EINVAL),
+                }
+            };
+            if file_handle != 0 {
+                crate::el1_delegation::remove_mark(
+                    file_handle,
+                    self.zone_handle().unwrap_or(0),
+                    wd,
+                );
+            }
+            if let Some(watch) = inner.watches.remove(&wd) {
+                for host_fd in &watch.host_fds {
+                    inner.wd_by_fd.remove(host_fd);
+                }
+                if !watch.host_fds.is_empty() {
+                    let scope = self.work_scope();
+                    self.backend
+                        .deregister_batch(&watch.host_fds, wd, &mut inner, scope.as_ref());
+                    for host_fd in watch.host_fds {
+                        unsafe { libc::close(host_fd) };
+                    }
+                }
+            }
+            if Self::push_zone(
+                &mut inner,
+                zone.0,
+                wd,
+                carrick_abi::LINUX_IN_IGNORED,
+                0,
+                None,
+            ) {
+                self.maybe_wake();
+            }
+            return Ok(());
+        }
         let Some(watch) = inner.watches.remove(&wd) else {
             return Err(LINUX_EINVAL);
         };
@@ -1206,6 +1418,15 @@ impl InotifyState {
     /// bounded-queue + `IN_Q_OVERFLOW` policy is enforced here, like a real read.
     pub(crate) fn enqueue(&self, wd: i32, mask: u32, cookie: u32, name: Option<&[u8]>) {
         let mut inner = self.inner.lock();
+        if let Some(zone) = inner.zone {
+            if wd > 0 && !self.watch_is_live(&inner, wd) {
+                return;
+            }
+            if Self::push_zone(&mut inner, zone.0, wd, mask, cookie, name) {
+                self.maybe_wake();
+            }
+            return;
+        }
         if inner.overflowed {
             return;
         }
@@ -1246,14 +1467,6 @@ impl InotifyState {
         cookie
     }
 
-    pub(crate) fn next_wd(&self) -> i32 {
-        self.inner.lock().next_wd
-    }
-
-    pub(crate) fn set_next_wd(&self, next_wd: i32) {
-        self.inner.lock().next_wd = next_wd;
-    }
-
     /// Read up to `max_bytes` of encoded Linux `inotify_event` records. First
     /// drains any newly-ready changes (the kqueue on macOS, the native inotify
     /// fd on Linux), then returns whole records up to the caller's buffer size,
@@ -1262,6 +1475,9 @@ impl InotifyState {
     /// wait on [`Self::poll_fd`]). A non-empty queue with `max_bytes` too small
     /// for a single record is signalled by `Err(EINVAL)`, matching Linux.
     pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, LinuxErrno> {
+        if self.zone_handle().is_some() {
+            return self.read_zone_records(max_bytes);
+        }
         let result = self.backend.read_records(max_bytes, &self.inner);
         // A backend wait consumes the user wake. Re-arm it when a short read or
         // EINVAL leaves complete records queued so readiness remains level-
@@ -1270,6 +1486,70 @@ impl InotifyState {
             self.maybe_wake();
         }
         result
+    }
+
+    /// read(2) on a zone-fronted instance: the zone queue first (it holds the
+    /// oldest records), then the spill, then refill the zone from the spill so
+    /// EL1 can serve again. Whole records only; EINVAL if the first record does
+    /// not fit.
+    fn read_zone_records(&self, max_bytes: usize) -> Result<Vec<u8>, LinuxErrno> {
+        // The backend is only a readiness source here: consume its edge.
+        {
+            let inner = self.inner.lock();
+            let pump = inner.pending.is_empty();
+            drop(inner);
+            if pump {
+                let _ = self.backend.read_records(0, &self.inner);
+            }
+        }
+        let mut inner = self.inner.lock();
+        let Some(zone) = inner.zone else {
+            drop(inner);
+            return self.read_records(max_bytes);
+        };
+        let _lock = crate::el1_inotify::InstanceLock::acquire(&zone);
+        let mut out = vec![0u8; max_bytes];
+        let mut taken = zone
+            .drain_into(&mut out)
+            .map_err(|e| LinuxErrno::new(e.0))?;
+        if !zone.has_records() && !inner.pending.is_empty() {
+            let spill = match drain_pending(&mut inner, max_bytes - taken) {
+                Ok(bytes) => bytes,
+                Err(errno) if taken == 0 => return Err(errno),
+                Err(_) => Vec::new(),
+            };
+            out[taken..taken + spill.len()].copy_from_slice(&spill);
+            taken += spill.len();
+            // Refill the zone from the spill head so EL1 can serve again.
+            while let Some(record) = inner.pending.front() {
+                let bytes = record.as_bytes();
+                let len = u32::from_ne_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+                let name = (len > 0).then(|| {
+                    let raw = &bytes[16..16 + len];
+                    &raw[..raw.iter().position(|b| *b == 0).unwrap_or(raw.len())]
+                });
+                let wd = i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                let mask = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+                let cookie = u32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+                if matches!(
+                    zone.push_record(wd, mask, cookie, name),
+                    carrick_el1_abi::QueuePush::NoSpace
+                ) {
+                    break;
+                }
+                let record = inner
+                    .pending
+                    .pop_front()
+                    .unwrap_or_else(|| unreachable!("front checked"));
+                inner.queued_bytes = inner.queued_bytes.saturating_sub(record.len());
+            }
+            if inner.pending.is_empty() {
+                inner.overflowed = false;
+                zone.spilled.store(0, std::sync::atomic::Ordering::Release);
+            }
+        }
+        out.truncate(taken);
+        Ok(out)
     }
 
     /// Render the per-watch `/proc/<pid>/fdinfo/<fd>` lines for this inotify
@@ -2140,6 +2420,10 @@ fn scan_dir_entries(path: &Path) -> std::io::Result<HashSet<Vec<u8>>> {
 
 impl Drop for InotifyState {
     fn drop(&mut self) {
+        // Last close of the instance: EL1 stops serving it and its handle frees.
+        if let Some(handle) = self.unbind_zone() {
+            crate::el1_inotify::release_instance(handle);
+        }
         let inner = self.inner.lock();
         for watch in inner.watches.values() {
             for host_fd in &watch.host_fds {
