@@ -42,6 +42,9 @@ pub fn clear_el1_region_host_ptr() {
 
 /// Publish the current task binding for an executor vCPU mailbox slot into the EL1 aperture.
 pub fn publish_current_task(slot: usize, task_id: El1TaskId, generation: u64, file_table: u64) {
+    if file_table == 0 {
+        TABLELESS_PUBLISHES.fetch_add(1, Ordering::Relaxed);
+    }
     let ptr = get_el1_region_host_ptr();
     if ptr == 0 || slot >= 256 {
         return;
@@ -53,6 +56,29 @@ pub fn publish_current_task(slot: usize, task_id: El1TaskId, generation: u64, fi
     current_task.task_id.store(task_id.raw(), Ordering::Relaxed);
     current_task.file_table.store(file_table, Ordering::Relaxed);
     current_task.generation.store(generation, Ordering::Release);
+}
+
+/// The record for `slot` is a cache of the loaded thread's identity; every
+/// host syscall boundary knows the true value and restores it here. Returns
+/// true (and counts it) when the record was wrong: any path that forgot to
+/// publish costs at most one forwarded syscall, and the count shows it.
+pub fn revalidate_current_task(slot: usize, task_id: El1TaskId, file_table: u64) -> bool {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= 256 {
+        return false;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    // SAFETY: the record lives in the EL1 region; only atomics are touched.
+    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    if current_task.task_id.load(Ordering::Acquire) == task_id.raw()
+        && current_task.file_table.load(Ordering::Acquire) == file_table
+    {
+        return false;
+    }
+    current_task.task_id.store(task_id.raw(), Ordering::Relaxed);
+    current_task.file_table.store(file_table, Ordering::Release);
+    REVALIDATED_RECORDS.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 /// Clear the current task binding for an executor vCPU mailbox slot.
@@ -752,6 +778,11 @@ static REFUSALS: [AtomicUsize; NotEligible::ALL.len()] =
     [const { AtomicUsize::new(0) }; NotEligible::ALL.len()];
 static DELEGATIONS: AtomicUsize = AtomicUsize::new(0);
 static RECALLS: AtomicUsize = AtomicUsize::new(0);
+/// vCPU task records published without a file table: EL1 serves nothing for
+/// such a thread, so this must stay zero for any thread that has fds.
+static TABLELESS_PUBLISHES: AtomicUsize = AtomicUsize::new(0);
+/// vCPU task records a host syscall boundary found wrong and restored.
+static REVALIDATED_RECORDS: AtomicUsize = AtomicUsize::new(0);
 /// Recalls per triggering call site (recall is a slow path; the population
 /// names which host path pulled a delegated object back).
 static RECALL_TRIGGERS: Mutex<Vec<(&'static std::panic::Location<'static>, usize)>> =
@@ -763,6 +794,8 @@ pub struct DelegationCounts {
     pub delegations: usize,
     pub recalls: usize,
     pub host_served: usize,
+    pub tableless_publishes: usize,
+    pub revalidated_records: usize,
     pub refusals: Vec<(NotEligible, usize)>,
     pub recall_triggers: Vec<(String, usize)>,
 }
@@ -773,6 +806,8 @@ pub fn delegation_counts() -> DelegationCounts {
         delegations: DELEGATIONS.load(Ordering::Relaxed),
         recalls: RECALLS.load(Ordering::Relaxed),
         host_served: HOST_SERVED.load(Ordering::Relaxed),
+        tableless_publishes: TABLELESS_PUBLISHES.load(Ordering::Relaxed),
+        revalidated_records: REVALIDATED_RECORDS.load(Ordering::Relaxed),
         refusals: NotEligible::ALL
             .iter()
             .map(|reason| (*reason, REFUSALS[*reason as usize].load(Ordering::Relaxed)))
@@ -792,6 +827,8 @@ pub fn reset_delegation_counts() {
     DELEGATIONS.store(0, Ordering::Relaxed);
     RECALLS.store(0, Ordering::Relaxed);
     HOST_SERVED.store(0, Ordering::Relaxed);
+    TABLELESS_PUBLISHES.store(0, Ordering::Relaxed);
+    REVALIDATED_RECORDS.store(0, Ordering::Relaxed);
     for counter in &REFUSALS {
         counter.store(0, Ordering::Relaxed);
     }
