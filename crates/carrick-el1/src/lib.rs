@@ -12,8 +12,8 @@ pub mod lock;
 
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
-    FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES, MAX_DELEGATED_MARKS_PER_FILE, TrapFrame,
-    fd_map_lookup,
+    EL1_GUEST_LOCK_SPINS, FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES,
+    MAX_DELEGATED_MARKS_PER_FILE, TrapFrame, fd_map_lookup,
 };
 #[cfg(target_os = "none")]
 use carrick_el1_abi::{
@@ -237,7 +237,7 @@ where
     if file.state.load(Ordering::Acquire) != DELEGATED_STATE_GUEST {
         return None;
     }
-    if !file.try_lock() {
+    if !file.lock_guest_bounded(EL1_GUEST_LOCK_SPINS) {
         return None;
     }
     // Re-validate fd_map slot and object incarnation after taking the lock
@@ -294,7 +294,7 @@ pub struct TryInstanceLock;
 
 impl InstanceLockPolicy for TryInstanceLock {
     fn acquire(&self, instance: &DelegatedInotify) -> bool {
-        instance.try_lock()
+        instance.lock_guest_bounded(EL1_GUEST_LOCK_SPINS)
     }
 }
 

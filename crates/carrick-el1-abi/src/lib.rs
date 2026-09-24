@@ -479,9 +479,29 @@ impl DelegatedFile {
     /// Guest calls this; if it returns `false`, guest must FORWARD.
     #[inline]
     pub fn try_lock(&self) -> bool {
+        // Strong: a spurious LL/SC failure must not look like contention.
         self.lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(0, LOCK_GUEST, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
+    }
+
+    /// EL1 acquire: wait a bounded while only for another vCPU's in-guest
+    /// critical section (short, and completed even across kicks); a host
+    /// holder may be a long recall, so forward at once. Bounded, so a lock
+    /// order inversion between vCPUs costs a forward, never a deadlock.
+    #[inline]
+    pub fn lock_guest_bounded(&self, max_spins: u32) -> bool {
+        for _ in 0..max_spins {
+            match self
+                .lock
+                .compare_exchange(0, LOCK_GUEST, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(LOCK_HOST) => return false,
+                Err(_) => core::hint::spin_loop(),
+            }
+        }
+        false
     }
 
     /// Release the spinlock.
@@ -500,7 +520,11 @@ impl DelegatedFile {
     /// Returns true if locked, false if timed out / exceeded max spins.
     pub fn host_lock_bounded(&self, max_spins: u64) -> bool {
         for _ in 0..max_spins {
-            if self.try_lock() {
+            if self
+                .lock
+                .compare_exchange(0, LOCK_HOST, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
                 return true;
             }
             core::hint::spin_loop();
@@ -870,6 +894,13 @@ use carrick_inotify_core::{
 };
 use core::sync::atomic::AtomicI32;
 
+/// Lock word values for delegated objects: which side holds the lock.
+pub const LOCK_GUEST: u32 = 1;
+pub const LOCK_HOST: u32 = 2;
+/// How long EL1 waits for another vCPU's in-guest critical section before
+/// forwarding (a few hundred nanoseconds; those sections copy a page at most).
+pub const EL1_GUEST_LOCK_SPINS: u32 = 1024;
+
 /// Maximum number of simultaneously delegated inotify instances.
 pub const MAX_DELEGATED_INOTIFY: usize = 8;
 
@@ -944,9 +975,29 @@ impl DelegatedInotify {
 
     #[inline]
     pub fn try_lock(&self) -> bool {
+        // Strong: a spurious LL/SC failure must not look like contention.
         self.lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(0, LOCK_GUEST, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
+    }
+
+    /// EL1 acquire: wait a bounded while only for another vCPU's in-guest
+    /// critical section (short, and completed even across kicks); a host
+    /// holder may be a long recall, so forward at once. Bounded, so a lock
+    /// order inversion between vCPUs costs a forward, never a deadlock.
+    #[inline]
+    pub fn lock_guest_bounded(&self, max_spins: u32) -> bool {
+        for _ in 0..max_spins {
+            match self
+                .lock
+                .compare_exchange(0, LOCK_GUEST, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(LOCK_HOST) => return false,
+                Err(_) => core::hint::spin_loop(),
+            }
+        }
+        false
     }
 
     #[inline]
@@ -961,7 +1012,11 @@ impl DelegatedInotify {
 
     pub fn host_lock_bounded(&self, max_spins: u64) -> bool {
         for _ in 0..max_spins {
-            if self.try_lock() {
+            if self
+                .lock
+                .compare_exchange(0, LOCK_HOST, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
                 return true;
             }
             core::hint::spin_loop();
@@ -1123,9 +1178,29 @@ impl InotifyNameCacheEntry {
 
     #[inline]
     pub fn try_lock(&self) -> bool {
+        // Strong: a spurious LL/SC failure must not look like contention.
         self.lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(0, LOCK_GUEST, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
+    }
+
+    /// EL1 acquire: wait a bounded while only for another vCPU's in-guest
+    /// critical section (short, and completed even across kicks); a host
+    /// holder may be a long recall, so forward at once. Bounded, so a lock
+    /// order inversion between vCPUs costs a forward, never a deadlock.
+    #[inline]
+    pub fn lock_guest_bounded(&self, max_spins: u32) -> bool {
+        for _ in 0..max_spins {
+            match self
+                .lock
+                .compare_exchange(0, LOCK_GUEST, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(LOCK_HOST) => return false,
+                Err(_) => core::hint::spin_loop(),
+            }
+        }
+        false
     }
 
     #[inline]
