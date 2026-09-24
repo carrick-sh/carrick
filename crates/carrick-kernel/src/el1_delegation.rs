@@ -361,6 +361,19 @@ pub enum NotEligible {
     RecalledTooOften,
 }
 
+#[cfg(test)]
+pub(crate) static YIELD_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn yield_count() -> u64 {
+    YIELD_COUNT.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_yield_count() {
+    YIELD_COUNT.store(0, Ordering::Relaxed);
+}
+
 fn lock_delegated_file(file: &DelegatedFile, handle: u32) {
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(30);
@@ -376,7 +389,9 @@ fn lock_delegated_file(file: &DelegatedFile, handle: u32) {
                 generation
             );
         }
-        core::hint::spin_loop();
+        #[cfg(test)]
+        YIELD_COUNT.fetch_add(1, Ordering::Relaxed);
+        std::thread::yield_now();
     }
 }
 
@@ -2271,6 +2286,7 @@ mod tests {
 
         #[test]
         fn test_lock_delegated_file_spins_and_yields() {
+            reset_yield_count();
             let file = DelegatedFile::new();
             assert!(file.try_lock()); // locked
             let file_ptr = &file as *const DelegatedFile as usize;
@@ -2285,6 +2301,10 @@ mod tests {
             assert!(file.is_locked());
             file.unlock();
             handle.join().unwrap();
+            assert!(
+                yield_count() > 0,
+                "lock_delegated_file must yield when contested"
+            );
         }
 
         #[test]
