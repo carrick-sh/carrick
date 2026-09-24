@@ -118,6 +118,10 @@ impl MailboxSlotAllocator {
             return Err(MailboxSlotError::Exhausted);
         };
         used[index] = true;
+        // The slot's EL1 current-task record starts empty with the lease: it
+        // may still name the thread of the vCPU that held the slot before,
+        // whose file table EL1 would otherwise resolve this vCPU's fds in.
+        carrick_el1_abi::clear_current_task_record(index);
         MAILBOX_SLOT_CLAIMS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         THREAD_MAILBOX_SLOT_CLAIMS_TOTAL
             .set(THREAD_MAILBOX_SLOT_CLAIMS_TOTAL.get().saturating_add(1));
@@ -135,6 +139,13 @@ impl Default for MailboxSlotAllocator {
     }
 }
 
+/// Exclusive ownership of one syscall mailbox slot, and with it of the slot's
+/// EL1 current-task record (the EL1 kernel derives the record's index from
+/// the vCPU's `SP_EL1`, which is this slot's mailbox). The record is empty
+/// when the lease begins and when it ends. A slot index copied out of a lease
+/// names nothing once the lease is gone: M:N reclaim and fork rebuild move a
+/// vCPU to a fresh lease, so every record access derives the slot from the
+/// live binding at the moment of use.
 #[derive(Debug)]
 pub struct MailboxSlotLease {
     id: MailboxSlotId,
@@ -149,7 +160,10 @@ impl MailboxSlotLease {
 
 impl Drop for MailboxSlotLease {
     fn drop(&mut self) {
-        self.allocator.used.lock()[usize::from(self.id.0)] = false;
+        let mut used = self.allocator.used.lock();
+        // The record ends with the lease, before the slot can be leased again.
+        carrick_el1_abi::clear_current_task_record(usize::from(self.id.0));
+        used[usize::from(self.id.0)] = false;
     }
 }
 
@@ -645,6 +659,12 @@ impl MailboxBinding {
         // SAFETY: upheld by this constructor's caller.
         unsafe { binding.rebind(host, false) };
         binding
+    }
+
+    /// The slot this binding leases now, if any (`None` while parked for
+    /// reclaim, when the binding holds no slot).
+    pub fn leased_slot(&self) -> Option<MailboxSlotId> {
+        self.lease.as_ref().map(MailboxSlotLease::id)
     }
 
     pub fn slot(&self) -> MailboxSlotId {

@@ -972,6 +972,22 @@ pub fn get_el1_region_host_ptr() -> usize {
     EL1_REGION_HOST_PTR.load(Ordering::Acquire)
 }
 
+/// End the current-task record of mailbox `slot`: it names no thread, so EL1
+/// forwards every syscall trapped through that slot until a host boundary
+/// publishes the thread that holds it. The mailbox slot allocator calls this
+/// when a slot's lease begins and ends, so a record never outlives, or
+/// predates, the lease of the vCPU that reads it.
+pub fn clear_current_task_record(slot: usize) {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    // SAFETY: the record lives in the EL1 region; only atomics are touched.
+    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    current_task.clear();
+}
+
 /// Mark return-to-user work pending for the vCPU at `slot`.
 pub fn mark_pending_host_work(slot: usize) {
     let ptr = get_el1_region_host_ptr();
