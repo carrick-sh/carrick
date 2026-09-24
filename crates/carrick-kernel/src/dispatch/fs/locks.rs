@@ -1964,11 +1964,6 @@ impl<'a> FsView<'a> {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    if let Err(err) =
-                        crate::el1_delegation::recall_if_delegated(&open_file.description)
-                    {
-                        return Ok(DispatchOutcome::errno(err));
-                    }
                     let common = open_file.description.common();
                     let Some(current_raw) = common.seals() else {
                         // Not a sealable fd (regular file, socket, …).
@@ -1991,7 +1986,14 @@ impl<'a> FsView<'a> {
                     {
                         return Ok(DispatchOutcome::errno(LINUX_EBUSY));
                     }
-                    common.set_seals(Some((current | new_seals).bits()));
+                    let recall_res = {
+                        let _guard = open_file.description.write();
+                        common.set_seals(Some((current | new_seals).bits()));
+                        crate::el1_delegation::recall_if_delegated(&open_file.description)
+                    };
+                    if let Err(err) = recall_res {
+                        return Ok(DispatchOutcome::errno(err));
+                    }
                     DispatchOutcome::Returned { value: 0 }
                 }
                 // Async-I/O owner + signal (F_SETOWN/F_GETOWN, F_SETOWN_EX/

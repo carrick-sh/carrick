@@ -330,7 +330,7 @@ impl crate::observe::SyscallObserver for ContainerPolicy {
     }
 
     fn observes_syscall(&self, nr: u64) -> bool {
-        self.denied_errno_for_args(nr, 0).is_some()
+        self.denied_errno(nr).is_some() || (nr == SYS_PERSONALITY && self.models_docker_default)
     }
 }
 
@@ -415,5 +415,15 @@ mod tests {
         assert_eq!(policy.denied_errno(100), Some(LinuxErrno::new(38)));
         assert!(policy.denied_errno(200).is_none());
         assert!(policy.denied_errno(300).is_some());
+    }
+
+    #[test]
+    fn docker_default_observes_argument_conditional_personality() {
+        use crate::observe::SyscallObserver;
+        let policy = ContainerPolicy::docker_default_model();
+        assert!(
+            policy.observes_syscall(SYS_PERSONALITY),
+            "argument-conditional personality must be observed, not approximated with args=0"
+        );
     }
 }
