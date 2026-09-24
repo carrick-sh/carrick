@@ -304,16 +304,7 @@ impl<'a> MemView<'a> {
             };
             let file_mapping_reference = if !map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                 this.open_file(fd.0).and_then(|open| {
-                    let inode = open.description.read().and_then(|g| match &*g {
-                        OpenDescription::HostFile { host_fd, .. } => {
-                            carrick_vfs::RootFsVfs::host_fd_inode_identity(host_fd.raw())
-                        }
-                        OpenDescription::File { path, .. } => {
-                            this.fs.rootfs_vfs.path_inode_identity(path)
-                        }
-                        _ => None,
-                    });
-                    open.description.retain_mapping_with_inode(inode)
+                    open.description.retain_mapping()
                 })
             } else {
                 None

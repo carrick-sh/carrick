@@ -5,7 +5,7 @@
     "create_install": 62,
     "epoll_wait": 17,
     "inspect_misc": 122,
-    "lifecycle": 6,
+    "lifecycle": 8,
     "mapping_ring": 5,
     "read_attempt": 9,
     "slot_description_mutation": 11,
