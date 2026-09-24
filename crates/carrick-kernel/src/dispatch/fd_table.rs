@@ -1800,10 +1800,9 @@ impl OpenFile {
     }
 
     pub(in crate::dispatch) fn is_pty(&self) -> bool {
-        let Some(open) = self.description.read() else {
-            return false;
-        };
-        matches!(&*open, OpenDescription::HostPipe { pty: Some(_), .. })
+        self.description
+            .inspect_kind(|open| matches!(open, OpenDescription::HostPipe { pty: Some(_), .. }))
+            .unwrap_or(false)
     }
 }
 
@@ -3012,6 +3011,16 @@ impl crate::kernel::FileDescription {
     // EL1 ownership record enforces single-description delegation), so each
     // accessor only checks its own description, and a non-delegated file pays
     // one atomic load here.
+
+    /// Inspect what KIND of description this is without recalling a
+    /// delegation. Only for facts delegation never changes: the variant and
+    /// the fields it fixes at open (path, host fd identity, pipe or socket
+    /// role). Anything EL1 can change (offset, size, contents) goes through
+    /// `read`/`write`, which recall first.
+    pub(crate) fn inspect_kind<R>(&self, inspect: impl FnOnce(&OpenDescription) -> R) -> Option<R> {
+        let d = self.open_description()?;
+        Some(inspect(&d.read()))
+    }
 
     #[track_caller]
     pub(crate) fn read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {

@@ -523,6 +523,7 @@ static RECALL_TRIGGERS: Mutex<Vec<(&'static std::panic::Location<'static>, usize
 pub struct DelegationCounts {
     pub delegations: usize,
     pub recalls: usize,
+    pub host_served: usize,
     pub refusals: Vec<(NotEligible, usize)>,
     pub recall_triggers: Vec<(String, usize)>,
 }
@@ -532,6 +533,7 @@ pub fn delegation_counts() -> DelegationCounts {
     DelegationCounts {
         delegations: DELEGATIONS.load(Ordering::Relaxed),
         recalls: RECALLS.load(Ordering::Relaxed),
+        host_served: HOST_SERVED.load(Ordering::Relaxed),
         refusals: NotEligible::ALL
             .iter()
             .map(|reason| (*reason, REFUSALS[*reason as usize].load(Ordering::Relaxed)))
@@ -550,6 +552,7 @@ pub fn delegation_counts() -> DelegationCounts {
 pub fn reset_delegation_counts() {
     DELEGATIONS.store(0, Ordering::Relaxed);
     RECALLS.store(0, Ordering::Relaxed);
+    HOST_SERVED.store(0, Ordering::Relaxed);
     for counter in &REFUSALS {
         counter.store(0, Ordering::Relaxed);
     }
@@ -892,6 +895,109 @@ fn delegate_transaction(
     Ok(handle)
 }
 
+/// Host implementation of the shared file operations' user copy: through the
+/// current guest address space. A failed copy makes the host fall back to the
+/// ordinary path (recall, then the host syscall with its exact EFAULT rules).
+struct HostUserCopy<'m, M: carrick_guest_mem::GuestMemory> {
+    memory: &'m mut M,
+}
+
+impl<M: carrick_guest_mem::GuestMemory> carrick_el1::file::UserCopy for HostUserCopy<'_, M> {
+    fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
+        self.memory.write_bytes(dst_va, src).is_ok()
+    }
+
+    fn copy_in(&mut self, dst: &mut [u8], src_va: u64) -> bool {
+        match self.memory.read_bytes(src_va, dst.len()) {
+            Ok(bytes) if bytes.len() == dst.len() => {
+                dst.copy_from_slice(&bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The host waits for a marking inotify instance (lock order: file, then
+/// instance); it has nowhere else to send the operation.
+struct HostInstanceLock;
+
+impl carrick_el1::InstanceLockPolicy for HostInstanceLock {
+    fn acquire(&self, instance: &DelegatedInotify) -> bool {
+        let start = std::time::Instant::now();
+        while !instance.host_lock_bounded(64) {
+            if start.elapsed() >= std::time::Duration::from_secs(30) {
+                carrick_fatal!(
+                    "el1_delegation",
+                    "DelegatedInotify::host_lock timed out while serving a delegated file write"
+                );
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
+}
+
+static HOST_SERVED: AtomicUsize = AtomicUsize::new(0);
+
+/// Serve a forwarded read, write, lseek, pread64 or pwrite64 on a delegated
+/// file on the host, against the delegated object itself, with the same code
+/// EL1 runs. The object stays delegated: a forwarded operation (EL1 lost a lock
+/// race, took a kick, or saw an unmapped buffer) is not an ownership change.
+/// `None` means it could not be served here exactly and the caller takes the
+/// ordinary path, whose guard accessor recalls first.
+pub(crate) fn serve_on_host<M: carrick_guest_mem::GuestMemory>(
+    description: &FileDescription,
+    nr: usize,
+    args: [u64; 3],
+    memory: &mut M,
+) -> Option<crate::dispatch::DispatchOutcome> {
+    let handle = description.delegation_handle();
+    if handle == 0 {
+        return None;
+    }
+    let region_ptr = get_el1_region_host_ptr();
+    if region_ptr == 0 {
+        return None;
+    }
+    let file = delegated_file_object(region_ptr, handle);
+    lock_delegated_file(file, handle);
+    if file.state.load(Ordering::Acquire) != DELEGATED_STATE_GUEST
+        || description.delegation_handle() != handle
+    {
+        file.unlock();
+        return None;
+    }
+    // SAFETY: the inotify table lives in the EL1 region with
+    // MAX_DELEGATED_INOTIFY entries; only atomics and their own locks are used.
+    let inotify_table = unsafe {
+        std::slice::from_raw_parts(
+            (region_ptr + EL1_INOTIFY_TABLE_OFFSET as usize) as *const DelegatedInotify,
+            MAX_DELEGATED_INOTIFY,
+        )
+    };
+    let mut user = HostUserCopy { memory };
+    // SAFETY: the object is locked and live; the cache pointer is its slot.
+    let result = unsafe {
+        carrick_el1::serve_locked_file_op(
+            file,
+            inotify_table,
+            nr,
+            args,
+            delegated_cache(region_ptr, handle),
+            &mut user,
+            &HostInstanceLock,
+        )
+    };
+    file.unlock();
+    let value = result.ok()?;
+    HOST_SERVED.fetch_add(1, Ordering::Relaxed);
+    Some(match carrick_abi::LinuxErrno::from_guest_retval(value) {
+        Some(errno) => crate::dispatch::DispatchOutcome::errno(errno),
+        None => crate::dispatch::DispatchOutcome::Returned { value },
+    })
+}
+
 /// Recall a delegated file description back to host authority. Must be called
 /// with no guard of this description held.
 #[track_caller]
@@ -1137,6 +1243,7 @@ mod tests {
 
     mod serial_host {
         use super::*;
+        use carrick_guest_mem::GuestMemory;
 
         static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
@@ -1418,6 +1525,65 @@ mod tests {
             assert_ne!(open_b.description.delegation_handle(), 0);
             assert!(!recall_inode(open_a.description.el1_identity().unwrap()));
             recall(&open_b.description).unwrap();
+        }
+
+        #[test]
+        fn forwarded_operations_are_served_on_the_host_without_recall() {
+            let _region = Region::new();
+            let tmp = temp_with(b"abc");
+            let open = open_host(&tmp);
+            let handle = delegate_default(&open, 3).unwrap();
+            let mut memory =
+                crate::dispatch::outcome::LinearMemory::new(0x1000, b"XYZ\0\0\0".to_vec());
+            let returned = |outcome: Option<crate::dispatch::DispatchOutcome>| match outcome {
+                Some(crate::dispatch::DispatchOutcome::Returned { value }) => value,
+                other => panic!("expected a served return, got {other:?}"),
+            };
+            // write(fd, 0x1000, 3) at the delegated offset 0.
+            assert_eq!(
+                returned(serve_on_host(
+                    &open.description,
+                    64,
+                    [0x1000, 3, 0],
+                    &mut memory
+                )),
+                3
+            );
+            // lseek(fd, 0, SEEK_SET).
+            assert_eq!(
+                returned(serve_on_host(&open.description, 62, [0, 0, 0], &mut memory)),
+                0
+            );
+            // read(fd, 0x1003, 3) reads back what the write stored.
+            assert_eq!(
+                returned(serve_on_host(
+                    &open.description,
+                    63,
+                    [0x1003, 3, 0],
+                    &mut memory
+                )),
+                3
+            );
+            assert_eq!(memory.read_bytes(0x1003, 3).unwrap(), b"XYZ");
+            // Still delegated: a forwarded operation is not an ownership change,
+            // and the host-served operations count toward the window.
+            assert_eq!(open.description.delegation_handle(), handle);
+            let file = delegated_file_object(get_el1_region_host_ptr(), handle);
+            assert_eq!(file.served_ops.load(Ordering::Relaxed), 3);
+            recall(&open.description).unwrap();
+            assert_eq!(host_bytes(&tmp), b"XYZ");
+        }
+
+        #[test]
+        fn a_user_copy_failure_falls_back_instead_of_serving() {
+            let _region = Region::new();
+            let tmp = temp_with(b"abc");
+            let open = open_host(&tmp);
+            delegate_default(&open, 3).unwrap();
+            let mut memory = crate::dispatch::outcome::LinearMemory::new(0x1000, vec![0; 4]);
+            // The buffer is outside guest memory: the host path must take over.
+            assert!(serve_on_host(&open.description, 63, [0x9000, 3, 0], &mut memory).is_none());
+            recall(&open.description).unwrap();
         }
 
         #[test]

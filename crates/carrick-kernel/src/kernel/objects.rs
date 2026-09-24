@@ -1441,10 +1441,18 @@ impl FileDescription {
     }
 
     pub(crate) fn release_fd_ref(&self) {
-        crate::el1_delegation::recall_if_delegated(self);
+        // Only the last fd reference ends an EL1 delegation: a transient
+        // reference (a dup, an in-flight syscall's lease) coming and going is
+        // not an ownership change. Recall runs outside `lifecycle_transition`,
+        // which is ordered before the description guard.
+        if self.common.fd_refs() <= 1 {
+            crate::el1_delegation::recall_if_delegated(self);
+        }
+        let released_last;
         let terminal_finalizers = {
             let mut lifecycle = self.lifecycle_transition.lock();
             let count = self.common.release_fd_ref();
+            released_last = count == 0;
             if count == 0 {
                 if let FileDescriptionKind::Concrete(backing) = &self.kind {
                     backing.0.on_last_fd_ref();
@@ -1457,6 +1465,12 @@ impl FileDescription {
                 Vec::new()
             }
         };
+        // Two releases that both saw another reference outstanding can reach
+        // zero together; the description (and its host fd) is still alive, so
+        // write the delegation back now.
+        if released_last {
+            crate::el1_delegation::recall_if_delegated(self);
+        }
         // A finalizer may take subsystem state (for example logical-record
         // locks). Do not nest that under `lifecycle_transition`; the terminal
         // count has already made further lease admission impossible.

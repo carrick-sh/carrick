@@ -1203,12 +1203,14 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return true;
         };
-        let Some(open) = open_file.description.read() else {
-            return true;
-        };
-        matches!(
-            &*open,
-            OpenDescription::EventFd { .. }
+        // Routing needs only the description's kind, which a delegation
+        // never changes: inspect it without recalling.
+        open_file
+            .description
+            .inspect_kind(|open| {
+                matches!(
+                    open,
+                    OpenDescription::EventFd { .. }
                 | OpenDescription::PipeWriter { .. }
                 // PipeReader is shared-safe: write dispatch on a pipe read end returns
                 // Linux EBADF immediately without performing mutable or legacy-only state transitions.
@@ -1230,7 +1232,9 @@ impl<'a> FsView<'a> {
                 | OpenDescription::SyntheticFile { .. }
                 | OpenDescription::ProcExecutable { .. }
                 | OpenDescription::SyntheticDevice { .. }
-        )
+                )
+            })
+            .unwrap_or(true)
     }
 
     fn record_unimplemented_virtual_file(
