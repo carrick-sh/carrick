@@ -5617,6 +5617,12 @@ mod real {
         /// EL1 trampoline), `kick_inject` (EL0 kick-path signal injections),
         /// `inject_at_el1` (carrick-vs-guest invariant violations — must be 0).
         fn kick__stats(_: u64, _: u64, _: u64) {}
+        /// A host syscall boundary found the EL1 current-task record of
+        /// mailbox `slot` naming a thread or file table other than the one
+        /// that trapped (`recorded_tid`/`recorded_table` vs `tid`/`table`):
+        /// until this point EL1 resolved the trapping thread's fds through
+        /// the recorded table.
+        fn el1__task__record__stale(_: u64, _: u64, _: u64, _: u64, _: u64) {}
         /// Reusable guest-memory watchpoint (compiled in only under the `watchpoint`
         /// feature). When that build has `CARRICK_WATCH_ADDR=<hex>` set, fires before
         /// EVERY syscall with (`syscall_nr`, `addr`, the current little-endian u64 at
@@ -7532,6 +7538,22 @@ mod real {
         carrick_usdt::kick__stats!(|| (el1_resumed, kick_inject, inject_at_el1));
     }
 
+    pub fn el1_task_record_stale(
+        slot: u64,
+        recorded_tid: u64,
+        recorded_table: u64,
+        tid: u64,
+        table: u64,
+    ) {
+        carrick_usdt::el1__task__record__stale!(|| (
+            slot,
+            recorded_tid,
+            recorded_table,
+            tid,
+            table
+        ));
+    }
+
     pub fn mem_watch(syscall_nr: u64, addr: u64, value: u64) {
         carrick_usdt::mem__watch!(|| (syscall_nr, addr, value));
     }
@@ -8557,6 +8579,7 @@ mod stub {
     stub!(kick_in_kernel(pc: u64, el: u32));
     stub!(vcpu_kick(vcpu: u64, valid: i32, rc: i32));
     stub!(kick_stats(el1_resumed: u64, kick_inject: u64, inject_at_el1: u64));
+    stub!(el1_task_record_stale(slot: u64, recorded_tid: u64, recorded_table: u64, tid: u64, table: u64));
     stub!(mem_watch(syscall_nr: u64, addr: u64, value: u64));
     stub!(sigaction_read(signum: i32, w0: u64, w1: u64, w2: u64, w3: u64));
     stub!(supervisor_fork(child_pid: i32));

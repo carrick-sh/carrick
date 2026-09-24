@@ -70,11 +70,18 @@ pub fn revalidate_current_task(slot: usize, task_id: El1TaskId, file_table: u64)
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     // SAFETY: the record lives in the EL1 region; only atomics are touched.
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    if current_task.task_id.load(Ordering::Acquire) == task_id.raw()
-        && current_task.file_table.load(Ordering::Acquire) == file_table
-    {
+    let recorded_tid = current_task.task_id.load(Ordering::Acquire);
+    let recorded_table = current_task.file_table.load(Ordering::Acquire);
+    if recorded_tid == task_id.raw() && recorded_table == file_table {
         return false;
     }
+    carrick_observability::probes::el1_task_record_stale(
+        slot as u64,
+        recorded_tid,
+        recorded_table,
+        task_id.raw(),
+        file_table,
+    );
     current_task.task_id.store(task_id.raw(), Ordering::Relaxed);
     current_task.file_table.store(file_table, Ordering::Release);
     REVALIDATED_RECORDS.fetch_add(1, Ordering::Relaxed);
@@ -1045,6 +1052,7 @@ pub(crate) static YIELD_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// mid-EL1 resume rule guarantees complete, so a wait is a scheduling delay:
 /// spin briefly, then yield between bursts. The long bound is evidence of a
 /// bug, never a scheduling budget.
+#[track_caller]
 fn lock_delegated_file(file: &DelegatedFile, handle: u32) {
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(30);
@@ -1052,18 +1060,65 @@ fn lock_delegated_file(file: &DelegatedFile, handle: u32) {
         if start.elapsed() >= timeout {
             let state = file.state.load(Ordering::Relaxed);
             let generation = file.generation.load(Ordering::Relaxed);
+            let word = file.lock.load(Ordering::Relaxed);
+            let (site, thread) = last_host_holder(handle);
             carrick_fatal!(
                 "el1_delegation",
-                "DelegatedFile::host_lock timed out spinning for handle={}, state={}, generation={}",
+                "DelegatedFile::host_lock timed out spinning for handle={}, state={}, generation={}, lock_word={} (1=guest, 2=host), last host holder={} on host thread {:#x}, waiter={}",
                 handle,
                 state,
-                generation
+                generation,
+                word,
+                site,
+                thread,
+                std::panic::Location::caller()
             );
         }
         #[cfg(test)]
         YIELD_COUNT.fetch_add(1, Ordering::Relaxed);
         std::thread::yield_now();
     }
+    note_host_holder(handle);
+}
+
+/// The call site and host thread of the last host acquisition of each inode
+/// lock. While the lock word says the host holds it, that acquisition is the
+/// holder (host acquisitions are exclusive); a lock timeout names it.
+static HOST_HOLDER_SITES: [std::sync::atomic::AtomicPtr<std::panic::Location<'static>>;
+    MAX_DELEGATED_FILES] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; MAX_DELEGATED_FILES];
+static HOST_HOLDER_THREADS: [std::sync::atomic::AtomicU64; MAX_DELEGATED_FILES] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MAX_DELEGATED_FILES];
+
+#[track_caller]
+fn note_host_holder(handle: u32) {
+    let Some(index) = (handle as usize).checked_sub(1) else {
+        return;
+    };
+    if index >= MAX_DELEGATED_FILES {
+        return;
+    }
+    let site = std::panic::Location::caller() as *const std::panic::Location<'static>;
+    HOST_HOLDER_SITES[index].store(site.cast_mut(), Ordering::Relaxed);
+    // SAFETY: pthread_self has no preconditions.
+    let thread = unsafe { libc::pthread_self() } as u64;
+    HOST_HOLDER_THREADS[index].store(thread, Ordering::Relaxed);
+}
+
+fn last_host_holder(handle: u32) -> (String, u64) {
+    let Some(index) = (handle as usize).checked_sub(1) else {
+        return ("none".to_owned(), 0);
+    };
+    if index >= MAX_DELEGATED_FILES {
+        return ("none".to_owned(), 0);
+    }
+    let site = HOST_HOLDER_SITES[index].load(Ordering::Relaxed);
+    let thread = HOST_HOLDER_THREADS[index].load(Ordering::Relaxed);
+    if site.is_null() {
+        return ("none".to_owned(), thread);
+    }
+    // SAFETY: only `&'static Location` values are ever stored.
+    (unsafe { &*site }.to_string(), thread)
 }
 
 /// Put a just-opened description in the zone, if it fits: the ONLY entry.
