@@ -117,10 +117,24 @@ slot with a paged cache.
 
 Phase 1 is implemented on `director/el1-inotify-r5`: instances are born in
 the zone and the host serves forwarded file operations against the in-zone
-object (`carrick_el1::serve_locked_file_op`). Kind probes and fstat no longer
-recall (`inspect_kind`, `sync_to_host`). About 80 accessor sites that match
-only kinds that can never be in the zone still recall if reached. Phase 2
-removes recall-on-access rather than migrating them one by one.
+object (`carrick_el1::serve_locked_file_op`). Kind probes, fstat and path
+stats no longer recall (`inspect_kind`, `sync_to_host`, `sync_inode`). About
+80 accessor sites that match only kinds that can never be in the zone still
+recall if reached. Phase 2 removes recall-on-access rather than migrating
+them one by one.
+
+The first full probe gate on the branch found five in-zone defects, all fixed
+with a red-first test each:
+- EL1's read fallback failed every short read of a non-zone fd with EINVAL;
+- a path stat read stale host metadata for an in-zone file;
+- a large inotify read returned one 512-byte chunk;
+- a bad user buffer lost drained records, and a spilled instance
+  returned EAGAIN;
+- an in-guest enqueue never woke a host waiter, and an in-guest drain left
+  the instance polling readable.
+Readiness of an in-zone instance is now answered from its queues; an
+enqueue onto an empty, host-observed queue owes a wake that EL1 delivers
+through the host boundary (`ServedWithWork`).
 
 | inotify09, signed CLI, serial phases | Wall |
 |---|---|
