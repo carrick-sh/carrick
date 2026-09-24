@@ -325,10 +325,13 @@ impl RootFsVfs {
     }
 
     pub fn path_inode_identity(&self, path: &str) -> Option<InodeIdentity> {
-        if let Ok(dentry) =
-            self.dentry_cache
-                .lookup_path(path, false, &*self.overlay, self.rootfs.as_ref())
-        {
+        if let Ok(dentry) = self.dentry_cache.lookup_path_options(
+            path,
+            false,
+            &*self.overlay,
+            self.rootfs.as_ref(),
+            false,
+        ) {
             Some(InodeIdentity::new(dentry.dentry.dev, dentry.dentry.ino))
         } else {
             None

@@ -1415,6 +1415,7 @@ impl FileDescription {
     }
 
     /// Acquire while an fd still owns the backing, serialized with final close.
+    #[allow(dead_code)]
     pub(crate) fn retain_mapping(self: &Arc<Self>) -> Option<Arc<MappedFileReference>> {
         self.retain_mapping_with_inode(None)
     }

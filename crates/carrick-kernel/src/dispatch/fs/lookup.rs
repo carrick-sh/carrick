@@ -267,7 +267,11 @@ impl<'a> FsView<'a> {
                 && self.dac_overrides_permissions()
                 && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(path)
             {
-                let inode = carrick_vfs::InodeIdentity::new(0, real.ino);
+                let inode = self
+                    .fs
+                    .rootfs_vfs
+                    .path_inode_identity(path)
+                    .unwrap_or(carrick_vfs::InodeIdentity::new(0, real.ino));
                 if crate::el1_delegation::is_inode_delegated(inode) {
                     crate::el1_delegation::recall_by_inode(inode);
                 } else {
@@ -375,7 +379,11 @@ impl<'a> FsView<'a> {
                 && self.dac_overrides_permissions()
                 && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(&resolved)
             {
-                let inode = carrick_vfs::InodeIdentity::new(0, real.ino);
+                let inode = self
+                    .fs
+                    .rootfs_vfs
+                    .path_inode_identity(&resolved)
+                    .unwrap_or(carrick_vfs::InodeIdentity::new(0, real.ino));
                 if crate::el1_delegation::is_inode_delegated(inode) {
                     crate::el1_delegation::recall_by_inode(inode);
                 } else {
