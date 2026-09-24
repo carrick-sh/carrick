@@ -397,10 +397,9 @@ pub(crate) fn el1_write<V: MemoryValidator>(
                 (cur_off - old_size) as usize,
             );
         }
-        mark_dirty_pages(file, old_size, delivered_end);
-    } else {
-        mark_dirty_pages(file, cur_off, delivered_end);
+        mark_gap_zero_pages(file, old_size, cur_off);
     }
+    mark_dirty_pages(file, cur_off, delivered_end);
     if delivered_end > old_size {
         file.size.store(delivered_end, Ordering::Release);
     }
@@ -461,14 +460,39 @@ pub(crate) fn el1_pwrite64<V: MemoryValidator>(
                 (off - old_size) as usize,
             );
         }
-        mark_dirty_pages(file, old_size, delivered_end);
-    } else {
-        mark_dirty_pages(file, off, delivered_end);
+        mark_gap_zero_pages(file, old_size, off);
     }
+    mark_dirty_pages(file, off, delivered_end);
     if delivered_end > old_size {
         file.size.store(delivered_end, Ordering::Release);
     }
     Ok(count as i64)
+}
+
+fn mark_gap_zero_pages(file: &DelegatedFile, old_size: u64, cur_off: u64) {
+    if cur_off <= old_size {
+        return;
+    }
+    let partial_end = old_size.div_ceil(DELEGATED_PAGE_SIZE) * DELEGATED_PAGE_SIZE;
+    if partial_end <= cur_off && (old_size % DELEGATED_PAGE_SIZE != 0) {
+        mark_dirty_pages(file, old_size, partial_end);
+    } else if partial_end > cur_off {
+        mark_dirty_pages(file, old_size, cur_off);
+        return;
+    }
+
+    let start_p = old_size.div_ceil(DELEGATED_PAGE_SIZE) as usize;
+    let end_p = (cur_off / DELEGATED_PAGE_SIZE) as usize;
+    if end_p > start_p {
+        let mut zero_mask = 0u64;
+        for p in start_p..core::cmp::min(end_p, 64) {
+            zero_mask |= 1u64 << p;
+        }
+        if zero_mask != 0 {
+            file.zero_filled_mask.fetch_or(zero_mask, Ordering::Release);
+            file.dirty_mask.fetch_and(!zero_mask, Ordering::Release);
+        }
+    }
 }
 
 fn mark_dirty_pages(file: &DelegatedFile, start: u64, end: u64) {
@@ -483,6 +507,7 @@ fn mark_dirty_pages(file: &DelegatedFile, start: u64, end: u64) {
     }
     if mask != 0 {
         file.dirty_mask.fetch_or(mask, Ordering::Release);
+        file.zero_filled_mask.fetch_and(!mask, Ordering::Release);
     }
 }
 
@@ -844,5 +869,38 @@ mod tests {
             assert_eq!(byte, 0, "byte at offset {} was not zeroed", 10 + i);
         }
         assert_eq!(cache[8000], b'x');
+    }
+
+    #[test]
+    fn test_extension_gap_pages_tracked_in_zero_filled_mask() {
+        let task = CurrentTask::new();
+        let (file, mut cache) = fixture_file(0, 0, DELEGATED_FLAG_WRITABLE);
+        let mut user_buf = vec![0x42u8; 128];
+        let user_va = user_buf.as_mut_ptr() as u64;
+        let validator = FakeOracleValidator {
+            writable_regions: vec![user_va..user_va + 128],
+            readable_regions: vec![user_va..user_va + 128],
+        };
+
+        // Write at offset 8192 (skipping 2 pages: page 0 and page 1)
+        file.offset.store(8192, Ordering::Relaxed);
+        let n = el1_write(&file, &task, cache.as_mut_ptr(), user_va, 128, &validator).unwrap();
+        assert_eq!(n, 128);
+        assert_eq!(file.offset.load(Ordering::Relaxed), 8192 + 128);
+        assert_eq!(file.size.load(Ordering::Relaxed), 8192 + 128);
+
+        // Page 0 and Page 1 must be in zero_filled_mask, NOT dirty_mask
+        assert_eq!(
+            file.zero_filled_mask.load(Ordering::Relaxed),
+            (1 << 0) | (1 << 1)
+        );
+        assert_eq!(file.dirty_mask.load(Ordering::Relaxed), (1 << 2));
+
+        // Now write into page 1: it must be removed from zero_filled_mask and added to dirty_mask!
+        file.offset.store(4096, Ordering::Relaxed);
+        let n = el1_write(&file, &task, cache.as_mut_ptr(), user_va, 64, &validator).unwrap();
+        assert_eq!(n, 64);
+        assert_eq!(file.zero_filled_mask.load(Ordering::Relaxed), (1 << 0));
+        assert_eq!(file.dirty_mask.load(Ordering::Relaxed), (1 << 1) | (1 << 2));
     }
 }

@@ -621,6 +621,7 @@ pub(crate) fn delegate_locked(
     }
     file.flags.store(flags_val, Ordering::Relaxed);
     file.dirty_mask.store(0, Ordering::Relaxed);
+    file.zero_filled_mask.store(0, Ordering::Relaxed);
     file.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
     file.unlock();
 
@@ -729,6 +730,7 @@ pub(crate) fn recall_locked(
     let guest_offset = file.offset.load(Ordering::Acquire);
     let guest_size = file.size.load(Ordering::Acquire);
     let dirty_mask = file.dirty_mask.swap(0, Ordering::AcqRel);
+    let zero_filled_mask = file.zero_filled_mask.swap(0, Ordering::AcqRel);
 
     let cache_ptr = (region_ptr
         + EL1_CACHE_OFFSET as usize
@@ -754,6 +756,24 @@ pub(crate) fn recall_locked(
                         if write_error.is_none() {
                             write_error = Some(err);
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    if zero_filled_mask != 0 {
+        if let OpenDescription::HostFile { host_fd, .. } = open {
+            for i in 0..64 {
+                if (zero_filled_mask & (1 << i)) != 0 {
+                    let page_offset = i as u64 * 4096;
+                    if page_offset < guest_size {
+                        let punch_len = std::cmp::min(4096, guest_size - page_offset);
+                        let _ = crate::dispatch::fs::rw::punch_host_file_hole(
+                            host_fd.raw(),
+                            page_offset,
+                            punch_len,
+                        );
                     }
                 }
             }
@@ -2335,6 +2355,54 @@ mod tests {
             assert_eq!(written, 11);
 
             let found = dispatcher.fs().seek_host_sparse_extents(raw_fd, 4096, true);
+            assert_eq!(found, Some(Some(4096)));
+        }
+
+        #[test]
+        fn test_recall_punches_zero_filled_gap_pages() {
+            let region = TestEl1Region::new();
+            let table_id = FileTableId::from_raw_u64(1).unwrap();
+            let (_tmp, host_file) = create_test_host_file(b"");
+
+            let handle = delegate_for_test(&host_file, table_id, 3).expect("delegate");
+            assert_eq!(host_file.description.delegation_handle(), handle);
+
+            let region_ptr = region.buffer.as_ptr() as usize;
+            let file_ptr = (region_ptr
+                + EL1_OBJECT_TABLE_OFFSET as usize
+                + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
+                as *const DelegatedFile;
+            let file = unsafe { &*file_ptr };
+            let cache_ptr = (region_ptr
+                + EL1_CACHE_OFFSET as usize
+                + (handle as usize - 1) * DELEGATED_FILE_MAX_SIZE as usize)
+                as *mut u8;
+
+            // Write 100 bytes at offset 4096 (page 1) in cache
+            unsafe {
+                let write_slice = std::slice::from_raw_parts_mut(cache_ptr.add(4096), 100);
+                write_slice.fill(b'x');
+            }
+            file.offset.store(4096 + 100, Ordering::Release);
+            file.size.store(4096 + 100, Ordering::Release);
+            // Page 0 was zero-filled gap on extension, page 1 is dirty
+            file.zero_filled_mask.store(1 << 0, Ordering::Release);
+            file.dirty_mask.store(1 << 1, Ordering::Release);
+
+            let sparse = DELEGATED_SPARSE.lock()[(handle - 1) as usize]
+                .clone()
+                .unwrap();
+            let raw_fd = match &*host_file.description.open_description().unwrap().read() {
+                OpenDescription::HostFile { host_fd, .. } => host_fd.raw(),
+                _ => panic!("expected HostFile"),
+            };
+            sparse.reset_host_sparse_extents(raw_fd, 8192);
+
+            recall(&host_file.description).unwrap();
+
+            // Page 0 was zero-filled, so it was never written to sparse extents.
+            // SEEK_DATA from offset 0 should find page 1 (4096).
+            let found = sparse.seek_host_sparse_extents(raw_fd, 0, true);
             assert_eq!(found, Some(Some(4096)));
         }
     }
