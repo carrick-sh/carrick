@@ -739,14 +739,6 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "delegate_locked::CARRICK_EL1",
-      "fingerprint": "579801ddcfcc6665984c1e49d675aad4d9096e8ef461f019f0de8ac034b5da76",
-      "classification": "config_debug",
-      "rationale": "Operator environment override to disable in-guest EL1 regular file delegation."
-    },
-    {
-      "kind": "env_var_os",
       "file": "crates/carrick-kernel/src/exec_stamps.rs",
       "symbol": "stamp_record::CARRICK_EXEC_STAMPS",
       "fingerprint": "857b733af0acdc35b398e51cf338091b3948d948728d2bcecabe8ce4ac86a6c1",
@@ -1532,86 +1524,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "DELEGATED_DESCRIPTIONS",
-      "fingerprint": "0fe669e6e836183b91c3bad0b2d805ca0297e6b999a7f58e0013770198de8d58",
-      "classification": "carrier_infra",
-      "rationale": "Weak table of delegated file descriptions used to recall files when watched by inotify or fanotify."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "DELEGATED_HANDLE_INODES",
-      "fingerprint": "dfd33358b1c280b6d5346d0783450791db8cd7839c1e50855b9e3b252dfdf532",
-      "classification": "carrier_infra",
-      "rationale": "Mapping from allocated EL1 delegation handle to inode number for targeted recall."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "DELEGATED_INODES",
-      "fingerprint": "32051133e34a16992b329c334e1db82ffbe35ffe90a3898e41ab33f96112ed74",
-      "classification": "carrier_infra",
-      "rationale": "Registry of active delegated inode numbers used for fast O(1) recall checks."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "DELEGATED_INODES_SNAPSHOT",
-      "fingerprint": "881336040305194e681a4d4a9ae2f8fd4e1826018788e944e48091f6ac6de7b5",
-      "classification": "carrier_infra",
-      "rationale": "Atomic RCU snapshot of delegated inodes for lock-free inspection."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "DELEGATED_ROOTFS",
-      "fingerprint": "6342d41ccbbb3aa5dd65eed4d44c6420928e9be1ea2b305c09248879edb0f96b",
-      "classification": "carrier_infra",
-      "rationale": "Weak rootfs reference used to resolve paths for delegated file eligibility checks."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "DELEGATED_SPARSE",
-      "fingerprint": "a533dacaef064267e82fd21569fc5f686039bd8e142e22f8e9f0512ef25435d2",
-      "classification": "carrier_infra",
-      "rationale": "Sparse extents registry tracking dirty ranges committed back from EL1 delegation."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "FD_MAP_LOCK",
-      "fingerprint": "64631f2fc003b0507ca399e4d0297ac136a9cfda74182b599db64873de5f9bea",
-      "classification": "carrier_infra",
-      "rationale": "Lock synchronizing slot allocation and clearing in the EL1 fd_map aperture."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "HAS_DELEGATED_FILES",
-      "fingerprint": "ed871e2665b9e1bfb44f46d116ec87dd8874a4ccc5f963b5e8d7f97c31c39a85",
-      "classification": "carrier_infra",
-      "rationale": "Atomic boolean flag indicating if any files are currently delegated to EL1."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "HOOK_INIT",
-      "fingerprint": "0c8710e299e4f7f9d830c6634e494ce636a5aae4610b9bddbc09c28cd503468e",
-      "classification": "carrier_infra",
-      "rationale": "Once cell ensuring one-time registration of the VFS inode recall hook."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "MAPPED_INODES",
-      "fingerprint": "9fbdce09ea0c3e8e026c30ecd45f0eda45610f9aab618461b7f4a21499de012b",
-      "classification": "carrier_infra",
-      "rationale": "Registry of active file memory mappings for inode-level delegation exclusion."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "symbol": "NEXT_INCARNATION",
       "fingerprint": "d61fa36f4ea30df3c347972b3d7041a2f1df505a9b50fa254c7cb47195314b8c",
       "classification": "monotonic_allocator",
@@ -1628,10 +1540,114 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "tests::TEST_LOCK",
+      "symbol": "ACTIVE_DELEGATIONS",
+      "fingerprint": "1e8fa6fb5c12e287dd86f54fe48e87bb1ae92129184b68eddbf3284d2735ecc8",
+      "classification": "carrier_infra",
+      "rationale": "Count of inodes the EL1 zone currently owns; carrier-wide because the EL1 aperture is one per VM carrier."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "DELEGATIONS",
+      "fingerprint": "2256202a5b2d83750a9a740ca134c27872963378c3c25d1f7b38520e5351c218",
+      "classification": "carrier_infra",
+      "rationale": "Population counter of EL1 delegations for contracts and diagnostics; never read for decisions."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "FD_MAP",
+      "fingerprint": "fe463a2f9a796d11ca36ae560fda279fed7f250a1c394a372e4bb77ac62dd48f",
+      "classification": "carrier_infra",
+      "rationale": "Host index of the carrier-wide EL1 fd-map aperture: (file table, fd) and handle to slot, plus the free list."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "FD_MAP_PUBLISHED",
+      "fingerprint": "d0eb7dd00a953274ec4af05bd21fdfab62559821396613a02de96e3de6a17ae5",
+      "classification": "carrier_infra",
+      "rationale": "Fast-path flag: whether any fd-map entry exists in the carrier-wide EL1 aperture."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "HOST_SERVED",
+      "fingerprint": "6a287028f65dc3407f3daf5db18ac6b1faa78288a3adf06aea54ca01d7a86b9f",
+      "classification": "carrier_infra",
+      "rationale": "Population counter of forwarded file operations the host served against in-zone objects; diagnostics only."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "OWNERS",
+      "fingerprint": "e9a1d4d132ca9ac78fa4c5c8593986d83abec04e77ce499f17da2793a9521974",
+      "classification": "carrier_infra",
+      "rationale": "Owner-per-inode table for EL1 zone objects: open count and Host/Delegating/Guest/Recalling state, one per carrier aperture."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "OWNERS_CHANGED",
+      "fingerprint": "a0273dac44b2d5a11b9db78c0e6d244642ff316cfc6d533b2208c31716c78822",
+      "classification": "carrier_infra",
+      "rationale": "Condvar paired with OWNERS so a recall waiting on a Delegating owner wakes when the transaction ends."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "RECALLS",
+      "fingerprint": "6cb7e215c32ca26e36a2387ab89a5e456a9dd8ec3978317dc86d61376894d3b9",
+      "classification": "carrier_infra",
+      "rationale": "Population counter of EL1 recalls for contracts and diagnostics; never read for decisions."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "RECALL_TRIGGERS",
+      "fingerprint": "9c6cd8f1ab95077f0e70ef2be7338624d4cf5ae8c3a9c60cac697cadf6994374",
+      "classification": "carrier_infra",
+      "rationale": "Per-call-site recall census (track_caller) naming what pulled files out of the zone; diagnostics only."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "REFUSALS",
+      "fingerprint": "7501dcb67b23ec26d072cff2d5b6b941dbed0fa6b1869a7ad10a58ad282663e2",
+      "classification": "carrier_infra",
+      "rationale": "Per-reason counters of refused EL1 delegations; diagnostics only."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "REVALIDATED_RECORDS",
+      "fingerprint": "40094535145427cfde4f8b38a4fc3d1b25c6c479b55e988c9737a100dcb439c8",
+      "classification": "carrier_infra",
+      "rationale": "Counter of vCPU task records corrected at a host syscall boundary; diagnostics only."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "TABLELESS_PUBLISHES",
+      "fingerprint": "c1f8c369fda8cc303674dbcd3a3b523436173ce3233f918fd1ed6c789f4612a3",
+      "classification": "carrier_infra",
+      "rationale": "Counter of delegations published without a file table; diagnostics only."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "tests::PAUSE_HOOK",
+      "fingerprint": "19230ee4d66b22a3b70ce50e36582c966edb18518b5955f6ef5f6a2bf4c64c0f",
+      "classification": "test_only",
+      "rationale": "Test-only hook pausing delegate_locked between fill and publish for the rollback test."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "tests::serial_host::TEST_LOCK",
       "fingerprint": "b45f2e0792f4c7c840555bdf52882bf567b1f7f35998d77b3e2084e080d8479d",
       "classification": "test_only",
-      "rationale": "Test-only mutex serializing unit tests for EL1 file delegation."
+      "rationale": "Test-only mutex serializing EL1 delegation unit tests that share the process-global region pointer."
     },
     {
       "kind": "static",
@@ -2344,14 +2360,6 @@
       "fingerprint": "be74cb5b68663042ef31d41c120e4754c786d129fd9d3a7eafd4dbea60560ea6",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static reflink_or_copy_file::FALLBACK_FLAGGED in crates/carrick-runtime/src/layer_cache.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vfs/src/vfs/dentry.rs",
-      "symbol": "INODE_RECALL_HOOK",
-      "fingerprint": "3c401f770c60cb149ca0f6943ec323e6a8fd8843c8521e36c603c5582d702ec6",
-      "classification": "carrier_infra",
-      "rationale": "Hook callback invoked by VFS dentry/inode mutation to recall active EL1 delegations."
     },
     {
       "kind": "static",
@@ -3192,6 +3200,22 @@
       "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
       "classification": "test_only",
       "rationale": "Test-only thread-local cell STAGE2_AUDIT_STATE in crates/carrick-vmm-hvf/src/trap.rs enabling hypervisor stage-2 audit and failure injection in unit tests."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_inotify.rs",
+      "symbol": "ALLOCATED_INOTIFY_HANDLES",
+      "fingerprint": "8293ec39d01c673ab285f92855c0e0e3db7704a84b520b763b54b77d14b63d5b",
+      "classification": "carrier_infra",
+      "rationale": "Allocation bitmap of in-zone inotify instance slots in the carrier-wide EL1 aperture."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_inotify.rs",
+      "symbol": "INSTANCE_STATES",
+      "fingerprint": "168e6ab4d62e6e115c6cd1b7618fe1ffbff304ea7d87ae3fd07671082b704841",
+      "classification": "carrier_infra",
+      "rationale": "Weak map from in-zone inotify handle to its fronting InotifyState, so host paths reach the one authoritative instance."
     }
   ]
 }
