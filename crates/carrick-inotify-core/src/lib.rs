@@ -248,6 +248,344 @@ impl<const CAP: usize> Default for InotifyRingCore<CAP> {
     }
 }
 
+/// Encoded size of one `inotify_event` record: the 16-byte header plus the
+/// NUL-terminated name padded to a 4-byte boundary (`len` includes padding).
+pub const fn encoded_record_len(name_len: Option<usize>) -> usize {
+    match name_len {
+        None => INOTIFY_EVENT_HEADER_SIZE,
+        Some(n) => INOTIFY_EVENT_HEADER_SIZE + ((n + 1 + 3) & !3),
+    }
+}
+
+/// Outcome of [`InotifyEventQueue::push`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuePush {
+    /// Appended; `was_empty` reports a readiness transition.
+    Appended { was_empty: bool },
+    /// Identical to the tail record (inotify(7) coalescing): dropped.
+    Coalesced,
+    /// The queue reached its event limit: one `IN_Q_OVERFLOW` record was
+    /// appended and later records are dropped until the queue drains.
+    Overflowed { was_empty: bool },
+    /// Dropped because the queue has already overflowed.
+    Dropped,
+    /// The byte buffer cannot hold this record. The caller must preserve
+    /// FIFO order some other way (the host keeps an ordered spill); the queue
+    /// is unchanged.
+    NoSpace,
+}
+
+/// The one inotify event queue, shared by the in-guest instance and the host.
+///
+/// Records are stored contiguously in exactly the wire format `read(2)`
+/// returns, so a read is a copy of a prefix. Semantics match the
+/// oracle-verified host model: byte-identical tail coalescing, an event-count
+/// bound of [`INOTIFY_MAX_QUEUED_EVENTS`] with a single overflow marker, a
+/// latch that lifts only when the queue fully drains, and whole-record reads
+/// (EINVAL when the first record does not fit).
+#[repr(C)]
+#[derive(Debug)]
+pub struct InotifyEventQueue<const BYTES: usize> {
+    used: usize,
+    count: usize,
+    tail: usize,
+    overflowed: bool,
+    buf: [u8; BYTES],
+}
+
+impl<const BYTES: usize> InotifyEventQueue<BYTES> {
+    pub const fn new() -> Self {
+        Self {
+            used: 0,
+            count: 0,
+            tail: 0,
+            overflowed: false,
+            buf: [0; BYTES],
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Number of queued records.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Bytes a `read(2)` could return right now (FIONREAD).
+    #[inline]
+    pub fn queued_bytes(&self) -> usize {
+        self.used
+    }
+
+    #[inline]
+    pub fn has_overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    fn write_record(&mut self, at: usize, wd: i32, mask: u32, cookie: u32, name: Option<&[u8]>) {
+        let len = encoded_record_len(name.map(<[u8]>::len));
+        let name_field = (len - INOTIFY_EVENT_HEADER_SIZE) as u32;
+        self.buf[at..at + 4].copy_from_slice(&wd.to_ne_bytes());
+        self.buf[at + 4..at + 8].copy_from_slice(&mask.to_ne_bytes());
+        self.buf[at + 8..at + 12].copy_from_slice(&cookie.to_ne_bytes());
+        self.buf[at + 12..at + 16].copy_from_slice(&name_field.to_ne_bytes());
+        if let Some(name) = name {
+            let start = at + INOTIFY_EVENT_HEADER_SIZE;
+            self.buf[start..start + name.len()].copy_from_slice(name);
+            for byte in &mut self.buf[start + name.len()..at + len] {
+                *byte = 0;
+            }
+        }
+    }
+
+    fn tail_equals(&self, wd: i32, mask: u32, cookie: u32, name: Option<&[u8]>) -> bool {
+        if self.count == 0 {
+            return false;
+        }
+        let len = encoded_record_len(name.map(<[u8]>::len));
+        if self.used - self.tail != len {
+            return false;
+        }
+        let t = self.tail;
+        let field = |o: usize| {
+            [
+                self.buf[t + o],
+                self.buf[t + o + 1],
+                self.buf[t + o + 2],
+                self.buf[t + o + 3],
+            ]
+        };
+        if i32::from_ne_bytes(field(0)) != wd
+            || u32::from_ne_bytes(field(4)) != mask
+            || u32::from_ne_bytes(field(8)) != cookie
+        {
+            return false;
+        }
+        match name {
+            None => true,
+            Some(name) => {
+                let start = t + INOTIFY_EVENT_HEADER_SIZE;
+                self.buf[start..start + name.len()] == *name
+                    && self.buf[start + name.len()..t + len]
+                        .iter()
+                        .all(|b| *b == 0)
+            }
+        }
+    }
+
+    /// Queue one event (see [`QueuePush`]).
+    pub fn push(&mut self, wd: i32, mask: u32, cookie: u32, name: Option<&[u8]>) -> QueuePush {
+        if self.overflowed {
+            return QueuePush::Dropped;
+        }
+        if self.tail_equals(wd, mask, cookie, name) {
+            return QueuePush::Coalesced;
+        }
+        let was_empty = self.count == 0;
+        if self.count >= INOTIFY_MAX_QUEUED_EVENTS {
+            if self.used + INOTIFY_EVENT_HEADER_SIZE > BYTES {
+                return QueuePush::NoSpace;
+            }
+            let at = self.used;
+            self.write_record(at, -1, LINUX_IN_Q_OVERFLOW, 0, None);
+            self.tail = at;
+            self.used += INOTIFY_EVENT_HEADER_SIZE;
+            self.count += 1;
+            self.overflowed = true;
+            return QueuePush::Overflowed { was_empty };
+        }
+        let len = encoded_record_len(name.map(<[u8]>::len));
+        if self.used + len > BYTES {
+            return QueuePush::NoSpace;
+        }
+        let at = self.used;
+        self.write_record(at, wd, mask, cookie, name);
+        self.tail = at;
+        self.used += len;
+        self.count += 1;
+        QueuePush::Appended { was_empty }
+    }
+
+    fn record_len_at(&self, at: usize) -> usize {
+        let name_field = u32::from_ne_bytes([
+            self.buf[at + 12],
+            self.buf[at + 13],
+            self.buf[at + 14],
+            self.buf[at + 15],
+        ]);
+        INOTIFY_EVENT_HEADER_SIZE + name_field as usize
+    }
+
+    /// Move whole records into `dest`, oldest first, stopping before the first
+    /// that does not fit. `Err(EINVAL)` when records are queued and even the
+    /// first does not fit.
+    pub fn drain_into(&mut self, dest: &mut [u8]) -> Result<usize, LinuxErrno> {
+        if self.count == 0 {
+            return Ok(0);
+        }
+        if self.record_len_at(0) > dest.len() {
+            return Err(LINUX_EINVAL);
+        }
+        let mut taken = 0;
+        let mut records = 0;
+        while taken < self.used {
+            let len = self.record_len_at(taken);
+            if taken + len > dest.len() {
+                break;
+            }
+            taken += len;
+            records += 1;
+        }
+        dest[..taken].copy_from_slice(&self.buf[..taken]);
+        self.buf.copy_within(taken..self.used, 0);
+        self.used -= taken;
+        self.count -= records;
+        self.tail = self.tail.saturating_sub(taken);
+        if self.count == 0 {
+            self.tail = 0;
+            self.overflowed = false;
+        }
+        Ok(taken)
+    }
+}
+
+impl<const BYTES: usize> Default for InotifyEventQueue<BYTES> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    extern crate std;
+    use super::*;
+    use std::{vec, vec::Vec};
+
+    type Q = InotifyEventQueue<4096>;
+
+    fn records(bytes: &[u8]) -> Vec<(i32, u32, u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let f = |o: usize| {
+                [
+                    bytes[at + o],
+                    bytes[at + o + 1],
+                    bytes[at + o + 2],
+                    bytes[at + o + 3],
+                ]
+            };
+            let len = u32::from_ne_bytes(f(12)) as usize;
+            let name = bytes[at + 16..at + 16 + len].to_vec();
+            out.push((
+                i32::from_ne_bytes(f(0)),
+                u32::from_ne_bytes(f(4)),
+                u32::from_ne_bytes(f(8)),
+                name,
+            ));
+            at += 16 + len;
+        }
+        out
+    }
+
+    #[test]
+    fn names_are_nul_terminated_and_padded_to_four_bytes() {
+        let mut q = Q::new();
+        assert_eq!(
+            q.push(1, 0x100, 0, Some(b"abc")),
+            QueuePush::Appended { was_empty: true }
+        );
+        assert_eq!(q.queued_bytes(), 16 + 4);
+        assert_eq!(
+            q.push(1, 0x100, 0, Some(b"abcd")),
+            QueuePush::Appended { was_empty: false }
+        );
+        assert_eq!(q.queued_bytes(), 16 + 4 + 16 + 8);
+        let mut out = [0u8; 64];
+        let n = q.drain_into(&mut out).unwrap();
+        let recs = records(&out[..n]);
+        assert_eq!(recs[0].3, b"abc\0".to_vec());
+        assert_eq!(recs[1].3, b"abcd\0\0\0\0".to_vec());
+    }
+
+    #[test]
+    fn identical_tail_coalesces_distinct_names_do_not() {
+        let mut q = Q::new();
+        q.push(1, 2, 0, None);
+        assert_eq!(q.push(1, 2, 0, None), QueuePush::Coalesced);
+        assert_eq!(
+            q.push(2, 2, 0, None),
+            QueuePush::Appended { was_empty: false }
+        );
+        q.push(1, 0x100, 0, Some(b"x"));
+        assert_eq!(q.push(1, 0x100, 0, Some(b"x")), QueuePush::Coalesced);
+        assert_eq!(
+            q.push(1, 0x100, 0, Some(b"y")),
+            QueuePush::Appended { was_empty: false }
+        );
+        assert_eq!(q.len(), 4);
+    }
+
+    #[test]
+    fn read_takes_whole_records_and_rejects_a_buffer_smaller_than_the_first() {
+        let mut q = Q::new();
+        q.push(1, 0x100, 0, Some(b"name"));
+        q.push(2, 2, 0, None);
+        let mut small = [0u8; 16];
+        assert_eq!(q.drain_into(&mut small), Err(LINUX_EINVAL));
+        let mut one = [0u8; 30];
+        assert_eq!(q.drain_into(&mut one), Ok(24));
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.queued_bytes(), 16);
+        // After compaction the remaining record is still intact and coalesces.
+        assert_eq!(q.push(2, 2, 0, None), QueuePush::Coalesced);
+    }
+
+    #[test]
+    fn overflow_appends_one_marker_and_lifts_only_when_drained() {
+        let mut q: InotifyEventQueue<{ (INOTIFY_MAX_QUEUED_EVENTS + 1) * 16 }> =
+            InotifyEventQueue::new();
+        for i in 0..INOTIFY_MAX_QUEUED_EVENTS as i32 {
+            assert!(matches!(
+                q.push(i + 1, 2, 0, None),
+                QueuePush::Appended { .. }
+            ));
+        }
+        assert_eq!(
+            q.push(-5, 2, 0, None),
+            QueuePush::Overflowed { was_empty: false }
+        );
+        assert_eq!(q.push(-6, 2, 0, None), QueuePush::Dropped);
+        let mut part = vec![0u8; 16 * 10];
+        q.drain_into(&mut part).unwrap();
+        assert_eq!(
+            q.push(-7, 2, 0, None),
+            QueuePush::Dropped,
+            "latch holds until drained"
+        );
+        let mut all = vec![0u8; 16 * (INOTIFY_MAX_QUEUED_EVENTS + 1)];
+        let n = q.drain_into(&mut all).unwrap();
+        let last = records(&all[..n]).pop().unwrap();
+        assert_eq!((last.0, last.1), (-1, LINUX_IN_Q_OVERFLOW));
+        assert!(matches!(
+            q.push(1, 2, 0, None),
+            QueuePush::Appended { was_empty: true }
+        ));
+    }
+
+    #[test]
+    fn a_record_that_does_not_fit_reports_no_space_and_changes_nothing() {
+        let mut q: InotifyEventQueue<40> = InotifyEventQueue::new();
+        assert!(matches!(q.push(1, 2, 0, None), QueuePush::Appended { .. }));
+        assert_eq!(q.push(1, 0x100, 0, Some(&[b'n'; 30])), QueuePush::NoSpace);
+        assert_eq!((q.len(), q.queued_bytes()), (1, 16));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
