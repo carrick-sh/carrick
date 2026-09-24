@@ -198,6 +198,9 @@ where
         ),
         _ => Err(Action::Forward),
     };
+    if outcome.is_ok() {
+        file.served_ops.fetch_add(1, Ordering::Relaxed);
+    }
     file.unlock();
     outcome.ok()
 }

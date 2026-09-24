@@ -20,7 +20,7 @@ semantic_authority = [
 ]
 fixture = "probe:el1_files"
 scale_points = [1, 8, 32, 128]
-rationale = "Eligible regular files are delegated to EL1 execution. Repeated read, write, lseek, pread64, and pwrite64 operations on delegated regular files are served at EL1 without VM exits or host kernel dispatches. A description recalled 2 times within its lifetime becomes ineligible for re-delegation until close to prevent unbounded recall-then-delegate thrashing from interleaved operations."
+rationale = "Eligible host regular files (the host passthrough rootfs) are delegated to EL1 execution while exactly one open description refers to the inode. Repeated read, write, lseek, pread64, and pwrite64 operations on a delegated file are served at EL1 without VM exits or host kernel dispatches. fstat and every other host access recall the file first. A delegation window recalled before serving 64 operations backs the description off for a doubling number of forwarded attempts, so an interleaving that recalls every window converges to the host path's cost; a window that pays off clears the backoff."
 
 [bindings]
 embed = "carrick-embed::el1_files_contract"
@@ -32,7 +32,7 @@ docker = "EL1 delegation is an internal execution path transparent to the Linux 
 [[structural_budgets]]
 kind = "affine"
 metric = "kernel_dispatches"
-base = 0
+base = 64
 per_unit = 0
 layers = ["embed-structural"]
-rationale = "Inside the 10,000 iteration loop on a delegated regular file, zero host dispatches occur for syscalls 62 (lseek) and 64 (write)."
+rationale = "Host dispatches of syscalls 62 (lseek) and 64 (write) do not grow with the loop: at most a fixed startup population (perl's startup fstat calls recall the file and start one short backoff) is forwarded, then every iteration of the 10,000-iteration write+lseek loop is served at EL1."
