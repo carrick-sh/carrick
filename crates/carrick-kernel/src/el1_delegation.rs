@@ -4,6 +4,7 @@
 //! EL1 kernel, and manages recall back to the host whenever host code touches
 //! the description or its authority.
 
+use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use std::sync::atomic::Ordering;
 
@@ -81,6 +82,7 @@ type InodeDelegationMap = HashMap<InodeIdentity, (u32, Weak<FileDescription>)>;
 
 static HAS_DELEGATED_FILES: AtomicBool = AtomicBool::new(false);
 static DELEGATED_INODES: Mutex<Option<InodeDelegationMap>> = Mutex::new(None);
+static DELEGATED_INODES_SNAPSHOT: ArcSwapOption<InodeDelegationMap> = ArcSwapOption::const_empty();
 static DELEGATED_HANDLE_INODES: Mutex<[Option<InodeIdentity>; MAX_DELEGATED_FILES]> =
     Mutex::new([const { None }; MAX_DELEGATED_FILES]);
 static DELEGATED_ROOTFS: Mutex<[Option<Weak<carrick_vfs::RootFsVfs>>; MAX_DELEGATED_FILES]> =
@@ -91,6 +93,17 @@ static DELEGATED_SPARSE: Mutex<
 static FD_MAP_LOCK: Mutex<()> = Mutex::new(());
 static MAPPED_INODES: Mutex<Option<HashMap<InodeIdentity, usize>>> = Mutex::new(None);
 static HOOK_INIT: std::sync::Once = std::sync::Once::new();
+
+fn publish_delegated_inodes_snapshot(map: &Option<InodeDelegationMap>) {
+    match map {
+        Some(m) if !m.is_empty() => {
+            DELEGATED_INODES_SNAPSHOT.store(Some(std::sync::Arc::new(m.clone())));
+        }
+        _ => {
+            DELEGATED_INODES_SNAPSHOT.store(None);
+        }
+    }
+}
 
 pub(crate) fn register_mapped_inode(inode: InodeIdentity) {
     recall_by_inode(inode);
@@ -140,15 +153,15 @@ pub(crate) fn init_delegation_hooks() {
 
 #[inline]
 pub(crate) fn has_delegated_files() -> bool {
-    HAS_DELEGATED_FILES.load(Ordering::Relaxed)
+    HAS_DELEGATED_FILES.load(Ordering::Acquire)
 }
 
 pub(crate) fn is_inode_delegated(inode: InodeIdentity) -> bool {
     if !has_delegated_files() {
         return false;
     }
-    let map = DELEGATED_INODES.lock();
-    if let Some(map) = map.as_ref() {
+    let guard = DELEGATED_INODES_SNAPSHOT.load();
+    if let Some(map) = guard.as_deref() {
         if map.contains_key(&inode) {
             return true;
         }
@@ -165,8 +178,8 @@ pub(crate) fn is_inode_delegated_by_other(inode: InodeIdentity, my_handle: u32) 
     if !has_delegated_files() {
         return false;
     }
-    let map = DELEGATED_INODES.lock();
-    if let Some(map) = map.as_ref() {
+    let guard = DELEGATED_INODES_SNAPSHOT.load();
+    if let Some(map) = guard.as_deref() {
         if let Some((handle, _)) = map.get(&inode) {
             return *handle != my_handle;
         }
@@ -184,8 +197,8 @@ pub(crate) fn recall_by_inode(inode: InodeIdentity) -> bool {
         return false;
     }
     let desc = {
-        let map = DELEGATED_INODES.lock();
-        if let Some(map) = map.as_ref() {
+        let guard = DELEGATED_INODES_SNAPSHOT.load();
+        if let Some(map) = guard.as_deref() {
             if let Some((_, weak)) = map.get(&inode) {
                 weak.upgrade()
             } else {
@@ -237,6 +250,7 @@ fn unregister_delegated_inode(handle: u32) {
                     HAS_DELEGATED_FILES.store(false, Ordering::Release);
                 }
             }
+            publish_delegated_inodes_snapshot(&map);
         }
     }
 }
@@ -564,6 +578,7 @@ pub(crate) fn delegate_locked(
                 vacant.insert((handle, Arc::downgrade(&open_file.description)));
             }
         }
+        publish_delegated_inodes_snapshot(&map);
         let mut handle_inodes = DELEGATED_HANDLE_INODES.lock();
         handle_inodes[(handle - 1) as usize] = Some(inode);
         let mut rootfs = DELEGATED_ROOTFS.lock();
@@ -951,8 +966,21 @@ mod tests {
         tmp.flush().unwrap();
         let raw_fd = unsafe { libc::dup(tmp.as_raw_fd()) };
         let host_fd = HostFdRef::new(raw_fd);
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        let inode = if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
+            Some(carrick_vfs::InodeIdentity::new(
+                st.st_dev as u64,
+                st.st_ino as u64,
+            ))
+        } else {
+            None
+        };
+        let mut base = OpenDescriptionBase::new(LINUX_O_RDWR);
+        if let Some(inode) = inode {
+            base = base.with_inode(inode);
+        }
         let desc = OpenDescription::HostFile {
-            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            base,
             host_fd,
             metadata: test_metadata(tmp.path(), initial_data.len()),
             writable: true,
@@ -2492,6 +2520,60 @@ mod tests {
             // SEEK_DATA from offset 0 should find page 1 (4096).
             let found = sparse.seek_host_sparse_extents(raw_fd, 0, true);
             assert_eq!(found, Some(Some(4096)));
+        }
+
+        #[test]
+        fn test_non_delegated_guard_access_is_lock_free_and_calls_no_fstat() {
+            let _region = TestEl1Region::new();
+            let table_id = FileTableId::from_raw_u64(1).unwrap();
+            let (_tmp1, host_file1) = create_test_host_file(b"delegated");
+            let (_tmp2, host_file2) = create_test_host_file(b"non-delegated");
+
+            // Delegate file 1 so HAS_DELEGATED_FILES is true
+            let handle1 = delegate_for_test(&host_file1, table_id, 3).expect("delegate file 1");
+            assert_eq!(host_file1.description.delegation_handle(), handle1);
+            assert!(has_delegated_files(), "must have delegated files");
+
+            // Verify non-delegated file has its InodeIdentity cached at open time
+            let inode2 = host_file2
+                .description
+                .open_description()
+                .unwrap()
+                .read()
+                .inode_identity_fast()
+                .expect("inode identity must be cached at open time");
+            assert_ne!(inode2.ino, 0);
+
+            // Hold DELEGATED_INODES mutex lock to simulate contention or slow-path mutation
+            let slow_path_lock = DELEGATED_INODES.lock();
+
+            // Guard accessors (read/write/try_read) on non-delegated file MUST succeed
+            // without deadlocking on DELEGATED_INODES.lock(), proving lock-freedom.
+            let read_guard = host_file2.description.read();
+            assert!(
+                read_guard.is_some(),
+                "read guard accessor must not deadlock or fail"
+            );
+            drop(read_guard);
+
+            let try_read_guard = host_file2.description.try_read();
+            assert!(
+                try_read_guard.is_some(),
+                "try_read guard accessor must succeed"
+            );
+            drop(try_read_guard);
+
+            let write_guard = host_file2.description.write();
+            assert!(
+                write_guard.is_some(),
+                "write guard accessor must not deadlock or fail"
+            );
+            drop(write_guard);
+
+            drop(slow_path_lock);
+
+            // Cleanup
+            recall(&host_file1.description).unwrap();
         }
     }
 }

@@ -280,11 +280,15 @@ impl<'a> FsView<'a> {
                     new_metadata.size = 0;
                     self.invalidate_dentry_host_fd(owned.as_raw_fd());
                 }
+                let mut new_base = OpenDescriptionBase::new(0).with_fs_identity(
+                    base.fs_identity()
+                        .unwrap_or(carrick_vfs::FsIdentity::Overlay),
+                );
+                if let Some(inode) = base.inode() {
+                    new_base = new_base.with_inode(inode);
+                }
                 let new_desc = OpenDescription::File {
-                    base: OpenDescriptionBase::new(0).with_fs_identity(
-                        base.fs_identity()
-                            .unwrap_or(carrick_vfs::FsIdentity::Overlay),
-                    ),
+                    base: new_base,
                     path: path_str.into_owned(),
                     metadata: new_metadata,
                     contents: FileContents::host_backed(owned),
@@ -379,11 +383,15 @@ impl<'a> FsView<'a> {
                 if let Some(errno) = err {
                     ReopenAction::Errno(errno)
                 } else {
+                    let mut new_base = OpenDescriptionBase::new(0).with_fs_identity(
+                        base.fs_identity()
+                            .unwrap_or(carrick_vfs::FsIdentity::Overlay),
+                    );
+                    if let Some(inode) = base.inode() {
+                        new_base = new_base.with_inode(inode);
+                    }
                     let new_desc = OpenDescription::File {
-                        base: OpenDescriptionBase::new(0).with_fs_identity(
-                            base.fs_identity()
-                                .unwrap_or(carrick_vfs::FsIdentity::Overlay),
-                        ),
+                        base: new_base,
                         path: path.clone(),
                         metadata: new_metadata,
                         contents: new_contents,
@@ -419,11 +427,15 @@ impl<'a> FsView<'a> {
                     if flags & LINUX_O_TRUNC != 0 && is_writable {
                         contents.write().clear();
                     }
+                    let mut new_base = OpenDescriptionBase::new(0).with_fs_identity(
+                        base.fs_identity()
+                            .unwrap_or(carrick_vfs::FsIdentity::Overlay),
+                    );
+                    if let Some(inode) = base.inode() {
+                        new_base = new_base.with_inode(inode);
+                    }
                     let new_desc = OpenDescription::InMemoryFile {
-                        base: OpenDescriptionBase::new(0).with_fs_identity(
-                            base.fs_identity()
-                                .unwrap_or(carrick_vfs::FsIdentity::Overlay),
-                        ),
+                        base: new_base,
                         path: path.clone(),
                         contents: Arc::clone(contents),
                         offset: 0,
