@@ -1994,7 +1994,7 @@ mod tests {
             }
             // Every member of the inode is at `end` (tests write through
             // their only member).
-            let allocated = ALLOCATED_OPEN_FILES.lock().clone();
+            let allocated = *ALLOCATED_OPEN_FILES.lock();
             for (index, in_use) in allocated.iter().enumerate() {
                 let record = open_file_object(region, (index + 1) as u32);
                 if *in_use && record.inode_handle.load(Ordering::Relaxed) == handle {
