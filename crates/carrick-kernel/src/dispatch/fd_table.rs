@@ -363,6 +363,7 @@ pub(super) struct TimerFdInner {
 #[derive(Debug, Clone)]
 pub(crate) struct OpenDescriptionBase {
     fs_identity: Option<carrick_vfs::FsIdentity>,
+    inode: Option<carrick_vfs::InodeIdentity>,
     /// SO_RCVTIMEO: bounds a blocking recv on this socket. None = block forever.
     recv_timeout: Option<Duration>,
     /// SO_SNDTIMEO: bounds a blocking send on this socket. None = block forever.
@@ -458,6 +459,7 @@ impl OpenDescriptionBase {
     pub(crate) fn new(#[allow(unused)] status_flags: u64) -> Self {
         Self {
             fs_identity: None,
+            inode: None,
             so_reuseaddr: false,
             so_reuseport: false,
             ipv6_v6only: false,
@@ -478,6 +480,20 @@ impl OpenDescriptionBase {
             inzone_listener: None,
             inzone_cleanup: None,
         }
+    }
+
+    pub(crate) fn inode(&self) -> Option<carrick_vfs::InodeIdentity> {
+        self.inode
+    }
+
+    pub(crate) fn with_inode(mut self, inode: carrick_vfs::InodeIdentity) -> Self {
+        self.inode = Some(inode);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_inode(&mut self, inode: carrick_vfs::InodeIdentity) {
+        self.inode = Some(inode);
     }
 
     pub(super) fn fs_identity(&self) -> Option<carrick_vfs::FsIdentity> {
@@ -3314,21 +3330,19 @@ impl OpenDescription {
 
     pub(crate) fn inode_identity_fast(&self) -> Option<carrick_vfs::InodeIdentity> {
         match self {
-            OpenDescription::HostFile { host_fd, .. } => {
-                let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0 {
-                    Some(carrick_vfs::InodeIdentity::new(
-                        st.st_dev as u64,
-                        st.st_ino as u64,
-                    ))
-                } else {
-                    None
-                }
-            }
-            OpenDescription::File { path, .. } => Some(carrick_vfs::InodeIdentity::new(
-                0,
-                super::inode_for_path(std::path::Path::new(path)),
-            )),
+            OpenDescription::HostFile { base, .. } => base.inode,
+            OpenDescription::File { base, path, .. } => base.inode.or_else(|| {
+                Some(carrick_vfs::InodeIdentity::new(
+                    0,
+                    super::inode_for_path(std::path::Path::new(path)),
+                ))
+            }),
+            OpenDescription::InMemoryFile { base, path, .. } => base.inode.or_else(|| {
+                Some(carrick_vfs::InodeIdentity::new(
+                    0,
+                    super::inode_for_path(std::path::Path::new(path)),
+                ))
+            }),
             _ => None,
         }
     }
