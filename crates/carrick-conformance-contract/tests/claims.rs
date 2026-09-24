@@ -143,7 +143,14 @@ fn live_registry_loads_all_claims() {
         .unwrap();
     let registry = carrick_conformance_contract::ContractRegistry::load(repo_root)
         .expect("live registry should load");
-    assert_eq!(registry.contracts().len(), 44);
+    // Every contract file on disk must load: a count pinned in this file
+    // went stale with each new contract, so compare against the directory.
+    let on_disk = std::fs::read_dir(repo_root.join("conformance-contracts/contracts"))
+        .expect("read contracts directory")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "toml"))
+        .count();
+    assert_eq!(registry.contracts().len(), on_disk);
     for id in [
         "kernel.execution.native-synchronous-syscall",
         "kernel.execution.native-data-demand",
