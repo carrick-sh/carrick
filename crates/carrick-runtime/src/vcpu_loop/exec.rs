@@ -6919,4 +6919,84 @@ pub(crate) mod tests {
         assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_ok, 0);
         assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_errno, 0);
     }
+
+    #[test]
+    fn el1_served_with_work_maps_negative_result_to_errno_outcome() {
+        let (kernel, context, mut state) =
+            typed_completion_fixture(72_498, SyscallDispatcher::new());
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(
+                    Some(Arc::clone(context.thread())),
+                    Arc::clone(&state.kicker),
+                    state.this_tid,
+                )
+                .expect("MM executor admission"),
+        );
+        let slot = 7;
+        let mut engine = CrashCaptureTestEngine {
+            mailbox_slot: Some(slot),
+            ..Default::default()
+        };
+
+        let layout =
+            std::alloc::Layout::from_size_align(carrick_el1_abi::EL1_REGION_SIZE as usize, 4096)
+                .unwrap();
+        let region = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!region.is_null());
+        carrick_el1_abi::record_el1_region_host_ptr(region as usize);
+
+        let offset = carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+            + slot * std::mem::size_of::<carrick_el1_abi::CurrentTask>();
+        let current_task =
+            unsafe { &*((region as usize + offset) as *const carrick_el1_abi::CurrentTask) };
+
+        // Test 1: negative return value (-22, -EINVAL)
+        current_task
+            .served_with_work
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let frame_err = carrick_hal::RawSyscall {
+            current_guest_sp: Some(0x80_000),
+            number: carrick_abi::CanonicalNr(carrick_abi::syscall::nr::READ.raw()),
+            args: [-22i64 as u64, 0, 0, 0, 0, 0],
+            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            native_number: carrick_abi::NativeNr(carrick_abi::syscall::nr::READ.raw()),
+        };
+        let outcome = state
+            .service_threaded_syscall(&kernel, &mut engine, frame_err, None)
+            .expect("service negative return");
+        match outcome {
+            DispatchOutcome::Errno { errno } => {
+                assert_eq!(errno.guest_retval(), -22);
+            }
+            other => panic!("expected DispatchOutcome::Errno, got {other:?}"),
+        }
+        state.retire_syscall().unwrap();
+
+        // Test 2: non-negative return value (42)
+        current_task
+            .served_with_work
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let frame_ok = carrick_hal::RawSyscall {
+            current_guest_sp: Some(0x80_000),
+            number: carrick_abi::CanonicalNr(carrick_abi::syscall::nr::READ.raw()),
+            args: [42, 0, 0, 0, 0, 0],
+            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            native_number: carrick_abi::NativeNr(carrick_abi::syscall::nr::READ.raw()),
+        };
+        let outcome = state
+            .service_threaded_syscall(&kernel, &mut engine, frame_ok, None)
+            .expect("service positive return");
+        match outcome {
+            DispatchOutcome::Returned { value } => {
+                assert_eq!(value, 42);
+            }
+            other => panic!("expected DispatchOutcome::Returned, got {other:?}"),
+        }
+        state.retire_syscall().unwrap();
+
+        carrick_el1_abi::record_el1_region_host_ptr(0);
+        unsafe { std::alloc::dealloc(region, layout) };
+    }
 }

@@ -1466,12 +1466,13 @@ where
                 original_args,
                 request,
             };
-            (
-                syscall,
-                Some(DispatchOutcome::Returned {
-                    value: frame.args[0] as i64,
-                }),
-            )
+            let val = frame.args[0] as i64;
+            let outcome = if let Some(errno) = LinuxErrno::from_guest_retval(val) {
+                DispatchOutcome::Errno { errno }
+            } else {
+                DispatchOutcome::Returned { value: val }
+            };
+            (syscall, Some(outcome))
         } else {
             match kernel
                 .dispatcher
@@ -2901,6 +2902,7 @@ pub(crate) mod tests {
         pub(crate) fail_read_at: Option<u64>,
         pub(crate) fail_execve_into: Option<String>,
         pub(crate) terminal_continuation_discards: usize,
+        pub(crate) mailbox_slot: Option<usize>,
     }
 
     impl carrick_guest_mem::GuestMemory for CrashCaptureTestEngine {
@@ -3101,6 +3103,10 @@ pub(crate) mod tests {
         fn discard_terminal_syscall_continuation(&mut self) -> Result<(), TrapError> {
             self.terminal_continuation_discards += 1;
             Ok(())
+        }
+
+        fn mailbox_slot(&self) -> Option<usize> {
+            self.mailbox_slot
         }
 
         fn frame_cow_owner_inventory(
