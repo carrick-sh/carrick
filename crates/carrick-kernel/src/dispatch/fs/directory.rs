@@ -473,6 +473,7 @@ impl<'a> FsView<'a> {
                         self.set_cwd(&format!("{resolved_new}/{rest}"));
                     }
                     self.rename_open_paths(&resolved_old, &resolved_new);
+                    crate::el1_inotify::invalidate_name_cache_all();
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
             },
@@ -1132,6 +1133,7 @@ impl<'a> FsView<'a> {
                 return Ok(match result {
                     Ok(()) => {
                         this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
+                        crate::el1_inotify::invalidate_name_cache_all();
                         DispatchOutcome::Returned { value: 0 }
                     }
                     Err(errno) => DispatchOutcome::errno(errno),
@@ -1164,6 +1166,7 @@ impl<'a> FsView<'a> {
                     return Ok(match mnew.vfs.link(&msrc.full_path, &mnew.full_path) {
                         Ok(()) => {
                             this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
+                            crate::el1_inotify::invalidate_name_cache_all();
                             DispatchOutcome::Returned { value: 0 }
                         }
                         Err(errno) => DispatchOutcome::errno(errno),
@@ -1181,6 +1184,7 @@ impl<'a> FsView<'a> {
             match this.fs.rootfs_vfs.link(&src, &resolved_new) {
                 Ok(()) => {
                     this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
+                    crate::el1_inotify::invalidate_name_cache_all();
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -1212,6 +1216,7 @@ impl<'a> FsView<'a> {
                 return match m.vfs.symlink(&target_path, &m.full_path) {
                     Ok(()) => {
                         this.dnotify_child(cx.kernel, &resolved_link, LinuxDnotifyMask::CREATE);
+                        crate::el1_inotify::invalidate_name_cache_all();
                         Ok(DispatchOutcome::Returned { value: 0 })
                     }
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -1234,6 +1239,7 @@ impl<'a> FsView<'a> {
             {
                 Ok(()) => {
                     this.dnotify_child(cx.kernel, &resolved_link, LinuxDnotifyMask::CREATE);
+                    crate::el1_inotify::invalidate_name_cache_all();
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -1462,6 +1468,7 @@ impl<'a> FsView<'a> {
                             this.fs.inotify_registry.unregister_path(&resolved);
                         }
                     }
+                    crate::el1_inotify::invalidate_name_cache_all();
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),

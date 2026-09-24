@@ -8,6 +8,7 @@ impl SyscallDispatcher {
         point: impl Into<std::path::PathBuf>,
         vfs: Box<dyn carrick_vfs::Vfs>,
     ) {
+        crate::el1_inotify::invalidate_name_cache_all();
         self.fs.vfs_mounts_mut().mount(point, vfs);
     }
 }
@@ -84,6 +85,7 @@ impl<'a> FsView<'a> {
             }
             this.captured_fs_context()
                 .set_cwd(display_rootfs_path(&metadata.path));
+            crate::el1_inotify::bump_cwd_generation();
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -118,6 +120,7 @@ impl<'a> FsView<'a> {
             // new root so getcwd can report a cwd left outside it as ENOENT
             // (realpath01 / CVE-2018-1000001).
             this.captured_fs_context().set_chroot_root(Some(new_root));
+            crate::el1_inotify::bump_cwd_generation();
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -159,6 +162,7 @@ impl<'a> FsView<'a> {
                         return Ok(DispatchOutcome::errno(LINUX_EACCES));
                     }
                     this.captured_fs_context().set_cwd(dir_path);
+                    crate::el1_inotify::bump_cwd_generation();
                     DispatchOutcome::Returned { value: 0 }
                 }
                 OpenDescription::File { .. }

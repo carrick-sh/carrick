@@ -76,6 +76,14 @@ const UNCONDITIONAL_EVENT_BITS: u32 = carrick_abi::LINUX_IN_IGNORED
     | carrick_abi::LINUX_IN_Q_OVERFLOW
     | carrick_abi::LINUX_IN_UNMOUNT;
 
+/// Unsupported mask flags in-guest that require host forwarding / recall.
+pub(crate) const UNSUPPORTED_INOTIFY_MASK_FLAGS: u32 = carrick_abi::LINUX_IN_MASK_ADD
+    | carrick_abi::LINUX_IN_MASK_CREATE
+    | carrick_abi::LINUX_IN_ONESHOT
+    | carrick_abi::LINUX_IN_EXCL_UNLINK
+    | carrick_abi::LINUX_IN_DONT_FOLLOW
+    | carrick_abi::LINUX_IN_ONLYDIR;
+
 /// macOS analogue producing the [`VnodeEvents`] the [`EventMultiplexer`]
 /// register API consumes. Requests the kqueue `NOTE_*` set corresponding to the
 /// Linux watch mask; a mask with no recognized data-changing bit falls back to
@@ -1091,6 +1099,22 @@ impl InotifyState {
         Ok(wd)
     }
 
+    /// Restore a watch from a delegated EL1 inotify instance during recall.
+    pub(crate) fn restore_watch(&self, wd: i32, mask: u32) {
+        let mut inner = self.inner.lock();
+        inner.watches.insert(
+            wd,
+            Watch {
+                host_fds: Vec::new(),
+                mask,
+            },
+        );
+        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+        {
+            inner.dispatch_authoritative = true;
+        }
+    }
+
     /// Replace or extend an existing watch mask while preserving its wd.
     pub(crate) fn update_watch(&self, wd: i32, requested: u32) -> Result<u32, LinuxErrno> {
         let current = self
@@ -1220,6 +1244,14 @@ impl InotifyState {
             inner.next_cookie = 1;
         }
         cookie
+    }
+
+    pub(crate) fn next_wd(&self) -> i32 {
+        self.inner.lock().next_wd
+    }
+
+    pub(crate) fn set_next_wd(&self, next_wd: i32) {
+        self.inner.lock().next_wd = next_wd;
     }
 
     /// Read up to `max_bytes` of encoded Linux `inotify_event` records. First
@@ -1443,19 +1475,49 @@ impl std::fmt::Debug for InotifyRegistry {
 }
 
 impl InotifyRegistry {
+    #[allow(dead_code)]
     pub fn has_watches_covering(&self, path: &str) -> bool {
         if self.is_empty() {
             return false;
         }
         let key = normalize_watch_path(path);
         let inner = self.inner.read();
-        if inner.by_path.contains_key(key) {
+        if inner.by_path.get(key).is_some_and(|w| !w.is_empty()) {
             return true;
         }
         if let Some((parent, _)) = key.rsplit_once('/') {
             let parent_key = if parent.is_empty() { "/" } else { parent };
-            if inner.by_path.contains_key(parent_key) {
+            if inner.by_path.get(parent_key).is_some_and(|w| !w.is_empty()) {
                 return true;
+            }
+        }
+        false
+    }
+
+    /// Check if watches covering `path` require recalling the covered file.
+    /// Returns false if every covering watch is an exact-path watch in the in-zone delegation.
+    pub fn watches_covering_require_recall<F>(&self, path: &str, is_in_zone: F) -> bool
+    where
+        F: Fn(&std::sync::Arc<InotifyState>, i32, u32) -> bool,
+    {
+        if self.is_empty() {
+            return false;
+        }
+        let key = normalize_watch_path(path);
+        let inner = self.inner.read();
+        // Directory watch on parent always requires recall
+        if let Some((parent, _)) = key.rsplit_once('/') {
+            let parent_key = if parent.is_empty() { "/" } else { parent };
+            if inner.by_path.get(parent_key).is_some_and(|w| !w.is_empty()) {
+                return true;
+            }
+        }
+        // Exact path watches
+        if let Some(watches) = inner.by_path.get(key) {
+            for watch in watches {
+                if !is_in_zone(&watch.state, watch.wd, watch.mask) {
+                    return true;
+                }
             }
         }
         false
@@ -2731,5 +2793,82 @@ mod registry_tests {
         reg.unregister(&state, wd_parent);
         reg.unregister(&state, wd_file);
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn oracle_churn_and_serial_full_shapes() {
+        for n in [1, 8, 32, 128] {
+            // Churn: add_watch -> rm_watch -> check wds and IN_IGNORED
+            let state = InotifyState::new().expect("inotify instance");
+            let mut wds = Vec::new();
+            for _ in 0..n {
+                let wd = state
+                    .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+                    .expect("add watch");
+                wds.push(wd);
+                state.rm_watch(wd).expect("rm watch");
+            }
+            let distinct: std::collections::HashSet<_> = wds.iter().copied().collect();
+            assert_eq!(distinct.len(), n, "churn: distinct wds must equal n={n}");
+            assert_eq!(
+                state.queued_bytes(),
+                16 * n,
+                "churn: queued bytes must equal 16 * {n}"
+            );
+            let bytes = state.read_records(65536).expect("read");
+            assert_eq!(bytes.len(), 16 * n);
+            let mut count = 0;
+            let mut pos = 0;
+            while pos < bytes.len() {
+                let (wd, mask, _, len) = parse_header(&bytes[pos..]);
+                assert_eq!(mask, carrick_abi::LINUX_IN_IGNORED);
+                assert_eq!(wd, wds[count]);
+                assert_eq!(len, 0);
+                pos += 16;
+                count += 1;
+            }
+            assert_eq!(count, n);
+
+            // Serial full: add -> modify -> rm
+            let state = InotifyState::new().expect("inotify instance");
+            let mut wds = Vec::new();
+            for _ in 0..n {
+                let wd = state
+                    .add_virtual_watch(carrick_abi::LINUX_IN_MODIFY)
+                    .expect("add watch");
+                wds.push(wd);
+                state.enqueue(wd, carrick_abi::LINUX_IN_MODIFY, 0, None);
+                state.rm_watch(wd).expect("rm watch");
+            }
+            let distinct: std::collections::HashSet<_> = wds.iter().copied().collect();
+            assert_eq!(
+                distinct.len(),
+                n,
+                "serial_full: distinct wds must equal n={n}"
+            );
+            assert_eq!(
+                state.queued_bytes(),
+                32 * n,
+                "serial_full: queued bytes must equal 32 * {n}"
+            );
+            let bytes = state.read_records(65536).expect("read");
+            assert_eq!(bytes.len(), 32 * n);
+            let mut pos = 0;
+            let mut count = 0;
+            while pos < bytes.len() {
+                let (wd, mask, _, len) = parse_header(&bytes[pos..]);
+                if count % 2 == 0 {
+                    assert_eq!(mask, carrick_abi::LINUX_IN_MODIFY);
+                    assert_eq!(wd, wds[count / 2]);
+                } else {
+                    assert_eq!(mask, carrick_abi::LINUX_IN_IGNORED);
+                    assert_eq!(wd, wds[count / 2]);
+                }
+                assert_eq!(len, 0);
+                pos += 16;
+                count += 1;
+            }
+            assert_eq!(count, 2 * n);
+        }
     }
 }
