@@ -16,6 +16,8 @@
 
 #![no_std]
 
+use core::cell::UnsafeCell;
+
 /// Guest VA/IPA base of the 64 MiB EL1 kernel region.
 /// Placed at 180 GiB + 64 MiB, cleanly within the 180..181 GiB L2 block table (L2_B)
 /// and disjoint from all other guest memory ranges.
@@ -292,6 +294,50 @@ pub const DELEGATED_MAX_PAGES: usize = 64;
 /// Capacity of the EL1 fd map (512 slots).
 pub const FD_MAP_CAPACITY: usize = 512;
 
+/// Inode identity of a delegated file matching the host inotify model.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct DelegatedInodeIdentity {
+    pub dev: AtomicU64,
+    pub ino: AtomicU64,
+}
+
+impl DelegatedInodeIdentity {
+    pub const fn new(dev: u64, ino: u64) -> Self {
+        Self {
+            dev: AtomicU64::new(dev),
+            ino: AtomicU64::new(ino),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self) -> (u64, u64) {
+        (
+            self.dev.load(Ordering::Relaxed),
+            self.ino.load(Ordering::Relaxed),
+        )
+    }
+
+    #[inline]
+    pub fn set(&self, dev: u64, ino: u64) {
+        self.dev.store(dev, Ordering::Relaxed);
+        self.ino.store(ino, Ordering::Relaxed);
+    }
+}
+
+/// In-guest notification mark attached to a delegated file.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DelegatedMark {
+    pub inotify_handle: u32,
+    pub wd: i32,
+    pub mask: u32,
+    pub _pad: u32,
+}
+
+/// Maximum in-guest notification marks attached to a single delegated file.
+pub const MAX_DELEGATED_MARKS_PER_FILE: usize = 8;
+
 /// EL1 object table entry representing a delegated regular file.
 #[repr(C)]
 #[repr(align(64))]
@@ -316,7 +362,17 @@ pub struct DelegatedFile {
     /// Operations EL1 served on this object during the current delegation
     /// window; the host reads it at recall to judge whether delegating paid off.
     pub served_ops: AtomicU64,
+    /// Exact host inode identity for inotify correspondence.
+    pub inode: DelegatedInodeIdentity,
+    /// Count of active marks currently attached.
+    pub num_marks: AtomicU32,
+    pub _reserved1: u32,
+    /// Fixed table of active marks attached to this file.
+    pub marks: UnsafeCell<[DelegatedMark; MAX_DELEGATED_MARKS_PER_FILE]>,
+    pub _pad: [u8; 40],
 }
+
+unsafe impl Sync for DelegatedFile {}
 
 impl DelegatedFile {
     pub const fn new() -> Self {
@@ -331,7 +387,92 @@ impl DelegatedFile {
             dirty_mask: AtomicU64::new(0),
             zero_filled_mask: AtomicU64::new(0),
             served_ops: AtomicU64::new(0),
+            inode: DelegatedInodeIdentity::new(0, 0),
+            num_marks: AtomicU32::new(0),
+            _reserved1: 0,
+            marks: UnsafeCell::new(
+                [const {
+                    DelegatedMark {
+                        inotify_handle: 0,
+                        wd: 0,
+                        mask: 0,
+                        _pad: 0,
+                    }
+                }; MAX_DELEGATED_MARKS_PER_FILE],
+            ),
+            _pad: [0; 40],
         }
+    }
+
+    /// Clear all marks from this file.
+    pub fn clear_marks(&self) {
+        let marks = unsafe { &mut *self.marks.get() };
+        for m in marks.iter_mut() {
+            *m = DelegatedMark::default();
+        }
+        self.num_marks.store(0, Ordering::Release);
+    }
+
+    /// Remove all marks belonging to a specific inotify handle.
+    pub fn remove_marks_for_inotify(&self, inotify_handle: u32) {
+        let marks = unsafe { &mut *self.marks.get() };
+        let mut count = 0;
+        for m in marks.iter_mut() {
+            if m.inotify_handle == inotify_handle {
+                *m = DelegatedMark::default();
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.num_marks.fetch_sub(count, Ordering::Release);
+        }
+    }
+
+    /// Attach a mark to this delegated file.
+    pub fn add_mark(&self, mark: DelegatedMark) -> bool {
+        let marks = unsafe { &mut *self.marks.get() };
+        for m in marks.iter() {
+            if m.inotify_handle == mark.inotify_handle && m.wd == mark.wd {
+                return true;
+            }
+        }
+        for m in marks.iter_mut() {
+            if m.inotify_handle == 0 {
+                *m = mark;
+                self.num_marks.fetch_add(1, Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Detach a mark from this delegated file.
+    pub fn remove_mark(&self, inotify_handle: u32, wd: i32) -> bool {
+        let marks = unsafe { &mut *self.marks.get() };
+        for m in marks.iter_mut() {
+            if m.inotify_handle == inotify_handle && m.wd == wd {
+                *m = DelegatedMark::default();
+                self.num_marks.fetch_sub(1, Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Iterate over active marks.
+    pub fn for_each_mark<F: FnMut(&DelegatedMark)>(&self, mut f: F) {
+        let marks = unsafe { &*self.marks.get() };
+        for m in marks.iter() {
+            if m.inotify_handle != 0 {
+                f(m);
+            }
+        }
+    }
+
+    /// Whether any marks are currently attached.
+    #[inline]
+    pub fn has_marks(&self) -> bool {
+        self.num_marks.load(Ordering::Acquire) > 0
     }
 
     /// Try to acquire the spinlock without blocking.
@@ -421,6 +562,16 @@ impl Default for FdMapSlot {
     }
 }
 
+/// Flag set on `handle` indicating the slot references a delegated inotify instance.
+pub const FD_HANDLE_INOTIFY_TAG: u32 = 0x8000_0000;
+
+/// Kind of delegated object bound to an fd-map slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdSlotKind {
+    File(u32),
+    Inotify(u32),
+}
+
 /// Lookup a delegated file handle and slot index for a given `(file_table, fd)`.
 pub fn fd_map_lookup(map: &[FdMapSlot], file_table: u64, fd: i32) -> Option<(u32, usize)> {
     if file_table == 0 || fd < 0 {
@@ -434,8 +585,59 @@ pub fn fd_map_lookup(map: &[FdMapSlot], file_table: u64, fd: i32) -> Option<(u32
             && slot.file_table.load(Ordering::Relaxed) == file_table
         {
             let h = slot.handle.load(Ordering::Relaxed);
-            if h != 0 {
+            if h != 0 && (h & FD_HANDLE_INOTIFY_TAG) == 0 {
                 return Some((h, idx));
+            }
+        }
+    }
+    None
+}
+
+/// Lookup a delegated inotify handle and slot index for a given `(file_table, fd)`.
+pub fn fd_map_lookup_inotify(map: &[FdMapSlot], file_table: u64, fd: i32) -> Option<(u32, usize)> {
+    if file_table == 0 || fd < 0 {
+        return None;
+    }
+    let ufd = fd as u32;
+    for (idx, slot) in map.iter().take(FD_MAP_CAPACITY).enumerate() {
+        let inc = slot.incarnation.load(Ordering::Acquire);
+        if inc != 0
+            && slot.fd.load(Ordering::Relaxed) == ufd
+            && slot.file_table.load(Ordering::Relaxed) == file_table
+        {
+            let h = slot.handle.load(Ordering::Relaxed);
+            if (h & FD_HANDLE_INOTIFY_TAG) != 0 {
+                return Some((h & !FD_HANDLE_INOTIFY_TAG, idx));
+            }
+        }
+    }
+    None
+}
+
+/// Lookup either kind of delegated descriptor handle.
+pub fn fd_map_lookup_kind(
+    map: &[FdMapSlot],
+    file_table: u64,
+    fd: i32,
+) -> Option<(FdSlotKind, usize)> {
+    if file_table == 0 || fd < 0 {
+        return None;
+    }
+    let ufd = fd as u32;
+    for (idx, slot) in map.iter().take(FD_MAP_CAPACITY).enumerate() {
+        let inc = slot.incarnation.load(Ordering::Acquire);
+        if inc != 0
+            && slot.fd.load(Ordering::Relaxed) == ufd
+            && slot.file_table.load(Ordering::Relaxed) == file_table
+        {
+            let h = slot.handle.load(Ordering::Relaxed);
+            if h != 0 {
+                let kind = if (h & FD_HANDLE_INOTIFY_TAG) != 0 {
+                    FdSlotKind::Inotify(h & !FD_HANDLE_INOTIFY_TAG)
+                } else {
+                    FdSlotKind::File(h)
+                };
+                return Some((kind, idx));
             }
         }
     }
@@ -505,6 +707,24 @@ impl core::fmt::Debug for Counters {
     }
 }
 
+/// Byte offset of the inotify table within the region.
+pub const EL1_INOTIFY_TABLE_OFFSET: u64 = 0x310_0000;
+
+/// Base guest virtual address of the inotify table.
+pub const EL1_INOTIFY_TABLE_BASE: u64 = EL1_REGION_BASE + EL1_INOTIFY_TABLE_OFFSET;
+
+/// Size of the inotify table (3 MiB).
+pub const EL1_INOTIFY_TABLE_SIZE: u64 = 0x30_0000;
+
+/// Byte offset of the name cache within the region.
+pub const EL1_NAME_CACHE_OFFSET: u64 = 0x340_0000;
+
+/// Base guest virtual address of the name cache.
+pub const EL1_NAME_CACHE_BASE: u64 = EL1_REGION_BASE + EL1_NAME_CACHE_OFFSET;
+
+/// Size of the name cache (64 KiB).
+pub const EL1_NAME_CACHE_SIZE: u64 = 0x1_0000;
+
 const _: () = assert!(EL1_REGION_BASE.is_multiple_of(0x0400_0000));
 const _: () = assert!(EL1_REGION_SIZE == 64 * 1024 * 1024);
 const _: () = assert!(EL1_IMAGE_OFFSET + EL1_IMAGE_SIZE <= EL1_COUNTERS_OFFSET);
@@ -516,7 +736,9 @@ const _: () = assert!(EL1_STACKS_OFFSET + EL1_STACKS_SIZE <= EL1_CURRENT_TASKS_O
 const _: () = assert!(EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE <= EL1_HEAP_OFFSET);
 const _: () = assert!(EL1_OBJECT_TABLE_OFFSET + EL1_OBJECT_TABLE_SIZE <= EL1_FD_MAP_OFFSET);
 const _: () = assert!(EL1_FD_MAP_OFFSET + EL1_FD_MAP_SIZE <= EL1_CACHE_OFFSET);
-const _: () = assert!(EL1_CACHE_OFFSET + EL1_CACHE_SIZE <= EL1_REGION_SIZE);
+const _: () = assert!(EL1_CACHE_OFFSET + EL1_CACHE_SIZE <= EL1_INOTIFY_TABLE_OFFSET);
+const _: () = assert!(EL1_INOTIFY_TABLE_OFFSET + EL1_INOTIFY_TABLE_SIZE <= EL1_NAME_CACHE_OFFSET);
+const _: () = assert!(EL1_NAME_CACHE_OFFSET + EL1_NAME_CACHE_SIZE <= EL1_REGION_SIZE);
 
 use core::sync::atomic::AtomicUsize;
 
@@ -642,6 +864,489 @@ pub fn get_orig_arg0(slot: usize) -> u64 {
     current_task.orig_arg0.load(Ordering::Relaxed)
 }
 
+use carrick_inotify_core::{
+    INOTIFY_EVENT_HEADER_SIZE, INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_RING_CAPACITY, LINUX_EINVAL,
+    LINUX_IN_Q_OVERFLOW, LinuxErrno, LinuxInotifyEventHeader, PushResult, alloc_wd,
+    should_coalesce,
+};
+use core::sync::atomic::AtomicI32;
+
+/// Maximum number of simultaneously delegated inotify instances.
+pub const MAX_DELEGATED_INOTIFY: usize = 8;
+
+/// Maximum number of live watches per delegated inotify instance.
+pub const MAX_DELEGATED_WATCHES: usize = 64;
+
+/// In-guest record of a live watch descriptor registered on an inotify instance.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DelegatedWatch {
+    pub wd: i32,
+    pub file_handle: u32,
+    pub mask: u32,
+    pub alive: u32,
+}
+
+/// EL1 inotify instance object table entry.
+#[repr(C)]
+#[repr(align(64))]
+pub struct DelegatedInotify {
+    pub state: AtomicU32,
+    pub lock: AtomicU32,
+    pub generation: AtomicU64,
+    pub flags: AtomicU32,
+    pub next_wd: AtomicI32,
+    pub queued_bytes: AtomicUsize,
+    pub overflowed: AtomicU32,
+    pub head: AtomicU32,
+    pub count: AtomicU32,
+    pub num_watches: AtomicU32,
+    pub _reserved: [u32; 3],
+    pub watches: UnsafeCell<[DelegatedWatch; MAX_DELEGATED_WATCHES]>,
+    pub ring: UnsafeCell<[LinuxInotifyEventHeader; INOTIFY_RING_CAPACITY]>,
+}
+
+unsafe impl Sync for DelegatedInotify {}
+
+impl DelegatedInotify {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU32::new(DELEGATED_STATE_DEAD),
+            lock: AtomicU32::new(0),
+            generation: AtomicU64::new(0),
+            flags: AtomicU32::new(0),
+            next_wd: AtomicI32::new(1),
+            queued_bytes: AtomicUsize::new(0),
+            overflowed: AtomicU32::new(0),
+            head: AtomicU32::new(0),
+            count: AtomicU32::new(0),
+            num_watches: AtomicU32::new(0),
+            _reserved: [0; 3],
+            watches: UnsafeCell::new(
+                [const {
+                    DelegatedWatch {
+                        wd: 0,
+                        file_handle: 0,
+                        mask: 0,
+                        alive: 0,
+                    }
+                }; MAX_DELEGATED_WATCHES],
+            ),
+            ring: UnsafeCell::new(
+                [const {
+                    LinuxInotifyEventHeader {
+                        wd: 0,
+                        mask: 0,
+                        cookie: 0,
+                        len: 0,
+                    }
+                }; INOTIFY_RING_CAPACITY],
+            ),
+        }
+    }
+
+    #[inline]
+    pub fn try_lock(&self) -> bool {
+        self.lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    #[inline]
+    pub fn unlock(&self) {
+        self.lock.store(0, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        self.lock.load(Ordering::Relaxed) != 0
+    }
+
+    pub fn host_lock_bounded(&self, max_spins: u64) -> bool {
+        for _ in 0..max_spins {
+            if self.try_lock() {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
+    }
+
+    pub fn alloc_wd(&self) -> Result<i32, LinuxErrno> {
+        let mut next = self.next_wd.load(Ordering::Relaxed);
+        let live_count = self.num_watches.load(Ordering::Relaxed) as usize;
+        let wd = alloc_wd(&mut next, live_count, |w| self.find_watch(w).is_some())?;
+        self.next_wd.store(next, Ordering::Relaxed);
+        Ok(wd)
+    }
+
+    pub fn find_watch(&self, wd: i32) -> Option<(usize, DelegatedWatch)> {
+        if wd <= 0 {
+            return None;
+        }
+        let watches = unsafe { &*self.watches.get() };
+        for (i, w) in watches.iter().enumerate() {
+            if w.alive != 0 && w.wd == wd {
+                return Some((i, *w));
+            }
+        }
+        None
+    }
+
+    pub fn add_watch(&self, wd: i32, file_handle: u32, mask: u32) -> bool {
+        let watches = unsafe { &mut *self.watches.get() };
+        for w in watches.iter_mut() {
+            if w.alive == 0 {
+                *w = DelegatedWatch {
+                    wd,
+                    file_handle,
+                    mask,
+                    alive: 1,
+                };
+                self.num_watches.fetch_add(1, Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn remove_watch(&self, wd: i32) -> Option<u32> {
+        let watches = unsafe { &mut *self.watches.get() };
+        for w in watches.iter_mut() {
+            if w.alive != 0 && w.wd == wd {
+                let file_handle = w.file_handle;
+                *w = DelegatedWatch::default();
+                self.num_watches.fetch_sub(1, Ordering::Release);
+                return Some(file_handle);
+            }
+        }
+        None
+    }
+
+    pub fn push_record(&self, wd: i32, mask: u32, cookie: u32) -> PushResult {
+        if self.overflowed.load(Ordering::Relaxed) != 0 {
+            return PushResult::DroppedOverflow;
+        }
+
+        let ring = unsafe { &mut *self.ring.get() };
+        let head = self.head.load(Ordering::Relaxed) as usize;
+        let count = self.count.load(Ordering::Relaxed) as usize;
+        if count > 0 {
+            let tail_idx = (head + count - 1) % INOTIFY_RING_CAPACITY;
+            let tail = ring[tail_idx];
+            let tail_wd = tail.wd;
+            let tail_mask = tail.mask;
+            let tail_cookie = tail.cookie;
+            if should_coalesce(tail_wd, tail_mask, tail_cookie, wd, mask, cookie) {
+                return PushResult::Coalesced;
+            }
+        }
+
+        let was_empty = count == 0;
+        if count >= INOTIFY_MAX_QUEUED_EVENTS || count >= INOTIFY_RING_CAPACITY {
+            self.overflowed.store(1, Ordering::Release);
+            let overflow_hdr = LinuxInotifyEventHeader {
+                wd: -1,
+                mask: LINUX_IN_Q_OVERFLOW,
+                cookie: 0,
+                len: 0,
+            };
+            let idx = (head + count) % INOTIFY_RING_CAPACITY;
+            ring[idx] = overflow_hdr;
+            self.count.store((count + 1) as u32, Ordering::Release);
+            self.queued_bytes
+                .fetch_add(INOTIFY_EVENT_HEADER_SIZE, Ordering::Release);
+            return PushResult::Overflowed { was_empty };
+        }
+
+        let idx = (head + count) % INOTIFY_RING_CAPACITY;
+        let hdr = LinuxInotifyEventHeader {
+            wd,
+            mask,
+            cookie,
+            len: 0,
+        };
+        ring[idx] = hdr;
+        self.count.store((count + 1) as u32, Ordering::Release);
+        self.queued_bytes
+            .fetch_add(INOTIFY_EVENT_HEADER_SIZE, Ordering::Release);
+        PushResult::Appended { was_empty }
+    }
+
+    pub fn pop_record(&self) -> Option<LinuxInotifyEventHeader> {
+        let count = self.count.load(Ordering::Relaxed) as usize;
+        if count == 0 {
+            return None;
+        }
+        let ring = unsafe { &*self.ring.get() };
+        let head = self.head.load(Ordering::Relaxed) as usize;
+        let hdr = ring[head];
+        self.head.store(
+            ((head + 1) % INOTIFY_RING_CAPACITY) as u32,
+            Ordering::Relaxed,
+        );
+        self.count.store((count - 1) as u32, Ordering::Release);
+        let qb = self.queued_bytes.load(Ordering::Relaxed);
+        self.queued_bytes.store(
+            qb.saturating_sub(INOTIFY_EVENT_HEADER_SIZE),
+            Ordering::Release,
+        );
+        if hdr.mask & LINUX_IN_Q_OVERFLOW != 0 {
+            self.overflowed.store(0, Ordering::Release);
+        }
+        Some(hdr)
+    }
+
+    pub fn drain_into(&self, dest: &mut [u8]) -> Result<usize, LinuxErrno> {
+        let count = self.count.load(Ordering::Relaxed) as usize;
+        if count == 0 {
+            return Ok(0);
+        }
+        if dest.len() < INOTIFY_EVENT_HEADER_SIZE {
+            return Err(LINUX_EINVAL);
+        }
+
+        let ring = unsafe { &*self.ring.get() };
+        let mut head = self.head.load(Ordering::Relaxed) as usize;
+        let mut cur_count = count;
+        let mut written = 0;
+        let mut qb = self.queued_bytes.load(Ordering::Relaxed);
+
+        while cur_count > 0 && written + INOTIFY_EVENT_HEADER_SIZE <= dest.len() {
+            let hdr = ring[head];
+            head = (head + 1) % INOTIFY_RING_CAPACITY;
+            cur_count -= 1;
+            qb = qb.saturating_sub(INOTIFY_EVENT_HEADER_SIZE);
+            if hdr.mask & LINUX_IN_Q_OVERFLOW != 0 {
+                self.overflowed.store(0, Ordering::Release);
+            }
+
+            let slice = &mut dest[written..written + INOTIFY_EVENT_HEADER_SIZE];
+            slice[0..4].copy_from_slice(&hdr.wd.to_ne_bytes());
+            slice[4..8].copy_from_slice(&hdr.mask.to_ne_bytes());
+            slice[8..12].copy_from_slice(&hdr.cookie.to_ne_bytes());
+            slice[12..16].copy_from_slice(&hdr.len.to_ne_bytes());
+            written += INOTIFY_EVENT_HEADER_SIZE;
+        }
+
+        self.head.store(head as u32, Ordering::Relaxed);
+        self.count.store(cur_count as u32, Ordering::Release);
+        self.queued_bytes.store(qb, Ordering::Release);
+        Ok(written)
+    }
+}
+
+impl Default for DelegatedInotify {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Number of entries in the in-guest inotify name cache.
+pub const NAME_CACHE_ENTRIES: usize = 32;
+
+/// Maximum pathname length cached in an inotify name cache entry.
+pub const MAX_NAME_CACHE_PATH_LEN: usize = 256;
+
+/// Fast, non-cryptographic FNV-1a hash for path byte slices.
+#[inline]
+pub fn hash_path(path: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in path {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// A single cache entry mapping `(cwd_gen, path_bytes)` -> `delegated_file_handle`.
+#[repr(C)]
+pub struct InotifyNameCacheEntry {
+    pub lock: AtomicU32,
+    pub valid: AtomicU32,
+    pub file_table: AtomicU64,
+    pub cwd_generation: AtomicU64,
+    pub path_len: AtomicU32,
+    pub delegated_file_handle: AtomicU32,
+    pub path_hash: AtomicU64,
+    pub path_bytes: UnsafeCell<[u8; MAX_NAME_CACHE_PATH_LEN]>,
+}
+
+unsafe impl Sync for InotifyNameCacheEntry {}
+
+impl InotifyNameCacheEntry {
+    pub const fn new() -> Self {
+        Self {
+            lock: AtomicU32::new(0),
+            valid: AtomicU32::new(0),
+            file_table: AtomicU64::new(0),
+            cwd_generation: AtomicU64::new(0),
+            path_len: AtomicU32::new(0),
+            delegated_file_handle: AtomicU32::new(0),
+            path_hash: AtomicU64::new(0),
+            path_bytes: UnsafeCell::new([0; MAX_NAME_CACHE_PATH_LEN]),
+        }
+    }
+
+    #[inline]
+    pub fn try_lock(&self) -> bool {
+        self.lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    #[inline]
+    pub fn unlock(&self) {
+        self.lock.store(0, Ordering::Release);
+    }
+}
+
+impl Default for InotifyNameCacheEntry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-process inotify path name cache at EL1 for exit-free `inotify_add_watch`.
+#[repr(C)]
+#[repr(align(64))]
+pub struct InotifyNameCache {
+    pub global_cwd_generation: AtomicU64,
+    pub entries: [InotifyNameCacheEntry; NAME_CACHE_ENTRIES],
+}
+
+unsafe impl Sync for InotifyNameCache {}
+
+impl InotifyNameCache {
+    pub const fn new() -> Self {
+        Self {
+            global_cwd_generation: AtomicU64::new(1),
+            entries: [const { InotifyNameCacheEntry::new() }; NAME_CACHE_ENTRIES],
+        }
+    }
+
+    #[inline]
+    pub fn bump_cwd_generation(&self) -> u64 {
+        self.global_cwd_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    #[inline]
+    pub fn cwd_generation(&self) -> u64 {
+        self.global_cwd_generation.load(Ordering::Acquire)
+    }
+
+    pub fn lookup(&self, file_table: u64, path: &[u8], path_hash: u64) -> Option<u32> {
+        let cur_cwd_gen = self.cwd_generation();
+        let path_len = path.len();
+        if path_len == 0 || path_len > MAX_NAME_CACHE_PATH_LEN {
+            return None;
+        }
+
+        for entry in self.entries.iter() {
+            if entry.valid.load(Ordering::Acquire) != 0
+                && entry.file_table.load(Ordering::Relaxed) == file_table
+                && entry.cwd_generation.load(Ordering::Relaxed) == cur_cwd_gen
+                && entry.path_hash.load(Ordering::Relaxed) == path_hash
+                && entry.path_len.load(Ordering::Relaxed) as usize == path_len
+            {
+                let path_bytes = unsafe { &*entry.path_bytes.get() };
+                if &path_bytes[..path_len] == path {
+                    let handle = entry.delegated_file_handle.load(Ordering::Relaxed);
+                    if handle != 0 && entry.valid.load(Ordering::Acquire) != 0 {
+                        return Some(handle);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn insert(
+        &self,
+        file_table: u64,
+        cwd_gen: u64,
+        path: &[u8],
+        path_hash: u64,
+        delegated_file_handle: u32,
+    ) {
+        let path_len = path.len();
+        if path_len == 0 || path_len > MAX_NAME_CACHE_PATH_LEN {
+            return;
+        }
+
+        for entry in self.entries.iter() {
+            if !entry.try_lock() {
+                continue;
+            }
+            let is_match = {
+                let cur_path = unsafe { &*entry.path_bytes.get() };
+                entry.valid.load(Ordering::Relaxed) != 0
+                    && entry.file_table.load(Ordering::Relaxed) == file_table
+                    && entry.path_hash.load(Ordering::Relaxed) == path_hash
+                    && entry.path_len.load(Ordering::Relaxed) as usize == path_len
+                    && &cur_path[..path_len] == path
+            };
+
+            let is_empty = entry.valid.load(Ordering::Relaxed) == 0;
+
+            if is_match || is_empty {
+                entry.valid.store(0, Ordering::Release);
+                entry.file_table.store(file_table, Ordering::Relaxed);
+                entry.cwd_generation.store(cwd_gen, Ordering::Relaxed);
+                entry.path_len.store(path_len as u32, Ordering::Relaxed);
+                entry.path_hash.store(path_hash, Ordering::Relaxed);
+                let path_bytes = unsafe { &mut *entry.path_bytes.get() };
+                path_bytes[..path_len].copy_from_slice(path);
+                entry
+                    .delegated_file_handle
+                    .store(delegated_file_handle, Ordering::Relaxed);
+                entry.valid.store(1, Ordering::Release);
+                entry.unlock();
+                return;
+            }
+            entry.unlock();
+        }
+
+        let Some(entry) = self.entries.first() else {
+            return;
+        };
+        if entry.try_lock() {
+            entry.valid.store(0, Ordering::Release);
+            entry.file_table.store(file_table, Ordering::Relaxed);
+            entry.cwd_generation.store(cwd_gen, Ordering::Relaxed);
+            entry.path_len.store(path_len as u32, Ordering::Relaxed);
+            entry.path_hash.store(path_hash, Ordering::Relaxed);
+            let path_bytes = unsafe { &mut *entry.path_bytes.get() };
+            path_bytes[..path_len].copy_from_slice(path);
+            entry
+                .delegated_file_handle
+                .store(delegated_file_handle, Ordering::Relaxed);
+            entry.valid.store(1, Ordering::Release);
+            entry.unlock();
+        }
+    }
+
+    pub fn invalidate_all(&self) {
+        for entry in self.entries.iter() {
+            entry.valid.store(0, Ordering::Release);
+        }
+    }
+
+    pub fn invalidate_file(&self, file_handle: u32) {
+        for entry in self.entries.iter() {
+            if entry.delegated_file_handle.load(Ordering::Relaxed) == file_handle {
+                entry.valid.store(0, Ordering::Release);
+            }
+        }
+    }
+}
+
+impl Default for InotifyNameCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,8 +1406,19 @@ mod tests {
 
     #[test]
     fn test_delegated_file_layout() {
-        assert_eq!(core::mem::size_of::<DelegatedFile>(), 64);
+        assert_eq!(core::mem::size_of::<DelegatedFile>(), 256);
         assert_eq!(core::mem::align_of::<DelegatedFile>(), 64);
+    }
+
+    #[test]
+    fn test_delegated_inotify_layout() {
+        assert!(core::mem::size_of::<DelegatedInotify>() <= 300 * 1024);
+        assert_eq!(core::mem::align_of::<DelegatedInotify>(), 64);
+        assert!(
+            MAX_DELEGATED_INOTIFY * core::mem::size_of::<DelegatedInotify>()
+                <= EL1_INOTIFY_TABLE_SIZE as usize
+        );
+        assert!(core::mem::size_of::<InotifyNameCache>() <= EL1_NAME_CACHE_SIZE as usize);
     }
 
     #[test]
@@ -835,5 +1551,86 @@ mod tests {
 
         record_el1_region_host_ptr(0);
         assert_eq!(get_el1_region_host_ptr(), 0);
+    }
+
+    #[test]
+    fn test_delegated_inotify_operations() {
+        let inotify = DelegatedInotify::new();
+        assert!(!inotify.is_locked());
+        assert!(inotify.try_lock());
+        assert!(inotify.is_locked());
+        inotify.unlock();
+
+        let wd1 = inotify.alloc_wd().unwrap();
+        assert_eq!(wd1, 1);
+        let wd2 = inotify.alloc_wd().unwrap();
+        assert_eq!(wd2, 2);
+
+        assert!(inotify.add_watch(wd1, 10, 0x2)); // IN_MODIFY
+        assert!(inotify.add_watch(wd2, 11, 0x2));
+        assert_eq!(inotify.find_watch(wd1).unwrap().1.file_handle, 10);
+        assert_eq!(inotify.find_watch(wd2).unwrap().1.file_handle, 11);
+
+        // Test push & coalesce
+        assert_eq!(
+            inotify.push_record(wd1, 0x2, 0),
+            PushResult::Appended { was_empty: true }
+        );
+        assert_eq!(inotify.push_record(wd1, 0x2, 0), PushResult::Coalesced);
+        assert_eq!(
+            inotify.push_record(wd2, 0x2, 0),
+            PushResult::Appended { was_empty: false }
+        );
+        // IN_IGNORED (0x8000) does not coalesce
+        assert_eq!(
+            inotify.push_record(wd1, 0x8000, 0),
+            PushResult::Appended { was_empty: false }
+        );
+
+        let mut buf = [0u8; 64];
+        let n = inotify.drain_into(&mut buf).unwrap();
+        assert_eq!(n, 48); // 3 events * 16 bytes
+
+        // Check removed watch
+        assert_eq!(inotify.remove_watch(wd1), Some(10));
+        assert_eq!(inotify.find_watch(wd1), None);
+    }
+
+    #[test]
+    fn test_inotify_name_cache() {
+        let cache = InotifyNameCache::new();
+        let path = b"test_file.txt";
+        let hash = hash_path(path);
+        let file_table = 42;
+
+        assert_eq!(cache.lookup(file_table, path, hash), None);
+
+        let cwd_gen = cache.cwd_generation();
+        cache.insert(file_table, cwd_gen, path, hash, 7);
+        assert_eq!(cache.lookup(file_table, path, hash), Some(7));
+        assert_eq!(cache.lookup(99, path, hash), None);
+        assert_eq!(
+            cache.lookup(file_table, b"other.txt", hash_path(b"other.txt")),
+            None
+        );
+
+        // Bump cwd_gen invalidates entries from old cwd_gen
+        cache.bump_cwd_generation();
+        assert_eq!(cache.lookup(file_table, path, hash), None);
+
+        // Re-insert under new cwd_gen
+        let new_gen = cache.cwd_generation();
+        cache.insert(file_table, new_gen, path, hash, 8);
+        assert_eq!(cache.lookup(file_table, path, hash), Some(8));
+
+        // Invalidate file
+        cache.invalidate_file(8);
+        assert_eq!(cache.lookup(file_table, path, hash), None);
+
+        // Invalidate all
+        cache.insert(file_table, new_gen, path, hash, 9);
+        assert_eq!(cache.lookup(file_table, path, hash), Some(9));
+        cache.invalidate_all();
+        assert_eq!(cache.lookup(file_table, path, hash), None);
     }
 }
