@@ -215,6 +215,7 @@ def reconcile_host_authority_positions(
             )
 
         inventory = [row for row in inventory if id(row) not in drop_ids]
+        inventory.sort(key=canonical_row_sort_key)
         inventory_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
         receipt = candidate["capture_receipt"]
