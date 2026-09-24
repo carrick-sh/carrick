@@ -1826,7 +1826,14 @@ fn attach_el1_registration(
         _ => None,
     };
     if let Some(identity) = identity {
-        file_desc.set_el1_registration(crate::el1_delegation::register_open(identity));
+        let registration = crate::el1_delegation::register_open(identity);
+        let join_pending = registration.join_pending();
+        file_desc.set_el1_registration(registration);
+        // The inode is in the zone: this description must join it (at open)
+        // before any host I/O, or its first host access recalls the inode.
+        if join_pending {
+            file_desc.set_delegation_handle(crate::el1_delegation::JOIN_PENDING);
+        }
     }
 }
 

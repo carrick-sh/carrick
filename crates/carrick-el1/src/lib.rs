@@ -12,13 +12,14 @@ pub mod lock;
 
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
-    EL1_GUEST_LOCK_SPINS, FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES,
-    MAX_DELEGATED_MARKS_PER_FILE, TrapFrame, fd_map_lookup,
+    DelegatedOpenFile, EL1_GUEST_LOCK_SPINS, FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES,
+    MAX_DELEGATED_MARKS_PER_FILE, MAX_ZONE_OPEN_FILES, TrapFrame, fd_map_lookup,
 };
 #[cfg(target_os = "none")]
 use carrick_el1_abi::{
     EL1_CURRENT_TASKS_BASE, EL1_FD_MAP_BASE, EL1_INOTIFY_TABLE_BASE, EL1_NAME_CACHE_BASE,
-    EL1_OBJECT_TABLE_BASE, EL1_STACK_SLOTS, FD_MAP_CAPACITY, MAX_DELEGATED_INOTIFY,
+    EL1_OBJECT_TABLE_BASE, EL1_OPEN_FILE_TABLE_BASE, EL1_STACK_SLOTS, FD_MAP_CAPACITY,
+    MAX_DELEGATED_INOTIFY,
 };
 use core::sync::atomic::Ordering;
 
@@ -31,6 +32,9 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         let fd_map = unsafe { &*(EL1_FD_MAP_BASE as *const [FdMapSlot; FD_MAP_CAPACITY]) };
         let object_table =
             unsafe { &*(EL1_OBJECT_TABLE_BASE as *const [DelegatedFile; MAX_DELEGATED_FILES]) };
+        let open_table = unsafe {
+            &*(EL1_OPEN_FILE_TABLE_BASE as *const [DelegatedOpenFile; MAX_ZONE_OPEN_FILES])
+        };
         let inotify_table = unsafe {
             &*(EL1_INOTIFY_TABLE_BASE as *const [DelegatedInotify; MAX_DELEGATED_INOTIFY])
         };
@@ -41,6 +45,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
             current_tasks,
             fd_map,
             object_table,
+            open_table,
             inotify_table,
             name_cache,
             |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
@@ -64,6 +69,7 @@ pub fn dispatch_syscall_with_regions<F>(
     current_tasks: &[CurrentTask],
     fd_map: &[FdMapSlot],
     object_table: &[DelegatedFile],
+    open_table: &[DelegatedOpenFile],
     inotify_table: &[DelegatedInotify],
     name_cache: &InotifyNameCache,
     cache_lookup: F,
@@ -144,6 +150,7 @@ where
                 current_tasks,
                 fd_map,
                 object_table,
+                open_table,
                 inotify_table,
                 &cache_lookup,
             )
@@ -186,6 +193,7 @@ where
                 current_tasks,
                 fd_map,
                 object_table,
+                open_table,
                 inotify_table,
                 &cache_lookup,
             ) {
@@ -224,12 +232,14 @@ fn claim_owed_inotify_wake(task: &CurrentTask, inotify_table: &[DelegatedInotify
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_serve_file_syscall<F>(
     frame: &TrapFrame,
     nr: usize,
     current_tasks: &[CurrentTask],
     fd_map: &[FdMapSlot],
     object_table: &[DelegatedFile],
+    open_table: &[DelegatedOpenFile],
     inotify_table: &[DelegatedInotify],
     cache_lookup: &F,
 ) -> Option<i64>
@@ -243,47 +253,50 @@ where
         return None;
     }
     let fd = frame.x[0] as i32;
+    // fd -> open file (this description's offset and flags) -> inode (bytes).
     let (handle, slot_idx) = fd_map_lookup(fd_map, file_table, fd)?;
-    if handle == 0 || handle as usize > MAX_DELEGATED_FILES {
+    if handle == 0 || handle as usize > MAX_ZONE_OPEN_FILES {
         return None;
     }
-    let file = object_table.get((handle - 1) as usize)?;
+    let open = open_table.get((handle - 1) as usize)?;
+    let inode_handle = open.inode_handle.load(Ordering::Acquire);
+    if inode_handle == 0 || inode_handle as usize > MAX_DELEGATED_FILES {
+        return None;
+    }
+    let file = object_table.get((inode_handle - 1) as usize)?;
     if file.state.load(Ordering::Acquire) != DELEGATED_STATE_GUEST {
         return None;
     }
     if !file.lock_guest_bounded(EL1_GUEST_LOCK_SPINS) {
         return None;
     }
-    // Re-validate fd_map slot and object incarnation after taking the lock
+    // Re-validate the fd-map slot, the open file and its inode under the
+    // inode's lock (which also guards the open-file record).
     let map_slot = fd_map.get(slot_idx)?;
     let slot_incarnation = map_slot.incarnation.load(Ordering::Acquire);
-    let slot_handle = map_slot.handle.load(Ordering::Relaxed);
-    let slot_fd = map_slot.fd.load(Ordering::Relaxed);
-    let slot_file_table = map_slot.file_table.load(Ordering::Relaxed);
-    let file_incarnation = file.generation.load(Ordering::Acquire);
-    let file_state = file.state.load(Ordering::Acquire);
-
     if slot_incarnation == 0
-        || slot_handle != handle
-        || slot_fd != fd as u32
-        || slot_file_table != file_table
-        || slot_incarnation != file_incarnation
-        || file_state != DELEGATED_STATE_GUEST
+        || map_slot.handle.load(Ordering::Relaxed) != handle
+        || map_slot.fd.load(Ordering::Relaxed) != fd as u32
+        || map_slot.file_table.load(Ordering::Relaxed) != file_table
+        || slot_incarnation != open.generation.load(Ordering::Acquire)
+        || open.inode_handle.load(Ordering::Acquire) != inode_handle
+        || !open.is_bound_to(file)
     {
         file.unlock();
         return None;
     }
 
-    let cache_ptr = cache_lookup(handle);
+    let cache_ptr = cache_lookup(inode_handle);
     let mut user = file::ValidatedCopy {
         task: cur_task,
         validator: &file::HardwareValidator,
     };
     let args = [frame.x[1], frame.x[2], frame.x[3]];
-    // SAFETY: the object is locked and revalidated; `cache_ptr` is its slot.
+    let zone_file = file::ZoneFile { inode: file, open };
+    // SAFETY: the inode is locked and revalidated; `cache_ptr` is its slot.
     let outcome = unsafe {
         serve_locked_file_op(
-            file,
+            &zone_file,
             inotify_table,
             nr,
             args,
@@ -324,7 +337,7 @@ impl InstanceLockPolicy for TryInstanceLock {
 /// The caller holds `file`'s lock, has revalidated it as live, and
 /// `cache_ptr` is its cache slot.
 pub unsafe fn serve_locked_file_op(
-    file: &DelegatedFile,
+    zone_file: &file::ZoneFile<'_>,
     inotify_table: &[DelegatedInotify],
     nr: usize,
     args: [u64; 3],
@@ -332,6 +345,7 @@ pub unsafe fn serve_locked_file_op(
     user: &mut impl file::UserCopy,
     locks: &impl InstanceLockPolicy,
 ) -> Result<i64, Action> {
+    let file = zone_file.inode;
     // The data event this operation produces on a marking watch: IN_MODIFY
     // for a write, IN_ACCESS for a read (inotify(7)), each only when bytes
     // moved.
@@ -379,11 +393,11 @@ pub unsafe fn serve_locked_file_op(
     // SAFETY: forwarded from the caller's contract.
     let outcome = unsafe {
         match nr {
-            62 => file::el1_lseek(file, args[0] as i64, args[1] as u32),
-            63 => file::read_with(file, cache_ptr, args[0], args[1] as usize, user),
-            64 => file::write_with(file, cache_ptr, args[0], args[1] as usize, user),
+            62 => file::el1_lseek(zone_file, args[0] as i64, args[1] as u32),
+            63 => file::read_with(zone_file, cache_ptr, args[0], args[1] as usize, user),
+            64 => file::write_with(zone_file, cache_ptr, args[0], args[1] as usize, user),
             67 => file::pread64_with(
-                file,
+                zone_file,
                 cache_ptr,
                 args[0],
                 args[1] as usize,
@@ -391,7 +405,7 @@ pub unsafe fn serve_locked_file_op(
                 user,
             ),
             68 => file::pwrite64_with(
-                file,
+                zone_file,
                 cache_ptr,
                 args[0],
                 args[1] as usize,
@@ -479,13 +493,20 @@ mod tests {
         fd_map[0].set(100, 3, 1, 42); // file_table 100, fd 3 -> handle 1, incarnation 42
 
         let object_table = [DelegatedFile::new()];
+        let open_table = [DelegatedOpenFile::new()];
+        open_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        open_table[0].inode_handle.store(1, Ordering::Relaxed);
         object_table[0]
             .state
             .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
         object_table[0].generation.store(42, Ordering::Relaxed);
+        open_table[0].generation.store(42, Ordering::Relaxed);
+        open_table[0].inode_generation.store(42, Ordering::Relaxed);
         object_table[0].size.store(100, Ordering::Relaxed);
-        object_table[0].offset.store(10, Ordering::Relaxed);
-        object_table[0]
+        open_table[0].offset.store(10, Ordering::Relaxed);
+        open_table[0]
             .flags
             .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
 
@@ -504,6 +525,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| core::ptr::null_mut(),
@@ -526,12 +548,19 @@ mod tests {
         fd_map[0].set(100, 3, 1, 42);
 
         let object_table = [DelegatedFile::new()];
+        let open_table = [DelegatedOpenFile::new()];
+        open_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        open_table[0].inode_handle.store(1, Ordering::Relaxed);
         object_table[0]
             .state
             .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
         object_table[0].generation.store(42, Ordering::Relaxed);
+        open_table[0].generation.store(42, Ordering::Relaxed);
+        open_table[0].inode_generation.store(42, Ordering::Relaxed);
         object_table[0].size.store(100, Ordering::Relaxed);
-        object_table[0].offset.store(10, Ordering::Relaxed);
+        open_table[0].offset.store(10, Ordering::Relaxed);
 
         let inotify_table = [DelegatedInotify::new()];
         let name_cache = InotifyNameCache::new();
@@ -548,6 +577,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| core::ptr::null_mut(),
@@ -555,7 +585,7 @@ mod tests {
 
         // Entry check: must forward immediately without modifying file state
         assert_eq!(action, Action::Forward);
-        assert_eq!(object_table[0].offset.load(Ordering::Relaxed), 10);
+        assert_eq!(open_table[0].offset.load(Ordering::Relaxed), 10);
         assert_eq!(counters.served[62].load(Ordering::Relaxed), 0);
         assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 1);
     }
@@ -570,13 +600,20 @@ mod tests {
         fd_map[0].set(100, 3, 1, 42);
 
         let object_table = [DelegatedFile::new()];
+        let open_table = [DelegatedOpenFile::new()];
+        open_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        open_table[0].inode_handle.store(1, Ordering::Relaxed);
         object_table[0]
             .state
             .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
         object_table[0].generation.store(42, Ordering::Relaxed);
+        open_table[0].generation.store(42, Ordering::Relaxed);
+        open_table[0].inode_generation.store(42, Ordering::Relaxed);
         object_table[0].size.store(100, Ordering::Relaxed);
-        object_table[0].offset.store(10, Ordering::Relaxed);
-        object_table[0]
+        open_table[0].offset.store(10, Ordering::Relaxed);
+        open_table[0]
             .flags
             .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
 
@@ -599,6 +636,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| core::ptr::null_mut(),
@@ -619,6 +657,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| core::ptr::null_mut(),
@@ -633,10 +672,10 @@ mod tests {
         let mut cache_mem = [0u8; 4096];
         let cache_ptr = cache_mem.as_mut_ptr();
         let task_ref = &tasks[0];
-        object_table[0]
+        open_table[0]
             .flags
             .store(carrick_el1_abi::DELEGATED_FLAG_WRITABLE, Ordering::Relaxed);
-        object_table[0].offset.store(0, Ordering::Relaxed);
+        open_table[0].offset.store(0, Ordering::Relaxed);
 
         let mut frame_write = TrapFrame::default();
         frame_write.x[0] = 3; // fd
@@ -650,6 +689,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             move |_| {
@@ -676,15 +716,23 @@ mod tests {
         fd_map[0].set(100, 3, 1, 10);
 
         let object_table = [DelegatedFile::new()];
+        let open_table = [DelegatedOpenFile::new()];
+        open_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        open_table[0].inode_handle.store(1, Ordering::Relaxed);
         // Suppose between fd_map_lookup and try_lock / re-validation,
         // the handle is recalled, freed, and re-delegated to another file with incarnation 11!
         object_table[0]
             .state
             .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
         object_table[0].generation.store(11, Ordering::Relaxed); // new incarnation!
+        // The open file still names the inode incarnation it joined (10).
+        open_table[0].generation.store(10, Ordering::Relaxed);
+        open_table[0].inode_generation.store(10, Ordering::Relaxed);
         object_table[0].size.store(100, Ordering::Relaxed);
-        object_table[0].offset.store(10, Ordering::Relaxed);
-        object_table[0]
+        open_table[0].offset.store(10, Ordering::Relaxed);
+        open_table[0]
             .flags
             .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
 
@@ -703,6 +751,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| core::ptr::null_mut(),
@@ -725,13 +774,20 @@ mod tests {
         fd_map[0].set(100, 3, 1, 42); // incarnation 42
 
         let object_table = [DelegatedFile::new()];
+        let open_table = [DelegatedOpenFile::new()];
+        open_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        open_table[0].inode_handle.store(1, Ordering::Relaxed);
         object_table[0]
             .state
             .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        object_table[0].generation.store(42, Ordering::Relaxed); // object incarnation 42
+        object_table[0].generation.store(42, Ordering::Relaxed);
+        open_table[0].generation.store(42, Ordering::Relaxed);
+        open_table[0].inode_generation.store(42, Ordering::Relaxed); // object incarnation 42
         object_table[0].size.store(100, Ordering::Relaxed);
-        object_table[0].offset.store(10, Ordering::Relaxed);
-        object_table[0]
+        open_table[0].offset.store(10, Ordering::Relaxed);
+        open_table[0]
             .flags
             .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
 
@@ -751,6 +807,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| core::ptr::null_mut(),
@@ -774,13 +831,20 @@ mod tests {
         fd_map[1].set(100, 4, FD_HANDLE_INOTIFY_TAG | 1, 42); // fd 4 -> delegated inotify handle 1
 
         let object_table = [DelegatedFile::new()];
+        let open_table = [DelegatedOpenFile::new()];
+        open_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        open_table[0].inode_handle.store(1, Ordering::Relaxed);
         object_table[0]
             .state
             .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
         object_table[0].generation.store(42, Ordering::Relaxed);
+        open_table[0].generation.store(42, Ordering::Relaxed);
+        open_table[0].inode_generation.store(42, Ordering::Relaxed);
         object_table[0].size.store(100, Ordering::Relaxed);
-        object_table[0].offset.store(0, Ordering::Relaxed);
-        object_table[0].flags.store(
+        open_table[0].offset.store(0, Ordering::Relaxed);
+        open_table[0].flags.store(
             carrick_el1_abi::DELEGATED_FLAG_READABLE | carrick_el1_abi::DELEGATED_FLAG_WRITABLE,
             Ordering::Relaxed,
         );
@@ -815,6 +879,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| cache_ptr,
@@ -843,6 +908,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| cache_ptr,
@@ -859,6 +925,71 @@ mod tests {
     }
 
     #[test]
+    fn test_two_open_files_share_one_inode_with_independent_offsets() {
+        let counters = Counters::default();
+        let tasks = [CurrentTask::new()];
+        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
+        let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
+        fd_map[0].set(100, 3, 1, 7); // fd 3 -> open file 1
+        fd_map[1].set(100, 4, 2, 8); // fd 4 -> open file 2
+        let object_table = [DelegatedFile::new()];
+        object_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        object_table[0].generation.store(42, Ordering::Relaxed);
+        let open_table = [DelegatedOpenFile::new(), DelegatedOpenFile::new()];
+        for (i, generation) in [(0usize, 7u64), (1, 8)] {
+            open_table[i]
+                .state
+                .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+            open_table[i]
+                .generation
+                .store(generation, Ordering::Relaxed);
+            open_table[i].inode_handle.store(1, Ordering::Relaxed);
+            open_table[i].inode_generation.store(42, Ordering::Relaxed);
+            open_table[i].flags.store(
+                carrick_el1_abi::DELEGATED_FLAG_READABLE | carrick_el1_abi::DELEGATED_FLAG_WRITABLE,
+                Ordering::Relaxed,
+            );
+        }
+        let inotify_table = [DelegatedInotify::new()];
+        let name_cache = InotifyNameCache::new();
+        let mut cache_mem = [0u8; 4096];
+        let cache_ptr = cache_mem.as_mut_ptr();
+        let run = |fd: u64, nr: u64, a1: u64, a2: u64| {
+            let mut frame = TrapFrame::default();
+            frame.x[0] = fd;
+            frame.x[1] = a1;
+            frame.x[2] = a2;
+            frame.x[8] = nr;
+            let action = dispatch_syscall_with_regions(
+                &mut frame,
+                &counters,
+                &tasks,
+                &fd_map,
+                &object_table,
+                &open_table,
+                &inotify_table,
+                &name_cache,
+                |_| cache_ptr,
+            );
+            assert_eq!(action, Action::Served, "fd {fd} nr {nr}");
+            frame.x[0] as i64
+        };
+        let mut hello = *b"hello";
+        assert_eq!(run(3, 64, hello.as_mut_ptr() as u64, 5), 5); // write via fd 3
+        let mut out = [0u8; 5];
+        // fd 4 has its own offset (0) and sees fd 3's bytes.
+        assert_eq!(run(4, 63, out.as_mut_ptr() as u64, 5), 5);
+        assert_eq!(&out, b"hello");
+        assert_eq!(open_table[0].offset.load(Ordering::Relaxed), 5);
+        assert_eq!(open_table[1].offset.load(Ordering::Relaxed), 5);
+        assert_eq!(run(3, 62, 1, 0), 1); // lseek fd 3 to 1 leaves fd 4 at 5
+        assert_eq!(open_table[1].offset.load(Ordering::Relaxed), 5);
+        assert_eq!(object_table[0].size.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
     fn test_inotify_add_watch_write_rm_watch_read_served() {
         use carrick_el1_abi::{FD_HANDLE_INOTIFY_TAG, hash_path};
 
@@ -871,13 +1002,20 @@ mod tests {
         fd_map[1].set(100, 4, FD_HANDLE_INOTIFY_TAG | 1, 42); // fd 4 -> delegated inotify handle 1
 
         let object_table = [DelegatedFile::new()];
+        let open_table = [DelegatedOpenFile::new()];
+        open_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        open_table[0].inode_handle.store(1, Ordering::Relaxed);
         object_table[0]
             .state
             .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
         object_table[0].generation.store(42, Ordering::Relaxed);
+        open_table[0].generation.store(42, Ordering::Relaxed);
+        open_table[0].inode_generation.store(42, Ordering::Relaxed);
         object_table[0].size.store(100, Ordering::Relaxed);
-        object_table[0].offset.store(0, Ordering::Relaxed);
-        object_table[0].flags.store(
+        open_table[0].offset.store(0, Ordering::Relaxed);
+        open_table[0].flags.store(
             carrick_el1_abi::DELEGATED_FLAG_READABLE | carrick_el1_abi::DELEGATED_FLAG_WRITABLE,
             Ordering::Relaxed,
         );
@@ -913,6 +1051,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| cache_ptr,
@@ -937,6 +1076,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| cache_ptr,
@@ -958,6 +1098,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| cache_ptr,
@@ -982,6 +1123,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| cache_ptr,
@@ -1002,6 +1144,11 @@ mod tests {
         fd_map[0].set(100, 4, carrick_el1_abi::FD_HANDLE_INOTIFY_TAG | 1, 42);
 
         let object_table = [DelegatedFile::new()];
+        let open_table = [DelegatedOpenFile::new()];
+        open_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        open_table[0].inode_handle.store(1, Ordering::Relaxed);
         let inotify_table = [DelegatedInotify::new()];
         inotify_table[0]
             .state
@@ -1022,6 +1169,7 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &open_table,
             &inotify_table,
             &name_cache,
             |_| core::ptr::null_mut(),

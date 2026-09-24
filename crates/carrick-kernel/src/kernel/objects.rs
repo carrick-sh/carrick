@@ -1386,7 +1386,10 @@ impl FileDescription {
     }
 
     pub(crate) fn retain_fd_ref(&self) {
-        crate::el1_delegation::recall_if_delegated(self);
+        // A new fd reference to an in-zone member (dup, fork, install) is
+        // not an ownership change: EL1 serves only the published fd, and
+        // every other reference forwards to the host, which serves the same
+        // zone records (`el1_delegation::serve_on_host`).
         let _guard = self.lifecycle_transition.lock();
         let count = self.common.retain_fd_ref();
         if count == 1 {
@@ -1446,7 +1449,7 @@ impl FileDescription {
         // not an ownership change. Recall runs outside `lifecycle_transition`,
         // which is ordered before the description guard.
         if self.common.fd_refs() <= 1 {
-            crate::el1_delegation::recall_if_delegated(self);
+            crate::el1_delegation::release_description(self);
         }
         let released_last;
         let terminal_finalizers = {
@@ -1469,7 +1472,7 @@ impl FileDescription {
         // zero together; the description (and its host fd) is still alive, so
         // write the delegation back now.
         if released_last {
-            crate::el1_delegation::recall_if_delegated(self);
+            crate::el1_delegation::release_description(self);
         }
         // A finalizer may take subsystem state (for example logical-record
         // locks). Do not nest that under `lifecycle_transition`; the terminal
