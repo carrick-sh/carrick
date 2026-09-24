@@ -329,6 +329,10 @@ test *ARGS:
         # threads (no `libc::fork()` from the harness), so it needs no serial
         # slot. One case deliberately costs its 5 s wait bound.
         cargo test -p carrick-kernel-example --tests {{ARGS}}
+        # The contract registry's own tests (`tests/claims.rs` loads the live
+        # conformance-contracts/ tree) are integration targets too, so the
+        # `--lib --bins` line never ran them; name the crate.
+        cargo test -p carrick-conformance-contract --tests {{ARGS}}
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -383,6 +387,7 @@ test *ARGS:
     # pull in carrick-vmm-hvf + the macos-default features and fail to compile.
     pkgs="$(just --justfile {{justfile()}} _platform_crates)"
     cargo test $pkgs {{_platform_features}} --lib --bins {{ARGS}}
+    cargo test -p carrick-conformance-contract --tests {{ARGS}}
 
 # Rustdoc gate: broken intra-doc links / unclosed-tag lints fail the build (matches CI).
 doc *ARGS:
