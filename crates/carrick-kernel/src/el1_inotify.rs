@@ -94,24 +94,13 @@ pub fn delegate_inotify(
     inotify.unlock();
 
     // Bind fd_map slot
-    let fd_map_base = (region_ptr + EL1_FD_MAP_OFFSET as usize) as *const FdMapSlot;
-    let slot_found = crate::el1_delegation::with_fd_map_lock(|| {
-        (0..FD_MAP_CAPACITY).any(|slot_idx| {
-            // SAFETY: fd map slot within the EL1 region.
-            let slot = unsafe { &*fd_map_base.add(slot_idx) };
-            if slot.incarnation.load(Ordering::Relaxed) == 0 {
-                slot.set(
-                    file_table.raw(),
-                    fd as u32,
-                    FD_HANDLE_INOTIFY_TAG | handle,
-                    incarnation,
-                );
-                true
-            } else {
-                false
-            }
-        })
-    });
+    let slot_found = crate::el1_delegation::fd_map_publish(
+        region_ptr,
+        file_table.raw(),
+        fd,
+        FD_HANDLE_INOTIFY_TAG | handle,
+        incarnation,
+    );
 
     if !slot_found {
         if inotify.host_lock_bounded(100_000) {
@@ -234,16 +223,7 @@ fn recall_inotify_internal(
     }
 
     // Clear fd_map slots for this inotify handle
-    let fd_map_base = (region_ptr + EL1_FD_MAP_OFFSET as usize) as *const FdMapSlot;
-    crate::el1_delegation::with_fd_map_lock(|| {
-        for slot_idx in 0..FD_MAP_CAPACITY {
-            // SAFETY: fd map slot within the EL1 region.
-            let slot = unsafe { &*fd_map_base.add(slot_idx) };
-            if slot.handle.load(Ordering::Acquire) == (FD_HANDLE_INOTIFY_TAG | handle) {
-                slot.clear();
-            }
-        }
-    });
+    crate::el1_delegation::fd_map_clear_handle(region_ptr, FD_HANDLE_INOTIFY_TAG | handle);
 
     free_inotify_handle(handle);
     inotify.state.store(DELEGATED_STATE_DEAD, Ordering::Release);

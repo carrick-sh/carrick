@@ -2955,6 +2955,9 @@ impl Drop for FileTableWriteGuard<'_> {
         }
         self.revision.publish();
         if !changed.is_empty() {
+            // EL1 must stop serving an fd number the moment it stops referring
+            // to the object it was published for.
+            crate::el1_delegation::fd_map_forget(self.table, &changed);
             self.subscriptions
                 .publish_changes(self.table, &self.guard, &changed);
         }
