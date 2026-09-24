@@ -46,9 +46,9 @@ print "contract_ok\n";
     let forwarded_writes = counters.forwarded[64].load(Ordering::Relaxed);
     let served_seeks = counters.served[62].load(Ordering::Relaxed);
     let _forwarded_seeks = counters.forwarded[62].load(Ordering::Relaxed);
-    // Forwards are a fixed startup population (perl's startup fstat calls
-    // recall the file and start one short backoff); they must not grow with
-    // the loop, and every other iteration is served in-guest.
+    // The file enters the zone at open and nothing in the loop takes it out,
+    // so forwards are a fixed startup population (contention with the entry
+    // at open); they must not grow with the loop.
     const STARTUP_FORWARD_BOUND: u64 = 64;
     let population = carrick_kernel::el1_delegation::delegation_counts();
     assert!(
@@ -207,14 +207,21 @@ print "path_mutation_ok\n";
 /// Each phase uses its own syscalls so the carrier-wide EL1 counters
 /// attribute them: pwrite64 (68) in the zone from open; lseek/write/read
 /// (62/64/63) on the demoted description; pread64 (67) after the fresh
-/// open. The script checks the Linux results itself and loads no module, so
-/// perl reads no other regular file that the zone could serve.
+/// open. The script checks the Linux results itself and loads no module.
+/// The only other in-zone work is perl's startup: the files it opens (the
+/// shared libraries, each demoted by its mmap; the population shows ~15
+/// mapping recalls per run) may have a seek or read served first. That is a
+/// fixed population independent of N (measured: 2 seeks and 1 read, no
+/// writes), so it is bounded rather than required to be zero.
 #[test]
 fn el1_zone_entry_at_open_contract() {
     const N: u64 = 500;
     /// Operations of an in-zone phase that may be forwarded (contention,
     /// the first access racing the entry at open).
     const FORWARD_BOUND: u64 = 16;
+    /// Seeks and reads the dynamic loader may have served on shared
+    /// libraries before mapping them; independent of N.
+    const STARTUP_SERVED_BOUND: u64 = 16;
     let _guard = common::guest_lock();
     reset_el1_counters();
     carrick_kernel::el1_delegation::reset_delegation_counts();
@@ -315,7 +322,7 @@ print "zone_entry_ok\n";
     }
     // Demotion is final for the description: none of its later operations
     // is served in-guest, and all of them ran on the host.
-    if served(62) != 0 || served(64) != 0 || served(63) != 0 {
+    if served(64) != 0 || served(62) > STARTUP_SERVED_BOUND || served(63) > STARTUP_SERVED_BOUND {
         failures.push("the demoted description re-entered the zone (lseek/write/read served)");
     }
     if forwarded(64) < 2 * N || forwarded(62) < 4 * N || forwarded(63) < 2 * N {

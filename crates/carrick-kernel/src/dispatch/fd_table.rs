@@ -3094,10 +3094,10 @@ impl crate::kernel::FileDescription {
                 }
             }
             let guard = d.read();
-            // A sibling thread's forwarded write may have re-delegated the
-            // description between the recall and this read; recall again.
-            // Each recall counts toward the description's recall limit, after
-            // which it is never delegated again, so this loop is finite.
+            // The one entry at open may land between the check above and
+            // this read (a sibling thread used the new fd before the opener
+            // put it in the zone); recall again. A description enters the
+            // zone at most once, so this loop runs at most twice.
             if self.delegation_handle() == 0 {
                 return Some(guard);
             }

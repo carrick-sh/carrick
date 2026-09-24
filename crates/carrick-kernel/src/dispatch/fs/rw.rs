@@ -441,17 +441,6 @@ impl<'a> FsView<'a> {
             (out, punch)
         };
         punch_result?;
-        if matches!(out, DispatchOutcome::Returned { .. }) {
-            let _ = crate::el1_delegation::delegate_locked(
-                open_file,
-                open,
-                self.captured_file_table().id(),
-                fd,
-                self.fs,
-                Some(&self.task_rlimits()),
-                Some(self.delegation_policy()),
-            );
-        }
         Ok(out)
     }
 
@@ -551,17 +540,6 @@ impl<'a> FsView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 let outcome = this.lseek_host_file(&host_io, offset, whence);
-                if matches!(outcome, DispatchOutcome::Returned { .. }) {
-                    let _ = crate::el1_delegation::delegate_locked(
-                        &open_file,
-                        &mut open,
-                        this.captured_file_table().id(),
-                        fd.0,
-                        this.fs,
-                        Some(&this.task_rlimits()),
-                        Some(this.delegation_policy()),
-                    );
-                }
                 return Ok(outcome);
             }
 
@@ -868,16 +846,6 @@ impl<'a> FsView<'a> {
             }
             drop(open);
             let outcome = DispatchOutcome::returned_offset_or_errno(next);
-            if matches!(outcome, DispatchOutcome::Returned { .. }) {
-                let _ = crate::el1_delegation::delegate(
-                    &open_file,
-                    this.captured_file_table().id(),
-                    fd.0,
-                    this.fs,
-                    Some(&this.task_rlimits()),
-                    Some(this.delegation_policy()),
-                );
-            }
             Ok(outcome)
 
         }
@@ -1429,32 +1397,10 @@ impl<'a> FsView<'a> {
                         )
                         .with_host_wait(host_wait_ref),
                     );
-                    if let Ok(DispatchOutcome::Returned { .. }) = &outcome {
-                        let _ = crate::el1_delegation::delegate_locked(
-                            &open_file,
-                            &mut open,
-                            files.id(),
-                            fd.0,
-                            this.fs,
-                            Some(&this.task_rlimits()),
-                            Some(this.delegation_policy()),
-                        );
-                    }
                     return outcome;
                 }
             };
             let outcome = DispatchOutcome::returned_len_or_errno(read_len);
-            if matches!(outcome, DispatchOutcome::Returned { .. }) {
-                let _ = crate::el1_delegation::delegate_locked(
-                    &open_file,
-                    &mut open,
-                    files.id(),
-                    fd.0,
-                    this.fs,
-                    Some(&this.task_rlimits()),
-                    Some(this.delegation_policy()),
-                );
-            }
             drop(open);
             memory.write_bytes(address, &bytes)?;
             Ok(outcome)
@@ -1867,16 +1813,6 @@ impl<'a> FsView<'a> {
                     .with_host_wait(host_wait_ref),
                 )?;
                 drop(open);
-                if matches!(outcome, DispatchOutcome::Returned { .. }) {
-                    let _ = crate::el1_delegation::delegate(
-                        &open_file,
-                        this.captured_file_table().id(),
-                        fd.0,
-                        this.fs,
-                        Some(&this.task_rlimits()),
-                        Some(this.delegation_policy()),
-                    );
-                }
                 return Ok(outcome);
             }
             let bytes = match &*open {
@@ -1957,16 +1893,6 @@ impl<'a> FsView<'a> {
                 memory.write_bytes(buffer, &bytes)?;
             }
             let outcome = DispatchOutcome::returned_len_or_errno(read_len);
-            if matches!(outcome, DispatchOutcome::Returned { .. }) {
-                let _ = crate::el1_delegation::delegate(
-                    &open_file,
-                    this.captured_file_table().id(),
-                    fd.0,
-                    this.fs,
-                    Some(&this.task_rlimits()),
-                    Some(this.delegation_policy()),
-                );
-            }
             Ok(outcome)
 
         }
@@ -2227,7 +2153,7 @@ impl<'a> FsView<'a> {
                     super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
                 )?;
             }
-            let Some(mut open) = open_file.description.write_for_io() else {
+            let Some(open) = open_file.description.write_for_io() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             // An O_APPEND fd forces EVERY write to EOF, ignoring the supplied
@@ -2312,17 +2238,6 @@ impl<'a> FsView<'a> {
                     }
                     outcome
                 };
-                if matches!(outcome, DispatchOutcome::Returned { .. }) {
-                    let _ = crate::el1_delegation::delegate_locked(
-                        &open_file,
-                        &mut open,
-                        this.captured_file_table().id(),
-                        fd.0,
-                        this.fs,
-                        Some(&this.task_rlimits()),
-                        Some(this.delegation_policy()),
-                    );
-                }
                 return Ok(outcome);
             }
             // In-memory File (memfd / O_TMPFILE fallback): positional write into
@@ -2392,17 +2307,6 @@ impl<'a> FsView<'a> {
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
                     let outcome = DispatchOutcome::returned_len_or_errno(written);
-                    if matches!(outcome, DispatchOutcome::Returned { .. }) {
-                        let _ = crate::el1_delegation::delegate_locked(
-                            &open_file,
-                            &mut open,
-                            this.captured_file_table().id(),
-                            fd.0,
-                            this.fs,
-                            Some(&this.task_rlimits()),
-                            Some(this.delegation_policy()),
-                        );
-                    }
                     return Ok(outcome);
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -2683,15 +2587,6 @@ impl<'a> FsView<'a> {
                                 punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
                             }
                             this.invalidate_dentry_host_fd(hfd);
-                            let _ = crate::el1_delegation::delegate_locked(
-                                &open_file,
-                                &mut open,
-                                this.captured_file_table().id(),
-                                fd.0,
-                                this.fs,
-                                Some(&this.task_rlimits()),
-                                Some(this.delegation_policy()),
-                            );
                         }
                         return Ok(DispatchOutcome::returned_isize_or_errno(n));
                     }
@@ -2752,15 +2647,6 @@ impl<'a> FsView<'a> {
                         punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
                     }
                     this.invalidate_dentry_host_fd(hfd);
-                    let _ = crate::el1_delegation::delegate_locked(
-                        &open_file,
-                        &mut open,
-                        this.captured_file_table().id(),
-                        fd.0,
-                        this.fs,
-                        Some(&this.task_rlimits()),
-                        Some(this.delegation_policy()),
-                    );
                 }
                 return Ok(DispatchOutcome::Returned { value: total });
             }
@@ -3416,16 +3302,6 @@ impl<'a> FsView<'a> {
                         .write_file_range(&path, offset, &bytes, final_size);
                 }
                 this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &outcome);
-                if matches!(outcome, DispatchOutcome::Returned { .. }) {
-                    let _ = crate::el1_delegation::delegate(
-                        &open_file,
-                        this.captured_file_table().id(),
-                        fd,
-                        this.fs,
-                        Some(&this.task_rlimits()),
-                        Some(this.delegation_policy()),
-                    );
-                }
                 return Ok(outcome);
             }
             // A stdio fd the guest explicitly closed (and did not reopen) is

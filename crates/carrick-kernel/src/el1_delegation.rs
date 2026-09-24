@@ -109,11 +109,16 @@ pub fn clear_current_task(slot: usize) {
 // access flags). A description's delegation handle names its open-file
 // record; the fd map points EL1 at the same record.
 //
-// Entry: an inode enters the zone through its only open description. A
-// description constructed while its inode is in the zone starts as
-// `JOIN_PENDING` and joins at open with its own open-file record. Any host
-// access through a description that has not joined recalls the inode first,
-// so no description ever reads or writes around the zone's copy.
+// Entry: a description enters the zone at open, and only there
+// (`enter_zone_at_open`, called by the open handlers). An inode enters
+// through its only open description; a description constructed while its
+// inode is in the zone starts as `JOIN_PENDING` and joins at open with its
+// own open-file record. Each description has one entry attempt
+// (`DescriptionCommon::take_zone_entry`): a refused, rolled-back or demoted
+// description stays on the host path for its whole life, and only a new
+// open(2) may put the file back in the zone. Any host access through a
+// description that has not joined recalls the inode first, so no description
+// ever reads or writes around the zone's copy.
 //
 // Exit: recalling an inode needs no description guard. It writes the zone's
 // size and pages back through a writable member's host fd, withdraws every
@@ -533,10 +538,6 @@ fn recall_binding(identity: InodeIdentity, binding: GuestBinding) {
     lock_delegated_file(file, handle);
     file.state
         .store(DELEGATED_STATE_RECALLING, Ordering::Release);
-    let served = file.served_ops.load(Ordering::Acquire);
-    for member in &live {
-        member.common().record_delegation_window(served);
-    }
     // In-guest watches on this file become host watches on its path: the
     // instances stay in the zone, and the host write path now produces their
     // events into the same zone queue.
@@ -904,16 +905,6 @@ pub(crate) struct DelegationPolicy<'a> {
     pub interceptors_active: bool,
 }
 
-/// A delegation window that served at least this many operations at EL1 paid
-/// for its delegate and recall; it clears the description's backoff.
-pub const DELEGATION_WINDOW_PAYOFF_OPS: u64 = 64;
-
-/// Forwarded attempts refused after the first unprofitable window; doubles
-/// with each consecutive one, so an interleaving that recalls every window
-/// (write, fstat, write, ...) converges to the host path's cost instead of
-/// paying a delegate and a recall per operation.
-pub const DELEGATION_BACKOFF_BASE: u32 = 8;
-
 /// Reasons why a file description cannot be delegated to EL1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -938,7 +929,8 @@ pub enum NotEligible {
     Sealed,
     SeccompFiltered,
     Observed,
-    BackingOff,
+    /// The description already had its one entry attempt, at open.
+    EntryUsed,
 }
 
 impl NotEligible {
@@ -964,7 +956,7 @@ impl NotEligible {
         NotEligible::Sealed,
         NotEligible::SeccompFiltered,
         NotEligible::Observed,
-        NotEligible::BackingOff,
+        NotEligible::EntryUsed,
     ];
 }
 
@@ -1074,8 +1066,15 @@ fn lock_delegated_file(file: &DelegatedFile, handle: u32) {
     }
 }
 
-/// Delegate an open file to EL1 if all eligibility rules pass.
-pub(crate) fn delegate(
+/// Put a just-opened description in the zone, if it fits: the ONLY entry.
+///
+/// Called once per open by the open handlers, right after the new
+/// description is installed at `fd`. The description's single entry attempt
+/// is consumed here whatever the outcome, so a later call (the fd number
+/// reused for an older description by a racing dup2) is refused with
+/// `EntryUsed`, and a description that is refused, rolled back or later
+/// demoted never re-enters: it is a host file for the rest of its life.
+pub(crate) fn enter_zone_at_open(
     open_file: &OpenFile,
     file_table: FileTableId,
     fd: i32,
@@ -1086,21 +1085,12 @@ pub(crate) fn delegate(
     let Some(d) = open_file.description.open_description() else {
         return Err(NotEligible::NotRegularFile);
     };
-    let mut open = d.write();
-    delegate_locked(open_file, &mut open, file_table, fd, fs, rlimits, policy)
-}
-
-/// Delegate with the description's write guard already held by the caller.
-pub(crate) fn delegate_locked(
-    open_file: &OpenFile,
-    open: &mut OpenDescription,
-    file_table: FileTableId,
-    fd: i32,
-    fs: &FsState,
-    rlimits: Option<&RlimitSet>,
-    policy: Option<DelegationPolicy<'_>>,
-) -> Result<u32, NotEligible> {
-    let result = delegate_transaction(open_file, open, file_table, fd, fs, rlimits, policy);
+    let result = if open_file.description.common().take_zone_entry() {
+        let mut open = d.write();
+        delegate_transaction(open_file, &mut open, file_table, fd, fs, rlimits, policy)
+    } else {
+        Err(NotEligible::EntryUsed)
+    };
     match result {
         Ok(_) => DELEGATIONS.fetch_add(1, Ordering::Relaxed),
         Err(reason) => REFUSALS[reason as usize].fetch_add(1, Ordering::Relaxed),
@@ -1185,8 +1175,8 @@ fn delegate_transaction(
     }
     // An inode with other host descriptions cannot enter the zone (they would
     // read and write around it); it enters only through its only description,
-    // and later descriptions join. Checked before backoff (the transaction
-    // re-checks under the lock).
+    // and later descriptions join. Checked before the host syscalls below
+    // (the transaction re-checks under the lock).
     if !joining {
         let shared = OWNERS
             .lock()
@@ -1195,12 +1185,6 @@ fn delegate_transaction(
             .is_none_or(|owner| owner.open_count != 1);
         if shared {
             return Err(NotEligible::Shared);
-        }
-        // Backoff gates every check that costs a host syscall or a registry
-        // scan (path resolution, watches, fstat, lseek below), so a backed-off
-        // file pays one atomic per forwarded operation.
-        if !description.common().admit_delegation() {
-            return Err(NotEligible::BackingOff);
         }
     }
 
@@ -1349,7 +1333,6 @@ fn delegate_transaction(
     file.size.store(size, Ordering::Relaxed);
     file.dirty_mask.store(0, Ordering::Relaxed);
     file.zero_filled_mask.store(0, Ordering::Relaxed);
-    file.served_ops.store(0, Ordering::Relaxed);
     file.inode.set(identity.dev, identity.ino);
     file.clear_marks();
     init_open_file(
@@ -1877,7 +1860,7 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::NamedTempFile;
 
-    /// A scoped hook that runs inside `delegate_locked` between the cache fill
+    /// A scoped hook that runs inside `enter_zone_at_open` between the cache fill
     /// and the publish step. Installed only by the rollback test.
     static PAUSE_HOOK: parking_lot::Mutex<Option<Box<dyn Fn() + Send>>> =
         parking_lot::Mutex::new(None);
@@ -1969,7 +1952,7 @@ mod tests {
 
         fn delegate_default(open: &OpenFile, fd: i32) -> Result<u32, NotEligible> {
             let fs = FsState::new_with_host_resolver(None);
-            delegate(
+            enter_zone_at_open(
                 open,
                 table(),
                 fd,
@@ -2230,34 +2213,13 @@ mod tests {
             assert_eq!(result, Err(NotEligible::RecallRequested));
             assert_eq!(open.description.delegation_handle(), 0);
             assert!(no_active_delegations());
-            // The rollback left the inode in Host, so it can delegate again.
-            assert!(delegate_default(&open, 3).is_ok());
-            // Final close recalls before the description can drop.
-            recall(&open.description).unwrap();
-        }
-
-        #[test]
-        fn unprofitable_windows_back_off_and_a_profitable_one_clears_it() {
-            let _region = Region::new();
-            let tmp = temp_with(b"x");
-            let open = open_host(&tmp);
-            // A window recalled before serving anything backs off for
-            // BASE << 1 forwarded attempts.
-            let handle = delegate_default(&open, 3).unwrap();
-            recall(&open.description).unwrap();
-            let backoff = DELEGATION_BACKOFF_BASE << 1;
-            for _ in 0..backoff {
-                assert_eq!(delegate_default(&open, 3), Err(NotEligible::BackingOff));
-            }
-            // Then it may delegate again; a window that serves enough clears it.
-            let handle2 = delegate_default(&open, 3).unwrap();
-            let file = delegated_file_object(get_el1_region_host_ptr(), handle2);
-            file.served_ops
-                .store(DELEGATION_WINDOW_PAYOFF_OPS, Ordering::Relaxed);
-            recall(&open.description).unwrap();
-            assert!(delegate_default(&open, 3).is_ok());
-            recall(&open.description).unwrap();
-            let _ = handle;
+            // The rollback left the inode in Host. This description used its
+            // one entry; a fresh open of the inode may enter.
+            assert_eq!(delegate_default(&open, 3), Err(NotEligible::EntryUsed));
+            drop(open);
+            let reopened = open_host(&tmp);
+            delegate_default(&reopened, 3).expect("a fresh open enters");
+            recall(&reopened.description).unwrap();
         }
 
         /// Contract `kernel.el1.zone-entry-at-open` (VM-free layer): a
@@ -2276,12 +2238,14 @@ mod tests {
             assert_eq!(open.description.delegation_handle(), 0);
             assert_eq!(host_bytes(&tmp), b"abcdef");
             for attempt in 0..1024 {
-                if delegate_default(&open, 3).is_ok() {
+                let entered = delegate_default(&open, 3);
+                if entered.is_ok() {
                     // Leave the zone before failing: a description must not
                     // drop while its inode is in it.
                     recall(&open.description).unwrap();
                     panic!("the demoted description re-entered at attempt {attempt}");
                 }
+                assert_eq!(entered, Err(NotEligible::EntryUsed));
                 assert_eq!(open.description.delegation_handle(), 0);
             }
             assert!(no_active_delegations());
@@ -2303,7 +2267,16 @@ mod tests {
             let mapping = open.description.retain_mapping().expect("fd owns backing");
             assert_eq!(open.description.delegation_handle(), 0);
             assert_eq!(host_bytes(&tmp), b"mapped");
-            assert_eq!(delegate_default(&open, 3), Err(NotEligible::Mapped));
+            drop(mapping);
+            drop(open);
+            // A description mapped before its entry runs (a sibling thread
+            // mapped the new fd first) stays on the host.
+            let mapped = open_host(&tmp);
+            let mapping = mapped
+                .description
+                .retain_mapping()
+                .expect("fd owns backing");
+            assert_eq!(delegate_default(&mapped, 3), Err(NotEligible::Mapped));
             drop(mapping);
         }
 
@@ -2383,11 +2356,8 @@ mod tests {
                 3
             );
             assert_eq!(memory.read_bytes(0x1003, 3).unwrap(), b"XYZ");
-            // Still delegated: a forwarded operation is not an ownership change,
-            // and the host-served operations count toward the window.
+            // Still delegated: a forwarded operation is not an ownership change.
             assert_eq!(inode_of(&open), handle);
-            let file = delegated_file_object(get_el1_region_host_ptr(), handle);
-            assert_eq!(file.served_ops.load(Ordering::Relaxed), 3);
             recall(&open.description).unwrap();
             assert_eq!(host_bytes(&tmp), b"XYZ");
         }
