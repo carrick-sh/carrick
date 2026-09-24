@@ -198,6 +198,139 @@ print "path_mutation_ok\n";
     );
 }
 
+/// Contract `kernel.el1.zone-entry-at-open`: a file enters the zone at
+/// open and only there. A demotion (a shared mmap of the file) is final for
+/// that open description: its later seeks, writes and reads are host-served
+/// and correct however many follow, and a watch added afterwards does not
+/// pull it back in. A fresh open of the same file enters the zone again.
+///
+/// Each phase uses its own syscalls so the carrier-wide EL1 counters
+/// attribute them: pwrite64 (68) in the zone from open; lseek/write/read
+/// (62/64/63) on the demoted description; pread64 (67) after the fresh
+/// open. The script checks the Linux results itself and loads no module, so
+/// perl reads no other regular file that the zone could serve.
+#[test]
+fn el1_zone_entry_at_open_contract() {
+    const N: u64 = 500;
+    /// Operations of an in-zone phase that may be forwarded (contention,
+    /// the first access racing the entry at open).
+    const FORWARD_BOUND: u64 = 16;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    carrick_kernel::el1_delegation::reset_delegation_counts();
+
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command([
+                "/usr/bin/perl",
+                "-e",
+                r#"
+my $N = 500;
+my $path = "/tmp/zone_entry.txt";
+my $buf;
+open(my $a, "+>", $path) or die "open: $!";
+# In the zone from open: pwrite64 only.
+for (my $i = 0; $i < $N; $i++) {
+    syscall(68, fileno($a), chr(65 + $i % 26), 1, $i % 64) == 1 or die "pwrite $i: $!";
+}
+# Demote: a shared mapping of the file takes the inode out of the zone.
+my $addr = syscall(222, 0, 4096, 1, 1, fileno($a), 0);
+$addr != -1 or die "mmap: $!";
+syscall(215, $addr, 4096) == 0 or die "munmap: $!";
+# The demoted description stays on the host path for its whole life. Half
+# way through, a watch on the demoted file is added: a host watch, which must
+# not pull it back in either.
+my $q;
+my $wd;
+for (my $i = 0; $i < 2 * $N; $i++) {
+    if ($i == $N) {
+        $q = syscall(26, 0x800);
+        $q >= 0 or die "inotify_init1: $!";
+        $wd = syscall(27, $q, "$path\0", 2);
+        $wd >= 0 or die "add_watch: $!";
+    }
+    my $c = chr(97 + $i % 26);
+    my $at = $i % 64;
+    defined(sysseek($a, $at, 0)) or die "seek $i: $!";
+    syswrite($a, $c) == 1 or die "write $i: $!";
+    defined(sysseek($a, $at, 0)) or die "seek back $i: $!";
+    sysread($a, $buf, 1) == 1 or die "read $i: $!";
+    $buf eq $c or die "demoted read '$buf' for '$c' at $i";
+}
+# The host-served writes reached the watching instance.
+my $pending = pack("i", 0);
+syscall(29, $q, 0x541B, $pending) == 0 or die "FIONREAD: $!";
+unpack("i", $pending) > 0 or die "no IN_MODIFY queued for the host-served writes";
+syscall(28, $q, $wd) == 0 or die "rm_watch: $!";
+syscall(57, $q) == 0 or die "close inotify: $!";
+my $expect = "";
+for (my $k = 0; $k < 64; $k++) {
+    my $last = $k;
+    $last += 64 while $last + 64 < 2 * $N;
+    $expect .= chr(97 + $last % 26);
+}
+close($a) or die "close: $!";
+# A fresh open enters the zone again: pread64 only.
+open(my $c, "+<", $path) or die "reopen: $!";
+for (my $i = 0; $i < $N; $i++) {
+    my $b = "\0";
+    syscall(67, fileno($c), $b, 1, $i % 64) == 1 or die "pread $i: $!";
+    $b eq substr($expect, $i % 64, 1) or die "reopened pread '$b' at $i";
+}
+close($c) or die "close reopened: $!";
+print "zone_entry_ok\n";
+"#,
+            ])
+            .run_blocking(),
+    );
+
+    assert!(
+        result.success(),
+        "exit_code={}: {}",
+        result.exit_code,
+        result.stderr_utf8()
+    );
+    assert_eq!(result.stdout_utf8().trim(), "zone_entry_ok");
+    let counters = read_el1_counters().expect("EL1 counters should be populated");
+    let served = |nr: usize| counters.served[nr].load(Ordering::Relaxed);
+    let forwarded = |nr: usize| counters.forwarded[nr].load(Ordering::Relaxed);
+    let population = carrick_kernel::el1_delegation::delegation_counts();
+    let report = format!(
+        "served pwrite64={} lseek={} write={} read={} pread64={}; forwarded lseek={} write={} read={}; population {population:?}",
+        served(68),
+        served(62),
+        served(64),
+        served(63),
+        served(67),
+        forwarded(62),
+        forwarded(64),
+        forwarded(63),
+    );
+    eprintln!("el1_zone_entry_at_open_contract: {report}");
+    let mut failures = Vec::new();
+    // Entry at open: the first phase is served in the zone.
+    if served(68) + FORWARD_BOUND < N {
+        failures.push("the file did not enter the zone at open (pwrite64 not served)");
+    }
+    // Demotion is final for the description: none of its later operations
+    // is served in-guest, and all of them ran on the host.
+    if served(62) != 0 || served(64) != 0 || served(63) != 0 {
+        failures.push("the demoted description re-entered the zone (lseek/write/read served)");
+    }
+    if forwarded(64) < 2 * N || forwarded(62) < 4 * N || forwarded(63) < 2 * N {
+        failures.push("the demoted phase did not run on the host");
+    }
+    // A fresh open enters again.
+    if served(67) + FORWARD_BOUND < N {
+        failures.push("a fresh open did not enter the zone (pread64 not served)");
+    }
+    assert!(
+        failures.is_empty(),
+        "zone entry at open: {failures:?}; {report}"
+    );
+}
+
 /// Read-after-write from second process after first process exits (proving recall on teardown).
 #[test]
 fn el1_files_recall_on_teardown() {

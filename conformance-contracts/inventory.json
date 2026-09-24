@@ -378,6 +378,7 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.inotify",
+        "kernel.el1.zone-entry-at-open",
         "kernel.execution.native-synchronous-syscall",
         "kernel.inotify.mark-race-hotpath",
         "kernel.inotify.readiness",
@@ -779,7 +780,8 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
-        "kernel.el1.files.path-mutation"
+        "kernel.el1.files.path-mutation",
+        "kernel.el1.zone-entry-at-open"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -863,6 +865,7 @@
         "kernel.el1.files",
         "kernel.el1.files.shared-inode",
         "kernel.el1.inotify",
+        "kernel.el1.zone-entry-at-open",
         "kernel.fs.write-seek",
         "kernel.inotify.mark-race-hotpath"
       ],
@@ -884,6 +887,7 @@
         "kernel.el1.files.path-mutation",
         "kernel.el1.files.shared-inode",
         "kernel.el1.inotify",
+        "kernel.el1.zone-entry-at-open",
         "kernel.inotify.readiness",
         "kernel.inotify.watch-churn",
         "kernel.mm.native-syscall-buffers",
@@ -908,6 +912,7 @@
         "kernel.el1.files.shared-inode",
         "kernel.el1.inotify",
         "kernel.el1.transparent",
+        "kernel.el1.zone-entry-at-open",
         "kernel.fs.write-seek",
         "kernel.inotify.mark-race-hotpath",
         "kernel.inotify.watch",
@@ -960,6 +965,7 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.files",
+        "kernel.el1.zone-entry-at-open",
         "kernel.mm.syscall-code-write",
         "kernel.scheduler.host-wait-handoff"
       ],
@@ -976,6 +982,7 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.files",
+        "kernel.el1.zone-entry-at-open",
         "kernel.scheduler.host-wait-handoff"
       ],
       "claims": [
@@ -2917,6 +2924,7 @@
       "handler": "memory",
       "authority": "hybrid",
       "contracts": [
+        "kernel.el1.zone-entry-at-open",
         "kernel.mm.current-read-reuse",
         "kernel.mm.native-data-activation",
         "kernel.mm.retained-fragment-query"
@@ -3020,6 +3028,7 @@
       "handler": "memory",
       "authority": "hybrid",
       "contracts": [
+        "kernel.el1.zone-entry-at-open",
         "kernel.fork.mappings",
         "kernel.mm.retained-fragment-query",
         "kernel.mm.scrub-remap-query"
