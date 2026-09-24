@@ -242,3 +242,67 @@ print "recall_ok\n";
     );
     assert_eq!(result.stdout_utf8().trim(), "recall_ok");
 }
+
+/// Contract: LTP inotify09 itself (two threads racing add/rm watch against
+/// write/lseek for 3,000,000 fuzzy-sync iterations) is served in-zone on EVERY
+/// run. A single run proves nothing about a system whose ownership is decided
+/// by startup races, so the contract runs the case five times and every run
+/// must meet the bounds; the report shows all runs, not the first failure.
+#[test]
+fn el1_inotify09_contract() {
+    const RUNS: usize = 5;
+    const ITERATIONS: u64 = 3_000_000;
+    /// At least 90% of each hot syscall is served in-guest.
+    const MIN_SERVED_PERMILLE: u64 = 900;
+    /// Delegations are a startup population, not a per-iteration cost.
+    const MAX_DELEGATIONS: usize = 64;
+    let _guard = common::guest_lock();
+    let mut failures = Vec::new();
+    let mut report = Vec::new();
+    for run in 1..=RUNS {
+        reset_el1_counters();
+        carrick_kernel::el1_delegation::reset_delegation_counts();
+        let start = std::time::Instant::now();
+        let result = common::run_or_fail(
+            ContainerBuilder::from_image("localhost:5050/ltp:arm64")
+                .pull_policy(PullPolicy::Missing)
+                .command(["/bin/sh", "-c", "/opt/ltp/testcases/bin/inotify09"])
+                .run_blocking(),
+        );
+        let wall = start.elapsed();
+        let counters = read_el1_counters().expect("EL1 counters should be populated");
+        let population = carrick_kernel::el1_delegation::delegation_counts();
+        let passed = result.success() && result.stderr_utf8().contains("TPASS");
+        let mut line = format!(
+            "run {run}: {:.2}s tpass={passed} delegations={} recalls={}",
+            wall.as_secs_f64(),
+            population.delegations,
+            population.recalls
+        );
+        if !passed {
+            failures.push(format!("run {run}: inotify09 did not TPASS"));
+        }
+        for nr in [27usize, 28, 62, 64] {
+            let served = counters.served[nr].load(Ordering::Relaxed);
+            line.push_str(&format!(" served[{nr}]={served}"));
+            if served * 1000 < ITERATIONS * MIN_SERVED_PERMILLE {
+                failures.push(format!(
+                    "run {run}: syscall {nr} served {served} < {MIN_SERVED_PERMILLE}/1000 of {ITERATIONS}"
+                ));
+            }
+        }
+        if population.delegations > MAX_DELEGATIONS {
+            failures.push(format!(
+                "run {run}: {} delegations exceed the startup bound {MAX_DELEGATIONS} ({:?})",
+                population.delegations, population.recall_triggers
+            ));
+        }
+        report.push(line);
+    }
+    assert!(
+        failures.is_empty(),
+        "inotify09 contract failed:\n{}\nruns:\n{}",
+        failures.join("\n"),
+        report.join("\n")
+    );
+}

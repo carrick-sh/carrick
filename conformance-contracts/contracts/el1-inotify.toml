@@ -21,19 +21,23 @@ semantic_authority = [
 ]
 fixture = "probe:el1_inotify"
 scale_points = [1, 8, 32, 128]
-rationale = "In-zone inotify instances and delegated files are serviced at EL1. Inotify add_watch, rm_watch, write, and lseek run with zero VM exits in the steady-state loop while preserving Linux inotify semantics."
+rationale = "LTP inotify09 (two threads racing inotify_add_watch/inotify_rm_watch against write/lseek on the watched file for 3,000,000 iterations) is served in-zone on every run: at least 90% of each hot syscall at EL1, a startup-bounded number of delegations, and within 2x of native Docker. Linux inotify semantics are preserved (TPASS). Ownership must not depend on startup races, so every one of several runs must meet the bounds."
 
 [bindings]
-embed = "carrick-embed::el1_inotify_contract"
+embed = "carrick-embed::el1_inotify09_contract"
 
 [bindings.unresolved]
 vm_free = "EL1 delegation requires hardware-assisted HVF execution."
 docker = "EL1 delegation is an internal execution path transparent to the Linux ABI."
 
 [[structural_budgets]]
-kind = "affine"
+kind = "upper-bound"
 metric = "kernel_dispatches"
-base = 0
-per_unit = 0
+maximum = 300000
 layers = ["embed-structural"]
-rationale = "Inside the delegated loop on a watched, delegated regular file, zero host dispatches occur for inotify_add_watch (27), inotify_rm_watch (28), write (64), and lseek (62)."
+rationale = "Per run, host dispatches of inotify_add_watch (27), inotify_rm_watch (28), write (64) and lseek (62) each stay under 10% of the 3,000,000 iterations (the embed contract checks served >= 90% per syscall per run); contention-forwarded operations are served on the host against the in-zone object without an ownership change."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 5
