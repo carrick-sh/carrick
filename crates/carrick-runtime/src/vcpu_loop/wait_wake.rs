@@ -717,6 +717,7 @@ impl HvpatchRuntimeDirectory {
         *pool = Some(started);
         let ptr = carrick_vmm_hvf::read_el1_region_host_ptr();
         carrick_kernel::el1_delegation::record_el1_region_host_ptr(ptr);
+        crate::el1_census::init_from_env();
         Ok(true)
     }
 
@@ -739,6 +740,9 @@ impl HvpatchRuntimeDirectory {
         // mapped: a recall after the pointer is cleared is fatal by design, so
         // this ordering belongs to teardown. Write-back errors stay sticky on
         // the affected descriptions.
+        // The census reads EL1's counters, so it is written before the region
+        // pointer is cleared.
+        crate::el1_census::write_at_teardown();
         carrick_kernel::el1_delegation::recall_all_delegated();
         carrick_kernel::el1_delegation::clear_el1_region_host_ptr();
         result

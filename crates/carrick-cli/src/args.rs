@@ -1011,6 +1011,21 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Rank EL1 census files (written by runs with
+    /// `CARRICK_EL1_CENSUS=<directory>`) by host syscall CPU: for each
+    /// syscall class, host services and their thread CPU, continuation
+    /// resumptions, and EL1's served/forwarded counts.
+    El1Census {
+        /// Census JSON files or directories of them.
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        /// Rows to print in the table.
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+        /// Print the full aggregate as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Parse a complete `CARRICK_EXEC_STAMPS` v2 export, validate every
     /// fork/exec/exit/reap relationship, and print CPU/wall attribution JSON.
     ExecStampCensus {
