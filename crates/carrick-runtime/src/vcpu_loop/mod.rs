@@ -1442,6 +1442,13 @@ where
                     "capture mandatory syscall kernel context: {error}"
                 ))
             })?;
+        if let Some(slot) = engine.mailbox_slot() {
+            carrick_kernel::el1_delegation::revalidate_current_task(
+                slot,
+                carrick_kernel::el1_delegation::El1TaskId::from_linux_tid(self.linux_tid.raw()),
+                kernel_context.resources().files().id().raw(),
+            );
+        }
         self.service_kernel_context = Some(kernel_context.retain_exact());
         let request = SyscallRequest::from_raw(frame)
             .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
