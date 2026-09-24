@@ -64,6 +64,30 @@ coalescing and overflow differ by platform. Existing churn ratios remain
 observations but are not proof of matched notification work. This discrepancy
 does not account for the invalid-fd pair, which has no queue mutation or timed I/O.
 
+## Task 4 Verification: Equal queue state with EL1 inotify delegation
+
+With EL1 inotify delegation and shared monotonic watch descriptor allocation in `carrick-inotify-core`,
+the independent ctypes diagnostic `queue_shape.py` runs under Carrick with full Linux parity.
+Signed Carrick SHA: `d5684476d057450bbd3950abbd752750c39232974cbb145228428240bc616f2f`.
+
+| Fresh instance, 128 iterations | Carrick (Task 4) | Linux |
+| --- | ---: | ---: |
+| Add/remove: distinct returned watch descriptors | 128 | 128 |
+| Add/remove: queued IN_IGNORED events | 128 | 128 |
+| Add/remove: queued bytes | 2048 | 2048 |
+| Add/write/seek/remove: total events | 256 | 256 |
+| Add/write/seek/remove: queued bytes | 4096 | 4096 |
+
+All eight diagnostic rows verified under `python:3.12-slim`:
+- `churn n=1`: `distinct_wds=1`, `first_wds=[1]`, `queued_bytes=16`, `events=1`, `ignored=1`, `modify=0`
+- `churn n=8`: `distinct_wds=8`, `first_wds=[1..8]`, `queued_bytes=128`, `events=8`, `ignored=8`, `modify=0`
+- `churn n=32`: `distinct_wds=32`, `first_wds=[1..8]`, `queued_bytes=512`, `events=32`, `ignored=32`, `modify=0`
+- `churn n=128`: `distinct_wds=128`, `first_wds=[1..8]`, `queued_bytes=2048`, `events=128`, `ignored=128`, `modify=0`
+- `serial_full n=1`: `distinct_wds=1`, `first_wds=[1]`, `queued_bytes=32`, `events=2`, `ignored=1`, `modify=1`
+- `serial_full n=8`: `distinct_wds=8`, `first_wds=[1..8]`, `queued_bytes=256`, `events=16`, `ignored=8`, `modify=8`
+- `serial_full n=32`: `distinct_wds=32`, `first_wds=[1..8]`, `queued_bytes=1024`, `events=64`, `ignored=32`, `modify=32`
+- `serial_full n=128`: `distinct_wds=128`, `first_wds=[1..8]`, `queued_bytes=4096`, `events=256`, `ignored=128`, `modify=128`
+
 ## Evidence that still guides prioritization
 
 The historical watch-refresh signed artifact measured medians of process
