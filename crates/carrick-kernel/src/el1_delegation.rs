@@ -87,7 +87,7 @@ pub fn clear_current_task(slot: usize) {
 //   description guard (OpenDescription RwLock)
 //     -> OWNERS (map + owner state)
 //       -> EL1 object lock word
-//         -> FD_MAP_LOCK
+//         -> FD_MAP (host index of the EL1 fd map)
 // No dentry-cache or namespace lock is ever held while any of these is
 // acquired, and nothing here is called from inside the VFS: recall happens at
 // dispatch level. `recall_inode` releases OWNERS before it takes a description
@@ -114,7 +114,146 @@ static OWNERS: Mutex<Option<HashMap<InodeIdentity, Owner>>> = Mutex::new(None);
 static OWNERS_CHANGED: Condvar = Condvar::new();
 /// Number of owners not in `Host`: the lock-free negative fast path.
 static ACTIVE_DELEGATIONS: AtomicUsize = AtomicUsize::new(0);
-static FD_MAP_LOCK: Mutex<()> = Mutex::new(());
+/// Host-side index of the EL1 fd map, the only writer of it. Keyed by
+/// `(file table, fd)`, so the file table can forget an fd number the moment it
+/// stops referring to the object (close, dup2 over it, close_range, exec)
+/// without scanning the map. Tied to the region it indexes.
+struct FdMapIndex {
+    region: usize,
+    by_fd: HashMap<(u64, u32), usize>,
+    by_handle: HashMap<u32, Vec<usize>>,
+    free: Vec<usize>,
+}
+
+static FD_MAP: Mutex<Option<FdMapIndex>> = Mutex::new(None);
+/// Published slots: the lock-free negative fast path for fd-table mutations.
+static FD_MAP_PUBLISHED: AtomicUsize = AtomicUsize::new(0);
+
+fn fd_map_slots(region_ptr: usize) -> &'static [FdMapSlot] {
+    // SAFETY: the fd map lives in the EL1 region, mapped for the carrier's
+    // lifetime, with FD_MAP_CAPACITY slots accessed only through atomics.
+    unsafe {
+        std::slice::from_raw_parts(
+            (region_ptr + EL1_FD_MAP_OFFSET as usize) as *const FdMapSlot,
+            FD_MAP_CAPACITY,
+        )
+    }
+}
+
+fn with_fd_map<R>(
+    region_ptr: usize,
+    f: impl FnOnce(&mut FdMapIndex, &'static [FdMapSlot]) -> R,
+) -> R {
+    let mut guard = FD_MAP.lock();
+    if guard
+        .as_ref()
+        .is_none_or(|index| index.region != region_ptr)
+    {
+        let stale = guard.as_ref().map_or(0, |index| index.by_fd.len());
+        FD_MAP_PUBLISHED.fetch_sub(stale, Ordering::AcqRel);
+        *guard = Some(FdMapIndex {
+            region: region_ptr,
+            by_fd: HashMap::new(),
+            by_handle: HashMap::new(),
+            free: (0..FD_MAP_CAPACITY).rev().collect(),
+        });
+    }
+    let index = guard
+        .as_mut()
+        .unwrap_or_else(|| unreachable!("installed above"));
+    f(index, fd_map_slots(region_ptr))
+}
+
+fn fd_map_release(index: &mut FdMapIndex, slots: &[FdMapSlot], slot: usize) {
+    slots[slot].clear();
+    index.free.push(slot);
+    FD_MAP_PUBLISHED.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// Publish `(file table, fd) -> handle` for EL1, replacing any earlier entry
+/// for that fd number. The incarnation is written last (Release) so EL1,
+/// which reads it first, never sees a torn slot. False when the map is full.
+pub(crate) fn fd_map_publish(
+    region_ptr: usize,
+    table: u64,
+    fd: i32,
+    handle_word: u32,
+    incarnation: u64,
+) -> bool {
+    with_fd_map(region_ptr, |index, slots| {
+        let key = (table, fd as u32);
+        if let Some(old) = index.by_fd.remove(&key) {
+            let old_handle = slots[old].handle.load(Ordering::Relaxed);
+            if let Some(list) = index.by_handle.get_mut(&old_handle) {
+                list.retain(|slot| *slot != old);
+            }
+            fd_map_release(index, slots, old);
+        }
+        let Some(slot) = index.free.pop() else {
+            return false;
+        };
+        slots[slot].set(table, fd as u32, handle_word, incarnation);
+        index.by_fd.insert(key, slot);
+        index.by_handle.entry(handle_word).or_default().push(slot);
+        FD_MAP_PUBLISHED.fetch_add(1, Ordering::AcqRel);
+        true
+    })
+}
+
+/// Remove every fd-map entry for `handle_word`; returns the file tables that
+/// could reach it (their vCPUs must stop at their next EL0 boundary).
+pub(crate) fn fd_map_clear_handle(region_ptr: usize, handle_word: u32) -> Vec<u64> {
+    with_fd_map(region_ptr, |index, slots| {
+        let mut tables = Vec::new();
+        for slot in index.by_handle.remove(&handle_word).unwrap_or_default() {
+            let table = slots[slot].file_table.load(Ordering::Relaxed);
+            let fd = slots[slot].fd.load(Ordering::Relaxed);
+            index.by_fd.remove(&(table, fd));
+            if table != 0 && !tables.contains(&table) {
+                tables.push(table);
+            }
+            fd_map_release(index, slots, slot);
+        }
+        tables
+    })
+}
+
+/// The file tables whose fd map can reach `handle_word`.
+pub(crate) fn fd_map_tables_for(region_ptr: usize, handle_word: u32) -> Vec<u64> {
+    with_fd_map(region_ptr, |index, slots| {
+        let mut tables = Vec::new();
+        for slot in index.by_handle.get(&handle_word).into_iter().flatten() {
+            let table = slots[*slot].file_table.load(Ordering::Relaxed);
+            if table != 0 && !tables.contains(&table) {
+                tables.push(table);
+            }
+        }
+        tables
+    })
+}
+
+/// The file table changed what these fd numbers refer to: EL1 must stop
+/// serving them. One atomic load when nothing is published.
+pub(crate) fn fd_map_forget(table: FileTableId, fds: &[i32]) {
+    if FD_MAP_PUBLISHED.load(Ordering::Acquire) == 0 || fds.is_empty() {
+        return;
+    }
+    let region_ptr = get_el1_region_host_ptr();
+    if region_ptr == 0 {
+        return;
+    }
+    with_fd_map(region_ptr, |index, slots| {
+        for fd in fds {
+            if let Some(slot) = index.by_fd.remove(&(table.raw(), *fd as u32)) {
+                let handle_word = slots[slot].handle.load(Ordering::Relaxed);
+                if let Some(list) = index.by_handle.get_mut(&handle_word) {
+                    list.retain(|s| *s != slot);
+                }
+                fd_map_release(index, slots, slot);
+            }
+        }
+    });
+}
 
 struct Owner {
     /// Live open descriptions of this inode.
@@ -363,13 +502,6 @@ fn free_handle(handle: u32) {
 /// instances share the counter so fd-map revalidation never aliases).
 pub(crate) fn next_incarnation() -> u64 {
     NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Serialize a writer of the EL1 fd map (delegated files and inotify
-/// instances share one map and one lock).
-pub(crate) fn with_fd_map_lock<R>(f: impl FnOnce() -> R) -> R {
-    let _fd_map = FD_MAP_LOCK.lock();
-    f()
 }
 
 /// The `(handle, description)` currently delegated for `identity`, if any.
@@ -863,20 +995,7 @@ fn delegate_transaction(
     file.clear_marks();
     file.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
     file.unlock();
-    let published = {
-        let _fd_map = FD_MAP_LOCK.lock();
-        let base = (region_ptr + EL1_FD_MAP_OFFSET as usize) as *const FdMapSlot;
-        (0..FD_MAP_CAPACITY).any(|index| {
-            // SAFETY: the fd map lives in the EL1 region with FD_MAP_CAPACITY slots.
-            let slot = unsafe { &*base.add(index) };
-            if slot.incarnation.load(Ordering::Relaxed) == 0 {
-                slot.set(file_table.raw(), fd as u32, handle, incarnation);
-                true
-            } else {
-                false
-            }
-        })
-    };
+    let published = fd_map_publish(region_ptr, file_table.raw(), fd, handle, incarnation);
     if !published {
         lock_delegated_file(file, handle);
         file.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
@@ -1063,24 +1182,7 @@ pub(crate) fn recall_locked(
     }
 
     // Stop every vCPU that can reach this object at its next EL0 boundary.
-    let mut tables = Vec::new();
-    {
-        let _fd_map = FD_MAP_LOCK.lock();
-        let base = (region_ptr + EL1_FD_MAP_OFFSET as usize) as *const FdMapSlot;
-        for index in 0..FD_MAP_CAPACITY {
-            // SAFETY: fd map slot within the EL1 region.
-            let slot = unsafe { &*base.add(index) };
-            if slot.incarnation.load(Ordering::Acquire) != 0
-                && slot.handle.load(Ordering::Relaxed) == handle
-            {
-                let table = slot.file_table.load(Ordering::Relaxed);
-                if table != 0 && !tables.contains(&table) {
-                    tables.push(table);
-                }
-            }
-        }
-    }
-    mark_pending_host_work_for_file_tables(&tables);
+    mark_pending_host_work_for_file_tables(&fd_map_tables_for(region_ptr, handle));
     RECALLS.fetch_add(1, Ordering::Relaxed);
     note_recall_trigger();
 
@@ -1189,17 +1291,7 @@ pub(crate) fn recall_locked(
         vfs.notify_inode_changed("", Some(identity));
     }
 
-    {
-        let _fd_map = FD_MAP_LOCK.lock();
-        let base = (region_ptr + EL1_FD_MAP_OFFSET as usize) as *const FdMapSlot;
-        for index in 0..FD_MAP_CAPACITY {
-            // SAFETY: fd map slot within the EL1 region.
-            let slot = unsafe { &*base.add(index) };
-            if slot.handle.load(Ordering::Acquire) == handle {
-                slot.clear();
-            }
-        }
-    }
+    fd_map_clear_handle(region_ptr, handle);
     file.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
     file.unlock();
     free_handle(handle);
@@ -1584,6 +1676,40 @@ mod tests {
             // The buffer is outside guest memory: the host path must take over.
             assert!(serve_on_host(&open.description, 63, [0x9000, 3, 0], &mut memory).is_none());
             recall(&open.description).unwrap();
+        }
+
+        #[test]
+        fn an_fd_number_the_table_reassigns_is_forgotten_by_el1() {
+            let _region = Region::new();
+            let region = get_el1_region_host_ptr();
+            let table = table();
+            assert!(fd_map_publish(region, table.raw(), 5, 7, 11));
+            assert!(fd_map_publish(region, table.raw(), 6, 7, 11));
+            assert!(fd_map_publish(region, table.raw(), 9, 8, 12));
+            let slots = fd_map_slots(region);
+            let live = |fd: u32| {
+                slots.iter().any(|slot| {
+                    slot.incarnation.load(Ordering::Acquire) != 0
+                        && slot.file_table.load(Ordering::Relaxed) == table.raw()
+                        && slot.fd.load(Ordering::Relaxed) == fd
+                })
+            };
+            // close(5) or dup2(x, 5): EL1 must stop serving fd 5 only.
+            fd_map_forget(table, &[5]);
+            assert!(!live(5) && live(6) && live(9));
+            // Clearing a handle removes its remaining fds and reports the table.
+            assert_eq!(fd_map_clear_handle(region, 7), vec![table.raw()]);
+            assert!(!live(6) && live(9));
+            // Re-publishing an fd number replaces, never duplicates.
+            assert!(fd_map_publish(region, table.raw(), 9, 8, 13));
+            assert_eq!(
+                slots
+                    .iter()
+                    .filter(|slot| slot.incarnation.load(Ordering::Acquire) != 0)
+                    .count(),
+                1
+            );
+            fd_map_clear_handle(region, 8);
         }
 
         #[test]
