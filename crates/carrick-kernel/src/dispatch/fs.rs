@@ -2574,7 +2574,7 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(in crate::dispatch) fn fd_stat_record(&self, fd: i32) -> Result<StatRecord, LinuxErrno> {
+    pub(crate) fn fd_stat_record(&self, fd: i32) -> Result<StatRecord, LinuxErrno> {
         self.fs_view().fd_stat_record(fd)
     }
 
