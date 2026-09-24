@@ -1060,16 +1060,15 @@ fn delegate_transaction(
     if fs.vfs_mounts.resolve(path).is_some() {
         return Err(NotEligible::NotRootfs);
     }
-    // A watch from a delegated inotify instance, with a mask the in-guest
-    // model implements exactly, keeps the file in-guest; any other watch
-    // covering the path keeps it on the host.
+    // A file already watched when it would enter the zone stays on the host:
+    // delegation does not turn host watches into in-zone marks, and a
+    // directory watch needs named child events the zone does not produce. A
+    // watch added after delegation attaches an in-zone mark instead
+    // (`attach_zone_watch`).
     if !fs.inotify_registry.is_empty()
         && fs
             .inotify_registry
-            .watches_covering_require_recall(path, |state, _wd, mask| {
-                crate::el1_inotify::is_inotify_state_delegated(state)
-                    && mask & crate::inotify::UNSUPPORTED_INOTIFY_MASK_FLAGS == 0
-            })
+            .watches_covering_require_recall(path, |_state, _wd, _mask| false)
     {
         return Err(NotEligible::Watched);
     }
