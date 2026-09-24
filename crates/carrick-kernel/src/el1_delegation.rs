@@ -2260,6 +2260,39 @@ mod tests {
             let _ = handle;
         }
 
+        /// Contract `kernel.el1.zone-entry-at-open` (VM-free layer): a
+        /// description enters the zone once, at open. After a demotion it
+        /// stays out however many forwarded operations follow; a fresh open
+        /// of the inode enters again.
+        #[test]
+        fn a_demoted_description_never_reenters_the_zone() {
+            let _region = Region::new();
+            let tmp = temp_with(b"abc");
+            let open = open_host(&tmp);
+            let handle = delegate_default(&open, 3).expect("enters at open");
+            guest_write(handle, 3, b"def");
+            // Demotion: a shared mapping takes the inode out of the zone.
+            drop(open.description.retain_mapping().expect("fd owns backing"));
+            assert_eq!(open.description.delegation_handle(), 0);
+            assert_eq!(host_bytes(&tmp), b"abcdef");
+            for attempt in 0..1024 {
+                if delegate_default(&open, 3).is_ok() {
+                    // Leave the zone before failing: a description must not
+                    // drop while its inode is in it.
+                    recall(&open.description).unwrap();
+                    panic!("the demoted description re-entered at attempt {attempt}");
+                }
+                assert_eq!(open.description.delegation_handle(), 0);
+            }
+            assert!(no_active_delegations());
+            // Closing the demoted description lets a fresh open enter again.
+            drop(open);
+            let reopened = open_host(&tmp);
+            let handle = delegate_default(&reopened, 3).expect("a fresh open enters");
+            assert_eq!(inode_of(&reopened), handle);
+            recall(&reopened.description).unwrap();
+        }
+
         #[test]
         fn mapping_recalls_and_blocks_delegation() {
             let _region = Region::new();

@@ -1,0 +1,43 @@
+schema_version = 1
+id = "kernel.el1.zone-entry-at-open"
+title = "A regular file enters the EL1 zone only at open, and a demotion is final for its description"
+guest_surfaces = [
+  "syscall:openat",
+  "syscall:mmap",
+  "syscall:munmap",
+  "syscall:read",
+  "syscall:write",
+  "syscall:lseek",
+  "syscall:pread64",
+  "syscall:pwrite64",
+  "syscall:inotify_add_watch",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 open",
+  "man 2 mmap",
+  "man 2 read",
+  "man 2 write",
+  "man 2 lseek",
+  "man 2 pread64",
+  "man 2 pwrite64",
+  "man 7 inotify",
+]
+fixture = "probe:el1_zone_entry_at_open"
+scale_points = [1, 8, 32, 128]
+rationale = "A host regular file enters the zone at open(2), and only there. An operation the zone cannot model (here a shared mmap of the file) demotes the inode; the demoted open description then stays on the host path for its whole life: its later reads, writes and seeks are host-served, return the Linux results, and never re-enter the zone however many of them follow, and a watch added afterwards does not pull it back in. A new open(2) of the same file, after the demoted description is closed, enters the zone again. One entry and one exit per description replaces delegate-at-first-forward and its backoff, whose delegate/recall churn had no Linux counterpart."
+
+[bindings]
+vm_free = "carrick-kernel::el1_delegation::tests::serial_host::a_demoted_description_never_reenters_the_zone"
+embed = "carrick-embed::el1_zone_entry_at_open_contract"
+
+[bindings.unresolved]
+docker = "The fixture checks the Linux results itself (bytes read back after the demotion and after the fresh open); EL1 serving is transparent to the Linux ABI."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 64
+per_unit = 4
+layers = ["embed-structural"]
+rationale = "Each iteration of the demoted phase dispatches exactly its four syscalls (lseek, write, lseek, read) on the host; the in-zone phases before the demotion and after the fresh open add only a fixed startup population. The embed contract asserts the EL1 served counters: none of the demoted phase's syscalls is served in-guest, and the phases in the zone are."
