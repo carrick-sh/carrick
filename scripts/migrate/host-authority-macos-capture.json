@@ -1,10 +1,10 @@
 {
   "catalog_sha256": "aa230c66221233fd4f87b931261e33b4975eedfb45efa04d6929a502a7d392ad",
   "diagnostic_counts": {
-    "macos-cli-default": 582,
+    "macos-cli-default": 588,
     "macos-hvf-default": 96,
-    "macos-runtime-default": 452,
-    "merged": 582
+    "macos-runtime-default": 455,
+    "merged": 588
   },
   "executed_profiles": [
     "macos-cli-default",
@@ -108,15 +108,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 44289,
-        "byte_start": 44276,
+        "byte_end": 44522,
+        "byte_start": 44509,
         "column": 29,
         "column_end": 42,
         "column_start": 29,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 978,
-        "line_end": 978,
-        "line_start": 978
+        "line": 984,
+        "line_end": 984,
+        "line_start": 984
       }
     },
     {
@@ -366,15 +366,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 12772,
-        "byte_start": 12760,
+        "byte_end": 12794,
+        "byte_start": 12782,
         "column": 18,
         "column_end": 30,
         "column_start": 18,
         "file": "crates/carrick-cli/src/main.rs",
-        "line": 254,
-        "line_end": 254,
-        "line_start": 254
+        "line": 255,
+        "line_end": 255,
+        "line_start": 255
       }
     },
     {
@@ -385,15 +385,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 14199,
-        "byte_start": 14187,
+        "byte_end": 14221,
+        "byte_start": 14209,
         "column": 28,
         "column_end": 40,
         "column_start": 28,
         "file": "crates/carrick-cli/src/main.rs",
-        "line": 289,
-        "line_end": 289,
-        "line_start": 289
+        "line": 290,
+        "line_end": 290,
+        "line_start": 290
       }
     },
     {
@@ -1039,15 +1039,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 46446,
-        "byte_start": 46434,
+        "byte_end": 46679,
+        "byte_start": 46667,
         "column": 39,
         "column_end": 51,
         "column_start": 39,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 1013,
-        "line_end": 1013,
-        "line_start": 1013
+        "line": 1019,
+        "line_end": 1019,
+        "line_start": 1019
       }
     },
     {
@@ -1078,15 +1078,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 23451,
-        "byte_start": 23441,
+        "byte_end": 23684,
+        "byte_start": 23674,
         "column": 17,
         "column_end": 27,
         "column_start": 17,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 616,
-        "line_end": 616,
-        "line_start": 616
+        "line": 624,
+        "line_end": 624,
+        "line_start": 624
       }
     },
     {
@@ -1097,15 +1097,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 28367,
-        "byte_start": 28357,
+        "byte_end": 28600,
+        "byte_start": 28590,
         "column": 13,
         "column_end": 23,
         "column_start": 13,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 759,
-        "line_end": 759,
-        "line_start": 759
+        "line": 767,
+        "line_end": 767,
+        "line_start": 767
       }
     },
     {
@@ -1116,34 +1116,34 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 28612,
-        "byte_start": 28602,
+        "byte_end": 28845,
+        "byte_start": 28835,
         "column": 13,
         "column_end": 23,
         "column_start": 13,
-        "file": "crates/carrick-cli/src/debug.rs",
-        "line": 764,
-        "line_end": 764,
-        "line_start": 764
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-PROCESS-KILL",
-      "expansion": null,
-      "operation": "libc::kill",
-      "profiles": [
-        "macos-cli-default"
-      ],
-      "source": {
-        "byte_end": 28964,
-        "byte_start": 28954,
-        "column": 17,
-        "column_end": 27,
-        "column_start": 17,
         "file": "crates/carrick-cli/src/debug.rs",
         "line": 772,
         "line_end": 772,
         "line_start": 772
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-KILL",
+      "expansion": null,
+      "operation": "libc::kill",
+      "profiles": [
+        "macos-cli-default"
+      ],
+      "source": {
+        "byte_end": 29197,
+        "byte_start": 29187,
+        "column": 17,
+        "column_end": 27,
+        "column_start": 17,
+        "file": "crates/carrick-cli/src/debug.rs",
+        "line": 780,
+        "line_end": 780,
+        "line_start": 780
       }
     },
     {
@@ -1332,15 +1332,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 12386,
-        "byte_start": 12374,
+        "byte_end": 12619,
+        "byte_start": 12607,
         "column": 17,
         "column_end": 29,
         "column_start": 17,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 306,
-        "line_end": 306,
-        "line_start": 306
+        "line": 314,
+        "line_end": 314,
+        "line_start": 314
       }
     },
     {
@@ -1351,15 +1351,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 19292,
-        "byte_start": 19280,
+        "byte_end": 19525,
+        "byte_start": 19513,
         "column": 9,
         "column_end": 21,
         "column_start": 9,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 498,
-        "line_end": 498,
-        "line_start": 498
+        "line": 506,
+        "line_end": 506,
+        "line_start": 506
       }
     },
     {
@@ -1370,15 +1370,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 27028,
-        "byte_start": 27016,
+        "byte_end": 27261,
+        "byte_start": 27249,
         "column": 9,
         "column_end": 21,
         "column_start": 9,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 726,
-        "line_end": 726,
-        "line_start": 726
+        "line": 734,
+        "line_end": 734,
+        "line_start": 734
       }
     },
     {
@@ -1449,15 +1449,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 92614,
-        "byte_start": 92595,
+        "byte_end": 92847,
+        "byte_start": 92828,
         "column": 25,
         "column_end": 44,
         "column_start": 25,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 2129,
-        "line_end": 2129,
-        "line_start": 2129
+        "line": 2135,
+        "line_end": 2135,
+        "line_start": 2135
       }
     },
     {
@@ -1468,15 +1468,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 16496,
-        "byte_start": 16486,
+        "byte_end": 16729,
+        "byte_start": 16719,
         "column": 30,
         "column_end": 40,
         "column_start": 30,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 418,
-        "line_end": 418,
-        "line_start": 418
+        "line": 426,
+        "line_end": 426,
+        "line_start": 426
       }
     },
     {
@@ -1547,15 +1547,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 122430,
-        "byte_start": 122416,
+        "byte_end": 122908,
+        "byte_start": 122894,
         "column": 20,
         "column_end": 34,
         "column_start": 20,
         "file": "crates/carrick-mem/src/memory.rs",
-        "line": 2845,
-        "line_end": 2845,
-        "line_start": 2845
+        "line": 2853,
+        "line_end": 2853,
+        "line_start": 2853
       }
     },
     {
@@ -1687,15 +1687,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 92766,
-        "byte_start": 92741,
+        "byte_end": 92999,
+        "byte_start": 92974,
         "column": 26,
         "column_end": 51,
         "column_start": 26,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 2131,
-        "line_end": 2131,
-        "line_start": 2131
+        "line": 2137,
+        "line_end": 2137,
+        "line_start": 2137
       }
     },
     {
@@ -1706,15 +1706,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 21253,
-        "byte_start": 21237,
+        "byte_end": 21486,
+        "byte_start": 21470,
         "column": 19,
         "column_end": 35,
         "column_start": 19,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 553,
-        "line_end": 553,
-        "line_start": 553
+        "line": 561,
+        "line_end": 561,
+        "line_start": 561
       }
     },
     {
@@ -2082,15 +2082,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 92841,
-        "byte_start": 92837,
+        "byte_end": 93074,
+        "byte_start": 93070,
         "column": 14,
         "column_end": 18,
         "column_start": 14,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 2134,
-        "line_end": 2134,
-        "line_start": 2134
+        "line": 2140,
+        "line_end": 2140,
+        "line_start": 2140
       }
     },
     {
@@ -2101,15 +2101,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 21313,
-        "byte_start": 21309,
+        "byte_end": 21546,
+        "byte_start": 21542,
         "column": 10,
         "column_end": 14,
         "column_start": 10,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 556,
-        "line_end": 556,
-        "line_start": 556
+        "line": 564,
+        "line_end": 564,
+        "line_start": 564
       }
     },
     {
@@ -2458,15 +2458,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 96024,
-        "byte_start": 96011,
+        "byte_end": 96257,
+        "byte_start": 96244,
         "column": 13,
         "column_end": 26,
         "column_start": 13,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 2201,
-        "line_end": 2201,
-        "line_start": 2201
+        "line": 2207,
+        "line_end": 2207,
+        "line_start": 2207
       }
     },
     {
@@ -2556,15 +2556,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 94314,
-        "byte_start": 94291,
+        "byte_end": 94547,
+        "byte_start": 94524,
         "column": 5,
         "column_end": 28,
         "column_start": 5,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 2167,
-        "line_end": 2167,
-        "line_start": 2167
+        "line": 2173,
+        "line_end": 2173,
+        "line_start": 2173
       }
     },
     {
@@ -2575,15 +2575,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 9199,
-        "byte_start": 9181,
+        "byte_end": 9432,
+        "byte_start": 9414,
         "column": 5,
         "column_end": 23,
         "column_start": 5,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 222,
-        "line_end": 222,
-        "line_start": 222
+        "line": 230,
+        "line_end": 230,
+        "line_start": 230
       }
     },
     {
@@ -2594,15 +2594,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 11754,
-        "byte_start": 11736,
+        "byte_end": 11987,
+        "byte_start": 11969,
         "column": 5,
         "column_end": 23,
         "column_start": 5,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 295,
-        "line_end": 295,
-        "line_start": 295
+        "line": 303,
+        "line_end": 303,
+        "line_start": 303
       }
     },
     {
@@ -2613,15 +2613,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 38138,
-        "byte_start": 38120,
+        "byte_end": 38371,
+        "byte_start": 38353,
         "column": 5,
         "column_end": 23,
         "column_start": 5,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 1020,
-        "line_end": 1020,
-        "line_start": 1020
+        "line": 1028,
+        "line_end": 1028,
+        "line_start": 1028
       }
     },
     {
@@ -3102,6 +3102,26 @@
         "macos-runtime-default"
       ],
       "source": {
+        "byte_end": 7721,
+        "byte_start": 7698,
+        "column": 18,
+        "column_end": 41,
+        "column_start": 18,
+        "file": "crates/carrick-runtime/src/el1_census.rs",
+        "line": 225,
+        "line_end": 225,
+        "line_start": 225
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-CREATE-DIR-ALL",
+      "expansion": null,
+      "operation": "std::fs::create_dir_all",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
         "byte_end": 30311,
         "byte_start": 30288,
         "column": 8,
@@ -3221,15 +3241,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 92272,
-        "byte_start": 92254,
+        "byte_end": 92505,
+        "byte_start": 92487,
         "column": 11,
         "column_end": 29,
         "column_start": 11,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 2120,
-        "line_end": 2120,
-        "line_start": 2120
+        "line": 2126,
+        "line_end": 2126,
+        "line_start": 2126
       }
     },
     {
@@ -3260,15 +3280,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 92089,
-        "byte_start": 92072,
+        "byte_end": 92322,
+        "byte_start": 92305,
         "column": 5,
         "column_end": 22,
         "column_start": 5,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 2116,
-        "line_end": 2116,
-        "line_start": 2116
+        "line": 2122,
+        "line_end": 2122,
+        "line_start": 2122
       }
     },
     {
@@ -3556,15 +3576,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 7426,
-        "byte_start": 7413,
+        "byte_end": 7659,
+        "byte_start": 7646,
         "column": 25,
         "column_end": 38,
         "column_start": 25,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 162,
-        "line_end": 162,
-        "line_start": 162
+        "line": 170,
+        "line_end": 170,
+        "line_start": 170
       }
     },
     {
@@ -3622,6 +3642,25 @@
         "line": 231,
         "line_end": 231,
         "line_start": 231
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-READ",
+      "expansion": null,
+      "operation": "std::fs::read",
+      "profiles": [
+        "macos-cli-default"
+      ],
+      "source": {
+        "byte_end": 939,
+        "byte_start": 926,
+        "column": 17,
+        "column_end": 30,
+        "column_start": 17,
+        "file": "crates/carrick-cli/src/debug_el1_census.rs",
+        "line": 26,
+        "line_end": 26,
+        "line_start": 26
       }
     },
     {
@@ -3986,15 +4025,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 63256,
-        "byte_start": 63248,
+        "byte_end": 63478,
+        "byte_start": 63470,
         "column": 20,
         "column_end": 28,
         "column_start": 20,
         "file": "crates/carrick-mem/src/memory.rs",
-        "line": 1313,
-        "line_end": 1313,
-        "line_start": 1313
+        "line": 1317,
+        "line_end": 1317,
+        "line_start": 1317
       }
     },
     {
@@ -4007,15 +4046,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 63365,
-        "byte_start": 63357,
+        "byte_end": 63587,
+        "byte_start": 63579,
         "column": 81,
         "column_end": 89,
         "column_start": 81,
         "file": "crates/carrick-mem/src/memory.rs",
-        "line": 1315,
-        "line_end": 1315,
-        "line_start": 1315
+        "line": 1319,
+        "line_end": 1319,
+        "line_start": 1319
       }
     },
     {
@@ -4206,15 +4245,34 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 94717,
-        "byte_start": 94700,
+        "byte_end": 94950,
+        "byte_start": 94933,
         "column": 18,
         "column_end": 35,
         "column_start": 18,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 2174,
-        "line_end": 2174,
-        "line_start": 2174
+        "line": 2180,
+        "line_end": 2180,
+        "line_start": 2180
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-READ-DIR",
+      "expansion": null,
+      "operation": "std::fs::read_dir",
+      "profiles": [
+        "macos-cli-default"
+      ],
+      "source": {
+        "byte_end": 416,
+        "byte_start": 399,
+        "column": 45,
+        "column_end": 62,
+        "column_start": 45,
+        "file": "crates/carrick-cli/src/debug_el1_census.rs",
+        "line": 11,
+        "line_end": 11,
+        "line_start": 11
       }
     },
     {
@@ -4700,15 +4758,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 95355,
-        "byte_start": 95337,
+        "byte_end": 95588,
+        "byte_start": 95570,
         "column": 26,
         "column_end": 44,
         "column_start": 26,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 2187,
-        "line_end": 2187,
-        "line_start": 2187
+        "line": 2193,
+        "line_end": 2193,
+        "line_start": 2193
       }
     },
     {
@@ -4777,15 +4835,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 47623,
-        "byte_start": 47600,
+        "byte_end": 47856,
+        "byte_start": 47833,
         "column": 30,
         "column_end": 53,
         "column_start": 30,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 1036,
-        "line_end": 1036,
-        "line_start": 1036
+        "line": 1042,
+        "line_end": 1042,
+        "line_start": 1042
       }
     },
     {
@@ -4796,15 +4854,34 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 57985,
-        "byte_start": 57962,
+        "byte_end": 58218,
+        "byte_start": 58195,
         "column": 39,
         "column_end": 62,
         "column_start": 39,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 1219,
-        "line_end": 1219,
-        "line_start": 1219
+        "line": 1225,
+        "line_end": 1225,
+        "line_start": 1225
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+      "expansion": null,
+      "operation": "std::fs::read_to_string",
+      "profiles": [
+        "macos-cli-default"
+      ],
+      "source": {
+        "byte_end": 1575,
+        "byte_start": 1552,
+        "column": 16,
+        "column_end": 39,
+        "column_start": 16,
+        "file": "crates/carrick-cli/src/debug_el1_census.rs",
+        "line": 40,
+        "line_end": 40,
+        "line_start": 40
       }
     },
     {
@@ -5030,15 +5107,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 14217,
-        "byte_start": 14194,
+        "byte_end": 14237,
+        "byte_start": 14214,
         "column": 22,
         "column_end": 45,
         "column_start": 22,
         "file": "crates/carrick-runtime/src/lib.rs",
-        "line": 257,
-        "line_end": 257,
-        "line_start": 257
+        "line": 258,
+        "line_end": 258,
+        "line_start": 258
       }
     },
     {
@@ -5406,15 +5483,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 93423,
-        "byte_start": 93403,
+        "byte_end": 93656,
+        "byte_start": 93636,
         "column": 17,
         "column_end": 37,
         "column_start": 17,
         "file": "crates/carrick-cli/src/commands.rs",
-        "line": 2149,
-        "line_end": 2149,
-        "line_start": 2149
+        "line": 2155,
+        "line_end": 2155,
+        "line_start": 2155
       }
     },
     {
@@ -6923,15 +7000,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 24228,
-        "byte_start": 24219,
+        "byte_end": 24461,
+        "byte_start": 24452,
         "column": 5,
         "column_end": 14,
         "column_start": 5,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 637,
-        "line_end": 637,
-        "line_start": 637
+        "line": 645,
+        "line_end": 645,
+        "line_start": 645
       }
     },
     {
@@ -6942,15 +7019,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 41690,
-        "byte_start": 41681,
+        "byte_end": 41923,
+        "byte_start": 41914,
         "column": 5,
         "column_end": 14,
         "column_start": 5,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 1097,
-        "line_end": 1097,
-        "line_start": 1097
+        "line": 1105,
+        "line_end": 1105,
+        "line_start": 1105
       }
     },
     {
@@ -7268,6 +7345,26 @@
       }
     },
     {
+      "catalog_id": "HA-CATALOG-FS-WRITE",
+      "expansion": null,
+      "operation": "std::fs::write",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 7858,
+        "byte_start": 7844,
+        "column": 9,
+        "column_end": 23,
+        "column_start": 9,
+        "file": "crates/carrick-runtime/src/el1_census.rs",
+        "line": 227,
+        "line_end": 227,
+        "line_start": 227
+      }
+    },
+    {
       "catalog_id": "HA-CATALOG-NET-TCP-LISTENER-BIND",
       "expansion": null,
       "operation": "std::net::TcpListener::bind",
@@ -7412,15 +7509,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 18948,
-        "byte_start": 18932,
+        "byte_end": 19181,
+        "byte_start": 19165,
         "column": 36,
         "column_end": 52,
         "column_start": 36,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 481,
-        "line_end": 481,
-        "line_start": 481
+        "line": 489,
+        "line_end": 489,
+        "line_start": 489
       }
     },
     {
@@ -7431,15 +7528,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 22288,
-        "byte_start": 22272,
+        "byte_end": 22521,
+        "byte_start": 22505,
         "column": 27,
         "column_end": 43,
         "column_start": 27,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 585,
-        "line_end": 585,
-        "line_start": 585
+        "line": 593,
+        "line_end": 593,
+        "line_start": 593
       }
     },
     {
@@ -7450,15 +7547,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 41373,
-        "byte_start": 41357,
+        "byte_end": 41606,
+        "byte_start": 41590,
         "column": 24,
         "column_end": 40,
         "column_start": 24,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 1089,
-        "line_end": 1089,
-        "line_start": 1089
+        "line": 1097,
+        "line_end": 1097,
+        "line_start": 1097
       }
     },
     {
@@ -9944,6 +10041,26 @@
         "macos-runtime-default"
       ],
       "source": {
+        "byte_end": 6943,
+        "byte_start": 6927,
+        "column": 14,
+        "column_end": 30,
+        "column_start": 14,
+        "file": "crates/carrick-runtime/src/el1_census.rs",
+        "line": 198,
+        "line_end": 198,
+        "line_start": 198
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-ID",
+      "expansion": null,
+      "operation": "std::process::id",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
         "byte_end": 40525,
         "byte_start": 40509,
         "column": 44,
@@ -10168,15 +10285,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 39776,
-        "byte_start": 39756,
+        "byte_end": 40009,
+        "byte_start": 39989,
         "column": 32,
         "column_end": 52,
         "column_start": 32,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 1055,
-        "line_end": 1055,
-        "line_start": 1055
+        "line": 1063,
+        "line_end": 1063,
+        "line_start": 1063
       }
     },
     {
@@ -10187,15 +10304,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 40218,
-        "byte_start": 40198,
+        "byte_end": 40451,
+        "byte_start": 40431,
         "column": 31,
         "column_end": 51,
         "column_start": 31,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 1063,
-        "line_end": 1063,
-        "line_start": 1063
+        "line": 1071,
+        "line_end": 1071,
+        "line_start": 1071
       }
     },
     {
@@ -10652,15 +10769,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 16040,
-        "byte_start": 16027,
+        "byte_end": 16273,
+        "byte_start": 16260,
         "column": 9,
         "column_end": 22,
         "column_start": 9,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 403,
-        "line_end": 403,
-        "line_start": 403
+        "line": 411,
+        "line_end": 411,
+        "line_start": 411
       }
     },
     {
@@ -10671,15 +10788,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 23520,
-        "byte_start": 23507,
+        "byte_end": 23753,
+        "byte_start": 23740,
         "column": 13,
         "column_end": 26,
         "column_start": 13,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 618,
-        "line_end": 618,
-        "line_start": 618
+        "line": 626,
+        "line_end": 626,
+        "line_start": 626
       }
     },
     {
@@ -10690,15 +10807,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 29474,
-        "byte_start": 29461,
+        "byte_end": 29707,
+        "byte_start": 29694,
         "column": 9,
         "column_end": 22,
         "column_start": 9,
         "file": "crates/carrick-cli/src/debug.rs",
-        "line": 790,
-        "line_end": 790,
-        "line_start": 790
+        "line": 798,
+        "line_end": 798,
+        "line_start": 798
       }
     },
     {
@@ -11686,9 +11803,9 @@
       }
     }
   ],
-  "rows_sha256": "39e5ad1516fc3dc2c5a91b5bf0ca4331c2fc9d8476c1b7058a723dbc2d5ce6ed",
+  "rows_sha256": "4ae59088b3baed6e00dc61dd418a7781d533c5859c15ae740db967fc00445362",
   "schema": 1,
-  "source_head": "5d5a3ae04fc5165c4c07e04477eb903e03d2a408",
+  "source_head": "4ed6be27ec7a812d99a0222193852522d9c80b66",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
