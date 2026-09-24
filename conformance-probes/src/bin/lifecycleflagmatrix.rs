@@ -1734,6 +1734,12 @@ unsafe fn test_process_control_waitid_matrix() {
         libc::setpgid(0, 0);
         libc::_exit(55);
     }
+    // Both sides set the group, the race-free job-control idiom: the parent's
+    // first P_PGID wait must not depend on whether the child ran setpgid yet
+    // (it otherwise sees ECHILD and the verdict follows the scheduler).
+    if child_pgid > 0 {
+        libc::setpgid(child_pgid, child_pgid);
+    }
     let pgid_deadline = Instant::now() + DEFAULT_DEADLINE;
     let mut waitid_p_pgid_rc_zero = false;
     let mut waitid_p_pgid_pid_matches = false;

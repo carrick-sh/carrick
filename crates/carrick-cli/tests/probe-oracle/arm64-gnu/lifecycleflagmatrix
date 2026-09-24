@@ -1,4 +1,4 @@
-f99b38d156ba2111
+227b104eb606c8c6
 clone_thread_no_sighand_einval=true
 clone_sighand_no_vm_einval=true
 clone_invalid_exit_signal_einval=false
@@ -134,7 +134,7 @@ waitid_wnowait_peek_si_code_exited=true
 waitid_wnowait_peek_si_status_matches=true
 waitid_after_wnowait_reap_clean=true
 waitid_no_children_echild=false
-waitid_p_pgid_rc_zero=false
-waitid_p_pgid_si_pid_matches=false
-waitid_p_pgid_si_code_exited=false
-waitid_p_pgid_status_matches=false
+waitid_p_pgid_rc_zero=true
+waitid_p_pgid_si_pid_matches=true
+waitid_p_pgid_si_code_exited=true
+waitid_p_pgid_status_matches=true
