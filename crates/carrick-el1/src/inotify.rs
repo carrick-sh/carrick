@@ -2,7 +2,7 @@
 
 use carrick_el1_abi::{
     Action, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify, DelegatedMark,
-    FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES, MAX_DELEGATED_INOTIFY,
+    EL1_GUEST_LOCK_SPINS, FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES, MAX_DELEGATED_INOTIFY,
     MAX_NAME_CACHE_PATH_LEN, fd_map_lookup_inotify, hash_path,
 };
 use carrick_inotify_core::{
@@ -104,26 +104,12 @@ pub fn el1_inotify_add_watch(
     };
 
     // Lock hierarchy: file lock first, then inotify lock (bounded retry before forward)
-    let mut file_locked = false;
-    for _ in 0..32 {
-        if file.try_lock() {
-            file_locked = true;
-            break;
-        }
-        core::hint::spin_loop();
-    }
+    let file_locked = file.lock_guest_bounded(EL1_GUEST_LOCK_SPINS);
     if !file_locked {
         return Err(Action::Forward);
     }
 
-    let mut inotify_locked = false;
-    for _ in 0..32 {
-        if inotify.try_lock() {
-            inotify_locked = true;
-            break;
-        }
-        core::hint::spin_loop();
-    }
+    let inotify_locked = inotify.lock_guest_bounded(EL1_GUEST_LOCK_SPINS);
     if !inotify_locked {
         file.unlock();
         return Err(Action::Forward);
@@ -213,26 +199,12 @@ pub fn el1_inotify_rm_watch(
     };
 
     // Lock hierarchy: file lock first, then inotify lock (bounded retry before forward)
-    let mut file_locked = false;
-    for _ in 0..32 {
-        if file.try_lock() {
-            file_locked = true;
-            break;
-        }
-        core::hint::spin_loop();
-    }
+    let file_locked = file.lock_guest_bounded(EL1_GUEST_LOCK_SPINS);
     if !file_locked {
         return Err(Action::Forward);
     }
 
-    let mut inotify_locked = false;
-    for _ in 0..32 {
-        if inotify.try_lock() {
-            inotify_locked = true;
-            break;
-        }
-        core::hint::spin_loop();
-    }
+    let inotify_locked = inotify.lock_guest_bounded(EL1_GUEST_LOCK_SPINS);
     if !inotify_locked {
         file.unlock();
         return Err(Action::Forward);
@@ -294,7 +266,7 @@ pub fn el1_inotify_read(
         return Err(Action::Forward);
     }
 
-    if !inotify.try_lock() {
+    if !inotify.lock_guest_bounded(EL1_GUEST_LOCK_SPINS) {
         return Err(Action::Forward);
     }
 
