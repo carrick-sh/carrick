@@ -1170,11 +1170,11 @@ fn delegate_transaction(
 /// Host implementation of the shared file operations' user copy: through the
 /// current guest address space. A failed copy makes the host fall back to the
 /// ordinary path (recall, then the host syscall with its exact EFAULT rules).
-struct HostUserCopy<'m, M: carrick_guest_mem::GuestMemory> {
+struct HostUserCopy<'m, M: carrick_guest_mem::CurrentMmMemory> {
     memory: &'m mut M,
 }
 
-impl<M: carrick_guest_mem::GuestMemory> carrick_el1::file::UserCopy for HostUserCopy<'_, M> {
+impl<M: carrick_guest_mem::CurrentMmMemory> carrick_el1::file::UserCopy for HostUserCopy<'_, M> {
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
         self.memory.write_bytes(dst_va, src).is_ok()
     }
@@ -1218,7 +1218,7 @@ static HOST_SERVED: AtomicUsize = AtomicUsize::new(0);
 /// race, took a kick, or saw an unmapped buffer) is not an ownership change.
 /// `None` means it could not be served here exactly and the caller takes the
 /// ordinary path, whose guard accessor recalls first.
-pub(crate) fn serve_on_host<M: carrick_guest_mem::GuestMemory>(
+pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
     description: &FileDescription,
     nr: usize,
     args: [u64; 3],
