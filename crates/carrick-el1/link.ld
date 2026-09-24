@@ -8,9 +8,10 @@ SECTIONS
 
     .header : ALIGN(8) {
         BYTE(0x43) BYTE(0x45) BYTE(0x4c) BYTE(0x31) /* "CEL1" */
-        LONG(1)                                       /* version 1 */
+        LONG(2)                                       /* version 2 */
         QUAD(carrick_el1_syscall - _image_start)      /* entry_offset */
         QUAD(_image_end - _image_start)               /* image_size */
+        QUAD(CARRICK_EL1_ABI_HASH - _image_start)     /* abi_hash_offset */
     }
 
     .text : ALIGN(16) {
