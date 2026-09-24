@@ -285,11 +285,142 @@ pub(crate) fn reconcile_carrier_stage2_authority_retention(
     }
 }
 
+/// One mm's extent ledger: exact logical `(IPA, length)` keys, plus a
+/// size-class index so "which extent contains this IPA" is a lookup.
+///
+/// The ledger used to be a bare `BTreeMap` answered with `iter().find(..)`,
+/// which made every containment question a walk of the whole mm: backing
+/// maintenance asks it once per scrubbed Linux page
+/// (`retained_output_lacks_exclusive_claim`), and the 2026-09-24 cpython
+/// profile spent about 14% of non-guest carrier CPU in that walk under
+/// `mremap` and `brk`. The index is private and every mutation goes through
+/// this type, so it cannot drift from the keys it indexes. Reads borrow the
+/// map through `Deref`; there is no mutable access to it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+pub(crate) struct InventoryExtentMap {
+    extents: std::collections::BTreeMap<(u64, u64), InventoryExtent>,
+    /// `(class, start, length)` for every key, where every member of
+    /// `class` has `length <= 1 << class`. A key can contain `ipa` only if it
+    /// starts within its class's width below `ipa`.
+    by_class: std::collections::BTreeSet<(u32, u64, u64)>,
+    class_counts: std::collections::BTreeMap<u32, usize>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl InventoryExtentMap {
+    fn class(length: u64) -> u32 {
+        AliasClassIndex::class(length)
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        key: (u64, u64),
+        extent: InventoryExtent,
+    ) -> Option<InventoryExtent> {
+        let previous = self.extents.insert(key, extent);
+        if previous.is_none() {
+            let class = Self::class(key.1);
+            self.by_class.insert((class, key.0, key.1));
+            *self.class_counts.entry(class).or_default() += 1;
+        }
+        previous
+    }
+
+    pub(crate) fn remove(&mut self, key: &(u64, u64)) -> Option<InventoryExtent> {
+        let removed = self.extents.remove(key)?;
+        let class = Self::class(key.1);
+        self.by_class.remove(&(class, key.0, key.1));
+        if let std::collections::btree_map::Entry::Occupied(mut count) =
+            self.class_counts.entry(class)
+        {
+            *count.get_mut() = count.get().saturating_sub(1);
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
+        Some(removed)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.extents.clear();
+        self.by_class.clear();
+        self.class_counts.clear();
+    }
+
+    /// Values may be edited in place; keys, and so the index, cannot be.
+    #[cfg(test)]
+    pub(crate) fn get_mut(&mut self, key: &(u64, u64)) -> Option<&mut InventoryExtent> {
+        self.extents.get_mut(key)
+    }
+
+    /// The first extent, in `(start, length)` key order, whose logical IPA
+    /// window contains `ipa`. Visits at most the keys each active size class
+    /// can place within its own width below `ipa`: O(classes * log n +
+    /// candidates), never O(extents).
+    pub(crate) fn containing(&self, ipa: u64) -> Option<(&(u64, u64), &InventoryExtent)> {
+        let mut first: Option<(u64, u64)> = None;
+        for &class in self.class_counts.keys() {
+            let radius = AliasClassIndex::class_radius(class);
+            let lower = ipa.saturating_sub(radius.saturating_sub(1));
+            for &(_, start, length) in self
+                .by_class
+                .range((class, lower, 0)..=(class, ipa, u64::MAX))
+            {
+                note_hot_path_rows(HotPathScan::FrameExtents, 1);
+                if ipa < start.saturating_add(length)
+                    && first.is_none_or(|best| (start, length) < best)
+                {
+                    first = Some((start, length));
+                }
+            }
+        }
+        self.extents.get_key_value(&first?)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for InventoryExtentMap {
+    type Target = std::collections::BTreeMap<(u64, u64), InventoryExtent>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.extents
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> IntoIterator for &'a InventoryExtentMap {
+    type Item = (&'a (u64, u64), &'a InventoryExtent);
+    type IntoIter = std::collections::btree_map::Iter<'a, (u64, u64), InventoryExtent>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.extents.iter()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl From<std::collections::BTreeMap<(u64, u64), InventoryExtent>> for InventoryExtentMap {
+    fn from(extents: std::collections::BTreeMap<(u64, u64), InventoryExtent>) -> Self {
+        extents.into_iter().collect()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl FromIterator<((u64, u64), InventoryExtent)> for InventoryExtentMap {
+    fn from_iter<I: IntoIterator<Item = ((u64, u64), InventoryExtent)>>(iter: I) -> Self {
+        let mut map = Self::default();
+        for (key, extent) in iter {
+            map.insert(key, extent);
+        }
+        map
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Default)]
 pub(crate) struct HvpatchFrameInventory {
     pub(crate) initialized: bool,
-    pub(crate) extents: std::collections::BTreeMap<(u64, u64), InventoryExtent>,
+    pub(crate) extents: InventoryExtentMap,
     pub(crate) frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
     pub(crate) alias_reservation: Option<carrick_hal::FrameInventoryReservation>,
     pub(crate) alias_commit: Option<carrick_hal::FrameInventoryCommit<()>>,
@@ -321,10 +452,7 @@ impl HvpatchFrameInventory {
     /// The first extent, in `(start, length)` key order, whose logical IPA
     /// window contains `ipa`.
     pub(crate) fn extent_containing(&self, ipa: u64) -> Option<(&(u64, u64), &InventoryExtent)> {
-        self.extents
-            .iter()
-            .inspect(|_| note_hot_path_rows(HotPathScan::FrameExtents, 1))
-            .find(|(key, _)| key.0 <= ipa && ipa < key.0.saturating_add(key.1))
+        self.extents.containing(ipa)
     }
 
     pub(crate) fn with_frames(
