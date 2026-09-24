@@ -3013,6 +3013,7 @@ impl crate::kernel::FileDescription {
     // accessor only checks its own description, and a non-delegated file pays
     // one atomic load here.
 
+    #[track_caller]
     pub(crate) fn read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
         let d = self.open_description()?;
         loop {
@@ -3035,6 +3036,7 @@ impl crate::kernel::FileDescription {
         }
     }
 
+    #[track_caller]
     pub(crate) fn try_read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
         let d = self.open_description()?;
         if self.delegation_handle() != 0 {
@@ -3048,6 +3050,7 @@ impl crate::kernel::FileDescription {
         (self.delegation_handle() == 0).then_some(guard)
     }
 
+    #[track_caller]
     pub(crate) fn write(&self) -> Option<FileDescriptionWriteGuard<'_>> {
         let d = self.open_description()?;
         let mut guard = d.write();

@@ -240,6 +240,7 @@ pub(crate) fn no_active_delegations() -> bool {
 /// operations that reach an inode without an open description of it (stat,
 /// truncate or a watch by path). Must be called with no description guard and
 /// no VFS lock held.
+#[track_caller]
 pub(crate) fn recall_inode(identity: InodeIdentity) -> bool {
     if no_active_delegations() {
         return false;
@@ -276,6 +277,7 @@ pub(crate) fn recall_inode(identity: InodeIdentity) -> bool {
 /// Recall whatever delegation covers the rootfs file at `path`, if any;
 /// returns true when one was recalled. Resolves the path's exact host identity
 /// first, with no delegation lock held.
+#[track_caller]
 pub(crate) fn recall_path(fs: &FsState, path: &str) -> bool {
     if no_active_delegations() {
         return false;
@@ -289,6 +291,7 @@ pub(crate) fn recall_path(fs: &FsState, path: &str) -> bool {
 /// A watch or mark was just added at `path`: recall what it covers. A watch on
 /// a delegated regular file recalls exactly that file; any other watch (a
 /// directory covers its children) recalls every active delegation.
+#[track_caller]
 pub(crate) fn recall_watched_path(fs: &FsState, path: &str) {
     if no_active_delegations() {
         return;
@@ -302,6 +305,7 @@ pub(crate) fn recall_watched_path(fs: &FsState, path: &str) {
 /// delegation roll back. Used when a carrier-wide policy changes (seccomp,
 /// rlimits) and at pool shutdown. Write-back errors stay sticky on the
 /// affected descriptions; they are never returned to the triggering syscall.
+#[track_caller]
 pub fn recall_all_delegated() {
     if no_active_delegations() {
         return;
@@ -509,6 +513,10 @@ static REFUSALS: [AtomicUsize; NotEligible::ALL.len()] =
     [const { AtomicUsize::new(0) }; NotEligible::ALL.len()];
 static DELEGATIONS: AtomicUsize = AtomicUsize::new(0);
 static RECALLS: AtomicUsize = AtomicUsize::new(0);
+/// Recalls per triggering call site (recall is a slow path; the population
+/// names which host path pulled a delegated object back).
+static RECALL_TRIGGERS: Mutex<Vec<(&'static std::panic::Location<'static>, usize)>> =
+    Mutex::new(Vec::new());
 
 /// Snapshot of the delegation population counters.
 #[derive(Debug, Clone, Default)]
@@ -516,6 +524,7 @@ pub struct DelegationCounts {
     pub delegations: usize,
     pub recalls: usize,
     pub refusals: Vec<(NotEligible, usize)>,
+    pub recall_triggers: Vec<(String, usize)>,
 }
 
 /// Read the delegation population counters (nonzero refusal reasons only).
@@ -528,6 +537,11 @@ pub fn delegation_counts() -> DelegationCounts {
             .map(|reason| (*reason, REFUSALS[*reason as usize].load(Ordering::Relaxed)))
             .filter(|(_, count)| *count > 0)
             .collect(),
+        recall_triggers: RECALL_TRIGGERS
+            .lock()
+            .iter()
+            .map(|(location, count)| (format!("{}:{}", location.file(), location.line()), *count))
+            .collect(),
     }
 }
 
@@ -538,6 +552,20 @@ pub fn reset_delegation_counts() {
     RECALLS.store(0, Ordering::Relaxed);
     for counter in &REFUSALS {
         counter.store(0, Ordering::Relaxed);
+    }
+    RECALL_TRIGGERS.lock().clear();
+}
+
+#[track_caller]
+fn note_recall_trigger() {
+    let location = std::panic::Location::caller();
+    let mut triggers = RECALL_TRIGGERS.lock();
+    match triggers
+        .iter_mut()
+        .find(|(seen, _)| std::ptr::eq(*seen, location))
+    {
+        Some((_, count)) => *count += 1,
+        None => triggers.push((location, 1)),
     }
 }
 
@@ -679,6 +707,23 @@ fn delegate_transaction(
     ) {
         return Err(NotEligible::UnsupportedFlags);
     }
+    // A shared inode is refused before backoff is consulted (the transaction
+    // re-checks under the lock).
+    let shared = OWNERS
+        .lock()
+        .as_ref()
+        .and_then(|map| map.get(&identity))
+        .is_none_or(|owner| owner.ever_shared || owner.open_count != 1);
+    if shared {
+        return Err(NotEligible::Shared);
+    }
+    // Backoff gates every check that costs a host syscall or a registry scan
+    // (path resolution, watches, fstat, lseek below), so a backed-off file
+    // pays one atomic per forwarded operation, not a delegation attempt.
+    if !description.common().admit_delegation() {
+        return Err(NotEligible::BackingOff);
+    }
+
     let acc = status & LINUX_O_ACCMODE;
     let readable = acc == LINUX_O_RDONLY || acc == LINUX_O_RDWR;
     let writable_flag = acc == LINUX_O_WRONLY || acc == LINUX_O_RDWR;
@@ -729,22 +774,6 @@ fn delegate_transaction(
     }
     let offset = offset as u64;
     let writable = *writable && writable_flag;
-
-    // A shared inode is refused before backoff is consulted (the transaction
-    // re-checks under the lock).
-    let shared = OWNERS
-        .lock()
-        .as_ref()
-        .and_then(|map| map.get(&identity))
-        .is_none_or(|owner| owner.ever_shared || owner.open_count != 1);
-    if shared {
-        return Err(NotEligible::Shared);
-    }
-    // Backoff is consumed only by attempts that would otherwise proceed, so a
-    // structurally ineligible attempt neither spends it nor hides its reason.
-    if !description.common().admit_delegation() {
-        return Err(NotEligible::BackingOff);
-    }
 
     // Transaction step 1: claim the inode.
     {
@@ -865,6 +894,7 @@ fn delegate_transaction(
 
 /// Recall a delegated file description back to host authority. Must be called
 /// with no guard of this description held.
+#[track_caller]
 pub(crate) fn recall(description: &FileDescription) -> Result<(), carrick_abi::LinuxErrno> {
     if description.delegation_handle() == 0 {
         return Ok(());
@@ -882,6 +912,7 @@ pub(crate) fn recall(description: &FileDescription) -> Result<(), carrick_abi::L
 
 /// Recall a file description if it is currently delegated. Write-back errors
 /// stay sticky on the description.
+#[track_caller]
 pub(crate) fn recall_if_delegated(description: &FileDescription) {
     if description.delegation_handle() != 0 {
         let _ = recall(description);
@@ -889,6 +920,7 @@ pub(crate) fn recall_if_delegated(description: &FileDescription) {
 }
 
 /// Recall with the description's write guard held by the caller.
+#[track_caller]
 pub(crate) fn recall_locked(
     description: &FileDescription,
     open: &mut OpenDescription,
@@ -944,6 +976,7 @@ pub(crate) fn recall_locked(
     }
     mark_pending_host_work_for_file_tables(&tables);
     RECALLS.fetch_add(1, Ordering::Relaxed);
+    note_recall_trigger();
 
     let file = delegated_file_object(region_ptr, handle);
     lock_delegated_file(file, handle);
