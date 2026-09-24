@@ -47,3 +47,33 @@ fn realtime_calibration_survives_sibling_exec() {
         );
     }
 }
+
+/// The container's FIRST process gets a calibrated vDSO too, not only an
+/// exec'd child: `date` reads CLOCK_REALTIME through the vDSO data page the
+/// VMM stamps at boot. A stamp that failed silently left that page zeroed,
+/// so the first process saw seconds since boot as wall time (and cpython's
+/// zipfile refused "timestamps before 1980").
+#[test]
+fn realtime_is_calibrated_for_the_first_process() {
+    let result = ContainerBuilder::from_image("docker.io/library/ubuntu:24.04")
+        .pull_policy(PullPolicy::Missing)
+        .command(["/bin/date", "+%s"])
+        .stdout(StdioConfig::Captured)
+        .stderr(StdioConfig::Captured)
+        .run_blocking()
+        .expect("signed fixture must execute; entitlement/setup errors are failures");
+    assert!(result.success(), "{}", result.stderr_utf8());
+    let guest: i64 = result
+        .stdout_utf8()
+        .trim()
+        .parse()
+        .expect("date prints seconds");
+    let host = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("host clock after the epoch")
+        .as_secs() as i64;
+    assert!(
+        (host - guest).abs() < 60,
+        "first-process CLOCK_REALTIME {guest} is not the host's {host}"
+    );
+}

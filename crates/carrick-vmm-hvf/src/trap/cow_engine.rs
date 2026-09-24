@@ -4302,14 +4302,22 @@ impl HvfVmState {
         let realtime_off = crate::vdso::set_realtime_off_ns(unix_ns.wrapping_sub(mono_ns));
 
         let base = crate::vdso::LINUX_VVAR_BASE;
-        let _ = self.write_guest_bytes(
-            base + crate::vdso::VVAR_OFF_FREQ as u64,
-            &freq.to_le_bytes(),
-        );
-        let _ = self.write_guest_bytes(
-            base + crate::vdso::VVAR_OFF_REALTIME_OFF_NS as u64,
-            &realtime_off.to_le_bytes(),
-        );
+        // A load path without the vDSO has no vvar page: the guest then uses
+        // syscalls and there is nothing to stamp. With the page mapped, a
+        // failed stamp leaves the vDSO computing wall time from a zero base
+        // (the first process read seconds since boot as CLOCK_REALTIME), so
+        // it is reported, never skipped.
+        if self.read_guest_bytes(base, 8).is_err() {
+            return;
+        }
+        for (offset, word) in [
+            (crate::vdso::VVAR_OFF_FREQ, freq),
+            (crate::vdso::VVAR_OFF_REALTIME_OFF_NS, realtime_off),
+        ] {
+            if let Err(error) = self.write_guest_bytes(base + offset as u64, &word.to_le_bytes()) {
+                tracing::error!(%error, offset, "vDSO vvar stamp failed");
+            }
+        }
         // seq stays 0 (even = stable); these aren't updated after boot.
     }
 
