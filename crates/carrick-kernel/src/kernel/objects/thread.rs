@@ -2510,8 +2510,16 @@ impl Thread {
         &self,
         replacement: Arc<ThreadResources>,
     ) -> Arc<ThreadResources> {
+        let files = replacement.files().id();
         let previous = self.resources.swap(replacement);
         self.revision.publish();
+        // A vCPU running this thread must see its current file table: EL1
+        // resolves fds through it (exec's close-on-exec successor, unshare,
+        // close_range all replace it here).
+        crate::el1_delegation::update_current_task_file_table_for_task(
+            carrick_el1_abi::El1TaskId::from_linux_tid(self.key().tid.raw()),
+            files.raw(),
+        );
         previous
     }
 

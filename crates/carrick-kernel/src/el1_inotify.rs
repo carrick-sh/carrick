@@ -4,236 +4,187 @@ use parking_lot::Mutex;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
-use carrick_abi::*;
 use carrick_el1_abi::*;
 use carrick_fatal::carrick_fatal;
 
-use crate::dispatch::fd_table::OpenFile;
-use crate::el1_delegation::NotEligible;
 use crate::inotify::InotifyState;
 use crate::kernel::FileTableId;
-use crate::kernel::objects::FileDescription;
+
+// ---------------------------------------------------------------------------
+// In-zone inotify instances: born in the zone, never recalled.
+// ---------------------------------------------------------------------------
+//
+// An instance is created in the EL1 aperture at `inotify_init1` and fronted by
+// its host `InotifyState` for its whole life: the zone's descriptor allocator,
+// watch table and event queue are authoritative, EL1 serves what it can, and
+// the host serves everything else against the same object. It leaves the zone
+// only when it outgrows it (watch-table capacity), terminally.
 
 static ALLOCATED_INOTIFY_HANDLES: Mutex<[bool; MAX_DELEGATED_INOTIFY]> =
     Mutex::new([false; MAX_DELEGATED_INOTIFY]);
-static DELEGATED_INOTIFY_DESCRIPTIONS: Mutex<
-    [Option<Weak<FileDescription>>; MAX_DELEGATED_INOTIFY],
-> = Mutex::new([const { None }; MAX_DELEGATED_INOTIFY]);
-static DELEGATED_INOTIFY_STATES: Mutex<[Option<Arc<InotifyState>>; MAX_DELEGATED_INOTIFY]> =
+/// Handle -> fronting state. Weak: the state owns the instance, not the table.
+static INSTANCE_STATES: Mutex<[Option<Weak<InotifyState>>; MAX_DELEGATED_INOTIFY]> =
     Mutex::new([const { None }; MAX_DELEGATED_INOTIFY]);
 
-/// Allocate an inotify delegation handle (1..=MAX_DELEGATED_INOTIFY).
-fn allocate_inotify_handle() -> Option<u32> {
-    let mut handles = ALLOCATED_INOTIFY_HANDLES.lock();
-    for (i, allocated) in handles.iter_mut().enumerate() {
-        if !*allocated {
-            *allocated = true;
-            return Some((i + 1) as u32);
+/// The host holding an in-zone instance's lock word (lock order: file, then
+/// instance; host model, then instance). The guest's critical sections are
+/// short and always complete, so the host spins briefly then yields; the long
+/// bound is evidence of a bug, never a scheduling budget.
+pub(crate) struct InstanceLock<'a> {
+    instance: &'a DelegatedInotify,
+}
+
+impl<'a> InstanceLock<'a> {
+    pub(crate) fn acquire(instance: &'a DelegatedInotify) -> Self {
+        let start = std::time::Instant::now();
+        while !instance.host_lock_bounded(64) {
+            if start.elapsed() >= std::time::Duration::from_secs(30) {
+                carrick_fatal!(
+                    "el1_inotify",
+                    "DelegatedInotify::host_lock timed out (state={})",
+                    instance.state.load(Ordering::Relaxed)
+                );
+            }
+            std::thread::yield_now();
         }
-    }
-    None
-}
-
-/// Free an inotify delegation handle.
-fn free_inotify_handle(handle: u32) {
-    if handle > 0 && (handle as usize) <= MAX_DELEGATED_INOTIFY {
-        let mut handles = ALLOCATED_INOTIFY_HANDLES.lock();
-        handles[(handle - 1) as usize] = false;
-        let mut descs = DELEGATED_INOTIFY_DESCRIPTIONS.lock();
-        descs[(handle - 1) as usize] = None;
-        let mut states = DELEGATED_INOTIFY_STATES.lock();
-        states[(handle - 1) as usize] = None;
+        Self { instance }
     }
 }
 
-/// Delegate an open inotify description to EL1.
-pub fn delegate_inotify(
-    open_file: &OpenFile,
-    file_table: FileTableId,
-    fd: i32,
-    state: &Arc<InotifyState>,
-    flags: u32,
-) -> Result<u32, NotEligible> {
+impl Drop for InstanceLock<'_> {
+    fn drop(&mut self) {
+        self.instance.unlock();
+    }
+}
+
+fn instance_object(region_ptr: usize, handle: u32) -> &'static DelegatedInotify {
+    // SAFETY: the inotify table lives in the EL1 region, mapped for the
+    // carrier's lifetime; `handle` is in 1..=MAX_DELEGATED_INOTIFY. Only
+    // atomics and the lock-guarded cells are accessed through it.
+    unsafe {
+        &*((region_ptr
+            + EL1_INOTIFY_TABLE_OFFSET as usize
+            + (handle as usize - 1) * core::mem::size_of::<DelegatedInotify>())
+            as *const DelegatedInotify)
+    }
+}
+
+/// Create the in-zone instance for a new inotify state and bind the state to
+/// it. `None` (EL1 disabled, no region, table full) leaves the state on the
+/// host model for its whole life.
+pub(crate) fn create_instance(state: &Arc<InotifyState>, flags: u32) -> Option<u32> {
+    if !carrick_mem::memory::el1_kernel_enabled() {
+        return None;
+    }
     let region_ptr = get_el1_region_host_ptr();
     if region_ptr == 0 {
-        return Err(NotEligible::Disabled);
+        return None;
     }
-    if open_file.description.delegation_handle() != 0 {
-        return Ok(open_file.description.delegation_handle());
+    let handle = {
+        let mut handles = ALLOCATED_INOTIFY_HANDLES.lock();
+        let index = handles.iter().position(|in_use| !*in_use)?;
+        handles[index] = true;
+        (index + 1) as u32
+    };
+    let instance = instance_object(region_ptr, handle);
+    {
+        let _lock = InstanceLock::acquire(instance);
+        instance
+            .generation
+            .store(crate::el1_delegation::next_incarnation(), Ordering::Relaxed);
+        instance.flags.store(flags, Ordering::Relaxed);
+        instance.next_wd.store(1, Ordering::Relaxed);
+        instance.num_watches.store(0, Ordering::Relaxed);
+        // SAFETY: the watch table is only touched under the instance lock.
+        for watch in unsafe { &mut *instance.watches.get() }.iter_mut() {
+            *watch = DelegatedWatch::default();
+        }
+        instance.reset_queue();
+        instance
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Release);
     }
+    INSTANCE_STATES.lock()[handle as usize - 1] = Some(Arc::downgrade(state));
+    state.bind_zone(handle, instance);
+    Some(handle)
+}
 
-    let handle = allocate_inotify_handle().ok_or(NotEligible::TableFull)?;
-
-    let inotify_ptr = (region_ptr
-        + EL1_INOTIFY_TABLE_OFFSET as usize
-        + (handle as usize - 1) * core::mem::size_of::<DelegatedInotify>())
-        as *const DelegatedInotify;
-    let inotify = unsafe { &*inotify_ptr };
-
-    if !inotify.host_lock_bounded(100_000) {
-        free_inotify_handle(handle);
-        return Err(NotEligible::TableFull);
+/// Publish `(file table, fd) -> instance` so EL1 serves this fd. A dup or a
+/// forked child's fd is served on the host through the same object.
+pub(crate) fn publish_instance_fd(
+    state: &InotifyState,
+    file_table: FileTableId,
+    fd: i32,
+    description: crate::kernel::FileDescriptionId,
+) {
+    let Some(handle) = state.zone_handle() else {
+        return;
+    };
+    let region_ptr = get_el1_region_host_ptr();
+    if region_ptr == 0 {
+        return;
     }
-
-    let incarnation = crate::el1_delegation::next_incarnation();
-    inotify.generation.store(incarnation, Ordering::Relaxed);
-    inotify.flags.store(flags, Ordering::Relaxed);
-    inotify.next_wd.store(state.next_wd(), Ordering::Relaxed);
-    inotify.reset_queue();
-    inotify.num_watches.store(0, Ordering::Relaxed);
-
-    // Initialize watches array
-    let watches = unsafe { &mut *inotify.watches.get() };
-    for w in watches.iter_mut() {
-        *w = DelegatedWatch::default();
-    }
-
-    inotify
-        .state
-        .store(DELEGATED_STATE_GUEST, Ordering::Release);
-    inotify.unlock();
-
-    // Bind fd_map slot
-    let slot_found = crate::el1_delegation::fd_map_publish(
+    let instance = instance_object(region_ptr, handle);
+    let incarnation = instance.generation.load(Ordering::Acquire);
+    // A full map only means EL1 forwards this fd; the host still serves it.
+    let _ = crate::el1_delegation::fd_map_publish(
         region_ptr,
         file_table.raw(),
         fd,
+        description,
         FD_HANDLE_INOTIFY_TAG | handle,
         incarnation,
     );
-
-    if !slot_found {
-        if inotify.host_lock_bounded(100_000) {
-            inotify.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
-            inotify.unlock();
-        }
-        free_inotify_handle(handle);
-        return Err(NotEligible::TableFull);
-    }
-
-    open_file.description.set_delegation_handle(handle);
-    {
-        let mut descs = DELEGATED_INOTIFY_DESCRIPTIONS.lock();
-        descs[(handle - 1) as usize] = Some(Arc::downgrade(&open_file.description));
-        let mut states = DELEGATED_INOTIFY_STATES.lock();
-        states[(handle - 1) as usize] = Some(Arc::clone(state));
-    }
-
-    Ok(handle)
 }
 
-/// Recall a delegated inotify description by handle.
-pub fn recall_inotify_by_handle(
-    handle: u32,
-    held_file_handle: Option<u32>,
-) -> Result<(), LinuxErrno> {
-    if handle == 0 || (handle as usize) > MAX_DELEGATED_INOTIFY {
-        return Ok(());
+/// The fronting state of in-zone instance `handle`, if it still exists.
+pub(crate) fn state_for_handle(handle: u32) -> Option<Arc<InotifyState>> {
+    if handle == 0 || handle as usize > MAX_DELEGATED_INOTIFY {
+        return None;
     }
-    let desc = {
-        let descs = DELEGATED_INOTIFY_DESCRIPTIONS.lock();
-        descs[(handle - 1) as usize]
-            .as_ref()
-            .and_then(|w| w.upgrade())
-    };
-    if let Some(desc) = desc {
-        recall_inotify_internal(&desc, held_file_handle)
-    } else {
-        Ok(())
-    }
+    INSTANCE_STATES.lock()[handle as usize - 1]
+        .as_ref()?
+        .upgrade()
 }
 
-/// Recall a delegated inotify description back to host authority.
-pub fn recall_inotify(description: &FileDescription) -> Result<(), LinuxErrno> {
-    recall_inotify_internal(description, None)
-}
-
-fn recall_inotify_internal(
-    description: &FileDescription,
-    held_file_handle: Option<u32>,
-) -> Result<(), LinuxErrno> {
-    let handle = description.delegation_handle();
-    if handle == 0 || (handle as usize) > MAX_DELEGATED_INOTIFY {
-        return Ok(());
-    }
-
-    mark_pending_host_work_all();
+/// Release the in-zone instance when its state is dropped (last close): EL1
+/// stops serving it, delegated files drop its marks, the handle is free.
+pub(crate) fn release_instance(handle: u32) {
     let region_ptr = get_el1_region_host_ptr();
-    if region_ptr == 0 {
-        return Ok(());
-    }
-
-    let inotify_ptr = (region_ptr
-        + EL1_INOTIFY_TABLE_OFFSET as usize
-        + (handle as usize - 1) * core::mem::size_of::<DelegatedInotify>())
-        as *const DelegatedInotify;
-    let inotify = unsafe { &*inotify_ptr };
-
-    if !inotify.host_lock_bounded(100_000) {
-        carrick_fatal!(
-            "el1_inotify",
-            "timed out waiting for EL1 inotify lock on recall (handle={handle})"
-        );
-    }
-
-    inotify
-        .state
-        .store(DELEGATED_STATE_RECALLING, Ordering::Release);
-
-    let state = {
-        let mut states = DELEGATED_INOTIFY_STATES.lock();
-        states[(handle - 1) as usize].take()
-    };
-
-    // Copy ring events, watches, and state back to host inotify
-    if let Some(state) = &state {
-        let watches = unsafe { &*inotify.watches.get() };
-        for w in watches.iter() {
-            if w.alive != 0 {
-                state.restore_watch(w.wd, w.mask);
-            }
+    if region_ptr != 0 && handle != 0 && handle as usize <= MAX_DELEGATED_INOTIFY {
+        let instance = instance_object(region_ptr, handle);
+        crate::el1_delegation::fd_map_clear_handle(region_ptr, FD_HANDLE_INOTIFY_TAG | handle);
+        {
+            let _lock = InstanceLock::acquire(instance);
+            instance
+                .state
+                .store(DELEGATED_STATE_DEAD, Ordering::Release);
+            instance.reset_queue();
         }
-        // The queue holds records in read(2) format: replay each, with its
-        // name, into the host model in order.
-        let mut records = vec![0u8; carrick_el1_abi::INOTIFY_QUEUE_BYTES];
-        let n = inotify.drain_into(&mut records).unwrap_or(0);
-        let mut at = 0;
-        while at + 16 <= n {
-            let field = |o: usize| {
-                [
-                    records[at + o],
-                    records[at + o + 1],
-                    records[at + o + 2],
-                    records[at + o + 3],
-                ]
-            };
-            let wd = i32::from_ne_bytes(field(0));
-            let mask = u32::from_ne_bytes(field(4));
-            let cookie = u32::from_ne_bytes(field(8));
-            let len = u32::from_ne_bytes(field(12)) as usize;
-            let name = (len > 0).then(|| {
-                let raw = &records[at + 16..at + 16 + len];
-                &raw[..raw.iter().position(|b| *b == 0).unwrap_or(raw.len())]
-            });
-            state.enqueue(wd, mask, cookie, name);
-            at += 16 + len;
-        }
-        let next_wd = inotify.next_wd.load(Ordering::Relaxed);
-        state.set_next_wd(next_wd);
+        crate::el1_delegation::remove_inotify_marks_from_all_files(handle, None);
     }
+    if handle != 0 && handle as usize <= MAX_DELEGATED_INOTIFY {
+        INSTANCE_STATES.lock()[handle as usize - 1] = None;
+        ALLOCATED_INOTIFY_HANDLES.lock()[handle as usize - 1] = false;
+    }
+}
 
-    // Clear fd_map slots for this inotify handle
-    crate::el1_delegation::fd_map_clear_handle(region_ptr, FD_HANDLE_INOTIFY_TAG | handle);
-
-    free_inotify_handle(handle);
-    inotify.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
-    inotify.unlock();
-
-    // Remove marks referencing this inotify handle from all delegated files after inotify lock is released
-    crate::el1_delegation::remove_inotify_marks_from_all_files(handle, held_file_handle);
-
-    description.set_delegation_handle(0);
-    Ok(())
+/// The live watch of in-zone instance `state` on delegated file
+/// `file_handle`, as `(wd, mask)`, so a host add_watch of an inode already
+/// watched in-guest returns the same descriptor (inotify(7)).
+pub(crate) fn zone_watch_for_file(state: &InotifyState, file_handle: u32) -> Option<(i32, u32)> {
+    let handle = state.zone_handle()?;
+    let region_ptr = get_el1_region_host_ptr();
+    if region_ptr == 0 || file_handle == 0 {
+        return None;
+    }
+    let instance = instance_object(region_ptr, handle);
+    let _lock = InstanceLock::acquire(instance);
+    // SAFETY: the watch table is only touched under the instance lock.
+    unsafe { &*instance.watches.get() }
+        .iter()
+        .find(|w| w.alive != 0 && w.file_handle == file_handle)
+        .map(|w| (w.wd, w.mask))
 }
 
 /// Bump process CWD generation in the EL1 name cache.
@@ -282,10 +233,7 @@ pub fn populate_name_cache(file_table: u64, path: &[u8], file_handle: u32) {
     cache.insert(file_table, cwd_gen, path, path_hash, file_handle);
 }
 
-/// Check if an InotifyState is currently delegated to EL1.
+/// Whether an inotify state fronts an in-zone instance.
 pub fn is_inotify_state_delegated(state: &Arc<InotifyState>) -> bool {
-    let states = DELEGATED_INOTIFY_STATES.lock();
-    states
-        .iter()
-        .any(|s| s.as_ref().map(|s| Arc::ptr_eq(s, state)).unwrap_or(false))
+    state.zone_handle().is_some()
 }

@@ -1007,6 +1007,19 @@ impl DelegatedInotify {
         false
     }
 
+    /// Point live watch `wd` at delegated file `file_handle` with `mask`,
+    /// adding the entry if the watch is not in the table yet. The caller holds
+    /// the instance lock.
+    pub fn attach_watch_file(&self, wd: i32, file_handle: u32, mask: u32) -> bool {
+        let watches = unsafe { &mut *self.watches.get() };
+        if let Some(w) = watches.iter_mut().find(|w| w.alive != 0 && w.wd == wd) {
+            w.file_handle = file_handle;
+            w.mask = mask;
+            return true;
+        }
+        self.add_watch(wd, file_handle, mask)
+    }
+
     pub fn remove_watch(&self, wd: i32) -> Option<u32> {
         let watches = unsafe { &mut *self.watches.get() };
         for w in watches.iter_mut() {
