@@ -17,10 +17,22 @@ use crate::kernel::objects::FileDescription;
 use crate::kernel::{FileTableId, RlimitSet};
 
 pub use carrick_el1_abi::{
-    clear_pending_host_work, get_el1_region_host_ptr, get_orig_arg0, mark_pending_host_work,
-    mark_pending_host_work_all, mark_pending_host_work_for_task, record_el1_region_host_ptr,
-    take_served_with_work, update_current_task_file_table_for_task,
+    El1TaskId, clear_pending_host_work, get_el1_region_host_ptr, get_orig_arg0,
+    mark_pending_host_work, mark_pending_host_work_all, mark_pending_host_work_for_task,
+    record_el1_region_host_ptr, take_served_with_work, update_current_task_file_table_for_task,
 };
+
+impl From<crate::kernel::ids::LinuxTid> for El1TaskId {
+    fn from(tid: crate::kernel::ids::LinuxTid) -> Self {
+        El1TaskId::from_linux_tid(tid.raw())
+    }
+}
+
+impl From<crate::kernel::ids::TaskId> for El1TaskId {
+    fn from(id: crate::kernel::ids::TaskId) -> Self {
+        El1TaskId::from_linux_tid(id.raw())
+    }
+}
 
 /// Clear the recorded host virtual address of the EL1 kernel aperture.
 pub fn clear_el1_region_host_ptr() {
@@ -28,7 +40,7 @@ pub fn clear_el1_region_host_ptr() {
 }
 
 /// Publish the current task binding for an executor vCPU mailbox slot into the EL1 aperture.
-pub fn publish_current_task(slot: usize, task_id: u64, generation: u64, file_table: u64) {
+pub fn publish_current_task(slot: usize, task_id: El1TaskId, generation: u64, file_table: u64) {
     let ptr = get_el1_region_host_ptr();
     if ptr == 0 || slot >= 256 {
         return;
@@ -37,7 +49,7 @@ pub fn publish_current_task(slot: usize, task_id: u64, generation: u64, file_tab
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
     current_task.pending_host_work.store(0, Ordering::Relaxed);
     current_task.served_with_work.store(0, Ordering::Relaxed);
-    current_task.task_id.store(task_id, Ordering::Relaxed);
+    current_task.task_id.store(task_id.raw(), Ordering::Relaxed);
     current_task.file_table.store(file_table, Ordering::Relaxed);
     current_task.generation.store(generation, Ordering::Release);
 }
@@ -2100,7 +2112,7 @@ mod tests {
             let ctx = dispatcher.capture_one_task_context().unwrap();
             let table = ctx.task().leader_file_table().unwrap();
             let old_table_id = table.id().raw();
-            let tid = ctx.thread().key().tid.raw() as u64;
+            let tid = El1TaskId::from_linux_tid(ctx.thread().key().tid.raw());
 
             // Publish current task for vCPU slot 0
             publish_current_task(0, tid, 1, old_table_id);

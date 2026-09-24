@@ -368,7 +368,9 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
 pub fn publish_pending_for_with_wake(tid: i32, signum: i32, wake: PublicationWake) {
     crate::probes::signal_publish(tid, signum, 1);
     carrick_signal_core::publish_pending_for(tid, signum);
-    carrick_el1_abi::mark_pending_host_work_for_task(tid as u64);
+    carrick_el1_abi::mark_pending_host_work_for_task(carrick_el1_abi::El1TaskId::from_linux_tid(
+        tid,
+    ));
     if !wake_thread_waiter(tid) {
         notify_waiters_fallback();
     }
