@@ -79,7 +79,18 @@ impl<'a> FsView<'a> {
             return Ok(StatRecord::synthetic("anon_inode:[io_uring]", 0, 0o600)
                 .with_fs_identity(carrick_vfs::FsIdentity::AnonInode));
         }
-        let Some(open) = open_file.description.read() else {
+        // An in-zone file's backing is brought up to date instead of the file
+        // being recalled: fstat reads the host metadata, and every in-zone
+        // write must be in it. Write-back errors stay sticky on the
+        // description, as at recall.
+        let _ = crate::el1_delegation::sync_to_host(&open_file.description);
+        let Some((is_named_pipe, fs_id, source)) = open_file.description.inspect_kind(|open| {
+            (
+                matches!(open, OpenDescription::HostPipe { pty: None, .. }),
+                open.fs_identity(),
+                open.stat_source(),
+            )
+        }) else {
             return Err(LINUX_EBADF);
         };
         // A named FIFO opened by path is modelled as a `HostPipe` (no pty),
@@ -92,10 +103,6 @@ impl<'a> FsView<'a> {
         // (test_rmtree_on_named_pipe). Anonymous pipe2() ends are also
         // `HostPipe` but carry no recorded path, so they keep the synthetic
         // record. Recover the real FIFO stat from the fd's recorded path.
-        let is_named_pipe = matches!(&*open, OpenDescription::HostPipe { pty: None, .. });
-        let fs_id = open.fs_identity();
-        let source = open.stat_source();
-        drop(open);
         if is_named_pipe
             && let Some(path) = self.lookup_recorded_fd_open_path(fd)
             && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, false)

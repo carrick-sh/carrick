@@ -693,9 +693,13 @@ impl<'a> FsView<'a> {
         let files = self.captured_file_table();
         let table = files.read_open_files();
         let open_file = table.get(&fd)?;
-        let description = open_file.description.read()?;
-        let path = description.open_path()?;
-        proc_ns_link(path).map(|t| t.to_owned())
+        // The recorded path is fixed at open: inspect without recalling.
+        open_file
+            .description
+            .inspect_kind(|description| {
+                proc_ns_link(description.open_path()?).map(|t| t.to_owned())
+            })
+            .flatten()
     }
 
     pub(super) fn install_proc_synthetic_bytes(

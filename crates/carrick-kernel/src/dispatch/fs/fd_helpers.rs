@@ -629,24 +629,24 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return;
         };
-        let (mask, is_dir) = {
-            let Some(open) = open_file.description.read() else {
-                return;
-            };
-            let writable = match &*open {
+        // Writability and kind are fixed at open: inspect without recalling.
+        let Some(Some((mask, is_dir))) = open_file.description.inspect_kind(|open| {
+            let writable = match open {
                 OpenDescription::File { writable, .. }
                 | OpenDescription::HostFile { writable, .. } => *writable,
                 // A synthetic file or a directory is always read-only.
                 OpenDescription::SyntheticFile { .. } | OpenDescription::Directory { .. } => false,
                 OpenDescription::ProcExecutable { .. } => false,
-                _ => return,
+                _ => return None,
             };
             let mask = if writable {
                 carrick_abi::LINUX_IN_CLOSE_WRITE
             } else {
                 carrick_abi::LINUX_IN_CLOSE_NOWRITE
             };
-            (mask, matches!(&*open, OpenDescription::Directory { .. }))
+            Some((mask, matches!(open, OpenDescription::Directory { .. })))
+        }) else {
+            return;
         };
         let Some(path) = self.lookup_recorded_fd_open_path(fd) else {
             return;

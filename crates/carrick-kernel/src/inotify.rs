@@ -1160,7 +1160,7 @@ impl InotifyState {
         cookie: u32,
         name: Option<&[u8]>,
     ) -> bool {
-        let _lock = crate::el1_inotify::InstanceLock::acquire(&zone);
+        let _lock = crate::el1_inotify::InstanceLock::acquire(zone);
         let was_empty = !zone.has_records() && inner.pending.is_empty();
         if zone.spilled.load(std::sync::atomic::Ordering::Acquire) == 0 {
             match zone.push_record(wd, mask, cookie, name) {
