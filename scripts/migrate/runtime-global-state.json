@@ -1524,6 +1524,22 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "HOST_HOLDER_SITES",
+      "fingerprint": "20429e67df0ae5c0da137d74e007372b4eee0575155daf1da034824e7a80d66a",
+      "classification": "carrier_infra",
+      "rationale": "Call site of the last host acquisition of each carrier-wide EL1 inode lock; read only to name the holder in a lock-timeout fatal."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "HOST_HOLDER_THREADS",
+      "fingerprint": "ca03dcbdfddc5bd53a51fd20298d96448940cb9ce75357df5d58147451b2f32f",
+      "classification": "carrier_infra",
+      "rationale": "Host thread of the last host acquisition of each carrier-wide EL1 inode lock; read only to name the holder in a lock-timeout fatal."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "symbol": "NEXT_INCARNATION",
       "fingerprint": "d61fa36f4ea30df3c347972b3d7041a2f1df505a9b50fa254c7cb47195314b8c",
       "classification": "monotonic_allocator",
