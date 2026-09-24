@@ -3793,18 +3793,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/fs/state.rs:638 in `new`, `std::fs::create_dir_all` accesses only the run-scoped host shared-memory directory used by `new`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/fs/state.rs:636 in `new`, `std::fs::create_dir_all` accesses only the run-scoped host shared-memory directory used by `new`.",
     "review_id": "HA-000171",
     "source": {
-      "byte_end": 24782,
-      "byte_start": 24759,
+      "byte_end": 24673,
+      "byte_start": 24650,
       "column": 25,
       "column_end": 48,
       "column_start": 25,
       "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-      "line": 638,
-      "line_end": 638,
-      "line_start": 638
+      "line": 636,
+      "line_end": 636,
+      "line_start": 636
     }
   },
   {
@@ -5851,18 +5851,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/inotify.rs:2072 in `scan_dir_entries`, `std::fs::read_dir` accesses only the resolved watched directory beneath the hostfs root used by `scan_dir_entries`.",
+    "rationale": "At crates/carrick-kernel/src/inotify.rs:2414 in `scan_dir_entries`, `std::fs::read_dir` accesses only the resolved watched directory beneath the hostfs root used by `scan_dir_entries`.",
     "review_id": "HA-000261",
     "source": {
-      "byte_end": 82419,
-      "byte_start": 82402,
+      "byte_end": 96478,
+      "byte_start": 96461,
       "column": 18,
       "column_end": 35,
       "column_start": 18,
       "file": "crates/carrick-kernel/src/inotify.rs",
-      "line": 2072,
-      "line_end": 2072,
-      "line_start": 2072
+      "line": 2414,
+      "line_end": 2414,
+      "line_start": 2414
     }
   },
   {
@@ -8453,18 +8453,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/fs/state.rs:646 in `new`, `std::fs::set_permissions` accesses only the run-scoped host shared-memory directory used by `new`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/fs/state.rs:644 in `new`, `std::fs::set_permissions` accesses only the run-scoped host shared-memory directory used by `new`.",
     "review_id": "HA-000369",
     "source": {
-      "byte_end": 25312,
-      "byte_start": 25288,
+      "byte_end": 25203,
+      "byte_start": 25179,
       "column": 21,
       "column_end": 45,
       "column_start": 21,
       "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-      "line": 646,
-      "line_end": 646,
-      "line_start": 646
+      "line": 644,
+      "line_end": 644,
+      "line_start": 644
     }
   },
   {
@@ -10875,18 +10875,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/fs/state.rs:637 in `new`, `std::process::id` accesses only the run-scoped host shared-memory directory used by `new`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/fs/state.rs:635 in `new`, `std::process::id` accesses only the run-scoped host shared-memory directory used by `new`.",
     "review_id": "HA-000494",
     "source": {
-      "byte_end": 24729,
-      "byte_start": 24713,
+      "byte_end": 24620,
+      "byte_start": 24604,
       "column": 73,
       "column_end": 89,
       "column_start": 73,
       "file": "crates/carrick-kernel/src/dispatch/fs/state.rs",
-      "line": 637,
-      "line_end": 637,
-      "line_start": 637
+      "line": 635,
+      "line_end": 635,
+      "line_start": 635
     }
   },
   {
@@ -11037,18 +11037,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mqueue.rs:1197 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue thread recipient used by `deliver_notify`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/mqueue.rs:1199 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue thread recipient used by `deliver_notify`.",
     "review_id": "HA-000501",
     "source": {
-      "byte_end": 45435,
-      "byte_start": 45419,
+      "byte_end": 45556,
+      "byte_start": 45540,
       "column": 40,
       "column_end": 56,
       "column_start": 40,
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1197,
-      "line_end": 1197,
-      "line_start": 1197
+      "line": 1199,
+      "line_end": 1199,
+      "line_start": 1199
     }
   },
   {
@@ -11064,18 +11064,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mqueue.rs:1225 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue signal recipient used by `deliver_notify`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/mqueue.rs:1227 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue signal recipient used by `deliver_notify`.",
     "review_id": "HA-000502",
     "source": {
-      "byte_end": 46699,
-      "byte_start": 46683,
+      "byte_end": 46820,
+      "byte_start": 46804,
       "column": 40,
       "column_end": 56,
       "column_start": 40,
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1225,
-      "line_end": 1225,
-      "line_start": 1225
+      "line": 1227,
+      "line_end": 1227,
+      "line_start": 1227
     }
   },
   {
@@ -14260,18 +14260,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/vcpu_kick.rs:419 in `spawn_signal_pump_inner`, `std::thread::Builder::new` acts only on the current HVF VM vCPU registry and kick helper used by `spawn_signal_pump_inner`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/vcpu_kick.rs:409 in `spawn_signal_pump_inner`, `std::thread::Builder::new` acts only on the current HVF VM vCPU registry and kick helper used by `spawn_signal_pump_inner`; no guest identity selects its host target.",
     "review_id": "HA-000591",
     "source": {
-      "byte_end": 18352,
-      "byte_start": 18327,
+      "byte_end": 17903,
+      "byte_start": 17878,
       "column": 18,
       "column_end": 43,
       "column_start": 18,
       "file": "crates/carrick-vmm-hvf/src/vcpu_kick.rs",
-      "line": 419,
-      "line_end": 419,
-      "line_start": 419
+      "line": 409,
+      "line_end": 409,
+      "line_start": 409
     }
   },
   {
@@ -15422,18 +15422,72 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/el1_delegation.rs:394 in `lock_delegated_file`, `std::thread::yield_now` acts only on the current host thread waiting on delegated file lock held by EL1 used by `lock_delegated_file`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/el1_delegation.rs:877 in `lock_delegated_file`, `std::thread::yield_now` acts only on the current host thread waiting on delegated file lock held by EL1 used by `lock_delegated_file`; no guest identity selects its host target.",
     "review_id": "HA-000671",
     "source": {
-      "byte_end": 13295,
-      "byte_start": 13273,
+      "byte_end": 32655,
+      "byte_start": 32633,
       "column": 9,
       "column_end": 31,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 394,
-      "line_end": 394,
-      "line_start": 394
+      "line": 877,
+      "line_end": 877,
+      "line_start": 877
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-YIELD-NOW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current host thread waiting on an in-zone inotify instance lock held by EL1 used by `HostInstanceLock::acquire`"
+    },
+    "expansion": null,
+    "operation": "std::thread::yield_now",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/el1_delegation.rs:1207 in `HostInstanceLock::acquire`, `std::thread::yield_now` acts only on the current host thread waiting on an in-zone inotify instance lock held by EL1 used by `HostInstanceLock::acquire`; no guest identity selects its host target.",
+    "review_id": "HA-000673",
+    "source": {
+      "byte_end": 44466,
+      "byte_start": 44444,
+      "column": 13,
+      "column_end": 35,
+      "column_start": 13,
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "line": 1207,
+      "line_end": 1207,
+      "line_start": 1207
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-YIELD-NOW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current host thread waiting on an in-zone inotify instance lock held by EL1 used by `InstanceLock::acquire`"
+    },
+    "expansion": null,
+    "operation": "std::thread::yield_now",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/el1_inotify.rs:48 in `InstanceLock::acquire`, `std::thread::yield_now` acts only on the current host thread waiting on an in-zone inotify instance lock held by EL1 used by `InstanceLock::acquire`; no guest identity selects its host target.",
+    "review_id": "HA-000672",
+    "source": {
+      "byte_end": 2129,
+      "byte_start": 2107,
+      "column": 13,
+      "column_end": 35,
+      "column_start": 13,
+      "file": "crates/carrick-kernel/src/el1_inotify.rs",
+      "line": 48,
+      "line_end": 48,
+      "line_start": 48
     }
   },
   {
