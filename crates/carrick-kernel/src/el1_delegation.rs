@@ -140,8 +140,10 @@ pub(crate) fn is_inode_delegated(inode: InodeIdentity) -> bool {
         if map.contains_key(&inode) {
             return true;
         }
-        if inode.dev == 0 {
-            return map.keys().any(|k| k.ino == inode.ino);
+        for (k, _) in map.iter() {
+            if (k.dev == 0 || inode.dev == 0) && k.ino == inode.ino {
+                return true;
+            }
         }
     }
     false
@@ -156,11 +158,9 @@ pub(crate) fn is_inode_delegated_by_other(inode: InodeIdentity, my_handle: u32) 
         if let Some((handle, _)) = map.get(&inode) {
             return *handle != my_handle;
         }
-        if inode.dev == 0 {
-            for (k, (handle, _)) in map.iter() {
-                if k.ino == inode.ino {
-                    return *handle != my_handle;
-                }
+        for (k, (handle, _)) in map.iter() {
+            if (k.dev == 0 || inode.dev == 0) && k.ino == inode.ino {
+                return *handle != my_handle;
             }
         }
     }
@@ -176,12 +176,10 @@ pub(crate) fn recall_by_inode(inode: InodeIdentity) -> bool {
         if let Some(map) = map.as_ref() {
             if let Some((_, weak)) = map.get(&inode) {
                 weak.upgrade()
-            } else if inode.dev == 0 {
-                map.iter()
-                    .find(|(k, _)| k.ino == inode.ino)
-                    .and_then(|(_, (_, weak))| weak.upgrade())
             } else {
-                None
+                map.iter()
+                    .find(|(k, _)| (k.dev == 0 || inode.dev == 0) && k.ino == inode.ino)
+                    .and_then(|(_, (_, weak))| weak.upgrade())
             }
         } else {
             None
@@ -471,7 +469,10 @@ pub(crate) fn delegate_locked(
             if cur_offset < 0 {
                 return Err(NotEligible::IoError);
             }
-            let inode = InodeIdentity::new(st.st_dev as u64, st.st_ino as u64);
+            let inode = fs.rootfs_vfs.path_inode_identity(path).unwrap_or_else(|| {
+                carrick_vfs::RootFsVfs::host_fd_inode_identity(host_fd.raw())
+                    .unwrap_or_else(|| InodeIdentity::new(st.st_dev as u64, st.st_ino as u64))
+            });
             (
                 path,
                 st.st_size as u64,
@@ -499,10 +500,15 @@ pub(crate) fn delegate_locked(
             if cur_len > DELEGATED_FILE_MAX_SIZE {
                 return Err(NotEligible::FileTooLarge);
             }
-            let inode = InodeIdentity::new(
-                0,
-                crate::dispatch::inode_for_path(std::path::Path::new(path)),
-            );
+            let inode = fs
+                .rootfs_vfs
+                .path_inode_identity(path.as_str())
+                .unwrap_or_else(|| {
+                    InodeIdentity::new(
+                        0,
+                        crate::dispatch::inode_for_path(std::path::Path::new(path.as_str())),
+                    )
+                });
             (
                 path.as_str(),
                 cur_len,
@@ -2201,8 +2207,12 @@ mod tests {
             let open1 = dispatcher.open_file(fd1).unwrap();
             let open2 = dispatcher.open_file(fd2).unwrap();
 
-            // Sibling open1 retains a mapping
-            let mapping = open1.description.retain_mapping().unwrap();
+            // Sibling open1 retains a mapping with inode identity
+            let inode = dispatcher
+                .fs()
+                .rootfs_vfs
+                .path_inode_identity("/test_map_shared_inode.txt");
+            let mapping = open1.description.retain_mapping_with_inode(inode).unwrap();
 
             // open2 delegation must be rejected because inode has active mapping
             let err = delegate(&open2, table_id, fd2, dispatcher.fs(), None, None).unwrap_err();
@@ -2219,11 +2229,62 @@ mod tests {
             assert_eq!(h, 1);
 
             // A new mapping on open1 must recall the delegated inode
-            let _mapping2 = open1.description.retain_mapping().unwrap();
+            let _mapping2 = open1.description.retain_mapping_with_inode(inode).unwrap();
             assert_eq!(
                 open2.description.delegation_handle(),
                 0,
                 "retaining mapping on sibling must recall delegated inode"
+            );
+        }
+
+        #[test]
+        fn test_in_memory_file_delegation_keyed_with_dentry_identity() {
+            let _region = TestEl1Region::new();
+            let dispatcher = crate::dispatch::SyscallDispatcher::new();
+            let ctx = dispatcher.capture_one_task_context().unwrap();
+            let table = ctx.task().leader_file_table().unwrap();
+            let table_id = table.id();
+
+            let path = "/test_inmem_dentry_ident.txt";
+            let fd = open_path_for_test(
+                &dispatcher,
+                &ctx,
+                path,
+                carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_RDWR,
+            );
+            let open_file = dispatcher.open_file(fd).unwrap();
+            let handle = delegate(&open_file, table_id, fd, dispatcher.fs(), None, None).unwrap();
+            assert_eq!(handle, 1);
+
+            // While delegated, DELEGATED_INODES must contain the inode
+            let delegated_inode = {
+                let map = DELEGATED_INODES.lock();
+                let map_ref = map.as_ref().unwrap();
+                let (inode, (h, _)) = map_ref.iter().next().unwrap();
+                assert_eq!(*h, handle);
+                *inode
+            };
+
+            // Querying identity alone must NOT recall:
+            let dentry_ident = dispatcher
+                .fs()
+                .rootfs_vfs
+                .path_inode_identity(path)
+                .unwrap();
+            assert_eq!(dentry_ident, delegated_inode);
+            assert_eq!(open_file.description.delegation_handle(), 1);
+
+            // Accessing the file via namei/dentry lookup must hit the choke point and recall it!
+            let _ = dispatcher.fs().rootfs_vfs.dentry_cache.lookup_path(
+                path,
+                false,
+                &*dispatcher.fs().rootfs_vfs.overlay,
+                dispatcher.fs().rootfs_vfs.rootfs.as_ref(),
+            );
+            assert_eq!(
+                open_file.description.delegation_handle(),
+                0,
+                "namei dentry lookup must recall delegated in-memory file at choke point"
             );
         }
     }
