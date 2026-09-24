@@ -63,6 +63,78 @@ print "contract_ok\n";
     );
 }
 
+/// Contract `kernel.el1.files.shared-inode`: two open descriptions of one
+/// inode stay in the zone. Each keeps its own offset (open(2): a new open file
+/// description); both see the same bytes (one inode). The script checks those
+/// Linux semantics itself and dies on any violation; the counters prove the
+/// interleaved loop is served in-guest.
+#[test]
+fn el1_files_shared_inode_contract() {
+    const ITERATIONS: u64 = 2000;
+    const MIN_SERVED_PERMILLE: u64 = 900;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    carrick_kernel::el1_delegation::reset_delegation_counts();
+
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command([
+                "/usr/bin/perl",
+                "-e",
+                r#"
+open(my $a, "+>", "/tmp/shared_inode.txt") or die "open a: $!";
+open(my $b, "+<", "/tmp/shared_inode.txt") or die "open b: $!";
+my $buf;
+for (my $i = 0; $i < 2000; $i++) {
+    my $c = chr(65 + $i % 26);
+    sysseek($a, 0, 0) // die "seek a: $!";
+    syswrite($a, $c) == 1 or die "write a: $!";
+    sysseek($b, 0, 0) // die "seek b: $!";
+    sysread($b, $buf, 1) == 1 or die "read b at $i: $!";
+    $buf eq $c or die "b saw '$buf' for '$c' at $i";
+}
+# Independent offsets: both are at 1; a write through a at 1 is read by b at 1.
+sysseek($a, 0, 1) == 1 or die "a offset";
+sysseek($b, 0, 1) == 1 or die "b offset";
+syswrite($a, "xyz") == 3 or die "write xyz";
+sysread($b, $buf, 3) == 3 or die "read xyz: $!";
+$buf eq "xyz" or die "b read '$buf'";
+my @st = stat($b);
+$st[7] == 4 or die "size $st[7]";
+print "shared_inode_ok
+";
+"#,
+            ])
+            .run_blocking(),
+    );
+
+    assert!(
+        result.success(),
+        "exit_code={}: {}",
+        result.exit_code,
+        result.stderr_utf8()
+    );
+    assert_eq!(result.stdout_utf8().trim(), "shared_inode_ok");
+    let counters = read_el1_counters().expect("EL1 counters should be populated");
+    let population = carrick_kernel::el1_delegation::delegation_counts();
+    let mut failures = Vec::new();
+    for (nr, count) in [
+        (62usize, 2 * ITERATIONS),
+        (63, ITERATIONS),
+        (64, ITERATIONS),
+    ] {
+        let served = counters.served[nr].load(Ordering::Relaxed);
+        if served * 1000 < count * MIN_SERVED_PERMILLE {
+            failures.push(format!("syscall {nr}: served {served} of {count}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "shared-inode loop not served in-guest: {failures:?}; population {population:?}"
+    );
+}
+
 /// Read-after-write from second process after first process exits (proving recall on teardown).
 #[test]
 fn el1_files_recall_on_teardown() {
