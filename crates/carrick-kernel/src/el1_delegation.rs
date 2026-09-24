@@ -1362,11 +1362,71 @@ pub(crate) fn recall_locked(
     file.clear_marks();
     crate::el1_inotify::invalidate_name_cache_file(handle);
     let guest_offset = file.offset.load(Ordering::Acquire);
+    file.zero_filled_mask.store(0, Ordering::Release);
+    let rootfs = binding.rootfs.upgrade();
+    let mut first_error = write_back_locked(
+        description,
+        open,
+        file,
+        handle,
+        identity,
+        rootfs.as_deref(),
+        &binding.sparse,
+    )
+    .err();
+    let mut record = |err: carrick_abi::LinuxErrno| {
+        description.common().record_writeback_error(err);
+        first_error.get_or_insert(err);
+    };
+    if let OpenDescription::HostFile { host_fd, .. } = open {
+        if unsafe { libc::lseek(host_fd.raw(), guest_offset as libc::off_t, libc::SEEK_SET) } < 0 {
+            record(crate::host_to_linux_errno(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            ));
+        }
+    }
+    fd_map_clear_handle(region_ptr, handle);
+    file.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
+    file.unlock();
+    free_handle(handle);
+    description.set_delegation_handle(0);
+
+    {
+        let mut owners = OWNERS.lock();
+        if let Some(map) = owners.as_mut() {
+            if let Some(owner) = map.get_mut(&identity) {
+                owner.state = OwnerState::Host;
+            }
+        }
+        ACTIVE_DELEGATIONS.fetch_sub(1, Ordering::AcqRel);
+        OWNERS_CHANGED.notify_all();
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Write a delegated file's in-zone size and dirty pages back to its host fd,
+/// with the object locked by the host and the description's write guard held.
+/// Ownership does not change: the zone keeps serving the file afterwards, and
+/// the zero-filled pages stay valid in the cache. Errors stay sticky on the
+/// description; the first is returned.
+fn write_back_locked(
+    description: &FileDescription,
+    open: &mut OpenDescription,
+    file: &DelegatedFile,
+    handle: u32,
+    identity: InodeIdentity,
+    rootfs: Option<&carrick_vfs::RootFsVfs>,
+    sparse: &crate::dispatch::fs::HostSparseExtentsRegistry,
+) -> Result<(), carrick_abi::LinuxErrno> {
+    let region_ptr = get_el1_region_host_ptr();
     let guest_size = file.size.load(Ordering::Acquire);
     let dirty = file.dirty_mask.swap(0, Ordering::AcqRel);
-    file.zero_filled_mask.store(0, Ordering::Release);
     let cache = delegated_cache(region_ptr, handle);
-    let rootfs = binding.rootfs.upgrade();
 
     let mut first_error = None;
     let mut record = |err: carrick_abi::LinuxErrno| {
@@ -1386,9 +1446,7 @@ pub(crate) fn recall_locked(
         // hole, exactly as the host write path would.
         size_changed = metadata.size as u64 != guest_size;
         if *writable && size_changed {
-            binding
-                .sparse
-                .truncate_host_sparse_extents(host_fd.raw(), guest_size);
+            sparse.truncate_host_sparse_extents(host_fd.raw(), guest_size);
             if unsafe { libc::ftruncate(host_fd.raw(), guest_size as libc::off_t) } != 0 {
                 record(crate::host_to_linux_errno(
                     std::io::Error::last_os_error()
@@ -1410,59 +1468,86 @@ pub(crate) fn recall_locked(
         let len = DELEGATED_PAGE_SIZE.min(guest_size - page_offset) as usize;
         // SAFETY: the page lies inside this handle's cache slot.
         let bytes = unsafe { std::slice::from_raw_parts(cache.add(page_offset as usize), len) };
-        match crate::dispatch::fs::rw::commit_bytes_at_offset(
-            open,
-            page_offset,
-            bytes,
-            rootfs.as_deref(),
-        ) {
+        match crate::dispatch::fs::rw::commit_bytes_at_offset(open, page_offset, bytes, rootfs) {
             Ok(written) => {
                 if let OpenDescription::HostFile { host_fd, .. } = open {
-                    binding
-                        .sparse
-                        .record_host_sparse_write(host_fd, page_offset, written);
+                    sparse.record_host_sparse_write(host_fd, page_offset, written);
                 }
             }
             Err(err) => record(err),
         }
     }
-    if let OpenDescription::HostFile { host_fd, .. } = open {
-        if unsafe { libc::lseek(host_fd.raw(), guest_offset as libc::off_t, libc::SEEK_SET) } < 0 {
-            record(crate::host_to_linux_errno(
-                std::io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO),
-            ));
-        }
-    }
     // The host write path invalidates cached stat state after every write;
     // the guest's writes need the same, once, now that they reached the host.
     if (dirty != 0 || size_changed)
-        && let Some(vfs) = rootfs.as_deref()
+        && let Some(vfs) = rootfs
     {
         vfs.notify_inode_changed("", Some(identity));
-    }
-
-    fd_map_clear_handle(region_ptr, handle);
-    file.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
-    file.unlock();
-    free_handle(handle);
-    description.set_delegation_handle(0);
-
-    {
-        let mut owners = OWNERS.lock();
-        if let Some(map) = owners.as_mut() {
-            if let Some(owner) = map.get_mut(&identity) {
-                owner.state = OwnerState::Host;
-            }
-        }
-        ACTIVE_DELEGATIONS.fetch_sub(1, Ordering::AcqRel);
-        OWNERS_CHANGED.notify_all();
     }
     match first_error {
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+/// Bring a delegated file's host backing up to date without recalling it, so
+/// a host operation that reads the backing (fstat's size and times) sees every
+/// in-zone write. A no-op for a description that is not delegated.
+pub(crate) fn sync_to_host(description: &FileDescription) -> Result<(), carrick_abi::LinuxErrno> {
+    if description.delegation_handle() == 0 {
+        return Ok(());
+    }
+    let Some(d) = description.open_description() else {
+        return Ok(());
+    };
+    let mut guard = d.write();
+    let handle = description.delegation_handle();
+    if handle == 0 {
+        return Ok(());
+    }
+    let Some(identity) = description.el1_identity() else {
+        carrick_fatal!(
+            "el1_delegation",
+            "delegated description (handle={handle}) has no inode registration"
+        );
+    };
+    let (rootfs, sparse) = {
+        let owners = OWNERS.lock();
+        match owners.as_ref().and_then(|map| map.get(&identity)) {
+            Some(Owner {
+                state: OwnerState::Guest(binding),
+                ..
+            }) if binding.handle == handle => (binding.rootfs.clone(), binding.sparse.clone()),
+            _ => carrick_fatal!(
+                "el1_delegation",
+                "sync of handle={handle} found no matching Guest owner for dev={} ino={}",
+                identity.dev,
+                identity.ino
+            ),
+        }
+    };
+    let region_ptr = get_el1_region_host_ptr();
+    if region_ptr == 0 {
+        return Ok(());
+    }
+    let file = delegated_file_object(region_ptr, handle);
+    lock_delegated_file(file, handle);
+    let result = if file.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST {
+        let rootfs = rootfs.upgrade();
+        write_back_locked(
+            description,
+            &mut guard,
+            file,
+            handle,
+            identity,
+            rootfs.as_deref(),
+            &sparse,
+        )
+    } else {
+        Ok(())
+    };
+    file.unlock();
+    result
 }
 
 #[cfg(test)]
@@ -1625,6 +1710,34 @@ mod tests {
             };
             assert_eq!(metadata.size, 11);
             assert_eq!(unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) }, 11);
+        }
+
+        #[test]
+        fn sync_writes_back_in_zone_bytes_without_recalling() {
+            let _region = Region::new();
+            let tmp = temp_with(b"hello");
+            let open = open_host(&tmp);
+            let handle = delegate_default(&open, 3).expect("eligible");
+            guest_write(handle, 5, b" world");
+            sync_to_host(&open.description).expect("sync");
+            // The backing has every in-zone write; the zone still owns the file.
+            assert_eq!(host_bytes(&tmp), b"hello world");
+            assert_eq!(open.description.delegation_handle(), handle);
+            let file = delegated_file_object(get_el1_region_host_ptr(), handle);
+            assert_eq!(file.dirty_mask.load(Ordering::Relaxed), 0);
+            assert_eq!(file.state.load(Ordering::Relaxed), DELEGATED_STATE_GUEST);
+            let size = open
+                .description
+                .inspect_kind(|open| match open {
+                    OpenDescription::HostFile { metadata, .. } => metadata.size,
+                    _ => panic!("host file"),
+                })
+                .unwrap();
+            assert_eq!(size, 11);
+            // Later in-zone writes still reach the backing at recall.
+            guest_write(handle, 11, b"!");
+            recall(&open.description).expect("recall");
+            assert_eq!(host_bytes(&tmp), b"hello world!");
         }
 
         #[test]

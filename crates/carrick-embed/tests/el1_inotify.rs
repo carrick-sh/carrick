@@ -16,6 +16,7 @@ use carrick_image::PullPolicy;
 fn el1_inotify_contract() {
     let _guard = common::guest_lock();
     reset_el1_counters();
+    carrick_kernel::el1_delegation::reset_delegation_counts();
 
     let result = common::run_or_fail(
         ContainerBuilder::from_image(common::SMOKE_IMAGE)
@@ -77,6 +78,10 @@ print "contract_ok\n";
     let served_writes = counters.served[64].load(Ordering::Relaxed);
     let served_seeks = counters.served[62].load(Ordering::Relaxed);
 
+    eprintln!(
+        "el1_inotify_contract population: {:?}",
+        carrick_kernel::el1_delegation::delegation_counts()
+    );
     eprintln!(
         "el1_inotify_contract: add_watch served={served_add_watch}, fwd={forwarded_add_watch}; rm_watch served={served_rm_watch}, fwd={forwarded_rm_watch}; write served={served_writes}; seek served={served_seeks}"
     );

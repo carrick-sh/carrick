@@ -413,14 +413,17 @@ impl<'a> FsView<'a> {
     /// host fd in one fd-table lookup.
     pub(super) fn pty_info(&self, fd: i32) -> Option<(crate::vfs::PtyRole, i32)> {
         self.open_file(fd)
-            .and_then(|of| match of.description.read().as_deref() {
-                Some(OpenDescription::HostPipe {
-                    host_fd,
-                    pty: Some(role),
-                    ..
-                }) => Some((*role, host_fd.raw())),
-                _ => None,
+            .and_then(|of| {
+                of.description.inspect_kind(|open| match open {
+                    OpenDescription::HostPipe {
+                        host_fd,
+                        pty: Some(role),
+                        ..
+                    } => Some((*role, host_fd.raw())),
+                    _ => None,
+                })
             })
+            .flatten()
     }
 
     pub(super) fn tty0_console(
@@ -428,13 +431,14 @@ impl<'a> FsView<'a> {
         fd: i32,
     ) -> Option<Arc<dyn carrick_vfs::VirtualConsoleDevice>> {
         let of = self.open_file(fd)?;
-        let desc = &of.description;
-        match desc.read().as_deref() {
-            Some(crate::dispatch::fd_table::OpenDescription::VirtualConsole {
-                console, ..
-            }) => Some(Arc::clone(console)),
-            _ => None,
-        }
+        of.description
+            .inspect_kind(|open| match open {
+                crate::dispatch::fd_table::OpenDescription::VirtualConsole { console, .. } => {
+                    Some(Arc::clone(console))
+                }
+                _ => None,
+            })
+            .flatten()
     }
 
     pub(super) fn fd_is_controlling_tty(
@@ -670,6 +674,19 @@ impl<'a> FsView<'a> {
             // (open13 issues FIGETBSZ on an O_PATH fd).
             if this.fd_is_o_path(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            // An in-zone description is always a regular host file in the fd
+            // table, which the terminal-query arms below answer with ENOTTY
+            // (`fd_is_tty` is false for any tabled fd). Answer isatty's probe
+            // here, before the kind probes further down recall the file.
+            if matches!(
+                ioctl_request,
+                LINUX_TCGETS | LINUX_TCGETS2 | LINUX_TIOCGWINSZ
+            ) && this
+                .open_file(fd.0)
+                .is_some_and(|file| file.description.delegation_handle() != 0)
+            {
+                return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
             }
             if ioctl_request == carrick_abi::LINUX_PROCMAP_QUERY && fd_is_proc_maps(this, fd.0) {
                 return Ok(procmap_query(this, cx.kernel, &mut *cx.memory, arg));

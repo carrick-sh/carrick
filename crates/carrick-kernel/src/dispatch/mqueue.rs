@@ -550,11 +550,13 @@ impl<'a> IpcView<'a> {
     fn mqueue_description_queue(
         description: &Arc<crate::kernel::FileDescription>,
     ) -> Option<Arc<MqueueInner>> {
-        let open = description.read()?;
-        let OpenDescription::Mqueue { queue, .. } = &*open else {
-            return None;
-        };
-        Some(Arc::clone(queue))
+        // A kind probe: never recall an in-zone file to learn it is not a queue.
+        description
+            .inspect_kind(|open| match open {
+                OpenDescription::Mqueue { queue, .. } => Some(Arc::clone(queue)),
+                _ => None,
+            })
+            .flatten()
     }
 
     /// One fd slot has already left `files`. Retire a registration only when

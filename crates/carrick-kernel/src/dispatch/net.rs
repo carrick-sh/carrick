@@ -701,8 +701,9 @@ impl<'a> NetView<'a> {
         desc: &Arc<crate::kernel::FileDescription>,
         materialize_pipe_readiness: bool,
     ) -> Option<HostFd> {
-        let open = desc.read()?;
-        match &*open {
+        // Readiness depends only on the kind and its host objects, fixed at
+        // open: inspect without recalling an in-zone file.
+        desc.inspect_kind(|open| match open {
             OpenDescription::HostPipe { host_fd, .. }
             | OpenDescription::HostFile { host_fd, .. } => Some(host_fd.view()),
             OpenDescription::HostSocket { host_fd, base, .. } => {
@@ -743,7 +744,8 @@ impl<'a> NetView<'a> {
                 _ => None,
             },
             _ => None,
-        }
+        })
+        .flatten()
     }
 
     /// Return the host fd backing an open file description (`&Arc<FileDescription>`) for ppoll's fast path.
