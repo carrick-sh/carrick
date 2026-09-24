@@ -6233,7 +6233,8 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
                     },
                 },
             ),
-        ]),
+        ])
+        .into(),
         ..HvpatchFrameInventory::default()
     }));
 
@@ -6793,7 +6794,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     }
     let stale_inventory = HvpatchFrameInventory {
         initialized: true,
-        extents: stale_extents,
+        extents: stale_extents.into(),
         ..HvpatchFrameInventory::default()
     };
     let stale_mm_access = MmAccessState::new(
@@ -8908,7 +8909,8 @@ fn foreign_mm_failure_injection_at_composition_boundaries() {
                 stage2_length: sentinel_len,
                 stage2_owner: sentinel_owner,
             },
-        )]),
+        )])
+        .into(),
         frames: sentinel_frames,
         ..HvpatchFrameInventory::default()
     }));
