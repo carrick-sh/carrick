@@ -2,7 +2,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 #[cfg(test)]
 use std::time::Duration;
@@ -825,6 +825,7 @@ pub struct DescriptionCommon {
     socket_flows: Mutex<Option<SocketFlows>>,
     cork: Mutex<SocketCork>,
     writeback_err: AtomicI32,
+    recall_count: AtomicU32,
 }
 
 impl DescriptionCommon {
@@ -843,6 +844,7 @@ impl DescriptionCommon {
             socket_flows: Mutex::new(None),
             cork: Mutex::new(SocketCork::default()),
             writeback_err: AtomicI32::new(0),
+            recall_count: AtomicU32::new(0),
         }
     }
 
@@ -861,6 +863,7 @@ impl DescriptionCommon {
             socket_flows: Mutex::new(None),
             cork: Mutex::new(SocketCork::default()),
             writeback_err: AtomicI32::new(0),
+            recall_count: AtomicU32::new(0),
         }
     }
 
@@ -1019,6 +1022,16 @@ impl DescriptionCommon {
         } else {
             None
         }
+    }
+
+    #[inline]
+    pub(crate) fn record_recall(&self) -> u32 {
+        self.recall_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    #[inline]
+    pub(crate) fn recall_count(&self) -> u32 {
+        self.recall_count.load(Ordering::Acquire)
     }
 }
 
