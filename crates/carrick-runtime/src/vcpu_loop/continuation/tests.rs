@@ -239,7 +239,7 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
         );
     }
     let dispatch = loop_source
-        .split("fn redispatch_threaded_syscall_for_executor")
+        .split("fn redispatch_threaded_syscall_for_executor_inner")
         .nth(1)
         .and_then(|tail| tail.split("\n    fn ").next())
         .expect("dispatch service body");
