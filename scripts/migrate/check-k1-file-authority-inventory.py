@@ -27,7 +27,11 @@ PATTERNS = {
         r"lock_splice_pushback|read_epoll_fds|write_epoll_fds|"
         r"epoll_wake_registry|nofile_soft|set_nofile_soft)\b"
     ),
-    "description_guard": re.compile(r"\.description\.(read|write|try_read)\("),
+    # The description accessors name their effect (inspect vs recall-for-I/O);
+    # every guard-returning form is a description-guard site.
+    "description_guard": re.compile(
+        r"\.description\.(read_for_io|write_for_io|inspect|try_inspect)\("
+    ),
     "description_backing": re.compile(
         r"\b(open_description\(\)|concrete_backing::<|OpenDescriptionRef\b)"
     ),

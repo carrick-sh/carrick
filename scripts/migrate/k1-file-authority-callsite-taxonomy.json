@@ -8,7 +8,7 @@
     "write_attempt": 22,
     "stream_transfer": 11,
     "lifecycle": 39,
-    "mapping_ring": 12,
+    "mapping_ring": 11,
     "epoll_wait": 30
   },
   "entries": [
@@ -18,7 +18,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().ok_or(LINUX_EINVAL)?;",
+      "text": "let open = open_file.description.inspect().ok_or(LINUX_EINVAL)?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "bpf_map_fd",
       "migration_family": "inspect_misc"
@@ -29,7 +29,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let mut open = self.description.write().ok_or(super::LINUX_EBADF)?;",
+      "text": "let mut open = self.description.write_for_io().ok_or(super::LINUX_EBADF)?;",
       "scope_kind": "test_or_definition",
       "enclosing_function": "set_ipv6_v6only",
       "migration_family": "inspect_misc"
@@ -40,7 +40,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = self.description.read() else {",
+      "text": "let Some(open) = self.description.read_for_io() else {",
       "scope_kind": "test_or_definition",
       "enclosing_function": "record_host_file_absolute_offset",
       "migration_family": "inspect_misc"
@@ -129,7 +129,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut desc) = open_file.description.write() {",
+      "text": "if let Some(mut desc) = open_file.description.write_for_io() {",
       "scope_kind": "test_or_definition",
       "enclosing_function": "rename_open_paths",
       "migration_family": "slot_description_mutation"
@@ -158,51 +158,51 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3036,
+      "line": 3060,
       "categories": [
         "description_backing"
       ],
       "text": "let d = self.open_description()?;",
       "scope_kind": "test_or_definition",
-      "migration_family": "read_attempt",
-      "enclosing_function": "FileDescription::read"
+      "enclosing_function": "FileDescription::read",
+      "migration_family": "read_attempt"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3042,
+      "line": 3067,
       "categories": [
         "description_backing"
       ],
       "text": "let d = self.open_description()?;",
       "scope_kind": "test_or_definition",
-      "migration_family": "read_attempt",
-      "enclosing_function": "FileDescription::try_read"
+      "enclosing_function": "FileDescription::try_read",
+      "migration_family": "read_attempt"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3065,
+      "line": 3086,
       "categories": [
         "description_backing"
       ],
       "text": "let d = self.open_description()?;",
       "scope_kind": "test_or_definition",
-      "migration_family": "write_attempt",
-      "enclosing_function": "FileDescription::write"
+      "enclosing_function": "FileDescription::write",
+      "migration_family": "write_attempt"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3079,
+      "line": 3111,
       "categories": [
         "description_backing"
       ],
       "text": "let d = self.open_description()?;",
       "scope_kind": "test_or_definition",
-      "migration_family": "write_attempt",
-      "enclosing_function": "FileDescription::try_write_for_test"
+      "enclosing_function": "FileDescription::try_write_for_test",
+      "migration_family": "write_attempt"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3093,
+      "line": 3125,
       "categories": [
         "description_backing"
       ],
@@ -217,7 +217,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fd_access",
       "migration_family": "inspect_misc"
@@ -228,7 +228,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "set_fd_times",
       "migration_family": "slot_description_mutation"
@@ -239,7 +239,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|of| match of.description.read().as_deref() {",
+      "text": ".and_then(|of| match of.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fchown_by_fd",
       "migration_family": "inspect_misc"
@@ -250,7 +250,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|of| match of.description.read().as_deref() {",
+      "text": ".and_then(|of| match of.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fchmod",
       "migration_family": "inspect_misc"
@@ -261,7 +261,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = of.description.write() {",
+      "text": "if let Some(mut open) = of.description.write_for_io() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fchmod",
       "migration_family": "inspect_misc"
@@ -338,7 +338,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let desc = open_file.description.read()?;",
+      "text": "let desc = open_file.description.read_for_io()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "materialize_anon_fd_to",
       "migration_family": "inspect_misc"
@@ -349,7 +349,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "getdents64",
       "migration_family": "create_install"
@@ -360,7 +360,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|f| f.description.read().and_then(|g| g.open_path().map(str::to_owned)))",
+      "text": ".and_then(|f| f.description.inspect().and_then(|g| g.open_path().map(str::to_owned)))",
       "scope_kind": "production_callsite",
       "enclosing_function": "readlinkat",
       "migration_family": "inspect_misc"
@@ -383,7 +383,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "f.description.read().and_then(|g| g.readlink_target())",
+      "text": "f.description.inspect().and_then(|g| g.readlink_target())",
       "scope_kind": "production_callsite",
       "enclosing_function": "readlinkat",
       "migration_family": "inspect_misc"
@@ -559,7 +559,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.read_for_io()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "regular_host_file_fd",
       "migration_family": "inspect_misc"
@@ -570,7 +570,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.read_for_io()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "regular_host_file_write_fd",
       "migration_family": "write_attempt"
@@ -581,7 +581,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "host_socket_fd",
       "migration_family": "create_install"
@@ -592,7 +592,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "inotify_state",
       "migration_family": "create_install"
@@ -603,7 +603,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "fanotify_group",
       "migration_family": "inspect_misc"
@@ -625,7 +625,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "inotify_emit_for_fd",
       "migration_family": "create_install"
@@ -636,7 +636,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "inotify_close_for_fd",
       "migration_family": "create_install"
@@ -647,7 +647,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fanotify_emit_for_fd",
       "migration_family": "inspect_misc"
@@ -658,7 +658,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "pipe_reader",
       "migration_family": "read_attempt"
@@ -669,7 +669,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "pipe_writer",
       "migration_family": "inspect_misc"
@@ -680,7 +680,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fanotify_close_for_fd",
       "migration_family": "inspect_misc"
@@ -691,7 +691,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "host_pipe_read_fd",
       "migration_family": "read_attempt"
@@ -702,7 +702,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "host_pipe_end",
       "migration_family": "create_install"
@@ -713,7 +713,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "splice_output_errno",
       "migration_family": "stream_transfer"
@@ -724,14 +724,14 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".is_some_and(|open_file| match open_file.description.read().as_deref() {",
+      "text": "|open_file| match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fd_is_random_device",
       "migration_family": "inspect_misc"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 485,
+      "line": 486,
       "categories": [
         "table_guard"
       ],
@@ -742,40 +742,40 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 491,
+      "line": 492,
       "categories": [
         "description_guard"
       ],
-      "text": "}) = of.description.read().as_deref()",
+      "text": "}) = of.description.inspect().as_deref()",
       "scope_kind": "production_callsite",
       "enclosing_function": "pty_winsize_target",
       "migration_family": "inspect_misc"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 515,
+      "line": 516,
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "ficlone_fs",
       "migration_family": "inspect_misc"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 604,
+      "line": 605,
       "categories": [
         "description_guard"
       ],
-      "text": "let g = of.description.read()?;",
+      "text": "let g = of.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "ficlone_errno",
       "migration_family": "lifecycle"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1323,
+      "line": 1324,
       "categories": [
         "table_guard"
       ],
@@ -786,7 +786,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1341,
+      "line": 1342,
       "categories": [
         "table_guard"
       ],
@@ -797,7 +797,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1353,
+      "line": 1354,
       "categories": [
         "table_guard"
       ],
@@ -808,7 +808,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1419,
+      "line": 1420,
       "categories": [
         "table_guard"
       ],
@@ -819,44 +819,44 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1538,
+      "line": 1539,
       "categories": [
         "description_guard"
       ],
-      "text": "Some(open_file) => match open_file.description.read().as_deref() {",
+      "text": "Some(open_file) => match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "ioctl",
       "migration_family": "create_install"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1612,
+      "line": 1613,
       "categories": [
         "description_guard"
       ],
-      "text": "let host_fd = match open_file.description.read().as_deref() {",
+      "text": "let host_fd = match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "ioctl",
       "migration_family": "create_install"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1635,
+      "line": 1636,
       "categories": [
         "description_guard"
       ],
-      "text": "Some(open_file) => match open_file.description.read().as_deref() {",
+      "text": "Some(open_file) => match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "ioctl",
       "migration_family": "create_install"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1667,
+      "line": 1668,
       "categories": [
         "description_guard"
       ],
-      "text": "Some(open_file) => match open_file.description.read().as_deref() {",
+      "text": "Some(open_file) => match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "ioctl",
       "migration_family": "create_install"
@@ -867,7 +867,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(open) = open_file.description.read() {",
+      "text": "if let Some(open) = open_file.description.inspect() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "legacy_aio_iocb_errno",
       "migration_family": "mapping_ring"
@@ -889,7 +889,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(desc) = open_file.description.read()",
+      "text": "if let Some(desc) = open_file.description.read_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "same_file_other_openers",
       "migration_family": "create_install"
@@ -900,7 +900,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "fasync_pipe_id_for_open_file",
       "migration_family": "create_install"
@@ -911,7 +911,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fcntl",
       "migration_family": "inspect_misc"
@@ -922,7 +922,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fcntl",
       "migration_family": "inspect_misc"
@@ -966,7 +966,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(open) = open_file.description.read()",
+      "text": "if let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite",
       "enclosing_function": "fcntl",
       "migration_family": "inspect_misc"
@@ -977,7 +977,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.write() else {",
+      "text": "let Some(open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fcntl",
       "migration_family": "inspect_misc"
@@ -988,7 +988,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let _guard = open_file.description.write();",
+      "text": "let _guard = open_file.description.write_for_io();",
       "scope_kind": "production_callsite",
       "enclosing_function": "fcntl",
       "migration_family": "inspect_misc"
@@ -999,7 +999,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fchdir",
       "migration_family": "inspect_misc"
@@ -1010,7 +1010,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let path = match open_file.description.read().as_deref() {",
+      "text": "let path = match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "dnotify_register",
       "migration_family": "inspect_misc"
@@ -1054,7 +1054,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "trusted_dir_of",
       "migration_family": "inspect_misc"
@@ -1065,29 +1065,18 @@
       "categories": [
         "description_guard"
       ],
-      "text": "Some(open_file) => match open_file.description.read().as_deref() {",
+      "text": "Some(open_file) => match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "openat2_anchor_for_dirfd",
       "migration_family": "create_install"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/pathres.rs",
-      "line": 481,
+      "line": 618,
       "categories": [
         "description_guard"
       ],
-      "text": "match self.open_file(dirfd as i32)?.description.read().as_deref() {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "absolute_input_path",
-      "migration_family": "inspect_misc"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs/pathres.rs",
-      "line": 613,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "Some(open_file) => match open_file.description.read().as_deref() {",
+      "text": "Some(open_file) => match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "resolve_at_path_inner",
       "migration_family": "inspect_misc"
@@ -1109,7 +1098,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "reopen_proc_self_fd",
       "migration_family": "create_install"
@@ -1120,7 +1109,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let desc = of.description.read();",
+      "text": "let desc = of.description.read_for_io();",
       "scope_kind": "production_callsite",
       "enclosing_function": "fdinfo_bytes",
       "migration_family": "inspect_misc"
@@ -1142,7 +1131,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "dispatch_rw",
       "migration_family": "create_install"
@@ -1153,7 +1142,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "dispatch_rw",
       "migration_family": "create_install"
@@ -1164,7 +1153,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "dispatch_rw",
       "migration_family": "create_install"
@@ -1175,7 +1164,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "dispatch_rw",
       "migration_family": "inspect_misc"
@@ -1186,7 +1175,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "dispatch_rw",
       "migration_family": "inspect_misc"
@@ -1197,7 +1186,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "dispatch_rw",
       "migration_family": "inspect_misc"
@@ -1208,7 +1197,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "dispatch_rw",
       "migration_family": "create_install"
@@ -1219,7 +1208,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "dispatch_rw",
       "migration_family": "inspect_misc"
@@ -1230,7 +1219,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "dispatch_rw",
       "migration_family": "write_attempt"
@@ -1241,7 +1230,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "dispatch_rw",
       "migration_family": "create_install"
@@ -1252,7 +1241,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read();",
+      "text": "let open = open_file.description.read_for_io();",
       "scope_kind": "production_callsite",
       "enclosing_function": "dispatch_rw",
       "migration_family": "inspect_misc"
@@ -1263,7 +1252,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "dispatch_rw",
       "migration_family": "create_install"
@@ -1274,7 +1263,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.read_for_io()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "host_fd_dev_ino",
       "migration_family": "inspect_misc"
@@ -1285,7 +1274,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.read_for_io()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "host_file_copy_info",
       "migration_family": "inspect_misc"
@@ -1296,7 +1285,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = in_file.description.read() else {",
+      "text": "let Some(open) = in_file.description.read_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "sendfile_offset",
       "migration_family": "stream_transfer"
@@ -1307,7 +1296,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = in_file.description.read() else {",
+      "text": "let Some(open) = in_file.description.read_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "sendfile_bytes",
       "migration_family": "stream_transfer"
@@ -1318,7 +1307,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "sendfile_dispatch",
       "migration_family": "create_install"
@@ -1329,7 +1318,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "Some(of) => match of.description.read().as_deref() {",
+      "text": "Some(of) => match of.description.read_for_io().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "copy_file_range",
       "migration_family": "stream_transfer"
@@ -1340,7 +1329,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = of.description.write()",
+      "text": "&& let Some(mut open) = of.description.write_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "copy_file_range",
       "migration_family": "inspect_misc"
@@ -1374,7 +1363,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|file| file.description.read()?.readlink_target())",
+      "text": ".and_then(|file| file.description.inspect()?.readlink_target())",
       "scope_kind": "test_or_definition",
       "enclosing_function": "host_stream_stats_distinguish_devices_and_preserve_pipe_identity",
       "migration_family": "create_install"
@@ -1385,7 +1374,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "open_file.description.read().as_deref(),",
+      "text": "open_file.description.inspect().as_deref(),",
       "scope_kind": "test_or_definition",
       "enclosing_function": "lane_dir_is_trusted",
       "migration_family": "inspect_misc"
@@ -1396,7 +1385,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().expect(\"open description\");",
+      "text": "let open = open_file.description.inspect().expect(\"open description\");",
       "scope_kind": "test_or_definition",
       "enclosing_function": "trusted_dirfd_lane_serves_walk_and_recurses",
       "migration_family": "inspect_misc"
@@ -1407,7 +1396,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().unwrap();",
+      "text": "let open = open_file.description.inspect().unwrap();",
       "scope_kind": "test_or_definition",
       "enclosing_function": "directory_listing_is_taken_at_read_time_not_open_time",
       "migration_family": "inspect_misc"
@@ -1418,7 +1407,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().expect(\"open description\");",
+      "text": "let open = open_file.description.inspect().expect(\"open description\");",
       "scope_kind": "test_or_definition",
       "enclosing_function": "trusted_dirfd_lane_falls_back_for_special_shapes",
       "migration_family": "inspect_misc"
@@ -1429,7 +1418,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let description = open.description.read().expect(\"open description\");",
+      "text": "let description = open.description.inspect().expect(\"open description\");",
       "scope_kind": "test_or_definition",
       "enclosing_function": "rlimit_fsize_straddling_regular_write_returns_only_the_limit_prefix",
       "migration_family": "write_attempt"
@@ -1462,7 +1451,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "bi_file.description.read().as_deref(),",
+      "text": "bi_file.description.inspect().as_deref(),",
       "scope_kind": "test_or_definition",
       "enclosing_function": "pipe_end_direction_matrix_and_fd_lifecycle_closure",
       "migration_family": "lifecycle"
@@ -1473,7 +1462,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "is_genuine_pipe",
       "migration_family": "create_install"
@@ -1484,7 +1473,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "splice_source_not_readable",
       "migration_family": "stream_transfer"
@@ -1495,7 +1484,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "host_pipe_splice_staging_target",
       "migration_family": "stream_transfer"
@@ -1506,7 +1495,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "splice_pipe_write_room",
       "migration_family": "stream_transfer"
@@ -1528,7 +1517,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(open) = open_file.description.read()",
+      "text": "if let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite",
       "enclosing_function": "splice_write_out",
       "migration_family": "inspect_misc"
@@ -1539,7 +1528,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "Some(of) => match of.description.read().as_deref() {",
+      "text": "Some(of) => match of.description.read_for_io().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "splice_write_out",
       "migration_family": "stream_transfer"
@@ -1550,7 +1539,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = file.description.read()?;",
+      "text": "let open = file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "splice_output_would_block",
       "migration_family": "stream_transfer"
@@ -1561,7 +1550,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "write_output_fd_inner",
       "migration_family": "write_attempt"
@@ -1572,7 +1561,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = file.description.read()?;",
+      "text": "let open = file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "splice_dispatch",
       "migration_family": "stream_transfer"
@@ -1583,7 +1572,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite",
       "enclosing_function": "splice_dispatch",
       "migration_family": "inspect_misc"
@@ -1594,7 +1583,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "splice_dispatch",
       "migration_family": "create_install"
@@ -1605,7 +1594,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "vmsplice_dispatch",
       "migration_family": "inspect_misc"
@@ -1616,7 +1605,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().ok_or(LINUX_ENOTSUP)?;",
+      "text": "let open = open_file.description.inspect().ok_or(LINUX_ENOTSUP)?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "xattr_target_path",
       "migration_family": "inspect_misc"
@@ -1649,7 +1638,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "write_shared_supported",
       "migration_family": "write_attempt"
@@ -1671,7 +1660,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(other_open) = other.description.read() else {",
+      "text": "let Some(other_open) = other.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "host_pipe_read_end_for_pipe_id",
       "migration_family": "read_attempt"
@@ -1693,7 +1682,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(other_open) = other.description.read() else {",
+      "text": "let Some(other_open) = other.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "host_pipe_write_end_for_pipe_id",
       "migration_family": "write_attempt"
@@ -1715,7 +1704,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(other_open) = other.description.try_read() else {",
+      "text": "let Some(other_open) = other.description.try_inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "host_pipe_read_end_buffered_bytes",
       "migration_family": "read_attempt"
@@ -1726,7 +1715,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "of.description.read().as_deref(),",
+      "text": "of.description.inspect().as_deref(),",
       "scope_kind": "production_callsite",
       "enclosing_function": "fd_lacks_fsync",
       "migration_family": "inspect_misc"
@@ -1737,7 +1726,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fallocate",
       "migration_family": "create_install"
@@ -1748,7 +1737,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "ftruncate",
       "migration_family": "create_install"
@@ -1759,7 +1748,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "open_file.description.read().as_deref(),",
+      "text": "open_file.description.inspect().as_deref(),",
       "scope_kind": "production_callsite",
       "enclosing_function": "sync_file_range",
       "migration_family": "inspect_misc"
@@ -1770,7 +1759,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "host_file_fd_for_flush",
       "migration_family": "inspect_misc"
@@ -1880,7 +1869,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(desc) = open_file.description.read() else {",
+      "text": "let Some(desc) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "readahead",
       "migration_family": "create_install"
@@ -1891,7 +1880,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let is_fifo = match open_file.description.read().as_deref() {",
+      "text": "let is_fifo = match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fadvise64",
       "migration_family": "inspect_misc"
@@ -1902,7 +1891,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "mmap",
       "migration_family": "inspect_misc"
@@ -1925,7 +1914,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.write();",
+      "text": "let open = open_file.description.write_for_io();",
       "scope_kind": "production_callsite",
       "enclosing_function": "mmap",
       "migration_family": "slot_description_mutation"
@@ -1936,7 +1925,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let path = match open_file.description.read().as_deref() {",
+      "text": "let path = match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "mmap",
       "migration_family": "inspect_misc"
@@ -1947,7 +1936,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "mmap",
       "migration_family": "create_install"
@@ -1958,7 +1947,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "mmap",
       "migration_family": "inspect_misc"
@@ -1969,7 +1958,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read();",
+      "text": "let open = open_file.description.read_for_io();",
       "scope_kind": "production_callsite",
       "enclosing_function": "mmap",
       "migration_family": "inspect_misc"
@@ -2031,18 +2020,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 1232,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "match &*mapper.description.read().expect(\"mapper open description\") {",
-      "scope_kind": "test_or_definition",
-      "enclosing_function": "shared_mmap_refreshes_an_independently_opened_vfs_inode",
-      "migration_family": "mapping_ring"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 1318,
+      "line": 1322,
       "categories": [
         "table_guard"
       ],
@@ -2068,7 +2046,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let classic_lock_release_fd = match open_file.description.read().as_deref() {",
+      "text": "let classic_lock_release_fd = match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "close_open_file_and_free_pty",
       "migration_family": "create_install"
@@ -2079,7 +2057,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(open) = open_file.description.read() {",
+      "text": "if let Some(open) = open_file.description.inspect() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "close_open_file_and_free_pty",
       "migration_family": "create_install"
@@ -2090,7 +2068,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "open_file.description.read().as_deref(),",
+      "text": "open_file.description.inspect().as_deref(),",
       "scope_kind": "production_callsite",
       "enclosing_function": "close_open_file_and_free_pty",
       "migration_family": "create_install"
@@ -2101,7 +2079,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(description) = open_file.description.read() else {",
+      "text": "let Some(description) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fsconfig",
       "migration_family": "inspect_misc"
@@ -2112,7 +2090,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(description) = open_file.description.read() else {",
+      "text": "let Some(description) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fsmount",
       "migration_family": "inspect_misc"
@@ -2123,7 +2101,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let mut open = self.description.write().ok_or(LINUX_EBADF)?;",
+      "text": "let mut open = self.description.write_for_io().ok_or(LINUX_EBADF)?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "enqueue",
       "migration_family": "write_attempt"
@@ -2145,7 +2123,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().ok_or(LINUX_EBADF)?;",
+      "text": "let open = open_file.description.inspect().ok_or(LINUX_EBADF)?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "mq_description",
       "migration_family": "inspect_misc"
@@ -2189,7 +2167,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.write() else {",
+      "text": "let Some(open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "mqueue_owner_alias_closed_known",
       "migration_family": "slot_description_mutation"
@@ -2200,7 +2178,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.write() else {",
+      "text": "let Some(open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "mqueue_retire_file_table_registration",
       "migration_family": "lifecycle"
@@ -2262,29 +2240,18 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1839,
+      "line": 1874,
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().expect(\"netlink description\");",
-      "scope_kind": "test_or_definition",
-      "enclosing_function": "netlink_bytes",
-      "migration_family": "inspect_misc"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1871,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = self.description.read();",
+      "text": "let open = self.description.inspect();",
       "scope_kind": "test_or_definition",
       "enclosing_function": "wake_task",
       "migration_family": "inspect_misc"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1908,
+      "line": 1911,
       "categories": [
         "table_guard"
       ],
@@ -2295,7 +2262,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1913,
+      "line": 1916,
       "categories": [
         "table_guard"
       ],
@@ -2306,7 +2273,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1924,
+      "line": 1927,
       "categories": [
         "table_guard"
       ],
@@ -2317,7 +2284,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 2590,
+      "line": 2593,
       "categories": [
         "table_guard"
       ],
@@ -2328,7 +2295,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 2751,
+      "line": 2754,
       "categories": [
         "table_guard"
       ],
@@ -2355,7 +2322,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fd_is_epollable",
       "migration_family": "epoll_wait"
@@ -2366,7 +2333,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "match open_file.description.read().as_deref() {",
+      "text": "match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fd_supports_epoll_oob",
       "migration_family": "epoll_wait"
@@ -2377,7 +2344,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "open_file.description.read().as_deref(),",
+      "text": "open_file.description.inspect().as_deref(),",
       "scope_kind": "production_callsite",
       "enclosing_function": "fd_is_listening_socket",
       "migration_family": "inspect_misc"
@@ -2399,7 +2366,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "epoll_rearm_after_io",
       "migration_family": "epoll_wait"
@@ -2432,7 +2399,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "epoll_pwait_wait_core",
       "migration_family": "epoll_wait"
@@ -2443,7 +2410,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "epoll_pwait_wait_core",
       "migration_family": "epoll_wait"
@@ -2454,7 +2421,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "epoll_pwait_wait_core",
       "migration_family": "epoll_wait"
@@ -2465,7 +2432,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "epoll_pwait_wait_core",
       "migration_family": "epoll_wait"
@@ -2476,7 +2443,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "epoll_pwait_wait_core",
       "migration_family": "epoll_wait"
@@ -2531,7 +2498,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "epoll_ctl",
       "migration_family": "create_install"
@@ -2564,7 +2531,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "open_file.description.read().as_deref(),",
+      "text": "open_file.description.inspect().as_deref(),",
       "scope_kind": "production_callsite",
       "enclosing_function": "add_scm_right",
       "migration_family": "inspect_misc"
@@ -2575,7 +2542,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().ok_or(LINUX_ENOTSOCK)?;",
+      "text": "let open = open_file.description.inspect().ok_or(LINUX_ENOTSOCK)?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "host_socket_lookup",
       "migration_family": "create_install"
@@ -2586,7 +2553,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.connect_in_progress())",
+      "text": "matches!(of.description.inspect().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.connect_in_progress())",
       "scope_kind": "production_callsite",
       "enclosing_function": "socket_connect_in_progress",
       "migration_family": "create_install"
@@ -2597,7 +2564,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "update_socket_connection_state",
       "migration_family": "create_install"
@@ -2608,7 +2575,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "set_socket_pending_error",
       "migration_family": "create_install"
@@ -2619,7 +2586,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let mut open = open_file.description.write()?;",
+      "text": "let mut open = open_file.description.write_for_io()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "take_socket_pending_error",
       "migration_family": "create_install"
@@ -2630,7 +2597,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "set_socket_error_after_send",
       "migration_family": "write_attempt"
@@ -2641,7 +2608,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "clear_socket_error_after_send",
       "migration_family": "write_attempt"
@@ -2652,7 +2619,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let mut open = open_file.description.write().ok_or(LINUX_ENOTSOCK)?;",
+      "text": "let mut open = open_file.description.write_for_io().ok_or(LINUX_ENOTSOCK)?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "reset_host_stream_socket_for_disconnect",
       "migration_family": "create_install"
@@ -2663,7 +2630,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "queue_socket_error_after_send",
       "migration_family": "write_attempt"
@@ -2674,7 +2641,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_passcred())",
+      "text": "matches!(of.description.inspect().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_passcred())",
       "scope_kind": "production_callsite",
       "enclosing_function": "socket_so_passcred",
       "migration_family": "create_install"
@@ -2685,7 +2652,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "socket_guest_type",
       "migration_family": "create_install"
@@ -2696,7 +2663,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "socket_guest_domain_type_and_protocol",
       "migration_family": "inspect_misc"
@@ -2707,7 +2674,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "socket_guest_protocol",
       "migration_family": "create_install"
@@ -2718,7 +2685,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "queue_synthetic_datagram",
       "migration_family": "create_install"
@@ -2729,7 +2696,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let mut open = open_file.description.write()?;",
+      "text": "let mut open = open_file.description.write_for_io()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "synthetic_datagram_drain",
       "migration_family": "lifecycle"
@@ -2740,7 +2707,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "match open_file.description.read().as_deref() {",
+      "text": "match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "accept_common",
       "migration_family": "inspect_misc"
@@ -2762,7 +2729,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "bind",
       "migration_family": "inspect_misc"
@@ -2773,7 +2740,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "connect",
       "migration_family": "inspect_misc"
@@ -2784,7 +2751,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read();",
+      "text": "let open = open_file.description.inspect();",
       "scope_kind": "production_callsite",
       "enclosing_function": "connect",
       "migration_family": "inspect_misc"
@@ -2795,7 +2762,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "connect",
       "migration_family": "create_install"
@@ -2806,7 +2773,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(OpenDescription::Netlink { pid, groups, .. }) = open_file.description.read().as_deref()",
+      "text": "&& let Some(OpenDescription::Netlink { pid, groups, .. }) = open_file.description.inspect().as_deref()",
       "scope_kind": "production_callsite",
       "enclosing_function": "getsockname",
       "migration_family": "inspect_misc"
@@ -2817,7 +2784,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite",
       "enclosing_function": "getsockname",
       "migration_family": "inspect_misc"
@@ -2828,7 +2795,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite",
       "enclosing_function": "getpeername",
       "migration_family": "inspect_misc"
@@ -2839,7 +2806,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite",
       "enclosing_function": "shutdown",
       "migration_family": "inspect_misc"
@@ -2850,7 +2817,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "of.description.read().as_deref(),",
+      "text": "of.description.inspect().as_deref(),",
       "scope_kind": "production_callsite",
       "enclosing_function": "fd_is_netlink",
       "migration_family": "inspect_misc"
@@ -2861,7 +2828,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "netlink_send",
       "migration_family": "write_attempt"
@@ -2872,7 +2839,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "netlink_send",
       "migration_family": "write_attempt"
@@ -2883,7 +2850,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "netlink_drain",
       "migration_family": "lifecycle"
@@ -2894,7 +2861,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "enqueue_netlink_message",
       "migration_family": "inspect_misc"
@@ -2905,7 +2872,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite",
       "enclosing_function": "sendto",
       "migration_family": "inspect_misc"
@@ -2916,7 +2883,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|f| f.description.read()?.send_timeout());",
+      "text": ".and_then(|f| f.description.inspect()?.send_timeout());",
       "scope_kind": "production_callsite",
       "enclosing_function": "sendto",
       "migration_family": "inspect_misc"
@@ -2927,7 +2894,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite",
       "enclosing_function": "recvfrom",
       "migration_family": "inspect_misc"
@@ -2938,7 +2905,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|f| f.description.read()?.recv_timeout());",
+      "text": ".and_then(|f| f.description.inspect()?.recv_timeout());",
       "scope_kind": "production_callsite",
       "enclosing_function": "recvfrom",
       "migration_family": "inspect_misc"
@@ -2949,7 +2916,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite",
       "enclosing_function": "sendmsg_inner",
       "migration_family": "inspect_misc"
@@ -2960,7 +2927,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|f| f.description.read()?.send_timeout());",
+      "text": ".and_then(|f| f.description.inspect()?.send_timeout());",
       "scope_kind": "production_callsite",
       "enclosing_function": "sendmsg_inner",
       "migration_family": "write_attempt"
@@ -2971,7 +2938,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite",
       "enclosing_function": "recvmsg_inner",
       "migration_family": "inspect_misc"
@@ -2982,7 +2949,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|f| f.description.read()?.recv_timeout());",
+      "text": ".and_then(|f| f.description.inspect()?.recv_timeout());",
       "scope_kind": "production_callsite",
       "enclosing_function": "recvmsg_inner",
       "migration_family": "read_attempt"
@@ -2993,7 +2960,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(desc) = of.description.read() else {",
+      "text": "let Some(desc) = of.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "setsockopt",
       "migration_family": "inspect_misc"
@@ -3004,7 +2971,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "setsockopt",
       "migration_family": "inspect_misc"
@@ -3015,7 +2982,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "setsockopt",
       "migration_family": "inspect_misc"
@@ -3026,7 +2993,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite",
       "enclosing_function": "setsockopt",
       "migration_family": "inspect_misc"
@@ -3037,7 +3004,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "setsockopt",
       "migration_family": "create_install"
@@ -3048,7 +3015,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "setsockopt",
       "migration_family": "create_install"
@@ -3059,7 +3026,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "setsockopt",
       "migration_family": "create_install"
@@ -3070,7 +3037,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(desc) = of.description.read() else {",
+      "text": "let Some(desc) = of.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "getsockopt",
       "migration_family": "inspect_misc"
@@ -3081,7 +3048,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "getsockopt",
       "migration_family": "inspect_misc"
@@ -3092,7 +3059,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read();",
+      "text": "let open = open_file.description.inspect();",
       "scope_kind": "production_callsite",
       "enclosing_function": "getsockopt",
       "migration_family": "inspect_misc"
@@ -3103,7 +3070,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(OpenDescription::HostSocket { base, .. }) = open_file.description.read().as_deref() {",
+      "text": "&& let Some(OpenDescription::HostSocket { base, .. }) = open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "getsockopt",
       "migration_family": "inspect_misc"
@@ -3114,7 +3081,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "wait_source_kind",
       "migration_family": "inspect_misc"
@@ -3125,7 +3092,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "f.description.read().as_deref(),",
+      "text": "f.description.inspect().as_deref(),",
       "scope_kind": "production_callsite",
       "enclosing_function": "fd_is_eventfd",
       "migration_family": "create_install"
@@ -3136,7 +3103,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "perf_event_state",
       "migration_family": "inspect_misc"
@@ -3158,7 +3125,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let desc = open.description.read()?;",
+      "text": "let desc = open.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "pidfd_target",
       "migration_family": "inspect_misc"
@@ -3169,7 +3136,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(desc) = open.description.read() else {",
+      "text": "let Some(desc) = open.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "pidfd_is_nonblocking",
       "migration_family": "inspect_misc"
@@ -3180,7 +3147,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let d = f.description.read()?;",
+      "text": "let d = f.description.inspect()?;",
       "scope_kind": "production_callsite",
       "enclosing_function": "execveat",
       "migration_family": "inspect_misc"
@@ -3191,7 +3158,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "signalfd4",
       "migration_family": "create_install"
@@ -3213,7 +3180,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = epoll_open.description.read().expect(\"open description\");",
+      "text": "let open = epoll_open.description.inspect().expect(\"open description\");",
       "scope_kind": "test_or_definition",
       "enclosing_function": "epoll_et_repolls_host_level_when_mux_misses_wake",
       "migration_family": "epoll_wait"
@@ -3258,7 +3225,7 @@
         "description_guard",
         "epoll"
       ],
-      "text": "let mut open = epoll.description.write().unwrap();",
+      "text": "let mut open = epoll.description.write_for_io().unwrap();",
       "scope_kind": "test_or_definition",
       "enclosing_function": "test_epoll_write_rearm_clears_staged_events",
       "migration_family": "epoll_wait"
@@ -3270,7 +3237,7 @@
         "description_guard",
         "epoll"
       ],
-      "text": "let open = epoll.description.read().unwrap();",
+      "text": "let open = epoll.description.inspect().unwrap();",
       "scope_kind": "test_or_definition",
       "enclosing_function": "test_epoll_write_rearm_clears_staged_events",
       "migration_family": "epoll_wait"
@@ -3281,7 +3248,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = epoll_open.description.read().expect(\"open description\");",
+      "text": "let open = epoll_open.description.inspect().expect(\"open description\");",
       "scope_kind": "test_or_definition",
       "enclosing_function": "epoll_close_rebinds_shared_host_fd_survivor",
       "migration_family": "epoll_wait"
@@ -3535,7 +3502,7 @@
         "description_guard",
         "epoll"
       ],
-      "text": "let epoll = epoll.description.read().expect(\"epoll open description\");",
+      "text": "let epoll = epoll.description.inspect().expect(\"epoll open description\");",
       "scope_kind": "test_or_definition",
       "enclosing_function": "final_target_close_detaches_epoll_owner_from_another_file_table",
       "migration_family": "epoll_wait"
@@ -3547,7 +3514,7 @@
         "description_guard",
         "epoll"
       ],
-      "text": "let epoll = epoll.description.read().expect(\"epoll open description\");",
+      "text": "let epoll = epoll.description.inspect().expect(\"epoll open description\");",
       "scope_kind": "test_or_definition",
       "enclosing_function": "hvpatch_child_dup3_does_not_detach_parent_epoll_interest",
       "migration_family": "epoll_wait"
@@ -3559,7 +3526,7 @@
         "description_guard",
         "epoll"
       ],
-      "text": "let epoll = epoll.description.read().expect(\"open description\");",
+      "text": "let epoll = epoll.description.inspect().expect(\"open description\");",
       "scope_kind": "test_or_definition",
       "enclosing_function": "hvpatch_child_dup3_does_not_detach_parent_epoll_interest",
       "migration_family": "epoll_wait"
@@ -3581,7 +3548,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "timerfd_settime",
       "migration_family": "inspect_misc"
@@ -3592,7 +3559,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite",
       "enclosing_function": "timerfd_gettime",
       "migration_family": "inspect_misc"
@@ -3636,7 +3603,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let guard = open.description.read().unwrap();",
+      "text": "let guard = open.description.read_for_io().unwrap();",
       "scope_kind": "test_or_definition",
       "enclosing_function": "recall_writes_back_bytes_size_and_offset",
       "migration_family": "read_attempt"
@@ -3647,62 +3614,84 @@
       "categories": [
         "description_guard"
       ],
-      "text": "drop(open.description.read().unwrap());",
+      "text": "drop(open.description.read_for_io().unwrap());",
       "scope_kind": "test_or_definition",
       "enclosing_function": "accessor_on_a_delegated_description_recalls_it_first",
       "migration_family": "read_attempt"
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 2132,
+      "line": 2118,
       "categories": [
         "description_guard"
       ],
-      "text": "drop(second.description.read());",
+      "text": "let guard = open.description.inspect().unwrap();",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "inspecting_a_delegated_description_leaves_it_in_the_zone",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "line": 2121,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "drop(open.description.try_inspect().unwrap());",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "inspecting_a_delegated_description_leaves_it_in_the_zone",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "line": 2157,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "drop(second.description.read_for_io());",
       "scope_kind": "test_or_definition",
       "enclosing_function": "a_second_open_joins_the_zone_with_its_own_offset",
       "migration_family": "read_attempt"
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 2134,
+      "line": 2159,
       "categories": [
         "description_guard"
       ],
-      "text": "let raw = |open: &OpenFile| match &*open.description.read().unwrap() {",
+      "text": "let raw = |open: &OpenFile| match &*open.description.read_for_io().unwrap() {",
       "scope_kind": "test_or_definition",
       "enclosing_function": "a_second_open_joins_the_zone_with_its_own_offset",
       "migration_family": "read_attempt"
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 2152,
+      "line": 2177,
       "categories": [
         "description_guard"
       ],
-      "text": "drop(second.description.read());",
+      "text": "drop(second.description.read_for_io());",
       "scope_kind": "test_or_definition",
       "enclosing_function": "a_pending_description_recalls_on_host_access",
       "migration_family": "read_attempt"
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 2155,
+      "line": 2180,
       "categories": [
         "description_guard"
       ],
-      "text": "drop(first.description.read());",
+      "text": "drop(first.description.read_for_io());",
       "scope_kind": "test_or_definition",
       "enclosing_function": "a_pending_description_recalls_on_host_access",
       "migration_family": "read_attempt"
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 2283,
+      "line": 2308,
       "categories": [
         "description_guard"
       ],
-      "text": "drop(open_a.description.read());",
+      "text": "drop(open_a.description.read_for_io());",
       "scope_kind": "test_or_definition",
       "enclosing_function": "recall_path_by_identity_recalls_only_that_inode",
       "migration_family": "read_attempt"
