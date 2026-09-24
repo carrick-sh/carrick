@@ -1,0 +1,34 @@
+schema_version = 1
+id = "kernel.el1.files.shared-inode"
+title = "Two open descriptions of one inode are served in the zone"
+guest_surfaces = [
+  "syscall:read",
+  "syscall:write",
+  "syscall:lseek",
+  "syscall:fstat",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 open",
+  "man 2 read",
+  "man 2 write",
+  "man 2 lseek",
+]
+fixture = "probe:el1_files_shared_inode"
+scale_points = [1, 8, 32, 128]
+rationale = "open(2) creates a new open file description with its own offset and status flags; every description of an inode reads and writes the same bytes. The zone models Linux's split: one in-zone inode (size, pages, marks) shared by every open description of it, and one open-file record (offset, flags) per description. A second description is therefore not a reason to leave the zone, and a loop interleaving writes through one description with reads through another is served in-guest."
+
+[bindings]
+embed = "carrick-embed::el1_files_shared_inode_contract"
+
+[bindings.unresolved]
+vm_free = "EL1 serving requires hardware-assisted HVF execution."
+docker = "The fixture checks the Linux semantics itself (independent offsets, shared bytes, fstat size); EL1 serving is transparent to the Linux ABI."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 64
+per_unit = 0
+layers = ["embed-structural"]
+rationale = "Host dispatches of lseek, read and write do not grow with the interleaved loop: at most a fixed startup population is forwarded, and at least 90% of the 2,000-iteration loop's syscalls through both descriptions are served at EL1."

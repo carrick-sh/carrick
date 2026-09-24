@@ -855,6 +855,7 @@
       "contracts": [
         "hvpatch.syscall.portal",
         "kernel.el1.files",
+        "kernel.el1.files.shared-inode",
         "kernel.el1.inotify",
         "kernel.fs.write-seek",
         "kernel.inotify.mark-race-hotpath"
@@ -874,6 +875,7 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.files",
+        "kernel.el1.files.shared-inode",
         "kernel.el1.inotify",
         "kernel.inotify.readiness",
         "kernel.inotify.watch-churn",
@@ -895,6 +897,7 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.files",
+        "kernel.el1.files.shared-inode",
         "kernel.el1.inotify",
         "kernel.el1.transparent",
         "kernel.fs.write-seek",
@@ -1127,6 +1130,7 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.files",
+        "kernel.el1.files.shared-inode",
         "kernel.fs.stat-allocation"
       ],
       "claims": [],
