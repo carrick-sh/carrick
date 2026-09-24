@@ -19,8 +19,9 @@ use crate::kernel::{FileTableId, RlimitSet};
 
 pub use carrick_el1_abi::{
     El1TaskId, clear_pending_host_work, get_el1_region_host_ptr, get_orig_arg0,
-    mark_pending_host_work, mark_pending_host_work_all, mark_pending_host_work_for_task,
-    record_el1_region_host_ptr, take_served_with_work, update_current_task_file_table_for_task,
+    mark_pending_host_work, mark_pending_host_work_all, mark_pending_host_work_for_file_tables,
+    mark_pending_host_work_for_task, record_el1_region_host_ptr, take_served_with_work,
+    update_current_task_file_table_for_task,
 };
 
 impl From<crate::kernel::ids::LinuxTid> for El1TaskId {
@@ -727,7 +728,6 @@ pub(crate) fn recall_locked(
     open: &mut OpenDescription,
     handle: u32,
 ) -> Result<(), carrick_abi::LinuxErrno> {
-    mark_pending_host_work_all();
     let region_ptr = get_el1_region_host_ptr();
     if region_ptr == 0 {
         carrick_fatal!(
@@ -735,6 +735,25 @@ pub(crate) fn recall_locked(
             "recall called with null EL1 region pointer (handle={handle})"
         );
     }
+    // Target only vCPUs whose CurrentTask.file_table is the object's table (or that hold the file),
+    // and never mark slots with no task.
+    let mut target_tables = Vec::new();
+    {
+        let _fd_map_guard = FD_MAP_LOCK.lock();
+        let fd_map_base = (region_ptr + EL1_FD_MAP_OFFSET as usize) as *const FdMapSlot;
+        for slot_idx in 0..FD_MAP_CAPACITY {
+            let slot = unsafe { &*fd_map_base.add(slot_idx) };
+            if slot.incarnation.load(Ordering::Acquire) != 0
+                && slot.handle.load(Ordering::Relaxed) == handle
+            {
+                let ft = slot.file_table.load(Ordering::Relaxed);
+                if ft != 0 && !target_tables.contains(&ft) {
+                    target_tables.push(ft);
+                }
+            }
+        }
+    }
+    mark_pending_host_work_for_file_tables(&target_tables);
     let rootfs_vfs = DELEGATED_ROOTFS.lock()[(handle - 1) as usize]
         .as_ref()
         .and_then(|w| w.upgrade());
@@ -2574,6 +2593,64 @@ mod tests {
 
             // Cleanup
             recall(&host_file1.description).unwrap();
+        }
+
+        #[test]
+        fn test_recall_targets_only_holding_file_table_and_never_unoccupied_slots() {
+            let region = TestEl1Region::new();
+            let table_id_1 = FileTableId::from_raw_u64(100).unwrap();
+            let (_tmp, host_file) = create_test_host_file(b"test data");
+
+            let handle = delegate_for_test(&host_file, table_id_1, 5).expect("delegate file");
+            assert_eq!(host_file.description.delegation_handle(), handle);
+
+            let region_ptr = region.buffer.as_ptr() as usize;
+
+            // Slot 10: running task 1001 with table 100 (matches delegated file table)
+            publish_current_task(10, El1TaskId::from_linux_tid(1001), 1, 100);
+
+            // Slot 11: running task 1002 with table 200 (unrelated file table)
+            publish_current_task(11, El1TaskId::from_linux_tid(1002), 1, 200);
+
+            // Slot 12: unoccupied slot (no task: task_id == 0), but with leftover file_table 100
+            let task_12_offset =
+                EL1_CURRENT_TASKS_OFFSET as usize + 12 * core::mem::size_of::<CurrentTask>();
+            let task_12 = unsafe { &*((region_ptr + task_12_offset) as *const CurrentTask) };
+            task_12.task_id.store(0, Ordering::Relaxed);
+            task_12.file_table.store(100, Ordering::Relaxed);
+            task_12.pending_host_work.store(0, Ordering::Relaxed);
+
+            // Recall the delegated file
+            recall(&host_file.description).expect("recall");
+
+            let task_10_offset =
+                EL1_CURRENT_TASKS_OFFSET as usize + 10 * core::mem::size_of::<CurrentTask>();
+            let task_10 = unsafe { &*((region_ptr + task_10_offset) as *const CurrentTask) };
+
+            let task_11_offset =
+                EL1_CURRENT_TASKS_OFFSET as usize + 11 * core::mem::size_of::<CurrentTask>();
+            let task_11 = unsafe { &*((region_ptr + task_11_offset) as *const CurrentTask) };
+
+            // Slot 10 (holding the file) MUST have pending_host_work set
+            assert_eq!(
+                task_10.pending_host_work.load(Ordering::Acquire),
+                1,
+                "slot 10 with matching file table must have pending_host_work set"
+            );
+
+            // Slot 11 (unrelated file table) MUST NOT have pending_host_work set
+            assert_eq!(
+                task_11.pending_host_work.load(Ordering::Acquire),
+                0,
+                "slot 11 with unrelated file table must not have pending_host_work set"
+            );
+
+            // Slot 12 (unoccupied slot, task_id == 0) MUST NEVER have pending_host_work set
+            assert_eq!(
+                task_12.pending_host_work.load(Ordering::Acquire),
+                0,
+                "slot 12 with no task running must never have pending_host_work set"
+            );
         }
     }
 }
