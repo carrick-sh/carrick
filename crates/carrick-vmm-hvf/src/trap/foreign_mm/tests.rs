@@ -7601,6 +7601,221 @@ fn semantic_lookup_enforces_exact_boundary_length_and_overflow_protection() {
     );
 }
 
+/// Register one more live global-frame owner in `custody`, as a frame COW
+/// replacement compound would be.
+fn register_replacement_compound_owner(
+    custody: &Arc<CarrierVmCustody>,
+) -> ((u64, u64), usize, u64) {
+    let mut lease = GlobalFrameStage2Lease::reserve(OWNER_LEN as u64, OWNER_LEN as u64)
+        .expect("reserve replacement compound IPA");
+    let key = lease.key();
+    let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        OWNER_LEN,
+        crate::host_mapping::HostMappingKind::FrameCow,
+    )
+    .expect("allocate replacement compound backing");
+    let host_addr = host.as_ptr() as usize;
+    assert_eq!(
+        unsafe { inventory_hv_vm_map(host.as_ptr().cast(), key.0, OWNER_LEN, 3) },
+        0,
+    );
+    lease.mark_mapped();
+    let generation = register_global_frame_host_owner_in(custody, lease, host, 3)
+        .expect("register replacement compound owner");
+    (key, host_addr, generation)
+}
+
+/// `kernel.mm.anonymous-discard-fork-reuse`, VM-free layer.
+///
+/// The shape cpython-fork1/cpython-wait4 aborted on: a glibc thread stack's
+/// discard edge [compound+0x1000, compound+0x4000) was frame-COWed by a
+/// previous `MADV_DONTNEED` (fork had shared it), which published a NEWER
+/// alias row naming the replacement compound while the older row fragment of
+/// the stack's bulk lease still spans the same VA. The discard then re-armed
+/// first touch, so the edge's stage-1 leaf is invalid and only retains the
+/// replacement output. The next discard's edge scrub resolved its COW source
+/// through the VA-keyed row cache, whose currency check asked only whether the
+/// registry still HAD the row's projection -- it does, shadowed -- and so
+/// selected the pre-COW bulk lease whose compound the inventory had already
+/// split out: "COW compound IPA .. has no exact inventory coverage".
+///
+/// A cached row is current only when it is the projection the registry
+/// itself resolves for the page: the newest live alias covering the range.
+#[test]
+fn invalid_leaf_lookup_selects_the_newest_projection_over_a_shadowed_row() {
+    use carrick_conformance_contract::{
+        Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
+        SemanticAssertion, WorkSnapshot, evaluate,
+    };
+    use sha2::{Digest, Sha256};
+
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external_alias_restore = ExternalAliasStateRestore::capture();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    // The discard edge sits one Linux page into its 16 KiB compound.
+    let edge_va = 0x6001_c21000_u64;
+    let edge_len = 0x3000_usize;
+    let (mut task, custody, old_key, old_generation) =
+        inventoried_cow_source_fixture(CowSourceInventoryFixture::Absent);
+    let (old_host, _) = global_frame_host_owner_identity_in(&custody, old_key.0, old_key.1)
+        .expect("bulk lease owner");
+    let (new_key, new_host, new_generation) = register_replacement_compound_owner(&custody);
+    let scope = alias_ownership_scope(
+        GuestMappingSharing::Private,
+        task.mm_root_slot,
+        task.container_root,
+    );
+    let projection = |key: (u64, u64), host: usize, generation: u64| AliasBacking {
+        start: edge_va,
+        ipa: key.0 + 0x1000,
+        host_addr: host + 0x1000,
+        size: edge_len,
+        physical_ipa: key.0,
+        physical_host_addr: host,
+        physical_size: OWNER_LEN,
+        perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+        guest_writable: true,
+        sharing: GuestMappingSharing::Private,
+        ownership_scope: scope,
+        inventory_backing: InventoryBackingIdentity::Private(9_611),
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation: generation,
+    };
+    // The bulk lease's surviving row fragment: in the registry AND cached as
+    // this task's local row.
+    let stale = projection(old_key, old_host, old_generation);
+    alias_registry().lock().push(stale);
+    task.mappings.insert(HvfMappedRegion {
+        start: edge_va,
+        ipa: stale.ipa,
+        physical_ipa: stale.physical_ipa,
+        end: edge_va + edge_len as u64,
+        host_addr: stale.host_addr as *mut u8,
+        size: edge_len,
+        physical_size: OWNER_LEN,
+        perms: applevisor::memory::MemPerms::ReadWrite,
+        memory: None,
+        host_mapping: None,
+        structural_owner: None,
+        stage2_lease: None,
+        is_dynamic_alias: true,
+        sharing: GuestMappingSharing::Private,
+        guest_writable: true,
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation: old_generation,
+    });
+    // First-touch re-arm after a discard: the leaf is invalid but keeps its
+    // output, so the ordinary translation misses and the VA path decides.
+    let mut tables = crate::page_table::PageTableManager::new(
+        carrick_mem::memory::stage1_hvpatch_page_tables(),
+        crate::memory::LINUX_PAGE_TABLES_BASE,
+    );
+    tables
+        .map_aliased(edge_va, stale.ipa, edge_len as u64, false, None)
+        .expect("publish bulk-lease edge leaves");
+    tables
+        .set_prot_none(edge_va, edge_len, None)
+        .expect("re-arm first touch");
+    task.page_tables_authority().set_manager(tables);
+    assert!(task.translate_va_for_cow(edge_va).is_none());
+
+    let resolve = |task: &HvfTaskState| {
+        let view = task
+            .mapping_for_range_in(&custody, edge_va, 0x1000)
+            .expect("a live projection covers the edge");
+        view.ipa + (edge_va - view.start)
+    };
+    // Control: while the bulk lease is the only projection, the cached row is
+    // the current one and must keep resolving.
+    let before_cow = resolve(&task);
+
+    // The previous discard's edge COW published the replacement compound as
+    // the newer projection and repointed the (now invalid) leaves to it.
+    let replacement = projection(new_key, new_host, new_generation);
+    alias_registry().lock().push(replacement);
+    let mut tables = crate::page_table::PageTableManager::new(
+        carrick_mem::memory::stage1_hvpatch_page_tables(),
+        crate::memory::LINUX_PAGE_TABLES_BASE,
+    );
+    tables
+        .map_aliased(edge_va, replacement.ipa, edge_len as u64, false, None)
+        .expect("publish replacement edge leaves");
+    tables
+        .set_prot_none(edge_va, edge_len, None)
+        .expect("re-arm first touch");
+    task.page_tables_authority().set_manager(tables);
+    assert!(task.translate_va_for_cow(edge_va).is_none());
+    let retained = task
+        .page_tables_authority()
+        .with_manager(|manager| manager.translate_retained_output(edge_va))
+        .flatten();
+    let after_cow = resolve(&task);
+
+    let assertions = vec![
+        SemanticAssertion {
+            name: "sole_projection_row_stays_current".into(),
+            passed: before_cow == stale.ipa,
+            detail: Some(format!(
+                "resolved {before_cow:#x}, expected the bulk lease {:#x}",
+                stale.ipa
+            )),
+        },
+        SemanticAssertion {
+            name: "shadowed_row_yields_to_newest_projection".into(),
+            passed: after_cow == replacement.ipa,
+            detail: Some(format!(
+                "resolved {after_cow:#x}, expected the replacement compound {:#x} \
+                 (stale bulk lease {:#x})",
+                replacement.ipa, stale.ipa
+            )),
+        },
+        SemanticAssertion {
+            name: "resolution_agrees_with_retained_leaf_output".into(),
+            passed: retained == Some(after_cow),
+            detail: Some(format!(
+                "retained leaf output {retained:#x?}, resolved {after_cow:#x}"
+            )),
+        },
+    ];
+
+    for (key, generation) in [(old_key, old_generation), (new_key, new_generation)] {
+        assert!(
+            retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
+                .is_retired()
+        );
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("repository root");
+    let registry = ContractRegistry::load(root).expect("contract registry");
+    let observation = ContractObservation {
+        contract_id: ContractId::new("kernel.mm.anonymous-discard-fork-reuse")
+            .expect("contract id"),
+        layer: ExecutionLayer::VmFree,
+        implementation_revision: format!(
+            "sha256:{:x}",
+            Sha256::digest(include_bytes!("../cow_engine.rs"))
+        ),
+        fixture_identity: "fixture:discard-fork-threads".into(),
+        scale: 1,
+        semantic_assertions: assertions,
+        work: Some(WorkSnapshot::new()),
+        timing: None,
+        completeness: Completeness::Complete,
+    };
+    evaluate(
+        registry
+            .require("kernel.mm.anonymous-discard-fork-reuse")
+            .expect("contract"),
+        &[observation],
+    )
+    .expect("kernel.mm.anonymous-discard-fork-reuse VM-free contract");
+}
+
 #[test]
 fn semantic_lookup_preserves_map_shared_and_maintenance_fallback() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
