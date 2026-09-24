@@ -133,6 +133,13 @@ pub(crate) fn run_debug(
         DebugCommand::ExecStampCensus { input, workload_ns } => {
             crate::debug_exec_stamps::run_exec_stamp_census(&input, workload_ns)?;
         }
+        DebugCommand::El1Census {
+            inputs,
+            limit,
+            json,
+        } => {
+            crate::debug_el1_census::run_el1_census(&inputs, limit, json)?;
+        }
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();
             let value = if let Some(hex) = stripped

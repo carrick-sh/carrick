@@ -128,6 +128,7 @@ mod commands;
 mod debug;
 mod debug_amplification;
 mod debug_core;
+mod debug_el1_census;
 mod debug_exec_stamps;
 mod fs_setup;
 mod hvpatch_carrier_cpu_low_rate_profile;

@@ -99,6 +99,7 @@ pub mod binfmt;
 pub mod dtrace_consumer;
 #[cfg(target_os = "macos")]
 pub mod dtrace_symbols;
+pub mod el1_census;
 pub mod host_process;
 pub mod interactive_supervisor;
 // `linux_abi` was lifted into the leaf crate `carrick-abi` (build-graph split,

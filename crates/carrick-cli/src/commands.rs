@@ -845,6 +845,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             DebugCommand::ExecStampCensus { input, workload_ns } => {
                 crate::debug_exec_stamps::run_exec_stamp_census(&input, workload_ns)?
             }
+            DebugCommand::El1Census {
+                inputs,
+                limit,
+                json,
+            } => crate::debug_el1_census::run_el1_census(&inputs, limit, json)?,
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },
         Commands::TraceChild {

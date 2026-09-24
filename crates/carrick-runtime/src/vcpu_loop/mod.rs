@@ -1422,6 +1422,43 @@ where
         mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
+        if !crate::el1_census::enabled() {
+            return self.service_threaded_syscall_for_executor_inner(
+                kernel,
+                engine,
+                frame,
+                mm_executor,
+                host_wait,
+            );
+        }
+        let nr = frame.number.raw();
+        let start = crate::el1_census::thread_cpu_ns();
+        CENSUS_EL1_BOUNDARY.with(|flag| flag.set(false));
+        CENSUS_IN_SERVICE.with(|flag| flag.set(true));
+        let result = self.service_threaded_syscall_for_executor_inner(
+            kernel,
+            engine,
+            frame,
+            mm_executor,
+            host_wait,
+        );
+        CENSUS_IN_SERVICE.with(|flag| flag.set(false));
+        if CENSUS_EL1_BOUNDARY.with(std::cell::Cell::get) {
+            crate::el1_census::record_el1_boundary(nr);
+        } else {
+            crate::el1_census::record_host_service(nr, start);
+        }
+        result
+    }
+
+    fn service_threaded_syscall_for_executor_inner(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+        frame: carrick_hal::RawSyscall,
+        mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
+        host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
+    ) -> Result<DispatchOutcome, RuntimeError> {
         self.service_kernel_context = None;
         if !self.syscall_completion.is_idle() {
             return Err(RuntimeError::Configuration(
@@ -1465,6 +1502,7 @@ where
             // An in-guest enqueue may have forced this boundary to wake a
             // host waiter it could not signal from EL1.
             carrick_kernel::el1_inotify::deliver_owed_wakes();
+            CENSUS_EL1_BOUNDARY.with(|flag| flag.set(true));
         }
 
         let (syscall, prepared_outcome) = if served_with_work {
@@ -1538,6 +1576,38 @@ where
     }
 
     fn redispatch_threaded_syscall_for_executor(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+        syscall: PreparedSyscall,
+        mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
+        host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
+    ) -> Result<DispatchOutcome, RuntimeError> {
+        // The first dispatch runs inside the host service and is counted
+        // there; only a continuation resumption counts as a redispatch.
+        if !crate::el1_census::enabled() || CENSUS_IN_SERVICE.with(std::cell::Cell::get) {
+            return self.redispatch_threaded_syscall_for_executor_inner(
+                kernel,
+                engine,
+                syscall,
+                mm_executor,
+                host_wait,
+            );
+        }
+        let nr = syscall.request.number.raw();
+        let start = crate::el1_census::thread_cpu_ns();
+        let result = self.redispatch_threaded_syscall_for_executor_inner(
+            kernel,
+            engine,
+            syscall,
+            mm_executor,
+            host_wait,
+        );
+        crate::el1_census::record_redispatch(nr, start);
+        result
+    }
+
+    fn redispatch_threaded_syscall_for_executor_inner(
         &mut self,
         kernel: &Kernel,
         engine: &mut E,
@@ -3394,4 +3464,14 @@ pub(crate) mod tests {
         // Unclassified → None (caller terminates by SIGSEGV).
         assert_eq!(lower_el0_fault(esr(0x00), elr, far), None);
     }
+}
+
+thread_local! {
+    /// Set by the host syscall service when the trap was an EL1
+    /// served-with-work boundary, so the EL1 census does not count it as a
+    /// host service.
+    static CENSUS_EL1_BOUNDARY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while the host syscall service runs, so the EL1 census counts the
+    /// first dispatch as part of the service rather than as a resumption.
+    static CENSUS_IN_SERVICE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
