@@ -20,5 +20,8 @@ mod tests {
         assert!(IMAGE.len() as u64 <= header.image_size);
         assert!(header.image_size <= carrick_el1_abi::EL1_IMAGE_SIZE);
         assert!(header.entry_offset < IMAGE.len() as u64);
+        // The embedded image was built against this host's shared-record
+        // layout.
+        assert_eq!(carrick_el1_abi::check_image_abi(IMAGE), Ok(header));
     }
 }

@@ -1247,6 +1247,10 @@ pub enum AddressSpaceError {
     #[error("failed to read ELF bytes: {0}")]
     Io(#[from] std::io::Error),
     #[error(
+        "the embedded EL1 image does not match this host's EL1 ABI ({0:?}); rebuild carrick so the image is rebuilt against the current carrick-el1-abi"
+    )]
+    El1ImageAbi(carrick_el1_abi::ImageAbiError),
+    #[error(
         "ELF segment at 0x{virtual_address:x} has file size {file_size} greater than memory size {memory_size}"
     )]
     FileLargerThanMemory {
@@ -2006,6 +2010,10 @@ impl AddressSpace {
 
     /// Install the in-guest EL1 kernel image region.
     pub fn with_el1_region(self) -> Result<Self, AddressSpaceError> {
+        // A stale image once served nothing, silently: refuse one built
+        // against a different layout of the shared records.
+        carrick_el1_abi::check_image_abi(carrick_el1_image::IMAGE)
+            .map_err(AddressSpaceError::El1ImageAbi)?;
         let start = LINUX_EL1_KERNEL_BASE;
         let size = LINUX_EL1_KERNEL_SIZE;
         let end = start

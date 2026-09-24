@@ -108,8 +108,123 @@ pub const EL1_CACHE_SIZE: u64 = (MAX_DELEGATED_FILES as u64) * DELEGATED_FILE_MA
 /// Magic bytes at offset 0 of the EL1 image header: `CEL1`.
 pub const IMAGE_MAGIC: [u8; 4] = *b"CEL1";
 
-/// Current version of the EL1 image format.
-pub const IMAGE_VERSION: u32 = 1;
+/// Current version of the EL1 image format. Version 2 adds the ABI layout
+/// hash ([`ImageHeader::abi_hash_offset`]).
+pub const IMAGE_VERSION: u32 = 2;
+
+/// Why an EL1 image cannot be used with this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageAbiError {
+    /// No complete header, or the wrong magic.
+    NotAnImage,
+    /// An image format this host does not read.
+    Version { found: u32 },
+    /// The hash offset lies outside the image.
+    HashOutOfBounds,
+    /// The image was built against a different layout of the shared records.
+    LayoutMismatch { expected: u64, found: u64 },
+}
+
+/// Check that `image` was built against this crate's shared-record layout
+/// (a stale image once served nothing, silently).
+pub fn check_image_abi(image: &[u8]) -> Result<ImageHeader, ImageAbiError> {
+    let header = ImageHeader::read_from_prefix(image).ok_or(ImageAbiError::NotAnImage)?;
+    if header.magic != IMAGE_MAGIC {
+        return Err(ImageAbiError::NotAnImage);
+    }
+    if header.version != IMAGE_VERSION {
+        return Err(ImageAbiError::Version {
+            found: header.version,
+        });
+    }
+    let at = usize::try_from(header.abi_hash_offset).map_err(|_| ImageAbiError::HashOutOfBounds)?;
+    let bytes = image
+        .get(at..at.checked_add(8).ok_or(ImageAbiError::HashOutOfBounds)?)
+        .ok_or(ImageAbiError::HashOutOfBounds)?;
+    let mut word = [0u8; 8];
+    word.copy_from_slice(bytes);
+    let found = u64::from_le_bytes(word);
+    if found != EL1_ABI_LAYOUT_HASH {
+        return Err(ImageAbiError::LayoutMismatch {
+            expected: EL1_ABI_LAYOUT_HASH,
+            found,
+        });
+    }
+    Ok(header)
+}
+
+/// FNV-1a over the layout facts both sides depend on: every shared record's
+/// size, alignment and field offsets, and the region layout. Computed at
+/// compile time; the EL1 image embeds its copy and the host refuses an image
+/// whose copy differs.
+pub const EL1_ABI_LAYOUT_HASH: u64 = {
+    let facts: &[u64] = &[
+        EL1_REGION_BASE,
+        EL1_REGION_SIZE,
+        EL1_COUNTERS_OFFSET,
+        EL1_STACKS_OFFSET,
+        EL1_STACK_SIZE,
+        EL1_CURRENT_TASKS_OFFSET,
+        EL1_OBJECT_TABLE_OFFSET,
+        EL1_FD_MAP_OFFSET,
+        EL1_OPEN_FILE_TABLE_OFFSET,
+        EL1_CACHE_OFFSET,
+        EL1_INOTIFY_TABLE_OFFSET,
+        EL1_NAME_CACHE_OFFSET,
+        MAX_DELEGATED_FILES as u64,
+        MAX_ZONE_OPEN_FILES as u64,
+        MAX_DELEGATED_INOTIFY as u64,
+        MAX_DELEGATED_WATCHES as u64,
+        MAX_DELEGATED_MARKS_PER_FILE as u64,
+        FD_MAP_CAPACITY as u64,
+        DELEGATED_FILE_MAX_SIZE,
+        DELEGATED_PAGE_SIZE,
+        INOTIFY_QUEUE_BYTES as u64,
+        FD_HANDLE_INOTIFY_TAG as u64,
+        core::mem::size_of::<TrapFrame>() as u64,
+        core::mem::size_of::<Counters>() as u64,
+        core::mem::size_of::<CurrentTask>() as u64,
+        core::mem::offset_of!(CurrentTask, file_table) as u64,
+        core::mem::offset_of!(CurrentTask, pending_host_work) as u64,
+        core::mem::offset_of!(CurrentTask, served_with_work) as u64,
+        core::mem::size_of::<FdMapSlot>() as u64,
+        core::mem::offset_of!(FdMapSlot, handle) as u64,
+        core::mem::offset_of!(FdMapSlot, incarnation) as u64,
+        core::mem::size_of::<DelegatedFile>() as u64,
+        core::mem::align_of::<DelegatedFile>() as u64,
+        core::mem::offset_of!(DelegatedFile, size) as u64,
+        core::mem::offset_of!(DelegatedFile, dirty_mask) as u64,
+        core::mem::offset_of!(DelegatedFile, served_ops) as u64,
+        core::mem::offset_of!(DelegatedFile, marks) as u64,
+        core::mem::size_of::<DelegatedOpenFile>() as u64,
+        core::mem::offset_of!(DelegatedOpenFile, inode_handle) as u64,
+        core::mem::offset_of!(DelegatedOpenFile, inode_generation) as u64,
+        core::mem::offset_of!(DelegatedOpenFile, offset) as u64,
+        core::mem::size_of::<DelegatedMark>() as u64,
+        core::mem::size_of::<DelegatedWatch>() as u64,
+        core::mem::size_of::<DelegatedInotify>() as u64,
+        core::mem::offset_of!(DelegatedInotify, queued_bytes) as u64,
+        core::mem::offset_of!(DelegatedInotify, host_observed) as u64,
+        core::mem::offset_of!(DelegatedInotify, wake_owed) as u64,
+        core::mem::offset_of!(DelegatedInotify, watches) as u64,
+        core::mem::offset_of!(DelegatedInotify, queue) as u64,
+        core::mem::size_of::<InotifyNameCache>() as u64,
+    ];
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < facts.len() {
+        let mut word = facts[i];
+        let mut b = 0;
+        while b < 8 {
+            hash ^= word & 0xff;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            word >>= 8;
+            b += 1;
+        }
+        i += 1;
+    }
+    hash
+};
 
 /// Fixed header placed at the beginning of the `carrick-el1` binary image.
 #[repr(C)]
@@ -123,6 +238,9 @@ pub struct ImageHeader {
     pub entry_offset: u64,
     /// Total binary size of the loaded image in bytes.
     pub image_size: u64,
+    /// Offset from the start of the image to the `u64` layout hash the
+    /// image was built against ([`EL1_ABI_LAYOUT_HASH`]).
+    pub abi_hash_offset: u64,
 }
 
 impl ImageHeader {
@@ -137,11 +255,13 @@ impl ImageHeader {
         let version = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
         let entry_offset = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
         let image_size = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
+        let abi_hash_offset = u64::from_le_bytes(bytes[24..32].try_into().ok()?);
         Some(Self {
             magic,
             version,
             entry_offset,
             image_size,
+            abi_hash_offset,
         })
     }
 }
@@ -1499,7 +1619,8 @@ mod tests {
 
     #[test]
     fn test_image_header_layout() {
-        assert_eq!(core::mem::size_of::<ImageHeader>(), 24);
+        assert_eq!(core::mem::size_of::<ImageHeader>(), 32);
+        assert_eq!(core::mem::offset_of!(ImageHeader, abi_hash_offset), 24);
         assert_eq!(core::mem::offset_of!(ImageHeader, magic), 0);
         assert_eq!(core::mem::offset_of!(ImageHeader, version), 4);
         assert_eq!(core::mem::offset_of!(ImageHeader, entry_offset), 8);
@@ -1768,5 +1889,29 @@ mod tests {
         // A new incarnation forgets its waiters.
         instance.reset_queue();
         assert_eq!(instance.host_observed.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn an_image_built_against_another_layout_is_refused() {
+        extern crate std;
+        let mut image = std::vec![0u8; 64];
+        image[0..4].copy_from_slice(&IMAGE_MAGIC);
+        image[4..8].copy_from_slice(&IMAGE_VERSION.to_le_bytes());
+        image[24..32].copy_from_slice(&40u64.to_le_bytes());
+        image[40..48].copy_from_slice(&EL1_ABI_LAYOUT_HASH.to_le_bytes());
+        assert!(check_image_abi(&image).is_ok());
+        image[40] ^= 1;
+        assert!(matches!(
+            check_image_abi(&image),
+            Err(ImageAbiError::LayoutMismatch { .. })
+        ));
+        image[4..8].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            check_image_abi(&image),
+            Err(ImageAbiError::Version { found: 1 })
+        );
+        image[24..32].copy_from_slice(&60u64.to_le_bytes());
+        image[4..8].copy_from_slice(&IMAGE_VERSION.to_le_bytes());
+        assert_eq!(check_image_abi(&image), Err(ImageAbiError::HashOutOfBounds));
     }
 }
