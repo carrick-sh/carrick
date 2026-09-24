@@ -3224,6 +3224,78 @@
       "fingerprint": "168e6ab4d62e6e115c6cd1b7618fe1ffbff304ea7d87ae3fd07671082b704841",
       "classification": "carrier_infra",
       "rationale": "Weak map from in-zone inotify handle to its fronting InotifyState, so host paths reach the one authoritative instance."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "snapshot::CARRICK_RUN_ID",
+      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
+      "classification": "config_debug",
+      "rationale": "The run id is copied into an EL1 census file so the CLI can join it to a conformance result; diagnostic only, it selects no container state."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "init_from_env::CARRICK_EL1_CENSUS",
+      "fingerprint": "b5d19b3f216428d054961abf0597b6df0b065599a654e73d7021b504670feac7",
+      "classification": "config_debug",
+      "rationale": "Opt-in diagnostic: names the directory an EL1 census is written to at carrier teardown. Unset, the census records nothing; set, it only counts and times syscall service and cannot change guest-visible state."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "DIRECTORY",
+      "fingerprint": "a76960aa7858750ad743cfba833e7c7e3f858cdfcae2ed77790caa138bca5057",
+      "classification": "config_debug",
+      "rationale": "Census output directory, read once from CARRICK_EL1_CENSUS; diagnostic only."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "ENABLED",
+      "fingerprint": "c96e6b69ce52fbad881d65ee889d26d2b181c0ff114b861e315c1c27624df699",
+      "classification": "config_debug",
+      "rationale": "Whether the EL1 census is recording (CARRICK_EL1_CENSUS set); gates counting only. Process-wide: several embedded containers in one host process share one census, a per-carrier-process measurement."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "STARTED",
+      "fingerprint": "77537edcbc492939d3374a9cf9a63a516cc476b40aed08b36191d52a95f6a8e3",
+      "classification": "config_debug",
+      "rationale": "Wall-clock start of the census window for the carrier process; diagnostic only."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "TABLE",
+      "fingerprint": "5f625142c8812c33cbfa3051ade028cdc07081b8bb4ba99d7fcae304858f38e8",
+      "classification": "config_debug",
+      "rationale": "Per-syscall atomic counters and host service time for the EL1 census; diagnostic accounting that no dispatch decision reads."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "WRITTEN",
+      "fingerprint": "95eb755f799704565536668d09ba2c6301503b2f00fb15627cf52183ab9c1306",
+      "classification": "config_debug",
+      "rationale": "Once-flag so the census file is written exactly once at carrier teardown; diagnostic only."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "CENSUS_EL1_BOUNDARY",
+      "fingerprint": "20029c1924cfffe7112bbb00c5a94704c22f081affec8c641ab4929c304271d4",
+      "classification": "config_debug",
+      "rationale": "Per-executor-thread flag marking that the current syscall crossed the EL1 boundary, read only by census accounting."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "CENSUS_IN_SERVICE",
+      "fingerprint": "7f3f3f597f23ef37ceefba377e332515df61380edd1e58629bcada3d7d17cf26",
+      "classification": "config_debug",
+      "rationale": "Per-executor-thread flag so a redispatch nested inside a host service is not double-counted by the census; accounting only."
     }
   ]
 }
