@@ -400,7 +400,15 @@ pub(crate) fn delegate_locked(
     if open_file.description.has_active_mappings() {
         return Err(NotEligible::Mapped);
     }
-    if let Some(limits) = rlimits {
+    let fallback_rlimits;
+    let effective_rlimits = match rlimits {
+        Some(limits) => Some(limits),
+        None => {
+            fallback_rlimits = crate::dispatch::resources::rlimits();
+            fallback_rlimits.as_ref()
+        }
+    };
+    if let Some(limits) = effective_rlimits {
         let lim = limits.get(LinuxResource::Fsize);
         if lim.rlim_cur != LINUX_RLIM_INFINITY {
             return Err(NotEligible::FsizeLimited);
@@ -1995,6 +2003,18 @@ mod tests {
                 crate::dispatch::DispatchOutcome::errno(carrick_abi::LINUX_EFBIG),
                 "write at or past RLIMIT_FSIZE must return EFBIG after recall"
             );
+
+            // Verify that subsequent attempt to delegate fails with NotEligible::FsizeLimited
+            let err = delegate(
+                &open_file,
+                table_id,
+                fd,
+                dispatcher.fs(),
+                Some(&ctx.task().rlimits()),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err, NotEligible::FsizeLimited);
 
             // 2. File delegated, then seccomp STRICT
             let fd2 = open_path_for_test(
