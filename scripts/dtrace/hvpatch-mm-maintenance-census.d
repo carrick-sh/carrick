@@ -98,6 +98,10 @@ carrick*:::hvpatch-backing-scrub
     @scrub_remapped = sum(arg2);
 }
 
+/* End with the traced run: `carrick trace` refuses a script that outlives its
+ * child by 60 s, and killing it then discards this END table. */
+proc:::exit /pid == $target/ { exit(0); }
+
 tick-1s { seconds++; }
 tick-1s /seconds >= 600/ { exit(0); }
 
