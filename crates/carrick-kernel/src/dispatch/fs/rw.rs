@@ -540,7 +540,7 @@ impl<'a> FsView<'a> {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let Some(mut open) = open_file.description.write() else {
+            let Some(mut open) = open_file.description.write_for_io() else {
                 if is_stdio_fd(fd.0) && !this.stdio_is_closed(fd.0) {
                     return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
                 }
@@ -1006,7 +1006,7 @@ impl<'a> FsView<'a> {
                     super::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
                 )?;
             }
-            let Some(mut open) = open_file.description.write() else {
+            let Some(mut open) = open_file.description.write_for_io() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             // read() on a regular file opened write-only (O_WRONLY) → EBADF
@@ -1492,7 +1492,7 @@ impl<'a> FsView<'a> {
                 )?;
             }
             let nonblocking = this.io_is_nonblocking(fd.0, 0);
-            let Some(mut open) = open_file.description.write() else {
+            let Some(mut open) = open_file.description.write_for_io() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             // readv() on a regular file opened write-only (O_WRONLY) → EBADF.
@@ -1834,7 +1834,7 @@ impl<'a> FsView<'a> {
                     super::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
                 )?;
             }
-            let Some(open) = open_file.description.read() else {
+            let Some(open) = open_file.description.read_for_io() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             // pread reads the fd, so a regular file descriptor not open for reading
@@ -2023,7 +2023,7 @@ impl<'a> FsView<'a> {
                     super::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
                 )?;
             }
-            let Some(open) = open_file.description.read() else {
+            let Some(open) = open_file.description.read_for_io() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             // preadv reads the fd, so a regular file descriptor not open for reading
@@ -2227,7 +2227,7 @@ impl<'a> FsView<'a> {
                     super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
                 )?;
             }
-            let Some(mut open) = open_file.description.write() else {
+            let Some(mut open) = open_file.description.write_for_io() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             // An O_APPEND fd forces EVERY write to EOF, ignoring the supplied
@@ -2331,7 +2331,7 @@ impl<'a> FsView<'a> {
             let is_inmem_file = matches!(&*open, OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. });
             drop(open);
             if is_inmem_file {
-                let Some(mut open) = open_file.description.write() else {
+                let Some(mut open) = open_file.description.write_for_io() else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 if let OpenDescription::InMemoryFile {
@@ -2407,7 +2407,7 @@ impl<'a> FsView<'a> {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
-            let Some(open) = open_file.description.read() else {
+            let Some(open) = open_file.description.inspect() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let errno = match &*open {
@@ -2504,7 +2504,7 @@ impl<'a> FsView<'a> {
                     super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
                 )?;
             }
-            let Some(mut open) = open_file.description.write() else {
+            let Some(mut open) = open_file.description.write_for_io() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             // An O_APPEND fd writes at EOF regardless of the offset, but pwritev
@@ -2930,7 +2930,7 @@ impl<'a> FsView<'a> {
                 let Some(io_lease) = open_file.description.retain_fd_lease() else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
-                let Some(mut open) = open_file.description.write() else {
+                let Some(mut open) = open_file.description.write_for_io() else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 if matches!(&*open, OpenDescription::HostFile { .. }) {
@@ -3479,7 +3479,7 @@ impl<'a> FsView<'a> {
                         super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
                     )?;
                 }
-                let open = open_file.description.read();
+                let open = open_file.description.read_for_io();
                 match open.as_deref() {
                     Some(OpenDescription::HostPipe {
                         base,
@@ -3687,7 +3687,7 @@ impl<'a> FsView<'a> {
                     let outcome: DispatchOutcome;
                     let writeback: Option<FileWriteback>;
                     {
-                        let Some(mut open) = open_file.description.write() else {
+                        let Some(mut open) = open_file.description.write_for_io() else {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         };
                         match &mut *open {

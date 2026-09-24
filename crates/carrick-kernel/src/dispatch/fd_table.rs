@@ -1688,7 +1688,7 @@ impl HostSocketAuthority {
     }
 
     pub(in crate::dispatch) fn set_ipv6_v6only(&self, enabled: bool) -> Result<(), LinuxErrno> {
-        let mut open = self.description.write().ok_or(super::LINUX_EBADF)?;
+        let mut open = self.description.write_for_io().ok_or(super::LINUX_EBADF)?;
         let OpenDescription::HostSocket {
             base,
             family,
@@ -1785,7 +1785,7 @@ impl<'guard> HostFileIo<'guard> {
 
 impl OpenFile {
     pub(in crate::dispatch) fn record_host_file_absolute_offset(&self, offset: i64) {
-        let Some(open) = self.description.read() else {
+        let Some(open) = self.description.read_for_io() else {
             return;
         };
         if let OpenDescription::HostFile { host_fd, .. } = &*open {
@@ -2215,7 +2215,7 @@ impl super::SyscallDispatcher {
     pub(in crate::dispatch) fn rename_open_paths(&self, resolved_old: &str, resolved_new: &str) {
         let file_table = self.captured_file_table();
         for (_, open_file) in file_table.read_open_files().iter() {
-            if let Some(mut desc) = open_file.description.write() {
+            if let Some(mut desc) = open_file.description.write_for_io() {
                 desc.rename_path(resolved_old, resolved_new);
             }
         }
@@ -2918,11 +2918,11 @@ impl crate::kernel::FileDescription {
     /// Snapshot the pathname recorded by an open description without exposing
     /// its backing lock to callers that only need stable metadata.
     pub(in crate::dispatch) fn open_path_snapshot(&self) -> Option<String> {
-        self.read()?.open_path().map(str::to_owned)
+        self.inspect()?.open_path().map(str::to_owned)
     }
 
     pub(in crate::dispatch) fn pidfd_watch(&self) -> PidfdWatchAccess {
-        let Some(open) = self.read() else {
+        let Some(open) = self.inspect() else {
             return PidfdWatchAccess::Closed;
         };
         match &*open {
@@ -2932,7 +2932,7 @@ impl crate::kernel::FileDescription {
     }
 
     pub(in crate::dispatch) fn in_memory_pipe_endpoint(&self) -> Option<InMemoryPipeEndpoint> {
-        match &*self.read()? {
+        match &*self.inspect()? {
             OpenDescription::PipeReader { .. } => Some(InMemoryPipeEndpoint::Reader),
             OpenDescription::PipeWriter { .. } => Some(InMemoryPipeEndpoint::Writer),
             _ => None,
@@ -2944,7 +2944,7 @@ impl crate::kernel::FileDescription {
     /// has a writer. Keeping both description and pipe-state locking here
     /// makes the readiness observation one owned operation.
     pub(in crate::dispatch) fn is_empty_pipe_reader_with_writer(&self) -> bool {
-        let Some(open) = self.read() else {
+        let Some(open) = self.inspect() else {
             return false;
         };
         let OpenDescription::PipeReader { pipe, .. } = &*open else {
@@ -2957,7 +2957,7 @@ impl crate::kernel::FileDescription {
     pub(in crate::dispatch) fn host_socket_authority(
         self: &Arc<Self>,
     ) -> Option<HostSocketAuthority> {
-        let open = self.read()?;
+        let open = self.inspect()?;
         let OpenDescription::HostSocket {
             base,
             host_fd,
@@ -2981,7 +2981,7 @@ impl crate::kernel::FileDescription {
     }
 
     pub(in crate::dispatch) fn in_memory_tcp_at_mark(&self) -> InMemoryTcpAtMark {
-        let Some(open) = self.read() else {
+        let Some(open) = self.inspect() else {
             return InMemoryTcpAtMark::NotInMemory;
         };
         let OpenDescription::InMemorySocket { socket, .. } = &*open else {
@@ -3005,7 +3005,7 @@ impl crate::kernel::FileDescription {
     pub(in crate::dispatch) fn retained_exec_source(
         &self,
     ) -> Option<crate::dispatch::executable_authority::ExecSource> {
-        self.read()?.retained_exec_source().cloned()
+        self.inspect()?.retained_exec_source().cloned()
     }
 
     /// Snapshot the exact executable, including its live dentry display, from
@@ -3013,32 +3013,76 @@ impl crate::kernel::FileDescription {
     pub(in crate::dispatch) fn retained_current_executable(
         &self,
     ) -> Option<crate::dispatch::executable_authority::CurrentExecutable> {
-        self.read()?.retained_executable().cloned()
+        self.inspect()?.retained_executable().cloned()
     }
 
     pub(crate) fn open_description(&self) -> Option<&RwLock<OpenDescription>> {
         self.concrete_backing::<RwLock<OpenDescription>>()
     }
 
-    // The accessors below are the ONLY host access to an OpenDescription.
-    // A delegated description is recalled before the host touches it. Other
-    // descriptions of the same inode cannot exist while it is delegated (the
-    // EL1 ownership record enforces single-description delegation), so each
-    // accessor only checks its own description, and a non-delegated file pays
-    // one atomic load here.
+    // The accessors below are the ONLY host access to an OpenDescription,
+    // and each name states whether it takes an in-zone description out of
+    // the EL1 zone:
+    //
+    // - `inspect` / `inspect_kind` never recall. They are for facts fixed at
+    //   open, which the zone never changes.
+    // - `read_for_io` / `write_for_io` recall first: an in-zone
+    //   description's inode is written back and leaves the zone before the
+    //   guard is returned, so the host fd offset, size and bytes the guard
+    //   reaches are current.
+    //
+    // There is deliberately no plain `read`/`write`: every call site states
+    // which one it needs. A recalling accessor checks only its own
+    // description's handle (a recall takes the whole inode out of the zone),
+    // and a description outside the zone pays one atomic load here.
 
-    /// Inspect what KIND of description this is without recalling a
-    /// delegation. Only for facts delegation never changes: the variant and
-    /// the fields it fixes at open (path, host fd identity, pipe or socket
-    /// role). Anything EL1 can change (offset, size, contents) goes through
-    /// `read`/`write`, which recall first.
-    pub(crate) fn inspect_kind<R>(&self, inspect: impl FnOnce(&OpenDescription) -> R) -> Option<R> {
+    /// Borrow the description WITHOUT taking it out of the EL1 zone.
+    ///
+    /// Only `OpenDescription::HostFile` can be in the zone. Through the
+    /// returned guard a caller may read:
+    /// - the variant (what kind of description this is);
+    /// - fields fixed at open, which the zone never changes: the recorded
+    ///   path, access mode and status flags (those change only under
+    ///   `write_for_io`), `metadata.kind`, a host fd's NUMBER or inode
+    ///   identity (for readiness, diagnostics and identity), pty role,
+    ///   writability flags;
+    /// - every field of a variant that is never in the zone (pipes, sockets,
+    ///   eventfd, epoll, inotify, timerfd, synthetic and directory
+    ///   descriptions, ...).
+    ///
+    /// A caller must NOT, for a `HostFile`, read its offset, `metadata.size`
+    /// or times, its contents, or do any I/O (read, write, seek, fstat,
+    /// truncate, mmap) through its host fd: while the file is in the zone
+    /// those are stale, and only `read_for_io`/`write_for_io` bring them
+    /// back. The guard is read-only; mutation always goes through
+    /// `write_for_io`.
+    pub(crate) fn inspect(&self) -> Option<InspectGuard<'_>> {
         let d = self.open_description()?;
-        Some(inspect(&d.read()))
+        Some(InspectGuard { guard: d.read() })
     }
 
+    /// Non-blocking [`Self::inspect`]: `None` when the description lock is
+    /// contended. Same contract as `inspect`.
+    pub(crate) fn try_inspect(&self) -> Option<InspectGuard<'_>> {
+        let d = self.open_description()?;
+        Some(InspectGuard {
+            guard: d.try_read()?,
+        })
+    }
+
+    /// Closure form of [`Self::inspect`], with the same contract.
+    pub(crate) fn inspect_kind<R>(&self, inspect: impl FnOnce(&OpenDescription) -> R) -> Option<R> {
+        let guard = self.inspect()?;
+        Some(inspect(&guard))
+    }
+
+    /// Borrow the description for I/O: an in-zone description is recalled
+    /// (its inode written back and taken out of the zone) before the guard
+    /// is returned. Use this when reading a `HostFile`'s offset, size, times
+    /// or contents, or doing I/O through its host fd; use [`Self::inspect`]
+    /// for anything fixed at open.
     #[track_caller]
-    pub(crate) fn read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
+    pub(crate) fn read_for_io(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
         let d = self.open_description()?;
         loop {
             let handle = self.delegation_handle();
@@ -3060,22 +3104,10 @@ impl crate::kernel::FileDescription {
         }
     }
 
+    /// Borrow the description mutably, recalling an in-zone description
+    /// first. Every mutation of a description goes through here.
     #[track_caller]
-    pub(crate) fn try_read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
-        let d = self.open_description()?;
-        if self.delegation_handle() != 0 {
-            let mut guard = d.try_write()?;
-            let handle = self.delegation_handle();
-            if handle != 0 {
-                let _ = crate::el1_delegation::recall_locked(self, &mut guard, handle);
-            }
-        }
-        let guard = d.try_read()?;
-        (self.delegation_handle() == 0).then_some(guard)
-    }
-
-    #[track_caller]
-    pub(crate) fn write(&self) -> Option<FileDescriptionWriteGuard<'_>> {
+    pub(crate) fn write_for_io(&self) -> Option<FileDescriptionWriteGuard<'_>> {
         let d = self.open_description()?;
         let mut guard = d.write();
         let handle = self.delegation_handle();
@@ -3100,6 +3132,28 @@ impl crate::kernel::FileDescription {
             guard,
             description: self,
         })
+    }
+}
+
+/// Read-only, non-recalling view of an open description, returned by
+/// [`crate::kernel::FileDescription::inspect`]. See that method for what may
+/// be read through it: fields fixed at open, never a `HostFile`'s offset,
+/// size, times or contents, and no I/O through its host fd.
+pub(crate) struct InspectGuard<'a> {
+    guard: RwLockReadGuard<'a, OpenDescription>,
+}
+
+impl std::fmt::Debug for InspectGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.guard, f)
+    }
+}
+
+impl Deref for InspectGuard<'_> {
+    type Target = OpenDescription;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
     }
 }
 
@@ -3617,7 +3671,7 @@ impl InMemoryPipeTestFixture {
     }
 
     pub(crate) fn read_base_capacity(&self) -> i64 {
-        let guard = self.read.read().expect("read description");
+        let guard = self.read.inspect().expect("read description");
         match &*guard {
             OpenDescription::PipeReader { base, .. } => base.pipe_capacity(),
             _ => panic!("expected PipeReader"),
@@ -3625,7 +3679,7 @@ impl InMemoryPipeTestFixture {
     }
 
     pub(crate) fn write_base_capacity(&self) -> i64 {
-        let guard = self.write.read().expect("write description");
+        let guard = self.write.inspect().expect("write description");
         match &*guard {
             OpenDescription::PipeWriter { base, .. } => base.pipe_capacity(),
             _ => panic!("expected PipeWriter"),
@@ -3687,7 +3741,7 @@ impl HostPipeTestFixture {
     }
 
     pub(crate) fn read_base_capacity(&self) -> i64 {
-        let guard = self.read.read().expect("host pipe read description");
+        let guard = self.read.inspect().expect("host pipe read description");
         match &*guard {
             OpenDescription::HostPipe { base, .. } => base.pipe_capacity(),
             _ => panic!("expected HostPipe"),

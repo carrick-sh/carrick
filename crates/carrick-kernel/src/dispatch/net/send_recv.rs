@@ -345,7 +345,7 @@ impl<'a> NetView<'a> {
             }
             let memory = &*cx.memory;
             if let Some(open_file) = this.open_file(fd)
-                && let Some(open) = open_file.description.read()
+                && let Some(open) = open_file.description.inspect()
             {
                 match &*open {
                     OpenDescription::Packet { socket, .. } => {
@@ -624,7 +624,7 @@ impl<'a> NetView<'a> {
             let my_cred = current_task_default_send_cred(&creds, cx.kernel);
             let send_to = this
                 .open_file(fd)
-                .and_then(|f| f.description.read()?.send_timeout());
+                .and_then(|f| f.description.inspect()?.send_timeout());
             let outcome = this.blocking_io(fd, host_fd.get(), IoDir::Write, nonblocking, send_to, || {
                 // Re-stated locally (idempotent) so the non-blocking guarantee
                 // is visible at every send site below: both the real socket and
@@ -774,7 +774,7 @@ impl<'a> NetView<'a> {
                 return Ok(drained);
             }
             if let Some(open_file) = this.open_file(fd)
-                && let Some(open) = open_file.description.read()
+                && let Some(open) = open_file.description.inspect()
             {
                 match &*open {
                     OpenDescription::Packet { socket, .. } => {
@@ -964,7 +964,7 @@ impl<'a> NetView<'a> {
             let is_peek = (flags & LinuxMsgFlags::PEEK.bits()) != 0;
             let recv_to = this
                 .open_file(fd)
-                .and_then(|f| f.description.read()?.recv_timeout());
+                .and_then(|f| f.description.inspect()?.recv_timeout());
             let recv_protocol = this.socket_port_protocol(fd);
             let received_source = std::cell::RefCell::new(None::<Vec<u8>>);
             let recv_targets: Vec<i32> = std::iter::once(host_fd.get())
@@ -1160,7 +1160,7 @@ impl<'a> NetView<'a> {
     ) -> Result<DispatchOutcome, DispatchError> {
         let is_netlink = self.fd_is_netlink(fd);
         if let Some(open_file) = self.open_file(fd)
-            && let Some(open) = open_file.description.read()
+            && let Some(open) = open_file.description.inspect()
             && let OpenDescription::InMemorySocket { socket, .. } = &*open
         {
             let socket = Arc::clone(socket);
@@ -1341,7 +1341,7 @@ impl<'a> NetView<'a> {
         }
         let send_to = self
             .open_file(fd)
-            .and_then(|f| f.description.read()?.send_timeout());
+            .and_then(|f| f.description.inspect()?.send_timeout());
         // `uv_udp_send` lowers to sendmsg, not sendto, so this path needs the
         // routing just as much as `sendto` does.
         let recverr_send_fd = match (&host_addr, recverr::is_enabled(host_fd.get())) {
@@ -1588,7 +1588,7 @@ impl<'a> NetView<'a> {
     ) -> Result<DispatchOutcome, DispatchError> {
         let is_netlink = self.fd_is_netlink(fd);
         if let Some(open_file) = self.open_file(fd)
-            && let Some(open) = open_file.description.read()
+            && let Some(open) = open_file.description.inspect()
             && let OpenDescription::InMemorySocket { socket, .. } = &*open
         {
             let socket = Arc::clone(socket);
@@ -1840,7 +1840,7 @@ impl<'a> NetView<'a> {
         let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
         let recv_to = self
             .open_file(fd)
-            .and_then(|f| f.description.read()?.recv_timeout());
+            .and_then(|f| f.description.inspect()?.recv_timeout());
         let want_control = msg.control != 0 && msg.controllen > 0;
         // SCM_RIGHTS host fds received this call, ferried out of the I/O closure
         // (which may run on a retry) so they're installed/written-back exactly

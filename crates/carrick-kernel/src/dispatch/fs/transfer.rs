@@ -63,7 +63,7 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return false;
         };
-        let Some(open) = open_file.description.read() else {
+        let Some(open) = open_file.description.inspect() else {
             return false;
         };
         match &*open {
@@ -86,7 +86,7 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return false;
         };
-        let Some(open) = open_file.description.read() else {
+        let Some(open) = open_file.description.inspect() else {
             return false;
         };
         match &*open {
@@ -282,7 +282,7 @@ impl<'a> FsView<'a> {
     fn host_pipe_splice_staging_target(&self, fd: i32) -> Option<(i32, usize)> {
         let (pipe_id, capacity) = {
             let open_file = self.open_file(fd)?;
-            let open = open_file.description.read()?;
+            let open = open_file.description.inspect()?;
             match &*open {
                 OpenDescription::HostPipe {
                     base,
@@ -309,7 +309,7 @@ impl<'a> FsView<'a> {
     /// write end, including in-memory pipes, pty, and bidirectional ends.
     pub(in crate::dispatch) fn splice_pipe_write_room(&self, fd: i32) -> Option<usize> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read()?;
+        let open = open_file.description.inspect()?;
         match &*open {
             OpenDescription::PipeWriter { pipe, .. } => {
                 let state = pipe.state.lock();
@@ -395,7 +395,7 @@ impl<'a> FsView<'a> {
     ) -> DispatchOutcome {
         if off_out_addr == 0 {
             if let Some(open_file) = self.open_file(out_fd) {
-                if let Some(open) = open_file.description.read()
+                if let Some(open) = open_file.description.inspect()
                     && let OpenDescription::SyntheticDevice {
                         kind:
                             carrick_vfs::SyntheticDeviceKind::Null
@@ -431,7 +431,7 @@ impl<'a> FsView<'a> {
             Err(errno) => return DispatchOutcome::errno(errno),
         };
         let host_fd = match self.open_file(out_fd).as_ref() {
-            Some(of) => match of.description.read().as_deref() {
+            Some(of) => match of.description.read_for_io().as_deref() {
                 Some(OpenDescription::HostFile {
                     host_fd,
                     writable: true,
@@ -586,7 +586,7 @@ impl<'a> FsView<'a> {
     /// the wait; a non-blocking caller gets `EAGAIN` instead.
     fn splice_output_would_block(&self, fd: i32, nonblocking: bool) -> DispatchOutcome {
         let target = self.open_file(fd).and_then(|file| {
-            let open = file.description.read()?;
+            let open = file.description.inspect()?;
             match &*open {
                 OpenDescription::HostPipe { host_fd, .. }
                 | OpenDescription::HostSocket { host_fd, .. } => {
@@ -697,7 +697,7 @@ impl<'a> FsView<'a> {
             let outcome: DispatchOutcome;
             let writeback: Option<(String, usize, usize)>;
             {
-                let Some(mut open) = open_file.description.write() else {
+                let Some(mut open) = open_file.description.write_for_io() else {
                     return DispatchOutcome::errno(LINUX_EBADF);
                 };
                 match &mut *open {
@@ -1186,7 +1186,7 @@ impl<'a> FsView<'a> {
                 let in_nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
                     || this.fd_is_nonblocking(in_fd.0);
                 let host_fd_owner = this.open_file(in_fd.0).and_then(|file| {
-                    let open = file.description.read()?;
+                    let open = file.description.inspect()?;
                     match &*open {
                         OpenDescription::HostPipe { host_fd, .. } => Some(host_fd.clone()),
                         _ => None,
@@ -1416,7 +1416,7 @@ impl<'a> FsView<'a> {
             }
 
             if let Some(open_file) = this.open_file(in_fd.0)
-                && let Some(open) = open_file.description.read()
+                && let Some(open) = open_file.description.inspect()
             {
                 if let OpenDescription::InMemorySocket { socket, .. } = &*open {
                     let socket = Arc::clone(socket);
@@ -1592,7 +1592,7 @@ impl<'a> FsView<'a> {
             offset = offset.saturating_add(written);
             if off_in_address == 0 {
                 if let Some(open_file) = this.open_file(in_fd.0)
-                    && let Some(mut open) = open_file.description.write()
+                    && let Some(mut open) = open_file.description.write_for_io()
                 {
                     match &mut *open {
                         OpenDescription::File {
@@ -1669,7 +1669,7 @@ impl<'a> FsView<'a> {
                 ReadMem,
             }
             let dir = {
-                let Some(open) = open_file.description.read() else {
+                let Some(open) = open_file.description.inspect() else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 match &*open {

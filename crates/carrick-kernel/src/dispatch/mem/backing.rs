@@ -895,7 +895,7 @@ impl<'a> MemView<'a> {
         let mut bytes = vec![0; length];
         let length_u64 = u64::try_from(length).map_err(|_| linux_errno::EOVERFLOW)?;
         let page_size = self.linux_page_size();
-        let Some(open) = description.read() else {
+        let Some(open) = description.read_for_io() else {
             return Err(LINUX_EBADF);
         };
         let offset_usize = usize::try_from(offset).map_err(|_| linux_errno::EOVERFLOW)?;
@@ -1041,7 +1041,7 @@ impl<'a> MemView<'a> {
                 .map_err(|_| LINUX_ENOMEM)?;
             if valid_len != 0 {
                 let direct = {
-                    let open = description.description().read().ok_or(LINUX_EBADF)?;
+                    let open = description.description().read_for_io().ok_or(LINUX_EBADF)?;
                     if let Some(fd) = open.shared_alias_host_fd() {
                         let provenance = match &*open {
                             OpenDescription::HostFile { host_fd, .. } => {

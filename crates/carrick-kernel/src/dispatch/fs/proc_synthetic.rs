@@ -481,7 +481,7 @@ impl<'a> FsView<'a> {
         };
 
         let action = {
-            let Some(mut open) = open_file.description.write() else {
+            let Some(mut open) = open_file.description.write_for_io() else {
                 *reservation = None;
                 return Ok(self.duplicate_fd(
                     n,
@@ -657,7 +657,7 @@ impl<'a> FsView<'a> {
     /// the status flags from the live fd table. `None` if fd N is not open.
     pub(super) fn fdinfo_bytes(&self, n: i32) -> Option<Vec<u8>> {
         let of = self.open_file(n)?;
-        let desc = of.description.read();
+        let desc = of.description.read_for_io();
         let cloexec = of.fd_flags & LINUX_FD_CLOEXEC != 0;
         let flags = reportable_status_flags(of.description.common().status_flags())
             | if cloexec { LINUX_O_CLOEXEC } else { 0 };

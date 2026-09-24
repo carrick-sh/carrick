@@ -129,7 +129,7 @@ impl<'a> FsView<'a> {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let Some(open) = open_file.description.read() else {
+            let Some(open) = open_file.description.inspect() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             Ok(match &*open {

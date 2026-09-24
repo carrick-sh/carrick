@@ -170,7 +170,7 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let Some(open) = open_file.description.read() else {
+            let Some(open) = open_file.description.inspect() else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let OpenDescription::TimerFd { state, .. } = &*open else {
@@ -210,7 +210,7 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let Some(open) = open_file.description.read() else {
+            let Some(open) = open_file.description.inspect() else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let OpenDescription::TimerFd { state, .. } = &*open else {

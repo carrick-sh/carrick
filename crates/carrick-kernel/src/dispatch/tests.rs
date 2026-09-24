@@ -512,7 +512,7 @@ mod overlay_dispatch_tests {
 
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
             {
-                let open = epoll_open.description.read().expect("open description");
+                let open = epoll_open.description.inspect().expect("open description");
                 let OpenDescription::Epoll { kqueue, .. } = &*open else {
                     panic!("epfd should be an epoll description");
                 };
@@ -576,7 +576,7 @@ mod overlay_dispatch_tests {
         dispatcher.close_open_file_and_free_pty(&removed);
         assert_eq!(description.fd_ref_count(), 0);
         assert!(matches!(
-            description.read().as_deref(),
+            description.inspect().as_deref(),
             Some(OpenDescription::Closed { .. })
         ));
     }
@@ -614,7 +614,7 @@ mod overlay_dispatch_tests {
         assert!(old_files.read_open_files().contains_key(&writer_fd));
         assert!(replacement.resources().files().slot_count() == 0);
         assert!(matches!(
-            writer.read().as_deref(),
+            writer.inspect().as_deref(),
             Some(OpenDescription::Closed { .. })
         ));
 
@@ -1400,7 +1400,7 @@ mod overlay_dispatch_tests {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
             let open = epoll_open
                 .description
-                .read()
+                .inspect()
                 .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
@@ -1918,7 +1918,7 @@ mod overlay_dispatch_tests {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
             let open = epoll_open
                 .description
-                .read()
+                .inspect()
                 .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
@@ -2034,7 +2034,7 @@ mod overlay_dispatch_tests {
     }
 
     fn set_epoll_latch(epoll: &OpenFile, target: i32, ready: u32, read_avail: u64) {
-        let mut open = epoll.description.write().unwrap();
+        let mut open = epoll.description.write_for_io().unwrap();
         let OpenDescription::Epoll { interest, .. } = &mut *open else {
             panic!("epoll")
         };
@@ -2048,7 +2048,7 @@ mod overlay_dispatch_tests {
     }
 
     fn staged_slot_state(epoll: &OpenFile, target: i32) -> (u32, u64, bool, u64, u32, u64) {
-        let open = epoll.description.read().unwrap();
+        let open = epoll.description.inspect().unwrap();
         let OpenDescription::Epoll { interest, .. } = &*open else {
             panic!("epoll")
         };
@@ -2355,7 +2355,7 @@ mod overlay_dispatch_tests {
         {
             let mut open = epoll_open
                 .description
-                .write()
+                .write_for_io()
                 .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &mut *open else {
                 panic!("epfd should be an epoll description");
@@ -2372,7 +2372,7 @@ mod overlay_dispatch_tests {
         {
             let open = epoll_open
                 .description
-                .read()
+                .inspect()
                 .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
@@ -2391,7 +2391,7 @@ mod overlay_dispatch_tests {
         {
             let open = epoll_open
                 .description
-                .read()
+                .inspect()
                 .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
@@ -2459,7 +2459,7 @@ mod overlay_dispatch_tests {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
             let open = epoll_open
                 .description
-                .read()
+                .inspect()
                 .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
@@ -2479,7 +2479,7 @@ mod overlay_dispatch_tests {
 
         let delivered_guest_fd = {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = epoll_open.description.read().expect("open description");
+            let open = epoll_open.description.inspect().expect("open description");
             let OpenDescription::Epoll { kqueue, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -2505,7 +2505,7 @@ mod overlay_dispatch_tests {
         let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
         let open = epoll_open
             .description
-            .read()
+            .inspect()
             .expect("epoll open description");
         let OpenDescription::Epoll { interest, .. } = &*open else {
             panic!("epfd should be an epoll description");
@@ -4094,7 +4094,7 @@ mod overlay_dispatch_tests {
 
         // Drain the backing to its Closed identity shell. Reaching this state used
         // to abort the process through OpenDescription::base().
-        *description.write().expect("open description write guard") =
+        *description.write_for_io().expect("open description write guard") =
             OpenDescription::Closed { was_epoll: false };
 
         assert_eq!(description.common().fd_refs(), 1);
@@ -4971,7 +4971,7 @@ mod hvpatch_in_process_fork_tests {
             .expect("detached target snapshot");
         assert!(owners.is_empty());
         let epoll = parent.open_file(epfd).expect("parent epoll fd");
-        let epoll = epoll.description.read().expect("epoll open description");
+        let epoll = epoll.description.inspect().expect("epoll open description");
         let OpenDescription::Epoll { interest, .. } = &*epoll else {
             panic!("epoll fd changed description kind");
         };
@@ -5087,7 +5087,7 @@ mod hvpatch_in_process_fork_tests {
         );
 
         let epoll = parent.open_file(epfd).expect("parent epoll fd");
-        let epoll = epoll.description.read().expect("epoll open description");
+        let epoll = epoll.description.inspect().expect("epoll open description");
         let OpenDescription::Epoll { interest, .. } = &*epoll else {
             panic!("epoll fd changed description kind");
         };
@@ -5115,7 +5115,7 @@ mod hvpatch_in_process_fork_tests {
         );
         let epoll = parent.open_file(epfd).expect("parent epoll fd");
         let poll_fd = {
-            let epoll = epoll.description.read().expect("open description");
+            let epoll = epoll.description.inspect().expect("open description");
             let OpenDescription::Epoll { kqueue, .. } = &*epoll else {
                 panic!("epoll fd changed description kind");
             };
@@ -7551,7 +7551,7 @@ mod container_clock_tests {
         );
         let open_file = dispatcher.open_file(fd as i32).expect("timerfd open file");
         let description = open_file.description();
-        let open = description.read().expect("timerfd open description");
+        let open = description.inspect().expect("timerfd open description");
         let OpenDescription::TimerFd { state, .. } = &*open else {
             panic!("fd {fd} is not a timerfd");
         };
@@ -7936,8 +7936,8 @@ fn a_backing_with_no_open_description_answers_generic_questions_without_aborting
     assert_eq!(description.common().fd_refs(), 0);
     assert!(!description.is_epoll());
     assert!(description.open_description().is_none());
-    assert!(description.read().is_none());
-    assert!(description.write().is_none());
+    assert!(description.read_for_io().is_none());
+    assert!(description.write_for_io().is_none());
 
     // Exercise retain_fd_ref() and release_fd_ref() directly on FileDescription,
     // asserting common counts after each and proving default no-op hooks make a third backing valid.
@@ -8739,7 +8739,7 @@ mod inzone_tcp {
         // Client must be replaced with InMemorySocket
         let client_of = g.dispatcher.open_file(client_fd).unwrap();
         let client_desc = client_of.description();
-        let client_guard = client_desc.read().unwrap();
+        let client_guard = client_desc.inspect().unwrap();
         assert!(
             matches!(&*client_guard, OpenDescription::InMemorySocket { .. }),
             "client description must be InMemorySocket"
@@ -8758,7 +8758,7 @@ mod inzone_tcp {
 
         let accepted_of = g.dispatcher.open_file(accepted_fd).unwrap();
         let accepted_desc = accepted_of.description();
-        let accepted_guard = accepted_desc.read().unwrap();
+        let accepted_guard = accepted_desc.inspect().unwrap();
         assert!(
             matches!(&*accepted_guard, OpenDescription::InMemorySocket { .. }),
             "accepted description must be InMemorySocket"
@@ -8848,7 +8848,7 @@ mod inzone_tcp {
         // Host socket must have had no host accept performed
         let listen_of = g.dispatcher.open_file(listen_fd).unwrap();
         let listen_desc = listen_of.description();
-        let listen_guard = listen_desc.read().unwrap();
+        let listen_guard = listen_desc.inspect().unwrap();
         if let OpenDescription::HostSocket { host_fd, .. } = &*listen_guard {
             let mut pfd = libc::pollfd {
                 fd: host_fd.raw(),

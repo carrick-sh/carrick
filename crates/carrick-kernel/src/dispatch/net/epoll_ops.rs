@@ -192,7 +192,7 @@ impl<'a> NetView<'a> {
         {
             return true;
         }
-        let Some(open) = open_file.description.read() else {
+        let Some(open) = open_file.description.inspect() else {
             return false;
         };
         match &*open {
@@ -214,7 +214,7 @@ impl<'a> NetView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return false;
         };
-        match open_file.description.read().as_deref() {
+        match open_file.description.inspect().as_deref() {
             Some(OpenDescription::HostSocket { .. }) => true,
             Some(OpenDescription::InMemorySocket { socket, .. }) => {
                 (socket.family() == LINUX_AF_INET || socket.family() == LINUX_AF_INET6)
@@ -229,7 +229,7 @@ impl<'a> NetView<'a> {
             return false;
         };
         matches!(
-            open_file.description.read().as_deref(),
+            open_file.description.inspect().as_deref(),
             Some(OpenDescription::HostSocket { base, .. } | OpenDescription::InMemorySocket { base, .. }) if base.listening()
         )
     }
@@ -237,7 +237,7 @@ impl<'a> NetView<'a> {
     pub(super) fn interest_is_connected_host_socket(&self, slot: &EpollInterest, fd: i32) -> bool {
         let is_host_connected = |desc: &crate::kernel::FileDescription| {
             matches!(
-                desc.read().as_deref(),
+                desc.inspect().as_deref(),
                 Some(OpenDescription::HostSocket { base, .. }) if !base.listening()
             )
         };
@@ -347,7 +347,7 @@ impl<'a> NetView<'a> {
                 InMemoryPipeEndpoint::Writer => interest.read = false,
             }
         }
-        let supports_oob = description.is_some_and(|desc| match desc.read().as_deref() {
+        let supports_oob = description.is_some_and(|desc| match desc.inspect().as_deref() {
             Some(OpenDescription::HostSocket { .. }) => true,
             Some(OpenDescription::InMemorySocket { socket, .. }) => {
                 (socket.family() == LINUX_AF_INET || socket.family() == LINUX_AF_INET6)
@@ -490,7 +490,7 @@ impl<'a> NetView<'a> {
         staged_splice_bytes: u64,
     ) -> u64 {
         let mut synthetic_bytes = 0u64;
-        if let Some(open) = desc.read() {
+        if let Some(open) = desc.inspect() {
             match &*open {
                 OpenDescription::PipeReader { pipe, .. } => return pipe.buffered_bytes() as u64,
                 OpenDescription::InMemorySocket { socket, .. } => {
@@ -693,7 +693,7 @@ impl<'a> NetView<'a> {
             let stale = match self.open_file(epfd) {
                 None => true,
                 Some(open_file) => {
-                    let Some(mut open) = open_file.description.write() else {
+                    let Some(mut open) = open_file.description.write_for_io() else {
                         return;
                     };
                     if let OpenDescription::Epoll {
@@ -858,7 +858,7 @@ impl<'a> NetView<'a> {
         detached_host_fd: Option<HostFd>,
     ) {
         for (owner, registration_fd) in target.take_epoll_owners() {
-            let Some(mut guard) = owner.write() else {
+            let Some(mut guard) = owner.write_for_io() else {
                 continue;
             };
             let OpenDescription::Epoll {
@@ -935,7 +935,7 @@ impl<'a> NetView<'a> {
             return;
         }
         for description in owners {
-            let Some(mut guard) = description.write() else {
+            let Some(mut guard) = description.write_for_io() else {
                 continue;
             };
             if let OpenDescription::Epoll {
@@ -1051,7 +1051,7 @@ impl<'a> NetView<'a> {
         // reassigned on the multiplexer path below (it collects the
         // drained-and-tagged events), so the `mut` is load-bearing.
         let pending_ready = {
-            let Some(mut open) = open_file.description.write() else {
+            let Some(mut open) = open_file.description.write_for_io() else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let OpenDescription::Epoll { pending_ready, .. } = &mut *open else {
@@ -1079,7 +1079,7 @@ impl<'a> NetView<'a> {
         // race without putting a live lock lookup on every returned event.
         {
             let (interests, kq, kq_fd) = {
-                let Some(open) = open_file.description.read() else {
+                let Some(open) = open_file.description.inspect() else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
                 let OpenDescription::Epoll {
@@ -1169,7 +1169,7 @@ impl<'a> NetView<'a> {
                         // -> guest fds sharing it (dup fan-out). Types inferred
                         // from the inserts.
                         let (gfd_info, host_to_gfds) = {
-                            let Some(open) = open_file.description.read() else {
+                            let Some(open) = open_file.description.inspect() else {
                                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                             };
                             // Per-guest-fd epoll interest snapshot: (host_fd,
@@ -1717,7 +1717,7 @@ impl<'a> NetView<'a> {
                 .collect();
 
             if !ready_updates.is_empty() || !oneshot_fds.is_empty() {
-                if let Some(mut open) = open_file.description.write() {
+                if let Some(mut open) = open_file.description.write_for_io() {
                     if let OpenDescription::Epoll {
                         interest, kqueue, ..
                     } = &mut *open
@@ -1845,7 +1845,7 @@ impl<'a> NetView<'a> {
                 .collect();
             if ready_tagged.len() > max_events {
                 let overflow: Vec<(i32, LinuxEpollEvent)> = ready_tagged.split_off(max_events);
-                if let Some(mut open) = open_file.description.write() {
+                if let Some(mut open) = open_file.description.write_for_io() {
                     if let OpenDescription::Epoll { pending_ready, .. } = &mut *open {
                         pending_ready.extend(overflow);
                     }
@@ -1987,7 +1987,7 @@ mod synthetic_datagram_readiness_tests {
             let open_file = dispatcher.open_file(fd).expect("udp socket open file");
             let mut open = open_file
                 .description
-                .write()
+                .write_for_io()
                 .expect("udp socket open description");
             let OpenDescription::HostSocket { synthetic_recv, .. } = &mut *open else {
                 panic!("udp socket must be a HostSocket");
@@ -3315,7 +3315,7 @@ impl<'a> NetView<'a> {
             // harmless: the re-arm prunes it lazily.
             this.captured_file_table().write_epoll_fds().insert(epfd);
 
-            let Some(mut open) = open_file.description.write() else {
+            let Some(mut open) = open_file.description.write_for_io() else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let OpenDescription::Epoll {

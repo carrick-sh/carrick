@@ -2037,7 +2037,7 @@ mod tests {
             assert_eq!(open.description.delegation_handle(), 0);
             assert!(no_active_delegations());
             assert_eq!(host_bytes(&tmp), b"hello world");
-            let guard = open.description.read().unwrap();
+            let guard = open.description.read_for_io().unwrap();
             let OpenDescription::HostFile {
                 host_fd, metadata, ..
             } = &*guard
@@ -2100,9 +2100,34 @@ mod tests {
             let open = open_host(&tmp);
             let handle = delegate_default(&open, 3).unwrap();
             guest_write(handle, 3, b"def");
-            // Any host access through the guard accessor pulls the object back.
-            drop(open.description.read().unwrap());
+            // Host access through a recalling accessor pulls the object back.
+            drop(open.description.read_for_io().unwrap());
             assert_eq!(open.description.delegation_handle(), 0);
+            assert_eq!(host_bytes(&tmp), b"abcdef");
+        }
+
+        #[test]
+        fn inspecting_a_delegated_description_leaves_it_in_the_zone() {
+            let _region = Region::new();
+            let tmp = temp_with(b"abc");
+            let open = open_host(&tmp);
+            let handle = delegate_default(&open, 3).unwrap();
+            guest_write(handle, 3, b"def");
+            // Every non-recalling form: guard, non-blocking guard, closure.
+            {
+                let guard = open.description.inspect().unwrap();
+                assert!(matches!(&*guard, OpenDescription::HostFile { .. }));
+            }
+            drop(open.description.try_inspect().unwrap());
+            assert_eq!(
+                open.description
+                    .inspect_kind(|d| matches!(d, OpenDescription::HostFile { .. })),
+                Some(true)
+            );
+            // Still in the zone, and nothing was written back.
+            assert_ne!(open.description.delegation_handle(), 0);
+            assert_eq!(host_bytes(&tmp), b"abc");
+            recall(&open.description).expect("recall");
             assert_eq!(host_bytes(&tmp), b"abcdef");
         }
 
@@ -2129,9 +2154,9 @@ mod tests {
             // with its own offset.
             recall(&first.description).unwrap();
             assert_eq!(host_bytes(&tmp), b"onetwo");
-            drop(second.description.read());
+            drop(second.description.read_for_io());
             assert_eq!(second.description.delegation_handle(), 0);
-            let raw = |open: &OpenFile| match &*open.description.read().unwrap() {
+            let raw = |open: &OpenFile| match &*open.description.read_for_io().unwrap() {
                 OpenDescription::HostFile { host_fd, .. } => host_fd.raw(),
                 _ => panic!("host file"),
             };
@@ -2149,10 +2174,10 @@ mod tests {
             let second = open_host(&tmp);
             // Host I/O through a description that has not joined takes the
             // inode out of the zone first, so it sees every in-zone byte.
-            drop(second.description.read());
+            drop(second.description.read_for_io());
             assert_eq!(second.description.delegation_handle(), 0);
             assert_eq!(host_bytes(&tmp), b"onetwo");
-            drop(first.description.read());
+            drop(first.description.read_for_io());
             assert_eq!(first.description.delegation_handle(), 0);
         }
 
@@ -2280,7 +2305,7 @@ mod tests {
             delegate_default(&open_b, 4).unwrap();
             assert!(recall_inode(open_a.description.el1_identity().unwrap()));
             // The member detaches on its next host access.
-            drop(open_a.description.read());
+            drop(open_a.description.read_for_io());
             assert_eq!(open_a.description.delegation_handle(), 0);
             assert_ne!(open_b.description.delegation_handle(), 0);
             assert!(!recall_inode(open_a.description.el1_identity().unwrap()));

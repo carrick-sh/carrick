@@ -1962,7 +1962,7 @@ fn lane_openat(
 fn lane_dir_is_trusted(dispatcher: &SyscallDispatcher, fd: i64) -> bool {
     let open_file = dispatcher.open_file(fd as i32).unwrap();
     matches!(
-        open_file.description.read().as_deref(),
+        open_file.description.inspect().as_deref(),
         Some(OpenDescription::Directory {
             trusted_host_dir: Some(_),
             ..
@@ -2069,7 +2069,7 @@ fn trusted_dirfd_lane_serves_walk_and_recurses() {
     assert!(file >= 0, "openat(sub, deep.txt): {file}");
     {
         let open_file = dispatcher.open_file(file as i32).unwrap();
-        let open = open_file.description.read().expect("open description");
+        let open = open_file.description.inspect().expect("open description");
         assert!(
             matches!(&*open, OpenDescription::HostFile { .. }),
             "lane-served regular file must be a HostFile, got {open:?}"
@@ -2487,7 +2487,7 @@ mod serial_host {
         assert!(!lane_dir_is_trusted(&dispatcher, dir));
         {
             let open_file = dispatcher.open_file(dir as i32).unwrap();
-            let open = open_file.description.read().unwrap();
+            let open = open_file.description.inspect().unwrap();
             let OpenDescription::Directory { listing, .. } = &*open else {
                 panic!("expected a directory description");
             };
@@ -3211,7 +3211,7 @@ fn trusted_dirfd_lane_falls_back_for_special_shapes() {
     assert!(fifo >= 0, "fifo openat: {fifo}");
     {
         let open_file = dispatcher.open_file(fifo as i32).unwrap();
-        let open = open_file.description.read().expect("open description");
+        let open = open_file.description.inspect().expect("open description");
         assert!(
             matches!(&*open, OpenDescription::HostPipe { .. }),
             "FIFO child must be a HostPipe, got {open:?}"
@@ -4416,7 +4416,7 @@ fn splice_synthetic_devices_pipe_capacity_and_nonblocking() {
         .open_file(write_fd as i32)
         .expect("write file")
         .description
-        .read()
+        .inspect()
         .expect("open description")
     {
         OpenDescription::PipeWriter { pipe, .. } => (
@@ -4949,7 +4949,7 @@ fn rlimit_fsize_straddling_regular_write_returns_only_the_limit_prefix() {
     let open = dispatcher
         .open_file(fd)
         .expect("created regular file remains open");
-    let description = open.description.read().expect("open description");
+    let description = open.description.inspect().expect("open description");
     let OpenDescription::File { contents, .. } = &*description else {
         panic!("expected in-memory regular-file description");
     };
@@ -6417,7 +6417,7 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
         .expect("install bidirectional pipe");
     let bi_file = pair.dispatcher.open_file(bi_fd).expect("open file");
     assert!(matches!(
-        bi_file.description.read().as_deref(),
+        bi_file.description.inspect().as_deref(),
         Some(OpenDescription::HostPipe {
             bidirectional: true,
             ..
@@ -7169,7 +7169,7 @@ fn pselect6_parks_full_pipe_write_end_on_readiness_pipe_pollin() {
         .open_file(write_fd as i32)
         .expect("write file")
         .description
-        .read()
+        .inspect()
         .expect("open description")
     {
         OpenDescription::PipeWriter { pipe, .. } => pipe
