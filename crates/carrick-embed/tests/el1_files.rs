@@ -135,6 +135,69 @@ print "shared_inode_ok
     );
 }
 
+/// Contract `kernel.el1.files.path-mutation`: an in-zone file mutated
+/// through another path (`O_TRUNC` by a second open, `truncate(2)` by path,
+/// `ftruncate(2)` through another description) shows exactly the Linux
+/// result through every description. The fixture checks sizes and bytes
+/// itself; the counters prove the writes before each mutation were served
+/// in-guest, so the zone's copy is what the mutation must not lose.
+#[test]
+fn el1_files_path_mutation_contract() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    carrick_kernel::el1_delegation::reset_delegation_counts();
+
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command([
+                "/usr/bin/perl",
+                "-e",
+                r#"
+my $buf;
+# O_TRUNC by a second open empties the file for every description.
+open(my $a, "+>", "/tmp/pm_otrunc.txt") or die "open a: $!";
+syswrite($a, "hello") == 5 or die for 1..64;
+open(my $b, ">", "/tmp/pm_otrunc.txt") or die "open b: $!";
+close($b);
+my @st = stat("/tmp/pm_otrunc.txt");
+$st[7] == 0 or die "O_TRUNC: size $st[7], want 0";
+sysseek($a, 0, 0) // die; sysread($a, $buf, 10) == 0 or die "O_TRUNC: a read old bytes";
+# truncate(2) by path shortens the file for the open description.
+open(my $c, "+>", "/tmp/pm_truncate.txt") or die "open c: $!";
+syswrite($c, "hello") == 5 or die for 1..64;
+truncate("/tmp/pm_truncate.txt", 2) or die "truncate: $!";
+@st = stat($c); $st[7] == 2 or die "truncate: size $st[7], want 2";
+sysseek($c, 0, 0) // die; sysread($c, $buf, 10) == 2 or die "truncate: read";
+$buf eq "he" or die "truncate: read '$buf'";
+# ftruncate(2) through another description of the same inode.
+open(my $d, "+>", "/tmp/pm_ftruncate.txt") or die "open d: $!";
+syswrite($d, "hello") == 5 or die for 1..64;
+open(my $e, "+<", "/tmp/pm_ftruncate.txt") or die "open e: $!";
+truncate($e, 3) or die "ftruncate: $!";
+sysseek($d, 0, 0) // die; sysread($d, $buf, 10) == 3 or die "ftruncate: read";
+$buf eq "hel" or die "ftruncate: read '$buf'";
+print "path_mutation_ok\n";
+"#,
+            ])
+            .run_blocking(),
+    );
+
+    assert!(
+        result.success(),
+        "exit_code={}: {}",
+        result.exit_code,
+        result.stderr_utf8()
+    );
+    assert_eq!(result.stdout_utf8().trim(), "path_mutation_ok");
+    let counters = read_el1_counters().expect("EL1 counters should be populated");
+    let served_writes = counters.served[64].load(Ordering::Relaxed);
+    assert!(
+        served_writes >= 3 * 60,
+        "the pre-mutation writes must be served in-guest for this contract to exercise the zone, got {served_writes}"
+    );
+}
+
 /// Read-after-write from second process after first process exits (proving recall on teardown).
 #[test]
 fn el1_files_recall_on_teardown() {

@@ -1,0 +1,33 @@
+schema_version = 1
+id = "kernel.el1.files.path-mutation"
+title = "Mutating an in-zone file through another path shows the Linux result"
+guest_surfaces = [
+  "syscall:openat",
+  "syscall:truncate",
+  "syscall:ftruncate",
+  "syscall:read",
+  "syscall:write",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 open",
+  "man 2 truncate",
+]
+fixture = "probe:el1_files_path_mutation"
+scale_points = [1, 8, 32, 128]
+rationale = "open(2) with O_TRUNC truncates the file to length 0, and truncate(2) and ftruncate(2) set its length; every open description of the inode then reads the new contents. An in-zone file's size and pages live in the zone until write-back, so a mutation that reaches the host inode another way (a new open, a path, another description) must take the inode out of the zone first; otherwise the zone's older copy is written back over the mutation."
+
+[bindings]
+embed = "carrick-embed::el1_files_path_mutation_contract"
+
+[bindings.unresolved]
+vm_free = "EL1 serving requires hardware-assisted HVF execution."
+docker = "The fixture checks the Linux results itself (sizes and bytes after each mutation), matching Docker's output for the same script."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 64
+per_unit = 0
+layers = ["embed-structural"]
+rationale = "Each mutation costs one recall of the in-zone inode, not work proportional to the writes before it."
