@@ -7,16 +7,18 @@
 
 pub mod alloc;
 pub mod file;
+pub mod inotify;
 pub mod lock;
 
 use carrick_el1_abi::{
-    Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, FdMapSlot,
-    MAX_DELEGATED_FILES, TrapFrame, fd_map_lookup,
+    Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
+    FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES, MAX_DELEGATED_MARKS_PER_FILE, TrapFrame,
+    fd_map_lookup,
 };
 #[cfg(target_os = "none")]
 use carrick_el1_abi::{
-    EL1_CURRENT_TASKS_BASE, EL1_FD_MAP_BASE, EL1_OBJECT_TABLE_BASE, EL1_STACK_SLOTS,
-    FD_MAP_CAPACITY,
+    EL1_CURRENT_TASKS_BASE, EL1_FD_MAP_BASE, EL1_INOTIFY_TABLE_BASE, EL1_NAME_CACHE_BASE,
+    EL1_OBJECT_TABLE_BASE, EL1_STACK_SLOTS, FD_MAP_CAPACITY, MAX_DELEGATED_INOTIFY,
 };
 use core::sync::atomic::Ordering;
 
@@ -29,12 +31,18 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         let fd_map = unsafe { &*(EL1_FD_MAP_BASE as *const [FdMapSlot; FD_MAP_CAPACITY]) };
         let object_table =
             unsafe { &*(EL1_OBJECT_TABLE_BASE as *const [DelegatedFile; MAX_DELEGATED_FILES]) };
+        let inotify_table = unsafe {
+            &*(EL1_INOTIFY_TABLE_BASE as *const [DelegatedInotify; MAX_DELEGATED_INOTIFY])
+        };
+        let name_cache = unsafe { &*(EL1_NAME_CACHE_BASE as *const InotifyNameCache) };
         dispatch_syscall_with_regions(
             frame,
             counters,
             current_tasks,
             fd_map,
             object_table,
+            inotify_table,
+            name_cache,
             |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
         )
     }
@@ -49,12 +57,15 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
 }
 
 /// Dispatch syscall with explicitly supplied tables (used at EL1 and for host tests).
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_syscall_with_regions<F>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
     fd_map: &[FdMapSlot],
     object_table: &[DelegatedFile],
+    inotify_table: &[DelegatedInotify],
+    name_cache: &InotifyNameCache,
     cache_lookup: F,
 ) -> Action
 where
@@ -76,7 +87,96 @@ where
 
     let nr = frame.x[8] as usize;
     match nr {
-        62 | 63 | 64 | 67 | 68 => {
+        27 => {
+            let orig_x0 = frame.x[0];
+            if let Some(task) = cur_task {
+                let validator = file::HardwareValidator;
+                if let Ok(res) = inotify::el1_inotify_add_watch(
+                    frame.x[0] as i32,
+                    frame.x[1],
+                    frame.x[2] as u32,
+                    task,
+                    fd_map,
+                    object_table,
+                    inotify_table,
+                    name_cache,
+                    &validator,
+                ) {
+                    frame.x[0] = res as u64;
+                    counters.served[27].fetch_add(1, Ordering::Relaxed);
+                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                    if task.has_pending_host_work() {
+                        task.served_with_work.store(1, Ordering::Release);
+                        return Action::ServedWithWork;
+                    }
+                    return Action::Served;
+                }
+            }
+        }
+        28 => {
+            let orig_x0 = frame.x[0];
+            if let Some(task) = cur_task
+                && let Ok(res) = inotify::el1_inotify_rm_watch(
+                    frame.x[0] as i32,
+                    frame.x[1] as i32,
+                    task,
+                    fd_map,
+                    object_table,
+                    inotify_table,
+                )
+            {
+                frame.x[0] = res as u64;
+                counters.served[28].fetch_add(1, Ordering::Relaxed);
+                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                if task.has_pending_host_work() {
+                    task.served_with_work.store(1, Ordering::Release);
+                    return Action::ServedWithWork;
+                }
+                return Action::Served;
+            }
+        }
+        63 => {
+            let orig_x0 = frame.x[0];
+            let res = try_serve_file_syscall(
+                frame,
+                nr,
+                current_tasks,
+                fd_map,
+                object_table,
+                inotify_table,
+                &cache_lookup,
+            )
+            .or_else(|| {
+                if let Some(task) = cur_task {
+                    let validator = file::HardwareValidator;
+                    inotify::el1_inotify_read(
+                        frame.x[0] as i32,
+                        frame.x[1],
+                        frame.x[2] as usize,
+                        task,
+                        fd_map,
+                        inotify_table,
+                        &validator,
+                    )
+                    .ok()
+                } else {
+                    None
+                }
+            });
+            if let Some(res) = res {
+                frame.x[0] = res as u64;
+                counters.served[63].fetch_add(1, Ordering::Relaxed);
+                if let Some(task) = cur_task {
+                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                    if task.has_pending_host_work() {
+                        task.served_with_work.store(1, Ordering::Release);
+                        return Action::ServedWithWork;
+                    }
+                }
+                return Action::Served;
+            }
+        }
+        62 | 64 | 67 | 68 => {
             let orig_x0 = frame.x[0];
             if let Some(res) = try_serve_file_syscall(
                 frame,
@@ -84,6 +184,7 @@ where
                 current_tasks,
                 fd_map,
                 object_table,
+                inotify_table,
                 &cache_lookup,
             ) {
                 frame.x[0] = res as u64;
@@ -115,6 +216,7 @@ fn try_serve_file_syscall<F>(
     current_tasks: &[CurrentTask],
     fd_map: &[FdMapSlot],
     object_table: &[DelegatedFile],
+    inotify_table: &[DelegatedInotify],
     cache_lookup: &F,
 ) -> Option<i64>
 where
@@ -154,6 +256,45 @@ where
         || slot_incarnation != file_incarnation
         || file_state != DELEGATED_STATE_GUEST
     {
+        file.unlock();
+        return None;
+    }
+
+    // If writing, lock any inotify instances marking this file
+    let mut locked_inotifys = [0u32; MAX_DELEGATED_MARKS_PER_FILE];
+    let mut num_locked = 0;
+    let mut lock_failed = false;
+
+    if (nr == 64 || nr == 68) && file.has_marks() {
+        file.for_each_mark(|m| {
+            if lock_failed {
+                return;
+            }
+            if (m.mask & 0x02) != 0
+                && m.inotify_handle != 0
+                && !locked_inotifys[..num_locked].contains(&m.inotify_handle)
+            {
+                if let Some(ino) = inotify_table.get((m.inotify_handle - 1) as usize) {
+                    if ino.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST && ino.try_lock()
+                    {
+                        locked_inotifys[num_locked] = m.inotify_handle;
+                        num_locked += 1;
+                    } else {
+                        lock_failed = true;
+                    }
+                } else {
+                    lock_failed = true;
+                }
+            }
+        });
+    }
+
+    if lock_failed {
+        for &h in &locked_inotifys[..num_locked] {
+            if let Some(ino) = inotify_table.get((h - 1) as usize) {
+                ino.unlock();
+            }
+        }
         file.unlock();
         return None;
     }
@@ -201,6 +342,27 @@ where
     if outcome.is_ok() {
         file.served_ops.fetch_add(1, Ordering::Relaxed);
     }
+
+    if nr == 64 || nr == 68 {
+        if let Ok(written) = outcome
+            && written > 0
+        {
+            file.for_each_mark(|m| {
+                if (m.mask & 0x02) != 0
+                    && m.inotify_handle != 0
+                    && let Some(ino) = inotify_table.get((m.inotify_handle - 1) as usize)
+                {
+                    ino.push_record(m.wd, 0x02, 0); // LINUX_IN_MODIFY
+                }
+            });
+        }
+        for &h in &locked_inotifys[..num_locked] {
+            if let Some(ino) = inotify_table.get((h - 1) as usize) {
+                ino.unlock();
+            }
+        }
+    }
+
     file.unlock();
     outcome.ok()
 }
@@ -279,12 +441,17 @@ mod tests {
         frame.x[2] = 0; // SEEK_SET
         frame.x[8] = 62; // lseek
 
+        let inotify_table = [DelegatedInotify::new()];
+        let name_cache = InotifyNameCache::new();
+
         let action = dispatch_syscall_with_regions(
             &mut frame,
             &counters,
             &tasks,
             &fd_map,
             &object_table,
+            &inotify_table,
+            &name_cache,
             |_| core::ptr::null_mut(),
         );
 
@@ -312,6 +479,9 @@ mod tests {
         object_table[0].size.store(100, Ordering::Relaxed);
         object_table[0].offset.store(10, Ordering::Relaxed);
 
+        let inotify_table = [DelegatedInotify::new()];
+        let name_cache = InotifyNameCache::new();
+
         let mut frame = TrapFrame::default();
         frame.x[0] = 3;
         frame.x[1] = 50;
@@ -324,6 +494,8 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &inotify_table,
+            &name_cache,
             |_| core::ptr::null_mut(),
         );
 
@@ -354,6 +526,9 @@ mod tests {
             .flags
             .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
 
+        let inotify_table = [DelegatedInotify::new()];
+        let name_cache = InotifyNameCache::new();
+
         let mut frame = TrapFrame::default();
         frame.x[0] = 3;
         frame.x[1] = 50;
@@ -370,6 +545,8 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &inotify_table,
+            &name_cache,
             |_| core::ptr::null_mut(),
         );
         assert_eq!(action, Action::Forward);
@@ -388,6 +565,8 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &inotify_table,
+            &name_cache,
             |_| core::ptr::null_mut(),
         );
         assert_eq!(action2, Action::Served);
@@ -417,6 +596,8 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &inotify_table,
+            &name_cache,
             move |_| {
                 // Host marks pending work during write operation
                 task_ref.mark_pending_host_work();
@@ -453,6 +634,9 @@ mod tests {
             .flags
             .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
 
+        let inotify_table = [DelegatedInotify::new()];
+        let name_cache = InotifyNameCache::new();
+
         let mut frame = TrapFrame::default();
         frame.x[0] = 3; // fd 3
         frame.x[1] = 50;
@@ -465,6 +649,8 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &inotify_table,
+            &name_cache,
             |_| core::ptr::null_mut(),
         );
 
@@ -495,6 +681,9 @@ mod tests {
             .flags
             .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
 
+        let inotify_table = [DelegatedInotify::new()];
+        let name_cache = InotifyNameCache::new();
+
         let mut frame = TrapFrame::default();
         frame.x[0] = 3;
         frame.x[1] = 50;
@@ -508,11 +697,187 @@ mod tests {
             &tasks,
             &fd_map,
             &object_table,
+            &inotify_table,
+            &name_cache,
             |_| core::ptr::null_mut(),
         );
 
         assert_eq!(action, Action::Served);
         assert_eq!(frame.x[0], 50);
         assert_eq!(counters.served[62].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_inotify_add_watch_write_rm_watch_read_served() {
+        use carrick_el1_abi::{FD_HANDLE_INOTIFY_TAG, hash_path};
+
+        let counters = Counters::default();
+        let tasks = [CurrentTask::new()];
+        tasks[0].set(1, 1, 100);
+
+        let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
+        fd_map[0].set(100, 3, 1, 42); // fd 3 -> delegated file handle 1
+        fd_map[1].set(100, 4, FD_HANDLE_INOTIFY_TAG | 1, 42); // fd 4 -> delegated inotify handle 1
+
+        let object_table = [DelegatedFile::new()];
+        object_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        object_table[0].generation.store(42, Ordering::Relaxed);
+        object_table[0].size.store(100, Ordering::Relaxed);
+        object_table[0].offset.store(0, Ordering::Relaxed);
+        object_table[0].flags.store(
+            carrick_el1_abi::DELEGATED_FLAG_READABLE | carrick_el1_abi::DELEGATED_FLAG_WRITABLE,
+            Ordering::Relaxed,
+        );
+
+        let inotify_table = [DelegatedInotify::new()];
+        inotify_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        inotify_table[0].generation.store(42, Ordering::Relaxed);
+        inotify_table[0]
+            .flags
+            .store(inotify::O_NONBLOCK, Ordering::Relaxed);
+
+        let name_cache = InotifyNameCache::new();
+        let path = b"test.txt";
+        let path_hash = hash_path(path);
+        name_cache.insert(100, name_cache.cwd_generation(), path, path_hash, 1);
+
+        let mut path_str = *b"test.txt\0";
+        let mut frame_add = TrapFrame::default();
+        frame_add.x[0] = 4; // inotify fd
+        frame_add.x[1] = path_str.as_mut_ptr() as u64; // pathname
+        frame_add.x[2] = 0x02; // IN_MODIFY
+        frame_add.x[8] = 27; // inotify_add_watch
+
+        let mut cache_mem = [0u8; 4096];
+        let cache_ptr = cache_mem.as_mut_ptr();
+
+        // 1. inotify_add_watch should be served at EL1
+        let action = dispatch_syscall_with_regions(
+            &mut frame_add,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            &inotify_table,
+            &name_cache,
+            |_| cache_ptr,
+        );
+        assert_eq!(action, Action::Served);
+        let wd = frame_add.x[0] as i32;
+        assert_eq!(wd, 1);
+        assert_eq!(counters.served[27].load(Ordering::Relaxed), 1);
+        assert!(object_table[0].has_marks());
+
+        // 2. write to file should be served at EL1 and enqueue IN_MODIFY
+        let mut write_buf = [0x55u8; 16];
+        let mut frame_write = TrapFrame::default();
+        frame_write.x[0] = 3; // file fd
+        frame_write.x[1] = write_buf.as_mut_ptr() as u64;
+        frame_write.x[2] = 16;
+        frame_write.x[8] = 64; // write
+
+        let action = dispatch_syscall_with_regions(
+            &mut frame_write,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            &inotify_table,
+            &name_cache,
+            |_| cache_ptr,
+        );
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame_write.x[0], 16);
+        assert_eq!(counters.served[64].load(Ordering::Relaxed), 1);
+        assert_eq!(inotify_table[0].count.load(Ordering::Relaxed), 1);
+
+        // 3. inotify_rm_watch should be served at EL1 and enqueue IN_IGNORED
+        let mut frame_rm = TrapFrame::default();
+        frame_rm.x[0] = 4; // inotify fd
+        frame_rm.x[1] = wd as u64;
+        frame_rm.x[8] = 28; // inotify_rm_watch
+
+        let action = dispatch_syscall_with_regions(
+            &mut frame_rm,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            &inotify_table,
+            &name_cache,
+            |_| cache_ptr,
+        );
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame_rm.x[0], 0);
+        assert_eq!(counters.served[28].load(Ordering::Relaxed), 1);
+        assert!(!object_table[0].has_marks());
+        assert_eq!(inotify_table[0].count.load(Ordering::Relaxed), 2); // IN_MODIFY + IN_IGNORED
+
+        // 4. read from inotify fd should be served at EL1 and drain 2 events (32 bytes)
+        let mut read_buf = [0u8; 64];
+        let mut frame_read = TrapFrame::default();
+        frame_read.x[0] = 4; // inotify fd
+        frame_read.x[1] = read_buf.as_mut_ptr() as u64;
+        frame_read.x[2] = 64;
+        frame_read.x[8] = 63; // read
+
+        let action = dispatch_syscall_with_regions(
+            &mut frame_read,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            &inotify_table,
+            &name_cache,
+            |_| cache_ptr,
+        );
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame_read.x[0], 32);
+        assert_eq!(counters.served[63].load(Ordering::Relaxed), 1);
+        assert_eq!(inotify_table[0].count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_inotify_cache_miss_forwards() {
+        let counters = Counters::default();
+        let tasks = [CurrentTask::new()];
+        tasks[0].set(1, 1, 100);
+
+        let fd_map = [FdMapSlot::new()];
+        fd_map[0].set(100, 4, carrick_el1_abi::FD_HANDLE_INOTIFY_TAG | 1, 42);
+
+        let object_table = [DelegatedFile::new()];
+        let inotify_table = [DelegatedInotify::new()];
+        inotify_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+
+        let name_cache = InotifyNameCache::new(); // empty name cache -> miss!
+
+        let mut path_str = *b"unknown.txt\0";
+        let mut frame = TrapFrame::default();
+        frame.x[0] = 4;
+        frame.x[1] = path_str.as_mut_ptr() as u64;
+        frame.x[2] = 0x02; // IN_MODIFY
+        frame.x[8] = 27; // inotify_add_watch
+
+        let action = dispatch_syscall_with_regions(
+            &mut frame,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            &inotify_table,
+            &name_cache,
+            |_| core::ptr::null_mut(),
+        );
+
+        assert_eq!(action, Action::Forward);
+        assert_eq!(counters.forwarded[27].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.served[27].load(Ordering::Relaxed), 0);
     }
 }
