@@ -354,6 +354,14 @@ impl InventoryExtentMap {
         self.extents.get_mut(key)
     }
 
+    /// Values may be edited in place; keys, and so the index, cannot be.
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
+    pub(crate) fn values_mut(
+        &mut self,
+    ) -> std::collections::btree_map::ValuesMut<'_, (u64, u64), InventoryExtent> {
+        self.extents.values_mut()
+    }
+
     /// The first extent, in `(start, length)` key order, whose logical IPA
     /// window contains `ipa`. Visits at most the keys each active size class
     /// can place within its own width below `ipa`: O(classes * log n +
