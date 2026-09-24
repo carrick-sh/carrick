@@ -34,11 +34,17 @@ fn el1_inotify09_probe() {
     }
     let counters = read_el1_counters().expect("EL1 counters should be populated");
     eprintln!("WALL| {wall:?} exit={}", result.exit_code);
-    for nr in 0..512usize {
+    for nr in 0..500usize {
         let s = counters.served[nr].load(Ordering::Relaxed);
         let f = counters.forwarded[nr].load(Ordering::Relaxed);
         if s + f > 0 {
             eprintln!("NR| {nr:>3} served={s:>10} forwarded={f:>10}");
+        }
+    }
+    for reason in 500..512usize {
+        let f = counters.forwarded[reason].load(Ordering::Relaxed);
+        if f > 0 {
+            eprintln!("WHY| {reason} {f}");
         }
     }
     eprintln!(

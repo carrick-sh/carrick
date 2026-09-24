@@ -234,6 +234,45 @@ impl MemoryValidator for HardwareValidator {
     }
 }
 
+/// How a file operation moves bytes between a user buffer and the object's
+/// cache. EL1 checks stage-1 permissions and copies with fixup-guarded
+/// unprivileged accesses; the host copies through the guest address space.
+/// `false` means the copy cannot be done exactly here, and the caller takes its
+/// fallback path (EL1 forwards to the host; the host recalls the object).
+pub trait UserCopy {
+    /// Copy `src` to the user buffer at `dst_va`.
+    fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool;
+    /// Fill `dst` from the user buffer at `src_va`.
+    fn copy_in(&mut self, dst: &mut [u8], src_va: u64) -> bool;
+}
+
+/// EL1's user copy: the whole range must pass the permission check, then the
+/// copy runs with the exception fixup armed.
+pub struct ValidatedCopy<'a, V: MemoryValidator> {
+    pub task: &'a CurrentTask,
+    pub validator: &'a V,
+}
+
+impl<V: MemoryValidator> UserCopy for ValidatedCopy<'_, V> {
+    fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
+        if self.validator.writable_bytes(dst_va, src.len()) < src.len() {
+            return false;
+        }
+        // SAFETY: faults on the user range are intercepted by the EL1 fixup.
+        unsafe { copy_to_user_guarded(self.task, dst_va as *mut u8, src.as_ptr(), src.len()) }
+    }
+
+    fn copy_in(&mut self, dst: &mut [u8], src_va: u64) -> bool {
+        if self.validator.readable_bytes(src_va, dst.len()) < dst.len() {
+            return false;
+        }
+        // SAFETY: faults on the user range are intercepted by the EL1 fixup.
+        unsafe {
+            copy_from_user_guarded(self.task, dst.as_mut_ptr(), src_va as *const u8, dst.len())
+        }
+    }
+}
+
 /// Service `lseek` at EL1.
 pub fn el1_lseek(file: &DelegatedFile, offset: i64, whence: u32) -> Result<i64, Action> {
     if whence == SEEK_DATA || whence == SEEK_HOLE {
@@ -260,14 +299,18 @@ pub fn el1_lseek(file: &DelegatedFile, offset: i64, whence: u32) -> Result<i64, 
     Ok(target)
 }
 
-/// Service `read` at EL1.
-pub(crate) fn el1_read<V: MemoryValidator>(
+/// `read` on a delegated object, for any caller holding its lock.
+///
+/// # Safety
+///
+/// `cache_base` must point at this object's cache slot of
+/// `DELEGATED_FILE_MAX_SIZE` bytes, and the caller must hold the object lock.
+pub unsafe fn read_with(
     file: &DelegatedFile,
-    cur_task: &CurrentTask,
     cache_base: *const u8,
     buf_va: u64,
     count: usize,
-    validator: &V,
+    user: &mut impl UserCopy,
 ) -> Result<i64, Action> {
     let flags = file.flags.load(Ordering::Acquire);
     if (flags & DELEGATED_FLAG_READABLE) == 0 {
@@ -282,34 +325,27 @@ pub(crate) fn el1_read<V: MemoryValidator>(
         return Ok(0);
     }
     let avail = core::cmp::min(count, (size - cur_off) as usize);
-    let valid_bytes = validator.writable_bytes(buf_va, avail);
-    if valid_bytes < avail {
-        return Err(Action::Forward);
-    }
-    let copy_ok = unsafe {
-        copy_to_user_guarded(
-            cur_task,
-            buf_va as *mut u8,
-            cache_base.add(cur_off as usize),
-            avail,
-        )
-    };
-    if !copy_ok {
+    // SAFETY: [cur_off, cur_off + avail) lies below size <= the slot size.
+    let src = unsafe { core::slice::from_raw_parts(cache_base.add(cur_off as usize), avail) };
+    if !user.copy_out(buf_va, src) {
         return Err(Action::Forward);
     }
     file.offset.store(cur_off + avail as u64, Ordering::Release);
     Ok(avail as i64)
 }
 
-/// Service `pread64` at EL1.
-pub(crate) fn el1_pread64<V: MemoryValidator>(
+/// `pread64` on a delegated object, for any caller holding its lock.
+///
+/// # Safety
+///
+/// As for [`read_with`].
+pub unsafe fn pread64_with(
     file: &DelegatedFile,
-    cur_task: &CurrentTask,
     cache_base: *const u8,
     buf_va: u64,
     count: usize,
     offset: i64,
-    validator: &V,
+    user: &mut impl UserCopy,
 ) -> Result<i64, Action> {
     if offset < 0 {
         return Ok(EINVAL);
@@ -327,32 +363,64 @@ pub(crate) fn el1_pread64<V: MemoryValidator>(
         return Ok(0);
     }
     let avail = core::cmp::min(count, (size - off) as usize);
-    let valid_bytes = validator.writable_bytes(buf_va, avail);
-    if valid_bytes < avail {
-        return Err(Action::Forward);
-    }
-    let copy_ok = unsafe {
-        copy_to_user_guarded(
-            cur_task,
-            buf_va as *mut u8,
-            cache_base.add(off as usize),
-            avail,
-        )
-    };
-    if !copy_ok {
+    // SAFETY: [off, off + avail) lies below size <= the slot size.
+    let src = unsafe { core::slice::from_raw_parts(cache_base.add(off as usize), avail) };
+    if !user.copy_out(buf_va, src) {
         return Err(Action::Forward);
     }
     Ok(avail as i64)
 }
 
-/// Service `write` at EL1.
-pub(crate) fn el1_write<V: MemoryValidator>(
+/// Copy `count` user bytes into the cache at `at`, zero any gap past the old
+/// size, and publish size, dirty and zero-filled state.
+///
+/// # Safety
+///
+/// As for [`read_with`]; `at + count` must not exceed the slot size.
+unsafe fn store_at(
     file: &DelegatedFile,
-    cur_task: &CurrentTask,
+    cache_base: *mut u8,
+    at: u64,
+    buf_va: u64,
+    count: usize,
+    user: &mut impl UserCopy,
+) -> Result<u64, Action> {
+    // SAFETY: [at, at + count) lies inside the slot (checked by the caller).
+    let dst = unsafe { core::slice::from_raw_parts_mut(cache_base.add(at as usize), count) };
+    if !user.copy_in(dst, buf_va) {
+        return Err(Action::Forward);
+    }
+    let delivered_end = at + count as u64;
+    let old_size = file.size.load(Ordering::Acquire);
+    if at > old_size {
+        // SAFETY: the gap [old_size, at) lies inside the slot.
+        unsafe {
+            core::ptr::write_bytes(
+                cache_base.add(old_size as usize),
+                0,
+                (at - old_size) as usize,
+            );
+        }
+        mark_gap_zero_pages(file, old_size, at);
+    }
+    mark_dirty_pages(file, at, delivered_end);
+    if delivered_end > old_size {
+        file.size.store(delivered_end, Ordering::Release);
+    }
+    Ok(delivered_end)
+}
+
+/// `write` on a delegated object, for any caller holding its lock.
+///
+/// # Safety
+///
+/// As for [`read_with`].
+pub unsafe fn write_with(
+    file: &DelegatedFile,
     cache_base: *mut u8,
     buf_va: u64,
     count: usize,
-    validator: &V,
+    user: &mut impl UserCopy,
 ) -> Result<i64, Action> {
     let flags = file.flags.load(Ordering::Acquire);
     if (flags & DELEGATED_FLAG_WRITABLE) == 0 {
@@ -365,57 +433,30 @@ pub(crate) fn el1_write<V: MemoryValidator>(
         return Ok(0);
     }
     let cur_off = file.offset.load(Ordering::Acquire);
-    let end_off = match cur_off.checked_add(count as u64) {
-        Some(e) => e,
-        None => return Err(Action::Forward),
+    let Some(end_off) = cur_off.checked_add(count as u64) else {
+        return Err(Action::Forward);
     };
     if end_off > DELEGATED_FILE_MAX_SIZE {
         return Err(Action::Forward);
     }
-    let valid_bytes = validator.readable_bytes(buf_va, count);
-    if valid_bytes < count {
-        return Err(Action::Forward);
-    }
-    let copy_ok = unsafe {
-        copy_from_user_guarded(
-            cur_task,
-            cache_base.add(cur_off as usize),
-            buf_va as *const u8,
-            count,
-        )
-    };
-    if !copy_ok {
-        return Err(Action::Forward);
-    }
-    let delivered_end = cur_off + count as u64;
-    let old_size = file.size.load(Ordering::Acquire);
-    if cur_off > old_size {
-        unsafe {
-            core::ptr::write_bytes(
-                cache_base.add(old_size as usize),
-                0,
-                (cur_off - old_size) as usize,
-            );
-        }
-        mark_gap_zero_pages(file, old_size, cur_off);
-    }
-    mark_dirty_pages(file, cur_off, delivered_end);
-    if delivered_end > old_size {
-        file.size.store(delivered_end, Ordering::Release);
-    }
+    // SAFETY: bounds checked above; the caller holds the lock.
+    let delivered_end = unsafe { store_at(file, cache_base, cur_off, buf_va, count, user)? };
     file.offset.store(delivered_end, Ordering::Release);
     Ok(count as i64)
 }
 
-/// Service `pwrite64` at EL1.
-pub(crate) fn el1_pwrite64<V: MemoryValidator>(
+/// `pwrite64` on a delegated object, for any caller holding its lock.
+///
+/// # Safety
+///
+/// As for [`read_with`].
+pub unsafe fn pwrite64_with(
     file: &DelegatedFile,
-    cur_task: &CurrentTask,
     cache_base: *mut u8,
     buf_va: u64,
     count: usize,
     offset: i64,
-    validator: &V,
+    user: &mut impl UserCopy,
 ) -> Result<i64, Action> {
     if offset < 0 {
         return Ok(EINVAL);
@@ -428,45 +469,89 @@ pub(crate) fn el1_pwrite64<V: MemoryValidator>(
         return Ok(0);
     }
     let off = offset as u64;
-    let end_off = match off.checked_add(count as u64) {
-        Some(e) => e,
-        None => return Err(Action::Forward),
+    let Some(end_off) = off.checked_add(count as u64) else {
+        return Err(Action::Forward);
     };
     if end_off > DELEGATED_FILE_MAX_SIZE {
         return Err(Action::Forward);
     }
-    let valid_bytes = validator.readable_bytes(buf_va, count);
-    if valid_bytes < count {
-        return Err(Action::Forward);
-    }
-    let copy_ok = unsafe {
-        copy_from_user_guarded(
-            cur_task,
-            cache_base.add(off as usize),
-            buf_va as *const u8,
-            count,
-        )
-    };
-    if !copy_ok {
-        return Err(Action::Forward);
-    }
-    let delivered_end = off + count as u64;
-    let old_size = file.size.load(Ordering::Acquire);
-    if off > old_size {
-        unsafe {
-            core::ptr::write_bytes(
-                cache_base.add(old_size as usize),
-                0,
-                (off - old_size) as usize,
-            );
-        }
-        mark_gap_zero_pages(file, old_size, off);
-    }
-    mark_dirty_pages(file, off, delivered_end);
-    if delivered_end > old_size {
-        file.size.store(delivered_end, Ordering::Release);
-    }
+    // SAFETY: bounds checked above; the caller holds the lock.
+    unsafe { store_at(file, cache_base, off, buf_va, count, user)? };
     Ok(count as i64)
+}
+
+#[cfg(test)]
+/// Service `read` at EL1.
+pub(crate) fn el1_read<V: MemoryValidator>(
+    file: &DelegatedFile,
+    cur_task: &CurrentTask,
+    cache_base: *const u8,
+    buf_va: u64,
+    count: usize,
+    validator: &V,
+) -> Result<i64, Action> {
+    let mut user = ValidatedCopy {
+        task: cur_task,
+        validator,
+    };
+    // SAFETY: EL1 callers pass this object's slot and hold its lock.
+    unsafe { read_with(file, cache_base, buf_va, count, &mut user) }
+}
+
+#[cfg(test)]
+/// Service `pread64` at EL1.
+pub(crate) fn el1_pread64<V: MemoryValidator>(
+    file: &DelegatedFile,
+    cur_task: &CurrentTask,
+    cache_base: *const u8,
+    buf_va: u64,
+    count: usize,
+    offset: i64,
+    validator: &V,
+) -> Result<i64, Action> {
+    let mut user = ValidatedCopy {
+        task: cur_task,
+        validator,
+    };
+    // SAFETY: EL1 callers pass this object's slot and hold its lock.
+    unsafe { pread64_with(file, cache_base, buf_va, count, offset, &mut user) }
+}
+
+#[cfg(test)]
+/// Service `write` at EL1.
+pub(crate) fn el1_write<V: MemoryValidator>(
+    file: &DelegatedFile,
+    cur_task: &CurrentTask,
+    cache_base: *mut u8,
+    buf_va: u64,
+    count: usize,
+    validator: &V,
+) -> Result<i64, Action> {
+    let mut user = ValidatedCopy {
+        task: cur_task,
+        validator,
+    };
+    // SAFETY: EL1 callers pass this object's slot and hold its lock.
+    unsafe { write_with(file, cache_base, buf_va, count, &mut user) }
+}
+
+#[cfg(test)]
+/// Service `pwrite64` at EL1.
+pub(crate) fn el1_pwrite64<V: MemoryValidator>(
+    file: &DelegatedFile,
+    cur_task: &CurrentTask,
+    cache_base: *mut u8,
+    buf_va: u64,
+    count: usize,
+    offset: i64,
+    validator: &V,
+) -> Result<i64, Action> {
+    let mut user = ValidatedCopy {
+        task: cur_task,
+        validator,
+    };
+    // SAFETY: EL1 callers pass this object's slot and hold its lock.
+    unsafe { pwrite64_with(file, cache_base, buf_va, count, offset, &mut user) }
 }
 
 fn mark_gap_zero_pages(file: &DelegatedFile, old_size: u64, cur_off: u64) {

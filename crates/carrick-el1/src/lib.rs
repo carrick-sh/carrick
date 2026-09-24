@@ -260,111 +260,143 @@ where
         return None;
     }
 
-    // If writing, lock any inotify instances marking this file
-    let mut locked_inotifys = [0u32; MAX_DELEGATED_MARKS_PER_FILE];
+    let cache_ptr = cache_lookup(handle);
+    let mut user = file::ValidatedCopy {
+        task: cur_task,
+        validator: &file::HardwareValidator,
+    };
+    let args = [frame.x[1], frame.x[2], frame.x[3]];
+    // SAFETY: the object is locked and revalidated; `cache_ptr` is its slot.
+    let outcome = unsafe {
+        serve_locked_file_op(
+            file,
+            inotify_table,
+            nr,
+            args,
+            cache_ptr,
+            &mut user,
+            &TryInstanceLock,
+        )
+    };
+    file.unlock();
+    outcome.ok()
+}
+
+/// How the caller acquires the inotify instances that mark a file it is
+/// writing. EL1 never waits (a busy instance forwards the syscall); the host
+/// waits, because it has nowhere else to send the operation.
+pub trait InstanceLockPolicy {
+    fn acquire(&self, instance: &DelegatedInotify) -> bool;
+}
+
+/// EL1: take the instance lock only if it is free.
+pub struct TryInstanceLock;
+
+impl InstanceLockPolicy for TryInstanceLock {
+    fn acquire(&self, instance: &DelegatedInotify) -> bool {
+        instance.try_lock()
+    }
+}
+
+/// Serve one read, write, lseek, pread64 or pwrite64 on a delegated file whose
+/// object lock the caller holds, running the single implementation shared by
+/// EL1 and the host: lock the marking inotify instances for a write, run the
+/// operation, count it, queue IN_MODIFY for each marking watch, release the
+/// instances. `args` are the syscall's x1..x3. `Err(Action::Forward)` means
+/// this caller cannot serve it exactly (EL1 forwards; the host recalls).
+///
+/// # Safety
+///
+/// The caller holds `file`'s lock, has revalidated it as live, and
+/// `cache_ptr` is its cache slot.
+pub unsafe fn serve_locked_file_op(
+    file: &DelegatedFile,
+    inotify_table: &[DelegatedInotify],
+    nr: usize,
+    args: [u64; 3],
+    cache_ptr: *mut u8,
+    user: &mut impl file::UserCopy,
+    locks: &impl InstanceLockPolicy,
+) -> Result<i64, Action> {
+    let writes = nr == 64 || nr == 68;
+    let mut locked = [0u32; MAX_DELEGATED_MARKS_PER_FILE];
     let mut num_locked = 0;
     let mut lock_failed = false;
-
-    if (nr == 64 || nr == 68) && file.has_marks() {
+    if writes && file.has_marks() {
         file.for_each_mark(|m| {
-            if lock_failed {
+            if lock_failed
+                || (m.mask & 0x02) == 0
+                || m.inotify_handle == 0
+                || locked[..num_locked].contains(&m.inotify_handle)
+            {
                 return;
             }
-            if (m.mask & 0x02) != 0
-                && m.inotify_handle != 0
-                && !locked_inotifys[..num_locked].contains(&m.inotify_handle)
-            {
-                if let Some(ino) = inotify_table.get((m.inotify_handle - 1) as usize) {
-                    if ino.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST && ino.try_lock()
-                    {
-                        locked_inotifys[num_locked] = m.inotify_handle;
-                        num_locked += 1;
-                    } else {
-                        lock_failed = true;
-                    }
-                } else {
-                    lock_failed = true;
+            match inotify_table.get((m.inotify_handle - 1) as usize) {
+                Some(ino)
+                    if ino.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST
+                        && locks.acquire(ino) =>
+                {
+                    locked[num_locked] = m.inotify_handle;
+                    num_locked += 1;
                 }
+                _ => lock_failed = true,
             }
         });
     }
-
-    if lock_failed {
-        for &h in &locked_inotifys[..num_locked] {
+    let release = |locked: &[u32]| {
+        for &h in locked {
             if let Some(ino) = inotify_table.get((h - 1) as usize) {
                 ino.unlock();
             }
         }
-        file.unlock();
-        return None;
+    };
+    if lock_failed {
+        release(&locked[..num_locked]);
+        return Err(Action::Forward);
     }
-
-    let cache_ptr = cache_lookup(handle);
-    let validator = file::HardwareValidator;
-    let outcome = match nr {
-        62 => file::el1_lseek(file, frame.x[1] as i64, frame.x[2] as u32),
-        63 => file::el1_read(
-            file,
-            cur_task,
-            cache_ptr as *const u8,
-            frame.x[1],
-            frame.x[2] as usize,
-            &validator,
-        ),
-        64 => file::el1_write(
-            file,
-            cur_task,
-            cache_ptr,
-            frame.x[1],
-            frame.x[2] as usize,
-            &validator,
-        ),
-        67 => file::el1_pread64(
-            file,
-            cur_task,
-            cache_ptr as *const u8,
-            frame.x[1],
-            frame.x[2] as usize,
-            frame.x[3] as i64,
-            &validator,
-        ),
-        68 => file::el1_pwrite64(
-            file,
-            cur_task,
-            cache_ptr,
-            frame.x[1],
-            frame.x[2] as usize,
-            frame.x[3] as i64,
-            &validator,
-        ),
-        _ => Err(Action::Forward),
+    // SAFETY: forwarded from the caller's contract.
+    let outcome = unsafe {
+        match nr {
+            62 => file::el1_lseek(file, args[0] as i64, args[1] as u32),
+            63 => file::read_with(file, cache_ptr, args[0], args[1] as usize, user),
+            64 => file::write_with(file, cache_ptr, args[0], args[1] as usize, user),
+            67 => file::pread64_with(
+                file,
+                cache_ptr,
+                args[0],
+                args[1] as usize,
+                args[2] as i64,
+                user,
+            ),
+            68 => file::pwrite64_with(
+                file,
+                cache_ptr,
+                args[0],
+                args[1] as usize,
+                args[2] as i64,
+                user,
+            ),
+            _ => Err(Action::Forward),
+        }
     };
     if outcome.is_ok() {
         file.served_ops.fetch_add(1, Ordering::Relaxed);
     }
-
-    if nr == 64 || nr == 68 {
-        if let Ok(written) = outcome
-            && written > 0
-        {
-            file.for_each_mark(|m| {
-                if (m.mask & 0x02) != 0
-                    && m.inotify_handle != 0
-                    && let Some(ino) = inotify_table.get((m.inotify_handle - 1) as usize)
-                {
-                    ino.push_record(m.wd, 0x02, 0); // LINUX_IN_MODIFY
-                }
-            });
-        }
-        for &h in &locked_inotifys[..num_locked] {
-            if let Some(ino) = inotify_table.get((h - 1) as usize) {
-                ino.unlock();
+    if writes
+        && let Ok(written) = outcome
+        && written > 0
+    {
+        file.for_each_mark(|m| {
+            if (m.mask & 0x02) != 0
+                && m.inotify_handle != 0
+                && let Some(ino) = inotify_table.get((m.inotify_handle - 1) as usize)
+            {
+                ino.push_record(m.wd, 0x02, 0); // LINUX_IN_MODIFY
             }
-        }
+        });
     }
-
-    file.unlock();
-    outcome.ok()
+    release(&locked[..num_locked]);
+    outcome
 }
 
 #[cfg(test)]
@@ -419,7 +451,7 @@ mod tests {
     fn test_dispatch_syscall_with_regions_served() {
         let counters = Counters::default();
         let tasks = [CurrentTask::new()];
-        tasks[0].set(1, 1, 100); // slot 0: task_id 1, generation 1, file_table 100
+        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100); // slot 0: task_id 1, generation 1, file_table 100
 
         let fd_map = [FdMapSlot::new()];
         fd_map[0].set(100, 3, 1, 42); // file_table 100, fd 3 -> handle 1, incarnation 42
@@ -465,7 +497,7 @@ mod tests {
     fn test_dispatch_syscall_with_regions_entry_pending_work() {
         let counters = Counters::default();
         let tasks = [CurrentTask::new()];
-        tasks[0].set(1, 1, 100);
+        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
         tasks[0].mark_pending_host_work(); // pending host work set at entry
 
         let fd_map = [FdMapSlot::new()];
@@ -510,7 +542,7 @@ mod tests {
     fn test_dispatch_syscall_with_regions_exit_pending_work() {
         let counters = Counters::default();
         let tasks = [CurrentTask::new()];
-        tasks[0].set(1, 1, 100);
+        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
 
         let fd_map = [FdMapSlot::new()];
         fd_map[0].set(100, 3, 1, 42);
@@ -615,7 +647,7 @@ mod tests {
     fn test_stale_handle_interleaving_forwards() {
         let counters = Counters::default();
         let tasks = [CurrentTask::new()];
-        tasks[0].set(1, 1, 100); // task_id 1, generation 1, file_table 100
+        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100); // task_id 1, generation 1, file_table 100
 
         let fd_map = [FdMapSlot::new()];
         // Initially: table 100, fd 3 -> handle 1, incarnation 10
@@ -665,7 +697,7 @@ mod tests {
         let counters = Counters::default();
         let tasks = [CurrentTask::new()];
         // Task has been switched out multiple times, so its scheduling generation is 5
-        tasks[0].set(1, 5, 100);
+        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 5, 100);
 
         let fd_map = [FdMapSlot::new()];
         fd_map[0].set(100, 3, 1, 42); // incarnation 42
@@ -713,7 +745,7 @@ mod tests {
 
         let counters = Counters::default();
         let tasks = [CurrentTask::new()];
-        tasks[0].set(1, 1, 100);
+        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
 
         let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
         fd_map[0].set(100, 3, 1, 42); // fd 3 -> delegated file handle 1
@@ -845,7 +877,7 @@ mod tests {
     fn test_inotify_cache_miss_forwards() {
         let counters = Counters::default();
         let tasks = [CurrentTask::new()];
-        tasks[0].set(1, 1, 100);
+        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
 
         let fd_map = [FdMapSlot::new()];
         fd_map[0].set(100, 4, carrick_el1_abi::FD_HANDLE_INOTIFY_TAG | 1, 42);

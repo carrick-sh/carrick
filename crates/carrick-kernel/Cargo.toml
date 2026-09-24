@@ -49,6 +49,7 @@ conformance-metrics = ["carrick-observability/conformance-metrics"]
 carrick-fatal.workspace = true
 carrick-abi = { path = "../carrick-abi" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-el1 = { path = "../carrick-el1" }
 carrick-inotify-core = { path = "../carrick-inotify-core" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-portable = { path = "../carrick-portable" }

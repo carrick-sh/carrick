@@ -510,6 +510,21 @@ impl<'a> FsView<'a> {
     define_syscall! {
 
         fn lseek(this, cx, fd: Fd, offset: u64, whence: u64) {
+            // A delegated file's forwarded operation is served on the host
+            // against the delegated object, with the code EL1 runs; the object
+            // stays delegated. Only what that cannot serve exactly falls
+            // through to the path below, whose accessor recalls first.
+            if let Some(delegated) = this.open_file(fd.0)
+                && delegated.description.delegation_handle() != 0
+                && let Some(outcome) = crate::el1_delegation::serve_on_host(
+                    &delegated.description,
+                    62,
+                    [offset, whence, 0],
+                    &mut *cx.memory,
+                )
+            {
+                return Ok(outcome);
+            }
             let fd: Fd = fd;
             let offset = offset as i64;
             let Some(open_file) = this.open_file(fd.0) else {
@@ -868,6 +883,21 @@ impl<'a> FsView<'a> {
         }
 
         fn read(this, cx, fd: Fd, buf: GuestPtr, count: u64) {
+            // A delegated file's forwarded operation is served on the host
+            // against the delegated object, with the code EL1 runs; the object
+            // stays delegated. Only what that cannot serve exactly falls
+            // through to the path below, whose accessor recalls first.
+            if let Some(delegated) = this.open_file(fd.0)
+                && delegated.description.delegation_handle() != 0
+                && let Some(outcome) = crate::el1_delegation::serve_on_host(
+                    &delegated.description,
+                    63,
+                    [buf.raw(), count, 0],
+                    &mut *cx.memory,
+                )
+            {
+                return Ok(outcome);
+            }
 
             let fd: Fd = fd;
             // An O_PATH descriptor is not open for I/O (open13 → EBADF).
@@ -1756,6 +1786,21 @@ impl<'a> FsView<'a> {
         }
 
         fn pread64(this, cx, fd: Fd, buf: GuestPtr, count: u64, offset: u64) {
+            // A delegated file's forwarded operation is served on the host
+            // against the delegated object, with the code EL1 runs; the object
+            // stays delegated. Only what that cannot serve exactly falls
+            // through to the path below, whose accessor recalls first.
+            if let Some(delegated) = this.open_file(fd.0)
+                && delegated.description.delegation_handle() != 0
+                && let Some(outcome) = crate::el1_delegation::serve_on_host(
+                    &delegated.description,
+                    67,
+                    [buf.raw(), count, offset],
+                    &mut *cx.memory,
+                )
+            {
+                return Ok(outcome);
+            }
 
             let fd: Fd = fd;
             // An O_PATH descriptor is not open for I/O (open13 → EBADF).
@@ -2124,6 +2169,21 @@ impl<'a> FsView<'a> {
         }
 
         fn pwrite64(this, cx, fd: Fd, buf: GuestPtr, count: u64, offset: u64) {
+            // A delegated file's forwarded operation is served on the host
+            // against the delegated object, with the code EL1 runs; the object
+            // stays delegated. Only what that cannot serve exactly falls
+            // through to the path below, whose accessor recalls first.
+            if let Some(delegated) = this.open_file(fd.0)
+                && delegated.description.delegation_handle() != 0
+                && let Some(outcome) = crate::el1_delegation::serve_on_host(
+                    &delegated.description,
+                    68,
+                    [buf.raw(), count, offset],
+                    &mut *cx.memory,
+                )
+            {
+                return Ok(outcome);
+            }
 
             let fd: Fd = fd;
             // An O_PATH descriptor is not open for I/O (open13 → EBADF).
@@ -2742,6 +2802,21 @@ impl<'a> FsView<'a> {
         }
 
         fn write(this, cx, fd: Fd, buf: GuestPtr, count: u64) {
+            // A delegated file's forwarded operation is served on the host
+            // against the delegated object, with the code EL1 runs; the object
+            // stays delegated. Only what that cannot serve exactly falls
+            // through to the path below, whose accessor recalls first.
+            if let Some(delegated) = this.open_file(fd.0)
+                && delegated.description.delegation_handle() != 0
+                && let Some(outcome) = crate::el1_delegation::serve_on_host(
+                    &delegated.description,
+                    64,
+                    [buf.raw(), count, 0],
+                    &mut *cx.memory,
+                )
+            {
+                return Ok(outcome);
+            }
 
             let fd = fd.0;
             let (open_file, slot_authority) = match this.open_file_with_authority(fd) {

@@ -221,4 +221,8 @@ fn main() {
     println!("cargo:rerun-if-changed=../carrick-el1/Cargo.toml");
     println!("cargo:rerun-if-changed=../carrick-el1-abi/src");
     println!("cargo:rerun-if-changed=../carrick-el1-abi/Cargo.toml");
+    // Every crate compiled into the image: a missed dependency here embeds a
+    // stale image whose object layout silently disagrees with the host.
+    println!("cargo:rerun-if-changed=../carrick-inotify-core/src");
+    println!("cargo:rerun-if-changed=../carrick-inotify-core/Cargo.toml");
 }
