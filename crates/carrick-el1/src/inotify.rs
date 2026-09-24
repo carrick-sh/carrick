@@ -254,7 +254,7 @@ pub fn el1_inotify_rm_watch(
     // Remove watch from inotify
     inotify.remove_watch(wd);
     // Push IN_IGNORED as last event for this wd
-    inotify.push_record(wd, LINUX_IN_IGNORED, 0);
+    inotify.push_record(wd, LINUX_IN_IGNORED, 0, None);
 
     inotify.unlock();
     file.unlock();
@@ -298,7 +298,7 @@ pub fn el1_inotify_read(
         return Err(Action::Forward);
     }
 
-    if inotify.count.load(Ordering::Relaxed) == 0 {
+    if !inotify.has_records() {
         inotify.unlock();
         let flags = inotify.flags.load(Ordering::Relaxed);
         if flags & O_NONBLOCK != 0 {

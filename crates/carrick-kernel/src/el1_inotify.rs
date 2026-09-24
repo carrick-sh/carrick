@@ -79,10 +79,7 @@ pub fn delegate_inotify(
     inotify.generation.store(incarnation, Ordering::Relaxed);
     inotify.flags.store(flags, Ordering::Relaxed);
     inotify.next_wd.store(state.next_wd(), Ordering::Relaxed);
-    inotify.queued_bytes.store(0, Ordering::Relaxed);
-    inotify.overflowed.store(0, Ordering::Relaxed);
-    inotify.head.store(0, Ordering::Relaxed);
-    inotify.count.store(0, Ordering::Relaxed);
+    inotify.reset_queue();
     inotify.num_watches.store(0, Ordering::Relaxed);
 
     // Initialize watches array
@@ -207,8 +204,30 @@ fn recall_inotify_internal(
                 state.restore_watch(w.wd, w.mask);
             }
         }
-        while let Some(record) = inotify.pop_record() {
-            state.enqueue(record.wd, record.mask, record.cookie, None);
+        // The queue holds records in read(2) format: replay each, with its
+        // name, into the host model in order.
+        let mut records = vec![0u8; carrick_el1_abi::INOTIFY_QUEUE_BYTES];
+        let n = inotify.drain_into(&mut records).unwrap_or(0);
+        let mut at = 0;
+        while at + 16 <= n {
+            let field = |o: usize| {
+                [
+                    records[at + o],
+                    records[at + o + 1],
+                    records[at + o + 2],
+                    records[at + o + 3],
+                ]
+            };
+            let wd = i32::from_ne_bytes(field(0));
+            let mask = u32::from_ne_bytes(field(4));
+            let cookie = u32::from_ne_bytes(field(8));
+            let len = u32::from_ne_bytes(field(12)) as usize;
+            let name = (len > 0).then(|| {
+                let raw = &records[at + 16..at + 16 + len];
+                &raw[..raw.iter().position(|b| *b == 0).unwrap_or(raw.len())]
+            });
+            state.enqueue(wd, mask, cookie, name);
+            at += 16 + len;
         }
         let next_wd = inotify.next_wd.load(Ordering::Relaxed);
         state.set_next_wd(next_wd);
