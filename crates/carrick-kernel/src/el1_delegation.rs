@@ -355,6 +355,62 @@ fn free_handle(handle: u32) {
     }
 }
 
+/// A fresh carrier-wide incarnation for a delegated object (files and inotify
+/// instances share the counter so fd-map revalidation never aliases).
+pub(crate) fn next_incarnation() -> u64 {
+    NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Serialize a writer of the EL1 fd map (delegated files and inotify
+/// instances share one map and one lock).
+pub(crate) fn with_fd_map_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _fd_map = FD_MAP_LOCK.lock();
+    f()
+}
+
+/// The `(handle, description)` currently delegated for `identity`, if any.
+pub(crate) fn delegated_file_by_inode(
+    identity: InodeIdentity,
+) -> Option<(u32, Arc<FileDescription>)> {
+    if no_active_delegations() {
+        return None;
+    }
+    let owners = OWNERS.lock();
+    match &owners.as_ref()?.get(&identity)?.state {
+        OwnerState::Guest(binding) => Some((binding.handle, binding.description.upgrade()?)),
+        _ => None,
+    }
+}
+
+/// Detach every mark of inotify instance `inotify_handle` from every delegated
+/// file. `held_file_handle` names a file whose EL1 lock the caller already
+/// holds (lock order: file, then instance).
+pub(crate) fn remove_inotify_marks_from_all_files(
+    inotify_handle: u32,
+    held_file_handle: Option<u32>,
+) {
+    let region_ptr = get_el1_region_host_ptr();
+    if region_ptr == 0 {
+        return;
+    }
+    let allocated: Vec<u32> = ALLOCATED_HANDLES
+        .lock()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, in_use)| in_use.then_some((index + 1) as u32))
+        .collect();
+    for handle in allocated {
+        let file = delegated_file_object(region_ptr, handle);
+        if Some(handle) == held_file_handle {
+            file.remove_marks_for_inotify(inotify_handle);
+        } else {
+            lock_delegated_file(file, handle);
+            file.remove_marks_for_inotify(inotify_handle);
+            file.unlock();
+        }
+    }
+}
+
 fn delegated_file_object(region_ptr: usize, handle: u32) -> &'static DelegatedFile {
     let file_ptr = (region_ptr
         + EL1_OBJECT_TABLE_OFFSET as usize
@@ -643,7 +699,17 @@ fn delegate_transaction(
     if fs.vfs_mounts.resolve(path).is_some() {
         return Err(NotEligible::NotRootfs);
     }
-    if !fs.inotify_registry.is_empty() && fs.inotify_registry.has_watches_covering(path) {
+    // A watch from a delegated inotify instance, with a mask the in-guest
+    // model implements exactly, keeps the file in-guest; any other watch
+    // covering the path keeps it on the host.
+    if !fs.inotify_registry.is_empty()
+        && fs
+            .inotify_registry
+            .watches_covering_require_recall(path, |state, _wd, mask| {
+                crate::el1_inotify::is_inotify_state_delegated(state)
+                    && mask & crate::inotify::UNSUPPORTED_INOTIFY_MASK_FLAGS == 0
+            })
+    {
         return Err(NotEligible::Watched);
     }
     let mut st: libc::stat = unsafe { core::mem::zeroed() };
@@ -761,6 +827,8 @@ fn delegate_transaction(
     file.dirty_mask.store(0, Ordering::Relaxed);
     file.zero_filled_mask.store(0, Ordering::Relaxed);
     file.served_ops.store(0, Ordering::Relaxed);
+    file.inode.set(identity.dev, identity.ino);
+    file.clear_marks();
     file.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
     file.unlock();
     let published = {
@@ -826,6 +894,9 @@ pub(crate) fn recall_locked(
     open: &mut OpenDescription,
     handle: u32,
 ) -> Result<(), carrick_abi::LinuxErrno> {
+    if matches!(open, OpenDescription::Inotify { .. }) {
+        return crate::el1_inotify::recall_inotify(description);
+    }
     let Some(identity) = description.el1_identity() else {
         carrick_fatal!(
             "el1_delegation",
@@ -881,6 +952,22 @@ pub(crate) fn recall_locked(
     description
         .common()
         .record_delegation_window(file.served_ops.load(Ordering::Acquire));
+    // Instances that mark this file come back first (lock order: file, then
+    // instance), so their queues and wd state return to the host model with
+    // the file's final events.
+    let mut marking = [0u32; MAX_DELEGATED_MARKS_PER_FILE];
+    let mut marking_len = 0;
+    file.for_each_mark(|mark| {
+        if mark.inotify_handle != 0 && !marking[..marking_len].contains(&mark.inotify_handle) {
+            marking[marking_len] = mark.inotify_handle;
+            marking_len += 1;
+        }
+    });
+    for &instance in &marking[..marking_len] {
+        let _ = crate::el1_inotify::recall_inotify_by_handle(instance, Some(handle));
+    }
+    file.clear_marks();
+    crate::el1_inotify::invalidate_name_cache_file(handle);
     let guest_offset = file.offset.load(Ordering::Acquire);
     let guest_size = file.size.load(Ordering::Acquire);
     let dirty = file.dirty_mask.swap(0, Ordering::AcqRel);

@@ -228,6 +228,157 @@ impl<'a> FsView<'a> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_delegate_inotify_watch(
+        &self,
+        pathname: u64,
+        fd: i32,
+        state: &Arc<crate::inotify::InotifyState>,
+        path: &str,
+        wd: i32,
+        mask: u32,
+        memory: &impl CurrentMmMemory,
+    ) -> bool {
+        if mask & crate::inotify::UNSUPPORTED_INOTIFY_MASK_FLAGS != 0 {
+            return false;
+        }
+        let inotify_open_file = self.open_file(fd);
+        let file_table_id = self.captured_file_table().id();
+        let mut inotify_handle = inotify_open_file
+            .as_ref()
+            .map(|of| of.description.delegation_handle())
+            .unwrap_or(0);
+        if inotify_handle == 0 {
+            if let Some(ino_of) = &inotify_open_file {
+                let flags = ino_of.description.common().status_flags();
+                if let Ok(h) = crate::el1_inotify::delegate_inotify(
+                    ino_of,
+                    file_table_id,
+                    fd,
+                    state,
+                    flags as u32,
+                ) {
+                    inotify_handle = h;
+                }
+            }
+        }
+        if inotify_handle == 0 {
+            return false;
+        }
+
+        // The watched file's exact host identity; a path with none is not a
+        // delegatable host regular file.
+        let Some(inode) = self.fs.rootfs_vfs.path_inode_identity(path) else {
+            return false;
+        };
+        let mut file_handle_opt =
+            crate::el1_delegation::delegated_file_by_inode(inode).map(|(h, _)| h);
+
+        // Not delegated yet: find this process's single description of the
+        // inode by its registered identity. No guard is taken while scanning
+        // (a guard accessor would recall a delegated description); `delegate`
+        // takes the one description's write guard itself.
+        if file_handle_opt.is_none() {
+            for open_fd in self.open_fd_numbers() {
+                let Some(of) = self.open_file(open_fd) else {
+                    continue;
+                };
+                if of.description.el1_identity() != Some(inode) {
+                    continue;
+                }
+                if let Ok(h) = crate::el1_delegation::delegate(
+                    &of,
+                    file_table_id,
+                    open_fd,
+                    self.fs,
+                    Some(&self.task_rlimits()),
+                    Some(self.delegation_policy()),
+                ) {
+                    file_handle_opt = Some(h);
+                }
+                break;
+            }
+        }
+
+        if let Some(file_handle) = file_handle_opt {
+            let region_ptr = carrick_el1_abi::get_el1_region_host_ptr();
+            if region_ptr != 0 {
+                let file_ptr = (region_ptr
+                    + carrick_el1_abi::EL1_OBJECT_TABLE_OFFSET as usize
+                    + (file_handle as usize - 1)
+                        * core::mem::size_of::<carrick_el1_abi::DelegatedFile>())
+                    as *const carrick_el1_abi::DelegatedFile;
+                let file = unsafe { &*file_ptr };
+                if !file.add_mark(carrick_el1_abi::DelegatedMark {
+                    inotify_handle,
+                    wd,
+                    mask,
+                    _pad: 0,
+                }) {
+                    return false;
+                }
+
+                let inotify_ptr = (region_ptr
+                    + carrick_el1_abi::EL1_INOTIFY_TABLE_OFFSET as usize
+                    + (inotify_handle as usize - 1)
+                        * core::mem::size_of::<carrick_el1_abi::DelegatedInotify>())
+                    as *const carrick_el1_abi::DelegatedInotify;
+                let inotify = unsafe { &*inotify_ptr };
+                inotify.add_watch(wd, file_handle, mask);
+
+                if let Ok(raw_path) = read_guest_c_string(memory, pathname) {
+                    crate::el1_inotify::populate_name_cache(
+                        file_table_id.raw(),
+                        raw_path.as_bytes(),
+                        file_handle,
+                    );
+                    if raw_path != path {
+                        crate::el1_inotify::populate_name_cache(
+                            file_table_id.raw(),
+                            path.as_bytes(),
+                            file_handle,
+                        );
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn cleanup_delegated_inotify_watch(&self, fd: i32, wd: i32) {
+        let inotify_open_file = self.open_file(fd);
+        if let Some(ino_of) = inotify_open_file {
+            let inotify_handle = ino_of.description.delegation_handle();
+            if inotify_handle != 0 {
+                let region_ptr = carrick_el1_abi::get_el1_region_host_ptr();
+                if region_ptr != 0 {
+                    let inotify_ptr = (region_ptr
+                        + carrick_el1_abi::EL1_INOTIFY_TABLE_OFFSET as usize
+                        + (inotify_handle as usize - 1)
+                            * core::mem::size_of::<carrick_el1_abi::DelegatedInotify>())
+                        as *const carrick_el1_abi::DelegatedInotify;
+                    let inotify = unsafe { &*inotify_ptr };
+                    if let Some((_, watch)) = inotify.find_watch(wd) {
+                        let file_handle = watch.file_handle;
+                        inotify.remove_watch(wd);
+                        if file_handle != 0
+                            && (file_handle as usize) <= carrick_el1_abi::MAX_DELEGATED_FILES
+                        {
+                            let file_ptr = (region_ptr
+                                + carrick_el1_abi::EL1_OBJECT_TABLE_OFFSET as usize
+                                + (file_handle as usize - 1)
+                                    * core::mem::size_of::<carrick_el1_abi::DelegatedFile>())
+                                as *const carrick_el1_abi::DelegatedFile;
+                            let file = unsafe { &*file_ptr };
+                            file.remove_mark(inotify_handle, wd);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     define_syscall! {
         fn inotify_init1(this, cx, flags: u64) {
             let known = crate::inotify::IN_NONBLOCK as u64 | crate::inotify::IN_CLOEXEC as u64;
@@ -285,7 +436,17 @@ impl<'a> FsView<'a> {
                 this.fs
                     .inotify_registry
                     .register(&path, &state, wd, effective);
-                crate::el1_delegation::recall_watched_path(this.fs, &path);
+                if !this.maybe_delegate_inotify_watch(
+                    pathname.0,
+                    fd.0,
+                    &state,
+                    &path,
+                    wd,
+                    effective,
+                    &*cx.memory,
+                ) {
+                    crate::el1_delegation::recall_watched_path(this.fs, &path);
+                }
                 return Ok(DispatchOutcome::returned_i32(wd));
             }
             // Try the per-instance backend first (kqueue host-vnode watch on
@@ -369,7 +530,17 @@ impl<'a> FsView<'a> {
                     .inotify_registry
                     .register(&path, &state, wd, mask);
             }
-            crate::el1_delegation::recall_watched_path(this.fs, &path);
+            if !this.maybe_delegate_inotify_watch(
+                pathname.0,
+                fd.0,
+                &state,
+                &path,
+                wd,
+                mask,
+                &*cx.memory,
+            ) {
+                crate::el1_delegation::recall_watched_path(this.fs, &path);
+            }
             Ok(DispatchOutcome::returned_i32(wd))
         }
 
@@ -391,6 +562,9 @@ impl<'a> FsView<'a> {
             // Drop the dispatch-registry entry to match.
             let result = state.rm_watch(wd);
             this.fs.inotify_registry.unregister(&state, wd);
+            if result.is_ok() {
+                this.cleanup_delegated_inotify_watch(fd.0, wd);
+            }
             Ok(match result {
                 Ok(()) => DispatchOutcome::Returned { value: 0 },
                 Err(errno) => DispatchOutcome::errno(errno),
