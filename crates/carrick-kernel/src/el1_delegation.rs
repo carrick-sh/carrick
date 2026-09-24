@@ -281,27 +281,17 @@ pub(crate) fn recall_all_watched(fs: &FsState) {
 
 /// Recall all currently delegated files across all tables back to host authority.
 ///
-/// Returns the first writeback error encountered, if any.
-pub(crate) fn recall_all_delegated() -> Result<(), carrick_abi::LinuxErrno> {
+/// Writeback errors are recorded sticky on the affected descriptions.
+pub(crate) fn recall_all_delegated() {
     let candidates: Vec<Arc<FileDescription>> = {
         let descs = DELEGATED_DESCRIPTIONS.lock();
         descs.iter().filter_map(|w| w.as_ref()?.upgrade()).collect()
     };
-    let mut first_err = None;
     for desc in candidates {
         if desc.delegation_handle() == 0 {
             continue;
         }
-        if let Err(err) = recall(&desc) {
-            if first_err.is_none() {
-                first_err = Some(err);
-            }
-        }
-    }
-    if let Some(err) = first_err {
-        Err(err)
-    } else {
-        Ok(())
+        let _ = recall(&desc);
     }
 }
 
@@ -689,13 +679,11 @@ pub(crate) fn recall(description: &FileDescription) -> Result<(), carrick_abi::L
 }
 
 /// Recall a file description if it is currently delegated.
-pub(crate) fn recall_if_delegated(
-    description: &FileDescription,
-) -> Result<(), carrick_abi::LinuxErrno> {
+///
+/// Writeback errors are recorded sticky on the description.
+pub(crate) fn recall_if_delegated(description: &FileDescription) {
     if description.delegation_handle() != 0 {
-        recall(description)
-    } else {
-        Ok(())
+        let _ = recall(description);
     }
 }
 
@@ -2034,6 +2022,74 @@ mod tests {
                 open_file2.description.delegation_handle(),
                 0,
                 "seccomp must recall delegated file"
+            );
+        }
+
+        #[test]
+        fn test_writeback_error_isolated_to_affected_description() {
+            let region = TestEl1Region::new();
+            let table_id = FileTableId::from_raw_u64(1).unwrap();
+            let mem_file = create_test_in_memory_file(b"initial");
+
+            let handle = delegate_for_test(&mem_file, table_id, 3).expect("delegate");
+
+            let region_ptr = region.buffer.as_ptr() as usize;
+            let file_ptr = (region_ptr
+                + EL1_OBJECT_TABLE_OFFSET as usize
+                + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
+                as *const DelegatedFile;
+            let file = unsafe { &*file_ptr };
+
+            // Mark a page dirty and set writable to false so commit_bytes_at_offset fails on recall
+            file.offset.store(10, Ordering::Release);
+            file.size.store(10, Ordering::Release);
+            file.dirty_mask.store(1, Ordering::Release);
+
+            {
+                let mut guard = mem_file.description.open_description().unwrap().write();
+                if let OpenDescription::File { writable, .. } = &mut *guard {
+                    *writable = false;
+                }
+            }
+
+            let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+            let ctx = dispatcher.capture_one_task_context().unwrap();
+
+            // Now prlimit64(RLIMIT_FSIZE) recalls all delegated files.
+            // It MUST NOT return EBADF to the caller of prlimit64!
+            let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 0x2000]);
+            let reporter = carrick_observability::compat::CompatReporter::default();
+            let rlimit_bytes = [1000u64.to_le_bytes(), 1000u64.to_le_bytes()].concat();
+            memory.write_bytes(0x1000, &rlimit_bytes).unwrap();
+
+            let outcome = dispatcher
+                .dispatch(
+                    &ctx,
+                    crate::dispatch::request::SyscallRequest::new(
+                        carrick_abi::syscall::nr::PRLIMIT64.0,
+                        carrick_observability::compat::SyscallArgs([
+                            0, // self
+                            carrick_abi::LinuxResource::Fsize as u64,
+                            0x1000,
+                            0,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap();
+            // Before fix: outcome was Err(EBADF). After fix: outcome is Returned { value: 0 }.
+            assert_eq!(
+                outcome,
+                crate::dispatch::DispatchOutcome::Returned { value: 0 }
+            );
+
+            // And the error is stored sticky on the affected description only!
+            assert_eq!(
+                mem_file.description.common().take_writeback_error(),
+                Some(carrick_abi::LINUX_EBADF)
             );
         }
 

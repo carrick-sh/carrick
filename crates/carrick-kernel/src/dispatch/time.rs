@@ -1118,9 +1118,7 @@ impl SyscallDispatcher {
                 // Published on the TARGET task, which is the whole point.
                 let _ = target.replace_rlimit(resource, |_current| Ok::<_, ()>(limit));
                 if resource == carrick_abi::LinuxResource::Fsize {
-                    if let Err(err) = crate::el1_delegation::recall_all_delegated() {
-                        return Ok(DispatchOutcome::errno(err));
-                    }
+                    crate::el1_delegation::recall_all_delegated();
                 }
                 if resource == carrick_abi::LinuxResource::Cpu {
                     // A finite CPU limit is enforced by the kernel's watchdog,
