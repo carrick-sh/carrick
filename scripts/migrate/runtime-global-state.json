@@ -1651,6 +1651,14 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "ALLOCATED_OPEN_FILES",
+      "fingerprint": "2d2e1fbb94cbea659ba3116b3ff792447f80e23f089cf5daf135a1d7bb013de4",
+      "classification": "carrier_infra",
+      "rationale": "Allocation bitmap of in-zone open-file records (one per open description of an in-zone inode) in the carrier-wide EL1 aperture."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-kernel/src/event_ring.rs",
       "symbol": "IDX",
       "fingerprint": "e0fd7642873c3b616f1a67936622eb4441990ca5cd85d8e6b7f513432bc88994",
