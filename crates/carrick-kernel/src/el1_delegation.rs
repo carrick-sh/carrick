@@ -2308,6 +2308,64 @@ mod tests {
         }
 
         #[test]
+        fn test_read_recall_loop_fails_loudly_after_bounded_iterations() {
+            carrick_fatal::set_hook(|domain, msg| {
+                panic!("carrick fatal [{domain}]: {msg}");
+            });
+            let (_tmp, host_file) = create_test_host_file(b"test data");
+            let inode = host_file
+                .description
+                .read()
+                .unwrap()
+                .inode_identity_fast()
+                .unwrap();
+
+            // Inject a delegated inode with a dead weak reference to simulate a crashed vCPU/process
+            {
+                let mut map = DELEGATED_INODES.lock();
+                let m = map.get_or_insert_with(HashMap::new);
+                m.insert(inode, (1, std::sync::Weak::new()));
+                publish_delegated_inodes_snapshot(&map);
+                HAS_DELEGATED_FILES.store(true, Ordering::Release);
+            }
+
+            // Spawn a thread to perform read(); if unbounded, this thread hangs forever.
+            let desc = Arc::clone(&host_file.description);
+            let handle = std::thread::spawn(move || {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = desc.read();
+                }));
+                res.is_err()
+            });
+
+            // Wait bounded time for the thread to complete (fail loudly)
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let mut failed_loudly = false;
+            while std::time::Instant::now() < deadline {
+                if handle.is_finished() {
+                    failed_loudly = handle.join().unwrap();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            // Clean up test injection
+            {
+                let mut map = DELEGATED_INODES.lock();
+                if let Some(m) = map.as_mut() {
+                    m.remove(&inode);
+                }
+                publish_delegated_inodes_snapshot(&map);
+                HAS_DELEGATED_FILES.store(false, Ordering::Release);
+            }
+
+            assert!(
+                failed_loudly,
+                "recall loop in read() must fail loudly after bounded iterations when an object lock is held by a dead/crashed vCPU"
+            );
+        }
+
+        #[test]
         fn test_delegate_rejects_o_path() {
             let _region = TestEl1Region::new();
             let dispatcher = crate::dispatch::SyscallDispatcher::new();

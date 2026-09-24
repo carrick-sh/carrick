@@ -2971,7 +2971,16 @@ impl crate::kernel::FileDescription {
 
     pub(crate) fn read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
         let d = self.open_description()?;
+        const MAX_RECALL_ITERATIONS: usize = 5;
+        let mut iterations = 0;
         loop {
+            iterations += 1;
+            if iterations > MAX_RECALL_ITERATIONS {
+                carrick_fatal!(
+                    "el1_delegation",
+                    "FileDescription::read recall loop exceeded bounded iterations ({iterations}); object lock held by dead/crashed vCPU?"
+                );
+            }
             let guard = d.read();
             if self.delegation_handle() != 0 {
                 drop(guard);
@@ -3029,7 +3038,16 @@ impl crate::kernel::FileDescription {
 
     pub(crate) fn write(&self) -> Option<FileDescriptionWriteGuard<'_>> {
         let d = self.open_description()?;
+        const MAX_RECALL_ITERATIONS: usize = 5;
+        let mut iterations = 0;
         loop {
+            iterations += 1;
+            if iterations > MAX_RECALL_ITERATIONS {
+                carrick_fatal!(
+                    "el1_delegation",
+                    "FileDescription::write recall loop exceeded bounded iterations ({iterations}); object lock held by dead/crashed vCPU?"
+                );
+            }
             let mut guard = d.write();
             let handle = self.delegation_handle();
             if handle != 0 {
