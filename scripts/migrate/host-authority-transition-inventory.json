@@ -15678,5 +15678,164 @@
       "line_end": 1410,
       "line_start": 1410
     }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-CREATE-DIR-ALL",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "operator-configured CARRICK_EL1_CENSUS output directory used by `write_at_teardown`"
+    },
+    "expansion": null,
+    "operation": "std::fs::create_dir_all",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/el1_census.rs:225 in `write_at_teardown`, `std::fs::create_dir_all` accesses only the operator-configured CARRICK_EL1_CENSUS output directory used by `write_at_teardown`.",
+    "review_id": "HA-000674",
+    "source": {
+      "byte_end": 7721,
+      "byte_start": 7698,
+      "column": 18,
+      "column_end": 41,
+      "column_start": 18,
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "line": 225,
+      "line_end": 225,
+      "line_start": 225
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "census file named on the `carrick debug el1-census` command line, read by `load`"
+    },
+    "expansion": null,
+    "operation": "std::fs::read",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/debug_el1_census.rs:26 in `load`, `std::fs::read` accesses only the census file named on the `carrick debug el1-census` command line, read by `load`.",
+    "review_id": "HA-000675",
+    "source": {
+      "byte_end": 939,
+      "byte_start": 926,
+      "column": 17,
+      "column_end": 30,
+      "column_start": 17,
+      "file": "crates/carrick-cli/src/debug_el1_census.rs",
+      "line": 26,
+      "line_end": 26,
+      "line_start": 26
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-DIR",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "census directory named on the `carrick debug el1-census` command line, read by `collect`"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_dir",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/debug_el1_census.rs:11 in `collect`, `std::fs::read_dir` accesses only the census directory named on the `carrick debug el1-census` command line, read by `collect`.",
+    "review_id": "HA-000676",
+    "source": {
+      "byte_end": 416,
+      "byte_start": 399,
+      "column": 45,
+      "column_end": 62,
+      "column_start": 45,
+      "file": "crates/carrick-cli/src/debug_el1_census.rs",
+      "line": 11,
+      "line_end": 11,
+      "line_start": 11
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "conformance results file named by `--results`, read by `per_suite`"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_to_string",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/debug_el1_census.rs:40 in `per_suite`, `std::fs::read_to_string` accesses only the conformance results file named by `--results`, read by `per_suite`.",
+    "review_id": "HA-000677",
+    "source": {
+      "byte_end": 1575,
+      "byte_start": 1552,
+      "column": 16,
+      "column_end": 39,
+      "column_start": 16,
+      "file": "crates/carrick-cli/src/debug_el1_census.rs",
+      "line": 40,
+      "line_end": 40,
+      "line_start": 40
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-WRITE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "EL1 census artifact in the operator-configured CARRICK_EL1_CENSUS directory used by `write_at_teardown`"
+    },
+    "expansion": null,
+    "operation": "std::fs::write",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/el1_census.rs:227 in `write_at_teardown`, `std::fs::write` accesses only the EL1 census artifact in the operator-configured CARRICK_EL1_CENSUS directory used by `write_at_teardown`.",
+    "review_id": "HA-000678",
+    "source": {
+      "byte_end": 7858,
+      "byte_start": 7844,
+      "column": 9,
+      "column_end": 23,
+      "column_start": 9,
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "line": 227,
+      "line_end": 227,
+      "line_start": 227
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-ID",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current carrier identity recorded in the diagnostic census file name and body by `snapshot`"
+    },
+    "expansion": null,
+    "operation": "std::process::id",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/el1_census.rs:198 in `snapshot`, `std::process::id` acts only on the current carrier identity recorded in the diagnostic census file name and body by `snapshot`; no guest identity selects its host target.",
+    "review_id": "HA-000679",
+    "source": {
+      "byte_end": 6943,
+      "byte_start": 6927,
+      "column": 14,
+      "column_end": 30,
+      "column_start": 14,
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "line": 198,
+      "line_end": 198,
+      "line_start": 198
+    }
   }
 ]
