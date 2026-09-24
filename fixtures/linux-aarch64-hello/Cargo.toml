@@ -81,3 +81,7 @@ path = "src/signal_default.rs"
 name = "carrick-linux-aarch64-scheduler-preemption"
 path = "src/scheduler_preemption.rs"
 
+
+[[bin]]
+name = "carrick-linux-aarch64-discard-fork-threads"
+path = "src/discard_fork_threads.rs"

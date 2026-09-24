@@ -1,0 +1,19 @@
+schema_version = 1
+id = "kernel.mm.anonymous-discard-fork-reuse"
+title = "Repeated unaligned discard of a reused thread stack across fork"
+guest_surfaces = ["syscall:madvise", "syscall:clone", "syscall:fork", "kernel:vm_projection"]
+semantic_authority = [
+  "man 2 madvise: MADV_DONTNEED on a private anonymous range zero-fills it in the calling process only and preserves bytes outside the range",
+  "man 2 fork: parent and child hold private copies; one process's discard never reaches the other",
+  "glibc advise_stack_range stack reuse, as exercised by CPython test.fork_wait (cpython-fork1, cpython-wait4)",
+]
+fixture = "fixture:discard-fork-threads"
+scale_points = [1]
+rationale = "A thread stack is discarded from one Linux page above its mapping, so both discard edges are partial 16 KiB host pages that are frame-COWed while a fork child shares them. That COW publishes a newer alias projection over an older fragment of the stack's bulk lease, and the discard re-arms first touch so the edge leaves are invalid. A later discard of the same reused stack must resolve each edge through the projection the alias registry resolves for the page (the newest live alias), never an older shadowed fragment whose compound the frame inventory has already split out. This contract fixes which projection is selected, not how much work selection costs: resolution stays one bounded registry query per lookup, so it carries no structural budget."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-vmm-hvf::trap::foreign_mm::tests::invalid_leaf_lookup_selects_the_newest_projection_over_a_shadowed_row"
+embed = "carrick-embed::discard_fork_threads::discard_fork_threads_contract"
+docker = "cached native ARM64 Docker oracle rows cpython-fork1 and cpython-wait4 (scripts/conformance/oracle-cache.jsonl)"
+ecosystem = ["cpython:fork1", "cpython:wait4"]

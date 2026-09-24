@@ -150,3 +150,4 @@ build_fixture "fork_bench.rs" "carrick-linux-aarch64-fork-bench"
 build_fixture "fork_bench_10k.rs" "carrick-linux-aarch64-fork-bench-10k"
 build_fixture "scheduler_preemption.rs" "carrick-linux-aarch64-scheduler-preemption"
 
+build_fixture "discard_fork_threads.rs" "carrick-linux-aarch64-discard-fork-threads"

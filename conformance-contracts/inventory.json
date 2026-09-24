@@ -2988,7 +2988,8 @@
       "contracts": [
         "kernel.fork.filetable",
         "kernel.fork.mappings",
-        "kernel.fork.stage1-image"
+        "kernel.fork.stage1-image",
+        "kernel.mm.anonymous-discard-fork-reuse"
       ],
       "claims": [
         "kernel.fork.filetable.copy-scaling",
@@ -3170,6 +3171,7 @@
       "contracts": [
         "kernel.mm.anonymous-discard",
         "kernel.mm.anonymous-discard-edges",
+        "kernel.mm.anonymous-discard-fork-reuse",
         "kernel.mm.anonymous-discard-no-scrub",
         "kernel.mm.retained-fragment-query",
         "kernel.mm.scrub-remap-query"
