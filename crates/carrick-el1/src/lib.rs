@@ -334,6 +334,7 @@ pub unsafe fn serve_locked_file_op(
             match inotify_table.get((m.inotify_handle - 1) as usize) {
                 Some(ino)
                     if ino.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST
+                        && ino.spilled.load(Ordering::Acquire) == 0
                         && locks.acquire(ino) =>
                 {
                     locked[num_locked] = m.inotify_handle;
@@ -391,7 +392,7 @@ pub unsafe fn serve_locked_file_op(
                 && m.inotify_handle != 0
                 && let Some(ino) = inotify_table.get((m.inotify_handle - 1) as usize)
             {
-                ino.push_record(m.wd, 0x02, 0); // LINUX_IN_MODIFY
+                ino.push_record(m.wd, 0x02, 0, None); // LINUX_IN_MODIFY
             }
         });
     }
@@ -825,7 +826,7 @@ mod tests {
         assert_eq!(action, Action::Served);
         assert_eq!(frame_write.x[0], 16);
         assert_eq!(counters.served[64].load(Ordering::Relaxed), 1);
-        assert_eq!(inotify_table[0].count.load(Ordering::Relaxed), 1);
+        assert!(inotify_table[0].has_records());
 
         // 3. inotify_rm_watch should be served at EL1 and enqueue IN_IGNORED
         let mut frame_rm = TrapFrame::default();
@@ -847,7 +848,7 @@ mod tests {
         assert_eq!(frame_rm.x[0], 0);
         assert_eq!(counters.served[28].load(Ordering::Relaxed), 1);
         assert!(!object_table[0].has_marks());
-        assert_eq!(inotify_table[0].count.load(Ordering::Relaxed), 2); // IN_MODIFY + IN_IGNORED
+        assert_eq!(inotify_table[0].queued_bytes.load(Ordering::Relaxed), 32); // IN_MODIFY + IN_IGNORED
 
         // 4. read from inotify fd should be served at EL1 and drain 2 events (32 bytes)
         let mut read_buf = [0u8; 64];
@@ -870,7 +871,7 @@ mod tests {
         assert_eq!(action, Action::Served);
         assert_eq!(frame_read.x[0], 32);
         assert_eq!(counters.served[63].load(Ordering::Relaxed), 1);
-        assert_eq!(inotify_table[0].count.load(Ordering::Relaxed), 0);
+        assert!(!inotify_table[0].has_records());
     }
 
     #[test]

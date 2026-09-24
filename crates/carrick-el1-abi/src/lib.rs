@@ -864,10 +864,9 @@ pub fn get_orig_arg0(slot: usize) -> u64 {
     current_task.orig_arg0.load(Ordering::Relaxed)
 }
 
+pub use carrick_inotify_core::QueuePush;
 use carrick_inotify_core::{
-    INOTIFY_EVENT_HEADER_SIZE, INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_RING_CAPACITY, LINUX_EINVAL,
-    LINUX_IN_Q_OVERFLOW, LinuxErrno, LinuxInotifyEventHeader, PushResult, alloc_wd,
-    should_coalesce,
+    INOTIFY_EVENT_HEADER_SIZE, INOTIFY_MAX_QUEUED_EVENTS, InotifyEventQueue, LinuxErrno, alloc_wd,
 };
 use core::sync::atomic::AtomicI32;
 
@@ -896,15 +895,24 @@ pub struct DelegatedInotify {
     pub generation: AtomicU64,
     pub flags: AtomicU32,
     pub next_wd: AtomicI32,
+    /// Mirror of the queue's byte count, published under the lock so
+    /// readiness and FIONREAD can read it without the lock.
     pub queued_bytes: AtomicUsize,
-    pub overflowed: AtomicU32,
-    pub head: AtomicU32,
-    pub count: AtomicU32,
+    /// Nonzero while the host holds an ordered spill of records that did not
+    /// fit the queue: EL1 then forwards reads and marked writes, so FIFO order
+    /// is kept by the host until the spill drains.
+    pub spilled: AtomicU32,
     pub num_watches: AtomicU32,
-    pub _reserved: [u32; 3],
+    pub _reserved: [u32; 4],
     pub watches: UnsafeCell<[DelegatedWatch; MAX_DELEGATED_WATCHES]>,
-    pub ring: UnsafeCell<[LinuxInotifyEventHeader; INOTIFY_RING_CAPACITY]>,
+    /// The instance's one event queue (shared implementation with the host).
+    pub queue: UnsafeCell<InotifyEventQueue<INOTIFY_QUEUE_BYTES>>,
 }
+
+/// Byte capacity of an in-zone instance's queue: every header-only event up
+/// to the event limit plus the overflow marker; named events beyond that
+/// spill to the host in order.
+pub const INOTIFY_QUEUE_BYTES: usize = (INOTIFY_MAX_QUEUED_EVENTS + 1) * INOTIFY_EVENT_HEADER_SIZE;
 
 unsafe impl Sync for DelegatedInotify {}
 
@@ -917,11 +925,9 @@ impl DelegatedInotify {
             flags: AtomicU32::new(0),
             next_wd: AtomicI32::new(1),
             queued_bytes: AtomicUsize::new(0),
-            overflowed: AtomicU32::new(0),
-            head: AtomicU32::new(0),
-            count: AtomicU32::new(0),
+            spilled: AtomicU32::new(0),
             num_watches: AtomicU32::new(0),
-            _reserved: [0; 3],
+            _reserved: [0; 4],
             watches: UnsafeCell::new(
                 [const {
                     DelegatedWatch {
@@ -932,16 +938,7 @@ impl DelegatedInotify {
                     }
                 }; MAX_DELEGATED_WATCHES],
             ),
-            ring: UnsafeCell::new(
-                [const {
-                    LinuxInotifyEventHeader {
-                        wd: 0,
-                        mask: 0,
-                        cookie: 0,
-                        len: 0,
-                    }
-                }; INOTIFY_RING_CAPACITY],
-            ),
+            queue: UnsafeCell::new(InotifyEventQueue::new()),
         }
     }
 
@@ -1023,116 +1020,39 @@ impl DelegatedInotify {
         None
     }
 
-    pub fn push_record(&self, wd: i32, mask: u32, cookie: u32) -> PushResult {
-        if self.overflowed.load(Ordering::Relaxed) != 0 {
-            return PushResult::DroppedOverflow;
-        }
-
-        let ring = unsafe { &mut *self.ring.get() };
-        let head = self.head.load(Ordering::Relaxed) as usize;
-        let count = self.count.load(Ordering::Relaxed) as usize;
-        if count > 0 {
-            let tail_idx = (head + count - 1) % INOTIFY_RING_CAPACITY;
-            let tail = ring[tail_idx];
-            let tail_wd = tail.wd;
-            let tail_mask = tail.mask;
-            let tail_cookie = tail.cookie;
-            if should_coalesce(tail_wd, tail_mask, tail_cookie, wd, mask, cookie) {
-                return PushResult::Coalesced;
-            }
-        }
-
-        let was_empty = count == 0;
-        if count >= INOTIFY_MAX_QUEUED_EVENTS || count >= INOTIFY_RING_CAPACITY {
-            self.overflowed.store(1, Ordering::Release);
-            let overflow_hdr = LinuxInotifyEventHeader {
-                wd: -1,
-                mask: LINUX_IN_Q_OVERFLOW,
-                cookie: 0,
-                len: 0,
-            };
-            let idx = (head + count) % INOTIFY_RING_CAPACITY;
-            ring[idx] = overflow_hdr;
-            self.count.store((count + 1) as u32, Ordering::Release);
-            self.queued_bytes
-                .fetch_add(INOTIFY_EVENT_HEADER_SIZE, Ordering::Release);
-            return PushResult::Overflowed { was_empty };
-        }
-
-        let idx = (head + count) % INOTIFY_RING_CAPACITY;
-        let hdr = LinuxInotifyEventHeader {
-            wd,
-            mask,
-            cookie,
-            len: 0,
-        };
-        ring[idx] = hdr;
-        self.count.store((count + 1) as u32, Ordering::Release);
+    /// Queue one event. The caller holds the instance lock.
+    pub fn push_record(&self, wd: i32, mask: u32, cookie: u32, name: Option<&[u8]>) -> QueuePush {
+        // SAFETY: the queue is only touched under the instance lock.
+        let queue = unsafe { &mut *self.queue.get() };
+        let result = queue.push(wd, mask, cookie, name);
         self.queued_bytes
-            .fetch_add(INOTIFY_EVENT_HEADER_SIZE, Ordering::Release);
-        PushResult::Appended { was_empty }
+            .store(queue.queued_bytes(), Ordering::Release);
+        result
     }
 
-    pub fn pop_record(&self) -> Option<LinuxInotifyEventHeader> {
-        let count = self.count.load(Ordering::Relaxed) as usize;
-        if count == 0 {
-            return None;
-        }
-        let ring = unsafe { &*self.ring.get() };
-        let head = self.head.load(Ordering::Relaxed) as usize;
-        let hdr = ring[head];
-        self.head.store(
-            ((head + 1) % INOTIFY_RING_CAPACITY) as u32,
-            Ordering::Relaxed,
-        );
-        self.count.store((count - 1) as u32, Ordering::Release);
-        let qb = self.queued_bytes.load(Ordering::Relaxed);
-        self.queued_bytes.store(
-            qb.saturating_sub(INOTIFY_EVENT_HEADER_SIZE),
-            Ordering::Release,
-        );
-        if hdr.mask & LINUX_IN_Q_OVERFLOW != 0 {
-            self.overflowed.store(0, Ordering::Release);
-        }
-        Some(hdr)
-    }
-
+    /// Move whole records into `dest` (read(2) semantics). The caller holds
+    /// the instance lock.
     pub fn drain_into(&self, dest: &mut [u8]) -> Result<usize, LinuxErrno> {
-        let count = self.count.load(Ordering::Relaxed) as usize;
-        if count == 0 {
-            return Ok(0);
-        }
-        if dest.len() < INOTIFY_EVENT_HEADER_SIZE {
-            return Err(LINUX_EINVAL);
-        }
+        // SAFETY: the queue is only touched under the instance lock.
+        let queue = unsafe { &mut *self.queue.get() };
+        let result = queue.drain_into(dest);
+        self.queued_bytes
+            .store(queue.queued_bytes(), Ordering::Release);
+        result
+    }
 
-        let ring = unsafe { &*self.ring.get() };
-        let mut head = self.head.load(Ordering::Relaxed) as usize;
-        let mut cur_count = count;
-        let mut written = 0;
-        let mut qb = self.queued_bytes.load(Ordering::Relaxed);
+    /// Whether any record is queued. The caller holds the instance lock.
+    pub fn has_records(&self) -> bool {
+        // SAFETY: the queue is only touched under the instance lock.
+        !unsafe { &*self.queue.get() }.is_empty()
+    }
 
-        while cur_count > 0 && written + INOTIFY_EVENT_HEADER_SIZE <= dest.len() {
-            let hdr = ring[head];
-            head = (head + 1) % INOTIFY_RING_CAPACITY;
-            cur_count -= 1;
-            qb = qb.saturating_sub(INOTIFY_EVENT_HEADER_SIZE);
-            if hdr.mask & LINUX_IN_Q_OVERFLOW != 0 {
-                self.overflowed.store(0, Ordering::Release);
-            }
-
-            let slice = &mut dest[written..written + INOTIFY_EVENT_HEADER_SIZE];
-            slice[0..4].copy_from_slice(&hdr.wd.to_ne_bytes());
-            slice[4..8].copy_from_slice(&hdr.mask.to_ne_bytes());
-            slice[8..12].copy_from_slice(&hdr.cookie.to_ne_bytes());
-            slice[12..16].copy_from_slice(&hdr.len.to_ne_bytes());
-            written += INOTIFY_EVENT_HEADER_SIZE;
-        }
-
-        self.head.store(head as u32, Ordering::Relaxed);
-        self.count.store(cur_count as u32, Ordering::Release);
-        self.queued_bytes.store(qb, Ordering::Release);
-        Ok(written)
+    /// Reset the queue for a new incarnation. The caller holds the lock.
+    pub fn reset_queue(&self) {
+        // SAFETY: the queue is only touched under the instance lock.
+        unsafe { *self.queue.get() = InotifyEventQueue::new() };
+        self.queued_bytes.store(0, Ordering::Release);
+        self.spilled.store(0, Ordering::Release);
     }
 }
 
@@ -1573,18 +1493,18 @@ mod tests {
 
         // Test push & coalesce
         assert_eq!(
-            inotify.push_record(wd1, 0x2, 0),
-            PushResult::Appended { was_empty: true }
+            inotify.push_record(wd1, 0x2, 0, None),
+            QueuePush::Appended { was_empty: true }
         );
-        assert_eq!(inotify.push_record(wd1, 0x2, 0), PushResult::Coalesced);
+        assert_eq!(inotify.push_record(wd1, 0x2, 0, None), QueuePush::Coalesced);
         assert_eq!(
-            inotify.push_record(wd2, 0x2, 0),
-            PushResult::Appended { was_empty: false }
+            inotify.push_record(wd2, 0x2, 0, None),
+            QueuePush::Appended { was_empty: false }
         );
         // IN_IGNORED (0x8000) does not coalesce
         assert_eq!(
-            inotify.push_record(wd1, 0x8000, 0),
-            PushResult::Appended { was_empty: false }
+            inotify.push_record(wd1, 0x8000, 0, None),
+            QueuePush::Appended { was_empty: false }
         );
 
         let mut buf = [0u8; 64];
