@@ -267,14 +267,9 @@ impl<'a> FsView<'a> {
                 && self.dac_overrides_permissions()
                 && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(path)
             {
-                let inode = self
-                    .fs
-                    .rootfs_vfs
-                    .path_inode_identity(path)
-                    .unwrap_or(carrick_vfs::InodeIdentity::new(0, real.ino));
-                if crate::el1_delegation::is_inode_delegated(inode) {
-                    crate::el1_delegation::recall_by_inode(inode);
-                } else {
+                // A recalled delegation may have changed the size the cached
+                // record describes: take the slow path after a recall.
+                if !crate::el1_delegation::recall_path(self.fs, path) {
                     return Ok(PathLookup {
                         resolved_path: path.to_string(),
                         fast_path: FastPathKind::StatCache,
@@ -379,14 +374,7 @@ impl<'a> FsView<'a> {
                 && self.dac_overrides_permissions()
                 && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(&resolved)
             {
-                let inode = self
-                    .fs
-                    .rootfs_vfs
-                    .path_inode_identity(&resolved)
-                    .unwrap_or(carrick_vfs::InodeIdentity::new(0, real.ino));
-                if crate::el1_delegation::is_inode_delegated(inode) {
-                    crate::el1_delegation::recall_by_inode(inode);
-                } else {
+                if !crate::el1_delegation::recall_path(self.fs, &resolved) {
                     return Ok(PathLookup {
                         resolved_path: resolved.clone(),
                         fast_path: FastPathKind::StatCache,

@@ -2203,7 +2203,7 @@ impl<'a> FsView<'a> {
 
             let fd: Fd = fd;
             if let Some(open_file) = this.open_file(fd.0) {
-                let _ = crate::el1_delegation::recall_if_delegated(&open_file.description);
+                crate::el1_delegation::recall_if_delegated(&open_file.description);
                 if let Some(err) = open_file.description.common().take_writeback_error() {
                     return Ok(DispatchOutcome::errno(err));
                 }
@@ -2349,7 +2349,7 @@ impl<'a> FsView<'a> {
 
             let fd: Fd = fd;
             if let Some(open_file) = this.open_file(fd.0) {
-                let _ = crate::el1_delegation::recall_if_delegated(&open_file.description);
+                crate::el1_delegation::recall_if_delegated(&open_file.description);
                 if let Some(err) = open_file.description.common().take_writeback_error() {
                     return Ok(DispatchOutcome::errno(err));
                 }

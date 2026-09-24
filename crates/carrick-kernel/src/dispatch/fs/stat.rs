@@ -454,8 +454,7 @@ impl<'a> FsView<'a> {
         }
         if typ == libc::S_IFREG as u32 {
             let inode = carrick_vfs::InodeIdentity::new(st.st_dev as u64, st.st_ino as u64);
-            if crate::el1_delegation::is_inode_delegated(inode) {
-                crate::el1_delegation::recall_by_inode(inode);
+            if crate::el1_delegation::recall_inode(inode) {
                 if unsafe {
                     libc::fstatat(
                         host_dir.fd.raw(),

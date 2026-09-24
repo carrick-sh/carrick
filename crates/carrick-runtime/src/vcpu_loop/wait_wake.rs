@@ -735,6 +735,11 @@ impl HvpatchRuntimeDirectory {
         for endpoint in self.endpoints.lock().values_mut() {
             endpoint.scheduler = None;
         }
+        // Every delegated object is written back while the EL1 region is still
+        // mapped: a recall after the pointer is cleared is fatal by design, so
+        // this ordering belongs to teardown. Write-back errors stay sticky on
+        // the affected descriptions.
+        carrick_kernel::el1_delegation::recall_all_delegated();
         carrick_kernel::el1_delegation::clear_el1_region_host_ptr();
         result
     }

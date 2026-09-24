@@ -2557,8 +2557,11 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                         || carrick_mem::memory::is_carrick_el0_clock_stub_va(pc)
                     {
                         // Clock completion may have already passed its flag
-                        // check. Normalize to the original SVC so replay must
-                        // cross host dispatch before delivering the kick.
+                        // check. Normalize to the original SVC, then arm the
+                        // pending IRQ: it fires the moment EL0 is re-entered,
+                        // so the kick is taken at the SVC's PC BEFORE the
+                        // syscall replays, and the replay crosses host
+                        // dispatch afterwards with the kick already served.
                         let normalized = self.vcpu.force_clock_host_boundary()?;
                         if in_vector || in_el1_image || normalized {
                             self.vcpu.set_pending_irq(true)?;

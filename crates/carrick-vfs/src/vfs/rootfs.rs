@@ -325,13 +325,10 @@ impl RootFsVfs {
     }
 
     pub fn path_inode_identity(&self, path: &str) -> Option<InodeIdentity> {
-        if let Ok(dentry) = self.dentry_cache.lookup_path_options(
-            path,
-            false,
-            &*self.overlay,
-            self.rootfs.as_ref(),
-            false,
-        ) {
+        if let Ok(dentry) =
+            self.dentry_cache
+                .lookup_path(path, false, &*self.overlay, self.rootfs.as_ref())
+        {
             Some(InodeIdentity::new(dentry.dentry.dev, dentry.dentry.ino))
         } else {
             None
@@ -535,13 +532,6 @@ impl RootFsVfs {
         match self.overlay.open_raw_fd(path, true, false, false) {
             crate::fs_backend::HostFdOpen::Served(host_fd) => {
                 let inode = Self::host_fd_inode_identity(host_fd);
-                if let Some(inode) = inode {
-                    if let Some(hook) = crate::vfs::dentry::get_inode_recall_hook() {
-                        if hook(inode) {
-                            self.dentry_cache.invalidate_inode(inode);
-                        }
-                    }
-                }
                 let err = unsafe { libc::ftruncate(host_fd, length as libc::off_t) }
                     .host_syscall_errno()
                     .err();
@@ -1062,22 +1052,11 @@ impl RootFsVfs {
                 if want_create && want_excl {
                     return Err(LINUX_EEXIST);
                 }
-                if let Some((host_fd, mut metadata)) = self
+                if let Some((host_fd, metadata)) = self
                     .overlay
                     .open_raw_fd_with_metadata(path, writable_request, false, want_trunc)
                     .lowerable()?
                 {
-                    if let Some(inode) = Self::host_fd_inode_identity(host_fd) {
-                        if let Some(hook) = crate::vfs::dentry::get_inode_recall_hook() {
-                            if hook(inode) {
-                                self.dentry_cache.invalidate_inode(inode);
-                                let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                                if unsafe { libc::fstat(host_fd, &mut st) } == 0 {
-                                    metadata.size = st.st_size as usize;
-                                }
-                            }
-                        }
-                    }
                     return Ok(OpenDispatchResult::HostFile {
                         host_fd,
                         metadata,
@@ -1093,22 +1072,10 @@ impl RootFsVfs {
                     .open_raw_fd(path, writable_request, false, want_trunc)
                     .lowerable()?
                 {
-                    if let Some(inode) = Self::host_fd_inode_identity(host_fd) {
-                        if let Some(hook) = crate::vfs::dentry::get_inode_recall_hook() {
-                            if hook(inode) {
-                                self.dentry_cache.invalidate_inode(inode);
-                            }
-                        }
-                    }
                     let size = if want_trunc {
                         0
                     } else {
-                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                        if unsafe { libc::fstat(host_fd, &mut st) } == 0 {
-                            st.st_size as usize
-                        } else {
-                            backend_md.as_ref().map(|m| m.size).unwrap_or(0)
-                        }
+                        backend_md.as_ref().map(|m| m.size).unwrap_or(0)
                     };
                     let metadata = RootFsMetadata {
                         path: std::path::Path::new(path).to_path_buf(),

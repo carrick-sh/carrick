@@ -331,16 +331,7 @@ pub fn spawn_signal_pump(
     kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
     futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
 ) -> SignalPump {
-    spawn_signal_pump_inner(kicker, futex, true, None)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub fn spawn_signal_pump_with_kernel_retry(
-    kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
-    futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
-    retry: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
-) -> SignalPump {
-    spawn_signal_pump_inner(kicker, futex, true, Some(retry))
+    spawn_signal_pump_inner(kicker, futex, true)
 }
 
 /// Spawn only the host-signal/xsignal wake half of the macOS pump. The native
@@ -353,7 +344,7 @@ pub fn spawn_signal_wake_pump(
     kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
     futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
 ) -> SignalPump {
-    spawn_signal_pump_inner(kicker, futex, false, None)
+    spawn_signal_pump_inner(kicker, futex, false)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -408,7 +399,6 @@ fn spawn_signal_pump_inner(
     kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
     futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
     monitor_hvf_events: bool,
-    _kernel_retry: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> SignalPump {
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let exited = ExitSignal::new();
