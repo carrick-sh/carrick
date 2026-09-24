@@ -228,11 +228,20 @@ impl<'a> FsView<'a> {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn maybe_delegate_inotify_watch(
+    /// Attach a new or updated watch to its file's in-zone inode as an
+    /// in-guest mark, when the file is ALREADY in the zone. Returns false
+    /// otherwise; the caller keeps the watch as a host watch.
+    ///
+    /// A watch never puts a file in the zone: files enter only at open
+    /// (`enter_zone_at_open`). A file opened before the watch was added is
+    /// normally in the zone already (it entered at its open), so its marks
+    /// are in-guest and its served writes enqueue into the instance's ring.
+    /// A file that is not in the zone (never opened, refused at open, or
+    /// demoted) is watched from the host: the host write path enqueues its
+    /// events into the same in-zone instance ring.
+    fn attach_watch_to_zone_file(
         &self,
         pathname: u64,
-        fd: i32,
         state: &Arc<crate::inotify::InotifyState>,
         path: &str,
         wd: i32,
@@ -242,44 +251,14 @@ impl<'a> FsView<'a> {
         if mask & crate::inotify::UNSUPPORTED_INOTIFY_MASK_FLAGS != 0 {
             return false;
         }
-        let _ = fd;
         let file_table_id = self.captured_file_table().id();
         let Some(inotify_handle) = state.zone_handle() else {
             return false;
         };
-
-        // The watched file's exact host identity; a path with none is not a
-        // delegatable host regular file.
         let Some(inode) = self.fs.rootfs_vfs.path_inode_identity(path) else {
             return false;
         };
-        let mut file_handle_opt = crate::el1_delegation::delegated_inode_handle(inode);
-
-        // Not delegated yet: find this process's single description of the
-        // inode by its registered identity. No guard is taken while scanning
-        // (`read_for_io`/`write_for_io` would recall a delegated description); `delegate`
-        // takes the one description's write guard itself.
-        if file_handle_opt.is_none() {
-            for open_fd in self.open_fd_numbers() {
-                let Some(of) = self.open_file(open_fd) else {
-                    continue;
-                };
-                if of.description.el1_identity() != Some(inode) {
-                    continue;
-                }
-                if let Ok(h) = crate::el1_delegation::delegate(
-                    &of,
-                    file_table_id,
-                    open_fd,
-                    self.fs,
-                    Some(&self.task_rlimits()),
-                    Some(self.delegation_policy()),
-                ) {
-                    file_handle_opt = Some(h);
-                }
-                break;
-            }
-        }
+        let file_handle_opt = crate::el1_delegation::delegated_inode_handle(inode);
 
         if let Some(file_handle) = file_handle_opt {
             let region_ptr = carrick_el1_abi::get_el1_region_host_ptr();
@@ -404,9 +383,8 @@ impl<'a> FsView<'a> {
                 this.fs
                     .inotify_registry
                     .register(&path, &state, wd, effective);
-                if !this.maybe_delegate_inotify_watch(
+                if !this.attach_watch_to_zone_file(
                     pathname.0,
-                    fd.0,
                     &state,
                     &path,
                     wd,
@@ -498,9 +476,8 @@ impl<'a> FsView<'a> {
                     .inotify_registry
                     .register(&path, &state, wd, mask);
             }
-            if !this.maybe_delegate_inotify_watch(
+            if !this.attach_watch_to_zone_file(
                 pathname.0,
-                fd.0,
                 &state,
                 &path,
                 wd,

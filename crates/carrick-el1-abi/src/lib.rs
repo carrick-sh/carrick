@@ -194,7 +194,6 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::align_of::<DelegatedFile>() as u64,
         core::mem::offset_of!(DelegatedFile, size) as u64,
         core::mem::offset_of!(DelegatedFile, dirty_mask) as u64,
-        core::mem::offset_of!(DelegatedFile, served_ops) as u64,
         core::mem::offset_of!(DelegatedFile, marks) as u64,
         core::mem::size_of::<DelegatedOpenFile>() as u64,
         core::mem::offset_of!(DelegatedOpenFile, inode_handle) as u64,
@@ -493,9 +492,9 @@ pub struct DelegatedFile {
     pub dirty_mask: AtomicU64,
     /// 64-bit zero-filled gap page mask (bit i indicates 4 KiB page i was zero-filled on extension and never written).
     pub zero_filled_mask: AtomicU64,
-    /// Operations EL1 served on this object during the current delegation
-    /// window; the host reads it at recall to judge whether delegating paid off.
-    pub served_ops: AtomicU64,
+    /// Formerly the served-operation count that fed the delegation backoff;
+    /// a file now enters the zone only at open, so nothing reads it.
+    pub _reserved_served_ops: u64,
     /// Exact host inode identity for inotify correspondence.
     pub inode: DelegatedInodeIdentity,
     /// Count of active marks currently attached.
@@ -581,7 +580,7 @@ impl DelegatedFile {
             _reserved0: 0,
             dirty_mask: AtomicU64::new(0),
             zero_filled_mask: AtomicU64::new(0),
-            served_ops: AtomicU64::new(0),
+            _reserved_served_ops: 0,
             inode: DelegatedInodeIdentity::new(0, 0),
             num_marks: AtomicU32::new(0),
             _reserved1: 0,

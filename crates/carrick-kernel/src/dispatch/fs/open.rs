@@ -33,12 +33,17 @@ pub struct OpenAtArgs<'a> {
 }
 
 impl<'a> FsView<'a> {
-    pub(in crate::dispatch) fn maybe_delegate_opened_file(&self, outcome: &DispatchOutcome) {
+    /// The only place a regular file enters the EL1 zone: right after
+    /// open(2) installed its new description. A description that does not
+    /// enter here (ineligible, or the zone is full) or that is demoted later
+    /// stays on the host path for its whole life; only a new open may put
+    /// the file back in the zone.
+    pub(in crate::dispatch) fn enter_zone_at_open(&self, outcome: &DispatchOutcome) {
         if let DispatchOutcome::Returned { value, .. } = *outcome {
             let fd = value as i32;
             if fd >= 0 {
                 if let Some(open_file) = self.open_file(fd) {
-                    let _ = crate::el1_delegation::delegate(
+                    let _ = crate::el1_delegation::enter_zone_at_open(
                         &open_file,
                         self.captured_file_table().id(),
                         fd,
@@ -71,7 +76,7 @@ impl<'a> FsView<'a> {
             },
             cx.reporter,
         )?;
-        self.maybe_delegate_opened_file(&outcome);
+        self.enter_zone_at_open(&outcome);
         Ok(outcome)
     }
 
@@ -2256,7 +2261,7 @@ impl<'a> FsView<'a> {
                 },
                 cx.reporter,
             )?;
-            this.maybe_delegate_opened_file(&outcome);
+            this.enter_zone_at_open(&outcome);
             Ok(outcome)
 
         }
