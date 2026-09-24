@@ -333,6 +333,11 @@ pub(crate) struct DelegationPolicy<'a> {
     pub interceptors_active: bool,
 }
 
+/// Maximum number of times a file description may be recalled before becoming
+/// permanently ineligible for EL1 delegation for the remainder of its lifetime.
+/// Prevents unbounded recall-then-delegate thrashing on interleaved operations.
+pub const MAX_DELEGATION_RECALLS_PER_LIFETIME: u32 = 2;
+
 /// Reasons why a file description cannot be delegated to EL1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotEligible {
@@ -353,6 +358,7 @@ pub enum NotEligible {
     Sealed,
     SeccompFiltered,
     Observed,
+    RecalledTooOften,
 }
 
 fn lock_delegated_file(file: &DelegatedFile, handle: u32) {
@@ -411,6 +417,9 @@ pub(crate) fn delegate_locked(
     }
     if open_file.description.common().fd_refs() != 1 {
         return Err(NotEligible::MultipleReferences);
+    }
+    if open_file.description.common().recall_count() >= MAX_DELEGATION_RECALLS_PER_LIFETIME {
+        return Err(NotEligible::RecalledTooOften);
     }
     if open_file.description.has_active_mappings() {
         return Err(NotEligible::Mapped);
@@ -754,6 +763,7 @@ pub(crate) fn recall_locked(
         }
     }
     mark_pending_host_work_for_file_tables(&target_tables);
+    description.common().record_recall();
     let rootfs_vfs = DELEGATED_ROOTFS.lock()[(handle - 1) as usize]
         .as_ref()
         .and_then(|w| w.upgrade());
@@ -2651,6 +2661,46 @@ mod tests {
                 0,
                 "slot 12 with no task running must never have pending_host_work set"
             );
+        }
+
+        #[test]
+        fn test_recalled_two_times_becomes_ineligible_until_close() {
+            let _region = TestEl1Region::new();
+            let table_id = FileTableId::from_raw_u64(1).unwrap();
+            let (_tmp, host_file) = create_test_host_file(b"hysteresis test data");
+
+            // 1st delegation
+            let h1 = delegate_for_test(&host_file, table_id, 3).expect("first delegate");
+            assert_eq!(h1, 1);
+            assert_eq!(host_file.description.common().recall_count(), 0);
+
+            // 1st recall
+            recall(&host_file.description).expect("first recall");
+            assert_eq!(host_file.description.common().recall_count(), 1);
+
+            // 2nd delegation: still eligible because recall_count == 1 (< 2)
+            let h2 = delegate_for_test(&host_file, table_id, 3).expect("second delegate");
+            assert_eq!(h2, 1);
+
+            // 2nd recall
+            recall(&host_file.description).expect("second recall");
+            assert_eq!(host_file.description.common().recall_count(), 2);
+
+            // 3rd delegation attempt: must be rejected with RecalledTooOften
+            let err = delegate_for_test(&host_file, table_id, 3).unwrap_err();
+            assert_eq!(
+                err,
+                NotEligible::RecalledTooOften,
+                "description recalled twice must become ineligible until close"
+            );
+
+            // Closing and creating a fresh description resets the lifetime recall count
+            let (_tmp2, fresh_host_file) = create_test_host_file(b"fresh description");
+            assert_eq!(fresh_host_file.description.common().recall_count(), 0);
+            let h3 = delegate_for_test(&fresh_host_file, table_id, 4)
+                .expect("delegate on fresh description");
+            assert_eq!(h3, 1);
+            recall(&fresh_host_file.description).expect("recall fresh description");
         }
     }
 }

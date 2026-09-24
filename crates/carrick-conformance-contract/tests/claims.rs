@@ -143,7 +143,7 @@ fn live_registry_loads_all_claims() {
         .unwrap();
     let registry = carrick_conformance_contract::ContractRegistry::load(repo_root)
         .expect("live registry should load");
-    assert_eq!(registry.contracts().len(), 39);
+    assert_eq!(registry.contracts().len(), 40);
     for id in [
         "kernel.execution.native-synchronous-syscall",
         "kernel.execution.native-data-demand",
