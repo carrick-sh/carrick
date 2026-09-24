@@ -12356,7 +12356,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 1319,
+      "line": 1318,
       "categories": [
         "description_backing"
       ],
@@ -12365,7 +12365,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 1539,
+      "line": 1538,
       "categories": [
         "description_backing"
       ],
@@ -12374,7 +12374,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 1743,
+      "line": 1742,
       "categories": [
         "description_guard"
       ],
@@ -12383,7 +12383,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 1807,
+      "line": 1806,
       "categories": [
         "description_guard"
       ],
@@ -12392,7 +12392,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 1900,
+      "line": 1899,
       "categories": [
         "mapping"
       ],
@@ -12401,7 +12401,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 1904,
+      "line": 1903,
       "categories": [
         "mapping"
       ],
