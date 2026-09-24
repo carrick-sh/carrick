@@ -267,9 +267,9 @@ impl<'a> FsView<'a> {
                 && self.dac_overrides_permissions()
                 && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(path)
             {
-                // A recalled delegation may have changed the size the cached
-                // record describes: take the slow path after a recall.
-                if !crate::el1_delegation::recall_path(self.fs, path) {
+                // An in-zone file's cached record may predate its in-zone
+                // writes: write them back and take the slow path.
+                if !crate::el1_delegation::sync_path(self.fs, path) {
                     return Ok(PathLookup {
                         resolved_path: path.to_string(),
                         fast_path: FastPathKind::StatCache,
@@ -374,7 +374,7 @@ impl<'a> FsView<'a> {
                 && self.dac_overrides_permissions()
                 && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(&resolved)
             {
-                if !crate::el1_delegation::recall_path(self.fs, &resolved) {
+                if !crate::el1_delegation::sync_path(self.fs, &resolved) {
                     return Ok(PathLookup {
                         resolved_path: resolved.clone(),
                         fast_path: FastPathKind::StatCache,

@@ -470,6 +470,43 @@ pub(crate) fn recall_path(fs: &FsState, path: &str) -> bool {
     }
 }
 
+/// Write back the zone's copy of `identity` when the zone owns it, so a host
+/// read of the inode's metadata (a path stat) sees every in-zone write. The
+/// file stays in the zone. True when the zone owned the inode: the caller's
+/// cached metadata for it is stale and must be read again.
+pub(crate) fn sync_inode(identity: InodeIdentity) -> bool {
+    if no_active_delegations() {
+        return false;
+    }
+    let description = {
+        let owners = OWNERS.lock();
+        match owners.as_ref().and_then(|map| map.get(&identity)) {
+            Some(Owner {
+                state: OwnerState::Guest(binding),
+                ..
+            }) => binding.description.upgrade(),
+            _ => None,
+        }
+    };
+    let Some(description) = description else {
+        return false;
+    };
+    // Write-back errors stay sticky on the description, as at recall.
+    let _ = sync_to_host(&description);
+    true
+}
+
+/// [`sync_inode`] for the inode at an absolute `path`.
+pub(crate) fn sync_path(fs: &FsState, path: &str) -> bool {
+    if no_active_delegations() {
+        return false;
+    }
+    match fs.rootfs_vfs.path_inode_identity(path) {
+        Some(identity) => sync_inode(identity),
+        None => false,
+    }
+}
+
 /// A watch or mark was just added at `path`: recall what it covers. A watch on
 /// a delegated regular file recalls exactly that file; any other watch (a
 /// directory covers its children) recalls every active delegation.
@@ -1738,6 +1775,23 @@ mod tests {
             guest_write(handle, 11, b"!");
             recall(&open.description).expect("recall");
             assert_eq!(host_bytes(&tmp), b"hello world!");
+        }
+
+        #[test]
+        fn sync_by_inode_writes_back_only_what_the_zone_owns() {
+            let _region = Region::new();
+            let tmp = temp_with(b"ab");
+            let open = open_host(&tmp);
+            let identity = open.description.el1_identity().expect("registered");
+            // Not in the zone yet: nothing to write back.
+            assert!(!sync_inode(identity));
+            let handle = delegate_default(&open, 3).expect("eligible");
+            guest_write(handle, 2, b"cd");
+            assert!(sync_inode(identity));
+            assert_eq!(host_bytes(&tmp), b"abcd");
+            assert_eq!(open.description.delegation_handle(), handle);
+            recall(&open.description).expect("recall");
+            assert!(!sync_inode(identity));
         }
 
         #[test]
