@@ -287,7 +287,9 @@ pub struct DelegatedFile {
     pub _reserved0: u32,
     /// 64-bit dirty page mask (bit i indicates 4 KiB page i is dirty).
     pub dirty_mask: AtomicU64,
-    pub _pad: [u8; 16],
+    /// 64-bit zero-filled gap page mask (bit i indicates 4 KiB page i was zero-filled on extension and never written).
+    pub zero_filled_mask: AtomicU64,
+    pub _pad: [u8; 8],
 }
 
 impl DelegatedFile {
@@ -301,7 +303,8 @@ impl DelegatedFile {
             flags: AtomicU32::new(0),
             _reserved0: 0,
             dirty_mask: AtomicU64::new(0),
-            _pad: [0; 16],
+            zero_filled_mask: AtomicU64::new(0),
+            _pad: [0; 8],
         }
     }
 
