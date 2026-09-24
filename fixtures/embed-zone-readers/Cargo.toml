@@ -1,0 +1,18 @@
+# Standalone (NOT a workspace member): this crate is cross-compiled for
+# aarch64-unknown-linux-musl and must not inherit the host workspace's
+# profile, lints, or target directory.
+[workspace]
+
+[package]
+name = "carrick-embed-zone-readers"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "zone-readers"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+panic = "abort"

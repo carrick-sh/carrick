@@ -338,6 +338,53 @@ print "zone_entry_ok\n";
     );
 }
 
+/// Contract `kernel.el1.files.cross-process-readers`: several live guest
+/// processes, each with more threads than the carrier has vCPUs, read files
+/// in the zone and verify every byte (the fixture's records name their file
+/// and offset). EL1 must resolve a thread's fds only through that thread's own
+/// file table. A vCPU whose current-task record named another thread's table
+/// served one process's reads with another process's files: `go build` read
+/// wrong GOROOT sources and cache archives, and this fixture saw wrong bytes,
+/// early EOFs and EBADF writes in 12 of 13 runs. The served-read floor proves
+/// the reads were served in-guest, so a pass is not a host-path pass.
+#[test]
+fn el1_files_cross_process_readers_contract() {
+    // 4 rounds x 4 processes x 8 threads x 40 iterations; 8 in 10 read a
+    // file of 0.5-120 KiB to EOF in 4 or 8 KiB steps (about 60,000 reads, of
+    // which EL1 serves those whose buffer is already mapped).
+    const SHAPE: [&str; 4] = ["4", "4", "8", "40"];
+    const MIN_SERVED_READS: u64 = 4_000;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    carrick_kernel::el1_delegation::reset_delegation_counts();
+    let watchdog = Watchdog::start(std::time::Duration::from_secs(120));
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command(std::iter::once("/opt/carrick/zone-readers").chain(SHAPE))
+            .vfs_mount("/opt/carrick", Box::new(common::zone_readers_vfs()))
+            .run_blocking(),
+    );
+    watchdog.disarm();
+    let counters = read_el1_counters().expect("EL1 counters should be populated");
+    let served_reads =
+        counters.served[63].load(Ordering::Relaxed) + counters.served[67].load(Ordering::Relaxed);
+    let forwarded_reads = counters.forwarded[63].load(Ordering::Relaxed)
+        + counters.forwarded[67].load(Ordering::Relaxed);
+    let population = carrick_kernel::el1_delegation::delegation_counts();
+    assert!(
+        result.success() && result.stdout_utf8().trim() == "zone_readers_ok",
+        "exit_code={} stdout={:?} stderr={}; served reads {served_reads}, forwarded {forwarded_reads}; population {population:?}",
+        result.exit_code,
+        result.stdout_utf8(),
+        result.stderr_utf8()
+    );
+    assert!(
+        served_reads >= MIN_SERVED_READS,
+        "only {served_reads} reads served in-guest (forwarded {forwarded_reads}); the zone was not exercised; population {population:?}"
+    );
+}
+
 /// Read-after-write from second process after first process exits (proving recall on teardown).
 #[test]
 fn el1_files_recall_on_teardown() {

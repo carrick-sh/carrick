@@ -1,0 +1,32 @@
+schema_version = 1
+id = "kernel.el1.files.cross-process-readers"
+title = "EL1 serves a thread's fds only through that thread's own file table"
+guest_surfaces = [
+  "syscall:openat",
+  "syscall:read",
+  "syscall:pread64",
+  "syscall:write",
+  "syscall:close",
+  "syscall:clone",
+  "syscall:wait4",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 open",
+  "man 2 read",
+  "man 2 pread64",
+  "man 2 write",
+  "man 2 fork",
+  "man 7 credentials",
+]
+fixture = "probe:el1_files_cross_process_readers"
+scale_points = [4]
+structural_budgets = []
+rationale = "A file descriptor number means an open file description in the calling process's file table only (open(2); fork(2) gives each process its own table). EL1 resolves an fd through the file table named by its vCPU's current-task record, so that record may name only the thread loaded on the vCPU that leases the record's mailbox slot, or nobody (EL1 then forwards, costing one host boundary). M:N reclaim and fork rebuild move a running thread's vCPU to a fresh mailbox lease while another vCPU takes the old slot: a slot number cached across that move, or a record that outlived or predated its lease, made EL1 serve one process's reads and writes with another process's files. go build read wrong GOROOT sources and cache archives (\"package statement must be first\", \"not the start of an archive file\"), and the fixture saw wrong bytes, early EOFs and EBADF writes. The record's lifetime is the lease's (empty when the lease begins and ends), and the executor derives the slot from its vCPU's live lease at every publish and clear."
+
+[bindings]
+vm_free = "carrick-vmm-hvf::syscall_mailbox::tests::a_mailbox_lease_owns_its_el1_current_task_record"
+embed = "carrick-embed::el1_files_cross_process_readers_contract"
+
+[bindings.unresolved]
+docker = "The fixture verifies every byte it reads against the content that names its file and offset, and the Linux results of open, read, pread64 and write; EL1 serving is transparent to the Linux ABI."

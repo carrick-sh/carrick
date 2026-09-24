@@ -204,11 +204,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Build carrick-embed's immutable raw-syscall fixture in a native arm64 Linux
-# container, and wait for that Docker phase to exit before any signed HVF test
-# process is started.
+# Build carrick-embed's immutable static guest fixtures (local musl
+# cross-compiles, no Docker) before any signed HVF test process is started.
 if [ "$pkg" = "carrick-embed" ]; then
     scripts/build-embed-interceptor-probe.sh
+    scripts/build-embed-zone-readers.sh
 fi
 
 # 1. Build (never run) the package's test executables and collect their
