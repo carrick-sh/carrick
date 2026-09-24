@@ -253,8 +253,7 @@ impl<'a> FsView<'a> {
         let Some(inode) = self.fs.rootfs_vfs.path_inode_identity(path) else {
             return false;
         };
-        let mut file_handle_opt =
-            crate::el1_delegation::delegated_file_by_inode(inode).map(|(h, _)| h);
+        let mut file_handle_opt = crate::el1_delegation::delegated_inode_handle(inode);
 
         // Not delegated yet: find this process's single description of the
         // inode by its registered identity. No guard is taken while scanning
@@ -391,8 +390,7 @@ impl<'a> FsView<'a> {
                 .filter(|(wd, _)| state.is_watch_live(*wd))
                 .or_else(|| {
                     let identity = this.fs.rootfs_vfs.path_inode_identity(&path)?;
-                    let (file_handle, _) =
-                        crate::el1_delegation::delegated_file_by_inode(identity)?;
+                    let file_handle = crate::el1_delegation::delegated_inode_handle(identity)?;
                     crate::el1_inotify::zone_watch_for_file(&state, file_handle)
                 });
             if let Some((wd, old_mask)) = existing {

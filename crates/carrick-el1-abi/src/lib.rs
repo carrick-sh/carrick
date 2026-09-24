@@ -83,6 +83,19 @@ pub const EL1_FD_MAP_BASE: u64 = EL1_REGION_BASE + EL1_FD_MAP_OFFSET;
 /// Size of the fd map area (64 KiB).
 pub const EL1_FD_MAP_SIZE: u64 = 0x1_0000;
 
+/// Offset of the in-zone open-file table (one record per open description of
+/// an in-zone inode), right after the fd map.
+pub const EL1_OPEN_FILE_TABLE_OFFSET: u64 = EL1_FD_MAP_OFFSET + EL1_FD_MAP_SIZE;
+
+/// Guest virtual base of the in-zone open-file table.
+pub const EL1_OPEN_FILE_TABLE_BASE: u64 = EL1_REGION_BASE + EL1_OPEN_FILE_TABLE_OFFSET;
+
+/// Size of the in-zone open-file table.
+pub const EL1_OPEN_FILE_TABLE_SIZE: u64 = 0x1_0000;
+
+/// Maximum open-file records (open descriptions of in-zone inodes).
+pub const MAX_ZONE_OPEN_FILES: usize = 512;
+
 /// Byte offset of the file page cache arena within the region.
 pub const EL1_CACHE_OFFSET: u64 = EL1_HEAP_OFFSET + 0x10_0000; // 1 MiB into heap
 
@@ -348,12 +361,13 @@ pub struct DelegatedFile {
     pub lock: AtomicU32,
     /// Owner generation word.
     pub generation: AtomicU64,
-    /// Current logical file offset.
-    pub offset: AtomicU64,
+    /// Formerly the offset: offsets belong to each open file
+    /// ([`DelegatedOpenFile`]), never to the inode.
+    pub _reserved_offset: u64,
     /// Current file size in bytes.
     pub size: AtomicU64,
-    /// File access flags (`DELEGATED_FLAG_*`).
-    pub flags: AtomicU32,
+    /// Formerly the access flags: they belong to each open file.
+    pub _reserved_flags: u32,
     pub _reserved0: u32,
     /// 64-bit dirty page mask (bit i indicates 4 KiB page i is dirty).
     pub dirty_mask: AtomicU64,
@@ -374,15 +388,76 @@ pub struct DelegatedFile {
 
 unsafe impl Sync for DelegatedFile {}
 
+/// One open description of an in-zone inode (open(2): an open file
+/// description has its own offset and status flags; every description of an
+/// inode shares its bytes). Guarded by its inode's lock.
+#[repr(C, align(64))]
+#[derive(Debug)]
+pub struct DelegatedOpenFile {
+    /// Dead (0) or Guest (1).
+    pub state: AtomicU32,
+    /// Access flags (`DELEGATED_FLAG_*`).
+    pub flags: AtomicU32,
+    /// This record's incarnation; the fd map publishes it.
+    pub generation: AtomicU64,
+    /// 1-based handle of the inode record ([`DelegatedFile`]).
+    pub inode_handle: AtomicU32,
+    pub _reserved0: u32,
+    /// The inode's generation when this record joined it: an inode handle
+    /// reused by another inode never matches.
+    pub inode_generation: AtomicU64,
+    /// Current file offset of this description.
+    pub offset: AtomicU64,
+    pub _pad: [u64; 3],
+}
+
+impl DelegatedOpenFile {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU32::new(DELEGATED_STATE_DEAD),
+            flags: AtomicU32::new(0),
+            generation: AtomicU64::new(0),
+            inode_handle: AtomicU32::new(0),
+            _reserved0: 0,
+            inode_generation: AtomicU64::new(0),
+            offset: AtomicU64::new(0),
+            _pad: [0; 3],
+        }
+    }
+
+    /// Whether this record is live and still bound to `inode`'s current
+    /// incarnation. The caller holds `inode`'s lock.
+    #[inline]
+    pub fn is_bound_to(&self, inode: &DelegatedFile) -> bool {
+        self.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST
+            && inode.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST
+            && self.inode_generation.load(Ordering::Acquire)
+                == inode.generation.load(Ordering::Acquire)
+    }
+}
+
+impl Default for DelegatedOpenFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<DelegatedOpenFile>() == 64);
+const _: () = assert!(
+    MAX_ZONE_OPEN_FILES as u64 * core::mem::size_of::<DelegatedOpenFile>() as u64
+        <= EL1_OPEN_FILE_TABLE_SIZE
+);
+const _: () = assert!(EL1_OPEN_FILE_TABLE_OFFSET + EL1_OPEN_FILE_TABLE_SIZE <= EL1_CACHE_OFFSET);
+
 impl DelegatedFile {
     pub const fn new() -> Self {
         Self {
             state: AtomicU32::new(DELEGATED_STATE_DEAD),
             lock: AtomicU32::new(0),
             generation: AtomicU64::new(0),
-            offset: AtomicU64::new(0),
+            _reserved_offset: 0,
             size: AtomicU64::new(0),
-            flags: AtomicU32::new(0),
+            _reserved_flags: 0,
             _reserved0: 0,
             dirty_mask: AtomicU64::new(0),
             zero_filled_mask: AtomicU64::new(0),

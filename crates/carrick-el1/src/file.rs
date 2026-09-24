@@ -2,7 +2,7 @@
 
 use carrick_el1_abi::{
     Action, CurrentTask, DELEGATED_FILE_MAX_SIZE, DELEGATED_FLAG_APPEND, DELEGATED_FLAG_READABLE,
-    DELEGATED_FLAG_WRITABLE, DELEGATED_PAGE_SIZE, DelegatedFile,
+    DELEGATED_FLAG_WRITABLE, DELEGATED_PAGE_SIZE, DelegatedFile, DelegatedOpenFile,
 };
 use core::sync::atomic::Ordering;
 
@@ -273,12 +273,23 @@ impl<V: MemoryValidator> UserCopy for ValidatedCopy<'_, V> {
     }
 }
 
+/// One open description of an in-zone inode, as the file operations see it:
+/// the inode's bytes, size and dirty state, and this description's offset and
+/// access flags (open(2): each open file description has its own offset; all
+/// share the inode). The caller holds the inode's lock.
+#[derive(Clone, Copy)]
+pub struct ZoneFile<'a> {
+    pub inode: &'a DelegatedFile,
+    pub open: &'a DelegatedOpenFile,
+}
+
 /// Service `lseek` at EL1.
-pub fn el1_lseek(file: &DelegatedFile, offset: i64, whence: u32) -> Result<i64, Action> {
+pub fn el1_lseek(zf: &ZoneFile<'_>, offset: i64, whence: u32) -> Result<i64, Action> {
+    let (file, open) = (zf.inode, zf.open);
     if whence == SEEK_DATA || whence == SEEK_HOLE {
         return Err(Action::Forward);
     }
-    let cur_off = file.offset.load(Ordering::Acquire) as i64;
+    let cur_off = open.offset.load(Ordering::Acquire) as i64;
     let size = file.size.load(Ordering::Acquire) as i64;
     let target = match whence {
         SEEK_SET => offset,
@@ -295,7 +306,7 @@ pub fn el1_lseek(file: &DelegatedFile, offset: i64, whence: u32) -> Result<i64, 
     if target < 0 {
         return Ok(EINVAL);
     }
-    file.offset.store(target as u64, Ordering::Release);
+    open.offset.store(target as u64, Ordering::Release);
     Ok(target)
 }
 
@@ -306,20 +317,21 @@ pub fn el1_lseek(file: &DelegatedFile, offset: i64, whence: u32) -> Result<i64, 
 /// `cache_base` must point at this object's cache slot of
 /// `DELEGATED_FILE_MAX_SIZE` bytes, and the caller must hold the object lock.
 pub unsafe fn read_with(
-    file: &DelegatedFile,
+    zf: &ZoneFile<'_>,
     cache_base: *const u8,
     buf_va: u64,
     count: usize,
     user: &mut impl UserCopy,
 ) -> Result<i64, Action> {
-    let flags = file.flags.load(Ordering::Acquire);
+    let (file, open) = (zf.inode, zf.open);
+    let flags = open.flags.load(Ordering::Acquire);
     if (flags & DELEGATED_FLAG_READABLE) == 0 {
         return Ok(EBADF);
     }
     if count == 0 {
         return Ok(0);
     }
-    let cur_off = file.offset.load(Ordering::Acquire);
+    let cur_off = open.offset.load(Ordering::Acquire);
     let size = file.size.load(Ordering::Acquire);
     if cur_off >= size {
         return Ok(0);
@@ -330,7 +342,7 @@ pub unsafe fn read_with(
     if !user.copy_out(buf_va, src) {
         return Err(Action::Forward);
     }
-    file.offset.store(cur_off + avail as u64, Ordering::Release);
+    open.offset.store(cur_off + avail as u64, Ordering::Release);
     Ok(avail as i64)
 }
 
@@ -340,17 +352,18 @@ pub unsafe fn read_with(
 ///
 /// As for [`read_with`].
 pub unsafe fn pread64_with(
-    file: &DelegatedFile,
+    zf: &ZoneFile<'_>,
     cache_base: *const u8,
     buf_va: u64,
     count: usize,
     offset: i64,
     user: &mut impl UserCopy,
 ) -> Result<i64, Action> {
+    let (file, open) = (zf.inode, zf.open);
     if offset < 0 {
         return Ok(EINVAL);
     }
-    let flags = file.flags.load(Ordering::Acquire);
+    let flags = open.flags.load(Ordering::Acquire);
     if (flags & DELEGATED_FLAG_READABLE) == 0 {
         return Ok(EBADF);
     }
@@ -416,13 +429,14 @@ unsafe fn store_at(
 ///
 /// As for [`read_with`].
 pub unsafe fn write_with(
-    file: &DelegatedFile,
+    zf: &ZoneFile<'_>,
     cache_base: *mut u8,
     buf_va: u64,
     count: usize,
     user: &mut impl UserCopy,
 ) -> Result<i64, Action> {
-    let flags = file.flags.load(Ordering::Acquire);
+    let (file, open) = (zf.inode, zf.open);
+    let flags = open.flags.load(Ordering::Acquire);
     if (flags & DELEGATED_FLAG_WRITABLE) == 0 {
         return Ok(EBADF);
     }
@@ -432,7 +446,7 @@ pub unsafe fn write_with(
     if count == 0 {
         return Ok(0);
     }
-    let cur_off = file.offset.load(Ordering::Acquire);
+    let cur_off = open.offset.load(Ordering::Acquire);
     let Some(end_off) = cur_off.checked_add(count as u64) else {
         return Err(Action::Forward);
     };
@@ -441,7 +455,7 @@ pub unsafe fn write_with(
     }
     // SAFETY: bounds checked above; the caller holds the lock.
     let delivered_end = unsafe { store_at(file, cache_base, cur_off, buf_va, count, user)? };
-    file.offset.store(delivered_end, Ordering::Release);
+    open.offset.store(delivered_end, Ordering::Release);
     Ok(count as i64)
 }
 
@@ -451,17 +465,18 @@ pub unsafe fn write_with(
 ///
 /// As for [`read_with`].
 pub unsafe fn pwrite64_with(
-    file: &DelegatedFile,
+    zf: &ZoneFile<'_>,
     cache_base: *mut u8,
     buf_va: u64,
     count: usize,
     offset: i64,
     user: &mut impl UserCopy,
 ) -> Result<i64, Action> {
+    let (file, open) = (zf.inode, zf.open);
     if offset < 0 {
         return Ok(EINVAL);
     }
-    let flags = file.flags.load(Ordering::Acquire);
+    let flags = open.flags.load(Ordering::Acquire);
     if (flags & DELEGATED_FLAG_WRITABLE) == 0 {
         return Ok(EBADF);
     }
@@ -483,7 +498,7 @@ pub unsafe fn pwrite64_with(
 #[cfg(test)]
 /// Service `read` at EL1.
 pub(crate) fn el1_read<V: MemoryValidator>(
-    file: &DelegatedFile,
+    zf: &ZoneFile<'_>,
     cur_task: &CurrentTask,
     cache_base: *const u8,
     buf_va: u64,
@@ -495,13 +510,13 @@ pub(crate) fn el1_read<V: MemoryValidator>(
         validator,
     };
     // SAFETY: EL1 callers pass this object's slot and hold its lock.
-    unsafe { read_with(file, cache_base, buf_va, count, &mut user) }
+    unsafe { read_with(zf, cache_base, buf_va, count, &mut user) }
 }
 
 #[cfg(test)]
 /// Service `pread64` at EL1.
 pub(crate) fn el1_pread64<V: MemoryValidator>(
-    file: &DelegatedFile,
+    zf: &ZoneFile<'_>,
     cur_task: &CurrentTask,
     cache_base: *const u8,
     buf_va: u64,
@@ -514,13 +529,13 @@ pub(crate) fn el1_pread64<V: MemoryValidator>(
         validator,
     };
     // SAFETY: EL1 callers pass this object's slot and hold its lock.
-    unsafe { pread64_with(file, cache_base, buf_va, count, offset, &mut user) }
+    unsafe { pread64_with(zf, cache_base, buf_va, count, offset, &mut user) }
 }
 
 #[cfg(test)]
 /// Service `write` at EL1.
 pub(crate) fn el1_write<V: MemoryValidator>(
-    file: &DelegatedFile,
+    zf: &ZoneFile<'_>,
     cur_task: &CurrentTask,
     cache_base: *mut u8,
     buf_va: u64,
@@ -532,13 +547,13 @@ pub(crate) fn el1_write<V: MemoryValidator>(
         validator,
     };
     // SAFETY: EL1 callers pass this object's slot and hold its lock.
-    unsafe { write_with(file, cache_base, buf_va, count, &mut user) }
+    unsafe { write_with(zf, cache_base, buf_va, count, &mut user) }
 }
 
 #[cfg(test)]
 /// Service `pwrite64` at EL1.
 pub(crate) fn el1_pwrite64<V: MemoryValidator>(
-    file: &DelegatedFile,
+    zf: &ZoneFile<'_>,
     cur_task: &CurrentTask,
     cache_base: *mut u8,
     buf_va: u64,
@@ -551,7 +566,7 @@ pub(crate) fn el1_pwrite64<V: MemoryValidator>(
         validator,
     };
     // SAFETY: EL1 callers pass this object's slot and hold its lock.
-    unsafe { pwrite64_with(file, cache_base, buf_va, count, offset, &mut user) }
+    unsafe { pwrite64_with(zf, cache_base, buf_va, count, offset, &mut user) }
 }
 
 fn mark_gap_zero_pages(file: &DelegatedFile, old_size: u64, cur_off: u64) {
@@ -644,57 +659,153 @@ mod tests {
         }
     }
 
-    fn fixture_file(size: u64, offset: u64, flags: u32) -> (DelegatedFile, Vec<u8>) {
+    fn fixture_file(
+        size: u64,
+        offset: u64,
+        flags: u32,
+    ) -> (DelegatedFile, DelegatedOpenFile, Vec<u8>) {
         let file = DelegatedFile::new();
+        let of = DelegatedOpenFile::new();
+        of.state.store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
         file.state.store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
         file.size.store(size, Ordering::Relaxed);
-        file.offset.store(offset, Ordering::Relaxed);
-        file.flags.store(flags, Ordering::Relaxed);
+        of.offset.store(offset, Ordering::Relaxed);
+        of.flags.store(flags, Ordering::Relaxed);
         let cache = vec![0u8; DELEGATED_FILE_MAX_SIZE as usize];
-        (file, cache)
+        (file, of, cache)
     }
 
     #[test]
     fn test_lseek_model() {
-        let (file, _) = fixture_file(100, 10, DELEGATED_FLAG_READABLE);
+        let (file, of, _) = fixture_file(100, 10, DELEGATED_FLAG_READABLE);
 
         // SEEK_SET
-        assert_eq!(el1_lseek(&file, 50, SEEK_SET), Ok(50));
-        assert_eq!(file.offset.load(Ordering::Relaxed), 50);
+        assert_eq!(
+            el1_lseek(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                50,
+                SEEK_SET
+            ),
+            Ok(50)
+        );
+        assert_eq!(of.offset.load(Ordering::Relaxed), 50);
 
         // SEEK_SET negative -> EINVAL
-        assert_eq!(el1_lseek(&file, -1, SEEK_SET), Ok(EINVAL));
-        assert_eq!(file.offset.load(Ordering::Relaxed), 50);
+        assert_eq!(
+            el1_lseek(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                -1,
+                SEEK_SET
+            ),
+            Ok(EINVAL)
+        );
+        assert_eq!(of.offset.load(Ordering::Relaxed), 50);
 
         // SEEK_CUR
-        assert_eq!(el1_lseek(&file, 20, SEEK_CUR), Ok(70));
-        assert_eq!(file.offset.load(Ordering::Relaxed), 70);
+        assert_eq!(
+            el1_lseek(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                20,
+                SEEK_CUR
+            ),
+            Ok(70)
+        );
+        assert_eq!(of.offset.load(Ordering::Relaxed), 70);
 
         // SEEK_CUR negative
-        assert_eq!(el1_lseek(&file, -30, SEEK_CUR), Ok(40));
-        assert_eq!(file.offset.load(Ordering::Relaxed), 40);
+        assert_eq!(
+            el1_lseek(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                -30,
+                SEEK_CUR
+            ),
+            Ok(40)
+        );
+        assert_eq!(of.offset.load(Ordering::Relaxed), 40);
 
         // SEEK_CUR past 0 -> EINVAL
-        assert_eq!(el1_lseek(&file, -50, SEEK_CUR), Ok(EINVAL));
-        assert_eq!(file.offset.load(Ordering::Relaxed), 40);
+        assert_eq!(
+            el1_lseek(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                -50,
+                SEEK_CUR
+            ),
+            Ok(EINVAL)
+        );
+        assert_eq!(of.offset.load(Ordering::Relaxed), 40);
 
         // SEEK_END
-        assert_eq!(el1_lseek(&file, 0, SEEK_END), Ok(100));
-        assert_eq!(file.offset.load(Ordering::Relaxed), 100);
+        assert_eq!(
+            el1_lseek(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                0,
+                SEEK_END
+            ),
+            Ok(100)
+        );
+        assert_eq!(of.offset.load(Ordering::Relaxed), 100);
 
         // SEEK_END with positive offset (allowed in Linux)
-        assert_eq!(el1_lseek(&file, 50, SEEK_END), Ok(150));
-        assert_eq!(file.offset.load(Ordering::Relaxed), 150);
+        assert_eq!(
+            el1_lseek(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                50,
+                SEEK_END
+            ),
+            Ok(150)
+        );
+        assert_eq!(of.offset.load(Ordering::Relaxed), 150);
 
         // SEEK_DATA / SEEK_HOLE -> Action::Forward
-        assert_eq!(el1_lseek(&file, 0, SEEK_DATA), Err(Action::Forward));
-        assert_eq!(el1_lseek(&file, 0, SEEK_HOLE), Err(Action::Forward));
+        assert_eq!(
+            el1_lseek(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                0,
+                SEEK_DATA
+            ),
+            Err(Action::Forward)
+        );
+        assert_eq!(
+            el1_lseek(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                0,
+                SEEK_HOLE
+            ),
+            Err(Action::Forward)
+        );
     }
 
     #[test]
     fn test_read_and_pread64_model() {
         let task = CurrentTask::new();
-        let (file, mut cache) = fixture_file(200, 0, DELEGATED_FLAG_READABLE);
+        let (file, of, mut cache) = fixture_file(200, 0, DELEGATED_FLAG_READABLE);
         for (i, byte) in cache.iter_mut().enumerate().take(200) {
             *byte = (i % 251) as u8;
         }
@@ -707,25 +818,70 @@ mod tests {
         };
 
         // Read 50 bytes from offset 0
-        let n = el1_read(&file, &task, cache.as_ptr(), user_va, 50, &validator).unwrap();
+        let n = el1_read(
+            &ZoneFile {
+                inode: &file,
+                open: &of,
+            },
+            &task,
+            cache.as_ptr(),
+            user_va,
+            50,
+            &validator,
+        )
+        .unwrap();
         assert_eq!(n, 50);
-        assert_eq!(file.offset.load(Ordering::Relaxed), 50);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 50);
         assert_eq!(&user_buf[0..50], &cache[0..50]);
 
         // Pread 30 bytes from offset 100 (should not change file offset 50)
-        let n = el1_pread64(&file, &task, cache.as_ptr(), user_va, 30, 100, &validator).unwrap();
+        let n = el1_pread64(
+            &ZoneFile {
+                inode: &file,
+                open: &of,
+            },
+            &task,
+            cache.as_ptr(),
+            user_va,
+            30,
+            100,
+            &validator,
+        )
+        .unwrap();
         assert_eq!(n, 30);
-        assert_eq!(file.offset.load(Ordering::Relaxed), 50);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 50);
         assert_eq!(&user_buf[0..30], &cache[100..130]);
 
         // Read past EOF
-        file.offset.store(200, Ordering::Relaxed);
-        let n = el1_read(&file, &task, cache.as_ptr(), user_va, 50, &validator).unwrap();
+        of.offset.store(200, Ordering::Relaxed);
+        let n = el1_read(
+            &ZoneFile {
+                inode: &file,
+                open: &of,
+            },
+            &task,
+            cache.as_ptr(),
+            user_va,
+            50,
+            &validator,
+        )
+        .unwrap();
         assert_eq!(n, 0);
 
         // Pread negative offset -> EINVAL
         assert_eq!(
-            el1_pread64(&file, &task, cache.as_ptr(), user_va, 30, -1, &validator),
+            el1_pread64(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                &task,
+                cache.as_ptr(),
+                user_va,
+                30,
+                -1,
+                &validator
+            ),
             Ok(EINVAL)
         );
     }
@@ -733,7 +889,7 @@ mod tests {
     #[test]
     fn test_write_and_pwrite64_model() {
         let task = CurrentTask::new();
-        let (file, mut cache) = fixture_file(0, 0, DELEGATED_FLAG_WRITABLE);
+        let (file, of, mut cache) = fixture_file(0, 0, DELEGATED_FLAG_WRITABLE);
         let mut user_data = vec![0xABu8; 8192];
         let user_va = user_data.as_mut_ptr() as u64;
         let validator = FakeOracleValidator {
@@ -742,23 +898,48 @@ mod tests {
         };
 
         // Write 4096 bytes: extends size from 0 to 4096, sets dirty bit 0
-        let n = el1_write(&file, &task, cache.as_mut_ptr(), user_va, 4096, &validator).unwrap();
+        let n = el1_write(
+            &ZoneFile {
+                inode: &file,
+                open: &of,
+            },
+            &task,
+            cache.as_mut_ptr(),
+            user_va,
+            4096,
+            &validator,
+        )
+        .unwrap();
         assert_eq!(n, 4096);
         assert_eq!(file.size.load(Ordering::Relaxed), 4096);
-        assert_eq!(file.offset.load(Ordering::Relaxed), 4096);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 4096);
         assert_eq!(file.dirty_mask.load(Ordering::Relaxed), 1 << 0);
         assert_eq!(&cache[0..4096], &user_data[0..4096]);
 
         // Write another 4096 bytes: extends size from 4096 to 8192, sets dirty bit 1
-        let n = el1_write(&file, &task, cache.as_mut_ptr(), user_va, 4096, &validator).unwrap();
+        let n = el1_write(
+            &ZoneFile {
+                inode: &file,
+                open: &of,
+            },
+            &task,
+            cache.as_mut_ptr(),
+            user_va,
+            4096,
+            &validator,
+        )
+        .unwrap();
         assert_eq!(n, 4096);
         assert_eq!(file.size.load(Ordering::Relaxed), 8192);
-        assert_eq!(file.offset.load(Ordering::Relaxed), 8192);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 8192);
         assert_eq!(file.dirty_mask.load(Ordering::Relaxed), (1 << 0) | (1 << 1));
 
         // Pwrite at offset 0 (does not change file offset 8192)
         let n = el1_pwrite64(
-            &file,
+            &ZoneFile {
+                inode: &file,
+                open: &of,
+            },
             &task,
             cache.as_mut_ptr(),
             user_va,
@@ -768,12 +949,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(n, 100);
-        assert_eq!(file.offset.load(Ordering::Relaxed), 8192);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 8192);
 
         // Pwrite with negative offset -> EINVAL
         assert_eq!(
             el1_pwrite64(
-                &file,
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
                 &task,
                 cache.as_mut_ptr(),
                 user_va,
@@ -785,10 +969,20 @@ mod tests {
         );
 
         // Write beyond 256 KiB returns Action::Forward
-        file.offset
+        of.offset
             .store(DELEGATED_FILE_MAX_SIZE - 10, Ordering::Relaxed);
         assert_eq!(
-            el1_write(&file, &task, cache.as_mut_ptr(), user_va, 100, &validator),
+            el1_write(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                &task,
+                cache.as_mut_ptr(),
+                user_va,
+                100,
+                &validator
+            ),
             Err(Action::Forward)
         );
     }
@@ -796,7 +990,7 @@ mod tests {
     #[test]
     fn test_efault_forward_semantics() {
         let task = CurrentTask::new();
-        let (file, mut cache) = fixture_file(
+        let (file, of, mut cache) = fixture_file(
             16384,
             8192,
             DELEGATED_FLAG_READABLE | DELEGATED_FLAG_WRITABLE,
@@ -817,42 +1011,97 @@ mod tests {
         // Read 8192 bytes into user_va: partial user range fails AT check.
         // EL1 must return Err(Action::Forward) without touching the file (no partial service).
         assert_eq!(
-            el1_read(&file, &task, cache.as_ptr(), user_va, 8192, &oracle),
+            el1_read(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                &task,
+                cache.as_ptr(),
+                user_va,
+                8192,
+                &oracle
+            ),
             Err(Action::Forward)
         );
-        assert_eq!(file.offset.load(Ordering::Relaxed), 8192);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 8192);
 
         // Read 4096 bytes: entire range is valid in AT check -> served at EL1!
-        let n = el1_read(&file, &task, cache.as_ptr(), user_va, 4096, &oracle).unwrap();
+        let n = el1_read(
+            &ZoneFile {
+                inode: &file,
+                open: &of,
+            },
+            &task,
+            cache.as_ptr(),
+            user_va,
+            4096,
+            &oracle,
+        )
+        .unwrap();
         assert_eq!(n, 4096);
-        assert_eq!(file.offset.load(Ordering::Relaxed), 8192 + 4096);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 8192 + 4096);
         assert_eq!(&user_buffer[0..4096], &cache[8192..8192 + 4096]);
 
         // Next read at readonly page: fails AT check -> Action::Forward, offset untouched.
         assert_eq!(
-            el1_read(&file, &task, cache.as_ptr(), user_va + 4096, 4096, &oracle),
+            el1_read(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                &task,
+                cache.as_ptr(),
+                user_va + 4096,
+                4096,
+                &oracle
+            ),
             Err(Action::Forward)
         );
-        assert_eq!(file.offset.load(Ordering::Relaxed), 8192 + 4096);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 8192 + 4096);
 
         // Same for write: partial user range fails AT check -> Action::Forward, file untouched.
-        file.offset.store(0, Ordering::Relaxed);
+        of.offset.store(0, Ordering::Relaxed);
         assert_eq!(
-            el1_write(&file, &task, cache.as_mut_ptr(), user_va, 8192, &oracle),
+            el1_write(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                &task,
+                cache.as_mut_ptr(),
+                user_va,
+                8192,
+                &oracle
+            ),
             Err(Action::Forward)
         );
-        assert_eq!(file.offset.load(Ordering::Relaxed), 0);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 0);
         assert_eq!(file.size.load(Ordering::Relaxed), 16384);
 
         // Write 4096 bytes: entire range is readable in AT check -> served at EL1!
-        let n = el1_write(&file, &task, cache.as_mut_ptr(), user_va, 4096, &oracle).unwrap();
+        let n = el1_write(
+            &ZoneFile {
+                inode: &file,
+                open: &of,
+            },
+            &task,
+            cache.as_mut_ptr(),
+            user_va,
+            4096,
+            &oracle,
+        )
+        .unwrap();
         assert_eq!(n, 4096);
-        assert_eq!(file.offset.load(Ordering::Relaxed), 4096);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 4096);
 
         // Next write from denied address: fails AT check -> Action::Forward, offset untouched.
         assert_eq!(
             el1_write(
-                &file,
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
                 &task,
                 cache.as_mut_ptr(),
                 user_va + 4096,
@@ -861,13 +1110,13 @@ mod tests {
             ),
             Err(Action::Forward)
         );
-        assert_eq!(file.offset.load(Ordering::Relaxed), 4096);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 4096);
     }
 
     #[test]
     fn test_fixup_fault_interception() {
         let task = CurrentTask::new();
-        let (file, mut cache) =
+        let (file, of, mut cache) =
             fixture_file(4096, 0, DELEGATED_FLAG_READABLE | DELEGATED_FLAG_WRITABLE);
         let mut user_buffer = vec![0u8; 100];
         let user_va = user_buffer.as_mut_ptr() as u64;
@@ -881,33 +1130,75 @@ mod tests {
 
         // Read must return Err(Action::Forward) and leave offset unchanged at 0
         assert_eq!(
-            el1_read(&file, &task, cache.as_ptr(), user_va, 50, &oracle),
+            el1_read(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                &task,
+                cache.as_ptr(),
+                user_va,
+                50,
+                &oracle
+            ),
             Err(Action::Forward)
         );
-        assert_eq!(file.offset.load(Ordering::Relaxed), 0);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 0);
 
         // Pread must return Err(Action::Forward) and leave offset unchanged
         assert_eq!(
-            el1_pread64(&file, &task, cache.as_ptr(), user_va, 50, 0, &oracle),
+            el1_pread64(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                &task,
+                cache.as_ptr(),
+                user_va,
+                50,
+                0,
+                &oracle
+            ),
             Err(Action::Forward)
         );
-        assert_eq!(file.offset.load(Ordering::Relaxed), 0);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 0);
 
         // Write must return Err(Action::Forward) and leave offset/size/dirty_mask unchanged
         assert_eq!(
-            el1_write(&file, &task, cache.as_mut_ptr(), user_va, 50, &oracle),
+            el1_write(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                &task,
+                cache.as_mut_ptr(),
+                user_va,
+                50,
+                &oracle
+            ),
             Err(Action::Forward)
         );
-        assert_eq!(file.offset.load(Ordering::Relaxed), 0);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 0);
         assert_eq!(file.size.load(Ordering::Relaxed), 4096);
         assert_eq!(file.dirty_mask.load(Ordering::Relaxed), 0);
 
         // Pwrite must return Err(Action::Forward) and leave offset/size/dirty_mask unchanged
         assert_eq!(
-            el1_pwrite64(&file, &task, cache.as_mut_ptr(), user_va, 50, 0, &oracle),
+            el1_pwrite64(
+                &ZoneFile {
+                    inode: &file,
+                    open: &of
+                },
+                &task,
+                cache.as_mut_ptr(),
+                user_va,
+                50,
+                0,
+                &oracle
+            ),
             Err(Action::Forward)
         );
-        assert_eq!(file.offset.load(Ordering::Relaxed), 0);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 0);
         assert_eq!(file.size.load(Ordering::Relaxed), 4096);
         assert_eq!(file.dirty_mask.load(Ordering::Relaxed), 0);
 
@@ -915,15 +1206,26 @@ mod tests {
         SIMULATE_COPY_FAULT.with(|f| f.store(false, Ordering::Relaxed));
 
         // Now read and write succeed
-        let n = el1_read(&file, &task, cache.as_ptr(), user_va, 50, &oracle).unwrap();
+        let n = el1_read(
+            &ZoneFile {
+                inode: &file,
+                open: &of,
+            },
+            &task,
+            cache.as_ptr(),
+            user_va,
+            50,
+            &oracle,
+        )
+        .unwrap();
         assert_eq!(n, 50);
-        assert_eq!(file.offset.load(Ordering::Relaxed), 50);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 50);
     }
 
     #[test]
     fn test_write_extension_zeroes_hole() {
         let task = CurrentTask::new();
-        let (file, mut cache) =
+        let (file, of, mut cache) =
             fixture_file(10, 0, DELEGATED_FLAG_WRITABLE | DELEGATED_FLAG_READABLE);
         // Fill cache with non-zero garbage simulating previous file contents
         cache.fill(0xFE);
@@ -937,7 +1239,10 @@ mod tests {
 
         // Pwrite at offset 8000: extends size from 10 to 8001
         let n = el1_pwrite64(
-            &file,
+            &ZoneFile {
+                inode: &file,
+                open: &of,
+            },
             &task,
             cache.as_mut_ptr(),
             user_va,
@@ -959,7 +1264,7 @@ mod tests {
     #[test]
     fn test_extension_gap_pages_tracked_in_zero_filled_mask() {
         let task = CurrentTask::new();
-        let (file, mut cache) = fixture_file(0, 0, DELEGATED_FLAG_WRITABLE);
+        let (file, of, mut cache) = fixture_file(0, 0, DELEGATED_FLAG_WRITABLE);
         let mut user_buf = vec![0x42u8; 128];
         let user_va = user_buf.as_mut_ptr() as u64;
         let validator = FakeOracleValidator {
@@ -968,10 +1273,21 @@ mod tests {
         };
 
         // Write at offset 8192 (skipping 2 pages: page 0 and page 1)
-        file.offset.store(8192, Ordering::Relaxed);
-        let n = el1_write(&file, &task, cache.as_mut_ptr(), user_va, 128, &validator).unwrap();
+        of.offset.store(8192, Ordering::Relaxed);
+        let n = el1_write(
+            &ZoneFile {
+                inode: &file,
+                open: &of,
+            },
+            &task,
+            cache.as_mut_ptr(),
+            user_va,
+            128,
+            &validator,
+        )
+        .unwrap();
         assert_eq!(n, 128);
-        assert_eq!(file.offset.load(Ordering::Relaxed), 8192 + 128);
+        assert_eq!(of.offset.load(Ordering::Relaxed), 8192 + 128);
         assert_eq!(file.size.load(Ordering::Relaxed), 8192 + 128);
 
         // Page 0 and Page 1 must be in zero_filled_mask, NOT dirty_mask
@@ -982,8 +1298,19 @@ mod tests {
         assert_eq!(file.dirty_mask.load(Ordering::Relaxed), (1 << 2));
 
         // Now write into page 1: it must be removed from zero_filled_mask and added to dirty_mask!
-        file.offset.store(4096, Ordering::Relaxed);
-        let n = el1_write(&file, &task, cache.as_mut_ptr(), user_va, 64, &validator).unwrap();
+        of.offset.store(4096, Ordering::Relaxed);
+        let n = el1_write(
+            &ZoneFile {
+                inode: &file,
+                open: &of,
+            },
+            &task,
+            cache.as_mut_ptr(),
+            user_va,
+            64,
+            &validator,
+        )
+        .unwrap();
         assert_eq!(n, 64);
         assert_eq!(file.zero_filled_mask.load(Ordering::Relaxed), (1 << 0));
         assert_eq!(file.dirty_mask.load(Ordering::Relaxed), (1 << 1) | (1 << 2));

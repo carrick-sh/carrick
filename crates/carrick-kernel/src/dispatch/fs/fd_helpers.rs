@@ -6,18 +6,20 @@ use super::*;
 use crate::linux_abi::LinuxErrno;
 
 pub(in crate::dispatch) fn event_ring_host_fd(open_file: &OpenFile) -> i32 {
-    let Some(description) = open_file.description.read() else {
-        return -1;
-    };
-    match &*description {
-        OpenDescription::HostPipe { host_fd, .. }
-        | OpenDescription::HostFile { host_fd, .. }
-        | OpenDescription::HostSocket { host_fd, .. } => host_fd.raw(),
-        OpenDescription::Pidfd { kqueue, .. } => kqueue.poll_fd(),
-        OpenDescription::Inotify { state, .. } => state.raw_poll_fd(),
-        OpenDescription::Fanotify { group, .. } => group.poll_fd(),
-        _ => -1,
-    }
+    // Diagnostics only read host objects fixed at open: never recall an
+    // in-zone file to record an event about it.
+    open_file
+        .description
+        .inspect_kind(|description| match description {
+            OpenDescription::HostPipe { host_fd, .. }
+            | OpenDescription::HostFile { host_fd, .. }
+            | OpenDescription::HostSocket { host_fd, .. } => host_fd.raw(),
+            OpenDescription::Pidfd { kqueue, .. } => kqueue.poll_fd(),
+            OpenDescription::Inotify { state, .. } => state.raw_poll_fd(),
+            OpenDescription::Fanotify { group, .. } => group.poll_fd(),
+            _ => -1,
+        })
+        .unwrap_or(-1)
 }
 
 impl<'a> FsView<'a> {

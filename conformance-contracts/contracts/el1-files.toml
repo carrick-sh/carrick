@@ -20,7 +20,7 @@ semantic_authority = [
 ]
 fixture = "probe:el1_files"
 scale_points = [1, 8, 32, 128]
-rationale = "Eligible host regular files (the host passthrough rootfs) are delegated to EL1 execution while exactly one open description refers to the inode. Repeated read, write, lseek, pread64, and pwrite64 operations on a delegated file are served at EL1 without VM exits or host kernel dispatches. fstat and every other host access recall the file first. A delegation window recalled before serving 64 operations backs the description off for a doubling number of forwarded attempts, so an interleaving that recalls every window converges to the host path's cost; a window that pays off clears the backoff."
+rationale = "A host regular file on the host passthrough rootfs enters the zone through its only open description; later descriptions of the inode join it with their own open-file records (see kernel.el1.files.shared-inode). Repeated read, write, lseek, pread64, and pwrite64 operations on an in-zone file are served at EL1 without VM exits or host kernel dispatches. fstat and path stats write the zone's size and pages back without recalling; operations the zone cannot model (mmap, record locks, O_APPEND) recall the inode. A delegation window recalled before serving 64 operations backs the description off for a doubling number of forwarded attempts, so an interleaving that recalls every window converges to the host path's cost; a window that pays off clears the backoff."
 
 [bindings]
 embed = "carrick-embed::el1_files_contract"
@@ -35,4 +35,4 @@ metric = "kernel_dispatches"
 base = 64
 per_unit = 0
 layers = ["embed-structural"]
-rationale = "Host dispatches of syscalls 62 (lseek) and 64 (write) do not grow with the loop: at most a fixed startup population (perl's startup fstat calls recall the file and start one short backoff) is forwarded, then every iteration of the 10,000-iteration write+lseek loop is served at EL1."
+rationale = "Host dispatches of syscalls 62 (lseek) and 64 (write) do not grow with the loop: at most a fixed startup population is forwarded, then every iteration of the 10,000-iteration write+lseek loop is served at EL1."
