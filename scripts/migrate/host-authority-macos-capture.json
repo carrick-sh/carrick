@@ -11514,15 +11514,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 45698,
-        "byte_start": 45676,
+        "byte_end": 45667,
+        "byte_start": 45645,
         "column": 13,
         "column_end": 35,
         "column_start": 13,
         "file": "crates/carrick-kernel/src/el1_delegation.rs",
-        "line": 1244,
-        "line_end": 1244,
-        "line_start": 1244
+        "line": 1243,
+        "line_end": 1243,
+        "line_start": 1243
       }
     },
     {
@@ -11686,9 +11686,9 @@
       }
     }
   ],
-  "rows_sha256": "29b114d307c4afe5cb5f8beed50dbe5ecc4f66a719ad28aba1a8d9e3d48def6e",
+  "rows_sha256": "c7a81f1310d6346be795f66bd17755b69cc041e4544919c7bc9bed00acf485a6",
   "schema": 1,
-  "source_head": "73d50a7b6de2a6930ef87550b98e7d02dba4dd80",
+  "source_head": "67f31f9eaaf21355f84591d20d07165c4c3f0c4f",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",

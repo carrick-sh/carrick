@@ -15449,18 +15449,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/el1_delegation.rs:1244 in `HostInstanceLock::acquire`, `std::thread::yield_now` acts only on the current host thread waiting on an in-zone inotify instance lock held by EL1 used by `HostInstanceLock::acquire`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/el1_delegation.rs:1243 in `HostInstanceLock::acquire`, `std::thread::yield_now` acts only on the current host thread waiting on an in-zone inotify instance lock held by EL1 used by `HostInstanceLock::acquire`; no guest identity selects its host target.",
     "review_id": "HA-000673",
     "source": {
-      "byte_end": 45698,
-      "byte_start": 45676,
+      "byte_end": 45667,
+      "byte_start": 45645,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 1244,
-      "line_end": 1244,
-      "line_start": 1244
+      "line": 1243,
+      "line_end": 1243,
+      "line_start": 1243
     }
   },
   {
