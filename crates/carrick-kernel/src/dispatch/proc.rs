@@ -954,14 +954,13 @@ impl<'a> ProcView<'a> {
         {
             return DispatchOutcome::errno(LINUX_EACCES);
         }
-        // Close in-guest syscall admission before the filter becomes visible.
-        // A call already admitted before this store also entered before the
-        // filter publication, matching Linux's syscall-entry evaluation point.
-        if let Err(err) = self.disable_syscall_fast_paths(memory) {
-            return DispatchOutcome::errno(err);
-        }
         match self.seccomp.install(prog) {
-            Ok(()) => DispatchOutcome::Returned { value: 0 },
+            Ok(()) => {
+                if let Err(err) = self.disable_syscall_fast_paths(memory) {
+                    return DispatchOutcome::errno(err);
+                }
+                DispatchOutcome::Returned { value: 0 }
+            }
             Err(crate::seccomp::SeccompInstallError::InvalidProgram) => {
                 DispatchOutcome::errno(LINUX_EINVAL)
             }
@@ -991,10 +990,10 @@ impl<'a> ProcView<'a> {
     }
 
     fn install_seccomp_strict<M: CurrentMmMemory>(&self, memory: &mut M) -> DispatchOutcome {
+        self.seccomp.install_strict();
         if let Err(err) = self.disable_syscall_fast_paths(memory) {
             return DispatchOutcome::errno(err);
         }
-        self.seccomp.install_strict();
         DispatchOutcome::Returned { value: 0 }
     }
 

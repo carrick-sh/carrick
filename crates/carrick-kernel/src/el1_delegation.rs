@@ -1838,6 +1838,13 @@ mod tests {
                 "F_ADD_SEALS must recall delegated file"
             );
 
+            // Re-delegation must be rejected as Sealed
+            let re_delegate = delegate(&open_file, table_id, fd, dispatcher.fs(), None, None);
+            assert!(
+                matches!(re_delegate, Err(NotEligible::Sealed)),
+                "re-delegation after F_ADD_SEALS must be rejected as Sealed: {re_delegate:?}"
+            );
+
             // 2. File delegation and recall on F_SETFL
             let fd2 = open_path_for_test(
                 &dispatcher,
