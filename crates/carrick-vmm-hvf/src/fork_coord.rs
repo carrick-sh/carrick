@@ -49,9 +49,22 @@ impl HostSignalPump for KqueuePump {
         }
         let mut pump = self.signal_pump.lock();
         if pump.is_none() {
-            *pump = Some(crate::vcpu_kick::spawn_signal_pump(
+            let registries = Arc::clone(&self.kernel_wake_registries);
+            *pump = Some(crate::vcpu_kick::spawn_signal_pump_with_kernel_retry(
                 Arc::clone(registry),
                 Arc::clone(futex),
+                Arc::new(move || {
+                    let mut registries = registries.lock();
+                    let mut owed = false;
+                    registries.retain(|weak| {
+                        let Some(registry) = weak.upgrade() else {
+                            return false;
+                        };
+                        owed |= registry.retry_kernel_wake_debt().owed;
+                        true
+                    });
+                    owed
+                }),
             ));
         }
     }
