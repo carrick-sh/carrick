@@ -2507,28 +2507,6 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "function": "recall_locked",
-      "ordinal_in_function": 2,
-      "fingerprint": "74747a6a3dbb9cd29cc9ca64760b830840c8fdcaab62df26395140b47385ea56",
-      "verdict": "carrier_fault",
-      "failure_domain": "el1_delegation",
-      "rationale": "Recall found no Guest owner matching the handle in the owner table; ownership bookkeeping is corrupt and write-back target is unknown.",
-      "sink": "fatal",
-      "domain": "el1_delegation"
-    },
-    {
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "function": "recall_locked",
-      "ordinal_in_function": 3,
-      "fingerprint": "90e9532a772ad823a17f30b269cf69017619fdda4e0f83320919fc5f7b628a2d",
-      "verdict": "carrier_fault",
-      "failure_domain": "el1_delegation",
-      "rationale": "Recall of a delegated file with no EL1 region mapped; the in-zone bytes are unreachable, so continuing would lose them.",
-      "sink": "fatal",
-      "domain": "el1_delegation"
-    },
-    {
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "function": "sync_to_host",
       "ordinal_in_function": 1,
       "fingerprint": "e62358e6a2864ad4f910af3fabaaaa6e76373a20e90d8aeb6315774c5e613b9a",
@@ -2540,12 +2518,23 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "function": "sync_to_host",
-      "ordinal_in_function": 2,
-      "fingerprint": "e47f0205121724fee24d7af66cd16fea2a0cf103cfa9fb8c39890cbd45361ea2",
+      "function": "recall_binding",
+      "ordinal_in_function": 1,
+      "fingerprint": "2dc2d4ad49b1cf4693e4a31b2cf319e382ee40a47846ac535352ad3e7dad8a24",
       "verdict": "carrier_fault",
       "failure_domain": "el1_delegation",
-      "rationale": "Write-back without recall found no Guest owner matching the handle; ownership bookkeeping is corrupt and write-back target is unknown.",
+      "rationale": "Inode recall with no EL1 region mapped; the in-zone bytes are unreachable, so continuing would lose them.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "write_back_target",
+      "ordinal_in_function": 1,
+      "fingerprint": "b0d6132a22ab3d265bb34c201866728d3a4f6b89fde9e1b79f01afd10e139f2b",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "An in-zone inode has dirty pages but no writable member ever joined; only a writable description can dirty pages, so the membership bookkeeping is corrupt and the bytes have no write-back target.",
       "sink": "fatal",
       "domain": "el1_delegation"
     },
