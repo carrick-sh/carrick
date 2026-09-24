@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-const CACHED_SHARD_2_PROBE_COUNT: usize = 152;
+const CACHED_SHARD_2_PROBE_COUNT: usize = 149;
 
 /// Derive the shard expected gap subset from the complete baseline gap set.
 pub fn expected_gaps_for_shard(baseline: &[&'static str]) -> BTreeSet<&'static str> {
@@ -97,17 +97,17 @@ pub fn probe_campaign_dir(repo_root: &Path, target: &str) -> Option<PathBuf> {
 
 #[test]
 fn test_shard_2_inventory_definition() {
-    // 1. Hard-assert exactly 163 sorted unique names.
+    // 1. Hard-assert exactly 164 sorted unique names.
     assert_eq!(
         SHARD_2_PROBES.len(),
-        163,
-        "shard 2 must contain exactly 163 probes"
+        164,
+        "shard 2 must contain exactly 164 probes"
     );
     let probe_set: BTreeSet<&str> = SHARD_2_PROBES.iter().copied().collect();
     assert_eq!(
         probe_set.len(),
-        163,
-        "SHARD_2_PROBES must contain 163 unique names"
+        164,
+        "SHARD_2_PROBES must contain 164 unique names"
     );
     for window in SHARD_2_PROBES.windows(2) {
         assert!(
@@ -155,8 +155,8 @@ fn test_shard_2_inventory_definition() {
     generic_conformance_probes.dedup();
     assert_eq!(
         generic_conformance_probes.len(),
-        491,
-        "expected exactly 491 generic conformance probes across all shards"
+        492,
+        "expected exactly 492 generic conformance probes across all shards"
     );
 
     let derived_shard_2: Vec<&str> = generic_conformance_probes
@@ -168,8 +168,8 @@ fn test_shard_2_inventory_definition() {
 
     assert_eq!(
         derived_shard_2.len(),
-        163,
-        "derived shard 2 must have 163 items"
+        164,
+        "derived shard 2 must have 164 items"
     );
     assert_eq!(
         derived_shard_2.as_slice(),
