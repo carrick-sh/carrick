@@ -2276,7 +2276,7 @@ impl HvfTaskState {
             retirement,
         } = {
             let inventory = self.frame_inventory.lock();
-            HvfVmState::cow_inventory_split_shape(
+            let shape = HvfVmState::cow_inventory_split_shape(
                 &inventory,
                 old_physical_ipa,
                 retain_old_compound,
@@ -2285,7 +2285,14 @@ impl HvfTaskState {
                         TrapError::Hypervisor(format!("query COW frame mapping count: {error}"))
                     })
                 },
-            )?
+            );
+            if shape.is_err() {
+                // The inventory refused the source this lookup selected; name
+                // the stage-1, alias and inventory evidence for it.
+                drop(inventory);
+                self.report_physical_cow_source_refusal(custody, span.va, old_ipa);
+            }
+            shape?
         };
         let old_frame = old_inventory_extent.frame;
         // Resolve every authority needed for stage-1 publication before the
@@ -5503,8 +5510,44 @@ impl HvfTaskState {
         // the wide fault window makes multi-page rows, and with them this
         // shape, routine (go_types `s.allocCount != s.nelems`, the
         // `windowcoherence` cross-thread stress). Authenticate the row against
-        // the registry at the page: the projection it caches must still exist
-        // for this process scope with the same physical incarnation.
+        // the registry at the page: the row is current only when it IS the
+        // projection the registry resolves for this range -- the newest live
+        // alias of this process scope covering it, exactly what the registry
+        // fallback below would return.
+        //
+        // "The registry still has this projection" is not that test. A frame
+        // COW whose old lease survives (retired_old_stage2 == false) publishes
+        // a NEWER row for the copied compound and leaves the older fragment of
+        // the bulk lease in place underneath it. With a valid leaf the IPA path
+        // above disambiguates; once a discard re-arms first touch the leaf is
+        // invalid, this VA path decides, and an existence test accepted the
+        // shadowed pre-COW fragment. The next discard of the reused glibc
+        // thread stack then COWed its edge from a compound the inventory had
+        // already split out ("COW compound IPA .. has no exact inventory
+        // coverage": cpython-fork1 / cpython-wait4,
+        // `kernel.mm.anonymous-discard-fork-reuse`).
+        let registry_projection = std::cell::OnceCell::new();
+        let current_registry_projection = || {
+            *registry_projection.get_or_init(|| {
+                let end = address.checked_add(length as u64)?;
+                // Geometry under the registry lock; `alias_is_live` (the
+                // carrier's owners map) only on the released candidates.
+                let candidates = alias_registry()
+                    .lock()
+                    .process_alias_containing_va_candidates(
+                        address,
+                        self.mm_root_slot,
+                        self.container_root,
+                        |alias| {
+                            alias
+                                .start
+                                .checked_add(alias.size as u64)
+                                .is_some_and(|limit| end <= limit)
+                        },
+                    );
+                candidates.into_iter().find(|alias| alias_is_live(alias))
+            })
+        };
         let row_projection_is_current = |mapping: &HvfMappedRegion| {
             // Only the persistent (HVPatch) lifecycle publishes multi-page
             // rows into a process-scoped registry; the mature lane stamps no
@@ -5513,28 +5556,13 @@ impl HvfTaskState {
             if !mapping.is_dynamic_alias || !self.persistent_vm_lifecycle {
                 return true;
             }
-            let Some(end) = address.checked_add(length as u64) else {
-                return false;
-            };
-            alias_registry()
-                .lock()
-                .newest_process_alias_containing_va(
-                    address,
-                    self.mm_root_slot,
-                    self.container_root,
-                    |alias| {
-                        alias
-                            .start
-                            .checked_add(alias.size as u64)
-                            .is_some_and(|limit| end <= limit)
-                            && alias.physical_ipa == mapping.physical_ipa
-                            && alias.physical_size == mapping.physical_size
-                            && alias.owner_generation == mapping.owner_generation
-                            && alias.ipa.checked_add(address - alias.start)
-                                == mapping.ipa.checked_add(address - mapping.start)
-                    },
-                )
-                .is_some()
+            current_registry_projection().is_some_and(|alias: AliasBacking| {
+                alias.physical_ipa == mapping.physical_ipa
+                    && alias.physical_size == mapping.physical_size
+                    && alias.owner_generation == mapping.owner_generation
+                    && alias.ipa.checked_add(address - alias.start)
+                        == mapping.ipa.checked_add(address - mapping.start)
+            })
         };
         if let Some(mapping) = self
             .mappings
@@ -5547,28 +5575,10 @@ impl HvfTaskState {
         {
             return Some(project(MappingSource::Region(mapping)));
         }
-        if !self.protections.range_no_access(address, length) {
-            let alias_candidates = alias_registry()
-                .lock()
-                .process_alias_containing_va_candidates(
-                    address,
-                    self.mm_root_slot,
-                    self.container_root,
-                    |alias| {
-                        address.checked_add(length as u64).is_some_and(|end| {
-                            alias
-                                .start
-                                .checked_add(alias.size as u64)
-                                .is_some_and(|limit| end <= limit)
-                        })
-                    },
-                );
-            if let Some(alias) = alias_candidates
-                .into_iter()
-                .find(|alias| alias_is_live(alias))
-            {
-                return Some(project(MappingSource::Alias(&alias)));
-            }
+        if !self.protections.range_no_access(address, length)
+            && let Some(alias) = current_registry_projection()
+        {
+            return Some(project(MappingSource::Alias(&alias)));
         }
         None
     }
