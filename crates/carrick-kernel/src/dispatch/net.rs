@@ -681,6 +681,12 @@ impl<'a> NetView<'a> {
                 },
                 OpenDescription::Epoll { kqueue, .. } => readiness(kqueue.poll_fd()),
                 OpenDescription::Pidfd { kqueue, .. } => direct(kqueue.poll_fd()),
+                // An in-zone instance's host fd is a wake source only: EL1
+                // drains the queue without touching it, so the description
+                // answers readiness.
+                OpenDescription::Inotify { state, .. } if state.zone_handle().is_some() => {
+                    readiness(state.poll_fd())
+                }
                 OpenDescription::Inotify { state, .. } => direct(state.poll_fd()),
                 OpenDescription::Fanotify { group, .. } => match group.poll_fd() {
                     fd if fd >= 0 => direct(fd),
@@ -732,6 +738,8 @@ impl<'a> NetView<'a> {
             OpenDescription::Pidfd { kqueue, .. } => Some(HostFd(kqueue.poll_fd())),
             // inotify readiness is the backing kqueue's fd, so poll/epoll/
             // blocking-read wait on it natively.
+            // In-zone: not a verbatim host answer (see the wait source).
+            OpenDescription::Inotify { state, .. } if state.zone_handle().is_some() => None,
             OpenDescription::Inotify { state, .. } => Some(HostFd(state.poll_fd())),
             // fanotify readiness is the group's readiness pipe: readable iff
             // an event is queued, so poll/epoll and a blocking read all

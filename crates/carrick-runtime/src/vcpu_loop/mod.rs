@@ -1461,6 +1461,11 @@ where
         } else {
             false
         };
+        if served_with_work {
+            // An in-guest enqueue may have forced this boundary to wake a
+            // host waiter it could not signal from EL1.
+            carrick_kernel::el1_inotify::deliver_owed_wakes();
+        }
 
         let (syscall, prepared_outcome) = if served_with_work {
             let mut original_args = request.args;

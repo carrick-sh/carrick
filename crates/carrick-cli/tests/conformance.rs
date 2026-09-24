@@ -2921,10 +2921,11 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// `generic`. `mqueueworkerprogress` and `procexeidentity` add execution-capacity
 /// and retained-executable coverage. `fdceiling` adds the carrier descriptor
 /// ceiling boundary matrix. `writeseek` and `inotifywrite` cover write/seek
-/// costs and write-completion notifications, bringing the inventory to 542 sources: 514
-/// conformance sources (491 generic, 23 dedicated), 27 performance sources,
-/// and one helper. Both libc lanes gate 1028 rows.
-const PROBE_SOURCE_COUNT: usize = 543;
+/// costs and write-completion notifications. `inotifywakethread` covers a
+/// waiter woken by a sibling thread's write, bringing the inventory to 544
+/// sources: 515 conformance sources (492 generic, 23 dedicated), 28
+/// performance sources, and one helper. Both libc lanes gate 1030 rows.
+const PROBE_SOURCE_COUNT: usize = 544;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4697,9 +4698,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 491);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 514);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1028);
+    assert_eq!(generic.len(), 492);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 515);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1030);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

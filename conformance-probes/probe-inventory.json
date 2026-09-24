@@ -890,6 +890,14 @@
     "excluded": false,
     "runner": "generic"
   },
+  "inotifywakethread": {
+    "class": "conformance",
+    "contract_ids": [
+      "kernel.inotify.readiness"
+    ],
+    "excluded": false,
+    "runner": "generic"
+  },
   "inotifywrite": {
     "class": "conformance",
     "excluded": false,
