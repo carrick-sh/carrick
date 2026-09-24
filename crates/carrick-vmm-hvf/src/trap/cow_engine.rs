@@ -6149,18 +6149,23 @@ pub(crate) fn live_ipa_mapping_row(
 ) -> Option<&HvfMappedRegion> {
     let end = ipa.checked_add(length)?;
     let semantic_end = semantic_va.checked_add(length)?;
-    mappings.iter().rev().find(|mapping| {
-        let mapping_end = mapping.ipa.checked_add(mapping.size as u64);
-        semantic_va >= mapping.start
-            && semantic_end <= mapping.end
-            && mapping
-                .ipa
-                .checked_add(semantic_va.saturating_sub(mapping.start))
-                == Some(ipa)
-            && ipa >= mapping.ipa
-            && mapping_end.is_some_and(|limit| end <= limit)
-            && owner_matches(mapping)
-    })
+    // Only a row overlapping the range can cover it, and the ordered overlap
+    // walk offers those rows in the same newest-first order the whole-table
+    // reverse walk did (live rows by descending start, then displaced rows).
+    mappings
+        .candidates_for_range(GuestVa(semantic_va), length)
+        .find(|mapping| {
+            let mapping_end = mapping.ipa.checked_add(mapping.size as u64);
+            semantic_va >= mapping.start
+                && semantic_end <= mapping.end
+                && mapping
+                    .ipa
+                    .checked_add(semantic_va.saturating_sub(mapping.start))
+                    == Some(ipa)
+                && ipa >= mapping.ipa
+                && mapping_end.is_some_and(|limit| end <= limit)
+                && owner_matches(mapping)
+        })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
