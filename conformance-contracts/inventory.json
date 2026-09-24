@@ -631,7 +631,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.files.path-mutation"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -644,7 +646,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.files.path-mutation"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -774,7 +778,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.files.path-mutation"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -875,6 +881,7 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.files",
+        "kernel.el1.files.path-mutation",
         "kernel.el1.files.shared-inode",
         "kernel.el1.inotify",
         "kernel.inotify.readiness",
@@ -897,6 +904,7 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.files",
+        "kernel.el1.files.path-mutation",
         "kernel.el1.files.shared-inode",
         "kernel.el1.inotify",
         "kernel.el1.transparent",
