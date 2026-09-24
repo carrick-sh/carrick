@@ -61,7 +61,6 @@ pub(crate) struct HvpatchPersistentExecutor {
     owner_thread_port: u32,
     residency_generation: ResidencyGeneration,
     resident_task: Option<HvpatchResidentTaskRecord>,
-    mailbox_slot: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -387,7 +386,6 @@ impl PersistentExecutorFactory for HvpatchPersistentExecutorFactory {
         let (lifecycle, vcpu) = self.authority.create_executor_parts()?;
         let raw_vcpu_id = carrick_vmm_hvf::hvf_aarch64_engine::persistent_vcpu_identity(&vcpu);
         let owner_thread_port = current_owner_thread_port();
-        let mailbox_slot = vcpu.mailbox_slot();
         Ok(HvpatchPersistentExecutor {
             executor_id: executor,
             lifecycle: Some(lifecycle),
@@ -401,7 +399,6 @@ impl PersistentExecutorFactory for HvpatchPersistentExecutorFactory {
             owner_thread_port,
             residency_generation: ResidencyGeneration::INITIAL,
             resident_task: None,
-            mailbox_slot,
         })
     }
 }
@@ -712,14 +709,13 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         let task_id = carrick_el1_abi::El1TaskId::from_linux_tid(task.thread_key().tid.raw());
         let generation = task.generation().raw();
         let file_table = task.lease().file_table_id().map_or(0, |id| id.raw());
-        carrick_kernel::el1_delegation::publish_current_task(
-            self.mailbox_slot,
-            task_id,
-            generation,
-            file_table,
-        );
+        if let Some(slot) = self.live_mailbox_slot() {
+            carrick_kernel::el1_delegation::publish_current_task(
+                slot, task_id, generation, file_table,
+            );
+        }
         asid_load.mark_resident().map_err(|error| {
-            carrick_kernel::el1_delegation::clear_current_task(self.mailbox_slot);
+            self.clear_live_current_task();
             TrapError::Hypervisor(format!("HVPatch ASID residence commit failed: {error}"))
         })
     }
@@ -867,7 +863,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             ));
         };
         self.cow_invalidation_observer = None;
-        carrick_kernel::el1_delegation::clear_current_task(self.mailbox_slot);
+        if let Some(slot) = carrick_vmm_hvf::hvf_aarch64_engine::leased_mailbox_slot(&engine) {
+            carrick_kernel::el1_delegation::clear_current_task(slot);
+        }
         let (backend, vcpu) = if let Some(task_only) = self.loaded_task_only.take() {
             let (lifecycle, vcpu) =
                 carrick_vmm_hvf::hvf_aarch64_engine::detach_task_only_engine(&task_only, engine);
@@ -969,7 +967,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
     }
 
     fn detach_loaded_task(&mut self) -> Result<(), TrapError> {
-        carrick_kernel::el1_delegation::clear_current_task(self.mailbox_slot);
+        self.clear_live_current_task();
         if let Some(mut engine) = self.current.take() {
             let _ = engine.restore_persistent_executor_invariants();
             let (backend, vcpu) = if let Some(task_only) = self.loaded_task_only.take() {
@@ -1010,7 +1008,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
     }
 
     fn destroy(mut self) -> Result<(), TrapError> {
-        carrick_kernel::el1_delegation::clear_current_task(self.mailbox_slot);
+        self.clear_live_current_task();
         if let Some(mut engine) = self.current.take() {
             let _ = catch_unwind(AssertUnwindSafe(|| {
                 engine.snapshot_task_state_from_live_executor()
@@ -1107,6 +1105,30 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for HvpatchPersistentExecutor {
     fn drop(&mut self) {
-        carrick_kernel::el1_delegation::clear_current_task(self.mailbox_slot);
+        self.clear_live_current_task();
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchPersistentExecutor {
+    /// The mailbox slot of the vCPU this executor holds right now, loaded or
+    /// idle. Read at every use, never cached: M:N reclaim and fork rebuild
+    /// give the vCPU a fresh mailbox lease, and a slot number kept from an
+    /// earlier lease names another executor's vCPU, whose EL1 would then
+    /// resolve its thread's fds through this executor's file table.
+    fn live_mailbox_slot(&self) -> Option<usize> {
+        match (&self.current, &self.vcpu) {
+            (Some(engine), _) => carrick_vmm_hvf::hvf_aarch64_engine::leased_mailbox_slot(engine),
+            (None, Some(vcpu)) => vcpu.leased_mailbox_slot(),
+            (None, None) => None,
+        }
+    }
+
+    /// Empty the current-task record of the slot this executor's vCPU leases.
+    /// A vCPU without a lease has no record (it ended with the lease).
+    fn clear_live_current_task(&self) {
+        if let Some(slot) = self.live_mailbox_slot() {
+            carrick_kernel::el1_delegation::clear_current_task(slot);
+        }
     }
 }

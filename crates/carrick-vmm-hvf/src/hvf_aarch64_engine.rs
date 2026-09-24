@@ -160,6 +160,21 @@ impl HvfAarch64Vcpu {
     pub fn mailbox_slot(&self) -> usize {
         self.mailbox.slot().raw() as usize
     }
+
+    /// The mailbox slot this vCPU leases right now (`None` while its vCPU is
+    /// parked for reclaim). The slot moves with every reclaim and rebuild, so
+    /// callers read it at the moment of use and never keep a copy.
+    pub fn leased_mailbox_slot(&self) -> Option<usize> {
+        self.mailbox
+            .leased_slot()
+            .map(|slot| usize::from(slot.raw()))
+    }
+}
+
+/// The mailbox slot `engine`'s vCPU leases right now; see
+/// [`HvfAarch64Vcpu::leased_mailbox_slot`].
+pub fn leased_mailbox_slot(engine: &HvfAarch64Engine) -> Option<usize> {
+    engine.vcpu().leased_mailbox_slot()
 }
 
 impl Drop for HvfAarch64Vcpu {

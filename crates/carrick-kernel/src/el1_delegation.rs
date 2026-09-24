@@ -60,8 +60,12 @@ pub fn publish_current_task(slot: usize, task_id: El1TaskId, generation: u64, fi
 
 /// The record for `slot` is a cache of the loaded thread's identity; every
 /// host syscall boundary knows the true value and restores it here. Returns
-/// true (and counts it) when the record was wrong: any path that forgot to
-/// publish costs at most one forwarded syscall, and the count shows it.
+/// true (and counts it) when the record was wrong. A record names the thread
+/// loaded on the vCPU leasing `slot` or nobody (it begins and ends empty with
+/// the slot's lease), so a path that forgot to publish costs at most one
+/// forwarded syscall, and the count shows it. A record naming ANOTHER thread
+/// would let EL1 serve this thread's fds from that thread's file table; the
+/// `el1-task-record-stale` probe reports each one.
 pub fn revalidate_current_task(slot: usize, task_id: El1TaskId, file_table: u64) -> bool {
     let ptr = get_el1_region_host_ptr();
     if ptr == 0 || slot >= 256 {
@@ -90,13 +94,7 @@ pub fn revalidate_current_task(slot: usize, task_id: El1TaskId, file_table: u64)
 
 /// Clear the current task binding for an executor vCPU mailbox slot.
 pub fn clear_current_task(slot: usize) {
-    let ptr = get_el1_region_host_ptr();
-    if ptr == 0 || slot >= 256 {
-        return;
-    }
-    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
-    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task.clear();
+    carrick_el1_abi::clear_current_task_record(slot);
 }
 // ---------------------------------------------------------------------------
 // Host-side ownership model
