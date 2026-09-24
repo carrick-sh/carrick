@@ -2454,7 +2454,7 @@
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "function": "lock_delegated_file",
       "ordinal_in_function": 1,
-      "fingerprint": "ec9ff49c339f702a67b26c3fcb06327aba0bc145a25f5227a301086a1fdcaaaa",
+      "fingerprint": "f3e409b4b3c4a81563e12254a3747f49e49bd4db6f1d08e1e46a752fb3f99cea",
       "verdict": "carrier_fault",
       "failure_domain": "el1_delegation",
       "rationale": "Host timed out spinning on delegated file lock held by EL1, indicating guest corruption, protocol violation, or deadlock.",
