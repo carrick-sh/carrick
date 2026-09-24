@@ -695,26 +695,21 @@ impl FsState {
         self.host_sparse_extents.has_host_sparse_extents()
     }
 
-    pub(in crate::dispatch) fn reset_host_sparse_extents(&self, fd: i32, len: u64) {
+    pub(crate) fn reset_host_sparse_extents(&self, fd: i32, len: u64) {
         self.host_sparse_extents.reset_host_sparse_extents(fd, len);
     }
 
-    pub(in crate::dispatch) fn truncate_host_sparse_extents(&self, fd: i32, len: u64) {
+    pub(crate) fn truncate_host_sparse_extents(&self, fd: i32, len: u64) {
         self.host_sparse_extents
             .truncate_host_sparse_extents(fd, len);
     }
 
-    pub(in crate::dispatch) fn record_host_sparse_write(
-        &self,
-        fd: &HostFdRef,
-        offset: u64,
-        len: usize,
-    ) {
+    pub(crate) fn record_host_sparse_write(&self, fd: &HostFdRef, offset: u64, len: usize) {
         self.host_sparse_extents
             .record_host_sparse_write(fd, offset, len);
     }
 
-    pub(in crate::dispatch) fn seek_host_sparse_extents(
+    pub(crate) fn seek_host_sparse_extents(
         &self,
         fd: i32,
         offset: u64,

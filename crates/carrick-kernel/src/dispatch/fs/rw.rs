@@ -12,7 +12,6 @@ use super::pipe::{PipeWriteNotification, PipeWriteOperation};
 use super::*;
 use crate::dispatch::fd_table::{
     DirListing, FileDescriptionWriteGuard, HostFdRef, HostFileIo, HostWriteKind,
-    is_anon_overlay_path,
 };
 use crate::dispatch::io_pipe::{
     HostPipeReadTarget, HostPipeWriteTarget, HostWaitRunner, read_host_pipe, read_host_pipe_at,
@@ -208,6 +207,96 @@ pub(crate) fn punch_unwritten_host_blocks(
     Ok(())
 }
 
+/// Commit a write to a host-backed file, updating dentry caches, sparse extents,
+/// and punch unwritten blocks uniformly across host writes and EL1 recall.
+pub(crate) fn commit_host_file_write_raw(
+    rootfs_vfs: Option<&carrick_vfs::RootFsVfs>,
+    sparse_registry: Option<&HostSparseExtentsRegistry>,
+    raw_fd: libc::c_int,
+    host_fd_ref: Option<&HostFdRef>,
+    inode_identity: Option<carrick_vfs::vfs::InodeIdentity>,
+    open_path: Option<&str>,
+    old_len_and_pos: Option<(u64, u64)>,
+    write_offset: Option<u64>,
+    written: usize,
+    kernel: Option<&crate::kernel::KernelContext>,
+    view: Option<&FsView<'_>>,
+) -> Result<(), LinuxErrno> {
+    if written == 0 {
+        return Ok(());
+    }
+    if let Some(vfs) = rootfs_vfs {
+        if vfs.dentry_cache.has_cached_inodes()
+            && let Some(identity) = inode_identity
+        {
+            vfs.notify_inode_changed("", Some(identity));
+        } else {
+            vfs.invalidate_host_fd(raw_fd);
+        }
+    }
+    if let Some((old_len, pos)) = old_len_and_pos {
+        punch_unwritten_host_blocks(raw_fd, old_len, pos)?;
+    }
+    if let Some(write_offset) = write_offset {
+        if let Some(host_fd_ref) = host_fd_ref {
+            if let Some(view) = view {
+                view.fs
+                    .record_host_sparse_write(host_fd_ref, write_offset, written);
+            } else if let Some(sparse) = sparse_registry {
+                sparse.record_host_sparse_write(host_fd_ref, write_offset, written);
+            }
+        } else if let Some(sparse) = sparse_registry {
+            sparse.record_host_sparse_write_raw(raw_fd, write_offset, written);
+        }
+    }
+    if let (Some(kernel), Some(view)) = (kernel, view) {
+        let out = DispatchOutcome::Returned {
+            value: written as i64,
+        };
+        view.notify_host_file_write_result(kernel, open_path, &out);
+    }
+    Ok(())
+}
+
+/// Commit a write to an in-memory File, mutating contents and writing back into
+/// the underlying VFS backend uniformly across host writes and EL1 recall.
+pub(crate) fn commit_file_write(
+    rootfs_vfs: Option<&carrick_vfs::RootFsVfs>,
+    path: &str,
+    contents: &mut FileContents,
+    metadata: &mut RootFsMetadata,
+    offset: u64,
+    bytes: &[u8],
+    kernel: Option<&crate::kernel::KernelContext>,
+    view: Option<&FsView<'_>>,
+    offset_cursor: Option<&mut usize>,
+) -> Result<usize, LinuxErrno> {
+    let end = offset.checked_add(bytes.len() as u64).ok_or(LINUX_EFBIG)?;
+    if !contents.accepts_len(end) {
+        return Err(LINUX_EFBIG);
+    }
+    let written = contents.write_at(offset, bytes)?;
+    if let Some(cursor) = offset_cursor {
+        *cursor += written;
+    }
+    let cur_len = contents.len().unwrap_or(0) as usize;
+    let new_len = cur_len.max(offset as usize + written);
+    metadata.size = new_len;
+    if let Some(vfs) = rootfs_vfs {
+        if !crate::dispatch::is_anon_overlay_path(path) {
+            let _ = vfs.write_file_range(path, offset as usize, &bytes[..written], new_len);
+            vfs.notify_inode_changed(path, None);
+        }
+    }
+    if let (Some(kernel), Some(view)) = (kernel, view) {
+        let outcome = DispatchOutcome::Returned {
+            value: written as i64,
+        };
+        view.notify_file_write_result(kernel, Some(path), &outcome);
+    }
+    Ok(written)
+}
+
 /// Commit bytes at an offset into an open file description, updating both the
 /// description's contents and the underlying filesystem backend uniformly across
 /// host writes and EL1 recall.
@@ -216,6 +305,39 @@ pub(crate) fn commit_bytes_at_offset(
     offset: u64,
     bytes: &[u8],
     rootfs_vfs: Option<&carrick_vfs::RootFsVfs>,
+    sparse_registry: Option<&HostSparseExtentsRegistry>,
+) -> Result<usize, LinuxErrno> {
+    commit_bytes_at_offset_internal(open, offset, bytes, rootfs_vfs, sparse_registry, None, None)
+}
+
+pub(crate) fn commit_bytes_at_offset_with_notify(
+    open: &mut OpenDescription,
+    offset: u64,
+    bytes: &[u8],
+    rootfs_vfs: Option<&carrick_vfs::RootFsVfs>,
+    sparse_registry: Option<&HostSparseExtentsRegistry>,
+    kernel: Option<&crate::kernel::KernelContext>,
+    view: Option<&FsView<'_>>,
+) -> Result<usize, LinuxErrno> {
+    commit_bytes_at_offset_internal(
+        open,
+        offset,
+        bytes,
+        rootfs_vfs,
+        sparse_registry,
+        kernel,
+        view,
+    )
+}
+
+fn commit_bytes_at_offset_internal(
+    open: &mut OpenDescription,
+    offset: u64,
+    bytes: &[u8],
+    rootfs_vfs: Option<&carrick_vfs::RootFsVfs>,
+    sparse_registry: Option<&HostSparseExtentsRegistry>,
+    kernel: Option<&crate::kernel::KernelContext>,
+    view: Option<&FsView<'_>>,
 ) -> Result<usize, LinuxErrno> {
     match open {
         OpenDescription::File {
@@ -228,28 +350,9 @@ pub(crate) fn commit_bytes_at_offset(
             if !*writable {
                 return Err(LINUX_EBADF);
             }
-            let end = offset.checked_add(bytes.len() as u64).ok_or(LINUX_EFBIG)?;
-            if !contents.accepts_len(end) {
-                return Err(LINUX_EFBIG);
-            }
-            let written = contents.write_at(offset, bytes)?;
-            let cur_len = contents.len().unwrap_or(0) as usize;
-            let new_len = cur_len.max(offset as usize + written);
-            metadata.size = new_len;
-            if let Some(vfs) = rootfs_vfs {
-                if !crate::dispatch::is_anon_overlay_path(path) {
-                    vfs.write_file_range(path, offset as usize, &bytes[..written], new_len)
-                        .map_err(|e| match e {
-                            carrick_vfs::fs_backend::BackendError::Host(err)
-                            | carrick_vfs::fs_backend::BackendError::Namespace(err) => err,
-                            carrick_vfs::fs_backend::BackendError::Invalid => LINUX_EINVAL,
-                            carrick_vfs::fs_backend::BackendError::Unsupported => LINUX_ENOTSUP,
-                            carrick_vfs::fs_backend::BackendError::Io => LINUX_EIO,
-                        })?;
-                    vfs.notify_inode_changed(path, None);
-                }
-            }
-            Ok(written)
+            commit_file_write(
+                rootfs_vfs, path, contents, metadata, offset, bytes, kernel, view, None,
+            )
         }
         OpenDescription::HostFile {
             host_fd,
@@ -277,6 +380,20 @@ pub(crate) fn commit_bytes_at_offset(
             }
             let written = res as usize;
             metadata.size = metadata.size.max(offset as usize + written);
+            let path_str = metadata.path.to_str();
+            commit_host_file_write_raw(
+                rootfs_vfs,
+                sparse_registry,
+                host_fd.raw(),
+                Some(host_fd),
+                host_fd.inode_identity(),
+                path_str,
+                None,
+                Some(offset),
+                written,
+                kernel,
+                view,
+            )?;
             Ok(written)
         }
         _ => Err(LINUX_EBADF),
@@ -331,6 +448,29 @@ impl<'a> FsView<'a> {
             return Err(LINUX_EFBIG);
         }
         Ok(len.min((limit - offset) as usize))
+    }
+
+    pub(crate) fn commit_host_file_write(
+        &self,
+        kernel: Option<&crate::kernel::KernelContext>,
+        host_io: &HostFileIo<'_>,
+        old_len_and_pos: Option<(u64, u64)>,
+        write_offset: Option<u64>,
+        written: usize,
+    ) -> Result<(), LinuxErrno> {
+        commit_host_file_write_raw(
+            Some(&self.fs.rootfs_vfs),
+            Some(&self.fs.host_sparse_extents),
+            host_io.raw(),
+            Some(host_io.host_fd_ref()),
+            host_io.inode_identity(),
+            host_io.open_path(),
+            old_len_and_pos,
+            write_offset,
+            written,
+            kernel,
+            Some(self),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -423,24 +563,13 @@ impl<'a> FsView<'a> {
             if let DispatchOutcome::Returned { value } = out
                 && value > 0
             {
-                if self.fs.rootfs_vfs.dentry_cache.has_cached_inodes()
-                    && let Some(identity) = host_io.inode_identity()
-                {
-                    self.fs.rootfs_vfs.notify_inode_changed("", Some(identity));
-                }
-                punch = if let Some((old_len, pos)) = old_len {
-                    punch_unwritten_host_blocks(raw_fd, old_len, pos)
-                } else {
-                    Ok(())
-                };
-                if let Some(write_offset) = write_offset {
-                    self.fs.record_host_sparse_write(
-                        host_io.host_fd_ref(),
-                        write_offset,
-                        value as usize,
-                    );
-                }
-                self.notify_host_file_write_result(cx.kernel, host_io.open_path(), &out);
+                punch = self.commit_host_file_write(
+                    Some(cx.kernel),
+                    &host_io,
+                    old_len,
+                    write_offset,
+                    value as usize,
+                );
             }
             (out, punch)
         };
@@ -2237,10 +2366,7 @@ impl<'a> FsView<'a> {
                         .with_host_wait(host_wait_ref),
                     )?;
                     if let DispatchOutcome::Returned { value } = outcome && value > 0 {
-                        if let Some(old_len) = old_len {
-                            punch_unwritten_host_blocks(raw_fd, old_len, offset as u64)?;
-                        }
-                        this.invalidate_dentry_host_fd(raw_fd);
+                        let old_len_and_pos = old_len.map(|len| (len, offset as u64));
                         let write_offset = if is_append {
                             let mut st: libc::stat = unsafe { core::mem::zeroed() };
                             if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
@@ -2251,8 +2377,13 @@ impl<'a> FsView<'a> {
                         } else {
                             offset as u64
                         };
-                        this.fs
-                            .record_host_sparse_write(host_io.host_fd_ref(), write_offset, value as usize);
+                        this.commit_host_file_write(
+                            Some(cx.kernel),
+                            &host_io,
+                            old_len_and_pos,
+                            Some(write_offset),
+                            value as usize,
+                        )?;
                     }
                     outcome
                 };
@@ -2326,11 +2457,14 @@ impl<'a> FsView<'a> {
                     ) {
                         return Ok(DispatchOutcome::errno(errno));
                     }
-                    let written = match commit_bytes_at_offset(
+                    let written = match commit_bytes_at_offset_with_notify(
                         &mut open,
                         write_at as u64,
                         &bytes,
                         Some(&this.fs.rootfs_vfs),
+                        Some(&this.fs.host_sparse_extents),
+                        Some(cx.kernel),
+                        Some(this),
                     ) {
                         Ok(n) => n,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -2623,10 +2757,16 @@ impl<'a> FsView<'a> {
                         restore_offset(saved_offset);
                         let n = n.host_syscall_errno()?;
                         if n > 0 {
-                            if let Some(old_len) = old_len {
-                                punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
+                            if let Some(host_io) = HostFileIo::from_read(&open) {
+                                let old_len_and_pos = old_len.map(|len| (len, offset as u64));
+                                this.commit_host_file_write(
+                                    Some(cx.kernel),
+                                    &host_io,
+                                    old_len_and_pos,
+                                    Some(offset as u64),
+                                    n as usize,
+                                )?;
                             }
-                            this.invalidate_dentry_host_fd(hfd);
                             let _ = crate::el1_delegation::delegate_locked(
                                 &open_file,
                                 &mut open,
@@ -2692,10 +2832,16 @@ impl<'a> FsView<'a> {
                 }
                 restore_offset(saved_offset);
                 if total > 0 {
-                    if let Some(old_len) = old_len {
-                        punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
+                    if let Some(host_io) = HostFileIo::from_read(&open) {
+                        let old_len_and_pos = old_len.map(|len| (len, offset as u64));
+                        this.commit_host_file_write(
+                            Some(cx.kernel),
+                            &host_io,
+                            old_len_and_pos,
+                            Some(offset as u64),
+                            total as usize,
+                        )?;
                     }
-                    this.invalidate_dentry_host_fd(hfd);
                     let _ = crate::el1_delegation::delegate_locked(
                         &open_file,
                         &mut open,
@@ -2875,18 +3021,7 @@ impl<'a> FsView<'a> {
                         slot_authority,
                     );
                 }
-                // Take an inner scope so the borrow on the description ends
-                // before we touch this.fs.rootfs_vfs.overlay (writable File path below).
-                enum FileWriteback {
-                    Range {
-                        path: String,
-                        offset: usize,
-                        bytes: Vec<u8>,
-                        final_size: usize,
-                    },
-                }
                 let outcome: DispatchOutcome;
-                let writeback: Option<FileWriteback>;
                 let modified_path;
                 {
                     modified_path = this.file_write_notification_path(&open, length);
@@ -3183,7 +3318,6 @@ impl<'a> FsView<'a> {
                             *offset = end;
                             this.fs.rootfs_vfs.notify_inode_changed(path, None);
                             outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
-                            writeback = None;
                         }
                         OpenDescription::File {
                             path,
@@ -3215,27 +3349,21 @@ impl<'a> FsView<'a> {
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                             };
                             let write_offset = *offset;
-                            let written = match write_into_file_contents(contents, offset, bytes) {
+                            let written = match commit_file_write(
+                                Some(&this.fs.rootfs_vfs),
+                                path,
+                                contents,
+                                metadata,
+                                write_offset as u64,
+                                bytes,
+                                None,
+                                None,
+                                Some(offset),
+                            ) {
                                 Ok(n) => n,
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                             };
-                            let new_len = match contents.len() {
-                                Ok(l) => l as usize,
-                                Err(errno) if written == 0 => {
-                                    return Ok(DispatchOutcome::errno(errno));
-                                }
-                                Err(_) => cur_len.max(write_offset.saturating_add(written)),
-                            };
-                            metadata.size = new_len;
                             outcome = DispatchOutcome::returned_len_or_errno(written);
-                            writeback = (!is_anon_overlay_path(path)).then(|| {
-                                FileWriteback::Range {
-                                    path: path.clone(),
-                                    offset: write_offset,
-                                    bytes: bytes[..written.min(bytes.len())].to_vec(),
-                                    final_size: new_len,
-                                }
-                            });
                         }
                         OpenDescription::SyntheticFile { path, .. }
                             if crate::vfs::proc::is_userns_map_path(path) =>
@@ -3331,18 +3459,6 @@ impl<'a> FsView<'a> {
                         _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                     }
                     drop(open);
-                }
-                if let Some(FileWriteback::Range {
-                    path,
-                    offset,
-                    bytes,
-                    final_size,
-                }) = writeback
-                {
-                    let _ = this
-                        .fs
-                        .rootfs_vfs
-                        .write_file_range(&path, offset, &bytes, final_size);
                 }
                 this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &outcome);
                 if matches!(outcome, DispatchOutcome::Returned { .. }) {
@@ -3556,10 +3672,36 @@ impl<'a> FsView<'a> {
                     .with_host_wait(host_wait_ref),
                 )?;
                 if let DispatchOutcome::Returned { value } = outcome && value > 0 {
-                    if let Some((old_len, pos)) = old_len {
-                        punch_unwritten_host_blocks(target.host_fd, old_len, pos)?;
-                    }
-                    this.invalidate_dentry_host_fd(target.host_fd);
+                    let write_offset = if target.append {
+                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                        if unsafe { libc::fstat(target.host_fd, &mut st) } == 0 {
+                            (st.st_size as u64).saturating_sub(value as u64)
+                        } else {
+                            0
+                        }
+                    } else if let Some((_, pos)) = old_len {
+                        pos
+                    } else {
+                        let cur = unsafe { libc::lseek(target.host_fd, 0, libc::SEEK_CUR) };
+                        if cur >= 0 {
+                            (cur as u64).saturating_sub(value as u64)
+                        } else {
+                            0
+                        }
+                    };
+                    commit_host_file_write_raw(
+                        Some(&this.fs.rootfs_vfs),
+                        Some(&this.fs.host_sparse_extents),
+                        target.host_fd,
+                        target.host_fd_owner.as_ref(),
+                        target.host_fd_owner.as_ref().and_then(|h| h.inode_identity()),
+                        None,
+                        old_len,
+                        Some(write_offset),
+                        value as usize,
+                        Some(cx.kernel),
+                        Some(this),
+                    )?;
                 }
                 return if target.sigpipe_on_epipe {
                     Ok(this.raise_sigpipe_on_epipe(cx, outcome))
@@ -3579,7 +3721,7 @@ impl<'a> FsView<'a> {
                 if iov_len == 0 {
                     continue;
                 }
-                let mut bytes = match (*cx.memory).read_bytes(iov_base, iov_len) {
+                let bytes = match (*cx.memory).read_bytes(iov_base, iov_len) {
                     Ok(bytes) => bytes,
                     Err(_) => {
                         // Bytes already written are already visible in the
@@ -3605,16 +3747,7 @@ impl<'a> FsView<'a> {
                     let Some(io_lease) = open_file.description.retain_fd_lease() else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    enum FileWriteback {
-                        Range {
-                            path: String,
-                            offset: usize,
-                            bytes: Vec<u8>,
-                            final_size: usize,
-                        },
-                    }
                     let outcome: DispatchOutcome;
-                    let writeback: Option<FileWriteback>;
                     {
                         let Some(mut open) = open_file.description.write() else {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -3629,14 +3762,12 @@ impl<'a> FsView<'a> {
                                         outcome = DispatchOutcome::returned_len_or_errno(
                                             bytes.len(),
                                         );
-                                        writeback = None;
                                     }
                                 }
                             }
                             OpenDescription::VirtualConsole { console, .. } => {
                                 console.write(&bytes);
                                 outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
-                                writeback = None;
                             }
                             OpenDescription::PipeWriter { pipe, .. } => {
                                 let pipe = Arc::clone(pipe);
@@ -3671,7 +3802,6 @@ impl<'a> FsView<'a> {
                                         )),
                                     },
                                 );
-                                writeback = None;
                             }
                             OpenDescription::HostPipe {
                                 base,
@@ -3762,7 +3892,6 @@ impl<'a> FsView<'a> {
                                         }
                                     }
                                 };
-                                writeback = None;
                             }
                             OpenDescription::HostSocket { host_fd, type_, .. } => {
                                 let Some(wait_authority) = this
@@ -3798,7 +3927,6 @@ impl<'a> FsView<'a> {
                                     .with_socket_flow(outbound_flow, Some(my_cred), is_stream)
                                     .with_host_wait(host_wait_ref),
                                 )?;
-                                writeback = None;
                             }
                             OpenDescription::InMemorySocket { socket, .. } => {
                                 let socket = Arc::clone(socket);
@@ -3821,7 +3949,6 @@ impl<'a> FsView<'a> {
                                         outcome = DispatchOutcome::errno(errno);
                                     }
                                 }
-                                writeback = None;
                             }
                             OpenDescription::HostFile {
                                 host_fd, writable, ..
@@ -3829,17 +3956,30 @@ impl<'a> FsView<'a> {
                                 if !*writable {
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                                 }
-                                // Mirror `write`(64): O_APPEND seeks to EOF, then
-                                // libc::write to the real fd advances the shared
-                                // kernel offset (visible across fork and to the
-                                // readv that follows).
-                                if LinuxOpenFlags::from_bits_truncate(
+                                let is_append = LinuxOpenFlags::from_bits_truncate(
                                     open_file.description.common().status_flags(),
                                 )
-                                .contains(LinuxOpenFlags::APPEND)
-                                {
+                                .contains(LinuxOpenFlags::APPEND);
+                                if is_append {
                                     unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                                 }
+                                let old_len = if !is_append {
+                                    let pos = unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) };
+                                    if pos >= 0 {
+                                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                                        if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
+                                            && (pos as u64) > st.st_size as u64
+                                        {
+                                            Some((st.st_size as u64, pos as u64))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
                                 let Some(wait_authority) = this
                                     .captured_slot_authority(fd)
                                     .map(WaitFdAuthority::logical)
@@ -3866,9 +4006,37 @@ impl<'a> FsView<'a> {
                                     .with_host_wait(host_wait_ref),
                                 )?;
                                 if let DispatchOutcome::Returned { value } = outcome && value > 0 {
-                                    this.invalidate_dentry_host_fd(raw_fd);
+                                    let write_offset = if is_append {
+                                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                                        if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
+                                            (st.st_size as u64).saturating_sub(value as u64)
+                                        } else {
+                                            0
+                                        }
+                                    } else if let Some((_, pos)) = old_len {
+                                        pos
+                                    } else {
+                                        let cur = unsafe { libc::lseek(raw_fd, 0, libc::SEEK_CUR) };
+                                        if cur >= 0 {
+                                            (cur as u64).saturating_sub(value as u64)
+                                        } else {
+                                            0
+                                        }
+                                    };
+                                    commit_host_file_write_raw(
+                                        Some(&this.fs.rootfs_vfs),
+                                        Some(&this.fs.host_sparse_extents),
+                                        raw_fd,
+                                        Some(&host_fd),
+                                        host_fd.inode_identity(),
+                                        None,
+                                        old_len,
+                                        Some(write_offset),
+                                        value as usize,
+                                        Some(cx.kernel),
+                                        Some(this),
+                                    )?;
                                 }
-                                writeback = None;
                             }
                             OpenDescription::InMemoryFile {
                                 path,
@@ -3904,7 +4072,6 @@ impl<'a> FsView<'a> {
                                 *offset = end;
                                 this.fs.rootfs_vfs.notify_inode_changed(path, None);
                                 outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
-                                writeback = None;
                             }
                             OpenDescription::File {
                                 path,
@@ -3930,43 +4097,24 @@ impl<'a> FsView<'a> {
                                     return Ok(DispatchOutcome::errno(errno));
                                 }
                                 let write_offset = *offset;
-                                let written = match write_into_file_contents(contents, offset, &bytes) {
+                                let written = match commit_file_write(
+                                    Some(&this.fs.rootfs_vfs),
+                                    path,
+                                    contents,
+                                    metadata,
+                                    write_offset as u64,
+                                    &bytes,
+                                    Some(cx.kernel),
+                                    Some(this),
+                                    Some(offset),
+                                ) {
                                     Ok(n) => n,
                                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                                 };
-                                bytes.truncate(written);
-                                let new_len = match contents.len() {
-                                    Ok(l) => l as usize,
-                                    Err(errno) if written == 0 => {
-                                        return Ok(DispatchOutcome::errno(errno));
-                                    }
-                                    Err(_) => cur_len.max(write_offset.saturating_add(written)),
-                                };
-                                metadata.size = new_len;
                                 outcome = DispatchOutcome::returned_len_or_errno(written);
-                                writeback = (!is_anon_overlay_path(path)).then(|| {
-                                    FileWriteback::Range {
-                                        path: path.clone(),
-                                        offset: write_offset,
-                                        bytes,
-                                        final_size: new_len,
-                                    }
-                                });
                             }
                             _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                         }
-                    }
-                    if let Some(FileWriteback::Range {
-                        path,
-                        offset,
-                        bytes,
-                        final_size,
-                    }) = writeback
-                    {
-                        let _ = this
-                            .fs
-                            .rootfs_vfs
-                            .write_file_range(&path, offset, &bytes, final_size);
                     }
                     if let DispatchOutcome::BlockingWrite(write) = outcome {
                         // `write_pipe` has committed a prefix of this iovec.
