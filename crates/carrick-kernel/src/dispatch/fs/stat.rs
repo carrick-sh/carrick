@@ -286,7 +286,12 @@ impl<'a> FsView<'a> {
         flags: u64,
     ) -> Result<StatRecord, LinuxErrno> {
         let at_flags = carrick_abi::LinuxAtFlags::from_bits_retain(flags);
-        let lookup = self.lookup_path(dirfd, path, at_flags, LookupIntent::Stat { context })?;
+        let mut lookup = self.lookup_path(dirfd, path, at_flags, LookupIntent::Stat { context })?;
+        // A file the zone owns has host metadata that predates its in-zone
+        // writes: write them back and look it up again.
+        if crate::el1_delegation::sync_path(self.fs, lookup.resolved_path()) {
+            lookup = self.lookup_path(dirfd, path, at_flags, LookupIntent::Stat { context })?;
+        }
         let _ = &lookup.resolved_path;
         let _ = lookup.fast_path();
         let _ = lookup.resolved_path();
@@ -461,7 +466,7 @@ impl<'a> FsView<'a> {
         }
         if typ == libc::S_IFREG as u32 {
             let inode = carrick_vfs::InodeIdentity::new(st.st_dev as u64, st.st_ino as u64);
-            if crate::el1_delegation::recall_inode(inode) {
+            if crate::el1_delegation::sync_inode(inode) {
                 if unsafe {
                     libc::fstatat(
                         host_dir.fd.raw(),
@@ -661,10 +666,17 @@ impl<'a> FsView<'a> {
             }
 
             let at_flags = carrick_abi::LinuxAtFlags::from_bits_retain(flags);
-            let lookup = match this.lookup_path(dirfd, &path, at_flags, LookupIntent::Statx { context: cx.kernel }) {
+            let mut lookup = match this.lookup_path(dirfd, &path, at_flags, LookupIntent::Statx { context: cx.kernel }) {
                 Ok(lookup) => lookup,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
+            // As for newfstatat: write back an in-zone file, then look again.
+            if crate::el1_delegation::sync_path(this.fs, lookup.resolved_path()) {
+                lookup = match this.lookup_path(dirfd, &path, at_flags, LookupIntent::Statx { context: cx.kernel }) {
+                    Ok(lookup) => lookup,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
+            }
             let _ = lookup.fast_path_answered();
             let _ = lookup.resolved_path();
             match lookup.into_stat() {
