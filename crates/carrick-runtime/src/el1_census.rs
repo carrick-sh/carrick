@@ -40,6 +40,7 @@ static TABLE: Table = Table {
 };
 
 static DIRECTORY: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+static STARTED: OnceLock<std::time::Instant> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static WRITTEN: AtomicBool = AtomicBool::new(false);
 
@@ -51,6 +52,22 @@ pub fn init_from_env() {
             .map(std::path::PathBuf::from)
     });
     ENABLED.store(directory.is_some(), Ordering::Relaxed);
+    let _ = STARTED.get_or_init(std::time::Instant::now);
+}
+
+/// The carrier process's user and system CPU so far, in nanoseconds.
+fn process_cpu_ns() -> (u64, u64) {
+    // SAFETY: `usage` is valid storage for one rusage.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return (0, 0);
+    }
+    let ns = |tv: libc::timeval| {
+        (tv.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(tv.tv_usec as u64 * 1_000)
+    };
+    (ns(usage.ru_utime), ns(usage.ru_stime))
 }
 
 #[inline]
@@ -130,6 +147,15 @@ pub struct Census {
     pub pid: u32,
     /// Whether the EL1 counters were readable (EL1 enabled and mapped).
     pub el1_counters: bool,
+    /// The carrier's user CPU for the whole run (guest execution included).
+    #[serde(default)]
+    pub process_user_ns: u64,
+    /// The carrier's system CPU for the whole run.
+    #[serde(default)]
+    pub process_sys_ns: u64,
+    /// Wall time from EL1 setup to teardown.
+    #[serde(default)]
+    pub wall_ns: u64,
     pub rows: Vec<CensusRow>,
 }
 
@@ -165,11 +191,17 @@ fn snapshot() -> Census {
             rows.push(row);
         }
     }
+    let (process_user_ns, process_sys_ns) = process_cpu_ns();
     Census {
         schema: 1,
         run_id: std::env::var("CARRICK_RUN_ID").ok(),
         pid: std::process::id(),
         el1_counters: counters.is_some(),
+        process_user_ns,
+        process_sys_ns,
+        wall_ns: STARTED
+            .get()
+            .map_or(0, |start| start.elapsed().as_nanos() as u64),
         rows,
     }
 }
@@ -230,6 +262,9 @@ pub struct Aggregate {
     pub runs: usize,
     pub runs_with_el1_counters: usize,
     pub host_total_ns: u64,
+    /// Summed carrier CPU (user + system) across the runs.
+    pub process_cpu_ns: u64,
+    pub wall_ns: u64,
     pub rows: Vec<AggregateRow>,
 }
 
@@ -273,17 +308,30 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
         runs: censuses.len(),
         runs_with_el1_counters: censuses.iter().filter(|c| c.el1_counters).count(),
         host_total_ns: rows.iter().map(AggregateRow::host_total_ns).sum(),
+        process_cpu_ns: censuses
+            .iter()
+            .map(|c| c.process_user_ns + c.process_sys_ns)
+            .sum(),
+        wall_ns: censuses.iter().map(|c| c.wall_ns).sum(),
         rows,
     })
 }
 
 /// A Markdown table of the top `limit` rows.
 pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
+    let share_of_process = if aggregate.process_cpu_ns == 0 {
+        0.0
+    } else {
+        aggregate.host_total_ns as f64 * 100.0 / aggregate.process_cpu_ns as f64
+    };
     let mut out = format!(
-        "runs: {} ({} with EL1 counters); host syscall CPU: {:.1} ms\n\n",
+        "runs: {} ({} with EL1 counters); host syscall CPU: {:.1} ms = {:.1}% of carrier CPU {:.1} ms; wall {:.1} ms\n\n",
         aggregate.runs,
         aggregate.runs_with_el1_counters,
-        aggregate.host_total_ns as f64 / 1e6
+        aggregate.host_total_ns as f64 / 1e6,
+        share_of_process,
+        aggregate.process_cpu_ns as f64 / 1e6,
+        aggregate.wall_ns as f64 / 1e6
     );
     out.push_str("| syscall | nr | host services | host CPU ms | share | redispatches | EL1 served | EL1 forwarded | EL1 boundaries |\n");
     out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
@@ -333,6 +381,9 @@ mod tests {
             run_id: None,
             pid: 1,
             el1_counters: true,
+            process_user_ns: 20_000,
+            process_sys_ns: 4_000,
+            wall_ns: 30_000,
             rows,
         }
     }
@@ -344,6 +395,7 @@ mod tests {
         let agg = aggregate(&[a, b]).unwrap();
         assert_eq!(agg.runs, 2);
         assert_eq!(agg.host_total_ns, 12_000);
+        assert_eq!(agg.process_cpu_ns, 48_000);
         assert_eq!(agg.rows[0].nr, 79);
         assert_eq!(agg.rows[1].nr, 56);
         assert_eq!(agg.rows[1].host_services, 20);
