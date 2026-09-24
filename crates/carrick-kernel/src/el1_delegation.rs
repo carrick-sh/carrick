@@ -748,18 +748,11 @@ pub(crate) fn recall_locked(
                         page_offset,
                         page_slice,
                         rootfs_vfs.as_deref(),
+                        sparse_registry.as_ref(),
                     ) {
                         description.common().record_writeback_error(err);
                         if write_error.is_none() {
                             write_error = Some(err);
-                        }
-                    } else if let OpenDescription::HostFile { host_fd, .. } = open {
-                        if let Some(sparse) = &sparse_registry {
-                            sparse.record_host_sparse_write_raw(
-                                host_fd.raw(),
-                                page_offset,
-                                page_len,
-                            );
                         }
                     }
                 }
@@ -2293,6 +2286,56 @@ mod tests {
                 0,
                 "namei dentry lookup must recall delegated in-memory file at choke point"
             );
+        }
+
+        #[test]
+        fn test_commit_bytes_at_offset_host_file_records_sparse() {
+            let scratch = tempfile::tempdir().unwrap();
+            let file_path = scratch.path().join("test_sparse_commit.txt");
+            std::fs::write(&file_path, b"initial").unwrap();
+
+            let backend =
+                carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+            let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+            dispatcher.set_fs_backend(Box::new(backend));
+
+            let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+                1,
+                crate::thread::ThreadId::synthetic_for_tests(1),
+                "test-sparse-commit".to_owned(),
+            )
+            .expect("root bootstrap");
+            let ctx = crate::kernel::Kernel::bootstrap_root(bootstrap)
+                .expect("root kernel")
+                .1;
+
+            let fd = open_path_for_test(
+                &dispatcher,
+                &ctx,
+                "/test_sparse_commit.txt",
+                carrick_abi::LINUX_O_RDWR,
+            );
+            let open_file = dispatcher.open_file(fd).unwrap();
+            let mut guard = open_file.description.write().unwrap();
+            let raw_fd = match &*guard {
+                OpenDescription::HostFile { host_fd, .. } => host_fd.raw(),
+                _ => panic!("expected HostFile"),
+            };
+
+            dispatcher.fs().reset_host_sparse_extents(raw_fd, 8192);
+
+            let written = crate::dispatch::fs::rw::commit_bytes_at_offset(
+                &mut guard,
+                4096,
+                b"sparse data",
+                Some(&dispatcher.fs().rootfs_vfs),
+                Some(&dispatcher.fs().host_sparse_extents),
+            )
+            .unwrap();
+            assert_eq!(written, 11);
+
+            let found = dispatcher.fs().seek_host_sparse_extents(raw_fd, 4096, true);
+            assert_eq!(found, Some(Some(4096)));
         }
     }
 }
