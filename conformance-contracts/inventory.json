@@ -780,6 +780,7 @@
       "handler": "filesystem",
       "authority": "host",
       "contracts": [
+        "kernel.el1.files.cross-process-readers",
         "kernel.el1.files.path-mutation",
         "kernel.el1.zone-entry-at-open"
       ],
@@ -795,7 +796,9 @@
       "support": "bring_up",
       "handler": "filesystem",
       "authority": "host",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.files.cross-process-readers"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -884,6 +887,7 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.files",
+        "kernel.el1.files.cross-process-readers",
         "kernel.el1.files.path-mutation",
         "kernel.el1.files.shared-inode",
         "kernel.el1.inotify",
@@ -908,6 +912,7 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.files",
+        "kernel.el1.files.cross-process-readers",
         "kernel.el1.files.path-mutation",
         "kernel.el1.files.shared-inode",
         "kernel.el1.inotify",
@@ -965,6 +970,7 @@
       "authority": "host",
       "contracts": [
         "kernel.el1.files",
+        "kernel.el1.files.cross-process-readers",
         "kernel.el1.zone-entry-at-open",
         "kernel.mm.syscall-code-write",
         "kernel.scheduler.host-wait-handoff"
@@ -2994,6 +3000,7 @@
       "handler": "lifecycle",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.files.cross-process-readers",
         "kernel.fork.filetable",
         "kernel.fork.mappings",
         "kernel.fork.stage1-image",
@@ -3328,6 +3335,7 @@
       "handler": "lifecycle",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.files.cross-process-readers",
         "kernel.fork.stage1-image",
         "kernel.signal.lease-gap",
         "kernel.wait.process-group"

@@ -1747,6 +1747,62 @@ mod tests {
         );
     }
 
+    /// The EL1 current-task record of `slot` in the region at `region`.
+    fn current_task(region: &[u8], slot: usize) -> &carrick_el1_abi::CurrentTask {
+        let offset = carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+            + slot * std::mem::size_of::<carrick_el1_abi::CurrentTask>();
+        // SAFETY: `region` is a whole EL1 region and the record lies inside it.
+        unsafe { &*(region.as_ptr().add(offset) as *const carrick_el1_abi::CurrentTask) }
+    }
+
+    /// Contract `kernel.el1.files.cross-process-readers` (VM-free layer): a
+    /// mailbox slot's EL1 current-task record lives exactly as long as the
+    /// slot's lease. EL1 resolves a vCPU's fds through the file table its
+    /// record names, and M:N reclaim moves a running thread's vCPU to a new
+    /// slot while another vCPU takes the old one. A record that outlived its
+    /// lease made the new holder's EL1 serve its thread's fds from the
+    /// previous thread's table (another process's files: wrong bytes in
+    /// `go build`); a record that predated its lease did the same for the
+    /// moved thread.
+    #[test]
+    fn a_mailbox_lease_owns_its_el1_current_task_record() {
+        let region = vec![0u8; carrick_el1_abi::EL1_REGION_SIZE as usize];
+        let previous = carrick_el1_abi::get_el1_region_host_ptr();
+        carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
+        let allocator = Arc::new(MailboxSlotAllocator::new());
+        let thread_a = carrick_el1_abi::El1TaskId::from_linux_tid(41);
+
+        // Thread A (file table 7) runs on the vCPU holding slot 0; slot 1 still
+        // names a thread whose vCPU gave it up without anyone clearing it.
+        let first = allocator.allocate().expect("slot 0");
+        assert_eq!(first.id().raw(), 0);
+        current_task(&region, 0).set(thread_a, 1, 7);
+        current_task(&region, 1).set(carrick_el1_abi::El1TaskId::from_linux_tid(99), 1, 9);
+
+        // Reclaim: A's vCPU gives up slot 0, another vCPU takes it, and A's
+        // vCPU resumes on slot 1.
+        drop(first);
+        let occupier = allocator.allocate().expect("slot 0 again");
+        let resumed = allocator.allocate().expect("slot 1");
+        assert_eq!((occupier.id().raw(), resumed.id().raw()), (0, 1));
+        let records = [0usize, 1].map(|slot| {
+            let record = current_task(&region, slot);
+            (
+                record.task_id.load(Ordering::Acquire),
+                record.file_table.load(Ordering::Acquire),
+            )
+        });
+        drop((occupier, resumed));
+        let after_release = current_task(&region, 1).file_table.load(Ordering::Acquire);
+        carrick_el1_abi::record_el1_region_host_ptr(previous);
+        assert_eq!(
+            records,
+            [(0, 0), (0, 0)],
+            "a new lease must start with an empty record: (task, table) of slots 0 and 1"
+        );
+        assert_eq!(after_release, 0, "a released lease must leave no record");
+    }
+
     #[test]
     fn reclaim_releases_slot_and_moves_outstanding_request_to_a_new_slot() {
         let allocator = Arc::new(MailboxSlotAllocator::new());
