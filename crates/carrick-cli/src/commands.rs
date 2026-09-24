@@ -849,7 +849,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 inputs,
                 limit,
                 json,
-            } => crate::debug_el1_census::run_el1_census(&inputs, limit, json)?,
+                results,
+            } => crate::debug_el1_census::run_el1_census(&inputs, limit, json, results.as_deref())?,
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },
         Commands::TraceChild {

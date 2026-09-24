@@ -1025,6 +1025,10 @@ pub(crate) enum DebugCommand {
         /// Print the full aggregate as JSON instead of a table.
         #[arg(long)]
         json: bool,
+        /// A conformance results JSONL: print one row per suite (joined by
+        /// `carrick_run_id`), slowest ratio to Docker first.
+        #[arg(long)]
+        results: Option<PathBuf>,
     },
     /// Parse a complete `CARRICK_EXEC_STAMPS` v2 export, validate every
     /// fork/exec/exit/reap relationship, and print CPU/wall attribution JSON.

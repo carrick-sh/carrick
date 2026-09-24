@@ -137,8 +137,9 @@ pub(crate) fn run_debug(
             inputs,
             limit,
             json,
+            results,
         } => {
-            crate::debug_el1_census::run_el1_census(&inputs, limit, json)?;
+            crate::debug_el1_census::run_el1_census(&inputs, limit, json, results.as_deref())?;
         }
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();
