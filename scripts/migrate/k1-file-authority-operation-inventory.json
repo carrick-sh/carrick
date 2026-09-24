@@ -3,16 +3,16 @@
   "scope": "production Rust sources under crates/carrick-runtime/src, crates/carrick-kernel/src and crates/carrick-vfs/src",
   "counts": {
     "table_guard": 153,
-    "description_guard": 201,
+    "description_guard": 200,
     "description_backing": 24,
-    "epoll": 421,
+    "epoll": 422,
     "stream": 175,
-    "mapping": 1139,
+    "mapping": 1140,
     "lifecycle": 28
   },
   "production_counts": {
     "table_guard": 66,
-    "description_guard": 174,
+    "description_guard": 173,
     "description_backing": 9,
     "epoll": 161,
     "stream": 120,
@@ -21,7 +21,7 @@
   },
   "files": {
     "table_guard": 25,
-    "description_guard": 39,
+    "description_guard": 38,
     "description_backing": 8,
     "epoll": 42,
     "stream": 19,
@@ -206,7 +206,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().ok_or(LINUX_EINVAL)?;",
+      "text": "let open = open_file.description.inspect().ok_or(LINUX_EINVAL)?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -485,7 +485,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let mut open = self.description.write().ok_or(super::LINUX_EBADF)?;",
+      "text": "let mut open = self.description.write_for_io().ok_or(super::LINUX_EBADF)?;",
       "scope_kind": "test_or_definition"
     },
     {
@@ -494,7 +494,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = self.description.read() else {",
+      "text": "let Some(open) = self.description.read_for_io() else {",
       "scope_kind": "test_or_definition"
     },
     {
@@ -639,7 +639,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut desc) = open_file.description.write() {",
+      "text": "if let Some(mut desc) = open_file.description.write_for_io() {",
       "scope_kind": "test_or_definition"
     },
     {
@@ -716,7 +716,25 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3036,
+      "line": 3050,
+      "categories": [
+        "epoll"
+      ],
+      "text": "///   eventfd, epoll, inotify, timerfd, synthetic and directory",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 3055,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// truncate, mmap) through its host fd: while the file is in the zone",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "line": 3060,
       "categories": [
         "description_backing"
       ],
@@ -725,7 +743,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3042,
+      "line": 3067,
       "categories": [
         "description_backing"
       ],
@@ -734,7 +752,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3065,
+      "line": 3086,
       "categories": [
         "description_backing"
       ],
@@ -743,7 +761,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3079,
+      "line": 3111,
       "categories": [
         "description_backing"
       ],
@@ -752,7 +770,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3093,
+      "line": 3125,
       "categories": [
         "description_backing"
       ],
@@ -761,7 +779,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3491,
+      "line": 3545,
       "categories": [
         "epoll"
       ],
@@ -770,7 +788,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3769,
+      "line": 3823,
       "categories": [
         "mapping"
       ],
@@ -779,7 +797,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3770,
+      "line": 3824,
       "categories": [
         "mapping"
       ],
@@ -788,7 +806,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3778,
+      "line": 3832,
       "categories": [
         "mapping"
       ],
@@ -797,7 +815,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3797,
+      "line": 3851,
       "categories": [
         "mapping"
       ],
@@ -806,7 +824,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "line": 3798,
+      "line": 3852,
       "categories": [
         "mapping"
       ],
@@ -828,7 +846,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -846,7 +864,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -855,7 +873,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|of| match of.description.read().as_deref() {",
+      "text": ".and_then(|of| match of.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -864,7 +882,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|of| match of.description.read().as_deref() {",
+      "text": ".and_then(|of| match of.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -873,7 +891,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = of.description.write() {",
+      "text": "if let Some(mut open) = of.description.write_for_io() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -954,7 +972,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let desc = open_file.description.read()?;",
+      "text": "let desc = open_file.description.read_for_io()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -963,7 +981,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -972,7 +990,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|f| f.description.read().and_then(|g| g.open_path().map(str::to_owned)))",
+      "text": ".and_then(|f| f.description.inspect().and_then(|g| g.open_path().map(str::to_owned)))",
       "scope_kind": "production_callsite"
     },
     {
@@ -1000,7 +1018,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "f.description.read().and_then(|g| g.readlink_target())",
+      "text": "f.description.inspect().and_then(|g| g.readlink_target())",
       "scope_kind": "production_callsite"
     },
     {
@@ -1180,7 +1198,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.read_for_io()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -1198,7 +1216,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.read_for_io()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -1216,7 +1234,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -1225,7 +1243,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -1234,7 +1252,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -1252,7 +1270,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1261,7 +1279,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1270,7 +1288,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1279,7 +1297,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -1288,7 +1306,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -1297,7 +1315,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1324,7 +1342,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -1342,7 +1360,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -1351,7 +1369,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -1450,12 +1468,12 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".is_some_and(|open_file| match open_file.description.read().as_deref() {",
+      "text": "|open_file| match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 392,
+      "line": 393,
       "categories": [
         "epoll"
       ],
@@ -1464,7 +1482,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 485,
+      "line": 486,
       "categories": [
         "table_guard"
       ],
@@ -1473,25 +1491,25 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 491,
+      "line": 492,
       "categories": [
         "description_guard"
       ],
-      "text": "}) = of.description.read().as_deref()",
+      "text": "}) = of.description.inspect().as_deref()",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 515,
+      "line": 516,
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 520,
+      "line": 521,
       "categories": [
         "epoll"
       ],
@@ -1500,16 +1518,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 604,
+      "line": 605,
       "categories": [
         "description_guard"
       ],
-      "text": "let g = of.description.read()?;",
+      "text": "let g = of.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1323,
+      "line": 1324,
       "categories": [
         "table_guard"
       ],
@@ -1518,7 +1536,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1341,
+      "line": 1342,
       "categories": [
         "table_guard"
       ],
@@ -1527,7 +1545,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1353,
+      "line": 1354,
       "categories": [
         "table_guard"
       ],
@@ -1536,7 +1554,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1419,
+      "line": 1420,
       "categories": [
         "table_guard"
       ],
@@ -1545,7 +1563,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1532,
+      "line": 1533,
       "categories": [
         "epoll"
       ],
@@ -1554,38 +1572,38 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1538,
+      "line": 1539,
       "categories": [
         "description_guard"
       ],
-      "text": "Some(open_file) => match open_file.description.read().as_deref() {",
+      "text": "Some(open_file) => match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1612,
+      "line": 1613,
       "categories": [
         "description_guard"
       ],
-      "text": "let host_fd = match open_file.description.read().as_deref() {",
+      "text": "let host_fd = match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1635,
+      "line": 1636,
       "categories": [
         "description_guard"
       ],
-      "text": "Some(open_file) => match open_file.description.read().as_deref() {",
+      "text": "Some(open_file) => match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "line": 1667,
+      "line": 1668,
       "categories": [
         "description_guard"
       ],
-      "text": "Some(open_file) => match open_file.description.read().as_deref() {",
+      "text": "Some(open_file) => match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1594,7 +1612,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(open) = open_file.description.read() {",
+      "text": "if let Some(open) = open_file.description.inspect() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1612,7 +1630,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(desc) = open_file.description.read()",
+      "text": "if let Some(desc) = open_file.description.read_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -1621,7 +1639,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -1630,7 +1648,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1639,7 +1657,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1675,7 +1693,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(open) = open_file.description.read()",
+      "text": "if let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite"
     },
     {
@@ -1684,7 +1702,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.write() else {",
+      "text": "let Some(open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1711,7 +1729,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let _guard = open_file.description.write();",
+      "text": "let _guard = open_file.description.write_for_io();",
       "scope_kind": "production_callsite"
     },
     {
@@ -1720,7 +1738,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1738,7 +1756,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let path = match open_file.description.read().as_deref() {",
+      "text": "let path = match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1774,7 +1792,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -1792,7 +1810,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "Some(open_file) => match open_file.description.read().as_deref() {",
+      "text": "Some(open_file) => match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1851,20 +1869,11 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/pathres.rs",
-      "line": 481,
+      "line": 618,
       "categories": [
         "description_guard"
       ],
-      "text": "match self.open_file(dirfd as i32)?.description.read().as_deref() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fs/pathres.rs",
-      "line": 613,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "Some(open_file) => match open_file.description.read().as_deref() {",
+      "text": "Some(open_file) => match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1936,7 +1945,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1945,7 +1954,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let desc = of.description.read();",
+      "text": "let desc = of.description.read_for_io();",
       "scope_kind": "production_callsite"
     },
     {
@@ -1963,7 +1972,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -1990,7 +1999,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2026,7 +2035,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2044,7 +2053,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2062,7 +2071,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2080,7 +2089,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2089,7 +2098,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2098,7 +2107,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2116,7 +2125,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2134,7 +2143,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2143,7 +2152,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read();",
+      "text": "let open = open_file.description.read_for_io();",
       "scope_kind": "production_callsite"
     },
     {
@@ -2152,7 +2161,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2188,7 +2197,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.read_for_io()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -2197,7 +2206,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.read_for_io()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -2206,7 +2215,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = in_file.description.read() else {",
+      "text": "let Some(open) = in_file.description.read_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2224,7 +2233,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = in_file.description.read() else {",
+      "text": "let Some(open) = in_file.description.read_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2323,7 +2332,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -2350,7 +2359,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "Some(of) => match of.description.read().as_deref() {",
+      "text": "Some(of) => match of.description.read_for_io().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2359,7 +2368,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = of.description.write()",
+      "text": "&& let Some(mut open) = of.description.write_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -2405,7 +2414,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|file| file.description.read()?.readlink_target())",
+      "text": ".and_then(|file| file.description.inspect()?.readlink_target())",
       "scope_kind": "test_or_definition"
     },
     {
@@ -2432,7 +2441,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "open_file.description.read().as_deref(),",
+      "text": "open_file.description.inspect().as_deref(),",
       "scope_kind": "test_or_definition"
     },
     {
@@ -2441,7 +2450,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().expect(\"open description\");",
+      "text": "let open = open_file.description.inspect().expect(\"open description\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -2450,7 +2459,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().unwrap();",
+      "text": "let open = open_file.description.inspect().unwrap();",
       "scope_kind": "test_or_definition"
     },
     {
@@ -2459,7 +2468,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().expect(\"open description\");",
+      "text": "let open = open_file.description.inspect().expect(\"open description\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -2774,7 +2783,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let description = open.description.read().expect(\"open description\");",
+      "text": "let description = open.description.inspect().expect(\"open description\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -2864,7 +2873,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "bi_file.description.read().as_deref(),",
+      "text": "bi_file.description.inspect().as_deref(),",
       "scope_kind": "test_or_definition"
     },
     {
@@ -2936,7 +2945,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -2963,7 +2972,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -3017,7 +3026,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -3035,7 +3044,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -3080,7 +3089,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(open) = open_file.description.read()",
+      "text": "if let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite"
     },
     {
@@ -3098,7 +3107,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "Some(of) => match of.description.read().as_deref() {",
+      "text": "Some(of) => match of.description.read_for_io().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -3161,7 +3170,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = file.description.read()?;",
+      "text": "let open = file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -3233,7 +3242,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -3360,7 +3369,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = file.description.read()?;",
+      "text": "let open = file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -3450,7 +3459,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite"
     },
     {
@@ -3495,7 +3504,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -3540,7 +3549,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -3594,7 +3603,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().ok_or(LINUX_ENOTSUP)?;",
+      "text": "let open = open_file.description.inspect().ok_or(LINUX_ENOTSUP)?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -3702,7 +3711,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -3720,7 +3729,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(other_open) = other.description.read() else {",
+      "text": "let Some(other_open) = other.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -3756,7 +3765,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(other_open) = other.description.read() else {",
+      "text": "let Some(other_open) = other.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -3774,7 +3783,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(other_open) = other.description.try_read() else {",
+      "text": "let Some(other_open) = other.description.try_inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -3783,7 +3792,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "of.description.read().as_deref(),",
+      "text": "of.description.inspect().as_deref(),",
       "scope_kind": "production_callsite"
     },
     {
@@ -3792,7 +3801,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -3801,7 +3810,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -3819,7 +3828,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "open_file.description.read().as_deref(),",
+      "text": "open_file.description.inspect().as_deref(),",
       "scope_kind": "production_callsite"
     },
     {
@@ -3837,7 +3846,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -4890,7 +4899,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(desc) = open_file.description.read() else {",
+      "text": "let Some(desc) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -4908,7 +4917,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let is_fifo = match open_file.description.read().as_deref() {",
+      "text": "let is_fifo = match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -5106,7 +5115,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -5431,7 +5440,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.write();",
+      "text": "let open = open_file.description.write_for_io();",
       "scope_kind": "production_callsite"
     },
     {
@@ -5791,7 +5800,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let path = match open_file.description.read().as_deref() {",
+      "text": "let path = match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -5800,7 +5809,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -5809,7 +5818,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.read_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -5989,7 +5998,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read();",
+      "text": "let open = open_file.description.read_for_io();",
       "scope_kind": "production_callsite"
     },
     {
@@ -6651,16 +6660,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 1232,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "match &*mapper.description.read().expect(\"mapper open description\") {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 1318,
+      "line": 1322,
       "categories": [
         "table_guard"
       ],
@@ -6669,7 +6669,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 2137,
+      "line": 2141,
       "categories": [
         "mapping"
       ],
@@ -6678,7 +6678,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 2276,
+      "line": 2280,
       "categories": [
         "mapping"
       ],
@@ -6687,7 +6687,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 2297,
+      "line": 2301,
       "categories": [
         "mapping"
       ],
@@ -6696,7 +6696,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 2651,
+      "line": 2655,
       "categories": [
         "mapping"
       ],
@@ -6705,7 +6705,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 2683,
+      "line": 2687,
       "categories": [
         "mapping"
       ],
@@ -6714,7 +6714,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 2695,
+      "line": 2699,
       "categories": [
         "mapping"
       ],
@@ -6723,7 +6723,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 2999,
+      "line": 3003,
       "categories": [
         "mapping"
       ],
@@ -6732,7 +6732,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 3183,
+      "line": 3187,
       "categories": [
         "mapping"
       ],
@@ -6741,7 +6741,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 3272,
+      "line": 3276,
       "categories": [
         "mapping"
       ],
@@ -6750,7 +6750,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 3374,
+      "line": 3378,
       "categories": [
         "mapping"
       ],
@@ -6759,7 +6759,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 3512,
+      "line": 3516,
       "categories": [
         "mapping"
       ],
@@ -6768,7 +6768,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 3819,
+      "line": 3823,
       "categories": [
         "mapping"
       ],
@@ -6777,7 +6777,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 3821,
+      "line": 3825,
       "categories": [
         "mapping"
       ],
@@ -6786,7 +6786,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4094,
+      "line": 4098,
       "categories": [
         "mapping"
       ],
@@ -6795,7 +6795,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4227,
+      "line": 4231,
       "categories": [
         "mapping"
       ],
@@ -6804,7 +6804,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4307,
+      "line": 4311,
       "categories": [
         "mapping"
       ],
@@ -6813,7 +6813,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4313,
+      "line": 4317,
       "categories": [
         "mapping"
       ],
@@ -6822,7 +6822,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4320,
+      "line": 4324,
       "categories": [
         "mapping"
       ],
@@ -6831,7 +6831,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4358,
+      "line": 4362,
       "categories": [
         "mapping"
       ],
@@ -6840,7 +6840,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4364,
+      "line": 4368,
       "categories": [
         "mapping"
       ],
@@ -6849,7 +6849,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4369,
+      "line": 4373,
       "categories": [
         "mapping"
       ],
@@ -6858,7 +6858,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4382,
+      "line": 4386,
       "categories": [
         "mapping"
       ],
@@ -6867,7 +6867,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4414,
+      "line": 4418,
       "categories": [
         "mapping"
       ],
@@ -6876,7 +6876,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4434,
+      "line": 4438,
       "categories": [
         "mapping"
       ],
@@ -6885,7 +6885,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4468,
+      "line": 4472,
       "categories": [
         "mapping"
       ],
@@ -6894,7 +6894,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4512,
+      "line": 4516,
       "categories": [
         "mapping"
       ],
@@ -6903,7 +6903,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4528,
+      "line": 4532,
       "categories": [
         "mapping"
       ],
@@ -6912,7 +6912,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4560,
+      "line": 4564,
       "categories": [
         "mapping"
       ],
@@ -6921,7 +6921,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4579,
+      "line": 4583,
       "categories": [
         "mapping"
       ],
@@ -6930,7 +6930,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4591,
+      "line": 4595,
       "categories": [
         "mapping"
       ],
@@ -6939,7 +6939,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4755,
+      "line": 4759,
       "categories": [
         "mapping"
       ],
@@ -6948,7 +6948,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4759,
+      "line": 4763,
       "categories": [
         "mapping"
       ],
@@ -6957,7 +6957,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4771,
+      "line": 4775,
       "categories": [
         "mapping"
       ],
@@ -6966,7 +6966,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4772,
+      "line": 4776,
       "categories": [
         "mapping"
       ],
@@ -6975,7 +6975,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4779,
+      "line": 4783,
       "categories": [
         "mapping"
       ],
@@ -6984,7 +6984,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 4784,
+      "line": 4788,
       "categories": [
         "mapping"
       ],
@@ -6993,7 +6993,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 5029,
+      "line": 5033,
       "categories": [
         "mapping"
       ],
@@ -7002,7 +7002,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 5064,
+      "line": 5068,
       "categories": [
         "mapping"
       ],
@@ -7011,7 +7011,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 5070,
+      "line": 5074,
       "categories": [
         "mapping"
       ],
@@ -7020,7 +7020,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 5212,
+      "line": 5216,
       "categories": [
         "mapping"
       ],
@@ -7029,7 +7029,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 5401,
+      "line": 5405,
       "categories": [
         "mapping"
       ],
@@ -7038,7 +7038,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 5481,
+      "line": 5485,
       "categories": [
         "mapping"
       ],
@@ -7047,7 +7047,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 5780,
+      "line": 5784,
       "categories": [
         "mapping"
       ],
@@ -7056,7 +7056,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 5801,
+      "line": 5805,
       "categories": [
         "mapping"
       ],
@@ -7065,7 +7065,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 5980,
+      "line": 5984,
       "categories": [
         "mapping"
       ],
@@ -7074,7 +7074,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 5992,
+      "line": 5996,
       "categories": [
         "mapping"
       ],
@@ -7083,7 +7083,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 5993,
+      "line": 5997,
       "categories": [
         "mapping"
       ],
@@ -7092,7 +7092,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 6020,
+      "line": 6024,
       "categories": [
         "mapping"
       ],
@@ -7101,7 +7101,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 6056,
+      "line": 6060,
       "categories": [
         "mapping"
       ],
@@ -7110,7 +7110,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 6061,
+      "line": 6065,
       "categories": [
         "mapping"
       ],
@@ -7119,7 +7119,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 6065,
+      "line": 6069,
       "categories": [
         "mapping"
       ],
@@ -7128,7 +7128,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 6068,
+      "line": 6072,
       "categories": [
         "mapping"
       ],
@@ -7137,7 +7137,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 6088,
+      "line": 6092,
       "categories": [
         "mapping"
       ],
@@ -7146,7 +7146,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 6092,
+      "line": 6096,
       "categories": [
         "mapping"
       ],
@@ -7155,7 +7155,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 6103,
+      "line": 6107,
       "categories": [
         "mapping"
       ],
@@ -7164,7 +7164,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 6144,
+      "line": 6148,
       "categories": [
         "mapping"
       ],
@@ -7173,7 +7173,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 6233,
+      "line": 6237,
       "categories": [
         "mapping"
       ],
@@ -7182,7 +7182,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 6310,
+      "line": 6314,
       "categories": [
         "mapping"
       ],
@@ -7191,7 +7191,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 6784,
+      "line": 6788,
       "categories": [
         "mapping"
       ],
@@ -8113,7 +8113,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let classic_lock_release_fd = match open_file.description.read().as_deref() {",
+      "text": "let classic_lock_release_fd = match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8122,7 +8122,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(open) = open_file.description.read() {",
+      "text": "if let Some(open) = open_file.description.inspect() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8131,7 +8131,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "open_file.description.read().as_deref(),",
+      "text": "open_file.description.inspect().as_deref(),",
       "scope_kind": "production_callsite"
     },
     {
@@ -8149,7 +8149,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(description) = open_file.description.read() else {",
+      "text": "let Some(description) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8158,7 +8158,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(description) = open_file.description.read() else {",
+      "text": "let Some(description) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8167,7 +8167,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let mut open = self.description.write().ok_or(LINUX_EBADF)?;",
+      "text": "let mut open = self.description.write_for_io().ok_or(LINUX_EBADF)?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -8185,7 +8185,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().ok_or(LINUX_EBADF)?;",
+      "text": "let open = open_file.description.inspect().ok_or(LINUX_EBADF)?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -8221,7 +8221,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.write() else {",
+      "text": "let Some(open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8230,7 +8230,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.write() else {",
+      "text": "let Some(open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8280,25 +8280,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1839,
+      "line": 1874,
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().expect(\"netlink description\");",
+      "text": "let open = self.description.inspect();",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1871,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = self.description.read();",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1908,
+      "line": 1911,
       "categories": [
         "table_guard"
       ],
@@ -8307,7 +8298,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1913,
+      "line": 1916,
       "categories": [
         "table_guard"
       ],
@@ -8316,7 +8307,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1924,
+      "line": 1927,
       "categories": [
         "table_guard"
       ],
@@ -8325,7 +8316,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 2590,
+      "line": 2593,
       "categories": [
         "table_guard"
       ],
@@ -8334,7 +8325,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 2751,
+      "line": 2754,
       "categories": [
         "table_guard"
       ],
@@ -8393,7 +8384,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8402,7 +8393,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "match open_file.description.read().as_deref() {",
+      "text": "match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8411,7 +8402,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "open_file.description.read().as_deref(),",
+      "text": "open_file.description.inspect().as_deref(),",
       "scope_kind": "production_callsite"
     },
     {
@@ -8528,7 +8519,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8618,7 +8609,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8645,7 +8636,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8681,7 +8672,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8726,7 +8717,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -8744,7 +8735,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9149,7 +9140,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9257,7 +9248,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "open_file.description.read().as_deref(),",
+      "text": "open_file.description.inspect().as_deref(),",
       "scope_kind": "production_callsite"
     },
     {
@@ -9266,7 +9257,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read().ok_or(LINUX_ENOTSOCK)?;",
+      "text": "let open = open_file.description.inspect().ok_or(LINUX_ENOTSOCK)?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -9275,7 +9266,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.connect_in_progress())",
+      "text": "matches!(of.description.inspect().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.connect_in_progress())",
       "scope_kind": "production_callsite"
     },
     {
@@ -9284,7 +9275,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9293,7 +9284,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9302,7 +9293,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let mut open = open_file.description.write()?;",
+      "text": "let mut open = open_file.description.write_for_io()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -9311,7 +9302,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9320,7 +9311,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9329,7 +9320,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let mut open = open_file.description.write().ok_or(LINUX_ENOTSOCK)?;",
+      "text": "let mut open = open_file.description.write_for_io().ok_or(LINUX_ENOTSOCK)?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -9338,7 +9329,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9347,7 +9338,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "matches!(of.description.read().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_passcred())",
+      "text": "matches!(of.description.inspect().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_passcred())",
       "scope_kind": "production_callsite"
     },
     {
@@ -9356,7 +9347,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -9365,7 +9356,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -9374,7 +9365,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -9392,7 +9383,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9401,7 +9392,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let mut open = open_file.description.write()?;",
+      "text": "let mut open = open_file.description.write_for_io()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -9410,7 +9401,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "match open_file.description.read().as_deref() {",
+      "text": "match open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9437,7 +9428,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9446,7 +9437,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9455,7 +9446,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read();",
+      "text": "let open = open_file.description.inspect();",
       "scope_kind": "production_callsite"
     },
     {
@@ -9464,7 +9455,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9473,7 +9464,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(OpenDescription::Netlink { pid, groups, .. }) = open_file.description.read().as_deref()",
+      "text": "&& let Some(OpenDescription::Netlink { pid, groups, .. }) = open_file.description.inspect().as_deref()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9482,7 +9473,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9491,7 +9482,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9500,7 +9491,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9509,7 +9500,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "of.description.read().as_deref(),",
+      "text": "of.description.inspect().as_deref(),",
       "scope_kind": "production_callsite"
     },
     {
@@ -9518,7 +9509,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9527,7 +9518,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9536,7 +9527,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9545,7 +9536,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9599,7 +9590,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9608,7 +9599,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|f| f.description.read()?.send_timeout());",
+      "text": ".and_then(|f| f.description.inspect()?.send_timeout());",
       "scope_kind": "production_callsite"
     },
     {
@@ -9617,7 +9608,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9635,7 +9626,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|f| f.description.read()?.recv_timeout());",
+      "text": ".and_then(|f| f.description.inspect()?.recv_timeout());",
       "scope_kind": "production_callsite"
     },
     {
@@ -9644,7 +9635,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9653,7 +9644,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|f| f.description.read()?.send_timeout());",
+      "text": ".and_then(|f| f.description.inspect()?.send_timeout());",
       "scope_kind": "production_callsite"
     },
     {
@@ -9671,7 +9662,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(open) = open_file.description.read()",
+      "text": "&& let Some(open) = open_file.description.inspect()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9680,7 +9671,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": ".and_then(|f| f.description.read()?.recv_timeout());",
+      "text": ".and_then(|f| f.description.inspect()?.recv_timeout());",
       "scope_kind": "production_callsite"
     },
     {
@@ -9689,7 +9680,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(desc) = of.description.read() else {",
+      "text": "let Some(desc) = of.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9698,7 +9689,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9707,7 +9698,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9716,7 +9707,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
+      "text": "&& let Some(mut open) = open_file.description.write_for_io()",
       "scope_kind": "production_callsite"
     },
     {
@@ -9725,7 +9716,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9734,7 +9725,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
+      "text": "if let Some(mut open) = open_file.description.write_for_io() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9743,7 +9734,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9752,7 +9743,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(desc) = of.description.read() else {",
+      "text": "let Some(desc) = of.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9761,7 +9752,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9770,7 +9761,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read();",
+      "text": "let open = open_file.description.inspect();",
       "scope_kind": "production_callsite"
     },
     {
@@ -9779,7 +9770,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "&& let Some(OpenDescription::HostSocket { base, .. }) = open_file.description.read().as_deref() {",
+      "text": "&& let Some(OpenDescription::HostSocket { base, .. }) = open_file.description.inspect().as_deref() {",
       "scope_kind": "production_callsite"
     },
     {
@@ -9978,7 +9969,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -10077,7 +10068,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "f.description.read().as_deref(),",
+      "text": "f.description.inspect().as_deref(),",
       "scope_kind": "production_callsite"
     },
     {
@@ -10600,7 +10591,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = open_file.description.read()?;",
+      "text": "let open = open_file.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -10636,7 +10627,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let desc = open.description.read()?;",
+      "text": "let desc = open.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -10645,7 +10636,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(desc) = open.description.read() else {",
+      "text": "let Some(desc) = open.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -10672,7 +10663,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let d = f.description.read()?;",
+      "text": "let d = f.description.inspect()?;",
       "scope_kind": "production_callsite"
     },
     {
@@ -10726,7 +10717,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(mut open) = open_file.description.write_for_io() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -10906,7 +10897,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = epoll_open.description.read().expect(\"open description\");",
+      "text": "let open = epoll_open.description.inspect().expect(\"open description\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -11204,7 +11195,7 @@
         "description_guard",
         "epoll"
       ],
-      "text": "let mut open = epoll.description.write().unwrap();",
+      "text": "let mut open = epoll.description.write_for_io().unwrap();",
       "scope_kind": "test_or_definition"
     },
     {
@@ -11259,7 +11250,7 @@
         "description_guard",
         "epoll"
       ],
-      "text": "let open = epoll.description.read().unwrap();",
+      "text": "let open = epoll.description.inspect().unwrap();",
       "scope_kind": "test_or_definition"
     },
     {
@@ -11565,7 +11556,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let open = epoll_open.description.read().expect(\"open description\");",
+      "text": "let open = epoll_open.description.inspect().expect(\"open description\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -12016,7 +12007,7 @@
         "description_guard",
         "epoll"
       ],
-      "text": "let epoll = epoll.description.read().expect(\"epoll open description\");",
+      "text": "let epoll = epoll.description.inspect().expect(\"epoll open description\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -12062,7 +12053,7 @@
         "description_guard",
         "epoll"
       ],
-      "text": "let epoll = epoll.description.read().expect(\"epoll open description\");",
+      "text": "let epoll = epoll.description.inspect().expect(\"epoll open description\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -12126,7 +12117,7 @@
         "description_guard",
         "epoll"
       ],
-      "text": "let epoll = epoll.description.read().expect(\"open description\");",
+      "text": "let epoll = epoll.description.inspect().expect(\"open description\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -12216,7 +12207,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -12225,7 +12216,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(open) = open_file.description.read() else {",
+      "text": "let Some(open) = open_file.description.inspect() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -12369,7 +12360,7 @@
       "categories": [
         "description_guard"
       ],
-      "text": "let guard = open.description.read().unwrap();",
+      "text": "let guard = open.description.read_for_io().unwrap();",
       "scope_kind": "test_or_definition"
     },
     {
@@ -12378,48 +12369,66 @@
       "categories": [
         "description_guard"
       ],
-      "text": "drop(open.description.read().unwrap());",
+      "text": "drop(open.description.read_for_io().unwrap());",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 2132,
+      "line": 2118,
       "categories": [
         "description_guard"
       ],
-      "text": "drop(second.description.read());",
+      "text": "let guard = open.description.inspect().unwrap();",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 2134,
+      "line": 2121,
       "categories": [
         "description_guard"
       ],
-      "text": "let raw = |open: &OpenFile| match &*open.description.read().unwrap() {",
+      "text": "drop(open.description.try_inspect().unwrap());",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 2152,
+      "line": 2157,
       "categories": [
         "description_guard"
       ],
-      "text": "drop(second.description.read());",
+      "text": "drop(second.description.read_for_io());",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 2155,
+      "line": 2159,
       "categories": [
         "description_guard"
       ],
-      "text": "drop(first.description.read());",
+      "text": "let raw = |open: &OpenFile| match &*open.description.read_for_io().unwrap() {",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 2245,
+      "line": 2177,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "drop(second.description.read_for_io());",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "line": 2180,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "drop(first.description.read_for_io());",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "line": 2270,
       "categories": [
         "mapping"
       ],
@@ -12428,7 +12437,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 2249,
+      "line": 2274,
       "categories": [
         "mapping"
       ],
@@ -12437,11 +12446,11 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 2283,
+      "line": 2308,
       "categories": [
         "description_guard"
       ],
-      "text": "drop(open_a.description.read());",
+      "text": "drop(open_a.description.read_for_io());",
       "scope_kind": "test_or_definition"
     },
     {
