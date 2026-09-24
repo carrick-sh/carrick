@@ -162,6 +162,30 @@ pub struct TrapFrame {
 
 pub use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+/// Linux thread identity as published into a [`CurrentTask`] record.
+///
+/// The record stores a `u64` word; this newtype is the only way to produce or
+/// compare that word, so a bare `tid as u64` (which sign-extends) can never
+/// cross the host/EL1 boundary. `NONE` (0) means no task is bound.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct El1TaskId(u64);
+
+impl El1TaskId {
+    /// No task bound to the slot.
+    pub const NONE: Self = Self(0);
+
+    /// Zero-extend a Linux tid (always positive) into the record word.
+    pub const fn from_linux_tid(tid: i32) -> Self {
+        Self(tid as u32 as u64)
+    }
+
+    /// The record word.
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// Per-vCPU slot task record published by the host runtime before running
 /// a vCPU and cleared when unloaded.
 #[repr(C, align(8))]
@@ -169,7 +193,7 @@ pub use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub struct CurrentTask {
     /// Host-managed generation of the currently loaded task.
     pub generation: AtomicU64,
-    /// Task ID / LinuxTid of the currently loaded task.
+    /// [`El1TaskId`] word of the currently loaded task (0 = none).
     pub task_id: AtomicU64,
     /// Raw FileTableId of the currently loaded task (0 = none/unbound).
     pub file_table: AtomicU64,
@@ -211,8 +235,8 @@ impl CurrentTask {
     }
 
     #[inline]
-    pub fn set(&self, task_id: u64, generation: u64, file_table: u64) {
-        self.task_id.store(task_id, Ordering::Relaxed);
+    pub fn set(&self, task_id: El1TaskId, generation: u64, file_table: u64) {
+        self.task_id.store(task_id.raw(), Ordering::Relaxed);
         self.generation.store(generation, Ordering::Release);
         self.file_table.store(file_table, Ordering::Release);
     }
@@ -542,7 +566,7 @@ pub fn mark_pending_host_work_all() {
 }
 
 /// Mark return-to-user work pending for any vCPU slot running the given task identity (tid).
-pub fn mark_pending_host_work_for_task(tid: u64) {
+pub fn mark_pending_host_work_for_task(tid: El1TaskId) {
     let ptr = get_el1_region_host_ptr();
     if ptr == 0 {
         return;
@@ -550,14 +574,14 @@ pub fn mark_pending_host_work_for_task(tid: u64) {
     for slot in 0..EL1_STACK_SLOTS as usize {
         let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
         let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-        if current_task.task_id.load(Ordering::Relaxed) == tid {
+        if current_task.task_id.load(Ordering::Relaxed) == tid.raw() {
             current_task.pending_host_work.store(1, Ordering::Release);
         }
     }
 }
 
 /// Update the file table for any vCPU slot running the given task identity (tid).
-pub fn update_current_task_file_table_for_task(tid: u64, file_table: u64) {
+pub fn update_current_task_file_table_for_task(tid: El1TaskId, file_table: u64) {
     let ptr = get_el1_region_host_ptr();
     if ptr == 0 {
         return;
@@ -565,7 +589,7 @@ pub fn update_current_task_file_table_for_task(tid: u64, file_table: u64) {
     for slot in 0..EL1_STACK_SLOTS as usize {
         let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
         let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-        if current_task.task_id.load(Ordering::Relaxed) == tid {
+        if current_task.task_id.load(Ordering::Relaxed) == tid.raw() {
             current_task.file_table.store(file_table, Ordering::Release);
         }
     }
@@ -667,13 +691,23 @@ mod tests {
     }
 
     #[test]
+    fn el1_task_id_zero_extends_and_never_matches_none() {
+        assert_eq!(El1TaskId::NONE.raw(), 0);
+        assert_eq!(El1TaskId::from_linux_tid(7).raw(), 7);
+        // A bare `tid as u64` would sign-extend a negative i32; the typed
+        // constructor zero-extends so the word is always a 32-bit value.
+        assert_eq!(El1TaskId::from_linux_tid(-1).raw(), 0xffff_ffff);
+        assert_ne!(El1TaskId::from_linux_tid(-1).raw(), (-1i32) as u64);
+    }
+
+    #[test]
     fn test_current_task_operations() {
         let task = CurrentTask::new();
         assert_eq!(task.task_id.load(Ordering::Relaxed), 0);
         assert_eq!(task.generation.load(Ordering::Relaxed), 0);
         assert_eq!(task.file_table.load(Ordering::Relaxed), 0);
 
-        task.set(7, 42, 100);
+        task.set(El1TaskId::from_linux_tid(7), 42, 100);
         assert_eq!(task.task_id.load(Ordering::Relaxed), 7);
         assert_eq!(task.generation.load(Ordering::Relaxed), 42);
         assert_eq!(task.file_table.load(Ordering::Relaxed), 100);
@@ -745,12 +779,12 @@ mod tests {
         task_6.task_id.store(43, Ordering::Relaxed);
 
         task_5.task_id.store(42, Ordering::Relaxed);
-        mark_pending_host_work_for_task(42);
+        mark_pending_host_work_for_task(El1TaskId::from_linux_tid(42));
         assert!(task_5.has_pending_host_work());
         assert!(!task_6.has_pending_host_work()); // sibling task remains untouched
 
         task_5.file_table.store(100, Ordering::Relaxed);
-        update_current_task_file_table_for_task(42, 200);
+        update_current_task_file_table_for_task(El1TaskId::from_linux_tid(42), 200);
         assert_eq!(task_5.file_table.load(Ordering::Acquire), 200);
         assert_eq!(task_6.file_table.load(Ordering::Acquire), 0);
 

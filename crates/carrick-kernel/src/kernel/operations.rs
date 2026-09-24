@@ -1079,7 +1079,7 @@ impl Kernel {
             drop(state);
             crate::dispatch::resources::update_captured_file_table(&files);
             crate::el1_delegation::update_current_task_file_table_for_task(
-                context.thread.key().tid.raw() as u64,
+                carrick_el1_abi::El1TaskId::from_linux_tid(context.thread.key().tid.raw()),
                 files.id().raw(),
             );
             self.retire_file_table_generation(&old_files, Some(&files), None);
