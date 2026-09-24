@@ -270,6 +270,12 @@ pub fn el1_inotify_read(
         return Err(Action::Forward);
     }
 
+    // A host spill holds records queued after the zone's, in order: the host
+    // serves reads until it drains (and refills the zone).
+    if inotify.spilled.load(Ordering::Acquire) != 0 {
+        return Err(Action::Forward);
+    }
+
     if !inotify.lock_guest_bounded(EL1_GUEST_LOCK_SPINS) {
         return Err(Action::Forward);
     }
@@ -280,31 +286,55 @@ pub fn el1_inotify_read(
         if flags & O_NONBLOCK != 0 {
             return Ok(-11); // -EAGAIN
         } else {
-            return Err(Action::Forward); // Host recalls and blocks
+            return Err(Action::Forward); // The host blocks.
         }
     }
 
+    // Validate the whole destination before consuming anything: a record
+    // drained from the queue must reach the guest or not leave the queue.
+    let want = count.min(inotify.queued_bytes.load(Ordering::Acquire));
+    if validator.writable_bytes(buf_va, want) < want {
+        inotify.unlock();
+        return Err(Action::Forward);
+    }
+
+    // Return every whole record that fits `count` (inotify(7)), staged through
+    // a bounded buffer that holds at least one maximal record.
     let mut temp = [0u8; 512];
-    let to_drain = count.min(temp.len());
-    let drained = match inotify.drain_into(&mut temp[..to_drain]) {
-        Ok(n) => n,
-        Err(_) => {
+    let mut copied = 0usize;
+    while copied < count && inotify.has_records() {
+        let room = (count - copied).min(temp.len());
+        let drained = match inotify.drain_into(&mut temp[..room]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // The next record does not fit what is left: a short read, or
+            // (nothing copied) the host's exact EINVAL.
+            Err(_) if copied > 0 => break,
+            Err(_) => {
+                inotify.unlock();
+                return Err(Action::Forward);
+            }
+        };
+        // SAFETY: `buf_va + copied .. + drained` lies inside the range
+        // validated above; a concurrent unmap faults into the fixup.
+        let ok = unsafe {
+            copy_to_user_guarded(
+                cur_task,
+                (buf_va + copied as u64) as *mut u8,
+                temp.as_ptr(),
+                drained,
+            )
+        };
+        if !ok {
+            // The records are consumed, as Linux consumes an event whose copy
+            // faults: report what reached the guest, or EFAULT.
             inotify.unlock();
-            return Err(Action::Forward);
+            return Ok(if copied > 0 { copied as i64 } else { -14 });
         }
-    };
+        copied += drained;
+    }
     inotify.unlock();
-
-    let writable = validator.writable_bytes(buf_va, drained);
-    if writable < drained {
-        return Err(Action::Forward);
-    }
-
-    let ok = unsafe { copy_to_user_guarded(cur_task, buf_va as *mut u8, temp.as_ptr(), drained) };
-    if !ok {
-        return Err(Action::Forward);
-    }
-    Ok(drained as i64)
+    Ok(copied as i64)
 }
 
 #[cfg(test)]
@@ -322,6 +352,112 @@ mod tests {
         fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
             len
         }
+    }
+
+    fn live_instance(fd_map: &[FdMapSlot], table: u64, fd: i32) -> DelegatedInotify {
+        let instance = DelegatedInotify::new();
+        instance
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Release);
+        instance.flags.store(O_NONBLOCK, Ordering::Release);
+        fd_map[0].file_table.store(table, Ordering::Relaxed);
+        fd_map[0].fd.store(fd as u32, Ordering::Relaxed);
+        fd_map[0].handle.store(
+            carrick_el1_abi::FD_HANDLE_INOTIFY_TAG | 1,
+            Ordering::Relaxed,
+        );
+        fd_map[0].incarnation.store(1, Ordering::Release);
+        instance
+    }
+
+    /// A buffer whose first record's worth of bytes is mapped and the rest is
+    /// not.
+    struct OneRecordWritable;
+
+    impl MemoryValidator for OneRecordWritable {
+        fn writable_bytes(&self, _user_va: u64, len: usize) -> usize {
+            len.min(16)
+        }
+
+        fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
+            len.min(16)
+        }
+    }
+
+    #[test]
+    fn a_large_read_returns_every_whole_record_that_fits() {
+        extern crate std;
+        let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
+        let task = CurrentTask::new();
+        task.set(El1TaskId::from_linux_tid(1), 1, 7);
+        let instance = std::boxed::Box::new(live_instance(&fd_map, 7, 4));
+        for wd in 1..=128 {
+            let _ = instance.push_record(wd, 0x8000, 0, None);
+        }
+        let table = core::slice::from_ref(&*instance);
+        let mut buf = std::vec![0u8; 65536];
+        let got = el1_inotify_read(
+            4,
+            buf.as_mut_ptr() as u64,
+            buf.len(),
+            &task,
+            &fd_map,
+            table,
+            &AllWritable,
+        );
+        assert_eq!(got, Ok(128 * 16));
+        assert_eq!(
+            i32::from_ne_bytes([
+                buf[127 * 16],
+                buf[127 * 16 + 1],
+                buf[127 * 16 + 2],
+                buf[127 * 16 + 3]
+            ]),
+            128
+        );
+        assert!(!instance.has_records());
+    }
+
+    #[test]
+    fn an_unwritable_buffer_forwards_without_consuming_records() {
+        extern crate std;
+        let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
+        let task = CurrentTask::new();
+        task.set(El1TaskId::from_linux_tid(1), 1, 7);
+        let instance = std::boxed::Box::new(live_instance(&fd_map, 7, 4));
+        let _ = instance.push_record(1, 0x2, 0, None);
+        let _ = instance.push_record(2, 0x2, 0, None);
+        let table = core::slice::from_ref(&*instance);
+        assert_eq!(
+            el1_inotify_read(4, 0x1000, 64, &task, &fd_map, table, &OneRecordWritable),
+            Err(Action::Forward)
+        );
+        // Both records are still queued for the host to deliver exactly.
+        assert_eq!(instance.queued_bytes.load(Ordering::Acquire), 32);
+    }
+
+    #[test]
+    fn a_spilled_instance_forwards_reads_to_the_host() {
+        extern crate std;
+        let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
+        let task = CurrentTask::new();
+        task.set(El1TaskId::from_linux_tid(1), 1, 7);
+        let instance = std::boxed::Box::new(live_instance(&fd_map, 7, 4));
+        instance.spilled.store(1, Ordering::Release);
+        let table = core::slice::from_ref(&*instance);
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            el1_inotify_read(
+                4,
+                buf.as_mut_ptr() as u64,
+                buf.len(),
+                &task,
+                &fd_map,
+                table,
+                &AllWritable
+            ),
+            Err(Action::Forward)
+        );
     }
 
     /// `read` falls back to the inotify path for every fd that is not an
