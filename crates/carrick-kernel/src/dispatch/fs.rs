@@ -1343,6 +1343,10 @@ impl<'a> FsView<'a> {
         if let Some(errno) = self.may_write(&resolved) {
             return Ok(DispatchOutcome::errno(errno));
         }
+        // The host inode is truncated directly: an in-zone copy leaves the
+        // zone first, or its older size and pages would be written back over
+        // the truncation.
+        crate::el1_delegation::recall_path(self.fs, &resolved);
         if let Some(errno) = self.rlimit_fsize_errno(length) {
             return Ok(DispatchOutcome::errno(errno));
         }

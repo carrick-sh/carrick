@@ -521,6 +521,12 @@ impl<'a> FsView<'a> {
         if let Some(outcome) = Self::record_unimplemented_virtual_file(reporter, &path) {
             return Ok(outcome);
         }
+        // O_TRUNC truncates the host inode itself: an in-zone copy leaves the
+        // zone first, or its older size and pages would be written back over
+        // the truncation.
+        if want_trunc {
+            crate::el1_delegation::recall_path(self.fs, &path);
+        }
         // Layered overlay+rootfs lookup with full openat semantics
         // (O_CREAT/O_EXCL/O_TRUNC, write-promotion of rootfs-only
         // files) lives in RootFsVfs::open_for_dispatch.
