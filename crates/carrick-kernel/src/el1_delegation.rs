@@ -2366,6 +2366,35 @@ mod tests {
         }
 
         #[test]
+        fn test_recall_unregisters_inode_before_vfs_calls() {
+            let _region = TestEl1Region::new();
+            let (_tmp, host_file) = create_test_host_file(b"initial data");
+            let table_id = FileTableId::from_raw_u64(1).unwrap();
+            let inode = host_file
+                .description
+                .read()
+                .unwrap()
+                .inode_identity_fast()
+                .unwrap();
+
+            let handle = delegate_for_test(&host_file, table_id, 3).expect("delegate");
+            assert_eq!(handle, 1);
+            assert!(is_inode_delegated(inode));
+
+            // Mark a page dirty in EL1 cache to force writeback during recall
+            let ptr = get_el1_region_host_ptr();
+            let file_ptr = (ptr + EL1_OBJECT_TABLE_OFFSET as usize) as *const DelegatedFile;
+            let file = unsafe { &*file_ptr };
+            file.dirty_mask.store(1, Ordering::Release);
+
+            recall(&host_file.description).expect("recall");
+            assert!(
+                !is_inode_delegated(inode),
+                "inode must be unregistered before VFS writeback completes"
+            );
+        }
+
+        #[test]
         fn test_delegate_rejects_o_path() {
             let _region = TestEl1Region::new();
             let dispatcher = crate::dispatch::SyscallDispatcher::new();
