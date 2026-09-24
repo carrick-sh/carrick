@@ -1674,6 +1674,62 @@ mod tests {
         }
 
         #[test]
+        fn test_fstat_on_delegated_host_fd_recalls_and_sees_current_size() {
+            let _region = TestEl1Region::new();
+            let scratch = tempfile::tempdir().unwrap();
+            let file_path = scratch.path().join("test_fstat.txt");
+            std::fs::write(&file_path, b"1234567890").unwrap();
+
+            let backend =
+                carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+            let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+            dispatcher.set_fs_backend(Box::new(backend));
+
+            let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+                1,
+                crate::thread::ThreadId::synthetic_for_tests(1),
+                "test-fstat-delegated".to_owned(),
+            )
+            .expect("root bootstrap");
+            let ctx = crate::kernel::Kernel::bootstrap_root(bootstrap)
+                .expect("root kernel")
+                .1;
+            let table = ctx.task().leader_file_table().unwrap();
+            let table_id = table.id();
+
+            let fd_a = open_path_for_test(
+                &dispatcher,
+                &ctx,
+                "/test_fstat.txt",
+                carrick_abi::LINUX_O_RDWR,
+            );
+
+            let open_file_a = dispatcher.open_file(fd_a).expect("open_file A");
+            let handle = delegate(&open_file_a, table_id, fd_a, dispatcher.fs(), None, None)
+                .expect("delegate A");
+
+            // Simulate EL1 extending the file size to 1000 bytes
+            let region_ptr = get_el1_region_host_ptr();
+            let file_ptr = (region_ptr
+                + EL1_OBJECT_TABLE_OFFSET as usize
+                + (handle as usize - 1) * core::mem::size_of::<DelegatedFile>())
+                as *const DelegatedFile;
+            let file = unsafe { &*file_ptr };
+            file.size.store(1000, Ordering::Release);
+            file.dirty_mask.store(1, Ordering::Release);
+
+            // Calling fstat on fd_a must recall the delegated file and report the updated size
+            let stat_rec = dispatcher.fd_stat_record(fd_a).expect("fd_stat_record");
+
+            assert_eq!(
+                open_file_a.description.delegation_handle(),
+                0,
+                "fd_a must be recalled when fstat is called"
+            );
+            assert_eq!(stat_rec.size, 1000, "fstat must see extended size from EL1");
+        }
+
+        #[test]
         fn test_pq_handle_reuse_cache_pages_zeroed() {
             let _region = TestEl1Region::new();
             let scratch = tempfile::tempdir().unwrap();
