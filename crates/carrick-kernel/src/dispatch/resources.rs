@@ -359,7 +359,7 @@ pub(super) fn with_retiring_file_table<R>(
 ///
 /// `None` only where no boundary has installed a binding (unit tests and lanes
 /// with no kernel graph); callers fall back to the defaults.
-pub(super) fn rlimits() -> Option<crate::kernel::RlimitSet> {
+pub(crate) fn rlimits() -> Option<crate::kernel::RlimitSet> {
     CAPTURED_RESOURCES.with(|stack| {
         stack
             .borrow()
