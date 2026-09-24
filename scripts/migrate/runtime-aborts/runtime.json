@@ -94,6 +94,28 @@
       "domain": "dispatch::fd_table"
     },
     {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "function": "crate::kernel::FileDescription::read",
+      "ordinal_in_function": 1,
+      "fingerprint": "56629cf872f9be0ad7f5d805ac5698f7dd868d58a1374235a76d26da173122fc",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "FileDescription::read recall loop exceeded bounded iterations due to dead or crashed vCPU holding object lock.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
+      "function": "crate::kernel::FileDescription::write",
+      "ordinal_in_function": 1,
+      "fingerprint": "ad71bb5bd204ac3f7b5a27af1d206ed3c8aae983c016fff5387b5c3d68161a62",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "FileDescription::write recall loop exceeded bounded iterations due to dead or crashed vCPU holding object lock.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
       "file": "crates/carrick-kernel/src/dispatch/io_buffers.rs",
       "function": "random_device_bytes",
       "ordinal_in_function": 1,
@@ -1603,7 +1625,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "function": "FileDescription::retain_mapping",
+      "function": "FileDescription::retain_mapping_with_inode",
       "ordinal_in_function": 1,
       "fingerprint": "f99681100c24162c74af8907d6aef5cd40f511ae1a78a8a33c4966935bdf75c6",
       "verdict": "carrier_fault",
@@ -2454,7 +2476,7 @@
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "function": "lock_delegated_file",
       "ordinal_in_function": 1,
-      "fingerprint": "a52a55b62ccdb6f7c90d61ebdc0f19c0f31ee3e0260ee99314cdcad1a7adcb44",
+      "fingerprint": "ec9ff49c339f702a67b26c3fcb06327aba0bc145a25f5227a301086a1fdcaaaa",
       "verdict": "carrier_fault",
       "failure_domain": "el1_delegation",
       "rationale": "Host timed out spinning on delegated file lock held by EL1, indicating guest corruption, protocol violation, or deadlock.",

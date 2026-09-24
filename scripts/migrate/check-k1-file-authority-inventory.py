@@ -187,10 +187,10 @@ def is_out_of_line_test_module(path: Path) -> bool:
 def generate() -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     for path in sorted(p for source in SOURCES for p in source.rglob("*.rs")):
-        if path.is_relative_to(FILE_AUTHORITY_MODULE) or path == ROOT / "crates/carrick-kernel/src/el1_delegation.rs":
+        if path.is_relative_to(FILE_AUTHORITY_MODULE):
             # Inventory the legacy authority escapes that production cutover
             # must delete, not the replacement authority's closed internal
-            # implementation or the EL1 delegated regular file subsystem.
+            # implementation.
             continue
         relative = str(path.relative_to(ROOT))
         lines = path.read_text().splitlines()
