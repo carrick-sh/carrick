@@ -1215,25 +1215,43 @@ impl AliasRegistry {
     ) -> Option<AliasBacking> {
         Self::process_visible_scopes(mm_root_slot, container_root)
             .into_iter()
-            .flat_map(|scope| self.scope_rows(scope))
+            .flat_map(|scope| {
+                let rows = self.scope_rows(scope);
+                note_alias_state_rows_scanned(rows.len());
+                rows
+            })
             .filter(|(_, alias)| matches(alias))
             .max_by_key(|(seq, _)| *seq)
             .map(|(_, alias)| *alias)
     }
 
-    /// Candidates for `newest_matching_for_process`, newest first; the
-    /// caller authenticates frame owners AFTER releasing the registry lock.
-    pub(crate) fn matching_for_process_candidates(
+    /// Rows of the scopes one process can see whose guest-VA window overlaps
+    /// `[va, va + len)` and that `matches`, NEWEST FIRST (highest insertion
+    /// sequence first; rows sharing a sequence -- fragments of one split row
+    /// -- keep their scope-bucket order). The caller authenticates frame
+    /// owners AFTER releasing the registry lock (see `containing_candidates`).
+    pub(crate) fn process_va_overlap_candidates(
         &self,
+        va: u64,
+        len: u64,
         mm_root_slot: Option<(u64, u64)>,
         container_root: ContainerRootToken,
         mut matches: impl FnMut(&AliasBacking) -> bool,
     ) -> Vec<AliasBacking> {
+        let end = va.saturating_add(len.max(1));
         let mut found: Vec<(u64, AliasBacking)> =
             Self::process_visible_scopes(mm_root_slot, container_root)
                 .into_iter()
-                .flat_map(|scope| self.scope_rows(scope))
-                .filter(|(_, alias)| matches(alias))
+                .flat_map(|scope| {
+                    let rows = self.scope_rows(scope);
+                    note_alias_state_rows_scanned(rows.len());
+                    rows
+                })
+                .filter(|(_, alias)| {
+                    alias.start < end
+                        && va < alias.start.saturating_add(alias.size as u64)
+                        && matches(alias)
+                })
                 .map(|(seq, alias)| (*seq, *alias))
                 .collect();
         found.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
@@ -3020,6 +3038,7 @@ pub(crate) fn retained_private_reuse_alias_fragment_in(
         .scope_rows(owned_scope)
         .iter()
         .rev()
+        .inspect(|_| note_alias_state_rows_scanned(1))
         .map(|(_, alias)| alias)
         .find(|entry| {
             entry.sharing == GuestMappingSharing::Private

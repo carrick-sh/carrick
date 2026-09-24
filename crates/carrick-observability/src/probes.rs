@@ -655,6 +655,39 @@ impl HvpatchSyscallService {
     }
 }
 
+/// Which memory-maintenance operation a [`HvpatchMmMaintenanceCensus`]
+/// describes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchMmMaintenanceSite {
+    /// `ensure_frame_cow_write` with backing-maintenance intent: the per-page
+    /// COW routing a scrub runs before it writes (brk shrink, mremap reuse,
+    /// munmap reuse, `MREMAP_DONTUNMAP`).
+    BackingMaintenanceRoute = 1,
+    /// `zero_guest_backing`: resolving each page's scrub target and zeroing it.
+    ScrubTargets = 2,
+}
+
+/// One census-armed memory-maintenance operation: the rows its lookups
+/// VISITED next to the populations those lookups were drawn from.
+///
+/// A visited count only means something beside its population: a count that
+/// tracks the population names a full-table walk, one that tracks the page
+/// count names per-page work, and one that stays flat is the intended
+/// indexed lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchMmMaintenanceCensus {
+    pub site: HvpatchMmMaintenanceSite,
+    /// Linux 4 KiB pages the operation covered.
+    pub pages: u64,
+    pub alias_rows_visited: u64,
+    pub task_rows_visited: u64,
+    pub extents_visited: u64,
+    pub alias_rows_live: u64,
+    pub task_rows_live: u64,
+    pub extents_live: u64,
+}
+
 /// One serviced HVPatch first-touch fault, as the mapping-index census sees
 /// it: what both lookup structures HELD, what their walks VISITED for this one
 /// fault, and what it cost.
@@ -5152,6 +5185,18 @@ mod real {
         /// bound (which sets how far its containment queries walk), and the
         /// displaced-row count.
         fn hvpatch__mapping__index__cost(_: u64, _: u64, _: u64) {}
+        /// Arms the memory-maintenance census and marks its start. Args:
+        /// site (`HvpatchMmMaintenanceSite`), requested bytes. Nothing below
+        /// fires, and no population is read, unless this probe is enabled.
+        fn hvpatch__mm__maintenance__begin(_: u32, _: u64) {}
+        /// Work of one census-armed memory-maintenance operation. Args: site,
+        /// Linux pages covered, alias rows visited, task mapping rows
+        /// visited, frame-inventory extents visited.
+        fn hvpatch__mm__maintenance__work(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+        /// Population companion fired immediately after `work` on the same
+        /// host thread. Args: site, live alias rows, live task mapping rows,
+        /// live frame-inventory extents of the operating mm.
+        fn hvpatch__mm__maintenance__population(_: u32, _: u64, _: u64, _: u64) {}
         /// HVPatch frame pool allocation hit.
         /// Args: site (0 = COW, 1 = sparse mmap), allocated physical IPA.
         fn hvpatch__frame__pool__hit(_: u32, _: u64) {}
@@ -6583,6 +6628,37 @@ mod real {
             event.root_slot_base(),
             event.root_slot_size(),
             event.ttbr0()
+        ));
+    }
+
+    /// See `hvpatch__mm__maintenance__begin`. Returns whether the census is
+    /// armed; callers read populations and visit counters only when it is.
+    #[inline(never)]
+    pub fn hvpatch_mm_maintenance_begin(site: super::HvpatchMmMaintenanceSite, len: u64) -> bool {
+        let mut armed = false;
+        carrick_usdt::hvpatch__mm__maintenance__begin!(|| {
+            armed = true;
+            (site as u32, len)
+        });
+        armed
+    }
+
+    /// See `hvpatch__mm__maintenance__work`; the population companion fires
+    /// immediately after on the same host thread.
+    #[inline(never)]
+    pub fn hvpatch_mm_maintenance(event: super::HvpatchMmMaintenanceCensus) {
+        carrick_usdt::hvpatch__mm__maintenance__work!(|| (
+            event.site as u32,
+            event.pages,
+            event.alias_rows_visited,
+            event.task_rows_visited,
+            event.extents_visited
+        ));
+        carrick_usdt::hvpatch__mm__maintenance__population!(|| (
+            event.site as u32,
+            event.alias_rows_live,
+            event.task_rows_live,
+            event.extents_live
         ));
     }
 
@@ -8516,6 +8592,8 @@ mod stub {
 
     stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService, args: [u64; 6]) -> Option<std::time::Instant> => None);
     stub!(hvpatch_backing_scrub(total: u64, zeroed: u64, remapped: u64, eligible: u32));
+    stub!(hvpatch_mm_maintenance_begin(site: super::HvpatchMmMaintenanceSite, len: u64) -> bool => false);
+    stub!(hvpatch_mm_maintenance(event: super::HvpatchMmMaintenanceCensus));
     stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));
     stub!(hvpatch_syscall_service_clear(event: super::HvpatchSyscallService));
     stub!(hvpatch_core_lifecycle(phase: u32, pid: i32, tid: i32, generation: u64, outcome: u32));

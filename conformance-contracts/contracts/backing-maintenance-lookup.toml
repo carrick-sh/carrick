@@ -1,0 +1,45 @@
+schema_version = 1
+id = "kernel.mm.backing-maintenance-lookup"
+title = "Backing-maintenance lookups are bounded by the rows relevant to the page"
+guest_surfaces = ["syscall:brk", "syscall:mremap", "syscall:munmap", "syscall:mmap", "kernel:vm_projection"]
+semantic_authority = [
+  "man 2 brk: a heap shrunk and grown again reads back zero-filled",
+  "man 2 mremap: a moved mapping carries its bytes; its reused destination exposes no prior owner's bytes",
+  "Linux private anonymous zero-fill and fork isolation",
+]
+fixture = "unit:maintenance_lookup_budget"
+scale_points = [1, 1000, 10000]
+rationale = "Before a brk shrink, an mremap onto reused arena VA or an MREMAP_DONTUNMAP source becomes observable again, Carrick resolves, per Linux page, the physical COW source, a retained reuse fragment, the exclusive-claim extent and the scrub target. Each is a question about one page of one mm. It must be answered from the rows that can overlap that page in that mm's visible scopes, never by walking the carrier's alias rows, the mm's whole extent ledger or its whole mapping table. The 2026-09-24 cpython profile (test_pprint/test_json/test_email) found all four walking their tables per page. The zeroing guarantee, owner-generation authentication after the registry lock is released, newest-row selection and fork isolation are unchanged; only which rows are offered to the unchanged predicates is bounded."
+
+[bindings]
+vm_free = "carrick-vmm-hvf::trap::memory_protection::tests::maintenance_lookup_budget"
+embed = "carrick-embed::anonymous_discard; carrick-embed::discard_fork_threads; carrick-embed::fork (signed; semantics only)"
+docker = "probe:memflagmatrix"
+ecosystem = ["cpython:pprint", "cpython:json", "cpython:email", "cpython:mmap", "cpython:multiprocessing_spawn", "go:build", "go:runtime"]
+
+[bindings.unresolved]
+embed_structural = "The signed census is scripts/dtrace/hvpatch-mm-maintenance-census.d over the hvpatch-mm-maintenance-* probes on the cpython fixture. It is a traced diagnostic, not a registered WorkObservation binding."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "alias_rows_visited"
+base = 8
+per_unit = 0
+layers = ["vm-free"]
+rationale = "One COW-source, containing-VA or retained-fragment lookup offers its predicate the compound, its four fragments and at most the class-window neighbours of the probe. Fork siblings holding rows at the same guest VA, the process's own rows elsewhere and newer rows on other physical extents are never visited. n is each unrelated population."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "frame_extents_visited"
+base = 4
+per_unit = 0
+layers = ["vm-free"]
+rationale = "Exclusive-claim containment visits at most one candidate per active extent size class plus the answer, however many extents the mm holds and wherever the answer sits in key order."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "task_mapping_rows_visited"
+base = 2
+per_unit = 0
+layers = ["vm-free"]
+rationale = "The scrub-target row is found among the rows that overlap the page: the covering row and the neighbour that ends the ordered walk, not every row above it."

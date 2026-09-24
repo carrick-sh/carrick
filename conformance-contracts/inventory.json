@@ -2916,7 +2916,9 @@
       "support": "bring_up",
       "handler": "memory",
       "authority": "hybrid",
-      "contracts": [],
+      "contracts": [
+        "kernel.mm.backing-maintenance-lookup"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2931,6 +2933,7 @@
       "authority": "hybrid",
       "contracts": [
         "kernel.el1.zone-entry-at-open",
+        "kernel.mm.backing-maintenance-lookup",
         "kernel.mm.current-read-reuse",
         "kernel.mm.native-data-activation",
         "kernel.mm.retained-fragment-query"
@@ -2947,7 +2950,9 @@
       "support": "bring_up",
       "handler": "memory",
       "authority": "hybrid",
-      "contracts": [],
+      "contracts": [
+        "kernel.mm.backing-maintenance-lookup"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -3037,6 +3042,7 @@
       "contracts": [
         "kernel.el1.zone-entry-at-open",
         "kernel.fork.mappings",
+        "kernel.mm.backing-maintenance-lookup",
         "kernel.mm.retained-fragment-query",
         "kernel.mm.scrub-remap-query"
       ],

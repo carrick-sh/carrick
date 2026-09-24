@@ -597,6 +597,28 @@ impl HvfVmState {
         address: u64,
         length: usize,
     ) -> Result<(), MemoryError> {
+        if !carrick_observability::probes::hvpatch_mm_maintenance_begin(
+            carrick_observability::probes::HvpatchMmMaintenanceSite::ScrubTargets,
+            length as u64,
+        ) {
+            return self.zero_guest_backing_targets(address, length);
+        }
+        let before = MmMaintenanceVisits::read();
+        let outcome = self.zero_guest_backing_targets(address, length);
+        self.emit_mm_maintenance_census(
+            carrick_observability::probes::HvpatchMmMaintenanceSite::ScrubTargets,
+            address,
+            length,
+            before,
+        );
+        outcome
+    }
+
+    fn zero_guest_backing_targets(
+        &mut self,
+        address: u64,
+        length: usize,
+    ) -> Result<(), MemoryError> {
         let address = strip_pointer_tag(address);
         // Scrub debug: CARRICK_FORK_DEBUG_VA=<hex> logs any zeroing whose range
         // covers that VA, with the caller — the instrument that named the agent
