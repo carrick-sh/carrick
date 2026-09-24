@@ -382,3 +382,245 @@ fn scrub_target_row_is_bounded_by_the_overlapping_rows() {
         );
     }
 }
+
+/// xorshift64: deterministic, seedable, no dependency.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound.max(1)
+    }
+}
+
+/// The scoped indexes answer every process-scoped query EXACTLY as the
+/// carrier-wide index filtered by scope did -- same rows, same order --
+/// including split fragments that share a sequence, rows rewritten in place
+/// by `upsert_by_key`, several scopes at the same VAs and nested windows.
+#[test]
+fn scoped_alias_queries_match_the_carrier_wide_oracle() {
+    let mut seeds_with_split_ties = 0;
+    let scopes = [
+        own_scope(),
+        AliasOwnershipScope::Global,
+        sibling_scope(0),
+        sibling_scope(1),
+    ];
+    for seed in 1..=64_u64 {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ seed);
+        let mut registry = AliasRegistry::default();
+        for _ in 0..48 {
+            let scope = scopes[rng.below(scopes.len() as u64) as usize];
+            let va = TARGET_VA + rng.below(64) * PAGE;
+            let size = PAGE << rng.below(5);
+            let physical = 0x20_0000_0000 + rng.below(32) * COMPOUND;
+            let physical_size = COMPOUND << rng.below(3);
+            let mut row = alias(va, size, physical, physical, physical_size, scope);
+            if rng.below(4) == 0 {
+                row.sharing = GuestMappingSharing::ForkSharedAnonymous;
+            }
+            registry.push(row);
+        }
+        // Split rows into same-sequence fragments, and rewrite some in place.
+        for _ in 0..4 {
+            let va = TARGET_VA + rng.below(64) * PAGE;
+            let _ = unregister_alias_entries(
+                &mut registry,
+                va,
+                (PAGE * (1 + rng.below(3))) as usize,
+                Some(OWN_SLOT),
+                ContainerRootToken::ROOT,
+            );
+        }
+        let own_rows: Vec<_> = registry.scope_rows(own_scope()).to_vec();
+        if own_rows.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            seeds_with_split_ties += 1;
+        }
+        for &(_, row) in own_rows.iter().take(3) {
+            let mut rewritten = row;
+            rewritten.perms ^= 1;
+            registry.upsert_by_key(rewritten);
+        }
+
+        let visible = |alias: &AliasBacking| {
+            alias_matches_process_scope(
+                alias.ownership_scope,
+                Some(OWN_SLOT),
+                ContainerRootToken::ROOT,
+            )
+        };
+        for probe_page in 0..72_u64 {
+            let va = TARGET_VA - 4 * PAGE + probe_page * PAGE;
+            let len = PAGE << (probe_page % 3);
+            let end = va + len;
+
+            // Overlap candidates: visible bucket rows, stable newest-first.
+            let mut expected: Vec<(u64, AliasBacking)> =
+                AliasRegistry::process_visible_scopes(Some(OWN_SLOT), ContainerRootToken::ROOT)
+                    .into_iter()
+                    .flat_map(|scope| registry.scope_rows(scope).iter().copied())
+                    .filter(|(_, a)| a.start < end && va < a.start + a.size as u64)
+                    .collect();
+            expected.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+            let expected: Vec<_> = expected.into_iter().map(|(_, a)| a).collect();
+            assert_eq!(
+                registry.process_va_overlap_candidates(
+                    va,
+                    len,
+                    Some(OWN_SLOT),
+                    ContainerRootToken::ROOT,
+                    |_| true
+                ),
+                expected,
+                "seed {seed} overlap {va:#x}+{len:#x}"
+            );
+
+            // Containing candidates / newest containing: the global index
+            // filtered by scope.
+            let expected = registry.va_classes.containing_candidates(va, |a| {
+                visible(a) && va >= a.start && va < a.start + a.size as u64
+            });
+            assert_eq!(
+                registry.process_alias_containing_va_candidates(
+                    va,
+                    Some(OWN_SLOT),
+                    ContainerRootToken::ROOT,
+                    |_| true
+                ),
+                expected,
+                "seed {seed} containing {va:#x}"
+            );
+            assert_eq!(
+                registry.newest_process_alias_containing_va(
+                    va,
+                    Some(OWN_SLOT),
+                    ContainerRootToken::ROOT,
+                    |_| true
+                ),
+                registry.va_classes.newest_containing(va, |a| {
+                    visible(a) && va >= a.start && va < a.start + a.size as u64
+                }),
+                "seed {seed} newest {va:#x}"
+            );
+
+            // Overlapping rows, sequence-ordered.
+            let mut expected: Vec<(u64, AliasBacking)> = registry
+                .va_window_rows(va, end)
+                .filter(|(_, a)| visible(a) && a.start + a.size as u64 > va)
+                .copied()
+                .collect();
+            expected.sort_by_key(|(seq, _)| *seq);
+            assert_eq!(
+                registry.overlapping_process_aliases(
+                    va,
+                    len as usize,
+                    Some(OWN_SLOT),
+                    ContainerRootToken::ROOT
+                ),
+                expected,
+                "seed {seed} overlapping {va:#x}+{len:#x}"
+            );
+            assert_eq!(
+                registry.has_live_process_alias_overlapping(
+                    va,
+                    end,
+                    Some(OWN_SLOT),
+                    ContainerRootToken::ROOT
+                ),
+                registry.va_window_rows(va, end).any(|(_, a)| visible(a)
+                    && a.start < end
+                    && a.start + a.size as u64 > va
+                    && alias_backing_is_live(a.physical_host_addr)),
+                "seed {seed} live overlap {va:#x}"
+            );
+
+            // Starts strictly inside a window.
+            let wide_end = va + 16 * PAGE;
+            let shared = |a: &AliasBacking| a.sharing == GuestMappingSharing::Private;
+            assert_eq!(
+                registry.first_matching_process_alias_start_between(
+                    va,
+                    wide_end,
+                    Some(OWN_SLOT),
+                    ContainerRootToken::ROOT,
+                    shared
+                ),
+                registry
+                    .va_classes
+                    .first_matching_start_between(va, wide_end, |a| visible(a) && shared(a)),
+                "seed {seed} first start {va:#x}"
+            );
+            assert_eq!(
+                registry.matching_process_alias_starts_between_candidates(
+                    va,
+                    wide_end,
+                    Some(OWN_SLOT),
+                    ContainerRootToken::ROOT,
+                    shared
+                ),
+                registry
+                    .va_classes
+                    .matching_starts_between_candidates(va, wide_end, |a| visible(a) && shared(a))
+                    .into_iter()
+                    .map(|(_, a)| a)
+                    .collect::<Vec<_>>(),
+                "seed {seed} starts {va:#x}"
+            );
+
+            // Existence of an exact existing projection.
+            let ipa = 0x20_0000_0000 + (probe_page % 32) * PAGE;
+            let exact = |a: &AliasBacking| {
+                va >= a.start
+                    && va + PAGE <= a.start + a.size as u64
+                    && a.ipa.checked_add(va - a.start) == Some(ipa)
+            };
+            assert_eq!(
+                registry.any_process_va_window_row(
+                    va,
+                    va + 1,
+                    Some(OWN_SLOT),
+                    ContainerRootToken::ROOT,
+                    exact
+                ),
+                registry
+                    .va_window_rows(va, va + 1)
+                    .any(|(_, a)| visible(a) && exact(a)),
+                "seed {seed} exists {va:#x}"
+            );
+
+            // Physical containment, newest first in reverse bucket order.
+            let expected: Vec<_> = registry
+                .scope_rows(own_scope())
+                .iter()
+                .rev()
+                .map(|(_, a)| *a)
+                .filter(|a| {
+                    a.sharing == GuestMappingSharing::Private
+                        && ipa >= a.physical_ipa
+                        && ipa + PAGE <= a.physical_ipa + a.physical_size as u64
+                })
+                .collect();
+            assert_eq!(
+                registry.private_rows_containing_physical_newest_first(
+                    own_scope(),
+                    ipa,
+                    ipa + PAGE
+                ),
+                expected,
+                "seed {seed} physical {ipa:#x}"
+            );
+        }
+    }
+    assert!(
+        seeds_with_split_ties > 0,
+        "the fixture must exercise same-sequence fragments"
+    );
+}

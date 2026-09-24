@@ -2560,12 +2560,16 @@ fn retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows() {
         owner.size = 0x100_0000;
         registry.push(owner);
         let mut examined = 0;
-        assert!(
-            registry.any_va_window_row(template.start, template.start + 1, |alias| {
+        assert!(registry.any_process_va_window_row(
+            template.start,
+            template.start + 1,
+            None,
+            ContainerRootToken::ROOT,
+            |alias| {
                 examined += 1;
                 alias.ipa == owner.ipa && alias.size == owner.size
-            })
-        );
+            }
+        ));
         assert_eq!(
             examined, 1,
             "wide owner must not inspect {scale} unrelated narrow rows"
@@ -2579,13 +2583,20 @@ fn retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows() {
                     .va_window_rows(start, start + 1)
                     .any(|(_, a)| a.ipa == wanted && start < a.start.saturating_add(a.size as u64));
                 assert_eq!(
-                    registry.any_va_window_row(start, start + 1, |a| a.ipa == wanted
-                        && start < a.start.saturating_add(a.size as u64)),
+                    registry.any_process_va_window_row(
+                        start,
+                        start + 1,
+                        None,
+                        ContainerRootToken::ROOT,
+                        |a| a.ipa == wanted && start < a.start.saturating_add(a.size as u64)
+                    ),
                     expected
                 );
             }
         }
-        assert!(!registry.any_va_window_row(0, 0, |_| true));
+        assert!(
+            !registry.any_process_va_window_row(0, 0, None, ContainerRootToken::ROOT, |_| true)
+        );
     }
 }
 
