@@ -313,7 +313,9 @@ pub struct DelegatedFile {
     pub dirty_mask: AtomicU64,
     /// 64-bit zero-filled gap page mask (bit i indicates 4 KiB page i was zero-filled on extension and never written).
     pub zero_filled_mask: AtomicU64,
-    pub _pad: [u8; 8],
+    /// Operations EL1 served on this object during the current delegation
+    /// window; the host reads it at recall to judge whether delegating paid off.
+    pub served_ops: AtomicU64,
 }
 
 impl DelegatedFile {
@@ -328,7 +330,7 @@ impl DelegatedFile {
             _reserved0: 0,
             dirty_mask: AtomicU64::new(0),
             zero_filled_mask: AtomicU64::new(0),
-            _pad: [0; 8],
+            served_ops: AtomicU64::new(0),
         }
     }
 

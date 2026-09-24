@@ -15,6 +15,7 @@ use carrick_image::PullPolicy;
 fn el1_files_contract() {
     let _guard = common::guest_lock();
     reset_el1_counters();
+    carrick_kernel::el1_delegation::reset_delegation_counts();
 
     let result = common::run_or_fail(
         ContainerBuilder::from_image(common::SMOKE_IMAGE)
@@ -45,13 +46,20 @@ print "contract_ok\n";
     let forwarded_writes = counters.forwarded[64].load(Ordering::Relaxed);
     let served_seeks = counters.served[62].load(Ordering::Relaxed);
     let _forwarded_seeks = counters.forwarded[62].load(Ordering::Relaxed);
+    // Forwards are a fixed startup population (perl's startup fstat calls
+    // recall the file and start one short backoff); they must not grow with
+    // the loop, and every other iteration is served in-guest.
+    const STARTUP_FORWARD_BOUND: u64 = 64;
+    let population = carrick_kernel::el1_delegation::delegation_counts();
     assert!(
-        served_writes >= 10_000,
-        "expected at least 10,000 writes served at EL1, got {served_writes} (forwarded: {forwarded_writes})"
+        forwarded_writes + _forwarded_seeks <= STARTUP_FORWARD_BOUND,
+        "lseek+write forwards {} exceed the fixed startup bound {STARTUP_FORWARD_BOUND}; served writes {served_writes}, seeks {served_seeks}; delegation population: {population:?}",
+        forwarded_writes + _forwarded_seeks
     );
     assert!(
-        served_seeks >= 10_000,
-        "expected at least 10,000 seeks served at EL1, got {served_seeks} (forwarded: {_forwarded_seeks})"
+        served_writes >= 10_000 - STARTUP_FORWARD_BOUND
+            && served_seeks >= 10_000 - STARTUP_FORWARD_BOUND,
+        "expected the loop served at EL1: writes {served_writes} (forwarded {forwarded_writes}), seeks {served_seeks} (forwarded {_forwarded_seeks}); delegation population: {population:?}"
     );
 }
 
@@ -294,7 +302,7 @@ if ($pid == 0) {
 /// F_ADD_SEALS (F_SEAL_WRITE). Subsequent write must be rejected with EPERM,
 /// proving EL1 delegation was recalled and subsequent operations trap to Carrick host.
 #[test]
-fn el1_files_memfd_seal_recall() {
+fn el1_files_memfd_never_delegated_and_seals_hold() {
     let _guard = common::guest_lock();
     reset_el1_counters();
 
@@ -311,7 +319,7 @@ if ($fd < 0) { die "memfd_create failed: $!"; }
 
 open(my $fh, "+<&=", $fd) or die "open fd: $!";
 
-# Warm up and delegate to EL1:
+# Writes and seeks that would delegate a host regular file:
 syswrite($fh, "x") or die "warmup write: $!";
 sysseek($fh, 0, 0) or die "warmup seek: $!";
 for (my $i = 0; $i < 50; $i++) {
@@ -348,11 +356,13 @@ print "memfd_seal_ok\n";
     );
     assert_eq!(result.stdout_utf8().trim(), "memfd_seal_ok");
 
+    // memfds are in-memory descriptions: they keep their single host path and
+    // are never delegated, so the seal is enforced by the host write path.
     let counters = read_el1_counters().expect("EL1 counters should be populated");
     let served_writes = counters.served[64].load(Ordering::Relaxed);
-    assert!(
-        served_writes >= 50,
-        "expected at least 50 writes served at EL1 before seal, got {served_writes}"
+    assert_eq!(
+        served_writes, 0,
+        "memfd writes must never be served at EL1, got {served_writes}"
     );
 }
 

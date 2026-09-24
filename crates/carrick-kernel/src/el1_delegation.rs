@@ -383,13 +383,19 @@ pub(crate) struct DelegationPolicy<'a> {
     pub interceptors_active: bool,
 }
 
-/// Maximum number of times a file description may be recalled before becoming
-/// permanently ineligible for EL1 delegation for the remainder of its lifetime.
-/// Prevents unbounded recall-then-delegate thrashing on interleaved operations.
-pub const MAX_DELEGATION_RECALLS_PER_LIFETIME: u32 = 2;
+/// A delegation window that served at least this many operations at EL1 paid
+/// for its delegate and recall; it clears the description's backoff.
+pub const DELEGATION_WINDOW_PAYOFF_OPS: u64 = 64;
+
+/// Forwarded attempts refused after the first unprofitable window; doubles
+/// with each consecutive one, so an interleaving that recalls every window
+/// (write, fstat, write, ...) converges to the host path's cost instead of
+/// paying a delegate and a recall per operation.
+pub const DELEGATION_BACKOFF_BASE: u32 = 8;
 
 /// Reasons why a file description cannot be delegated to EL1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
 pub enum NotEligible {
     Disabled,
     NoRegion,
@@ -411,7 +417,72 @@ pub enum NotEligible {
     Sealed,
     SeccompFiltered,
     Observed,
-    RecalledTooOften,
+    BackingOff,
+}
+
+impl NotEligible {
+    /// Every reason, in discriminant order.
+    pub const ALL: [NotEligible; 21] = [
+        NotEligible::Disabled,
+        NotEligible::NoRegion,
+        NotEligible::NotRegularFile,
+        NotEligible::NotRootfs,
+        NotEligible::Watched,
+        NotEligible::UnsupportedFlags,
+        NotEligible::FileTooLarge,
+        NotEligible::MultipleReferences,
+        NotEligible::Shared,
+        NotEligible::Unregistered,
+        NotEligible::FsizeLimited,
+        NotEligible::Mapped,
+        NotEligible::RecordLocks,
+        NotEligible::TableFull,
+        NotEligible::AlreadyDelegated,
+        NotEligible::RecallRequested,
+        NotEligible::IoError,
+        NotEligible::Sealed,
+        NotEligible::SeccompFiltered,
+        NotEligible::Observed,
+        NotEligible::BackingOff,
+    ];
+}
+
+/// Carrier-wide count of delegation refusals per reason, and of successful
+/// delegations and recalls: the population a delegation contract binds to.
+static REFUSALS: [AtomicUsize; NotEligible::ALL.len()] =
+    [const { AtomicUsize::new(0) }; NotEligible::ALL.len()];
+static DELEGATIONS: AtomicUsize = AtomicUsize::new(0);
+static RECALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Snapshot of the delegation population counters.
+#[derive(Debug, Clone, Default)]
+pub struct DelegationCounts {
+    pub delegations: usize,
+    pub recalls: usize,
+    pub refusals: Vec<(NotEligible, usize)>,
+}
+
+/// Read the delegation population counters (nonzero refusal reasons only).
+pub fn delegation_counts() -> DelegationCounts {
+    DelegationCounts {
+        delegations: DELEGATIONS.load(Ordering::Relaxed),
+        recalls: RECALLS.load(Ordering::Relaxed),
+        refusals: NotEligible::ALL
+            .iter()
+            .map(|reason| (*reason, REFUSALS[*reason as usize].load(Ordering::Relaxed)))
+            .filter(|(_, count)| *count > 0)
+            .collect(),
+    }
+}
+
+/// Reset the delegation population counters (test harnesses only reset
+/// between runs; production never reads them for decisions).
+pub fn reset_delegation_counts() {
+    DELEGATIONS.store(0, Ordering::Relaxed);
+    RECALLS.store(0, Ordering::Relaxed);
+    for counter in &REFUSALS {
+        counter.store(0, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -470,6 +541,23 @@ pub(crate) fn delegate_locked(
     rlimits: Option<&RlimitSet>,
     policy: Option<DelegationPolicy<'_>>,
 ) -> Result<u32, NotEligible> {
+    let result = delegate_transaction(open_file, open, file_table, fd, fs, rlimits, policy);
+    match result {
+        Ok(_) => DELEGATIONS.fetch_add(1, Ordering::Relaxed),
+        Err(reason) => REFUSALS[reason as usize].fetch_add(1, Ordering::Relaxed),
+    };
+    result
+}
+
+fn delegate_transaction(
+    open_file: &OpenFile,
+    open: &mut OpenDescription,
+    file_table: FileTableId,
+    fd: i32,
+    fs: &FsState,
+    rlimits: Option<&RlimitSet>,
+    policy: Option<DelegationPolicy<'_>>,
+) -> Result<u32, NotEligible> {
     if !carrick_mem::memory::el1_kernel_enabled() {
         return Err(NotEligible::Disabled);
     }
@@ -483,9 +571,6 @@ pub(crate) fn delegate_locked(
     }
     if description.common().fd_refs() != 1 {
         return Err(NotEligible::MultipleReferences);
-    }
-    if description.common().recall_count() >= MAX_DELEGATION_RECALLS_PER_LIFETIME {
-        return Err(NotEligible::RecalledTooOften);
     }
     if description.has_active_mappings() {
         return Err(NotEligible::Mapped);
@@ -579,6 +664,22 @@ pub(crate) fn delegate_locked(
     let offset = offset as u64;
     let writable = *writable && writable_flag;
 
+    // A shared inode is refused before backoff is consulted (the transaction
+    // re-checks under the lock).
+    let shared = OWNERS
+        .lock()
+        .as_ref()
+        .and_then(|map| map.get(&identity))
+        .is_none_or(|owner| owner.ever_shared || owner.open_count != 1);
+    if shared {
+        return Err(NotEligible::Shared);
+    }
+    // Backoff is consumed only by attempts that would otherwise proceed, so a
+    // structurally ineligible attempt neither spends it nor hides its reason.
+    if !description.common().admit_delegation() {
+        return Err(NotEligible::BackingOff);
+    }
+
     // Transaction step 1: claim the inode.
     {
         let mut owners = OWNERS.lock();
@@ -659,6 +760,7 @@ pub(crate) fn delegate_locked(
     file.flags.store(flags, Ordering::Relaxed);
     file.dirty_mask.store(0, Ordering::Relaxed);
     file.zero_filled_mask.store(0, Ordering::Relaxed);
+    file.served_ops.store(0, Ordering::Relaxed);
     file.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
     file.unlock();
     let published = {
@@ -770,12 +872,15 @@ pub(crate) fn recall_locked(
         }
     }
     mark_pending_host_work_for_file_tables(&tables);
-    description.common().record_recall();
+    RECALLS.fetch_add(1, Ordering::Relaxed);
 
     let file = delegated_file_object(region_ptr, handle);
     lock_delegated_file(file, handle);
     file.state
         .store(DELEGATED_STATE_RECALLING, Ordering::Release);
+    description
+        .common()
+        .record_delegation_window(file.served_ops.load(Ordering::Acquire));
     let guest_offset = file.offset.load(Ordering::Acquire);
     let guest_size = file.size.load(Ordering::Acquire);
     let dirty = file.dirty_mask.swap(0, Ordering::AcqRel);
@@ -1122,18 +1227,27 @@ mod tests {
         }
 
         #[test]
-        fn repeated_recalls_make_the_description_ineligible() {
+        fn unprofitable_windows_back_off_and_a_profitable_one_clears_it() {
             let _region = Region::new();
             let tmp = temp_with(b"x");
             let open = open_host(&tmp);
-            for _ in 0..MAX_DELEGATION_RECALLS_PER_LIFETIME {
-                delegate_default(&open, 3).unwrap();
-                recall(&open.description).unwrap();
+            // A window recalled before serving anything backs off for
+            // BASE << 1 forwarded attempts.
+            let handle = delegate_default(&open, 3).unwrap();
+            recall(&open.description).unwrap();
+            let backoff = DELEGATION_BACKOFF_BASE << 1;
+            for _ in 0..backoff {
+                assert_eq!(delegate_default(&open, 3), Err(NotEligible::BackingOff));
             }
-            assert_eq!(
-                delegate_default(&open, 3),
-                Err(NotEligible::RecalledTooOften)
-            );
+            // Then it may delegate again; a window that serves enough clears it.
+            let handle2 = delegate_default(&open, 3).unwrap();
+            let file = delegated_file_object(get_el1_region_host_ptr(), handle2);
+            file.served_ops
+                .store(DELEGATION_WINDOW_PAYOFF_OPS, Ordering::Relaxed);
+            recall(&open.description).unwrap();
+            assert!(delegate_default(&open, 3).is_ok());
+            recall(&open.description).unwrap();
+            let _ = handle;
         }
 
         #[test]

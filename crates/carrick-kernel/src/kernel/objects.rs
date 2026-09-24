@@ -825,7 +825,10 @@ pub struct DescriptionCommon {
     socket_flows: Mutex<Option<SocketFlows>>,
     cork: Mutex<SocketCork>,
     writeback_err: AtomicI32,
-    recall_count: AtomicU32,
+    /// Consecutive delegation windows recalled before paying off.
+    delegation_strikes: AtomicU32,
+    /// Forwarded delegation attempts still to be refused before retrying.
+    delegation_backoff: AtomicU32,
 }
 
 impl DescriptionCommon {
@@ -844,7 +847,8 @@ impl DescriptionCommon {
             socket_flows: Mutex::new(None),
             cork: Mutex::new(SocketCork::default()),
             writeback_err: AtomicI32::new(0),
-            recall_count: AtomicU32::new(0),
+            delegation_strikes: AtomicU32::new(0),
+            delegation_backoff: AtomicU32::new(0),
         }
     }
 
@@ -863,7 +867,8 @@ impl DescriptionCommon {
             socket_flows: Mutex::new(None),
             cork: Mutex::new(SocketCork::default()),
             writeback_err: AtomicI32::new(0),
-            recall_count: AtomicU32::new(0),
+            delegation_strikes: AtomicU32::new(0),
+            delegation_backoff: AtomicU32::new(0),
         }
     }
 
@@ -1024,14 +1029,37 @@ impl DescriptionCommon {
         }
     }
 
-    #[inline]
-    pub(crate) fn record_recall(&self) -> u32 {
-        self.recall_count.fetch_add(1, Ordering::Relaxed) + 1
+    /// Record the end of an EL1 delegation window that served `served`
+    /// operations. A window that paid for itself clears the backoff; one that
+    /// did not doubles it (deterministic, counted in forwarded attempts).
+    pub(crate) fn record_delegation_window(&self, served: u64) {
+        if served >= crate::el1_delegation::DELEGATION_WINDOW_PAYOFF_OPS {
+            self.delegation_strikes.store(0, Ordering::Relaxed);
+            self.delegation_backoff.store(0, Ordering::Relaxed);
+        } else {
+            let strikes = self.delegation_strikes.fetch_add(1, Ordering::Relaxed) + 1;
+            let backoff = crate::el1_delegation::DELEGATION_BACKOFF_BASE
+                .saturating_mul(1u32 << strikes.min(16));
+            self.delegation_backoff.store(backoff, Ordering::Relaxed);
+        }
     }
 
-    #[inline]
-    pub(crate) fn recall_count(&self) -> u32 {
-        self.recall_count.load(Ordering::Acquire)
+    /// Whether a forwarded operation may try to delegate now; each refused
+    /// attempt consumes one unit of backoff.
+    pub(crate) fn admit_delegation(&self) -> bool {
+        let mut remaining = self.delegation_backoff.load(Ordering::Relaxed);
+        while remaining != 0 {
+            match self.delegation_backoff.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return false,
+                Err(current) => remaining = current,
+            }
+        }
+        true
     }
 }
 
