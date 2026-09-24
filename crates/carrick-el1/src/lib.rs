@@ -169,6 +169,7 @@ where
                 counters.served[63].fetch_add(1, Ordering::Relaxed);
                 if let Some(task) = cur_task {
                     task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                    claim_owed_inotify_wake(task, inotify_table);
                     if task.has_pending_host_work() {
                         task.served_with_work.store(1, Ordering::Release);
                         return Action::ServedWithWork;
@@ -194,7 +195,7 @@ where
                 }
                 if let Some(task) = cur_task {
                     task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    if nr == 64 || nr == 68 {
+                    if matches!(nr, 63 | 64 | 67 | 68) {
                         claim_owed_inotify_wake(task, inotify_table);
                     }
                     if task.has_pending_host_work() {
@@ -331,14 +332,21 @@ pub unsafe fn serve_locked_file_op(
     user: &mut impl file::UserCopy,
     locks: &impl InstanceLockPolicy,
 ) -> Result<i64, Action> {
-    let writes = nr == 64 || nr == 68;
+    // The data event this operation produces on a marking watch: IN_MODIFY
+    // for a write, IN_ACCESS for a read (inotify(7)), each only when bytes
+    // moved.
+    let event: u32 = match nr {
+        64 | 68 => 0x02, // LINUX_IN_MODIFY
+        63 | 67 => 0x01, // LINUX_IN_ACCESS
+        _ => 0,
+    };
     let mut locked = [0u32; MAX_DELEGATED_MARKS_PER_FILE];
     let mut num_locked = 0;
     let mut lock_failed = false;
-    if writes && file.has_marks() {
+    if event != 0 && file.has_marks() {
         file.for_each_mark(|m| {
             if lock_failed
-                || (m.mask & 0x02) == 0
+                || (m.mask & event) == 0
                 || m.inotify_handle == 0
                 || locked[..num_locked].contains(&m.inotify_handle)
             {
@@ -396,16 +404,16 @@ pub unsafe fn serve_locked_file_op(
     if outcome.is_ok() {
         file.served_ops.fetch_add(1, Ordering::Relaxed);
     }
-    if writes
-        && let Ok(written) = outcome
-        && written > 0
+    if event != 0
+        && let Ok(moved) = outcome
+        && moved > 0
     {
         file.for_each_mark(|m| {
-            if (m.mask & 0x02) != 0
+            if (m.mask & event) != 0
                 && m.inotify_handle != 0
                 && let Some(ino) = inotify_table.get((m.inotify_handle - 1) as usize)
             {
-                ino.push_record(m.wd, 0x02, 0, None); // LINUX_IN_MODIFY
+                ino.push_record(m.wd, event, 0, None);
             }
         });
     }
@@ -751,6 +759,103 @@ mod tests {
         assert_eq!(action, Action::Served);
         assert_eq!(frame.x[0], 50);
         assert_eq!(counters.served[62].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_in_guest_read_queues_in_access_and_owes_an_observed_waiter_a_wake() {
+        use carrick_el1_abi::{FD_HANDLE_INOTIFY_TAG, hash_path};
+
+        let counters = Counters::default();
+        let tasks = [CurrentTask::new()];
+        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
+
+        let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
+        fd_map[0].set(100, 3, 1, 42); // fd 3 -> delegated file handle 1
+        fd_map[1].set(100, 4, FD_HANDLE_INOTIFY_TAG | 1, 42); // fd 4 -> delegated inotify handle 1
+
+        let object_table = [DelegatedFile::new()];
+        object_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        object_table[0].generation.store(42, Ordering::Relaxed);
+        object_table[0].size.store(100, Ordering::Relaxed);
+        object_table[0].offset.store(0, Ordering::Relaxed);
+        object_table[0].flags.store(
+            carrick_el1_abi::DELEGATED_FLAG_READABLE | carrick_el1_abi::DELEGATED_FLAG_WRITABLE,
+            Ordering::Relaxed,
+        );
+
+        let inotify_table = [DelegatedInotify::new()];
+        inotify_table[0]
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
+        inotify_table[0].generation.store(42, Ordering::Relaxed);
+        inotify_table[0]
+            .flags
+            .store(inotify::O_NONBLOCK, Ordering::Relaxed);
+
+        let name_cache = InotifyNameCache::new();
+        let path = b"test.txt";
+        let path_hash = hash_path(path);
+        name_cache.insert(100, name_cache.cwd_generation(), path, path_hash, 1);
+
+        let mut path_str = *b"test.txt\0";
+        let mut frame_add = TrapFrame::default();
+        frame_add.x[0] = 4; // inotify fd
+        frame_add.x[1] = path_str.as_mut_ptr() as u64; // pathname
+        frame_add.x[2] = 0x01; // IN_ACCESS
+        frame_add.x[8] = 27; // inotify_add_watch
+
+        let mut cache_mem = [0u8; 4096];
+        let cache_ptr = cache_mem.as_mut_ptr();
+
+        let action = dispatch_syscall_with_regions(
+            &mut frame_add,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            &inotify_table,
+            &name_cache,
+            |_| cache_ptr,
+        );
+        assert_eq!(action, Action::Served);
+        let wd = frame_add.x[0] as i32;
+        assert_eq!(wd, 1);
+        assert_eq!(counters.served[27].load(Ordering::Relaxed), 1);
+        assert!(object_table[0].has_marks());
+
+        // A host thread waits on the (empty) instance.
+        inotify_table[0].host_observed.store(1, Ordering::SeqCst);
+
+        // A read of the watched file, served in-guest, queues IN_ACCESS and
+        // returns through the host boundary to deliver the owed wake.
+        let mut read_buf = [0u8; 16];
+        let mut frame_read = TrapFrame::default();
+        frame_read.x[0] = 3; // file fd
+        frame_read.x[1] = read_buf.as_mut_ptr() as u64;
+        frame_read.x[2] = 16;
+        frame_read.x[8] = 63; // read
+
+        let action = dispatch_syscall_with_regions(
+            &mut frame_read,
+            &counters,
+            &tasks,
+            &fd_map,
+            &object_table,
+            &inotify_table,
+            &name_cache,
+            |_| cache_ptr,
+        );
+        assert_eq!(action, Action::ServedWithWork);
+        assert_eq!(frame_read.x[0], 16);
+        assert!(inotify_table[0].wake_is_owed());
+        let mut records = [0u8; 64];
+        assert_eq!(inotify_table[0].drain_into(&mut records), Ok(16));
+        assert_eq!(
+            u32::from_ne_bytes([records[4], records[5], records[6], records[7]]),
+            0x01
+        );
     }
 
     #[test]
