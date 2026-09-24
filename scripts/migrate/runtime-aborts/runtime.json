@@ -83,7 +83,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "function": "kernel_file_description",
+      "function": "kernel_file_description_unregistered",
       "ordinal_in_function": 1,
       "fingerprint": "bab96fc7ca7e60536376eda45e4baa6325d4efb7ad25d5bdc9597a8d10ff4c06",
       "verdict": "typed_error_debt",
@@ -92,28 +92,6 @@
       "typed_error": "KernelOperationError",
       "sink": "fatal",
       "domain": "dispatch::fd_table"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "function": "crate::kernel::FileDescription::read",
-      "ordinal_in_function": 1,
-      "fingerprint": "56629cf872f9be0ad7f5d805ac5698f7dd868d58a1374235a76d26da173122fc",
-      "verdict": "carrier_fault",
-      "failure_domain": "el1_delegation",
-      "rationale": "FileDescription::read recall loop exceeded bounded iterations due to dead or crashed vCPU holding object lock.",
-      "sink": "fatal",
-      "domain": "el1_delegation"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/fd_table.rs",
-      "function": "crate::kernel::FileDescription::write",
-      "ordinal_in_function": 1,
-      "fingerprint": "ad71bb5bd204ac3f7b5a27af1d206ed3c8aae983c016fff5387b5c3d68161a62",
-      "verdict": "carrier_fault",
-      "failure_domain": "el1_delegation",
-      "rationale": "FileDescription::write recall loop exceeded bounded iterations due to dead or crashed vCPU holding object lock.",
-      "sink": "fatal",
-      "domain": "el1_delegation"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/io_buffers.rs",
@@ -1625,17 +1603,6 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
-      "function": "FileDescription::retain_mapping_with_inode",
-      "ordinal_in_function": 1,
-      "fingerprint": "f99681100c24162c74af8907d6aef5cd40f511ae1a78a8a33c4966935bdf75c6",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::file_description_refs",
-      "rationale": "Mapped backing reference count overflow while retaining an internal allocated lease; a representable live lease population cannot reach this count, so wrapping would indicate corrupted lifetime accounting.",
-      "sink": "fatal",
-      "domain": "kernel::file_description_refs"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "function": "FileTable::mutation_lease",
       "ordinal_in_function": 1,
       "fingerprint": "b1c6ebd6bff4b8c3833de8e0447c58e9a7c308aa52c146676ee541c5f46b99fa",
@@ -1744,6 +1711,17 @@
       "rationale": "FileSlot generation atomic counter overflow or zero; wrapping slot generations would cause ABA aliasing across file slot lifecycle.",
       "sink": "fatal",
       "domain": "kernel::file_slot_generation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects.rs",
+      "function": "FileDescription::retain_mapping",
+      "ordinal_in_function": 1,
+      "fingerprint": "f99681100c24162c74af8907d6aef5cd40f511ae1a78a8a33c4966935bdf75c6",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::file_description_refs",
+      "rationale": "Mapped backing reference count overflow while retaining an internal allocated lease; a representable live lease population cannot reach this count, so wrapping would indicate corrupted lifetime accounting.",
+      "sink": "fatal",
+      "domain": "kernel::file_description_refs"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
@@ -2498,12 +2476,89 @@
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "function": "recall_locked",
       "ordinal_in_function": 1,
+      "fingerprint": "e62358e6a2864ad4f910af3fabaaaa6e76373a20e90d8aeb6315774c5e613b9a",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Delegated description has no inode registration at recall; every delegation registers at description construction, so the owner model is violated and the write-back target is unknown.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "<InodeOpenRegistration as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "f644f830a0187ed776e9467a0c03d173ad173a4d67883c2bf1a44ed3bf62a95b",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Last open description of an inode dropped while the zone still owns it: final close and the last mapping recall first, so reaching this would silently lose dirty in-zone bytes.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "<HostInstanceLock as carrick_el1::InstanceLockPolicy>::acquire",
+      "ordinal_in_function": 1,
+      "fingerprint": "0285ac566fdba1ff40d214e10c6e1e271a47f010c922ac1111f25d3b070e0894",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Host timed out after 30 s waiting for an in-zone inotify instance lock while serving a forwarded file write; guest critical sections are bounded, so this is a dead vCPU or lock-protocol violation.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "recall_locked",
+      "ordinal_in_function": 2,
+      "fingerprint": "74747a6a3dbb9cd29cc9ca64760b830840c8fdcaab62df26395140b47385ea56",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Recall found no Guest owner matching the handle in the owner table; ownership bookkeeping is corrupt and write-back target is unknown.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "recall_locked",
+      "ordinal_in_function": 3,
       "fingerprint": "90e9532a772ad823a17f30b269cf69017619fdda4e0f83320919fc5f7b628a2d",
       "verdict": "carrier_fault",
       "failure_domain": "el1_delegation",
-      "rationale": "Recall called with null EL1 region pointer indicating uninitialized or dropped region.",
+      "rationale": "Recall of a delegated file with no EL1 region mapped; the in-zone bytes are unreachable, so continuing would lose them.",
       "sink": "fatal",
       "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "sync_to_host",
+      "ordinal_in_function": 1,
+      "fingerprint": "e62358e6a2864ad4f910af3fabaaaa6e76373a20e90d8aeb6315774c5e613b9a",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Delegated description has no inode registration; every delegation registers at description construction, so the owner model is violated.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "sync_to_host",
+      "ordinal_in_function": 2,
+      "fingerprint": "e47f0205121724fee24d7af66cd16fea2a0cf103cfa9fb8c39890cbd45361ea2",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Write-back without recall found no Guest owner matching the handle; ownership bookkeeping is corrupt and write-back target is unknown.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_inotify.rs",
+      "function": "InstanceLock<'a>::acquire",
+      "ordinal_in_function": 1,
+      "fingerprint": "bc5d592ed3e67ef10ec21929c94d7260a390677bce0109e29535052f985b25cb",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_inotify",
+      "rationale": "Host timed out after 30 s waiting for an in-zone inotify instance lock; guest critical sections are bounded, so this is a dead vCPU or lock-protocol violation.",
+      "sink": "fatal",
+      "domain": "el1_inotify"
     }
   ]
 }
