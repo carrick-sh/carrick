@@ -243,10 +243,6 @@ pub fn el1_inotify_read(
     inotify_table: &[DelegatedInotify],
     validator: &impl MemoryValidator,
 ) -> Result<i64, Action> {
-    if count < 16 {
-        return Ok(-22); // -EINVAL
-    }
-
     let file_table = cur_task.file_table.load(Ordering::Acquire);
     if file_table == 0 {
         return Err(Action::Forward);
@@ -261,6 +257,14 @@ pub fn el1_inotify_read(
         Some(ino) if ino.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST => ino,
         _ => return Err(Action::Forward),
     };
+
+    // A buffer too small for one event is the host's to answer: Linux blocks
+    // or returns EAGAIN on an empty queue and EINVAL only when the next event
+    // does not fit. This check must follow the fd lookup, since `read` falls
+    // back to this path for every fd that is not an in-zone file.
+    if count < 16 {
+        return Err(Action::Forward);
+    }
 
     if validator.writable_bytes(buf_va, 16) < 16 {
         return Err(Action::Forward);
@@ -301,4 +305,38 @@ pub fn el1_inotify_read(
         return Err(Action::Forward);
     }
     Ok(drained as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carrick_el1_abi::El1TaskId;
+
+    struct AllWritable;
+
+    impl MemoryValidator for AllWritable {
+        fn writable_bytes(&self, _user_va: u64, len: usize) -> usize {
+            len
+        }
+
+        fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
+            len
+        }
+    }
+
+    /// `read` falls back to the inotify path for every fd that is not an
+    /// in-zone file. A short read of a pipe, tty or synthetic file is not an
+    /// inotify read and must forward, never fail with inotify's EINVAL.
+    #[test]
+    fn a_short_read_of_a_non_inotify_fd_forwards() {
+        let task = CurrentTask::new();
+        task.set(El1TaskId::from_linux_tid(1), 1, 7);
+        for count in [1usize, 4, 15, 16, 64] {
+            assert_eq!(
+                el1_inotify_read(3, 0x1000, count, &task, &[], &[], &AllWritable),
+                Err(Action::Forward),
+                "count={count}"
+            );
+        }
+    }
 }
