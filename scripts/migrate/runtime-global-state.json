@@ -3196,6 +3196,14 @@
     {
       "kind": "thread_local",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "FRAME_EXTENTS_SCANNED",
+      "fingerprint": "b663d748820d9278fab2ba18e5cbb193c7a6703f5bf99fb090f4d903cf5f1c62",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local counter of frame-inventory extents one containment lookup visited, read by the hvpatch-mm-maintenance census probe and by exclusive_claim_extent_lookup_is_bounded_by_size_classes. Same per-host-thread scope and rationale as ALIAS_STATE_ROWS_SCANNED and TASK_MAPPING_ROWS_SCANNED: it measures the calling thread's own walk length and carries no Linux process semantics."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "THREAD_VCPU_CREATED_TOTAL",
       "fingerprint": "d4c0c2b4d0434b284b08ad53be54942e8a78fe5ab78362a24ab33dbb97953d8e",
       "classification": "carrier_infra",
