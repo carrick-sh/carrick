@@ -742,18 +742,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/host_signal.rs:1363 in `raise_for_self`, the host result from `libc::getpid` determines the guest signal sender PID used by `raise_for_self`.",
+    "rationale": "At crates/carrick-vmm-hvf/src/host_signal.rs:1365 in `raise_for_self`, the host result from `libc::getpid` determines the guest signal sender PID used by `raise_for_self`.",
     "review_id": "HA-000041",
     "source": {
-      "byte_end": 62214,
-      "byte_start": 62202,
+      "byte_end": 62266,
+      "byte_start": 62254,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
       "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
-      "line": 1363,
-      "line_end": 1363,
-      "line_start": 1363
+      "line": 1365,
+      "line_end": 1365,
+      "line_start": 1365
     }
   },
   {
@@ -773,8 +773,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:7418 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000048",
     "source": {
-      "byte_end": 332443,
-      "byte_start": 332431,
+      "byte_end": 332445,
+      "byte_start": 332433,
       "column": 21,
       "column_end": 33,
       "column_start": 21,
@@ -798,18 +798,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:7471 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:7489 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000049",
     "source": {
-      "byte_end": 335402,
-      "byte_start": 335390,
+      "byte_end": 336334,
+      "byte_start": 336322,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 7471,
-      "line_end": 7471,
-      "line_start": 7471
+      "line": 7489,
+      "line_end": 7489,
+      "line_start": 7489
     }
   },
   {
@@ -826,18 +826,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:7529 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:7547 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000050",
     "source": {
-      "byte_end": 338595,
-      "byte_start": 338583,
+      "byte_end": 339491,
+      "byte_start": 339479,
       "column": 29,
       "column_end": 41,
       "column_start": 29,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 7529,
-      "line_end": 7529,
-      "line_start": 7529
+      "line": 7547,
+      "line_end": 7547,
+      "line_start": 7547
     }
   },
   {
@@ -1212,18 +1212,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1224 in `raise_host_nofile_backing`, `libc::getrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1222 in `raise_host_nofile_backing`, `libc::getrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
     "review_id": "HA-000059",
     "source": {
-      "byte_end": 61058,
-      "byte_start": 61043,
+      "byte_end": 60953,
+      "byte_start": 60938,
       "column": 15,
       "column_end": 30,
       "column_start": 15,
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 1224,
-      "line_end": 1224,
-      "line_start": 1224
+      "line": 1222,
+      "line_end": 1222,
+      "line_start": 1222
     }
   },
   {
@@ -1612,18 +1612,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1293 in `raise_host_nofile_backing`, `libc::setrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1291 in `raise_host_nofile_backing`, `libc::setrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
     "review_id": "HA-000076",
     "source": {
-      "byte_end": 64365,
-      "byte_start": 64350,
+      "byte_end": 64260,
+      "byte_start": 64245,
       "column": 9,
       "column_end": 24,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 1293,
-      "line_end": 1293,
-      "line_start": 1293
+      "line": 1291,
+      "line_end": 1291,
+      "line_start": 1291
     }
   },
   {
@@ -5824,18 +5824,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1260 in `host_open_descriptor_count`, `std::fs::read_dir` acts only on the current carrier open host-descriptor census used by `host_open_descriptor_count` (the `/dev/fd` listing that backs guest `/proc/sys/fs/file-nr`); no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1258 in `host_open_descriptor_count`, `std::fs::read_dir` acts only on the current carrier open host-descriptor census used by `host_open_descriptor_count` (the `/dev/fd` listing that backs guest `/proc/sys/fs/file-nr`); no guest identity selects its host target.",
     "review_id": "HA-000642",
     "source": {
-      "byte_end": 62807,
-      "byte_start": 62790,
+      "byte_end": 62702,
+      "byte_start": 62685,
       "column": 5,
       "column_end": 22,
       "column_start": 5,
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 1260,
-      "line_end": 1260,
-      "line_start": 1260
+      "line": 1258,
+      "line_end": 1258,
+      "line_start": 1258
     }
   },
   {
@@ -14600,18 +14600,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:2321 in `futex`, `std::thread::sleep` acts only on the current process-dispatch wait worker used by `futex`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:2320 in `futex`, `std::thread::sleep` acts only on the current process-dispatch wait worker used by `futex`; no guest identity selects its host target.",
     "review_id": "HA-000605",
     "source": {
-      "byte_end": 105715,
-      "byte_start": 105697,
+      "byte_end": 105533,
+      "byte_start": 105515,
       "column": 29,
       "column_end": 47,
       "column_start": 29,
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 2321,
-      "line_end": 2321,
-      "line_start": 2321
+      "line": 2320,
+      "line_end": 2320,
+      "line_start": 2320
     }
   },
   {
@@ -15341,18 +15341,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:1982 in `sched_yield`, `std::thread::yield_now` acts only on the current process-dispatch wait worker used by `sched_yield`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:1981 in `sched_yield`, `std::thread::yield_now` acts only on the current process-dispatch wait worker used by `sched_yield`; no guest identity selects its host target.",
     "review_id": "HA-000630",
     "source": {
-      "byte_end": 88872,
-      "byte_start": 88850,
+      "byte_end": 88690,
+      "byte_start": 88668,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-kernel/src/dispatch/proc.rs",
-      "line": 1982,
-      "line_end": 1982,
-      "line_start": 1982
+      "line": 1981,
+      "line_end": 1981,
+      "line_start": 1981
     }
   },
   {
@@ -15407,6 +15407,33 @@
       "line": 2706,
       "line_end": 2706,
       "line_start": 2706
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-YIELD-NOW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current host thread waiting on delegated file lock held by EL1 used by `lock_delegated_file`"
+    },
+    "expansion": null,
+    "operation": "std::thread::yield_now",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/el1_delegation.rs:394 in `lock_delegated_file`, `std::thread::yield_now` acts only on the current host thread waiting on delegated file lock held by EL1 used by `lock_delegated_file`; no guest identity selects its host target.",
+    "review_id": "HA-000671",
+    "source": {
+      "byte_end": 13295,
+      "byte_start": 13273,
+      "column": 9,
+      "column_end": 31,
+      "column_start": 9,
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "line": 394,
+      "line_end": 394,
+      "line_start": 394
     }
   },
   {
