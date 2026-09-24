@@ -1807,7 +1807,40 @@ impl OpenFile {
     }
 }
 
+/// Count a new host regular-file description against its inode's EL1 owner
+/// record. Runs once per description, after construction, with no guard of
+/// the new description held; it may recall another description's delegation
+/// of the same inode before the new one can do any I/O.
+fn attach_el1_registration(
+    file_desc: &crate::kernel::FileDescription,
+    description: &OpenDescriptionRef,
+) {
+    if !carrick_mem::memory::el1_kernel_enabled() {
+        return;
+    }
+    let identity = match &*description.read() {
+        OpenDescription::HostFile {
+            host_fd, metadata, ..
+        } if metadata.kind == carrick_vfs::rootfs::RootFsEntryKind::File => {
+            host_fd.inode_identity()
+        }
+        _ => None,
+    };
+    if let Some(identity) = identity {
+        file_desc.set_el1_registration(crate::el1_delegation::register_open(identity));
+    }
+}
+
 pub(crate) fn kernel_file_description(
+    description: OpenDescriptionRef,
+    status_flags: u64,
+) -> Arc<crate::kernel::FileDescription> {
+    let file_desc = kernel_file_description_unregistered(Arc::clone(&description), status_flags);
+    attach_el1_registration(&file_desc, &description);
+    file_desc
+}
+
+fn kernel_file_description_unregistered(
     description: OpenDescriptionRef,
     status_flags: u64,
 ) -> Arc<crate::kernel::FileDescription> {
@@ -1846,8 +1879,12 @@ impl crate::kernel::FileSlot {
             Arc::clone(&common),
         ) {
             Ok(file_desc) => Arc::new(file_desc),
-            Err(_) => kernel_file_description(description, common.status_flags()),
+            Err(_) => kernel_file_description_unregistered(
+                Arc::clone(&description),
+                common.status_flags(),
+            ),
         };
+        attach_el1_registration(&file_desc, &description);
         Self::new(file_desc, fd_flags)
     }
 }
@@ -2969,104 +3006,59 @@ impl crate::kernel::FileDescription {
         self.concrete_backing::<RwLock<OpenDescription>>()
     }
 
+    // The accessors below are the ONLY host access to an OpenDescription.
+    // A delegated description is recalled before the host touches it. Other
+    // descriptions of the same inode cannot exist while it is delegated (the
+    // EL1 ownership record enforces single-description delegation), so each
+    // accessor only checks its own description, and a non-delegated file pays
+    // one atomic load here.
+
     pub(crate) fn read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
         let d = self.open_description()?;
-        const MAX_RECALL_ITERATIONS: usize = 5;
-        let mut iterations = 0;
         loop {
-            iterations += 1;
-            if iterations > MAX_RECALL_ITERATIONS {
-                carrick_fatal!(
-                    "el1_delegation",
-                    "FileDescription::read recall loop exceeded bounded iterations ({iterations}); object lock held by dead/crashed vCPU?"
-                );
-            }
-            let guard = d.read();
-            if self.delegation_handle() != 0 {
-                drop(guard);
-                let mut write_guard = d.write();
+            let handle = self.delegation_handle();
+            if handle != 0 {
+                let mut guard = d.write();
                 let handle = self.delegation_handle();
                 if handle != 0 {
-                    let _ = crate::el1_delegation::recall_locked(self, &mut write_guard, handle);
-                }
-                drop(write_guard);
-                continue;
-            }
-            if crate::el1_delegation::has_delegated_files() {
-                if let Some(inode) = guard.inode_identity_fast() {
-                    if crate::el1_delegation::is_inode_delegated_by_other(inode, 0) {
-                        drop(guard);
-                        crate::el1_delegation::recall_by_inode(inode);
-                        continue;
-                    }
+                    let _ = crate::el1_delegation::recall_locked(self, &mut guard, handle);
                 }
             }
-            return Some(guard);
+            let guard = d.read();
+            // A sibling thread's forwarded write may have re-delegated the
+            // description between the recall and this read; recall again.
+            // Each recall counts toward the description's recall limit, after
+            // which it is never delegated again, so this loop is finite.
+            if self.delegation_handle() == 0 {
+                return Some(guard);
+            }
         }
     }
 
     pub(crate) fn try_read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
         let d = self.open_description()?;
-        let guard = d.try_read()?;
         if self.delegation_handle() != 0 {
-            drop(guard);
-            let mut write_guard = d.try_write()?;
-            let handle = self.delegation_handle();
-            if handle != 0 {
-                let _ = crate::el1_delegation::recall_locked(self, &mut write_guard, handle);
-            }
-            drop(write_guard);
-            let guard = d.try_read()?;
-            if self.delegation_handle() == 0 {
-                Some(guard)
-            } else {
-                None
-            }
-        } else {
-            if crate::el1_delegation::has_delegated_files() {
-                if let Some(inode) = guard.inode_identity_fast() {
-                    if crate::el1_delegation::is_inode_delegated_by_other(inode, 0) {
-                        drop(guard);
-                        crate::el1_delegation::recall_by_inode(inode);
-                        return d.try_read();
-                    }
-                }
-            }
-            Some(guard)
-        }
-    }
-
-    pub(crate) fn write(&self) -> Option<FileDescriptionWriteGuard<'_>> {
-        let d = self.open_description()?;
-        const MAX_RECALL_ITERATIONS: usize = 5;
-        let mut iterations = 0;
-        loop {
-            iterations += 1;
-            if iterations > MAX_RECALL_ITERATIONS {
-                carrick_fatal!(
-                    "el1_delegation",
-                    "FileDescription::write recall loop exceeded bounded iterations ({iterations}); object lock held by dead/crashed vCPU?"
-                );
-            }
-            let mut guard = d.write();
+            let mut guard = d.try_write()?;
             let handle = self.delegation_handle();
             if handle != 0 {
                 let _ = crate::el1_delegation::recall_locked(self, &mut guard, handle);
             }
-            if crate::el1_delegation::has_delegated_files() {
-                if let Some(inode) = guard.inode_identity_fast() {
-                    if crate::el1_delegation::is_inode_delegated_by_other(inode, 0) {
-                        drop(guard);
-                        crate::el1_delegation::recall_by_inode(inode);
-                        continue;
-                    }
-                }
-            }
-            return Some(FileDescriptionWriteGuard {
-                guard,
-                description: self,
-            });
         }
+        let guard = d.try_read()?;
+        (self.delegation_handle() == 0).then_some(guard)
+    }
+
+    pub(crate) fn write(&self) -> Option<FileDescriptionWriteGuard<'_>> {
+        let d = self.open_description()?;
+        let mut guard = d.write();
+        let handle = self.delegation_handle();
+        if handle != 0 {
+            let _ = crate::el1_delegation::recall_locked(self, &mut guard, handle);
+        }
+        Some(FileDescriptionWriteGuard {
+            guard,
+            description: self,
+        })
     }
 
     #[cfg(test)]
@@ -3343,25 +3335,6 @@ impl OpenDescription {
                 .unwrap_or(carrick_vfs::FsIdentity::Overlay),
             Self::ProcExecutable { .. } => carrick_vfs::FsIdentity::Overlay,
             _ => carrick_vfs::FsIdentity::AnonInode,
-        }
-    }
-
-    pub(crate) fn inode_identity_fast(&self) -> Option<carrick_vfs::InodeIdentity> {
-        match self {
-            OpenDescription::HostFile { base, .. } => base.inode,
-            OpenDescription::File { base, path, .. } => base.inode.or_else(|| {
-                Some(carrick_vfs::InodeIdentity::new(
-                    0,
-                    super::inode_for_path(std::path::Path::new(path)),
-                ))
-            }),
-            OpenDescription::InMemoryFile { base, path, .. } => base.inode.or_else(|| {
-                Some(carrick_vfs::InodeIdentity::new(
-                    0,
-                    super::inode_for_path(std::path::Path::new(path)),
-                ))
-            }),
-            _ => None,
         }
     }
 

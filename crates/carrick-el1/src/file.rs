@@ -474,7 +474,7 @@ fn mark_gap_zero_pages(file: &DelegatedFile, old_size: u64, cur_off: u64) {
         return;
     }
     let partial_end = old_size.div_ceil(DELEGATED_PAGE_SIZE) * DELEGATED_PAGE_SIZE;
-    if partial_end <= cur_off && (old_size % DELEGATED_PAGE_SIZE != 0) {
+    if partial_end <= cur_off && !old_size.is_multiple_of(DELEGATED_PAGE_SIZE) {
         mark_dirty_pages(file, old_size, partial_end);
     } else if partial_end > cur_off {
         mark_dirty_pages(file, old_size, cur_off);

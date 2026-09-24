@@ -98,24 +98,6 @@ impl From<InodeIdentity> for (u64, u64) {
     }
 }
 
-pub type InodeRecallHook = fn(InodeIdentity) -> bool;
-
-static INODE_RECALL_HOOK: std::sync::atomic::AtomicPtr<()> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
-pub fn set_inode_recall_hook(hook: InodeRecallHook) {
-    INODE_RECALL_HOOK.store(hook as *mut (), std::sync::atomic::Ordering::Release);
-}
-
-pub fn get_inode_recall_hook() -> Option<InodeRecallHook> {
-    let ptr = INODE_RECALL_HOOK.load(std::sync::atomic::Ordering::Acquire);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { std::mem::transmute::<*mut (), InodeRecallHook>(ptr) })
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InodeRecord {
     pub mode: u32,
@@ -434,17 +416,6 @@ impl DentryCache {
         backend: &dyn FsBackend,
         rootfs: Option<&RootFs>,
     ) -> Result<ResolvedDentry, LinuxErrno> {
-        self.lookup_path_options(path, follow_trailing, backend, rootfs, true)
-    }
-
-    pub fn lookup_path_options(
-        &self,
-        path: &str,
-        follow_trailing: bool,
-        backend: &dyn FsBackend,
-        rootfs: Option<&RootFs>,
-        recall_delegated: bool,
-    ) -> Result<ResolvedDentry, LinuxErrno> {
         self.check_fork();
 
         if path.split('/').any(|c| c.len() > 255) {
@@ -468,38 +439,18 @@ impl DentryCache {
                 &fp.lookup_nofollow
             };
             if let Some(res) = map.get(norm_path) {
-                if let Ok(r) = res {
-                    let inode = InodeIdentity::new(r.dentry.dev, r.dentry.ino);
-                    if recall_delegated && let Some(hook) = get_inode_recall_hook() {
-                        if hook(inode) {
-                            drop(fp);
-                            self.invalidate_inode(inode);
-                        } else {
-                            if requires_dir && r.dentry.kind != RootFsEntryKind::Directory {
-                                return Err(LINUX_ENOTDIR);
-                            }
-                            return Ok(r.clone());
-                        }
-                    } else {
-                        if requires_dir && r.dentry.kind != RootFsEntryKind::Directory {
-                            return Err(LINUX_ENOTDIR);
-                        }
-                        return Ok(r.clone());
-                    }
-                } else {
-                    return res.clone();
+                if requires_dir
+                    && let Ok(r) = res
+                    && r.dentry.kind != RootFsEntryKind::Directory
+                {
+                    return Err(LINUX_ENOTDIR);
                 }
+                return res.clone();
             }
         }
 
         let start_gen = self.mutation_gen.load(Ordering::SeqCst);
-        let res = self.lookup_path_slow(
-            norm_path,
-            effective_follow,
-            backend,
-            rootfs,
-            recall_delegated,
-        );
+        let res = self.lookup_path_slow(norm_path, effective_follow, backend, rootfs);
 
         if !self.is_shared && (res.is_ok() || matches!(res, Err(LINUX_ENOENT))) {
             if self.mutation_gen.load(Ordering::SeqCst) == start_gen {
@@ -671,7 +622,6 @@ impl DentryCache {
         follow_trailing: bool,
         backend: &dyn FsBackend,
         rootfs: Option<&RootFs>,
-        recall_delegated: bool,
     ) -> Result<ResolvedDentry, LinuxErrno> {
         if norm_path == "/" {
             return self.resolve_dir_id(DentryId::ROOT, backend, rootfs);
@@ -1063,12 +1013,6 @@ impl DentryCache {
 
             // Regular file or other non-dir leaf
             if is_last {
-                let inode = InodeIdentity::new(node.dev, node.ino);
-                if recall_delegated && let Some(hook) = get_inode_recall_hook() {
-                    if hook(inode) {
-                        self.invalidate_inode(inode);
-                    }
-                }
                 let leaf_path = format!("{}/{}", current_dir_path.trim_end_matches('/'), name);
                 let leaf_name_c = CString::new(name.as_bytes()).map_err(|_| LINUX_ENOENT)?;
                 return Ok(ResolvedDentry {
@@ -2121,26 +2065,13 @@ impl DentryCache {
             };
             if let Some(res) = map.get(norm_path) {
                 let stat_res = *res;
-                if let (Ok(st), Some(hook)) = (stat_res, get_inode_recall_hook()) {
-                    let inode = InodeIdentity::new(0, st.ino);
-                    if hook(inode) {
-                        drop(fp);
-                        self.invalidate_inode(inode);
-                    } else {
-                        if requires_dir && st.kind != RootFsEntryKind::Directory {
-                            return Err(LINUX_ENOTDIR);
-                        }
-                        return stat_res;
-                    }
-                } else {
-                    if requires_dir
-                        && let Ok(st) = stat_res
-                        && st.kind != RootFsEntryKind::Directory
-                    {
-                        return Err(LINUX_ENOTDIR);
-                    }
-                    return stat_res;
+                if requires_dir
+                    && let Ok(st) = stat_res
+                    && st.kind != RootFsEntryKind::Directory
+                {
+                    return Err(LINUX_ENOTDIR);
                 }
+                return stat_res;
             }
         }
 

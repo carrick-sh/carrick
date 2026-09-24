@@ -1603,7 +1603,7 @@ impl<'a> MemView<'a> {
                         LINUX_EBADF,
                     ));
                 };
-                let _ = crate::el1_delegation::recall_if_delegated(&open_file.description);
+                crate::el1_delegation::recall_if_delegated(&open_file.description);
                 // Independently opened in-memory descriptions are snapshots of
                 // one shared overlay inode. Another process can extend/write
                 // that inode after this description was opened (Go telemetry

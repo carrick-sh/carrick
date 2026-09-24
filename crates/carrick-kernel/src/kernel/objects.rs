@@ -1046,25 +1046,16 @@ struct DescriptionLifecycle {
 #[derive(Debug)]
 pub struct MappedFileReference {
     description: Arc<FileDescription>,
-    inode: Option<carrick_vfs::InodeIdentity>,
 }
 
 impl MappedFileReference {
     pub(crate) fn description(&self) -> &FileDescription {
         &self.description
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn inode(&self) -> Option<carrick_vfs::InodeIdentity> {
-        self.inode
-    }
 }
 
 impl Drop for MappedFileReference {
     fn drop(&mut self) {
-        if let Some(inode) = self.inode {
-            crate::el1_delegation::unregister_mapped_inode(inode);
-        }
         let mut lifecycle = self.description.lifecycle_transition.lock();
         lifecycle.mapping_refs = lifecycle.mapping_refs.checked_sub(1).unwrap_or_else(|| {
             carrick_fatal!(
@@ -1090,6 +1081,9 @@ pub struct FileDescription {
     epoll_registrations: Mutex<BTreeMap<(FileDescriptionId, i32), Weak<FileDescription>>>,
     revision: ObjectRevision,
     delegation_handle: std::sync::atomic::AtomicU32,
+    /// Counts this description against its host inode's EL1 ownership record
+    /// (host regular files only; set once at construction).
+    el1_registration: std::sync::OnceLock<crate::el1_delegation::InodeOpenRegistration>,
 }
 
 impl FileDescription {
@@ -1117,6 +1111,7 @@ impl FileDescription {
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
             delegation_handle: std::sync::atomic::AtomicU32::new(0),
+            el1_registration: std::sync::OnceLock::new(),
         })
     }
 
@@ -1148,6 +1143,7 @@ impl FileDescription {
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
             delegation_handle: std::sync::atomic::AtomicU32::new(0),
+            el1_registration: std::sync::OnceLock::new(),
         })
     }
 
@@ -1176,6 +1172,7 @@ impl FileDescription {
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
             delegation_handle: std::sync::atomic::AtomicU32::new(0),
+            el1_registration: std::sync::OnceLock::new(),
         }
     }
 
@@ -1188,6 +1185,7 @@ impl FileDescription {
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
             delegation_handle: std::sync::atomic::AtomicU32::new(0),
+            el1_registration: std::sync::OnceLock::new(),
         }
     }
 
@@ -1199,6 +1197,19 @@ impl FileDescription {
     pub fn set_delegation_handle(&self, handle: u32) {
         self.delegation_handle
             .store(handle, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Attach the EL1 inode registration; first caller wins.
+    pub(crate) fn set_el1_registration(
+        &self,
+        registration: crate::el1_delegation::InodeOpenRegistration,
+    ) {
+        let _ = self.el1_registration.set(registration);
+    }
+
+    /// The host inode identity this description is registered under, if any.
+    pub(crate) fn el1_identity(&self) -> Option<carrick_vfs::InodeIdentity> {
+        self.el1_registration.get().map(|r| r.identity())
     }
 
     pub(crate) fn has_active_mappings(&self) -> bool {
@@ -1347,7 +1358,7 @@ impl FileDescription {
     }
 
     pub(crate) fn retain_fd_ref(&self) {
-        let _ = crate::el1_delegation::recall_if_delegated(self);
+        crate::el1_delegation::recall_if_delegated(self);
         let _guard = self.lifecycle_transition.lock();
         let count = self.common.retain_fd_ref();
         if count == 1 {
@@ -1402,7 +1413,7 @@ impl FileDescription {
     }
 
     pub(crate) fn release_fd_ref(&self) {
-        let _ = crate::el1_delegation::recall_if_delegated(self);
+        crate::el1_delegation::recall_if_delegated(self);
         let terminal_finalizers = {
             let mut lifecycle = self.lifecycle_transition.lock();
             let count = self.common.release_fd_ref();
@@ -1428,29 +1439,12 @@ impl FileDescription {
     }
 
     /// Acquire while an fd still owns the backing, serialized with final close.
-    #[allow(dead_code)]
+    /// A mapping and an EL1 delegation never coexist: the delegation is
+    /// recalled first, and a mapped description is never delegated.
     pub(crate) fn retain_mapping(self: &Arc<Self>) -> Option<Arc<MappedFileReference>> {
-        self.retain_mapping_with_inode(None)
-    }
-
-    pub(crate) fn retain_mapping_with_inode(
-        self: &Arc<Self>,
-        inode: Option<carrick_vfs::InodeIdentity>,
-    ) -> Option<Arc<MappedFileReference>> {
-        let inode = inode.or_else(|| {
-            self.concrete_backing::<parking_lot::RwLock<crate::dispatch::fd_table::OpenDescription>>()
-                .and_then(|open| open.try_read().and_then(|g| g.inode_identity_fast()))
-        });
-        if let Some(ino) = inode {
-            crate::el1_delegation::register_mapped_inode(ino);
-        } else {
-            let _ = crate::el1_delegation::recall_if_delegated(self);
-        }
+        crate::el1_delegation::recall_if_delegated(self);
         let mut lifecycle = self.lifecycle_transition.lock();
         if self.common.fd_refs() == 0 {
-            if let Some(ino) = inode {
-                crate::el1_delegation::unregister_mapped_inode(ino);
-            }
             return None;
         }
         lifecycle.mapping_refs = lifecycle.mapping_refs.checked_add(1).unwrap_or_else(|| {
@@ -1462,7 +1456,6 @@ impl FileDescription {
         self.revision.publish();
         Some(Arc::new(MappedFileReference {
             description: Arc::clone(self),
-            inode,
         }))
     }
 
@@ -2044,7 +2037,7 @@ impl FileTable {
     pub(crate) fn for_fork_copy(id: FileTableId, parent: &Self) -> Self {
         let open_files = parent.open_files.read().clone();
         for slot in open_files.values() {
-            let _ = crate::el1_delegation::recall_if_delegated(&slot.description);
+            crate::el1_delegation::recall_if_delegated(&slot.description);
             slot.description.retain_fd_ref();
         }
         let epoll_wake_registry = Arc::clone(&parent.epoll_wake_registry);

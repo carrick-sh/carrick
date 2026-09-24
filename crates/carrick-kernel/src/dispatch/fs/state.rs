@@ -202,8 +202,6 @@ pub(crate) struct FsState {
     /// cannot describe the sparse layout Linux callers created. Key by host
     /// object identity so dup/open/fork aliases observe one layout.
     pub(crate) host_sparse_extents: HostSparseExtentsRegistry,
-    #[cfg(test)]
-    pub(crate) before_host_write_test_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -662,8 +660,6 @@ impl FsState {
             hvpatch_exec_cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             classic_record_locks: std::sync::Arc::new(super::LogicalRecordLocks::default()),
             host_sparse_extents: HostSparseExtentsRegistry::new(),
-            #[cfg(test)]
-            before_host_write_test_hook: None,
         }
     }
 
@@ -684,8 +680,6 @@ impl FsState {
             hvpatch_exec_cache: std::sync::Arc::clone(&self.hvpatch_exec_cache),
             classic_record_locks: std::sync::Arc::clone(&self.classic_record_locks),
             host_sparse_extents: self.host_sparse_extents.clone(),
-            #[cfg(test)]
-            before_host_write_test_hook: self.before_host_write_test_hook.clone(),
         }
     }
 
@@ -781,22 +775,6 @@ impl HostSparseExtentsRegistry {
         let identity = HostFileIdentity {
             device: identity.dev,
             inode: identity.ino,
-        };
-        if let Some(extents) = extents.get_mut(&identity) {
-            extents.record_write(offset, len as u64);
-        }
-    }
-
-    pub(crate) fn record_host_sparse_write_raw(&self, fd: i32, offset: u64, len: usize) {
-        if !self.has_host_sparse_extents() {
-            return;
-        }
-        let mut extents = self.extents.lock();
-        if extents.is_empty() {
-            return;
-        }
-        let Some(identity) = host_file_identity(fd) else {
-            return;
         };
         if let Some(extents) = extents.get_mut(&identity) {
             extents.record_write(offset, len as u64);
