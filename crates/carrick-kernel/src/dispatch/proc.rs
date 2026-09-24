@@ -974,7 +974,7 @@ impl<'a> ProcView<'a> {
         &self,
         memory: &mut M,
     ) -> Result<(), carrick_abi::LinuxErrno> {
-        crate::el1_delegation::recall_all_delegated()?;
+        crate::el1_delegation::recall_all_delegated();
         if crate::syscall_shim_enabled() {
             let _ = crate::kernel::identity_page::stamp_clock_gate(
                 memory,

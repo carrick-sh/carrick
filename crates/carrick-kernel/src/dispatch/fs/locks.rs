@@ -1709,11 +1709,7 @@ impl<'a> FsView<'a> {
                     // kernel signals the F_SETOWN owner on a readiness edge).
                     const LINUX_F_SETFL_MUTABLE: u64 =
                         LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_ASYNC;
-                    if let Err(err) =
-                        crate::el1_delegation::recall_if_delegated(&open_file.description)
-                    {
-                        return Ok(DispatchOutcome::errno(err));
-                    }
+                    crate::el1_delegation::recall_if_delegated(&open_file.description);
                     let Some(open) = open_file.description.write() else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
@@ -1986,13 +1982,10 @@ impl<'a> FsView<'a> {
                     {
                         return Ok(DispatchOutcome::errno(LINUX_EBUSY));
                     }
-                    let recall_res = {
+                    {
                         let _guard = open_file.description.write();
                         common.set_seals(Some((current | new_seals).bits()));
-                        crate::el1_delegation::recall_if_delegated(&open_file.description)
-                    };
-                    if let Err(err) = recall_res {
-                        return Ok(DispatchOutcome::errno(err));
+                        crate::el1_delegation::recall_if_delegated(&open_file.description);
                     }
                     DispatchOutcome::Returned { value: 0 }
                 }
