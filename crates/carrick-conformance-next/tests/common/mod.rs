@@ -73,6 +73,7 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "getrandomvdsofork",
     "hugepage",
     "inotifyqueue",
+    "inotifywakethread",
     "inzonetcpclose",
     "iopriovhangup",
     "iouringsqpoll",

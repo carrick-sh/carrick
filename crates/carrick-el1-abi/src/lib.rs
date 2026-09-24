@@ -934,7 +934,14 @@ pub struct DelegatedInotify {
     /// is kept by the host until the spill drains.
     pub spilled: AtomicU32,
     pub num_watches: AtomicU32,
-    pub _reserved: [u32; 4],
+    /// Nonzero once a host thread has waited on (polled, epolled or blocked
+    /// reading) this instance: from then on an EL1 enqueue onto an empty
+    /// queue owes that waiter a wake.
+    pub host_observed: AtomicU32,
+    /// Set by an enqueue that owes a host waiter a wake; the host delivers
+    /// it at its next boundary and clears it.
+    pub wake_owed: AtomicU32,
+    pub _reserved: [u32; 2],
     pub watches: UnsafeCell<[DelegatedWatch; MAX_DELEGATED_WATCHES]>,
     /// The instance's one event queue (shared implementation with the host).
     pub queue: UnsafeCell<InotifyEventQueue<INOTIFY_QUEUE_BYTES>>,
@@ -958,7 +965,9 @@ impl DelegatedInotify {
             queued_bytes: AtomicUsize::new(0),
             spilled: AtomicU32::new(0),
             num_watches: AtomicU32::new(0),
-            _reserved: [0; 4],
+            host_observed: AtomicU32::new(0),
+            wake_owed: AtomicU32::new(0),
+            _reserved: [0; 2],
             watches: UnsafeCell::new(
                 [const {
                     DelegatedWatch {
@@ -1092,10 +1101,31 @@ impl DelegatedInotify {
     pub fn push_record(&self, wd: i32, mask: u32, cookie: u32, name: Option<&[u8]>) -> QueuePush {
         // SAFETY: the queue is only touched under the instance lock.
         let queue = unsafe { &mut *self.queue.get() };
+        let was_empty = queue.is_empty();
         let result = queue.push(wd, mask, cookie, name);
+        // SeqCst store and load: pairs with the host's `host_observed` store
+        // and its readiness probe, so a waiter either sees the record or is
+        // owed the wake.
         self.queued_bytes
-            .store(queue.queued_bytes(), Ordering::Release);
+            .store(queue.queued_bytes(), Ordering::SeqCst);
+        // Readable edge: a host thread that waited on the empty instance
+        // sleeps on a host object EL1 cannot signal, so the wake is owed.
+        if was_empty && !queue.is_empty() && self.host_observed.load(Ordering::SeqCst) != 0 {
+            self.wake_owed.store(1, Ordering::Release);
+        }
         result
+    }
+
+    /// Whether an enqueue owes a host waiter a wake (without clearing it).
+    #[inline]
+    pub fn wake_is_owed(&self) -> bool {
+        self.wake_owed.load(Ordering::Acquire) != 0
+    }
+
+    /// Take the owed wake, if any.
+    #[inline]
+    pub fn take_wake_owed(&self) -> bool {
+        self.wake_owed.swap(0, Ordering::AcqRel) != 0
     }
 
     /// Move whole records into `dest` (read(2) semantics). The caller holds
@@ -1121,6 +1151,8 @@ impl DelegatedInotify {
         unsafe { *self.queue.get() = InotifyEventQueue::new() };
         self.queued_bytes.store(0, Ordering::Release);
         self.spilled.store(0, Ordering::Release);
+        self.host_observed.store(0, Ordering::Release);
+        self.wake_owed.store(0, Ordering::Release);
     }
 }
 
@@ -1640,5 +1672,26 @@ mod tests {
         assert_eq!(cache.lookup(file_table, path, hash), Some(9));
         cache.invalidate_all();
         assert_eq!(cache.lookup(file_table, path, hash), None);
+    }
+
+    #[test]
+    fn an_enqueue_owes_a_wake_only_on_the_readable_edge_of_an_observed_instance() {
+        extern crate std;
+        let instance = std::boxed::Box::new(DelegatedInotify::new());
+        // Unobserved: nobody waits on a host object, nothing is owed.
+        let _ = instance.push_record(1, 0x2, 0, None);
+        assert!(!instance.wake_is_owed());
+        let mut out = [0u8; 64];
+        assert!(instance.drain_into(&mut out).is_ok());
+        // Observed and empty: the first record owes the waiter a wake.
+        instance.host_observed.store(1, Ordering::SeqCst);
+        let _ = instance.push_record(1, 0x2, 0, None);
+        assert!(instance.take_wake_owed());
+        // Already readable: a second record owes nothing new.
+        let _ = instance.push_record(2, 0x2, 0, None);
+        assert!(!instance.wake_is_owed());
+        // A new incarnation forgets its waiters.
+        instance.reset_queue();
+        assert_eq!(instance.host_observed.load(Ordering::SeqCst), 0);
     }
 }

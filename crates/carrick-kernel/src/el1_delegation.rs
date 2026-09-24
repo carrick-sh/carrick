@@ -1299,6 +1299,8 @@ pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
         )
     };
     file.unlock();
+    // The host is already at its boundary: deliver what a write owed now.
+    crate::el1_inotify::deliver_owed_wakes();
     let value = result.ok()?;
     HOST_SERVED.fetch_add(1, Ordering::Relaxed);
     Some(match carrick_abi::LinuxErrno::from_guest_retval(value) {

@@ -187,6 +187,38 @@ pub(crate) fn zone_watch_for_file(state: &InotifyState, file_handle: u32) -> Opt
         .map(|w| (w.wd, w.mask))
 }
 
+/// A host thread is about to wait on in-zone instance `handle`: from now on
+/// an in-guest enqueue onto its empty queue owes a wake (see
+/// `DelegatedInotify::push_record`). SeqCst pairs with that enqueue: either
+/// the enqueue sees this store and owes the wake, or the waiter's readiness
+/// probe after this store sees the record.
+pub(crate) fn observe_instance(handle: u32) {
+    let region_ptr = get_el1_region_host_ptr();
+    if region_ptr == 0 || handle == 0 || handle as usize > MAX_DELEGATED_INOTIFY {
+        return;
+    }
+    instance_object(region_ptr, handle)
+        .host_observed
+        .store(1, Ordering::SeqCst);
+}
+
+/// Deliver every wake an in-guest enqueue owed a host waiter. Called at the
+/// host boundary EL1 forces after such an enqueue, and after the host serves
+/// a forwarded write itself.
+pub fn deliver_owed_wakes() {
+    let region_ptr = get_el1_region_host_ptr();
+    if region_ptr == 0 {
+        return;
+    }
+    for handle in 1..=MAX_DELEGATED_INOTIFY as u32 {
+        if instance_object(region_ptr, handle).take_wake_owed()
+            && let Some(state) = state_for_handle(handle)
+        {
+            state.wake_waiters();
+        }
+    }
+}
+
 /// Bump process CWD generation in the EL1 name cache.
 pub fn bump_cwd_generation() {
     let region_ptr = get_el1_region_host_ptr();

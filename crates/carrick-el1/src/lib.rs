@@ -128,6 +128,7 @@ where
                 frame.x[0] = res as u64;
                 counters.served[28].fetch_add(1, Ordering::Relaxed);
                 task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                claim_owed_inotify_wake(task, inotify_table);
                 if task.has_pending_host_work() {
                     task.served_with_work.store(1, Ordering::Release);
                     return Action::ServedWithWork;
@@ -193,6 +194,9 @@ where
                 }
                 if let Some(task) = cur_task {
                     task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                    if nr == 64 || nr == 68 {
+                        claim_owed_inotify_wake(task, inotify_table);
+                    }
                     if task.has_pending_host_work() {
                         task.served_with_work.store(1, Ordering::Release);
                         return Action::ServedWithWork;
@@ -208,6 +212,15 @@ where
         counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
     }
     Action::Forward
+}
+
+/// An in-guest enqueue that owes a host waiter a wake cannot deliver it
+/// from EL1: return through the host boundary, which delivers it.
+#[inline]
+fn claim_owed_inotify_wake(task: &CurrentTask, inotify_table: &[DelegatedInotify]) {
+    if inotify_table.iter().any(DelegatedInotify::wake_is_owed) {
+        task.mark_pending_host_work();
+    }
 }
 
 fn try_serve_file_syscall<F>(

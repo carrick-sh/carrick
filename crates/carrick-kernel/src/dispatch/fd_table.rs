@@ -2548,6 +2548,14 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 }
                 ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
             }
+            OpenDescription::Inotify { state, .. } if state.zone_handle().is_some() => {
+                // In-zone: the queues answer; the host fd is only a wake source.
+                let mut ready = LinuxEpollEvents::empty();
+                if state.readable_now() {
+                    ready |= LinuxEpollEvents::IN;
+                }
+                ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+            }
             OpenDescription::Inotify { state, .. } => {
                 let mut ready = LinuxEpollEvents::empty();
                 if state.has_queued_records() {

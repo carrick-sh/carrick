@@ -1163,7 +1163,10 @@ impl InotifyState {
         let _lock = crate::el1_inotify::InstanceLock::acquire(zone);
         let was_empty = !zone.has_records() && inner.pending.is_empty();
         if zone.spilled.load(std::sync::atomic::Ordering::Acquire) == 0 {
-            match zone.push_record(wd, mask, cookie, name) {
+            let pushed = zone.push_record(wd, mask, cookie, name);
+            // The host wakes its own waiters (`maybe_wake`); nothing is owed.
+            let _ = zone.take_wake_owed();
+            match pushed {
                 carrick_el1_abi::QueuePush::NoSpace => {}
                 carrick_el1_abi::QueuePush::Appended { .. }
                 | carrick_el1_abi::QueuePush::Overflowed { .. } => return was_empty,
@@ -1203,6 +1206,9 @@ impl InotifyState {
     /// Linux), so poll/epoll/blocking-read can wait on inotify readiness the
     /// same way they do for timerfd/pidfd.
     pub(crate) fn poll_fd(&self) -> RawFd {
+        if let Some(handle) = self.zone_handle() {
+            crate::el1_inotify::observe_instance(handle);
+        }
         if !self
             .observed
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -1212,6 +1218,26 @@ impl InotifyState {
             }
         }
         self.poll_fd
+    }
+
+    /// Wake host threads waiting on this instance (an owed wake from an
+    /// in-guest enqueue).
+    pub(crate) fn wake_waiters(&self) {
+        self.backend.wake();
+    }
+
+    /// Whether a read would return records now. For an in-zone instance the
+    /// queues are the only answer: the backend's readiness edge may predate an
+    /// in-guest drain, so consume it and ask the queues again.
+    pub(crate) fn readable_now(&self) -> bool {
+        if self.has_queued_records() {
+            return true;
+        }
+        if self.zone_handle().is_some() {
+            let _ = self.backend.read_records(0, &self.inner);
+            return self.has_queued_records();
+        }
+        false
     }
 
     #[inline]
@@ -1321,7 +1347,8 @@ impl InotifyState {
             let inner = self.inner.lock();
             !inner.pending.is_empty()
                 || inner.zone.is_some_and(|zone| {
-                    zone.queued_bytes.load(std::sync::atomic::Ordering::Acquire) != 0
+                    // SeqCst: pairs with `observe_instance` (see there).
+                    zone.queued_bytes.load(std::sync::atomic::Ordering::SeqCst) != 0
                 })
         };
         if let Some(scope) = self.work_scope() {
