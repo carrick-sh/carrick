@@ -596,10 +596,14 @@ el1-gate: build
       otool -l "$bin" | grep -q __dof_carrick || { echo "missing __dof_carrick"; exit 1; }
       echo "dof present"
     } | tee "$out/artifact.txt"
-    ./scripts/test-signed.sh carrick-embed el1_ > "$out/el1-embed.log" 2>&1
-    just --no-deps conformance-probes > "$out/probes.log" 2>&1
+    for t in aarch64-unknown-linux-musl aarch64-unknown-linux-gnu; do
+      [ -d "conformance-probes/target/$t/release" ] || { echo "probe binaries missing for $t: run scripts/build-probes.sh (Docker) or copy conformance-probes/target/$t from a checkout that has them"; exit 1; }
+    done
+    step() { local name=$1; shift; "$@" > "$out/$name.log" 2>&1 || { echo "el1-gate: step $name failed; tail of $out/$name.log:"; tail -40 "$out/$name.log"; exit 1; }; }
+    step el1-embed ./scripts/test-signed.sh carrick-embed el1_
+    step probes just --no-deps conformance-probes
     suites=$(grep -oE 'name = "ltp-(inotify|fanotify|read|write|lseek|pread|pwrite|fstat|stat|dup|close|open|fsync|ftruncate|truncate|creat)[0-9a-z_]*"' scripts/conformance/suites.toml | sed 's/name = //; s/"//g; s/^/--suite /' | tr '\n' ' ')
-    cargo run -q -p carrick-conformance -- --tier full $suites > "$out/ltp.log" 2>&1
+    step ltp cargo run -q -p carrick-conformance -- --tier full $suites --jsonl "$out/ltp.jsonl"
     for mode in 1 0; do
       start=$(python3 -c 'import time;print(time.time())')
       CARRICK_RUN_ID=el1-gate-$mode CARRICK_EL1=$mode "$bin" run --rm localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/inotify09 > "$out/inotify09-$mode.out" 2> "$out/inotify09-$mode.err" < /dev/null
