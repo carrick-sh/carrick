@@ -92,7 +92,7 @@ impl RetainedNetlinkDescription {
     }
 
     fn enqueue(&self, bytes: &[u8]) -> Result<(), LinuxErrno> {
-        let mut open = self.description.write().ok_or(LINUX_EBADF)?;
+        let mut open = self.description.write_for_io().ok_or(LINUX_EBADF)?;
         let OpenDescription::Netlink { recv_queue, .. } = &mut *open else {
             return Err(LINUX_EBADF);
         };
@@ -523,7 +523,7 @@ impl<'a> IpcView<'a> {
             .map(crate::kernel::FileSlot::description)
             .ok_or(LINUX_EBADF)?;
         let is_netlink = matches!(
-            description.read().as_deref(),
+            description.inspect().as_deref(),
             Some(OpenDescription::Netlink { .. })
         );
         if !is_netlink {
@@ -537,7 +537,7 @@ impl<'a> IpcView<'a> {
 
     fn mq_description(&self, fd: i32) -> Result<MqDescription, LinuxErrno> {
         let open_file = self.open_file(fd).ok_or(LINUX_EBADF)?;
-        let open = open_file.description.read().ok_or(LINUX_EBADF)?;
+        let open = open_file.description.inspect().ok_or(LINUX_EBADF)?;
         match &*open {
             OpenDescription::Mqueue { queue, .. } => Ok(MqDescription {
                 description: Arc::clone(&open_file.description),
@@ -646,7 +646,7 @@ impl<'a> IpcView<'a> {
         // removal already linearized under table WRITE; take description WRITE
         // before queue so an in-flight registrar either published first (and
         // is removed here) or cannot validate the now-absent owner-local alias.
-        let Some(open) = open_file.description.write() else {
+        let Some(open) = open_file.description.write_for_io() else {
             return;
         };
         let OpenDescription::Mqueue { queue, .. } = &*open else {
@@ -677,7 +677,7 @@ impl<'a> IpcView<'a> {
         file_table: crate::kernel::FileTableId,
         open_file: &OpenFile,
     ) {
-        let Some(open) = open_file.description.write() else {
+        let Some(open) = open_file.description.write_for_io() else {
             return;
         };
         let OpenDescription::Mqueue { queue, .. } = &*open else {
@@ -973,7 +973,7 @@ impl<'a> IpcView<'a> {
                 // READ->queue order until publication, so either unregister
                 // wins before close (and close observes no record) or close
                 // wins and this sees Closed/EBADF. There is no stale midpoint.
-                let Some(open) = description.read() else {
+                let Some(open) = description.inspect() else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 let OpenDescription::Mqueue { queue, .. } = &*open else {
@@ -1079,7 +1079,7 @@ impl<'a> IpcView<'a> {
             // See unregister above: the read guard is the lifetime lease that
             // prevents last-close from turning the description into Closed
             // between validation and queue publication.
-            let Some(open) = description.read() else {
+            let Some(open) = description.inspect() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let OpenDescription::Mqueue { queue, .. } = &*open else {
@@ -1808,7 +1808,7 @@ mod tests {
     ) -> (Arc<crate::kernel::FileDescription>, Arc<MqueueInner>) {
         let description = file_description(dispatcher, context, fd);
         let queue = {
-            let open = description.read().expect("mqueue open description");
+            let open = description.inspect().expect("mqueue open description");
             let OpenDescription::Mqueue { queue, .. } = &*open else {
                 panic!("fd {fd} is not an mqueue");
             };
@@ -1836,7 +1836,10 @@ mod tests {
     ) -> Vec<u8> {
         super::super::resources::with_captured_resources(context, || {
             let open_file = dispatcher.open_file(fd).expect("netlink fd");
-            let open = open_file.description.read().expect("netlink description");
+            let open = open_file
+                .description
+                .inspect()
+                .expect("netlink description");
             let OpenDescription::Netlink { recv_queue, .. } = &*open else {
                 panic!("fd {fd} is not netlink");
             };
@@ -1868,7 +1871,7 @@ mod tests {
 
     impl crate::kernel::TaskWaker for NetlinkObservingWaker {
         fn wake_task(&self) {
-            let open = self.description.read();
+            let open = self.description.inspect();
             let queued = match open.as_deref() {
                 Some(OpenDescription::Netlink { recv_queue, .. }) => recv_queue.len(),
                 _ => 0,

@@ -317,7 +317,7 @@ impl<'a> MemView<'a> {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
-            let Some(desc) = open_file.description.read() else {
+            let Some(desc) = open_file.description.inspect() else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             // readahead only applies to objects with a readahead-capable
@@ -344,7 +344,7 @@ impl<'a> MemView<'a> {
             // ask the host kernel (fstat S_IFIFO) rather than keying on the
             // variant alone.
             if let Some(open_file) = this.open_file(fd.0) {
-                let is_fifo = match open_file.description.read().as_deref() {
+                let is_fifo = match open_file.description.inspect().as_deref() {
                     Some(OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. }) => true,
                     Some(OpenDescription::HostPipe { host_fd, .. }) => {
                         let mut st: libc::stat = unsafe { core::mem::zeroed() };

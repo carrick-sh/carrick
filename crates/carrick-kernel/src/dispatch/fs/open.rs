@@ -930,7 +930,7 @@ impl<'a> FsView<'a> {
             return None; // AT_FDCWD and friends
         }
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read()?;
+        let open = open_file.description.inspect()?;
         match &*open {
             OpenDescription::Directory {
                 path,
@@ -2076,7 +2076,7 @@ impl<'a> FsView<'a> {
             return Ok(self.cwd());
         }
         match self.open_file(dirfd as i32).as_ref() {
-            Some(open_file) => match open_file.description.read().as_deref() {
+            Some(open_file) => match open_file.description.inspect().as_deref() {
                 Some(OpenDescription::Directory { path, .. }) => {
                     if self.layered_metadata(path).is_err() {
                         Err(LINUX_ENOENT)

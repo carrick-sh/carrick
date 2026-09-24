@@ -51,7 +51,7 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return DispatchOutcome::errno(LINUX_EBADF);
         };
-        let Some(open) = open_file.description.read() else {
+        let Some(open) = open_file.description.read_for_io() else {
             return DispatchOutcome::errno(LINUX_EBADF);
         };
         match &*open {
@@ -291,7 +291,7 @@ impl<'a> FsView<'a> {
     ) -> DispatchOutcome {
         let (path, raw_host_fd) = self
             .open_file(fd)
-            .and_then(|of| match of.description.read().as_deref() {
+            .and_then(|of| match of.description.inspect().as_deref() {
                 Some(OpenDescription::HostFile {
                     metadata, host_fd, ..
                 }) => Some((
@@ -343,7 +343,7 @@ impl<'a> FsView<'a> {
             // directly, so fstat kept reporting the stale creation-time mode.
             let path = this
                 .open_file(fd.0)
-                .and_then(|of| match of.description.read().as_deref() {
+                .and_then(|of| match of.description.inspect().as_deref() {
                     Some(
                         OpenDescription::HostFile { metadata, .. }
                         | OpenDescription::File { metadata, .. }
@@ -370,7 +370,7 @@ impl<'a> FsView<'a> {
                 // open-time mode (LTP fchmod04/05). metadata.mode holds the
                 // permission bits; the type comes from `kind`.
                 if let Some(of) = this.open_file(fd.0) {
-                    if let Some(mut open) = of.description.write() {
+                    if let Some(mut open) = of.description.write_for_io() {
                         match &mut *open {
                             OpenDescription::Directory { metadata, .. }
                             | OpenDescription::File { metadata, .. } => {

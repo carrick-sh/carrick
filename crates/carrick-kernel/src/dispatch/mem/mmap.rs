@@ -207,7 +207,7 @@ impl<'a> MemView<'a> {
             } else {
                 this.open_file(fd.0)
                     .map(|open_file| {
-                        let Some(open) = open_file.description.read() else {
+                        let Some(open) = open_file.description.inspect() else {
                             return String::new();
                         };
                         match &*open {
@@ -869,7 +869,7 @@ impl<'a> MemView<'a> {
                     // the file offset across the swap, and read/write hold
                     // this same guard across their host I/O, so no offset
                     // can move underneath it.
-                    let open = open_file.description.write();
+                    let open = open_file.description.write_for_io();
                     // A host regular file (`HostFile`) or a memfd whose bytes
                     // live in an unlinked host file (`File`/`HostBacked`) both
                     // have a host inode the guest mapping can view live.
@@ -1270,7 +1270,7 @@ impl<'a> MemView<'a> {
                 && this.open_file(fd.0).is_some_and(|open_file| {
                     open_file
                         .description
-                        .read()
+                        .inspect()
                         .as_deref()
                         .and_then(OpenDescription::shared_alias_host_fd)
                         .is_some()
@@ -1611,14 +1611,14 @@ impl<'a> MemView<'a> {
                 // EOF classification and the initial mapped bytes come from the
                 // live inode rather than a stale per-open snapshot.
                 if map_sharing == MmapSharing::Shared {
-                    let path = match open_file.description.read().as_deref() {
+                    let path = match open_file.description.inspect().as_deref() {
                         Some(OpenDescription::File { path, .. }) => Some(path.clone()),
                         _ => None,
                     };
                     if let Some(path) = path
                         && let Some(live) = this.fs.rootfs_vfs.overlay.file_contents(&path)
                     {
-                        if let Some(mut open) = open_file.description.write() {
+                        if let Some(mut open) = open_file.description.write_for_io() {
                             if let OpenDescription::File {
                                 path: open_path,
                                 contents,
@@ -1633,7 +1633,7 @@ impl<'a> MemView<'a> {
                         }
                     }
                 }
-                let Some(open) = open_file.description.read() else {
+                let Some(open) = open_file.description.read_for_io() else {
                     return Ok(request.refused(
                         MmapRefusal::Internal("file description vanished mid-dispatch (content load)"),
                         LINUX_EBADF,
@@ -1983,7 +1983,7 @@ impl<'a> MemView<'a> {
                         LINUX_EBADF,
                     ));
                 };
-                let open = open_file.description.read();
+                let open = open_file.description.read_for_io();
                 let Some(host_fd) = open.as_deref().and_then(OpenDescription::shared_alias_host_fd)
                 else {
                     return Ok(request.refused(
@@ -2720,7 +2720,7 @@ impl<'a> MemView<'a> {
                 let pf = source_metadata.prot;
                 let desc = &alias_entry.description;
                 let bus_fault = (|| {
-                    let open = desc.read();
+                    let open = desc.read_for_io();
                     let file_len = open
                         .as_deref()
                         .and_then(OpenDescription::shared_alias_host_fd)
@@ -2953,7 +2953,7 @@ impl<'a> MemView<'a> {
                     .file_page_offset
                     .unwrap_or(0)
                     .checked_mul(crate::core_dump::GUEST_PAGE as u64)?;
-                let open = description.read();
+                let open = description.read_for_io();
                 let file_len = match open.as_deref() {
                     Some(description) => description
                         .shared_alias_host_fd()
@@ -3108,7 +3108,7 @@ impl<'a> MemView<'a> {
                     let description = alias_entry.description;
                     let mapping = alias_entry.mapping;
                     let dup_fd = {
-                        let open = description.read();
+                        let open = description.read_for_io();
                         match open.as_deref().and_then(OpenDescription::shared_alias_host_fd) {
                             Some(raw_fd) if host_fd_can_back_shared_alias(raw_fd) => {
                                 let d = unsafe { libc::dup(raw_fd) };

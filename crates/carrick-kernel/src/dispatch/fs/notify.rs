@@ -35,7 +35,7 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return Err(LINUX_EBADF);
         };
-        let path = match open_file.description.read().as_deref() {
+        let path = match open_file.description.inspect().as_deref() {
             Some(OpenDescription::Directory { path, .. }) => path.clone(),
             _ => match self.lookup_recorded_fd_open_path(fd) {
                 Some(path) => path,
@@ -257,7 +257,7 @@ impl<'a> FsView<'a> {
 
         // Not delegated yet: find this process's single description of the
         // inode by its registered identity. No guard is taken while scanning
-        // (a guard accessor would recall a delegated description); `delegate`
+        // (`read_for_io`/`write_for_io` would recall a delegated description); `delegate`
         // takes the one description's write guard itself.
         if file_handle_opt.is_none() {
             for open_fd in self.open_fd_numbers() {

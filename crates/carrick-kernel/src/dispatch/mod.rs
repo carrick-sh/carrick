@@ -2047,7 +2047,7 @@ impl SyscallDispatcher {
         // closing) — a dup'd fd sharing the Arc keeps the writer/pty alive.
         let last_ref = open_file.description.fd_ref_count() == 1;
         if !last_ref {
-            let classic_lock_release_fd = match open_file.description.read().as_deref() {
+            let classic_lock_release_fd = match open_file.description.inspect().as_deref() {
                 Some(OpenDescription::HostFile { host_fd, .. }) => Some(host_fd.raw()),
                 _ => None,
             };
@@ -2075,7 +2075,7 @@ impl SyscallDispatcher {
         let mut closing_fanotify = false;
         let mut closing_host_socket = false;
         if last_ref {
-            if let Some(open) = open_file.description.read() {
+            if let Some(open) = open_file.description.inspect() {
                 // A reuseport membership must never outlive its socket: host fds
                 // are REUSED, so a stale entry would hand a later unrelated
                 // socket's traffic to this group. Removal is by host fd and is a
@@ -2148,7 +2148,7 @@ impl SyscallDispatcher {
             self.fs.inotify_registry.unregister_all(&state);
         }
         let is_inmem_stream = matches!(
-            open_file.description.read().as_deref(),
+            open_file.description.inspect().as_deref(),
             Some(
                 OpenDescription::PipeReader { .. }
                     | OpenDescription::PipeWriter { .. }

@@ -163,7 +163,7 @@ impl TimerFdPollSource {
 pub(crate) fn timerfd_poll_source_from_lease(
     lease: crate::kernel::objects::FileDescriptionFdLease,
 ) -> Option<TimerFdPollSource> {
-    let open = lease.description().read()?;
+    let open = lease.description().inspect()?;
     let state = match &*open {
         super::fd_table::OpenDescription::TimerFd { state, .. } => std::sync::Arc::clone(state),
         _ => return None,

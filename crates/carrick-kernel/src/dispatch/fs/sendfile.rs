@@ -130,7 +130,7 @@ impl<'a> FsView<'a> {
         self.open_file(fd)
             .and_then(|file| {
                 file.description
-                    .read()
+                    .inspect()
                     .map(|open| matches!(&*open, OpenDescription::ProcExecutable { .. }))
             })
             .unwrap_or(false)
@@ -138,7 +138,7 @@ impl<'a> FsView<'a> {
 
     fn host_fd_dev_ino(&self, fd: i32) -> Option<(i64, u64)> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read()?;
+        let open = open_file.description.read_for_io()?;
         if let OpenDescription::ProcExecutable { executable, .. } = &*open {
             return executable
                 .source()
@@ -162,7 +162,7 @@ impl<'a> FsView<'a> {
     #[cfg(target_os = "macos")]
     fn host_file_copy_info(&self, fd: i32) -> Option<HostFileCopyInfo> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read()?;
+        let open = open_file.description.read_for_io()?;
         let OpenDescription::HostFile {
             host_fd, writable, ..
         } = &*open
@@ -202,7 +202,7 @@ impl<'a> FsView<'a> {
         let Some(in_file) = self.open_file(in_fd) else {
             return Ok(Err(LINUX_EBADF));
         };
-        let Some(open) = in_file.description.read() else {
+        let Some(open) = in_file.description.read_for_io() else {
             return Ok(Err(LINUX_EINVAL));
         };
         match &*open {
@@ -254,7 +254,7 @@ impl<'a> FsView<'a> {
         let Some(in_file) = self.open_file(in_fd) else {
             return Err(LINUX_EBADF);
         };
-        let Some(open) = in_file.description.read() else {
+        let Some(open) = in_file.description.read_for_io() else {
             return Err(LINUX_EINVAL);
         };
         // HostFile / File: pread/read the requested window. Cap the buffer:
@@ -504,7 +504,7 @@ impl<'a> FsView<'a> {
             }
             if offset_address == 0 {
                 if let Some(open_file) = this.open_file(in_fd.0)
-                    && let Some(mut open) = open_file.description.write()
+                    && let Some(mut open) = open_file.description.write_for_io()
                 {
                     match &mut *open {
                         OpenDescription::File {
@@ -626,7 +626,7 @@ impl<'a> FsView<'a> {
             } else {
                 let out_off = read_u64(memory, off_out_addr)?;
                 let host_fd = match this.open_file(out_fd.0).as_ref() {
-                    Some(of) => match of.description.read().as_deref() {
+                    Some(of) => match of.description.read_for_io().as_deref() {
                         Some(OpenDescription::HostFile {
                             host_fd,
                             writable: true,
@@ -666,7 +666,7 @@ impl<'a> FsView<'a> {
             let new_in = in_offset.saturating_add(written);
             if off_in_addr == 0 {
                 if let Some(of) = this.open_file(in_fd.0).as_ref()
-                    && let Some(mut open) = of.description.write()
+                    && let Some(mut open) = of.description.write_for_io()
                 {
                     match &mut *open {
                         OpenDescription::File { offset, .. }

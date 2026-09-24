@@ -478,7 +478,12 @@ impl<'a> FsView<'a> {
         } else if dirfd == LINUX_AT_FDCWD {
             (fs_context.cwd(), path)
         } else {
-            match self.open_file(dirfd as i32)?.description.read().as_deref() {
+            match self
+                .open_file(dirfd as i32)?
+                .description
+                .inspect()
+                .as_deref()
+            {
                 Some(OpenDescription::Directory { path: dir, .. }) => (dir.clone(), path),
                 _ => return None,
             }
@@ -610,7 +615,7 @@ impl<'a> FsView<'a> {
             (fs_context.cwd(), path)
         } else {
             match self.open_file(dirfd as i32).as_ref() {
-                Some(open_file) => match open_file.description.read().as_deref() {
+                Some(open_file) => match open_file.description.inspect().as_deref() {
                     Some(OpenDescription::Directory {
                         path: dir,
                         trusted_host_dir,

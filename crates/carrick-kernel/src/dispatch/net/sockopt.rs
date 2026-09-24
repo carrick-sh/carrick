@@ -497,7 +497,7 @@ impl<'a> NetView<'a> {
             match this.open_file(fd) {
                 None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                 Some(of) => {
-                    let Some(desc) = of.description.read() else {
+                    let Some(desc) = of.description.inspect() else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                     };
                     if let OpenDescription::Packet { socket, .. } = &*desc {
@@ -570,7 +570,7 @@ impl<'a> NetView<'a> {
             {
                 let v = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
                 if let Some(open_file) = this.open_file(fd)
-                    && let Some(mut open) = open_file.description.write()
+                    && let Some(mut open) = open_file.description.write_for_io()
                     && let OpenDescription::HostSocket { base, .. } = &mut *open
                 {
                     if optname == LINUX_SO_REUSEADDR {
@@ -633,7 +633,7 @@ impl<'a> NetView<'a> {
             {
                 let index = u32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
                 if let Some(open_file) = this.open_file(fd)
-                    && let Some(mut open) = open_file.description.write()
+                    && let Some(mut open) = open_file.description.write_for_io()
                     && let OpenDescription::HostSocket { base, .. } = &mut *open
                 {
                     base.set_ipv6_multicast_if(index);
@@ -652,7 +652,7 @@ impl<'a> NetView<'a> {
                         i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) != 0
                     });
                 if let Some(open_file) = this.open_file(fd)
-                    && let Some(mut open) = open_file.description.write()
+                    && let Some(mut open) = open_file.description.write_for_io()
                     && let OpenDescription::HostSocket { base, .. } = &mut *open
                 {
                     base.set_so_passcred(on);
@@ -695,7 +695,7 @@ impl<'a> NetView<'a> {
                 let Some(open_file) = this.open_file(fd) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
-                let Some(mut open) = open_file.description.write() else {
+                let Some(mut open) = open_file.description.write_for_io() else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                 };
                 let OpenDescription::HostSocket { base, family, .. } = &mut *open else {
@@ -741,7 +741,7 @@ impl<'a> NetView<'a> {
                     }
                 };
                 if let Some(open_file) = this.open_file(fd) {
-                    if let Some(mut open) = open_file.description.write() {
+                    if let Some(mut open) = open_file.description.write_for_io() {
                         if let OpenDescription::HostSocket { base, .. } = &mut *open {
                         if optname == LINUX_SO_RCVTIMEO {
                             base.set_recv_timeout(dur);
@@ -816,7 +816,7 @@ impl<'a> NetView<'a> {
                     let Some(open_file) = this.open_file(fd) else {
                         return Ok(DispatchOutcome::errno(a::LINUX_EBADF));
                     };
-                    let Some(mut open) = open_file.description.write() else {
+                    let Some(mut open) = open_file.description.write_for_io() else {
                         return Ok(DispatchOutcome::errno(a::LINUX_ENOTSOCK));
                     };
                     let OpenDescription::HostSocket {
@@ -928,7 +928,7 @@ impl<'a> NetView<'a> {
             match this.open_file(fd) {
                 None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                 Some(of) => {
-                    let Some(desc) = of.description.read() else {
+                    let Some(desc) = of.description.inspect() else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                     };
                     if let OpenDescription::InMemorySocket { socket, .. } = &*desc {
@@ -1010,7 +1010,7 @@ impl<'a> NetView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 let val: i32 = {
-                    let Some(open) = open_file.description.read() else {
+                    let Some(open) = open_file.description.inspect() else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                     };
                     if let OpenDescription::HostSocket { base, .. } = &*open {
@@ -1045,7 +1045,7 @@ impl<'a> NetView<'a> {
                 && let Some(open_file) = this.open_file(fd)
             {
                 let index = {
-                    let open = open_file.description.read();
+                    let open = open_file.description.inspect();
                     match open.as_deref() {
                         Some(OpenDescription::HostSocket { base, .. }) => base.ipv6_multicast_if(),
                         _ => None,
@@ -1071,7 +1071,7 @@ impl<'a> NetView<'a> {
                 let mut handled = false;
                 let mut dur: Option<std::time::Duration> = None;
                 if let Some(open_file) = this.open_file(fd)
-                    && let Some(OpenDescription::HostSocket { base, .. }) = open_file.description.read().as_deref() {
+                    && let Some(OpenDescription::HostSocket { base, .. }) = open_file.description.inspect().as_deref() {
                         handled = true;
                         dur = if optname == LINUX_SO_RCVTIMEO {
                             base.recv_timeout()
@@ -1399,7 +1399,7 @@ mod ipv6_addrform_tests {
 
         if let Some(open_file) = dispatcher.open_file(fd) {
             let desc = open_file.description();
-            if let Some(mut open) = desc.write() {
+            if let Some(mut open) = desc.write_for_io() {
                 if let OpenDescription::HostSocket { base, .. } = &mut *open {
                     base.set_connected(true);
                 }

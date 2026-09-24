@@ -336,7 +336,7 @@ impl SyscallDispatcher {
     /// not a bpf map).
     fn bpf_map_fd(&self, fd: i32) -> Result<Arc<BpfMap>, LinuxErrno> {
         let open_file = self.open_file(fd).ok_or(LINUX_EBADF)?;
-        let open = open_file.description.read().ok_or(LINUX_EINVAL)?;
+        let open = open_file.description.inspect().ok_or(LINUX_EINVAL)?;
         match &*open {
             OpenDescription::BpfMap { map, .. } => Ok(map.clone()),
             _ => Err(LINUX_EINVAL),

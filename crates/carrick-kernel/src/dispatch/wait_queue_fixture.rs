@@ -316,7 +316,7 @@ fn epoll() -> WaitQueueFixture {
             // An event the instance already observed but has not handed to the
             // guest (the `maxevents` remainder) is what makes an epoll fd
             // readable without re-polling its targets.
-            if let Some(mut open) = producer_description.write()
+            if let Some(mut open) = producer_description.write_for_io()
                 && let OpenDescription::Epoll { pending_ready, .. } = &mut *open
             {
                 pending_ready.push_back((
@@ -350,7 +350,7 @@ fn netlink() -> WaitQueueFixture {
         description,
         interest: LinuxPollEvents::IN,
         producer: Box::new(move || {
-            if let Some(mut open) = producer_description.write()
+            if let Some(mut open) = producer_description.write_for_io()
                 && let OpenDescription::Netlink { recv_queue, .. } = &mut *open
             {
                 recv_queue.extend(std::iter::repeat_n(0xAAu8, 32));
@@ -450,5 +450,7 @@ fn inzone_listener_host_socket(host_client: bool) -> WaitQueueFixture {
 /// private to `crate::dispatch`, so the property test reaches the classifier
 /// through here.
 pub(crate) fn classify(description: &Arc<FileDescription>) -> Option<WaitQueueKind> {
-    description.read().and_then(|open| open.wait_queue_kind())
+    description
+        .inspect()
+        .and_then(|open| open.wait_queue_kind())
 }
