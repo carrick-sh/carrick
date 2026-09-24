@@ -250,9 +250,7 @@ pub(crate) fn commit_host_file_write_raw(
         }
     }
     if let (Some(kernel), Some(view)) = (kernel, view) {
-        let out = DispatchOutcome::Returned {
-            value: written as i64,
-        };
+        let out = DispatchOutcome::returned_len_or_errno(written);
         view.notify_host_file_write_result(kernel, open_path, &out);
     }
     Ok(())
@@ -289,9 +287,7 @@ pub(crate) fn commit_file_write(
         }
     }
     if let (Some(kernel), Some(view)) = (kernel, view) {
-        let outcome = DispatchOutcome::Returned {
-            value: written as i64,
-        };
+        let outcome = DispatchOutcome::returned_len_or_errno(written);
         view.notify_file_write_result(kernel, Some(path), &outcome);
     }
     Ok(written)

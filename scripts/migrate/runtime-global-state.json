@@ -1556,6 +1556,14 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "DELEGATED_INODES_SNAPSHOT",
+      "fingerprint": "881336040305194e681a4d4a9ae2f8fd4e1826018788e944e48091f6ac6de7b5",
+      "classification": "carrier_infra",
+      "rationale": "Atomic RCU snapshot of delegated inodes for lock-free inspection."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "symbol": "DELEGATED_ROOTFS",
       "fingerprint": "6342d41ccbbb3aa5dd65eed4d44c6420928e9be1ea2b305c09248879edb0f96b",
       "classification": "carrier_infra",
@@ -1568,6 +1576,14 @@
       "fingerprint": "a533dacaef064267e82fd21569fc5f686039bd8e142e22f8e9f0512ef25435d2",
       "classification": "carrier_infra",
       "rationale": "Sparse extents registry tracking dirty ranges committed back from EL1 delegation."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "FD_MAP_LOCK",
+      "fingerprint": "64631f2fc003b0507ca399e4d0297ac136a9cfda74182b599db64873de5f9bea",
+      "classification": "carrier_infra",
+      "rationale": "Lock synchronizing slot allocation and clearing in the EL1 fd_map aperture."
     },
     {
       "kind": "static",
@@ -1588,10 +1604,26 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "MAPPED_INODES",
+      "fingerprint": "9fbdce09ea0c3e8e026c30ecd45f0eda45610f9aab618461b7f4a21499de012b",
+      "classification": "carrier_infra",
+      "rationale": "Registry of active file memory mappings for inode-level delegation exclusion."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "symbol": "NEXT_INCARNATION",
       "fingerprint": "d61fa36f4ea30df3c347972b3d7041a2f1df505a9b50fa254c7cb47195314b8c",
       "classification": "monotonic_allocator",
       "rationale": "Monotonic counter allocating generation numbers for delegated file incarnations."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "YIELD_COUNT",
+      "fingerprint": "75c603212e7c7f80bc9213c618bc4b11b19cc9176043d8b39ebdb073f7867948",
+      "classification": "test_only",
+      "rationale": "Test-only counter tracking thread yields in lock_delegated_file."
     },
     {
       "kind": "static",
