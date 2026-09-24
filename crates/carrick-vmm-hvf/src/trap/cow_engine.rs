@@ -97,11 +97,7 @@ impl HvfVmState {
                 return true;
             }
             inventory
-                .extents
-                .iter()
-                .find(|(key, _)| {
-                    key.0 <= physical_ipa && physical_ipa < key.0.saturating_add(key.1)
-                })
+                .extent_containing(physical_ipa)
                 .map(|(_, extent)| {
                     matches!(extent.backing, InventoryBackingIdentity::PrivateFileView(_))
                 })
@@ -454,11 +450,7 @@ impl HvfVmState {
             return false;
         }
         let inventory = self.frame_inventory.lock();
-        let extent = inventory
-            .extents
-            .iter()
-            .find(|(key, _)| key.0 <= ipa && ipa < key.0.saturating_add(key.1))
-            .map(|(_, extent)| *extent);
+        let extent = inventory.extent_containing(ipa).map(|(_, extent)| *extent);
         let Some(extent) = extent else {
             return true;
         };
@@ -3086,6 +3078,27 @@ pub(crate) fn zero_anonymous_remap_enabled() -> bool {
     }
 }
 
+/// The calling thread's hot-path visit counters at one instant; two reads
+/// bracket a census-armed maintenance operation.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MmMaintenanceVisits {
+    alias: u64,
+    task: u64,
+    extents: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MmMaintenanceVisits {
+    pub(crate) fn read() -> Self {
+        Self {
+            alias: hot_path_rows_scanned_live(HotPathScan::AliasState),
+            task: hot_path_rows_scanned_live(HotPathScan::TaskMappings),
+            extents: hot_path_rows_scanned_live(HotPathScan::FrameExtents),
+        }
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct ScrubRun {
     pub(crate) host_start: *mut u8,
@@ -3220,6 +3233,69 @@ impl HvfVmState {
     }
 
     pub(crate) fn ensure_frame_cow_write(
+        &mut self,
+        va: u64,
+        len: usize,
+        intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        if intent != carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance
+            || !carrick_observability::probes::hvpatch_mm_maintenance_begin(
+                carrick_observability::probes::HvpatchMmMaintenanceSite::BackingMaintenanceRoute,
+                len as u64,
+            )
+        {
+            return self.ensure_frame_cow_write_routed(va, len, intent, flush_stage1);
+        }
+        let before = MmMaintenanceVisits::read();
+        let outcome = self.ensure_frame_cow_write_routed(va, len, intent, flush_stage1);
+        self.emit_mm_maintenance_census(
+            carrick_observability::probes::HvpatchMmMaintenanceSite::BackingMaintenanceRoute,
+            va,
+            len,
+            before,
+        );
+        outcome
+    }
+
+    /// Report one census-armed maintenance operation: the rows its lookups
+    /// visited beside the populations they were drawn from. Only called
+    /// while `hvpatch-mm-maintenance-begin` is enabled.
+    pub(crate) fn emit_mm_maintenance_census(
+        &self,
+        site: carrick_observability::probes::HvpatchMmMaintenanceSite,
+        va: u64,
+        len: usize,
+        before: MmMaintenanceVisits,
+    ) {
+        let after = MmMaintenanceVisits::read();
+        let start = align_down(strip_pointer_tag(va), 0x1000);
+        let end = strip_pointer_tag(va)
+            .saturating_add(len as u64)
+            .saturating_add(0xfff)
+            & !0xfff;
+        let alias_rows_live = {
+            let registry = alias_registry().lock();
+            AliasRegistry::process_visible_scopes(self.mm_root_slot, self.container_root)
+                .into_iter()
+                .map(|scope| registry.scope_rows(scope).len() as u64)
+                .sum()
+        };
+        carrick_observability::probes::hvpatch_mm_maintenance(
+            carrick_observability::probes::HvpatchMmMaintenanceCensus {
+                site,
+                pages: end.saturating_sub(start) / 0x1000,
+                alias_rows_visited: after.alias.wrapping_sub(before.alias),
+                task_rows_visited: after.task.wrapping_sub(before.task),
+                extents_visited: after.extents.wrapping_sub(before.extents),
+                alias_rows_live,
+                task_rows_live: self.mappings.len() as u64,
+                extents_live: self.frame_inventory.lock().extents.len() as u64,
+            },
+        );
+    }
+
+    fn ensure_frame_cow_write_routed(
         &mut self,
         va: u64,
         len: usize,
@@ -4789,23 +4865,16 @@ impl HvfVmState {
         let length = u64::try_from(length).ok()?;
         let end = ipa.checked_add(length)?;
         let semantic_end = semantic_va.checked_add(length)?;
-        if let Some(mapping) = self.mappings.iter().rev().find(|mapping| {
-            let mapping_end = mapping.ipa.checked_add(mapping.size as u64);
-            semantic_va >= mapping.start
-                && semantic_end <= mapping.end
-                && mapping
-                    .ipa
-                    .checked_add(semantic_va.saturating_sub(mapping.start))
-                    == Some(ipa)
-                && ipa >= mapping.ipa
-                && mapping_end.is_some_and(|limit| end <= limit)
-                && (!self.persistent_vm_lifecycle
+        if let Some(mapping) =
+            live_ipa_mapping_row(&self.mappings, semantic_va, ipa, length, |mapping| {
+                !self.persistent_vm_lifecycle
                     || !is_reusable_global_frame_extent(
                         mapping.physical_ipa,
                         mapping.physical_size as u64,
                     )
-                    || global_frame_region_owner_matches_in(self.custody(), mapping))
-        }) {
+                    || global_frame_region_owner_matches_in(self.custody(), mapping)
+            })
+        {
             return Some(mapping.view());
         }
         alias_registry()
@@ -5180,7 +5249,9 @@ impl HvfTaskState {
         };
         // Geometry under the registry lock; owner authentication on the
         // released candidates (lock order, see `containing_candidates`).
-        let alias_candidates = alias_registry().lock().matching_for_process_candidates(
+        let alias_candidates = alias_registry().lock().process_va_overlap_candidates(
+            semantic_va,
+            CowArmedRanges::COMPOUND_SIZE,
             self.mm_root_slot,
             self.container_root,
             |alias| {
@@ -6060,6 +6131,36 @@ pub(crate) fn next_frame_cow_write_probe(
         }
     };
     next.max(current.saturating_add(1)).min(end)
+}
+
+/// The newest task mapping row that covers `[semantic_va, semantic_va +
+/// length)` AND projects exactly `ipa` at `semantic_va` (VA/IPA affine
+/// consistency), among the rows `owner_matches` authenticates.
+///
+/// This is the per-page scrub-target question `zero_guest_backing` asks; it is
+/// answered from the rows that can overlap the range, never the whole table.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn live_ipa_mapping_row(
+    mappings: &TaskMappingIndex,
+    semantic_va: u64,
+    ipa: u64,
+    length: u64,
+    mut owner_matches: impl FnMut(&HvfMappedRegion) -> bool,
+) -> Option<&HvfMappedRegion> {
+    let end = ipa.checked_add(length)?;
+    let semantic_end = semantic_va.checked_add(length)?;
+    mappings.iter().rev().find(|mapping| {
+        let mapping_end = mapping.ipa.checked_add(mapping.size as u64);
+        semantic_va >= mapping.start
+            && semantic_end <= mapping.end
+            && mapping
+                .ipa
+                .checked_add(semantic_va.saturating_sub(mapping.start))
+                == Some(ipa)
+            && ipa >= mapping.ipa
+            && mapping_end.is_some_and(|limit| end <= limit)
+            && owner_matches(mapping)
+    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

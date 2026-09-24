@@ -78,7 +78,7 @@ contracts = ["kernel.fork.filetable", "kernel.fork.mappings"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration", "kernel.mm.backing-maintenance-lookup"]
 
 [[surfaces]]
 path = "crates/carrick-mem/src/vdso.rs"
@@ -114,11 +114,11 @@ contracts = ["kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/task_mapping_index.rs"
-contracts = ["kernel.fork.stage1-image"]
+contracts = ["kernel.fork.stage1-image", "kernel.mm.backing-maintenance-lookup"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/memory_protection.rs"
-contracts = ["kernel.fork.stage1-image"]
+contracts = ["kernel.fork.stage1-image", "kernel.mm.backing-maintenance-lookup"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs"
@@ -343,7 +343,7 @@ contracts = ["kernel.mm.syscall-code-write"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/guest_memory.rs"
-contracts = ["kernel.mm.syscall-code-write"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.mm.backing-maintenance-lookup"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fs/rw.rs"
@@ -389,3 +389,11 @@ contracts = ["kernel.el1.files.cross-process-readers"]
 [[surfaces]]
 path = "fixtures/embed-zone-readers/src/main.rs"
 contracts = ["kernel.el1.files.cross-process-readers"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs"
+contracts = ["kernel.mm.backing-maintenance-lookup"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/memory_protection/tests/maintenance_lookup_budget.rs"
+contracts = ["kernel.mm.backing-maintenance-lookup"]

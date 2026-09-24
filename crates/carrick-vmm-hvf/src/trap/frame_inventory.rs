@@ -318,6 +318,15 @@ pub(crate) struct HvpatchFrameInventory {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvpatchFrameInventory {
+    /// The first extent, in `(start, length)` key order, whose logical IPA
+    /// window contains `ipa`.
+    pub(crate) fn extent_containing(&self, ipa: u64) -> Option<(&(u64, u64), &InventoryExtent)> {
+        self.extents
+            .iter()
+            .inspect(|_| note_hot_path_rows(HotPathScan::FrameExtents, 1))
+            .find(|(key, _)| key.0 <= ipa && ipa < key.0.saturating_add(key.1))
+    }
+
     pub(crate) fn with_frames(
         frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
     ) -> Self {

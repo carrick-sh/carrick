@@ -4039,6 +4039,11 @@ pub(crate) enum HotPathScan {
     /// until the consumer stops pulling, so one thread-local `Cell` add per
     /// visited row is the price of knowing the walk length at all.
     TaskMappings,
+    /// Frame-inventory extents one mm's ledger offered to a containment
+    /// lookup. Counted per extent visited, like [`Self::TaskMappings`]: a
+    /// per-lookup count that tracks the mm's extent population names a
+    /// surviving linear walk of `HvpatchFrameInventory::extents`.
+    FrameExtents,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4046,6 +4051,7 @@ thread_local! {
     static ALIAS_STATE_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static FORK_MAPPING_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static TASK_MAPPING_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FRAME_EXTENTS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Account one linear pass over the alias / replay / version state.
@@ -4084,6 +4090,7 @@ pub(crate) fn note_hot_path_rows(scan: HotPathScan, rows: usize) {
         HotPathScan::AliasState => &ALIAS_STATE_ROWS_SCANNED,
         HotPathScan::ForkMappings => &FORK_MAPPING_ROWS_SCANNED,
         HotPathScan::TaskMappings => &TASK_MAPPING_ROWS_SCANNED,
+        HotPathScan::FrameExtents => &FRAME_EXTENTS_SCANNED,
     };
     counter.with(|cell| cell.set(cell.get().saturating_add(rows as u64)));
 }
@@ -4103,6 +4110,7 @@ fn hot_path_rows_scanned_live(scan: HotPathScan) -> u64 {
         HotPathScan::AliasState => ALIAS_STATE_ROWS_SCANNED.with(std::cell::Cell::get),
         HotPathScan::ForkMappings => FORK_MAPPING_ROWS_SCANNED.with(std::cell::Cell::get),
         HotPathScan::TaskMappings => TASK_MAPPING_ROWS_SCANNED.with(std::cell::Cell::get),
+        HotPathScan::FrameExtents => FRAME_EXTENTS_SCANNED.with(std::cell::Cell::get),
     }
 }
 

@@ -2588,3 +2588,5 @@ fn retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows() {
         assert!(!registry.any_va_window_row(0, 0, |_| true));
     }
 }
+
+mod maintenance_lookup_budget;

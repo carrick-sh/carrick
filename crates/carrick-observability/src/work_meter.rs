@@ -84,10 +84,19 @@ pub enum WorkMetric {
     MmSnapshotCollections,
     /// Physical backing owner pins acquired in the operation window.
     ForeignOwnerPins,
+    /// Alias-registry rows one memory lookup offered its predicate. A lookup
+    /// is answered from the rows of the process-visible scopes that can
+    /// overlap its window, so this must not grow with unrelated live rows.
+    AliasRowsVisited,
+    /// Task mapping rows one memory lookup visited.
+    TaskMappingRowsVisited,
+    /// Frame-inventory extents one containment lookup visited in an mm's
+    /// extent ledger.
+    FrameExtentsVisited,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 40;
+    pub const COUNT: usize = 43;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -129,6 +138,9 @@ impl WorkMetric {
         Self::NativeCodeInvalidationPages,
         Self::MmSnapshotCollections,
         Self::ForeignOwnerPins,
+        Self::AliasRowsVisited,
+        Self::TaskMappingRowsVisited,
+        Self::FrameExtentsVisited,
     ];
 }
 
