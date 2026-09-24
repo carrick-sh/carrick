@@ -580,6 +580,29 @@ pub fn mark_pending_host_work_for_task(tid: El1TaskId) {
     }
 }
 
+/// Mark return-to-user work pending for any vCPU slot running a task whose `file_table`
+/// matches one of the given tables. Slots with no task (`task_id == 0`) are never marked.
+pub fn mark_pending_host_work_for_file_tables(tables: &[u64]) {
+    if tables.is_empty() {
+        return;
+    }
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return;
+    }
+    for slot in 0..EL1_STACK_SLOTS as usize {
+        let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+        let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+        if current_task.task_id.load(Ordering::Relaxed) == 0 {
+            continue;
+        }
+        let ft = current_task.file_table.load(Ordering::Relaxed);
+        if tables.contains(&ft) {
+            current_task.pending_host_work.store(1, Ordering::Release);
+        }
+    }
+}
+
 /// Update the file table for any vCPU slot running the given task identity (tid).
 pub fn update_current_task_file_table_for_task(tid: El1TaskId, file_table: u64) {
     let ptr = get_el1_region_host_ptr();
@@ -790,7 +813,23 @@ mod tests {
 
         task_5.served_with_work.store(1, Ordering::Relaxed);
         assert!(take_served_with_work(5));
-        assert!(!take_served_with_work(5)); // cleared after take
+        assert!(!take_served_with_work(5));
+
+        task_5.clear_pending_host_work();
+        task_6.clear_pending_host_work();
+        let task_7 =
+            unsafe { &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 7 * 64) as *const CurrentTask) };
+        task_7.file_table.store(200, Ordering::Relaxed);
+        // task_7 has task_id = 0 (no task running)
+        assert_eq!(task_7.task_id.load(Ordering::Relaxed), 0);
+
+        mark_pending_host_work_for_file_tables(&[200]);
+        // task_5 has task_id = 42 and file_table = 200, so it must be marked
+        assert!(task_5.has_pending_host_work());
+        // task_6 has task_id = 43 and file_table = 0, so it must NOT be marked
+        assert!(!task_6.has_pending_host_work());
+        // task_7 has no task (task_id = 0), so it must NEVER be marked
+        assert!(!task_7.has_pending_host_work()); // cleared after take
 
         record_el1_region_host_ptr(0);
         assert_eq!(get_el1_region_host_ptr(), 0);
