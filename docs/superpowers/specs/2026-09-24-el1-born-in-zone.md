@@ -54,7 +54,10 @@ compat zone.
 
 4. **The host fd is backing, not an owner.** Write-back happens at `fsync`,
    `fdatasync`, `syncfs`, last close of the inode, exec (close-on-exec), carrier
-   teardown and eviction. Write-back never changes where the object lives.
+   teardown and eviction, and before a host operation reads the backing
+   (`fstat`, via `el1_delegation::sync_to_host`). Write-back never changes where
+   the object lives. The host mtime is the write-back time, not the time of
+   each in-zone write; exact times need the inode to carry them.
 
 5. **Demotion is the only exit, and it is one-way per inode lifetime.** An
    operation the zone cannot model exactly demotes the inode to the host path:
@@ -66,12 +69,15 @@ compat zone.
    it has open descriptions. A demoted inode is a host file, exactly as today
    without EL1.
 
-6. **Inotify instances never leave the zone.** Their ring, wd allocator and
-   watch table are authoritative. Watches on host-path (demoted or non-zone)
-   files are served by the host enqueueing into the same in-zone ring, so an
-   event always lands in the one queue the guest reads. The host inotify model
-   remains only for instances the zone cannot hold (capacity), and for them
-   every watched zone file is demoted.
+6. **Inotify instances leave the zone only by outgrowing it.** Their ring, wd
+   allocator and watch table are authoritative. Watches on host-path (demoted
+   or non-zone) files are served by the host enqueueing into the same in-zone
+   ring, so an event always lands in the one queue the guest reads. An
+   instance that reaches the zone's watch capacity demotes to the host inotify
+   model, terminally: its in-zone files with marks are recalled first, then
+   its watches, wd allocator and pending events move to the host state. An
+   instance the zone cannot hold at `inotify_init1` (no slot) is a host
+   instance for its whole life.
 
 ## Invariants (each gets a type or a test, not a comment)
 
@@ -106,6 +112,21 @@ slot with a paged cache.
   is the last event of its wd), against the Docker oracle.
 - `kernel.el1.files` keeps its loop contract and adds two descriptions of one
   inode (different offsets, shared bytes) and fstat after in-zone writes.
+
+## Status (2026-09-23)
+
+Phase 1 is implemented on `director/el1-inotify-r5`: instances are born in
+the zone and the host serves forwarded file operations against the in-zone
+object (`carrick_el1::serve_locked_file_op`). Kind probes and fstat no longer
+recall (`inspect_kind`, `sync_to_host`). About 80 accessor sites that match
+only kinds that can never be in the zone still recall if reached. Phase 2
+removes recall-on-access rather than migrating them one by one.
+
+| inotify09, signed CLI, serial phases | Wall |
+|---|---|
+| Carrick, EL1 on | 2.64-2.95 s |
+| Carrick, `CARRICK_EL1=0` | 37.2-37.8 s |
+| Docker (native arm64) | 5.67-6.03 s |
 
 ## Phases
 
