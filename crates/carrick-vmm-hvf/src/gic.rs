@@ -70,6 +70,14 @@ pub fn interrupt_model() -> InterruptModel {
     *MODEL.get_or_init(|| interrupt_model_from_env(std::env::var("CARRICK_HVF_GIC").ok()))
 }
 
+/// The EL1 vector page's interrupt mode for this carrier's model.
+pub fn el1_irq_mode() -> carrick_mem::memory::El1IrqMode {
+    match interrupt_model() {
+        InterruptModel::Gic => carrick_mem::memory::El1IrqMode::GicWindow,
+        InterruptModel::LegacyPendingLine => carrick_mem::memory::El1IrqMode::Masked,
+    }
+}
+
 fn interrupt_model_from_env(value: Option<String>) -> InterruptModel {
     if value.as_deref() == Some("0") {
         InterruptModel::LegacyPendingLine
@@ -412,6 +420,145 @@ pub fn carrier_gic_snapshot() -> CarrierGicSnapshot {
             vcpus: gic.next_index,
             capacity: gic.capacity,
         })
+}
+
+/// Signed-test probe of the guest virtual timer (EL1 plan 1a): arm a
+/// one-shot EL1 timer on the vCPU that resumes the next forwarded Linux
+/// syscall `marker_nr`, then account every exit of that vCPU until EL1 has
+/// taken the timer interrupt. 1a has no production timer user (the EL1
+/// scheduler adds preemption); idle, the probe costs one relaxed load per
+/// `hv_vcpu_run` entry and one per exit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VtimerProbeReport {
+    /// The host armed the timer on a vCPU resuming the marker syscall.
+    pub armed: bool,
+    /// An exit of that vCPU found the timer interrupt taken at EL1.
+    pub delivered: bool,
+    /// The probed vCPU.
+    pub vcpu: u64,
+    /// Exits of the probed vCPU between arming and delivery that the host
+    /// itself caused: a host kick (`CANCELED`, the `hvc #4` kick exit) or a
+    /// syscall forwarded for pending host work. They carry no timer.
+    pub host_initiated_exits: u64,
+    /// Every other exit of the probed vCPU between arming and delivery.
+    pub other_exits: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VtimerProbeError {
+    /// `CARRICK_HVF_GIC=0`: without the in-kernel GIC the timer exits to the
+    /// host.
+    NoGic,
+    /// `CARRICK_EL1=0`: no EL1 kernel, no IRQ window.
+    El1Disabled,
+}
+
+#[derive(Debug, Default)]
+struct VtimerProbe {
+    /// `(marker_nr, delay_ticks)` until a vCPU resumes the marker.
+    request: Option<(u64, u64)>,
+    /// `irq_taken[vtimer]` when the timer was armed.
+    taken_before: u64,
+    report: VtimerProbeReport,
+}
+
+static VTIMER_PROBE_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static VTIMER_PROBE: parking_lot::Mutex<Option<VtimerProbe>> = parking_lot::Mutex::new(None);
+
+pub fn el1_vtimer_probe_arm_after_syscall(
+    marker_nr: u64,
+    delay_ticks: u64,
+) -> Result<(), VtimerProbeError> {
+    if interrupt_model() != InterruptModel::Gic {
+        return Err(VtimerProbeError::NoGic);
+    }
+    if !carrick_mem::memory::el1_kernel_enabled() {
+        return Err(VtimerProbeError::El1Disabled);
+    }
+    *VTIMER_PROBE.lock() = Some(VtimerProbe {
+        request: Some((marker_nr, delay_ticks)),
+        ..VtimerProbe::default()
+    });
+    VTIMER_PROBE_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+pub fn el1_vtimer_probe_report() -> VtimerProbeReport {
+    VTIMER_PROBE
+        .lock()
+        .as_ref()
+        .map_or_else(VtimerProbeReport::default, |probe| probe.report)
+}
+
+/// Before `hv_vcpu_run` (owning thread): arm the requested timer if this
+/// vCPU is about to resume the marker syscall.
+pub(crate) fn service_vtimer_probe(
+    vcpu: &applevisor::vcpu::Vcpu,
+    mailbox: &crate::syscall_mailbox::MailboxBinding,
+) -> Result<(), TrapError> {
+    if !VTIMER_PROBE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+    let mut guard = VTIMER_PROBE.lock();
+    let Some(probe) = guard.as_mut() else {
+        return Ok(());
+    };
+    let Some((marker_nr, delay_ticks)) = probe.request else {
+        return Ok(());
+    };
+    if mailbox.leased_slot().is_none() || mailbox.diagnostics().native_nr != marker_nr {
+        return Ok(());
+    }
+    let mut offset = 0u64;
+    // SAFETY: owning thread of a live vCPU; CNTV_* are this vCPU's registers.
+    unsafe {
+        gic_check(
+            sys::hv_vcpu_get_vtimer_offset(vcpu.id(), &mut offset),
+            "hv_vcpu_get_vtimer_offset",
+        )?;
+        let now = carrick_host::clock::monotonic_ticks().wrapping_sub(offset);
+        gic_check(
+            sys::hv_vcpu_set_sys_reg(
+                vcpu.id(),
+                sys::hv_sys_reg_t::CNTV_CVAL_EL0,
+                now.wrapping_add(delay_ticks),
+            ),
+            "CNTV_CVAL_EL0",
+        )?;
+        gic_check(
+            sys::hv_vcpu_set_sys_reg(vcpu.id(), sys::hv_sys_reg_t::CNTV_CTL_EL0, 1),
+            "CNTV_CTL_EL0",
+        )?;
+    }
+    probe.request = None;
+    probe.taken_before = crate::trap::el1_irqs_taken(VTIMER_INTID);
+    probe.report.armed = true;
+    probe.report.vcpu = vcpu.id();
+    Ok(())
+}
+
+/// After `hv_vcpu_run` returns (owning thread): account the exit of the
+/// probed vCPU until the timer interrupt has been taken at EL1.
+pub(crate) fn note_vtimer_probe_exit(vcpu: u64, host_initiated: impl FnOnce() -> bool) {
+    if !VTIMER_PROBE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut guard = VTIMER_PROBE.lock();
+    let Some(probe) = guard.as_mut() else {
+        return;
+    };
+    if !probe.report.armed || probe.report.delivered || probe.report.vcpu != vcpu {
+        return;
+    }
+    if crate::trap::el1_irqs_taken(VTIMER_INTID) > probe.taken_before {
+        probe.report.delivered = true;
+        VTIMER_PROBE_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    } else if host_initiated() {
+        probe.report.host_initiated_exits += 1;
+    } else {
+        probe.report.other_exits += 1;
+    }
 }
 
 /// `ID_AA64PFR0_EL1.GIC`, bits 27:24: the GIC system-register interface.

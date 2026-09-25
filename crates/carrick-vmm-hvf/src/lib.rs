@@ -73,7 +73,10 @@ pub mod vcpu_kick;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf_aarch64_engine;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use gic::{CarrierGicSnapshot, InterruptModel, carrier_gic_snapshot, interrupt_model};
+pub use gic::{
+    CarrierGicSnapshot, InterruptModel, VtimerProbeError, VtimerProbeReport, carrier_gic_snapshot,
+    el1_irq_mode, el1_vtimer_probe_arm_after_syscall, el1_vtimer_probe_report, interrupt_model,
+};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use trap::{
     VcpuLifecycleTotals, read_el1_counters, read_el1_region_host_ptr, reset_el1_counters,
