@@ -24,6 +24,12 @@
 //!   return (qualified with a standalone HVF probe on macOS 27.2 / M4), so any
 //!   exit the loop handles internally before the IRQ is taken must re-arm it.
 //!
+//! - Carrick's EL1 syscall hook saves SPSR_EL1 on entry and reloads it before
+//!   its served `eret`, which would overwrite the unmask. `absorb` therefore
+//!   also publishes the kick to the vCPU's EL1 slot (`publish_owed_kick`),
+//!   and the hook consults it after its last SPSR_EL1 write: before that point
+//!   the syscall leaves through the host, after it the unmask survives.
+//!
 //! The obligation ends at the first exit that surfaces to the runtime: the host
 //! then has control, which is all a kick asks for.
 
@@ -63,6 +69,10 @@ impl OwedKick {
         pc: u64,
         site: AbsorbedKickSite,
     ) -> Result<(), TrapError> {
+        // Every owed kick is visible to the EL1 hook's pending-host-work
+        // check, whoever issued it: the served path forwards on it, or finds
+        // its SPSR_EL1 already final and keeps the unmask below.
+        vcpu.publish_owed_kick()?;
         let el0_state = el0_return_state(vcpu)?;
         let el0_pstate = vcpu.get_reg(el0_state)?;
         carrick_observability::probes::kick_rearm_irq(
@@ -172,6 +182,9 @@ mod tests {
         /// Trapped clock reads (emulated inside the backend's run, so invisible
         /// to the engine) before the guest's next surfaced syscall.
         clock_reads_before_syscall: u32,
+        /// Owed kicks published to Carrick's EL1 code (the slot's
+        /// pending-host-work flag the EL1 syscall hook consults).
+        published_owed_kicks: u32,
     }
 
     impl ModelVcpu {
@@ -189,6 +202,7 @@ mod tests {
                 el1_exits_before_eret: 0,
                 el0_steps: 0,
                 clock_reads_before_syscall,
+                published_owed_kicks: 0,
             }
         }
 
@@ -274,6 +288,11 @@ mod tests {
 
         fn injects_kick_irq(&self) -> bool {
             true
+        }
+
+        fn publish_owed_kick(&mut self) -> Result<(), TrapError> {
+            self.published_owed_kicks += 1;
+            Ok(())
         }
 
         fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
@@ -432,5 +451,22 @@ mod tests {
         assert!(!owed.is_owed());
         assert_eq!(vcpu.spsr_el1, EL0_DAIF_MASKED);
         assert!(!vcpu.pending_irq);
+    }
+
+    /// Carrick's EL1 syscall hook reloads SPSR_EL1 from its entry snapshot
+    /// before a served `eret`, so the unmask alone cannot carry a kick absorbed
+    /// in the hook. Every absorbed kick must also be published to the vCPU's
+    /// EL1 slot, which the hook consults after that reload (the hook's own
+    /// VM-free binding, `carrick_mem`'s `el1_hook_kick`, proves the other
+    /// half against the emitted bytes).
+    #[test]
+    fn absorbed_kick_is_published_to_the_el1_hook() {
+        let mut vcpu = ModelVcpu::at_vector_resume(0);
+        let mut owed = OwedKick::default();
+        for absorbed in 1..=3 {
+            owed.absorb(&mut vcpu, vector_resume_pc(), AbsorbedKickSite::El1Vector)
+                .expect("absorb");
+            assert_eq!(vcpu.published_owed_kicks, absorbed);
+        }
     }
 }

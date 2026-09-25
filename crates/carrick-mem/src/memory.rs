@@ -81,6 +81,8 @@
 //! guest VA differs from its IPA.
 
 mod el1_clock;
+#[cfg(test)]
+mod el1_hook_kick;
 
 /// Host/EL1 wire layout for one AArch64 syscall mailbox slot.
 ///
@@ -4503,8 +4505,27 @@ fn write_el1_vector_hook(bytes: &mut [u8], hook_offset: usize, mailbox_capture: 
     emit(bytes, &mut cursor, 0); // b.ne forward_label (placeholder)
 
     // ===== SERVED PATH (x0 == 0) =====
+    //
+    // EL0's return state goes back into ELR/SPSR_EL1 FIRST, and the
+    // pending-host-work check comes after it, because a host kick can stop
+    // the vCPU at any instruction here. The engine owes such a kick to the
+    // EL0 boundary (`carrick_aarch64::owed_kick`): it publishes the kick to
+    // this slot's `pending_host_work` and clears `I` in the live SPSR_EL1.
+    // A kick absorbed before the check is seen by the check, and the syscall
+    // leaves through the host. A kick absorbed after the check finds SPSR_EL1
+    // already final, so its unmask survives to `eret` and the kick IRQ is
+    // taken at the first EL0 instruction. With the check before the reload
+    // (as it once was), a kick absorbed between the two had its unmask
+    // overwritten by the saved, masked copy: EL0 ran on with the kick
+    // pending and masked, and a page-table drain waiting on that vCPU waited
+    // until the thread's next host exit, forever for a thread that computes.
+    // Nothing between the check and `eret` may write SPSR_EL1.
     emit(bytes, &mut cursor, 0x9100_03F0); // mov x16, sp (TrapFrame pointer)
     emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 272)); // ldr x17, [x16, #272] (slot)
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(1, 16, 248)); // elr
+    emit(bytes, &mut cursor, 0xD518_4021); // msr elr_el1, x1
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(1, 16, 256)); // spsr
+    emit(bytes, &mut cursor, 0xD518_4001); // msr spsr_el1, x1
 
     // Check pending_host_work before eret
     let tasks_base = carrick_el1_abi::EL1_CURRENT_TASKS_BASE;
@@ -4557,11 +4578,6 @@ fn write_el1_vector_hook(bytes: &mut [u8], hook_offset: usize, mailbox_capture: 
     );
     emit(bytes, &mut cursor, 0x8B11_2031); // add x17, x1, x17, lsl #8
     emit(bytes, &mut cursor, 0x9100_023F); // mov sp, x17 (restores SP_EL1)
-    // Restore ELR and SPSR
-    emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 248)); // elr
-    emit(bytes, &mut cursor, 0xD518_4031); // msr elr_el1, x17
-    emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 256)); // spsr
-    emit(bytes, &mut cursor, 0xD518_4011); // msr spsr_el1, x17
     // Restore x1..x15, x18..x30
     for r in 1..=15 {
         emit(bytes, &mut cursor, enc_ldr_xt_xn(r, 16, (r * 8) as u64));
