@@ -380,7 +380,15 @@ impl HvfVmState {
     /// TTBR/CPACR/CNTKCTL/VBAR/SP/vdso setup into one constructor.
     pub(crate) fn new_with_plan(
         plan: &GuestMappingPlan,
-    ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
+    ) -> Result<
+        (
+            HvfVmState,
+            applevisor::vcpu::Vcpu,
+            MailboxBinding,
+            crate::staged_cpu::StagedCpu,
+        ),
+        TrapError,
+    > {
         let mut pending_creation = None;
         let result = Self::new_with_plan_inner(plan, &mut pending_creation);
         finish_pending_vm_creation(pending_creation, result)
@@ -389,7 +397,15 @@ impl HvfVmState {
     fn new_with_plan_inner(
         plan: &GuestMappingPlan,
         pending_creation: &mut Option<PendingCarrierVmCreation>,
-    ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
+    ) -> Result<
+        (
+            HvfVmState,
+            applevisor::vcpu::Vcpu,
+            MailboxBinding,
+            crate::staged_cpu::StagedCpu,
+        ),
+        TrapError,
+    > {
         use applevisor::prelude::*;
 
         // Carrier reuse: when this carrier already owns a VM, a new container's
@@ -823,6 +839,7 @@ impl HvfVmState {
         // CNTVCT_EL0 in userspace. After the creation commits: host writes are
         // admitted only against committed backing owners.
         state.populate_vdso_data_page();
-        Ok((state, vcpu.into_inner(), mailbox))
+        let staged = crate::staged_cpu::StagedCpu::initial_root(plan);
+        Ok((state, vcpu.into_inner(), mailbox, staged))
     }
 }

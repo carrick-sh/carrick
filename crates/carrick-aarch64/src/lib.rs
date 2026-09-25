@@ -38,4 +38,7 @@ pub use engine::{
     Aarch64TaskRuntimeProjection,
 };
 pub use stage1_authority::{ShareState, Stage1Authority, Stage1Editor, Stage1ImagePool};
-pub use vmm::{Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy};
+pub use vmm::{
+    Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
+    OwedStage1Maintenance, Stage1Maintenance,
+};

@@ -57,6 +57,8 @@ pub mod posix_timer;
 // `crate::syscall` so HVF's compat reporter + the probes provider are unchanged.
 pub use carrick_abi::syscall;
 pub mod signal_arrival;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod staged_cpu;
 pub mod syscall_mailbox;
 pub mod thread;
 pub mod threaded_impl;

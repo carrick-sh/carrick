@@ -102,15 +102,14 @@ fn hvf_vcpu_reclaim_enabled() -> bool {
 /// `next_syscall` runs into EL0). Mirrors `KvmAarch64Vmm::bring_up`.
 pub fn bring_up(image: &AddressSpace) -> Result<HvfAarch64Engine, TrapError> {
     let plan = GuestMappingPlan::from_address_space(image)?;
-    let (state, vcpu, mailbox) = HvfVmState::new_with_plan(&plan)?;
+    let (state, vcpu, mailbox, staged) = HvfVmState::new_with_plan(&plan)?;
     let vmm = HvfAarch64Vmm {
         state,
         host_writes: Default::default(),
     };
-    Ok(Aarch64EngineCore::from_parts(
-        vmm,
-        HvfAarch64Vcpu::new(vcpu, mailbox),
-    ))
+    let mut vcpu = HvfAarch64Vcpu::new(vcpu, mailbox);
+    vcpu.root_shadow = Some(parking_lot::Mutex::new(staged));
+    Ok(Aarch64EngineCore::from_parts(vmm, vcpu))
 }
 
 // ─── neutral ⟷ HVF VcpuSnapshot ──────────────────────────────────────────────
@@ -146,6 +145,10 @@ pub struct HvfAarch64Vcpu {
     pub(crate) inner: std::mem::ManuallyDrop<applevisor::vcpu::Vcpu>,
     pub(crate) mailbox: MailboxBinding,
     tidstamp_debug: Option<bool>,
+    /// Transition evidence (EL1 plan 1a D2): the root's register file built as
+    /// data, mirrored from every register write the boot vCPU receives, and
+    /// compared with the boot vCPU's snapshot at the initial-runner hand-off.
+    root_shadow: Option<parking_lot::Mutex<crate::staged_cpu::StagedCpu>>,
 }
 
 impl HvfAarch64Vcpu {
@@ -154,6 +157,17 @@ impl HvfAarch64Vcpu {
             inner: std::mem::ManuallyDrop::new(vcpu),
             mailbox,
             tidstamp_debug: None,
+            root_shadow: None,
+        }
+    }
+
+    fn mirror(
+        &self,
+        write: impl FnOnce(&mut crate::staged_cpu::StagedCpu) -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        match self.root_shadow.as_ref() {
+            Some(shadow) => write(&mut shadow.lock()),
+            None => Ok(()),
         }
     }
 
@@ -243,13 +257,15 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         hvf_get_reg(&self.inner, r).map_err(os_to_trap)
     }
     fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), TrapError> {
-        hvf_set_reg(&self.inner, r, v).map_err(os_to_trap)
+        hvf_set_reg(&self.inner, r, v).map_err(os_to_trap)?;
+        self.mirror(|shadow| shadow.set_reg(r, v))
     }
     fn get_sys_reg(&self, r: SysReg) -> Result<u64, TrapError> {
         hvf_get_sys_reg(&self.inner, r).map_err(os_to_trap)
     }
     fn set_sys_reg(&mut self, r: SysReg, v: u64) -> Result<(), TrapError> {
-        hvf_set_sys_reg(&self.inner, r, v).map_err(os_to_trap)
+        hvf_set_sys_reg(&self.inner, r, v).map_err(os_to_trap)?;
+        self.mirror(|shadow| shadow.set_sys_reg(r, v))
     }
 
     fn get_vreg(&self, n: u32) -> Result<u128, TrapError> {
@@ -275,7 +291,7 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         // class). Reads are pointer-based and unaffected (above).
         let rc = set_simd_fp_reg_v(self.inner.id(), crate::trap::SIMD_FP_TABLE[idx], v);
         if rc == 0 {
-            Ok(())
+            self.mirror(|shadow| shadow.set_vreg(n, v))
         } else {
             Err(TrapError::Hypervisor(format!(
                 "set_simd_fp_reg(q{idx}) rc={rc:#x}"
@@ -290,7 +306,11 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
     fn set_fpcr(&mut self, v: u64) -> Result<(), TrapError> {
         self.inner
             .set_reg(applevisor::vcpu::Reg::FPCR, v)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        self.mirror(|shadow| {
+            shadow.set_fpcr(v);
+            Ok(())
+        })
     }
     fn get_fpsr(&self) -> Result<u64, TrapError> {
         self.inner
@@ -300,7 +320,11 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
     fn set_fpsr(&mut self, v: u64) -> Result<(), TrapError> {
         self.inner
             .set_reg(applevisor::vcpu::Reg::FPSR, v)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        self.mirror(|shadow| {
+            shadow.set_fpsr(v);
+            Ok(())
+        })
     }
 
     fn get_esr_el1(&self) -> Result<u64, TrapError> {
@@ -325,7 +349,11 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         // last_exit_class is engine-owned; the neutral snapshot doesn't carry it, so
         // restore 0 (the inner restore overwrites the vCPU latch from the snapshot's
         // own field, which we set to 0 — the trap loop relatches it on the next exit).
-        HvfInner::restore_vcpu_into(&mut self.inner, &from_neutral(snap))
+        HvfInner::restore_vcpu_into(&mut self.inner, &from_neutral(snap))?;
+        self.mirror(|shadow| {
+            shadow.restore(snap);
+            Ok(())
+        })
     }
 
     fn restore_thread_start(&mut self, snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError> {
@@ -364,6 +392,7 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
             HvfSyscallTransport::Legacy => {
                 hvf_set_reg(&self.inner, carrick_hal::Reg::X(0), return_value as u64)
                     .map_err(os_to_trap)?;
+                self.mirror(|shadow| shadow.set_reg(carrick_hal::Reg::X(0), return_value as u64))?;
                 self.mailbox
                     .publish_registers_prepared()
                     .map_err(|error| {
@@ -419,6 +448,10 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         self.inner
             .set_sys_reg(SysReg::TPIDRRO_EL0, packed)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        self.mirror(|shadow| {
+            shadow.stamp_guest_thread_id(packed);
+            Ok(())
+        })?;
 
         if std::env::var_os("CARRICK_TIDSTAMP_DEBUG").is_some() {
             let back = self.inner.get_sys_reg(SysReg::CONTEXTIDR_EL1);
@@ -472,12 +505,78 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         let next = if tso { actlr | EN_TSO } else { actlr & !EN_TSO };
         self.inner
             .set_sys_reg(applevisor::vcpu::SysReg::ACTLR_EL1, next)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        self.mirror(|shadow| {
+            let staged = shadow.actlr_el1();
+            shadow.set_actlr_el1(if tso {
+                staged | EN_TSO
+            } else {
+                staged & !EN_TSO
+            });
+            Ok(())
+        })
     }
 
     fn set_memory_model(&mut self, tso: bool) -> Result<(), TrapError> {
         self.set_hardware_tso(tso)
     }
+}
+
+/// The first field the data-built root CPU gets wrong, compared with the boot
+/// vCPU HVF programmed. `SP_EL1` is excluded: it names the boot vCPU's mailbox
+/// slot, and a task restore keeps the destination executor's own.
+fn first_root_snapshot_difference(
+    live: &Aarch64VcpuSnapshot,
+    staged: &Aarch64VcpuSnapshot,
+) -> Option<String> {
+    macro_rules! compare {
+        ($($field:ident),* $(,)?) => {
+            $(
+                if live.$field != staged.$field {
+                    return Some(format!(
+                        "{}: boot vCPU {:#x?} data {:#x?}",
+                        stringify!($field),
+                        live.$field,
+                        staged.$field
+                    ));
+                }
+            )*
+        };
+    }
+    // SCTLR_EL1's architecturally RES1 bits read back as one only once the
+    // vCPU has run (observed: 0x3400d185 after the bring-up maintenance
+    // trampoline ran, 0x400d005 when it did not), so they are not compared.
+    let res1 = carrick_mem::arch_sysregs::SCTLR_EL1_RES1;
+    if live.sctlr & !res1 != staged.sctlr & !res1 {
+        return Some(format!(
+            "sctlr: boot vCPU {:#x} data {:#x}",
+            live.sctlr, staged.sctlr
+        ));
+    }
+    compare!(
+        gprs,
+        pc,
+        pstate,
+        sp_el0,
+        elr_el1,
+        spsr_el1,
+        ttbr0,
+        ttbr1,
+        tcr,
+        mair,
+        vbar,
+        cpacr,
+        cntkctl_el1,
+        tpidr_el0,
+        tpidrro_el0,
+        tpidr_el1,
+        contextidr_el1,
+        actlr_el1,
+        vregs,
+        fpsr,
+        fpcr,
+    );
+    None
 }
 
 // ─── HvfAarch64Vmm ───────────────────────────────────────────────────────────
@@ -1946,6 +2045,14 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         let snapshot = vcpu.snapshot().map_err(|error| {
             TrapError::Hypervisor(format!("HVF initial-runner snapshot capture: {error}"))
         })?;
+        if let Some(shadow) = vcpu.root_shadow.take() {
+            let staged = shadow.into_inner().snapshot();
+            if let Some(difference) = first_root_snapshot_difference(&snapshot, &staged) {
+                return Err(TrapError::Hypervisor(format!(
+                    "data-built root CPU differs from the boot vCPU: {difference}"
+                )));
+            }
+        }
         self.state
             .initial_runner_park(&mut vcpu.inner, &mut vcpu.mailbox)?;
         Ok(snapshot)
