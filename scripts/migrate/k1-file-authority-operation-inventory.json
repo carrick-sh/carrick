@@ -7,7 +7,7 @@
     "description_backing": 24,
     "epoll": 422,
     "stream": 175,
-    "mapping": 1143,
+    "mapping": 1141,
     "lifecycle": 28
   },
   "production_counts": {
@@ -16,7 +16,7 @@
     "description_backing": 9,
     "epoll": 161,
     "stream": 120,
-    "mapping": 762,
+    "mapping": 760,
     "lifecycle": 16
   },
   "files": {
@@ -7880,24 +7880,6 @@
         "mapping"
       ],
       "text": "/// Holds this thread's stage-1 exclusivity claim for a mapping syscall's whole",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mm_quiesce.rs",
-      "line": 299,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// (spurious `ENOMEM` the moment two threads `mmap` at once) and the drain 30 s",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mm_quiesce.rs",
-      "line": 307,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// multi-threaded `mmap` contention into spurious `ENOMEM` \u2014 trading a rare",
       "scope_kind": "production_callsite"
     },
     {
@@ -18873,7 +18855,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2147,
+      "line": 2146,
       "categories": [
         "mapping"
       ],
@@ -18882,7 +18864,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2411,
+      "line": 2412,
       "categories": [
         "mapping"
       ],
@@ -18891,7 +18873,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3451,
+      "line": 3452,
       "categories": [
         "mapping"
       ],
@@ -18900,7 +18882,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3461,
+      "line": 3462,
       "categories": [
         "mapping"
       ],
@@ -18909,7 +18891,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3475,
+      "line": 3476,
       "categories": [
         "mapping"
       ],
@@ -18918,7 +18900,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3497,
+      "line": 3498,
       "categories": [
         "mapping"
       ],
@@ -18927,7 +18909,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3518,
+      "line": 3519,
       "categories": [
         "mapping"
       ],
@@ -18936,7 +18918,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3533,
+      "line": 3534,
       "categories": [
         "mapping"
       ],
@@ -18945,7 +18927,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3560,
+      "line": 3561,
       "categories": [
         "mapping"
       ],
@@ -18954,7 +18936,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3570,
+      "line": 3571,
       "categories": [
         "mapping"
       ],
@@ -18963,7 +18945,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3584,
+      "line": 3585,
       "categories": [
         "mapping"
       ],
@@ -18972,7 +18954,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3601,
+      "line": 3602,
       "categories": [
         "mapping"
       ],
@@ -19125,7 +19107,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "line": 2416,
+      "line": 2414,
       "categories": [
         "mapping"
       ],
