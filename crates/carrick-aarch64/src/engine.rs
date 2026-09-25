@@ -2439,6 +2439,9 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
     fn next_syscall(&mut self) -> Result<Option<RawSyscall>, TrapError> {
         // One guest run per call. The loop exists ONLY to re-enter the guest when a
         // kick lands mid-syscall-trap (the `Kicked` arm); every other exit returns.
+        // A kick absorbed inside Carrick's EL1 code is owed to the next EL0
+        // boundary and settled by whichever exit surfaces first (see `OwedKick`).
+        let mut owed_kick = crate::owed_kick::OwedKick::default();
         loop {
             // Account the guest's CPU time (wall time inside the backend's guest
             // run) into this thread's guest_cpu slot so getrusage(RUSAGE_SELF) /
@@ -2469,6 +2472,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                     // ISA-neutral: x8 → number, x0..x5 → args. `last_syscall_nr`/
                     // `orig_x0` stay set from the raw frame above (their x8/x0
                     // meaning is aarch64-fixed).
+                    owed_kick.settle(&mut self.vcpu)?;
                     let (number, args) = <Self as ThreadedEngine>::Arch::decode_syscall(&frame);
                     let guest_abi = <Self as ThreadedEngine>::Arch::linux_guest_abi();
                     return Ok(Some(RawSyscall {
@@ -2496,6 +2500,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                     // it so `inject_signal` can put it in the arm64 sigframe's
                     // `esr_context` (required by Rosetta's handler).
                     self.last_fault_esr = syndrome;
+                    owed_kick.settle(&mut self.vcpu)?;
                     return Err(TrapError::el0_fault(
                         syndrome,
                         elr,
@@ -2510,6 +2515,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                 }
                 Aarch64Exit::Stage1CowFault { syndrome, far } => {
                     self.last_fault_esr = syndrome;
+                    owed_kick.settle(&mut self.vcpu)?;
                     return Err(TrapError::Stage1CowFault {
                         syndrome,
                         far,
@@ -2523,17 +2529,22 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                     // never surfaces on the KVM path; a future HVF migration
                     // services it via the shared `emulate_el0_sys64_read` and
                     // re-enters. Re-run the guest for now (no-op on KVM).
+                    owed_kick.rearm(&mut self.vcpu)?;
                     continue;
                 }
                 Aarch64Exit::MaintenanceDone => {
                     // The maintenance trampoline's completion vehicle is consumed by
                     // `run_el1_maintenance`'s own loop; reaching it here is a
                     // spurious re-entry — re-run the guest.
+                    owed_kick.rearm(&mut self.vcpu)?;
                     continue;
                 }
                 // A WFI/halt with no pending syscall: report `None` so the run loop
                 // can run signal delivery and resume.
-                Aarch64Exit::Halt => return Ok(None),
+                Aarch64Exit::Halt => {
+                    owed_kick.settle(&mut self.vcpu)?;
+                    return Ok(None);
+                }
                 Aarch64Exit::Kicked => {
                     // A cross-thread kick (host signal → KVM_RUN EINTR, e.g. a timer
                     // or `tgkill`) can land while the guest is MID-SYSCALL-TRAP: the
@@ -2557,17 +2568,24 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                         || carrick_mem::memory::is_carrick_el0_clock_stub_va(pc)
                     {
                         // Clock completion may have already passed its flag
-                        // check. Normalize to the original SVC, then arm the
-                        // pending IRQ: it fires the moment EL0 is re-entered,
-                        // so the kick is taken at the SVC's PC BEFORE the
+                        // check. Normalize to the original SVC, then owe the
+                        // kick to EL0: it is taken at the SVC's PC BEFORE the
                         // syscall replays, and the replay crosses host
                         // dispatch afterwards with the kick already served.
                         let normalized = self.vcpu.force_clock_host_boundary()?;
                         if in_vector || in_el1_image || normalized {
-                            self.vcpu.set_pending_irq(true)?;
+                            let site = if in_vector {
+                                crate::owed_kick::AbsorbedKickSite::El1Vector
+                            } else if in_el1_image {
+                                crate::owed_kick::AbsorbedKickSite::El1Image
+                            } else {
+                                crate::owed_kick::AbsorbedKickSite::El0ClockStub
+                            };
+                            owed_kick.absorb(&mut self.vcpu, pc, site)?;
                             continue;
                         }
                     }
+                    owed_kick.settle(&mut self.vcpu)?;
                     return Ok(None);
                 }
                 Aarch64Exit::Memory { gpa, va } => {
@@ -2575,6 +2593,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                     // resolve + retry; KVM keeps the default `Ok(false)`. Unhandled
                     // → surface.
                     if self.vm.handle_memory_exit(gpa, va)? {
+                        owed_kick.rearm(&mut self.vcpu)?;
                         continue;
                     }
                     return Err(TrapError::Hypervisor(format!(

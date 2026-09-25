@@ -450,8 +450,12 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
 
     fn set_pending_irq(&mut self, pending: bool) -> Result<(), TrapError> {
         self.inner
-            .set_pending_interrupt(applevisor::prelude::InterruptType::IRQ, pending)
+            .set_pending_interrupt(crate::trap::HVF_VIRTUAL_IRQ, pending)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
+    }
+
+    fn injects_kick_irq(&self) -> bool {
+        true
     }
 
     fn set_hardware_tso(&mut self, tso: bool) -> Result<(), TrapError> {

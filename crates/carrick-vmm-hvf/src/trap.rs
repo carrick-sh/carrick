@@ -6072,6 +6072,43 @@ impl HvfVmState {
     }
 }
 
+/// The Hypervisor.framework virtual IRQ line, numbered as the SDK numbers it.
+///
+/// Every kick Carrick cannot surface where it lands (inside its own EL1 code) is
+/// re-armed as a pending virtual IRQ whose lower-EL vector (`hvc #4`) surfaces
+/// it at the next EL0 boundary. `applevisor-sys` 1.0.0 declares
+/// `hv_interrupt_type_t { FIQ, IRQ }` — the reverse of the SDK's
+/// `hv_vcpu_types.h`, where `HV_INTERRUPT_TYPE_IRQ` is 0 and
+/// `HV_INTERRUPT_TYPE_FIQ` is 1 — so its `IRQ` variant asserts the FIQ line.
+/// Carrick masks FIQ at every exception level, so each "IRQ" re-arm was a
+/// silent no-op: the kick was lost until some unrelated exit, which is how a
+/// page-table drain came to wait out its budget on a sibling computing at EL0
+/// (qualified live with standalone HVF probes: the SDK IRQ line with PSTATE.I
+/// clear is taken at EL0 through Carrick's own vector page; the binding's
+/// `IRQ` never is). Name the line by its SDK number and pin that number.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const HVF_VIRTUAL_IRQ: applevisor::prelude::InterruptType =
+    applevisor::prelude::InterruptType::FIQ;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const _: () = assert!(
+    HVF_VIRTUAL_IRQ as u32 == 0,
+    "HVF_VIRTUAL_IRQ must be the SDK's HV_INTERRUPT_TYPE_IRQ (0)"
+);
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod virtual_irq_line_tests {
+    /// Contract `kernel.vcpu.kick-el0-boundary`: the line Carrick asserts is
+    /// the SDK's `HV_INTERRUPT_TYPE_IRQ` (`hv_vcpu_types.h`: IRQ = 0, FIQ = 1),
+    /// not whatever a binding crate happens to call "IRQ". The FIQ line is
+    /// masked at every exception level Carrick runs, so asserting it drops the
+    /// kick without a trace.
+    #[test]
+    fn kick_irq_asserts_the_sdk_irq_line() {
+        const SDK_HV_INTERRUPT_TYPE_IRQ: u32 = 0;
+        assert_eq!(super::HVF_VIRTUAL_IRQ as u32, SDK_HV_INTERRUPT_TYPE_IRQ);
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod cow_engine;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -7319,6 +7356,14 @@ impl HvfInner {
             let cpsr = vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?;
             let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
 
+            if is_canceled {
+                crate::probes::vcpu_canceled(
+                    vcpu.id(),
+                    pc,
+                    ((cpsr >> 2) & 0b11) as u32,
+                    i32::from(Self::should_resume_mid_el1(is_canceled, cpsr, pc)),
+                );
+            }
             if Self::should_resume_mid_el1(is_canceled, cpsr, pc) {
                 if last_el1_resume_pc == Some(pc) {
                     consecutive_el1_resumes_without_progress += 1;
@@ -7333,7 +7378,7 @@ impl HvfInner {
                         exit.reason,
                     );
                 }
-                vcpu.set_pending_interrupt(InterruptType::IRQ, true)
+                vcpu.set_pending_interrupt(HVF_VIRTUAL_IRQ, true)
                     .map_err(hvf_error)?;
                 EL1_KICK_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::probes::kick_in_kernel(pc, ((cpsr >> 2) & 0b11) as u32);
@@ -7504,12 +7549,13 @@ impl HvfInner {
                 });
             }
             if is_aarch64_hvc_kick(exception.syndrome) {
-                vcpu.set_pending_interrupt(InterruptType::IRQ, false)
+                vcpu.set_pending_interrupt(HVF_VIRTUAL_IRQ, false)
                     .map_err(hvf_error)?;
                 let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
                 let spsr = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
                 vcpu.set_reg(Reg::PC, elr).map_err(hvf_error)?;
                 vcpu.set_reg(Reg::CPSR, spsr).map_err(hvf_error)?;
+                crate::probes::vcpu_irq_kick(elr);
                 return Ok(Aarch64Exit::Kicked);
             }
             if !is_aarch64_syscall_exception(exception.syndrome) {
