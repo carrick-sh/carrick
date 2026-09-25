@@ -193,6 +193,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         FD_HANDLE_INOTIFY_TAG as u64,
         core::mem::size_of::<TrapFrame>() as u64,
         core::mem::size_of::<Counters>() as u64,
+        core::mem::offset_of!(Counters, irq_taken) as u64,
         core::mem::size_of::<CurrentTask>() as u64,
         core::mem::offset_of!(CurrentTask, file_table) as u64,
         core::mem::offset_of!(CurrentTask, pending_host_work) as u64,
@@ -900,6 +901,9 @@ pub struct Counters {
     pub served: [AtomicU64; 512],
     /// Number of times syscall nr was forwarded to the host.
     pub forwarded: [AtomicU64; 512],
+    /// GIC interrupts EL1 took and completed, by INTID (SGIs 0-15, PPIs
+    /// 16-31); written by the vector page's IRQ hook.
+    pub irq_taken: [AtomicU64; 32],
 }
 
 impl Counters {
@@ -907,6 +911,7 @@ impl Counters {
         Self {
             served: [const { AtomicU64::new(0) }; 512],
             forwarded: [const { AtomicU64::new(0) }; 512],
+            irq_taken: [const { AtomicU64::new(0) }; 32],
         }
     }
 
@@ -917,9 +922,15 @@ impl Counters {
             snapshot.forwarded[i]
                 .store(self.forwarded[i].load(Ordering::Relaxed), Ordering::Relaxed);
         }
+        for i in 0..32 {
+            snapshot.irq_taken[i]
+                .store(self.irq_taken[i].load(Ordering::Relaxed), Ordering::Relaxed);
+        }
         snapshot
     }
 }
+
+const _: () = assert!(core::mem::size_of::<Counters>() as u64 <= EL1_COUNTERS_SIZE);
 
 impl Default for Counters {
     fn default() -> Self {
@@ -1095,6 +1106,18 @@ pub fn take_served_with_work(slot: usize) -> bool {
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
     current_task.served_with_work.swap(0, Ordering::AcqRel) != 0
+}
+
+/// Whether the syscall the vCPU at `slot` last left EL1 with was served at
+/// EL1 and forwarded only for pending host work, without consuming the flag.
+pub fn peek_served_with_work(slot: usize) -> bool {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return false;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    current_task.served_with_work.load(Ordering::Acquire) != 0
 }
 
 /// Read the preserved original argument 0 for an executor slot.
@@ -1637,9 +1660,11 @@ mod tests {
 
     #[test]
     fn test_counters_layout() {
-        assert_eq!(core::mem::size_of::<Counters>(), 1024 * 8);
+        assert_eq!(core::mem::size_of::<Counters>(), (1024 + 32) * 8);
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);
+        // The vector page's IRQ hook addresses this array directly.
+        assert_eq!(core::mem::offset_of!(Counters, irq_taken), 1024 * 8);
     }
 
     #[test]

@@ -952,6 +952,21 @@ pub fn reset_el1_counters() {
     carrick_el1_abi::record_el1_region_host_ptr(0);
 }
 
+/// GIC interrupts with `intid` EL1 has taken in the live carrier so far.
+pub(crate) fn el1_irqs_taken(intid: u32) -> u64 {
+    let ptr = EL1_COUNTERS_HOST_PTR.load(std::sync::atomic::Ordering::Acquire);
+    if ptr == 0 {
+        return 0;
+    }
+    // SAFETY: the counters page stays mapped for the carrier VM's life; only
+    // an atomic is read.
+    let counters = unsafe { &*(ptr as *const carrick_el1_abi::Counters) };
+    counters
+        .irq_taken
+        .get(intid as usize)
+        .map_or(0, |taken| taken.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 pub fn read_el1_counters() -> Option<carrick_el1_abi::Counters> {
     let ptr = EL1_COUNTERS_HOST_PTR.load(std::sync::atomic::Ordering::Acquire);
     if ptr != 0 {

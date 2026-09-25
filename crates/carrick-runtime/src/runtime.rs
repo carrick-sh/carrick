@@ -846,7 +846,13 @@ fn with_hvf_syscall_mailbox(
     // identity-page gate decide whether matched calls return in EL1 or fall
     // through to the host dispatcher.
     let identity_fast_path = carrick_kernel::syscall_shim_enabled();
-    let image = image.with_el1_vectors_mailbox_clock(identity_fast_path, true)?;
+    // The carrier's interrupt model (one reader, `carrick_vmm_hvf::gic`)
+    // decides whether EL1 takes GIC interrupts in the served-syscall window.
+    let image = image.with_el1_vectors_mailbox_clock(
+        identity_fast_path,
+        true,
+        carrick_vmm_hvf::el1_irq_mode(),
+    )?;
     // The page is part of the compile-enabled transport shape even when its
     // runtime gate is closed. Boot/fork/exec stampers still publish the task
     // identity there; interceptor/observer visibility keeps the gate at zero

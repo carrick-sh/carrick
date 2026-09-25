@@ -241,7 +241,10 @@ pub fn read_el1_region_host_ptr() -> usize {
 pub fn reset_el1_counters() {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use carrick_vmm_hvf::{CarrierGicSnapshot, carrier_gic_snapshot};
+pub use carrick_vmm_hvf::{
+    CarrierGicSnapshot, VtimerProbeError, VtimerProbeReport, carrier_gic_snapshot,
+    el1_vtimer_probe_arm_after_syscall, el1_vtimer_probe_report,
+};
 
 /// The carrier VM's in-kernel GIC; only the HVF backend has one.
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -256,6 +259,34 @@ pub struct CarrierGicSnapshot {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn carrier_gic_snapshot() -> CarrierGicSnapshot {
     CarrierGicSnapshot::default()
+}
+
+/// See `carrick_vmm_hvf::VtimerProbeReport`; only the HVF backend has one.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VtimerProbeReport {
+    pub armed: bool,
+    pub delivered: bool,
+    pub vcpu: u64,
+    pub host_initiated_exits: u64,
+    pub other_exits: u64,
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VtimerProbeError {
+    NoGic,
+    El1Disabled,
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn el1_vtimer_probe_arm_after_syscall(_: u64, _: u64) -> Result<(), VtimerProbeError> {
+    Err(VtimerProbeError::NoGic)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn el1_vtimer_probe_report() -> VtimerProbeReport {
+    VtimerProbeReport::default()
 }
 
 /// Absolute host path to Apple's Rosetta 2 Linux interpreter that carrick probes

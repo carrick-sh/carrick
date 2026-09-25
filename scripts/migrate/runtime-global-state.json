@@ -3320,6 +3320,22 @@
       "fingerprint": "fa483063c426ee2f4d80f211a0f64a27464c418553aea4a7985e3f987617329b",
       "classification": "carrier_infra",
       "rationale": "The in-kernel GIC of the carrier process's one live Hypervisor.framework VM generation (affinity counter and capacity); created with the VM and reset when custody releases it."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/gic.rs",
+      "symbol": "VTIMER_PROBE",
+      "fingerprint": "cdb3df8c7ff960bc50bc54498d6deb7885e2dffc968f9a9388bec6e1d3ae990c",
+      "classification": "config_debug",
+      "rationale": "Signed-test probe of the guest virtual timer (EL1 plan 1a): the marker request, the probed vCPU and its exit accounting until EL1 takes the timer. Idle in every production run."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/gic.rs",
+      "symbol": "VTIMER_PROBE_ACTIVE",
+      "fingerprint": "436806f13bde761bc802e1a42c15cbbb592ce65008c6ffa0be19e0aefcdec495",
+      "classification": "config_debug",
+      "rationale": "Gate of the signed-test virtual-timer probe: one relaxed load per hv_vcpu_run entry and exit when no probe is armed."
     }
   ]
 }

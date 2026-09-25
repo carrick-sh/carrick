@@ -578,6 +578,14 @@ const AARCH64_IC_IALLUIS_OPCODE: u32 = 0xd508_711f;
 const AARCH64_DSB_SY_OPCODE: u32 = 0xd503_3f9f;
 // AArch64 `isb` — instruction synchronization barrier.
 const AARCH64_ISB_OPCODE: u32 = 0xd503_3fdf;
+// EL1 GIC interrupt window and handler (EL1 plan 1a), encodings checked with
+// the system assembler.
+const AARCH64_MRS_ISR_EL1_X1_OPCODE: u32 = 0xd538_c101; // mrs x1, isr_el1
+const AARCH64_MSR_DAIFCLR_I_OPCODE: u32 = 0xd503_42ff; // msr daifclr, #2
+const AARCH64_MSR_DAIFSET_I_OPCODE: u32 = 0xd503_42df; // msr daifset, #2
+const AARCH64_MRS_ICC_IAR1_EL1_X1_OPCODE: u32 = 0xd538_cc01; // mrs x1, icc_iar1_el1
+const AARCH64_MSR_ICC_EOIR1_EL1_X1_OPCODE: u32 = 0xd518_cc21; // msr icc_eoir1_el1, x1
+const AARCH64_MSR_CNTV_CTL_EL0_XZR_OPCODE: u32 = 0xd51b_e33f; // msr cntv_ctl_el0, xzr
 // Size of one AArch64 exception vector slot (16 slots in the 2 KiB table).
 // `pub` so the backends can share this one definition cross-crate.
 pub const AARCH64_VECTOR_SLOT_SIZE: usize = 0x80;
@@ -587,6 +595,8 @@ const AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET: usize = 0x400;
 // Offset of the "Lower EL using AArch64, IRQ" slot in the vector table.
 // Virtual IRQ injected on an EL1 kick lands here upon eret to EL0.
 const AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET: usize = 0x480;
+// "Current EL with SP_ELx, IRQ": where EL1 takes a GIC interrupt.
+const AARCH64_VECTOR_CUR_EL_SPX_IRQ_OFFSET: usize = 0x280;
 // Offsets of the two "Current EL" SYNCHRONOUS slots: SP_EL0 (0x000) and SP_ELx
 // (0x200). A synchronous exception here means carrick's own EL1 trampoline code
 // faulted — only possible if the guest was wrongly left at EL1 (the fail-loud
@@ -2037,9 +2047,10 @@ impl AddressSpace {
         self,
         identity_fast_path: bool,
         fd_ceiling: bool,
+        irq: El1IrqMode,
     ) -> Result<Self, AddressSpaceError> {
         self.with_mailbox_vectors(
-            el1_vectors_bytes_mailbox_clock(identity_fast_path, fd_ceiling),
+            el1_vectors_bytes_mailbox_clock(identity_fast_path, fd_ceiling, irq),
             identity_fast_path,
         )
     }
@@ -3812,6 +3823,23 @@ fn enc_blo(pc: u64, target: u64) -> u32 {
     let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
     0x5400_0003 | (imm19 << 5)
 }
+/// `tbz xN, #bit, target` (bit < 32).
+fn enc_tbz(reg: u32, bit: u32, pc: u64, target: u64) -> u32 {
+    let imm14 = ((target as i64 - pc as i64) / 4) as u32 & 0x3FFF;
+    0x3600_0000 | ((bit & 31) << 19) | (imm14 << 5) | (reg & 31)
+}
+
+/// `adr xN, target`.
+fn enc_adr(reg: u32, pc: u64, target: u64) -> u32 {
+    let delta = (target as i64 - pc as i64) as u32 & 0x1F_FFFF;
+    0x1000_0000 | ((delta & 3) << 29) | ((delta >> 2) << 5) | (reg & 31)
+}
+
+/// `cmp xN, #imm12`.
+fn enc_cmp_xn_imm(reg: u32, imm: u16) -> u32 {
+    0xF100_001F | (u32::from(imm & 0xFFF) << 10) | ((reg & 31) << 5)
+}
+
 fn enc_b(pc: u64, target: u64) -> u32 {
     let imm26 = (((target as i64 - pc as i64) >> 2) as u32) & 0x03FF_FFFF;
     0x1400_0000 | imm26
@@ -4449,8 +4477,35 @@ const MAILBOX_HANDLER_OFFSET: usize = 0xA00;
 const MAILBOX_HANDLER_SIZE: usize = 0x200;
 
 const EL1_VECTOR_HOOK_OFFSET: usize = 0x1000;
+/// The EL1 GIC interrupt handler ([`write_el1_irq_hook`]); the current-EL
+/// SPx IRQ slot branches here in [`El1IrqMode::GicWindow`].
+const EL1_IRQ_HOOK_OFFSET: usize = 0x2000;
 
-fn write_el1_vector_hook(bytes: &mut [u8], hook_offset: usize, mailbox_capture: usize) {
+/// Whether Carrick's EL1 code takes interrupts itself. The HVF carrier chooses
+/// it (`carrick_vmm_hvf::gic`), one reader for the VM, the kick vehicle and
+/// these bytes; every other backend and the `CARRICK_HVF_GIC=0` hatch use
+/// [`El1IrqMode::Masked`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum El1IrqMode {
+    /// No interrupt controller: EL1 never unmasks IRQs and the current-EL
+    /// IRQ slots are a bare `eret` (the pre-GIC vector bytes, unchanged).
+    Masked,
+    /// Hypervisor.framework's in-kernel GICv3: the served-syscall return path
+    /// opens a one-instruction IRQ window when `ISR_EL1.I` shows an interrupt
+    /// pending, and [`write_el1_irq_hook`] acknowledges and completes it.
+    GicWindow,
+}
+
+/// Emit the syscall hook. In [`El1IrqMode::GicWindow`] the served path opens
+/// its IRQ window, and the vector-page offset of the window's `isb` (the
+/// return address an IRQ taken in the window records) is returned for the
+/// IRQ hook's window check.
+fn write_el1_vector_hook(
+    bytes: &mut [u8],
+    hook_offset: usize,
+    mailbox_capture: usize,
+    irq: El1IrqMode,
+) -> Option<usize> {
     let put = |bytes: &mut [u8], off: usize, op: u32| {
         bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
     };
@@ -4593,6 +4648,31 @@ fn write_el1_vector_hook(bytes: &mut [u8], hook_offset: usize, mailbox_capture: 
     // pending and masked, and a page-table drain waiting on that vCPU waited
     // until the thread's next host exit, forever for a thread that computes.
     // Nothing between the check and `eret` may write SPSR_EL1.
+    //
+    // GIC mode opens the EL1 IRQ window first, before that reload: taking an
+    // IRQ at EL1 overwrites ELR_EL1/SPSR_EL1, which the reload then puts
+    // back. Every GPR is dead here (all are restored from the TrapFrame
+    // below) and SP is the TrapFrame, so the IRQ hook may use x1-x3. The
+    // window opens only when `ISR_EL1.I` shows an interrupt pending, so a
+    // served syscall with nothing pending pays one `mrs` and one `tbz`. A kick
+    // SGI taken here is republished as pending host work, which the check
+    // below turns into a forward; a kick absorbed after the window is
+    // published by the engine and caught the same way, or, after the check,
+    // keeps its unmask and is taken at the first EL0 instruction.
+    let window_isb = match irq {
+        El1IrqMode::Masked => None,
+        El1IrqMode::GicWindow => {
+            emit(bytes, &mut cursor, AARCH64_MRS_ISR_EL1_X1_OPCODE);
+            let tbz = cursor;
+            emit(bytes, &mut cursor, 0); // tbz x1, #7, skip (placeholder)
+            emit(bytes, &mut cursor, AARCH64_MSR_DAIFCLR_I_OPCODE);
+            let window_isb = cursor;
+            emit(bytes, &mut cursor, AARCH64_ISB_OPCODE);
+            emit(bytes, &mut cursor, AARCH64_MSR_DAIFSET_I_OPCODE);
+            put(bytes, tbz, enc_tbz(1, 7, tbz as u64, cursor as u64));
+            Some(window_isb)
+        }
+    };
     emit(bytes, &mut cursor, 0x9100_03F0); // mov x16, sp (TrapFrame pointer)
     emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 272)); // ldr x17, [x16, #272] (slot)
     emit(bytes, &mut cursor, enc_ldr_xt_xn(1, 16, 248)); // elr
@@ -4720,9 +4800,159 @@ fn write_el1_vector_hook(bytes: &mut [u8], hook_offset: usize, mailbox_capture: 
     );
 
     debug_assert!(
-        cursor <= LINUX_EL1_VECTORS_SIZE as usize,
-        "EL1 vector hook overruns vector page"
+        cursor <= EL1_IRQ_HOOK_OFFSET,
+        "EL1 vector hook overruns into the IRQ hook"
     );
+    window_isb
+}
+
+/// The EL1 GIC interrupt handler ([`El1IrqMode::GicWindow`]), and the branch
+/// to it from the current-EL SPx IRQ slot.
+///
+/// EL1 unmasks IRQs only in the served-syscall window of the syscall hook,
+/// whose `isb` is at `window_isb`: an IRQ is taken there with `ELR_EL1` at the
+/// `isb` or at the `msr daifset` after it, SP on the slot's TrapFrame, and
+/// x1-x3 dead. Anything else is Carrick corruption and fails loud through
+/// `hvc #3` with the EL1 panic sentinel. The handler acknowledges the highest
+/// pending interrupt (`ICC_IAR1_EL1`):
+/// - 1023 (none pending): return;
+/// - the virtual timer: disable it (EL1 plan 1a arms it only as a signed-test
+///   probe; preemption arrives with the EL1 scheduler), count it, complete;
+/// - the owed-kick SGI: republish it as the slot's pending host work, which
+///   the hook's check then forwards to the host, count it, complete;
+/// - any other INTID: complete it and fail loud.
+fn write_el1_irq_hook(bytes: &mut [u8], hook_offset: usize, window_isb: usize) {
+    let put = |bytes: &mut [u8], off: usize, op: u32| {
+        bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
+    };
+    let mut cursor = hook_offset;
+    let emit = |bytes: &mut [u8], cursor: &mut usize, opcode: u32| {
+        put(bytes, *cursor, opcode);
+        *cursor += 4;
+    };
+    let emit_mov64 = |bytes: &mut [u8], cursor: &mut usize, reg: u32, value: u64| {
+        emit(bytes, cursor, enc_movz_xn(reg, (value & 0xFFFF) as u16, 0));
+        for hw in 1..4_u32 {
+            let part = ((value >> (hw * 16)) & 0xFFFF) as u16;
+            if part != 0 {
+                emit(bytes, cursor, enc_movk_xn(reg, part, hw));
+            }
+        }
+    };
+    let counter = |intid: u32| {
+        carrick_el1_abi::EL1_COUNTERS_BASE
+            + core::mem::offset_of!(carrick_el1_abi::Counters, irq_taken) as u64
+            + u64::from(intid) * 8
+    };
+    let spurious = u16::try_from(carrick_el1_abi::GIC_SPURIOUS_INTID).unwrap_or(u16::MAX);
+    let vtimer = u16::try_from(carrick_el1_abi::GIC_VTIMER_INTID).unwrap_or(u16::MAX);
+    let kick = u16::try_from(carrick_el1_abi::GIC_KICK_INTID).unwrap_or(u16::MAX);
+
+    emit(bytes, &mut cursor, AARCH64_MRS_ICC_IAR1_EL1_X1_OPCODE);
+    emit(bytes, &mut cursor, enc_cmp_xn_imm(1, spurious));
+    let to_return = cursor;
+    emit(bytes, &mut cursor, 0); // b.eq return (placeholder)
+    // Taken in the window?
+    emit(bytes, &mut cursor, 0xD538_4022); // mrs x2, elr_el1
+    let adr = enc_adr(3, cursor as u64, window_isb as u64);
+    emit(bytes, &mut cursor, adr); // adr x3, window isb
+    emit(bytes, &mut cursor, 0xEB03_005F); // cmp x2, x3
+    let to_in_window = cursor;
+    emit(bytes, &mut cursor, 0); // b.eq in_window (placeholder)
+    emit(bytes, &mut cursor, enc_add_xd_xn_imm(3, 3, 4)); // the `msr daifset`
+    emit(bytes, &mut cursor, 0xEB03_005F); // cmp x2, x3
+    let to_fault_outside = cursor;
+    emit(bytes, &mut cursor, 0); // b.ne fault (placeholder)
+    let in_window = cursor;
+    put(
+        bytes,
+        to_in_window,
+        enc_beq(to_in_window as u64, in_window as u64),
+    );
+    emit(bytes, &mut cursor, enc_cmp_xn_imm(1, vtimer));
+    let to_not_vtimer = cursor;
+    emit(bytes, &mut cursor, 0); // b.ne not_vtimer (placeholder)
+    emit(bytes, &mut cursor, AARCH64_MSR_CNTV_CTL_EL0_XZR_OPCODE);
+    emit(bytes, &mut cursor, AARCH64_ISB_OPCODE);
+    emit_mov64(
+        bytes,
+        &mut cursor,
+        3,
+        counter(carrick_el1_abi::GIC_VTIMER_INTID),
+    );
+    let to_count = cursor;
+    emit(bytes, &mut cursor, 0); // b count (placeholder)
+    let not_vtimer = cursor;
+    put(
+        bytes,
+        to_not_vtimer,
+        enc_bne(to_not_vtimer as u64, not_vtimer as u64),
+    );
+    emit(bytes, &mut cursor, enc_cmp_xn_imm(1, kick));
+    let to_fault_intid = cursor;
+    emit(bytes, &mut cursor, 0); // b.ne fault_eoi (placeholder)
+    // The kick SGI: the slot's CurrentTask.pending_host_work = 1.
+    emit(bytes, &mut cursor, enc_ldr_xt_xn(2, 31, 272)); // ldr x2, [sp, #272] (slot)
+    emit_mov64(
+        bytes,
+        &mut cursor,
+        3,
+        carrick_el1_abi::EL1_CURRENT_TASKS_BASE,
+    );
+    emit(bytes, &mut cursor, 0x8B02_1863); // add x3, x3, x2, lsl #6 (CurrentTask[slot])
+    emit(
+        bytes,
+        &mut cursor,
+        enc_add_xd_xn_imm(
+            3,
+            3,
+            core::mem::offset_of!(carrick_el1_abi::CurrentTask, pending_host_work) as u16,
+        ),
+    );
+    emit(bytes, &mut cursor, enc_movz_xn(2, 1, 0)); // mov x2, #1
+    emit(bytes, &mut cursor, 0x889F_FC62); // stlr w2, [x3]
+    emit_mov64(
+        bytes,
+        &mut cursor,
+        3,
+        counter(carrick_el1_abi::GIC_KICK_INTID),
+    );
+    let count = cursor;
+    put(bytes, to_count, enc_b(to_count as u64, count as u64));
+    emit(bytes, &mut cursor, enc_movz_xn(2, 1, 0)); // mov x2, #1
+    emit(bytes, &mut cursor, 0xF822_007F); // stadd x2, [x3]
+    emit(bytes, &mut cursor, AARCH64_MSR_ICC_EOIR1_EL1_X1_OPCODE);
+    let return_label = cursor;
+    put(
+        bytes,
+        to_return,
+        enc_beq(to_return as u64, return_label as u64),
+    );
+    emit(bytes, &mut cursor, AARCH64_ERET_OPCODE);
+    let fault_eoi = cursor;
+    put(
+        bytes,
+        to_fault_intid,
+        enc_bne(to_fault_intid as u64, fault_eoi as u64),
+    );
+    emit(bytes, &mut cursor, AARCH64_MSR_ICC_EOIR1_EL1_X1_OPCODE);
+    let fault = cursor;
+    put(
+        bytes,
+        to_fault_outside,
+        enc_bne(to_fault_outside as u64, fault as u64),
+    );
+    emit_mov64(bytes, &mut cursor, 0, carrick_el1_abi::PANIC_SENTINEL);
+    emit(bytes, &mut cursor, AARCH64_HVC_FAULT_OPCODE);
+    debug_assert!(
+        cursor <= LINUX_EL1_VECTORS_SIZE as usize,
+        "EL1 IRQ hook overruns the vector page"
+    );
+
+    // Current-EL SPx IRQ slot: branch to the handler (it was a bare `eret`,
+    // which would re-take a level-sensitive GIC interrupt forever).
+    let slot = AARCH64_VECTOR_CUR_EL_SPX_IRQ_OFFSET;
+    put(bytes, slot, enc_b(slot as u64, hook_offset as u64));
 }
 
 fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -> Vec<u8> {
@@ -4733,6 +4963,21 @@ pub fn el1_vectors_bytes_mailbox_configured(
     identity_fast_path: bool,
     fd_ceiling: bool,
     el1_enabled: bool,
+) -> Vec<u8> {
+    el1_vectors_bytes_mailbox_irq(
+        identity_fast_path,
+        fd_ceiling,
+        el1_enabled,
+        El1IrqMode::Masked,
+    )
+}
+
+/// [`el1_vectors_bytes_mailbox_configured`] with the carrier's EL1 IRQ mode.
+pub fn el1_vectors_bytes_mailbox_irq(
+    identity_fast_path: bool,
+    fd_ceiling: bool,
+    el1_enabled: bool,
+    irq: El1IrqMode,
 ) -> Vec<u8> {
     let mut bytes = if identity_fast_path {
         el1_vectors_bytes_shim_inner(fd_ceiling)
@@ -5214,7 +5459,11 @@ pub fn el1_vectors_bytes_mailbox_configured(
 
     debug_assert!(cursor <= MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE);
     if el1_enabled {
-        write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, mailbox_capture);
+        let window_isb =
+            write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, mailbox_capture, irq);
+        if let Some(window_isb) = window_isb {
+            write_el1_irq_hook(&mut bytes, EL1_IRQ_HOOK_OFFSET, window_isb);
+        }
     }
     bytes
 }
@@ -5230,8 +5479,13 @@ pub fn el1_vectors_bytes_mailbox_fd_ceiling(identity_fast_path: bool) -> Vec<u8>
 /// Build mailbox vectors containing the dormant raw-clock transport.
 /// Production must not select this image until the clock admission contract is
 /// fully installed; its separate per-MM gate starts closed.
-pub fn el1_vectors_bytes_mailbox_clock(identity_fast_path: bool, fd_ceiling: bool) -> Vec<u8> {
-    let mut bytes = el1_vectors_bytes_mailbox_inner(identity_fast_path, fd_ceiling);
+pub fn el1_vectors_bytes_mailbox_clock(
+    identity_fast_path: bool,
+    fd_ceiling: bool,
+    irq: El1IrqMode,
+) -> Vec<u8> {
+    let mut bytes =
+        el1_vectors_bytes_mailbox_irq(identity_fast_path, fd_ceiling, el1_kernel_enabled(), irq);
     if identity_fast_path {
         let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
         const ESR_GUARD_LEN: usize = 6 * 4;
@@ -7702,7 +7956,7 @@ mod el1_shim_tests {
 
     #[test]
     fn mailbox_shim_routes_raw_clock_gettime_only_when_fast_paths_are_enabled() {
-        let enabled = el1_vectors_bytes_mailbox_clock(true, false);
+        let enabled = el1_vectors_bytes_mailbox_clock(true, false, El1IrqMode::Masked);
         assert!(
             enabled
                 .chunks_exact(4)

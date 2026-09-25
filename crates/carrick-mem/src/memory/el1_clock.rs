@@ -260,7 +260,7 @@ pub(super) mod tests {
                 esr: (0x15 << 26) | (1 << 25),
                 pc: ENTRY,
                 equal: false,
-                vectors: el1_vectors_bytes_mailbox_clock(true, false),
+                vectors: el1_vectors_bytes_mailbox_clock(true, false, El1IrqMode::Masked),
             };
             m.regs[0] = 1;
             m.regs[8] = 113;
@@ -546,7 +546,7 @@ pub(super) mod tests {
     fn stub_mapping_collision_is_rejected() {
         let image = AddressSpace::from_regions(0, vec![region()]).expect("stub");
         assert!(matches!(
-            image.with_el1_vectors_mailbox_clock(true, false),
+            image.with_el1_vectors_mailbox_clock(true, false, El1IrqMode::Masked),
             Err(AddressSpaceError::OverlappingRegion { .. })
         ));
     }
@@ -556,7 +556,7 @@ pub(super) mod tests {
         for enabled in [false, true] {
             let image = AddressSpace::from_regions(0, vec![])
                 .expect("empty")
-                .with_el1_vectors_mailbox_clock(enabled, false)
+                .with_el1_vectors_mailbox_clock(enabled, false, El1IrqMode::Masked)
                 .expect("vectors");
             let stub = image.regions.iter().find(|r| r.start == STUB_BASE);
             assert_eq!(stub.is_some(), enabled);

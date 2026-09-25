@@ -7440,10 +7440,19 @@ impl HvfInner {
         let mut last_el1_resume_pc: Option<u64> = None;
         let mut consecutive_el1_resumes_without_progress: u32 = 0;
         loop {
+            crate::gic::service_vtimer_probe(vcpu, mailbox)?;
             // The engine accounts the guest CPU time via `guest_cpu::timed_run`
             // around its `vcpu.run()` call, so do NOT double-account here.
             vcpu.run().map_err(hvf_error)?;
             let exit = vcpu.get_exit_info();
+            crate::gic::note_vtimer_probe_exit(vcpu.id(), || {
+                exit.reason == ExitReason::CANCELED
+                    || (exit.reason == ExitReason::EXCEPTION
+                        && is_aarch64_hvc_kick(exit.exception.syndrome))
+                    || mailbox.leased_slot().is_some_and(|slot| {
+                        carrick_el1_abi::peek_served_with_work(usize::from(slot.raw()))
+                    })
+            });
 
             let is_canceled = exit.reason == ExitReason::CANCELED;
             let cpsr = vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?;
