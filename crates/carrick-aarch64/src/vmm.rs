@@ -194,6 +194,16 @@ pub trait Aarch64Vcpu {
         None
     }
 
+    /// Publish a kick the engine now owes to the EL0 boundary to Carrick's
+    /// EL1 code on this vCPU, while the vCPU is stopped. Carrick's EL1 syscall
+    /// hook consults it after its last write to SPSR_EL1: a kick absorbed
+    /// before that check leaves through the host, and one absorbed after it
+    /// keeps the owed IRQ unmask to `eret` (`crate::owed_kick`). A backend
+    /// with no EL1-served syscall path keeps this no-op default.
+    fn publish_owed_kick(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     // ── GPR / sysreg access ──
     fn get_reg(&self, r: Reg) -> Result<u64, TrapError>;
     fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), TrapError>;

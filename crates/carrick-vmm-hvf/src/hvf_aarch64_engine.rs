@@ -196,6 +196,11 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         Some(self.mailbox_slot())
     }
 
+    fn publish_owed_kick(&mut self) -> Result<(), TrapError> {
+        carrick_el1_abi::mark_pending_host_work(self.mailbox_slot());
+        Ok(())
+    }
+
     fn force_clock_host_boundary(&mut self) -> Result<bool, TrapError> {
         let pc = self.get_reg(Reg::Pc)?;
         if !carrick_mem::memory::is_carrick_el1_clock_handler_va(pc)

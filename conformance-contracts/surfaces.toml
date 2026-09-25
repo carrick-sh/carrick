@@ -6,7 +6,7 @@ contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.
 
 [[surfaces]]
 path = "crates/carrick-mem/src/memory.rs"
-contracts = ["hvpatch.syscall.portal", "kernel.el1.transparent"]
+contracts = ["hvpatch.syscall.portal", "kernel.el1.transparent", "kernel.vcpu.kick-el0-boundary"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_transparent.rs"
@@ -126,7 +126,7 @@ contracts = ["kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.transport.exit-overhead"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.kick-el0-boundary"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap.rs"
@@ -339,7 +339,7 @@ contracts = ["kernel.mm.syscall-code-write"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/vmm.rs"
-contracts = ["kernel.mm.syscall-code-write"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.vcpu.kick-el0-boundary"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/guest_memory.rs"
@@ -417,3 +417,15 @@ contracts = ["kernel.vcpu.kick-el0-boundary"]
 [[surfaces]]
 path = "crates/carrick-embed/tests/pt_pause_drain_pressure.rs"
 contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.vcpu.kick-el0-boundary"]
+
+[[surfaces]]
+path = "crates/carrick-mem/src/memory/el1_hook_kick.rs"
+contracts = ["kernel.vcpu.kick-el0-boundary"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/el1_kick_served_loop.rs"
+contracts = ["kernel.vcpu.kick-el0-boundary"]
+
+[[surfaces]]
+path = "fixtures/linux-aarch64-hello/src/el1_served_loop_kick.rs"
+contracts = ["kernel.vcpu.kick-el0-boundary"]
