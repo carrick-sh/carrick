@@ -1070,7 +1070,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                              reclaim_disabled={unsafe_to_coalesce} engines={engines} pmr={pmr})"
                         )))
                     }
-                    Err(PageTableError::BadAddress) => {
+                    // An output in the in-kernel GIC's window is an address
+                    // no guest translation may reach, like a bad address.
+                    Err(PageTableError::BadAddress | PageTableError::GicWindowOutput) => {
                         Err(MemoryError::OutOfBounds {
                             address: 0,
                             length: 0,
