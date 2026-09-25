@@ -587,10 +587,12 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
     }
 
     fn set_pending_irq(&mut self, pending: bool) -> Result<(), TrapError> {
-        self.live_mut()?
-            .inner
-            .set_pending_interrupt(crate::trap::HVF_VIRTUAL_IRQ, pending)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+        let vcpu = &self.live()?.inner;
+        if pending {
+            crate::gic::arm_kick(vcpu)
+        } else {
+            crate::gic::clear_kick(vcpu)
+        }
     }
 
     fn injects_kick_irq(&self) -> bool {

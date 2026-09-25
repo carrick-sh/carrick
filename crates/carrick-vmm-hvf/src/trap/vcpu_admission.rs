@@ -654,6 +654,8 @@ pub(super) fn record_vm_released() {
     crate::probes::vm_lifecycle(3, -1);
     CARRIER_VM_LIVE.store(false, std::sync::atomic::Ordering::Release);
     end_vcpu_topology_generation();
+    // The VM's in-kernel GIC died with it.
+    crate::gic::carrier_vm_released();
     // The eager mmap arena belonged to the VM that just died. A VM rebuilt
     // after this point gets a fresh eager mapping and must retire it once of
     // its own accord, so the carrier's once-flag is released with the VM.
@@ -906,7 +908,14 @@ pub(super) fn create_vcpu_with_permit(
                 register_admission_permit(vcpu.id(), permit.into_inner());
             }
             vcpu_created();
-            Ok(SetupVcpuGuard::new(vcpu, SetupVcpuCleanup::PendingRaw))
+            // A vCPU whose GIC setup fails never runs: the guard destroys it
+            // through the one raw-destroy funnel before this returns.
+            let guard = SetupVcpuGuard::new(vcpu, SetupVcpuCleanup::DestroyOnError);
+            crate::gic::configure_new_vcpu(guard.id())?;
+            Ok(SetupVcpuGuard::new(
+                guard.into_inner(),
+                SetupVcpuCleanup::PendingRaw,
+            ))
         }
         Err(e) => {
             drop(permit);
@@ -928,7 +937,9 @@ pub(super) fn create_vcpu(
     match create_admitted(|| vm.vcpu_create()) {
         Ok(vcpu) => {
             vcpu_created();
-            Ok(SetupVcpuGuard::new(vcpu, SetupVcpuCleanup::DestroyOnError))
+            let guard = SetupVcpuGuard::new(vcpu, SetupVcpuCleanup::DestroyOnError);
+            crate::gic::configure_new_vcpu(guard.id())?;
+            Ok(guard)
         }
         Err(e) => Err(TrapError::Hypervisor(format!(
             "hv_vcpu_create (existing carrier VM): {e}"

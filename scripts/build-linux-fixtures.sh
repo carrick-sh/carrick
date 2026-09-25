@@ -152,3 +152,4 @@ build_fixture "scheduler_preemption.rs" "carrick-linux-aarch64-scheduler-preempt
 
 build_fixture "discard_fork_threads.rs" "carrick-linux-aarch64-discard-fork-threads"
 build_fixture "el1_served_loop_kick.rs" "carrick-linux-aarch64-el1-served-loop-kick"
+build_fixture "el0_id_view.rs" "carrick-linux-aarch64-el0-id-view"

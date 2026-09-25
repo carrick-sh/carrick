@@ -829,12 +829,38 @@ pub(in crate::trap) fn create_vm_with_admission(
     let create_result = {
         // Config is rebuilt per attempt inside the closure because
         // `with_config` consumes it, so an HV_NO_RESOURCES retry needs a
-        // fresh one.
+        // fresh one. The in-kernel GIC belongs to the same attempt: it must
+        // exist before any vCPU of this VM (`hv_gic.h`), every VM is created
+        // here, and its HV_NO_RESOURCES parks and retries like hv_vm_create's.
+        // A VM whose GIC failed is still unpublished, vCPU-less and unmapped,
+        // so dropping it (applevisor's `hv_vm_destroy`) returns the VM slot
+        // before the park or the error, and custody aborts the creation below.
         crate::probes::vm_lifecycle(0, admission.probe_code());
-        create_with_no_resources_backpressure("hv_vm_create", || {
-            let config = fresh_vm_config()?;
-            virtual_machine_with_private_signals_blocked(config)
-        })
+        let mut gic_error = None;
+        let created =
+            create_with_no_resources_backpressure("hv_vm_create (with its in-kernel GIC)", || {
+                let config = fresh_vm_config()?;
+                let vm = virtual_machine_with_private_signals_blocked(config)?;
+                match crate::gic::create_carrier_gic(generation.0) {
+                    Ok(()) => Ok(Some(vm)),
+                    Err(crate::gic::GicCreateFailure::NoResources) => {
+                        drop(vm);
+                        Err(applevisor::error::HypervisorError::NoResources)
+                    }
+                    Err(crate::gic::GicCreateFailure::Fatal(error)) => {
+                        drop(vm);
+                        gic_error = Some(error);
+                        Ok(None)
+                    }
+                }
+            });
+        match created {
+            Ok(Some(vm)) => Ok(vm),
+            Ok(None) => Err(gic_error.unwrap_or_else(|| {
+                TrapError::Hypervisor("in-kernel GIC creation failed without an error".to_owned())
+            })),
+            Err(error) => Err(error),
+        }
     };
     match create_result {
         Ok(vm) => {
@@ -7380,6 +7406,24 @@ impl HvfInner {
         vcpu: &mut applevisor::vcpu::Vcpu,
         mailbox: &mut MailboxBinding,
     ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
+        let mut kick_armed = false;
+        let exit = Self::run_to_exit_inner(vcpu, mailbox, &mut kick_armed);
+        // A kick re-armed for an EL1 critical section is owed only until the
+        // next surfaced exit, which is the host boundary it asked for. The
+        // legacy IRQ line died with the run's return by itself; under the
+        // in-kernel GIC the SGI survives run returns, so withdraw it here.
+        if kick_armed {
+            let cleared = crate::gic::clear_kick(vcpu);
+            return exit.and_then(|value| cleared.map(|()| value));
+        }
+        exit
+    }
+
+    fn run_to_exit_inner(
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
+        kick_armed: &mut bool,
+    ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
         use applevisor::prelude::*;
         use carrick_aarch64::Aarch64Exit;
 
@@ -7427,8 +7471,8 @@ impl HvfInner {
                         exit.reason,
                     );
                 }
-                vcpu.set_pending_interrupt(HVF_VIRTUAL_IRQ, true)
-                    .map_err(hvf_error)?;
+                crate::gic::arm_kick(vcpu)?;
+                *kick_armed = true;
                 EL1_KICK_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::probes::kick_in_kernel(pc, ((cpsr >> 2) & 0b11) as u32);
                 continue;
@@ -7598,8 +7642,8 @@ impl HvfInner {
                 });
             }
             if is_aarch64_hvc_kick(exception.syndrome) {
-                vcpu.set_pending_interrupt(HVF_VIRTUAL_IRQ, false)
-                    .map_err(hvf_error)?;
+                crate::gic::clear_kick(vcpu)?;
+                *kick_armed = false;
                 let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
                 let spsr = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
                 vcpu.set_reg(Reg::PC, elr).map_err(hvf_error)?;
