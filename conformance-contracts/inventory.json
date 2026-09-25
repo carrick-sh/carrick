@@ -2936,6 +2936,7 @@
         "kernel.mm.backing-maintenance-lookup",
         "kernel.mm.current-read-reuse",
         "kernel.mm.native-data-activation",
+        "kernel.mm.pt-pause-drain-acknowledgement",
         "kernel.mm.retained-fragment-query"
       ],
       "claims": [],
@@ -3043,6 +3044,7 @@
         "kernel.el1.zone-entry-at-open",
         "kernel.fork.mappings",
         "kernel.mm.backing-maintenance-lookup",
+        "kernel.mm.pt-pause-drain-acknowledgement",
         "kernel.mm.retained-fragment-query",
         "kernel.mm.scrub-remap-query"
       ],
@@ -3098,7 +3100,8 @@
       "authority": "hybrid",
       "contracts": [
         "kernel.mm.current-read-reuse",
-        "kernel.mm.native-data-activation"
+        "kernel.mm.native-data-activation",
+        "kernel.mm.pt-pause-drain-acknowledgement"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -3195,6 +3198,7 @@
         "kernel.mm.anonymous-discard-edges",
         "kernel.mm.anonymous-discard-fork-reuse",
         "kernel.mm.anonymous-discard-no-scrub",
+        "kernel.mm.pt-pause-drain-acknowledgement",
         "kernel.mm.retained-fragment-query",
         "kernel.mm.scrub-remap-query"
       ],

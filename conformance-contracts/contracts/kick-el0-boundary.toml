@@ -1,0 +1,18 @@
+schema_version = 1
+id = "kernel.vcpu.kick-el0-boundary"
+title = "A kick absorbed in Carrick's EL1 code surfaces at the next EL0 instruction boundary"
+guest_surfaces = ["scheduler:vcpu-kick", "scheduler:page-table-quiescence", "signal:asynchronous-delivery"]
+semantic_authority = ["Hypervisor.framework hv_vcpu_types.h: HV_INTERRUPT_TYPE_IRQ = 0, HV_INTERRUPT_TYPE_FIQ = 1", "Arm ARM: an unmasked pending IRQ is taken before the first instruction after the ERET that unmasks it", "man 7 signal: an asynchronous signal is delivered on the next return to user mode"]
+fixture = "unit:owed-kick-model"
+scale_points = [1, 8, 32, 128]
+rationale = "A cross-thread kick that stops a vCPU inside Carrick's syscall vector, EL1 image or clock stub cannot be surfaced there, so the engine re-enters the guest and owes the kick to EL0 as a pending virtual IRQ. Two defects made every such kick a silent no-op: applevisor-sys 1.0.0 numbers `hv_interrupt_type_t` in the reverse of the SDK, so its `IRQ` asserted the FIQ line, which Carrick masks at every level; and Carrick runs EL0 with DAIF masked, so even a real IRQ would not be taken. The owed kick unmasks I in the EL0 return state (SPSR_EL1 at EL1, live PSTATE at EL0), re-arms after every internally handled exit because HVF clears pending interrupts on each run return, and restores the original I bit at the first surfaced exit, so guest-visible PSTATE is unchanged. Qualified live with standalone Hypervisor.framework probes on macOS 27.2 / M4, including Carrick's own vector page: the SDK IRQ line with I clear is taken at EL0 and exits through `hvc #4`; the binding's `IRQ` never is."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-aarch64::owed_kick::tests::kick_absorbed_in_el1_vector_surfaces_at_the_el0_boundary; carrick-aarch64::owed_kick::tests::owed_kick_survives_internal_el1_exits_before_eret; carrick-aarch64::owed_kick::tests::surfaced_el1_exit_settles_the_owed_kick_in_spsr; carrick-vmm-hvf::trap::virtual_irq_line_tests::kick_irq_asserts_the_sdk_irq_line"
+embed = "carrick-embed::pt_pause_drain_pressure"
+ecosystem = ["go:testing", "go:time", "go:os_signal", "go:net_http"]
+
+[bindings.unresolved]
+docker = "Hypervisor interrupt delivery is host-internal; Linux supplies no oracle for it. The Linux obligation is timely asynchronous interruption, carried by the ecosystem rows."
+embed_structural = "Owed-kick outcomes are observable only through `scripts/dtrace/hvpatch-pt-pause-drain-stall.d` (irq-kick-taken vs kick-owed); no WorkObservation metric is registered. The KVM backend keeps a no-op IRQ vehicle (`injects_kick_irq` false) and is not covered."
