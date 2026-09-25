@@ -206,6 +206,7 @@ pub mod trap {
 pub mod carrier;
 pub use carrier::{
     CarrierAdmissionState, CarrierLease, CarrierRuntime, CarrierSnapshot, ContainerInitSnapshot,
+    VcpuLifecycleSnapshot, vcpu_lifecycle_snapshot,
 };
 pub mod threaded_loop;
 pub mod vcpu_loop;

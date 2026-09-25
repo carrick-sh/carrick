@@ -624,6 +624,28 @@ pub fn vcpu_census() -> &'static carrick_hal::VcpuCensus {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) static VCPU_CREATED_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Every reported `hv_vcpu_destroy` in this carrier process (see
+/// [`vcpu_destroyed`]). Read with [`VCPU_CREATED_TOTAL`] through
+/// [`vcpu_lifecycle_totals`].
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static VCPU_DESTROYED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-lifetime vCPU create and destroy counts for this carrier.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VcpuLifecycleTotals {
+    pub created: u64,
+    pub destroyed: u64,
+}
+
+/// The carrier's vCPU create and destroy totals. Topology tests read deltas
+/// across a workload to prove when vCPUs are created and destroyed.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn vcpu_lifecycle_totals() -> VcpuLifecycleTotals {
+    VcpuLifecycleTotals {
+        created: VCPU_CREATED_TOTAL.load(std::sync::atomic::Ordering::SeqCst),
+        destroyed: VCPU_DESTROYED_TOTAL.load(std::sync::atomic::Ordering::SeqCst),
+    }
+}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 thread_local! {
     static THREAD_VCPU_CREATED_TOTAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -879,6 +901,7 @@ pub(crate) fn enable_el0_counter_access(vcpu_id: applevisor_sys::hv_vcpu_t) {
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn vcpu_destroyed(vcpu_id: u64) {
+    VCPU_DESTROYED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     release_admission_permit_for_vcpu(vcpu_id);
     // A slot freed: wake a sibling thread blocked in the admission gate.
     vcpu_gate::notify();

@@ -2556,6 +2556,14 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "VCPU_DESTROYED_TOTAL",
+      "fingerprint": "c6b2d904a486d53a7f3464038b030622712a7be1715d8f1dae7bf58c3df6579b",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide host infrastructure static VCPU_DESTROYED_TOTAL in crates/carrick-vmm-hvf/src/trap.rs counting the carrier VM's reported vCPU destroys for the vCPU lifetime census."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "admission_trace_enabled::ON",
       "fingerprint": "4a5946b761b412948bacfd404a2372b9db61a3b6e1eda7850caf23ea8770a62e",
       "classification": "config_debug",
