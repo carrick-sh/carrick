@@ -2147,7 +2147,6 @@ mod pt_pause_tests {
             Arc::clone(&coordinator),
             PtPauseBudget {
                 election: Duration::from_secs(1),
-                drain: Duration::from_secs(1),
             },
         )
         .expect("first real page-table pause");
@@ -2169,7 +2168,6 @@ mod pt_pause_tests {
                 Arc::clone(&worker_coordinator),
                 PtPauseBudget {
                     election: Duration::from_secs(1),
-                    drain: Duration::from_secs(1),
                 },
             )
             .expect("second real page-table pause");
@@ -2763,57 +2761,226 @@ mod pt_pause_tests {
         ));
     }
 
+    fn thread_cpu_time() -> Duration {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid out-pointer for the calling thread's clock.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        assert_eq!(rc, 0, "thread CPU clock");
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    /// Contract `kernel.mm.pt-pause-drain-acknowledgement` (VM-free binding).
+    ///
+    /// A page-table drain waits for each sibling's acknowledgement (its
+    /// in-guest flag falling), never for a wall-clock budget, and it sleeps
+    /// while it waits. The siblings here are registered with kicks that do NOT
+    /// evict them — the shape of a kick absorbed inside Carrick's EL1 code, or
+    /// of a sibling whose host thread is descheduled under load — and they
+    /// leave guest only after a delay longer than the retired 500 ms drain
+    /// budget. Under that budget this was the go-testing/go-time/go-os_signal/
+    /// go-net_http crash: `fault page-table pause failed before mutation:
+    /// TimedOut`.
+    ///
+    /// Semantics: the pause is granted, and only after every sibling left.
+    /// Structure: the coordinator's own CPU time while waiting stays far below
+    /// the wall time it waited (no yield-spin competing with the very siblings
+    /// it waits for).
     #[test]
-    fn pt_pause_timeout_skips_backend_and_resumes_parked_sibling() {
-        let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
-        let registry = Arc::new(GenericVcpuRegistry::new());
-        // Recorded into `pt-pause-begin` beside the waiting lease identity; these
-        // tests exercise the DRAIN, which reads the registry.
-        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
-        let coordinator = tid(1501);
-        let sibling = tid(1502);
-        let mut coordinator_participation = enter_for_test(&census, &registry, coordinator);
-        let _sibling_participation = enter_for_test(&census, &registry, sibling);
-        let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
-        let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
-        sibling_in_guest.enter_guest();
-        register_for_test(&registry, coordinator, &coordinator_in_guest);
-        register_for_test(&registry, sibling, &sibling_in_guest);
-
-        let resumed = Arc::new(AtomicBool::new(false));
-        let sibling_resumed = Arc::clone(&resumed);
-        let sibling_barrier = Arc::clone(&barrier);
-        let sibling_thread = std::thread::spawn(move || {
-            while !sibling_barrier.is_quiescing() {
-                std::thread::yield_now();
+    fn pt_pause_drain_waits_for_late_sibling_acknowledgement() {
+        for siblings in [1_usize, 8, 32] {
+            let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
+            let registry = Arc::new(GenericVcpuRegistry::new());
+            let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
+            let coordinator = tid(1601);
+            let mut coordinator_participation = enter_for_test(&census, &registry, coordinator);
+            let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+            register_for_test(&registry, coordinator, &coordinator_in_guest);
+            let mut participations = Vec::new();
+            let mut flags = Vec::new();
+            for index in 0..siblings {
+                let sibling = tid(1602 + index as i32);
+                participations.push(enter_for_test(&census, &registry, sibling));
+                let flag = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
+                register_for_test(&registry, sibling, &flag);
+                flag.enter_guest();
+                flags.push(flag);
             }
-            sibling_barrier.park();
-            sibling_resumed.store(true, Ordering::SeqCst);
-        });
-        let backend_repoint_calls = AtomicUsize::new(0);
-        let result = acquire_pt_pause(
-            &barrier,
-            &mut coordinator_participation,
-            coordinator,
-            PtPauseBudget {
-                election: Duration::from_secs(30),
-                drain: Duration::from_millis(20),
-            },
-        );
-        if result.is_ok() {
-            backend_repoint_calls.fetch_add(1, Ordering::SeqCst);
-        }
 
-        assert_eq!(result.err(), Some(PtPauseError::TimedOut));
-        assert_eq!(backend_repoint_calls.load(Ordering::SeqCst), 0);
-        sibling_thread.join().expect("join rolled-back sibling");
-        assert!(resumed.load(Ordering::SeqCst));
-        assert!(!barrier.is_quiescing());
-        assert!(
-            barrier.try_become_coordinator(),
-            "timeout must release coordinator ownership"
+            let left = Arc::new(AtomicUsize::new(0));
+            let release_barrier = Arc::clone(&barrier);
+            let release_left = Arc::clone(&left);
+            let releaser = std::thread::spawn(move || {
+                while !release_barrier.is_quiescing() {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(Duration::from_millis(700));
+                for flag in &flags {
+                    release_left.fetch_add(1, Ordering::SeqCst);
+                    flag.leave_guest();
+                }
+            });
+
+            let wall = Instant::now();
+            let cpu = thread_cpu_time();
+            let result = acquire_pt_pause(
+                &barrier,
+                &mut coordinator_participation,
+                coordinator,
+                PtPauseBudget::DEFAULT,
+            );
+            let waited_cpu = thread_cpu_time().saturating_sub(cpu);
+            let waited_wall = wall.elapsed();
+            let observed_left = left.load(Ordering::SeqCst);
+            assert!(
+                result.is_ok(),
+                "{siblings} late sibling(s): the pause must wait for acknowledgement, got {:?} after {waited_wall:?}",
+                result.err()
+            );
+            assert_eq!(
+                observed_left, siblings,
+                "the pause was granted while a sibling was still in guest"
+            );
+            assert!(barrier.is_quiescing());
+            drop(result);
+            assert!(!barrier.is_quiescing());
+            assert!(
+                waited_cpu < Duration::from_millis(100),
+                "{siblings} sibling(s): coordinator burned {waited_cpu:?} CPU over a {waited_wall:?} wait; the drain must sleep, not spin"
+            );
+            releaser.join().expect("releaser");
+            drop(participations);
+        }
+    }
+
+    /// A registry that registers the sibling and publishes it in guest exactly
+    /// when the drain has just taken its watches: an admitted executor whose
+    /// vCPU lease was transiently absent re-registering mid-drain.
+    struct RegisterDuringWatch {
+        inner: Arc<GenericVcpuRegistry>,
+        sibling: ThreadId,
+        flag: Arc<carrick_hal::InGuestFlag>,
+        armed: AtomicBool,
+    }
+
+    impl VcpuRegistry for RegisterDuringWatch {
+        fn poll_lease_drain(&self, except: ThreadId) -> carrick_hal::VcpuLeaseDrainPoll {
+            self.inner.poll_lease_drain(except)
+        }
+        fn subscribe_lease_drain(
+            &self,
+            except: ThreadId,
+            callback: Arc<dyn Fn() + Send + Sync + 'static>,
+        ) -> carrick_hal::VcpuLeaseDrainEnrollment {
+            self.inner.subscribe_lease_drain(except, callback)
+        }
+        fn subscribe_register(
+            &self,
+            tid: ThreadId,
+            handle: Box<dyn VcpuKickDyn>,
+            in_guest: &carrick_hal::InGuestFlag,
+            callback: Arc<dyn Fn() + Send + Sync + 'static>,
+        ) -> carrick_hal::VcpuRegistrationEnrollment {
+            self.inner
+                .subscribe_register(tid, handle, in_guest, callback)
+        }
+        fn unregister(&self, tid: ThreadId) {
+            self.inner.unregister(tid);
+        }
+        fn kick(&self, tid: ThreadId) {
+            self.inner.kick(tid);
+        }
+        fn kick_if_in_guest(&self, tid: ThreadId) -> bool {
+            self.inner.kick_if_in_guest(tid)
+        }
+        fn kick_all(&self) {
+            self.inner.kick_all();
+        }
+        fn kick_all_in_guest(&self) -> bool {
+            self.inner.kick_all_in_guest()
+        }
+        fn kick_all_except(&self, except: ThreadId) {
+            self.inner.kick_all_except(except);
+        }
+        fn any_other_in_guest(&self, except: ThreadId) -> bool {
+            self.inner.any_other_in_guest(except)
+        }
+        fn is_in_guest(&self, tid: ThreadId) -> bool {
+            self.inner.is_in_guest(tid)
+        }
+        fn watch_leave_guest(
+            &self,
+            tid: ThreadId,
+            wake: &Arc<carrick_hal::GuestLeaveWake>,
+        ) -> carrick_hal::GuestLeaveWatch {
+            let watch = self.inner.watch_leave_guest(tid, wake);
+            if tid == self.sibling && self.armed.swap(false, Ordering::SeqCst) {
+                register_for_test(&self.inner, self.sibling, &self.flag);
+                self.flag.enter_guest();
+            }
+            watch
+        }
+    }
+
+    /// Contract `kernel.mm.pt-pause-drain-acknowledgement`: a sibling that
+    /// registers its vCPU and enters guest AFTER the drain took its watches
+    /// must still wake the drain when it leaves. The first unbounded drain
+    /// watched only cells registered at watch time; this sibling's leave then
+    /// woke nobody and go-net_http hung with the coordinator asleep in
+    /// `GuestLeaveWake::wait_past` and no executor in guest.
+    #[test]
+    fn pt_pause_drain_wakes_for_a_sibling_registered_mid_drain() {
+        let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
+        let inner = Arc::new(GenericVcpuRegistry::new());
+        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
+        let coordinator = tid(1651);
+        let sibling = tid(1652);
+        let flag = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
+        let hook: Arc<dyn VcpuRegistry> = Arc::new(RegisterDuringWatch {
+            inner: Arc::clone(&inner),
+            sibling,
+            flag: Arc::clone(&flag),
+            armed: AtomicBool::new(true),
+        });
+        let mut coordinator_participation = enter_for_test(&census, &inner, coordinator);
+        let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        register_for_test(&inner, coordinator, &coordinator_in_guest);
+        // Admitted, but with no vCPU registration yet.
+        let sibling_participation = census
+            .enter_with_pause_endpoint(None, hook, sibling)
+            .expect("sibling participation");
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let pause_barrier = Arc::clone(&barrier);
+        let pause_worker = std::thread::spawn(move || {
+            let guard = acquire_pt_pause(
+                &pause_barrier,
+                &mut coordinator_participation,
+                coordinator,
+                PtPauseBudget::DEFAULT,
+            )
+            .expect("pause after the mid-drain sibling leaves");
+            paused_tx.send(()).expect("announce pause");
+            drop(guard);
+            coordinator_participation
+        });
+        assert_eq!(
+            paused_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "the pause was granted while the mid-drain sibling was in guest"
         );
-        barrier.end();
+        flag.leave_guest();
+        if paused_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            // The stranded coordinator still holds the exact-MM census lock;
+            // dropping the sibling's participation would block this thread on
+            // it forever instead of failing.
+            std::mem::forget(sibling_participation);
+            panic!("the mid-drain sibling's leave did not wake the drain");
+        }
+        drop(pause_worker.join().expect("pause worker"));
+        drop(sibling_participation);
     }
 
     /// A coordinator that never finishes must not wedge the next editor.
@@ -2844,7 +3011,6 @@ mod pt_pause_tests {
             waiter,
             PtPauseBudget {
                 election: Duration::from_millis(50),
-                drain: Duration::from_secs(30),
             },
         );
 
@@ -2899,7 +3065,6 @@ mod pt_pause_tests {
             coordinator,
             PtPauseBudget {
                 election: Duration::from_secs(30),
-                drain: Duration::from_secs(1),
             },
         )
         .expect("sibling drains exactly after kick");
@@ -2933,7 +3098,6 @@ mod pt_pause_tests {
             coordinator,
             PtPauseBudget {
                 election: Duration::from_secs(1),
-                drain: Duration::from_secs(1),
             },
         )
         .expect("outer exact-MM pause");
@@ -2944,7 +3108,6 @@ mod pt_pause_tests {
             coordinator,
             PtPauseBudget {
                 election: Duration::from_millis(10),
-                drain: Duration::from_millis(10),
             },
         )
         .expect("nested COW borrows the exact outer lease");
@@ -3006,7 +3169,6 @@ mod pt_pause_tests {
                 coordinator_tid,
                 PtPauseBudget {
                     election: Duration::from_secs(1),
-                    drain: Duration::from_secs(1),
                 },
             )
             .expect("cross-dispatcher pause");
@@ -3078,7 +3240,6 @@ mod pt_pause_tests {
             tid(1531),
             PtPauseBudget {
                 election: Duration::from_secs(1),
-                drain: Duration::from_secs(1),
             },
         )
         .expect("standalone COW sole witness");
@@ -3122,7 +3283,6 @@ mod pt_pause_tests {
             tid(1541),
             PtPauseBudget {
                 election: Duration::from_secs(1),
-                drain: Duration::from_secs(1),
             },
         )
         .expect("raise page-table pause");
@@ -3166,14 +3326,12 @@ mod pt_pause_tests {
     /// `any_other_in_guest` answered FALSE while the sibling executed guest
     /// code, and `acquire_pt_pause` returned a guard IMMEDIATELY — licensing a
     /// stage-1 page-table edit under a live vCPU with no error, hang, or event.
-    /// With one indivisible registration the drain correctly refuses to
-    /// complete (here the sibling never leaves, so it is a clean timeout).
+    /// With one indivisible registration the drain waits for exactly this
+    /// sibling's acknowledgement, and the re-registered flag's leave wakes it.
     #[test]
     fn pt_pause_drain_sees_a_sibling_that_reregistered_after_a_block() {
         let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let registry = Arc::new(GenericVcpuRegistry::new());
-        // Recorded into `pt-pause-begin` beside the waiting lease identity; these
-        // tests exercise the DRAIN, which reads the registry.
         let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let coordinator = tid(1531);
         let sibling = tid(1532);
@@ -3181,7 +3339,7 @@ mod pt_pause_tests {
         let _sibling_participation = enter_for_test(&census, &registry, sibling);
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         // The sibling's ONE lifetime flag, as `ThreadRuntimeState` holds it.
-        let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let sibling_in_guest = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
         register_for_test(&registry, coordinator, &coordinator_in_guest);
         register_for_test(&registry, sibling, &sibling_in_guest);
 
@@ -3193,23 +3351,31 @@ mod pt_pause_tests {
         // It then re-enters guest code through the flag it has held all along.
         sibling_in_guest.enter_guest();
 
-        let result = acquire_pt_pause(
-            &barrier,
-            &mut coordinator_participation,
-            coordinator,
-            PtPauseBudget {
-                election: Duration::from_secs(30),
-                drain: Duration::from_millis(20),
-            },
-        );
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let pause_barrier = Arc::clone(&barrier);
+        let pause_worker = std::thread::spawn(move || {
+            let guard = acquire_pt_pause(
+                &pause_barrier,
+                &mut coordinator_participation,
+                coordinator,
+                PtPauseBudget::DEFAULT,
+            )
+            .expect("pause after the re-registered sibling leaves");
+            paused_tx.send(()).expect("announce pause");
+            drop(guard);
+            coordinator_participation
+        });
         assert_eq!(
-            result.err(),
-            Some(PtPauseError::TimedOut),
+            paused_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
             "the coordinator must NOT be handed a pause while a re-registered \
              sibling is executing guest code"
         );
-        assert!(!barrier.is_quiescing(), "a timeout rolls the request back");
-        assert!(barrier.try_become_coordinator());
-        barrier.end();
+        sibling_in_guest.leave_guest();
+        paused_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the re-registered flag's leave must wake the drain");
+        drop(pause_worker.join().expect("pause worker"));
+        assert!(!barrier.is_quiescing());
     }
 }

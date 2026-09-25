@@ -139,6 +139,13 @@ mod tests {
         fn is_in_guest(&self, tid: crate::ThreadId) -> bool {
             self.inner.is_in_guest(tid)
         }
+        fn watch_leave_guest(
+            &self,
+            tid: crate::ThreadId,
+            wake: &Arc<crate::GuestLeaveWake>,
+        ) -> crate::GuestLeaveWatch {
+            self.inner.watch_leave_guest(tid, wake)
+        }
         fn debug_registered_vcpus(&self) -> Vec<(crate::ThreadId, bool)> {
             self.inner.debug_registered_vcpus()
         }

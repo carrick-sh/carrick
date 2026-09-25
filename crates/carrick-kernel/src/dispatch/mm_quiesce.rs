@@ -233,8 +233,7 @@ pub fn acquire_mm_stage1_authority<'participant>(
     let pt_quiesce = Arc::clone(participation.pt_quiesce());
     begin_pt_pause(&pt_quiesce, tid, budget)?;
     let census = participation.participation_mut().lock_exact_mm();
-    drain_exact_mm(&pt_quiesce, mm, Some(coordinator), census, tid, budget)
-        .map(MmStage1Authority::Paused)
+    drain_exact_mm(&pt_quiesce, mm, Some(coordinator), census, tid).map(MmStage1Authority::Paused)
 }
 
 pub struct PtPauseGuard<'mm> {
@@ -288,40 +287,45 @@ pub fn pt_barrier() -> &'static Arc<crate::fork_quiesce::PtQuiesce> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PtPauseError {
+    /// The coordinator election exceeded [`PtPauseBudget::election`]. The drain
+    /// itself never times out; it waits for acknowledgement.
     TimedOut,
     UnkickableExecutor,
 }
 
-/// The two independent budgets in a page-table pause.
+/// The bound on a page-table pause: the election only.
 ///
-/// Named rather than passed as two adjacent `Duration`s because they mean
-/// opposite things and swapping them is silent: the election would get 500 ms
-/// (spurious `ENOMEM` the moment two threads `mmap` at once) and the drain 30 s
-/// (one stalled sibling freezing the VM for half a minute).
+/// Wait for the CURRENT coordinator to finish, before we hold anything. Real
+/// contention resolves in low milliseconds (a loser waits out one page-table
+/// edit), so a wait this long is not contention: the coordinator is blocked on
+/// something the waiter holds. That was a live deadlock — the host-alias/pt-pause
+/// ABBA — and the class survives its fix, since any syscall that takes the
+/// host-alias phase and then triggers frame COW can rebuild it. Bounding here
+/// makes the next instance a named `pt__pause__election__timeout` and a guest
+/// `ENOMEM` instead of a silent, unrecoverable carrier stop.
+///
+/// There is deliberately NO drain budget. Once this thread is the coordinator
+/// it waits for every sibling's acknowledgement (its in-guest flag falling),
+/// however long the host takes to schedule that sibling: the old 500 ms drain
+/// deadline turned host scheduling delay — and kicks that Carrick's own EL1
+/// code absorbed — into `fault page-table pause failed before mutation:
+/// TimedOut`, a fatal guest error under ordinary load. The drain terminates
+/// because a kicked sibling always reaches an exit (see
+/// `carrick_aarch64::engine`'s owed-kick handling) and exit/exec teardown
+/// kicks every sibling out of guest too; it sleeps on a
+/// [`carrick_hal::GuestLeaveWake`] rather than spinning, so it does not compete
+/// for the CPU the siblings need to get there. The coordinator keeps its own
+/// executor while it waits: nothing the siblings need to leave guest depends on
+/// that capacity (each already occupies its vCPU, and every other executor of
+/// this MM parks at the raised barrier regardless).
 #[derive(Debug, Clone, Copy)]
 pub struct PtPauseBudget {
-    /// Wait for the CURRENT coordinator to finish, before we hold anything.
-    ///
-    /// Far larger than `drain`, and deliberately not shared with it: charging a
-    /// loser for the winner's whole editing syscall would turn honest
-    /// multi-threaded `mmap` contention into spurious `ENOMEM` — trading a rare
-    /// wedge for a common correctness bug. Real contention resolves in low
-    /// milliseconds (a loser waits out one page-table edit), so a wait this long
-    /// is not contention: the coordinator is blocked on something the waiter
-    /// holds. That was a live deadlock — the host-alias/pt-pause ABBA — and the
-    /// class survives its fix, since any syscall that takes the host-alias phase
-    /// and then triggers frame COW can rebuild it. Bounding here makes the next
-    /// instance a named `pt__pause__election__timeout` and a guest `ENOMEM`
-    /// instead of a silent, unrecoverable carrier stop.
     pub election: Duration,
-    /// Wait for siblings to leave guest once WE are the coordinator.
-    pub drain: Duration,
 }
 
 impl PtPauseBudget {
     pub const DEFAULT: Self = Self {
         election: Duration::from_secs(30),
-        drain: Duration::from_millis(500),
     };
 }
 
@@ -400,13 +404,22 @@ pub fn raise_pt_pause_for_test(
     begin_pt_pause(barrier, tid, budget)
 }
 
+/// Kick every sibling of the exact MM out of guest and wait for each one's
+/// acknowledgement, then mint the guard.
+///
+/// The census lock is held throughout, so no new executor can be admitted, and
+/// `quiescing` is raised, so an admitted one that has not entered parks at its
+/// guest-entry re-check instead. Each round reads the wake generation, then
+/// re-takes a watch on every endpoint (an admitted executor may register its
+/// vCPU mid-drain, onto a cell the previous round could not watch), then reads
+/// the predicate, so no leave or registration can fall between the check and
+/// the sleep.
 fn drain_exact_mm<'mm>(
     barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     mm: crate::kernel::MmId,
     mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
     census: crate::kernel::ExactMmCensusGuard,
     tid: ThreadId,
-    budget: PtPauseBudget,
 ) -> Result<PtPauseGuard<'mm>, PtPauseError> {
     if !census.all_have_pause_endpoints() {
         barrier.end();
@@ -420,22 +433,67 @@ fn drain_exact_mm<'mm>(
     );
 
     let start = Instant::now();
-    let deadline = start + budget.drain;
-    let mut spins: i32 = 0;
+    let wake = carrick_hal::GuestLeaveWake::new();
     census.kick_all_in_guest();
-    while census.any_in_guest() {
-        if Instant::now() >= deadline {
-            crate::probes::pt_pause_timeout(tid.raw(), start.elapsed().as_micros() as i64);
-            // Roll back BOTH persistent request bits and wake every sibling that
-            // already parked. Returning a guard while the predicate is still
-            // true would let the caller edit live page tables.
-            barrier.end();
-            return Err(PtPauseError::TimedOut);
+    let mut rounds: i32 = 0;
+    loop {
+        // Generation first, then fresh watches, then the predicate: any
+        // leave, registration or removal after `seen` bumps the generation,
+        // and anything before it is visible to the watches or the read.
+        let seen = wake.generation();
+        let _watches = census.watch_leaves(&wake);
+        if !census.any_in_guest() {
+            break;
         }
-        spins = spins.saturating_add(1);
-        std::thread::yield_now();
+        if rounds == 0 {
+            for sibling in census.in_guest_tids() {
+                crate::probes::pt_pause_drain_wait(
+                    tid.raw(),
+                    sibling.raw(),
+                    start.elapsed().as_micros() as i64,
+                );
+            }
+        }
+        rounds = rounds.saturating_add(1);
+        wake.wait_past(seen);
     }
-    crate::probes::pt_pause_ready(tid.raw(), spins, start.elapsed().as_micros() as i64);
+    crate::probes::pt_pause_ready(tid.raw(), rounds, start.elapsed().as_micros() as i64);
+    Ok(PtPauseGuard::new(
+        mm,
+        mutation_coordinator,
+        census,
+        barrier.pause_guard(tid),
+    ))
+}
+
+/// A non-blocking drain for single-thread test fixtures whose only "sibling"
+/// is native code the same thread must run to its checkpoint: report whether
+/// the drain would have to wait instead of waiting. Production has no such
+/// arm; it always waits for acknowledgement.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtPauseTryError {
+    Pause(PtPauseError),
+    SiblingInGuest,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn try_drain_exact_mm<'mm>(
+    barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
+    mm: crate::kernel::MmId,
+    mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
+    census: crate::kernel::ExactMmCensusGuard,
+    tid: ThreadId,
+) -> Result<PtPauseGuard<'mm>, PtPauseTryError> {
+    if !census.all_have_pause_endpoints() {
+        barrier.end();
+        return Err(PtPauseTryError::Pause(PtPauseError::UnkickableExecutor));
+    }
+    census.kick_all_in_guest();
+    if census.any_in_guest() {
+        barrier.end();
+        return Err(PtPauseTryError::SiblingInGuest);
+    }
     Ok(PtPauseGuard::new(
         mm,
         mutation_coordinator,
@@ -460,7 +518,26 @@ pub fn acquire_pt_pause<'participant>(
             .unwrap_or_else(|| std::num::NonZeroU64::new(1).unwrap()),
     );
     let census = participation.lock_exact_mm();
-    drain_exact_mm(barrier, mm, None, census, tid, budget)
+    drain_exact_mm(barrier, mm, None, census, tid)
+}
+
+/// [`acquire_pt_pause`] for a fixture whose in-guest sibling is driven by the
+/// calling thread itself: fail instead of waiting.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+pub fn try_acquire_pt_pause_for_test<'participant>(
+    barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
+    participation: &'participant mut crate::kernel::GuestExecutorParticipation,
+    tid: ThreadId,
+    budget: PtPauseBudget,
+) -> Result<PtPauseGuard<'participant>, PtPauseTryError> {
+    begin_pt_pause(barrier, tid, budget).map_err(PtPauseTryError::Pause)?;
+    let mm = crate::kernel::MmId::from_registry_allocation(
+        std::num::NonZeroU64::new(tid.raw() as u64)
+            .unwrap_or_else(|| std::num::NonZeroU64::new(1).unwrap()),
+    );
+    let census = participation.lock_exact_mm();
+    try_drain_exact_mm(barrier, mm, None, census, tid)
 }
 
 // Test fixture reachable through `test-support`, so `cfg(test)` is not set
@@ -483,15 +560,8 @@ pub fn with_real_pt_pause_for_test<T>(
         .expect("test must elect a real page-table pause");
     let mm = coordinator.mm();
     let census = participation.lock_exact_mm();
-    let mut authority = drain_exact_mm(
-        &barrier,
-        mm,
-        Some(coordinator),
-        census,
-        tid,
-        PtPauseBudget::DEFAULT,
-    )
-    .expect("test must acquire a real page-table pause");
+    let mut authority = drain_exact_mm(&barrier, mm, Some(coordinator), census, tid)
+        .expect("test must acquire a real page-table pause");
     run(&mut authority)
 }
 
@@ -647,7 +717,7 @@ pub(crate) fn acquire_foreign_mm_mutation_quiesce(
     drop(sole);
     begin_pt_pause(barrier, tid, budget)?;
     let census = census.lock_for_frame_cow();
-    drain_exact_mm(barrier, mm, Some(coordinator), census, tid, budget).map(|guard| {
+    drain_exact_mm(barrier, mm, Some(coordinator), census, tid).map(|guard| {
         FrameCowExactMmGuard::Paused {
             _guard: guard,
             foreign_stage1: Some(stage1),
@@ -683,7 +753,7 @@ fn acquire_frame_cow_quiesce_inner(
     drop(sole);
     begin_pt_pause(barrier, tid, budget)?;
     let census = census.lock_for_frame_cow();
-    drain_exact_mm(barrier, mm, mutation_coordinator, census, tid, budget).map(|guard| {
+    drain_exact_mm(barrier, mm, mutation_coordinator, census, tid).map(|guard| {
         FrameCowExactMmGuard::Paused {
             _guard: guard,
             foreign_stage1: None,
@@ -702,5 +772,21 @@ pub fn acquire_mutation_pause_for_test<'participant>(
 ) -> Result<PtPauseGuard<'participant>, PtPauseError> {
     begin_pt_pause(barrier, tid, budget)?;
     let census = participation.lock_exact_mm();
-    drain_exact_mm(barrier, mm, Some(coordinator), census, tid, budget)
+    drain_exact_mm(barrier, mm, Some(coordinator), census, tid)
+}
+
+/// [`acquire_mutation_pause_for_test`] for a fixture whose in-guest sibling is
+/// driven by the calling thread itself: fail instead of waiting.
+#[cfg(any(test, feature = "test-support"))]
+pub fn try_acquire_mutation_pause_for_test<'participant>(
+    barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
+    participation: &'participant mut crate::kernel::GuestExecutorParticipation,
+    tid: ThreadId,
+    mm: crate::kernel::MmId,
+    coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
+    budget: PtPauseBudget,
+) -> Result<PtPauseGuard<'participant>, PtPauseTryError> {
+    begin_pt_pause(barrier, tid, budget).map_err(PtPauseTryError::Pause)?;
+    let census = participation.lock_exact_mm();
+    try_drain_exact_mm(barrier, mm, Some(coordinator), census, tid)
 }

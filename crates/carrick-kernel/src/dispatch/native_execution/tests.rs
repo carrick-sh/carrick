@@ -1,5 +1,7 @@
 use super::*;
-use crate::dispatch::mm_quiesce::{PtPauseBudget, PtPauseError, acquire_pt_pause};
+use crate::dispatch::mm_quiesce::{
+    PtPauseBudget, PtPauseTryError, acquire_pt_pause, try_acquire_pt_pause_for_test,
+};
 use crate::kernel::mm_access::test_support::execution_lease;
 use std::time::Duration;
 
@@ -80,16 +82,15 @@ fn real_mutation_drain_cannot_pass_until_execution_scope_ends() {
     let scope = dispatcher
         .enter_native_execution(&mut executor, &context, &mut lease)
         .unwrap();
-    let result = acquire_pt_pause(
+    let result = try_acquire_pt_pause_for_test(
         &barrier,
         &mut mutator,
         tid,
         PtPauseBudget {
             election: Duration::ZERO,
-            drain: Duration::ZERO,
         },
     );
-    assert!(matches!(result, Err(PtPauseError::TimedOut)));
+    assert!(matches!(result, Err(PtPauseTryError::SiblingInGuest)));
     drop(result);
     assert!(scope.stop_requested());
     assert!(!barrier.is_quiescing()); // refusal rolls back the mutation request

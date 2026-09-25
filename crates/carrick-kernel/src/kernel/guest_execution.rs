@@ -244,6 +244,14 @@ impl GuestExecutorPauseEndpoint {
             Self::Native(state) => state.is_running(),
         }
     }
+    /// Wake `wake` whenever this endpoint stops reading as in guest.
+    fn watch_leave(&self, wake: &Arc<carrick_hal::GuestLeaveWake>) -> carrick_hal::GuestLeaveWatch {
+        match self {
+            Self::Registered { registry, tid } => registry.watch_leave_guest(*tid, wake),
+            Self::Native(state) => state.watch_running(wake),
+        }
+    }
+
     fn kick_if_in_guest(&self) {
         match self {
             Self::Registered { registry, tid } => {
@@ -322,6 +330,36 @@ impl ExactMmCensusGuard {
             .values()
             .flatten()
             .find_map(|endpoint| endpoint.is_in_guest().then_some(endpoint.tid()))
+    }
+
+    /// Every registered endpoint currently entering or executing guest code.
+    pub(crate) fn in_guest_tids(&self) -> Vec<carrick_hal::ThreadId> {
+        self.state
+            .participants
+            .values()
+            .flatten()
+            .filter(|endpoint| endpoint.is_in_guest())
+            .map(GuestExecutorPauseEndpoint::tid)
+            .collect()
+    }
+
+    /// Watch every endpoint for its leave-guest acknowledgement.
+    ///
+    /// All endpoints, not only the ones in guest now: an admitted executor can
+    /// publish in-guest transiently, observe the raised pause and withdraw, and
+    /// that withdrawal must wake a drain that happened to read it in guest. An
+    /// admitted executor may also (re-)register its vCPU during the drain; the
+    /// registry then wakes the drain, which must take fresh watches.
+    pub(crate) fn watch_leaves(
+        &self,
+        wake: &Arc<carrick_hal::GuestLeaveWake>,
+    ) -> Vec<carrick_hal::GuestLeaveWatch> {
+        self.state
+            .participants
+            .values()
+            .flatten()
+            .map(|endpoint| endpoint.watch_leave(wake))
+            .collect()
     }
 
     pub(crate) fn kick_all_in_guest(&self) {
