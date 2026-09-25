@@ -198,6 +198,21 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(CurrentTask, file_table) as u64,
         core::mem::offset_of!(CurrentTask, pending_host_work) as u64,
         core::mem::offset_of!(CurrentTask, served_with_work) as u64,
+        core::mem::offset_of!(CurrentTask, zone_mm) as u64,
+        core::mem::offset_of!(CurrentTask, thread_serial) as u64,
+        EL1_ZONE_OFFSET,
+        core::mem::size_of::<ZoneTables>() as u64,
+        core::mem::align_of::<ZoneTables>() as u64,
+        core::mem::size_of::<ZoneRecord>() as u64,
+        core::mem::size_of::<ThreadCtx>() as u64,
+        carrick_sched_core::THREAD_CTX_V_OFFSET as u64,
+        carrick_sched_core::THREAD_CTX_FPSR_OFFSET as u64,
+        carrick_sched_core::ZONE_RECORDS as u64,
+        carrick_sched_core::ZONE_ENTRIES as u64,
+        carrick_sched_core::ZONE_BUCKETS as u64,
+        carrick_sched_core::ZONE_SLOTS as u64,
+        carrick_sched_core::ZONE_RUNQ_CAPACITY as u64,
+        EL1_STACK_SLOTS,
         core::mem::size_of::<FdMapSlot>() as u64,
         core::mem::offset_of!(FdMapSlot, handle) as u64,
         core::mem::offset_of!(FdMapSlot, incarnation) as u64,
@@ -312,7 +327,7 @@ pub use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 /// The record stores a `u64` word; this newtype is the only way to produce or
 /// compare that word, so a bare `tid as u64` (which sign-extends) can never
 /// cross the host/EL1 boundary. `NONE` (0) means no task is bound.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[repr(transparent)]
 pub struct El1TaskId(u64);
 
@@ -350,8 +365,14 @@ pub struct CurrentTask {
     pub pending_host_work: AtomicU32,
     /// Flag indicating this syscall completed at EL1 with return value in `x0`/`args[0]`.
     pub served_with_work: AtomicU32,
-    /// Reserved padding to align struct to 64 bytes (1 << 6).
-    pub _reserved: [u64; 2],
+    /// The zone key of the loaded task's process (its address-space id), or 0
+    /// when the process's futexes are not served in-guest. EL1 serves a
+    /// futex operation only for a non-zero key and switches only among
+    /// threads with the same key.
+    pub zone_mm: AtomicU64,
+    /// The host's serial of the loaded thread (with `task_id`, the exact
+    /// kernel thread a parked record names).
+    pub thread_serial: AtomicU64,
 }
 
 impl CurrentTask {
@@ -364,7 +385,8 @@ impl CurrentTask {
             orig_arg0: AtomicU64::new(0),
             pending_host_work: AtomicU32::new(0),
             served_with_work: AtomicU32::new(0),
-            _reserved: [0; 2],
+            zone_mm: AtomicU64::new(0),
+            thread_serial: AtomicU64::new(0),
         }
     }
 
@@ -377,6 +399,8 @@ impl CurrentTask {
         self.orig_arg0.store(0, Ordering::Relaxed);
         self.pending_host_work.store(0, Ordering::Release);
         self.served_with_work.store(0, Ordering::Release);
+        self.zone_mm.store(0, Ordering::Release);
+        self.thread_serial.store(0, Ordering::Release);
     }
 
     #[inline]
@@ -964,6 +988,26 @@ pub const EL1_NAME_CACHE_BASE: u64 = EL1_REGION_BASE + EL1_NAME_CACHE_OFFSET;
 /// Size of the name cache (64 KiB).
 pub const EL1_NAME_CACHE_SIZE: u64 = 0x1_0000;
 
+pub use carrick_sched_core::{
+    BoundedSpin, Claim, CurrentHandback, Exhausted, Handback, HostClaim, LockWait, RecordId,
+    RecordRef, SlotDrain, SlotId, ThreadCtx, ThreadIdentity, WakeRefusal, Waker,
+    ZONE_RUNQ_CAPACITY, ZoneRecord, ZoneTables,
+};
+
+/// Byte offset of the in-guest scheduler's tables ([`ZoneTables`]: futex
+/// wait queues, parked-thread records, per-vCPU run queues).
+pub const EL1_ZONE_OFFSET: u64 = 0x350_0000;
+
+/// Base guest virtual address of the zone tables.
+pub const EL1_ZONE_BASE: u64 = EL1_REGION_BASE + EL1_ZONE_OFFSET;
+
+/// Space reserved for the zone tables (11 MiB, to the end of the region).
+pub const EL1_ZONE_SIZE: u64 = 0xB0_0000;
+
+const _: () = assert!(core::mem::size_of::<ZoneTables>() as u64 <= EL1_ZONE_SIZE);
+const _: () = assert!(EL1_ZONE_OFFSET.is_multiple_of(core::mem::align_of::<ZoneTables>() as u64));
+const _: () = assert!(carrick_sched_core::ZONE_SLOTS as u64 >= EL1_STACK_SLOTS);
+
 const _: () = assert!(EL1_REGION_BASE.is_multiple_of(0x0400_0000));
 const _: () = assert!(EL1_REGION_SIZE == 64 * 1024 * 1024);
 const _: () = assert!(EL1_IMAGE_OFFSET + EL1_IMAGE_SIZE <= EL1_COUNTERS_OFFSET);
@@ -977,7 +1021,8 @@ const _: () = assert!(EL1_OBJECT_TABLE_OFFSET + EL1_OBJECT_TABLE_SIZE <= EL1_FD_
 const _: () = assert!(EL1_FD_MAP_OFFSET + EL1_FD_MAP_SIZE <= EL1_CACHE_OFFSET);
 const _: () = assert!(EL1_CACHE_OFFSET + EL1_CACHE_SIZE <= EL1_INOTIFY_TABLE_OFFSET);
 const _: () = assert!(EL1_INOTIFY_TABLE_OFFSET + EL1_INOTIFY_TABLE_SIZE <= EL1_NAME_CACHE_OFFSET);
-const _: () = assert!(EL1_NAME_CACHE_OFFSET + EL1_NAME_CACHE_SIZE <= EL1_REGION_SIZE);
+const _: () = assert!(EL1_NAME_CACHE_OFFSET + EL1_NAME_CACHE_SIZE <= EL1_ZONE_OFFSET);
+const _: () = assert!(EL1_ZONE_OFFSET + EL1_ZONE_SIZE <= EL1_REGION_SIZE);
 
 use core::sync::atomic::AtomicUsize;
 
@@ -1095,6 +1140,53 @@ pub fn update_current_task_file_table_for_task(tid: El1TaskId, file_table: u64) 
             current_task.file_table.store(file_table, Ordering::Release);
         }
     }
+}
+
+/// The zone tables through the host's mapping of the EL1 region, when it is
+/// mapped. The tables are shared with guest EL1; every access follows the
+/// ownership protocol of `carrick_sched_core`.
+pub fn zone_tables() -> Option<&'static ZoneTables> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: the region is mapped for the carrier's life while the pointer
+    // is recorded, zero-initialised (a valid empty zone), suitably aligned
+    // (the region base is 64 MiB aligned and the offset is checked above),
+    // and ZoneTables is atomics plus claim-protected context.
+    Some(unsafe { &*((ptr + EL1_ZONE_OFFSET as usize) as *const ZoneTables) })
+}
+
+/// Publish the zone identity of the task loaded on `slot` (0 disables
+/// in-guest futex service for it).
+pub fn publish_zone_identity(slot: usize, zone_mm: u64, thread_serial: u64) {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    // SAFETY: the record lives in the EL1 region; only atomics are touched.
+    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    current_task
+        .thread_serial
+        .store(thread_serial, Ordering::Relaxed);
+    current_task.zone_mm.store(zone_mm, Ordering::Release);
+}
+
+/// Read the task record of `slot` (what EL1 last published as running): the
+/// task id and thread serial.
+pub fn current_task_snapshot(slot: usize) -> Option<(El1TaskId, u64)> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return None;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    // SAFETY: the record lives in the EL1 region; only atomics are touched.
+    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    Some((
+        El1TaskId(current_task.task_id.load(Ordering::Acquire)),
+        current_task.thread_serial.load(Ordering::Acquire),
+    ))
 }
 
 /// Check and atomically clear the `served_with_work` flag for an executor slot.

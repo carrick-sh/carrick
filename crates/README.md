@@ -44,6 +44,7 @@ Platform code is selected by Cargo features. The default feature is
 | `carrick-signal-core` | Platform-neutral pending-signal bookkeeping. |
 | `carrick-timer-core` | Platform-neutral interval/POSIX timer slot bookkeeping and timer due-time decisions. |
 | `carrick-inotify-core` | Platform-neutral inotify queue ring buffer, coalescing, and watch descriptor bookkeeping. |
+| `carrick-sched-core` | `no_std` in-guest scheduling core shared by guest EL1 and the host: the zone of futex-parked threads (records whose claim word names their one owner, hash-bucket wait queues, per-vCPU-slot run queues), laid out `repr(C)` in the shared EL1 region. |
 | `carrick-observability` | Platform-neutral compat-reporting support. |
 
 ## Host Primitive Layers

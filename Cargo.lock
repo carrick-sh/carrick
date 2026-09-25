@@ -434,6 +434,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-el1-abi",
  "carrick-inotify-core",
+ "carrick-sched-core",
 ]
 
 [[package]]
@@ -441,6 +442,7 @@ name = "carrick-el1-abi"
 version = "0.1.0"
 dependencies = [
  "carrick-inotify-core",
+ "carrick-sched-core",
 ]
 
 [[package]]
@@ -784,6 +786,10 @@ dependencies = [
  "tracing-subscriber",
  "zerocopy",
 ]
+
+[[package]]
+name = "carrick-sched-core"
+version = "0.1.0"
 
 [[package]]
 name = "carrick-signal-core"
