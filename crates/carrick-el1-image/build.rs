@@ -48,9 +48,25 @@ fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) {
     }
     let stdout = String::from_utf8(output.stdout).expect("disassembly not valid utf-8");
 
+    // The in-guest thread switch saves and restores the guest's FP/SIMD
+    // state in exactly these two audited routines (`carrick-el1`
+    // `sched.rs`); every other FP/SIMD instruction is a violation.
+    const FPSIMD_SWITCH_ROUTINES: [&str; 2] =
+        ["carrick_el1_fpsimd_save", "carrick_el1_fpsimd_load"];
+    let mut allowed_hits = [0usize; 2];
+    let mut in_routine: Option<usize> = None;
     let mut violations = Vec::new();
     for line in stdout.lines() {
         let trimmed = line.trim();
+        // A symbol header: `0000000000001234 <name>:`.
+        if let Some(name) = trimmed
+            .strip_suffix(">:")
+            .and_then(|head| head.split_once(" <"))
+            .map(|(_, name)| name)
+        {
+            in_routine = FPSIMD_SWITCH_ROUTINES.iter().position(|r| *r == name);
+            continue;
+        }
         let Some((addr, rest)) = trimmed.split_once(':') else {
             continue;
         };
@@ -130,7 +146,19 @@ fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) {
         }
 
         if is_violation {
-            violations.push(line.to_string());
+            match in_routine {
+                Some(routine) => allowed_hits[routine] += 1,
+                None => violations.push(line.to_string()),
+            }
+        }
+    }
+    // Both routines exist and move all 32 Q registers plus FPSR and FPCR.
+    for (routine, hits) in FPSIMD_SWITCH_ROUTINES.iter().zip(allowed_hits) {
+        if hits < 18 {
+            panic!(
+                "carrick-el1 image: FP/SIMD switch routine {routine} missing or incomplete \
+                 ({hits} FP/SIMD instructions, expected 16 q-pair moves plus FPSR/FPCR)"
+            );
         }
     }
 
@@ -139,7 +167,8 @@ fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) {
             "\n\n======================================================================\n\
              ERROR: FP/SIMD instructions detected in carrick-el1 image!\n\
              The EL1 vector hook does not save/restore FP/SIMD registers (q0-q31, FPCR, FPSR).\n\
-             Any FP/SIMD use in EL1 will silently corrupt guest userspace registers.\n\
+             Any FP/SIMD use in EL1 outside the audited switch routines\n\
+             (carrick_el1_fpsimd_save/_load) silently corrupts guest userspace registers.\n\
              Violating instructions ({} found):\n  {}\n\
              ======================================================================\n\n",
             violations.len(),
@@ -225,4 +254,6 @@ fn main() {
     // stale image whose object layout silently disagrees with the host.
     println!("cargo:rerun-if-changed=../carrick-inotify-core/src");
     println!("cargo:rerun-if-changed=../carrick-inotify-core/Cargo.toml");
+    println!("cargo:rerun-if-changed=../carrick-sched-core/src");
+    println!("cargo:rerun-if-changed=../carrick-sched-core/Cargo.toml");
 }
