@@ -489,3 +489,35 @@ contracts = ["kernel.el1.gic"]
 [[surfaces]]
 path = "crates/carrick-mem/src/memory/el1_clock.rs"
 contracts = ["kernel.el1.gic"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/lib.rs"
+contracts = ["kernel.el1.futex-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/tests.rs"
+contracts = ["kernel.el1.futex-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/sched.rs"
+contracts = ["kernel.el1.futex-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/sched/hw.rs"
+contracts = ["kernel.el1.futex-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/sched/tests.rs"
+contracts = ["kernel.el1.futex-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/el1_zone.rs"
+contracts = ["kernel.el1.futex-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/zone.rs"
+contracts = ["kernel.el1.futex-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/el1_sched.rs"
+contracts = ["kernel.el1.futex-handoff"]
