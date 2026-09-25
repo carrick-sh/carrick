@@ -810,7 +810,14 @@ impl ZoneTables {
         waker: Waker,
         woken: &mut [RecordId],
     ) -> Result<u32, WakeRefusal> {
-        let limit = (count as usize).min(woken.len());
+        // An EL1 wake is all or nothing: it must wake every eligible waiter
+        // up to `count` or refuse (the host then serves it), never return a
+        // short count because its run queue or `woken` is smaller. A host
+        // wake takes a batch of at most `woken.len()` and the caller loops.
+        let limit = match waker {
+            Waker::El1 { .. } => (count as usize).min(woken.len() + 1),
+            Waker::Host => (count as usize).min(woken.len()),
+        };
         let bucket = &self.buckets[guard.bucket];
         // First pass: decide without changing anything.
         let mut planned = 0usize;
@@ -827,7 +834,7 @@ impl ZoneTables {
             cursor = next;
         }
         if let Waker::El1 { slot } = waker
-            && self.slot(slot).queued() + planned > ZONE_RUNQ_CAPACITY
+            && (planned > woken.len() || self.slot(slot).queued() + planned > ZONE_RUNQ_CAPACITY)
         {
             return Err(WakeRefusal::RunQueueFull);
         }

@@ -186,6 +186,59 @@ fn el1_refuses_multi_entry_waiters_and_a_full_run_queue() {
     );
 }
 
+/// futexforkwakegroups / LTP futex_wake02: `FUTEX_WAKE(9)` with nine or more
+/// waiters must wake nine. EL1's buffer is the run queue's capacity (8), so
+/// it must refuse rather than return a short count (it returned 8, leaving a
+/// waiter asleep until a later wake).
+#[test]
+fn el1_wake_beyond_run_queue_capacity_refuses_instead_of_waking_fewer() {
+    let zone = zone();
+    let parked: Vec<_> = (0..ZONE_RUNQ_CAPACITY as u64 + 2)
+        .map(|tid| park(&zone, 200 + tid, 0x5000))
+        .collect();
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, 0x5000), &HostWait)
+        .unwrap();
+    let mut woken = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
+    let count = ZONE_RUNQ_CAPACITY as u32 + 1;
+    assert_eq!(
+        zone.wake(
+            &guard,
+            MM,
+            0x5000,
+            u32::MAX,
+            count,
+            Waker::El1 { slot: SLOT },
+            &mut woken
+        ),
+        Err(WakeRefusal::RunQueueFull)
+    );
+    assert!(
+        parked
+            .iter()
+            .all(|r| matches!(zone.record(*r).claim(), Claim::Parked { .. }))
+    );
+    // Exactly the capacity is still served in-guest.
+    assert_eq!(
+        zone.wake(
+            &guard,
+            MM,
+            0x5000,
+            u32::MAX,
+            ZONE_RUNQ_CAPACITY as u32,
+            Waker::El1 { slot: SLOT },
+            &mut woken
+        ),
+        Ok(ZONE_RUNQ_CAPACITY as u32)
+    );
+    // The host takes batches of its buffer and its caller loops.
+    let mut small = [RecordId::PLACEHOLDER; 1];
+    assert_eq!(
+        zone.wake(&guard, MM, 0x5000, u32::MAX, 5, Waker::Host, &mut small),
+        Ok(1)
+    );
+}
+
 #[test]
 fn host_claims_parked_but_is_refused_by_el1_held() {
     let zone = zone();
