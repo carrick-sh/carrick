@@ -5656,6 +5656,27 @@ mod real {
         /// live owner, and `rc` is the raw `hv_vcpus_exit` result. A zero vCPU
         /// with `valid=0` means no HV call was possible.
         fn vcpu__kick(_: u64, _: i32, _: i32) {}
+        /// One `hv_vcpu_run` return with `CANCELED` (a cross-thread kick that
+        /// actually stopped the vCPU). `vcpu` is the HVF id, `pc`/`el` where it
+        /// stopped, `resumed` = 1 when the run loop re-entered the guest to finish
+        /// an EL1 critical section instead of surfacing the kick. Pair with
+        /// `vcpu-kick` by id: a kick whose id never shows a cancel did not stop a
+        /// running vCPU.
+        fn vcpu__canceled(_: u64, _: u64, _: u32, _: i32) {}
+        /// The engine absorbed a surfaced kick inside Carrick's EL1 vector/image
+        /// or the EL0 clock stub and re-entered the guest with a pending IRQ
+        /// armed (`where`: 1 vector, 2 EL1 image, 3 clock stub). The kick is only
+        /// served once that IRQ is taken back at EL0. `spsr_el1`/`elr_el1` are
+        /// the state the EL1 path will `eret` into.
+        fn kick__rearm__irq(_: u64, _: u32, _: u64, _: u64) {}
+        /// A re-armed kick IRQ was taken: the EL1 IRQ vector's `hvc` kick
+        /// surfaced with the interrupted EL0 `pc`.
+        fn vcpu__irq__kick(_: u64) {}
+        /// An owed kick was settled by a surfaced exit. `pc`/`pstate` where the
+        /// vCPU stopped, `el0_state` the EL0 return PSTATE before restoring its
+        /// `I` bit (`I` clear here means EL0 ran unmasked yet did not take the
+        /// armed IRQ).
+        fn owed__kick__settle(_: u64, _: u64, _: u64) {}
         /// Cumulative kick/inject counters fired once at process exit (cheap, one
         /// fire per process) so a trace can read the totals without paying the
         /// per-event `kick-in-kernel` cost: `el1_resumed` (kicks absorbed in the
@@ -5737,6 +5758,10 @@ mod real {
         fn pt__pause__begin(_: i32, _: i32, _: i32, _: i32) {}
         fn pt__pause__ready(_: i32, _: i32, _: i64) {}
         fn pt__pause__timeout(_: i32, _: i64) {}
+        /// A page-table drain found `sibling_tid` still in guest after
+        /// `wait_us`; fired once per sibling per kick round, naming exactly
+        /// whom the coordinator is waiting for.
+        fn pt__pause__drain__wait(_: i32, _: i32, _: i64) {}
         fn pt__pause__election__timeout(_: i32, _: i64) {}
         fn pt__pause__end(_: i32) {}
         /// Stage-1 spare sub-table pool occupancy, fired after each table edit.
@@ -7610,6 +7635,22 @@ mod real {
         carrick_usdt::vcpu__kick!(|| (vcpu, valid, rc));
     }
 
+    pub fn vcpu_canceled(vcpu: u64, pc: u64, el: u32, resumed: i32) {
+        carrick_usdt::vcpu__canceled!(|| (vcpu, pc, el, resumed));
+    }
+
+    pub fn kick_rearm_irq(pc: u64, where_: u32, spsr_el1: u64, elr_el1: u64) {
+        carrick_usdt::kick__rearm__irq!(|| (pc, where_, spsr_el1, elr_el1));
+    }
+
+    pub fn vcpu_irq_kick(pc: u64) {
+        carrick_usdt::vcpu__irq__kick!(|| pc);
+    }
+
+    pub fn owed_kick_settle(pc: u64, pstate: u64, el0_state: u64) {
+        carrick_usdt::owed__kick__settle!(|| (pc, pstate, el0_state));
+    }
+
     pub fn kick_stats(el1_resumed: u64, kick_inject: u64, inject_at_el1: u64) {
         carrick_usdt::kick__stats!(|| (el1_resumed, kick_inject, inject_at_el1));
     }
@@ -7678,6 +7719,10 @@ mod real {
 
     pub fn pt_pause_timeout(tid: i32, wait_us: i64) {
         carrick_usdt::pt__pause__timeout!(|| (tid, wait_us));
+    }
+
+    pub fn pt_pause_drain_wait(coordinator_tid: i32, sibling_tid: i32, wait_us: i64) {
+        carrick_usdt::pt__pause__drain__wait!(|| (coordinator_tid, sibling_tid, wait_us));
     }
 
     pub fn pt_pause_election_timeout(tid: i32, wait_us: i64) {
@@ -8656,6 +8701,10 @@ mod stub {
     stub!(signal_restore(saved_pc: u64, sp: u64, magic: u64));
     stub!(kick_in_kernel(pc: u64, el: u32));
     stub!(vcpu_kick(vcpu: u64, valid: i32, rc: i32));
+    stub!(vcpu_canceled(vcpu: u64, pc: u64, el: u32, resumed: i32));
+    stub!(kick_rearm_irq(pc: u64, where_: u32, spsr_el1: u64, elr_el1: u64));
+    stub!(vcpu_irq_kick(pc: u64));
+    stub!(owed_kick_settle(pc: u64, pstate: u64, el0_state: u64));
     stub!(kick_stats(el1_resumed: u64, kick_inject: u64, inject_at_el1: u64));
     stub!(el1_task_record_stale(slot: u64, recorded_tid: u64, recorded_table: u64, tid: u64, table: u64));
     stub!(mem_watch(syscall_nr: u64, addr: u64, value: u64));
@@ -8678,6 +8727,7 @@ mod stub {
     ));
     stub!(pt_pause_ready(tid: i32, spins: i32, wait_us: i64));
     stub!(pt_pause_timeout(tid: i32, wait_us: i64));
+    stub!(pt_pause_drain_wait(coordinator_tid: i32, sibling_tid: i32, wait_us: i64));
     stub!(pt_pause_election_timeout(tid: i32, wait_us: i64));
     stub!(pt_pause_end(tid: i32));
     stub!(pt_pool(in_use: u32, free_list: u32, capacity: u32, changed: i32));

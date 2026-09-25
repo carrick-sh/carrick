@@ -308,6 +308,14 @@ pub trait Aarch64Vcpu {
         Ok(())
     }
 
+    /// Whether [`Self::set_pending_irq`] really injects an IRQ that Carrick's
+    /// lower-EL IRQ vector turns into a surfaced kick. A backend answering
+    /// `false` keeps the no-op default above, so an owed kick must not unmask
+    /// the guest's EL0 IRQ state on its behalf.
+    fn injects_kick_irq(&self) -> bool {
+        false
+    }
+
     /// Set the hardware TSO (total-store-order) memory model. HVF sets
     /// `ACTLR_EL1.EnTSO` for Rosetta; KVM keeps the no-op default. Carried
     /// separately from [`Self::set_memory_model`] so a backend that needs both a

@@ -29,6 +29,7 @@ mod anonymous_discard;
 pub mod engine;
 pub mod esr;
 pub mod mailbox;
+pub mod owed_kick;
 pub mod stage1_authority;
 pub mod vmm;
 
