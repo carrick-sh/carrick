@@ -608,6 +608,7 @@ pub(crate) fn destroy_and_unregister<E: PersistentExecutor>(
     registration: &ExecutorRegistration,
     kick: &WorkerKick,
     receipts: &ReceiptLog,
+    already_unregistered: bool,
 ) -> Option<String> {
     let executor = registration.id();
     let observed_hardware = catch_unwind(AssertUnwindSafe(|| backend.hardware_kick()));
@@ -648,10 +649,14 @@ pub(crate) fn destroy_and_unregister<E: PersistentExecutor>(
         (_, Some(_)) => Some("executor shutdown cleared mismatched hardware identity".to_owned()),
         (_, None) => Some("executor shutdown found no published hardware identity".to_owned()),
     };
-    let unregister_error = scheduler
-        .unregister_executor(registration)
-        .err()
-        .map(|error| format!("executor unregister failed: {error}"));
+    let unregister_error = if already_unregistered {
+        None
+    } else {
+        scheduler
+            .unregister_executor(registration)
+            .err()
+            .map(|error| format!("executor unregister failed: {error}"))
+    };
     let mut failures = Vec::new();
     failures.extend(hardware_error);
     failures.extend(destroy_error);

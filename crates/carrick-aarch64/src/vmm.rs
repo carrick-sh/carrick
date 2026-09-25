@@ -20,10 +20,9 @@ use std::sync::Arc;
 
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{Aarch64SyscallFrame, Gpa, MemoryError, SharedFutexLocation};
-use carrick_hal::threaded::Aarch64TaskCpuStateV1;
 use carrick_hal::{
-    GuestEntryRegs, GuestVmBackend, HostAliasBacking, MemPerms, ProcessForkRequest, Reg, SlotId,
-    SysReg, TrapError, VcpuKick, VcpuRegistry,
+    GuestEntryRegs, GuestVmBackend, HostAliasBacking, MemPerms, ProcessForkRequest, Reg, SysReg,
+    TrapError, VcpuKick, VcpuRegistry,
 };
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::page_table::PageTableManager;
@@ -157,8 +156,8 @@ pub struct Aarch64VcpuSnapshot {
     /// reclaim/fork round-trips that too.)
     pub tpidr_el1: u64,
     /// CONTEXTIDR_EL1 — the guest-visible tid that HVF's EL1 `gettid` fast path
-    /// returns without a VM exit. `hv_vcpu_create` zeroes it, and an HVF reclaim
-    /// DESTROYS and recreates the vCPU, so a rebuilt vCPU that does not restore
+    /// returns without a VM exit. `hv_vcpu_create` zeroes it, so a task loaded
+    /// onto another executor's vCPU that does not restore
     /// this reads 0 and sends every later `gettid` down the handler's degrade
     /// branch to the host — silently, since the host still returns the correct
     /// tid, so only the cost changes. KVM does not use it (left 0).
@@ -1117,102 +1116,6 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     // shared [`GuestVmBackend`] supertrait (ISA-neutral, signature-identical with
     // x86).
 
-    /// Save THIS thread's full guest CPU state before releasing its vCPU slot at a
-    /// block point (M:N reclaim), passing the engine-owned `vcpu`. KVM aarch64 does
-    /// not reclaim (default no-op error). HVF DESTROYS the vCPU here (snapshot then
-    /// raw `hv_vcpu_destroy`) and stashes the snapshot internally; the returned
-    /// snapshot is unused for HVF (it round-trips through its own field). The engine
-    /// passes `&mut self.vcpu` so a destroy-in-place backend can recycle it.
-    fn save_guest_state(
-        &mut self,
-        _vcpu: &mut Self::Vcpu,
-    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
-        Err(TrapError::Hypervisor(
-            "aarch64 backend does not reclaim (save_guest_state)".into(),
-        ))
-    }
-
-    /// Destroy/release a newly materialized, still-idle vCPU before its first
-    /// guest instruction. Backends must not route this through syscall-block
-    /// reclaim, whose mailbox contract requires an outstanding continuation.
-    fn save_initial_runner_state(
-        &mut self,
-        _vcpu: &mut Self::Vcpu,
-    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
-        Err(TrapError::Hypervisor(
-            "aarch64 backend does not support idle initial-runner transfer".into(),
-        ))
-    }
-
-    fn rebind_initial_runner_state(
-        &mut self,
-        _state: &Aarch64TaskCpuStateV1,
-        _vcpu: &mut Self::Vcpu,
-    ) -> Result<(), TrapError> {
-        Err(TrapError::Hypervisor(
-            "aarch64 backend does not support idle initial-runner restore".into(),
-        ))
-    }
-
-    /// Save state for a process-shared futex wait. Defaults to the generic
-    /// vCPU-only reclaim; HVF overrides this for single-threaded process waits
-    /// so it can tear down the whole VM while the process is parked.
-    fn save_shared_wait_state(
-        &mut self,
-        vcpu: &mut Self::Vcpu,
-    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
-        self.save_guest_state(vcpu)
-    }
-
-    /// Re-bind to `slot`'s vCPU after a block (M:N reclaim wake), passing the
-    /// engine-owned `vcpu`. HVF RECREATES the vCPU in its existing VM and restores
-    /// the parked state, writing the new vCPU back through `vcpu`. KVM no-op.
-    fn rebind_to_slot(
-        &mut self,
-        slot: SlotId,
-        state: &Aarch64TaskCpuStateV1,
-        vcpu: &mut Self::Vcpu,
-    ) -> Result<(), TrapError> {
-        let _ = (slot, state, vcpu);
-        Err(TrapError::Hypervisor(
-            "aarch64 backend does not support complete typed guest-state restore".to_owned(),
-        ))
-    }
-
-    /// Restore state saved by [`Self::save_shared_wait_state`].
-    fn rebind_shared_wait_state(
-        &mut self,
-        slot: SlotId,
-        state: &Aarch64TaskCpuStateV1,
-        vcpu: &mut Self::Vcpu,
-    ) -> Result<(), TrapError> {
-        self.rebind_to_slot(slot, state, vcpu)
-    }
-
-    /// MT whole-VM lease — VM-only release by the LAST parker, whose own vCPU
-    /// was already destroyed by [`Self::save_guest_state`] (snapshot stashed;
-    /// compatible with the shared-wait resume). `Ok(true)` iff whole-VM state
-    /// was released. Default `Ok(false)`: the backend has no whole-VM state
-    /// to release (KVM), and the caller keeps the park vCPU-only.
-    fn release_vm_after_reclaim_park(&mut self) -> Result<bool, TrapError> {
-        Ok(false)
-    }
-
-    /// [`Self::rebind_shared_wait_state`] for a MULTI-THREADED parked process
-    /// (the whole-VM residency lease): the first waker rebuilds the process VM
-    /// for every still-parked sibling, so the mapping replay must carry the
-    /// UNION of every thread's dynamic mappings. HVF overrides this; the
-    /// default (KVM: no whole-VM teardown on park) is the single-threaded
-    /// restore.
-    fn rebind_shared_wait_state_mt(
-        &mut self,
-        slot: SlotId,
-        state: &Aarch64TaskCpuStateV1,
-        vcpu: &mut Self::Vcpu,
-    ) -> Result<(), TrapError> {
-        self.rebind_shared_wait_state(slot, state, vcpu)
-    }
-
     /// Build the `Send` payload a `clone(CLONE_THREAD)` sibling needs to add its
     /// own vCPU on the SAME VM (shared VM handle + window descriptors + a
     /// live-vcpu ticket). KVM `build_sibling_spec` (ignores `vcpu`); HVF publishes
@@ -1276,14 +1179,6 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     // so the forker can `hv_vm_destroy` before `libc::fork`, then republish the
     // rebuilt VM for them to recreate vCPUs in. KVM siblings share ONE VM and rely
     // on Linux COW, so none of this is needed (defaults).
-
-    /// Whether this backend's M:N reclaim DESTROYS the vCPU (so its kick handle goes
-    /// dead and the runtime must unregister it from the registry before the block
-    /// and re-register on wake). `true` for HVF (raw `hv_vcpu_destroy` does not drop
-    /// applevisor's liveness Weak); `false` (default) for pool-swap backends.
-    fn reclaim_refreshes_kicker(&self) -> bool {
-        false
-    }
 
     /// A guest thread is exiting: destroy its vCPU (freeing an HVF concurrent-vCPU
     /// slot). KVM no-op (vCPU drops with the engine).

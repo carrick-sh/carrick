@@ -3025,48 +3025,26 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     fn reclaims(&self) -> bool {
         false
     }
-    /// Whether this backend's reclaim DESTROYS the vCPU (so its kick handle goes
-    /// dead and the runtime must unregister it from the VcpuRegistry before the
-    /// block and re-register on wake). `true` for HVF (destroy/recreate; raw
-    /// hv_vcpu_destroy does not drop applevisor's liveness Weak, so a stale handle
-    /// would lie `is_valid`); `false` for bhyve (pool-swap keeps the vCPU alive).
-    fn reclaim_refreshes_kicker(&self) -> bool {
-        false
-    }
     /// Save THIS thread's full guest CPU state (GPRs + RSP/RFLAGS + FS/GS base +
     /// FP/AVX) before releasing its vCPU slot at a block point. Only ever called by
     /// the owning host thread, only when [`reclaims`](Self::reclaims). Opaque,
     /// backend-serialized bytes round-tripped to [`rebind_to_slot`](Self::rebind_to_slot).
-    /// `&mut self`: HVF DESTROYS its vCPU inside this call (snapshot then
-    /// hv_vcpu_destroy); bhyve/KVM read registers and ignore the extra mutability.
+    /// The x86 backends read registers. AArch64 never reclaims: an HVF vCPU
+    /// lives for its VM's whole life.
     fn save_guest_state(&mut self) -> Result<GuestCpuState, TrapError> {
         Err(TrapError::Hypervisor(
             "backend does not support complete typed guest-state snapshots".to_owned(),
         ))
     }
-    /// Save a freshly materialized task before it has executed one guest
-    /// instruction so production can transfer it to a persistent executor.
-    /// This is deliberately distinct from blocking-wait reclaim: an initial
-    /// task has no outstanding syscall/mailbox continuation to preserve.
+    /// The CPU state of a freshly materialized root before it has executed
+    /// one guest instruction, so production can load it onto a persistent
+    /// executor. HVF roots own no vCPU at this point: their registers are
+    /// staged data, and the state is a copy. An initial task has no
+    /// outstanding syscall/mailbox continuation to preserve.
     fn save_initial_runner_state(&mut self) -> Result<GuestCpuState, TrapError> {
         Err(TrapError::Hypervisor(
             "backend does not support idle initial-runner state transfer".to_owned(),
         ))
-    }
-    fn rebind_initial_runner_state(
-        &mut self,
-        _slot: crate::SlotId,
-        _state: &GuestCpuState,
-    ) -> Result<(), TrapError> {
-        Err(TrapError::Hypervisor(
-            "backend does not support idle initial-runner restore".to_owned(),
-        ))
-    }
-    /// Save state for a process-shared futex wait. Backends that can release
-    /// stronger host resources while parked may override this separately from
-    /// the generic private-futex reclaim path.
-    fn save_shared_wait_state(&mut self) -> Result<GuestCpuState, TrapError> {
-        self.save_guest_state()
     }
     /// Re-bind this engine to `slot`'s vCPU and restore `state` into it — called by
     /// the owning thread when it re-acquires a (possibly different) slot after a
@@ -3080,46 +3058,6 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         Err(TrapError::Hypervisor(
             "backend does not support complete typed guest-state restore".to_owned(),
         ))
-    }
-    /// Restore state saved by [`Self::save_shared_wait_state`].
-    fn rebind_shared_wait_state(
-        &mut self,
-        slot: crate::SlotId,
-        state: &GuestCpuState,
-    ) -> Result<(), TrapError> {
-        self.rebind_to_slot(slot, state)
-    }
-    /// MT whole-VM residency lease — VM-only release, called by the LAST
-    /// parker of a multi-threaded process AFTER its own vCPU was already
-    /// destroyed by [`Self::save_guest_state`] (so the runtime registry's
-    /// "parked" mark truthfully means "vCPU destroyed" for every marked
-    /// thread, and this call finds zero live vCPUs). Returns `Ok(true)` iff
-    /// the backend released whole-VM state that a claim-true waker must
-    /// rebuild via [`Self::rebind_shared_wait_state_mt`]; `Ok(false)` (the
-    /// default) means the backend has no whole-VM state to release
-    /// (pool-swap backends). On `Err` or `Ok(false)` the caller MUST NOT set
-    /// the registry's vm-released flag — the park stays a vCPU-only park (a
-    /// failed teardown must never poison an innocent sibling's wake with a
-    /// rebuild against a live VM).
-    fn release_vm_after_reclaim_park(&mut self) -> Result<bool, TrapError> {
-        Ok(false)
-    }
-    /// Restore state saved by [`Self::save_shared_wait_state`] when the parked
-    /// process was MULTI-THREADED (the whole-VM residency lease): the FIRST
-    /// waker rebuilds the per-process VM state on behalf of every still-parked
-    /// sibling, so a backend whose shared-wait park tears the whole VM down
-    /// must replay the UNION of every thread's dynamic mappings — not just
-    /// this (waking) thread's per-thread list (HVF overrides this via its
-    /// process-global alias registry). Defaults to the single-threaded
-    /// restore: pool-swap backends (KVM x86, bhyve) never tear down
-    /// per-process VM state on a shared-wait park, so there is nothing extra
-    /// to rebuild.
-    fn rebind_shared_wait_state_mt(
-        &mut self,
-        slot: crate::SlotId,
-        state: &GuestCpuState,
-    ) -> Result<(), TrapError> {
-        self.rebind_shared_wait_state(slot, state)
     }
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError>;
     fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError>

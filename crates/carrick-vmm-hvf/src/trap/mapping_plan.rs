@@ -373,22 +373,14 @@ impl HvfVmState {
         }
     }
 
-    /// Create the VM + the (one) vCPU, map the guest address space, program the
-    /// initial vCPU sysregs/trampoline, and return the `(state_without_vcpu,
-    /// vcpu)` pair the shared engine owns separately. Consolidates the old
-    /// `HvfTrapEngine::new_platform` + `map_plan` + the initial-PC/SPSR/SCTLR/
-    /// TTBR/CPACR/CNTKCTL/VBAR/SP/vdso setup into one constructor.
+    /// Boot a container root: create the carrier VM (first root) or reuse the
+    /// live one (later roots), map the guest address space, and stage the
+    /// root's first-instruction registers as data. No vCPU is created: every
+    /// vCPU lives for its VM's whole life (EL1 plan 1a D2), so the root runs on
+    /// a persistent executor's vCPU, which restores the staged state.
     pub(crate) fn new_with_plan(
         plan: &GuestMappingPlan,
-    ) -> Result<
-        (
-            HvfVmState,
-            applevisor::vcpu::Vcpu,
-            MailboxBinding,
-            crate::staged_cpu::StagedCpu,
-        ),
-        TrapError,
-    > {
+    ) -> Result<(HvfVmState, crate::staged_cpu::StagedCpu), TrapError> {
         let mut pending_creation = None;
         let result = Self::new_with_plan_inner(plan, &mut pending_creation);
         finish_pending_vm_creation(pending_creation, result)
@@ -397,17 +389,7 @@ impl HvfVmState {
     fn new_with_plan_inner(
         plan: &GuestMappingPlan,
         pending_creation: &mut Option<PendingCarrierVmCreation>,
-    ) -> Result<
-        (
-            HvfVmState,
-            applevisor::vcpu::Vcpu,
-            MailboxBinding,
-            crate::staged_cpu::StagedCpu,
-        ),
-        TrapError,
-    > {
-        use applevisor::prelude::*;
-
+    ) -> Result<(HvfVmState, crate::staged_cpu::StagedCpu), TrapError> {
         // Carrier reuse: when this carrier already owns a VM, a new container's
         // root boots INSIDE it. Its image is placed the way `execve_rebuild`
         // places a replacement image (global-frame stage-2 leases + rebased
@@ -453,7 +435,7 @@ impl HvfVmState {
         };
         let (
             vm,
-            permit,
+            _permit,
             syscall_transport,
             mailbox_slots,
             carrier_mappings,
@@ -501,24 +483,6 @@ impl HvfVmState {
         };
         let vm = SetupVmGuard::new(vm, carrier.is_none());
         drop(boot_gate);
-        let vcpu = SetupVcpuGuard::new(
-            if carrier.is_some() {
-                // Existing-VM vCPU: admitted by the in-process scheduler, like a
-                // thread sibling (see `create_vcpu`).
-                create_vcpu(&vm)?
-            } else {
-                create_vcpu_with_permit(&vm, permit)?
-            },
-            if carrier.is_some() {
-                SetupVcpuCleanup::LocalRaii
-            } else {
-                SetupVcpuCleanup::PendingRaw
-            },
-        );
-        if let Some(creation) = pending_creation.as_mut() {
-            creation.record_vcpu(vcpu.id());
-        }
-        enable_el0_counter_access(vcpu.id());
 
         #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&carrier_foreign_mm_transport.custody);
@@ -560,17 +524,13 @@ impl HvfVmState {
                 registration: None,
             },
             carrier_mappings,
-            reclaim_authority: ReclaimParkAuthority::Live,
             mailbox_slots,
             syscall_transport,
-            vcpu_id: vcpu.id(),
-            vcpu_handle: vcpu.get_handle(),
-            _vcpu_guard: Some(vcpu_census().created()),
+            executor_vcpu: None,
             cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
             last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
             last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
         };
-        state.publish_live_vcpu();
         state.seed_readonly_spans_from_plan(plan);
 
         // Reuse lane: map the relocated image with owning stage-2 leases (the
@@ -683,155 +643,10 @@ impl HvfVmState {
             )?;
         }
 
-        // Start PC: if an EL0 entry trampoline is installed, the vCPU begins
-        // at the trampoline page (in EL1h) and executes the single `eret`
-        // there to drop into EL0t at the real user entry. Otherwise the vCPU
-        // starts directly at the user entry (used by the existing EL1-only
-        // unit tests).
-        let initial_pc = plan.el0_trampoline_entry.unwrap_or(plan.entry);
-        vcpu.set_reg(Reg::PC, initial_pc).map_err(hvf_error)?;
-        // M[3:0]=0b0101 = EL1h (AArch64 EL1 using SP_EL1) + DAIF masked.
-        // HVF reset CPSR is also EL1h; we set it explicitly so a re-entry
-        // after a syscall trap doesn't depend on whatever HVF left in place.
-        // The vCPU stays at EL1h until the trampoline `eret` swaps PSTATE
-        // for the SPSR_EL1 value programmed below.
-        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
-        vcpu.set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
-            .map_err(hvf_error)?;
-        // When using the trampoline, stage SPSR_EL1 with "AArch64 EL0t, DAIF
-        // masked" (M[3:0]=0b0000) and ELR_EL1 with the user-mode entry. The
-        // `eret` at the trampoline page then transitions to EL0t with
-        // PC=plan.entry, which is the state Linux user code expects so the
-        // first `svc #0` raises a "lower EL using AArch64" synchronous
-        // exception that HVF surfaces to the host.
-        if let Some(_trampoline) = plan.el0_trampoline_entry {
-            const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
-            vcpu.set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
-                .map_err(hvf_error)?;
-            vcpu.set_sys_reg(SysReg::ELR_EL1, plan.entry)
-                .map_err(hvf_error)?;
-        }
-        // Disable stage-1 MMU translation for the EL0/EL1 guest. Without this,
-        // the vCPU's reset value of SCTLR_EL1 has .M=1, which makes every
-        // instruction fetch translate through page tables we never built, and
-        // the first fetch faults with FSC=Translation fault, level 3. With
-        // .M=0 the guest sees stage-2 mappings directly. Bits C/I (caches) are
-        // also cleared since we have no maintenance ops yet.
-        // SCTLR_EL1 layout:
-        //   bit  0 = M  (MMU enable)        — 0: stage-1 MMU off, identity
-        //   bit  2 = C  (D-cache enable)    — 1: data accesses cacheable
-        //   bit 12 = I  (I-cache enable)    — 1: instruction fetches cacheable
-        //   bits 22..21 = SED/UCT etc. (default 0 is fine)
-        //   bits 28..23 = RES1 (reserved-as-one); HVF accepts 0 for them.
-        // We keep M=0 (no page tables) but set C=1 and I=1 so the memory we
-        // use is treated as cacheable Normal memory. ARMv8-A defines
-        // exclusive load/store on non-cacheable memory as UNPREDICTABLE,
-        // and Apple HVF appears to abort externally rather than treat it as
-        // implementation-defined; musl's `ldaxr` on first mutex acquire
-        // depends on this.
-        // If a stage-1 page-table region is installed, program TTBR0_EL1,
-        // TCR_EL1 and MAIR_EL1 to point at our identity-mapping tables,
-        // and set SCTLR_EL1.M = 1 so EL0/EL1 data accesses go through
-        // the Normal-cacheable mapping. ARMv8-A treats data accesses as
-        // Device-nGnRnE memory whenever stage-1 is disabled, and
-        // `ldaxr`/`stlxr` on Device memory abort externally — which is
-        // exactly the wall musl's pthread_mutex_lock hits otherwise.
-        // C=1, I=1 (caches); UCI=1 (bit 26: EL0 cache-maintenance ops DC CVAU/
-        // CIVAC/CVAC, IC IVAU — glibc __clear_cache), UCT=1 (bit 15: EL0 read of
-        // CTR_EL0 — glibc 2.41 reads cache line sizes at startup; without this
-        // the MRS traps to EL1 and crashed CPython), DZE=1 (bit 14: EL0 DC ZVA +
-        // DCZID_EL0 read — glibc memset). Matches Linux's SCTLR_EL1 for EL0.
-        // Shared bootstrap SCTLR (via GuestArch; canonical rationale in
-        // carrick_mem::arch_sysregs) carries M=1 (stage-1 on); HVF enables M
-        // only when stage-1 tables exist (below), so start from the value with
-        // M cleared and OR M back in there. HVF leaves SPAN(23) CLEAR and
-        // forces PSTATE.PAN=1 (FEAT_PAN3) — SPAN is KVM glue, NOT part of the
-        // shared value.
-        use carrick_hal::GuestArch as _;
-        let boot = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs();
-        let mut sctlr_el1: u64 = boot.sctlr_el1 & !1;
-        // Stage-1 MMU is on by default. The identity tables use AP=00 for
-        // kernel pages (trampoline/vectors/PT) and AP=01+PXN=1 for user
-        // pages, which is required on Apple Silicon because HVF starts
-        // vCPUs with PSTATE.PAN=1 and FEAT_PAN3 turns any EL1 fetch from
-        // an AP[1]=1 page into a permission fault. See
-        // `stage1_identity_page_tables` in src/memory.rs.
-        if let Some(pt_base) = plan.stage1_page_tables_base {
-            // MAIR_EL1 slot 0 = Normal memory, Inner & Outer Write-Back
-            // Cacheable, RW-allocate (0xFF). Slot 1..7 stay 0 (Device-
-            // nGnRnE), unused for now.
-            vcpu.set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
-                .map_err(hvf_error)?;
-            // TCR_EL1: TTBR0 (lower half) and TTBR1 (upper half) BOTH active.
-            //   T0SZ = T1SZ = 16 (48-bit VA each half) — wide enough for
-            //              Rosetta's fixed ET_EXEC load base at 2^47 AND the
-            //              x86-64 high-half (negative) addresses it maps into.
-            //   IRGN0/1 = 0b11, ORGN0/1 = 0b11, SH0/1 = 0b11 (Inner WB, Inner
-            //              Shareable) for both halves; TG0 = 0b00 (4K),
-            //              TG1 = 0b10 (4K — note TG1's encoding differs!).
-            //   EPD1 = 0 (TTBR1 walks ENABLED). TTBR1 shares the TTBR0 page-
-            //              table root: a walk indexes VA[47:0] regardless of
-            //              which TTBR selected it, and carrick's lower-half
-            //              mappings + the upper-half alias projections occupy
-            //              disjoint L0 slots.
-            //   IPS = 0b010 (40-bit IPA, max for M-series HVF — output stays
-            //              <=40 bits; high VAs are mapped down to a low IPA).
-            //   TBI0/TBI1 = 1: the MMU ignores the top byte on translation —
-            //              Rosetta tags pointers in the top byte and asserts
-            //              unless hardware ignores it (pairs with the 16-bit
-            //              software tag strip in mapping_for_range / mmap).
-            // boot.tcr_el1 is the shared bootstrap value via GuestArch
-            // (canonical rationale in carrick_mem::arch_sysregs).
-            vcpu.set_sys_reg(SysReg::TCR_EL1, boot.tcr_el1)
-                .map_err(hvf_error)?;
-            vcpu.set_sys_reg(SysReg::TTBR0_EL1, pt_base)
-                .map_err(hvf_error)?;
-            // TTBR1 shares the same root (see the TCR comment above).
-            vcpu.set_sys_reg(SysReg::TTBR1_EL1, pt_base)
-                .map_err(hvf_error)?;
-            // Enable stage-1 MMU (M=1) on top of the C=1, I=1 flags above.
-            sctlr_el1 |= 1;
-        }
-        vcpu.set_sys_reg(SysReg::SCTLR_EL1, sctlr_el1)
-            .map_err(hvf_error)?;
-        // Enable FP/SIMD for the guest. Without this, CPACR_EL1.FPEN defaults
-        // to "trap at EL0", and musl's `memset` (which uses NEON `dup`/`stp`
-        // instructions) faults on its very first call — the trap is misrouted
-        // through our EL1 vector as if it were an SVC, the dispatcher sees
-        // garbage syscall numbers, and the guest spins forever. FPEN=0b11
-        // turns the trap off; the bottom two bits of each TRC* field are kept
-        // at zero (trace unsupported, no SME).
-        // boot.cpacr_el1 (FPEN=0b11, no FP/SIMD trap at EL0) is shared.
-        vcpu.set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
-            .map_err(hvf_error)?;
-        // Allow EL0 to read the virtual (EL0VCTEN, bit 1) and physical
-        // (EL0PCTEN, bit 0) counters directly without trapping to EL1. This is
-        // the foundation for the vDSO fast clock path: `__kernel_clock_gettime`
-        // reads CNTVCT_EL0 in userspace, so it must NOT vmexit. The
-        // emulate_el0_sys64_read path stays as a fallback for any guest whose
-        // read still traps. Harmless for guests that don't read the counter.
-        const CNTKCTL_EL1_EL0_COUNTER_ACCESS: u64 = (1 << 1) | (1 << 0);
-        vcpu.set_sys_reg(SysReg::CNTKCTL_EL1, CNTKCTL_EL1_EL0_COUNTER_ACCESS)
-            .map_err(hvf_error)?;
-        // Route lower-EL synchronous exceptions (EL0 `svc #0`) through our
-        // vector page. Without this, VBAR_EL1 defaults to 0 (or whatever
-        // HVF leaves it at) and the SVC fetch faults on an unmapped page.
-        if let Some(vectors_base) = plan.el1_vectors_base {
-            vcpu.set_sys_reg(SysReg::VBAR_EL1, vectors_base)
-                .map_err(hvf_error)?;
-        }
-        if let Some(stack_pointer) = plan.initial_stack_pointer {
-            // SP_EL0 is the Linux userspace stack. SP_EL1 is reserved for the
-            // per-vCPU syscall mailbox and is bound after mappings are live.
-            vcpu.set_sys_reg(SysReg::SP_EL0, stack_pointer)
-                .map_err(hvf_error)?;
-        }
-        let mailbox = match &carrier {
-            // Shared arena, shared allocator: the slot is unique across every
-            // container's vCPUs in this VM.
-            Some(spec) => Self::allocate_persistent_mailbox_for_vcpu(spec, &vcpu)?,
-            None => state.allocate_mailbox_for_vcpu(&vcpu)?,
-        };
+        // The root's first registers (EL0-entry trampoline, stage-1 MMU,
+        // FP/SIMD and counter access, vectors, user stack) are programmed as
+        // data from the relocated `plan`; see `StagedCpu::initial_root`.
+        let staged = crate::staged_cpu::StagedCpu::initial_root(plan);
         if pending_creation.is_some() {
             commit_pending_creation_before_vcpu_handoff(pending_creation)?;
         }
@@ -839,7 +654,6 @@ impl HvfVmState {
         // CNTVCT_EL0 in userspace. After the creation commits: host writes are
         // admitted only against committed backing owners.
         state.populate_vdso_data_page();
-        let staged = crate::staged_cpu::StagedCpu::initial_root(plan);
-        Ok((state, vcpu.into_inner(), mailbox, staged))
+        Ok((state, staged))
     }
 }

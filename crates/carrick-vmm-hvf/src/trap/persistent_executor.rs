@@ -1,63 +1,5 @@
 use super::*;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReclaimParkAuthority {
-    Live,
-    InitialRunnerParked,
-    VcpuParked,
-    VmParked,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl ReclaimParkAuthority {
-    pub(crate) fn mark_initial_runner_parked(&mut self) -> Result<(), TrapError> {
-        if *self != Self::Live {
-            return Err(TrapError::Hypervisor(
-                "initial runner park attempted without live executor authority".to_owned(),
-            ));
-        }
-        *self = Self::InitialRunnerParked;
-        Ok(())
-    }
-
-    pub(crate) fn mark_vcpu_parked(&mut self) -> Result<(), TrapError> {
-        if *self != Self::Live {
-            return Err(TrapError::Hypervisor(
-                "vCPU reclaim park attempted without live executor authority".to_owned(),
-            ));
-        }
-        *self = Self::VcpuParked;
-        Ok(())
-    }
-
-    pub(crate) fn mark_vm_parked(&mut self) -> Result<(), TrapError> {
-        if *self != Self::VcpuParked {
-            return Err(TrapError::Hypervisor(
-                "VM reclaim park attempted without parked vCPU authority".to_owned(),
-            ));
-        }
-        *self = Self::VmParked;
-        Ok(())
-    }
-
-    pub(crate) fn destination_vcpu_is_live(self) -> Result<(), TrapError> {
-        (self == Self::Live).then_some(()).ok_or_else(|| {
-            TrapError::Hypervisor("destination executor vCPU is not live".to_owned())
-        })
-    }
-
-    pub(crate) fn mark_live_after_recreate(&mut self) -> Result<(), TrapError> {
-        if *self == Self::Live {
-            return Err(TrapError::Hypervisor(
-                "reclaim resume attempted to recreate a live destination vCPU".to_owned(),
-            ));
-        }
-        *self = Self::Live;
-        Ok(())
-    }
-}
-
 /// lives in the same HVF VM as the parent, so the stage-2 entries are already
 /// present; the descriptor only re-materialises local syscall-path metadata as
 /// `HvfMappedRegion { memory: None }` (UNOWNED) so the sibling never
@@ -927,440 +869,22 @@ impl HvfVmState {
         )
     }
 
-    /// M:N reclaim — BLOCK side. Snapshot this vCPU and DESTROY it (freeing one
-    /// HVF concurrent-vCPU slot) so another guest thread can run while this one
-    /// parks in the futex wait. The SAME thread recreates it via
-    /// [`reclaim_resume`](Self::reclaim_resume) on wake. Unlike the fork
-    /// path this does NOT publish mappings or rebuild the VM — the VM is unchanged;
-    /// only the per-thread vCPU is recycled. Task state is returned through the
-    /// typed engine boundary; this backend retains only executor lifecycle.
-    ///
-    /// WIRED via the HVF engine override `ThreadedEngine::save_guest_state`
-    /// (`hvf_aarch64_engine.rs:536`), which passes the engine's separately-owned
-    /// `&mut vcpu` through to this destroy-in-place reclaim; the wake side is
-    /// `rebind_to_slot` (`hvf_aarch64_engine.rs:557`) → [`reclaim_resume`].
-    /// This is the multi-threaded blocked-wait park (vCPU-only; the VM stays
-    /// alive) that `park_vcpu_for_blocking_wait` routes to.
-    pub(crate) fn reclaim_park(
-        &mut self,
-        vcpu: &mut applevisor::vcpu::Vcpu,
-        mailbox: &mut MailboxBinding,
-    ) -> Result<(), TrapError> {
-        // Raw destroy — only the owning thread may, and applevisor's Drop would
-        // panic on the post-destroy handle.
-        let vcpu_id = vcpu.id();
-        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
-        if rc == 0 {
-            self._vcpu_guard = None;
-            vcpu_destroyed(vcpu_id);
-        }
-        if rc != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "reclaim_park: hv_vcpu_destroy rc={rc:#x}"
-            )));
-        }
-        self.reclaim_authority.mark_vcpu_parked()?;
-        self.release_mailbox_for_reclaim(mailbox)?;
-        Ok(())
-    }
-
-    /// Owner-thread zero-instruction handoff. The initial mailbox must still be
-    /// idle; validate before destroying the vCPU so an incompatible protocol
-    /// state fails without partially relinquishing hardware authority.
-    pub(crate) fn initial_runner_park(
-        &mut self,
-        vcpu: &mut applevisor::vcpu::Vcpu,
-        mailbox: &mut MailboxBinding,
-    ) -> Result<(), TrapError> {
-        let diagnostics = mailbox.diagnostics();
-        if diagnostics.state != carrick_aarch64::mailbox::MailboxState::Idle.raw() {
-            return Err(TrapError::Hypervisor(format!(
-                "initial runner mailbox is not idle: diagnostics={diagnostics:?}"
-            )));
-        }
-        let vcpu_id = vcpu.id();
-        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
-        if rc == 0 {
-            self._vcpu_guard = None;
-            vcpu_destroyed(vcpu_id);
-        }
-        if rc != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "initial_runner_park: hv_vcpu_destroy rc={rc:#x}"
-            )));
-        }
-        self.reclaim_authority.mark_initial_runner_parked()?;
-        mailbox
-            .release_idle_for_initial_handoff()
-            .map_err(|error| TrapError::Hypervisor(format!("release initial mailbox: {error}")))
-    }
-
-    pub(crate) fn initial_runner_resume(
-        &mut self,
-        vcpu: &mut applevisor::vcpu::Vcpu,
-        mailbox: &mut MailboxBinding,
-    ) -> Result<(), TrapError> {
-        if self.reclaim_authority != ReclaimParkAuthority::InitialRunnerParked {
-            return Err(TrapError::Hypervisor(
-                "initial_runner_resume: no idle initial-runner authority".to_owned(),
-            ));
-        }
-        let new_vcpu = create_vcpu(&self._vm)?;
-        enable_el0_counter_access(new_vcpu.id());
-        Self::configure_executor_invariants(&new_vcpu)?;
-        self.vcpu_id = new_vcpu.id();
-        self.vcpu_handle = new_vcpu.get_handle();
-        self._vcpu_guard = Some(vcpu_census().created());
-        self.publish_live_vcpu();
-        std::mem::forget(std::mem::replace(vcpu, new_vcpu));
-        self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox, None)?;
-        self.reclaim_authority.mark_live_after_recreate()
-    }
-
-    /// M:N reclaim — WAKE side. Recreate this executor's vCPU in the EXISTING VM
-    /// when it was locally parked. A live destination executor is retained as-is;
-    /// the caller overlays only Kernel-owned typed task state. Writes the recreated
-    /// vCPU back through `vcpu` via `std::mem::replace` + `forget` of the old
-    /// (already-destroyed) handle (no applevisor Drop).
-    ///
-    /// WIRED — see [`reclaim_park`](Self::reclaim_park): reached via the HVF
-    /// engine override `ThreadedEngine::rebind_to_slot`
-    /// (`hvf_aarch64_engine.rs:557`), which passes the `&mut vcpu` this
-    /// destroy/recreate-in-place reclaim needs.
-    pub(crate) fn reclaim_resume(
-        &mut self,
-        vcpu: &mut applevisor::vcpu::Vcpu,
-        mailbox: &mut MailboxBinding,
-        continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
-    ) -> Result<(), TrapError> {
-        if self.reclaim_authority.destination_vcpu_is_live().is_ok() {
-            if let Some(continuation) = continuation {
-                mailbox
-                    .import_task_continuation(continuation)
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "restore task continuation into live destination mailbox: {error}"
-                        ))
-                    })?;
-            }
-            return Ok(());
-        }
-        if self.reclaim_authority != ReclaimParkAuthority::VcpuParked {
-            return Err(TrapError::Hypervisor(
-                "reclaim_resume: executor requires whole-VM recreation".to_owned(),
-            ));
-        }
-        let continuation = continuation.ok_or_else(|| {
-            TrapError::Hypervisor(
-                "reclaim_resume: parked syscall has no typed continuation authority".to_owned(),
-            )
-        })?;
-        let new_vcpu = create_vcpu(&self._vm)?;
-        enable_el0_counter_access(new_vcpu.id());
-        Self::configure_executor_invariants(&new_vcpu)?;
-        self.vcpu_id = new_vcpu.id();
-        self.vcpu_handle = new_vcpu.get_handle();
-        self._vcpu_guard = Some(vcpu_census().created());
-        self.publish_live_vcpu();
-        // Replace the destroyed handle WITHOUT running applevisor's panicky Drop on
-        // the (already hv_vcpu_destroy'd) old one — mirror the fork rebuild.
-        std::mem::forget(std::mem::replace(vcpu, new_vcpu));
-        self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox, Some(continuation))?;
-        self.reclaim_authority.mark_live_after_recreate()?;
-        Ok(())
-    }
-
-    /// Single-threaded process shared-futex park. Unlike `reclaim_park`, this
-    /// destroys the whole VM, not just the vCPU, so a large process-fork fanout
-    /// parked in `FUTEX_WAIT` does not keep one HVF VM alive per waiter.
-    pub(crate) fn shared_wait_park(
-        &mut self,
-        vcpu: &mut applevisor::vcpu::Vcpu,
-        mailbox: &mut MailboxBinding,
-    ) -> Result<(), TrapError> {
-        let vcpu_id = vcpu.id();
-        let vcpu_rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
-        if vcpu_rc == 0 {
-            self._vcpu_guard = None;
-            vcpu_destroyed(vcpu_id);
-        }
-        if vcpu_rc != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "shared_wait_park: hv_vcpu_destroy rc={vcpu_rc:#x}"
-            )));
-        }
-        self.reclaim_authority.mark_vcpu_parked()?;
-        self.release_mailbox_for_reclaim(mailbox)?;
-        destroy_vm_with_custody(
-            &self.carrier_foreign_mm_transport.custody,
-            "shared_wait_park",
-        )?;
-        self.reclaim_authority.mark_vm_parked()?;
-        Ok(())
-    }
-
-    /// MT whole-VM lease — VM-only release by the LAST parker of a
-    /// multi-threaded process. Its own vCPU was ALREADY destroyed by
-    /// [`Self::reclaim_park`] (its executor lifecycle is recorded in
-    /// `reclaim_authority`), and every
-    /// sibling's registry "parked" mark is set only AFTER its own
-    /// `reclaim_park` destroy — so when the runtime's re-check passes, zero
-    /// vCPUs are live and the bare `hv_vm_destroy` succeeds. Any nonzero rc
-    /// (e.g. HV_BUSY from a vCPU in a teardown window the registry no longer
-    /// tracks, like a thread mid-exit) is a clean error: the VM was NOT
-    /// destroyed, and the caller must NOT set the vm-released flag — the park
-    /// stays vCPU-only and the wake side stays `reclaim_resume`.
-    pub(crate) fn release_vm_after_reclaim_park(&mut self) -> Result<(), TrapError> {
-        if self.reclaim_authority != ReclaimParkAuthority::VcpuParked {
-            return Err(TrapError::Hypervisor(
-                "release_vm_after_reclaim_park: no parked vCPU authority (reclaim_park did not run)"
-                    .into(),
-            ));
-        }
-        destroy_vm_with_custody(
-            &self.carrier_foreign_mm_transport.custody,
-            "release_vm_after_reclaim_park",
-        )?;
-        self.reclaim_authority.mark_vm_parked()?;
-        Ok(())
-    }
-
-    /// Resume a process parked by [`Self::shared_wait_park`]: create a fresh VM
-    /// and vCPU, re-map this process's existing host backings, then restore the
-    /// saved guest registers.
-    ///
-    /// `replay_alias_union` (the MT whole-VM lease first-waker rebuild): also
-    /// re-map every live process-global [`alias_registry`] entry this thread's
-    /// per-thread `mappings` lacks. Threads share ONE VM but `mappings` is
-    /// per-thread, so a high-VA alias a STILL-PARKED sibling mapped would
-    /// otherwise be missing from the rebuilt stage-2 (the same shape the fork
-    /// rebuild repairs with its quiesced-sibling union). Safe because every
-    /// parked sibling holds its `OwnedHostMapping`s alive while parked, and no
-    /// guest thread of this process runs during the rebuild (the caller holds
-    /// the topology lock; claim-false wakers rebind behind it) — so no
-    /// interleaving `munmap` can invalidate an entry mid-replay. Entries are
-    /// NOT pushed into `self.mappings` (ownership stays with the mapping
-    /// thread; a later rebuild re-reads the registry, which reflects any
-    /// munmap since). Single-threaded resumes pass `false` — their own
-    /// `mappings` list is complete by construction, and a forked child must
-    /// NOT re-establish inherited parent/sibling aliases the fork rebuild
-    /// deliberately dropped. The bounded lazy on-fault re-map in `run_to_exit`
-    /// remains the backstop either way.
-    pub(crate) fn shared_wait_resume(
-        &mut self,
-        vcpu: &mut applevisor::vcpu::Vcpu,
-        mailbox: &mut MailboxBinding,
-        replay_alias_union: bool,
-        continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
-    ) -> Result<(), TrapError> {
-        let mut pending_creation = None;
-        let result = self.shared_wait_resume_inner(
-            vcpu,
-            mailbox,
-            replay_alias_union,
-            continuation,
-            &mut pending_creation,
-        );
-        finish_pending_vm_creation(pending_creation, result)
-    }
-
-    pub(crate) fn shared_wait_resume_inner(
-        &mut self,
-        vcpu: &mut applevisor::vcpu::Vcpu,
-        mailbox: &mut MailboxBinding,
-        replay_alias_union: bool,
-        continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
-        pending_creation: &mut Option<PendingCarrierVmCreation>,
-    ) -> Result<(), TrapError> {
-        if self.reclaim_authority != ReclaimParkAuthority::VmParked {
-            return Err(TrapError::Hypervisor(
-                "shared_wait_resume: no parked VM executor authority".to_owned(),
-            ));
-        }
-        let continuation = continuation.ok_or_else(|| {
-            TrapError::Hypervisor(
-                "shared_wait_resume: parked syscall has no typed continuation authority".to_owned(),
-            )
-        })?;
-        let (new_vm, permit, creation) = create_vm_with_admission(
-            VmCreateAdmission::SharedWaitResume,
-            &self.carrier_foreign_mm_transport.custody,
-        )?;
-        let new_vm = SetupVmGuard::new(new_vm, true);
-        *pending_creation = Some(creation);
-        let new_vcpu = SetupVcpuGuard::new(
-            create_vcpu_with_permit(&new_vm, permit)?,
-            SetupVcpuCleanup::PendingRaw,
-        );
-        let creation = pending_creation.as_mut().ok_or_else(|| {
-            TrapError::Hypervisor("shared-wait creation transaction disappeared".to_owned())
-        })?;
-        creation.record_vcpu(new_vcpu.id());
-        enable_el0_counter_access(new_vcpu.id());
-        Self::configure_executor_invariants(&new_vcpu)?;
-        // Snapshot the registry's CURRENT membership before the replay: an
-        // alias another thread `munmap`'d while we were parked was removed
-        // from the registry (`unregister_alias`) but may still sit in this
-        // thread's per-thread `mappings` list — re-REGISTERING it below would
-        // resurrect a dead index entry that a later syscall/fault could
-        // resolve to a freed backing. Registration is creation-complete
-        // (every `add_alias` registers; removal happens only on munmap /
-        // execve-clear), so absence here means "gone on purpose".
-        let registered_aliases = alias_registry()
-            .lock()
-            .process_visible_ordered(self.mm_root_slot, self.container_root);
-        let mut mapped_extents = std::collections::HashSet::new();
-        let mut replayed_global_owners = Vec::new();
-        for mapping in &self.mappings {
-            // Skip a sibling-munmap'd stale high-VA entry ENTIRELY (absence
-            // from the registry = gone on purpose, mirroring the union loop
-            // below): hv_vm_map'ing it would map a freed host VA
-            // (ChildMapFailed → wake fatal) or squat a dead IPA a later mmap
-            // collides with.
-            let live_alias = mapping
-                .is_dynamic_alias
-                .then(|| {
-                    registered_aliases.iter().find(|alias| {
-                        alias_matches_process_scope(
-                            alias.ownership_scope,
-                            self.mm_root_slot,
-                            self.container_root,
-                        ) && alias.start == mapping.start
-                            && alias.ipa == mapping.ipa
-                            && alias.host_addr == mapping.host_addr as usize
-                            && alias.size == semantic_extent_size(mapping.start, mapping.end)
-                    })
-                })
-                .flatten();
-            if mapping.is_dynamic_alias && live_alias.is_none() {
-                continue;
-            }
-            let (host_addr, ipa, size, perms, owner_generation) = live_alias.map_or(
-                (
-                    mapping.host_addr,
-                    mapping.ipa,
-                    mapping.size,
-                    u64::from(mapping.perms),
-                    mapping.owner_generation,
-                ),
-                |alias| {
-                    (
-                        alias.physical_host_addr as *mut u8,
-                        alias.physical_ipa,
-                        alias.physical_size,
-                        alias.perms,
-                        alias.owner_generation,
-                    )
-                },
-            );
-            if is_reusable_global_frame_extent(ipa, size as u64)
-                && !global_frame_owner_is_replayable_in(
-                    &self.carrier_foreign_mm_transport.custody,
-                    ipa,
-                    size as u64,
-                    host_addr as usize,
-                    owner_generation,
-                )
-            {
-                continue;
-            }
-            if !mapped_extents.insert((ipa, size)) {
-                continue;
-            }
-            let r = unsafe { inventory_hv_vm_map(host_addr.cast(), ipa, size, perms) };
-            if r != 0 {
-                return Err(TrapError::ChildMapFailed {
-                    host_addr: host_addr as u64,
-                    guest_start: ipa,
-                    size,
-                    code: r as u32,
-                });
-            }
-            replayed_global_owners.push(GlobalFrameReplayExtent {
-                ipa,
-                length: size as u64,
-                host_addr: host_addr as usize,
-                perms,
-            });
-        }
-
-        if replay_alias_union || self.mappings.iter().any(|mapping| mapping.is_dynamic_alias) {
-            // Copy the entries out so the registry mutex isn't held across the
-            // hv_vm_map syscalls (`AliasBacking` is `Copy`).
-            for b in registered_aliases {
-                if !alias_matches_process_scope(
-                    b.ownership_scope,
-                    self.mm_root_slot,
-                    self.container_root,
-                ) || !mapped_extents.insert((b.physical_ipa, b.physical_size))
-                    || !alias_backing_is_live(b.host_addr)
-                {
-                    continue;
-                }
-                if is_reusable_global_frame_extent(b.physical_ipa, b.physical_size as u64)
-                    && !global_frame_owner_is_replayable_in(
-                        &self.carrier_foreign_mm_transport.custody,
-                        b.physical_ipa,
-                        b.physical_size as u64,
-                        b.physical_host_addr,
-                        b.owner_generation,
-                    )
-                {
-                    continue;
-                }
-                let r = unsafe {
-                    inventory_hv_vm_map(
-                        b.physical_host_addr as *mut std::ffi::c_void,
-                        b.physical_ipa,
-                        b.physical_size,
-                        b.perms,
-                    )
-                };
-                if r != 0 {
-                    return Err(TrapError::ChildMapFailed {
-                        host_addr: b.host_addr as u64,
-                        guest_start: b.physical_ipa,
-                        size: b.physical_size,
-                        code: r as u32,
-                    });
-                }
-                replayed_global_owners.push(GlobalFrameReplayExtent {
-                    ipa: b.physical_ipa,
-                    length: b.physical_size as u64,
-                    host_addr: b.physical_host_addr,
-                    perms: b.perms,
-                });
-            }
-        }
-
-        reconcile_global_frame_owners_after_replay_in(
-            &self.carrier_foreign_mm_transport.custody,
-            &replayed_global_owners,
-            false,
-        )?;
-
-        self.reacquire_mailbox_after_vcpu_create(&new_vcpu, mailbox, Some(continuation))?;
-        self.reclaim_authority.mark_live_after_recreate()?;
-        commit_pending_creation_before_vcpu_handoff(pending_creation)?;
-        self.vcpu_id = new_vcpu.id();
-        self.vcpu_handle = new_vcpu.get_handle();
-        self.publish_live_vcpu();
-        std::mem::forget(std::mem::replace(vcpu, new_vcpu.into_inner()));
-        replace_destroyed_vm(self, new_vm.into_inner());
-        Ok(())
-    }
-
-    /// A guest thread is exiting: destroy ITS OWN vCPU (only the owning thread
-    /// may) so the slot is freed in the process-global VM. Without this, the
-    /// no-op `Drop` leaks the vCPU live forever, and a later fork's
-    /// `hv_vm_destroy` trips over the accumulated dead-thread vCPUs (HV_BUSY).
-    /// Raw `hv_vcpu_destroy`, not applevisor's panicky wrapper.
+    /// A persistent executor is leaving: destroy ITS OWN vCPU (only the owning
+    /// thread may). Executors leave only at pool shutdown, which is carrier
+    /// teardown, or at a pool-start rollback before any vCPU ran (EL1 plan 1a
+    /// D2); `destroy_raw_vcpu` faults the carrier on any other moment.
     pub(crate) fn destroy_vcpu_on_thread_exit(&mut self, vcpu: &mut applevisor::vcpu::Vcpu) {
-        let vcpu_id = vcpu.id();
-        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
-        if rc == 0 {
-            self._vcpu_guard = None;
-            vcpu_destroyed(vcpu_id);
+        self.destroy_setup_vcpu(vcpu, VcpuDestroySite::WorkerExit);
+    }
+
+    /// Destroy this backend's own vCPU at `site` and drop its identity.
+    pub(crate) fn destroy_setup_vcpu(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        site: VcpuDestroySite,
+    ) {
+        if destroy_raw_vcpu(vcpu.id(), site) == 0 {
+            self.executor_vcpu = None;
         }
     }
 
@@ -1454,12 +978,9 @@ impl HvfVmState {
             carrier_foreign_mm_transport: std::sync::Arc::clone(&spec.carrier_foreign_mm_transport),
             task: HvfTaskState::neutral(),
             carrier_mappings: Some(std::sync::Arc::clone(&spec.carrier_mappings)),
-            reclaim_authority: ReclaimParkAuthority::Live,
             mailbox_slots: std::sync::Arc::clone(&spec.mailbox_slots),
             syscall_transport: spec.syscall_transport,
-            vcpu_id: vcpu.id(),
-            vcpu_handle: vcpu.get_handle(),
-            _vcpu_guard: Some(vcpu_census().created()),
+            executor_vcpu: Some(ExecutorVcpuIdentity::of(&vcpu)),
             cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
             last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
             last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
@@ -1469,7 +990,7 @@ impl HvfVmState {
         let mailbox = Self::allocate_persistent_mailbox_for_vcpu(spec, &vcpu)?;
         Self::audit_executor_invariants(&vcpu, mailbox.slot().guest_address())?;
         state.task.audit_neutral()?;
-        Ok((state, vcpu, mailbox))
+        Ok((state, vcpu.into_inner(), mailbox))
     }
 
     pub(crate) fn audit_persistent_executor_idle(&self) -> Result<(), TrapError> {
@@ -1507,7 +1028,7 @@ impl HvfVmState {
         mailbox: &MailboxBinding,
     ) -> Result<(), TrapError> {
         self.audit_persistent_executor_idle()?;
-        if self.reclaim_authority != ReclaimParkAuthority::Live {
+        if self.executor_vcpu.is_none() {
             return Err(TrapError::Hypervisor(
                 "persistent worker lost its live owner-thread vCPU authority".to_owned(),
             ));
@@ -1651,12 +1172,9 @@ impl HvfVmState {
                 registration: None,
             },
             carrier_mappings: None,
-            reclaim_authority: ReclaimParkAuthority::Live,
             mailbox_slots,
             syscall_transport,
-            vcpu_id: vcpu.id(),
-            vcpu_handle: vcpu.get_handle(),
-            _vcpu_guard: Some(vcpu_census().created()),
+            executor_vcpu: Some(ExecutorVcpuIdentity::of(&vcpu)),
             cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
             last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
             last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
@@ -1674,7 +1192,7 @@ impl HvfVmState {
         }
 
         let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
-        Ok((state, vcpu, mailbox))
+        Ok((state, vcpu.into_inner(), mailbox))
     }
 
     pub(crate) fn build_process_spec(

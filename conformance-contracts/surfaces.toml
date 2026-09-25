@@ -98,7 +98,7 @@ contracts = ["kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-mem/src/page_table.rs"
@@ -122,15 +122,15 @@ contracts = ["kernel.fork.stage1-image", "kernel.mm.backing-maintenance-lookup"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs"
-contracts = ["kernel.fork.stage1-image"]
+contracts = ["kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.kick-el0-boundary"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.kick-el0-boundary", "kernel.vcpu.vm-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead"]
+contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.vm-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/dispatcher.rs"
@@ -339,7 +339,7 @@ contracts = ["kernel.mm.syscall-code-write"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/vmm.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.vcpu.kick-el0-boundary"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.vcpu.kick-el0-boundary", "kernel.vcpu.vm-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/guest_memory.rs"
@@ -429,3 +429,35 @@ contracts = ["kernel.vcpu.kick-el0-boundary"]
 [[surfaces]]
 path = "fixtures/linux-aarch64-hello/src/el1_served_loop_kick.rs"
 contracts = ["kernel.vcpu.kick-el0-boundary"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/staged_cpu.rs"
+contracts = ["kernel.vcpu.vm-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/vcpu_topology.rs"
+contracts = ["kernel.vcpu.vm-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/vcpu_admission.rs"
+contracts = ["kernel.vcpu.vm-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs"
+contracts = ["kernel.vcpu.vm-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/carrier_custody.rs"
+contracts = ["kernel.vcpu.vm-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/executor.rs"
+contracts = ["kernel.vcpu.vm-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs"
+contracts = ["kernel.vcpu.vm-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/el1_vcpu_lifetime.rs"
+contracts = ["kernel.vcpu.vm-lifetime"]

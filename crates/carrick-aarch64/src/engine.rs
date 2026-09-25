@@ -32,7 +32,7 @@ use carrick_guest_mem::{
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 use carrick_hal::{
-    GuestEntryRegs, HostAliasBacking, OsError, ProcessForkRequest, RawSyscall, Reg, SlotId, SysReg,
+    GuestEntryRegs, HostAliasBacking, OsError, ProcessForkRequest, RawSyscall, Reg, SysReg,
     SyscallTrap, ThreadedEngine, TrapError,
 };
 use carrick_mem::memory::AddressSpace;
@@ -160,6 +160,12 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// (`mark_exec_predecessor_shared`) to cross-check against the stage-1
     /// authority's own share decision.
     exec_predecessor_shared: Option<bool>,
+
+    /// Stage-1 maintenance a staged (never-run) vCPU recorded during this
+    /// task's bring-up. The task's first live executor discharges it in
+    /// [`Self::overlay_task_state_on_live_executor`] before the task's first
+    /// instruction.
+    owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance,
 }
 
 pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
@@ -177,6 +183,7 @@ pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
     page_tables: Stage1Authority,
     protections: Arc<MemoryProtections>,
     pending_process_fork: Option<ParentForkCowRollback>,
+    owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance,
 }
 
 /// Task-owned runtime authorities that must follow a logical HVPatch task
@@ -256,6 +263,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_process_fork: None,
             exec_predecessor_shared: None,
+            owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
         }
     }
 
@@ -292,12 +300,31 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let destination = self.vcpu.snapshot()?;
         let restored = restore_aarch64_task_state(&destination, state)?;
         self.vcpu.restore(&restored)?;
+        self.discharge_owed_stage1_maintenance()?;
         self.vm.install_task_continuation_for_executor_switch(
             &mut self.vcpu,
             state.syscall_continuation,
         )?;
         self.apply_task_metadata(state);
         self.validate_loaded_task_runtime_projection()?;
+        Ok(())
+    }
+
+    /// Run the stage-1 maintenance this task's bring-up owed, on the live
+    /// executor vCPU it just loaded onto, before its first instruction. The
+    /// debt clears only once the maintenance completed.
+    fn discharge_owed_stage1_maintenance(&mut self) -> Result<(), TrapError> {
+        match self.owed_stage1_maintenance.discharge() {
+            None => {}
+            Some(crate::vmm::Stage1Maintenance::AllAsids) => {
+                Self::run_el1_maintenance_on(&mut self.vcpu)?;
+            }
+            Some(crate::vmm::Stage1Maintenance::Asid(asid)) => {
+                let root = self.vm.carrier_maintenance_root()?;
+                Self::invalidate_asid_on_vcpu(&mut self.vcpu, asid, root)?;
+            }
+        }
+        self.owed_stage1_maintenance = crate::vmm::OwedStage1Maintenance::default();
         Ok(())
     }
 
@@ -396,7 +423,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     pub fn into_task_state_and_vcpu(self) -> (Aarch64TaskEngineState<V>, V::Vcpu) {
         let Self {
             vm,
-            vcpu,
+            mut vcpu,
             pending_resume_pc,
             last_syscall_nr,
             last_syscall_orig_x0,
@@ -410,8 +437,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page_tables,
             protections,
             pending_process_fork,
+            mut owed_stage1_maintenance,
             ..
         } = self;
+        owed_stage1_maintenance.merge(vcpu.take_deferred_stage1_maintenance());
         (
             Aarch64TaskEngineState {
                 vm,
@@ -428,6 +457,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 page_tables,
                 protections,
                 pending_process_fork,
+                owed_stage1_maintenance,
             },
             vcpu,
         )
@@ -449,6 +479,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page_tables,
             protections,
             pending_process_fork,
+            owed_stage1_maintenance,
         } = state;
         Self {
             vm,
@@ -470,6 +501,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_process_fork,
             exec_predecessor_shared: None,
+            owed_stage1_maintenance,
         }
     }
 }
@@ -758,6 +790,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_process_fork: None,
             exec_predecessor_shared: None,
+            owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
         }
     }
 
@@ -878,6 +911,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_process_fork: None,
             exec_predecessor_shared: None,
+            owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
         }
     }
 
@@ -1199,6 +1233,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// the sentinel-address scratch). With those restored, the in-flight syscall
     /// resumes exactly as before. Mirrors HVF's `run_el1_maintenance`.
     fn run_el1_maintenance_on(vcpu: &mut V::Vcpu) -> Result<(), TrapError> {
+        if vcpu.defer_stage1_maintenance(crate::vmm::Stage1Maintenance::AllAsids) {
+            return Ok(());
+        }
         // M[3:0]=0b0101 EL1h (SP_EL1) + DAIF masked, PAN(bit22)=0 — the SAME PSTATE
         // boot uses to run the EL0-entry trampoline at EL1 (program_sysregs sets
         // `PSTATE_M_EL1H | DAIF_MASKED`). The maintenance trampoline issues no
@@ -1269,6 +1306,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             return Err(TrapError::Hypervisor(
                 "refusing to invalidate reserved ASID zero".to_owned(),
             ));
+        }
+        if vcpu.defer_stage1_maintenance(crate::vmm::Stage1Maintenance::Asid(asid)) {
+            return Ok(());
         }
         const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
         let saved_pc = vcpu.get_reg(Reg::Pc).map_err(|e| {
@@ -3832,33 +3872,6 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.reclaims()
     }
 
-    fn reclaim_refreshes_kicker(&self) -> bool {
-        self.vm.reclaim_refreshes_kicker()
-    }
-
-    fn save_guest_state(&mut self) -> Result<GuestCpuState, TrapError> {
-        require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
-        let continuation = self.vm.task_continuation(&self.vcpu)?;
-        let snapshot = self
-            .vm
-            .save_guest_state(&mut self.vcpu)
-            .map_err(|error| TrapError::Hypervisor(format!("save AArch64 guest state: {error}")))?;
-        Ok(GuestCpuState::from_aarch64_v1(
-            aarch64_task_state_from_snapshot(
-                &snapshot,
-                self.pending_resume_pc,
-                self.last_syscall_nr,
-                self.last_syscall_orig_x0,
-                self.last_fault_esr,
-                self.last_exit_class,
-                self.is_forked_child,
-                continuation,
-                self.mm_generation,
-                self.asid_generation,
-            )?,
-        ))
-    }
-
     fn save_initial_runner_state(&mut self) -> Result<GuestCpuState, TrapError> {
         require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
         if self.vm.task_continuation(&self.vcpu)?.is_some() {
@@ -3866,12 +3879,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 "initial AArch64 runner unexpectedly owns a syscall continuation".to_owned(),
             ));
         }
-        let snapshot = self
-            .vm
-            .save_initial_runner_state(&mut self.vcpu)
-            .map_err(|error| {
-                TrapError::Hypervisor(format!("save initial AArch64 runner state: {error}"))
-            })?;
+        // A root that has not run owns no vCPU: its registers are staged data
+        // (HVF), so the snapshot is a copy, never a vCPU hand-off.
+        let snapshot = self.vcpu.snapshot().map_err(|error| {
+            TrapError::Hypervisor(format!("save initial AArch64 runner state: {error}"))
+        })?;
         Ok(GuestCpuState::from_aarch64_v1(
             aarch64_task_state_from_snapshot(
                 &snapshot,
@@ -3886,99 +3898,6 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 self.asid_generation,
             )?,
         ))
-    }
-
-    fn rebind_initial_runner_state(
-        &mut self,
-        _slot: SlotId,
-        state: &GuestCpuState,
-    ) -> Result<(), TrapError> {
-        let GuestCpuState::Aarch64V1(state) = state else {
-            return Err(TrapError::Hypervisor(
-                "AArch64 initial restore rejected non-AArch64 V1 state".to_owned(),
-            ));
-        };
-        self.validate_task_metadata(state)?;
-        self.vm.rebind_initial_runner_state(state, &mut self.vcpu)?;
-        self.apply_task_metadata(state);
-        Ok(())
-    }
-
-    fn save_shared_wait_state(&mut self) -> Result<GuestCpuState, TrapError> {
-        require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
-        let continuation = self.vm.task_continuation(&self.vcpu)?;
-        let snapshot = self
-            .vm
-            .save_shared_wait_state(&mut self.vcpu)
-            .map_err(|error| {
-                TrapError::Hypervisor(format!("save shared-wait AArch64 guest state: {error}"))
-            })?;
-        Ok(GuestCpuState::from_aarch64_v1(
-            aarch64_task_state_from_snapshot(
-                &snapshot,
-                self.pending_resume_pc,
-                self.last_syscall_nr,
-                self.last_syscall_orig_x0,
-                self.last_fault_esr,
-                self.last_exit_class,
-                self.is_forked_child,
-                continuation,
-                self.mm_generation,
-                self.asid_generation,
-            )?,
-        ))
-    }
-
-    fn rebind_to_slot(&mut self, slot: SlotId, state: &GuestCpuState) -> Result<(), TrapError> {
-        let GuestCpuState::Aarch64V1(state) = state else {
-            return Err(TrapError::Hypervisor(format!(
-                "AArch64 restore rejected {:?} snapshot version {}",
-                state.guest_abi(),
-                state.version()
-            )));
-        };
-        self.validate_task_metadata(state)?;
-        self.vm.rebind_to_slot(slot, state, &mut self.vcpu)?;
-        self.apply_task_metadata(state);
-        Ok(())
-    }
-
-    fn rebind_shared_wait_state(
-        &mut self,
-        slot: SlotId,
-        state: &GuestCpuState,
-    ) -> Result<(), TrapError> {
-        let GuestCpuState::Aarch64V1(state) = state else {
-            return Err(TrapError::Hypervisor(
-                "AArch64 shared-wait restore rejected non-AArch64 V1 state".to_owned(),
-            ));
-        };
-        self.validate_task_metadata(state)?;
-        self.vm
-            .rebind_shared_wait_state(slot, state, &mut self.vcpu)?;
-        self.apply_task_metadata(state);
-        Ok(())
-    }
-
-    fn rebind_shared_wait_state_mt(
-        &mut self,
-        slot: SlotId,
-        state: &GuestCpuState,
-    ) -> Result<(), TrapError> {
-        let GuestCpuState::Aarch64V1(state) = state else {
-            return Err(TrapError::Hypervisor(
-                "AArch64 MT shared-wait restore rejected non-AArch64 V1 state".to_owned(),
-            ));
-        };
-        self.validate_task_metadata(state)?;
-        self.vm
-            .rebind_shared_wait_state_mt(slot, state, &mut self.vcpu)?;
-        self.apply_task_metadata(state);
-        Ok(())
-    }
-
-    fn release_vm_after_reclaim_park(&mut self) -> Result<bool, TrapError> {
-        self.vm.release_vm_after_reclaim_park()
     }
 
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError> {

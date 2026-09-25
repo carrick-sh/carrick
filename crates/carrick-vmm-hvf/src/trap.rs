@@ -220,9 +220,18 @@ pub(crate) use task_mapping_index::*;
 mod vcpu_admission;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vcpu_gate;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod vcpu_topology;
 pub use vcpu_admission::cooperative_release_atomic_permit;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use vcpu_admission::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use vcpu_topology::begin_carrier_vcpu_teardown;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use vcpu_topology::{
+    VcpuDestroySite, admit_vcpu_first_run, begin_vcpu_topology_generation, create_admitted,
+    destroy_raw_vcpu, end_vcpu_topology_generation,
+};
 mod persistent_executor;
 pub use persistent_executor::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -844,6 +853,9 @@ pub(in crate::trap) fn create_vm_with_admission(
             // if that destroy fails the flag correctly stays set -- a VM does
             // still exist.
             CARRIER_VM_LIVE.store(true, std::sync::atomic::Ordering::Release);
+            // A new VM is a new topology generation: its vCPUs are created
+            // before any of them runs (`vcpu_topology`).
+            begin_vcpu_topology_generation(generation.0);
             // Stand the pre-mapped root-slot pool up now, while no stage-1
             // root slot is mapped yet. Created lazily at the first fork, its
             // 128 MiB pre-map collided with an already-exec'd process's Owned
@@ -908,18 +920,20 @@ pub(crate) fn vcpu_destroyed(vcpu_id: u64) {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// A logical task handed to the executor pool owns no vCPU: its backend
+/// carries no executor vCPU identity and its CPU is staged data.
 pub(crate) fn audit_hvpatch_executor_boundary(
     state: &HvfVmState,
-    mailbox: &MailboxBinding,
+    vcpu_is_staged: bool,
 ) -> Result<(), TrapError> {
-    if state.reclaim_authority == ReclaimParkAuthority::Live {
+    if state.executor_vcpu.is_some() {
         return Err(TrapError::Hypervisor(
             "HVF executor boundary retained live vCPU authority".to_owned(),
         ));
     }
-    if !mailbox.is_released_for_executor_boundary() {
+    if !vcpu_is_staged {
         return Err(TrapError::Hypervisor(
-            "HVF executor boundary retained mailbox slot".to_owned(),
+            "HVF executor boundary retained a live vCPU and mailbox slot".to_owned(),
         ));
     }
     Ok(())
@@ -1019,6 +1033,24 @@ pub fn dump_kick_stats() {
     );
 }
 
+/// A persistent executor's live vCPU: its id, the handle `hv_vcpus_exit`
+/// needs, and its census entry.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct ExecutorVcpuIdentity {
+    pub(crate) handle: applevisor::vcpu::VcpuHandle,
+    _census: carrick_hal::VcpuLiveGuard,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ExecutorVcpuIdentity {
+    pub(crate) fn of(vcpu: &applevisor::vcpu::Vcpu) -> Self {
+        Self {
+            handle: vcpu.get_handle(),
+            _census: vcpu_census().created(),
+        }
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct HvfVmState {
     pub(crate) _vm:
@@ -1029,20 +1061,16 @@ pub(crate) struct HvfVmState {
     /// This is executor-local authority: load/save swaps it with the worker,
     /// while a logical task binding always carries `None`.
     pub(crate) carrier_mappings: Option<std::sync::Arc<PersistentCarrierMappings>>,
-    /// Executor-local lifecycle only. Task registers are owned exclusively by
-    /// the Kernel's typed execution lease and never stashed in this backend.
-    pub(crate) reclaim_authority: ReclaimParkAuthority,
     /// Carrick-owned logical mailbox slots shared by every vCPU in this VM.
     /// Slot identity is deliberately independent of opaque/recycled HVF ids.
     pub(crate) mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     /// Internal diagnostic transport selection, parsed once before first entry
     /// and inherited by every sibling/rebuild. This is not public CLI policy.
     pub(crate) syscall_transport: HvfSyscallTransport,
-    /// Raw worker-local vCPU identity used by teardown and exact kick audit.
-    pub(crate) vcpu_id: applevisor_sys::hv_vcpu_t,
-    /// Cloneable worker-local handle for `hv_vcpus_exit`.
-    pub(crate) vcpu_handle: applevisor::vcpu::VcpuHandle,
-    pub(crate) _vcpu_guard: Option<carrick_hal::VcpuLiveGuard>,
+    /// The executor's own live vCPU. `None` for a logical task's backend (a
+    /// staged root, or any task between executor loads): load/save swaps it
+    /// with the worker, so a task never owns a vCPU.
+    pub(crate) executor_vcpu: Option<ExecutorVcpuIdentity>,
     pub(crate) cached_fork_alias_snapshot: parking_lot::Mutex<Option<ForkAliasSnapshot>>,
     /// Fresh host anonymous mappings the most recent `build_process_spec`
     /// created for the child (`ProcessMappingHost::Owned`); pooled root slots
@@ -1070,7 +1098,7 @@ pub(crate) struct ForkAliasSnapshot {
 
 /// Every backend field whose authority follows a logical HVPatch task rather
 /// than a Task4 worker. Keeping this as one value makes load/save a literal
-/// swap: the carrier VM, reclaim/mailbox transport, and live vCPU identity stay
+/// swap: the carrier VM, mailbox transport, and live vCPU identity stay
 /// on the worker while MM mappings, stage-1, inventory, and per-thread COW
 /// authority move with the binding.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1917,11 +1945,9 @@ impl HvfVmState {
         }
         std::mem::swap(&mut self._vm, &mut other._vm);
         std::mem::swap(&mut self.carrier_mappings, &mut other.carrier_mappings);
-        std::mem::swap(&mut self.reclaim_authority, &mut other.reclaim_authority);
         std::mem::swap(&mut self.mailbox_slots, &mut other.mailbox_slots);
         std::mem::swap(&mut self.syscall_transport, &mut other.syscall_transport);
-        std::mem::swap(&mut self.vcpu_id, &mut other.vcpu_id);
-        std::mem::swap(&mut self.vcpu_handle, &mut other.vcpu_handle);
+        std::mem::swap(&mut self.executor_vcpu, &mut other.executor_vcpu);
     }
 }
 
@@ -6075,8 +6101,8 @@ impl HvfVmState {
 
     /// A `Send`/`Sync` kick handle for THIS thread's live vCPU. The engine's
     /// `ThreadedEngine::kick_handle` routes through the Vmm, which does not hold
-    /// the vCPU, so HVF stashes the handle on every vCPU create (see the
-    /// `vcpu_handle` field) and hands it out here.
+    /// the vCPU, so the handle follows the task's live-vCPU slot, which each
+    /// executor attach republishes from its `executor_vcpu`.
     pub(crate) fn vcpu_kick_handle(&self) -> crate::vcpu_kick::VcpuKickHandle {
         crate::vcpu_kick::VcpuKickHandle::following(std::sync::Arc::clone(&self.task.live_vcpu))
     }
@@ -6085,7 +6111,10 @@ impl HvfVmState {
     /// Called on every attach and whenever the vCPU is recreated underneath a
     /// loaded task, so registered kick handles keep following the task.
     pub(crate) fn publish_live_vcpu(&self) {
-        self.task.live_vcpu.publish(self.vcpu_handle.clone());
+        match self.executor_vcpu.as_ref() {
+            Some(vcpu) => self.task.live_vcpu.publish(vcpu.handle.clone()),
+            None => self.task.live_vcpu.clear(),
+        }
     }
 
     /// The task is leaving this vCPU; a kick registered for it now has nothing
@@ -6953,12 +6982,9 @@ impl HvfVmState {
                 registration: None,
             },
             carrier_mappings: None,
-            reclaim_authority: ReclaimParkAuthority::Live,
             mailbox_slots: plan.mailbox_slots,
             syscall_transport: plan.syscall_transport,
-            vcpu_id: vcpu.id(),
-            vcpu_handle: vcpu.get_handle(),
-            _vcpu_guard: Some(vcpu_census().created()),
+            executor_vcpu: Some(ExecutorVcpuIdentity::of(&vcpu)),
             cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
             last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
             last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
@@ -7080,7 +7106,7 @@ impl HvfVmState {
             inventory.process_commit = Some(process_reservation.commit(()));
         }
         state.pending_fork_frame_receipts = pending_fork_frame_receipts;
-        Ok((state, vcpu, mailbox))
+        Ok((state, vcpu.into_inner(), mailbox))
     }
 
     fn global_frame_exec_plan(&self, plan: &GuestMappingPlan) -> Result<GlobalExecPlan, TrapError> {

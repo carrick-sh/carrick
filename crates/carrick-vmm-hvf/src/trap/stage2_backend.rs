@@ -491,18 +491,6 @@ fn raw_vm_destroy_is_custody_transaction_gated() {
 
 #[cfg(test)]
 #[test]
-fn reclaim_park_authority_contains_no_task_snapshot() {
-    let mut authority = ReclaimParkAuthority::Live;
-    authority.mark_vcpu_parked().unwrap();
-    assert_eq!(authority, ReclaimParkAuthority::VcpuParked);
-    assert!(authority.destination_vcpu_is_live().is_err());
-    authority.mark_live_after_recreate().unwrap();
-    assert_eq!(authority, ReclaimParkAuthority::Live);
-    assert!(authority.destination_vcpu_is_live().is_ok());
-}
-
-#[cfg(test)]
-#[test]
 fn carrier_exit_without_a_vm_is_a_recorded_no_op() {
     use carrick_observability::vm_lifecycle::{VmLifecycleOperation, process_snapshot};
     fn destroy_events() -> usize {
@@ -1042,8 +1030,8 @@ pub(crate) fn hvf_mem_perms(perms: carrick_hal::MemPerms) -> applevisor::memory:
 
 /// The HVF concurrent-vCPU budget for the bounded M:N scheduler the engine
 /// installs via `GuestVmBackend::vcpu_budget`: physical host cores, capped by
-/// HVF's usable per-VM vCPU ceiling. Reclaim recycles vCPUs so >budget guest
-/// threads run instead of hanging. macOS/HVF-only: `vcpu_gate` (and the whole HVF
+/// HVF's usable per-VM vCPU ceiling. The persistent executor pool is sized from it
+/// before the VM's first run. macOS/HVF-only: `vcpu_gate` (and the whole HVF
 /// backend) is cfg'd out off the HVF lane, and the only caller (the new module's
 /// `GuestVmBackend::vcpu_budget`) is macOS-only too.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

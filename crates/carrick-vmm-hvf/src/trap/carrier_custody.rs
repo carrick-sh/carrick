@@ -107,7 +107,7 @@ pub(crate) fn drive_pending_carrier_vm_cleanup(
             raw_vm_destroyed,
             context,
         },
-        |id| unsafe { applevisor_sys::hv_vcpu_destroy(id) },
+        |id| destroy_raw_vcpu(id, VcpuDestroySite::CreationRollback),
         |custody, generation, context| {
             destroy_vm_with_custody_target(
                 custody,
@@ -145,13 +145,13 @@ pub(crate) fn drive_pending_carrier_vm_cleanup_using(
         context,
     } = state;
     if let Some(id) = *vcpu_id {
+        // `destroy_vcpu` reports a successful destroy itself (`destroy_raw_vcpu`).
         let rc = destroy_vcpu(id);
         if rc != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "{context}: hv_vcpu_destroy rc={rc:#x}; exact vCPU cleanup retained"
             )));
         }
-        vcpu_destroyed(id);
         *vcpu_id = None;
     }
     if !*raw_vm_destroyed {
@@ -215,8 +215,12 @@ pub(crate) fn prepare_initial_carrier_before_admission<T, U>(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum SetupVcpuCleanup {
+    /// The pending VM-creation transaction destroys the recorded vCPU with its
+    /// VM on rollback.
     PendingRaw,
-    LocalRaii,
+    /// The vCPU's own setup failed before it ran: destroy it through
+    /// `destroy_raw_vcpu` (`VcpuDestroySite::CreationError`).
+    DestroyOnError,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -301,31 +305,14 @@ impl std::ops::Deref for SetupVcpuGuard {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn complete_local_vcpu_raii_cleanup(
-    id: applevisor_sys::hv_vcpu_t,
-    drop_wrapper: impl FnOnce(),
-    record_destroyed: impl FnOnce(applevisor_sys::hv_vcpu_t),
-) {
-    drop_wrapper();
-    record_destroyed(id);
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for SetupVcpuGuard {
     fn drop(&mut self) {
         if !self.armed || self.cleanup == SetupVcpuCleanup::PendingRaw {
             return;
         }
-        let id = self.vcpu.id();
-        complete_local_vcpu_raii_cleanup(
-            id,
-            || {
-                // SAFETY: the local-reuse lane has no Pending transaction. Its
-                // ordinary applevisor RAII destruction remains the sole HV owner.
-                unsafe { std::mem::ManuallyDrop::drop(&mut self.vcpu) };
-            },
-            vcpu_destroyed,
-        );
+        // The wrapper stays in `ManuallyDrop`: applevisor's destructor never
+        // runs, and the one raw destroy funnel reports the destroy.
+        let _ = destroy_raw_vcpu(self.vcpu.id(), VcpuDestroySite::CreationError);
         self.armed = false;
     }
 }
@@ -1682,22 +1669,6 @@ mod carrier_vm_custody_tests {
             include_str!("mapping_plan.rs"),
             include_str!("persistent_executor.rs")
         );
-        let shared_wait = source
-            .split(concat!("pub(crate) fn shared_wait_", "resume("))
-            .nth(1)
-            .and_then(|tail| {
-                tail.split(concat!("pub(crate) fn destroy_vcpu_", "on_thread_exit"))
-                    .next()
-            })
-            .expect("shared-wait resume body");
-        let shared_rebind = shared_wait
-            .rfind("reconcile_global_frame_owners_after_replay_in(")
-            .expect("shared-wait owner rebind");
-        let shared_entry = shared_wait
-            .find("self.reacquire_mailbox_after_vcpu_create")
-            .expect("shared-wait guest-entry preparation");
-        assert!(shared_rebind < shared_entry);
-
         let initial = source
             .split(concat!("fn new_with_", "plan_inner("))
             .nth(1)
@@ -1710,7 +1681,7 @@ mod carrier_vm_custody_tests {
             .find("reconcile_global_frame_owners_after_replay_in(")
             .expect("initial carrier owner reconciliation");
         let initial_entry = initial
-            .find("// Start PC:")
+            .find("StagedCpu::initial_root(plan)")
             .expect("initial guest entry setup");
         assert!(initial_rebind < initial_entry);
 
@@ -3405,27 +3376,6 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
-    fn carrier_reuse_vcpu_failure_drops_wrapper_then_releases_accounting_once() {
-        let order = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        struct DropProbe(std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>);
-        impl Drop for DropProbe {
-            fn drop(&mut self) {
-                self.0.lock().push("wrapper-drop");
-            }
-        }
-        let wrapper = DropProbe(std::sync::Arc::clone(&order));
-        super::complete_local_vcpu_raii_cleanup(
-            71,
-            || drop(wrapper),
-            |id| {
-                assert_eq!(id, 71);
-                order.lock().push("accounting-release");
-            },
-        );
-        assert_eq!(&*order.lock(), &["wrapper-drop", "accounting-release"]);
-    }
-
-    #[test]
     fn fresh_vm_vcpu_and_permit_wrappers_remain_guarded_until_commit_static_audit() {
         let source = concat!(
             include_str!("../trap.rs"),
@@ -3447,31 +3397,13 @@ mod carrier_vm_custody_tests {
             "permit ownership must be armed before any fallible custody transition"
         );
 
-        let shared = source
-            .split(concat!("fn shared_wait_resume_", "inner("))
-            .nth(1)
-            .and_then(|tail| {
-                tail.split("pub(crate) fn destroy_vcpu_on_thread_exit")
-                    .next()
-            })
-            .expect("shared-wait rebuild body");
-        assert!(shared.contains("SetupVmGuard::new(new_vm, true)"));
-        assert!(shared.contains("SetupVcpuCleanup::PendingRaw"));
-        assert!(
-            shared
-                .find("commit_pending_creation_before_vcpu_handoff")
-                .expect("shared commit")
-                < shared
-                    .find("new_vcpu.into_inner()")
-                    .expect("shared handoff")
-        );
-
         let exec = include_str!("execve_rebuild.rs")
             .split(concat!("fn execve_rebuild_", "inner("))
             .nth(1)
             .expect("exec rebuild body");
         assert!(exec.contains("SetupVmGuard::new(new_vm, true)"));
-        assert!(exec.contains("SetupVcpuCleanup::PendingRaw"));
+        // `create_vcpu_with_permit` hands back a `PendingRaw` guard.
+        assert!(exec.contains("create_vcpu_with_permit(&new_vm, permit)"));
         let commit = exec
             .rfind("commit_pending_creation_before_vcpu_handoff")
             .expect("exec commit");
@@ -3970,10 +3902,6 @@ mod carrier_vm_custody_tests {
             (
                 concat!("pub(crate) fn new_with_", "plan("),
                 "Self::new_with_plan_inner",
-            ),
-            (
-                concat!("pub(crate) fn shared_wait_", "resume("),
-                "self.shared_wait_resume_inner",
             ),
             (
                 concat!("pub(crate) fn execve_", "rebuild("),

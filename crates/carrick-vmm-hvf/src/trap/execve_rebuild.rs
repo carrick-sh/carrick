@@ -1242,11 +1242,11 @@ impl HvfVmState {
             extents
         } else {
             // Mature VMM behavior: tear down the current HVF VM and rebuild it.
-            let inherited_vcpu_id = vcpu.id();
-            let vcpu_destroy_rc = unsafe { applevisor_sys::hv_vcpu_destroy(inherited_vcpu_id) };
-            if vcpu_destroy_rc == 0 {
-                self._vcpu_guard = None;
-                vcpu_destroyed(inherited_vcpu_id);
+            // The whole VM is torn down with its one vCPU; the rebuilt VM is a
+            // new topology generation.
+            begin_carrier_vcpu_teardown();
+            if destroy_raw_vcpu(vcpu.id(), VcpuDestroySite::ExecveRebuild) == 0 {
+                self.executor_vcpu = None;
             }
             destroy_vm_with_custody(&self.carrier_foreign_mm_transport.custody, "execve_rebuild")?;
 
@@ -1261,10 +1261,7 @@ impl HvfVmState {
                 &[],
                 true,
             )?;
-            let new_vcpu = SetupVcpuGuard::new(
-                create_vcpu_with_permit(&new_vm, permit)?,
-                SetupVcpuCleanup::PendingRaw,
-            );
+            let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
             let creation = pending_creation.as_mut().ok_or_else(|| {
                 TrapError::Hypervisor("exec creation transaction disappeared".to_owned())
             })?;
@@ -1402,7 +1399,6 @@ impl HvfVmState {
             drop_backings_started,
         );
         let page_tables_started = std::time::Instant::now();
-        self.reclaim_authority = ReclaimParkAuthority::Live;
         self.last_exit_class = 0;
         self.last_fault_esr = 0;
         self.is_forked_child = was_forked_child;
@@ -1800,9 +1796,7 @@ impl HvfVmState {
                 )
             })?;
             commit_pending_creation_before_vcpu_handoff(pending_creation)?;
-            self._vcpu_guard = Some(vcpu_census().created());
-            self.vcpu_id = new_vcpu.id();
-            self.vcpu_handle = new_vcpu.get_handle();
+            self.executor_vcpu = Some(ExecutorVcpuIdentity::of(&new_vcpu));
             self.publish_live_vcpu();
             std::mem::forget(std::mem::replace(vcpu, new_vcpu.into_inner()));
             replace_destroyed_vm(self, new_vm.into_inner());

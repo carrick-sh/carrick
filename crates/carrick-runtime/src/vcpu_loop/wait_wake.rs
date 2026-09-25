@@ -1009,6 +1009,10 @@ impl HvpatchRuntimeDirectory {
             }
         }
         let process_result = self.join_all_process_threads();
+        // Carrier teardown: the executors' vCPUs are destroyed with the VM from
+        // here on, and only from here on (EL1 plan 1a D2).
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        carrick_vmm_hvf::trap::begin_carrier_vcpu_teardown();
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let pool_result = self.shutdown_persistent_pool();
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

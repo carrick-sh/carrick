@@ -70,12 +70,13 @@ pub(crate) fn hvf_cap_budget() -> usize {
 /// (10 physical cores, HVF ceiling 63): with the clamp, 23 clone children pass
 /// the vCPU gate, only 17 ever get a scheduler slot, and the 6 that do not make
 /// their parents' 10 s start gate expire into `std::process::abort()` -- 4 runs
-/// out of 4. `CARRICK_HVF_VCPU_RECLAIM=0`, which admits one live HVF vCPU per
-/// guest thread and so removes the bound entirely, passes the same test in
-/// under a second.
+/// out of 4. Removing the bound entirely (the since-retired reclaim hatch set
+/// to 0) passed the same test in under a second.
 ///
-/// Reclaim still matters above this ceiling: HVF caps concurrent vCPUs, and
-/// guests do exceed it (CPython `test_queue.test_many_threads` spawns 100).
+/// The HVPatch executor pool is sized from this budget once, before the VM's
+/// first run, and every executor keeps its vCPU for the VM's life (EL1 plan 1a
+/// D2): guest threads above the budget are scheduled onto those executors,
+/// never given vCPUs of their own.
 pub(crate) fn budget_from_limits(hvf_budget: usize, physical_cores: usize) -> usize {
     let _ = physical_cores;
     hvf_budget.max(1)

@@ -5120,9 +5120,9 @@ where
         let start_gate = prepared_task.start_gate;
         let thread = Arc::clone(context.thread());
 
-        // Initial-runner park has stopped/destroyed its vCPU. Only now may the
-        // factory take the owning carrier mappings: every failure below
-        // can drop them without unmapping stage-2 under a live bootstrap vCPU.
+        // The root's CPU state is staged data and it owns no vCPU (every vCPU
+        // lives for the VM's life, EL1 plan 1a D2), so the factory may take
+        // the owning carrier mappings: every failure below can drop them.
         let authority = match (&mut engine as &mut dyn std::any::Any).downcast_mut::<HvfEngine>() {
             Some(engine) => {
                 match carrick_vmm_hvf::hvf_aarch64_engine::persistent_executor_factory_authority(
@@ -5162,9 +5162,11 @@ where
                 )));
             }
         };
-        let (task_backend, parked_vcpu) =
+        let (task_backend, staged_cpu) =
             carrick_vmm_hvf::hvf_aarch64_engine::split_initial_task_engine(hvf_engine);
-        drop(parked_vcpu);
+        // The staged registers already travel in `exact_cpu`; the staged
+        // stage-1 maintenance debt travels in `task_backend`.
+        drop(staged_cpu);
 
         let (execution_lease, injected_lease) = ExecutionLeaseCell::injected();
         let process_members = threads.clone();

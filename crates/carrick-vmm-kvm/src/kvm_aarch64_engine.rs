@@ -494,18 +494,6 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         KvmKickHandle::for_current_thread()
     }
 
-    fn save_guest_state(
-        &mut self,
-        _vcpu: &mut Self::Vcpu,
-    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
-        // KVM aarch64 does NOT reclaim (`reclaims()` is the default `false`), so
-        // the M:N save/rebind round-trip is never exercised on this path. Surface a
-        // clear error rather than silently corrupting state if it ever is.
-        Err(TrapError::Hypervisor(
-            "kvm-aarch64: save_guest_state called but this backend does not reclaim".into(),
-        ))
-    }
-
     fn build_sibling_builder(
         &self,
         // KVM's sibling shares the parent VM (Arc handle) + window descriptors, so it
@@ -564,7 +552,7 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         Arc::new(KvmKicker::new())
     }
 
-    // process_exit_cleanup / handle_memory_exit / rebind_to_slot keep their trait
+    // process_exit_cleanup / handle_memory_exit keep their trait
     // defaults: KVM's RAM is released by the OS on `_exit`, siblings share one VM
     // (no lazy-alias re-map), and this backend does not reclaim.
 }

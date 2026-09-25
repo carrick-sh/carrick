@@ -761,23 +761,6 @@ pub(crate) fn pin_exact_live_global_frame_owner_in(
     still_current.then_some(pin)
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn global_frame_owner_is_replayable_in(
-    custody: &CarrierVmCustody,
-    ipa: u64,
-    length: u64,
-    host_addr: usize,
-    generation: u64,
-) -> bool {
-    match custody.global_frame_host_owners.lock().get(&(ipa, length)) {
-        Some(GlobalFrameOwnerEntry::Live(owner)) => {
-            owner.host_addr() == host_addr && (generation == 0 || owner.generation() == generation)
-        }
-        Some(GlobalFrameOwnerEntry::RetirementPending { .. }) => false,
-        None => generation == 0,
-    }
-}
-
 // SAFETY: the mapping is process-address-space state. Its address is stable,
 // HVF and guest-memory access already cross host threads, and explicit custody
 // retirement serializes stage-2 unmap before the final owning Arc is removed.

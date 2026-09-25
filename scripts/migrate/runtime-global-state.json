@@ -555,14 +555,6 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
-      "symbol": "hvf_vcpu_reclaim_enabled::CARRICK_HVF_VCPU_RECLAIM",
-      "fingerprint": "5bc60d9e4c097ce1c91b2f65b4d74e267b0207ad56c845b056865ed8f76d2f86",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVF_VCPU_RECLAIM read in hvf_vcpu_reclaim_enabled::CARRICK_HVF_VCPU_RECLAIM (crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "atomic_permit_enabled::CARRICK_HVF_ATOMIC_PERMIT",
       "fingerprint": "7c1104910ed6f736c037002331d4485a6a5586982025257244ca54fb28cd25cf",
@@ -2164,30 +2156,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "VCPU_RECLAIMS",
-      "fingerprint": "9c9eed3496910025a3cbb1adf8b5b2440d9415429ca7a3314d7ca6783401e87d",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static VCPU_RECLAIMS in crates/carrick-runtime/src/vcpu_loop/mod.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "VCPU_RECLAIM_PARK_NS",
-      "fingerprint": "736f1990bdfdc6d48514e2cced072ead1b82e8b36f385139d9f53e7779670b98",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static VCPU_RECLAIM_PARK_NS in crates/carrick-runtime/src/vcpu_loop/mod.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "VCPU_RECLAIM_RESUME_NS",
-      "fingerprint": "f671eefff793694121ac98e634504092682b760dd31a4008b0c47de8e30fd20f",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static VCPU_RECLAIM_RESUME_NS in crates/carrick-runtime/src/vcpu_loop/mod.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "symbol": "macos_helper_stubs::execve_trace_filter::FILTER",
       "fingerprint": "8f561fa7f46f8336b60e37897fe253a69245320364c3abfb867389253efcdde7",
       "classification": "config_debug",
@@ -2483,14 +2451,6 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
-      "symbol": "hvf_vcpu_reclaim_enabled::ENABLED",
-      "fingerprint": "d3bce58c23c5a39148597c742d4efc3d23c0c671f159649ee582aae719dda689",
-      "classification": "config_debug",
-      "rationale": "Process-global configuration or failpoint cache hvf_vcpu_reclaim_enabled::ENABLED in crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs initialized from environment flags."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/lib.rs",
       "symbol": "fork_test_lock::LOCK",
       "fingerprint": "288018efe95a37fd564fc0b6a228d27fb76843c5fbcd9babdf360756b9e69102",
@@ -2560,6 +2520,14 @@
       "fingerprint": "c6b2d904a486d53a7f3464038b030622712a7be1715d8f1dae7bf58c3df6579b",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static VCPU_DESTROYED_TOTAL in crates/carrick-vmm-hvf/src/trap.rs counting the carrier VM's reported vCPU destroys for the vCPU lifetime census."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/vcpu_topology.rs",
+      "symbol": "carrier_vcpu_topology::TOPOLOGY",
+      "fingerprint": "216999d50e5af27fd902fece5bc84652163d08f4cf74c99a152c15adc1cbdd2c",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide vCPU topology lifetime of the one Hypervisor.framework VM this process may own (EL1 plan 1a D2): gates every hv_vcpu_create, first hv_vcpu_run and hv_vcpu_destroy against the VM generation's phase."
     },
     {
       "kind": "static",
@@ -3071,7 +3039,7 @@
       "symbol": "SYSTEM_CHARGE_WINDOW",
       "fingerprint": "761f744a623027ad2ff9fefe442521860f8fcfae43bd03d5dd2c8dbd9b920fee",
       "classification": "carrier_infra",
-      "rationale": "Host thread-local cell SYSTEM_CHARGE_WINDOW in crates/carrick-runtime/src/kernel/objects.rs holding this HOST thread's open system-CPU charge window for the logical guest thread its executor is currently running. It is per-host-thread by construction \u2014 the CLOCK_THREAD_CPUTIME_ID reading it brackets describes this host thread and no other \u2014 and it selects no container state: the logical thread it charges is named by a WEAK reference that every use upgrades, so it neither keeps a retired Thread alive nor can be aliased by a recycled allocation, and the executor closes it at every boundary audit."
+      "rationale": "Host thread-local cell SYSTEM_CHARGE_WINDOW in crates/carrick-runtime/src/kernel/objects.rs holding this HOST thread's open system-CPU charge window for the logical guest thread its executor is currently running. It is per-host-thread by construction — the CLOCK_THREAD_CPUTIME_ID reading it brackets describes this host thread and no other — and it selects no container state: the logical thread it charges is named by a WEAK reference that every use upgrades, so it neither keeps a retired Thread alive nor can be aliased by a recycled allocation, and the executor closes it at every boundary audit."
     },
     {
       "kind": "thread_local",
