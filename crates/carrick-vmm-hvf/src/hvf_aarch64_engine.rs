@@ -145,7 +145,7 @@ enum HvfVcpuBacking {
 /// the `set_simd_fp_reg_v` C-shim (the u128-by-value ABI-bug workaround).
 /// `run()` decodes HVF's native exit into the neutral `Aarch64Exit`.
 ///
-/// A root is born [`HvfVcpuBacking::Staged`]: its bring-up programs registers
+/// A root is born staged: its bring-up programs registers
 /// as data and any stage-1 maintenance it asks for is owed to its first live
 /// executor. A staged vCPU cannot run, be kicked into, or carry a syscall.
 pub struct HvfAarch64Vcpu {
