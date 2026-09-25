@@ -85,6 +85,7 @@ pub mod deadlock_watchdog;
 pub mod dispatch;
 pub mod el1_delegation;
 pub mod el1_inotify;
+pub mod el1_zone;
 pub mod event_mux;
 pub mod event_ring;
 pub(crate) mod eventfd_shm;

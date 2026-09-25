@@ -670,6 +670,33 @@ pub enum DispatchOutcome {
         timeout: Option<Duration>,
         index: i64,
     },
+    /// A private `FUTEX_WAIT`/`FUTEX_WAIT_BITSET` (or the waited entry of a
+    /// `futex_waitv`) of a process whose private futexes the in-guest zone
+    /// serves ([`crate::el1_zone`]). The runtime parks the thread in the zone
+    /// queue for `(zone mm, uaddr)` after re-checking the word under the
+    /// bucket lock (`EAGAIN` if it changed), so a waker in either venue finds
+    /// it; a wake completes it with `index`.
+    ///
+    /// Backend: park in the zone (capturing the thread's EL0 context) and
+    /// suspend on its zone continuation; complete with `index` when woken,
+    /// `-ETIMEDOUT` at `timeout`, `-EINTR` for a signal.
+    ZoneFutexWait {
+        uaddr: u64,
+        value: u32,
+        bitset: u32,
+        timeout: Option<Duration>,
+        index: u32,
+    },
+    /// A host wake (or requeue) on a zone process's private futex claimed
+    /// `woken`; the syscall returns `value`.
+    ///
+    /// Backend: hand every woken record back to its thread, then complete
+    /// with `value`.
+    ZoneFutexWoken {
+        value: i64,
+        #[serde(skip)]
+        woken: Vec<carrick_el1_abi::RecordRef>,
+    },
     /// A `FUTEX_WAIT` on a genuine `MAP_SHARED` file mapping — an inter-PROCESS
     /// rendezvous (LTP `tst_checkpoint`). The in-process parking-lot table can't
     /// reach a waker in another carrick process, so the runtime blocks on the

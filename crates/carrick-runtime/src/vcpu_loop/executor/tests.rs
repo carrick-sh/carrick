@@ -304,6 +304,9 @@ impl PersistentTaskBinding for FakeBinding {
                 super::residency::TaskCpuResidency::Materialized(cpu) => {
                     return Ok(Some(cpu.clone()));
                 }
+                super::residency::TaskCpuResidency::Zone { base, record } => {
+                    return super::residency::materialize_zone(base, *record).map(Some);
+                }
                 super::residency::TaskCpuResidency::Resident { .. } => {
                     let now = std::time::Instant::now();
                     if now >= deadline {

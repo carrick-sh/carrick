@@ -5,17 +5,28 @@
 
 use super::*;
 
+/// `CLONE_CHILD_CLEARTID` at thread exit: clear the word and wake one waiter.
+/// A zone process's waiters are in the in-guest zone's queue (`zone`), whose
+/// woken records `handback` returns to their threads.
 pub(super) fn clear_persistent_child_tid_and_wake<M: carrick_guest_mem::CurrentMmMemory>(
     memory: &mut M,
     registry: &ThreadRegistry,
     futex: &FutexTable,
     tid: ThreadId,
+    zone: Option<(&'static carrick_el1_abi::ZoneTables, u64)>,
+    handback: impl FnOnce(&[carrick_el1_abi::RecordRef]),
 ) {
     if let Some(address) = registry.clear_child_tid(tid)
         && address != 0
     {
         let _ = memory.write_bytes(address, &0_i32.to_le_bytes());
-        let woken = futex.wake(address, 1);
+        let woken = if let Some((zone, mm)) = zone {
+            let woken = carrick_kernel::el1_zone::wake(zone, mm, address, u32::MAX, 1);
+            handback(&woken);
+            woken.len() as u32
+        } else {
+            futex.wake(address, 1)
+        };
         carrick_kernel::event_ring::rec_futex_wake(address, woken);
     }
 }
@@ -759,7 +770,14 @@ where
     ) -> bool {
         let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 1);
-        clear_persistent_child_tid_and_wake(engine, &self.registry, &self.futex, self.this_tid);
+        clear_persistent_child_tid_and_wake(
+            engine,
+            &self.registry,
+            &self.futex,
+            self.this_tid,
+            zone::zone_for(self.zone_mm),
+            |woken| zone::publish_zone_handbacks(kernel, woken),
+        );
         let last = self.registry.exit(self.this_tid);
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 2);
         carrick_kernel::run_state::clear_guest_tid(self.this_tid.raw());

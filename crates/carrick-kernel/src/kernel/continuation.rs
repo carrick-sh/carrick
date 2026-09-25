@@ -473,6 +473,12 @@ fn detail_diagnostic(detail: &ContinuationDetail) -> String {
         ContinuationDetail::Futex { wait, index } => {
             format!("futex addr={:#x} index={index:?}", wait.addr)
         }
+        ContinuationDetail::Zone(wait) => format!(
+            "zone record={}#{} armed_seq={}",
+            wait.record.id.raw(),
+            wait.record.incarnation,
+            wait.armed_seq
+        ),
         ContinuationDetail::SharedFutex {
             generation, value, ..
         } => format!("shared-futex addr={:#x} value={value}", generation.addr),
@@ -530,6 +536,10 @@ fn detail_diagnostic(detail: &ContinuationDetail) -> String {
 fn probe_diagnostic(probe: &ReadinessProbe) -> (String, Vec<DiagnosticPollFd>) {
     match probe {
         ReadinessProbe::Futex { wait, .. } => (format!("futex addr={:#x}", wait.addr), Vec::new()),
+        ReadinessProbe::Zone { record, .. } => (
+            format!("zone record={}#{}", record.id.raw(), record.incarnation),
+            Vec::new(),
+        ),
         ReadinessProbe::Fds { registrations, .. } => (
             format!("fds n={}", registrations.len()),
             registrations
@@ -706,12 +716,51 @@ fn fd_wait_deadline(
         })
 }
 
+/// A thread parked in the in-guest scheduler zone ([`crate::el1_zone`]).
+/// The zone record, not this continuation, owns the thread's register
+/// context and decides how the wait ended ([`carrick_el1_abi::Handback`]);
+/// this continuation is the host's handle for waking it and for signals,
+/// timeouts and teardown, each of which must first win the record's claim.
+#[derive(Debug)]
+pub struct ZoneWait {
+    pub record: carrick_el1_abi::RecordRef,
+    /// The park whose deadline this continuation arms (a timeout claims only
+    /// that park; a later in-guest park of the same thread is untimed).
+    pub armed_seq: u32,
+    /// Set when the runtime resumed the thread from the record, which it then
+    /// frees; otherwise dropping the continuation retires the record.
+    consumed: std::sync::atomic::AtomicBool,
+}
+
+impl ZoneWait {
+    pub fn new(record: carrick_el1_abi::RecordRef, armed_seq: u32) -> Self {
+        Self {
+            record,
+            armed_seq,
+            consumed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn mark_consumed(&self) {
+        self.consumed.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for ZoneWait {
+    fn drop(&mut self) {
+        if !self.consumed.load(Ordering::Acquire) {
+            crate::el1_zone::cancel(self.record);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ContinuationDetail {
     Futex {
         wait: FutexWait,
         index: Option<i64>,
     },
+    Zone(ZoneWait),
     SharedFutex {
         location: SharedFutexLocation,
         waiter_key: usize,
@@ -839,6 +888,7 @@ impl Drop for ContinuationState {
 
 #[derive(Debug)]
 pub enum BlockedContinuation {
+    ZoneFutexWait(ContinuationState),
     FutexWait(ContinuationState),
     FutexWaitv(ContinuationState),
     SharedFutexWait(ContinuationState),
@@ -862,6 +912,7 @@ pub enum BlockedContinuation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContinuationFamily {
+    ZoneFutexWait,
     FutexWait,
     FutexWaitv,
     SharedFutexWait,
@@ -888,6 +939,7 @@ impl ContinuationFamily {
     /// depending on Rust's enum layout: cores and LLDB scripts outlive builds.
     pub const fn event_code(self) -> u8 {
         match self {
+            Self::ZoneFutexWait => 22,
             Self::FutexWait => 1,
             Self::FutexWaitv => 2,
             Self::SharedFutexWait => 3,
@@ -915,6 +967,7 @@ impl ContinuationFamily {
     /// than derived from the Rust variant.
     pub(crate) const fn wire_name(self) -> &'static str {
         match self {
+            Self::ZoneFutexWait => "zone-futex-wait",
             Self::FutexWait => "futex-wait",
             Self::FutexWaitv => "futex-waitv",
             Self::SharedFutexWait => "shared-futex-wait",
@@ -1325,7 +1378,11 @@ impl BlockedContinuation {
             | DispatchOutcome::ThreadExit { .. }
             | DispatchOutcome::SignalThread { .. }
             | DispatchOutcome::SharedFutexWake { .. }
-            | DispatchOutcome::SharedFutexRequeue { .. } => {
+            | DispatchOutcome::SharedFutexRequeue { .. }
+            // A zone wait is built by `from_zone_park` once the runtime has
+            // parked the thread; a zone wake completes at once.
+            | DispatchOutcome::ZoneFutexWait { .. }
+            | DispatchOutcome::ZoneFutexWoken { .. } => {
                 return Err(ContinuationBuildError::NonBlockingOutcome);
             }
         })
@@ -1368,9 +1425,48 @@ impl BlockedContinuation {
         }))
     }
 
+    /// The continuation of a thread the runtime parked in the in-guest zone
+    /// (a host park, or an in-guest park settled at an executor exit). `wait`
+    /// names the record and the park its `timeout` belongs to.
+    pub fn from_zone_park(
+        capture: ContinuationCapture,
+        wait: ZoneWait,
+        timeout: Option<Duration>,
+    ) -> Self {
+        let persistent_signal_mask = capture.persistent_signal_mask;
+        let restore_after_signal = capture.restore_after_signal;
+        let authority = ContinuationAuthority::from_capture(capture);
+        Self::ZoneFutexWait(ContinuationState {
+            id: ContinuationId(next_nonzero(&NEXT_CONTINUATION_ID)),
+            authority,
+            deadline: timeout.map(|value| Instant::now() + value),
+            outputs: Vec::new(),
+            signal_masks: SignalMaskContinuationState {
+                persistent: persistent_signal_mask,
+                temporary: None,
+                restore_after_signal,
+            },
+            detail: ContinuationDetail::Zone(wait),
+            resource_generation: next_nonzero(&NEXT_RESOURCE_GENERATION),
+            private_futex: None,
+            producer_completion: Arc::new(Mutex::new(None)),
+            registration: None,
+            cleanup: CleanupState::new(),
+        })
+    }
+
+    /// The zone record a zone wait parks on.
+    pub fn zone_wait(&self) -> Option<&ZoneWait> {
+        match &self.state().detail {
+            ContinuationDetail::Zone(wait) => Some(wait),
+            _ => None,
+        }
+    }
+
     pub(crate) fn state(&self) -> &ContinuationState {
         match self {
-            Self::FutexWait(state)
+            Self::ZoneFutexWait(state)
+            | Self::FutexWait(state)
             | Self::FutexWaitv(state)
             | Self::SharedFutexWait(state)
             | Self::SharedFutexWaitv(state)
@@ -1394,7 +1490,8 @@ impl BlockedContinuation {
 
     fn state_mut(&mut self) -> &mut ContinuationState {
         match self {
-            Self::FutexWait(state)
+            Self::ZoneFutexWait(state)
+            | Self::FutexWait(state)
             | Self::FutexWaitv(state)
             | Self::SharedFutexWait(state)
             | Self::SharedFutexWaitv(state)
@@ -1418,6 +1515,7 @@ impl BlockedContinuation {
 
     pub const fn family(&self) -> ContinuationFamily {
         match self {
+            Self::ZoneFutexWait(_) => ContinuationFamily::ZoneFutexWait,
             Self::FutexWait(_) => ContinuationFamily::FutexWait,
             Self::FutexWaitv(_) => ContinuationFamily::FutexWaitv,
             Self::SharedFutexWait(_) => ContinuationFamily::SharedFutexWait,
@@ -1459,6 +1557,7 @@ impl BlockedContinuation {
         !matches!(
             self,
             Self::VforkParent(_)
+                | Self::ZoneFutexWait(_)
                 | Self::FutexWait(_)
                 | Self::FutexWaitv(_)
                 | Self::SharedFutexWait(_)
@@ -1575,6 +1674,9 @@ impl BlockedContinuation {
         match &state.detail {
             ContinuationDetail::Futex { wait, index } => {
                 fingerprint ^= wait.addr ^ index.unwrap_or(0) as u64;
+            }
+            ContinuationDetail::Zone(wait) => {
+                fingerprint ^= u64::from(wait.record.id.raw()) ^ wait.record.incarnation;
             }
             ContinuationDetail::SharedFutex {
                 location,
@@ -1842,6 +1944,10 @@ impl BlockedContinuation {
         {
             service.consume_ready_exact(binding.token)?;
         }
+        // The runtime resumes a zone wait from its record and frees it.
+        if let ContinuationDetail::Zone(wait) = &self.state().detail {
+            wait.mark_consumed();
+        }
         let exact_file_slots_live = match &self.state().detail {
             ContinuationDetail::Fds {
                 file_table,
@@ -1915,6 +2021,9 @@ impl BlockedContinuation {
                 Some(DispatchOutcome::Errno { errno }) => ContinuationCompletion::Errno(errno),
                 Some(_) => ContinuationCompletion::Redispatch,
                 None => match family {
+                    // How a zone wait ended is the record's handback, which the
+                    // runtime applies; `Return(0)` only names "woken".
+                    ContinuationFamily::ZoneFutexWait => ContinuationCompletion::Return(0),
                     ContinuationFamily::FutexWait => ContinuationCompletion::Return(0),
                     ContinuationFamily::FutexWaitv => {
                         let index = match &self.state().detail {
@@ -2011,7 +2120,8 @@ impl BlockedContinuation {
                 },
             },
             ContinuationEvent::Timeout => match family {
-                ContinuationFamily::FutexWait
+                ContinuationFamily::ZoneFutexWait
+                | ContinuationFamily::FutexWait
                 | ContinuationFamily::FutexWaitv
                 | ContinuationFamily::SharedFutexWait
                 | ContinuationFamily::SharedFutexWaitv => {

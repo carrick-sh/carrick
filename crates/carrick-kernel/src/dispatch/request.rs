@@ -372,6 +372,10 @@ pub struct ThreadCtx<'a> {
     pub registry: &'a crate::thread::ThreadRegistry,
     pub futex: &'a crate::thread::FutexTable,
     pub work_scope: Option<&'a carrick_observability::work_meter::WorkScope>,
+    /// The in-guest scheduler zone serving this thread's process's private
+    /// futexes, with the process's zone key, when the carrier runs one
+    /// ([`crate::el1_zone`]). `None`: the private futex table serves them.
+    pub zone: Option<(&'static carrick_el1_abi::ZoneTables, u64)>,
 }
 
 impl<'a> ThreadCtx<'a> {
@@ -386,7 +390,16 @@ impl<'a> ThreadCtx<'a> {
             registry,
             futex,
             work_scope: None,
+            zone: None,
         }
+    }
+
+    /// Serve this thread's private futexes from the in-guest zone under
+    /// `zone_mm` (its process's zone key).
+    #[inline]
+    pub fn with_zone(mut self, zone: Option<(&'static carrick_el1_abi::ZoneTables, u64)>) -> Self {
+        self.zone = zone;
+        self
     }
 
     #[inline]
