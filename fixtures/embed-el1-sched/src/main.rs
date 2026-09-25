@@ -14,6 +14,20 @@
 //!   and a pair is handing off.
 //! - `exec`: `execve` from a non-leader thread while siblings are parked.
 //! - `exec-child`: the image `exec` runs.
+//! - `pinned-pingpong <iters>`: `pingpong` with the two threads pinned to
+//!   different guest CPUs, so every handoff crosses vCPUs (EL1 plan 1c).
+//! - `timed-wait <iters>`: `FUTEX_WAIT_PRIVATE` with a 1 ms relative timeout
+//!   and no waker, `iters` times: every result must be `ETIMEDOUT`; prints the
+//!   lateness past the deadline.
+//! - `compute-pair <ms>`: the main thread wakes a sibling parked in a host
+//!   served wait onto its own vCPU, then both compute without a syscall for
+//!   `<ms>`; prints how far each got.
+//! - `idle-carrier <ms>`: four threads parked in untimed futex waits while the
+//!   main thread waits `<ms>` with a timeout: the carrier has nothing to run.
+//! - `wfi-signal <rounds>`: a thread parked in an untimed futex wait on an
+//!   idle vCPU is signalled `rounds` times; each wait must return `EINTR`.
+//! - `pstate`: the PSTATE a signal handler sees, for a signal delivered at a
+//!   syscall boundary and for one that interrupts a computing thread.
 //!
 //! Every wait in the checks is bounded, so a lost wake or a lost signal is a
 //! failed line, never a hung test.
@@ -28,6 +42,10 @@ const SYS_TGKILL: u64 = 131;
 const FUTEX_WAIT_PRIVATE: u64 = 128;
 const FUTEX_WAKE_PRIVATE: u64 = 129;
 const EINTR: i64 = 4;
+const ETIMEDOUT: i64 = 110;
+const SYS_SCHED_SETAFFINITY: u64 = 122;
+const FUTEX_WAIT_BITSET_PRIVATE: u64 = 128 | 9;
+const FUTEX_BITSET_MATCH_ANY: u64 = 0xffff_ffff;
 
 unsafe fn raw6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
     let ret: i64;
@@ -340,6 +358,397 @@ fn exec_mode(argv0: &str) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// EL1 plan 1c modes
+
+/// Pin the calling thread to guest CPU `cpu` (raw `sched_setaffinity`).
+fn pin(cpu: u32) -> i64 {
+    let mask: u64 = 1 << cpu;
+    unsafe {
+        raw6(
+            SYS_SCHED_SETAFFINITY,
+            0,
+            8,
+            &mask as *const u64 as u64,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+fn ns_per_tick() -> f64 {
+    1e9 / cntfrq() as f64
+}
+
+fn percentile(sorted: &[u64], p: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let index = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted[index.min(sorted.len() - 1)]
+}
+
+static PTURN: AtomicU32 = AtomicU32::new(0); // 0: A acts, 1: B acts, 2: stop
+static PREADY: AtomicU32 = AtomicU32::new(0);
+
+/// `pingpong` between threads pinned to guest CPUs 0 and 1.
+fn pinned_pingpong(iters: usize) -> i32 {
+    const WARMUP: usize = 2000;
+    let pin_a = pin(0);
+    let b = std::thread::spawn(|| {
+        let rc = pin(1);
+        PREADY.store(if rc == 0 { 1 } else { 2 }, Ordering::Release);
+        let _ = futex_wake(&PREADY, 1);
+        loop {
+            while PTURN.load(Ordering::Acquire) == 0 {
+                let _ = futex_wait(&PTURN, 0);
+            }
+            if PTURN.load(Ordering::Acquire) == 2 {
+                return;
+            }
+            PTURN.store(0, Ordering::Release);
+            let _ = futex_wake(&PTURN, 1);
+        }
+    });
+    if !wait_until_changed(&PREADY, 0, Duration::from_secs(10)) {
+        println!("pinned-pingpong partner never started");
+        return 1;
+    }
+    if pin_a != 0 || PREADY.load(Ordering::Acquire) != 1 {
+        println!(
+            "pinned-pingpong sched_setaffinity failed: main={pin_a} partner={}",
+            PREADY.load(Ordering::Acquire)
+        );
+        return 1;
+    }
+    let mut samples = Vec::with_capacity(iters);
+    for i in 0..WARMUP + iters {
+        let t0 = cntvct();
+        PTURN.store(1, Ordering::Release);
+        let _ = futex_wake(&PTURN, 1);
+        while PTURN.load(Ordering::Acquire) == 1 {
+            let _ = futex_wait(&PTURN, 1);
+        }
+        if i >= WARMUP {
+            samples.push(cntvct() - t0);
+        }
+    }
+    PTURN.store(2, Ordering::Release);
+    let _ = futex_wake(&PTURN, 1);
+    b.join().expect("pinned-pingpong partner exits");
+    samples.sort_unstable();
+    let ns = ns_per_tick();
+    println!(
+        "pinned-pingpong iters={iters} p50_ns={:.0} p99_ns={:.0} max_ns={:.0}",
+        percentile(&samples, 0.5) as f64 * ns,
+        percentile(&samples, 0.99) as f64 * ns,
+        *samples.last().unwrap_or(&0) as f64 * ns
+    );
+    0
+}
+
+static NEVER: AtomicU32 = AtomicU32::new(0);
+
+/// `iters` 1 ms waits on a word nobody wakes: each must return
+/// `ETIMEDOUT`, no earlier than its deadline.
+fn timed_wait(iters: usize) -> i32 {
+    let timeout = Duration::from_millis(1);
+    let freq = cntfrq();
+    let timeout_ticks = (freq as u128 * timeout.as_nanos() / 1_000_000_000) as u64;
+    let mut lateness = Vec::with_capacity(iters);
+    let mut wrong = 0usize;
+    let mut early = 0usize;
+    for _ in 0..iters {
+        let t0 = cntvct();
+        let rc = futex_wait_timeout(&NEVER, 0, timeout);
+        let t1 = cntvct();
+        if rc != -ETIMEDOUT {
+            wrong += 1;
+            if wrong < 4 {
+                println!("timed-wait result={rc}");
+            }
+            continue;
+        }
+        let elapsed = t1 - t0;
+        if elapsed < timeout_ticks {
+            early += 1;
+        }
+        lateness.push(elapsed.saturating_sub(timeout_ticks));
+    }
+    lateness.sort_unstable();
+    let ns = ns_per_tick();
+    println!(
+        "timed-wait iters={iters} wrong={wrong} early={early} late_p50_ns={:.0} \
+         late_p99_ns={:.0} late_max_ns={:.0}",
+        percentile(&lateness, 0.5) as f64 * ns,
+        percentile(&lateness, 0.99) as f64 * ns,
+        *lateness.last().unwrap_or(&0) as f64 * ns
+    );
+    i32::from(wrong != 0 || early != 0)
+}
+
+static CP_PARK: AtomicU32 = AtomicU32::new(0);
+static CP_READY: AtomicU32 = AtomicU32::new(0);
+static CP_STOP: AtomicU32 = AtomicU32::new(0);
+static CP_A: AtomicU64Counter = AtomicU64Counter::new();
+static CP_B: AtomicU64Counter = AtomicU64Counter::new();
+
+/// A counter bumped by a compute loop (no syscall anywhere in the loop).
+struct AtomicU64Counter(std::sync::atomic::AtomicU64);
+
+impl AtomicU64Counter {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+    fn bump(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// `FUTEX_WAIT_BITSET_PRIVATE` with an absolute `CLOCK_MONOTONIC` deadline:
+/// a wait EL1 forwards, so the host parks the thread.
+fn futex_wait_bitset_until(word: &AtomicU32, expected: u32, after: Duration) -> i64 {
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    let total_ns = now.tv_nsec as u128 + after.subsec_nanos() as u128;
+    let ts = libc::timespec {
+        tv_sec: now.tv_sec + after.as_secs() as i64 + (total_ns / 1_000_000_000) as i64,
+        tv_nsec: (total_ns % 1_000_000_000) as libc::c_long,
+    };
+    unsafe {
+        raw6(
+            SYS_FUTEX,
+            word.as_ptr() as u64,
+            FUTEX_WAIT_BITSET_PRIVATE,
+            u64::from(expected),
+            &ts as *const libc::timespec as u64,
+            0,
+            FUTEX_BITSET_MATCH_ANY,
+        )
+    }
+}
+
+/// Two compute loops sharing the main thread's vCPU: the sibling parks in a
+/// host-served wait, the main thread wakes it in-guest (so it is queued on
+/// the main thread's vCPU) and both then count for `ms` without a syscall.
+fn compute_pair(ms: u64) -> i32 {
+    let b = std::thread::spawn(|| {
+        CP_READY.store(1, Ordering::Release);
+        let _ = futex_wake(&CP_READY, 1);
+        while CP_PARK.load(Ordering::Acquire) == 0 {
+            let _ = futex_wait_bitset_until(&CP_PARK, 0, Duration::from_secs(20));
+        }
+        while CP_STOP.load(Ordering::Relaxed) == 0 {
+            CP_B.bump();
+        }
+    });
+    if !wait_until_changed(&CP_READY, 0, Duration::from_secs(10)) {
+        println!("compute-pair sibling never started");
+        return 1;
+    }
+    // Let the sibling reach its host-served wait.
+    sleep_ms(30);
+    CP_PARK.store(1, Ordering::Release);
+    let _ = futex_wake(&CP_PARK, 1);
+    let freq = cntfrq();
+    let start = cntvct();
+    let window = freq * ms / 1000;
+    let mut b_started_ticks = None;
+    loop {
+        CP_A.bump();
+        let now = cntvct();
+        if b_started_ticks.is_none() && CP_B.get() != 0 {
+            b_started_ticks = Some(now - start);
+        }
+        if now - start >= window {
+            break;
+        }
+    }
+    CP_STOP.store(1, Ordering::Relaxed);
+    let (a, bcount) = (CP_A.get(), CP_B.get());
+    b.join().expect("compute-pair sibling exits");
+    let ns = ns_per_tick();
+    println!(
+        "compute-pair ms={ms} a_count={a} b_count={bcount} b_first_ms={:.3}",
+        b_started_ticks.map_or(-1.0, |t| t as f64 * ns / 1e6)
+    );
+    i32::from(a == 0 || bcount == 0)
+}
+
+static IDLE_WORDS: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static IDLE_MAIN: AtomicU32 = AtomicU32::new(0);
+
+/// Every thread blocked: four in untimed waits, the main thread in one timed
+/// wait of `ms`. The carrier has nothing to run for `ms`.
+fn idle_carrier(ms: u64) -> i32 {
+    let mut threads = Vec::new();
+    for word in &IDLE_WORDS {
+        threads.push(std::thread::spawn(move || {
+            while word.load(Ordering::Acquire) == 0 {
+                let _ = futex_wait(word, 0);
+            }
+        }));
+    }
+    // Let every sibling park.
+    sleep_ms(20);
+    let t0 = cntvct();
+    let rc = futex_wait_timeout(&IDLE_MAIN, 0, Duration::from_millis(ms));
+    let elapsed_ms = (cntvct() - t0) as f64 * ns_per_tick() / 1e6;
+    for word in &IDLE_WORDS {
+        word.store(1, Ordering::Release);
+        let _ = futex_wake(word, 1);
+    }
+    for thread in threads {
+        thread.join().expect("idle sibling exits");
+    }
+    println!("idle-carrier ms={ms} result={rc} elapsed_ms={elapsed_ms:.3}");
+    i32::from(rc != -ETIMEDOUT)
+}
+
+static WS_READY: AtomicU32 = AtomicU32::new(0);
+static WS_DONE: AtomicU32 = AtomicU32::new(0);
+static WS_PARK: AtomicU32 = AtomicU32::new(0);
+static WS_HANDLED: AtomicU32 = AtomicU32::new(0);
+static WS_EINTR: AtomicU32 = AtomicU32::new(0);
+static WS_WOKE_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+extern "C" fn on_ws_signal(_: libc::c_int) {
+    WS_HANDLED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// A thread parked with nothing else to run (its vCPU idles in EL1) is
+/// signalled `rounds` times; every wait returns `EINTR` and the handler runs.
+fn wfi_signal(rounds: u32) -> i32 {
+    install(libc::SIGUSR1, on_ws_signal, 0);
+    let worker = std::thread::spawn(move || {
+        WORKER_TID.store(gettid(), Ordering::SeqCst);
+        for round in 0..rounds {
+            WS_READY.store(round + 1, Ordering::Release);
+            let _ = futex_wake(&WS_READY, 1);
+            let rc = futex_wait(&WS_PARK, 0);
+            WS_WOKE_AT.store(cntvct(), Ordering::SeqCst);
+            if rc == -EINTR {
+                WS_EINTR.fetch_add(1, Ordering::SeqCst);
+            }
+            WS_DONE.store(round + 1, Ordering::Release);
+            let _ = futex_wake(&WS_DONE, 1);
+        }
+    });
+    let limit = Duration::from_secs(5);
+    let mut latency = Vec::with_capacity(rounds as usize);
+    for round in 0..rounds {
+        if !wait_until_changed(&WS_READY, round, limit) {
+            println!("wfi-signal round={round} worker never parked");
+            return 1;
+        }
+        // Past the idle vCPU's spin: it is in WFI.
+        sleep_ms(2);
+        let t0 = cntvct();
+        let rc = tgkill(WORKER_TID.load(Ordering::SeqCst), libc::SIGUSR1);
+        if rc != 0 {
+            println!("wfi-signal round={round} tgkill={rc}");
+            return 1;
+        }
+        if !wait_until_changed(&WS_DONE, round, limit) {
+            println!("wfi-signal round={round} the signal never reached the parked thread");
+            return 1;
+        }
+        latency.push(WS_WOKE_AT.load(Ordering::SeqCst).saturating_sub(t0));
+    }
+    worker.join().expect("wfi-signal worker exits");
+    latency.sort_unstable();
+    let ns = ns_per_tick();
+    let eintr = WS_EINTR.load(Ordering::SeqCst);
+    let handled = WS_HANDLED.load(Ordering::SeqCst);
+    println!(
+        "wfi-signal rounds={rounds} eintr={eintr} handled={handled} wake_p50_us={:.1} \
+         wake_max_us={:.1}",
+        percentile(&latency, 0.5) as f64 * ns / 1e3,
+        *latency.last().unwrap_or(&0) as f64 * ns / 1e3
+    );
+    i32::from(eintr != rounds || handled != rounds)
+}
+
+static PS_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static PS_ASYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static PS_SPIN_TID: AtomicI32 = AtomicI32::new(0);
+static PS_SPINNING: AtomicU32 = AtomicU32::new(0);
+static PS_SCRATCH: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn on_ps_sync(_: libc::c_int, _: *mut libc::siginfo_t, context: *mut libc::c_void) {
+    let context = context as *const libc::ucontext_t;
+    PS_SYNC.store(unsafe { (*context).uc_mcontext.pstate }, Ordering::SeqCst);
+}
+
+extern "C" fn on_ps_async(_: libc::c_int, _: *mut libc::siginfo_t, context: *mut libc::c_void) {
+    let context = context as *const libc::ucontext_t;
+    PS_ASYNC.store(unsafe { (*context).uc_mcontext.pstate }, Ordering::SeqCst);
+}
+
+fn install_siginfo(
+    signal: libc::c_int,
+    handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void),
+) {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler as usize;
+        action.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut action.sa_mask);
+        assert_eq!(
+            libc::sigaction(signal, &action, std::ptr::null_mut()),
+            0,
+            "sigaction"
+        );
+    }
+}
+
+/// The PSTATE a handler finds in its `ucontext` for a signal taken at a
+/// syscall boundary and for one that interrupts guest computation after
+/// in-guest futex service (the EL1 return path) ran on that thread.
+fn pstate_mode() -> i32 {
+    install_siginfo(libc::SIGUSR1, on_ps_sync);
+    install_siginfo(libc::SIGUSR2, on_ps_async);
+    let rc = tgkill(gettid(), libc::SIGUSR1);
+    let spinner = std::thread::spawn(|| {
+        PS_SPIN_TID.store(gettid(), Ordering::SeqCst);
+        // In-guest futex service: wakes with no waiter return 0 at EL1.
+        for _ in 0..16 {
+            let _ = futex_wake(&PS_SCRATCH, 1);
+        }
+        PS_SPINNING.store(1, Ordering::Release);
+        let start = cntvct();
+        let limit = cntfrq() * 10;
+        while PS_ASYNC.load(Ordering::SeqCst) == u64::MAX && cntvct() - start < limit {
+            std::hint::spin_loop();
+        }
+    });
+    while PS_SPINNING.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+    sleep_ms(5);
+    let rc2 = tgkill(PS_SPIN_TID.load(Ordering::SeqCst), libc::SIGUSR2);
+    spinner.join().expect("pstate spinner exits");
+    let sync = PS_SYNC.load(Ordering::SeqCst);
+    let async_ = PS_ASYNC.load(Ordering::SeqCst);
+    println!(
+        "pstate tgkill={rc}/{rc2} sync_daif={:#x} async_daif={:#x} sync_el={} async_el={}",
+        sync & 0x3c0,
+        async_ & 0x3c0,
+        sync & 0xf,
+        async_ & 0xf
+    );
+    i32::from(sync == u64::MAX || async_ == u64::MAX)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("pingpong");
@@ -348,6 +757,14 @@ fn main() {
         "signal" => signal_mode(),
         "exit-group" => exit_group_mode(),
         "exec" => exec_mode(&args[0]),
+        "pinned-pingpong" => {
+            pinned_pingpong(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000))
+        }
+        "timed-wait" => timed_wait(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200)),
+        "compute-pair" => compute_pair(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(300)),
+        "idle-carrier" => idle_carrier(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(500)),
+        "wfi-signal" => wfi_signal(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100)),
+        "pstate" => pstate_mode(),
         "exec-child" => {
             println!("exec-child ok");
             0

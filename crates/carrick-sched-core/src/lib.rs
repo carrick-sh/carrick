@@ -451,6 +451,26 @@ pub struct ZoneCounters {
     pub el1_held_refusals: AtomicU64,
     /// Record or entry allocation failures.
     pub exhausted: AtomicU64,
+    /// Threads EL1 woke onto ANOTHER vCPU slot's run queue (a cross-vCPU
+    /// handoff).
+    pub el1_cross_wakes: AtomicU64,
+    /// Wake SGIs EL1 sent to a vCPU parked in WFI.
+    pub el1_sgis: AtomicU64,
+    /// Running threads EL1 preempted at a virtual-timer tick.
+    pub el1_preemptions: AtomicU64,
+    /// Queued threads EL1 moved to an idle vCPU slot at a tick.
+    pub el1_migrations: AtomicU64,
+    /// Timed waits EL1 ended at their deadline (ETIMEDOUT).
+    pub el1_timeouts: AtomicU64,
+    /// Times a vCPU slot went idle in EL1 (nothing runnable).
+    pub el1_idle_entries: AtomicU64,
+    /// WFIs an idle vCPU executed.
+    pub el1_wfi_entries: AtomicU64,
+    /// Idle vCPUs that left the guest for host work (a kick).
+    pub el1_idle_exits: AtomicU64,
+    /// Woken threads EL1 could not place where they belong, queued on the
+    /// waker's slot, which then exits so the host places them.
+    pub el1_misplaced: AtomicU64,
 }
 
 /// The zone: every table, as one `repr(C)` object in the shared EL1 region.

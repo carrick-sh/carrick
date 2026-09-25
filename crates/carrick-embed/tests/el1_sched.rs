@@ -1,7 +1,9 @@
-//! EL1 plan 1b signed tests: guest threads that hand off through a private
-//! futex switch inside the guest at EL1, with no host exit and no host
-//! condvar wake, and the host still reaches a thread parked in-guest for
-//! signals, `exit_group` and `execve`.
+//! EL1 plan 1b and 1c signed tests: guest threads that hand off through a
+//! private futex switch inside the guest at EL1, on one vCPU or across vCPUs,
+//! with no host exit and no host condvar wake; timed waits end on the guest
+//! virtual timer; compute loops are preempted in-guest; idle vCPUs park in
+//! WFI at no host cost; and the host still reaches a thread parked in-guest
+//! for signals, `exit_group` and `execve`.
 //!
 //! Run ONLY through `just test-embed el1_sched` (scripts/test-signed.sh, which
 //! also builds the static `fixtures/embed-el1-sched` guest): it signs the test
@@ -75,6 +77,15 @@ struct ZoneCounts {
     host_parks: u64,
     signal_claims: u64,
     control_claims: u64,
+    cross_wakes: u64,
+    sgis: u64,
+    preemptions: u64,
+    migrations: u64,
+    timeouts: u64,
+    idle_entries: u64,
+    wfi_entries: u64,
+    idle_exits: u64,
+    misplaced: u64,
 }
 
 impl ZoneCounts {
@@ -94,6 +105,15 @@ impl ZoneCounts {
             control_claims: load(
                 &counters.host_claims[carrick_el1_abi::Handback::Control as usize],
             ),
+            cross_wakes: load(&counters.el1_cross_wakes),
+            sgis: load(&counters.el1_sgis),
+            preemptions: load(&counters.el1_preemptions),
+            migrations: load(&counters.el1_migrations),
+            timeouts: load(&counters.el1_timeouts),
+            idle_entries: load(&counters.el1_idle_entries),
+            wfi_entries: load(&counters.el1_wfi_entries),
+            idle_exits: load(&counters.el1_idle_exits),
+            misplaced: load(&counters.el1_misplaced),
         }
     }
 
@@ -104,6 +124,15 @@ impl ZoneCounts {
             host_parks: self.host_parks - before.host_parks,
             signal_claims: self.signal_claims - before.signal_claims,
             control_claims: self.control_claims - before.control_claims,
+            cross_wakes: self.cross_wakes - before.cross_wakes,
+            sgis: self.sgis - before.sgis,
+            preemptions: self.preemptions - before.preemptions,
+            migrations: self.migrations - before.migrations,
+            timeouts: self.timeouts - before.timeouts,
+            idle_entries: self.idle_entries - before.idle_entries,
+            wfi_entries: self.wfi_entries - before.wfi_entries,
+            idle_exits: self.idle_exits - before.idle_exits,
+            misplaced: self.misplaced - before.misplaced,
         }
     }
 }
@@ -278,6 +307,14 @@ fn el1_sched_exit_group_with_parked_threads() {
             "exit_group did not reach threads parked in the zone: {:?}",
             measured.zone
         );
+        // Part (e) of `kernel.el1.guest-scheduler`: the siblings parked with
+        // nothing to switch to idled their vCPUs in WFI, and exit_group's
+        // kicks forced those vCPUs out.
+        assert!(
+            measured.zone.wfi_entries > 0 && measured.zone.idle_exits > 0,
+            "exit_group did not reach threads on vCPUs parked in WFI: {:?}",
+            measured.zone
+        );
     }
 }
 
@@ -302,6 +339,261 @@ fn el1_sched_exec_from_a_sibling_with_parked_threads() {
             "the exec drain did not reach threads parked in the zone: {:?}",
             measured.zone
         );
+        assert!(
+            measured.zone.wfi_entries > 0 && measured.zone.idle_exits > 0,
+            "the exec drain did not reach threads on vCPUs parked in WFI: {:?}",
+            measured.zone
+        );
         assert_eq!(measured.result.stdout_utf8(), "exec-child ok\n");
     }
+}
+
+/// Contract `kernel.el1.guest-scheduler` (EL1 plan 1c), part (a): two threads
+/// pinned to different guest CPUs ping-pong through
+/// `FUTEX_WAIT_PRIVATE`/`FUTEX_WAKE_PRIVATE`. Every handoff crosses vCPUs:
+/// the waker places the woken thread on the other vCPU (which idles in EL1)
+/// and wakes it with an SGI if it parked in WFI. The budget is the affine
+/// one of the 1b handoff: host exits over the difference of `LONG` and
+/// `SHORT` round trips must stay below 0.01 per round trip, and at least one
+/// cross-vCPU wake per round trip must have happened in-guest.
+#[test]
+fn el1_sched_cross_vcpu_handoff_has_no_host_exits() {
+    const SHORT: u64 = 5_000;
+    const LONG: u64 = 55_000;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for iters in [SHORT, LONG, SHORT, LONG] {
+        let measured = run_fixture(
+            &carrier,
+            &["pinned-pingpong", &iters.to_string()],
+            Duration::from_secs(120),
+        );
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched pinned-pingpong iters={iters} exits={} carrier_cpu_ns={} wall_ms={} \
+             zone={:?} {}",
+            measured.exits,
+            measured.cpu_ns,
+            measured.wall.as_millis(),
+            measured.zone,
+            stdout.trim()
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            measured.zone.cross_wakes >= iters,
+            "only {} in-guest cross-vCPU wakes for {iters} round trips: {:?}",
+            measured.zone.cross_wakes,
+            measured.zone
+        );
+        runs.push((
+            iters,
+            measured.exits,
+            measured.cpu_ns,
+            field(&stdout, "p50_ns"),
+        ));
+    }
+    let span = (LONG - SHORT) as f64;
+    let mut worst: f64 = 0.0;
+    for pair in runs.chunks(2) {
+        let (short, long) = (&pair[0], &pair[1]);
+        let exits_per_rt = (long.1 as f64 - short.1 as f64) / span;
+        let cpu_ns_per_rt = (long.2 as f64 - short.2 as f64) / span;
+        println!(
+            "el1-sched cross-vcpu-handoff exits_per_round_trip={exits_per_rt:.4} \
+             carrier_cpu_ns_per_round_trip={cpu_ns_per_rt:.0} p50_ns={:.0}",
+            long.3
+        );
+        worst = worst.max(exits_per_rt);
+    }
+    assert!(
+        worst < 0.01,
+        "a futex handoff between threads on different vCPUs cost {worst:.3} host exits per \
+         round trip; the in-guest (EL1) cross-vCPU handoff must cost none in steady state"
+    );
+}
+
+/// Part (b): a 1 ms `FUTEX_WAIT_PRIVATE` timeout ends in EL1 on the virtual
+/// timer. Every wait returns `ETIMEDOUT`, never before its deadline (the
+/// fixture fails otherwise), the host exits per wait over the difference of
+/// two run lengths stay below 0.01, and EL1 counted the timeouts. Lateness
+/// past the deadline is reported.
+#[test]
+fn el1_sched_timed_wait_times_out_in_guest() {
+    const SHORT: u64 = 200;
+    const LONG: u64 = 1_200;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for iters in [SHORT, LONG, SHORT, LONG] {
+        let measured = run_fixture(
+            &carrier,
+            &["timed-wait", &iters.to_string()],
+            Duration::from_secs(120),
+        );
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched timed-wait iters={iters} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+            measured.exits,
+            measured.cpu_ns,
+            measured.wall.as_millis(),
+            measured.zone,
+            stdout.trim()
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            measured.zone.timeouts >= iters,
+            "only {} timeouts ended in-guest for {iters} waits: {:?}",
+            measured.zone.timeouts,
+            measured.zone
+        );
+        runs.push((iters, measured.exits, field(&stdout, "late_p50_ns")));
+    }
+    let span = (LONG - SHORT) as f64;
+    let mut worst: f64 = 0.0;
+    for pair in runs.chunks(2) {
+        let exits_per_wait = (pair[1].1 as f64 - pair[0].1 as f64) / span;
+        println!(
+            "el1-sched timed-wait exits_per_wait={exits_per_wait:.4} late_p50_ns={:.0}",
+            pair[1].2
+        );
+        worst = worst.max(exits_per_wait);
+    }
+    assert!(
+        worst < 0.01,
+        "a timed futex wait cost {worst:.3} host exits; EL1 must end it on the virtual timer"
+    );
+}
+
+/// Part (c): two threads that compute without a syscall share one vCPU (the
+/// main thread wakes a sibling onto its own run queue, then both count).
+/// Both make progress, through EL1 timer preemption at EL0 rather than a
+/// host exit.
+#[test]
+fn el1_sched_preemption_reaches_compute_loops() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    for _ in 0..3 {
+        let measured = run_fixture(&carrier, &["compute-pair", "300"], Duration::from_secs(60));
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched compute-pair exits={} wall_ms={} zone={:?} {}",
+            measured.exits,
+            measured.wall.as_millis(),
+            measured.zone,
+            stdout.trim()
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        let (a, b) = (field(&stdout, "a_count"), field(&stdout, "b_count"));
+        assert!(a > 0.0 && b > 0.0, "{stdout:?}");
+        assert!(
+            measured.zone.preemptions >= 2,
+            "the compute loops were not preempted in-guest: {:?}",
+            measured.zone
+        );
+    }
+}
+
+/// Part (d): with every thread blocked (four in untimed waits, one in a
+/// timed wait) the carrier costs almost no host CPU: the idle vCPUs park in
+/// WFI. The CPU of a 500 ms and a 2500 ms idle window differ by less than
+/// 1% of one core over the extra two seconds.
+#[test]
+fn el1_sched_idle_carrier_costs_no_host_cpu() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for ms in [500u64, 2500, 500, 2500] {
+        let measured = run_fixture(
+            &carrier,
+            &["idle-carrier", &ms.to_string()],
+            Duration::from_secs(60),
+        );
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched idle-carrier ms={ms} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+            measured.exits,
+            measured.cpu_ns,
+            measured.wall.as_millis(),
+            measured.zone,
+            stdout.trim()
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            measured.zone.wfi_entries > 0 && measured.zone.idle_entries >= 4,
+            "the blocked threads did not idle their vCPUs in WFI: {:?}",
+            measured.zone
+        );
+        runs.push((measured.cpu_ns, measured.exits));
+    }
+    let mut worst: f64 = 0.0;
+    for pair in runs.chunks(2) {
+        let cpu_fraction = (pair[1].0 as f64 - pair[0].0 as f64) / 2e9;
+        let exits_per_s = (pair[1].1 as f64 - pair[0].1 as f64) / 2.0;
+        println!(
+            "el1-sched idle-carrier cpu_fraction_of_one_core={cpu_fraction:.5} \
+             exits_per_idle_second={exits_per_s:.1}"
+        );
+        worst = worst.max(cpu_fraction);
+    }
+    assert!(
+        worst < 0.01,
+        "an idle carrier burned {:.2}% of a core",
+        worst * 100.0
+    );
+}
+
+/// Part (e), signals: a thread parked with nothing else to run idles its
+/// vCPU in EL1 (in WFI past the spin); each of 200 signals must reach it (the
+/// host kick forces the WFI-parked vCPU out), its handler runs and its wait
+/// returns `EINTR`.
+#[test]
+fn el1_sched_signal_reaches_a_wfi_parked_vcpu() {
+    const ROUNDS: u64 = 200;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["wfi-signal", &ROUNDS.to_string()],
+        Duration::from_secs(120),
+    );
+    let stdout = measured.result.stdout_utf8();
+    println!(
+        "el1-sched wfi-signal exits={} wall_ms={} zone={:?} {}",
+        measured.exits,
+        measured.wall.as_millis(),
+        measured.zone,
+        stdout.trim()
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert_eq!(field(&stdout, "eintr"), ROUNDS as f64, "{stdout:?}");
+    assert!(
+        measured.zone.idle_exits >= ROUNDS && measured.zone.wfi_entries >= ROUNDS,
+        "the signals did not reach vCPUs parked in WFI: {:?}",
+        measured.zone
+    );
+}
+
+/// The PSTATE a guest signal handler reads from its `ucontext` is unchanged
+/// by the EL0 interrupt policy of the in-guest scheduler: Carrick has always
+/// shown EL0t with DAIF set (0x3c0), for a signal at a syscall boundary and
+/// for one that interrupts computation after in-guest futex service.
+#[test]
+fn el1_sched_pstate_seen_by_the_guest_is_unchanged() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(&carrier, &["pstate"], Duration::from_secs(60));
+    let stdout = measured.result.stdout_utf8();
+    println!("el1-sched pstate {}", stdout.trim());
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert!(
+        stdout.contains("sync_daif=0x3c0 async_daif=0x3c0 sync_el=0 async_el=0"),
+        "{stdout:?}"
+    );
 }
