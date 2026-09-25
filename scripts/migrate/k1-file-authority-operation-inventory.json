@@ -18432,7 +18432,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 1351,
+      "line": 1357,
       "categories": [
         "mapping"
       ],
@@ -18441,7 +18441,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 1356,
+      "line": 1362,
       "categories": [
         "mapping"
       ],
@@ -18450,7 +18450,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 3069,
+      "line": 3075,
       "categories": [
         "mapping"
       ],
@@ -18459,7 +18459,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 3322,
+      "line": 3328,
       "categories": [
         "stream"
       ],
