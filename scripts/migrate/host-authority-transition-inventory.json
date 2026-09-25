@@ -15465,33 +15465,6 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
-      "resource": "current carrier fork-quiesce worker used by `drain_exact_mm`"
-    },
-    "expansion": null,
-    "operation": "std::thread::yield_now",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mm_quiesce.rs:436 in `drain_exact_mm`, `std::thread::yield_now` acts only on the current carrier fork-quiesce worker used by `drain_exact_mm`; no guest identity selects its host target.",
-    "review_id": "HA-000641",
-    "source": {
-      "byte_end": 17030,
-      "byte_start": 17008,
-      "column": 9,
-      "column_end": 31,
-      "column_start": 9,
-      "file": "crates/carrick-kernel/src/dispatch/mm_quiesce.rs",
-      "line": 436,
-      "line_end": 436,
-      "line_start": 436
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-YIELD-NOW",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
       "resource": "current process-dispatch wait worker used by `sched_yield`"
     },
     "expansion": null,
