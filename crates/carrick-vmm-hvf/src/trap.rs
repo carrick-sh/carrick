@@ -655,6 +655,18 @@ pub fn vcpu_lifecycle_totals() -> VcpuLifecycleTotals {
         destroyed: VCPU_DESTROYED_TOTAL.load(std::sync::atomic::Ordering::SeqCst),
     }
 }
+/// Every `hv_vcpu_run` return in this carrier process: each one is a guest
+/// exit to Carrick, whatever its reason. Read through [`vcpu_run_exits_total`].
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static VCPU_RUN_EXITS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The carrier's total count of vCPU exits to the host (`hv_vcpu_run`
+/// returns). Tests read deltas across a workload to count host exits per
+/// operation; the counter is carrier-global, so hold the guest lock.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn vcpu_run_exits_total() -> u64 {
+    VCPU_RUN_EXITS_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 thread_local! {
     static THREAD_VCPU_CREATED_TOTAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -7445,6 +7457,7 @@ impl HvfInner {
             // The engine accounts the guest CPU time via `guest_cpu::timed_run`
             // around its `vcpu.run()` call, so do NOT double-account here.
             vcpu.run().map_err(hvf_error)?;
+            VCPU_RUN_EXITS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let exit = vcpu.get_exit_info();
             crate::gic::note_vtimer_probe_exit(vcpu.id(), || {
                 exit.reason == ExitReason::CANCELED

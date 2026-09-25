@@ -1,0 +1,22 @@
+# Standalone (NOT a workspace member): this crate is cross-compiled for
+# aarch64-unknown-linux-musl and must not inherit the host workspace's
+# profile, lints, or target directory.
+[workspace]
+
+[package]
+name = "carrick-embed-el1-sched"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[[bin]]
+name = "el1-sched"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+panic = "abort"
