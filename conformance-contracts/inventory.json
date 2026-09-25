@@ -1337,7 +1337,9 @@
       "support": "bring_up",
       "handler": "lifecycle",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.futex-handoff"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -1392,6 +1394,7 @@
       "handler": "thread_local",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.futex-handoff",
         "kernel.futex.contention",
         "kernel.futex.requeue"
       ],
@@ -1831,7 +1834,9 @@
       "support": "bring_up",
       "handler": "signal",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.futex-handoff"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -3026,6 +3031,7 @@
       "handler": "lifecycle",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.futex-handoff",
         "kernel.time.realtime-calibration"
       ],
       "claims": [],
@@ -4397,7 +4403,9 @@
       "support": "deferred",
       "handler": "unimplemented",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.futex-handoff"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "deferred refusal behavior unverified by contract"

@@ -65,11 +65,55 @@ fn carrier_cpu_ns() -> u64 {
     tv(usage.ru_utime) + tv(usage.ru_stime)
 }
 
+/// The zone's counters (shared EL1 memory, zeroed with each carrier), so a
+/// test proves its threads were parked and switched in-guest rather than
+/// passing on the host path.
+#[derive(Clone, Copy, Debug, Default)]
+struct ZoneCounts {
+    el1_parks: u64,
+    el1_switches: u64,
+    host_parks: u64,
+    signal_claims: u64,
+    control_claims: u64,
+}
+
+impl ZoneCounts {
+    fn read() -> Self {
+        let Some(zone) = carrick_el1_abi::zone_tables() else {
+            return Self::default();
+        };
+        let counters = &zone.counters;
+        let load = |counter: &std::sync::atomic::AtomicU64| {
+            counter.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        Self {
+            el1_parks: load(&counters.el1_parks),
+            el1_switches: load(&counters.el1_switches),
+            host_parks: load(&counters.host_parks),
+            signal_claims: load(&counters.host_claims[carrick_el1_abi::Handback::Signal as usize]),
+            control_claims: load(
+                &counters.host_claims[carrick_el1_abi::Handback::Control as usize],
+            ),
+        }
+    }
+
+    fn since(self, before: Self) -> Self {
+        Self {
+            el1_parks: self.el1_parks - before.el1_parks,
+            el1_switches: self.el1_switches - before.el1_switches,
+            host_parks: self.host_parks - before.host_parks,
+            signal_claims: self.signal_claims - before.signal_claims,
+            control_claims: self.control_claims - before.control_claims,
+        }
+    }
+}
+
 struct Measured {
     result: ContainerResult,
     exits: u64,
     cpu_ns: u64,
     wall: Duration,
+    zone: ZoneCounts,
 }
 
 fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured {
@@ -77,6 +121,7 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
     command.extend(args.iter().map(|arg| (*arg).to_owned()));
     let watchdog = common::Watchdog::start(timeout);
     let exits_before = vcpu_run_exits_total();
+    let zone_before = ZoneCounts::read();
     let cpu_before = carrier_cpu_ns();
     let start = std::time::Instant::now();
     let result = common::run_or_fail(
@@ -90,12 +135,14 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
     let wall = start.elapsed();
     let cpu_ns = carrier_cpu_ns() - cpu_before;
     let exits = vcpu_run_exits_total() - exits_before;
+    let zone = ZoneCounts::read().since(zone_before);
     watchdog.disarm();
     Measured {
         result,
         exits,
         cpu_ns,
         wall,
+        zone,
     }
 }
 
@@ -141,11 +188,18 @@ fn el1_sched_futex_handoff_has_no_host_exits() {
         assert!(measured.result.success(), "{}", describe(&measured));
         let stdout = measured.result.stdout_utf8();
         println!(
-            "el1-sched pingpong iters={iters} exits={} carrier_cpu_ns={} wall_ms={} {}",
+            "el1-sched pingpong iters={iters} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
             measured.exits,
             measured.cpu_ns,
             measured.wall.as_millis(),
+            measured.zone,
             stdout.trim()
+        );
+        // Each round trip is two handoffs; nearly all must be in-guest.
+        assert!(
+            measured.zone.el1_switches >= iters,
+            "only {:?} in-guest switches for {iters} round trips",
+            measured.zone
         );
         runs.push((
             iters,
@@ -186,8 +240,18 @@ fn el1_sched_signal_reaches_a_parked_thread() {
     let carrier = carrier_or_fail();
     let measured = run_fixture(&carrier, &["signal"], Duration::from_secs(90));
     let stdout = measured.result.stdout_utf8();
-    println!("el1-sched signal {}", stdout.trim());
+    println!(
+        "el1-sched signal zone={:?} {}",
+        measured.zone,
+        stdout.trim()
+    );
     assert!(measured.result.success(), "{}", describe(&measured));
+    // The waiters were parked in the zone and the signals won their records.
+    assert!(
+        measured.zone.signal_claims >= 2,
+        "signals did not claim zone-parked waiters: {:?}",
+        measured.zone
+    );
     assert_eq!(field(&stdout, "eintr_result"), -4.0, "{stdout:?}");
     assert_eq!(field(&stdout, "usr1_handled"), 1.0, "{stdout:?}");
     assert_eq!(field(&stdout, "usr2_handled"), 1.0, "{stdout:?}");
@@ -203,11 +267,17 @@ fn el1_sched_exit_group_with_parked_threads() {
     for _ in 0..5 {
         let measured = run_fixture(&carrier, &["exit-group"], Duration::from_secs(90));
         println!(
-            "el1-sched exit-group exit={} wall_ms={}",
+            "el1-sched exit-group exit={} wall_ms={} zone={:?}",
             measured.result.exit_code,
-            measured.wall.as_millis()
+            measured.wall.as_millis(),
+            measured.zone
         );
         assert_eq!(measured.result.exit_code, 42, "{}", describe(&measured));
+        assert!(
+            measured.zone.el1_parks > 0 && measured.zone.control_claims > 0,
+            "exit_group did not reach threads parked in the zone: {:?}",
+            measured.zone
+        );
     }
 }
 
@@ -221,11 +291,17 @@ fn el1_sched_exec_from_a_sibling_with_parked_threads() {
         let carrier = carrier_or_fail();
         let measured = run_fixture(&carrier, &["exec"], Duration::from_secs(90));
         println!(
-            "el1-sched exec {} wall_ms={}",
+            "el1-sched exec {} wall_ms={} zone={:?}",
             measured.result.stdout_utf8().trim(),
-            measured.wall.as_millis()
+            measured.wall.as_millis(),
+            measured.zone
         );
         assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            measured.zone.el1_parks > 0 && measured.zone.control_claims > 0,
+            "the exec drain did not reach threads parked in the zone: {:?}",
+            measured.zone
+        );
         assert_eq!(measured.result.stdout_utf8(), "exec-child ok\n");
     }
 }
