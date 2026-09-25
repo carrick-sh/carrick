@@ -9,17 +9,19 @@ pub mod alloc;
 pub mod file;
 pub mod inotify;
 pub mod lock;
+pub mod sched;
 
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
     DelegatedOpenFile, EL1_GUEST_LOCK_SPINS, FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES,
-    MAX_DELEGATED_MARKS_PER_FILE, MAX_ZONE_OPEN_FILES, TrapFrame, fd_map_lookup,
+    MAX_DELEGATED_MARKS_PER_FILE, MAX_ZONE_OPEN_FILES, SlotId, TrapFrame, ZoneTables,
+    fd_map_lookup,
 };
 #[cfg(target_os = "none")]
 use carrick_el1_abi::{
     EL1_CURRENT_TASKS_BASE, EL1_FD_MAP_BASE, EL1_INOTIFY_TABLE_BASE, EL1_NAME_CACHE_BASE,
-    EL1_OBJECT_TABLE_BASE, EL1_OPEN_FILE_TABLE_BASE, EL1_STACK_SLOTS, FD_MAP_CAPACITY,
-    MAX_DELEGATED_INOTIFY,
+    EL1_OBJECT_TABLE_BASE, EL1_OPEN_FILE_TABLE_BASE, EL1_STACK_SLOTS, EL1_ZONE_BASE,
+    FD_MAP_CAPACITY, MAX_DELEGATED_INOTIFY,
 };
 use core::sync::atomic::Ordering;
 
@@ -46,6 +48,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
             &*(EL1_INOTIFY_TABLE_BASE as *const [DelegatedInotify; MAX_DELEGATED_INOTIFY])
         };
         let name_cache = unsafe { &*(EL1_NAME_CACHE_BASE as *const InotifyNameCache) };
+        let zone = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
         dispatch_syscall_with_regions(
             frame,
             counters,
@@ -55,6 +58,11 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
             open_table,
             inotify_table,
             name_cache,
+            Some(Zone {
+                tables: zone,
+                cpu: &mut sched::HardwareCpu,
+                user: &sched::HardwareUserWord,
+            }),
             |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
         )
     }
@@ -68,9 +76,17 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
     }
 }
 
+/// The in-guest scheduler's tables and the CPU and user-memory access an
+/// in-guest switch uses ([`sched`]).
+pub struct Zone<'a, C: sched::ThreadCpu, U: sched::UserWord> {
+    pub tables: &'a ZoneTables,
+    pub cpu: &'a mut C,
+    pub user: &'a U,
+}
+
 /// Dispatch syscall with explicitly supplied tables (used at EL1 and for host tests).
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_syscall_with_regions<F>(
+pub fn dispatch_syscall_with_regions<F, C, U>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
@@ -79,10 +95,13 @@ pub fn dispatch_syscall_with_regions<F>(
     open_table: &[DelegatedOpenFile],
     inotify_table: &[DelegatedInotify],
     name_cache: &InotifyNameCache,
+    zone: Option<Zone<'_, C, U>>,
     cache_lookup: F,
 ) -> Action
 where
     F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
 {
     let slot = frame.slot as usize;
     let cur_task = current_tasks.get(slot);
@@ -96,6 +115,37 @@ where
             counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
         }
         return Action::Forward;
+    }
+
+    // Threads EL1 woke onto this vCPU wait for the running one to block in
+    // a served futex wait; any other syscall goes to the host, which takes
+    // them at that exit rather than let them wait behind this thread.
+    if let (Some(zone), Some(task), Some(zslot)) = (zone, cur_task, SlotId::from_index(slot)) {
+        let queued = zone.tables.slot(zslot).queued() != 0;
+        if sched::is_served_futex_op(frame) {
+            let orig_x0 = frame.x[0];
+            if let Some(served) =
+                sched::serve_futex(frame, zslot, task, zone.tables, zone.cpu, zone.user)
+            {
+                counters.served[sched::SYS_FUTEX].fetch_add(1, Ordering::Relaxed);
+                // After a switch the frame is the switched-in thread's, whose
+                // own futex argument serve_futex recorded.
+                if !served.switched {
+                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                }
+                if task.has_pending_host_work() {
+                    task.served_with_work.store(1, Ordering::Release);
+                    return Action::ServedWithWork;
+                }
+                return Action::Served;
+            }
+        } else if queued {
+            let nr = frame.x[8] as usize;
+            if nr < 512 {
+                counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
+            }
+            return Action::Forward;
+        }
     }
 
     let nr = frame.x[8] as usize;
@@ -532,6 +582,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| core::ptr::null_mut(),
         );
 
@@ -584,6 +635,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| core::ptr::null_mut(),
         );
 
@@ -643,6 +695,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| core::ptr::null_mut(),
         );
         assert_eq!(action, Action::Forward);
@@ -664,6 +717,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| core::ptr::null_mut(),
         );
         assert_eq!(action2, Action::Served);
@@ -696,6 +750,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             move |_| {
                 // Host marks pending work during write operation
                 task_ref.mark_pending_host_work();
@@ -758,6 +813,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| core::ptr::null_mut(),
         );
 
@@ -814,6 +870,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| core::ptr::null_mut(),
         );
 
@@ -886,6 +943,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| cache_ptr,
         );
         assert_eq!(action, Action::Served);
@@ -915,6 +973,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| cache_ptr,
         );
         assert_eq!(action, Action::ServedWithWork);
@@ -975,6 +1034,7 @@ mod tests {
                 &open_table,
                 &inotify_table,
                 &name_cache,
+                None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
                 |_| cache_ptr,
             );
             assert_eq!(action, Action::Served, "fd {fd} nr {nr}");
@@ -1058,6 +1118,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| cache_ptr,
         );
         assert_eq!(action, Action::Served);
@@ -1083,6 +1144,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| cache_ptr,
         );
         assert_eq!(action, Action::Served);
@@ -1105,6 +1167,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| cache_ptr,
         );
         assert_eq!(action, Action::Served);
@@ -1130,6 +1193,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| cache_ptr,
         );
         assert_eq!(action, Action::Served);
@@ -1176,6 +1240,7 @@ mod tests {
             &open_table,
             &inotify_table,
             &name_cache,
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| core::ptr::null_mut(),
         );
 
