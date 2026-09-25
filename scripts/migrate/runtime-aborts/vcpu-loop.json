@@ -1751,6 +1751,17 @@
       "rationale": "The exact process owner failed to publish unexpected executor-failure retirement; returning would expose an incomplete terminal receipt.",
       "sink": "fatal",
       "domain": "kernel::terminal_settlement"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
+      "function": "publish_zone_slot",
+      "ordinal_in_function": 1,
+      "fingerprint": "ddd0c1afa78e2efb14edca84ad4e16908c39f74831ef619e053c2e18db4d26a1",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::el1_zone",
+      "rationale": "An EL1 zone slot still held threads (current, queued or host-owned) when the executor loaded a task on it: the previous residency's exit must have reconciled the slot, so a non-empty slot means a parked thread's only owner would be overwritten; continuing would lose that thread.",
+      "sink": "fatal",
+      "domain": "vcpu_loop::el1_zone"
     }
   ]
 }
