@@ -127,6 +127,7 @@ pub(crate) fn dispatch_threaded_futex(
     registry: &crate::thread::ThreadRegistry,
     hvpatch_linux_tid: Option<u32>,
     work_scope: Option<&carrick_observability::work_meter::WorkScope>,
+    zone: Option<(&'static carrick_el1_abi::ZoneTables, u64)>,
 ) -> DispatchOutcome {
     let address = request.arg(0);
     let operation = request.arg(1);
@@ -263,6 +264,25 @@ pub(crate) fn dispatch_threaded_futex(
             .map(|location| location.wait_addr().raw() as u64)
             .unwrap_or(0),
     );
+
+    // A zone process's in-process futexes live in the in-guest zone's queues,
+    // shared with guest EL1 (`crate::el1_zone`): one queue per process, and
+    // every host operation on it goes there too.
+    if shared_location.is_none()
+        && let Some((zone, mm)) = zone
+    {
+        return dispatch_zone_futex(
+            clock,
+            request,
+            memory,
+            raw_command,
+            command,
+            futex_flags,
+            word,
+            zone,
+            mm,
+        );
+    }
 
     match command {
         LINUX_FUTEX_WAKE => {
@@ -491,6 +511,121 @@ pub(crate) fn dispatch_threaded_futex(
     }
 }
 
+/// The zone half of [`dispatch_threaded_futex`]: argument validation already
+/// happened; `word` is the value read at the top (0 if unreadable for a wake).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_zone_futex(
+    clock: &crate::kernel::container::ClockDomain,
+    request: SyscallRequest,
+    memory: &mut impl CurrentMmMemory,
+    raw_command: u64,
+    command: u64,
+    futex_flags: LinuxFutexFlags,
+    word: u32,
+    zone: &'static carrick_el1_abi::ZoneTables,
+    mm: u64,
+) -> DispatchOutcome {
+    let address = request.arg(0);
+    let value = request.arg(2) as u32;
+    let timeout_address = request.arg(3);
+    let bitset = if matches!(
+        raw_command,
+        LINUX_FUTEX_WAIT_BITSET | LINUX_FUTEX_WAKE_BITSET
+    ) {
+        request.arg(5) as u32
+    } else {
+        u32::MAX
+    };
+    match command {
+        LINUX_FUTEX_WAKE => {
+            let woken = crate::el1_zone::wake(zone, mm, address, bitset, value);
+            DispatchOutcome::ZoneFutexWoken {
+                value: woken.len() as i64,
+                woken,
+            }
+        }
+        LINUX_FUTEX_WAIT => {
+            if word != value {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EAGAIN,
+                };
+            }
+            let timeout = if timeout_address == 0 {
+                None
+            } else {
+                let timespec = match read_timespec(memory, timeout_address) {
+                    Ok(t) => t,
+                    Err(errno) => return DispatchOutcome::Errno { errno },
+                };
+                if raw_command == LINUX_FUTEX_WAIT_BITSET {
+                    Some(relative_from_absolute_timespec(
+                        clock,
+                        timespec.tv_sec,
+                        timespec.tv_nsec,
+                        futex_flags.contains(LinuxFutexFlags::CLOCK_REALTIME),
+                    ))
+                } else {
+                    match duration_from_linux_timespec(timespec) {
+                        Ok(t) => Some(clock.scale_timeout(t.unwrap_or(Duration::ZERO))),
+                        Err(errno) => return DispatchOutcome::Errno { errno },
+                    }
+                }
+            };
+            DispatchOutcome::ZoneFutexWait {
+                uaddr: address,
+                value,
+                bitset,
+                timeout,
+                index: 0,
+            }
+        }
+        LINUX_FUTEX_REQUEUE | LINUX_FUTEX_CMP_REQUEUE => {
+            if (request.arg(2) as i32) < 0 || (request.arg(3) as i32) < 0 {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
+            let uaddr2 = request.arg(4);
+            if address == uaddr2 {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
+            let val3 = request.arg(5) as u32;
+            let result = crate::el1_zone::requeue(
+                zone,
+                mm,
+                address,
+                uaddr2,
+                value,
+                request.arg(3) as u32,
+                || {
+                    if raw_command != LINUX_FUTEX_CMP_REQUEUE {
+                        return Ok(());
+                    }
+                    // CMP_REQUEUE compares under both bucket locks, so no
+                    // waiter can enqueue between the check and the requeue.
+                    match read_futex_word(memory, address) {
+                        Ok(current) if current == val3 => Ok(()),
+                        Ok(_) => Err(LINUX_EAGAIN),
+                        Err(errno) => Err(errno),
+                    }
+                },
+            );
+            match result {
+                Ok((woken, moved)) => DispatchOutcome::ZoneFutexWoken {
+                    value: woken.len() as i64 + i64::from(moved),
+                    woken,
+                },
+                Err(errno) => DispatchOutcome::Errno { errno },
+            }
+        }
+        _ => DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FutexWaitvEntry {
     address: u64,
@@ -503,6 +638,7 @@ pub(crate) fn dispatch_futex_waitv_args(
     clock: &crate::kernel::container::ClockDomain,
     memory: &mut impl CurrentMmMemory,
     futex: Option<&crate::thread::FutexTable>,
+    zone: Option<(&'static carrick_el1_abi::ZoneTables, u64)>,
     waiters: u64,
     nr_futexes: u64,
     flags: u64,
@@ -620,6 +756,16 @@ pub(crate) fn dispatch_futex_waitv_args(
                 value: entry.value,
                 timeout,
                 index: index as i64,
+            };
+        }
+        // As on the table path below, the wait parks on the last entry only.
+        if zone.is_some() {
+            return DispatchOutcome::ZoneFutexWait {
+                uaddr: entry.address,
+                value: entry.value,
+                bitset: u32::MAX,
+                timeout,
+                index: index as u32,
             };
         }
         if let Some(futex) = futex {

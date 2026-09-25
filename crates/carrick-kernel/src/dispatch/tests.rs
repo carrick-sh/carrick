@@ -3508,6 +3508,7 @@ mod overlay_dispatch_tests {
             &registry,
             None,
             None,
+            None,
         );
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
@@ -3542,6 +3543,7 @@ mod overlay_dispatch_tests {
             &futex,
             crate::thread::ThreadId::synthetic_for_tests(1001),
             &registry,
+            None,
             None,
             None,
         );
@@ -3611,6 +3613,7 @@ mod overlay_dispatch_tests {
             &registry,
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -3665,6 +3668,7 @@ mod overlay_dispatch_tests {
             &futex,
             crate::thread::ThreadId::synthetic_for_tests(1001),
             &registry,
+            None,
             None,
             None,
         );

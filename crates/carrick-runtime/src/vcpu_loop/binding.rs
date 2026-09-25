@@ -231,6 +231,9 @@ pub(super) enum HvpatchProductionPhase {
         frame: carrick_hal::RawSyscall,
         vfork_child_pid: Option<i32>,
     },
+    /// Parked in the in-guest zone (EL1 plan 1b); loaded from its zone record
+    /// once the host owns it again ([`super::zone`]).
+    ResumeZone,
     ExecSiblingDrain {
         context: carrick_kernel::kernel::KernelContext,
         owner: Box<exec::PreparedExecveDrain>,
@@ -371,6 +374,7 @@ impl HvpatchProductionPhase {
             Self::TerminalRetireRetry { .. } => 11,
             Self::Complete => 12,
             Self::BootstrapThreadChild => 13,
+            Self::ResumeZone => 14,
         }
     }
 }
@@ -2578,7 +2582,7 @@ where
         self.publish_terminal_result();
     }
 
-    fn suspend(
+    pub(super) fn suspend(
         &mut self,
         suspension: HvpatchLoopSuspension,
         exit: executor::ExecutorExit,
@@ -2689,6 +2693,23 @@ where
             return Ok(self.suspend(HvpatchLoopSuspension::BlockedContinuation, exit));
         }
 
+        let outcome = match outcome {
+            DispatchOutcome::ZoneFutexWait {
+                uaddr,
+                value,
+                bitset,
+                timeout,
+                index,
+            } => {
+                return self
+                    .zone_park(engine, control, frame, uaddr, value, bitset, timeout, index);
+            }
+            DispatchOutcome::ZoneFutexWoken { value, woken } => {
+                zone::publish_zone_handbacks(&self.kernel, &woken);
+                DispatchOutcome::Returned { value }
+            }
+            other => other,
+        };
         Ok(match outcome {
             DispatchOutcome::Returned { value } => {
                 self.state
@@ -3306,7 +3327,7 @@ where
     /// Route a terminal outcome produced outside `service_outcome` — a fault
     /// signal that killed the process, or a forced-exit signal service — into
     /// the persistent terminal, the same way the trap watchdog does.
-    fn enter_terminal_with_outcome(
+    pub(super) fn enter_terminal_with_outcome(
         &mut self,
         engine: &mut E,
         outcome: VcpuLoopOutcome,
@@ -3489,8 +3510,10 @@ where
             )?);
         }
 
+        self.refresh_zone_key(control);
         let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
         match phase {
+            HvpatchProductionPhase::ResumeZone => return self.resume_zone(engine, control),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             HvpatchProductionPhase::BootstrapProcessChild(bootstrap) => {
                 bootstrap_hvpatch_process_child(&self.kernel, &mut self.state, engine, bootstrap)?;
@@ -3899,6 +3922,20 @@ where
             thread.charge_user_ns(engine.take_guest_run_receipt_ns());
         }
         self.state.in_guest.leave_guest();
+        // EL1 may have switched this vCPU to another thread of the process
+        // (a futex handoff in the guest): settle that before the exit is
+        // used. A stage-1 COW fault stopped EL1 code mid-operation; it is
+        // resolved and re-entered without a thread boundary.
+        let zone_exit = match &next {
+            Ok(Some(_)) => Some(zone::ZoneExit::Syscall { completed: false }),
+            Ok(None) | Err(TrapError::EL0Fault { .. }) => Some(zone::ZoneExit::El0),
+            _ => None,
+        };
+        if let Some(zone_exit) = zone_exit
+            && let Some(exit) = self.reconcile_zone_exit(engine, control, zone_exit)?
+        {
+            return Ok(exit);
+        }
         // Every guest boundary that is NOT a syscall arrives here: a forced exit
         // with no pending syscall, a stage-1 COW fault, and — the one that
         // matters most — a synchronous EL0 fault. This handling used to live
@@ -6601,7 +6638,14 @@ mod tests {
             owner.raw().to_le_bytes().to_vec(),
         );
 
-        threads::clear_persistent_child_tid_and_wake(&mut memory, &registry, &futex, owner);
+        threads::clear_persistent_child_tid_and_wake(
+            &mut memory,
+            &registry,
+            &futex,
+            owner,
+            None,
+            |_| {},
+        );
 
         assert_eq!(
             memory.read_bytes(clear_address, std::mem::size_of::<i32>()),

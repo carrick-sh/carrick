@@ -324,6 +324,13 @@ impl ContinuationWakeToken {
 
 #[derive(Clone, Debug)]
 pub enum ReadinessProbe {
+    /// A thread parked in the in-guest zone: ready once the host owns its
+    /// record (a waker, a signal, a timeout or its executor handed it back).
+    Zone {
+        record: carrick_el1_abi::RecordRef,
+        armed_seq: u32,
+        deadline: Option<Instant>,
+    },
     Futex {
         table: FutexSource,
         wait: FutexWait,
@@ -738,6 +745,11 @@ impl ReadinessProbe {
                 .map_or(Self::Passive { deadline: None }, |deadline| Self::Timer {
                     deadline,
                 }),
+            ContinuationDetail::Zone(wait) => Self::Zone {
+                record: wait.record,
+                armed_seq: wait.armed_seq,
+                deadline: state.deadline,
+            },
             ContinuationDetail::Futex { wait, .. } => state.private_futex.as_ref().map_or(
                 Self::Passive {
                     deadline: state.deadline,
@@ -762,6 +774,20 @@ impl ReadinessProbe {
                 .then_some(ContinuationEvent::Timeout)
         };
         match self {
+            Self::Zone {
+                record, deadline, ..
+            } => {
+                if carrick_el1_abi::zone_tables().is_some_and(|zone| {
+                    zone.live(*record).is_none_or(|rec| {
+                        matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. })
+                    })
+                }) {
+                    return Some(ContinuationEvent::Ready);
+                }
+                // The publish gate claims the record for the timeout, or
+                // refuses it if the park it belongs to already ended.
+                deadline_event(*deadline)
+            }
             Self::Futex {
                 table,
                 wait,

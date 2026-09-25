@@ -30,6 +30,17 @@ pub struct ThreadKey {
     pub serial: ThreadSerial,
 }
 
+impl ThreadKey {
+    /// The thread an in-guest zone record names (`tid`, `serial` as the host
+    /// published them); `None` for a malformed pair.
+    pub fn from_zone_identity(tid: i32, serial: std::num::NonZeroU64) -> Option<Self> {
+        Some(Self {
+            tid: LinuxTid::from_registry_allocation(std::num::NonZeroI32::new(tid)?),
+            serial: ThreadSerial::from_registry_allocation(serial),
+        })
+    }
+}
+
 impl std::fmt::Display for ThreadKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "thread#{}:{}", self.tid.raw(), self.serial.raw())
@@ -1221,6 +1232,24 @@ impl Thread {
         Ok(action)
     }
 
+    /// The host owns `record` now (a wake, or the executor of the vCPU slot
+    /// that ran it handing it back): if this thread's blocked continuation is
+    /// the zone wait on `record`, make it ready. A thread still settling (its
+    /// continuation not yet registered) sees the host-owned record when it
+    /// enrolls.
+    pub(crate) fn publish_zone_ready(&self, record: carrick_el1_abi::RecordRef) -> bool {
+        let execution = self.execution.lock();
+        if let Some(continuation) = execution.blocked_continuation.as_ref()
+            && continuation
+                .zone_wait()
+                .is_some_and(|wait| wait.record == record)
+        {
+            return continuation
+                .publish_ready_event(crate::kernel::continuation::ContinuationEvent::Ready);
+        }
+        false
+    }
+
     /// Schedule owner-thread control work without manufacturing readiness for
     /// the guest continuation. A real producer wake may still arrive while the
     /// control quantum runs; that independent edge uses `wake_pending` and
@@ -1237,6 +1266,49 @@ impl Thread {
         }
         let mut execution = self.execution.lock();
         let found = execution.state;
+        // A thread parked in the in-guest zone runs only once the host owns
+        // its record. If EL1 holds it (it is running, or woken, on a vCPU
+        // slot), the claim kicked that slot, whose executor hands it back at
+        // the exit and makes it runnable; there is nothing to queue here.
+        // Otherwise the host now owns it and it is woken like any handback:
+        // its wait ends (spuriously, as far as the guest can tell), which
+        // needs no control quantum and leaves nothing to restore.
+        if let ThreadExecutionState::Blocked {
+            generation: predecessor,
+            ..
+        } = execution.state
+            && let Some(wait) = execution
+                .blocked_continuation
+                .as_ref()
+                .and_then(|continuation| continuation.zone_wait())
+        {
+            match crate::el1_zone::claim(wait.record, None, carrick_el1_abi::Handback::Control) {
+                carrick_el1_abi::HostClaim::El1Held { .. } => {
+                    return Ok(ThreadSchedulerAction::None);
+                }
+                carrick_el1_abi::HostClaim::Claimed
+                | carrick_el1_abi::HostClaim::AlreadyHost
+                | carrick_el1_abi::HostClaim::Stale => {
+                    let generation = predecessor
+                        .next()
+                        .ok_or(ThreadExecutionError::GenerationExhausted)?;
+                    if let Some(continuation) = execution.blocked_continuation.as_ref() {
+                        continuation.publish_ready_event(
+                            crate::kernel::continuation::ContinuationEvent::Ready,
+                        );
+                    }
+                    execution.state = ThreadExecutionState::Runnable { generation };
+                    drop(execution);
+                    self.revision.publish();
+                    return Ok(ThreadSchedulerAction::Queue {
+                        key: self.key,
+                        predecessor: Some(predecessor),
+                        generation,
+                        closing_authorized: true,
+                    });
+                }
+            }
+        }
         // A retry may temporarily park the same quantum as HostWait. Preserve
         // a blocked reason only when there is an actual continuation token to
         // displace and later restore. Fork/clone/job-control retry phases also
@@ -1970,8 +2042,43 @@ impl Thread {
                 ExecutionSettlement::BlockedContinuation(reason, continuation) => {
                     execution.task_state = lease.task_state.take();
                     let continuation_id = continuation.id();
+                    // A zone record handed back while this thread was still
+                    // settling found no registered continuation to make
+                    // ready (its handback only left `wake_pending`): the
+                    // host-owned record is the readiness, so publish it here.
+                    let zone_ready = continuation
+                        .zone_wait()
+                        .is_some_and(|wait| crate::el1_zone::is_host_owned(wait.record));
+                    if zone_ready {
+                        continuation.publish_ready_event(
+                            crate::kernel::continuation::ContinuationEvent::Ready,
+                        );
+                    }
                     let generic_wake_ready =
-                        wake_pending && continuation.accepts_scheduler_wake_now();
+                        (wake_pending || zone_ready) && continuation.accepts_scheduler_wake_now();
+                    // A thread parked in the in-guest zone may run only once
+                    // the host owns its record: a pending control quantum
+                    // claims it first. If EL1 holds it, the claim kicked its
+                    // vCPU slot, whose executor hands it back (publishing
+                    // readiness); until then it stays blocked.
+                    let control_pending = control_pending
+                        && continuation.zone_wait().is_none_or(
+                            |wait| match crate::el1_zone::claim(
+                                wait.record,
+                                None,
+                                carrick_el1_abi::Handback::Control,
+                            ) {
+                                carrick_el1_abi::HostClaim::El1Held { .. } => false,
+                                carrick_el1_abi::HostClaim::Claimed
+                                | carrick_el1_abi::HostClaim::AlreadyHost
+                                | carrick_el1_abi::HostClaim::Stale => {
+                                    continuation.publish_ready_event(
+                                        crate::kernel::continuation::ContinuationEvent::Ready,
+                                    );
+                                    true
+                                }
+                            },
+                        );
                     if generic_wake_ready || control_pending {
                         if generic_wake_ready {
                             continuation.publish_ready_event(

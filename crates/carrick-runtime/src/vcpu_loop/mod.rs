@@ -826,6 +826,7 @@ pub(crate) type PlatformFutexFactory =
     Arc<dyn Fn(Arc<FutexTable>) -> Arc<dyn PlatformFutex> + Send + Sync>;
 
 pub(crate) mod binding;
+mod zone;
 
 pub(crate) use binding::{
     ExecutionLeaseCell, HvpatchBlockInput, HvpatchContinuationInput, HvpatchLogicalJobInput,
@@ -878,6 +879,10 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// Exact authority captured at the current syscall boundary. Lifecycle
     /// outcomes consume it rather than recapturing a newer registry generation.
     pub(super) service_kernel_context: Option<carrick_kernel::kernel::KernelContext>,
+    /// The zone key (address-space id) of this thread's process when the
+    /// in-guest zone serves its private futexes; refreshed from the loaded
+    /// task binding at every poll ([`zone`]).
+    pub(super) zone_mm: Option<u64>,
     #[cfg(test)]
     pub(in crate::vcpu_loop) exec_terminal_context_failpoint:
         Option<exec::ExecTerminalContextFailpoint>,
@@ -963,6 +968,7 @@ where
             linux_tid,
             fatal_image_generation,
             service_kernel_context: None,
+            zone_mm: None,
             #[cfg(test)]
             exec_terminal_context_failpoint: None,
             #[cfg(test)]
@@ -1695,7 +1701,8 @@ where
                 dispatch_with_panic_backstop(request.number.raw(), self.this_tid, || {
                     let work_scope = kernel.dispatcher.work_scope();
                     let make_thread_ctx = || {
-                        let ctx = ThreadCtx::new(self.this_tid, &self.registry, &self.futex);
+                        let ctx = ThreadCtx::new(self.this_tid, &self.registry, &self.futex)
+                            .with_zone(zone::zone_for(self.zone_mm));
                         if let Some(ref scope) = work_scope {
                             ctx.with_work_scope(scope)
                         } else {

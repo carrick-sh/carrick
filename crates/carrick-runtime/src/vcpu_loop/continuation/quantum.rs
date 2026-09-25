@@ -171,9 +171,21 @@ impl HvpatchTaskQuantum {
     }
 }
 
+/// A thread its own job parked in the in-guest zone: at the save that
+/// follows, its registers are in `record`, not on the vCPU. `base` is the
+/// task-invariant state (translation, controls, generations) the loader
+/// combines with the record's EL0 context.
+pub(crate) struct ZoneSave {
+    pub(crate) base: carrick_hal::threaded::GuestCpuState,
+    pub(crate) record: carrick_el1_abi::RecordRef,
+}
+
 pub(crate) struct HvpatchTaskBinding {
     identity: crate::vcpu_loop::executor::TaskLoadIdentity,
     backend: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+    /// Set by the thread's job right before it settles into the zone; taken
+    /// by the executor's save.
+    zone_save: Mutex<Option<ZoneSave>>,
     stage1_mm: Option<Arc<crate::hvpatch::Stage1MmLease>>,
     terminal_generation: Mutex<HvpatchBindingTerminalGeneration>,
     // Last by construction: the quantum's drop receipt may become visible
@@ -199,6 +211,7 @@ impl HvpatchTaskBinding {
             identity,
             quantum,
             backend: Mutex::new(Some(backend)),
+            zone_save: Mutex::new(None),
             stage1_mm: None,
             terminal_generation: Mutex::new(HvpatchBindingTerminalGeneration::Active),
         }
@@ -219,6 +232,7 @@ impl HvpatchTaskBinding {
             identity,
             quantum,
             backend: Mutex::new(Some(backend)),
+            zone_save: Mutex::new(None),
             stage1_mm: Some(stage1_mm),
             terminal_generation: Mutex::new(HvpatchBindingTerminalGeneration::Active),
         })
@@ -226,6 +240,16 @@ impl HvpatchTaskBinding {
 
     pub(crate) const fn identity(&self) -> crate::vcpu_loop::executor::TaskLoadIdentity {
         self.identity
+    }
+
+    /// The thread's job parked it in the in-guest zone: the next save keeps
+    /// its registers in the zone record, not on the vCPU.
+    pub(crate) fn set_zone_save(&self, save: ZoneSave) {
+        *self.zone_save.lock() = Some(save);
+    }
+
+    pub(crate) fn take_zone_save(&self) -> Option<ZoneSave> {
+        self.zone_save.lock().take()
     }
 
     #[cfg(test)]
@@ -237,6 +261,7 @@ impl HvpatchTaskBinding {
             identity,
             quantum: Arc::clone(&self.quantum),
             backend: Mutex::new(None),
+            zone_save: Mutex::new(None),
             stage1_mm: self.stage1_mm.clone(),
             terminal_generation: Mutex::new(HvpatchBindingTerminalGeneration::Active),
         }
@@ -256,6 +281,7 @@ impl HvpatchTaskBinding {
             identity,
             quantum: Arc::clone(&self.quantum),
             backend: Mutex::new(None),
+            zone_save: Mutex::new(None),
             stage1_mm: Some(stage1_mm),
             terminal_generation: Mutex::new(HvpatchBindingTerminalGeneration::Active),
         })

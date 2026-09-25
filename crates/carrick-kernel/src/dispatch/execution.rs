@@ -522,6 +522,7 @@ impl SyscallDispatcher {
                     thread.registry,
                     hvpatch_linux_tid,
                     thread.work_scope,
+                    thread.zone,
                 )
             }
             99 => {
@@ -593,6 +594,7 @@ impl SyscallDispatcher {
                     &clock,
                     memory,
                     Some(thread.futex),
+                    thread.zone,
                     request.arg(0),
                     request.arg(1),
                     request.arg(2),

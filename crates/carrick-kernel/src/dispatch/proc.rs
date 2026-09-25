@@ -2503,6 +2503,7 @@ impl<'a> ProcView<'a> {
                 &clock,
                 &mut *cx.memory,
                 cx.thread.map(|t| t.futex),
+                cx.thread.and_then(|t| t.zone),
                 waiters.0,
                 nr_futexes,
                 flags,

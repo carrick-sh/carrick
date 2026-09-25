@@ -106,6 +106,9 @@ impl HvpatchResidencyHandle {
                 let guard = self.residency.lock();
                 match &*guard {
                     Some(TaskCpuResidency::Materialized(cpu)) => return Ok(Some(cpu.clone())),
+                    Some(TaskCpuResidency::Zone { base, record }) => {
+                        return super::residency::materialize_zone(base, *record).map(Some);
+                    }
                     None => return Ok(None),
                     Some(TaskCpuResidency::Resident { .. }) => {}
                 }
@@ -116,6 +119,9 @@ impl HvpatchResidencyHandle {
         loop {
             match &*guard {
                 Some(TaskCpuResidency::Materialized(cpu)) => return Ok(Some(cpu.clone())),
+                Some(TaskCpuResidency::Zone { base, record }) => {
+                    return super::residency::materialize_zone(base, *record).map(Some);
+                }
                 None => return Ok(None),
                 Some(TaskCpuResidency::Resident { .. }) => {
                     let now = std::time::Instant::now();
@@ -617,6 +623,11 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 task.binding().wait_for_materialized(task.thread_key())?
             }
             Some(TaskCpuResidency::Materialized(cpu)) => Some(cpu),
+            // Parked in the in-guest zone: its registers are in the record
+            // its handback made host-owned (the job frees it on resume).
+            Some(TaskCpuResidency::Zone { base, record }) => {
+                Some(super::residency::materialize_zone(&base, record)?)
+            }
             _ => None,
         };
         let cpu = materialized_cpu.as_ref().unwrap_or(initial_cpu);
@@ -713,6 +724,12 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             carrick_kernel::el1_delegation::publish_current_task(
                 slot, task_id, generation, file_table,
             );
+            publish_zone_slot(
+                slot,
+                self.raw_vcpu_id,
+                task.binding().identity().mm.raw(),
+                task.thread_key().serial.raw(),
+            );
         }
         asid_load.mark_resident().map_err(|error| {
             self.clear_live_current_task();
@@ -789,6 +806,13 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         // Exec keeps the thread (and its tid) loaded on this vCPU: the record
         // stays published, and the kernel updates its file table when exec
         // installs the close-on-exec successor (`replace_resources`).
+        // The successor image is a new address space: its zone key follows.
+        if let Some(slot) = self.live_mailbox_slot()
+            && carrick_kernel::el1_zone::zone().is_some()
+        {
+            let (_, serial) = carrick_el1_abi::current_task_snapshot(slot).unwrap_or_default();
+            carrick_el1_abi::publish_zone_identity(slot, binding.identity().mm.raw(), serial);
+        }
         self.binding = Some(binding);
         Ok(())
     }
@@ -826,6 +850,13 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 ));
             }
         };
+        // A task its job parked in the in-guest zone keeps its registers in
+        // the zone record: never leave it resident on this vCPU (whose
+        // registers may be another thread's by now).
+        let zone_save = self
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.take_zone_save());
         let metadata = match engine.extract_resident_task_metadata_for_lazy_save() {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -892,15 +923,25 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 carrick_vmm_hvf::hvf_aarch64_engine::detach_task_engine(engine, lifecycle);
             (HvpatchTaskEngineBindingState::initial(state), vcpu)
         };
-        backend.set_residency(TaskCpuResidency::Resident {
-            executor: self.executor_id,
-            generation: self.residency_generation,
-        });
-        self.resident_task = Some(HvpatchResidentTaskRecord {
-            thread: lease.thread_key(),
-            binding: Arc::downgrade(&binding),
-            metadata,
-        });
+        if let Some(zone_save) = zone_save {
+            let _ = metadata;
+            backend.set_residency(TaskCpuResidency::Zone {
+                base: zone_save.base,
+                record: zone_save.record,
+            });
+            self.resident_task = None;
+            self.residency_generation = self.residency_generation.next();
+        } else {
+            backend.set_residency(TaskCpuResidency::Resident {
+                executor: self.executor_id,
+                generation: self.residency_generation,
+            });
+            self.resident_task = Some(HvpatchResidentTaskRecord {
+                thread: lease.thread_key(),
+                binding: Arc::downgrade(&binding),
+                metadata,
+            });
+        }
         if let Err(error) = restore_worker_vcpu_before_binding_publication(
             &mut self.vcpu,
             vcpu,
@@ -1131,4 +1172,27 @@ impl HvpatchPersistentExecutor {
             carrick_kernel::el1_delegation::clear_current_task(slot);
         }
     }
+}
+
+/// Publish the zone identity of the task just loaded on mailbox `slot`: its
+/// process's zone key (0 when the zone is off, so EL1 forwards every futex
+/// operation), its thread serial, and the slot's vCPU for zone kicks. The
+/// slot's EL1 scheduler state must be empty: the previous residency's last
+/// exit settled it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn publish_zone_slot(slot: usize, vcpu: u64, mm: u64, serial: u64) {
+    carrick_vmm_hvf::vcpu_kick::bind_zone_slot_vcpu(slot, vcpu);
+    let Some(zone) = carrick_kernel::el1_zone::zone() else {
+        carrick_el1_abi::publish_zone_identity(slot, 0, serial);
+        return;
+    };
+    if let Some(zone_slot) = carrick_el1_abi::SlotId::from_index(slot)
+        && !zone.reset_slot(zone_slot)
+    {
+        carrick_fatal!(
+            "vcpu_loop::el1_zone",
+            "EL1 zone slot {slot} still held threads when a task was loaded on it"
+        );
+    }
+    carrick_el1_abi::publish_zone_identity(slot, mm, serial);
 }

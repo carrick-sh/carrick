@@ -627,6 +627,9 @@ impl CarrierWaitServiceInner {
         token: ContinuationWakeToken,
         event: ContinuationEvent,
     ) -> WakePublishReceipt {
+        if !self.zone_event_admitted(token, &event) {
+            return WakePublishReceipt::rejected();
+        }
         let (won, task_waker) = {
             let mut state = self.state.lock();
             let Some(mut entry) = state.registration_mut(token.continuation) else {
@@ -659,6 +662,79 @@ impl CarrierWaitServiceInner {
         WakePublishReceipt {
             accepted: won,
             first: won,
+        }
+    }
+
+    /// A zone wait's thread is owned by its record's claim word, not by this
+    /// registration: an event may wake it only once the host owns the
+    /// record. A signal or a timeout claims it here (a timeout only for the
+    /// park that armed it); a record EL1 holds has its vCPU slot kicked and
+    /// the event is refused, because that slot's executor hands the thread
+    /// back at the exit, which publishes `Ready`. Any other event is refused:
+    /// only the record's owner makes a zone wait ready.
+    fn zone_event_admitted(&self, token: ContinuationWakeToken, event: &ContinuationEvent) -> bool {
+        let zone = {
+            let state = self.state.lock();
+            state
+                .entries
+                .get(&token.continuation)
+                .filter(|entry| entry.token == token)
+                .and_then(|entry| match &entry.probe {
+                    ReadinessProbe::Zone {
+                        record, armed_seq, ..
+                    } => Some((*record, *armed_seq)),
+                    _ => None,
+                })
+        };
+        let Some((record, armed_seq)) = zone else {
+            return true;
+        };
+        let Some(tables) = carrick_el1_abi::zone_tables() else {
+            return true;
+        };
+        let Some(rec) = tables.live(record) else {
+            // Freed: nothing holds the thread back any longer.
+            return true;
+        };
+        if matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. }) {
+            return true;
+        }
+        let (seq, kind) = match event {
+            ContinuationEvent::Timeout => (Some(armed_seq), carrick_el1_abi::Handback::Timeout),
+            ContinuationEvent::Signal | ContinuationEvent::ReservedSignal(_) => {
+                (None, carrick_el1_abi::Handback::Signal)
+            }
+            ContinuationEvent::Ready => return false,
+        };
+        match crate::el1_zone::claim(record, seq, kind) {
+            carrick_el1_abi::HostClaim::Claimed | carrick_el1_abi::HostClaim::AlreadyHost => true,
+            carrick_el1_abi::HostClaim::El1Held { .. } | carrick_el1_abi::HostClaim::Stale => {
+                // The handback publishes `Ready`; a stale or held timeout
+                // must not re-fire every reactor cycle meanwhile.
+                if matches!(event, ContinuationEvent::Timeout) {
+                    self.clear_deadline(token);
+                }
+                false
+            }
+        }
+    }
+
+    fn clear_deadline(&self, token: ContinuationWakeToken) {
+        let mut state = self.state.lock();
+        let deadline = {
+            let Some(mut entry) = state
+                .registration_mut(token.continuation)
+                .filter(|entry| entry.token == token)
+            else {
+                return;
+            };
+            entry.deadline.take()
+        };
+        if let Some(deadline) = deadline {
+            state
+                .reactor_work
+                .deadlines
+                .remove(&(deadline, token.continuation));
         }
     }
 

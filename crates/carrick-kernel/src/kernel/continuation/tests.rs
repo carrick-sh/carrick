@@ -619,6 +619,9 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
         ContinuationFamily::VforkParent => {
             panic!("vfork continuation is constructed from the published Kernel relationship")
         }
+        ContinuationFamily::ZoneFutexWait => {
+            panic!("a zone futex wait is constructed from the zone record it parked in")
+        }
     }
 }
 
@@ -626,6 +629,7 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
 fn continuation_family_event_codes_are_stable_unique_and_nonzero() {
     let mut families = DISPATCH_FAMILIES.to_vec();
     families.push(ContinuationFamily::VforkParent);
+    families.push(ContinuationFamily::ZoneFutexWait);
     let mut codes = families
         .into_iter()
         .map(ContinuationFamily::event_code)
@@ -640,7 +644,7 @@ fn continuation_family_event_codes_are_stable_unique_and_nonzero() {
     assert_eq!(
         codes,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22
         ]
     );
 }

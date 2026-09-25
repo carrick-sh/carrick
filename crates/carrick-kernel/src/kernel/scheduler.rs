@@ -3336,6 +3336,21 @@ impl Scheduler {
         Ok(true)
     }
 
+    /// Hand a zone record the host now owns back to its thread: its zone
+    /// wait becomes ready and the thread runnable (or, if it is still
+    /// running and about to settle, kicked so it settles promptly).
+    pub fn publish_zone_handback(&self, record: carrick_el1_abi::RecordRef) {
+        let Some(key) = crate::el1_zone::thread_key_of(record) else {
+            return;
+        };
+        if let Some(thread) = self.kernel.exact_thread_for_scheduler(key) {
+            let _ = thread.publish_zone_ready(record);
+        }
+        // A rejected wake names a generation that has already retired (exit
+        // or exec won the record); `wake` audits it and nothing is owed.
+        let _ = self.wake(key);
+    }
+
     pub fn wake(&self, thread: ThreadKey) -> Result<WakeDisposition, SchedulerError> {
         let _transition = self.generation_transition.lock();
         let pending = match self.begin_wake(thread) {

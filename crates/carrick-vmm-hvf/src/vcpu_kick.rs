@@ -174,6 +174,37 @@ fn valid_id(_h: &VcpuKickHandle) -> Option<u64> {
 /// Force the given vCPU ids out of `hv_vcpu_run`. Errors (e.g. a vCPU destroyed
 /// in the race window) are ignored — a stale id yields `HV_BAD_ARGUMENT`, never
 /// UB, and the worst case is a missed kick the next syscall boundary catches.
+/// The vCPU each syscall-mailbox slot's executor holds, as `id + 1` (0: none),
+/// for the EL1 zone's slot kicks: the host reaches a thread EL1 holds on a
+/// slot by forcing that slot's vCPU out of the guest.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static ZONE_SLOT_VCPU: [std::sync::atomic::AtomicU64; 256] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 256];
+
+/// Record that the executor holding mailbox `slot` runs vCPU `vcpu`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn bind_zone_slot_vcpu(slot: usize, vcpu: u64) {
+    if let Some(entry) = ZONE_SLOT_VCPU.get(slot) {
+        entry.store(vcpu.wrapping_add(1), std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Force the vCPU on mailbox `slot` out of the guest (the caller marked the
+/// slot's pending host work first).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn kick_zone_slot(slot: usize) {
+    let Some(raw) = ZONE_SLOT_VCPU
+        .get(slot)
+        .map(|entry| entry.load(std::sync::atomic::Ordering::Acquire))
+    else {
+        return;
+    };
+    if raw != 0 {
+        let rc = kick_ids(&[raw - 1]);
+        crate::probes::vcpu_kick(raw - 1, 1, rc);
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn kick_ids(ids: &[u64]) -> i32 {
     if ids.is_empty() {

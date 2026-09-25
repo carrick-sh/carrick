@@ -1149,8 +1149,15 @@ where
             | DispatchOutcome::BlockingRecordLock(_)
             | DispatchOutcome::WaitOnHvpatchChild { .. }
             | DispatchOutcome::WaitOnSignals { .. }
+            // The single-threaded path dispatches without a thread context,
+            // so the in-guest zone never serves its futexes.
+            | DispatchOutcome::ZoneFutexWait { .. }
             | DispatchOutcome::WaitOnSleep { .. } => {
                 let value = crate::linux_abi::LINUX_EINTR.guest_retval();
+                complete_single_threaded_syscall(runtime, &mut completion, &reporter, value)?;
+                last_syscall_retval = Some(value);
+            }
+            DispatchOutcome::ZoneFutexWoken { value, .. } => {
                 complete_single_threaded_syscall(runtime, &mut completion, &reporter, value)?;
                 last_syscall_retval = Some(value);
             }
