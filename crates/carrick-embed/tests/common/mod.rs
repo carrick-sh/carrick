@@ -126,3 +126,56 @@ pub fn run_id() -> String {
              scripts/sudo/kill.sh can reap this run's guests",
         )
 }
+
+/// Bound a guest run: if the run outlives `timeout`, reap this run id with
+/// `scripts/sudo/kill.sh`, so a hang is a test failure rather than a wedge.
+pub struct Watchdog {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    pub fn start(timeout: std::time::Duration) -> Self {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_clone = done.clone();
+        let run_id = run_id();
+        let handle = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while start.elapsed() < timeout {
+                if done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if !done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "WATCHDOG: timeout ({timeout:?}) exceeded for CARRICK_RUN_ID={run_id}; reaping with scripts/sudo/kill.sh"
+                );
+                let kill_script = repo_root().join("scripts/sudo/kill.sh");
+                let _ = std::process::Command::new(kill_script)
+                    .arg(&run_id)
+                    .status();
+            }
+        });
+        Self {
+            done,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn disarm(mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}

@@ -357,7 +357,7 @@ fn el1_files_cross_process_readers_contract() {
     let _guard = common::guest_lock();
     reset_el1_counters();
     carrick_kernel::el1_delegation::reset_delegation_counts();
-    let watchdog = Watchdog::start(std::time::Duration::from_secs(120));
+    let watchdog = common::Watchdog::start(std::time::Duration::from_secs(120));
     let result = common::run_or_fail(
         ContainerBuilder::from_image(common::SMOKE_IMAGE)
             .pull_policy(PullPolicy::Missing)
@@ -422,57 +422,6 @@ print "got: $buf";
     );
 }
 
-struct Watchdog {
-    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Watchdog {
-    fn start(timeout: std::time::Duration) -> Self {
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let done_clone = done.clone();
-        let run_id = common::run_id();
-        let handle = std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            while start.elapsed() < timeout {
-                if done_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            if !done_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "WATCHDOG: timeout ({timeout:?}) exceeded for CARRICK_RUN_ID={run_id}; reaping with scripts/sudo/kill.sh"
-                );
-                let kill_script = common::repo_root().join("scripts/sudo/kill.sh");
-                let _ = std::process::Command::new(kill_script)
-                    .arg(&run_id)
-                    .status();
-            }
-        });
-        Self {
-            done,
-            handle: Some(handle),
-        }
-    }
-
-    fn disarm(mut self) {
-        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-impl Drop for Watchdog {
-    fn drop(&mut self) {
-        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
 /// Exit-group stress test: multi-threaded guest where threads hammer write/lseek on a
 /// delegated regular file while the main thread calls exit_group; run 20 times.
 #[test]
@@ -480,7 +429,7 @@ fn el1_files_exit_group_stress() {
     let _guard = common::guest_lock();
 
     for iteration in 1..=20 {
-        let watchdog = Watchdog::start(std::time::Duration::from_secs(30));
+        let watchdog = common::Watchdog::start(std::time::Duration::from_secs(30));
         let builder = common::interceptor_probe_builder("exit-group-stress");
         let result = common::run_or_fail(builder.run_blocking());
         watchdog.disarm();
@@ -499,7 +448,7 @@ fn el1_files_signal_stress() {
     let _guard = common::guest_lock();
 
     for iteration in 1..=20 {
-        let watchdog = Watchdog::start(std::time::Duration::from_secs(30));
+        let watchdog = common::Watchdog::start(std::time::Duration::from_secs(30));
         let builder = common::interceptor_probe_builder("signal-stress");
         let result = common::run_or_fail(builder.run_blocking());
         watchdog.disarm();
@@ -519,7 +468,7 @@ fn el1_files_blocking_survives_task_reschedule() {
     reset_el1_counters();
 
     for iteration in 1..=20 {
-        let watchdog = Watchdog::start(std::time::Duration::from_secs(30));
+        let watchdog = common::Watchdog::start(std::time::Duration::from_secs(30));
         let result = common::run_or_fail(
             ContainerBuilder::from_image(common::SMOKE_IMAGE)
                 .pull_policy(PullPolicy::Missing)
@@ -696,7 +645,7 @@ fn el1_files_kick_delivery_spin_loop() {
     let _guard = common::guest_lock();
 
     for iteration in 1..=20 {
-        let watchdog = Watchdog::start(std::time::Duration::from_secs(2));
+        let watchdog = common::Watchdog::start(std::time::Duration::from_secs(2));
         let builder = common::interceptor_probe_builder("spin-loop-exit");
         let result = common::run_or_fail(builder.run_blocking());
         watchdog.disarm();
@@ -717,7 +666,7 @@ fn el1_files_kick_delivery_spin_loop_signal() {
     let _guard = common::guest_lock();
 
     for iteration in 1..=20 {
-        let watchdog = Watchdog::start(std::time::Duration::from_secs(2));
+        let watchdog = common::Watchdog::start(std::time::Duration::from_secs(2));
         let builder = common::interceptor_probe_builder("spin-loop-signal");
         let result = common::run_or_fail(builder.run_blocking());
         watchdog.disarm();
