@@ -105,6 +105,16 @@ pub const EL1_CACHE_BASE: u64 = EL1_REGION_BASE + EL1_CACHE_OFFSET;
 /// Size of the file page cache arena (32 MiB).
 pub const EL1_CACHE_SIZE: u64 = (MAX_DELEGATED_FILES as u64) * DELEGATED_FILE_MAX_SIZE;
 
+/// GIC INTID of the kick a vCPU owes at its next EL0 boundary: an SGI the
+/// HVF host makes pending in the vCPU's redistributor when a host kick stops
+/// the vCPU inside Carrick's EL1 code (EL1 plan 1a).
+pub const GIC_KICK_INTID: u32 = 15;
+/// GIC INTID of the EL1 virtual timer (Hypervisor.framework
+/// `HV_GIC_INT_EL1_VIRTUAL_TIMER`, checked at every GIC creation).
+pub const GIC_VTIMER_INTID: u32 = 27;
+/// What `ICC_IAR1_EL1` returns when no interrupt is pending.
+pub const GIC_SPURIOUS_INTID: u32 = 1023;
+
 /// Magic bytes at offset 0 of the EL1 image header: `CEL1`.
 pub const IMAGE_MAGIC: [u8; 4] = *b"CEL1";
 

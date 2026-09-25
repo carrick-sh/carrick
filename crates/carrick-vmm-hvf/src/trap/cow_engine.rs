@@ -4252,6 +4252,12 @@ impl HvfVmState {
                 _ => None,
             };
             let value = match id_reg {
+                // The in-kernel GIC makes the vCPU report the GIC
+                // system-register interface; Linux hides that field from EL0.
+                Some(SysReg::ID_AA64PFR0_EL1) => crate::gic::el0_id_aa64pfr0_view(
+                    vcpu.get_sys_reg(SysReg::ID_AA64PFR0_EL1)
+                        .map_err(hvf_error)?,
+                ),
                 Some(reg) => vcpu.get_sys_reg(reg).map_err(hvf_error)?,
                 None => 0,
             };

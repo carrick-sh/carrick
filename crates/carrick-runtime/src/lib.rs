@@ -240,6 +240,24 @@ pub fn read_el1_region_host_ptr() -> usize {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn reset_el1_counters() {}
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use carrick_vmm_hvf::{CarrierGicSnapshot, carrier_gic_snapshot};
+
+/// The carrier VM's in-kernel GIC; only the HVF backend has one.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CarrierGicSnapshot {
+    pub gic: bool,
+    pub generation: u64,
+    pub vcpus: usize,
+    pub capacity: usize,
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn carrier_gic_snapshot() -> CarrierGicSnapshot {
+    CarrierGicSnapshot::default()
+}
+
 /// Absolute host path to Apple's Rosetta 2 Linux interpreter that carrick probes
 /// (and, on macOS, redirects x86_64 ELF loads to). Resolution order, so the same
 /// probe is correct on every Apple-Silicon host regardless of OS:

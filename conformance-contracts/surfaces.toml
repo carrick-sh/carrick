@@ -6,7 +6,7 @@ contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.
 
 [[surfaces]]
 path = "crates/carrick-mem/src/memory.rs"
-contracts = ["hvpatch.syscall.portal", "kernel.el1.transparent", "kernel.vcpu.kick-el0-boundary"]
+contracts = ["hvpatch.syscall.portal", "kernel.el1.transparent", "kernel.vcpu.kick-el0-boundary", "kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_transparent.rs"
@@ -78,7 +78,7 @@ contracts = ["kernel.fork.filetable", "kernel.fork.mappings"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration", "kernel.mm.backing-maintenance-lookup"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration", "kernel.mm.backing-maintenance-lookup", "kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-mem/src/vdso.rs"
@@ -102,7 +102,7 @@ contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel
 
 [[surfaces]]
 path = "crates/carrick-mem/src/page_table.rs"
-contracts = ["kernel.fork.stage1-image"]
+contracts = ["kernel.fork.stage1-image", "kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/quiesce.rs"
@@ -130,7 +130,7 @@ contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.vm-lifetime"]
+contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.vm-lifetime", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/dispatcher.rs"
@@ -440,7 +440,7 @@ contracts = ["kernel.vcpu.vm-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/vcpu_admission.rs"
-contracts = ["kernel.vcpu.vm-lifetime"]
+contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs"
@@ -461,3 +461,23 @@ contracts = ["kernel.vcpu.vm-lifetime"]
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_vcpu_lifetime.rs"
 contracts = ["kernel.vcpu.vm-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/gic.rs"
+contracts = ["kernel.el1.gic", "kernel.vcpu.kick-el0-boundary"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/el1_gic.rs"
+contracts = ["kernel.el1.gic"]
+
+[[surfaces]]
+path = "fixtures/linux-aarch64-hello/src/el0_id_view.rs"
+contracts = ["kernel.el1.gic"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs"
+contracts = ["kernel.el1.gic"]
+
+[[surfaces]]
+path = "crates/carrick-el1-abi/src/lib.rs"
+contracts = ["kernel.el1.gic"]

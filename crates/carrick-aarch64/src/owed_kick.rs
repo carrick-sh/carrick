@@ -20,9 +20,14 @@
 //!   Owing the kick therefore unmasks `I` in the EL0 return state, and the
 //!   surfacing exit restores the original bit, so the guest never observes the
 //!   change.
-//! - Hypervisor.framework clears pending interrupts on EVERY `hv_vcpu_run`
-//!   return (qualified with a standalone HVF probe on macOS 27.2 / M4), so any
-//!   exit the loop handles internally before the IRQ is taken must re-arm it.
+//! - Without an interrupt controller, Hypervisor.framework clears pending
+//!   interrupts on EVERY `hv_vcpu_run` return (qualified with a standalone HVF
+//!   probe on macOS 27.2 / M4), so any exit the loop handles internally before
+//!   the IRQ is taken must re-arm it. With the in-kernel GICv3 (the HVF
+//!   default since EL1 plan 1a) the owed kick is a redistributor-pending SGI
+//!   that survives run returns until it is taken or withdrawn: the re-arm is
+//!   then an idempotent write (kept for the `CARRICK_HVF_GIC=0` hatch), and
+//!   `settle` must withdraw it, because nothing else will.
 //!
 //! - Carrick's EL1 syscall hook saves SPSR_EL1 on entry and reloads it before
 //!   its served `eret`, which would overwrite the unmask. `absorb` therefore
@@ -185,6 +190,9 @@ mod tests {
         /// Owed kicks published to Carrick's EL1 code (the slot's
         /// pending-host-work flag the EL1 syscall hook consults).
         published_owed_kicks: u32,
+        /// The in-kernel GIC: the pending kick is an SGI that survives run
+        /// returns (qualified live) instead of a line HVF clears on each one.
+        gic_semantics: bool,
     }
 
     impl ModelVcpu {
@@ -203,6 +211,7 @@ mod tests {
                 el0_steps: 0,
                 clock_reads_before_syscall,
                 published_owed_kicks: 0,
+                gic_semantics: false,
             }
         }
 
@@ -297,8 +306,11 @@ mod tests {
 
         fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
             let exit = self.run_until_exit();
-            // Hypervisor.framework: every run return clears pending IRQs.
-            self.pending_irq = false;
+            // Hypervisor.framework without a GIC: every run return clears
+            // pending IRQs. The GIC's redistributor keeps them.
+            if !self.gic_semantics {
+                self.pending_irq = false;
+            }
             Ok(exit)
         }
 
@@ -327,6 +339,9 @@ mod tests {
                     // the interrupted EL0 PC/PSTATE back before surfacing.
                     self.spsr_el1 = self.pstate;
                     self.elr_el1 = self.pc;
+                    // The backend's `hvc #4` decode withdraws the kick in
+                    // both models.
+                    self.pending_irq = false;
                     return Aarch64Exit::Kicked;
                 }
                 if self.clock_reads_before_syscall == 0 {
@@ -349,7 +364,9 @@ mod tests {
                 // pending IRQ exactly as a surfaced exit would.
                 self.clock_reads_before_syscall -= 1;
                 self.el0_steps += 1;
-                self.pending_irq = false;
+                if !self.gic_semantics {
+                    self.pending_irq = false;
+                }
             }
         }
     }
@@ -468,5 +485,38 @@ mod tests {
                 .expect("absorb");
             assert_eq!(vcpu.published_owed_kicks, absorbed);
         }
+    }
+
+    /// With the in-kernel GIC the kick is a redistributor-pending SGI that
+    /// survives every run return, so `rearm` is an idempotent write. The owed
+    /// kick must still surface at the EL0 boundary with the original PSTATE,
+    /// and nothing may stay pending once any exit has surfaced: a stale SGI
+    /// would later be taken as a kick nobody issued.
+    #[test]
+    fn gic_pending_kick_survives_run_returns_and_is_withdrawn_when_served() {
+        for internal_exits in [0_u32, 8] {
+            let mut vcpu = ModelVcpu::at_vector_resume(32);
+            vcpu.gic_semantics = true;
+            vcpu.el1_exits_before_eret = internal_exits;
+            assert_eq!(
+                next_surfaced(&mut vcpu),
+                Surfaced::Kick {
+                    pc: GUEST_PC,
+                    pstate: EL0_DAIF_MASKED,
+                }
+            );
+            assert_eq!(vcpu.el0_steps, 0);
+            assert!(!vcpu.pending_irq, "a surfaced kick left the SGI pending");
+        }
+        // An unrelated exit surfaces first: `settle` withdraws the SGI.
+        let mut vcpu = ModelVcpu::at_vector_resume(0);
+        vcpu.gic_semantics = true;
+        let mut owed = OwedKick::default();
+        owed.absorb(&mut vcpu, vector_resume_pc(), AbsorbedKickSite::El1Vector)
+            .expect("absorb");
+        assert!(vcpu.pending_irq);
+        owed.settle(&mut vcpu).expect("settle");
+        assert!(!vcpu.pending_irq, "settle left the SGI pending");
+        assert_eq!(vcpu.spsr_el1, EL0_DAIF_MASKED);
     }
 }

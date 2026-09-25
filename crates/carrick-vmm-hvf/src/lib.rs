@@ -48,6 +48,8 @@ pub mod darwin_kqueue;
 pub mod fork_coord;
 pub mod fork_quiesce;
 pub mod frame_pool;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod gic;
 pub mod host_signal;
 pub mod io_wait;
 pub mod itimer;
@@ -70,6 +72,8 @@ pub mod vcpu_kick;
 // is parameterized over. `crate::trap::HvfTrapEngine` aliases the specialization.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf_aarch64_engine;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use gic::{CarrierGicSnapshot, InterruptModel, carrier_gic_snapshot, interrupt_model};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use trap::{
     VcpuLifecycleTotals, read_el1_counters, read_el1_region_host_ptr, reset_el1_counters,
