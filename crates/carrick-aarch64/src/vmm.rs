@@ -339,6 +339,77 @@ pub trait Aarch64Vcpu {
     fn set_memory_model(&mut self, _tso: bool) -> Result<(), TrapError> {
         Ok(())
     }
+
+    /// A staged vCPU holds a task's registers as data and has never run, so it
+    /// cannot execute stage-1 maintenance. It records `maintenance` and returns
+    /// `true`; the task's first live executor discharges the debt before the
+    /// task's first instruction. A live vCPU returns `false` and runs it.
+    fn defer_stage1_maintenance(&mut self, _maintenance: Stage1Maintenance) -> bool {
+        false
+    }
+
+    /// Take the maintenance a staged vCPU recorded (see
+    /// [`Self::defer_stage1_maintenance`]).
+    fn take_deferred_stage1_maintenance(&mut self) -> OwedStage1Maintenance {
+        OwedStage1Maintenance::default()
+    }
+}
+
+/// One stage-1 TLB invalidation the engine asks a vCPU to run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Stage1Maintenance {
+    /// `tlbi vmalle1is`: every EL1&0 entry of the VM.
+    AllAsids,
+    /// `tlbi aside1is` for one process ASID.
+    Asid(u16),
+}
+
+/// Stage-1 maintenance owed by a task that has not yet run on a live vCPU.
+/// Invalidating every ASID subsumes invalidating one, and two different ASIDs
+/// escalate to every ASID.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OwedStage1Maintenance {
+    all_asids: bool,
+    asid: Option<u16>,
+}
+
+impl OwedStage1Maintenance {
+    pub fn record(&mut self, maintenance: Stage1Maintenance) {
+        match maintenance {
+            Stage1Maintenance::AllAsids => self.all_asids = true,
+            Stage1Maintenance::Asid(asid) => match self.asid {
+                None => self.asid = Some(asid),
+                Some(owed) if owed == asid => {}
+                Some(_) => self.all_asids = true,
+            },
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        if other.all_asids {
+            self.record(Stage1Maintenance::AllAsids);
+        }
+        if let Some(asid) = other.asid {
+            self.record(Stage1Maintenance::Asid(asid));
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        !self.all_asids && self.asid.is_none()
+    }
+
+    pub fn all_asids(&self) -> bool {
+        self.all_asids
+    }
+
+    /// The single maintenance that discharges this debt, if any.
+    pub fn discharge(&self) -> Option<Stage1Maintenance> {
+        if self.all_asids {
+            Some(Stage1Maintenance::AllAsids)
+        } else {
+            self.asid.map(Stage1Maintenance::Asid)
+        }
+    }
 }
 
 /// One live guest-private writable range that fork must share read-only until
