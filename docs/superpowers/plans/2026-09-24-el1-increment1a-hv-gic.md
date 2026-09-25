@@ -3,13 +3,17 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: use superpowers:executing-plans
 > (or superpowers:subagent-driven-development) to run this plan task by task.
 > Steps use checkbox (`- [ ]`) syntax. Read `AGENTS.md` first (Rule 0 codesign,
-> `just` recipes, red-first, commit style, never `git stash`). Task 1 and
-> Task 2 are DECISION tasks: later tasks are only valid under the outcome their
-> decision gate records, and each gate names the STOP condition.
+> `just` recipes, red-first, commit style, never `git stash`). The GIC setup
+> follows libkrun and `hv_gic.h` (see "Prior art") and is not re-proven. Task 1
+> checks only the uses no reference VMM exercises, and Task 2 designs out the
+> one use the SDK forbids. Both are DECISION tasks: later tasks are valid only
+> under the outcome their gate records, and each gate names its STOP
+> condition.
 
 **Goal:** Every production HVF carrier VM is created with Hypervisor.framework's
 in-kernel GICv3 (`hv_gic_create`), every vCPU carries a unique MPIDR and a
-configured redistributor, host kicks travel as a GIC interrupt, and EL1 can take
+configured redistributor, every vCPU lives for its VM's life, the interrupt a
+kicked vCPU owes at its EL0 boundary travels as a GIC interrupt, and EL1 can take
 and complete a GIC interrupt itself, with no guest-visible behaviour change. A
 signed embed test proves the guest virtual timer interrupt reaches EL1 in the
 production VM with zero host exits between arming and delivery other than host
@@ -18,11 +22,14 @@ kicks (which carry no timer).
 **Architecture:** One module, `carrick-vmm-hvf/src/gic.rs`, is the only caller of
 raw `hv_gic_*`. The single VM-creation funnel (`create_vm_with_admission`) creates
 the GIC right after `hv_vm_create`, inside the same custody transaction, so every
-path that creates a VM (boot, execve rebuild, shared-wait resume, fork rebuild)
-gets one before its first vCPU. The two vCPU-creation wrappers (the only
+VM gets one before its first vCPU. This is the reference order libkrun uses and
+`hv_gic.h` requires. The two vCPU-creation wrappers (the only
 `vm.vcpu_create()` callers) give each vCPU an MPIDR and configure its
-redistributor and CPU interface on the owning thread before it can run. The kick
-vehicle becomes a redistributor-pending SGI, because the SDK makes
+redistributor and CPU interface on the owning thread before it can run. vCPUs
+are created before the VM's first run and destroyed only at teardown (Task 2).
+Host kicks stay `hv_vcpus_exit`, as in every VMM. The deferred interrupt a
+kicked vCPU owes at its next EL0 boundary (`OwedKick`) becomes a
+redistributor-pending SGI, because the SDK makes
 `hv_vcpu_set_pending_interrupt` return `HV_UNSUPPORTED` once a GIC exists. EL1
 takes GIC interrupts in one place: a short IRQ window on the EL1 served-syscall
 return path, where a compiled Rust handler (`carrick_el1_irq`, image header v3)
@@ -37,6 +44,126 @@ DAIF masked exactly as today.
 **Spec:** `docs/superpowers/specs/2026-09-24-el1-kernel.md` (ACCEPTED 2026-09-24),
 sections "Scheduling" (consequences for the design) and "Open items (entry
 criteria for dependent increments)" items 1 and 2.
+
+---
+
+## Prior art: how other VMMs use the in-kernel GIC
+
+Carrick is clean-room with respect to GPL code (AGENTS.md). Every fact below
+comes from a permissively licensed source or from Apple's SDK; QEMU (GPL-2.0)
+also drives `hv_gic_*`, but nothing from its code or patches is used here.
+
+| Source | License | Link |
+|---|---|---|
+| Apple Hypervisor.framework SDK headers (`hv_gic.h`, `hv_vcpu.h`), macOS 27 SDK in Xcode-beta | Apple SDK | local: `$(xcrun --show-sdk-path)/System/Library/Frameworks/Hypervisor.framework/Headers/` |
+| libkrun at `85bed715434ed644857d963f7df0981ce43eef56` (2026-09-21; `containers/libkrun` redirects here) | Apache-2.0 (`LICENSE`; no GPL text in the tree) | https://github.com/libkrun/libkrun |
+
+libkrun paths below are relative to
+`https://github.com/libkrun/libkrun/blob/85bed715434ed644857d963f7df0981ce43eef56/`.
+
+**Creation and placement.**
+- The five calls are `hv_gic_get_distributor_size`,
+  `hv_gic_get_redistributor_size`, `hv_gic_config_create`,
+  `hv_gic_config_set_{distributor,redistributor}_base` and `hv_gic_create`, in
+  that order (`src/devices/src/legacy/hvfgicv3.rs` L76-108).
+- The ordering is `hv_vm_create` (`src/hvf/src/lib.rs` L301, via
+  `src/libkrun/src/vmm/builder.rs` L829 → L2092), then the GIC
+  (`builder.rs` L1175), then `hv_vcpu_create` on each vCPU's own thread
+  (`lib.rs` L396 from `vstate.rs` L443). This is the order `hv_gic.h` requires.
+- Placement comes from libkrun's own board layout: the GIC sits directly below
+  its MMIO start `0x0a00_0000`, and the redistributor region is sized for
+  exactly `vcpu_count` (`hvfgicv3.rs` L88-90; `src/arch/src/aarch64/layout.rs`
+  L89). Each VMM chooses its own window. Carrick's (D6, Task 4) comes from
+  Carrick's IPA map, not from any board.
+- libkrun does not call the alignment getters, the MSI configuration or
+  `hv_gic_get_spi_interrupt_range`. `hv_gic.h` documents the alignment getters,
+  and Carrick keeps them (Task 5 `GicGeometry::fits_window`).
+- If a symbol or call fails, libkrun falls back to its userspace GIC
+  (`builder.rs` L1173-1178). It resolves the symbols with `dlsym` so the binary
+  still loads on macOS 14.
+- Geometry on the planning host, read once with a stand-alone C query (not
+  from libkrun), agrees with Fact 11: distributor 0x10000, one redistributor
+  0x20000, region 0x2000000 (256 redistributors), both alignments 0x10000, MSI
+  region 0x10000, SPI range base 32, count 988.
+
+**Per-vCPU setup.**
+- Right after `hv_vcpu_create`, on the owning thread, libkrun writes
+  `MPIDR_EL1` = the CPU index in Aff0 (`lib.rs` L406-411, value from
+  `vstate.rs` L291). The code comment there says Aff1; it is stale since
+  commit 98520ef.
+- libkrun never calls `hv_gic_get_redistributor_base`. The guest finds its
+  redistributor by scanning the region.
+- The VMM writes no redistributor or ICC register: there is no
+  `hv_gic_set_redistributor_reg` or `hv_gic_set_icc_reg`. The guest's Linux
+  GICv3 driver programs everything.
+
+**Device interrupts.**
+- `set_irq` calls `hv_gic_set_spi(intid, true)` and nothing else
+  (`hvfgicv3.rs` L130-150). INTIDs are absolute and allocated from 32
+  (`layout.rs` L75-78). The devices are described as edge-rising in the FDT,
+  except pl031, which is level.
+- `hv_gic.h` says a `true` level also produces an edge, and a `false` level on
+  an edge interrupt is ignored.
+- The VMM writes no distributor register (no `hv_gic_set_distributor_reg`).
+  Group, priority, routing (`GICD_IROUTER`), enables and `GICD_CTLR` are all
+  programmed by the guest through the distributor's MMIO frame.
+- libkrun does not kick a vCPU after `hv_gic_set_spi`: HVF delivers the
+  interrupt to a running vCPU by itself.
+- **What the scheduler spike did differently** (`c9897ae4c`,
+  `hvf_el1_sched_probe.rs` L1025-1057): it programmed the distributor from the
+  host with `hv_gic_set_distributor_reg` right after `hv_gic_create`, before any
+  vCPU existed, and never touched the distributor's MMIO frame from the guest.
+  libkrun, whose SPIs work, never uses host-side distributor writes. The data
+  does not show which difference mattered, so this plan records it as a
+  hypothesis, not a finding. 1a needs no SPI (D4). Whoever next needs one
+  starts from the reference shape: the guest (Carrick's EL1) programs the
+  distributor through MMIO, and the host calls `hv_gic_set_spi(intid, true)`.
+
+**Kicks and exits.**
+- libkrun uses `hv_vcpus_exit` to stop a running vCPU (`lib.rs` L181-190). It
+  calls it from `Vmm::pause` (`src/libkrun/src/vmm/mod.rs` L266-270) and, on the
+  userspace-GIC path only, from IRQ injection (`src/devices/src/legacy/vcpu.rs`
+  L45-47).
+- `HV_EXIT_REASON_CANCELED` is a no-op exit, after which the loop checks for a
+  pause (`vstate.rs` L370-373, L469).
+- libkrun has no deferred, per-vCPU interrupt of the kind Carrick's `OwedKick`
+  needs (a kick that must surface at the next EL0 boundary, not in the middle of
+  an EL1 critical section). That need is Carrick's alone; see D1.
+
+**vCPU lifecycle and scale.**
+- Each vCPU has one host thread for the VM's life (`vstate.rs` L338-346,
+  L442-443). Nothing calls `hv_vcpu_destroy` or `hv_vm_destroy`. The
+  generated `src/hvf/src/bindings.rs` declares both, and nothing else in
+  `src` names them.
+- libkrun runs one VM per process (HVF allows no more), with `vcpu_count`
+  defaulting to 1 (`vmm_config/machine_config.rs` L35, L47).
+- `hv_gic.h`: "Once the virtual machine vcpus are running, its topology is
+  considered final. Destroy vcpus only when you are tearing down the virtual
+  machine." Carrick adopts the same lifecycle (D2, Task 2) instead of testing
+  what happens when it is violated.
+
+**Not exercised by libkrun, so Carrick checks it itself (Task 1):**
+- the owed-kick vehicle (C2);
+- `hv_vcpus_exit` with several vCPUs under a GIC, in Carrick's EL1/EL0 states
+  (C1);
+- many concurrent processes, each with its own GIC VM (C3).
+
+libkrun has no GIC state save or restore at this commit. `bindings.rs` declares
+`hv_gic_state_*` and `hv_gic_set_state` (L4530-4612), but nothing calls them.
+1a needs none.
+
+**Headers, directly** (macOS 27 SDK):
+- `hv_gic_set_spi`, `hv_gic_{get,set}_distributor_reg` and `hv_gic_send_msi`
+  carry no owning-thread requirement.
+- Redistributor, ICC, ICH and ICV register accessors "Must be called by the
+  owning thread".
+- `hv_vcpu_{get,set}_pending_interrupt` return `HV_UNSUPPORTED` once the VM has
+  a GIC.
+- `hv_vcpus_exit` on a vCPU that is not running makes its next `hv_vcpu_run`
+  return at once.
+- `hv_vcpu_get_wait_for_interrupt_time` (macOS 27) exists only with a GIC,
+  which suggests in-kernel WFI parking. 1c is the increment that relies on
+  parking, and qualifies it.
 
 ---
 
@@ -61,7 +188,7 @@ reports; the plan is not valid under a different fact.
    `hv_vcpu_set_pending_interrupt` "Returns HV_UNSUPPORTED if the VM was created
    with a GIC device (hv_gic_create)". The same header says pending interrupts
    set this way are cleared on every `hv_vcpu_run` return; GIC redistributor
-   pending state is not (Task 1 E1 qualifies that).
+   pending state is not (Task 1 C2 checks that).
 3. **GIC ordering and topology rules** (`hv_gic.h`): `hv_gic_create` only after
    `hv_vm_create` and before any `hv_vcpu_create`; one GIC per VM; affinity
    routing, so each vCPU sets `MPIDR_EL1`; `hv_gic_get_redistributor_base` only
@@ -80,28 +207,48 @@ reports; the plan is not valid under a different fact.
    1192, 1450, 1617). No production code sets `MPIDR_EL1`, touches `CNTV_*`, or
    handles `VTIMER_ACTIVATED` (any non-EXCEPTION, non-CANCELED exit is
    `TrapError::UnexpectedExit`, trap.rs:7449).
-5. **Mid-life vCPU destroys exist, and not every destroy reports.** Raw
-   `hv_vcpu_destroy` with the VM kept alive: `reclaim_park`
-   (persistent_executor.rs:952; the last one under the MT whole-VM lease leaves
-   the VM with zero vCPUs, and `reclaim_resume` later creates a new vCPU in the
-   same VM, persistent_executor.rs:1020-1066), the initial-runner park
-   (persistent_executor.rs:982, reached from `save_initial_runner_state`, which
-   the HVPatch boot hand-off calls at binding.rs:5383 on every carrier boot;
-   executors then create vCPUs in the same VM), `destroy_vcpu_on_thread_exit`
-   (persistent_executor.rs:1360, also the persistent worker's
-   `destroy_worker_vcpu`, and every vCPU's destroy during carrier teardown).
-   Whole-VM paths: `shared_wait_park` (persistent_executor.rs:1082), execve's
-   mature rebuild (execve_rebuild.rs:1246), creation rollback
-   (carrier_custody.rs:110/154). Those six report through
-   `trap::vcpu_destroyed(vcpu_id)` (trap.rs:881). Three more destroy through
-   applevisor's `Drop` (`impl Drop for Vcpu` calls `hv_vcpu_destroy`,
-   applevisor-1.0.0 vcpu.rs:157-161): the local-RAII setup rollback
-   (`SetupVcpuGuard` with `SetupVcpuCleanup::LocalRaii`, carrier_custody.rs:314-329,
-   selected for existing carriers at mapping_plan.rs:489-497, reports through a
-   bare `vcpu_destroyed` fn pointer), `HvfVmState::add_vcpu`'s mailbox failure
-   (cow_engine.rs:3695, no report), and the error returns of
-   `from_process_spec` after its `create_vcpu` (trap.rs:6610, no report).
-   HVF vCPU ids are small integers that a later `hv_vcpu_create` can reuse.
+5. **vCPU destroy sites, and which ones the default HVPatch lane reaches**
+   (code map of 2026-09-24; the decision is D2, Task 2).
+   - **Reached: the initial-runner park.** It runs on every root boot:
+     `launch_persistent_hvpatch_job` (binding.rs:5059) →
+     `prepare_initial_runner_handoff` → `save_initial_runner_state`
+     (binding.rs:5381-5383) → `initial_runner_park` (persistent_executor.rs:970-996,
+     raw `hv_vcpu_destroy` at 982). For the first root this happens before any
+     executor vCPU exists, and the boot vCPU never runs. For a later root in a
+     reused carrier (carrier.rs:12; boot vCPU created in the live VM at
+     mapping_plan.rs:389-497) it destroys a vCPU while pool vCPUs run: a
+     mid-life destroy.
+   - **Reached: `destroy_vcpu_on_thread_exit`** (persistent_executor.rs:1358),
+     called from `HvpatchPersistentExecutor::destroy` (executor/backend.rs:1010-1060)
+     when a worker leaves at pool shutdown (teardown) or after a worker fault
+     (`retire_failed_worker`, executor.rs:188-214), which is mid-life.
+   - **Reached only on error paths:** the boot vCPU's local-RAII rollback
+     (`SetupVcpuGuard` `LocalRaii`, carrier_custody.rs:313-329, chosen at
+     mapping_plan.rs:489-500), the boot-vCPU error destroy
+     (threaded_loop.rs:361), and creation rollback (carrier_custody.rs:110/154;
+     whole VM).
+   - **No runtime caller** (only HVF engine overrides and trait default
+     forwarders):
+     - `reclaim_park`/`reclaim_resume` (persistent_executor.rs:944-1070);
+     - `release_vm_after_reclaim_park`;
+     - `shared_wait_park`/`shared_wait_resume`;
+     - `initial_runner_resume`;
+     - execve's mature rebuild (execve_rebuild.rs:1243-1256; the lane takes the
+       persistent branch at :1072);
+     - `HvfVmState::add_vcpu` (cow_engine.rs:3686-3697);
+     - `from_process_spec` (trap.rs:6606-6610; HVPatch fork never calls
+       `materialize_process`, quantum.rs:1410-1419).
+
+     `CARRICK_HVF_VCPU_RECLAIM` (hvf_aarch64_engine.rs:85-98) now only switches
+     the executor budget between the clamp and `usize::MAX`.
+   - **Pool workers**, spares included, are all spawned and initialised at pool
+     start (pool.rs:1206-1262). No idle shrink exists.
+   - **Reporting.** Six of the raw destroys report through
+     `trap::vcpu_destroyed(vcpu_id)` (trap.rs:881). The Drop-based ones
+     (applevisor-1.0.0 vcpu.rs:157-161: `add_vcpu`'s mailbox failure,
+     `from_process_spec`'s error returns, the local-RAII rollback) report
+     inconsistently or not at all.
+   - HVF vCPU ids are small integers that a later `hv_vcpu_create` can reuse.
 6. **Guest EL0 cannot park in HVF.** `SCTLR_EL1_BOOTSTRAP = 0x0400_d005`
    (carrick-mem/src/arch_sysregs.rs:72) leaves `nTWI`(16) and `nTWE`(18) clear, so
    an EL0 `wfi`/`wfe` traps to EL1. `CNTKCTL_EL1` is programmed to
@@ -138,12 +285,16 @@ reports; the plan is not valid under a different fact.
    of `ID_AA64PFR0_EL1` and nine other ID registers with
    `vcpu.get_sys_reg(reg)`. Linux hides the GIC system-register field
    (`ID_AA64PFR0_EL1` bits 27:24) from EL0, so if HVF sets it once a GIC
-   exists, every guest would see a change (Task 1 E0 measures it; D12).
+   exists, every guest would see a change (Task 5 Step 8's probe measures it
+   against the Docker oracle; D12).
 11. **HVF geometry on the planning host** (read-only query, macOS 27.2 / M4):
    distributor 0x10000, redistributor region 0x2000000 of 0x20000 frames (256
    redistributors), alignment 0x10000, `hv_vm_get_max_vcpu_count` 64, maximum
    IPA 40 bits. The per-VM vCPU cap (64) is below the redistributor count, so
-   D5's clamp is a no-op here; E5 re-measures both.
+   D5's clamp is a no-op here. Task 5's `GicGeometry::query` re-reads the
+   geometry at every GIC creation and fails closed if it does not fit the
+   window. An independent query during the libkrun reading also reported SPI
+   base 32, count 988, and an MSI region of 0x10000 ("Prior art").
 
 ---
 
@@ -152,18 +303,18 @@ reports; the plan is not valid under a different fact.
 | # | Decision | Where decided |
 |---|---|---|
 | D0 | 1a depends on the landed pause fix and reuses its names; nothing from the branch is re-landed. | Fact 1 |
-| D1 | Kick vehicle under GIC: SGI 15 made pending on the owning thread with `GICR_ISPENDR0`, cleared with `GICR_ICPENDR0`, including production's un-acknowledged `hvc #4` path (E1(f)). Fallback PPI 20 if SGI 15 fails E1. `HVF_VIRTUAL_IRQ` survives only for the `CARRICK_HVF_GIC=0` hatch. | Task 1 E1 |
-| D2 | vCPU lifecycle: a destroy is mid-life when a later create follows it in the same VM generation. Keep today's lifecycle only if E3 qualifies mid-life recreates and the census (Task 2) measures them; otherwise STOP 1a and replan lifecycle. | Tasks 1 E3, 2 |
-| D3 | Wedge anomaly: qualified by E2 (8 vCPUs kicked together, 100,000 rounds per state) with named hypotheses; any wedge in a production-reachable state is a STOP; WFI states run in their own executable as data. | Task 1 E2 |
-| D4 | SPI anomaly: investigated by E4; 1a uses no SPI and exposes no SPI API. | Task 1 E4 |
-| D5 | Per-carrier vCPU capacity is clamped to the GIC redistributor count; `hv_gic_create`'s `HV_NO_RESOURCES` joins the VM-creation park+retry, and `GLOBAL_VCPU_CEILING` follows the E5b ceiling with a GIC (D5b). | Task 1 E5/E5b, Task 5 |
-| D6 | GIC IPA window `0x2F_0000_0000..0x2F_1000_0000`: distributor at the base, redistributors at base + 16 MiB; refused by both the stage-2 map boundary and stage-1 publication. | Task 4 |
-| D7 | MPIDR = `1<<31 | (index/16)<<8 | index%16`, lowest free index per VM generation. The index is released under the GIC topology lock in the same critical section as `hv_vcpu_destroy`, so no vCPU created with a reused HVF id can observe a stale owner, and every private interrupt is scrubbed before a reused redistributor is enabled. | Tasks 1 E3/E5, 5 |
+| D1 | Host kicks stay `hv_vcpus_exit` (the reference pattern). The interrupt a kicked vCPU owes at its next EL0 boundary (`OwedKick`) is SGI 15 made pending on the owning thread with `GICR_ISPENDR0` and withdrawn with `GICR_ICPENDR0`, including production's un-acknowledged `hvc #4` path. The reference device vehicle (`hv_gic_set_spi`) was considered and not adopted: a shared SPI per vCPU would need per-vCPU `GICD_IROUTER` routing and distributor programming that no reference does for this purpose. If C2 fails, STOP and replan from the reference injection path. `HVF_VIRTUAL_IRQ` survives only for the `CARRICK_HVF_GIC=0` hatch. | Task 1 C2 |
+| D2 | Every vCPU is created before its VM's first run and destroyed only at VM teardown (`hv_gic.h`; libkrun does the same). The root boots from a snapshot built as data, the dead reclaim/shared-wait paths are deleted, a faulted worker keeps its vCPU until shutdown, and `gic::configure_new_vcpu` fails closed on a create after the generation's first run or first destroy. No mid-life recreate experiment. | Fact 5, Task 2, Task 5 |
+| D3 | `hv_vcpus_exit` under a GIC: a smoke check (C1: 8 vCPUs, 1,000 rounds in each of three production states, hang detector). The only spike wedge in a reachable shape came from the ASID spike's deliberately broken no-save control; the scheduler spike's wake runs parked in WFI, which 1a never enters. Any wedge in C1 is a STOP. WFI liveness belongs to 1c. | Task 1 C1 |
+| D4 | SPI: 1a uses no SPI and exposes no SPI API. The reference setup (the guest programs the distributor through MMIO; the host raises `hv_gic_set_spi(intid, true)`) and the spike's difference from it (host-side distributor writes before any vCPU existed) are recorded under "Prior art" as a hypothesis for whoever next needs an SPI. | Prior art |
+| D5 | Per-carrier vCPU capacity is clamped to the GIC redistributor count read from the SDK at GIC creation. `hv_gic_create`'s `HV_NO_RESOURCES` joins the VM-creation park+retry. `GLOBAL_VCPU_CEILING` follows the C3 ceiling with a GIC (D5b). | Task 1 C3, Task 5 |
+| D6 | GIC IPA window `0x2F_0000_0000..0x2F_1000_0000`: distributor at the base, redistributors at base + 16 MiB; refused by both the stage-2 map boundary and stage-1 publication. Carrick-specific: libkrun places its GIC from its own board layout, and Carrick has none. | Task 4 |
+| D7 | MPIDR = `1<<31 \| (index/16)<<8 \| index%16`, lowest free index per VM generation (libkrun uses the index in Aff0; Carrick's layout keeps 1c's `ICC_SGI1R_EL1` TargetList able to address every vCPU). Under D2 an index is never reused within a generation; destroys are recorded under the GIC topology lock in the same critical section as `hv_vcpu_destroy`. | Tasks 2, 5 |
 | D8 | EL1 takes GIC interrupts only in the served-syscall return window, opened before ELR/SPSR are reloaded from the TrapFrame; EL0 masking is unchanged. | Tasks 7, 9 |
 | D9 | Opt-out hatch `CARRICK_HVF_GIC=0` (exact string), read once in `gic.rs`, restores today's VM, vector bytes and kick vehicle for bisection; the vector builder takes the IRQ mode as an argument from that one reader; 1c deletes it. | Tasks 5, 9 |
 | D10 | The applevisor-sys IRQ/FIQ swap is corrected once, in a typed `HvfInterruptLine`, and a semgrep rule forbids the binding's variants anywhere else. | Task 3 |
 | D11 | Fact 9 is decided on the frozen base before 1a code lands; a confirmed hang on main is reported at once as its own defect. | Task 0B |
-| D12 | EL0 ID view: if a GIC changes an ID register EL0 can read, the EL0 view matches Linux (the `ID_AA64PFR0_EL1` GIC field reads 0), proven by a red-first probe against the Docker oracle. | Task 1 E0, Task 5 |
+| D12 | EL0 ID view: if a GIC changes an ID register EL0 can read, the EL0 view matches Linux (the `ID_AA64PFR0_EL1` GIC field reads 0), proven by a red-first probe against the Docker oracle in the production VM. | Task 5 Step 8 |
 
 ## Global constraints
 
@@ -194,12 +345,11 @@ reports; the plan is not valid under a different fact.
 | Path | Responsibility | Task |
 |---|---|---|
 | `fixtures/linux-aarch64-hello/src/el1_served_loop_kick.rs` (new), `crates/carrick-embed/tests/el1_kick_served_loop.rs` (new), `tests/common/mod.rs`, `tests/el1_files.rs` | Fact 9 on the base; shared embed watchdog | 0B |
-| `crates/carrick-vmm-hvf/tests/gic_qual/harness.rs`, `tests/gic_qualification.rs`, `tests/gic_qualification_wfi.rs` (new) | Signed HVF qualification suite E0-E6 with its own guest blob; WFI states in their own executable | 1 |
-| `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs` | E5b: `concurrent-ceiling` with a GIC per VM | 1 |
-| `docs/perf-results/2026-09-25-hvf-gic-qualification.md` (new) | Fact 9 on main, E0-E6 results and the D1-D12 decisions | 0B, 1, 2, 8, 13 |
-| `crates/carrick-observability/src/probes.rs` | `hvf-vcpu-lifecycle` USDT probe | 2 |
-| `scripts/dtrace/hvf-vcpu-lifecycle-census.d` (new), `crates/carrick-runtime/src/dtrace_consumer.rs`, `crates/carrick-cli/src/{hvf_vcpu_lifecycle_profile.rs (new), main.rs, trace_profile.rs, commands.rs, args.rs}` | Durable census of vCPU create/destroy sites as the strict `carrick trace` profile `hvf-vcpu-lifecycle-census` | 2 |
-| `crates/carrick-vmm-hvf/src/trap/cow_engine.rs` | `add_vcpu` error path reports its destroy (2); EL0 ID view sanitised (5) | 2, 5 |
+| `crates/carrick-vmm-hvf/tests/gic_qual/harness.rs`, `tests/gic_qualification.rs` (new) | Signed checks C1 (`hv_vcpus_exit` smoke) and C2 (owed-kick vehicle) on a reference-setup GIC, with their own guest blob | 1 |
+| `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs` | C3: `concurrent-ceiling` with a GIC per VM | 1 |
+| `docs/perf-results/2026-09-25-hvf-gic-qualification.md` (new) | Fact 9 on main, the reference setup, C1-C3 results, the vCPU lifecycle evidence and the D1-D12 decisions | 0B, 1, 2, 8, 13 |
+| `crates/carrick-vmm-hvf/src/trap/persistent_executor.rs`, `hvf_aarch64_engine.rs`, `trap/mapping_plan.rs`, `crates/carrick-runtime/src/vcpu_loop/{binding.rs, executor.rs, threaded_loop.rs}`, `crates/carrick-vmm-hvf/tests/initial_runner_handoff.rs` (deleted) | vCPUs live for the VM's life: root boot from a snapshot built as data, reclaim/shared-wait paths and the `CARRICK_HVF_VCPU_RECLAIM` hatch deleted, a faulted worker keeps its vCPU until shutdown | 2 |
+| `crates/carrick-vmm-hvf/src/trap/cow_engine.rs` | `add_vcpu` error path destroys through `destroy_raw_vcpu` (2); EL0 ID view sanitised (5) | 2, 5 |
 | `crates/carrick-vmm-hvf/src/interrupt.rs` (new) | `HvfInterruptLine`: the one correction of the binding's IRQ/FIQ swap | 3 |
 | `.semgrep/typed-domains.yml` | Rule `hvf-interrupt-line-outside-boundary` | 3 |
 | `crates/carrick-mem/src/memory.rs`, `memory/el1_clock.rs` | `LINUX_GIC_*` window constants, non-overlap asserts, vector bytes (IRQ hook, served-path window, kick tail) with the IRQ mode as an explicit argument | 4, 9 |
@@ -207,9 +357,9 @@ reports; the plan is not valid under a different fact.
 | `crates/carrick-vmm-hvf/src/trap/stage2_backend.rs` | Stage-2 map refuses the GIC window | 4 |
 | `crates/carrick-runtime/src/runtime.rs` | Passes the carrier's IRQ mode to the vector builder | 9 |
 | `conformance-probes/src/bin/idaa64pfr0.rs` (new), probe lists | EL0 view of `ID_AA64PFR0_EL1` against the Docker oracle (D12) | 5 |
-| `crates/carrick-vmm-hvf/src/gic.rs` (new) | Geometry, placement, `CarrierGic`, `MpidrAllocator`, vCPU configuration, affinity release under the lock, kick vehicle, interrupt model and IRQ mode, vtimer probe | 5, 6, 8 |
-| `crates/carrick-vmm-hvf/src/trap.rs`, `trap/vcpu_admission.rs`, `trap/persistent_executor.rs`, `trap/execve_rebuild.rs`, `trap/carrier_custody.rs`, `trap/vcpu_gate.rs` | Lifecycle sites, GIC in VM creation, vCPU creation/destroy, VM release, capacity, kick sites, exit counting | 2, 5, 6, 8 |
-| `crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs` | `set_pending_irq` through the kick vehicle | 6 |
+| `crates/carrick-vmm-hvf/src/gic.rs` (new) | Geometry, placement, `CarrierGic`, `MpidrAllocator`, vCPU configuration, the D2 lifecycle guard (topology sealed at first run, destroys recorded under the lock), kick vehicle, interrupt model and IRQ mode, vtimer probe | 5, 6, 8 |
+| `crates/carrick-vmm-hvf/src/trap.rs`, `trap/vcpu_admission.rs`, `trap/persistent_executor.rs`, `trap/execve_rebuild.rs`, `trap/carrier_custody.rs`, `trap/vcpu_gate.rs` | Teardown-class destroy sites, GIC in VM creation, vCPU creation/destroy, VM release, capacity, first-run seal, kick sites, exit counting | 2, 5, 6, 8 |
+| `crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs` | `set_pending_irq` through the owed-kick vehicle | 2, 6 |
 | `crates/carrick-aarch64/src/owed_kick.rs` | Doc update for the GIC vehicle; GIC-semantics model test | 6 |
 | `crates/carrick-el1-abi/src/lib.rs` | Shared INTIDs, `TrapFrame.kick`, `IrqFrame`, header v3, IRQ counters, host-exit counters | 5, 7 |
 | `crates/carrick-el1/src/irq.rs` (new), `src/entry.rs`, `link.ld`, `src/lib.rs` | `classify_intid`, `carrick_el1_irq` | 7 |
@@ -218,8 +368,8 @@ reports; the plan is not valid under a different fact.
 | `fixtures/linux-aarch64-hello/src/el1_vtimer_loop.rs` (new), `scripts/build-linux-fixtures.sh` | Guest fixture | 8 |
 | `crates/carrick-embed/tests/el1_gic.rs` (new) | Signed embed tests | 8 |
 | `conformance-contracts/contracts/{gic-topology,el1-gic-vtimer,kick-el0-boundary}.toml`, `surfaces.toml`, `inventory.json` | Contracts | 5, 6, 10 |
-| `scripts/migrate/runtime-global-state.json` | Ledger rows for the new statics | 2, 5, 8 |
-| `justfile` | `el1-gate` runs the fixtures build, each qualification experiment in its own process and a three-arm inotify09 screen | 12 |
+| `scripts/migrate/runtime-global-state.json`, `scripts/migrate/runtime-aborts/hvf.json` | Ledger rows for the new statics; the D2 guard's `carrick_fatal!` site | 5, 8 |
+| `justfile` | `el1-gate` runs the fixtures build, each GIC check (C1 states, C2) in its own process and a three-arm inotify09 screen | 12 |
 | `docs/superpowers/specs/2026-09-24-el1-kernel.md`, `AGENTS.md`, `docs/hal.md` | Record outcomes, the HVF GIC rules, the backend note | 11 |
 
 ---
@@ -685,67 +835,105 @@ Replace `<D11 outcome>` with the row that applied before committing.
 
 ---
 
-### Task 1: HVF GIC qualification suite (decides D1-D6, D12)
+### Task 1: Reference setup and the Carrick-specific GIC checks (decides D1, D3, D5b)
 
-This is the first GIC code task because the design choices depend on HVF
-behaviour nobody has measured under Carrick's lifecycle: the kick vehicle under
-a GIC (including production's un-acknowledged EL0-boundary kick), whether a
-vCPU may be destroyed and recreated while its VM and siblings live and what
-state a recreated redistributor inherits, whether `hv_vcpus_exit` is always
-honoured under a GIC with many vCPUs kicked at once, why `hv_gic_set_spi`
-never reached the CPU interface in the scheduler spike, what a GIC costs in
-VM-creation capacity, and whether a GIC changes the ID registers EL0 can read.
-Each production-reachable experiment is a signed `#[test]` so a later macOS
-update that changes the answer fails `just el1-gate` (Task 12 adds the steps,
-one process per experiment), and each has a negative control.
+**Reference setup (adopted, not re-proven).** 1a creates and configures the
+GIC the way libkrun does and `hv_gic.h` prescribes (see "Prior art"):
+- `hv_gic_config_create`, both bases, then `hv_gic_create` right after
+  `hv_vm_create`, before any vCPU;
+- one vCPU per host thread for the VM's life;
+- `MPIDR_EL1` written on the owning thread before anything touches the vCPU's
+  redistributor;
+- `hv_vcpus_exit` to stop a running vCPU.
 
-Verdicts are semantic events, never rates: "at least one in-guest delivery and
-zero VTIMER_ACTIVATED exits", not "N interrupts in M ms". The only time bounds
-are hang detectors (a wait that did not finish within seconds is recorded as a
-wedge), which AGENTS.md requires of every wait.
+Carrick differs from libkrun in three places, each for a Carrick reason:
+- **Placement.** The window comes from Carrick's IPA map (D6), not from a
+  board layout.
+- **MPIDR layout.** Aff1 = i/16, Aff0 = i%16 (D7), so plan 1c's
+  `ICC_SGI1R_EL1` TargetList can address every vCPU.
+- **Who configures the GIC.** There is no Linux GIC driver in the guest, so the
+  host writes what that driver would: `GICD_CTLR`, and per vCPU the
+  redistributor and ICC registers on the owning thread (Task 5). Both spikes
+  ran the vtimer PPI with `GICD_CTLR` and the redistributor programmed from
+  the host (`c9897ae4c`, `25f6e2f4e`; the ASID spike also wrote the ICC
+  registers from the host).
+
+These properties are checked where they live, not in a separate harness:
+- ordering and placement, by the VM-free source tests of Task 5;
+- vtimer delivery to EL1, by Task 8's red and Task 9's green signed test in the
+  production VM;
+- the EL0 ID view, by Task 5 Step 8's probe against the Docker oracle.
+
+**What is checked here** is only what no reference VMM exercises and 1a relies
+on:
+
+| Check | Why no reference covers it | Decides |
+|---|---|---|
+| **C1**: `hv_vcpus_exit` smoke under a GIC, 8 vCPUs, production-reachable EL1/EL0 states | libkrun kicks only to pause; Carrick kicks siblings on every page-table drain | D3 |
+| **C2**: the owed-kick vehicle, SGI 15 via `GICR_ISPENDR0` on the owning thread, including production's un-acknowledged `hvc #4` exit | No reference VMM defers a kick to the next EL0 boundary | D1 |
+| **C3**: many concurrent processes, each with a GIC VM | libkrun runs one small VM; Carrick's gates run many carriers at once | D5b |
+
+Dropped, and why:
+- **The vtimer-to-EL1 experiment (old E0).** It is the standard use of the
+  device, and 1a's own signed test proves it in production (Tasks 8-9).
+- **The SPI matrix (old E4).** 1a uses no SPI; the reference setup is recorded
+  under "Prior art".
+- **The cost experiment (old E6).** Exit cost is measured where it matters, in
+  Task 13's paired runs against the base artifact.
+- **The capacity and placement experiment (old E5).** The geometry is read
+  from the SDK at every GIC creation and checked against the window, failing
+  closed (Task 5). The clamp is arithmetic on those reads.
+- **The mid-life recreate experiment (old E3).** It is designed out (D2,
+  Task 2): Carrick keeps every vCPU for its VM's life, as libkrun does and
+  `hv_gic.h` asks.
+- **The WFI liveness states.** 1a never enters in-HVF WFI (Fact 6; Task 7
+  Step 5's image ban). Parking and its wake liveness belong to plan 1c, which
+  qualifies them.
+
+The only wedge the spikes attributed to `hv_vcpus_exit` under a GIC was the
+ASID spike's deliberately broken no-save negative control (`25f6e2f4e`: "A
+handler that does not save ELR/SPSR before a nested fault ERETs to EL0 at 0
+(3/3) or wedges"). The scheduler spike's failed wake runs parked the target in
+in-HVF `wfi` (`c9897ae4c`, `gic-wfi-hvc-*` modes), a state 1a never enters.
+C1 is therefore a smoke check with a hang detector, not a hypothesis test.
+
+Verdicts are semantic events, never rates. The only time bounds are hang
+detectors (AGENTS.md: bound every wait).
 
 **Files:**
 - Create: `crates/carrick-vmm-hvf/tests/gic_qual/harness.rs` (shared harness, `include!`d)
-- Create: `crates/carrick-vmm-hvf/tests/gic_qualification.rs` (E0-E6, production-reachable)
-- Create: `crates/carrick-vmm-hvf/tests/gic_qualification_wfi.rs` (E2 WFI states; data only)
-- Modify: `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs` (E5b: `concurrent-ceiling` with a GIC)
+- Create: `crates/carrick-vmm-hvf/tests/gic_qualification.rs` (C1, C2)
+- Modify: `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs` (C3: `concurrent-ceiling` with a GIC)
 - Modify: `docs/perf-results/2026-09-25-hvf-gic-qualification.md`
 
 **Interfaces:**
-- Consumes: `applevisor_sys` raw `hv_vm_*`, `hv_vcpu_*`, `hv_gic_*`; `libc::mmap`;
-  `carrick_host::clock::monotonic_ticks` (the crate's `#[allow(deprecated)]`
-  wrapper of `mach_absolute_time`, which libc 0.2.186 deprecates).
-- Produces (recorded decisions, consumed by Tasks 4-6): `KICK_INTID` value (SGI 15
-  or PPI 20), `REDISTRIBUTOR_CAPACITY` and `max_vcpu` measured on the
-  qualifying host, the E3 verdict and inherited-state record, the E2 verdict per
-  state with its detection bound, the E4 SPI classification, the E5b VM
-  ceilings with and without a GIC, the E6 cost numbers, the E0 ID-register
-  difference (D12).
+- Consumes: `applevisor_sys` raw `hv_vm_*`, `hv_vcpu_*`, `hv_gic_*`;
+  `libc::mmap`; `carrick_host::clock::monotonic_ticks`.
+- Produces (recorded decisions, consumed by Tasks 5-6): the C2 verdict for
+  SGI 15 (D1), the C1 verdict per state (D3), and the C3 VM ceilings with and
+  without a GIC (D5b).
 
 Reference code (read, do not copy blindly): `spike/el1-scheduler` `c9897ae4c`
 `crates/carrick-vmm-hvf/src/bin/hvf_el1_sched_probe.rs` lines 975-1080
-(`create_gic`) and 1244-1320 (`setup_vcpu`); `spike/el1-asid` `25f6e2f4e`
-`crates/carrick-vmm-hvf/src/bin/hvf_el1_asid_probe.rs` lines 1660-1890 (the
-straggler kick loop).
+(`create_gic`) and 1244-1320 (`setup_vcpu`).
 
-Two executables, because HVF allows one VM per process: a wedge leaks its VM,
-and every later VM-creating test in the same executable would then fail in
-`hv_vm_create`. The WFI states production never enters (Fact 6) live in
-`gic_qualification_wfi.rs`, report wedges as data, and never gate. `el1-gate`
-runs each production experiment as its own process.
+HVF allows one VM per process, and a wedge leaks it, so each check runs in its
+own process (`just test-hvf gic_qualification_c<N>`, and one `el1-gate` step
+per check).
 
 - [ ] **Step 1: Write the harness (guest blob, VM, vCPU helpers)**
 
-Create `crates/carrick-vmm-hvf/tests/gic_qual/harness.rs` (a subdirectory
-without `main.rs`, so cargo does not build it as a test target):
+Create `crates/carrick-vmm-hvf/tests/gic_qual/harness.rs`. It lives in a
+subdirectory without `main.rs`, so cargo does not build it as a test target.
 
 ```rust
-// Shared harness of the HVF GIC qualification executables
-// (gic_qualification.rs: production-reachable experiments;
-// gic_qualification_wfi.rs: the in-HVF WFI states production never enters).
-// Each executable `include!`s this file, so each owns its guest blob and its
-// one VM per process. Results are printed as `E<n> {json}` lines and recorded
-// in docs/perf-results/2026-09-25-hvf-gic-qualification.md.
+// Harness of the HVF GIC checks of EL1 plan 1a (C1, C2). The GIC is set up
+// the reference way (libkrun, hv_gic.h): created after hv_vm_create and before
+// any vCPU, MPIDR written on the owning thread before any redistributor
+// access, one host thread per vCPU for the VM's life. Carrick's host-side
+// writes of what a guest GIC driver would program (GICD_CTLR, GICR, ICC)
+// mirror Task 5. Results are printed as `C<n> {json}` lines and recorded in
+// docs/perf-results/2026-09-25-hvf-gic-qualification.md.
 
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -769,24 +957,16 @@ const L1_OFF: u64 = 0x8000;
 const L2_OFF: u64 = 0x9000;
 const BLOCKS_OFF: u64 = 0x20_0000;
 const BLOCK_SIZE: u64 = 0x1000;
-const MAX_BLOCKS: usize = 256;
+const MAX_BLOCKS: usize = 16;
 // Per-vCPU data block; the guest asm below uses the same offsets. The guest's
 // IRQ handler also stores the last acknowledged INTID at 0x08.
 const B_HEARTBEAT: u64 = 0x00;
-const B_SPURIOUS: u64 = 0x18;
 const B_MODE: u64 = 0x20;
 const B_VTIMER_PERIOD: u64 = 0x30;
 const B_COUNTS: u64 = 0x40; // [u64; 64] by INTID
 const MODE_SPIN_UNMASKED: u64 = 0;
 const MODE_SPIN_MASKED: u64 = 1;
-const MODE_WFI: u64 = 2;
-const MODE_SVC_LOOP: u64 = 4;
-const MODE_HVC_LOOP: u64 = 5;
-/// Masked spin that opens a one-instruction IRQ window per iteration
-/// (`daifclr; isb; daifset`), the shape of Task 9's served-path window.
-const MODE_IRQ_WINDOW: u64 = 6;
 const HVC_BAD_VECTOR: u64 = 0x1c;
-const HVC_NULL: u64 = 0x1d;
 /// Production's lower-EL IRQ slot exits with `hvc #4` (Fact 8).
 const HVC_EL0_KICK: u64 = 0x4;
 const EC_HVC64: u64 = 0x16;
@@ -804,12 +984,10 @@ const MAIR: u64 = 0xff;
 const GIC_DIST_IPA: u64 = 0x2F_0000_0000;
 const GIC_REDIST_IPA: u64 = 0x2F_0100_0000;
 const GIC_WINDOW_END: u64 = 0x2F_1000_0000;
+/// Affinity routing + group 1 enable, as Task 5 writes it.
 const GICD_CTLR_ARE_GRP1: u64 = 0x12;
 const VTIMER_INTID: u32 = 27;
 const KICK_SGI: u32 = 15;
-const UNUSED_PPI: u32 = 20;
-const KICK_CANDIDATES: [u32; 2] = [15, 20];
-const TICKS_PER_MS: u64 = 24_000;
 const ALL_PRIVATE: u64 = 0xffff_ffff;
 
 std::arch::global_asm!(
@@ -822,10 +1000,8 @@ std::arch::global_asm!(
     "hvc #0x1c", "b .", ".p2align 7",
     "hvc #0x1c", "b .", ".p2align 7",
     "hvc #0x1c", "b .", ".p2align 7",
-    // 0x200: current EL SPx sync. MODE_SVC_LOOP re-executes its svc forever.
-    "mrs x9, elr_el1", "sub x9, x9, #4", "msr elr_el1, x9", "eret", ".p2align 7",
-    // 0x280: current EL SPx IRQ
-    "b Lgq_irq", ".p2align 7",
+    "hvc #0x1c", "b .", ".p2align 7", // 0x200 current EL SPx sync
+    "b Lgq_irq", ".p2align 7",        // 0x280 current EL SPx IRQ
     "hvc #0x1c", "b .", ".p2align 7", // 0x300 FIQ
     "hvc #0x1c", "b .", ".p2align 7", // 0x380 SError
     "hvc #0x1c", "b .", ".p2align 7", // 0x400 lower-EL sync
@@ -845,12 +1021,7 @@ std::arch::global_asm!(
     "mrs x10, S3_0_C12_C12_0", // ICC_IAR1_EL1
     "str x10, [x9, #0x08]",
     "cmp x10, #1023",
-    "b.ne Lgq_irq_real",
-    "ldr x11, [x9, #0x18]",
-    "add x11, x11, #1",
-    "str x11, [x9, #0x18]",
-    "b Lgq_irq_out",
-    "Lgq_irq_real:",
+    "b.eq Lgq_irq_out",
     "cmp x10, #27",
     "b.ne Lgq_irq_count",
     "msr cntv_ctl_el0, xzr",
@@ -874,7 +1045,7 @@ std::arch::global_asm!(
     "ldp x11, x12, [sp], #16",
     "ldp x9, x10, [sp], #16",
     "eret",
-    // EL1 entry: x9 = block, dispatch on the block's mode word.
+    // EL1 entry: x9 = block; the mode word selects masked or unmasked spin.
     ".p2align 7",
     ".globl _gq_main",
     "_gq_main:",
@@ -882,14 +1053,6 @@ std::arch::global_asm!(
     "ldr x10, [x9, #0x20]",
     "cmp x10, #1",
     "b.eq Lgq_masked",
-    "cmp x10, #2",
-    "b.eq Lgq_wfi",
-    "cmp x10, #4",
-    "b.eq Lgq_svc",
-    "cmp x10, #5",
-    "b.eq Lgq_hvc",
-    "cmp x10, #6",
-    "b.eq Lgq_window",
     "msr daifclr, #2",
     "Lgq_spin:",
     "ldr x11, [x9]",
@@ -899,31 +1062,6 @@ std::arch::global_asm!(
     "Lgq_masked:",
     "msr daifset, #2",
     "b Lgq_spin",
-    "Lgq_wfi:",
-    "msr daifclr, #2",
-    ".globl _gq_wfi_insn",
-    "_gq_wfi_insn:",
-    "wfi",
-    "ldr x11, [x9]",
-    "add x11, x11, #1",
-    "str x11, [x9]",
-    "b _gq_wfi_insn",
-    "Lgq_svc:",
-    "svc #0",
-    "b Lgq_svc",
-    "Lgq_hvc:",
-    "hvc #0x1d",
-    "b Lgq_hvc",
-    "Lgq_window:",
-    "msr daifset, #2",
-    "Lgq_window_loop:",
-    "ldr x11, [x9]",
-    "add x11, x11, #1",
-    "str x11, [x9]",
-    "msr daifclr, #2",
-    "isb",
-    "msr daifset, #2",
-    "b Lgq_window_loop",
     // EL0 entry: the host sets x9 = block and the EL0t PSTATE.
     ".globl _gq_el0_spin",
     "_gq_el0_spin:",
@@ -960,7 +1098,6 @@ std::arch::global_asm!(
 unsafe extern "C" {
     static gq_start: u8;
     static gq_main: u8;
-    static gq_wfi_insn: u8;
     static gq_el0_spin: u8;
     static gq_vectors_el0_hvc4: u8;
     static gq_end: u8;
@@ -974,75 +1111,51 @@ fn check(rc: hv_return_t, what: &str) {
     assert_eq!(rc, 0, "{what}: rc={:#x}", rc as u32);
 }
 
-fn now_ticks() -> u64 {
-    carrick_host::clock::monotonic_ticks()
-}
-
-fn ticks_to_ns(ticks: u64) -> u64 {
-    ticks * 125 / 3 // 24 MHz counter
-}
-
-struct Gic {
-    dist_size: usize,
-    redist_region: usize,
-    redist_size: usize,
-    spi_base: u32,
-    spi_count: u32,
-    vtimer_intid: u32,
-}
-
-impl Gic {
-    /// `hv_gic_create` after `hv_vm_create`, before any vCPU, at the production
-    /// placement; fails the test if the placement does not fit.
-    fn create() -> Gic {
-        let (mut ds, mut da, mut rr, mut rs, mut ra) = (0usize, 0usize, 0usize, 0usize, 0usize);
-        unsafe {
-            check(hv_gic_get_distributor_size(&mut ds), "distributor size");
-            check(hv_gic_get_distributor_base_alignment(&mut da), "distributor alignment");
-            check(hv_gic_get_redistributor_region_size(&mut rr), "redistributor region");
-            check(hv_gic_get_redistributor_size(&mut rs), "redistributor size");
-            check(hv_gic_get_redistributor_base_alignment(&mut ra), "redistributor alignment");
-        }
-        assert!(GIC_DIST_IPA.is_multiple_of(da as u64), "distributor alignment {da:#x}");
-        assert!(GIC_DIST_IPA + ds as u64 <= GIC_REDIST_IPA, "distributor size {ds:#x}");
-        assert!(GIC_REDIST_IPA.is_multiple_of(ra as u64), "redistributor alignment {ra:#x}");
-        assert!(GIC_REDIST_IPA + rr as u64 <= GIC_WINDOW_END, "redistributor region {rr:#x}");
-        let (mut spi_base, mut spi_count, mut vtimer_intid) = (0u32, 0u32, 0u32);
-        unsafe {
-            let config = hv_gic_config_create();
-            assert!(!config.is_null(), "hv_gic_config_create");
-            check(hv_gic_config_set_distributor_base(config, GIC_DIST_IPA), "distributor base");
-            check(hv_gic_config_set_redistributor_base(config, GIC_REDIST_IPA), "redistributor base");
-            check(hv_gic_create(config), "hv_gic_create");
-            os_release(config);
-            check(hv_gic_get_spi_interrupt_range(&mut spi_base, &mut spi_count), "spi range");
-            check(
-                hv_gic_get_intid(hv_gic_intid_t::EL1_VIRTUAL_TIMER, &mut vtimer_intid),
-                "vtimer intid",
-            );
-            check(
-                hv_gic_set_distributor_reg(hv_gic_distributor_reg_t::CTLR, GICD_CTLR_ARE_GRP1),
-                "GICD_CTLR",
-            );
-        }
-        Gic { dist_size: ds, redist_region: rr, redist_size: rs, spi_base, spi_count, vtimer_intid }
+/// Reference creation (hv_gic.h; libkrun hvfgicv3.rs L76-108): size queries,
+/// config, both bases, `hv_gic_create` after `hv_vm_create` and before any
+/// vCPU. Carrick additionally checks the documented alignments and writes the
+/// GICD_CTLR a guest driver would (Task 5 does the same).
+fn create_gic() {
+    let (mut ds, mut da, mut rr, mut ra) = (0usize, 0usize, 0usize, 0usize);
+    unsafe {
+        check(hv_gic_get_distributor_size(&mut ds), "distributor size");
+        check(hv_gic_get_distributor_base_alignment(&mut da), "distributor alignment");
+        check(hv_gic_get_redistributor_region_size(&mut rr), "redistributor region");
+        check(hv_gic_get_redistributor_base_alignment(&mut ra), "redistributor alignment");
     }
-
-    fn redistributors(&self) -> usize {
-        self.redist_region / self.redist_size
+    assert!(GIC_DIST_IPA.is_multiple_of(da as u64), "distributor alignment {da:#x}");
+    assert!(GIC_DIST_IPA + ds as u64 <= GIC_REDIST_IPA, "distributor size {ds:#x}");
+    assert!(GIC_REDIST_IPA.is_multiple_of(ra as u64), "redistributor alignment {ra:#x}");
+    assert!(GIC_REDIST_IPA + rr as u64 <= GIC_WINDOW_END, "redistributor region {rr:#x}");
+    let mut vtimer_intid = 0u32;
+    unsafe {
+        let config = hv_gic_config_create();
+        assert!(!config.is_null(), "hv_gic_config_create");
+        check(hv_gic_config_set_distributor_base(config, GIC_DIST_IPA), "distributor base");
+        check(hv_gic_config_set_redistributor_base(config, GIC_REDIST_IPA), "redistributor base");
+        check(hv_gic_create(config), "hv_gic_create");
+        os_release(config);
+        check(
+            hv_gic_get_intid(hv_gic_intid_t::EL1_VIRTUAL_TIMER, &mut vtimer_intid),
+            "vtimer intid",
+        );
+        check(
+            hv_gic_set_distributor_reg(hv_gic_distributor_reg_t::CTLR, GICD_CTLR_ARE_GRP1),
+            "GICD_CTLR",
+        );
     }
+    assert_eq!(vtimer_intid, VTIMER_INTID, "HVF EL1 virtual timer INTID");
 }
 
 struct Vm {
     host: *mut u8,
-    gic: Option<Gic>,
 }
 
 unsafe impl Send for Vm {}
 unsafe impl Sync for Vm {}
 
 impl Vm {
-    fn create(with_gic: bool) -> Vm {
+    fn create() -> Vm {
         unsafe {
             let config = hv_vm_config_create();
             let mut max_ipa = 0u32;
@@ -1051,7 +1164,7 @@ impl Vm {
             check(hv_vm_create(config), "hv_vm_create");
             os_release(config.cast());
         }
-        let gic = with_gic.then(Gic::create);
+        create_gic();
         let host = unsafe {
             libc::mmap(
                 ptr::null_mut(),
@@ -1063,16 +1176,11 @@ impl Vm {
             )
         };
         assert_ne!(host, libc::MAP_FAILED, "guest RAM mmap");
-        let vm = Vm { host: host.cast(), gic };
+        let vm = Vm { host: host.cast() };
         vm.install_guest();
         unsafe {
             check(
-                hv_vm_map(
-                    host,
-                    RAM_IPA,
-                    RAM_SIZE,
-                    HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC,
-                ),
+                hv_vm_map(host, RAM_IPA, RAM_SIZE, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC),
                 "hv_vm_map",
             );
         }
@@ -1120,7 +1228,8 @@ impl Vm {
         self.block_read(block, B_COUNTS + u64::from(intid) * 8)
     }
 
-    /// Destroy the VM. Every vCPU must already be destroyed on its own thread.
+    /// Destroy the VM. Every vCPU must already be destroyed on its own thread,
+    /// at teardown only (hv_gic.h; D2).
     fn destroy(self) {
         unsafe {
             check(hv_vm_unmap(RAM_IPA, RAM_SIZE), "hv_vm_unmap");
@@ -1130,6 +1239,7 @@ impl Vm {
     }
 }
 
+/// Task 5's MPIDR layout (D7).
 fn mpidr(index: u16) -> u64 {
     (1 << 31) | ((u64::from(index) / 16) << 8) | (u64::from(index) % 16)
 }
@@ -1137,8 +1247,6 @@ fn mpidr(index: u16) -> u64 {
 #[derive(Clone, Copy, Debug, Default)]
 struct Tally {
     canceled: u64,
-    vtimer_activated: u64,
-    hvc_null: u64,
     bad_vector: u64,
     other_exception: u64,
     other_reason: u64,
@@ -1150,10 +1258,10 @@ struct Vcpu {
 }
 
 impl Vcpu {
-    /// Create on the calling (owning) thread, set MPIDR and the minimal EL1
-    /// state, and zero the vCPU's data block. No GIC register is touched, so a
-    /// caller can read the redistributor exactly as HVF hands it out.
-    fn create_unconfigured(vm: &Vm, block: usize, mpidr_index: u16) -> Vcpu {
+    /// Create on the calling (owning) thread, write MPIDR first, then the
+    /// minimal EL1 state and the redistributor/CPU interface for `enable`,
+    /// as Task 5's `configure_new_vcpu` does. Zeroes the vCPU's data block.
+    fn create(vm: &Vm, block: usize, mpidr_index: u16, enable: &[u32]) -> Vcpu {
         let (mut id, mut exit) = (0, ptr::null());
         unsafe { check(hv_vcpu_create(&mut id, &mut exit, ptr::null_mut()), "hv_vcpu_create") };
         let vcpu = Vcpu { id, exit };
@@ -1169,16 +1277,7 @@ impl Vcpu {
         for field in (0..BLOCK_SIZE / 2).step_by(8) {
             vm.block_write(block, field, 0);
         }
-        vcpu
-    }
-
-    /// `create_unconfigured`, then (GIC VMs only) scrub and configure the
-    /// redistributor and CPU interface for `enable`, as production does.
-    fn create(vm: &Vm, block: usize, mpidr_index: u16, enable: &[u32]) -> Vcpu {
-        let vcpu = Self::create_unconfigured(vm, block, mpidr_index);
-        if vm.gic.is_some() {
-            vcpu.gic_enable(enable);
-        }
+        vcpu.gic_enable(enable);
         vcpu
     }
 
@@ -1192,19 +1291,11 @@ impl Vcpu {
         unsafe { check(hv_gic_set_redistributor_reg(self.id, reg, value), "GICR write") }
     }
 
-    fn icc_reg(&self, reg: hv_gic_icc_reg_t) -> u64 {
-        let mut value = 0u64;
-        unsafe { check(hv_gic_get_icc_reg(self.id, reg, &mut value), "ICC read") };
-        value
-    }
-
-    /// Production's configuration (Task 5 `configure_new_vcpu`): withdraw any
-    /// pending, active or enabled private interrupt a previous owner of this
-    /// redistributor left, then group, prioritise and enable `intids`.
+    /// Task 5's `configure_new_vcpu`, minus the affinity allocator.
     fn gic_enable(&self, intids: &[u32]) {
         use hv_gic_redistributor_reg_t as R;
         let mask = intids.iter().fold(0u64, |mask, intid| mask | (1 << intid));
-        self.set_redistributor_reg(R::ICENABLER0, ALL_PRIVATE);
+        self.set_redistributor_reg(R::ICENABLER0, ALL_PRIVATE & !mask);
         self.set_redistributor_reg(R::ICPENDR0, ALL_PRIVATE);
         self.set_redistributor_reg(R::ICACTIVER0, ALL_PRIVATE);
         self.set_redistributor_reg(R::IGROUPR0, mask);
@@ -1250,12 +1341,6 @@ impl Vcpu {
         unsafe { check(hv_vcpu_set_reg(self.id, reg, value), "hv_vcpu_set_reg") }
     }
 
-    fn get(&self, reg: hv_reg_t) -> u64 {
-        let mut value = 0;
-        unsafe { check(hv_vcpu_get_reg(self.id, reg, &mut value), "hv_vcpu_get_reg") };
-        value
-    }
-
     fn enter_el1(&self, vm: &Vm, block: usize, mode: u64) {
         vm.block_write(block, B_MODE, mode);
         self.set(hv_reg_t::PC, guest_ipa(ptr::addr_of!(gq_main)));
@@ -1268,16 +1353,13 @@ impl Vcpu {
         self.set(hv_reg_t::CPSR, if masked { PSTATE_EL0T_MASKED } else { PSTATE_EL0T_UNMASKED });
     }
 
-    fn cntvct(&self) -> u64 {
+    /// Periodic vtimer every `period_ticks`, first expiry one period ahead.
+    fn arm_vtimer(&self, vm: &Vm, block: usize, period_ticks: u64) {
         let mut offset = 0;
         unsafe { check(hv_vcpu_get_vtimer_offset(self.id, &mut offset), "vtimer offset") };
-        now_ticks() - offset
-    }
-
-    /// One-shot at `delay_ticks`; the guest re-arms every `period_ticks` (0 = once).
-    fn arm_vtimer(&self, vm: &Vm, block: usize, delay_ticks: u64, period_ticks: u64) {
         vm.block_write(block, B_VTIMER_PERIOD, period_ticks);
-        self.set_sys(hv_sys_reg_t::CNTV_CVAL_EL0, self.cntvct() + delay_ticks);
+        let now = carrick_host::clock::monotonic_ticks() - offset;
+        self.set_sys(hv_sys_reg_t::CNTV_CVAL_EL0, now + period_ticks);
         self.set_sys(hv_sys_reg_t::CNTV_CTL_EL0, 1);
     }
 
@@ -1293,62 +1375,34 @@ impl Vcpu {
         self.set_redistributor_reg(hv_gic_redistributor_reg_t::ICPENDR0, 1 << intid);
     }
 
-    fn set_active(&self, intid: u32) {
-        self.set_redistributor_reg(hv_gic_redistributor_reg_t::ISACTIVER0, 1 << intid);
-    }
-
-    /// Run until a CANCELED exit (re-entering after null HVCs and, in a GIC-less
-    /// VM, after VTIMER_ACTIVATED with the timer disabled), or any other exit.
-    fn run_until_canceled(&self, max_internal_exits: u64) -> Tally {
+    /// Run until a CANCELED exit or any other exit; every exit ends the call.
+    fn run_until_canceled(&self) -> Tally {
         let mut tally = Tally::default();
-        loop {
-            unsafe { check(hv_vcpu_run(self.id), "hv_vcpu_run") };
-            let exit = unsafe { &*self.exit };
-            match exit.reason {
-                hv_exit_reason_t::CANCELED => {
-                    tally.canceled += 1;
-                    return tally;
-                }
-                hv_exit_reason_t::VTIMER_ACTIVATED => {
-                    tally.vtimer_activated += 1;
-                    self.set_sys(hv_sys_reg_t::CNTV_CTL_EL0, 0);
-                }
-                hv_exit_reason_t::EXCEPTION => {
-                    let syndrome = exit.exception.syndrome;
-                    let (ec, imm) = (syndrome >> 26, syndrome & 0xffff);
-                    if ec == EC_HVC64 && imm == HVC_NULL {
-                        tally.hvc_null += 1;
-                    } else if ec == EC_HVC64 && imm == HVC_BAD_VECTOR {
-                        tally.bad_vector += 1;
-                        return tally;
-                    } else {
-                        tally.other_exception += 1;
-                        return tally;
-                    }
-                }
-                _ => {
-                    tally.other_reason += 1;
-                    return tally;
-                }
+        unsafe { check(hv_vcpu_run(self.id), "hv_vcpu_run") };
+        let exit = unsafe { &*self.exit };
+        match exit.reason {
+            hv_exit_reason_t::CANCELED => tally.canceled += 1,
+            hv_exit_reason_t::EXCEPTION
+                if exit.exception.syndrome >> 26 == EC_HVC64
+                    && exit.exception.syndrome & 0xffff == HVC_BAD_VECTOR =>
+            {
+                tally.bad_vector += 1
             }
-            if tally.hvc_null + tally.vtimer_activated > max_internal_exits {
-                return tally;
-            }
+            hv_exit_reason_t::EXCEPTION => tally.other_exception += 1,
+            _ => tally.other_reason += 1,
         }
+        tally
     }
 
+    /// Only at teardown, on the owning thread (D2).
     fn destroy(self) {
         unsafe { check(hv_vcpu_destroy(self.id), "hv_vcpu_destroy") }
     }
 }
 
+/// Production's kick: one `hv_vcpus_exit` call per vCPU (vcpu_kick.rs, per-handle kick).
 fn kick(id: hv_vcpu_t) {
-    kick_all(&[id]);
-}
-
-/// One `hv_vcpus_exit` call naming every vCPU, as a page-table drain does.
-fn kick_all(ids: &[hv_vcpu_t]) {
-    unsafe { check(hv_vcpus_exit(ids.as_ptr(), ids.len() as u32), "hv_vcpus_exit") }
+    unsafe { check(hv_vcpus_exit(&id, 1), "hv_vcpus_exit") }
 }
 
 fn kick_after(id: hv_vcpu_t, after: Duration) -> std::thread::JoinHandle<()> {
@@ -1358,224 +1412,25 @@ fn kick_after(id: hv_vcpu_t, after: Duration) -> std::thread::JoinHandle<()> {
     })
 }
 
-/// Create a vCPU on a fresh owning thread, run `body`, destroy the vCPU.
-fn on_vcpu_thread<R: Send + 'static>(
-    vm: &Arc<Vm>,
-    block: usize,
-    mpidr_index: u16,
-    enable: &'static [u32],
-    body: impl FnOnce(&Vm, &Vcpu) -> R + Send + 'static,
-) -> R {
-    let vm = Arc::clone(vm);
-    std::thread::spawn(move || {
-        let vcpu = Vcpu::create(&vm, block, mpidr_index, enable);
-        let result = body(&vm, &vcpu);
-        vcpu.destroy();
-        result
-    })
-    .join()
-    .expect("vCPU thread")
-}
-
 fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// xorshift64*, seeded per test, for kick jitter without a new dependency.
-struct Jitter(u64);
-
-impl Jitter {
-    fn next_micros(&mut self, bound: u64) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % bound
-    }
-}
-
-const ENABLE_VTIMER: &[u32] = &[VTIMER_INTID];
-const ENABLE_VTIMER_AND_KICK: &[u32] = &[VTIMER_INTID, KICK_SGI];
-/// vCPUs kicked together per E2 round (a page-table drain kicks every sibling).
-const LIVENESS_VCPUS: usize = 8;
-/// Rounds per E2 state. Zero wedges in N rounds bounds the per-round wedge
-/// probability below about 3/N at 95% confidence; the results doc states it.
-const LIVENESS_ROUNDS: u64 = 100_000;
-/// Hang detectors, not verdict rates: a vCPU that has not honoured a kick in
-/// SUSPECT is re-kicked every 5 ms until WEDGE; only then is it a wedge.
-const LIVENESS_SUSPECT: Duration = Duration::from_secs(1);
-const LIVENESS_WEDGE: Duration = Duration::from_secs(5);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Entry {
-    El1(u64),
-    El0 { masked: bool },
-}
-
-#[derive(Clone, Copy, Debug)]
-struct LivenessState {
-    name: &'static str,
-    production_reachable: bool,
-    entry: Entry,
-    vtimer_period: u64,
-    /// Make the kick SGI pending before the first run (masked states keep it
-    /// pending for the whole experiment, as a production EL0 does).
-    kick_pending: bool,
-}
-
-/// Printed through Debug in the `E2` lines.
-#[allow(dead_code)]
-#[derive(Debug)]
-struct LivenessReport {
-    state: &'static str,
-    production_reachable: bool,
-    rounds: u64,
-    canceled: Vec<u64>,
-    pc_at_wfi: u64,
-    pc_past_wfi: u64,
-    /// (round, vCPU index, heartbeat still advancing)
-    wedges: Vec<(u64, usize, bool)>,
-    unexpected: u64,
-}
-
-/// Kick `LIVENESS_VCPUS` vCPUs in one `hv_vcpus_exit` list per round, with
-/// jitter, and require every one to honour every kick.
-fn liveness(state: LivenessState) -> LivenessReport {
-    let vm = Arc::new(Vm::create(true));
-    let canceled: Arc<Vec<AtomicU64>> =
-        Arc::new((0..LIVENESS_VCPUS).map(|_| AtomicU64::new(0)).collect());
-    let pc_at_wfi = Arc::new(AtomicU64::new(0));
-    let pc_past_wfi = Arc::new(AtomicU64::new(0));
-    let unexpected = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let ids = Arc::new(Mutex::new(vec![0; LIVENESS_VCPUS]));
-    let ready = Arc::new(Barrier::new(LIVENESS_VCPUS + 1));
-    let owners: Vec<_> = (0..LIVENESS_VCPUS)
-        .map(|index| {
-            let (vm, canceled, pc_at_wfi, pc_past_wfi, unexpected, stop, ids, ready) = (
-                Arc::clone(&vm),
-                Arc::clone(&canceled),
-                Arc::clone(&pc_at_wfi),
-                Arc::clone(&pc_past_wfi),
-                Arc::clone(&unexpected),
-                Arc::clone(&stop),
-                Arc::clone(&ids),
-                Arc::clone(&ready),
-            );
-            std::thread::spawn(move || {
-                let vcpu = Vcpu::create(&vm, index, index as u16, ENABLE_VTIMER_AND_KICK);
-                match state.entry {
-                    Entry::El1(mode) => vcpu.enter_el1(&vm, index, mode),
-                    Entry::El0 { masked } => vcpu.enter_el0(index, masked),
-                }
-                if state.vtimer_period != 0 {
-                    vcpu.arm_vtimer(&vm, index, state.vtimer_period, state.vtimer_period);
-                }
-                if state.kick_pending {
-                    vcpu.set_pending(KICK_SGI);
-                }
-                ids.lock().expect("ids")[index] = vcpu.id;
-                ready.wait();
-                let wfi = guest_ipa(ptr::addr_of!(gq_wfi_insn));
-                loop {
-                    unsafe { check(hv_vcpu_run(vcpu.id), "hv_vcpu_run") };
-                    let exit = unsafe { &*vcpu.exit };
-                    if exit.reason != hv_exit_reason_t::CANCELED {
-                        unexpected.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                    if state.entry == Entry::El1(MODE_WFI) {
-                        if vcpu.get(hv_reg_t::PC) == wfi {
-                            pc_at_wfi.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            pc_past_wfi.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    canceled[index].fetch_add(1, Ordering::Release);
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                }
-                vcpu.destroy();
-            })
-        })
-        .collect();
-    ready.wait();
-    let targets: Vec<hv_vcpu_t> = ids.lock().expect("ids").clone();
-    let mut jitter = Jitter(0x9e37_79b9_7f4a_7c15 ^ targets[0]);
-    let mut wedges = Vec::new();
-    let mut rounds = 0;
-    'rounds: while rounds < LIVENESS_ROUNDS && unexpected.load(Ordering::Relaxed) == 0 {
-        std::thread::sleep(Duration::from_micros(jitter.next_micros(50)));
-        let want: Vec<u64> = canceled.iter().map(|c| c.load(Ordering::Acquire) + 1).collect();
-        let behind = || -> Vec<usize> {
-            (0..LIVENESS_VCPUS)
-                .filter(|&i| canceled[i].load(Ordering::Acquire) < want[i])
-                .collect()
-        };
-        kick_all(&targets);
-        let sent = Instant::now();
-        while !behind().is_empty() && sent.elapsed() < LIVENESS_SUSPECT {
-            std::thread::yield_now();
-        }
-        for index in behind() {
-            // Suspect: is the guest still executing, and does a re-kick help?
-            let h0 = vm.block_read(index, B_HEARTBEAT);
-            std::thread::sleep(Duration::from_millis(100));
-            let h1 = vm.block_read(index, B_HEARTBEAT);
-            let deadline = Instant::now() + LIVENESS_WEDGE;
-            while canceled[index].load(Ordering::Acquire) < want[index] && Instant::now() < deadline {
-                kick(targets[index]);
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            if canceled[index].load(Ordering::Acquire) < want[index] {
-                wedges.push((rounds, index, h1 > h0));
-                break 'rounds;
-            }
-        }
-        rounds += 1;
-    }
-    stop.store(true, Ordering::Release);
-    if wedges.is_empty() {
-        kick_all(&targets);
-        for owner in owners {
-            owner.join().expect("owner thread");
-        }
-        Arc::into_inner(vm).expect("sole VM handle").destroy();
-    } else {
-        // A wedged owner cannot destroy its vCPU; leak the threads and the VM.
-        // HVF allows one VM per process, so no later VM can be created in this
-        // executable: callers stop creating VMs after a wedge.
-        std::mem::forget(owners);
-        std::mem::forget(vm);
-    }
-    LivenessReport {
-        state: state.name,
-        production_reachable: state.production_reachable,
-        rounds,
-        canceled: canceled.iter().map(|c| c.load(Ordering::Acquire)).collect(),
-        pc_at_wfi: pc_at_wfi.load(Ordering::Acquire),
-        pc_past_wfi: pc_past_wfi.load(Ordering::Acquire),
-        wedges,
-        unexpected: unexpected.load(Ordering::Acquire),
-    }
 }
 ```
 
 Create `crates/carrick-vmm-hvf/tests/gic_qualification.rs`:
 
 ```rust
-//! Hypervisor.framework in-kernel GIC qualification for EL1 plan 1a (Task 1):
-//! the production-reachable experiments E0-E6, one `#[test]` each, each with a
-//! negative control. The in-HVF WFI states production never enters live in
-//! gic_qualification_wfi.rs.
+//! Hypervisor.framework in-kernel GIC checks for EL1 plan 1a (Task 1): only
+//! what no reference VMM exercises (C1 hv_vcpus_exit under a GIC in Carrick's
+//! states, C2 the owed-kick vehicle). The GIC setup itself follows libkrun and
+//! hv_gic.h and is not re-proven here.
 //!
-//! Run ONLY through `just test-hvf gic_qualification_e<N> --nocapture`
-//! (scripts/test-signed.sh), one experiment per process: an unsigned
-//! executable gets HV_DENIED, which is a failure here, never a skip, and a
-//! wedge leaks the process's one VM.
+//! Run ONLY through `just test-hvf gic_qualification_c<N> --nocapture`
+//! (scripts/test-signed.sh), one check per process: an unsigned executable
+//! gets HV_DENIED, which is a failure here, never a skip, and a wedge leaks
+//! the process's one VM.
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #![allow(
-    dead_code, // the shared harness is included by two executables
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::panic,
@@ -1587,165 +1442,38 @@ include!("gic_qual/harness.rs");
 ```
 
 `hv_vcpus_exit`'s first parameter is `*const hv_vcpu_t` in applevisor-sys 1.0.0
-(production passes `ids.as_ptr()` in `vcpu_kick.rs`); if the compiler reports
-`*mut`, use `ids.as_ptr().cast_mut()`.
+(production passes `ids.as_ptr()` in `vcpu_kick.rs`). If the compiler reports
+`*mut`, use `ptr::addr_of!(id).cast_mut()`.
 
-- [ ] **Step 2: E0: geometry, the vtimer PPI at EL1 and the EL0 ID view, with a GIC-less control**
+- [ ] **Step 2: C2, the owed-kick vehicle (decides D1)**
+
+`OwedKick` needs an interrupt that is pending on one particular vCPU, is taken
+at the next EL0 boundary, and can be withdrawn when some other exit surfaces
+first. `hv_vcpus_exit` stays the kick itself, as in every VMM. The owed
+interrupt cannot use the legacy line once a GIC exists: the SDK refuses it
+(Fact 2).
+
+The reference device vehicle, `hv_gic_set_spi`, does not fit here without
+adding things no reference exercises. An SPI is a shared interrupt, so each
+vCPU would need its own SPI, routed with `GICD_IROUTER` to its MPIDR and
+re-routed whenever an index is reused. The distributor would have to be
+programmed from the host, the path on which the scheduler spike's SPIs were
+never delivered, or through MMIO from EL1, which needs a stage-1 mapping of the
+distributor that Task 4 forbids. A private SGI made pending in the vCPU's own
+redistributor avoids all of that, and it is written on the thread that already
+absorbs the kick. This check proves that one shape and nothing else.
 
 Append to `gic_qualification.rs`:
 
 ```rust
-/// The ID registers Carrick's EL0 MRS emulation returns raw
-/// (cow_engine.rs `emulate_el0_sys64_read_inner`).
-const ID_REGISTERS: [(&str, hv_sys_reg_t); 10] = [
-    ("MIDR_EL1", hv_sys_reg_t::MIDR_EL1),
-    ("ID_AA64PFR0_EL1", hv_sys_reg_t::ID_AA64PFR0_EL1),
-    ("ID_AA64PFR1_EL1", hv_sys_reg_t::ID_AA64PFR1_EL1),
-    ("ID_AA64DFR0_EL1", hv_sys_reg_t::ID_AA64DFR0_EL1),
-    ("ID_AA64DFR1_EL1", hv_sys_reg_t::ID_AA64DFR1_EL1),
-    ("ID_AA64ISAR0_EL1", hv_sys_reg_t::ID_AA64ISAR0_EL1),
-    ("ID_AA64ISAR1_EL1", hv_sys_reg_t::ID_AA64ISAR1_EL1),
-    ("ID_AA64MMFR0_EL1", hv_sys_reg_t::ID_AA64MMFR0_EL1),
-    ("ID_AA64MMFR1_EL1", hv_sys_reg_t::ID_AA64MMFR1_EL1),
-    ("ID_AA64MMFR2_EL1", hv_sys_reg_t::ID_AA64MMFR2_EL1),
-];
-
-fn id_registers(vcpu: &Vcpu) -> Vec<u64> {
-    ID_REGISTERS.iter().map(|&(_, reg)| vcpu.get_sys(reg)).collect()
-}
-
-#[test]
-fn gic_qualification_e0_geometry_and_vtimer_ppi() {
-    let _serial = serial();
-    let vm = Arc::new(Vm::create(true));
-    let gic = vm.gic.as_ref().expect("GIC VM");
-    assert_eq!(gic.vtimer_intid, VTIMER_INTID, "HVF EL1 virtual timer INTID");
-    let geometry = (
-        gic.dist_size,
-        gic.redist_region,
-        gic.redist_size,
-        gic.redistributors(),
-        gic.spi_base,
-        gic.spi_count,
-    );
-    let (tally, vtimer_irqs, spurious, heartbeat, icc_sre, gicd_ctlr, redist_base, ids_gic) =
-        on_vcpu_thread(&vm, 0, 0, ENABLE_VTIMER, |vm, vcpu| {
-            let (mut gicd_ctlr, mut redist_base) = (0u64, 0u64);
-            let icc_sre = vcpu.icc_reg(hv_gic_icc_reg_t::SRE_EL1);
-            unsafe {
-                check(
-                    hv_gic_get_distributor_reg(hv_gic_distributor_reg_t::CTLR, &mut gicd_ctlr),
-                    "GICD_CTLR read",
-                );
-                check(hv_gic_get_redistributor_base(vcpu.id, &mut redist_base), "redistributor base");
-            }
-            let ids = id_registers(vcpu);
-            vcpu.enter_el1(vm, 0, MODE_SPIN_UNMASKED);
-            vcpu.arm_vtimer(vm, 0, TICKS_PER_MS, 10 * TICKS_PER_MS);
-            let stop = kick_after(vcpu.id, Duration::from_millis(200));
-            let tally = vcpu.run_until_canceled(1_000);
-            stop.join().expect("kicker");
-            (
-                tally,
-                vm.count(0, VTIMER_INTID),
-                vm.block_read(0, B_SPURIOUS),
-                vm.block_read(0, B_HEARTBEAT),
-                icc_sre,
-                gicd_ctlr,
-                redist_base,
-                ids,
-            )
-        });
-    println!(
-        "E0 {{\"distributor_size\":{},\"redistributor_region\":{},\"redistributor_size\":{},\
-         \"redistributors\":{},\"spi_base\":{},\"spi_count\":{},\"icc_sre\":\"{icc_sre:#x}\",\
-         \"gicd_ctlr\":\"{gicd_ctlr:#x}\",\"redistributor_base_vcpu0\":\"{redist_base:#x}\",\
-         \"vtimer_irqs\":{vtimer_irqs},\"spurious\":{spurious},\"heartbeat\":{heartbeat},\
-         \"tally\":\"{tally:?}\"}}",
-        geometry.0, geometry.1, geometry.2, geometry.3, geometry.4, geometry.5
-    );
-    assert_eq!(icc_sre & 1, 1, "ICC_SRE_EL1.SRE: the system-register interface is live");
-    assert!(vtimer_irqs >= 1, "vtimer PPI 27 taken in-guest at least once");
-    assert_eq!(tally.vtimer_activated, 0, "no VTIMER_ACTIVATED exit under the GIC");
-    assert_eq!((tally.canceled, tally.other_exception, tally.other_reason, tally.bad_vector), (1, 0, 0, 0));
-    assert!(heartbeat > 0, "guest ran");
-    Arc::into_inner(vm).expect("sole VM handle").destroy();
-
-    // Negative control: the same guest with no GIC exits with VTIMER_ACTIVATED
-    // and never takes INTID 27 in-guest. Its ID registers are the D12 baseline.
-    let vm = Arc::new(Vm::create(false));
-    let (tally, vtimer_irqs, ids_plain) = on_vcpu_thread(&vm, 0, 0, &[], |vm, vcpu| {
-        let ids = id_registers(vcpu);
-        vcpu.enter_el1(vm, 0, MODE_SPIN_UNMASKED);
-        vcpu.arm_vtimer(vm, 0, TICKS_PER_MS, 0);
-        let stop = kick_after(vcpu.id, Duration::from_millis(50));
-        let tally = vcpu.run_until_canceled(10);
-        stop.join().expect("kicker");
-        (tally, vm.count(0, VTIMER_INTID), ids)
-    });
-    println!("E0-control {{\"vtimer_irqs\":{vtimer_irqs},\"tally\":\"{tally:?}\"}}");
-    let differs: Vec<String> = ID_REGISTERS
-        .iter()
-        .zip(ids_gic.iter().zip(&ids_plain))
-        .filter(|(_, (gic, plain))| gic != plain)
-        .map(|((name, _), (gic, plain))| format!("{name}: plain={plain:#x} gic={gic:#x}"))
-        .collect();
-    println!("E0-id {{\"differs\":\"{differs:?}\"}}");
-    assert!(tally.vtimer_activated >= 1 && vtimer_irqs == 0, "control: {tally:?} irqs {vtimer_irqs}");
-    Arc::into_inner(vm).expect("sole VM handle").destroy();
-}
-```
-
-- [ ] **Step 3: Build, sign and run E0**
-
-```bash
-just test-hvf gic_qualification_e0 --nocapture 2>&1 | tee target/gic-qual-e0.log
-grep -a '^E0' target/gic-qual-e0.log
-```
-
-Expected: `test gic_qualification_e0_geometry_and_vtimer_ppi ... ok`, one `E0 {...}`,
-one `E0-control {...}` and one `E0-id {...}` line, and the script's unentitled
-negative control passing. A `HV_DENIED` means the executable was not signed:
-rerun through the recipe, never bare `cargo test`. If the placement asserts
-fail, STOP and report the printed geometry: D6's window must be re-derived
-before anything else. **Gate D12:** if `E0-id` names `ID_AA64PFR0_EL1`, Task 5
-Step 8 sanitises the EL0 view; any other named register is a STOP (a
-guest-visible change this plan has no design for).
-
-- [ ] **Step 4: E1: the kick vehicle (decides D1)**
-
-Append:
-
-```rust
 #[derive(Debug)]
 struct KickOutcome {
-    intid: u32,
     legacy_rc: hv_return_t,
     survives_run_return: bool,
     taken_at_el1: bool,
-    taken_at_el0: bool,
-    withdrawn_by_icpendr: bool,
     el0_boundary_exits: u64,
     el0_boundary_withdrawn: bool,
-    tallies: [Tally; 5],
-}
-
-impl KickOutcome {
-    fn qualifies(&self) -> bool {
-        self.survives_run_return
-            && self.taken_at_el1
-            && self.taken_at_el0
-            && self.withdrawn_by_icpendr
-            && self.el0_boundary_exits == 1
-            && self.el0_boundary_withdrawn
-    }
-}
-
-fn kick_round(vcpu: &Vcpu) -> Tally {
-    let stop = kick_after(vcpu.id, Duration::from_millis(20));
-    let tally = vcpu.run_until_canceled(100);
-    stop.join().expect("kicker");
-    tally
+    tallies: [Tally; 3],
 }
 
 /// Run with the production-shaped lower-EL IRQ slot (`hvc #4; eret`, no
@@ -1754,7 +1482,7 @@ fn kick_round(vcpu: &Vcpu) -> Tally {
 /// ELR_EL1 with SPSR_EL1 and I clear (OwedKick::absorb's state). Returns the
 /// number of `hvc #4` exits; more than one means the withdrawn, never
 /// acknowledged interrupt was re-taken.
-fn el0_boundary_kick_round(vcpu: &Vcpu, intid: u32) -> (u64, Tally) {
+fn el0_boundary_kick_round(vcpu: &Vcpu) -> (u64, Tally) {
     let stop = kick_after(vcpu.id, Duration::from_millis(20));
     let mut tally = Tally::default();
     let mut boundary_exits = 0;
@@ -1771,7 +1499,7 @@ fn el0_boundary_kick_round(vcpu: &Vcpu, intid: u32) -> (u64, Tally) {
                     && exit.exception.syndrome & 0xffff == HVC_EL0_KICK =>
             {
                 boundary_exits += 1;
-                vcpu.clear_pending(intid);
+                vcpu.clear_pending(KICK_SGI);
                 vcpu.set(hv_reg_t::PC, vcpu.get_sys(hv_sys_reg_t::ELR_EL1));
                 vcpu.set(hv_reg_t::CPSR, vcpu.get_sys(hv_sys_reg_t::SPSR_EL1) & !PSTATE_I);
                 if boundary_exits > 100 {
@@ -1793,397 +1521,66 @@ fn el0_boundary_kick_round(vcpu: &Vcpu, intid: u32) -> (u64, Tally) {
     (boundary_exits, tally)
 }
 
+fn kick_round(vcpu: &Vcpu) -> Tally {
+    let stop = kick_after(vcpu.id, Duration::from_millis(20));
+    let tally = vcpu.run_until_canceled();
+    stop.join().expect("kicker");
+    tally
+}
+
 #[test]
-fn gic_qualification_e1_kick_vehicle() {
+fn gic_qualification_c2_owed_kick_vehicle() {
     let _serial = serial();
-    let vm = Arc::new(Vm::create(true));
-    let mut outcomes = Vec::new();
-    for (index, &intid) in KICK_CANDIDATES.iter().enumerate() {
-        let enable: &'static [u32] = if intid == 15 { &[15] } else { &[20] };
-        outcomes.push(on_vcpu_thread(&vm, index, index as u16, enable, move |vm, vcpu| {
-            // (a) The legacy vehicle is refused once the VM has a GIC.
+    let vm = Arc::new(Vm::create());
+    let outcome = {
+        let vm = Arc::clone(&vm);
+        std::thread::spawn(move || {
+            let vcpu = Vcpu::create(&vm, 0, 0, &[KICK_SGI]);
+            // (a) Negative control: the legacy vehicle is refused under a GIC.
             let legacy_rc = unsafe { hv_vcpu_set_pending_interrupt(vcpu.id, SDK_IRQ, true) };
-            // (b) Pending state survives an hv_vcpu_run return while masked.
-            vcpu.enter_el1(vm, index, MODE_SPIN_MASKED);
-            vcpu.set_pending(intid);
-            let t_b = kick_round(vcpu);
-            let survives_run_return = vcpu.pending(intid) && vm.count(index, intid) == 0;
-            // (c) Taken and acknowledged at EL1 once unmasked.
-            vcpu.enter_el1(vm, index, MODE_SPIN_UNMASKED);
-            let t_c = kick_round(vcpu);
-            let taken_at_el1 = vm.count(index, intid) == 1 && !vcpu.pending(intid);
-            // (d) Taken at EL0 through the lower-EL IRQ vector.
-            vcpu.enter_el0(index, false);
-            vcpu.set_pending(intid);
-            let t_d = kick_round(vcpu);
-            let taken_at_el0 = vm.count(index, intid) == 2 && !vcpu.pending(intid);
-            // (e) GICR_ICPENDR0 withdraws a pending kick before it is taken.
-            vcpu.enter_el1(vm, index, MODE_SPIN_MASKED);
-            vcpu.set_pending(intid);
-            vcpu.clear_pending(intid);
-            vcpu.enter_el1(vm, index, MODE_SPIN_UNMASKED);
-            let t_e = kick_round(vcpu);
-            let withdrawn_by_icpendr = vm.count(index, intid) == 2;
-            // (f) Production's EL0-boundary kick: signalled, never acknowledged,
+            // (b) Pending state survives an hv_vcpu_run return while masked
+            // (the legacy line is cleared on every return; Fact 2).
+            vcpu.enter_el1(&vm, 0, MODE_SPIN_MASKED);
+            vcpu.set_pending(KICK_SGI);
+            let t_b = kick_round(&vcpu);
+            let survives_run_return = vcpu.pending(KICK_SGI) && vm.count(0, KICK_SGI) == 0;
+            // (c) Taken and acknowledged at EL1 once unmasked (Task 9's window).
+            vcpu.enter_el1(&vm, 0, MODE_SPIN_UNMASKED);
+            let t_c = kick_round(&vcpu);
+            let taken_at_el1 = vm.count(0, KICK_SGI) == 1 && !vcpu.pending(KICK_SGI);
+            // (d) Production's EL0-boundary kick: signalled, never acknowledged,
             // withdrawn by the host, resumed with I clear. Exactly one hvc #4.
             vcpu.set_sys(hv_sys_reg_t::VBAR_EL1, guest_ipa(ptr::addr_of!(gq_vectors_el0_hvc4)));
-            vcpu.enter_el0(index, false);
-            vcpu.set_pending(intid);
-            let (el0_boundary_exits, t_f) = el0_boundary_kick_round(vcpu, intid);
-            let el0_boundary_withdrawn = !vcpu.pending(intid) && vm.count(index, intid) == 2;
-            vcpu.set_sys(hv_sys_reg_t::VBAR_EL1, RAM_IPA);
+            vcpu.enter_el0(0, false);
+            vcpu.set_pending(KICK_SGI);
+            let (el0_boundary_exits, t_d) = el0_boundary_kick_round(&vcpu);
+            let el0_boundary_withdrawn = !vcpu.pending(KICK_SGI) && vm.count(0, KICK_SGI) == 1;
+            vcpu.destroy(); // teardown
             KickOutcome {
-                intid,
                 legacy_rc,
                 survives_run_return,
                 taken_at_el1,
-                taken_at_el0,
-                withdrawn_by_icpendr,
                 el0_boundary_exits,
                 el0_boundary_withdrawn,
-                tallies: [t_b, t_c, t_d, t_e, t_f],
+                tallies: [t_b, t_c, t_d],
             }
-        }));
-    }
-    for outcome in &outcomes {
-        println!("E1 {{\"outcome\":\"{outcome:?}\",\"qualifies\":{}}}", outcome.qualifies());
-        assert_eq!(outcome.legacy_rc, HV_UNSUPPORTED, "hv_vcpu_set_pending_interrupt under a GIC");
-        for tally in &outcome.tallies[..4] {
-            assert_eq!(
-                (tally.canceled, tally.other_exception, tally.other_reason, tally.bad_vector),
-                (1, 0, 0, 0),
-                "{tally:?}"
-            );
-        }
-    }
-    let chosen = outcomes.iter().find(|o| o.qualifies()).map(|o| o.intid);
-    println!("E1 {{\"chosen_kick_intid\":{chosen:?}}}");
-    assert!(chosen.is_some(), "no GIC kick vehicle qualified: STOP at gate D1");
-    Arc::into_inner(vm).expect("sole VM handle").destroy();
-}
-```
-
-Run:
-
-```bash
-just test-hvf gic_qualification_e1 --nocapture 2>&1 | tee target/gic-qual-e1.log
-grep -a '^E1' target/gic-qual-e1.log
-```
-
-Expected: `ok`; `legacy_rc` = `HV_UNSUPPORTED` for both candidates (this is the
-SDK fact made executable, and the negative control for the legacy vehicle);
-`el0_boundary_exits` = 1 for the chosen candidate; a `chosen_kick_intid` line.
-**Gate D1:** a candidate qualifies only if (f) holds as well as (b)-(e), because
-(f) is the path production takes. Tasks 5-6 use `chosen_kick_intid`. The plan's
-code below is written for SGI 15; if E1 chose 20, Task 5 sets
-`KICK_INTID = GicIntid::ppi(20)` instead and nothing else changes. If neither
-qualifies only because of (f) (`el0_boundary_exits > 1`), STOP and report: the
-lower-EL IRQ slot must acknowledge before `hvc #4`, which is a design change.
-
-- [ ] **Step 5: E2: `hv_vcpus_exit` liveness under a GIC (decides D3)**
-
-Hypotheses under test, from the spec's two anomalies:
-- **H-a** (scheduler spike, "one of three `hv_vcpus_exit` wake runs wedged"): a
-  CANCELED exit taken while the guest sits in in-HVF `wfi` leaves PC on the
-  `wfi`, so a harness that re-enters the guest re-parks it and a wake carried
-  only by `hv_vcpus_exit` is lost. Evidence: `pc_at_wfi > 0` in the WFI
-  states, with no missed CANCELED.
-- **H-b** (asid spike: "a handler that does not save ELR/SPSR before a nested
-  fault ERETs to EL0 at 0 (3/3) or wedges"): the wedged vCPU was spinning in an
-  in-guest exception loop. Evidence: the EL1 exception storm honours every
-  `hv_vcpus_exit`.
-- **H-c**: HVF itself drops an exit that races in-kernel WFI entry under the GIC.
-  Evidence: a missed CANCELED in a WFI state.
-
-Every state runs 8 vCPUs kicked together through one `hv_vcpus_exit` list, as a
-page-table drain kicks every sibling, for 100,000 rounds.
-
-Append to `gic_qualification.rs`:
-
-```rust
-#[test]
-fn gic_qualification_e2_vcpus_exit_liveness() {
-    let _serial = serial();
-    let states = [
-        LivenessState {
-            name: "el1-spin-unmasked-vtimer-100us",
-            production_reachable: true,
-            entry: Entry::El1(MODE_SPIN_UNMASKED),
-            vtimer_period: 2_400,
-            kick_pending: false,
-        },
-        LivenessState {
-            name: "el1-spin-masked",
-            production_reachable: true,
-            entry: Entry::El1(MODE_SPIN_MASKED),
-            vtimer_period: 0,
-            kick_pending: false,
-        },
-        LivenessState {
-            name: "el1-exception-storm",
-            production_reachable: true,
-            entry: Entry::El1(MODE_SVC_LOOP),
-            vtimer_period: 0,
-            kick_pending: false,
-        },
-        LivenessState {
-            name: "el1-irq-window-vtimer-100us",
-            production_reachable: true,
-            entry: Entry::El1(MODE_IRQ_WINDOW),
-            vtimer_period: 2_400,
-            kick_pending: false,
-        },
-        LivenessState {
-            name: "el0-spin-unmasked",
-            production_reachable: true,
-            entry: Entry::El0 { masked: false },
-            vtimer_period: 0,
-            kick_pending: false,
-        },
-        LivenessState {
-            name: "el0-masked-kick-pending",
-            production_reachable: true,
-            entry: Entry::El0 { masked: true },
-            vtimer_period: 0,
-            kick_pending: true,
-        },
-    ];
-    for state in states {
-        let report = liveness(state);
-        println!("E2 {{\"report\":\"{report:?}\"}}");
-        assert_eq!(report.unexpected, 0, "{report:?}");
-        assert!(report.wedges.is_empty(), "production-reachable wedge: STOP at gate D3: {report:?}");
-        assert_eq!(report.rounds, LIVENESS_ROUNDS, "{report:?}");
-    }
-}
-```
-
-Create `crates/carrick-vmm-hvf/tests/gic_qualification_wfi.rs`:
-
-```rust
-//! EL1 plan 1a qualification E2, WFI states: in-HVF `wfi` is a state
-//! production never enters (Fact 6; the EL1 image refuses wfi/wfe, Task 7).
-//! Wedges here are recorded as data for plan 1c's entry criterion and never
-//! fail the test. A separate executable because a wedge leaks the process's
-//! only VM.
-//!
-//! Run ONLY through `just test-hvf gic_qualification_wfi_ --nocapture`.
-#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#![allow(
-    dead_code, // the shared harness is included by two executables
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_safety_doc,
-    clippy::undocumented_unsafe_blocks
-)]
-
-include!("gic_qual/harness.rs");
-
-#[test]
-fn gic_qualification_wfi_e2_liveness() {
-    let _serial = serial();
-    let states = [
-        LivenessState {
-            name: "wfi-idle",
-            production_reachable: false,
-            entry: Entry::El1(MODE_WFI),
-            vtimer_period: 0,
-            kick_pending: false,
-        },
-        LivenessState {
-            name: "wfi-vtimer-1ms",
-            production_reachable: false,
-            entry: Entry::El1(MODE_WFI),
-            vtimer_period: TICKS_PER_MS,
-            kick_pending: false,
-        },
-    ];
-    let mut wedged = false;
-    for state in states {
-        if wedged {
-            println!("E2W {{\"state\":\"{}\",\"skipped\":\"a prior wedge leaked this process's VM\"}}", state.name);
-            continue;
-        }
-        let report = liveness(state);
-        println!("E2W {{\"report\":\"{report:?}\"}}");
-        wedged = !report.wedges.is_empty();
-    }
-}
-```
-
-Run each executable in its own process:
-
-```bash
-just test-hvf gic_qualification_e2 --nocapture 2>&1 | tee target/gic-qual-e2.log
-grep -a '^E2' target/gic-qual-e2.log
-just test-hvf gic_qualification_wfi_ --nocapture 2>&1 | tee target/gic-qual-e2w.log
-grep -a '^E2W' target/gic-qual-e2w.log
-```
-
-Expected: the production test `ok` with six `E2` lines; the WFI test `ok`
-whatever it records. **Gate D3:** any wedge in a production-reachable state
-fails the test: STOP 1a, keep the log, take a core of the test process
-(`sudo lldb -p <pid> -o "process save-core target/gic-e2.core" -o detach`), and
-report. Record for the WFI states: `pc_at_wfi` (H-a), wedges (H-c). A wedge
-only in a WFI state does not block 1a (production never parks in WFI: Fact 6,
-enforced by Task 7 Step 5's image ban) but is an entry criterion carried to 1c,
-written into the spec in Task 11.
-
-- [ ] **Step 6: E3: mid-life vCPU destroy and recreate (decides D2)**
-
-Append to `gic_qualification.rs`:
-
-```rust
-const RECREATE_CYCLES: usize = 500;
-/// A hang detector for one cycle's 50 us timer, not a latency verdict.
-const CYCLE_HANG_BOUND: Duration = Duration::from_secs(10);
-
-/// What a freshly created vCPU's redistributor and CPU interface hold before
-/// Carrick configures anything.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct RawGicState {
-    igroupr0: u64,
-    isenabler0: u64,
-    ispendr0: u64,
-    isactiver0: u64,
-    ipriorityr3: u64,
-    icc_pmr: u64,
-    icc_igrpen1: u64,
-}
-
-fn raw_gic_state(vcpu: &Vcpu) -> RawGicState {
-    use hv_gic_redistributor_reg_t as R;
-    RawGicState {
-        igroupr0: vcpu.redistributor_reg(R::IGROUPR0),
-        isenabler0: vcpu.redistributor_reg(R::ISENABLER0),
-        ispendr0: vcpu.redistributor_reg(R::ISPENDR0),
-        isactiver0: vcpu.redistributor_reg(R::ISACTIVER0),
-        ipriorityr3: vcpu.redistributor_reg(R::IPRIORITYR3),
-        icc_pmr: vcpu.icc_reg(hv_gic_icc_reg_t::PMR_EL1),
-        icc_igrpen1: vcpu.icc_reg(hv_gic_icc_reg_t::IGRPEN1_EL1),
-    }
-}
-
-#[test]
-fn gic_qualification_e3_midlife_vcpu_recreate() {
-    let _serial = serial();
-    let vm = Arc::new(Vm::create(true));
-    let capacity = vm.gic.as_ref().expect("GIC VM").redistributors();
-    assert!(capacity >= 8, "redistributor capacity {capacity}");
-    let stop = Arc::new(AtomicBool::new(false));
-    let sibling_ids = Arc::new(Mutex::new(Vec::new()));
-    let started = Arc::new(Barrier::new(4));
-    let mut siblings = Vec::new();
-    for s in 0..3usize {
-        let (vm, stop, ids, started) =
-            (Arc::clone(&vm), Arc::clone(&stop), Arc::clone(&sibling_ids), Arc::clone(&started));
-        siblings.push(std::thread::spawn(move || {
-            let vcpu = Vcpu::create(&vm, s, s as u16, ENABLE_VTIMER);
-            vcpu.enter_el1(&vm, s, MODE_SPIN_UNMASKED);
-            vcpu.arm_vtimer(&vm, s, TICKS_PER_MS, TICKS_PER_MS);
-            ids.lock().expect("ids").push(vcpu.id);
-            started.wait();
-            let tally = loop {
-                let tally = vcpu.run_until_canceled(0);
-                if tally.canceled != 1 || stop.load(Ordering::Acquire) {
-                    break tally;
-                }
-            };
-            // Only the owning thread may destroy its vCPU; siblings are
-            // destroyed at teardown, after every vCPU has stopped.
-            vcpu.destroy();
-            tally
-        }));
-    }
-    started.wait();
-    let sibling_irqs_before: Vec<u64> = (0..3).map(|s| vm.count(s, VTIMER_INTID)).collect();
-
-    let churn = {
-        let vm = Arc::clone(&vm);
-        std::thread::spawn(move || {
-            let mut failures = Vec::new();
-            let mut raw_states = std::collections::BTreeSet::new();
-            let mut carried_over = 0u64;
-            let mut bases = std::collections::BTreeMap::<u16, u64>::new();
-            let mut previous_left_state = false;
-            for cycle in 0..2 * RECREATE_CYCLES {
-                let reuse = cycle < RECREATE_CYCLES;
-                let index = if reuse { 3 } else { 3 + (cycle % (capacity - 3)) as u16 };
-                let block = 3;
-                let vcpu = Vcpu::create_unconfigured(&vm, block, index);
-                let raw = raw_gic_state(&vcpu);
-                raw_states.insert(raw);
-                if previous_left_state
-                    && (raw.ispendr0 & (1 << KICK_SGI) != 0 || raw.isactiver0 & (1 << UNUSED_PPI) != 0)
-                {
-                    carried_over += 1;
-                }
-                let mut base = 0u64;
-                unsafe { check(hv_gic_get_redistributor_base(vcpu.id, &mut base), "redistributor base") };
-                if let Some(previous) = bases.insert(index, base)
-                    && previous != base
-                {
-                    failures.push(format!("cycle {cycle}: index {index} base moved {previous:#x} -> {base:#x}"));
-                }
-                vcpu.gic_enable(ENABLE_VTIMER); // scrubs, as production does
-                vcpu.enter_el1(&vm, block, MODE_SPIN_UNMASKED);
-                vcpu.arm_vtimer(&vm, block, 1_200, 0); // 50 us, one shot
-                let id = vcpu.id;
-                let watcher = {
-                    let vm = Arc::clone(&vm);
-                    std::thread::spawn(move || {
-                        let deadline = Instant::now() + CYCLE_HANG_BOUND;
-                        while vm.count(block, VTIMER_INTID) == 0 && Instant::now() < deadline {
-                            std::thread::yield_now();
-                        }
-                        kick(id);
-                    })
-                };
-                let tally = vcpu.run_until_canceled(0);
-                watcher.join().expect("watcher");
-                if vm.count(block, VTIMER_INTID) != 1 || tally.canceled != 1 {
-                    failures.push(format!("cycle {cycle}: irqs {} tally {tally:?}", vm.count(block, VTIMER_INTID)));
-                }
-                // Reuse cycles leave a pending kick SGI and an active PPI behind,
-                // so the next incarnation of index 3 shows whether HVF resets them.
-                previous_left_state = reuse;
-                if reuse {
-                    vcpu.set_pending(KICK_SGI);
-                    vcpu.set_active(UNUSED_PPI);
-                }
-                vcpu.destroy();
-            }
-            (failures, raw_states, carried_over, bases.len())
         })
+        .join()
+        .expect("vCPU thread")
     };
-    let (failures, raw_states, carried_over, distinct_indices) = churn.join().expect("churn thread");
-    let sibling_irqs: Vec<u64> = (0..3)
-        .map(|s| vm.count(s, VTIMER_INTID) - sibling_irqs_before[s])
-        .collect();
-
-    // Teardown in HVF's order: stop every vCPU, destroy each on its own thread,
-    // then the VM.
-    stop.store(true, Ordering::Release);
-    for &id in sibling_ids.lock().expect("ids").iter() {
-        kick(id);
+    println!("C2 {{\"outcome\":\"{outcome:?}\"}}");
+    assert_eq!(outcome.legacy_rc, HV_UNSUPPORTED, "hv_vcpu_set_pending_interrupt under a GIC");
+    for tally in &outcome.tallies {
+        assert_eq!(
+            (tally.canceled, tally.other_exception, tally.other_reason, tally.bad_vector),
+            (1, 0, 0, 0),
+            "{tally:?}"
+        );
     }
-    for sibling in siblings {
-        let tally = sibling.join().expect("sibling");
-        assert_eq!((tally.other_exception, tally.other_reason, tally.bad_vector), (0, 0, 0), "{tally:?}");
-    }
-    println!(
-        "E3 {{\"cycles\":{},\"failures\":{},\"raw_states\":\"{raw_states:?}\",\
-         \"carried_over\":{carried_over},\"distinct_indices\":{distinct_indices},\
-         \"sibling_irqs\":\"{sibling_irqs:?}\",\"first_failures\":\"{:?}\"}}",
-        2 * RECREATE_CYCLES,
-        failures.len(),
-        failures.iter().take(5).collect::<Vec<_>>()
-    );
-    assert!(failures.is_empty(), "mid-life recreate failed: STOP at gate D2");
-    for irqs in sibling_irqs {
-        assert!(irqs >= 1, "a sibling took no vtimer interrupt during the churn");
-    }
+    assert!(outcome.survives_run_return, "SGI 15 pending state lost on a run return: STOP at gate D1");
+    assert!(outcome.taken_at_el1, "SGI 15 not taken at EL1: STOP at gate D1");
+    assert_eq!(outcome.el0_boundary_exits, 1, "hvc #4 path re-took a withdrawn SGI: STOP at gate D1");
+    assert!(outcome.el0_boundary_withdrawn, "GICR_ICPENDR0 did not withdraw the kick: STOP at gate D1");
     Arc::into_inner(vm).expect("sole VM handle").destroy();
 }
 ```
@@ -2191,206 +1588,193 @@ fn gic_qualification_e3_midlife_vcpu_recreate() {
 Run:
 
 ```bash
-just test-hvf gic_qualification_e3 --nocapture 2>&1 | tee target/gic-qual-e3.log
-grep -a '^E3' target/gic-qual-e3.log
+just test-hvf gic_qualification_c2 --nocapture 2>&1 | tee target/gic-qual-c2.log
+grep -a '^C2' target/gic-qual-c2.log
 ```
 
-Expected: `ok` with `failures: 0`. **Gate D2** is decided together with the
-Task 2 census: if E3 fails, STOP 1a after Task 2 and write a lifecycle plan
-(vCPUs held for the VM's life; the initial runner becomes an executor or keeps
-its vCPU). Record `raw_states` (what an unconfigured redistributor holds) and
-`carried_over` (recreated vCPUs that inherited the previous incarnation's
-pending SGI or active PPI). A non-zero `carried_over` does not fail E3, because
-production scrubs every private interrupt before enabling its own (Task 5
-`configure_new_vcpu`, mirrored by the harness's `gic_enable`), and the delivery
-check above runs after that scrub.
+Expected: `ok` with one `C2` line, and the script's unentitled negative control
+passing. A `HV_DENIED` means the executable was not signed: rerun through the
+recipe, never bare `cargo test`. **Gate D1:** green means SGI 15 through
+`GICR_ISPENDR0`/`ICPENDR0` is the owed-kick vehicle, and Tasks 5-6 use it. Red
+in (b)-(d) means STOP and replan the vehicle from the reference injection path,
+before any Task 5 code: a per-vCPU SPI routed by an EL1-programmed distributor
+and raised with `hv_gic_set_spi(intid, true)`. Do not fall back to a different
+private INTID without a new plan decision.
 
-- [ ] **Step 7: E4: the SPI matrix (explains D4; does not gate 1a)**
+- [ ] **Step 3: C1, `hv_vcpus_exit` smoke under a GIC (decides D3)**
 
-Append:
+Eight vCPUs, as a page-table drain kicks every sibling. Each vCPU is kicked
+with its own call, as production does. The states are the ones production
+reaches: EL1 running with the vtimer firing at 100 us, EL1 masked, and EL0
+masked with the kick SGI pending. 1,000 rounds per state. The only time bound
+is a 5 s hang detector per round.
+
+Append to `gic_qualification.rs`:
 
 ```rust
-#[test]
-fn gic_qualification_e4_spi_delivery_matrix() {
-    let _serial = serial();
-    let vm = Arc::new(Vm::create(true));
-    let (spi_base, spi_count) = {
-        let gic = vm.gic.as_ref().expect("GIC VM");
-        (gic.spi_base, gic.spi_count)
-    };
-    assert!(spi_count > 0, "no SPI range");
-    let rows = on_vcpu_thread(&vm, 0, 0, &[], move |vm, vcpu| {
-        let mut rows = Vec::new();
-        let (mut typer, mut ctlr_reset) = (0u64, 0u64);
-        unsafe {
-            check(hv_gic_get_distributor_reg(hv_gic_distributor_reg_t::TYPER, &mut typer), "GICD_TYPER");
-            check(hv_gic_get_distributor_reg(hv_gic_distributor_reg_t::CTLR, &mut ctlr_reset), "GICD_CTLR");
-        }
-        rows.push(format!("typer={typer:#x} ctlr_after_create={ctlr_reset:#x} spi_base={spi_base}"));
-        if spi_base != 32 {
-            rows.push("spi_base is not 32: IROUTER32/ICFGR2/IPRIORITYR8 do not cover it; matrix skipped".into());
-            return rows;
-        }
-        let bit = 1u64; // INTID 32 is bit 0 of the *1 registers
-        for ctlr in [0x12u64, 0x02, 0x13, 0x10] {
-            for edge in [true, false] {
-                for route in [mpidr(0) & 0xff_00ff_ffff, 1 << 31] {
-                    use hv_gic_distributor_reg_t as D;
-                    let (mut ctlr_back, mut pended, mut active) = (0u64, 0u64, 0u64);
-                    unsafe {
-                        check(hv_gic_set_distributor_reg(D::CTLR, ctlr), "CTLR");
-                        check(hv_gic_get_distributor_reg(D::CTLR, &mut ctlr_back), "CTLR back");
-                        check(hv_gic_set_distributor_reg(D::IGROUPR1, bit), "IGROUPR1");
-                        check(hv_gic_set_distributor_reg(D::ICFGR2, if edge { 0b10 } else { 0 }), "ICFGR2");
-                        check(hv_gic_set_distributor_reg(D::IPRIORITYR8, 0x80), "IPRIORITYR8");
-                        check(hv_gic_set_distributor_reg(D::IROUTER32, route), "IROUTER32");
-                        check(hv_gic_set_distributor_reg(D::ISENABLER1, bit), "ISENABLER1");
-                        let before = vm.count(0, 32);
-                        check(hv_gic_set_spi(32, true), "hv_gic_set_spi");
-                        check(hv_gic_get_distributor_reg(D::ISPENDR1, &mut pended), "ISPENDR1");
-                        vcpu.enter_el1(vm, 0, MODE_SPIN_UNMASKED);
-                        let tally = kick_round(vcpu);
-                        check(hv_gic_get_distributor_reg(D::ISACTIVER1, &mut active), "ISACTIVER1");
-                        let delivered = vm.count(0, 32) > before;
-                        if !edge {
-                            check(hv_gic_set_spi(32, false), "hv_gic_set_spi low");
-                        }
-                        check(hv_gic_set_distributor_reg(D::ICPENDR1, bit), "ICPENDR1");
-                        rows.push(format!(
-                            "ctlr={ctlr:#x} ctlr_back={ctlr_back:#x} edge={edge} route={route:#x} \
-                             pended={} active_after={} delivered={delivered} tally={tally:?}",
-                            pended & bit != 0,
-                            active & bit != 0
-                        ));
-                    }
-                }
-            }
-        }
-        rows
-    });
-    for row in &rows {
-        println!("E4 {{\"row\":\"{row}\"}}");
-    }
-    assert!(rows.len() == 17 || rows.len() == 2, "every configuration classified");
-    Arc::into_inner(vm).expect("sole VM handle").destroy();
+const SMOKE_VCPUS: usize = 8;
+const SMOKE_ROUNDS: u64 = 1_000;
+/// Hang detector, not a verdict rate.
+const SMOKE_WEDGE: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug)]
+enum SmokeState {
+    El1SpinUnmaskedVtimer,
+    El1SpinMasked,
+    El0MaskedKickPending,
 }
-```
 
-Run:
+/// Printed through Debug in the `C1` lines.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct SmokeReport {
+    state: SmokeState,
+    rounds: u64,
+    unexpected: u64,
+    /// (round, vCPU index, heartbeat still advancing)
+    wedge: Option<(u64, usize, bool)>,
+}
 
-```bash
-just test-hvf gic_qualification_e4 --nocapture 2>&1 | tee target/gic-qual-e4.log
-grep -a '^E4' target/gic-qual-e4.log
-```
-
-Expected: `ok`, 16 classified rows (plus the header row). Classify the anomaly in
-the results doc as exactly one of: (i) a configuration delivers, naming the bits
-the spike lacked; (ii) SPIs pend (`pended=true`) but never reach the CPU interface
-under any configuration; (iii) SPIs never pend. 1a exposes no SPI API whatever the
-outcome; (ii) or (iii) is recorded as an HVF limit, and cross-vCPU wakes stay on
-SGIs (1c).
-
-- [ ] **Step 8: E5: vCPU capacity and redistributor placement under a GIC (decides D5, qualifies D7)**
-
-Append:
-
-```rust
-#[test]
-fn gic_qualification_e5_vcpu_capacity() {
-    let _serial = serial();
-    let vm = Arc::new(Vm::create(true));
-    let (redistributors, redistributor_size, region) = {
-        let gic = vm.gic.as_ref().expect("GIC VM");
-        (gic.redistributors(), gic.redist_size as u64, gic.redist_region as u64)
-    };
-    let mut max_vcpus = 0u32;
-    unsafe { check(hv_vm_get_max_vcpu_count(&mut max_vcpus), "hv_vm_get_max_vcpu_count") };
-    let capacity = redistributors.min(max_vcpus as usize);
-    let attempts = (capacity + 4).min(MAX_BLOCKS);
-    let release = Arc::new(Barrier::new(attempts + 1));
-    let results = Arc::new(Mutex::new(Vec::new()));
-    let threads: Vec<_> = (0..attempts)
+fn smoke(state: SmokeState) -> SmokeReport {
+    let vm = Arc::new(Vm::create());
+    let canceled: Arc<Vec<AtomicU64>> = Arc::new((0..SMOKE_VCPUS).map(|_| AtomicU64::new(0)).collect());
+    let unexpected = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let ids = Arc::new(Mutex::new(vec![0; SMOKE_VCPUS]));
+    let ready = Arc::new(Barrier::new(SMOKE_VCPUS + 1));
+    let owners: Vec<_> = (0..SMOKE_VCPUS)
         .map(|index| {
-            let (release, results) = (Arc::clone(&release), Arc::clone(&results));
+            let (vm, canceled, unexpected, stop, ids, ready) = (
+                Arc::clone(&vm),
+                Arc::clone(&canceled),
+                Arc::clone(&unexpected),
+                Arc::clone(&stop),
+                Arc::clone(&ids),
+                Arc::clone(&ready),
+            );
             std::thread::spawn(move || {
-                let (mut id, mut exit) = (0, ptr::null());
-                let rc = unsafe { hv_vcpu_create(&mut id, &mut exit, ptr::null_mut()) };
-                let (mut base_rc, mut base) = (-1, 0u64);
-                if rc == 0 {
-                    unsafe {
-                        check(hv_vcpu_set_sys_reg(id, hv_sys_reg_t::MPIDR_EL1, mpidr(index as u16)), "MPIDR");
-                        base_rc = hv_gic_get_redistributor_base(id, &mut base);
+                let vcpu = Vcpu::create(&vm, index, index as u16, &[VTIMER_INTID, KICK_SGI]);
+                match state {
+                    SmokeState::El1SpinUnmaskedVtimer => {
+                        vcpu.enter_el1(&vm, index, MODE_SPIN_UNMASKED);
+                        vcpu.arm_vtimer(&vm, index, 2_400);
+                    }
+                    SmokeState::El1SpinMasked => vcpu.enter_el1(&vm, index, MODE_SPIN_MASKED),
+                    SmokeState::El0MaskedKickPending => {
+                        vcpu.enter_el0(index, true);
+                        vcpu.set_pending(KICK_SGI);
                     }
                 }
-                results.lock().expect("results").push((index, rc, base_rc, base));
-                release.wait();
-                if rc == 0 {
-                    unsafe { check(hv_vcpu_destroy(id), "hv_vcpu_destroy") };
+                ids.lock().expect("ids")[index] = vcpu.id;
+                ready.wait();
+                loop {
+                    let tally = vcpu.run_until_canceled();
+                    if tally.canceled != 1 {
+                        unexpected.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    canceled[index].fetch_add(1, Ordering::Release);
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
+                vcpu.destroy(); // teardown
             })
         })
         .collect();
-    release.wait();
-    for thread in threads {
-        thread.join().expect("capacity thread");
+    ready.wait();
+    let targets: Vec<hv_vcpu_t> = ids.lock().expect("ids").clone();
+    let mut wedge = None;
+    let mut rounds = 0;
+    'rounds: while rounds < SMOKE_ROUNDS && unexpected.load(Ordering::Relaxed) == 0 {
+        std::thread::sleep(Duration::from_micros(20));
+        let want: Vec<u64> = canceled.iter().map(|c| c.load(Ordering::Acquire) + 1).collect();
+        for &id in &targets {
+            kick(id);
+        }
+        let sent = Instant::now();
+        loop {
+            let behind: Vec<usize> =
+                (0..SMOKE_VCPUS).filter(|&i| canceled[i].load(Ordering::Acquire) < want[i]).collect();
+            if behind.is_empty() {
+                break;
+            }
+            if sent.elapsed() >= SMOKE_WEDGE {
+                let index = behind[0];
+                let h0 = vm.block_read(index, B_HEARTBEAT);
+                std::thread::sleep(Duration::from_millis(100));
+                wedge = Some((rounds, index, vm.block_read(index, B_HEARTBEAT) > h0));
+                break 'rounds;
+            }
+            std::thread::yield_now();
+        }
+        rounds += 1;
     }
-    let mut results = results.lock().expect("results").clone();
-    results.sort();
-    let created = results.iter().filter(|r| r.1 == 0).count();
-    let placed: Vec<(usize, u64)> =
-        results.iter().filter(|r| r.1 == 0 && r.2 == 0).map(|r| (r.0, r.3)).collect();
-    let first_failure = results.iter().find(|r| r.1 != 0).map(|r| (r.0, r.1 as u32));
-    let distinct: std::collections::BTreeSet<u64> = placed.iter().map(|&(_, base)| base).collect();
-    let linear = placed
-        .iter()
-        .all(|&(index, base)| base == GIC_REDIST_IPA + index as u64 * redistributor_size);
-    println!(
-        "E5 {{\"redistributors\":{redistributors},\"max_vcpus\":{max_vcpus},\"capacity\":{capacity},\
-         \"attempts\":{attempts},\"created\":{created},\"with_redistributor\":{},\
-         \"distinct_bases\":{},\"linear_by_index\":{linear},\"first_failure\":\"{first_failure:?}\"}}",
-        placed.len(),
-        distinct.len()
-    );
-    for index in 0..capacity {
-        assert!(
-            placed.iter().any(|&(placed_index, _)| placed_index == index),
-            "vCPU {index} below the capacity has no redistributor"
-        );
+    stop.store(true, Ordering::Release);
+    if wedge.is_none() {
+        for &id in &targets {
+            kick(id);
+        }
+        for owner in owners {
+            owner.join().expect("owner thread");
+        }
+        Arc::into_inner(vm).expect("sole VM handle").destroy();
+    } else {
+        // A wedged owner cannot destroy its vCPU; leak the threads and the VM
+        // (HVF allows one VM per process; this process creates no other).
+        std::mem::forget(owners);
+        std::mem::forget(vm);
     }
-    assert_eq!(distinct.len(), placed.len(), "two MPIDRs share a redistributor frame");
-    for &(index, base) in &placed {
-        assert!(
-            (GIC_REDIST_IPA..GIC_REDIST_IPA + region).contains(&base)
-                && (base - GIC_REDIST_IPA).is_multiple_of(redistributor_size),
-            "vCPU {index}: redistributor base {base:#x} outside the region or off-stride"
-        );
-    }
-    Arc::into_inner(vm).expect("sole VM handle").destroy();
+    SmokeReport { state, rounds, unexpected: unexpected.load(Ordering::Acquire), wedge }
+}
+
+#[test]
+fn gic_qualification_c1_vcpus_exit_smoke_el1_vtimer() {
+    let _serial = serial();
+    let report = smoke(SmokeState::El1SpinUnmaskedVtimer);
+    println!("C1 {{\"report\":\"{report:?}\"}}");
+    assert!(report.wedge.is_none() && report.unexpected == 0 && report.rounds == SMOKE_ROUNDS, "STOP at gate D3: {report:?}");
+}
+
+#[test]
+fn gic_qualification_c1_vcpus_exit_smoke_el1_masked() {
+    let _serial = serial();
+    let report = smoke(SmokeState::El1SpinMasked);
+    println!("C1 {{\"report\":\"{report:?}\"}}");
+    assert!(report.wedge.is_none() && report.unexpected == 0 && report.rounds == SMOKE_ROUNDS, "STOP at gate D3: {report:?}");
+}
+
+#[test]
+fn gic_qualification_c1_vcpus_exit_smoke_el0_kick_pending() {
+    let _serial = serial();
+    let report = smoke(SmokeState::El0MaskedKickPending);
+    println!("C1 {{\"report\":\"{report:?}\"}}");
+    assert!(report.wedge.is_none() && report.unexpected == 0 && report.rounds == SMOKE_ROUNDS, "STOP at gate D3: {report:?}");
 }
 ```
 
-Run:
+Each state is its own `#[test]`, so each runs in its own process, and a wedge in
+one state cannot turn another red through the leaked VM:
 
 ```bash
-just test-hvf gic_qualification_e5 --nocapture 2>&1 | tee target/gic-qual-e5.log
-grep -a '^E5' target/gic-qual-e5.log
+for s in el1_vtimer el1_masked el0_kick_pending; do
+  just test-hvf gic_qualification_c1_vcpus_exit_smoke_$s --nocapture 2>&1 | tee target/gic-qual-c1-$s.log
+done
+grep -a '^C1' target/gic-qual-c1-*.log
 ```
 
-Expected: `ok`. **Gate D5:** `REDISTRIBUTOR_CAPACITY = redistributors`; Task 5
-clamps the per-carrier vCPU budget to `min(max_vcpus, redistributors)`. Record
-whether the clamp is effective on this host (a planning-time read-only query
-here reported 256 redistributors and `max_vcpus` 64, which makes the clamp a
-no-op; E5 confirms or corrects that). Record the first failure's return code
-as data (it need not be `HV_NO_RESOURCES`). The distinct/in-region/stride
-asserts qualify D7: every MPIDR of the Aff1/Aff0 layout gets its own
-redistributor frame; `linear_by_index` records whether HVF assigns frames by
-index order (informational).
+Expected: three `ok` results, each with one `C1` line and
+`rounds: 1000, unexpected: 0, wedge: None`. **Gate D3:** any wedge means
+STOP 1a. Keep the log, take a core of the test process
+(`sudo lldb -p <pid> -o "process save-core target/gic-c1.core" -o detach`),
+and report.
 
-- [ ] **Step 9: E5b: the concurrent VM ceiling with a GIC per VM (decides D5b)**
+- [ ] **Step 4: C3, many concurrent processes each with a GIC VM (decides D5b)**
 
-Carrick's soft pre-throttle (`GLOBAL_VCPU_CEILING = 120`,
-vcpu_admission.rs) rests on 127 concurrent VMs measured without a GIC. A GIC
-per VM may lower it. Extend the probe that measured it.
+Carrick's soft pre-throttle (`GLOBAL_VCPU_CEILING = 120`, vcpu_admission.rs)
+rests on 127 concurrent VMs measured without a GIC, and Carrick's gates run
+many carriers at once. libkrun runs one small VM, so no reference covers this.
+Extend the probe that measured the ceiling.
 
 In `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs`:
 - add `hv_gic_config_create, hv_gic_config_set_distributor_base,
@@ -2399,8 +1783,9 @@ In `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs`:
 - add the helper:
 
 ```rust
-    /// Hypervisor.framework's in-kernel GIC at Carrick's production placement
-    /// (EL1 plan 1a, Task 4 promotes the literals to carrick-mem constants).
+    /// Hypervisor.framework's in-kernel GIC at Carrick's production placement,
+    /// created the reference way (EL1 plan 1a; Task 4 promotes the literals to
+    /// carrick-mem constants).
     fn create_probe_gic() -> Result<(), hv_return_t> {
         unsafe {
             let config = hv_gic_config_create();
@@ -2431,15 +1816,16 @@ In `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs`:
   which prints `with_gic={with_gic}` in its `case=` line; the usage line gains
   `[with_gic 0|1]`.
 
-Quiet host: no guest, no Docker VM, nothing else using Hypervisor.framework
-(this creates about 127 VMs; the July 2026 E4 measurement ran the same probe).
+Run on a quiet host: no guest, no Docker VM, and nothing else using
+Hypervisor.framework. This creates about 127 VMs; the July 2026 measurement ran
+the same probe.
 
 ```bash
 cargo build --release -p carrick-vmm-hvf --bin hvf_fork_probe
 codesign --force --sign - --entitlements scripts/entitlements.plist target/release/hvf_fork_probe
-target/release/hvf_fork_probe concurrent-ceiling 140 30 1 0 0 2>&1 | tee target/gic-qual-e5b-plain.log
-target/release/hvf_fork_probe concurrent-ceiling 140 30 1 0 1 2>&1 | tee target/gic-qual-e5b-gic.log
-grep -a 'live_at_failure\|case=' target/gic-qual-e5b-*.log
+target/release/hvf_fork_probe concurrent-ceiling 140 30 1 0 0 2>&1 | tee target/gic-qual-c3-plain.log
+target/release/hvf_fork_probe concurrent-ceiling 140 30 1 0 1 2>&1 | tee target/gic-qual-c3-gic.log
+grep -a 'live_at_failure\|case=' target/gic-qual-c3-*.log
 ```
 
 Expected: both runs report a `live_at_failure` ceiling (the children
@@ -2447,139 +1833,56 @@ self-destruct after 30 s). **Gate D5b:** if the GIC ceiling is below the plain
 ceiling, Task 5 Step 4 sets `GLOBAL_VCPU_CEILING` to the GIC ceiling minus 7
 (the same margin as 127 → 120) and rewrites its doc comment with both numbers;
 otherwise the constant stays. Either way, Task 5 routes `HV_NO_RESOURCES` from
-`hv_gic_create` through the existing park+retry backpressure.
+`hv_gic_create` through the existing park+retry backpressure. The production
+form of this check is `page_table_pauses_survive_carrier_load` (four concurrent
+carriers, each with its GIC VM after Task 5), which Tasks 6 and 9 run and
+Task 12 adds to `el1-gate`.
 
-- [ ] **Step 10: E6: costs (decides nothing; records D6 inputs)**
+- [ ] **Step 5: Record the results and decisions**
 
-Append to `gic_qualification.rs`:
+Append to `docs/perf-results/2026-09-25-hvf-gic-qualification.md`:
+- the host (model, and the macOS build from `sw_vers`) and source HEAD;
+- the test executable's SHA-256 (the path is in
+  `target/test-results/carrick-vmm-hvf-signed-artifacts.jsonl`);
+- every `C1`/`C2` line verbatim, and both C3 ceilings;
+- a "Reference setup" paragraph that points to the plan's "Prior art" section,
+  names the libkrun commit and license, and lists the three differences
+  (placement, MPIDR layout, host-side register writes);
+- a decisions table:
+  - D1: the C2 verdict;
+  - D3: the per-state C1 verdict, with the detection bound "zero wedges in
+    1,000 rounds x 8 vCPUs per state is a smoke bound, not a probability
+    claim";
+  - D5b: both ceilings and the `GLOBAL_VCPU_CEILING` decision.
 
-```rust
-fn p50_p99(mut samples: Vec<u64>) -> (u64, u64) {
-    samples.sort_unstable();
-    (samples[samples.len() / 2], samples[samples.len() * 99 / 100])
-}
-
-fn exit_round_trips(with_gic: bool) -> (u64, u64) {
-    let vm = Arc::new(Vm::create(with_gic));
-    let samples = on_vcpu_thread(&vm, 0, 0, &[], |vm, vcpu| {
-        vcpu.enter_el1(vm, 0, MODE_HVC_LOOP);
-        let mut samples = Vec::with_capacity(100_000);
-        for _ in 0..100_000 {
-            let start = now_ticks();
-            unsafe { check(hv_vcpu_run(vcpu.id), "hv_vcpu_run") };
-            samples.push(ticks_to_ns(now_ticks() - start));
-            let exit = unsafe { &*vcpu.exit };
-            assert_eq!(exit.reason, hv_exit_reason_t::EXCEPTION);
-        }
-        samples
-    });
-    Arc::into_inner(vm).expect("sole VM handle").destroy();
-    p50_p99(samples)
-}
-
-#[test]
-fn gic_qualification_e6_costs() {
-    let _serial = serial();
-    let vm = Arc::new(Vm::create(true));
-    let kick_pair = on_vcpu_thread(&vm, 0, 0, &[15], |_, vcpu| {
-        let mut samples = Vec::with_capacity(100_000);
-        for _ in 0..100_000 {
-            let start = now_ticks();
-            vcpu.set_pending(15);
-            vcpu.clear_pending(15);
-            samples.push(ticks_to_ns(now_ticks() - start));
-        }
-        p50_p99(samples)
-    });
-    Arc::into_inner(vm).expect("sole VM handle").destroy();
-    let vm = Arc::new(Vm::create(false));
-    let legacy_pair = on_vcpu_thread(&vm, 0, 0, &[], |_, vcpu| {
-        let mut samples = Vec::with_capacity(100_000);
-        for _ in 0..100_000 {
-            let start = now_ticks();
-            unsafe {
-                check(hv_vcpu_set_pending_interrupt(vcpu.id, SDK_IRQ, true), "legacy arm");
-                check(hv_vcpu_set_pending_interrupt(vcpu.id, SDK_IRQ, false), "legacy clear");
-            }
-            samples.push(ticks_to_ns(now_ticks() - start));
-        }
-        p50_p99(samples)
-    });
-    Arc::into_inner(vm).expect("sole VM handle").destroy();
-    let exits_gic = exit_round_trips(true);
-    let exits_plain = exit_round_trips(false);
-    println!(
-        "E6 {{\"gic_kick_pair_ns\":\"{kick_pair:?}\",\"legacy_kick_pair_ns\":\"{legacy_pair:?}\",\
-         \"exit_round_trip_ns_gic\":\"{exits_gic:?}\",\"exit_round_trip_ns_plain\":\"{exits_plain:?}\"}}"
-    );
-}
-```
-
-`MODE_HVC_LOOP` exits with `hvc #0x1d`; HVF reports the post-`hvc` PC, so each
-re-entry executes the loop's branch and the next `hvc`.
-
-Run on a quiet host (no other guest, no Docker VM busy):
-
-```bash
-just test-hvf gic_qualification_e6 --nocapture 2>&1 | tee target/gic-qual-e6.log
-grep -a '^E6' target/gic-qual-e6.log
-```
-
-Expected: `ok` and one `E6` line. If `exit_round_trip_ns_gic` p50 exceeds
-`exit_round_trip_ns_plain` p50 by more than 10%, every exit in production pays
-that: record it as a finding and require the Task 13 paired runs to report the
-exit-heavy rows (`go-build`, `cpython-subprocess`) against the base artifact.
-
-- [ ] **Step 11: Record the results and decisions**
-
-Append to `docs/perf-results/2026-09-25-hvf-gic-qualification.md`: host (model,
-macOS build from `sw_vers`), source HEAD, both test executables' SHA-256 (the
-paths are in `target/test-results/carrick-vmm-hvf-signed-artifacts.jsonl`), every
-`E<n>`/`E2W` line verbatim, both E5b ceilings, and a decisions table filling D1
-(chosen INTID, with (f)), D2 (E3 verdict, `raw_states`, `carried_over`), D3
-(per-state wedges; the detection bound "zero wedges in 100,000 rounds x 8 vCPUs
-per state bounds the per-round wedge probability below about 3e-5 at 95%
-confidence"; `pc_at_wfi`; which of H-a/H-b/H-c the data supports), D4 (SPI
-class i/ii/iii), D5 (`redistributors`, `max_vcpus`, whether the clamp is
-effective), D5b (both ceilings and the `GLOBAL_VCPU_CEILING` decision), D6 (cost
-ratios), D7 (distinct, in-region, on-stride bases), D12 (the `E0-id` line).
-Write "not explained" where the data does not discriminate; do not pick a
-hypothesis the data does not support.
-
-- [ ] **Step 12: Lint and commit**
+- [ ] **Step 6: Lint and commit**
 
 ```bash
 cargo clippy -p carrick-vmm-hvf --all-targets -- -D warnings
 just fmt-check
 git add crates/carrick-vmm-hvf/tests/gic_qual/harness.rs crates/carrick-vmm-hvf/tests/gic_qualification.rs \
-  crates/carrick-vmm-hvf/tests/gic_qualification_wfi.rs crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs \
-  docs/perf-results/2026-09-25-hvf-gic-qualification.md
+  crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs docs/perf-results/2026-09-25-hvf-gic-qualification.md
 git commit -F- <<'MSG'
-test(hvf): qualify the in-kernel GIC before carrick adopts it
+test(hvf): check the carrick-specific uses of the in-kernel GIC
 
-Why: the EL1 kernel design requires Hypervisor.framework's in-kernel
-GIC, but the behaviours it depends on were unmeasured under Carrick's
-lifecycle: the kick vehicle once `hv_vcpu_set_pending_interrupt` is
-refused (including the un-acknowledged EL0-boundary kick), destroying
-and recreating a vCPU while its VM and siblings live, whether
-`hv_vcpus_exit` is always honoured, why `hv_gic_set_spi` never reached
-the CPU interface in the scheduler spike, and what a GIC per VM costs
-in VM-creation capacity.
+Why: Carrick adopts Hypervisor.framework's in-kernel GIC the way
+libkrun (Apache-2.0) uses it and hv_gic.h prescribes. Three uses have
+no reference: an owed kick deferred to the next EL0 boundary once
+hv_vcpu_set_pending_interrupt is refused; hv_vcpus_exit on eight
+vCPUs in Carrick's EL1/EL0 states; and many concurrent processes,
+each with a GIC VM.
 
-What: a signed qualification suite with its own guest blob, split into
-a production-reachable executable and a WFI-state executable (a wedge
-leaks the process's one VM). E0 geometry, the vtimer PPI at EL1 and the
-EL0 ID view (control: GIC-less VM); E1 SGI 15 / PPI 20 through
-GICR_ISPENDR0, including production's `hvc #4` slot (control: the
-legacy call returns HV_UNSUPPORTED); E2 8-vCPU kick liveness, 100,000
-rounds per state, hypotheses H-a/H-b/H-c; E3 500+500 mid-life recreate
-cycles beside three running siblings, with inherited-state capture; E4
-SPI matrix; E5 capacity and redistributor placement; E5b the concurrent
-VM ceiling with a GIC (hvf_fork_probe); E6 costs.
+What: a signed check suite with its own guest blob, set up the
+reference way (GIC after hv_vm_create and before any vCPU, MPIDR
+first, one thread per vCPU for the VM's life). C2: SGI 15 through
+GICR_ISPENDR0, including production's un-acknowledged `hvc #4` slot
+(control: the legacy call returns HV_UNSUPPORTED). C1: hv_vcpus_exit
+smoke, 8 vCPUs, 1,000 rounds in each of three production states. C3:
+the concurrent VM ceiling with a GIC per VM (hvf_fork_probe).
 
-Verified: `just test-hvf gic_qualification_e<N> --nocapture` per
-experiment and `gic_qualification_wfi_` on <host>; results and decisions
-in docs/perf-results/2026-09-25-hvf-gic-qualification.md.
+Verified: `just test-hvf gic_qualification_c<N> --nocapture` per
+check on <host>; results and decisions in
+docs/perf-results/2026-09-25-hvf-gic-qualification.md.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 MSG
@@ -2589,722 +1892,372 @@ Replace `<host>` with the `sw_vers`/model line before committing.
 
 ---
 
-### Task 2: vCPU lifecycle census (decides D2 with E3)
+### Task 2: Every vCPU lives for its VM's life (decides D2)
 
-E3 answers "is a mid-life recreate safe under a GIC"; this task answers "which
-production paths recreate a vCPU in a VM that already destroyed one, and how
-often". HVF's rule ("once the virtual machine vcpus are running, its topology
-is considered final. Destroy vcpus only when you are tearing down the virtual
-machine") is about the VM going on to be used after a destroy, so the census
-classifies a destroy as mid-life only when a later create follows it in the
-same VM generation. That definition counts the initial-runner hand-off and the
-last `reclaim_park` under the whole-VM lease (both leave zero vCPUs and later
-create new ones in the same VM), and does not count the one-by-one destroys of
-an ordinary teardown (no create follows them in that generation).
+`hv_gic.h`: "Once the virtual machine vcpus are running, its topology is
+considered final. Destroy vcpus only when you are tearing down the virtual
+machine." libkrun follows this: one thread per vCPU, and no `hv_vcpu_destroy`
+before teardown. The previous plan qualified Carrick's mid-life destroy and
+recreate against HVF (old E3) and censused how often production does it. This
+task removes the behaviour instead.
 
-The census is a `carrick trace` profile with a strict Rust reader (AGENTS.md:
-D scripts belong to a Rust profile that hashes them, and a capture that yields
-nothing is an error). It also makes every destroy go through one raw-destroy
-function, including the paths that today destroy through applevisor's `Drop`
-without reporting (Fact 5), so Task 5 can release a vCPU's GIC affinity in the
-same critical section as `hv_vcpu_destroy`.
+**Evidence that it can be designed out.** The code map of 2026-09-24 (Fact 5
+states it site by site) shows the following for the default HVPatch lane:
+- **Guest waits keep the vCPU.** A blocking wait detaches the task and the
+  executor keeps its vCPU (`executor/backend.rs:969-1005`,
+  `executor.rs:258-279`). The idle audit requires a live vCPU
+  (`persistent_executor.rs:1505-1517`).
+- **The M:N reclaim and shared-wait machinery has no runtime caller.** This
+  covers `reclaim_park`/`reclaim_resume`, `release_vm_after_reclaim_park` and
+  `shared_wait_park`/`shared_wait_resume`. The only references are the HVF
+  engine overrides (`hvf_aarch64_engine.rs:1925-2039`) and the trait default
+  forwarders in `carrick-hal`/`carrick-aarch64`.
+- **Workers live for the carrier.** Every worker, spares included, is spawned
+  and initialised at pool start (`pool.rs:1206-1262`). Workers leave only on
+  pool shutdown at carrier teardown (`wait_wake.rs:727-750`) or on a worker
+  fault (`executor.rs:173-213`, `retire_failed_worker`). There is no idle
+  shrink.
+- **fork, clone and exec never rebuild the VM.** fork and clone materialise
+  tasks without a vCPU (`hvf_aarch64_engine.rs:819,882`), and exec takes the
+  persistent branch (`execve_rebuild.rs:1072`).
+- **The one live mid-life pattern is the initial-runner hand-off.** Every root
+  boot creates a boot vCPU, snapshots it and destroys it
+  (`binding.rs:5381-5383` → `persistent_executor.rs:970-996`). For the first
+  root this happens before any executor vCPU exists, and the boot vCPU never
+  runs. For a later root in a reused carrier (`carrier.rs:12`,
+  `mapping_plan.rs:389-497`) it happens while pool vCPUs run. That second case
+  is exactly what `hv_gic.h` forbids.
+- **No path needs more simultaneous vCPU-owning threads than the per-VM cap,
+  and none moves a vCPU between threads.** The pool has about 18 executors on
+  the canonical host (10 bound plus 8 spares), against a budget of 60.
+
+**Decision D2:** every vCPU is created before the VM's first `hv_vcpu_run` and
+is destroyed only at VM teardown. The root boots without a vCPU, as clone
+children already do. The dead reclaim machinery is deleted. A faulted worker
+keeps its vCPU until pool shutdown. The executor budget is always clamped.
+Task 5 enforces the rule at runtime and fails closed (`gic::configure_new_vcpu`
+refuses a create after the generation's first run or first destroy), so a path
+this map missed turns a gate red instead of relying on HVF behaviour nobody has
+qualified.
+
+If Step 2's reachability check finds a runtime caller the map missed, STOP and
+replan. The fallback is not a return to E3. It is to bring that caller under
+the same rule.
 
 **Files:**
-- Modify: `crates/carrick-observability/src/probes.rs` (provider fn, real and stub wrappers)
-- Modify: `crates/carrick-vmm-hvf/src/trap.rs` (`VcpuDestroySite`, `VcpuCreateSite`,
-  `CARRIER_VM_GENERATION`, `destroy_raw_vcpu`, `vcpu_created`/`vcpu_destroyed`
-  signatures, `from_process_spec` guard, the funnel's generation publication)
-- Modify: `crates/carrick-vmm-hvf/src/trap/vcpu_admission.rs` (create sites, test)
-- Modify: `crates/carrick-vmm-hvf/src/trap/persistent_executor.rs` (4 destroy sites)
-- Modify: `crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs` (1 destroy site)
-- Modify: `crates/carrick-vmm-hvf/src/trap/carrier_custody.rs` (creation rollback, `SetupVcpuGuard`)
-- Modify: `crates/carrick-vmm-hvf/src/trap/cow_engine.rs` (`add_vcpu` error path)
-- Create: `scripts/dtrace/hvf-vcpu-lifecycle-census.d`
-- Modify: `crates/carrick-runtime/src/dtrace_consumer.rs` (bundled script constant)
-- Create: `crates/carrick-cli/src/hvf_vcpu_lifecycle_profile.rs`
-- Modify: `crates/carrick-cli/src/main.rs`, `trace_profile.rs`, `commands.rs`, `args.rs`
-- Modify: `scripts/migrate/runtime-global-state.json` (one row)
+- Modify: `crates/carrick-vmm-hvf/src/trap.rs` (`VcpuDestroySite`, `destroy_raw_vcpu`,
+  `vcpu_destroyed(vcpu_id, site)`)
+- Modify: `crates/carrick-vmm-hvf/src/trap/persistent_executor.rs` (delete the park/resume
+  paths; `destroy_vcpu_on_thread_exit` through `destroy_raw_vcpu`)
+- Modify: `crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs` (delete the reclaim,
+  shared-wait and initial-runner overrides and the `CARRICK_HVF_VCPU_RECLAIM` hatch;
+  root snapshot as data)
+- Modify: `crates/carrick-vmm-hvf/src/trap/mapping_plan.rs` (`new_with_plan` creates no boot vCPU)
+- Modify: `crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs`, `trap/carrier_custody.rs`,
+  `trap/cow_engine.rs`, `trap/vcpu_gate.rs` (remaining destroys name a site; budget always clamped)
+- Modify: `crates/carrick-vmm-hvf/src/trap/vcpu_admission.rs` (source test)
+- Modify: `crates/carrick-runtime/src/vcpu_loop/binding.rs` (`prepare_initial_runner_handoff`
+  takes the root snapshot as data), `crates/carrick-runtime/src/vcpu_loop/executor.rs`
+  (a faulted worker keeps its vCPU until Stop), `crates/carrick-runtime/src/vcpu_loop/threaded_loop.rs`
+  (the boot-vCPU error destroy at :361 goes away)
+- Modify: `crates/carrick-vmm-hvf/tests/initial_runner_handoff.rs` (retire with the hand-off it tests)
+- Modify: `docs/perf-results/2026-09-25-hvf-gic-qualification.md` ("vCPU lifecycle" section)
 
 **Interfaces:**
-- Produces: `pub(crate) enum VcpuDestroySite { ReclaimPark = 1, InitialRunnerPark = 2,
-  SharedWaitPark = 3, ThreadExit = 4, ExecveRebuild = 5, CreationRollback = 6,
-  SetupRollbackLocal = 7, CreationError = 8 }`,
-  `pub(crate) enum VcpuCreateSite { VmCreation = 101, ExistingVm = 102 }`,
+- Produces: `pub(crate) enum VcpuDestroySite { WorkerExit = 1, CreationRollback = 2,
+  CreationError = 3, ExecveRebuild = 4 }`;
   `pub(crate) fn destroy_raw_vcpu(vcpu_id: u64, site: VcpuDestroySite) -> applevisor_sys::hv_return_t`
-  (the only raw `hv_vcpu_destroy` in the crate's `src/` outside `src/bin`),
-  `pub(crate) fn vcpu_destroyed(vcpu_id: u64, site: VcpuDestroySite)`,
-  `pub(crate) fn carrier_vm_generation() -> u64`,
-  `carrick_observability::probes::hvf_vcpu_lifecycle(site: u32, vcpu: u64, generation: u64)`,
-  USDT `carrick*:::hvf-vcpu-lifecycle`,
-  `carrick trace --profile hvf-vcpu-lifecycle-census`.
-- Consumed by: Task 5 (`destroy_raw_vcpu` and the `SetupVcpuGuard` drop take
-  the GIC lock and release the affinity index; the D2 guard reads the site).
+  (the only raw `hv_vcpu_destroy` in the crate's `src/`, outside `src/bin`);
+  `pub(crate) fn vcpu_destroyed(vcpu_id: u64, site: VcpuDestroySite)`;
+  the root's initial CPU state as data (`initial_root_snapshot`, named in
+  Step 4).
+- Consumed by: Task 5 (`destroy_raw_vcpu` takes the GIC topology lock; the
+  lifecycle guard records the site).
 
-- [ ] **Step 1: Write the failing site test**
+- [ ] **Step 1: Write the failing lifecycle source test**
 
 Append to `crates/carrick-vmm-hvf/src/trap/vcpu_admission.rs`:
 
 ```rust
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-mod vcpu_lifecycle_site_tests {
-    fn source(file: &str) -> String {
+mod vcpu_lifetime_tests {
+    fn src(file: &str) -> String {
         std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(file))
             .unwrap()
     }
 
-    /// Every vCPU destroy goes through `destroy_raw_vcpu` (or, for the local
-    /// RAII lane, applevisor's Drop inside `SetupVcpuGuard`) and reports where
-    /// it happened, so the lifecycle census and the GIC affinity release see
-    /// every destroy exactly once.
+    fn code_lines(text: &str) -> impl Iterator<Item = &str> {
+        text.lines().filter(|line| !line.trim_start().starts_with("//"))
+    }
+
+    /// EL1 plan 1a D2: a vCPU is destroyed only at VM teardown (hv_gic.h:
+    /// "Destroy vcpus only when you are tearing down the virtual machine").
+    /// One raw destroy, every destroy names a teardown-class site, and the
+    /// destroy-and-recreate paths no longer exist.
     #[test]
-    fn every_vcpu_destroy_names_its_site() {
+    fn vcpus_live_for_the_vm_lifetime() {
         let raw = concat!("hv_vcpu_", "destroy(");
-        let mut raw_sites = Vec::new();
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = vec![src.join("trap.rs"), src.join("hvf_aarch64_engine.rs")];
-        for entry in std::fs::read_dir(src.join("trap")).unwrap() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = vec![src_dir.join("trap.rs"), src_dir.join("hvf_aarch64_engine.rs")];
+        for entry in std::fs::read_dir(src_dir.join("trap")).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|ext| ext == "rs") {
                 files.push(path);
             }
         }
+        let mut raw_sites = Vec::new();
         for path in &files {
-            let count: usize = std::fs::read_to_string(path)
-                .unwrap()
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .map(|line| line.matches(raw).count())
-                .sum();
+            let text = std::fs::read_to_string(path).unwrap();
+            let count: usize = code_lines(&text).map(|line| line.matches(raw).count()).sum();
             if count != 0 {
                 raw_sites.push((path.file_name().unwrap().to_string_lossy().into_owned(), count));
             }
         }
         assert_eq!(raw_sites, [("trap.rs".to_owned(), 1)], "one raw destroy: destroy_raw_vcpu");
 
-        for (file, site) in [
-            ("trap/persistent_executor.rs", "VcpuDestroySite::ReclaimPark"),
-            ("trap/persistent_executor.rs", "VcpuDestroySite::InitialRunnerPark"),
-            ("trap/persistent_executor.rs", "VcpuDestroySite::SharedWaitPark"),
-            ("trap/persistent_executor.rs", "VcpuDestroySite::ThreadExit"),
-            ("trap/execve_rebuild.rs", "VcpuDestroySite::ExecveRebuild"),
-            ("trap/carrier_custody.rs", "VcpuDestroySite::CreationRollback"),
-            ("trap/carrier_custody.rs", "VcpuDestroySite::SetupRollbackLocal"),
-            ("trap/cow_engine.rs", "VcpuDestroySite::CreationError"),
-        ] {
-            assert!(source(file).contains(site), "{file}: {site}");
-        }
-
-        // Every reference to `vcpu_destroyed` in production files is a call
-        // naming its site (no bare fn-pointer use that loses the site).
-        for file in [
-            "trap/persistent_executor.rs",
-            "trap/execve_rebuild.rs",
-            "trap/carrier_custody.rs",
-            "trap/cow_engine.rs",
-        ] {
-            for line in source(file).lines().filter(|line| line.contains("vcpu_destroyed")) {
+        const TEARDOWN_SITES: [&str; 4] = [
+            "VcpuDestroySite::WorkerExit",
+            "VcpuDestroySite::CreationRollback",
+            "VcpuDestroySite::CreationError",
+            "VcpuDestroySite::ExecveRebuild",
+        ];
+        for path in &files {
+            let text = std::fs::read_to_string(path).unwrap();
+            for line in code_lines(&text).filter(|line| line.contains(concat!("destroy_raw_", "vcpu(")) && !line.contains("fn destroy_raw_vcpu")) {
                 assert!(
-                    line.contains("vcpu_destroyed(") && line.contains("VcpuDestroySite::"),
-                    "{file}: `{}` must call vcpu_destroyed with a site",
+                    TEARDOWN_SITES.iter().any(|site| line.contains(site)),
+                    "{}: `{}` must name a teardown-class VcpuDestroySite",
+                    path.display(),
                     line.trim()
                 );
             }
         }
+
+        let executor = src("trap/persistent_executor.rs");
+        let engine = src("hvf_aarch64_engine.rs");
+        for gone in [
+            "fn reclaim_park(",
+            "fn reclaim_resume(",
+            "fn initial_runner_park(",
+            "fn initial_runner_resume(",
+            "fn shared_wait_park(",
+            "fn shared_wait_resume(",
+            "fn release_vm_after_reclaim_park(",
+        ] {
+            assert!(!executor.contains(gone), "persistent_executor.rs still has {gone}");
+        }
+        assert!(!engine.contains("CARRICK_HVF_VCPU_RECLAIM"), "reclaim hatch still read");
+        assert!(!engine.contains("fn save_initial_runner_state("), "boot vCPU hand-off still present");
     }
 }
 ```
-
-- [ ] **Step 2: Run it red**
 
 ```bash
-env RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib every_vcpu_destroy_names_its_site
+env RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib vcpus_live_for_the_vm_lifetime
 ```
 
-Expected: FAIL `one raw destroy: destroy_raw_vcpu` with six raw sites listed
-(`persistent_executor.rs` 4, `execve_rebuild.rs` 1, `carrier_custody.rs` 1).
+Expected: FAIL with the raw-destroy inventory (seven or more raw
+`hv_vcpu_destroy` sites across `persistent_executor.rs`, `execve_rebuild.rs`
+and `carrier_custody.rs`). Record the output for the commit body.
 
-- [ ] **Step 3: Add the probe**
+- [ ] **Step 2: Confirm the map before deleting anything**
 
-In `crates/carrick-observability/src/probes.rs`, inside
-`#[usdt::provider(provider = "carrick")] mod carrick_usdt` next to
-`fn vm__lifecycle(_: u32, _: i32) {}`:
-
-```rust
-        /// HVF vCPU created or destroyed. arg0 = site (1-8 destroy, 101-102
-        /// create), arg1 = HVF vCPU id, arg2 = carrier VM generation.
-        fn hvf__vcpu__lifecycle(_: u32, _: u64, _: u64) {}
+```bash
+for sym in save_guest_state rebind_to_slot save_shared_wait_state rebind_shared_wait_state \
+           release_vm_after_reclaim_park rebind_initial_runner_state add_vcpu materialize_process; do
+  printf '%s: ' "$sym"; grep -rn "\.$sym(" crates/carrick-runtime crates/carrick-embed crates/carrick-engine | grep -v '/tests\?/' | wc -l
+done
+grep -n 'retire_failed_worker\|WorkerCommand::Stop\|WorkerCommand::Run\|WorkerCommand::Initialize' \
+  crates/carrick-runtime/src/vcpu_loop/executor.rs crates/carrick-runtime/src/vcpu_loop/executor/pool.rs \
+  crates/carrick-runtime/src/vcpu_loop/executor/settlement.rs
+grep -rn 'CARRICK_HVF_VCPU_RECLAIM' --exclude-dir=target . | grep -v '^./docs/superpowers/plans/'
 ```
 
-In the real wrapper module, next to `pub fn vm_lifecycle`:
+Expected:
+- `0` for every symbol;
+- pool start sends `Run` only after every worker has reported its startup,
+  so every executor vCPU exists before any guest instruction runs;
+- pool shutdown sends `Stop` to every worker handle, retired ones included;
+- the hatch's readers and mentions are listed, so Step 5 can remove every one
+  (docs and scripts included).
+
+A non-zero count, a `Run` sent before all startups, or a shutdown that skips
+retired workers is a STOP: the map missed something (see D2).
+
+- [ ] **Step 3: One raw destroy, sites for the teardown-class destroys**
+
+In `trap.rs`, next to `vcpu_destroyed` (trap.rs:881):
 
 ```rust
-    pub fn hvf_vcpu_lifecycle(site: u32, vcpu: u64, generation: u64) {
-        carrick_usdt::hvf__vcpu__lifecycle!(|| (site, vcpu, generation));
-    }
-```
-
-In the stub module, next to `stub!(kick_rearm_irq(...))`:
-
-```rust
-    stub!(hvf_vcpu_lifecycle(site: u32, vcpu: u64, generation: u64));
-```
-
-- [ ] **Step 4: Add the site types, the raw-destroy function and the generation**
-
-In `crates/carrick-vmm-hvf/src/trap.rs`, next to `CARRIER_VM_LIVE` (trap.rs:457):
-
-```rust
-/// Custody generation of the carrier's current VM, published with
-/// `CARRIER_VM_LIVE` on the creation funnel's success. Diagnostic: the
-/// `hvf-vcpu-lifecycle` census groups vCPU events by VM generation.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-static CARRIER_VM_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn carrier_vm_generation() -> u64 {
-    CARRIER_VM_GENERATION.load(std::sync::atomic::Ordering::Acquire)
-}
-```
-
-and in `create_vm_with_admission`, directly after
-`CARRIER_VM_LIVE.store(true, std::sync::atomic::Ordering::Release);`:
-
-```rust
-            CARRIER_VM_GENERATION.store(generation.0, std::sync::atomic::Ordering::Release);
-```
-
-Next to `VCPU_CREATED_TOTAL`:
-
-```rust
-/// Where an HVF vCPU was destroyed. Reported to the `hvf-vcpu-lifecycle`
-/// probe and (Task 5) to the GIC topology, which releases the vCPU's affinity.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Where a vCPU was destroyed. Every class is teardown: a worker leaving at
+/// pool shutdown, the rollback of a VM being created, a vCPU that failed its
+/// own setup before it ran, and execve's whole-VM rebuild (EL1 plan 1a D2;
+/// hv_gic.h: destroy vCPUs only when tearing down the VM).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub(crate) enum VcpuDestroySite {
-    ReclaimPark = 1,
-    InitialRunnerPark = 2,
-    SharedWaitPark = 3,
-    /// Includes persistent worker retirement and carrier teardown.
-    ThreadExit = 4,
-    ExecveRebuild = 5,
-    CreationRollback = 6,
-    /// `SetupVcpuGuard` with `SetupVcpuCleanup::LocalRaii` (applevisor Drop).
-    SetupRollbackLocal = 7,
-    /// A vCPU created but never handed out because a later setup step failed.
-    CreationError = 8,
+    WorkerExit = 1,
+    CreationRollback = 2,
+    CreationError = 3,
+    ExecveRebuild = 4,
 }
 
-/// Which wrapper created an HVF vCPU.
+/// The only raw `hv_vcpu_destroy` in the crate (test
+/// `vcpus_live_for_the_vm_lifetime`). Owning thread; the caller forgets its
+/// handle so applevisor's Drop never runs on it.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub(crate) enum VcpuCreateSite {
-    VmCreation = 101,
-    ExistingVm = 102,
-}
-
-/// The crate's only raw `hv_vcpu_destroy` (test `every_vcpu_destroy_names_its_site`).
-/// The caller is the owning thread and never uses the handle afterwards; on
-/// success it reports `vcpu_destroyed(vcpu_id, site)` after dropping its
-/// census guard. EL1 plan 1a Task 5 makes this hold the GIC topology lock
-/// across the destroy and the affinity release, keyed by `site`.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn destroy_raw_vcpu(vcpu_id: u64, site: VcpuDestroySite) -> applevisor_sys::hv_return_t {
-    let _ = site;
+pub(crate) fn destroy_raw_vcpu(vcpu_id: u64, _site: VcpuDestroySite) -> applevisor_sys::hv_return_t {
     // SAFETY: the caller owns the vCPU on this thread and forgets its handle.
     unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) }
 }
 ```
 
-Change `vcpu_created()` (trap.rs:638) to take the id and site and report them:
+`vcpu_destroyed(vcpu_id)` becomes `vcpu_destroyed(vcpu_id, site: VcpuDestroySite)`.
+Route every remaining raw destroy through `destroy_raw_vcpu` with its site:
+- `destroy_vcpu_on_thread_exit` → `WorkerExit`;
+- the creation rollbacks at `carrier_custody.rs:110/154` → `CreationRollback`;
+- execve's mature rebuild (`execve_rebuild.rs:1246`) → `ExecveRebuild`;
+- `HvfVmState::add_vcpu`'s mailbox failure (`cow_engine.rs:3695`) and the error
+  returns of `from_process_spec` after its `create_vcpu` (`trap.rs:6610`), which
+  today destroy through applevisor's `Drop`, → `CreationError`. Wrap the
+  handle in `ManuallyDrop` and destroy explicitly.
 
-```rust
-fn vcpu_created(vcpu_id: u64, site: VcpuCreateSite) {
-    VCPU_CREATED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    THREAD_VCPU_CREATED_TOTAL.set(THREAD_VCPU_CREATED_TOTAL.get().saturating_add(1));
-    crate::probes::hvf_vcpu_lifecycle(site as u32, vcpu_id, carrier_vm_generation());
-}
-```
+Task 5 gives `destroy_raw_vcpu` its GIC lock. The unused `_site` becomes the
+lifecycle record then.
 
-and `vcpu_destroyed` (trap.rs:881):
+- [ ] **Step 4: The root boots without a vCPU**
 
-```rust
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn vcpu_destroyed(vcpu_id: u64, site: VcpuDestroySite) {
-    crate::probes::hvf_vcpu_lifecycle(site as u32, vcpu_id, carrier_vm_generation());
-    release_admission_permit_for_vcpu(vcpu_id);
-    // A slot freed: wake a sibling thread blocked in the admission gate.
-    vcpu_gate::notify();
-}
-```
+Today `new_with_plan` (`mapping_plan.rs:381-500`) creates the root's boot vCPU,
+programs its initial registers, and `prepare_initial_runner_handoff`
+(`binding.rs:5320-5395`) snapshots it (`save_initial_runner_state`) and
+destroys it before the pool loads the snapshot into an executor vCPU. The boot
+vCPU exists only to hold registers (`hvf_aarch64_engine.rs:1937-1947`). Clone
+children already start from data (`initial_cpu_state`,
+`hvf_aarch64_engine.rs:614/737`, via `sibling_task_cpu_state`).
 
-Update the destroy sites (Fact 5), each keeping its existing shape
-(`self._vcpu_guard = None;` stays between the destroy and the report):
-- persistent_executor.rs `reclaim_park`: `let rc = destroy_raw_vcpu(vcpu_id, VcpuDestroySite::ReclaimPark);`
-  and `vcpu_destroyed(vcpu_id, VcpuDestroySite::ReclaimPark);`
-- persistent_executor.rs `initial_runner_park`: the same with `InitialRunnerPark`
-- persistent_executor.rs `shared_wait_park`: the same with `SharedWaitPark`
-  (`let vcpu_rc = destroy_raw_vcpu(...)`)
-- persistent_executor.rs `destroy_vcpu_on_thread_exit`: the same with `ThreadExit`
-- execve_rebuild.rs mature branch: `let vcpu_destroy_rc = destroy_raw_vcpu(inherited_vcpu_id, VcpuDestroySite::ExecveRebuild);`
-  and `vcpu_destroyed(inherited_vcpu_id, VcpuDestroySite::ExecveRebuild);`
-- carrier_custody.rs `drive_pending_carrier_vm_cleanup`: the closure becomes
-  `|id| destroy_raw_vcpu(id, VcpuDestroySite::CreationRollback)`, and
-  `drive_pending_carrier_vm_cleanup_using` reports
-  `vcpu_destroyed(id, VcpuDestroySite::CreationRollback);`
-- carrier_custody.rs `impl Drop for SetupVcpuGuard`: the third argument of
-  `complete_local_vcpu_raii_cleanup` becomes
-  `|id| vcpu_destroyed(id, VcpuDestroySite::SetupRollbackLocal)`.
+1. Add `initial_root_snapshot(...) -> Result<Aarch64VcpuSnapshot, TrapError>`
+   beside `initial_cpu_state`. It builds the snapshot from the same register
+   program `new_with_plan` writes into the boot vCPU (entry PC, SP, PSTATE, and
+   the per-task system registers the snapshot carries). Build it from those
+   values, not from a vCPU.
+2. Transition commit (evidence, not the final shape): in
+   `prepare_initial_runner_handoff`, compute both the vCPU snapshot and
+   `initial_root_snapshot`, and return a `RuntimeError::Configuration` naming
+   the first differing field if they differ. Then run:
 
-Route the two paths that destroy through applevisor's `Drop` without
-reporting:
-- cow_engine.rs `add_vcpu`: replace `let mailbox = self.allocate_mailbox_for_vcpu(&vcpu)?;` with
+   ```bash
+   just build
+   just test-embed 2>&1 | tail -5
+   just --no-deps conformance smoke 2>&1 | tail -10
+   ```
 
-```rust
-        let mailbox = match self.allocate_mailbox_for_vcpu(&vcpu) {
-            Ok(mailbox) => mailbox,
-            Err(error) => {
-                // Never handed out: destroy it here, reported, instead of
-                // letting applevisor's Drop destroy it unreported.
-                let vcpu = std::mem::ManuallyDrop::new(vcpu);
-                let id = vcpu.id();
-                if destroy_raw_vcpu(id, VcpuDestroySite::CreationError) == 0 {
-                    self._vcpu_guard = None;
-                    vcpu_destroyed(id, VcpuDestroySite::CreationError);
-                }
-                return Err(error);
-            }
-        };
-```
+   Expected: green. Every root boot in those gates compared equal. Record the
+   counts.
+3. Final shape: `new_with_plan` creates the VM (first root) or uses the live
+   one (later roots), and never a vCPU. `prepare_initial_runner_handoff`
+   publishes `initial_root_snapshot` as the `MigratableTaskState`'s `cpu`.
+   Delete the following:
+   - the comparison;
+   - `save_initial_runner_state` and `rebind_initial_runner_state` (HVF
+     overrides) and `initial_runner_park`/`initial_runner_resume`;
+   - the boot vCPU's `SetupVcpuGuard` lane (`mapping_plan.rs:489-500`,
+     `carrier_custody.rs:313-329`);
+   - the boot-vCPU error destroy at `threaded_loop.rs:361`;
+   - `tests/initial_runner_handoff.rs`, which tests only the deleted mailbox
+     hand-off.
 
-- trap.rs `from_process_spec` (trap.rs:6610): wrap the new vCPU so every
-  `?`/`return Err` after it destroys it through the reporting guard:
-  `let vcpu = SetupVcpuGuard::new(create_vcpu(&vm)?, SetupVcpuCleanup::LocalRaii);`
-  (uses of `vcpu` keep working through `Deref`), and the success tail returns
-  `vcpu.into_inner()` where it returned `vcpu`. `vm` is declared before `vcpu`,
-  so on an error the vCPU is destroyed before the VM handle drops.
+   Do not keep them behind a flag (AGENTS.md: no second paths). If the trait
+   method `save_initial_runner_state` has no other implementor, delete it from
+   the trait. Otherwise leave its default.
 
-In `vcpu_admission.rs`, `create_vcpu_with_permit` calls
-`vcpu_created(vcpu.id(), VcpuCreateSite::VmCreation)` and `create_vcpu` calls
-`vcpu_created(vcpu.id(), VcpuCreateSite::ExistingVm)`. Import the new names where
-the compiler asks (`use crate::trap::{VcpuCreateSite, VcpuDestroySite, destroy_raw_vcpu};`
-in each touched module that does not already glob-import `super::*`; `SetupVcpuGuard`
-and `SetupVcpuCleanup` in trap.rs through the path carrier_custody exports them on).
+If `initial_root_snapshot` cannot reproduce a field without a vCPU (a register
+HVF derives at `hv_vcpu_create` that the snapshot carries), STOP and report
+the field. That field is then read once from the first executor vCPU instead,
+which the replan must name.
 
-- [ ] **Step 5: Run green, then the whole crate's lib tests**
+- [ ] **Step 5: Delete the reclaim and shared-wait machinery and its hatch**
+
+Delete `reclaim_park`, `reclaim_resume`, `release_vm_after_reclaim_park`,
+`shared_wait_park`, `shared_wait_resume`/`shared_wait_resume_inner` and the
+`ReclaimParkAuthority` states only they use (`persistent_executor.rs:14-60,
+930-1200`). Delete the HVF engine overrides that call them
+(`save_guest_state`, `rebind_to_slot`, `save_shared_wait_state`,
+`rebind_shared_wait_state*`, `release_vm_after_reclaim_park`;
+`hvf_aarch64_engine.rs:1925-2039`), so the trait defaults apply. Delete
+`CARRICK_HVF_VCPU_RECLAIM` (`hvf_aarch64_engine.rs:85-98, 1345-1354`): the
+executor budget is always `vcpu_gate::budget()`, which closes the hole where
+`=0` let a large `CARRICK_BOUND_EXECUTORS` exceed the per-VM cap. Update the
+stale doc comments that name these paths (`persistent_executor.rs:930-943`,
+`vcpu_gate.rs:1-16, 56-78`). `-D warnings` names anything that becomes unused;
+delete it rather than `allow` it.
+
+- [ ] **Step 6: A faulted worker keeps its vCPU until pool shutdown**
+
+In `crates/carrick-runtime/src/vcpu_loop/executor.rs`, after
+`retire_failed_worker` and its `terminal_drain` (executor.rs:188-214), a retired
+worker whose startup was published waits for `WorkerCommand::Stop` (or a closed
+channel) before `destroy_and_unregister`. Its vCPU is idle and no longer
+scheduled; it is destroyed at shutdown with the rest. The pool's capacity
+shrinks exactly as today. Only the moment of the destroy moves. Keep the
+`tracing::error!` that names the death when it happens.
+
+- [ ] **Step 7: Run green and record**
 
 ```bash
-env RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib every_vcpu_destroy_names_its_site
+env RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib vcpus_live_for_the_vm_lifetime
 env RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib
-cargo test -p carrick-observability
-```
-
-Expected: all PASS. (`carrier_custody.rs` source-slicing tests assert ordering
-around `SetupVcpuCleanup`, not the `vcpu_destroyed` argument list; if one fails,
-it names the string it expected; restore that string, do not edit the test.)
-
-- [ ] **Step 6: Ledger row for the new static**
-
-```bash
-python3 scripts/migrate/check-runtime-global-state.py --check || true
-python3 scripts/migrate/check-runtime-global-state.py --bootstrap \
-  | python3 -c 'import json,sys; rows=json.load(sys.stdin)["rows"]; print(json.dumps([r for r in rows if r["symbol"]=="CARRIER_VM_GENERATION"], indent=1))'
-```
-
-Add the printed row to `scripts/migrate/runtime-global-state.json` `rows`, with
-`"classification": "carrier_infra"` and the rationale "Custody generation of
-the carrier's one live HVF VM, published beside CARRIER_VM_LIVE; the
-hvf-vcpu-lifecycle census groups vCPU events by it.", keeping the bootstrap
-fingerprint. Re-run `--check`: exit 0.
-
-- [ ] **Step 7: The census script and its strict profile**
-
-Create `scripts/dtrace/hvf-vcpu-lifecycle-census.d`:
-
-```d
-#!/usr/sbin/dtrace -Zs
-/*
- * hvf-vcpu-lifecycle-census.d -- every HVF vCPU create and destroy of one run,
- * in order, with its site and carrier VM generation. The strict reader
- * (carrick-cli hvf_vcpu_lifecycle_profile.rs, `carrick trace --profile
- * hvf-vcpu-lifecycle-census`) derives the MID-LIFE recreates: a create that
- * follows a destroy in the same VM generation, the topology change hv_gic.h
- * advises against once a GIC exists. Teardown destroys (no create follows in
- * that generation) are not mid-life.
- *
- * (a) What it measures: one HVFVCPU|event line per carrick*:::hvf-vcpu-lifecycle.
- *     Site legend: 1 reclaim-park, 2 initial-runner-park, 3 shared-wait-park,
- *     4 thread-exit (worker retirement and carrier teardown), 5 execve-rebuild,
- *     6 creation-rollback, 7 setup-rollback-local, 8 creation-error,
- *     101 vm-creation, 102 existing-vm.
- * (b) Provider ABI (carrick-observability probes.rs, hvf__vcpu__lifecycle):
- *     arg0 = site (u32), arg1 = HVF vCPU id (u64), arg2 = carrier VM custody
- *     generation (u64; one VM per carrier process). `-Z` is required: the
- *     carrier is spawned after arming. Other agents' guests share carrick*:::,
- *     so every clause screens pid == $target || progenyof($target). Qualified
- *     live on the host named in the 1a census record.
- * (c) Perturbation: fires only at vCPU create/destroy; negligible.
- *
- * The reader fails closed on a capture with no event lines: that means the
- * probe did not fire, never "no vCPUs were created".
- */
-#pragma D option quiet
-
-BEGIN
-{
-    printf("HVFVCPU|header|version=1\n");
-}
-
-carrick*:::hvf-vcpu-lifecycle
-/pid == $target || progenyof($target)/
-{
-    printf("HVFVCPU|event|site=%d|vcpu=%d|generation=%d\n", arg0, arg1, arg2);
-}
-
-dtrace:::ERROR
-{
-    printf("HVFVCPU|error\n");
-}
-
-dtrace:::END
-{
-    printf("HVFVCPU|end|version=1\n");
-}
-```
-
-In `crates/carrick-runtime/src/dtrace_consumer.rs`, next to
-`BUNDLED_HVPATCH_K1_LIFECYCLE_D`:
-
-```rust
-/// HVF vCPU create/destroy census (EL1 plan 1a gate D2).
-pub const BUNDLED_HVF_VCPU_LIFECYCLE_CENSUS_D: &str =
-    include_str!("../../../scripts/dtrace/hvf-vcpu-lifecycle-census.d");
-```
-
-Create `crates/carrick-cli/src/hvf_vcpu_lifecycle_profile.rs`:
-
-```rust
-//! Strict reader for the bundled HVF vCPU lifecycle census
-//! (`scripts/dtrace/hvf-vcpu-lifecycle-census.d`). It fails closed on a lossy,
-//! truncated, malformed or empty capture: zero events means the probe did not
-//! fire, never "no vCPUs were created".
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::Path;
-
-use anyhow::{Context, Result, anyhow, bail};
-
-use crate::trace_profile::ProfileCaptureStatus;
-
-const PREFIX: &str = "HVFVCPU";
-const VERSION: u64 = 1;
-
-/// `trap::VcpuDestroySite` (1-8) and `trap::VcpuCreateSite` (101-102).
-fn site_name(site: u32) -> Option<&'static str> {
-    Some(match site {
-        1 => "reclaim-park",
-        2 => "initial-runner-park",
-        3 => "shared-wait-park",
-        4 => "thread-exit",
-        5 => "execve-rebuild",
-        6 => "creation-rollback",
-        7 => "setup-rollback-local",
-        8 => "creation-error",
-        101 => "vm-creation",
-        102 => "existing-vm",
-        _ => return None,
-    })
-}
-
-/// Validated counts from one complete census capture.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct HvfVcpuLifecycleSummary {
-    /// Events by site code.
-    pub(crate) events: BTreeMap<u32, u64>,
-    /// Creates that followed a destroy in the same VM generation, keyed by the
-    /// most recent destroy site of that generation (the mid-life recreates).
-    pub(crate) recreate_after_destroy: BTreeMap<u32, u64>,
-    pub(crate) generations: u64,
-}
-
-fn field(text: &str, name: &str) -> Result<u64> {
-    let value = text
-        .strip_prefix(name)
-        .and_then(|rest| rest.strip_prefix('='))
-        .ok_or_else(|| anyhow!("expected {name}=, got {text:?}"))?;
-    value.parse().with_context(|| format!("{name} is not a u64: {value:?}"))
-}
-
-fn require_version(text: &str) -> Result<()> {
-    let version = field(text, "version")?;
-    if version != VERSION {
-        bail!("census version {version}, reader expects {VERSION}");
-    }
-    Ok(())
-}
-
-impl HvfVcpuLifecycleSummary {
-    pub(crate) fn from_path(path: &Path, status: ProfileCaptureStatus) -> Result<Self> {
-        let contents = fs::read_to_string(path)
-            .with_context(|| format!("read HVF vCPU lifecycle census {}", path.display()))?;
-        Self::from_lines(contents.lines(), status)
-    }
-
-    fn from_lines<I, S>(lines: I, status: ProfileCaptureStatus) -> Result<Self>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        if status != ProfileCaptureStatus::default() {
-            bail!("HVF vCPU lifecycle census is not lossless: {status:?}");
-        }
-        let mut summary = Self::default();
-        let (mut header, mut end) = (false, false);
-        let mut last_destroy = BTreeMap::<u64, u32>::new();
-        let mut generations = BTreeSet::new();
-        for line in lines {
-            let line = line.as_ref();
-            if line.is_empty() {
-                continue;
-            }
-            let fields: Vec<&str> = line.split('|').collect();
-            match fields.as_slice() {
-                [PREFIX, "header", version] if !header => {
-                    require_version(version)?;
-                    header = true;
-                }
-                [PREFIX, "event", site, vcpu, generation] if header && !end => {
-                    let site = u32::try_from(field(site, "site")?)?;
-                    field(vcpu, "vcpu")?;
-                    let generation = field(generation, "generation")?;
-                    site_name(site).ok_or_else(|| anyhow!("unknown site {site}: {line}"))?;
-                    *summary.events.entry(site).or_default() += 1;
-                    generations.insert(generation);
-                    if site < 100 {
-                        last_destroy.insert(generation, site);
-                    } else if let Some(&destroy) = last_destroy.get(&generation) {
-                        *summary.recreate_after_destroy.entry(destroy).or_default() += 1;
-                    }
-                }
-                [PREFIX, "error"] => bail!("dtrace ERROR during the census"),
-                [PREFIX, "end", version] if header && !end => {
-                    require_version(version)?;
-                    end = true;
-                }
-                _ => bail!("malformed or out-of-order census line: {line:?}"),
-            }
-        }
-        if !header || !end {
-            bail!("census stream is truncated (header={header}, end={end})");
-        }
-        if summary.events.is_empty() {
-            bail!("hvf-vcpu-lifecycle never fired: the capture proves nothing");
-        }
-        summary.generations = generations.len() as u64;
-        Ok(summary)
-    }
-
-    pub(crate) fn render_human(&self) -> String {
-        let mut out = format!("hvf-vcpu-lifecycle-census generations={}\n", self.generations);
-        for (site, count) in &self.events {
-            out.push_str(&format!(
-                "events site={} count={count}\n",
-                site_name(*site).unwrap_or("?")
-            ));
-        }
-        for (site, count) in &self.recreate_after_destroy {
-            out.push_str(&format!(
-                "midlife-recreates after={} count={count}\n",
-                site_name(*site).unwrap_or("?")
-            ));
-        }
-        out
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn stream(events: &[(u32, u64, u64)]) -> String {
-        let mut lines = vec!["HVFVCPU|header|version=1".to_owned()];
-        for (site, vcpu, generation) in events {
-            lines.push(format!("HVFVCPU|event|site={site}|vcpu={vcpu}|generation={generation}"));
-        }
-        lines.push("HVFVCPU|end|version=1".to_owned());
-        lines.join("\n")
-    }
-
-    #[test]
-    fn a_create_after_a_destroy_in_one_generation_is_midlife_and_teardown_is_not() {
-        let text = stream(&[
-            (101, 0, 1),
-            (102, 1, 1),
-            (2, 0, 1),   // initial-runner park
-            (102, 0, 1), // recreate in the same VM: mid-life
-            (4, 0, 1),   // teardown: no create follows in generation 1
-            (4, 1, 1),
-            (101, 0, 2),
-            (4, 0, 2),
-        ]);
-        let summary =
-            HvfVcpuLifecycleSummary::from_lines(text.lines(), ProfileCaptureStatus::default())
-                .expect("valid census");
-        assert_eq!(summary.recreate_after_destroy, BTreeMap::from([(2, 1)]));
-        assert_eq!(summary.generations, 2);
-        assert_eq!(summary.events[&4], 3);
-    }
-
-    #[test]
-    fn an_empty_lossy_truncated_or_unknown_capture_is_refused() {
-        let ok = ProfileCaptureStatus::default();
-        assert!(HvfVcpuLifecycleSummary::from_lines(stream(&[]).lines(), ok).is_err());
-        let lossy = ProfileCaptureStatus { principal_drops: 1, ..ok };
-        assert!(HvfVcpuLifecycleSummary::from_lines(stream(&[(101, 0, 1)]).lines(), lossy).is_err());
-        let truncated = stream(&[(101, 0, 1)]).replace("HVFVCPU|end|version=1", "");
-        assert!(HvfVcpuLifecycleSummary::from_lines(truncated.lines(), ok).is_err());
-        assert!(HvfVcpuLifecycleSummary::from_lines(stream(&[(9, 0, 1)]).lines(), ok).is_err());
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    #[test]
-    fn profile_selection_embeds_the_census_program() {
-        let profile = crate::trace_profile::TraceProfileKind::HvfVcpuLifecycleCensus;
-        assert_eq!(profile.as_str(), "hvf-vcpu-lifecycle-census");
-        let source = profile.bundled_script();
-        assert_eq!(source, carrick_runtime::dtrace_consumer::BUNDLED_HVF_VCPU_LIFECYCLE_CENSUS_D);
-        for required in [
-            "HVFVCPU|header|version=1",
-            "carrick*:::hvf-vcpu-lifecycle",
-            "progenyof($target)",
-            "dtrace:::ERROR",
-            "HVFVCPU|end|version=1",
-        ] {
-            assert!(source.contains(required), "missing census source {required}");
-        }
-    }
-}
-```
-
-Register the profile the way `hvpatch-k1-lifecycle` is registered:
-- `crates/carrick-cli/src/main.rs`: `mod hvf_vcpu_lifecycle_profile;` next to
-  `mod hvpatch_k1_profile;`.
-- `crates/carrick-cli/src/trace_profile.rs`: variant `HvfVcpuLifecycleCensus`
-  in `TraceProfileKind`; `as_str` → `"hvf-vcpu-lifecycle-census"`;
-  `capture_bound_placeholder` → `None` (add it to the `None` arm);
-  `bundled_script` → `carrick_runtime::dtrace_consumer::BUNDLED_HVF_VCPU_LIFECYCLE_CENSUS_D`;
-  `parse_protocol` → `"hvf-vcpu-lifecycle-census" => Ok(Self::HvfVcpuLifecycleCensus)`;
-  and the `(kind, name)` table in its test module gains
-  `(TraceProfileKind::HvfVcpuLifecycleCensus, "hvf-vcpu-lifecycle-census")`.
-- `crates/carrick-cli/src/commands.rs`: beside the `hvpatch-inotify09-population`
-  check, `hvf-vcpu-lifecycle-census` requires `--trace-out` and refuses
-  `--summary-jsonl` (same two `bail!`s, with this profile's name); in the
-  freebsd block beside `hvpatch-k1-lifecycle`, it bails "requires a Darwin/HVF
-  host"; in the post-capture chain beside the K1 branch:
-
-```rust
-                        } else if requested_profile
-                            == crate::trace_profile::TraceProfileKind::HvfVcpuLifecycleCensus
-                        {
-                            let summary =
-                                crate::hvf_vcpu_lifecycle_profile::HvfVcpuLifecycleSummary::from_path(
-                                    raw_path,
-                                    capture_status,
-                                )?;
-                            eprintln!("{}", summary.render_human());
-```
-
-- `crates/carrick-cli/src/args.rs`: a test `hvf_vcpu_lifecycle_census_profile_is_cli_selectable`
-  copying `hvpatch_k1_lifecycle_profile_is_cli_selectable` with this profile's name.
-
-```bash
-cargo test -p carrick-cli --bin carrick hvf_vcpu_lifecycle
-cargo test -p carrick-cli --bin carrick trace_profile
-```
-
-Expected: PASS (the reader tests, the embedded-program test, the kind table and
-the CLI selection test).
-
-- [ ] **Step 8: Build signed and run the census on four workloads**
-
-No other guest may be running. Carrick first, never alongside Docker. Each
-capture exits non-zero if the reader refuses it (lossy, truncated, or the
-probe never fired), and `set -e` stops the sequence there.
-
-```bash
+just test
 just build
-mkdir -p target/el1-1a-census
-bin=target/release/carrick
-set -e
-run_census() { name=$1; shift
-  CARRICK_RUN_ID=census-$name "$bin" trace --profile hvf-vcpu-lifecycle-census \
-    --trace-out target/el1-1a-census/$name.raw -- run --rm "$@" < /dev/null \
-    2> >(tee target/el1-1a-census/$name.summary >&2)
-}
-run_census smoke docker.io/library/ubuntu:24.04 /bin/sh -c 'echo hi'
-run_census gobuild --fs host localhost:5005/carrick-go-conformance:1.24 /bin/sh -c \
-  'cd /tmp && printf "package main\nfunc main(){println(\"ok\")}\n" > h.go && GOCACHE=/tmp/gc /usr/local/go/bin/go build -o /tmp/h ./h.go && /tmp/h && echo BUILD_OK'
-run_census cpy-threading localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_threading
-run_census cpy-subprocess localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_subprocess
-set +e
-for id in census-smoke census-gobuild census-cpy-threading census-cpy-subprocess; do scripts/sudo/kill.sh "$id"; done
-grep -a 'events site=\|midlife-recreates' target/el1-1a-census/*.summary
+just test-embed 2>&1 | tail -5
+CARRICK_RUN_ID=d2-smoke target/release/carrick run --rm docker.io/library/ubuntu:24.04 /bin/sh -c 'echo hi; nproc' < /dev/null
+scripts/sudo/kill.sh d2-smoke
 ```
 
-Expected: each summary has `events` lines. Record, per workload, the event
-counts by site and the `midlife-recreates` counts (expected non-zero at least
-for `initial-runner-park`, which every carrier boot performs).
+Expected: all green. Add a "vCPU lifecycle (D2)" section to
+`docs/perf-results/2026-09-25-hvf-gic-qualification.md` with:
+- the code-map citations above;
+- the Step 1 red inventory;
+- the Step 2 zero counts;
+- the Step 4 comparison counts.
 
-- [ ] **Step 9: Decide gate D2 and record it**
+- [ ] **Step 8: Commit**
 
-Append a "Census" section to `docs/perf-results/2026-09-25-hvf-gic-qualification.md`
-with the four summaries and this decision (exactly one row applies):
-
-| E3 | Census mid-life recreates | Decision |
-|---|---|---|
-| pass | any | Keep today's lifecycle under the GIC. The E3 test becomes an `el1-gate` step (Task 12) so an OS update that breaks it is caught. |
-| fail | 0 in all four workloads | Proceed; Task 5 adds a fail-closed guard: a vCPU created in a GIC generation that already released an affinity index is a `carrick_fatal!` naming the last destroy site. Teardown destroys are unaffected (no create follows them). |
-| fail | > 0 | STOP 1a here. Write a lifecycle plan: vCPUs held for the VM's life (the initial runner keeps its vCPU or becomes an executor, persistent workers never retire mid-carrier) and re-run this gate. |
-
-- [ ] **Step 10: Commit**
+Two commits: Step 4.2's comparison lands first, as the evidence commit, then
+the rest.
 
 ```bash
-just fmt-check && cargo clippy -p carrick-vmm-hvf -p carrick-observability -p carrick-runtime -p carrick-cli --all-targets -- -D warnings
-git add crates/carrick-observability/src/probes.rs crates/carrick-vmm-hvf/src/trap.rs \
-  crates/carrick-vmm-hvf/src/trap/vcpu_admission.rs crates/carrick-vmm-hvf/src/trap/persistent_executor.rs \
-  crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs crates/carrick-vmm-hvf/src/trap/carrier_custody.rs \
-  crates/carrick-vmm-hvf/src/trap/cow_engine.rs scripts/dtrace/hvf-vcpu-lifecycle-census.d \
-  crates/carrick-runtime/src/dtrace_consumer.rs crates/carrick-cli/src/hvf_vcpu_lifecycle_profile.rs \
-  crates/carrick-cli/src/main.rs crates/carrick-cli/src/trace_profile.rs crates/carrick-cli/src/commands.rs \
-  crates/carrick-cli/src/args.rs scripts/migrate/runtime-global-state.json \
-  docs/perf-results/2026-09-25-hvf-gic-qualification.md
+just fmt-check && cargo clippy -p carrick-vmm-hvf -p carrick-runtime --all-targets -- -D warnings
+git add -A crates/carrick-vmm-hvf crates/carrick-runtime docs/perf-results/2026-09-25-hvf-gic-qualification.md
+git status --short   # only files this task names
 git commit -F- <<'MSG'
-diagnostics(hvf): census where vCPUs are created and destroyed
+refactor(hvf): keep every vcpu for its vm's life
 
-Why: HVF's GIC documentation says to destroy vCPUs only at VM teardown,
-and Carrick recreates them in a live VM (initial-runner hand-off on
-every boot, M:N reclaim, worker retirement). Adopting the GIC needs to
-know which of those paths fire and how often before deciding the
-lifecycle. Two paths also destroyed vCPUs through applevisor's Drop
-without any report (add_vcpu's mailbox failure, from_process_spec's
-error returns), and the local-RAII setup rollback reported through a
-bare fn pointer.
+Why: Hypervisor.framework's in-kernel GIC treats a VM's topology as
+final once its vCPUs run ("Destroy vcpus only when you are tearing down
+the virtual machine", hv_gic.h), and libkrun (Apache-2.0) keeps one
+vCPU per thread for the VM's life. Carrick destroyed and recreated a
+boot vCPU on every root boot, including inside a live carrier for
+later roots, and carried an unreachable M:N reclaim and shared-wait
+destroy/recreate machinery from the retired one-thread-per-guest-thread
+lane. EL1 plan 1a designs this out instead of qualifying HVF behaviour
+the SDK advises against.
 
 What:
-- `destroy_raw_vcpu` is the only raw hv_vcpu_destroy; every destroy
-  names a `VcpuDestroySite`, every create a `VcpuCreateSite`; the
-  unreported Drop paths now destroy and report explicitly.
-- USDT `hvf-vcpu-lifecycle` (site, vCPU, VM generation) and
-  `carrick trace --profile hvf-vcpu-lifecycle-census`, whose strict
-  reader classifies a create after a destroy in the same generation as
-  mid-life and refuses a lossy, truncated or empty capture.
+- The root boots from an initial CPU snapshot built as data, as clone
+  children already do; no boot vCPU, no initial-runner park/resume.
+- reclaim_park/resume, shared_wait_park/resume,
+  release_vm_after_reclaim_park, their engine overrides and the
+  CARRICK_HVF_VCPU_RECLAIM hatch are deleted; the executor budget is
+  always clamped to the per-VM cap.
+- A faulted executor keeps its idle vCPU until pool shutdown.
+- `destroy_raw_vcpu` is the only raw hv_vcpu_destroy and every destroy
+  names a teardown-class `VcpuDestroySite`.
 
-Verified: `every_vcpu_destroy_names_its_site` red (six raw destroys)
-then green; census reader tests; census on smoke, go build, cpython
-test_threading and test_subprocess recorded in
-docs/perf-results/2026-09-25-hvf-gic-qualification.md with gate D2.
+Verified: `vcpus_live_for_the_vm_lifetime` red (<N> raw destroys,
+park/resume paths present) then green; the transition commit compared
+the data-built root snapshot with the boot vCPU's on every root boot of
+`just test-embed` and conformance smoke (<counts>, all equal); signed
+smoke; `just test`.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 MSG
@@ -3464,10 +2417,10 @@ const SDK_IRQ: hv_interrupt_type_t = carrick_vmm_hvf::interrupt::HvfInterruptLin
 ```bash
 env RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib -- interrupt::tests kick_irq_asserts_the_sdk_irq_line
 ./scripts/lint-domains.sh
-just test-hvf gic_qualification_e1 --nocapture 2>&1 | grep -a '^E1'
+just test-hvf gic_qualification_c2 --nocapture 2>&1 | grep -a '^C2'
 ```
 
-Expected: both unit tests PASS; `lint-domains.sh` exits 0; E1 unchanged (the
+Expected: both unit tests PASS; `lint-domains.sh` exits 0; C2 unchanged (the
 legacy call still reports `HV_UNSUPPORTED` through the wrapper).
 
 - [ ] **Step 4: Commit**
@@ -3492,7 +2445,7 @@ variants anywhere else.
 
 Verified: the rule flagged trap.rs and the qualification test before the
 change and passes after; `lines_carry_the_sdk_numbers` and
-`kick_irq_asserts_the_sdk_irq_line` pass; E1 unchanged.
+`kick_irq_asserts_the_sdk_irq_line` pass; C2 unchanged.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 MSG
@@ -3739,10 +2692,11 @@ env RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib stage2_map_refuses_t
 cargo test -p carrick-mem --lib gic_window_is_below_the_trampoline_and_above_the_vdso
 cargo test -p carrick-mem --lib stage1_publication_refuses_outputs_in_the_gic_window
 cargo test -p carrick-mem --lib page_table
-just test-hvf gic_qualification_e0 --nocapture 2>&1 | grep -a '^E0'
+just test-hvf gic_qualification_c2 --nocapture 2>&1 | grep -a '^C2'
 ```
 
-Expected: PASS for all; E0 unchanged.
+Expected: PASS for all; C2 unchanged (its GIC is created at the window
+constants).
 
 - [ ] **Step 6: Commit**
 
@@ -3767,8 +2721,8 @@ the window yet.
 
 Verified: `stage2_map_refuses_the_gic_window` and
 `stage1_publication_refuses_outputs_in_the_gic_window` red then green;
-`gic_window_is_below_the_trampoline_and_above_the_vdso`; qualification
-E0 passes at this placement.
+`gic_window_is_below_the_trampoline_and_above_the_vdso`; check C2
+passes at this placement.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 MSG
@@ -3778,7 +2732,8 @@ MSG
 
 ### Task 5: Create the GIC in the VM funnel and configure every vCPU (D5, D7, D9)
 
-Valid only if gates D1, D2, D3, D5b and D12 passed.
+Valid only if gates D1, D3 and D5b passed and Task 2 (D2) has landed. D12 is
+decided inside this task (Step 8).
 
 Task 5 is not committed on its own. It turns the GIC on by default, and until
 Task 6 lands the kick vehicle every kick still goes through
@@ -3791,17 +2746,17 @@ Task 6 commits both.
 **Files:**
 - Create: `crates/carrick-vmm-hvf/src/gic.rs`
 - Modify: `crates/carrick-vmm-hvf/src/lib.rs` (module)
-- Modify: `crates/carrick-vmm-hvf/src/trap.rs` (`create_vm_with_admission`, `destroy_raw_vcpu`)
+- Modify: `crates/carrick-vmm-hvf/src/trap.rs` (`create_vm_with_admission`, `destroy_raw_vcpu`,
+  the first-run seal in `run_to_exit`)
 - Modify: `crates/carrick-vmm-hvf/src/trap/vcpu_admission.rs` (both wrappers, `record_vm_released`,
   `GLOBAL_VCPU_CEILING` per D5b, tests)
-- Modify: `crates/carrick-vmm-hvf/src/trap/carrier_custody.rs` (`SetupVcpuGuard` drop under the GIC lock)
 - Modify: `crates/carrick-vmm-hvf/src/trap/vcpu_gate.rs` (capacity clamp)
 - Modify: `crates/carrick-vmm-hvf/src/trap/cow_engine.rs` (EL0 ID view, D12)
 - Modify: `crates/carrick-el1-abi/src/lib.rs` (shared INTID constants)
 - Create: `conformance-probes/src/bin/idaa64pfr0.rs` and its registrations (D12)
 - Create: `conformance-contracts/contracts/gic-topology.toml`
 - Modify: `conformance-contracts/surfaces.toml`, `scripts/migrate/runtime-global-state.json`,
-  `scripts/migrate/runtime-aborts/hvf.json` (only if gate D2's middle row applied)
+  `scripts/migrate/runtime-aborts/hvf.json` (the D2 guard's `carrick_fatal!`)
 
 **Interfaces:**
 - Consumes: `carrick_mem::memory::{LINUX_GIC_DISTRIBUTOR_BASE, LINUX_GIC_DISTRIBUTOR_MAX,
@@ -3809,7 +2764,7 @@ Task 6 commits both.
   `crate::trap::{VcpuDestroySite, destroy_raw_vcpu}`.
 - Produces in `carrick_el1_abi`: `pub const GIC_KICK_INTID: u32 = 15;`,
   `pub const GIC_VTIMER_INTID: u32 = 27;`, `pub const GIC_SPURIOUS_INTID: u32 = 1023;`
-  (single source for host and EL1; `GIC_KICK_INTID` is 20 if gate D1 chose the PPI).
+  (single source for host and EL1).
 - Produces in `crate::gic`: `pub(crate) struct PrivateIntid`, `pub(crate) const KICK_INTID`,
   `pub(crate) const VTIMER_INTID`, `pub(crate) struct Mpidr`, `pub(crate) struct MpidrAllocator`,
   `pub(crate) struct GicGeometry`, `pub(crate) enum InterruptModel { Gic, LegacyPendingLine }`,
@@ -3819,6 +2774,8 @@ Task 6 commits both.
   `pub(crate) fn carrier_vm_released()`,
   `pub(crate) fn configure_new_vcpu(vcpu: u64) -> Result<(), TrapError>`,
   `pub(crate) fn destroy_releasing_affinity(vcpu: u64, site: VcpuDestroySite, destroy: impl FnOnce() -> applevisor_sys::hv_return_t) -> applevisor_sys::hv_return_t`,
+  `pub(crate) fn seal_topology_before_run()`,
+  `fn lifecycle_admits_create(sealed: bool, last_release_site: Option<VcpuDestroySite>) -> Result<(), String>` (D2 guard),
   `pub(crate) fn redistributor_capacity() -> Option<usize>`,
   `pub fn gic_topology_snapshot() -> GicTopologySnapshot` (pub, re-exported for embed tests).
 
@@ -3827,9 +2784,9 @@ Task 6 commits both.
 In `crates/carrick-el1-abi/src/lib.rs`, near `IMAGE_VERSION`:
 
 ```rust
-/// GIC INTID of the host kick: an SGI the host makes pending in the vCPU's
-/// redistributor (GICR_ISPENDR0) and EL1 surfaces as a kick exit (EL1 plan
-/// 1a, gate D1).
+/// GIC INTID of the owed host kick: an SGI the host makes pending in the
+/// vCPU's redistributor (GICR_ISPENDR0) after an `hv_vcpus_exit` lands inside
+/// EL1, and EL1 surfaces as a kick exit (EL1 plan 1a, gate D1).
 pub const GIC_KICK_INTID: u32 = 15;
 /// GIC INTID of the EL1 virtual timer (Hypervisor.framework
 /// `HV_GIC_INT_EL1_VIRTUAL_TIMER`; checked at every GIC creation).
@@ -3903,8 +2860,10 @@ mod tests {
         let mut allocator = MpidrAllocator::with_capacity(4);
         assert_eq!(allocator.allocate(5).unwrap(), 0);
         assert_eq!(allocator.allocate(6).unwrap(), 1);
-        // HVF reuses vCPU ids: 5 is destroyed (released under the lock) and a
-        // new vCPU with the same id gets the lowest free index again.
+        // Allocator semantics only: HVF reuses vCPU ids, so a released index
+        // is handed out again. In production the D2 guard refuses any create
+        // after a destroy within one VM generation, and a new generation gets
+        // a fresh allocator.
         assert_eq!(allocator.release(5), Some(0));
         assert_eq!(allocator.allocate(5).unwrap(), 0);
         assert_eq!(allocator.live(), 2);
@@ -3917,6 +2876,19 @@ mod tests {
         assert_eq!(crate::trap::vcpu_gate::hvf_cap_from(64, Some(32)), 28);
         assert_eq!(crate::trap::vcpu_gate::hvf_cap_from(64, None), 60);
         assert_eq!(crate::trap::vcpu_gate::hvf_cap_from(3, Some(2)), 1);
+    }
+
+    /// D2: vCPUs are created before the VM's first run and destroyed only at
+    /// teardown (hv_gic.h). A create after the first run or after any destroy
+    /// of the generation is refused.
+    #[test]
+    fn lifecycle_guard_refuses_a_create_after_first_run_or_destroy() {
+        assert!(lifecycle_admits_create(false, None).is_ok());
+        assert!(lifecycle_admits_create(true, None).is_err(), "topology sealed at first run");
+        assert!(
+            lifecycle_admits_create(false, Some(VcpuDestroySite::WorkerExit)).is_err(),
+            "a create after a destroy is a mid-life recreate"
+        );
     }
 
     /// One raw-API boundary: only this module names `hv_gic_*`.
@@ -3997,7 +2969,7 @@ env RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib gic::tests
 ```
 
 Expected: FAIL to compile (`cannot find type Mpidr`, `MpidrAllocator`,
-`GicGeometry`, `hvf_cap_from`). That compile failure is the red for the types;
+`GicGeometry`, `hvf_cap_from`, `lifecycle_admits_create`). That compile failure is the red for the types;
 `gic_is_created_inside_the_vm_creation_funnel` and
 `every_vcpu_is_configured_by_its_creation_wrapper` must additionally fail on
 their assertions once Step 3 makes the module compile and before Step 4 wires it.
@@ -4011,12 +2983,16 @@ Prepend to `crates/carrick-vmm-hvf/src/gic.rs` (above the test module):
 //! GICv3 (`hv_gic_create`). This module is the only caller of raw `hv_gic_*`
 //! (test `raw_hv_gic_calls_stay_in_gic_rs`).
 //!
-//! Facts it is built on (docs/perf-results/2026-09-25-hvf-gic-qualification.md):
+//! Setup follows hv_gic.h and libkrun (Apache-2.0; EL1 plan 1a "Prior art"):
 //! the GIC is created after `hv_vm_create` and before any `hv_vcpu_create`;
-//! each vCPU needs a unique MPIDR before its redistributor is touched;
-//! redistributor and ICC registers are written on the owning thread;
-//! `hv_vcpu_set_pending_interrupt` returns HV_UNSUPPORTED once a GIC exists,
-//! and redistributor pending state survives `hv_vcpu_run` returns.
+//! each vCPU gets a unique MPIDR on its owning thread before its
+//! redistributor is touched; vCPUs live for the VM's life (created before the
+//! first run, destroyed only at teardown; D2, enforced here). Carrick has no
+//! guest GIC driver, so this module writes what one would (GICD_CTLR, and per
+//! vCPU the redistributor and ICC registers, on the owning thread).
+//! `hv_vcpu_set_pending_interrupt` returns HV_UNSUPPORTED once a GIC exists;
+//! the owed kick is a redistributor-pending SGI that survives `hv_vcpu_run`
+//! returns (check C2, docs/perf-results/2026-09-25-hvf-gic-qualification.md).
 
 use applevisor_sys as sys;
 use carrick_hal::TrapError;
@@ -4060,7 +3036,9 @@ const VTIMER_PRIORITY: u8 = 0x80;
 const KICK_PRIORITY: u8 = 0xa0;
 /// Every Carrick priority passes the CPU-interface mask.
 const ICC_PMR: u64 = 0xf0;
-/// GICD_CTLR: affinity routing (ARE) + group 1 enable, as qualified in E0.
+/// GICD_CTLR: affinity routing (ARE) + group 1 enable, as a guest GICv3
+/// driver sets it; both spikes ran the vtimer PPI after a host-side write of
+/// this register.
 const GICD_CTLR_ARE_GRP1: u64 = 0x12;
 /// Every SGI and PPI bit of the *R0 redistributor registers.
 const ALL_PRIVATE: u64 = 0xffff_ffff;
@@ -4222,7 +3200,7 @@ fn gic_check(rc: sys::hv_return_t, what: &str) -> Result<(), TrapError> {
 
 /// Why `create_carrier_gic` failed. `NoResources` is Hypervisor.framework's
 /// `HV_NO_RESOURCES` from `hv_gic_create`, which the VM-creation funnel parks
-/// and retries like `hv_vm_create`'s (qualification E5b).
+/// and retries like `hv_vm_create`'s (check C3).
 #[derive(Debug)]
 pub(crate) enum GicCreateFailure {
     NoResources,
@@ -4354,10 +3332,9 @@ pub(crate) fn configure_new_vcpu(vcpu: u64) -> Result<(), TrapError> {
                 sys::hv_vcpu_set_sys_reg(vcpu, sys::hv_sys_reg_t::MPIDR_EL1, Mpidr::for_index(index).raw()),
                 "MPIDR_EL1",
             )?;
-            // A reused index may name a redistributor a destroyed vCPU left
-            // with a pending kick or an active interrupt (qualification E3
-            // `carried_over`); an inherited active interrupt would block the
-            // kick at its priority. Withdraw every private interrupt first.
+            // Bring-up reset, as a guest GIC driver does for its CPU:
+            // withdraw every private interrupt Carrick does not use, and any
+            // pending or active state, before enabling its own.
             gic_check(sys::hv_gic_set_redistributor_reg(vcpu, R::ICENABLER0, ALL_PRIVATE & !enabled), "GICR_ICENABLER0")?;
             gic_check(sys::hv_gic_set_redistributor_reg(vcpu, R::ICPENDR0, ALL_PRIVATE), "GICR_ICPENDR0")?;
             gic_check(sys::hv_gic_set_redistributor_reg(vcpu, R::ICACTIVER0, ALL_PRIVATE), "GICR_ICACTIVER0")?;
@@ -4389,13 +3366,13 @@ fn release_vcpu_index(vcpu: u64) {
     }
 }
 
-/// Destroy a vCPU and free its affinity index in one critical section: the
-/// topology lock is held across `destroy` (the caller's `hv_vcpu_destroy`,
-/// raw or applevisor's Drop) and the release, so no other thread can create
-/// a vCPU with the reused HVF id and allocate before the old index is free,
-/// and no late release can free a new vCPU's index. Releases in a VM
-/// generation that no longer has a GIC are no-ops. The topology lock is a
-/// leaf: nothing else is locked inside it.
+/// Destroy a vCPU (teardown-class only, D2) and record it in one critical
+/// section: the topology lock is held across `destroy` (the caller's raw
+/// `hv_vcpu_destroy`) and the release, so the D2 guard in
+/// `configure_new_vcpu` sees the destroy before any other thread can create
+/// a vCPU with the reused HVF id. Releases in a VM generation that no longer
+/// has a GIC are no-ops. The topology lock is a leaf: nothing else is locked
+/// inside it.
 pub(crate) fn destroy_releasing_affinity(
     vcpu: u64,
     site: VcpuDestroySite,
@@ -4451,32 +3428,68 @@ pub fn gic_topology_snapshot() -> GicTopologySnapshot {
 }
 ```
 
-If gate D2's middle row applied (E3 failed, no mid-life recreates in the
-census), add `use carrick_fatal::carrick_fatal;` to `gic.rs` and, in
-`configure_new_vcpu`, directly before `let index = gic.mpidrs.allocate(vcpu)?;`:
+The D2 lifecycle guard. Add `use carrick_fatal::carrick_fatal;` to `gic.rs`,
+and above `configure_new_vcpu`:
 
 ```rust
-        // Gate D2 (middle row): E3 failed, so a vCPU may not be created in a
-        // VM generation that already destroyed one. Teardown destroys never
-        // reach this (no create follows them in their generation).
-        if let Some(site) = gic.last_release_site {
+/// Set on the generation's first `hv_vcpu_run`; reset with the GIC. hv_gic.h:
+/// "Once the virtual machine vcpus are running, its topology is considered
+/// final."
+static TOPOLOGY_SEALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called by `run_to_exit` before every `hv_vcpu_run`: one relaxed load once
+/// sealed.
+pub(crate) fn seal_topology_before_run() {
+    use std::sync::atomic::Ordering;
+    if !TOPOLOGY_SEALED.load(Ordering::Relaxed) {
+        TOPOLOGY_SEALED.store(true, Ordering::Release);
+    }
+}
+
+/// D2: a vCPU may be created only before the generation's first run and
+/// before any of its destroys (which are all teardown-class, Task 2).
+fn lifecycle_admits_create(sealed: bool, last_release_site: Option<VcpuDestroySite>) -> Result<(), String> {
+    match (sealed, last_release_site) {
+        (false, None) => Ok(()),
+        (true, _) => Err("the VM's vCPUs are already running (topology final)".to_owned()),
+        (false, Some(site)) => Err(format!("the generation already destroyed a vCPU at {site:?}")),
+    }
+}
+```
+
+In `configure_new_vcpu`, directly before `let index = gic.mpidrs.allocate(vcpu)?;`:
+
+```rust
+        // D2: every vCPU lives for its VM's life. A create after the first run
+        // or after a teardown-class destroy is a path Task 2 missed; refuse it
+        // rather than rely on HVF behaviour hv_gic.h advises against.
+        if let Err(reason) = lifecycle_admits_create(
+            TOPOLOGY_SEALED.load(std::sync::atomic::Ordering::Acquire),
+            gic.last_release_site,
+        ) {
             carrick_fatal!(
                 "gic::configure_new_vcpu",
-                "vCPU created in VM generation {} after a destroy at {site:?} under the in-kernel GIC (qualification E3 failed)",
+                "vCPU {vcpu} created in VM generation {} under the in-kernel GIC: {reason}",
                 gic.generation
             );
         }
 ```
 
-then run `python3 scripts/migrate/check-runtime-aborts.py --check`, which names
-the new `carrick_fatal!` site and its fingerprint, and add that row to
-`scripts/migrate/runtime-aborts/hvf.json` with `"verdict": "carrier_fault"`,
-`"failure_domain": "gic::configure_new_vcpu"`, `"sink": "fatal"`,
-`"domain": "gic::configure_new_vcpu"` and the rationale "A vCPU was created in
-a VM generation that already destroyed one while the in-kernel GIC is active;
-qualification E3 showed Hypervisor.framework does not support that topology
-change." Re-run `--check`: exit 0. Otherwise `last_release_site` is still read
-by `gic_topology_snapshot` (below) and no fatal is added.
+In `create_carrier_gic` and `carrier_vm_released`, reset the seal with
+`TOPOLOGY_SEALED.store(false, Ordering::Release)` while holding the
+`CARRIER_GIC` lock. Run `python3 scripts/migrate/check-runtime-aborts.py --check`.
+It names the new `carrick_fatal!` site and its fingerprint. Add that row to
+`scripts/migrate/runtime-aborts/hvf.json` with:
+- `"verdict": "carrier_fault"`;
+- `"failure_domain": "gic::configure_new_vcpu"`;
+- `"sink": "fatal"`;
+- `"domain": "gic::configure_new_vcpu"`;
+- the rationale "A vCPU was created after the VM's vCPUs started running or
+  after one was destroyed while the in-kernel GIC is active. hv_gic.h treats
+  the topology as final once vCPUs run; Carrick keeps every vCPU for the VM's
+  life (EL1 plan 1a D2)."
+
+Re-run `--check`: exit 0.
 
 `HV_BAD_ARGUMENT` is used by Task 6's kick vehicle; if clippy reports it unused
 at this step, add it in Task 6 instead.
@@ -4495,7 +3508,7 @@ the `match create_result {` head with:
         // fresh one. The in-kernel GIC belongs to the same attempt: it must
         // exist before any vCPU of this VM, every VM (boot, execve rebuild,
         // shared-wait resume, fork rebuild) is created here, and its
-        // HV_NO_RESOURCES parks and retries like hv_vm_create's (E5b).
+        // HV_NO_RESOURCES parks and retries like hv_vm_create's (check C3).
         crate::probes::vm_lifecycle(0, admission.probe_code());
         create_with_no_resources_backpressure("hv_vm_create+hv_gic_create", || {
             let config = fresh_vm_config()?;
@@ -4517,7 +3530,6 @@ the `match create_result {` head with:
             // A VM exists: publish it so custody's rollback owns and destroys
             // it (and clears the flag through `record_vm_released`).
             CARRIER_VM_LIVE.store(true, std::sync::atomic::Ordering::Release);
-            CARRIER_VM_GENERATION.store(generation.0, std::sync::atomic::Ordering::Release);
             let pending = PendingCarrierVmCreation {
                 custody: std::sync::Arc::clone(custody),
                 generation,
@@ -4543,8 +3555,8 @@ Result<(), TrapError>`, carrier_custody.rs:68), follow it; do not add a second
 destroy path.
 
 If gate D5b lowered the ceiling, set `GLOBAL_VCPU_CEILING` (vcpu_admission.rs)
-to the E5b GIC ceiling minus 7 and add both measured ceilings to its doc
-comment ("127 VMs without a GIC, N with one; qualification E5b").
+to the C3 GIC ceiling minus 7 and add both measured ceilings to its doc
+comment ("127 VMs without a GIC, N with one; EL1 plan 1a check C3").
 
 In `vcpu_admission.rs`, the two wrappers become:
 
@@ -4566,7 +3578,7 @@ pub(super) fn create_vcpu_with_permit(
             if let Some(permit) = permit {
                 register_admission_permit(vcpu.id(), permit.into_inner());
             }
-            vcpu_created(vcpu.id(), VcpuCreateSite::VmCreation);
+            vcpu_created();
             Ok(vcpu)
         }
         Err(e) => {
@@ -4580,16 +3592,16 @@ pub(super) fn create_vcpu_with_permit(
 pub(super) fn create_vcpu(
     vm: &applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
 ) -> Result<applevisor::vcpu::Vcpu, TrapError> {
-    // Existing-VM vCPUs (thread siblings and reclaim/rebind) are admitted by the
-    // in-process scheduler. Applying the VM-creation permit here would duplicate
-    // that scheduler's bounded vCPU accounting.
+    // Existing-VM vCPUs (persistent pool executors, all created at pool start;
+    // D2) are admitted by the in-process scheduler. Applying the VM-creation
+    // permit here would duplicate that scheduler's bounded vCPU accounting.
     match vm.vcpu_create() {
         Ok(vcpu) => {
             if let Err(error) = crate::gic::configure_new_vcpu(vcpu.id()) {
                 discard_unconfigured_vcpu(vcpu);
                 return Err(error);
             }
-            vcpu_created(vcpu.id(), VcpuCreateSite::ExistingVm);
+            vcpu_created();
             Ok(vcpu)
         }
         Err(e) => Err(TrapError::Hypervisor(format!(
@@ -4628,28 +3640,20 @@ pub(crate) fn destroy_raw_vcpu(vcpu_id: u64, site: VcpuDestroySite) -> appleviso
 }
 ```
 
-and `impl Drop for SetupVcpuGuard` (carrier_custody.rs) runs applevisor's Drop
-inside the same critical section:
+Task 2 removed the boot vCPU's local-RAII lane, so every destroy now passes
+through `destroy_raw_vcpu`. Each one is recorded under the topology lock in
+the same critical section as `hv_vcpu_destroy`, so the D2 guard sees it
+before any other thread can create a vCPU with a reused HVF id.
+`vcpu_destroyed` (admission permit, gate wake) runs after the lock is dropped.
 
-```rust
-        complete_local_vcpu_raii_cleanup(
-            id,
-            || {
-                crate::gic::destroy_releasing_affinity(id, VcpuDestroySite::SetupRollbackLocal, || {
-                    // SAFETY: the local-reuse lane has no Pending transaction. Its
-                    // ordinary applevisor RAII destruction remains the sole HV owner;
-                    // applevisor's Drop panics rather than return on failure.
-                    unsafe { std::mem::ManuallyDrop::drop(&mut self.vcpu) };
-                    0
-                });
-            },
-            |id| vcpu_destroyed(id, VcpuDestroySite::SetupRollbackLocal),
-        );
-```
-
-Every destroy therefore frees its affinity index before any other thread can
-allocate for a reused HVF id; `vcpu_destroyed` (census, admission permit, gate
-wake) runs after the lock is dropped.
+In `run_to_exit` (trap.rs:7330), directly before its
+`vcpu.run().map_err(hvf_error)?` (trap.rs:7352, the only guest entry of the
+lane), call `crate::gic::seal_topology_before_run();`. Add
+`gic_seal_precedes_every_run` to `gic::tests`. It asserts that
+`include_str!("trap.rs")` contains `vcpu.run()` exactly once, and that
+`crate::gic::seal_topology_before_run()` appears before it in the same
+function. Run it red before the edit. Task 6 renames the function to
+`run_to_exit_inner`, and the test does not depend on the name.
 
 In `record_vm_released` (vcpu_admission.rs:655), after
 `CARRIER_VM_LIVE.store(false, ...)`, add `crate::gic::carrier_vm_released();`.
@@ -4712,19 +3716,20 @@ Create `conformance-contracts/contracts/gic-topology.toml`:
 ```toml
 schema_version = 1
 id = "kernel.vcpu.gic-topology"
-title = "Every carrier vCPU has a unique GIC affinity and a configured redistributor before it runs"
+title = "Every carrier vCPU has a unique GIC affinity and a configured redistributor before it runs, and lives for its VM's life"
 guest_surfaces = ["vmm:hvf", "scheduler:vcpu-kick", "execution:linux-aarch64"]
 semantic_authority = [
-  "Hypervisor.framework hv_gic.h: hv_gic_create after hv_vm_create and before any hv_vcpu_create; vCPUs set affinity values in MPIDR_EL1; redistributor registers are written by the owning thread",
+  "Hypervisor.framework hv_gic.h: hv_gic_create after hv_vm_create and before any hv_vcpu_create; vCPUs set affinity values in MPIDR_EL1; once the VM's vCPUs are running its topology is final and vCPUs are destroyed only at VM teardown; redistributor registers are written by the owning thread",
+  "libkrun (Apache-2.0) 85bed715: the same creation order, MPIDR on the owning thread, one vCPU per host thread for the VM's life",
   "Arm GICv3 architecture specification: affinity routing identifies a PE by MPIDR_EL1 Aff3.Aff2.Aff1.Aff0; ICC_SGI1R_EL1 TargetList addresses Aff0 0-15",
 ]
 fixture = "unit:gic-topology"
 scale_points = [1, 8, 32, 128]
-rationale = "The carrier VM carries Hypervisor.framework's in-kernel GICv3. It is created inside the single VM-creation funnel, so every VM generation (boot, execve rebuild, shared-wait resume, fork rebuild) has it before its first vCPU; both vCPU-creation wrappers give each vCPU the lowest free affinity index of that generation and configure its redistributor (every private interrupt a previous owner left withdrawn, then kick SGI and vtimer PPI enabled, group 1, priorities) and CPU interface on the owning thread before the vCPU is counted or handed out; every destroy releases its index under the topology lock in the same critical section as hv_vcpu_destroy, so a reused HVF vCPU id never meets a stale owner. The vCPU budget is clamped to the redistributor count. Two live guest processes with threads are the embed evidence: the single-process lane cannot see a duplicate affinity."
+rationale = "The carrier VM carries Hypervisor.framework's in-kernel GICv3, set up the reference way. It is created inside the single VM-creation funnel, so every VM generation has it before its first vCPU; both vCPU-creation wrappers give each vCPU the lowest free affinity index of that generation and configure its redistributor (bring-up reset, then kick SGI and vtimer PPI enabled, group 1, priorities) and CPU interface on the owning thread before the vCPU is counted or handed out. Every vCPU is created before the VM's first run and destroyed only at teardown: the root boots from a snapshot built as data, and a create after the first run or after any destroy of the generation is a carrier fault (D2). Destroys are recorded under the topology lock in the same critical section as hv_vcpu_destroy. The vCPU budget is clamped to the redistributor count. Two live guest processes with threads are the embed evidence: the single-process lane cannot see a duplicate affinity or a mid-life destroy."
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-vmm-hvf::gic::tests::mpidr_carries_res1_and_sgi_addressable_affinity; carrick-vmm-hvf::gic::tests::mpidr_allocator_hands_out_the_lowest_free_index; carrick-vmm-hvf::gic::tests::mpidr_allocator_refuses_a_second_index_for_one_vcpu_and_a_full_topology; carrick-vmm-hvf::gic::tests::geometry_must_fit_the_reserved_window; carrick-vmm-hvf::gic::tests::a_destroy_releases_its_index_and_the_next_generation_starts_empty; carrick-vmm-hvf::gic::tests::capacity_clamps_the_vcpu_budget; carrick-vmm-hvf::gic::tests::raw_hv_gic_calls_stay_in_gic_rs; carrick-vmm-hvf::gic::tests::gic_is_created_inside_the_vm_creation_funnel; carrick-vmm-hvf::gic::tests::every_vcpu_is_configured_by_its_creation_wrapper; carrick-vmm-hvf::trap::vcpu_admission::vcpu_lifecycle_site_tests::every_vcpu_destroy_names_its_site"
+vm_free = "carrick-vmm-hvf::gic::tests::mpidr_carries_res1_and_sgi_addressable_affinity; carrick-vmm-hvf::gic::tests::mpidr_allocator_hands_out_the_lowest_free_index; carrick-vmm-hvf::gic::tests::mpidr_allocator_refuses_a_second_index_for_one_vcpu_and_a_full_topology; carrick-vmm-hvf::gic::tests::geometry_must_fit_the_reserved_window; carrick-vmm-hvf::gic::tests::a_destroy_releases_its_index_and_the_next_generation_starts_empty; carrick-vmm-hvf::gic::tests::capacity_clamps_the_vcpu_budget; carrick-vmm-hvf::gic::tests::raw_hv_gic_calls_stay_in_gic_rs; carrick-vmm-hvf::gic::tests::gic_is_created_inside_the_vm_creation_funnel; carrick-vmm-hvf::gic::tests::every_vcpu_is_configured_by_its_creation_wrapper; carrick-vmm-hvf::gic::tests::lifecycle_guard_refuses_a_create_after_first_run_or_destroy; carrick-vmm-hvf::gic::tests::gic_seal_precedes_every_run; carrick-vmm-hvf::trap::vcpu_admission::vcpu_lifetime_tests::vcpus_live_for_the_vm_lifetime"
 embed = "carrick-embed::el1_gic_topology_two_processes"
 
 [bindings.unresolved]
@@ -4748,10 +3753,6 @@ path = "crates/carrick-vmm-hvf/tests/gic_qualification.rs"
 contracts = ["kernel.vcpu.gic-topology", "kernel.vcpu.kick-el0-boundary"]
 
 [[surfaces]]
-path = "crates/carrick-vmm-hvf/tests/gic_qualification_wfi.rs"
-contracts = ["kernel.vcpu.kick-el0-boundary"]
-
-[[surfaces]]
 path = "crates/carrick-vmm-hvf/tests/gic_qual/harness.rs"
 contracts = ["kernel.vcpu.gic-topology", "kernel.vcpu.kick-el0-boundary"]
 
@@ -4762,9 +3763,13 @@ contracts = ["kernel.vcpu.gic-topology"]
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/carrier_custody.rs"
 contracts = ["kernel.vcpu.gic-topology"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs"
+contracts = ["kernel.vcpu.gic-topology"]
 ```
 
-If `surfaces.toml` already lists `carrier_custody.rs`, append the contract id to
+If `surfaces.toml` already lists `carrier_custody.rs` or `persistent_executor.rs`, append the contract id to
 that entry instead of adding a second one.
 
 The embed binding's test is written in Task 8; `check-contracts` validates
@@ -4781,9 +3786,13 @@ Step 2 moves it back once the test exists.
 - [ ] **Step 8: The EL0 ID view (gate D12)**
 
 Linux hides the GIC system-register field (`ID_AA64PFR0_EL1` bits 27:24) from
-EL0; Carrick's EL0 MRS emulation returns the raw vCPU value (Fact 10). Run this
-step whether or not E0 reported a difference, so the view is pinned against the
-oracle either way.
+EL0; Carrick's EL0 MRS emulation returns the raw vCPU value (Fact 10). This
+probe is the measurement: it runs in the production VM with the GIC that
+Step 4 just enabled, so no separate experiment is needed. (libkrun ORs a GIC
+field into `ID_AA64PFR0_EL1` only for nested virtualisation, which suggests
+HVF may leave it clear. The probe settles it.) The other nine ID registers
+the EL0 emulation returns are guarded by Task 13's row-by-row probe diff
+against the base artifact.
 
 Create `conformance-probes/src/bin/idaa64pfr0.rs`:
 
@@ -4822,10 +3831,11 @@ just build
 ./scripts/test-signed.sh carrick-conformance-next idaa64pfr0 --nocapture 2>&1 | tee target/el1-1a-idview-red.log
 ```
 
-Expected red when E0's `E0-id` named `ID_AA64PFR0_EL1`: a DIFF on
-`id_aa64pfr0_gic_field` (oracle 0, Carrick non-zero). Record it. If E0 named
-no difference, the probe passes here: record that it is a regression guard,
-not a red-first proof, and skip the sanitisation below.
+Expected red if HVF reports the GIC interface once a GIC exists: a DIFF on
+`id_aa64pfr0_gic_field` (oracle 0, Carrick non-zero). Record it. If the probe
+passes here, record that it is a regression guard rather than a red-first
+proof (confirm the pass with `CARRICK_HVF_GIC=0` too), and skip the
+sanitisation below.
 
 Sanitise the EL0 view in `emulate_el0_sys64_read_inner` (cow_engine.rs), in
 the `let value = match id_reg { ... }` statement:
@@ -5021,8 +4031,8 @@ In `trap.rs`, rename the existing `run_to_exit` to
     ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
         let mut kick_armed = false;
         let exit = Self::run_to_exit_inner(vcpu, mailbox, &mut kick_armed);
-        // Under the GIC the kick SGI survives run returns (qualification
-        // E1(b)); a kick re-armed for an EL1 critical section that ended in
+        // Under the GIC the kick SGI survives run returns (check C2(b));
+        // a kick re-armed for an EL1 critical section that ended in
         // any other surfaced exit is withdrawn here, as the legacy line was by
         // HVF itself. The surfaced exit is the boundary the kick asked for.
         if kick_armed {
@@ -5151,20 +4161,22 @@ just fmt-check
 cargo clippy -p carrick-vmm-hvf -p carrick-el1-abi -p carrick-aarch64 --all-targets -- -D warnings
 git add crates/carrick-vmm-hvf/src/gic.rs crates/carrick-vmm-hvf/src/lib.rs crates/carrick-vmm-hvf/src/trap.rs \
   crates/carrick-vmm-hvf/src/trap/vcpu_admission.rs crates/carrick-vmm-hvf/src/trap/vcpu_gate.rs \
-  crates/carrick-vmm-hvf/src/trap/carrier_custody.rs crates/carrick-vmm-hvf/src/trap/cow_engine.rs \
+  crates/carrick-vmm-hvf/src/trap/cow_engine.rs \
   crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs crates/carrick-aarch64/src/owed_kick.rs \
   crates/carrick-el1-abi/src/lib.rs conformance-probes/src/bin/idaa64pfr0.rs conformance-probes/probe-inventory.json \
   crates/carrick-conformance-next \
   conformance-contracts/contracts/gic-topology.toml conformance-contracts/contracts/kick-el0-boundary.toml \
-  conformance-contracts/surfaces.toml scripts/migrate/runtime-global-state.json
-git status --short   # add scripts/migrate/runtime-aborts/hvf.json too if gate D2's middle row applied
+  conformance-contracts/surfaces.toml scripts/migrate/runtime-global-state.json \
+  scripts/migrate/runtime-aborts/hvf.json
+git status --short
 git commit -F- <<'MSG'
 feat(hvf): create the in-kernel GIC with every carrier VM
 
 Why: the EL1 kernel's scheduler needs Hypervisor.framework's in-kernel
 GICv3 so the virtual timer, SGIs and WFI stay inside the hypervisor.
-hv_gic_create must follow hv_vm_create and precede every vCPU, and each
-vCPU needs a unique MPIDR before its redistributor is touched. Once a
+Setup follows hv_gic.h and libkrun (Apache-2.0): hv_gic_create after
+hv_vm_create and before every vCPU, a unique MPIDR on the owning thread
+before the redistributor is touched, vCPUs kept for the VM's life. Once a
 VM has a GIC, hv_vcpu_set_pending_interrupt returns HV_UNSUPPORTED
 (hv_vcpu.h), so the kick vehicle must change in the same commit: the
 GIC alone failed every EL1-absorbed kick
@@ -5176,13 +4188,16 @@ What:
   hv_vm_create; its HV_NO_RESOURCES parks and retries, any other
   failure rolls the VM back through custody.
 - Both vCPU wrappers give the vCPU the lowest free affinity index of
-  the VM generation (MPIDR RES1 | Aff1 | Aff0), withdraw every private
-  interrupt a previous owner left, and configure its redistributor
-  (kick SGI 15, vtimer PPI 27, group 1, priorities) and CPU interface
-  before it is counted. Every destroy frees its index under the
-  topology lock in the same critical section as hv_vcpu_destroy.
-- `gic::arm_kick`/`clear_kick` make SGI 15 pending in the vCPU's
-  redistributor (GICR_ISPENDR0/ICPENDR0) and are the only kick vehicle;
+  the VM generation (MPIDR RES1 | Aff1 | Aff0) and configure its
+  redistributor (bring-up reset, then kick SGI 15, vtimer PPI 27, group
+  1, priorities) and CPU interface before it is counted: what a guest
+  GIC driver would program, since Carrick has none.
+- The D2 guard: a vCPU created after the VM's first run or after any
+  destroy of the generation is a carrier fault (`carrick_fatal!`);
+  destroys are recorded under the topology lock with hv_vcpu_destroy.
+- Host kicks stay hv_vcpus_exit. `gic::arm_kick`/`clear_kick` make the
+  owed kick SGI 15 pending in the vCPU's redistributor
+  (GICR_ISPENDR0/ICPENDR0) and are the only owed-kick vehicle;
   `run_to_exit` withdraws a kick it re-armed for an EL1 critical
   section on every other surfaced exit. OwedKick is unchanged.
 - The vCPU budget is clamped to the redistributor count; the EL0 view
@@ -5196,8 +4211,8 @@ run_to_exit assertions) and green; `kick_vehicle_is_chosen_in_one_place`
 red (3 legacy calls) then green; owed_kick model tests including GIC
 semantics; `idaa64pfr0` probe <red then MATCH | regression guard>;
 signed smoke and `page_table_pauses_survive_carrier_load` with and
-without the hatch; el1_ embed tests. Qualification:
-docs/perf-results/2026-09-25-hvf-gic-qualification.md.
+without the hatch; el1_ embed tests. Checks C1-C3 and the reference
+setup: docs/perf-results/2026-09-25-hvf-gic-qualification.md.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 MSG
@@ -5505,7 +4520,8 @@ mod gic_regs {
     pub fn acknowledge() -> u64 {
         let intid: u64;
         // SAFETY: ICC_IAR1_EL1 read at EL1 with the system-register interface
-        // enabled (ICC_SRE_EL1.SRE, qualified in E0).
+        // enabled (hv_gic.h: the device supports the GIC CPU system
+        // registers; the spikes and check C2 acknowledge through it).
         unsafe { core::arch::asm!("mrs {}, S3_0_C12_C12_0", out(reg) intid, options(nostack)) };
         intid
     }
@@ -5602,8 +4618,8 @@ second violation class before the FP checks:
 
 ```rust
         // EL1 plan 1a: EL1 never parks. A wfi/wfe at EL1 would sleep inside
-        // Hypervisor.framework's in-kernel GIC, the state where an
-        // hv_vcpus_exit wedge is unexplained (qualification E2). Parking
+        // Hypervisor.framework's in-kernel GIC, a state 1a does not qualify
+        // (check C1 covers only the running states). Parking
         // arrives with the EL1 scheduler (plan 1c) and its own contract.
         if matches!(mnemonic, "wfi" | "wfe" | "wfit" | "wfet") {
             park_violations.push(line.to_string());
@@ -6070,8 +5086,10 @@ fn el1_gic_vtimer_reaches_el1_without_host_exits() {
 }
 
 /// Contract `kernel.vcpu.gic-topology`: two live guest processes with worker
-/// threads run under the GIC; every vCPU the carrier created holds a distinct
-/// affinity, and allocations balance releases plus live vCPUs.
+/// threads run under the GIC, then a second root boots in the same carrier
+/// (the case that destroyed a boot vCPU mid-life before D2). Every vCPU the
+/// carrier created holds a distinct affinity and none was destroyed while the
+/// carrier lives.
 #[test]
 fn el1_gic_topology_two_processes() {
     let _guard = common::guest_lock();
@@ -6091,11 +5109,23 @@ fn el1_gic_topology_two_processes() {
     );
     assert!(result.success(), "exit {} signal {:?}", result.exit_code, result.signal);
     assert_eq!(result.stdout_utf8().matches("preemption ok").count(), 2);
+    let after_first = gic_topology_snapshot();
+    // A later root in the same carrier boots without a vCPU (Task 2).
+    let second = common::run_or_fail(
+        carrier
+            .container(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command(["/bin/sh".to_owned(), "-c".to_owned(), "echo second-root".to_owned()])
+            .run_blocking(),
+    );
+    assert!(second.success(), "second root: exit {} signal {:?}", second.exit_code, second.signal);
     let topology = gic_topology_snapshot();
-    println!("el1-gic-topology {topology:?}");
+    println!("el1-gic-topology {after_first:?} -> {topology:?}");
     assert!(topology.gic, "the production VM has the in-kernel GIC");
     assert!(topology.live >= 2, "more than one vCPU live: {topology:?}");
-    assert_eq!(topology.allocations, topology.releases + topology.live as u64, "{topology:?}");
+    assert_eq!(topology.releases, 0, "a vCPU was destroyed while the carrier lives (D2): {topology:?}");
+    assert_eq!(topology.allocations, topology.live as u64, "{topology:?}");
+    assert_eq!(topology.allocations, after_first.allocations, "the second root created a vCPU: {topology:?}");
     assert!(topology.peak_live >= topology.live);
     drop(carrier);
 }
@@ -6943,8 +5973,10 @@ Add a section "Interrupt controllers (EL1 plan 1a)":
 HVF carrier VMs carry Hypervisor.framework's in-kernel GICv3. It is created in
 the single VM-creation funnel, lives in a reserved IPA window
 (`LINUX_GIC_WINDOW_BASE`, 0x2F_0000_0000, 256 MiB), and is driven only from
-`carrick-vmm-hvf/src/gic.rs`. Host kicks are SGI 15 made pending in the vCPU's
-redistributor; EL1 takes GIC interrupts in the served-syscall return window.
+`carrick-vmm-hvf/src/gic.rs`. Setup follows hv_gic.h and libkrun, and every
+vCPU lives for its VM's life. Host kicks stay `hv_vcpus_exit`; the kick a
+vCPU owes at its EL0 boundary is SGI 15 made pending in its redistributor. EL1
+takes GIC interrupts in the served-syscall return window.
 `CARRICK_HVF_GIC=0` restores the GIC-less VM for bisection until plan 1c.
 
 KVM, bhyve and NVMM are unchanged: no interrupt controller is modelled, host
@@ -6960,16 +5992,29 @@ contract; nothing in 1a constrains it.
 In `docs/superpowers/specs/2026-09-24-el1-kernel.md`:
 - under "Consequences for the design", after the `hv_gic` bullet, add: "Adopted
   in the production VM by plan 1a (`docs/superpowers/plans/2026-09-24-el1-increment1a-hv-gic.md`).
-  With a GIC, `hv_vcpu_set_pending_interrupt` returns `HV_UNSUPPORTED`; host
-  kicks are a redistributor-pending SGI. Qualification:
-  `docs/perf-results/2026-09-25-hvf-gic-qualification.md`."
-- replace open items 1 and 2 with the recorded outcomes: item 1 "SPI: <class
-  i/ii/iii from E4>; `hv_vcpus_exit` wake wedge: <H-a/H-b/H-c or not explained
-  from E2>"; item 2 "Mid-life vCPU destroy under the GIC: <E3 verdict and D2
-  row>; wedged-vCPU recovery: <E2 production-reachable states clean /
-  WFI-state result>, carried to plan 1c as its entry criterion." Fill each
-  `<...>` from the results doc; write "not explained" where the data did not
-  discriminate.
+  Setup follows hv_gic.h and libkrun (Apache-2.0). With a GIC,
+  `hv_vcpu_set_pending_interrupt` returns `HV_UNSUPPORTED`; host kicks stay
+  `hv_vcpus_exit`, and the owed kick is a redistributor-pending SGI. Checks
+  and reference setup: `docs/perf-results/2026-09-25-hvf-gic-qualification.md`."
+- in "Scheduling", replace "the host adds vCPUs up to the core count and
+  retires idle ones" (or its equivalent wording) with: "the carrier creates its
+  vCPUs before the VM's first run and keeps them for the VM's life (hv_gic.h:
+  topology is final once vCPUs run); an idle vCPU parks (plan 1c) instead of
+  being retired."
+- replace open items 1 and 2 with the recorded outcomes:
+  - item 1: "SPI: not used by 1a. The reference setup (the guest programs the
+    distributor through MMIO; the host raises `hv_gic_set_spi(intid, true)`)
+    and the spike's difference from it (host-side distributor writes before
+    any vCPU existed) are recorded in plan 1a's Prior art; the cause of the
+    spike's failure is not established. `hv_vcpus_exit` under a GIC:
+    <C1 verdicts> in the running states; the spike wedges were a deliberately
+    broken no-save control and WFI-parked wake runs."
+  - item 2: "Mid-life vCPU destroy: designed out (plan 1a D2; every vCPU
+    lives for its VM's life, enforced by a carrier fault). Wedged-vCPU
+    recovery and WFI wake liveness under the GIC: carried to plan 1c as its
+    entry criterion."
+
+  Fill each `<...>` from the results doc.
 
 - [ ] **Step 4: One AGENTS.md rule**
 
@@ -6980,13 +6025,17 @@ Under "Where key subsystems live", add:
   `hv_gic_*` caller. The GIC is created inside `create_vm_with_admission`
   (never elsewhere) and every vCPU gets its MPIDR and redistributor setup in
   the two creation wrappers. With a GIC, `hv_vcpu_set_pending_interrupt`
-  returns `HV_UNSUPPORTED` (hv_vcpu.h): kicks are SGI 15 via GICR_ISPENDR0.
+  returns `HV_UNSUPPORTED` (hv_vcpu.h): host kicks stay `hv_vcpus_exit`, and
+  the owed kick is SGI 15 via GICR_ISPENDR0. Every vCPU is created before the
+  VM's first run and destroyed only at teardown (hv_gic.h; a create after that
+  is a carrier fault).
   Name legacy interrupt lines only through `interrupt::HvfInterruptLine`
   (applevisor-sys numbers them in reverse of the SDK). EL1 unmasks IRQs only in
   the served-syscall return window and never executes `wfi`/`wfe` (the image
   build refuses them) until the EL1 scheduler lands with its wedge-recovery
-  contract. Qualification suite: `just test-hvf gic_qualification_e<N>`, one
-  experiment per process (a wedge leaks the process's only VM).
+  contract. Setup follows libkrun and hv_gic.h; the Carrick-specific checks
+  are `just test-hvf gic_qualification_c<N>`, one per process (a wedge leaks
+  the process's only VM).
 ```
 
 - [ ] **Step 5: Commit**
@@ -7000,7 +6049,9 @@ Why: plan 1a resolves (or explicitly carries forward) the spec's open
 items on SPI delivery, the hv_vcpus_exit wedge and mid-life vCPU
 destroys under the GIC, and adds rules a future change must not break.
 
-What: spec open items 1 and 2 carry the qualification outcomes;
+What: spec open items 1 and 2 carry the outcomes (SPI unused with the
+reference setup recorded, C1 verdicts, mid-life destroys designed out),
+and "Scheduling" keeps vCPUs for the VM's life instead of retiring them;
 docs/hal.md notes the HVF interrupt controller and that KVM, bhyve and
 NVMM are unchanged; one AGENTS.md entry names the GIC boundary, the
 kick vehicle, the interrupt-line wrapper and the EL1 no-park rule.
@@ -7020,21 +6071,24 @@ MSG
 **Files:**
 - Modify: `justfile` (`el1-gate`)
 
-- [ ] **Step 1: Add the qualification suite and the hatch screen to `el1-gate`**
+- [ ] **Step 1: Add the GIC checks and the hatch screen to `el1-gate`**
 
 In the `el1-gate` recipe, after `step el1-embed ./scripts/test-signed.sh carrick-embed el1_`,
-one process per production-reachable experiment (HVF allows one VM per
-process, so a wedge in one experiment must not turn the others red), and never
-the WFI executable (its states are data, not a gate):
+add one process per check (HVF allows one VM per process, so a wedge in one
+check must not turn the others red):
 
 ```bash
-    for e in e0 e1 e2 e3 e4 e5 e6; do
-      step hvf-gic-$e ./scripts/test-signed.sh carrick-vmm-hvf gic_qualification_$e --nocapture
+    for c in c1_vcpus_exit_smoke_el1_vtimer c1_vcpus_exit_smoke_el1_masked \
+             c1_vcpus_exit_smoke_el0_kick_pending c2_owed_kick_vehicle; do
+      step hvf-gic-$c ./scripts/test-signed.sh carrick-vmm-hvf gic_qualification_$c --nocapture
     done
 ```
 
-(E5b is a 127-VM probe run, not a test; it is re-run by hand when macOS
-changes, per Task 1 Step 9.)
+C3 is a 127-VM probe run, not a test. It is re-run by hand when macOS changes
+(Task 1 Step 4). Its production form is `page_table_pauses_survive_carrier_load`
+(four concurrent carriers, each with its GIC VM). Add it as a step here so the
+gate exercises concurrent GIC carriers:
+`step gic-concurrent-carriers ./scripts/test-signed.sh carrick-embed page_table_pauses_survive_carrier_load`.
 
 and extend the inotify09 A/B loop to three arms, recording wall time for each:
 
@@ -7067,15 +6121,17 @@ Expected: `el1-gate: green on <sha>`; `artifact.txt` has three inotify09 walls.
 ```bash
 git add justfile
 git commit -F- <<'MSG'
-test(el1): run the GIC qualification in the EL1 landing gate
+test(el1): run the GIC checks in the EL1 landing gate
 
-Why: 1a depends on Hypervisor.framework behaviour (kick vehicle,
-mid-life vCPU recreate, hv_vcpus_exit liveness) that a macOS update can
-change; a gate that does not run the qualification cannot notice.
+Why: 1a relies on Hypervisor.framework behaviour no reference VMM
+exercises (the owed-kick SGI, hv_vcpus_exit on eight vCPUs in Carrick's
+states, many concurrent GIC carriers) and a macOS update can change it;
+a gate that does not run the checks cannot notice.
 
 What: el1-gate builds the fixtures, runs each signed
-gic_qualification_e<N> experiment in its own process on the gated
-artifact, and screens inotify09 in three arms (EL1+GIC, no EL1, EL1
+gic_qualification_c<N> check in its own process on the gated artifact,
+runs `page_table_pauses_survive_carrier_load` (concurrent GIC
+carriers), and screens inotify09 in three arms (EL1+GIC, no EL1, EL1
 without GIC).
 
 Verified: `just el1-gate` green on <sha>.
@@ -7140,10 +6196,11 @@ ident() {
 }
 ident > target/el1-1a-ident.txt
 same() { ident | diff - target/el1-1a-ident.txt > /dev/null || { echo "artifact changed after $1"; exit 1; }; }
-for e in e0 e1 e2 e3 e4 e5 e6; do
-  ./scripts/test-signed.sh carrick-vmm-hvf gic_qualification_$e --nocapture 2>&1 | tail -5
+for c in c1_vcpus_exit_smoke_el1_vtimer c1_vcpus_exit_smoke_el1_masked \
+         c1_vcpus_exit_smoke_el0_kick_pending c2_owed_kick_vehicle; do
+  ./scripts/test-signed.sh carrick-vmm-hvf gic_qualification_$c --nocapture 2>&1 | tail -5
 done
-same qualification
+same checks
 just --no-deps el1-gate 2>&1 | tail -30
 same el1-gate
 just --no-deps conformance smoke 2>&1 | tail -20
@@ -7153,7 +6210,7 @@ scripts/sudo/kill.sh hatch-smoke
 same hatch
 ```
 
-Expected: every qualification experiment green; `el1-gate: green on <sha>`
+Expected: every GIC check green; `el1-gate: green on <sha>`
 (it includes the `el1_` embed tests, `conformance-probes` and the LTP
 file/inotify set); smoke green; hatch prints `hatch-ok`; no `artifact changed`
 line.
@@ -7184,27 +6241,38 @@ verdicts). A changed row is a guest-visible change: STOP and attribute it
 
 - [ ] **Step 4: Paired ecosystem subset (Carrick only, cached oracle)**
 
-Interleave the base artifact (Task 0) and the new one, two rounds each, on a
-quiet host, never alongside Docker:
+Interleave three arms, two rounds each, on a quiet host, never alongside
+Docker:
+- `base`: the base artifact (Task 0);
+- `new`: the new artifact;
+- `nogic`: the new artifact under `CARRICK_HVF_GIC=0`.
+
+The `nogic` arm replaces the dropped exit-cost experiment. `new` over `nogic`
+isolates what the GIC itself costs the exit-heavy rows, and `new` over `base`
+is the whole of 1a.
 
 ```bash
 suites="--suite go-build --suite go-testing --suite go-time --suite go-os_signal --suite go-net_http \
   --suite cpython-threading --suite cpython-subprocess --suite cpython-asyncio --suite node-app-smoke"
 mkdir -p target/el1-1a-paired
 for round in 1 2; do
-  for arm in base new; do
-    b=target/el1-1a-base/carrick; [ $arm = new ] && b=target/release/carrick
-    cargo run -q -p carrick-conformance -- --tier full $suites --require-cached-oracle \
+  for arm in base new nogic; do
+    b=target/release/carrick; gic=1
+    [ $arm = base ] && b=target/el1-1a-base/carrick
+    [ $arm = nogic ] && gic=0
+    CARRICK_HVF_GIC=$gic cargo run -q -p carrick-conformance -- --tier full $suites --require-cached-oracle \
       --carrick-bin "$b" --jsonl target/el1-1a-paired/$arm-$round.jsonl
   done
 done
 ```
 
-Expected: every suite has the same verdict in all four runs. Record, per suite,
-the wall time of `new` over `base` in each round. A suite whose ratio exceeds
-1.10 in both rounds is a finding: attribute it with E6's exit-round-trip numbers
-and the census before accepting (write "suggests", not "confirmed"; this is a
-paired measurement, not a controlled experiment). No suite may change verdict.
+Expected: every suite has the same verdict in all six runs. Record, per suite
+and round, the wall time of `new` over `base` and of `new` over `nogic`. A
+suite whose `new`/`base` ratio exceeds 1.10 in both rounds is a finding.
+Attribute it with the `new`/`nogic` ratio before accepting: GIC cost if that
+ratio carries it, the rest of 1a otherwise. Write "suggests", not "confirmed";
+this is a paired measurement, not a controlled experiment. No suite may change
+verdict. (The base artifact ignores `CARRICK_HVF_GIC`, which it predates.)
 
 - [ ] **Step 5: Record and hand off**
 
@@ -7292,11 +6360,15 @@ latency-sensitive policy.
    1 ms sleep woke 258 µs late at default QoS, about 5 µs under the policy).
 6. Delete the `CARRICK_HVF_GIC=0` hatch, the legacy pending-line kick vehicle
    and `HVF_VIRTUAL_IRQ` (the EL1 scheduler requires the GIC; `HvfInterruptLine`
-   stays for the qualification suite's legacy control).
+   stays for check C2's legacy negative control).
 
-**Entry criteria:** E2's WFI states explained (H-a/H-c) and wedged-vCPU recovery
-under the GIC established (spec open item 2): either a proven recovery sequence
-or a proof that the wedge needs a state Carrick never enters; 1b landed; the
+**Entry criteria:** WFI park and wake under the GIC checked by 1c's own
+Carrick-specific check, in the shape 1a's C1 uses (1a never enters in-HVF WFI,
+so it did not check it). Start from the scheduler spike's `gic-wfi-hvc-*` wake
+runs (`c9897ae4c`), whose one wedge is unexplained: re-entering after a CANCELED
+exit taken at `wfi` re-parks the vCPU. Also establish wedged-vCPU recovery
+under the GIC (spec open item 2): either a proven recovery sequence or a proof
+that the wedge needs a state Carrick never enters. And: 1b landed; the
 sigframe/ptrace PSTATE normalisation has its own red-first probe against the
 Docker oracle.
 
@@ -7354,14 +6426,15 @@ experiment on a quiet host.
 
 | Question | Answered by |
 |---|---|
-| Does SGI 15 pend through GICR_ISPENDR0 from the host, or only PPI 20, including production's un-acknowledged `hvc #4` path? | Task 1 E1 (gate D1) |
-| Is a mid-life vCPU recreate safe under the GIC (HVF advises against it), and what does a recreated redistributor inherit? | Task 1 E3 + Task 2 census (gate D2) |
-| What wedged a vCPU under the GIC in the spikes (H-a, H-b, H-c)? | Task 1 E2 and the WFI executable (gate D3; WFI states carried to 1c) |
-| Why did `hv_gic_set_spi` never reach the CPU interface? | Task 1 E4 (class i/ii/iii; not needed by 1a) |
-| Per-VM vCPU capacity and redistributor placement under the GIC | Task 1 E5 (gates D5, D7) |
-| Does a GIC per VM lower the concurrent VM ceiling (127 without)? | Task 1 E5b (gate D5b) |
-| Does a GIC change an ID register EL0 can read? | Task 1 E0 (gate D12), Task 5 Step 8 |
-| Cost of an exit with the GIC present | Task 1 E6, Task 13 paired runs |
+| How do other VMMs create, place and drive the in-kernel GIC? | "Prior art" (libkrun, Apache-2.0; `hv_gic.h`), adopted as the reference setup in Task 1 |
+| Does SGI 15 pend through GICR_ISPENDR0 from the host and serve the owed kick, including production's un-acknowledged `hvc #4` path? | Task 1 C2 (gate D1) |
+| Can Carrick keep every vCPU for its VM's life instead of recreating one mid-life? | Fact 5 code map and Task 2 (D2), enforced by the Task 5 guard |
+| Is `hv_vcpus_exit` honoured under a GIC with eight vCPUs in Carrick's running states? | Task 1 C1 (gate D3); WFI states carried to 1c |
+| Why did `hv_gic_set_spi` never reach the CPU interface in the spike? | Not needed by 1a (D4). "Prior art" records the reference setup and the spike's difference from it, as a hypothesis |
+| Per-VM vCPU capacity and redistributor placement under the GIC | Task 5 geometry read at every creation, fail-closed (D5, D7) |
+| Does a GIC per VM lower the concurrent VM ceiling (127 without)? | Task 1 C3 (gate D5b) |
+| Does a GIC change an ID register EL0 can read? | Task 5 Step 8 probe against the Docker oracle (D12); Task 13 probe diff for the rest |
+| Cost of an exit with the GIC present | Task 13 paired runs (`new` over `nogic` arm) |
 | Is Fact 9 (lost kick in EL1-served loops) real on main? | Task 0B, on the frozen base (gate D11) |
 
 Fact 9, if confirmed, is a defect on main independent of the GIC (the
@@ -7380,10 +6453,11 @@ record what was applied only in part or rejected, one line each.
 - Drop paths and allocator key (facts, major): applied as one raw-destroy function, reported Drop paths and a lock-held destroy-plus-release; an owned `ConfiguredVcpu` guard and a `(generation, id)` key were not adopted, because the lock makes a stale id owner unobservable and `CarrierGic` is replaced per VM generation.
 - Typed `GicAffinityLease` (safety, major): not adopted for the same reason; the lock-held release closes the race it targets without adding a value to thread through nine creation sites.
 - Fact 9 first (safety, major): the experiment moved to Task 0B; "drop the kick tail if Fact 9 is refuted" is rejected, because once the window unmasks IRQs it acknowledges the kick SGI, so EL1 must surface that kick whatever Fact 9's verdict.
-- Load-dependent verdicts (safety, major): applied; E2's 1 s suspect and 5 s wedge bounds are kept, because they are hang detectors that AGENTS.md requires of every wait, not verdict rates.
-- Detector for a kicked vCPU that never surfaces (safety, major, E2 scale): not added as a new probe; `scripts/dtrace/hvpatch-pt-pause-drain-stall.d` (commit 854eeff8b) already names each sibling still in the guest for a drain of 100 ms or more, and D11's mixed row calls for it.
+- Load-dependent verdicts (safety, major): applied; C1's 5 s wedge bound is a hang detector that AGENTS.md requires of every wait, not a verdict rate.
+- Detector for a kicked vCPU that never surfaces (safety, major, kick liveness at scale): not added as a new probe; `scripts/dtrace/hvpatch-pt-pause-drain-stall.d` (commit 854eeff8b) already names each sibling still in the guest for a drain of 100 ms or more, and D11's mixed row calls for it.
 - `hvf_gic_enabled` in carrick-mem (safety, major): moved to the one reader in `gic.rs`, with the vector mode passed as an argument; the extra fail-closed assertion at VM creation was not added, because both sides now derive from the same `OnceLock` and cannot differ within a process.
 - Vehicle before GIC (safety, blocker): landed as one Task 5+6 commit with a signed red, the facts finding's alternative; a vehicle-only commit would need an `InterruptModel::Gic` variant that nothing can construct, which `-D warnings` rejects as dead code.
 - Stage-1 window guard (safety, minor): placed in `PageTableManager`'s three output-writing paths (`map_aliased_with_flags`, `repoint_preserving_attributes`, `apply`'s identity rebuild) rather than in `Stage1Authority`, which owns the manager but writes no descriptor.
 - Per-exit counter cost (safety, minor): resolved by counting only on the probed slot and only for non-kick exits, so no cache-line padding is needed.
-- `live_hvf_vcpus` duplicate census (facts, minor): the second counter was removed rather than justified; the census keys mid-life on VM generation, not on a live count.
+- `live_hvf_vcpus` duplicate census (facts, minor): moot. The census was dropped when D2 designed out mid-life destroys; the Task 5 guard and the topology snapshot (`releases == 0` while the carrier lives) replace it.
+- Owner direction, 2026-09-24 ("Don't other projects use the hv gic? Do we really need to experiment with it?"): applied. The setup follows libkrun and `hv_gic.h` ("Prior art"). The old E0 (vtimer to EL1), E4 (SPI matrix), E5 (capacity/placement) and E6 (costs) are dropped. E2 shrinks to the C1 smoke. E1 shrinks to the SGI-only C2. E3 and the census are replaced by the Task 2 design-out. E5b is kept as C3. QEMU (GPL-2.0) is not used as a source.
