@@ -15810,5 +15810,113 @@
       "line_end": 1430,
       "line_start": 1430
     }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "carrier-owned EL1 zone run-queue guard thread used by `start_run_queue_guard`"
+    },
+    "expansion": null,
+    "operation": "std::thread::Builder::new",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/el1_zone.rs:93 in `start_run_queue_guard`, `std::thread::Builder::new` acts only on the carrier-owned EL1 zone run-queue guard thread used by `start_run_queue_guard`; no guest identity selects its host target.",
+    "review_id": "HA-000680",
+    "source": {
+      "byte_end": 3759,
+      "byte_start": 3734,
+      "column": 17,
+      "column_end": 42,
+      "column_start": 17,
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "line": 93,
+      "line_end": 93,
+      "line_start": 93
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current carrier EL1 zone run-queue guard thread (idle while the zone is off) used by `run_queue_guard`"
+    },
+    "expansion": null,
+    "operation": "std::thread::sleep",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/el1_zone.rs:104 in `run_queue_guard`, `std::thread::sleep` acts only on the current carrier EL1 zone run-queue guard thread (idle while the zone is off) used by `run_queue_guard`; no guest identity selects its host target.",
+    "review_id": "HA-000681",
+    "source": {
+      "byte_end": 4046,
+      "byte_start": 4028,
+      "column": 13,
+      "column_end": 31,
+      "column_start": 13,
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "line": 104,
+      "line_end": 104,
+      "line_start": 104
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current carrier EL1 zone run-queue guard thread (between scans) used by `run_queue_guard`"
+    },
+    "expansion": null,
+    "operation": "std::thread::sleep",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/el1_zone.rs:122 in `run_queue_guard`, `std::thread::sleep` acts only on the current carrier EL1 zone run-queue guard thread (between scans) used by `run_queue_guard`; no guest identity selects its host target.",
+    "review_id": "HA-000682",
+    "source": {
+      "byte_end": 4617,
+      "byte_start": 4599,
+      "column": 9,
+      "column_end": 27,
+      "column_start": 9,
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "line": 122,
+      "line_end": 122,
+      "line_start": 122
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-YIELD-NOW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current host thread waiting on an EL1 zone bucket lock held by EL1 or another host thread used by `HostLockWait::wait`"
+    },
+    "expansion": null,
+    "operation": "std::thread::yield_now",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/el1_zone.rs:35 in `HostLockWait::wait`, `std::thread::yield_now` acts only on the current host thread waiting on an EL1 zone bucket lock held by EL1 or another host thread used by `HostLockWait::wait`; no guest identity selects its host target.",
+    "review_id": "HA-000683",
+    "source": {
+      "byte_end": 1622,
+      "byte_start": 1600,
+      "column": 13,
+      "column_end": 35,
+      "column_start": 13,
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "line": 35,
+      "line_end": 35,
+      "line_start": 35
+    }
   }
 ]
