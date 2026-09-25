@@ -1416,7 +1416,7 @@ mod tests {
             compat::{CompatReporter, SyscallArgs},
             dispatch::{
                 DispatchOutcome, SyscallRequest, ThreadCtx,
-                mm_quiesce::{PtPauseBudget, PtPauseError, acquire_mutation_pause_for_test},
+                mm_quiesce::{PtPauseBudget, PtPauseTryError, try_acquire_mutation_pause_for_test},
             },
             kernel::mm_access::MmAccessTarget,
             thread::{FutexTable, ThreadRegistry},
@@ -1498,7 +1498,7 @@ mod tests {
                     let mut active = prepared.activate(&scope).unwrap();
                     // Request a real memory drain while code owns the grant. It
                     // must refuse until the code reaches its checkpoint and exits.
-                    let refusal = acquire_mutation_pause_for_test(
+                    let refusal = try_acquire_mutation_pause_for_test(
                         fixture.dispatch_mm.pt_quiesce(),
                         &mut mutator,
                         ThreadId::synthetic_for_tests(37002),
@@ -1506,10 +1506,9 @@ mod tests {
                         dispatcher.mm_mutation_coordinator(),
                         PtPauseBudget {
                             election: std::time::Duration::ZERO,
-                            drain: std::time::Duration::ZERO,
                         },
                     );
-                    assert!(matches!(refusal, Err(PtPauseError::TimedOut)));
+                    assert!(matches!(refusal, Err(PtPauseTryError::SiblingInGuest)));
                     drop(refusal);
                     assert!(scope.stop_requested());
                     code.run_carrier_until_checkpoint(&image, &memory, &mut active, &mut state)
@@ -2238,7 +2237,10 @@ mod tests {
     #[test]
     fn native_data_activation_requires_exact_authority_and_real_drain() {
         use carrick_kernel::{
-            dispatch::mm_quiesce::{PtPauseBudget, PtPauseError, acquire_mutation_pause_for_test},
+            dispatch::mm_quiesce::{
+                PtPauseBudget, PtPauseTryError, acquire_mutation_pause_for_test,
+                try_acquire_mutation_pause_for_test,
+            },
             kernel::mm_access::{MmAccessError, MmAccessTarget},
         };
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
@@ -2320,7 +2322,7 @@ mod tests {
             .unwrap();
         {
             let active = prepared.activate(&scope).unwrap();
-            let result = acquire_mutation_pause_for_test(
+            let result = try_acquire_mutation_pause_for_test(
                 barrier,
                 &mut mutator,
                 mutator_tid,
@@ -2328,10 +2330,9 @@ mod tests {
                 dispatcher.mm_mutation_coordinator(),
                 PtPauseBudget {
                     election: std::time::Duration::ZERO,
-                    drain: std::time::Duration::ZERO,
                 },
             );
-            assert!(matches!(result, Err(PtPauseError::TimedOut)));
+            assert!(matches!(result, Err(PtPauseTryError::SiblingInGuest)));
             drop(result);
             assert!(scope.stop_requested());
             assert_eq!(active.len(), 4);

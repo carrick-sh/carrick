@@ -821,6 +821,14 @@ mod tests {
             self.inner.is_in_guest(tid)
         }
 
+        fn watch_leave_guest(
+            &self,
+            tid: ThreadId,
+            wake: &Arc<carrick_hal::GuestLeaveWake>,
+        ) -> carrick_hal::GuestLeaveWatch {
+            self.inner.watch_leave_guest(tid, wake)
+        }
+
         fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {
             self.inner.debug_registered_vcpus()
         }

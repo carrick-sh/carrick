@@ -141,7 +141,55 @@ impl<T: VcpuKick> VcpuKickDyn for T {
 /// [`InGuestFlag::enter_guest`] / [`InGuestFlag::leave_guest`], and there is
 /// deliberately no `Clone`/`Default` (docs/typed-interfaces-audit.md P1.3) —
 /// a second flag for one thread would silently split the handshake in half.
-pub struct InGuestFlag(Arc<AtomicBool>);
+pub struct InGuestFlag(Arc<InGuestCell>);
+
+/// The shared cell behind one guest thread's [`InGuestFlag`]: the handshake
+/// bit plus the page-table drains currently waiting for it to fall.
+///
+/// A drain waits for an acknowledgement (this bit going false), never for a
+/// wall-clock budget. So every transition that can make a registered executor
+/// read as out-of-guest must wake the waiters: [`InGuestFlag::leave_guest`]
+/// here, and registry removal in [`VcpuRegistry::unregister`]. Keeping the
+/// wake inside the one primitive every leave path already calls is what makes
+/// the wait complete; a notification bolted onto individual call sites would
+/// hang the first time a new leave path forgot it.
+pub(crate) struct InGuestCell {
+    in_guest: AtomicBool,
+    watchers: std::sync::atomic::AtomicUsize,
+    wakes: Mutex<Vec<Arc<GuestLeaveWake>>>,
+}
+
+impl InGuestCell {
+    fn new() -> Self {
+        Self {
+            in_guest: AtomicBool::new(false),
+            watchers: std::sync::atomic::AtomicUsize::new(0),
+            wakes: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn is_in_guest(&self) -> bool {
+        self.in_guest.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wake every drain watching this cell. The SeqCst `watchers` load pairs
+    /// with [`GuestLeaveWatch`]'s SeqCst watcher increment: either the leaver sees
+    /// the watcher and wakes it, or the watcher's later predicate read sees
+    /// the leave.
+    fn wake_watchers(&self) {
+        if self.watchers.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return;
+        }
+        let wakes = self
+            .wakes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        for wake in wakes {
+            wake.notify();
+        }
+    }
+}
 
 impl InGuestFlag {
     /// The one flag belonging to ONE guest thread, created together with that
@@ -149,30 +197,150 @@ impl InGuestFlag {
     /// later (re-)registration of that thread hands `subscribe_register` this
     /// same flag.
     pub fn for_guest_thread() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self(Arc::new(InGuestCell::new()))
     }
 
     /// Publish "entering guest code" before the guest-entry re-check of the
     /// coordinator's `quiescing` flag. SeqCst on both sides of the handshake
     /// guarantees at least one side observes the other.
     pub fn enter_guest(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.0
+            .in_guest
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Publish "back in host code" — a coordinator may now proceed past us.
+    /// Publish "back in host code" — a coordinator may now proceed past us —
+    /// and wake any page-table drain waiting for exactly that.
     pub fn leave_guest(&self) {
-        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.0
+            .in_guest
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.0.wake_watchers();
     }
 
     /// The current handshake state (diagnostics and tests; coordination uses
     /// [`VcpuRegistry::any_other_in_guest`]).
     pub fn is_in_guest(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::SeqCst)
+        self.0.is_in_guest()
+    }
+
+    /// Wake `wake` whenever this flag leaves guest, for as long as the returned
+    /// watch lives. For a census endpoint that owns its flag directly.
+    pub fn watch_leave(&self, wake: &Arc<GuestLeaveWake>) -> GuestLeaveWatch {
+        GuestLeaveWatch::on_cell(Arc::clone(&self.0), Arc::clone(wake))
     }
 
     /// The registry's clone of this thread's cell, taken at registration.
-    fn share(&self) -> Arc<AtomicBool> {
+    fn share(&self) -> Arc<InGuestCell> {
         Arc::clone(&self.0)
+    }
+}
+
+/// A page-table drain's wakeup: a generation bumped by every watched leave.
+///
+/// The waiter reads [`GuestLeaveWake::generation`] BEFORE re-evaluating its
+/// predicate and then sleeps only while the generation is unchanged, so a
+/// leave that lands between the predicate read and the sleep is never lost.
+/// There is no timeout: the wait ends on an acknowledgement, not a deadline.
+#[derive(Default)]
+pub struct GuestLeaveWake {
+    generation: Mutex<u64>,
+    changed: std::sync::Condvar,
+}
+
+impl GuestLeaveWake {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn generation(&self) -> u64 {
+        *self
+            .generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Sleep until a watched leave has happened since `seen` was read.
+    pub fn wait_past(&self, seen: u64) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while *generation == seen {
+            generation = self
+                .changed
+                .wait(generation)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    pub fn notify(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *generation = generation.wrapping_add(1);
+        self.changed.notify_all();
+    }
+}
+
+/// RAII registration of one [`GuestLeaveWake`] on one guest thread: on its
+/// cell (so the thread's leave wakes it) and, for a registry endpoint, on the
+/// registry's per-thread list (so a registration or removal of that thread
+/// wakes it, and the drain re-takes its watches against the new cell).
+pub struct GuestLeaveWatch {
+    cell: Option<(Arc<InGuestCell>, Arc<GuestLeaveWake>)>,
+    registry: Option<RegistryLeaveWatch>,
+}
+
+struct RegistryLeaveWatch {
+    state: Weak<Mutex<VcpuRegistryState>>,
+    tid: ThreadId,
+    wake: Arc<GuestLeaveWake>,
+}
+
+impl GuestLeaveWatch {
+    fn on_cell(cell: Arc<InGuestCell>, wake: Arc<GuestLeaveWake>) -> Self {
+        cell.wakes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(Arc::clone(&wake));
+        cell.watchers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            cell: Some((cell, wake)),
+            registry: None,
+        }
+    }
+}
+
+impl Drop for GuestLeaveWatch {
+    fn drop(&mut self) {
+        if let Some((cell, wake)) = self.cell.take() {
+            let mut wakes = cell.wakes.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(index) = wakes.iter().position(|entry| Arc::ptr_eq(entry, &wake)) {
+                wakes.swap_remove(index);
+            }
+            drop(wakes);
+            cell.watchers
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(watch) = self.registry.take()
+            && let Some(state) = watch.state.upgrade()
+        {
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(wakes) = state.leave_wakes.get_mut(&watch.tid) {
+                if let Some(index) = wakes
+                    .iter()
+                    .position(|entry| Arc::ptr_eq(entry, &watch.wake))
+                {
+                    wakes.swap_remove(index);
+                }
+                if wakes.is_empty() {
+                    state.leave_wakes.remove(&watch.tid);
+                }
+            }
+        }
     }
 }
 
@@ -234,6 +402,11 @@ pub trait VcpuRegistry: Send + Sync {
     fn any_other_in_guest(&self, except: ThreadId) -> bool;
     /// Whether this exact registered vCPU is entering or executing guest code.
     fn is_in_guest(&self, tid: ThreadId) -> bool;
+    /// Wake `wake` whenever `tid`'s registered executor leaves guest, or `tid`
+    /// is registered or unregistered, for as long as the returned watch lives.
+    /// A registration change means the caller must take a fresh watch: the
+    /// returned one is attached only to the cell registered right now.
+    fn watch_leave_guest(&self, tid: ThreadId, wake: &Arc<GuestLeaveWake>) -> GuestLeaveWatch;
     fn publish_kernel_wake_debt(&self) {}
     fn retry_kernel_wake_debt(&self) -> KernelWakeRetryPoll {
         KernelWakeRetryPoll::default()
@@ -355,6 +528,8 @@ struct VcpuRegistryState {
     // None means acknowledged, not retired; publication during a lease gap
     // must still leave debt for this exact thread's next registration.
     kernel_wake_debts: HashMap<ThreadId, Option<u64>>,
+    // Page-table drains watching a thread across its registration changes.
+    leave_wakes: HashMap<ThreadId, Vec<Arc<GuestLeaveWake>>>,
 }
 
 impl Default for VcpuRegistryState {
@@ -368,6 +543,7 @@ impl Default for VcpuRegistryState {
             next_enrollment: 1,
             next_kernel_wake_generation: 1,
             kernel_wake_debts: HashMap::new(),
+            leave_wakes: HashMap::new(),
         }
     }
 }
@@ -382,14 +558,14 @@ pub struct GenericVcpuRegistry {
 /// decay away across a reclaim.
 struct VcpuRegistration {
     kick: Box<dyn VcpuKickDyn>,
-    in_guest: Arc<AtomicBool>,
+    in_guest: Arc<InGuestCell>,
     enrollment: u64,
     kernel_wake_generation: Option<u64>,
 }
 
 impl VcpuRegistration {
     fn is_in_guest(&self) -> bool {
-        self.in_guest.load(std::sync::atomic::Ordering::SeqCst)
+        self.in_guest.is_in_guest()
     }
 }
 
@@ -612,12 +788,20 @@ impl VcpuRegistry for GenericVcpuRegistry {
                     },
                 )
                 .is_none();
-            if inserted {
+            let leave_wakes = state.leave_wakes.get(&tid).cloned().unwrap_or_default();
+            let callbacks = if inserted {
                 state.take_listeners(VcpuLeaseListenerKind::Membership)
             } else {
                 Vec::new()
-            }
+            };
+            (callbacks, leave_wakes)
         };
+        let (callbacks, leave_wakes) = callbacks;
+        // A drain watching this thread must re-take its watch on the newly
+        // registered cell before trusting its next read.
+        for wake in leave_wakes {
+            wake.notify();
+        }
         for callback in callbacks {
             callback();
         }
@@ -625,14 +809,26 @@ impl VcpuRegistry for GenericVcpuRegistry {
     }
 
     fn unregister(&self, tid: ThreadId) {
-        let callbacks = {
+        let (callbacks, removed, leave_wakes) = {
             let mut state = self.lock();
-            if state.vcpus.remove(&tid).is_some() {
-                state.take_listeners(VcpuLeaseListenerKind::Membership)
-            } else {
-                Vec::new()
+            let leave_wakes = state.leave_wakes.get(&tid).cloned().unwrap_or_default();
+            match state.vcpus.remove(&tid) {
+                Some(removed) => (
+                    state.take_listeners(VcpuLeaseListenerKind::Membership),
+                    Some(removed),
+                    leave_wakes,
+                ),
+                None => (Vec::new(), None, Vec::new()),
             }
         };
+        // A removed registration reads as out of guest through this registry,
+        // exactly like a leave, so a drain watching it must re-evaluate.
+        if let Some(removed) = removed {
+            removed.in_guest.wake_watchers();
+        }
+        for wake in leave_wakes {
+            wake.notify();
+        }
         for callback in callbacks {
             callback();
         }
@@ -694,6 +890,31 @@ impl VcpuRegistry for GenericVcpuRegistry {
             .vcpus
             .get(&tid)
             .is_some_and(VcpuRegistration::is_in_guest)
+    }
+
+    fn watch_leave_guest(&self, tid: ThreadId, wake: &Arc<GuestLeaveWake>) -> GuestLeaveWatch {
+        let mut state = self.lock();
+        // Both halves are installed under the registry lock, so a concurrent
+        // `subscribe_register`/`unregister` either precedes this watch (and the
+        // cell half reflects it) or follows it (and wakes the per-thread half).
+        state
+            .leave_wakes
+            .entry(tid)
+            .or_default()
+            .push(Arc::clone(wake));
+        let mut watch = match state.vcpus.get(&tid) {
+            Some(entry) => GuestLeaveWatch::on_cell(Arc::clone(&entry.in_guest), Arc::clone(wake)),
+            None => GuestLeaveWatch {
+                cell: None,
+                registry: None,
+            },
+        };
+        watch.registry = Some(RegistryLeaveWatch {
+            state: Arc::downgrade(&self.state),
+            tid,
+            wake: Arc::clone(wake),
+        });
+        watch
     }
 
     fn publish_kernel_wake_debt(&self) {

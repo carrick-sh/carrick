@@ -43,6 +43,12 @@ impl NativeExecutorState {
     pub(crate) fn is_running(&self) -> bool {
         self.running.is_in_guest()
     }
+    pub(crate) fn watch_running(
+        &self,
+        wake: &Arc<carrick_hal::GuestLeaveWake>,
+    ) -> carrick_hal::GuestLeaveWatch {
+        self.running.watch_leave(wake)
+    }
     pub(crate) fn request_memory_pause(&self) {
         self.requests.fetch_or(MEMORY_PAUSE, Ordering::SeqCst);
     }
