@@ -3336,6 +3336,14 @@
       "fingerprint": "436806f13bde761bc802e1a42c15cbbb592ce65008c6ffa0be19e0aefcdec495",
       "classification": "config_debug",
       "rationale": "Gate of the signed-test virtual-timer probe: one relaxed load per hv_vcpu_run entry and exit when no probe is armed."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "VCPU_RUN_EXITS_TOTAL",
+      "fingerprint": "a94d07f6c32ea0f4275a9c5e826877fbd2c9719b58ca802ae8f1e40ae7473aaa",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide diagnostic counter VCPU_RUN_EXITS_TOTAL in crates/carrick-vmm-hvf/src/trap.rs counting every hv_vcpu_run return (host exits), read by signed tests as deltas."
     }
   ]
 }

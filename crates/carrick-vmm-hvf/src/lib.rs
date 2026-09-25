@@ -80,7 +80,7 @@ pub use gic::{
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use trap::{
     VcpuLifecycleTotals, read_el1_counters, read_el1_region_host_ptr, reset_el1_counters,
-    vcpu_lifecycle_totals,
+    vcpu_lifecycle_totals, vcpu_run_exits_total,
 };
 /// Serializes tests that fork REAL child processes. The test binary is one
 /// process, so any-child wait paths under test (`wait4(-1)`,

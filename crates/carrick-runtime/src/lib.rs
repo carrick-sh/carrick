@@ -227,6 +227,15 @@ pub use prepare::{
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use carrick_vmm_hvf::{read_el1_counters, read_el1_region_host_ptr, reset_el1_counters};
 
+/// Carrier-wide count of vCPU exits to the host (every `hv_vcpu_run` return).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use carrick_vmm_hvf::vcpu_run_exits_total;
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn vcpu_run_exits_total() -> u64 {
+    0
+}
+
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn read_el1_counters() -> Option<carrick_el1_abi::Counters> {
     None
