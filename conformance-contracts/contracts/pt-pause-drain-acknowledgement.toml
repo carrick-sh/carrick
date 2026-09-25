@@ -1,0 +1,18 @@
+schema_version = 1
+id = "kernel.mm.pt-pause-drain-acknowledgement"
+title = "A stage-1 page-table pause waits for sibling acknowledgement, never a wall-clock budget"
+guest_surfaces = ["kernel:current-mm", "scheduler:page-table-quiescence", "fault:first-touch", "syscall:mmap", "syscall:munmap", "syscall:mprotect", "syscall:madvise"]
+semantic_authority = ["man 2 mmap", "man 2 munmap", "man 2 mprotect", "Linux never fails a user page fault or an mmap-family call because a sibling thread of the same MM was slow to be scheduled"]
+fixture = "unit:late-sibling-acknowledgement"
+scale_points = [1, 8, 32]
+rationale = "Before editing stage-1 descriptors the coordinator kicks every executor of the exact MM out of guest and waits for each one's in-guest flag to fall. That wait ends on acknowledgement: the retired 500 ms drain deadline turned host scheduling delay and kicks absorbed in Carrick's EL1 code into `fault page-table pause failed before mutation: TimedOut`, a fatal guest error (go-testing, go-time, go-os_signal, go-net_http under a loaded gate). The waiter sleeps on a leave-guest wake raised by the one primitive every leave path uses (`InGuestFlag::leave_guest`, plus registry removal) instead of yield-spinning against the siblings it waits for. Termination rests on kick delivery (`kernel.vcpu.kick-el0-boundary`): a kicked sibling always reaches an exit, and exit/exec teardown kicks every sibling. The coordinator keeps its own executor while waiting because nothing a sibling needs to leave guest depends on that capacity. The coordinator election keeps its bound; it is a deadlock detector for the host-alias ABBA and stays guest-visible as ENOMEM (syscall) or a runtime error (fault)."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-runtime::vcpu_loop::quiesce::pt_pause_tests::pt_pause_drain_waits_for_late_sibling_acknowledgement; carrick-runtime::vcpu_loop::quiesce::pt_pause_tests::pt_pause_drain_sees_a_sibling_that_reregistered_after_a_block"
+embed = "carrick-embed::pt_pause_drain_pressure"
+ecosystem = ["go:testing", "go:time", "go:os_signal", "go:net_http"]
+
+[bindings.unresolved]
+docker = "Internal quiescence invariant. The Linux-visible obligation is that the faulting instruction or mmap-family call completes; the go ecosystem rows carry the differential."
+embed_structural = "The VM-free binding asserts the coordinator's CPU time stays far below its wait (no spin) as a wall-clock-free ratio, not a deterministic work counter; no WorkObservation metric for drain wake rounds is registered yet."

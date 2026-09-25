@@ -397,3 +397,23 @@ contracts = ["kernel.mm.backing-maintenance-lookup"]
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/memory_protection/tests/maintenance_lookup_budget.rs"
 contracts = ["kernel.mm.backing-maintenance-lookup"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/mm_quiesce.rs"
+contracts = ["kernel.mm.pt-pause-drain-acknowledgement"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/guest_execution.rs"
+contracts = ["kernel.mm.pt-pause-drain-acknowledgement"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/threaded.rs"
+contracts = ["kernel.mm.pt-pause-drain-acknowledgement"]
+
+[[surfaces]]
+path = "crates/carrick-aarch64/src/owed_kick.rs"
+contracts = ["kernel.vcpu.kick-el0-boundary"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/pt_pause_drain_pressure.rs"
+contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.vcpu.kick-el0-boundary"]
