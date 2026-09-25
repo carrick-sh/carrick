@@ -3681,19 +3681,17 @@ impl HvfVmState {
         Ok(())
     }
 
-    /// Create a fresh vCPU bound to this VM (the boot/clone/fork/reclaim
-    /// vcpu_create; admission is the bounded scheduler's job, NOT this path).
+    /// Create a fresh vCPU bound to this VM. Admitted only while the VM's
+    /// topology assembles (`vcpu_topology`).
     pub(crate) fn add_vcpu(
         &mut self,
     ) -> Result<(applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
         let vcpu = create_vcpu(&self._vm)?;
         enable_el0_counter_access(vcpu.id());
-        self.vcpu_id = vcpu.id();
-        self.vcpu_handle = vcpu.get_handle();
-        self._vcpu_guard = Some(vcpu_census().created());
-        self.publish_live_vcpu();
         let mailbox = self.allocate_mailbox_for_vcpu(&vcpu)?;
-        Ok((vcpu, mailbox))
+        self.executor_vcpu = Some(ExecutorVcpuIdentity::of(&vcpu));
+        self.publish_live_vcpu();
+        Ok((vcpu.into_inner(), mailbox))
     }
 
     pub(crate) fn mailbox_host_pointer(
@@ -3808,36 +3806,6 @@ impl HvfVmState {
             binding.host_address(),
             live.map(|pointer| pointer.as_ptr() as usize),
         ))
-    }
-
-    pub(crate) fn release_mailbox_for_reclaim(
-        &self,
-        binding: &mut MailboxBinding,
-    ) -> Result<(), TrapError> {
-        binding.release_for_reclaim().map_err(|error| {
-            TrapError::Hypervisor(format!("park AArch64 syscall mailbox: {error}"))
-        })
-    }
-
-    pub(crate) fn reacquire_mailbox_after_vcpu_create(
-        &self,
-        vcpu: &applevisor::vcpu::Vcpu,
-        binding: &mut MailboxBinding,
-        continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
-    ) -> Result<(), TrapError> {
-        use applevisor::prelude::SysReg;
-
-        let lease = self
-            .mailbox_slots
-            .allocate()
-            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
-        let address = lease.id().guest_address();
-        let pointer = self.mailbox_host_pointer(lease.id())?;
-        // SAFETY: the allocator lease uniquely owns the complete fixed slot.
-        unsafe { binding.reacquire_after_reclaim(lease, pointer, continuation) }.map_err(
-            |error| TrapError::Hypervisor(format!("resume AArch64 syscall mailbox: {error}")),
-        )?;
-        vcpu.set_sys_reg(SysReg::SP_EL1, address).map_err(hvf_error)
     }
 
     /// Host pointer backing `[gpa, gpa+len)`, or `None` if unmapped. The

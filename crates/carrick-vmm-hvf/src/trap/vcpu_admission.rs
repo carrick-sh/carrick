@@ -14,7 +14,6 @@ use super::*;
 pub(super) enum VmCreateAdmission {
     Initial,
     ExecveRebuild,
-    SharedWaitResume,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -23,7 +22,6 @@ impl VmCreateAdmission {
         match self {
             Self::Initial => 0,
             Self::ExecveRebuild => 3,
-            Self::SharedWaitResume => 4,
         }
     }
 
@@ -57,7 +55,7 @@ impl VmCreateAdmission {
 
     pub(super) fn global_permit_budget(self) -> Option<usize> {
         match self {
-            Self::Initial | Self::SharedWaitResume => Some(Self::GLOBAL_VCPU_CEILING),
+            Self::Initial => Some(Self::GLOBAL_VCPU_CEILING),
             Self::ExecveRebuild => None,
         }
     }
@@ -655,6 +653,7 @@ pub(super) fn record_vm_resident() {
 pub(super) fn record_vm_released() {
     crate::probes::vm_lifecycle(3, -1);
     CARRIER_VM_LIVE.store(false, std::sync::atomic::Ordering::Release);
+    end_vcpu_topology_generation();
     // The eager mmap arena belonged to the VM that just died. A VM rebuilt
     // after this point gets a fresh eager mapping and must retire it once of
     // its own accord, so the carrier's once-flag is released with the VM.
@@ -888,20 +887,26 @@ pub(super) fn create_with_no_resources_backpressure_bounded<T>(
     }
 }
 
+/// Create the vCPU of a VM whose creation transaction is still pending. The
+/// returned guard leaves cleanup to that transaction, which destroys the
+/// recorded vCPU with the VM on rollback.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn create_vcpu_with_permit(
     vm: &applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     permit: Option<HeldPermitGuard>,
-) -> Result<applevisor::vcpu::Vcpu, TrapError> {
+) -> Result<SetupVcpuGuard, TrapError> {
     // The permit (this process's admitted soft-budget slot) is held across all
     // retries; only the terminal outcome registers or releases it.
-    match create_with_no_resources_backpressure("hv_vcpu_create", || vm.vcpu_create()) {
+    let created = create_admitted(|| {
+        create_with_no_resources_backpressure("hv_vcpu_create", || vm.vcpu_create())
+    });
+    match created {
         Ok(vcpu) => {
             if let Some(permit) = permit {
                 register_admission_permit(vcpu.id(), permit.into_inner());
             }
             vcpu_created();
-            Ok(vcpu)
+            Ok(SetupVcpuGuard::new(vcpu, SetupVcpuCleanup::PendingRaw))
         }
         Err(e) => {
             drop(permit);
@@ -910,17 +915,20 @@ pub(super) fn create_vcpu_with_permit(
     }
 }
 
+/// Create a vCPU in the live carrier VM. Admitted only while the VM's
+/// topology assembles; the returned guard destroys the vCPU through
+/// `destroy_raw_vcpu` if its setup fails before `into_inner`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn create_vcpu(
     vm: &applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
-) -> Result<applevisor::vcpu::Vcpu, TrapError> {
-    // Existing-VM vCPUs (thread siblings and reclaim/rebind) are admitted by the
-    // in-process scheduler. Applying the VM-creation permit here would duplicate
-    // that scheduler's bounded vCPU accounting.
-    match vm.vcpu_create() {
+) -> Result<SetupVcpuGuard, TrapError> {
+    // Existing-VM vCPUs are admitted by the in-process scheduler. Applying the
+    // VM-creation permit here would duplicate that scheduler's bounded vCPU
+    // accounting.
+    match create_admitted(|| vm.vcpu_create()) {
         Ok(vcpu) => {
             vcpu_created();
-            Ok(vcpu)
+            Ok(SetupVcpuGuard::new(vcpu, SetupVcpuCleanup::DestroyOnError))
         }
         Err(e) => Err(TrapError::Hypervisor(format!(
             "hv_vcpu_create (existing carrier VM): {e}"
@@ -941,11 +949,6 @@ mod vm_create_admission_tests {
                 .global_permit_budget()
                 .is_none()
         );
-        assert!(
-            VmCreateAdmission::SharedWaitResume
-                .global_permit_budget()
-                .is_some()
-        );
     }
 
     #[test]
@@ -956,11 +959,6 @@ mod vm_create_admission_tests {
         // at runtime via HV_NO_RESOURCES park+retry, not this soft pre-throttle.
         let ceiling = Some(VmCreateAdmission::GLOBAL_VCPU_CEILING);
         assert_eq!(VmCreateAdmission::Initial.global_permit_budget(), ceiling);
-        assert_eq!(
-            VmCreateAdmission::SharedWaitResume.global_permit_budget(),
-            ceiling,
-            "shared-wait resume drains parked processes through the creation ceiling"
-        );
         // Execve rebuilds must make progress and therefore bypass the global
         // creation permit.
         assert_eq!(
@@ -1255,7 +1253,7 @@ mod vm_create_admission_tests {
     // admission class's budget is `None`, so the replacement acquires no
     // permit at all). After Task 1's tokenization this is ALREADY correct: the
     // pre-exec `vcpu_id` was registered when its process/thread was admitted
-    // (`Initial`/`SharedWaitResume` have `Some` budgets), so `vcpu_destroyed`'s
+    // (`Initial` has a `Some` budget), so `vcpu_destroyed`'s
     // `release_token(vcpu_id)` finds it in the
     // local map and frees exactly that slot — no leak, and nothing left for an
     // extra explicit release to double-free. These tests drive that exact
@@ -1425,6 +1423,149 @@ mod vm_create_admission_tests {
             observed <= budget,
             "observed {observed} concurrently-held permits with budget {budget} \
              — over-admission past the budget cap (store-buffering regression)"
+        );
+    }
+}
+
+/// EL1 plan 1a D2: every vCPU lives for its VM's whole life. The rule is the
+/// `vcpu_topology` state machine; this ratchet proves that machine cannot be
+/// bypassed. Every `hv_vcpu_create`, first `hv_vcpu_run` and raw
+/// `hv_vcpu_destroy` in the crate goes through its funnel, and the paths that
+/// destroyed and recreated vCPUs while a VM ran no longer exist.
+#[cfg(test)]
+mod vcpu_lifetime_tests {
+    fn src_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// Every production source file of the crate (`src/bin` probes excluded).
+    fn sources() -> Vec<(String, String)> {
+        let mut stack = vec![src_dir()];
+        let mut files = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|name| name != "bin") {
+                        stack.push(path);
+                    }
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let name = path
+                        .strip_prefix(src_dir())
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    files.push((name, std::fs::read_to_string(&path).unwrap()));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    fn code_lines(text: &str) -> impl Iterator<Item = &str> {
+        text.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+    }
+
+    fn sites(needle: &str) -> Vec<(String, usize)> {
+        sources()
+            .into_iter()
+            .filter_map(|(name, text)| {
+                let count: usize = code_lines(&text)
+                    .map(|line| line.matches(needle).count())
+                    .sum();
+                (count != 0).then_some((name, count))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vcpus_live_for_the_vm_lifetime() {
+        assert_eq!(
+            sites(concat!("hv_vcpu_", "destroy(")),
+            [("trap/vcpu_topology.rs".to_owned(), 1)],
+            "the only raw hv_vcpu_destroy is `destroy_raw_vcpu`, which admits the \
+             destroy against the VM's topology"
+        );
+        assert_eq!(
+            sites(concat!("vm.vcpu_", "create()")),
+            [("trap/vcpu_admission.rs".to_owned(), 2)],
+            "vCPUs are created only by `create_vcpu`/`create_vcpu_with_permit`"
+        );
+        let admission = sources()
+            .into_iter()
+            .find(|(name, _)| name == "trap/vcpu_admission.rs")
+            .unwrap()
+            .1;
+        assert_eq!(
+            code_lines(&admission)
+                .filter(|line| line.contains(concat!("create_", "admitted(||")))
+                .count(),
+            2,
+            "both creates run inside the topology's create admission"
+        );
+        assert_eq!(
+            sites(concat!("vcpu.", "run()")),
+            [("trap.rs".to_owned(), 1)],
+            "the one hv_vcpu_run is `run_to_exit`"
+        );
+        let engine = sources()
+            .into_iter()
+            .find(|(name, _)| name == "hvf_aarch64_engine.rs")
+            .unwrap()
+            .1;
+        let run = engine
+            .split(concat!(
+                "fn run(&mut self) -> Result<Aarch64Exit, ",
+                "TrapError>"
+            ))
+            .nth(1)
+            .and_then(|tail| tail.split(concat!("run_to_", "exit(")).next())
+            .expect("HvfAarch64Vcpu::run reaches run_to_exit");
+        assert!(
+            run.contains(concat!("admit_vcpu_", "first_run()")),
+            "a vCPU's first run seals the topology before `run_to_exit`"
+        );
+
+        for (name, text) in sources() {
+            // `destroy_setup_vcpu` forwards its caller's site unchanged.
+            let calls = |line: &&str| {
+                (line.contains(concat!("destroy_raw_", "vcpu("))
+                    || line.contains(concat!("destroy_setup_", "vcpu(")))
+                    && !line.contains("fn destroy_")
+            };
+            for line in code_lines(&text).filter(calls) {
+                assert!(
+                    line.contains("VcpuDestroySite::") || line.contains(", site)"),
+                    "{name}: `{}` must name a teardown-class VcpuDestroySite",
+                    line.trim()
+                );
+            }
+        }
+
+        let all: String = sources().into_iter().map(|(_, text)| text).collect();
+        for gone in [
+            concat!("fn reclaim_", "park("),
+            concat!("fn reclaim_", "resume("),
+            concat!("fn initial_runner_", "park("),
+            concat!("fn initial_runner_", "resume("),
+            concat!("fn shared_wait_", "park("),
+            concat!("fn shared_wait_", "resume("),
+            concat!("fn release_vm_after_", "reclaim_park("),
+            concat!("CARRICK_HVF_VCPU_", "RECLAIM"),
+            concat!("ReclaimPark", "Authority"),
+        ] {
+            assert!(!all.contains(gone), "{gone} still present");
+        }
+        let new_with_plan = all
+            .split(concat!("fn new_with_", "plan_inner("))
+            .nth(1)
+            .and_then(|tail| tail.split("\n    }\n").next())
+            .expect("root bring-up body");
+        assert!(
+            !new_with_plan.contains(concat!("create_", "vcpu")),
+            "a root boots without a vCPU of its own"
         );
     }
 }

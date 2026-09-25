@@ -14,9 +14,12 @@
 //!     with the EL1-trampoline kick swallow + the lazy high-VA alias re-map),
 //!   - the per-VMM VM/memory model: host-`MAP_SHARED` windows + `hv_vm_map` stage-2,
 //!     the `EagerCopy` fork strategy (the parent freezes / both sides rebuild a
-//!     fresh `applevisor` VM), `execve` VM rebuild, the M:N reclaim (destroy/recreate
-//!     the vCPU around a block), the multithreaded-fork sibling quiesce dance, and
-//!     the process-shared high-VA alias registry + cross-thread syscall fallback.
+//!     fresh `applevisor` VM), `execve` VM rebuild, the multithreaded-fork sibling
+//!     quiesce dance, and the process-shared high-VA alias registry +
+//!     cross-thread syscall fallback,
+//!   - the vCPU lifetime: a root's registers are staged as data until its first
+//!     executor load, and every vCPU lives for its VM's whole life
+//!     (`trap::vcpu_topology`, EL1 plan 1a D2).
 //!
 //! The bulk of those atoms still LIVE in [`crate::trap`] (the alias registry, the
 //! region types, the EL1-vector boot image, the `applevisor` helpers, the sysreg
@@ -27,21 +30,20 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use carrick_fatal::carrick_fatal;
 
-use carrick_aarch64::engine::restore_aarch64_task_state;
 use carrick_aarch64::engine::{Aarch64ProcessSpec, Aarch64SiblingSpec};
 use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
+    OwedStage1Maintenance, Stage1Maintenance,
 };
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{Gpa, MemoryError, SharedFutexLocation};
-use carrick_hal::threaded::Aarch64TaskCpuStateV1;
 use carrick_hal::{
-    GuestEntryRegs, GuestVmBackend, HostAliasBacking, ProcessForkRequest, Reg, SlotId, SysReg,
-    TrapError, VcpuRegistry,
+    GuestEntryRegs, GuestVmBackend, HostAliasBacking, ProcessForkRequest, Reg, SysReg, TrapError,
+    VcpuRegistry,
 };
 use carrick_mem::memory::AddressSpace;
 
@@ -63,7 +65,7 @@ pub use crate::trap::{
 pub type HvfAarch64Engine = Aarch64EngineCore<HvfAarch64Vmm>;
 
 pub fn persistent_vcpu_identity(vcpu: &HvfAarch64Vcpu) -> u64 {
-    vcpu.inner.id()
+    vcpu.executor_vcpu().inner.id()
 }
 
 pub fn persistent_hardware_kick(
@@ -75,41 +77,30 @@ pub fn persistent_hardware_kick(
 pub fn persistent_vcpu_hardware_kick(
     vcpu: &HvfAarch64Vcpu,
 ) -> (crate::vcpu_kick::VcpuKickHandle, u64, u32) {
-    let raw_vcpu_id = vcpu.inner.id();
-    let slot = vcpu.mailbox_slot();
-    let handle = crate::vcpu_kick::VcpuKickHandle::with_mailbox_slot(vcpu.inner.get_handle(), slot);
+    let live = vcpu.executor_vcpu();
+    let raw_vcpu_id = live.inner.id();
+    let slot = live.mailbox.slot().raw() as usize;
+    let handle = crate::vcpu_kick::VcpuKickHandle::with_mailbox_slot(live.inner.get_handle(), slot);
     let owner_thread_port = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
     (handle, raw_vcpu_id, owner_thread_port)
 }
 
-fn hvf_vcpu_reclaim_enabled_value(value: Option<&str>) -> bool {
-    value != Some("0")
-}
-
-/// Exact diagnostic hatch for separating HVF vCPU destroy/recreate defects
-/// from guest futex/scheduler defects. Default-on is the shipped M:N path.
-/// `0` keeps one VM but admits one live HVF vCPU per guest thread, so it is a
-/// correctness experiment rather than a performance configuration.
-fn hvf_vcpu_reclaim_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        hvf_vcpu_reclaim_enabled_value(std::env::var("CARRICK_HVF_VCPU_RECLAIM").ok().as_deref())
-    })
-}
-
-/// Build the engine from a freestanding/loaded image: create the VM + vCPU, map the
-/// guest address space, and park the vCPU at the EL0-entry trampoline (the first
-/// `next_syscall` runs into EL0). Mirrors `KvmAarch64Vmm::bring_up`.
+/// Build a container root's engine from a loaded image: map the guest address
+/// space into the carrier VM (creating the VM for the carrier's first root)
+/// and stage the root's first-instruction registers as data. No vCPU is
+/// created here (EL1 plan 1a D2): the root runs on a persistent executor's
+/// vCPU, which restores the staged state at the root's first load.
 pub fn bring_up(image: &AddressSpace) -> Result<HvfAarch64Engine, TrapError> {
     let plan = GuestMappingPlan::from_address_space(image)?;
-    let (state, vcpu, mailbox, staged) = HvfVmState::new_with_plan(&plan)?;
+    let (state, staged) = HvfVmState::new_with_plan(&plan)?;
     let vmm = HvfAarch64Vmm {
         state,
         host_writes: Default::default(),
     };
-    let mut vcpu = HvfAarch64Vcpu::new(vcpu, mailbox);
-    vcpu.root_shadow = Some(parking_lot::Mutex::new(staged));
-    Ok(Aarch64EngineCore::from_parts(vmm, vcpu))
+    Ok(Aarch64EngineCore::from_parts(
+        vmm,
+        HvfAarch64Vcpu::staged(staged),
+    ))
 }
 
 // ─── neutral ⟷ HVF VcpuSnapshot ──────────────────────────────────────────────
@@ -128,58 +119,106 @@ pub(crate) fn from_neutral(s: &Aarch64VcpuSnapshot) -> VcpuSnapshot {
 
 // ─── impl Aarch64Vcpu for HvfAarch64Vcpu ─────────────────────────────────────
 
-/// The per-vCPU half: a newtype over `applevisor::vcpu::Vcpu`. All register access
-/// routes through the HVF↔HAL translation helpers in `crate::trap`; the V-register
-/// WRITE routes through the `set_simd_fp_reg_v` C-shim (the u128-by-value ABI-bug
-/// workaround). `run()` decodes HVF's native exit into the neutral `Aarch64Exit`.
+/// A live HVF vCPU and its syscall mailbox. Only the owning host thread
+/// creates, runs and destroys it.
 ///
 /// The `Vcpu` is held in `ManuallyDrop`: on Drop we deliberately do NOT run
-/// applevisor's `Vcpu::Drop`. Once carrick has executed a single `fork(2)` inside
-/// the trap loop, applevisor's internal handle bookkeeping no longer matches HVF and
-/// its destructor unwraps `hv_vcpu_destroy` and panics ("no VM or vCPU available").
-/// The process is exiting either way; the kernel reclaims the vCPU. (This preserves
-/// the old `ManuallyDrop<HvfInner>` discipline, now per-half.) The reclaim/fork
-/// rebuilds raw-`hv_vcpu_destroy`/recreate the inner vCPU via `std::mem::replace`
-/// inside it (`replace_destroyed_vcpu`), never running applevisor Drop.
-pub struct HvfAarch64Vcpu {
+/// applevisor's `Vcpu::Drop`, whose destructor unwraps `hv_vcpu_destroy` and
+/// panics. A live vCPU is destroyed only through `destroy_raw_vcpu`, at VM
+/// teardown (EL1 plan 1a D2).
+pub(crate) struct LiveHvfVcpu {
     pub(crate) inner: std::mem::ManuallyDrop<applevisor::vcpu::Vcpu>,
     pub(crate) mailbox: MailboxBinding,
+    /// Whether this vCPU has run; its first run seals the VM's topology.
+    ran: bool,
+}
+
+enum HvfVcpuBacking {
+    /// A persistent executor's vCPU (or a mature-lane vCPU).
+    Live(LiveHvfVcpu),
+    /// A container root before its first load: registers as data, no vCPU.
+    Staged(Box<parking_lot::Mutex<crate::staged_cpu::StagedCpu>>),
+}
+
+/// The per-vCPU half. All register access routes through the HVF↔HAL
+/// translation helpers in `crate::trap`; the V-register WRITE routes through
+/// the `set_simd_fp_reg_v` C-shim (the u128-by-value ABI-bug workaround).
+/// `run()` decodes HVF's native exit into the neutral `Aarch64Exit`.
+///
+/// A root is born [`HvfVcpuBacking::Staged`]: its bring-up programs registers
+/// as data and any stage-1 maintenance it asks for is owed to its first live
+/// executor. A staged vCPU cannot run, be kicked into, or carry a syscall.
+pub struct HvfAarch64Vcpu {
+    backing: HvfVcpuBacking,
     tidstamp_debug: Option<bool>,
-    /// Transition evidence (EL1 plan 1a D2): the root's register file built as
-    /// data, mirrored from every register write the boot vCPU receives, and
-    /// compared with the boot vCPU's snapshot at the initial-runner hand-off.
-    root_shadow: Option<parking_lot::Mutex<crate::staged_cpu::StagedCpu>>,
+}
+
+fn staged_error(operation: &str) -> TrapError {
+    TrapError::Hypervisor(format!(
+        "{operation} needs a live vCPU; a staged root has none until its first executor load"
+    ))
 }
 
 impl HvfAarch64Vcpu {
     pub(crate) fn new(vcpu: applevisor::vcpu::Vcpu, mailbox: MailboxBinding) -> Self {
         Self {
-            inner: std::mem::ManuallyDrop::new(vcpu),
-            mailbox,
+            backing: HvfVcpuBacking::Live(LiveHvfVcpu {
+                inner: std::mem::ManuallyDrop::new(vcpu),
+                mailbox,
+                ran: false,
+            }),
             tidstamp_debug: None,
-            root_shadow: None,
         }
     }
 
-    fn mirror(
-        &self,
-        write: impl FnOnce(&mut crate::staged_cpu::StagedCpu) -> Result<(), TrapError>,
-    ) -> Result<(), TrapError> {
-        match self.root_shadow.as_ref() {
-            Some(shadow) => write(&mut shadow.lock()),
-            None => Ok(()),
+    pub(crate) fn staged(cpu: crate::staged_cpu::StagedCpu) -> Self {
+        Self {
+            backing: HvfVcpuBacking::Staged(Box::new(parking_lot::Mutex::new(cpu))),
+            tidstamp_debug: None,
+        }
+    }
+
+    /// Whether this vCPU is a root's staged register file.
+    pub fn is_staged(&self) -> bool {
+        matches!(self.backing, HvfVcpuBacking::Staged(_))
+    }
+
+    pub(crate) fn live(&self) -> Result<&LiveHvfVcpu, TrapError> {
+        match &self.backing {
+            HvfVcpuBacking::Live(live) => Ok(live),
+            HvfVcpuBacking::Staged(_) => Err(staged_error("this operation")),
+        }
+    }
+
+    pub(crate) fn live_mut(&mut self) -> Result<&mut LiveHvfVcpu, TrapError> {
+        match &mut self.backing {
+            HvfVcpuBacking::Live(live) => Ok(live),
+            HvfVcpuBacking::Staged(_) => Err(staged_error("this operation")),
+        }
+    }
+
+    /// A persistent executor's own vCPU. Executors are created live, so a
+    /// staged vCPU here is a broken executor lease: a carrier fault.
+    fn executor_vcpu(&self) -> &LiveHvfVcpu {
+        match &self.backing {
+            HvfVcpuBacking::Live(live) => live,
+            HvfVcpuBacking::Staged(_) => carrick_fatal!(
+                "hvf::vcpu_lifetime",
+                "persistent executor holds a staged root CPU instead of its live vCPU"
+            ),
         }
     }
 
     pub fn mailbox_slot(&self) -> usize {
-        self.mailbox.slot().raw() as usize
+        self.executor_vcpu().mailbox.slot().raw() as usize
     }
 
-    /// The mailbox slot this vCPU leases right now (`None` while its vCPU is
-    /// parked for reclaim). The slot moves with every reclaim and rebuild, so
-    /// callers read it at the moment of use and never keep a copy.
+    /// The mailbox slot this vCPU leases right now (`None` for a staged root).
+    /// Callers read it at the moment of use and never keep a copy.
     pub fn leased_mailbox_slot(&self) -> Option<usize> {
-        self.mailbox
+        self.live()
+            .ok()?
+            .mailbox
             .leased_slot()
             .map(|slot| usize::from(slot.raw()))
     }
@@ -189,12 +228,6 @@ impl HvfAarch64Vcpu {
 /// [`HvfAarch64Vcpu::leased_mailbox_slot`].
 pub fn leased_mailbox_slot(engine: &HvfAarch64Engine) -> Option<usize> {
     engine.vcpu().leased_mailbox_slot()
-}
-
-impl Drop for HvfAarch64Vcpu {
-    fn drop(&mut self) {
-        // Intentionally skip `ManuallyDrop::drop` — see the type doc.
-    }
 }
 
 fn os_to_trap(e: carrick_hal::OsError) -> TrapError {
@@ -207,15 +240,21 @@ fn needs_clock_entry_latch(native_nr: u64, esr: u64) -> bool {
 
 impl Aarch64Vcpu for HvfAarch64Vcpu {
     fn mailbox_slot(&self) -> Option<usize> {
-        Some(self.mailbox_slot())
+        self.live()
+            .ok()
+            .map(|live| live.mailbox.slot().raw() as usize)
     }
 
     fn publish_owed_kick(&mut self) -> Result<(), TrapError> {
-        carrick_el1_abi::mark_pending_host_work(self.mailbox_slot());
+        let slot = self.live()?.mailbox.slot().raw() as usize;
+        carrick_el1_abi::mark_pending_host_work(slot);
         Ok(())
     }
 
     fn force_clock_host_boundary(&mut self) -> Result<bool, TrapError> {
+        if self.is_staged() {
+            return Ok(false);
+        }
         let pc = self.get_reg(Reg::Pc)?;
         if !carrick_mem::memory::is_carrick_el1_clock_handler_va(pc)
             && !carrick_mem::memory::is_carrick_el0_clock_stub_va(pc)
@@ -224,6 +263,7 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
                 return Ok(false);
             }
             return self
+                .live_mut()?
                 .mailbox
                 .force_clock_host_boundary()
                 .map(|()| false)
@@ -231,14 +271,13 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
                     TrapError::Hypervisor(format!("mailbox kick latch failed: {error}"))
                 });
         }
-        let restart = self
+        let esr = self.get_esr_el1()?;
+        let live = self.live_mut()?;
+        let elr = hvf_get_reg(&live.inner, Reg::ElrEl1).map_err(os_to_trap)?;
+        let spsr = hvf_get_reg(&live.inner, Reg::SpsrEl1).map_err(os_to_trap)?;
+        let restart = live
             .mailbox
-            .clock_kick_restart(
-                pc,
-                hvf_get_reg(&self.inner, Reg::ElrEl1).map_err(os_to_trap)?,
-                hvf_get_reg(&self.inner, Reg::SpsrEl1).map_err(os_to_trap)?,
-                self.get_esr_el1()?,
-            )
+            .clock_kick_restart(pc, elr, spsr, esr)
             .map_err(|error| {
                 TrapError::Hypervisor(format!("mailbox kick normalization failed: {error}"))
             })?;
@@ -254,18 +293,28 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
     }
 
     fn get_reg(&self, r: Reg) -> Result<u64, TrapError> {
-        hvf_get_reg(&self.inner, r).map_err(os_to_trap)
+        match &self.backing {
+            HvfVcpuBacking::Live(live) => hvf_get_reg(&live.inner, r).map_err(os_to_trap),
+            HvfVcpuBacking::Staged(cpu) => cpu.lock().get_reg(r),
+        }
     }
     fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), TrapError> {
-        hvf_set_reg(&self.inner, r, v).map_err(os_to_trap)?;
-        self.mirror(|shadow| shadow.set_reg(r, v))
+        match &mut self.backing {
+            HvfVcpuBacking::Live(live) => hvf_set_reg(&live.inner, r, v).map_err(os_to_trap),
+            HvfVcpuBacking::Staged(cpu) => cpu.get_mut().set_reg(r, v),
+        }
     }
     fn get_sys_reg(&self, r: SysReg) -> Result<u64, TrapError> {
-        hvf_get_sys_reg(&self.inner, r).map_err(os_to_trap)
+        match &self.backing {
+            HvfVcpuBacking::Live(live) => hvf_get_sys_reg(&live.inner, r).map_err(os_to_trap),
+            HvfVcpuBacking::Staged(cpu) => cpu.lock().get_sys_reg(r),
+        }
     }
     fn set_sys_reg(&mut self, r: SysReg, v: u64) -> Result<(), TrapError> {
-        hvf_set_sys_reg(&self.inner, r, v).map_err(os_to_trap)?;
-        self.mirror(|shadow| shadow.set_sys_reg(r, v))
+        match &mut self.backing {
+            HvfVcpuBacking::Live(live) => hvf_set_sys_reg(&live.inner, r, v).map_err(os_to_trap),
+            HvfVcpuBacking::Staged(cpu) => cpu.get_mut().set_sys_reg(r, v),
+        }
     }
 
     fn get_vreg(&self, n: u32) -> Result<u128, TrapError> {
@@ -275,9 +324,13 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
                 "vreg index {n} out of range"
             )));
         }
-        self.inner
-            .get_simd_fp_reg(crate::trap::SIMD_FP_TABLE[idx])
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+        match &self.backing {
+            HvfVcpuBacking::Live(live) => live
+                .inner
+                .get_simd_fp_reg(crate::trap::SIMD_FP_TABLE[idx])
+                .map_err(|e| TrapError::Hypervisor(e.to_string())),
+            HvfVcpuBacking::Staged(cpu) => cpu.lock().get_vreg(n),
+        }
     }
     fn set_vreg(&mut self, n: u32, v: u128) -> Result<(), TrapError> {
         let idx = n as usize;
@@ -286,12 +339,16 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
                 "vreg index {n} out of range"
             )));
         }
+        let live = match &mut self.backing {
+            HvfVcpuBacking::Live(live) => live,
+            HvfVcpuBacking::Staged(cpu) => return cpu.get_mut().set_vreg(n, v),
+        };
         // The u128-by-value ABI-bug workaround: route the V-register WRITE through
         // the C shim (applevisor's `set_simd_fp_reg` zeroes via the wrong register
         // class). Reads are pointer-based and unaffected (above).
-        let rc = set_simd_fp_reg_v(self.inner.id(), crate::trap::SIMD_FP_TABLE[idx], v);
+        let rc = set_simd_fp_reg_v(live.inner.id(), crate::trap::SIMD_FP_TABLE[idx], v);
         if rc == 0 {
-            self.mirror(|shadow| shadow.set_vreg(n, v))
+            Ok(())
         } else {
             Err(TrapError::Hypervisor(format!(
                 "set_simd_fp_reg(q{idx}) rc={rc:#x}"
@@ -299,41 +356,57 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         }
     }
     fn get_fpcr(&self) -> Result<u64, TrapError> {
-        self.inner
-            .get_reg(applevisor::vcpu::Reg::FPCR)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+        match &self.backing {
+            HvfVcpuBacking::Live(live) => live
+                .inner
+                .get_reg(applevisor::vcpu::Reg::FPCR)
+                .map_err(|e| TrapError::Hypervisor(e.to_string())),
+            HvfVcpuBacking::Staged(cpu) => Ok(cpu.lock().fpcr()),
+        }
     }
     fn set_fpcr(&mut self, v: u64) -> Result<(), TrapError> {
-        self.inner
-            .set_reg(applevisor::vcpu::Reg::FPCR, v)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        self.mirror(|shadow| {
-            shadow.set_fpcr(v);
-            Ok(())
-        })
+        match &mut self.backing {
+            HvfVcpuBacking::Live(live) => live
+                .inner
+                .set_reg(applevisor::vcpu::Reg::FPCR, v)
+                .map_err(|e| TrapError::Hypervisor(e.to_string())),
+            HvfVcpuBacking::Staged(cpu) => {
+                cpu.get_mut().set_fpcr(v);
+                Ok(())
+            }
+        }
     }
     fn get_fpsr(&self) -> Result<u64, TrapError> {
-        self.inner
-            .get_reg(applevisor::vcpu::Reg::FPSR)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+        match &self.backing {
+            HvfVcpuBacking::Live(live) => live
+                .inner
+                .get_reg(applevisor::vcpu::Reg::FPSR)
+                .map_err(|e| TrapError::Hypervisor(e.to_string())),
+            HvfVcpuBacking::Staged(cpu) => Ok(cpu.lock().fpsr()),
+        }
     }
     fn set_fpsr(&mut self, v: u64) -> Result<(), TrapError> {
-        self.inner
-            .set_reg(applevisor::vcpu::Reg::FPSR, v)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        self.mirror(|shadow| {
-            shadow.set_fpsr(v);
-            Ok(())
-        })
+        match &mut self.backing {
+            HvfVcpuBacking::Live(live) => live
+                .inner
+                .set_reg(applevisor::vcpu::Reg::FPSR, v)
+                .map_err(|e| TrapError::Hypervisor(e.to_string())),
+            HvfVcpuBacking::Staged(cpu) => {
+                cpu.get_mut().set_fpsr(v);
+                Ok(())
+            }
+        }
     }
 
     fn get_esr_el1(&self) -> Result<u64, TrapError> {
-        self.inner
+        self.live()?
+            .inner
             .get_sys_reg(applevisor::vcpu::SysReg::ESR_EL1)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
     fn get_far_el1(&self) -> Result<u64, TrapError> {
-        self.inner
+        self.live()?
+            .inner
             .get_sys_reg(applevisor::vcpu::SysReg::FAR_EL1)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
@@ -343,17 +416,26 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         // FPSR/FPCR + ACTLR/TPIDRRO/TPIDR_EL1), gated like the signal path on
         // `fpsimd_save_enabled()`. The engine owns `last_exit_class`, so it is not
         // carried here (restored from the vCPU latch on the inner restore path).
-        HvfInner::snapshot_vcpu_from(&self.inner).map(|s| to_neutral(&s))
+        match &self.backing {
+            HvfVcpuBacking::Live(live) => {
+                HvfInner::snapshot_vcpu_from(&live.inner).map(|s| to_neutral(&s))
+            }
+            HvfVcpuBacking::Staged(cpu) => Ok(cpu.lock().snapshot()),
+        }
     }
     fn restore(&mut self, snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError> {
         // last_exit_class is engine-owned; the neutral snapshot doesn't carry it, so
         // restore 0 (the inner restore overwrites the vCPU latch from the snapshot's
         // own field, which we set to 0 — the trap loop relatches it on the next exit).
-        HvfInner::restore_vcpu_into(&mut self.inner, &from_neutral(snap))?;
-        self.mirror(|shadow| {
-            shadow.restore(snap);
-            Ok(())
-        })
+        match &mut self.backing {
+            HvfVcpuBacking::Live(live) => {
+                HvfInner::restore_vcpu_into(&mut live.inner, &from_neutral(snap))
+            }
+            HvfVcpuBacking::Staged(cpu) => {
+                cpu.get_mut().restore(snap);
+                Ok(())
+            }
+        }
     }
 
     fn restore_thread_start(&mut self, snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError> {
@@ -361,7 +443,7 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         // enter via the EL0 trampoline (PC=trampoline, SPSR_EL1=EL0t, ELR_EL1=snap.pc)
         // — distinct from the plain `restore` a fork resume uses. (KVM keeps the trait
         // default, which is a plain restore.)
-        HvfInner::restore_vcpu_thread_start_into(&mut self.inner, &from_neutral(snap))
+        HvfInner::restore_vcpu_thread_start_into(&mut self.live_mut()?.inner, &from_neutral(snap))
     }
 
     fn get_saved_x9(&self) -> Result<Option<u64>, TrapError> {
@@ -377,23 +459,23 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
     }
 
     fn complete_syscall_return(&mut self, return_value: i64) -> Result<(), TrapError> {
-        let transport = self.mailbox.transport();
+        let live = self.live_mut()?;
+        let transport = live.mailbox.transport();
         let result = match transport {
             HvfSyscallTransport::Mailbox => {
-                self.mailbox
+                live.mailbox
                     .publish_normal_return(return_value)
                     .map_err(|error| {
-                        let diagnostics = self.mailbox.diagnostics();
+                        let diagnostics = live.mailbox.diagnostics();
                         TrapError::Hypervisor(format!(
                             "mailbox return publication failed: {error}; diagnostics={diagnostics:?}; attempted_return={return_value}"
                         ))
                     })
             }
             HvfSyscallTransport::Legacy => {
-                hvf_set_reg(&self.inner, carrick_hal::Reg::X(0), return_value as u64)
+                hvf_set_reg(&live.inner, carrick_hal::Reg::X(0), return_value as u64)
                     .map_err(os_to_trap)?;
-                self.mirror(|shadow| shadow.set_reg(carrick_hal::Reg::X(0), return_value as u64))?;
-                self.mailbox
+                live.mailbox
                     .publish_registers_prepared()
                     .map_err(|error| {
                         TrapError::Hypervisor(format!(
@@ -415,16 +497,20 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
     }
 
     fn pending_syscall_return(&self) -> Result<Option<i64>, TrapError> {
-        if self.mailbox.transport() == HvfSyscallTransport::Legacy {
+        let HvfVcpuBacking::Live(live) = &self.backing else {
+            return Ok(None);
+        };
+        if live.mailbox.transport() == HvfSyscallTransport::Legacy {
             return Ok(None);
         }
-        self.mailbox.pending_normal_return().map_err(|error| {
+        live.mailbox.pending_normal_return().map_err(|error| {
             TrapError::Hypervisor(format!("mailbox pending-return validation failed: {error}"))
         })
     }
 
     fn prepare_register_resume(&mut self) -> Result<(), TrapError> {
-        self.mailbox
+        self.live_mut()?
+            .mailbox
             .publish_register_resume_if_outstanding()
             .map_err(|error| {
                 TrapError::Hypervisor(format!(
@@ -435,27 +521,30 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
 
     fn stamp_guest_thread_id(&self, packed: u64) -> Result<(), TrapError> {
         use applevisor::prelude::SysReg;
+        let live = match &self.backing {
+            HvfVcpuBacking::Live(live) => live,
+            HvfVcpuBacking::Staged(cpu) => {
+                cpu.lock().stamp_guest_thread_id(packed);
+                return Ok(());
+            }
+        };
         // HVF's `gettid` fast path reads CONTEXTIDR_EL1 (serviced at EL1, no
         // host trap), leaving TPIDR_EL1 free as the syscall-shim scratch that
         // preserves x16 while checking ESR_EL1.
         // Smart island fast paths at EL0 read TPIDRRO_EL0, which holds packed
         // (pid << 32) | tid for zero-exit getpid and gettid.
         let tid = packed & 0xffff_ffff;
-        let result = self
+        let result = live
             .inner
             .set_sys_reg(SysReg::CONTEXTIDR_EL1, tid)
             .map_err(|e| TrapError::Hypervisor(e.to_string()));
-        self.inner
+        live.inner
             .set_sys_reg(SysReg::TPIDRRO_EL0, packed)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        self.mirror(|shadow| {
-            shadow.stamp_guest_thread_id(packed);
-            Ok(())
-        })?;
 
         if std::env::var_os("CARRICK_TIDSTAMP_DEBUG").is_some() {
-            let back = self.inner.get_sys_reg(SysReg::CONTEXTIDR_EL1);
-            let back_ro = self.inner.get_sys_reg(SysReg::TPIDRRO_EL0);
+            let back = live.inner.get_sys_reg(SysReg::CONTEXTIDR_EL1);
+            let back_ro = live.inner.get_sys_reg(SysReg::TPIDRRO_EL0);
             eprintln!(
                 "[TIDSTAMP] set CONTEXTIDR_EL1={tid} -> readback={back:?} TPIDRRO_EL0={packed:#x} -> readback={back_ro:?} set_ok={}",
                 result.is_ok()
@@ -465,16 +554,24 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
     }
 
     fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
-        let exit = HvfInner::run_to_exit(&mut self.inner, &mut self.mailbox);
         let tidstamp_debug = *self
             .tidstamp_debug
             .get_or_insert_with(|| std::env::var_os("CARRICK_TIDSTAMP_DEBUG").is_some());
+        let live = match &mut self.backing {
+            HvfVcpuBacking::Live(live) => live,
+            HvfVcpuBacking::Staged(_) => return Err(staged_error("hv_vcpu_run")),
+        };
+        if !live.ran {
+            crate::trap::admit_vcpu_first_run();
+            live.ran = true;
+        }
+        let exit = HvfInner::run_to_exit(&mut live.inner, &mut live.mailbox);
         if tidstamp_debug {
             use applevisor::prelude::SysReg;
             // Does the tid stamp SURVIVE a run/trap round trip? The stamp itself
             // reads back fine immediately after `set_sys_reg`, so if the EL1
             // `gettid` fast path is degrading, this is where it would show.
-            let back = self.inner.get_sys_reg(SysReg::CONTEXTIDR_EL1);
+            let back = live.inner.get_sys_reg(SysReg::CONTEXTIDR_EL1);
             eprintln!("[TIDSTAMP] after run: CONTEXTIDR_EL1={back:?}");
         }
         exit
@@ -482,12 +579,16 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
 
     fn kick(&self) -> Result<(), TrapError> {
         use carrick_hal::VcpuKick as _;
-        crate::vcpu_kick::VcpuKickHandle::new(self.inner.get_handle()).kick();
+        // A staged root is not running, so there is nothing to interrupt.
+        if let HvfVcpuBacking::Live(live) = &self.backing {
+            crate::vcpu_kick::VcpuKickHandle::new(live.inner.get_handle()).kick();
+        }
         Ok(())
     }
 
     fn set_pending_irq(&mut self, pending: bool) -> Result<(), TrapError> {
-        self.inner
+        self.live_mut()?
+            .inner
             .set_pending_interrupt(crate::trap::HVF_VIRTUAL_IRQ, pending)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
@@ -498,85 +599,44 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
 
     fn set_hardware_tso(&mut self, tso: bool) -> Result<(), TrapError> {
         const EN_TSO: u64 = 1 << 1;
-        let actlr = self
+        let apply = |actlr: u64| if tso { actlr | EN_TSO } else { actlr & !EN_TSO };
+        let live = match &mut self.backing {
+            HvfVcpuBacking::Live(live) => live,
+            HvfVcpuBacking::Staged(cpu) => {
+                let cpu = cpu.get_mut();
+                cpu.set_actlr_el1(apply(cpu.actlr_el1()));
+                return Ok(());
+            }
+        };
+        let actlr = live
             .inner
             .get_sys_reg(applevisor::vcpu::SysReg::ACTLR_EL1)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        let next = if tso { actlr | EN_TSO } else { actlr & !EN_TSO };
-        self.inner
-            .set_sys_reg(applevisor::vcpu::SysReg::ACTLR_EL1, next)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        self.mirror(|shadow| {
-            let staged = shadow.actlr_el1();
-            shadow.set_actlr_el1(if tso {
-                staged | EN_TSO
-            } else {
-                staged & !EN_TSO
-            });
-            Ok(())
-        })
+        live.inner
+            .set_sys_reg(applevisor::vcpu::SysReg::ACTLR_EL1, apply(actlr))
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
 
     fn set_memory_model(&mut self, tso: bool) -> Result<(), TrapError> {
         self.set_hardware_tso(tso)
     }
-}
 
-/// The first field the data-built root CPU gets wrong, compared with the boot
-/// vCPU HVF programmed. `SP_EL1` is excluded: it names the boot vCPU's mailbox
-/// slot, and a task restore keeps the destination executor's own.
-fn first_root_snapshot_difference(
-    live: &Aarch64VcpuSnapshot,
-    staged: &Aarch64VcpuSnapshot,
-) -> Option<String> {
-    macro_rules! compare {
-        ($($field:ident),* $(,)?) => {
-            $(
-                if live.$field != staged.$field {
-                    return Some(format!(
-                        "{}: boot vCPU {:#x?} data {:#x?}",
-                        stringify!($field),
-                        live.$field,
-                        staged.$field
-                    ));
-                }
-            )*
-        };
+    fn defer_stage1_maintenance(&mut self, maintenance: Stage1Maintenance) -> bool {
+        match &mut self.backing {
+            HvfVcpuBacking::Live(_) => false,
+            HvfVcpuBacking::Staged(cpu) => {
+                cpu.get_mut().owe(maintenance);
+                true
+            }
+        }
     }
-    // SCTLR_EL1's architecturally RES1 bits read back as one only once the
-    // vCPU has run (observed: 0x3400d185 after the bring-up maintenance
-    // trampoline ran, 0x400d005 when it did not), so they are not compared.
-    let res1 = carrick_mem::arch_sysregs::SCTLR_EL1_RES1;
-    if live.sctlr & !res1 != staged.sctlr & !res1 {
-        return Some(format!(
-            "sctlr: boot vCPU {:#x} data {:#x}",
-            live.sctlr, staged.sctlr
-        ));
+
+    fn take_deferred_stage1_maintenance(&mut self) -> OwedStage1Maintenance {
+        match &mut self.backing {
+            HvfVcpuBacking::Live(_) => OwedStage1Maintenance::default(),
+            HvfVcpuBacking::Staged(cpu) => cpu.get_mut().take_owed(),
+        }
     }
-    compare!(
-        gprs,
-        pc,
-        pstate,
-        sp_el0,
-        elr_el1,
-        spsr_el1,
-        ttbr0,
-        ttbr1,
-        tcr,
-        mair,
-        vbar,
-        cpacr,
-        cntkctl_el1,
-        tpidr_el0,
-        tpidrro_el0,
-        tpidr_el1,
-        contextidr_el1,
-        actlr_el1,
-        vregs,
-        fpsr,
-        fpcr,
-    );
-    None
 }
 
 // ─── HvfAarch64Vmm ───────────────────────────────────────────────────────────
@@ -1324,8 +1384,9 @@ pub fn invalidate_worker_asid(
     vcpu: &mut HvfAarch64Vcpu,
     asid: u16,
 ) -> Result<(), TrapError> {
+    let live = vcpu.live()?;
     vmm.state
-        .audit_persistent_worker_vcpu_boundary(&vcpu.inner, &vcpu.mailbox)?;
+        .audit_persistent_worker_vcpu_boundary(&live.inner, &live.mailbox)?;
     let carrier_root = vmm.state.carrier_maintenance_root()?;
     Aarch64EngineCore::<HvfAarch64Vmm>::invalidate_asid_on_vcpu(vcpu, asid, carrier_root)
 }
@@ -1441,20 +1502,11 @@ impl GuestVmBackend for HvfAarch64Vmm {
 
     fn wait_for_vcpu_slot() {
         // RETIRED: the bounded carrick-hal scheduler (installed for `vcpu_budget()`)
-        // does admission in the shared spawn path. Double-gating here would defeat
-        // reclaim (the gate slot would stay held while the thread blocks). No-op.
+        // does admission in the shared spawn path. No-op.
     }
 
     fn vcpu_budget() -> usize {
-        if hvf_vcpu_reclaim_enabled() {
-            crate::trap::hvf_vcpu_budget()
-        } else {
-            usize::MAX
-        }
-    }
-
-    fn reclaims(&self) -> bool {
-        hvf_vcpu_reclaim_enabled()
+        crate::trap::hvf_vcpu_budget()
     }
 }
 
@@ -1539,15 +1591,16 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn audit_executor_boundary(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
-        crate::trap::audit_hvpatch_executor_boundary(&self.state, &vcpu.mailbox)
+        crate::trap::audit_hvpatch_executor_boundary(&self.state, vcpu.is_staged())
     }
 
     fn restore_persistent_executor_invariants(
         &mut self,
         vcpu: &mut Self::Vcpu,
     ) -> Result<(), TrapError> {
+        let live = vcpu.live()?;
         self.state
-            .restore_persistent_worker_vcpu_boundary(&vcpu.inner, &vcpu.mailbox)
+            .restore_persistent_worker_vcpu_boundary(&live.inner, &live.mailbox)
     }
 
     fn carrier_maintenance_root(
@@ -1769,7 +1822,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn enrich_vcpu_run_error(&self, vcpu: &Self::Vcpu, error: TrapError) -> TrapError {
-        self.state.enrich_mailbox_run_error(&vcpu.mailbox, error)
+        match vcpu.live() {
+            Ok(live) => self.state.enrich_mailbox_run_error(&live.mailbox, error),
+            Err(_) => error,
+        }
     }
 
     // ── guest-memory access (the GuestMemory backing seam) ──
@@ -1850,7 +1906,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn refresh_vcpu_after_frame_cow(&self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
-        self.state.relocate_mailbox_after_cow(&mut vcpu.mailbox)
+        match vcpu.live_mut() {
+            Ok(live) => self.state.relocate_mailbox_after_cow(&mut live.mailbox),
+            // A staged root has no mailbox for a COW to relocate.
+            Err(_) => Ok(()),
+        }
     }
 
     fn ensure_frame_cow_write(
@@ -1996,8 +2056,9 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // Tear down + rebuild the VM around the new image, reset the vCPU to "initial
         // process startup" (zeroed GPRs, EL0 trampoline). Clears the alias registry.
         let plan = GuestMappingPlan::from_address_space(new_image)?;
+        let live = vcpu.live_mut()?;
         self.state
-            .execve_rebuild(&mut vcpu.inner, &mut vcpu.mailbox, &plan)
+            .execve_rebuild(&mut live.inner, &mut live.mailbox, &plan)
     }
 
     fn exec_page_tables(&self) -> Option<carrick_mem::page_table::PageTableManager> {
@@ -2018,137 +2079,6 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // live-vCPU slot (published on attach, cleared on detach) instead of
         // naming the vCPU it happened to be on when it registered.
         self.state.vcpu_kick_handle()
-    }
-
-    fn reclaim_refreshes_kicker(&self) -> bool {
-        // HVF reclaim DESTROYS the vCPU, so the runtime must unregister this thread's
-        // (now-dead-id) kick handle before the no-vCPU wait and re-register on wake.
-        true
-    }
-
-    fn save_guest_state(
-        &mut self,
-        vcpu: &mut Self::Vcpu,
-    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
-        let snapshot = vcpu.snapshot().map_err(|error| {
-            TrapError::Hypervisor(format!("HVF reclaim typed snapshot capture: {error}"))
-        })?;
-        self.state
-            .reclaim_park(&mut vcpu.inner, &mut vcpu.mailbox)?;
-        Ok(snapshot)
-    }
-
-    fn save_initial_runner_state(
-        &mut self,
-        vcpu: &mut Self::Vcpu,
-    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
-        let snapshot = vcpu.snapshot().map_err(|error| {
-            TrapError::Hypervisor(format!("HVF initial-runner snapshot capture: {error}"))
-        })?;
-        if let Some(shadow) = vcpu.root_shadow.take() {
-            let staged = shadow.into_inner().snapshot();
-            if let Some(difference) = first_root_snapshot_difference(&snapshot, &staged) {
-                return Err(TrapError::Hypervisor(format!(
-                    "data-built root CPU differs from the boot vCPU: {difference}"
-                )));
-            }
-        }
-        self.state
-            .initial_runner_park(&mut vcpu.inner, &mut vcpu.mailbox)?;
-        Ok(snapshot)
-    }
-
-    fn rebind_initial_runner_state(
-        &mut self,
-        state: &Aarch64TaskCpuStateV1,
-        vcpu: &mut Self::Vcpu,
-    ) -> Result<(), TrapError> {
-        if state.syscall_continuation.is_some() {
-            return Err(TrapError::Hypervisor(
-                "HVF initial runner restore rejected syscall continuation".to_owned(),
-            ));
-        }
-        self.state
-            .initial_runner_resume(&mut vcpu.inner, &mut vcpu.mailbox)?;
-        let destination = vcpu.snapshot()?;
-        let restored = restore_aarch64_task_state(&destination, state)?;
-        vcpu.restore(&restored)
-    }
-
-    fn save_shared_wait_state(
-        &mut self,
-        vcpu: &mut Self::Vcpu,
-    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
-        let snapshot = vcpu.snapshot().map_err(|error| {
-            TrapError::Hypervisor(format!("HVF shared-wait typed snapshot capture: {error}"))
-        })?;
-        self.state
-            .shared_wait_park(&mut vcpu.inner, &mut vcpu.mailbox)?;
-        Ok(snapshot)
-    }
-
-    fn rebind_to_slot(
-        &mut self,
-        _slot: SlotId,
-        state: &Aarch64TaskCpuStateV1,
-        vcpu: &mut Self::Vcpu,
-    ) -> Result<(), TrapError> {
-        self.state.reclaim_resume(
-            &mut vcpu.inner,
-            &mut vcpu.mailbox,
-            state.syscall_continuation,
-        )?;
-        let destination = vcpu.snapshot()?;
-        let restored = restore_aarch64_task_state(&destination, state)?;
-        vcpu.restore(&restored)
-    }
-
-    fn rebind_shared_wait_state(
-        &mut self,
-        _slot: SlotId,
-        state: &Aarch64TaskCpuStateV1,
-        vcpu: &mut Self::Vcpu,
-    ) -> Result<(), TrapError> {
-        self.state.shared_wait_resume(
-            &mut vcpu.inner,
-            &mut vcpu.mailbox,
-            /*replay_alias_union=*/ false,
-            state.syscall_continuation,
-        )?;
-        let destination = vcpu.snapshot()?;
-        let restored = restore_aarch64_task_state(&destination, state)?;
-        vcpu.restore(&restored)
-    }
-
-    fn rebind_shared_wait_state_mt(
-        &mut self,
-        _slot: SlotId,
-        state: &Aarch64TaskCpuStateV1,
-        vcpu: &mut Self::Vcpu,
-    ) -> Result<(), TrapError> {
-        // MT whole-VM lease first-waker rebuild: `self.mappings` is PER-THREAD,
-        // so replay the process-global alias registry's union on top of it —
-        // a high-VA alias a still-parked sibling mapped would otherwise be
-        // missing from the rebuilt VM's stage-2 (same shape as the fork
-        // rebuild's sibling-union replay).
-        self.state.shared_wait_resume(
-            &mut vcpu.inner,
-            &mut vcpu.mailbox,
-            /*replay_alias_union=*/ true,
-            state.syscall_continuation,
-        )?;
-        let destination = vcpu.snapshot()?;
-        let restored = restore_aarch64_task_state(&destination, state)?;
-        vcpu.restore(&restored)
-    }
-
-    fn release_vm_after_reclaim_park(&mut self) -> Result<bool, TrapError> {
-        // MT last-parker VM-only release: this thread's own vCPU is already
-        // gone (reclaim_park, snapshot stashed), and the runtime re-checked
-        // that every sibling's post-destroy "parked" mark is set — so only
-        // the VM remains. Ok(true) = the wake side must rebuild
-        // (shared_wait_resume works from the reclaim_park snapshot).
-        self.state.release_vm_after_reclaim_park().map(|()| true)
     }
 
     fn build_sibling_builder(
@@ -2207,12 +2137,16 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn abort_process_materialization(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
         self.state.abort_process_materialization()?;
-        self.state.destroy_vcpu_on_thread_exit(&mut vcpu.inner);
+        // A materialized fork child's vCPU never ran: its setup failed.
+        let site = crate::trap::VcpuDestroySite::CreationError;
+        self.state
+            .destroy_setup_vcpu(&mut vcpu.live_mut()?.inner, site);
         Ok(())
     }
 
     fn set_guest_sp(&self, vcpu: &Self::Vcpu, sp: u64) -> Result<(), TrapError> {
-        vcpu.inner
+        vcpu.live()?
+            .inner
             .set_sys_reg(applevisor::vcpu::SysReg::SP_EL0, sp)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
@@ -2222,7 +2156,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn destroy_vcpu_on_thread_exit(&mut self, vcpu: &mut Self::Vcpu) {
-        self.state.destroy_vcpu_on_thread_exit(&mut vcpu.inner);
+        // A staged root never had a vCPU, so it has none to destroy.
+        if let Ok(live) = vcpu.live_mut() {
+            self.state.destroy_vcpu_on_thread_exit(&mut live.inner);
+        }
     }
 
     fn fpsimd_enabled(&self) -> bool {
@@ -2233,7 +2170,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         &self,
         vcpu: &Self::Vcpu,
     ) -> Result<Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>, TrapError> {
-        vcpu.mailbox
+        let Ok(live) = vcpu.live() else {
+            return Ok(None);
+        };
+        live.mailbox
             .export_task_continuation()
             .map_err(|error| TrapError::Hypervisor(format!("export syscall continuation: {error}")))
     }
@@ -2242,7 +2182,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         &mut self,
         vcpu: &mut Self::Vcpu,
     ) -> Result<Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>, TrapError> {
-        vcpu.mailbox
+        let Ok(live) = vcpu.live_mut() else {
+            return Ok(None);
+        };
+        live.mailbox
             .take_task_continuation_for_executor_switch()
             .map_err(|error| TrapError::Hypervisor(format!("detach syscall continuation: {error}")))
     }
@@ -2253,7 +2196,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
     ) -> Result<(), TrapError> {
         if let Some(continuation) = continuation {
-            vcpu.mailbox
+            vcpu.live_mut()?
+                .mailbox
                 .import_task_continuation(continuation)
                 .map_err(|error| {
                     TrapError::Hypervisor(format!("attach syscall continuation: {error}"))
@@ -2264,16 +2208,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 }
 
 #[cfg(test)]
-mod reclaim_hatch_tests {
-    use super::hvf_vcpu_reclaim_enabled_value;
-
-    #[test]
-    fn hvf_vcpu_reclaim_hatch_is_default_on_and_exact_zero_off() {
-        assert!(hvf_vcpu_reclaim_enabled_value(None));
-        assert!(!hvf_vcpu_reclaim_enabled_value(Some("0")));
-        assert!(hvf_vcpu_reclaim_enabled_value(Some("1")));
-        assert!(hvf_vcpu_reclaim_enabled_value(Some("false")));
-    }
+mod persistent_worker_tests {
 
     #[test]
     fn persistent_hvf_workers_install_and_run_the_scoped_asid_trampoline() {

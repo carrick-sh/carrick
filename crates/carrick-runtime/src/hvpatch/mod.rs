@@ -1474,7 +1474,7 @@ fn finish_hvpatch_image_owned(
     })?;
     let _patch_summary = (prepared.manifest.len(), prepared.island_bases.len());
     let requires_syscall_traps = dispatcher.requires_syscall_traps();
-    let outcome = match ownership {
+    match ownership {
         Some((carrier, lease)) => crate::runtime::finish_and_run_image_on(
             prepared.image,
             dispatcher,
@@ -1491,23 +1491,7 @@ fn finish_hvpatch_image_owned(
             max_traps,
             debug_state_path,
         ),
-    };
-    // vCPU reclaim census for the whole run. The M:N executor design deletes
-    // the destroy/recreate reclaim path, and the rule is that the win is
-    // measured before the path is removed. One line at the end of a run is not
-    // debug spam; it is the before-number that change has to beat.
-    let (reclaims, park_ns, resume_ns) = crate::vcpu_loop::vcpu_reclaim_census();
-    if reclaims > 0 {
-        tracing::info!(
-            target: "carrick::vcpu",
-            reclaims,
-            park_ms = park_ns / 1_000_000,
-            resume_ms = resume_ns / 1_000_000,
-            total_ms = (park_ns + resume_ns) / 1_000_000,
-            "hvpatch vCPU reclaim census"
-        );
     }
-    outcome
 }
 
 #[cfg(all(

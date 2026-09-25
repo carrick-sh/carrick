@@ -23,8 +23,6 @@ pub(crate) const ROOT_EL0_ENTRY_SPSR: u64 = 0x3c0;
 pub(crate) const EL0_COUNTER_ACCESS: u64 = (1 << 1) | (1 << 0);
 
 /// The registers of a task that owns no vCPU yet.
-// Transition: only the boot vCPU's shadow uses this until the root boots on it.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct StagedCpu {
     snapshot: Aarch64VcpuSnapshot,
@@ -35,7 +33,6 @@ fn unsupported(what: &str) -> TrapError {
     TrapError::Hypervisor(format!("staged root CPU has no {what}"))
 }
 
-#[allow(dead_code)]
 impl StagedCpu {
     /// The root's first-instruction register file, programmed from `plan`
     /// exactly as a freshly created vCPU would be before its first run.

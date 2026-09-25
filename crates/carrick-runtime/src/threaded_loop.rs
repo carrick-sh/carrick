@@ -202,19 +202,6 @@ where
     }))
 }
 
-fn resolve_hvpatch_setup<T, Retire>(
-    setup: Result<T, RuntimeError>,
-    retire_vcpu: Retire,
-) -> Result<T, RuntimeError>
-where
-    Retire: FnOnce(),
-{
-    if setup.is_err() {
-        retire_vcpu();
-    }
-    setup
-}
-
 /// HVPatch is the only execution path, so the root registry identity is always
 /// the Linux bootstrap pid. It was previously selected against the backend, with
 /// the host pid as the retired lanes' answer.
@@ -355,11 +342,10 @@ where
             std::panic::resume_unwind(payload);
         }
     };
-    let root_initialization = resolve_hvpatch_setup(setup, || {
-        // The outer HVPatch owner destroys the VM and records the terminal.
-        // Retire only this already-created vCPU so teardown has one owner.
-        engine.destroy_vcpu_on_thread_exit();
-    })?;
+    // A root boots without a vCPU (its registers are staged data), so a
+    // failed setup has no vCPU to retire; the outer HVPatch owner destroys the
+    // VM and records the terminal.
+    let root_initialization = setup?;
     let (hvpatch_process, mut first_root_publications) = match root_initialization {
         Some(initialization) => {
             let (process, publications) = initialization.into_parts();
@@ -777,18 +763,5 @@ mod tests {
                 .mappings
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn hvpatch_setup_failure_retires_only_the_created_vcpu_once() {
-        let retire_count = std::cell::Cell::new(0_u32);
-        let result = resolve_hvpatch_setup::<(), _>(
-            Err(RuntimeError::Unsupported(
-                "deterministic post-vCPU setup failure".to_owned(),
-            )),
-            || retire_count.set(retire_count.get() + 1),
-        );
-        assert!(result.is_err());
-        assert_eq!(retire_count.get(), 1);
     }
 }

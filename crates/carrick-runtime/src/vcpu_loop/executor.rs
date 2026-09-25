@@ -215,9 +215,29 @@ where
             failure = Some(drain_error);
         }
     }
-    if let Some(destroy_error) =
-        destroy_and_unregister(backend, &scheduler, &registration, &kick, &receipts)
-    {
+    // A worker that faulted after publishing its startup leaves the scheduler
+    // now, but keeps its idle vCPU until pool shutdown: a vCPU is destroyed
+    // only at VM teardown (EL1 plan 1a D2), and the pool's capacity shrinks
+    // exactly as before.
+    let faulted_after_startup = startup_sent && failure.is_some();
+    if faulted_after_startup {
+        if let Err(error) = scheduler.unregister_executor(&registration) {
+            let message = format!("executor unregister failed: {error}");
+            if let Some(existing) = &mut failure {
+                existing.push_str("; ");
+                existing.push_str(&message);
+            }
+        }
+        control.wait_for_shutdown();
+    }
+    if let Some(destroy_error) = destroy_and_unregister(
+        backend,
+        &scheduler,
+        &registration,
+        &kick,
+        &receipts,
+        faulted_after_startup,
+    ) {
         retired = true;
         if let Some(existing) = &mut failure {
             existing.push_str("; ");

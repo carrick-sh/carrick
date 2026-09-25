@@ -64,33 +64,6 @@ mod fd_ceiling;
 
 const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 
-/// vCPU reclaim census.
-///
-/// The M:N scheduler design removes the destroy/recreate reclaim path
-/// entirely, and the rule is that the win must be measured before the path is
-/// deleted rather than assumed. A cutoff sweep only bounds the reclaims the
-/// 250 ms cutoff currently SUPPRESSES (measured at ~+9% CPU); it cannot say
-/// what today's reclaims actually cost. These counters can.
-///
-/// Three relaxed atomics on a path that already destroys and recreates an HVF
-/// vCPU are not measurable overhead.
-pub(crate) static VCPU_RECLAIMS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub(crate) static VCPU_RECLAIM_PARK_NS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub(crate) static VCPU_RECLAIM_RESUME_NS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Totals for this process: (reclaims, park ns, resume ns).
-pub(crate) fn vcpu_reclaim_census() -> (u64, u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (
-        VCPU_RECLAIMS.load(Relaxed),
-        VCPU_RECLAIM_PARK_NS.load(Relaxed),
-        VCPU_RECLAIM_RESUME_NS.load(Relaxed),
-    )
-}
-
 pub(crate) mod memory;
 #[cfg(test)]
 pub(crate) mod native_probe;

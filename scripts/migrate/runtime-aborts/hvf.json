@@ -1883,6 +1883,28 @@
       "rationale": "EL1 in-guest panic handler invoked and forwarded fatal marker via hvc #3 with panic sentinel.",
       "sink": "fatal",
       "domain": "el1"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
+      "function": "HvfAarch64Vcpu::executor_vcpu",
+      "ordinal_in_function": 1,
+      "fingerprint": "79c378105ab7464aa786d5e5c99d3dbd618840f6b1096f723944c44088740924",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvf::vcpu_lifetime",
+      "rationale": "A persistent executor's vCPU half holds a staged root CPU instead of its own live vCPU: the executor lease was assembled from a task's backing, so kick handles, mailbox slots and vCPU identity would name no hardware.",
+      "sink": "fatal",
+      "domain": "hvf::vcpu_lifetime"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/vcpu_topology.rs",
+      "function": "topology_fault",
+      "ordinal_in_function": 1,
+      "fingerprint": "6bea825aca6b06278fcf9469d8eae2bcbe8c32f41f27dce51077d6be404957ef",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvf::vcpu_lifetime",
+      "rationale": "A vCPU create after the VM generation's first run, a first run during teardown, or a destroy before teardown violates Hypervisor.framework's final-topology rule (hv_gic.h) that EL1 plan 1a D2 makes structural; continuing would run the in-kernel GIC on a topology HVF forbids.",
+      "sink": "fatal",
+      "domain": "hvf::vcpu_lifetime"
     }
   ]
 }

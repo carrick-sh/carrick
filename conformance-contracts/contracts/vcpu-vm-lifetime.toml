@@ -1,0 +1,18 @@
+schema_version = 1
+id = "kernel.vcpu.vm-lifetime"
+title = "Every vCPU lives for its VM's whole life: created before the VM's first run, destroyed only at teardown"
+guest_surfaces = ["scheduler:vcpu-lifecycle", "scheduler:executor-pool", "kernel:container-root-boot"]
+semantic_authority = ["Hypervisor.framework hv_gic.h: once the virtual machine vcpus are running, its topology is considered final; destroy vcpus only when you are tearing down the virtual machine", "libkrun (Apache-2.0) keeps one vCPU per thread for the VM's life", "Linux supplies no oracle: the guest-visible obligation is that container roots, clone children and forks run unchanged"]
+fixture = "unit:vcpu-topology-model; embed:two-roots-one-carrier"
+scale_points = [1, 2]
+rationale = "EL1 plan 1a adopts the in-kernel GIC, whose topology must be final once a vCPU runs. Carrick destroyed and recreated vCPUs mid-life: every container root created a boot vCPU only to hold its first registers, ran the bring-up TLB maintenance trampoline on it (so the executor pool's vCPUs were created after the VM's first run), snapshotted it and destroyed it; a second root in a reused carrier did this while executor vCPUs ran; a faulted executor destroyed its vCPU at once; and an unreached M:N reclaim/shared-wait machinery destroyed and recreated vCPUs around blocking waits. Roots now boot from a CPU state staged as data (`StagedCpu`), as clone children already did; stage-1 maintenance a never-run staged CPU is asked for is owed to its first executor load and discharged there before the first instruction; the reclaim/shared-wait/initial-runner paths and the CARRICK_HVF_VCPU_RECLAIM hatch are deleted; a faulted executor keeps its idle vCPU until pool shutdown. `vcpu_topology::VcpuTopology` makes the rule structural: the only hv_vcpu_create, first hv_vcpu_run and raw hv_vcpu_destroy consult it, and a create after the generation's first run or a destroy before teardown is a carrier fault."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-vmm-hvf::trap::vcpu_admission::vcpu_lifetime_tests::vcpus_live_for_the_vm_lifetime; carrick-vmm-hvf::trap::vcpu_topology::tests::a_create_after_the_first_run_is_a_violation; carrick-vmm-hvf::trap::vcpu_topology::tests::a_destroy_while_the_topology_runs_is_a_violation_at_every_site; carrick-vmm-hvf::trap::vcpu_topology::tests::the_retired_initial_runner_hand_off_violates_the_topology; carrick-vmm-hvf::staged_cpu::tests::a_staged_root_starts_at_the_el0_entry_trampoline"
+embed = "carrick-embed::el1_vcpu_lifetime (signed; two roots in one carrier, zero vCPU creates or destroys between them, teardown destroys exactly what the carrier created)"
+ecosystem = ["go:build", "go:testing", "go:os_signal", "cpython:threading", "cpython:multiprocessing_spawn"]
+
+[bindings.unresolved]
+docker = "vCPU lifetime is host-internal; Linux supplies no oracle for it. The Linux obligation (roots, threads and forks run unchanged) is carried by the ecosystem rows and the el1-gate LTP rows."
+embed_structural = "The embed binding reads process-lifetime create/destroy totals (`carrick_runtime::vcpu_lifecycle_snapshot`), not a per-container WorkObservation metric."

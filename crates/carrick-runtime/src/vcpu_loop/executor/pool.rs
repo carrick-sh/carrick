@@ -518,6 +518,11 @@ pub(crate) struct PoolControl {
     pub(crate) wait_service: carrick_kernel::kernel::continuation::CarrierWaitService,
     scheduler: Arc<Scheduler>,
     workers: Mutex<std::collections::BTreeMap<ExecutorId, WorkerControlHandle>>,
+    /// Set once pool shutdown (or startup rollback) begins. A worker that
+    /// faulted after its startup keeps its idle vCPU until then: every vCPU
+    /// lives for its VM's life (EL1 plan 1a D2).
+    shutdown_begun: Mutex<bool>,
+    shutdown_changed: parking_lot::Condvar,
 }
 
 #[derive(Clone, Debug)]
@@ -550,6 +555,21 @@ impl PoolControl {
             ),
             scheduler,
             workers: Mutex::new(std::collections::BTreeMap::new()),
+            shutdown_begun: Mutex::new(false),
+            shutdown_changed: parking_lot::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        *self.shutdown_begun.lock() = true;
+        self.shutdown_changed.notify_all();
+    }
+
+    /// Block a faulted worker, holding its idle vCPU, until pool shutdown.
+    pub(crate) fn wait_for_shutdown(&self) {
+        let mut begun = self.shutdown_begun.lock();
+        while !*begun {
+            self.shutdown_changed.wait(&mut begun);
         }
     }
 
@@ -1024,7 +1044,6 @@ where
     resolver: Arc<R>,
     _debug_aux_provider: Arc<dyn carrick_kernel::kernel::debug::KernelDebugAuxProvider>,
     debug_aux_registration: carrick_kernel::kernel::core::DebugAuxProviderRegistration,
-    #[cfg(test)]
     pub(crate) control: Arc<PoolControl>,
 }
 
@@ -1233,7 +1252,7 @@ where
                 }) {
                 Ok(join) => join,
                 Err(error) => {
-                    let cleanup_failures = stop_and_join_startup(handles);
+                    let cleanup_failures = stop_and_join_startup(&control, handles);
                     let mut message = format!("worker {index} spawn failed: {error}");
                     append_failures(&mut message, cleanup_failures);
                     return Err(ExecutorPoolStartError {
@@ -1305,7 +1324,7 @@ where
         }
 
         if let Some(mut message) = startup_failure {
-            append_failures(&mut message, stop_and_join_startup(handles));
+            append_failures(&mut message, stop_and_join_startup(&control, handles));
             return Err(ExecutorPoolStartError {
                 configured_workers,
                 message,
@@ -1316,7 +1335,7 @@ where
         for handle in &handles {
             if handle.command.send(WorkerCommand::Run).is_err() {
                 let mut message = "worker stopped before pool publication".to_owned();
-                append_failures(&mut message, stop_and_join_startup(handles));
+                append_failures(&mut message, stop_and_join_startup(&control, handles));
                 return Err(ExecutorPoolStartError {
                     configured_workers,
                     message,
@@ -1334,7 +1353,7 @@ where
             Ok(driver) => driver,
             Err(error) => {
                 let mut message = format!("preemption driver start failed: {error}");
-                append_failures(&mut message, stop_and_join_startup(handles));
+                append_failures(&mut message, stop_and_join_startup(&control, handles));
                 return Err(ExecutorPoolStartError {
                     configured_workers,
                     message,
@@ -1352,7 +1371,6 @@ where
             resolver,
             _debug_aux_provider: debug_aux_provider,
             debug_aux_registration,
-            #[cfg(test)]
             control,
         })
     }
@@ -1384,6 +1402,7 @@ where
     }
 
     pub fn shutdown(mut self) -> Result<ExecutorPoolReport, ExecutorPoolShutdownError> {
+        self.control.begin_shutdown();
         let fair_preemption_enabled = self.driver.is_enabled();
         self.driver.shutdown();
         self.scheduler
@@ -1482,7 +1501,8 @@ where
     }
 }
 
-fn stop_and_join_startup(handles: Vec<WorkerHandle>) -> Vec<String> {
+fn stop_and_join_startup(control: &PoolControl, handles: Vec<WorkerHandle>) -> Vec<String> {
+    control.begin_shutdown();
     for handle in &handles {
         let _ = handle.command.send(WorkerCommand::Stop);
     }
