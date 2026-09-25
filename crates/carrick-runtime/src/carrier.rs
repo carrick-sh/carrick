@@ -150,7 +150,33 @@ pub struct CarrierSnapshot {
     pub live_workers: Option<usize>,
     pub vm_create_success_events: usize,
     pub vm_lifecycle_violations: usize,
+    /// Process-lifetime vCPU create/destroy totals on HVF; `None` elsewhere.
+    /// Topology tests compare deltas across a workload.
+    pub vcpu_lifecycle: Option<VcpuLifecycleSnapshot>,
     pub container_inits: Option<Vec<ContainerInitSnapshot>>,
+}
+
+/// vCPU create and destroy totals for the carrier process.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct VcpuLifecycleSnapshot {
+    pub created: u64,
+    pub destroyed: u64,
+}
+
+/// The carrier process's vCPU create/destroy totals (HVF only).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn vcpu_lifecycle_snapshot() -> Option<VcpuLifecycleSnapshot> {
+    let totals = carrick_vmm_hvf::vcpu_lifecycle_totals();
+    Some(VcpuLifecycleSnapshot {
+        created: totals.created,
+        destroyed: totals.destroyed,
+    })
+}
+
+/// The carrier process's vCPU create/destroy totals (HVF only).
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn vcpu_lifecycle_snapshot() -> Option<VcpuLifecycleSnapshot> {
+    None
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1075,6 +1101,7 @@ impl CarrierRuntime {
                 })
                 .count(),
             vm_lifecycle_violations: lifecycle.violations.len(),
+            vcpu_lifecycle: vcpu_lifecycle_snapshot(),
             container_inits,
         }
     }
