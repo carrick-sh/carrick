@@ -801,6 +801,72 @@ const fn ranges_do_not_overlap(a_base: u64, a_size: u64, b_base: u64, b_size: u6
     a_base + a_size <= b_base || b_base + b_size <= a_base
 }
 
+/// Guest-physical window of Hypervisor.framework's in-kernel GICv3
+/// (`hv_gic_create`) on the HVF carrier VM. Nothing maps it: the guest reaches
+/// its CPU interface through the ICC_* system registers, and the host
+/// programs the redistributors through `hv_gic_*` calls. The stage-2 map
+/// boundary and stage-1 publication both refuse it. It sits between the
+/// vvar/vDSO/clock-stub pages (0x2E_0000_0000) and the sigreturn trampoline
+/// (0x30_0000_0000), below 2^40.
+pub const LINUX_GIC_WINDOW_BASE: u64 = 0x2F_0000_0000;
+pub const LINUX_GIC_WINDOW_SIZE: u64 = 0x1000_0000; // 256 MiB
+pub const LINUX_GIC_DISTRIBUTOR_BASE: u64 = LINUX_GIC_WINDOW_BASE;
+/// Room for the distributor frame (Hypervisor.framework reports 64 KiB).
+pub const LINUX_GIC_DISTRIBUTOR_MAX: u64 = 0x100_0000; // 16 MiB
+pub const LINUX_GIC_REDISTRIBUTOR_BASE: u64 = LINUX_GIC_WINDOW_BASE + LINUX_GIC_DISTRIBUTOR_MAX;
+/// Room for the redistributor region (Hypervisor.framework reports 32 MiB).
+pub const LINUX_GIC_REDISTRIBUTOR_MAX: u64 = LINUX_GIC_WINDOW_SIZE - LINUX_GIC_DISTRIBUTOR_MAX;
+
+/// Every reserved guest region the GIC window must stay clear of.
+const GIC_WINDOW_NEIGHBOURS: &[(u64, u64)] = &[
+    (LINUX_ROSETTA_IPA_BASE, LINUX_ROSETTA_WINDOW_SIZE),
+    (LINUX_ALIAS_IPA_BASE, LINUX_ALIAS_IPA_SIZE),
+    (LINUX_INFO_PAGE_BASE, 0x1_0000),
+    (LINUX_KERNEL_REGION_BASE, LINUX_KERNEL_REGION_SIZE),
+    (LINUX_EL1_KERNEL_BASE, LINUX_EL1_KERNEL_SIZE),
+    (
+        crate::vdso::LINUX_VVAR_BASE,
+        LINUX_EL0_CLOCK_STUB_BASE + LINUX_EL0_CLOCK_STUB_SIZE - crate::vdso::LINUX_VVAR_BASE,
+    ),
+    (
+        LINUX_SIGRETURN_TRAMPOLINE_BASE,
+        LINUX_SIGRETURN_TRAMPOLINE_SIZE,
+    ),
+    (LINUX_HEAP_BASE, LINUX_HEAP_SIZE),
+    (LINUX_MMAP_BASE, LINUX_MMAP_SIZE_MAX),
+    (LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE),
+    (LINUX_PRIVATE_OVERLAY_BASE, LINUX_PRIVATE_OVERLAY_SIZE),
+    (
+        LINUX_HVPATCH_ROOT_SLOT_BASE,
+        LINUX_HVPATCH_RESERVED_END - LINUX_HVPATCH_ROOT_SLOT_BASE,
+    ),
+    (LINUX_STACK_TOP - LINUX_STACK_SIZE, LINUX_STACK_SIZE),
+];
+
+const _: () = {
+    let mut i = 0;
+    while i < GIC_WINDOW_NEIGHBOURS.len() {
+        let (base, len) = GIC_WINDOW_NEIGHBOURS[i];
+        assert!(
+            ranges_do_not_overlap(LINUX_GIC_WINDOW_BASE, LINUX_GIC_WINDOW_SIZE, base, len),
+            "GIC window overlaps a reserved guest region"
+        );
+        i += 1;
+    }
+};
+const _: () = assert!(LINUX_GIC_WINDOW_BASE + LINUX_GIC_WINDOW_SIZE <= 1 << 40);
+const _: () = assert!(LINUX_GIC_WINDOW_BASE.is_multiple_of(LINUX_GIC_WINDOW_SIZE));
+// The boot stage-1 image leaves the whole 1 GiB block holding the window
+// invalid (`stage1_identity_page_tables`); nothing else may live in it.
+const _: () = assert!(LINUX_GIC_WINDOW_BASE.is_multiple_of(1 << 30));
+const _: () = assert!(LINUX_GIC_WINDOW_SIZE <= 1 << 30);
+const _: () = assert!(LINUX_GIC_WINDOW_BASE >> 30 != LINUX_KERNEL_REGION_BASE >> 30);
+
+/// True if `[ipa, ipa + len)` touches the in-kernel GIC's window.
+pub const fn ipa_overlaps_gic_window(ipa: u64, len: u64) -> bool {
+    len != 0 && !ranges_do_not_overlap(ipa, len, LINUX_GIC_WINDOW_BASE, LINUX_GIC_WINDOW_SIZE)
+}
+
 const _: () = assert!(
     ranges_do_not_overlap(
         LINUX_EL1_KERNEL_BASE,
@@ -3310,6 +3376,13 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
         let va = index << 30;
         let descriptor = if index == kernel_l1_index {
             table_descriptor(l2_b_pa)
+        } else if index == LINUX_GIC_WINDOW_BASE >> 30 {
+            // The in-kernel GIC's window has no stage-1 translation: an
+            // identity user block here would hand guest EL0 the distributor
+            // and redistributors as MMIO. The 1 GiB block holding the window
+            // is left invalid; an access faults at stage 1 exactly as an
+            // access to unbacked guest-physical memory did before the GIC.
+            0
         } else {
             let mut flags = USER_BLOCK_FLAGS;
             if va >= arena_start && va < arena_end {
@@ -6460,6 +6533,10 @@ mod stage1_tests {
                 );
                 continue;
             }
+            if index as u64 == LINUX_GIC_WINDOW_BASE >> 30 {
+                assert_eq!(d, 0, "L1A[{index}] (in-kernel GIC window) must be invalid");
+                continue;
+            }
             assert!(valid_block(d), "L1A[{}] must be a block", index);
             assert_eq!(ap(d), 0b01, "L1A[{}] AP must be 01", index);
             assert_eq!(pxn(d), 1, "L1A[{}] PXN must be 1", index);
@@ -7988,6 +8065,37 @@ mod kernel_only_range_tests {
         assert!(!is_carrick_kernel_only_range(
             LINUX_HEAP_BASE,
             LINUX_HEAP_BASE + 0x4000
+        ));
+    }
+
+    #[test]
+    fn gic_window_is_below_the_trampoline_and_above_the_vdso() {
+        const { assert!(LINUX_GIC_WINDOW_BASE >= LINUX_EL0_CLOCK_STUB_BASE + LINUX_EL0_CLOCK_STUB_SIZE) };
+        const {
+            assert!(
+                LINUX_GIC_WINDOW_BASE + LINUX_GIC_WINDOW_SIZE <= LINUX_SIGRETURN_TRAMPOLINE_BASE
+            )
+        };
+        assert!(ipa_overlaps_gic_window(
+            LINUX_GIC_REDISTRIBUTOR_BASE,
+            0x2_0000
+        ));
+        assert!(ipa_overlaps_gic_window(
+            LINUX_GIC_WINDOW_BASE - 0x2000,
+            0x4000
+        ));
+        assert!(!ipa_overlaps_gic_window(
+            LINUX_GIC_WINDOW_BASE - 0x4000,
+            0x4000
+        ));
+        assert!(!ipa_overlaps_gic_window(
+            LINUX_SIGRETURN_TRAMPOLINE_BASE,
+            0x4000
+        ));
+        assert!(!ipa_overlaps_gic_window(LINUX_GIC_WINDOW_BASE, 0));
+        assert!(!is_carrick_kernel_only_range(
+            LINUX_GIC_WINDOW_BASE,
+            LINUX_GIC_WINDOW_BASE + 0x4000
         ));
     }
 }

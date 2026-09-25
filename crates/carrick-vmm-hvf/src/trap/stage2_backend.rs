@@ -287,6 +287,11 @@ pub(crate) unsafe fn inventory_hv_vm_map(
     size: usize,
     permissions: u64,
 ) -> applevisor_sys::hv_return_t {
+    // The in-kernel GIC owns this guest-physical window: a stage-2 mapping
+    // there would shadow the distributor or a redistributor.
+    if carrick_mem::memory::ipa_overlaps_gic_window(ipa, size as u64) {
+        return 0xfae9_4003_u32 as applevisor_sys::hv_return_t; // HV_BAD_ARGUMENT
+    }
     #[cfg(test)]
     if STAGE2_AUDIT_STATE.with(|s| s.borrow().enabled) {
         let should_fail = STAGE2_AUDIT_STATE.with(|s| {
@@ -1200,4 +1205,43 @@ mod tests {
         assert!(!is_aarch64_el0_abort_exception(svc_syndrome, el0_pstate));
         assert!(!is_aarch64_el0_abort_exception(hvc_syndrome, el0_pstate));
     }
+}
+
+/// The in-kernel GIC owns its guest-physical window: a stage-2 mapping there
+/// would shadow the distributor or a redistributor, so the one raw map
+/// boundary refuses any extent touching it.
+#[cfg(test)]
+#[test]
+fn stage2_map_refuses_the_gic_window() {
+    use carrick_mem::memory::{
+        LINUX_GIC_DISTRIBUTOR_BASE, LINUX_GIC_REDISTRIBUTOR_BASE, LINUX_GIC_WINDOW_BASE,
+        LINUX_GIC_WINDOW_SIZE,
+    };
+    const HV_BAD_ARGUMENT: applevisor_sys::hv_return_t =
+        0xfae9_4003_u32 as applevisor_sys::hv_return_t;
+    let _stub = ScopedStage2MapTestStub::enable();
+    let mut page = vec![0u8; 0x4000];
+    for ipa in [
+        LINUX_GIC_DISTRIBUTOR_BASE,
+        LINUX_GIC_REDISTRIBUTOR_BASE,
+        LINUX_GIC_WINDOW_BASE + LINUX_GIC_WINDOW_SIZE - 0x4000,
+        LINUX_GIC_WINDOW_BASE - 0x2000,
+    ] {
+        // SAFETY: the test stub records the call; nothing reaches HVF.
+        let rc = unsafe { inventory_hv_vm_map(page.as_mut_ptr().cast(), ipa, 0x4000, 0b111) };
+        assert_eq!(
+            rc, HV_BAD_ARGUMENT,
+            "stage-2 map at {ipa:#x} must be refused"
+        );
+    }
+    // SAFETY: as above.
+    let rc = unsafe {
+        inventory_hv_vm_map(
+            page.as_mut_ptr().cast(),
+            LINUX_GIC_WINDOW_BASE - 0x4000,
+            0x4000,
+            0b111,
+        )
+    };
+    assert_eq!(rc, 0, "the page below the window is ordinary");
 }

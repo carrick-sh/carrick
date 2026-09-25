@@ -190,6 +190,10 @@ pub enum PageTableError {
     ConflictingArenaSource,
     /// Host backing pointer for the page-table arena at base IPA was unresolved.
     UnresolvedArena(u64),
+    /// An output address in the in-kernel GIC's guest-physical window
+    /// ([`crate::memory::LINUX_GIC_WINDOW_BASE`]): a stage-1 leaf there would
+    /// give the guest MMIO access to the distributor or a redistributor.
+    GicWindowOutput,
 }
 
 impl core::fmt::Display for PageTableError {
@@ -206,6 +210,7 @@ impl core::fmt::Display for PageTableError {
                     base
                 )
             }
+            Self::GicWindowOutput => write!(f, "output address in the in-kernel GIC window"),
         }
     }
 }
@@ -1859,6 +1864,14 @@ impl PageTableManager {
                     | PtOp::ReadWrite { .. }
                     | PtOp::KernelReadOnly { .. } => self.desc_for(op, block_start, level),
                 };
+                // A valid leaf whose output lies in the in-kernel GIC's window
+                // would expose the distributor or a redistributor as memory,
+                // whether the output was rebuilt from the identity VA or kept.
+                if new_desc & VALID != 0
+                    && crate::memory::ipa_overlaps_gic_window(new_desc & mask, span)
+                {
+                    return Err(PageTableError::GicWindowOutput);
+                }
                 if new_desc != desc {
                     self.write_desc(off, new_desc);
                     changed = true;
@@ -2310,6 +2323,9 @@ impl PageTableManager {
         if va & (FOUR_KIB - 1) != ipa & (FOUR_KIB - 1) {
             return Err(PageTableError::BadAddress);
         }
+        if crate::memory::ipa_overlaps_gic_window(ipa, len) {
+            return Err(PageTableError::GicWindowOutput);
+        }
         let pages = len.div_ceil(FOUR_KIB);
         let mut changed = false;
         for index in 0..pages {
@@ -2413,6 +2429,9 @@ impl PageTableManager {
         const L1_SPAN: u64 = 1 << 39;
         if len == 0 {
             return Ok(false);
+        }
+        if crate::memory::ipa_overlaps_gic_window(ipa, len) {
+            return Err(PageTableError::GicWindowOutput);
         }
         let end = va.checked_add(len).ok_or(PageTableError::BadAddress)?;
 
@@ -2640,6 +2659,79 @@ mod tests {
         let mut bytes = stage1_identity_page_tables();
         bytes.resize(0x40000, 0);
         PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE)
+    }
+
+    /// No stage-1 leaf may output into the in-kernel GIC's guest-physical
+    /// window: EL0 or EL1 would reach the distributor or a redistributor as
+    /// memory. Every publication path that writes an output address refuses.
+    #[test]
+    fn stage1_publication_refuses_outputs_in_the_gic_window() {
+        use crate::memory::{LINUX_GIC_REDISTRIBUTOR_BASE, LINUX_GIC_WINDOW_BASE};
+        let mut pt = manager();
+        assert_eq!(
+            pt.map_aliased(
+                LINUX_MMAP_BASE,
+                LINUX_GIC_REDISTRIBUTOR_BASE,
+                0x4000,
+                true,
+                None
+            ),
+            Err(PageTableError::GicWindowOutput)
+        );
+        assert_eq!(
+            pt.map_private_aliased(
+                LINUX_MMAP_BASE,
+                LINUX_GIC_WINDOW_BASE - 0x2000,
+                0x4000,
+                true,
+                None
+            ),
+            Err(PageTableError::GicWindowOutput)
+        );
+        pt.map_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, true, None)
+            .expect("an ordinary alias");
+        assert_eq!(
+            pt.repoint_preserving_attributes(LINUX_MMAP_BASE, LINUX_GIC_WINDOW_BASE, 0x4000, None),
+            Err(PageTableError::GicWindowOutput)
+        );
+        assert_eq!(pt.translate(LINUX_MMAP_BASE), Some(LINUX_ALIAS_IPA_BASE));
+        let applied = pt.apply(
+            LINUX_GIC_WINDOW_BASE,
+            0x4000,
+            PtOp::ReadWrite { exec: false },
+            None,
+        );
+        assert!(
+            applied.is_err(),
+            "apply published the GIC window: {applied:?}"
+        );
+        assert_eq!(pt.translate(LINUX_GIC_WINDOW_BASE), None);
+    }
+
+    /// The boot stage-1 images (identity and per-mm HVPatch) give the GIC
+    /// window no translation at all, so guest EL0 cannot reach the
+    /// distributor or a redistributor through an identity VA.
+    #[test]
+    fn boot_stage1_images_leave_the_gic_window_untranslated() {
+        use crate::memory::{
+            LINUX_GIC_DISTRIBUTOR_BASE, LINUX_GIC_REDISTRIBUTOR_BASE, LINUX_GIC_WINDOW_BASE,
+            LINUX_GIC_WINDOW_SIZE,
+        };
+        for bytes in [stage1_identity_page_tables(), stage1_hvpatch_page_tables()] {
+            let pt = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
+            for va in [
+                LINUX_GIC_DISTRIBUTOR_BASE,
+                LINUX_GIC_REDISTRIBUTOR_BASE,
+                LINUX_GIC_WINDOW_BASE + LINUX_GIC_WINDOW_SIZE - 0x1000,
+            ] {
+                assert_eq!(pt.translate(va), None, "{va:#x}");
+            }
+            assert_eq!(
+                pt.translate(LINUX_GIC_WINDOW_BASE - 0x1000),
+                Some(LINUX_GIC_WINDOW_BASE - 0x1000),
+                "the block below keeps its identity user mapping"
+            );
+        }
     }
 
     /// The undo journal must roll a transaction back to EXACTLY the image a
