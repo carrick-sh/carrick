@@ -4492,7 +4492,7 @@ pub enum El1IrqMode {
     Masked,
     /// Hypervisor.framework's in-kernel GICv3: the served-syscall return path
     /// opens a one-instruction IRQ window when `ISR_EL1.I` shows an interrupt
-    /// pending, and [`write_el1_irq_hook`] acknowledges and completes it.
+    /// pending, and the vector page's IRQ hook acknowledges and completes it.
     GicWindow,
 }
 

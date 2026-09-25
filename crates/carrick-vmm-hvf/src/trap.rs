@@ -6152,9 +6152,10 @@ impl HvfVmState {
 
 /// The Hypervisor.framework virtual IRQ line, numbered as the SDK numbers it.
 ///
-/// Every kick Carrick cannot surface where it lands (inside its own EL1 code) is
-/// re-armed as a pending virtual IRQ whose lower-EL vector (`hvc #4`) surfaces
-/// it at the next EL0 boundary. `applevisor-sys` 1.0.0 declares
+/// Without an in-kernel GIC (only the `CARRICK_HVF_GIC=0` hatch since EL1 plan
+/// 1a; `crate::gic` owns the choice) every kick Carrick cannot surface where it
+/// lands (inside its own EL1 code) is re-armed as a pending virtual IRQ whose
+/// lower-EL vector (`hvc #4`) surfaces it at the next EL0 boundary. `applevisor-sys` 1.0.0 declares
 /// `hv_interrupt_type_t { FIQ, IRQ }` — the reverse of the SDK's
 /// `hv_vcpu_types.h`, where `HV_INTERRUPT_TYPE_IRQ` is 0 and
 /// `HV_INTERRUPT_TYPE_FIQ` is 1 — so its `IRQ` variant asserts the FIQ line.

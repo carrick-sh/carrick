@@ -15,7 +15,7 @@
 //!
 //! Once a VM has a GIC, `hv_vcpu_set_pending_interrupt` returns
 //! `HV_UNSUPPORTED` (`hv_vcpu.h`), so the kick a vCPU owes at its next EL0
-//! boundary (`carrick_aarch64::owed_kick`) is SGI [`KICK_INTID`] made pending
+//! boundary (`carrick_aarch64::owed_kick`) is SGI 15 (`KICK_INTID`) made pending
 //! in the vCPU's redistributor (`GICR_ISPENDR0`) and withdrawn with
 //! `GICR_ICPENDR0`. Unlike the legacy line, that pending state survives
 //! `hv_vcpu_run` returns until the guest takes it or the host withdraws it.
