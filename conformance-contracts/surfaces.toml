@@ -405,15 +405,19 @@ contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.mm.address-spac
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/mm_occupancy.rs"
-contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.mm.address-space-occupancy", "kernel.mm.executor-admission"]
+contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.mm.address-space-occupancy", "kernel.mm.executor-admission", "kernel.el1.address-space-switch"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/mm_occupancy/tests.rs"
-contracts = ["kernel.mm.address-space-occupancy", "kernel.mm.executor-admission"]
+contracts = ["kernel.mm.address-space-occupancy", "kernel.mm.executor-admission", "kernel.el1.address-space-switch"]
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/occupancy.rs"
-contracts = ["kernel.mm.address-space-occupancy"]
+contracts = ["kernel.mm.address-space-occupancy", "kernel.el1.address-space-switch"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/spaces.rs"
+contracts = ["kernel.el1.address-space-switch"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/threaded.rs"

@@ -1340,6 +1340,7 @@
       "handler": "lifecycle",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.address-space-switch",
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
@@ -1399,6 +1400,7 @@
       "handler": "thread_local",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.address-space-switch",
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
@@ -2951,6 +2953,7 @@
       "handler": "memory",
       "authority": "hybrid",
       "contracts": [
+        "kernel.el1.address-space-switch",
         "kernel.el1.zone-entry-at-open",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.backing-maintenance-lookup",
@@ -3026,6 +3029,7 @@
       "handler": "lifecycle",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.address-space-switch",
         "kernel.el1.files.cross-process-readers",
         "kernel.el1.guest-run-queue",
         "kernel.fork.filetable",
@@ -3048,6 +3052,7 @@
       "handler": "lifecycle",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.address-space-switch",
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
@@ -3067,6 +3072,7 @@
       "handler": "memory",
       "authority": "hybrid",
       "contracts": [
+        "kernel.el1.address-space-switch",
         "kernel.el1.zone-entry-at-open",
         "kernel.fork.mappings",
         "kernel.mm.address-space-occupancy",
@@ -3126,6 +3132,7 @@
       "handler": "memory",
       "authority": "hybrid",
       "contracts": [
+        "kernel.el1.address-space-switch",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.current-read-reuse",
         "kernel.mm.native-data-activation",
