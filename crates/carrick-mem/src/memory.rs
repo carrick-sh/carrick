@@ -6367,16 +6367,24 @@ mod loader_tests {
             .iter()
             .find(|r| r.start == LINUX_PAGE_TABLES_BASE)
             .expect("stage-1 page-table region");
-        let mut mgr = carrick_mmu_core::aarch64::PageTableManager::new(
+        let mgr = carrick_mmu_core::aarch64::PageTableManager::new(
             pt_region.bytes().to_vec(),
             LINUX_PAGE_TABLES_BASE,
             AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
         const AP_RO: u64 = 0b11 << 6; // AP[2:1]=11: RO at EL0+EL1
         const AP_RW: u64 = 0b01 << 6; // AP[2:1]=01: RW at EL0+EL1
-        assert_eq!(mgr.ap_bits(0x400000), AP_RO, "RO span leaf is read-only");
-        assert_eq!(mgr.ap_bits(0x401000), AP_RW, "page past the span stays RW");
-        assert!(mgr.is_valid(0x400000), "RO leaf is still mapped");
+        assert_eq!(
+            carrick_mmu_core::aarch64::terminal_descriptor(mgr.debug_walk(0x400000)) & (0b11 << 6),
+            AP_RO,
+            "RO span leaf is read-only"
+        );
+        assert_eq!(
+            carrick_mmu_core::aarch64::terminal_descriptor(mgr.debug_walk(0x401000)) & (0b11 << 6),
+            AP_RW,
+            "page past the span stays RW"
+        );
+        assert!(mgr.translate(0x400000).is_some(), "RO leaf is still mapped");
     }
 
     #[test]
