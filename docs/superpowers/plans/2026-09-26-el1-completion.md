@@ -334,3 +334,25 @@ signed executable. Negative entitlement and all scoped cleanup checks passed.
 Exact evidence: `docs/perf-results/2026-09-26-el1-occupancy-witness/README.md`.
 This is witness acceptance only; the live-snapshot and first-touch failures,
 full promotion and end-to-end stages remain open. No timing ratio is claimed.
+
+2026-09-26, continued review: `5d612ffb5` preserves the independent round-2
+live-table draft snapshot failure (Cargo exit 101, panic rather than the older
+silent live fallback). Round 2 ended without a committed candidate. Final
+review round 3 is active on the same worker, requiring fallible snapshots,
+non-silent restoration/rollback failure, and actual pooled-root retirement and
+reuse evidence. It remains unintegrated. If that round does not converge,
+stop the delegated review loop and resolve the remaining runtime work directly;
+do not open a replacement worker to evade the review cap.
+
+Started the explicitly parallel checkpoint 2a task `host-namespace` in the idle
+`el1-personality-boundary` worktree, clean at `5d612ffb5`. Its bounded scope is
+rename/unlink host opens and metadata work under the existing admitted namespace
+transaction. It must establish red-first structural counts with existing counter
+coverage, then remove demonstrated redundant work while preserving containment,
+revalidation, hardlink behavior, tombstones and error propagation. No guest or
+Docker runs are authorized for the worker. The director retains serial native
+and signed differential acceptance. Openat, remaining host-file work, and all
+higher checkpoint gates remain pending. The previous occupancy worker commits
+are preserved on `el1-occupancy-witness-accepted`; their accepted changes were
+already integrated. No memory/host-namespace source files are shared between
+these two active worker tasks.
