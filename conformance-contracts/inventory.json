@@ -1338,7 +1338,8 @@
       "handler": "lifecycle",
       "authority": "guest",
       "contracts": [
-        "kernel.el1.futex-handoff"
+        "kernel.el1.futex-handoff",
+        "kernel.el1.guest-scheduler"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -1395,6 +1396,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.futex-handoff",
+        "kernel.el1.guest-scheduler",
         "kernel.futex.contention",
         "kernel.futex.requeue"
       ],
@@ -1715,7 +1717,9 @@
       "support": "bring_up",
       "handler": "process",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.guest-scheduler"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -1835,7 +1839,8 @@
       "handler": "signal",
       "authority": "guest",
       "contracts": [
-        "kernel.el1.futex-handoff"
+        "kernel.el1.futex-handoff",
+        "kernel.el1.guest-scheduler"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -1942,7 +1947,9 @@
       "support": "bring_up",
       "handler": "signal",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.guest-scheduler"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -3032,6 +3039,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.futex-handoff",
+        "kernel.el1.guest-scheduler",
         "kernel.time.realtime-calibration"
       ],
       "claims": [],
