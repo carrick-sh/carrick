@@ -416,3 +416,13 @@ manifest and verifies equal root filesystem layer digests. All 12 native rows
 pass with cleanup proved. Receipts:
 [matching-image fork authority](../../perf-results/2026-09-26-el1-live-table-review/native-fork-54f3167a7/README.md).
 Signed validation and every remaining migration checkpoint remain open.
+
+Full CI for `54f3167a7` now exits zero: 6,180 passing tests across 101 result
+groups, zero failures and 12 existing ignores. Only evidence documentation
+changed to `b6ce9ab26` during the run. The complete transcript and hash are
+preserved in the [integrated receipt](../../perf-results/2026-09-26-el1-live-table-review/integrated/README.md).
+Signed fork validation is running separately from `b6ce9ab26`, run ID
+`el1-live-fork-20260926-b6ce9ab26`; do not treat its in-progress build as
+signed acceptance. After it completes, preserve the exact signed artifact and
+receipt, then run the occupancy contract. Actual EL1 fault service remains the
+next implementation milestone, with no broader goal scope removed.
