@@ -350,68 +350,80 @@ fn el1_sched_exec_from_a_sibling_with_parked_threads() {
 
 /// Contract `kernel.el1.guest-scheduler` (EL1 plan 1c), part (a): two threads
 /// pinned to different guest CPUs ping-pong through
-/// `FUTEX_WAIT_PRIVATE`/`FUTEX_WAKE_PRIVATE`. Every handoff crosses vCPUs:
-/// the waker places the woken thread on the other vCPU (which idles in EL1)
-/// and wakes it with an SGI if it parked in WFI. The budget is the affine
-/// one of the 1b handoff: host exits over the difference of `LONG` and
-/// `SHORT` round trips must stay below 0.01 per round trip, and at least one
-/// cross-vCPU wake per round trip must have happened in-guest.
+/// `FUTEX_WAIT_PRIVATE`/`FUTEX_WAKE_PRIVATE`, each computing for a while with
+/// the turn, so every handoff wakes a thread parked on the OTHER vCPU: the
+/// waker queues it there and, if that vCPU parked in WFI, sends it an SGI.
+/// Two regimes: 5 us of work (the partner's vCPU is still polling) and
+/// 200 us (it has parked in WFI). The budget is the affine one of the 1b
+/// handoff: host exits over the difference of a long and a short run stay
+/// below 0.01 per round trip, and every round trip woke across vCPUs
+/// in-guest (plus an SGI per round trip in the WFI regime). Handoff latency
+/// is reported.
 #[test]
 fn el1_sched_cross_vcpu_handoff_has_no_host_exits() {
-    const SHORT: u64 = 5_000;
-    const LONG: u64 = 55_000;
     let _guard = common::guest_lock();
     reset_el1_counters();
     let carrier = carrier_or_fail();
-    let mut runs = Vec::new();
-    for iters in [SHORT, LONG, SHORT, LONG] {
-        let measured = run_fixture(
-            &carrier,
-            &["pinned-pingpong", &iters.to_string()],
-            Duration::from_secs(120),
-        );
-        let stdout = measured.result.stdout_utf8();
-        println!(
-            "el1-sched pinned-pingpong iters={iters} exits={} carrier_cpu_ns={} wall_ms={} \
-             zone={:?} {}",
-            measured.exits,
-            measured.cpu_ns,
-            measured.wall.as_millis(),
-            measured.zone,
-            stdout.trim()
-        );
-        assert!(measured.result.success(), "{}", describe(&measured));
+    for (work_us, short, long) in [(5u64, 2_000u64, 22_000u64), (200, 300, 3_300)] {
+        let mut runs = Vec::new();
+        for iters in [short, long, short, long] {
+            let measured = run_fixture(
+                &carrier,
+                &["pinned-pingpong", &iters.to_string(), &work_us.to_string()],
+                Duration::from_secs(120),
+            );
+            let stdout = measured.result.stdout_utf8();
+            println!(
+                "el1-sched pinned-pingpong iters={iters} work_us={work_us} exits={} \
+                 carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+                measured.exits,
+                measured.cpu_ns,
+                measured.wall.as_millis(),
+                measured.zone,
+                stdout.trim()
+            );
+            assert!(measured.result.success(), "{}", describe(&measured));
+            assert!(
+                measured.zone.cross_wakes >= iters,
+                "only {} in-guest cross-vCPU wakes for {iters} round trips: {:?}",
+                measured.zone.cross_wakes,
+                measured.zone
+            );
+            if work_us > 100 {
+                assert!(
+                    measured.zone.sgis >= iters,
+                    "the partner's vCPU was not woken from WFI by SGI: {:?}",
+                    measured.zone
+                );
+            }
+            runs.push((
+                iters,
+                measured.exits,
+                measured.cpu_ns,
+                field(&stdout, "handoff_p50_ns"),
+            ));
+        }
+        let span = (long - short) as f64;
+        let mut worst: f64 = 0.0;
+        for pair in runs.chunks(2) {
+            let (short, long) = (&pair[0], &pair[1]);
+            let exits_per_rt = (long.1 as f64 - short.1 as f64) / span;
+            let cpu_ns_per_rt = (long.2 as f64 - short.2 as f64) / span;
+            println!(
+                "el1-sched cross-vcpu-handoff work_us={work_us} \
+                 exits_per_round_trip={exits_per_rt:.4} \
+                 carrier_cpu_ns_per_round_trip={cpu_ns_per_rt:.0} handoff_p50_ns={:.0}",
+                long.3
+            );
+            worst = worst.max(exits_per_rt);
+        }
         assert!(
-            measured.zone.cross_wakes >= iters,
-            "only {} in-guest cross-vCPU wakes for {iters} round trips: {:?}",
-            measured.zone.cross_wakes,
-            measured.zone
+            worst < 0.01,
+            "a futex handoff between threads on different vCPUs ({work_us} us of work per \
+             turn) cost {worst:.3} host exits per round trip; the in-guest (EL1) cross-vCPU \
+             handoff must cost none in steady state"
         );
-        runs.push((
-            iters,
-            measured.exits,
-            measured.cpu_ns,
-            field(&stdout, "p50_ns"),
-        ));
     }
-    let span = (LONG - SHORT) as f64;
-    let mut worst: f64 = 0.0;
-    for pair in runs.chunks(2) {
-        let (short, long) = (&pair[0], &pair[1]);
-        let exits_per_rt = (long.1 as f64 - short.1 as f64) / span;
-        let cpu_ns_per_rt = (long.2 as f64 - short.2 as f64) / span;
-        println!(
-            "el1-sched cross-vcpu-handoff exits_per_round_trip={exits_per_rt:.4} \
-             carrier_cpu_ns_per_round_trip={cpu_ns_per_rt:.0} p50_ns={:.0}",
-            long.3
-        );
-        worst = worst.max(exits_per_rt);
-    }
-    assert!(
-        worst < 0.01,
-        "a futex handoff between threads on different vCPUs cost {worst:.3} host exits per \
-         round trip; the in-guest (EL1) cross-vCPU handoff must cost none in steady state"
-    );
 }
 
 /// Part (b): a 1 ms `FUTEX_WAIT_PRIVATE` timeout ends in EL1 on the virtual
