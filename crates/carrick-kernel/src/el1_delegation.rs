@@ -1513,13 +1513,43 @@ fn join_transaction(
 /// Host implementation of the shared file operations' user copy: through the
 /// current guest address space. A failed copy makes the host fall back to the
 /// ordinary path (recall, then the host syscall with its exact EFAULT rules).
+/// The host's user copies for an operation it serves with an inode locked.
+///
+/// A copy OUT is only validated under the lock and lands after the unlock
+/// ([`Self::finish`]): writing guest memory may materialize a page or break a
+/// frame COW, which pauses every executor of the address space, and a
+/// sibling that recalls this inode (a rename, a stat) waits for the inode
+/// lock where the pause cannot reach it. Holding the inode lock across the
+/// pause deadlocked the two (a host `pread` under the lock, a `rename`
+/// spinning on it, the pause waiting for both).
 struct HostUserCopy<'m, M: carrick_guest_mem::CurrentMmMemory> {
     memory: &'m mut M,
+    pending: Vec<(u64, Vec<u8>)>,
+}
+
+impl<M: carrick_guest_mem::CurrentMmMemory> HostUserCopy<'_, M> {
+    /// Land the copies out, with no lock held. False: the guest unmapped or
+    /// protected a destination since it was validated (the operation then
+    /// fails with `EFAULT`, as a concurrent unmap mid-copy does on Linux).
+    fn finish(self) -> bool {
+        let mut landed = true;
+        for (dst_va, bytes) in self.pending {
+            landed &= self.memory.write_bytes(dst_va, &bytes).is_ok();
+        }
+        landed
+    }
 }
 
 impl<M: carrick_guest_mem::CurrentMmMemory> carrick_el1::file::UserCopy for HostUserCopy<'_, M> {
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
-        self.memory.write_bytes(dst_va, src).is_ok()
+        if src.is_empty() {
+            return true;
+        }
+        if !self.memory.guest_range_is_writable(dst_va, src.len()) {
+            return false;
+        }
+        self.pending.push((dst_va, src.to_vec()));
+        true
     }
 
     fn copy_in(&mut self, dst: &mut [u8], src_va: u64) -> bool {
@@ -1597,7 +1627,10 @@ pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
             MAX_DELEGATED_INOTIFY,
         )
     };
-    let mut user = HostUserCopy { memory };
+    let mut user = HostUserCopy {
+        memory,
+        pending: Vec::new(),
+    };
     let zone_file = carrick_el1::file::ZoneFile {
         inode: file,
         open: record,
@@ -1615,9 +1648,16 @@ pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
         )
     };
     file.unlock();
+    let landed = user.finish();
     // The host is already at its boundary: deliver what a write owed now.
     crate::el1_inotify::deliver_owed_wakes();
     let value = result.ok()?;
+    if !landed {
+        HOST_SERVED.fetch_add(1, Ordering::Relaxed);
+        return Some(crate::dispatch::DispatchOutcome::errno(
+            carrick_abi::LINUX_EFAULT,
+        ));
+    }
     HOST_SERVED.fetch_add(1, Ordering::Relaxed);
     Some(match carrick_abi::LinuxErrno::from_guest_retval(value) {
         Some(errno) => crate::dispatch::DispatchOutcome::errno(errno),

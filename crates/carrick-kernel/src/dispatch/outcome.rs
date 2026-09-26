@@ -939,6 +939,16 @@ impl LinearMemory {
 }
 
 impl GuestMemory for LinearMemory {
+    /// Writable means inside the linear backing: it models no protections,
+    /// but nothing outside it is mapped at all.
+    fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
+        address
+            .checked_sub(self.base)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|offset| offset.checked_add(length))
+            .is_some_and(|end| end <= self.bytes.len())
+    }
+
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         let offset = address
             .checked_sub(self.base)
