@@ -1,0 +1,29 @@
+   Compiling serde_derive v1.0.228
+   Compiling pest_generator v2.8.6
+   Compiling zerocopy-derive v0.8.48
+   Compiling scroll_derive v0.13.1
+   Compiling once_cell v1.21.4
+   Compiling tempfile v3.27.0
+   Compiling pest_derive v2.8.6
+   Compiling scroll v0.13.0
+   Compiling dtrace-parser v0.3.0
+   Compiling zerocopy v0.8.48
+   Compiling goblin v0.10.5
+   Compiling serde v1.0.228
+   Compiling serde_tokenstream v0.2.3
+   Compiling usdt-impl v0.6.0
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling toml_edit v0.22.27
+   Compiling usdt-attr-macro v0.6.0
+   Compiling usdt-macro v0.6.0
+   Compiling dof v0.4.0
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-guest-mem)
+   Compiling toml v0.8.23
+   Compiling usdt v0.6.0
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-observability)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-conformance-contract)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.90s
+     Running `target/debug/check-contracts --root .`
+conformance contracts checked: 57 contracts, 15 claims, 135 surfaces (inventory: 338 syscalls, 14 with claims)

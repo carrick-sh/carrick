@@ -1,0 +1,20 @@
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.36s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-1d1f88d6a1eb2090)
+
+running 1 test
+
+thread 'aarch64::tests::restore_quiesced_snapshot_to_host_fails_and_preserves_on_missing_root_or_extension' (11664511) panicked at crates/carrick-mmu-core/src/aarch64.rs:5822:9:
+missing extension must not partially overwrite the root backing
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test aarch64::tests::restore_quiesced_snapshot_to_host_fails_and_preserves_on_missing_root_or_extension ... FAILED
+
+failures:
+
+failures:
+    aarch64::tests::restore_quiesced_snapshot_to_host_fails_and_preserves_on_missing_root_or_extension
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 81 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p carrick-mmu-core --lib`

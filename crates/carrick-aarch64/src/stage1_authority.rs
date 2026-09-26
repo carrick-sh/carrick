@@ -604,33 +604,38 @@ impl Stage1Authority {
     }
 
     /// Restore a previous manager image (e.g. during rollback).
+    /// The input remains owned by the caller on error and is consumed only on success.
     ///
     /// Adopts live extension arenas from the active manager into `image`, retains
     /// this authority's arena source, fires `stage1_arena_replace(site, before, after, authority)`,
     /// restores quiesced descriptors to live host memory, and replaces the manager. Returns the replaced manager.
     pub fn restore_image(
         &self,
-        mut image: PageTableManager,
+        image: &mut Option<PageTableManager>,
         site: u32,
     ) -> Result<Option<PageTableManager>, PageTableError> {
+        let snapshot = image.as_mut().ok_or(PageTableError::BadAddress)?;
         let authority = self.authority_id();
         let mut inner = self.inner.lock();
         if let Some(live) = inner.manager.as_ref() {
             let before = u32::from(inner.arena_source.is_some());
-            image.adopt_live_extension_state(live);
+            snapshot.adopt_live_extension_state(live);
             let after = before;
             carrick_observability::probes::stage1_arena_replace(site, before, after, authority);
         }
         if let Some(ref resolver) = inner.host_resolver {
             unsafe {
-                image.restore_quiesced_snapshot_to_host(resolver)?;
-                image.make_live(Arc::clone(resolver));
+                snapshot.restore_quiesced_snapshot_to_host(resolver)?;
+                snapshot.make_live(Arc::clone(resolver));
             }
         }
-        Ok(inner.manager.replace(image))
+        Ok(inner
+            .manager
+            .replace(image.take().ok_or(PageTableError::BadAddress)?))
     }
 
     /// Like [`Self::restore_image`], but also restores quiesced table descriptors to host memory.
+    /// The caller retains `image` on every error.
     ///
     /// # Safety
     ///
@@ -642,26 +647,29 @@ impl Stage1Authority {
     /// across manager image restores.
     pub unsafe fn restore_image_and_host<H>(
         &self,
-        mut image: PageTableManager,
+        image: &mut Option<PageTableManager>,
         site: u32,
         resolve_page_table_host: H,
     ) -> Result<Option<PageTableManager>, PageTableError>
     where
         H: HostArenaResolver,
     {
+        let snapshot = image.as_mut().ok_or(PageTableError::BadAddress)?;
         let authority = self.authority_id();
         let mut inner = self.inner.lock();
         if let Some(live) = inner.manager.as_ref() {
             let before = u32::from(inner.arena_source.is_some());
-            image.adopt_live_extension_state(live);
+            snapshot.adopt_live_extension_state(live);
             let after = before;
             carrick_observability::probes::stage1_arena_replace(site, before, after, authority);
         }
-        unsafe { image.restore_quiesced_snapshot_to_host(resolve_page_table_host)? };
+        unsafe { snapshot.restore_quiesced_snapshot_to_host(resolve_page_table_host)? };
         if let Some(ref resolver) = inner.host_resolver {
-            unsafe { image.make_live(Arc::clone(resolver)) };
+            unsafe { snapshot.make_live(Arc::clone(resolver)) };
         }
-        Ok(inner.manager.replace(image))
+        Ok(inner
+            .manager
+            .replace(image.take().ok_or(PageTableError::BadAddress)?))
     }
 
     /// Replace the stage-1 authority for `execve`.
@@ -1097,21 +1105,22 @@ impl<'a> Stage1Editor<'a> {
     /// preserving the arena source, restoring descriptors to hardware memory, and firing `stage1_arena_replace`.
     pub fn restore_image(
         &mut self,
-        mut image: PageTableManager,
+        image: &mut Option<PageTableManager>,
         site: u32,
         authority: u64,
     ) -> Result<(), PageTableError> {
+        let snapshot = image.as_mut().ok_or(PageTableError::BadAddress)?;
         let before = u32::from(self.arena_source.is_some());
-        image.adopt_live_extension_state(self.manager);
+        snapshot.adopt_live_extension_state(self.manager);
         let after = before;
         carrick_observability::probes::stage1_arena_replace(site, before, after, authority);
         if let Some(resolver) = self.manager.resolver().cloned() {
             unsafe {
-                image.restore_quiesced_snapshot_to_host(&resolver)?;
-                image.make_live(resolver);
+                snapshot.restore_quiesced_snapshot_to_host(&resolver)?;
+                snapshot.make_live(resolver);
             }
         }
-        *self.manager = image;
+        *self.manager = image.take().ok_or(PageTableError::BadAddress)?;
         Ok(())
     }
 }
@@ -1201,7 +1210,7 @@ mod tests {
         assert!(failed.is_err());
         let after_error = observed_generation(&authority);
         assert_ne!(after_error, original);
-        authority.restore_image(image, 0).unwrap();
+        authority.restore_image(&mut Some(image), 0).unwrap();
         let after_restore = observed_generation(&authority);
         assert_ne!(after_restore, original);
         assert_ne!(after_restore, after_error);
@@ -1809,7 +1818,7 @@ mod tests {
         });
 
         // Restore snapshot 1
-        authority.restore_image(snap1, 1).unwrap();
+        authority.restore_image(&mut Some(snap1), 1).unwrap();
 
         // Hardware memory and live translation must now reflect ipa1
         authority.with_manager(|mgr| {
@@ -1848,11 +1857,34 @@ mod tests {
         let snap = authority.snapshot_image().expect("initial snapshot");
 
         // Attempt restore with a failing resolver
-        let res = unsafe { authority.restore_image_and_host(snap, 0, FailingResolver) };
+        let mut snapshot = Some(snap);
+        let res = unsafe { authority.restore_image_and_host(&mut snapshot, 0, FailingResolver) };
+        assert!(
+            snapshot.is_some(),
+            "failed restore retains caller recovery image"
+        );
         assert!(matches!(res, Err(PageTableError::UnresolvedArena(_))));
         assert!(
             authority.is_present(),
             "manager remains present after failed restore"
+        );
+
+        let mut host = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+        let restored = unsafe {
+            authority.restore_image_and_host(
+                &mut snapshot,
+                0,
+                (LINUX_PAGE_TABLES_BASE, host.as_mut_ptr()),
+            )
+        }
+        .expect("retry retained snapshot with available backing");
+        assert!(
+            snapshot.is_none(),
+            "successful restore consumes the recovery image"
+        );
+        assert!(
+            restored.is_some(),
+            "previous manager is available for recycling"
         );
 
         // Attempt rollback with failing resolver

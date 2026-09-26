@@ -691,6 +691,31 @@ impl MmAccessState {
         *self.cow_runtime.write() = Some(binding);
     }
 
+    /// Rollback cannot return an ordinary guest error with modified descriptors
+    /// still pointing at the replacement owner that error cleanup will retire.
+    /// Preserve the recovery image for diagnostics and stop the carrier if its
+    /// already-retained table backing cannot be restored.
+    fn finish_foreign_cow_restore(
+        &self,
+        restored: Result<
+            Option<carrick_mmu_core::aarch64::PageTableManager>,
+            carrick_mmu_core::aarch64::PageTableError,
+        >,
+        preimage: &mut Option<carrick_mmu_core::aarch64::PageTableManager>,
+        site: u32,
+    ) -> Option<carrick_mmu_core::aarch64::PageTableManager> {
+        match restored {
+            Ok(recycled) => recycled,
+            Err(error) => {
+                *self.cow_rollback_scratch.lock() = preimage.take();
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "foreign COW rollback could not restore retained stage-1 backing at site {site}: {error}"
+                );
+            }
+        }
+    }
+
     /// Drop this mm's retained authority over a retired structural extent and,
     /// when it was served by the carrier's root-slot pool, hand the slot back.
     /// The runtime's stage-1 slot allocator reissues a retired extension arena
@@ -2246,12 +2271,18 @@ pub(crate) fn perform_foreign_cow_transaction(
         requested.binding.stage1_root,
     );
     if let Err(error) = page_table_result {
-        if let Some(snapshot) = rollback.take() {
-            let recycled_manager = unsafe {
-                page_tables_authority.restore_image_and_host(snapshot, 8, resolve_page_table_host)
-            }
-            .ok()
-            .flatten();
+        if rollback.is_some() {
+            let restored = unsafe {
+                page_tables_authority.restore_image_and_host(
+                    &mut rollback,
+                    8,
+                    resolve_page_table_host,
+                )
+            };
+            let recycled_manager =
+                lease
+                    .state
+                    .finish_foreign_cow_restore(restored, &mut rollback, 8);
             *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
             if invalidator
                 .invalidate_exact_asid(binding, deadline)
@@ -2267,18 +2298,19 @@ pub(crate) fn perform_foreign_cow_transaction(
         }
         return Err(error);
     }
-    let rollback = rollback.unwrap_or_else(|| {
+    if rollback.is_none() {
         carrick_fatal!(
             "hvpatch::mm_authority",
             "missing page-table rollback pre-image after successful page-table modification"
-        )
-    });
+        );
+    }
     if let Err(error) = invalidator.invalidate_exact_asid(binding, deadline) {
-        let recycled_manager = unsafe {
-            page_tables_authority.restore_image_and_host(rollback, 9, resolve_page_table_host)
-        }
-        .ok()
-        .flatten();
+        let restored = unsafe {
+            page_tables_authority.restore_image_and_host(&mut rollback, 9, resolve_page_table_host)
+        };
+        let recycled_manager = lease
+            .state
+            .finish_foreign_cow_restore(restored, &mut rollback, 9);
         *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
         if invalidator
             .invalidate_exact_asid(binding, deadline)
@@ -2292,11 +2324,12 @@ pub(crate) fn perform_foreign_cow_transaction(
         return Err(error);
     }
     if let Err(error) = foreign_cow_failpoint(&lease.state, 4) {
-        let recycled_manager = unsafe {
-            page_tables_authority.restore_image_and_host(rollback, 10, resolve_page_table_host)
-        }
-        .ok()
-        .flatten();
+        let restored = unsafe {
+            page_tables_authority.restore_image_and_host(&mut rollback, 10, resolve_page_table_host)
+        };
+        let recycled_manager = lease
+            .state
+            .finish_foreign_cow_restore(restored, &mut rollback, 10);
         *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
         if invalidator
             .invalidate_exact_asid(binding, deadline)
@@ -2309,7 +2342,7 @@ pub(crate) fn perform_foreign_cow_transaction(
         }
         return Err(error);
     }
-    *lease.state.cow_rollback_scratch.lock() = Some(rollback);
+    *lease.state.cow_rollback_scratch.lock() = rollback;
     let commit = reservation.commit(());
     let mut committed_mapping_ids = requested.mapping_ids.clone();
     for event in commit.batch().events() {
@@ -2391,11 +2424,18 @@ pub(crate) fn perform_foreign_cow_transaction(
                         "missing rollback pre-image in scratch storage during foreign COW kernel publication failure"
                     )
                 });
-            let recycled_manager = unsafe {
-                page_tables_authority.restore_image_and_host(rollback, 11, resolve_page_table_host)
-            }
-            .ok()
-            .flatten();
+            let mut rollback = Some(rollback);
+            let restored = unsafe {
+                page_tables_authority.restore_image_and_host(
+                    &mut rollback,
+                    11,
+                    resolve_page_table_host,
+                )
+            };
+            let recycled_manager =
+                lease
+                    .state
+                    .finish_foreign_cow_restore(restored, &mut rollback, 11);
             *lease.state.cow_rollback_scratch.lock() = recycled_manager;
             if invalidator
                 .invalidate_exact_asid(binding, deadline)
@@ -3817,7 +3857,7 @@ pub mod foreign_cow_test_support {
                     let authority = self.state.page_tables_authority();
                     let image = authority.snapshot_image().ok_or("absent")?;
                     authority
-                        .restore_image(image, 0)
+                        .restore_image(&mut Some(image), 0)
                         .map_err(|e| format!("restore image failed: {e:?}"))?;
                     Ok(())
                 }
