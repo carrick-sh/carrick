@@ -1,0 +1,28 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 27.73s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-f404900c9013898a)
+
+running 1 test
+test vcpu_loop::memory::tests::native_buffers::stage1_snapshot_observes_live_leaf_after_guest_publication ... FAILED
+
+failures:
+
+---- vcpu_loop::memory::tests::native_buffers::stage1_snapshot_observes_live_leaf_after_guest_publication stdout ----
+
+thread 'vcpu_loop::memory::tests::native_buffers::stage1_snapshot_observes_live_leaf_after_guest_publication' (10351406) panicked at crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs:1028:5:
+assertion `left == right` failed: fork/rollback snapshot resurrected a revoked live leaf
+  left: Some(665719930880)
+ right: None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    vcpu_loop::memory::tests::native_buffers::stage1_snapshot_observes_live_leaf_after_guest_publication
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 626 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p carrick-runtime --lib`
