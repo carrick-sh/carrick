@@ -1,0 +1,17 @@
+running 14 tests
+test occupancy_report_accepts_valid_tight_report ... ok
+test occupancy_report_rejects_child_failures ... ok
+test occupancy_report_rejects_edit_failures ... ok
+test occupancy_report_rejects_failed_child_ok ... ok
+test occupancy_report_rejects_fork_count_mismatch ... ok
+test occupancy_report_rejects_join_failures ... ok
+test occupancy_report_rejects_legacy_missing_counters_transcript ... ok
+test occupancy_report_rejects_malformed_counter_values ... ok
+test occupancy_report_rejects_missing_child_ok ... ok
+test occupancy_report_rejects_missing_role_line ... ok
+test occupancy_report_rejects_snapshot_changes ... ok
+test occupancy_report_rejects_spurious_ok_substring ... ok
+test occupancy_report_rejects_torn_writes ... ok
+test occupancy_report_rejects_zero_edits ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s

@@ -322,3 +322,15 @@ Review round 2 was sent to the same live-table worker with explicit failure,
 complete-range access, sound resolver installation, coordinated retirement and
 behavioral test requirements. Existing work budgets and full migration scope
 remain unchanged. No signed or performance acceptance is claimed.
+
+### Occupancy witness repair and signed evidence
+
+Integrated `8bafb145b` / `77b044194` repair false-pass paths in the existing
+occupancy fixture without reducing writer concurrency. Director independently
+verified 16 parser tests, cross-build, embed check, Clippy and formatting. Native
+arm64 Docker passed the exact fixture, then signed Carrick passed the default
+case and three separate scheduler/futex/GIC-disabled controls on one unchanged
+signed executable. Negative entitlement and all scoped cleanup checks passed.
+Exact evidence: `docs/perf-results/2026-09-26-el1-occupancy-witness/README.md`.
+This is witness acceptance only; the live-snapshot and first-touch failures,
+full promotion and end-to-end stages remain open. No timing ratio is claimed.
