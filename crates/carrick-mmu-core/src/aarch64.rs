@@ -14,7 +14,84 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use hashbrown::HashSet;
+
+/// Narrow substrate guest-physical address type for stage-1 table arena boundaries.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct SubstrateGpa(pub u64);
+
+impl SubstrateGpa {
+    #[inline]
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for SubstrateGpa {
+    #[inline]
+    fn from(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+impl From<SubstrateGpa> for u64 {
+    #[inline]
+    fn from(gpa: SubstrateGpa) -> Self {
+        gpa.0
+    }
+}
+
+/// Layout constraints and reserved memory bounds required for AArch64 page-table operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageTableLayoutConfig {
+    /// Representative user VA used to detect whether initial descriptors carry nG.
+    pub user_leaf_check_va: u64,
+    /// Capacity in bytes for newly attached extension arenas.
+    pub extension_arena_capacity: usize,
+    /// Start of excluded / forbidden IPA range (e.g. GIC window).
+    pub excluded_ipa_start: u64,
+    /// Length in bytes of excluded / forbidden IPA range.
+    pub excluded_ipa_len: u64,
+}
+
+impl PageTableLayoutConfig {
+    #[must_use]
+    pub const fn new(
+        user_leaf_check_va: u64,
+        extension_arena_capacity: usize,
+        excluded_ipa_start: u64,
+        excluded_ipa_len: u64,
+    ) -> Self {
+        Self {
+            user_leaf_check_va,
+            extension_arena_capacity,
+            excluded_ipa_start,
+            excluded_ipa_len,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn ipa_overlaps_excluded(&self, ipa: u64, len: u64) -> bool {
+        if self.excluded_ipa_len == 0 || len == 0 {
+            return false;
+        }
+        let Some(a_end) = ipa.checked_add(len) else {
+            return true;
+        };
+        let Some(b_end) = self.excluded_ipa_start.checked_add(self.excluded_ipa_len) else {
+            return true;
+        };
+        !(a_end <= self.excluded_ipa_start || b_end <= ipa)
+    }
+}
 
 // Leaf attribute layout (must match `memory::stage1_identity_page_tables`).
 const VALID: u64 = 1 << 0;
@@ -194,9 +271,9 @@ pub enum PageTableError {
     ConflictingArenaSource,
     /// Host backing pointer for the page-table arena at base IPA was unresolved.
     UnresolvedArena(u64),
-    /// An output address in the in-kernel GIC's guest-physical window:
-    /// a stage-1 leaf there would give the guest MMIO access to the distributor
-    /// or a redistributor.
+    /// An output address in the in-kernel GIC's guest-physical window
+    /// (the caller-supplied excluded IPA interval): a stage-1 leaf there would
+    /// give the guest MMIO access to the distributor or a redistributor.
     GicWindowOutput,
 }
 
@@ -272,7 +349,7 @@ pub fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
 /// backing in place instead of a copy of it.
 ///
 /// [`walk_descriptors`] needs an owned `&[u8]` of the whole region, so a caller
-/// holding only a host pointer had to copy the entire page table size (1.75 MiB)
+/// holding only a host pointer had to copy `LINUX_PAGE_TABLES_SIZE` (1.75 MiB)
 /// to read four 8-byte descriptors. On the frame-COW fault path that copy is
 /// per fault, which made a diagnostic probe the most expensive thing in the
 /// handler. This reads the eight bytes it actually needs.
@@ -371,39 +448,6 @@ impl TableLocation {
             arena: self.arena,
             offset: self.offset + index * 8,
         }
-    }
-}
-
-/// Narrow substrate guest-physical address type for stage-1 table arena boundaries.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct SubstrateGpa(pub u64);
-
-impl SubstrateGpa {
-    #[inline]
-    #[must_use]
-    pub const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
-
-impl From<u64> for SubstrateGpa {
-    #[inline]
-    fn from(raw: u64) -> Self {
-        Self(raw)
-    }
-}
-
-impl From<SubstrateGpa> for u64 {
-    #[inline]
-    fn from(gpa: SubstrateGpa) -> Self {
-        gpa.0
     }
 }
 
@@ -573,51 +617,6 @@ impl Clone for TableArena {
     }
 }
 
-/// Layout constraints and reserved memory bounds required for AArch64 page-table operations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PageTableLayoutConfig {
-    /// Representative user VA used to detect whether initial descriptors carry nG.
-    pub user_leaf_check_va: u64,
-    /// Capacity in bytes for newly attached extension arenas.
-    pub extension_arena_capacity: usize,
-    /// Start of excluded / forbidden IPA range (e.g. GIC window).
-    pub excluded_ipa_start: u64,
-    /// Length in bytes of excluded / forbidden IPA range.
-    pub excluded_ipa_len: u64,
-}
-
-impl PageTableLayoutConfig {
-    #[must_use]
-    pub const fn new(
-        user_leaf_check_va: u64,
-        extension_arena_capacity: usize,
-        excluded_ipa_start: u64,
-        excluded_ipa_len: u64,
-    ) -> Self {
-        Self {
-            user_leaf_check_va,
-            extension_arena_capacity,
-            excluded_ipa_start,
-            excluded_ipa_len,
-        }
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn ipa_overlaps_excluded(&self, ipa: u64, len: u64) -> bool {
-        if self.excluded_ipa_len == 0 || len == 0 {
-            return false;
-        }
-        let Some(a_end) = ipa.checked_add(len) else {
-            return true;
-        };
-        let Some(b_end) = self.excluded_ipa_start.checked_add(self.excluded_ipa_len) else {
-            return true;
-        };
-        !(a_end <= self.excluded_ipa_start || b_end <= ipa)
-    }
-}
-
 /// Mutable editor over a copy of the page-table region bytes.
 ///
 /// `Clone` is used by `fork`: the child needs its OWN manager (it gets a
@@ -627,12 +626,13 @@ impl PageTableLayoutConfig {
 ///
 /// `Clone` is implemented by hand ONLY to give `clone_from` an allocation-reusing
 /// body; `clone` itself is the field-wise copy `#[derive(Clone)]` would have
-/// produced. The table image is large enough that the system allocator serves
-/// it from a fresh `mmap`, so every snapshot costs a host `mmap`, a zero-fill
-/// fault per 16 KiB page, and a `munmap`/`madvise` on drop. The frame-COW handler
-/// takes such a snapshot on EVERY fault as its rollback pre-image, so reusing one
-/// buffer removes that host-VM churn from the COW path without weakening the
-/// snapshot (it is still the complete pre-transaction image).
+/// produced. The 1.75 MiB `LINUX_PAGE_TABLES_SIZE` image is large enough that
+/// the system allocator serves it from a fresh `mmap`, so every snapshot costs a
+/// host `mmap`, a zero-fill fault per 16 KiB page, and a `munmap`/`madvise` on
+/// drop. The frame-COW handler takes such a snapshot on EVERY fault as its
+/// rollback pre-image, so reusing one buffer removes that host-VM churn from the
+/// COW path without weakening the snapshot (it is still the complete
+/// pre-transaction image).
 pub struct PageTableManager {
     arenas: Vec<TableArena>,
     layout: PageTableLayoutConfig,
@@ -702,7 +702,7 @@ struct UndoJournal {
     replaced_valid: bool,
     /// Locations already journalled by this transaction, so only the first
     /// pre-image of each word decides `replaced_valid`.
-    first_written: HashSet<(usize, usize)>,
+    first_written: hashbrown::HashSet<(usize, usize)>,
 }
 
 impl Clone for PageTableManager {
@@ -724,7 +724,7 @@ impl Clone for PageTableManager {
     /// Overwrite `self` with `source`, reusing `self`'s buffers. Every field is
     /// copied, so the result is indistinguishable from `clone()`; only the
     /// allocations differ. `Vec::clone_from` keeps the destination's capacity,
-    /// which is the entire point on the large table image.
+    /// which is the entire point on the 1.75 MiB table image.
     fn clone_from(&mut self, source: &Self) {
         self.arenas.clone_from(&source.arenas);
         self.layout = source.layout;
@@ -740,6 +740,11 @@ impl Clone for PageTableManager {
 }
 
 impl PageTableManager {
+    /// Caller-supplied layout constraints retained by this image.
+    pub fn layout(&self) -> PageTableLayoutConfig {
+        self.layout
+    }
+
     pub fn new(mut bytes: Vec<u8>, base: u64, layout: PageTableLayoutConfig) -> Self {
         let next_free = discover_next_free_spare(&bytes);
         let asid_scoped_leaves =
@@ -766,13 +771,6 @@ impl PageTableManager {
             dirty: Vec::new(),
             undo: None,
         }
-    }
-
-    /// Return the layout configuration for this page-table manager.
-    #[inline]
-    #[must_use]
-    pub fn layout(&self) -> PageTableLayoutConfig {
-        self.layout
     }
 
     /// Guest-physical address of the L0 table represented by this image.
@@ -942,6 +940,8 @@ impl PageTableManager {
         Ok(())
     }
 
+    /// Tell the manager whether sibling vCPUs are live (set per-edit from the
+    /// process-wide live-vCPU count). Gates coalescing.
     /// Record whether this thread's stage-1 edits are exclusive. Gates ONLY the
     /// last-resort reclaim sweep, never the eager paths — making exclusivity
     /// enable eager coalescing took `go-net_http` from 50 s to over 200 s,
@@ -951,8 +951,6 @@ impl PageTableManager {
         self.stage1_exclusive = exclusive;
     }
 
-    /// Tell the manager whether sibling vCPUs are live (set per-edit from the
-    /// process-wide live-vCPU count). Gates coalescing.
     pub fn set_multi_vcpu(&mut self, multi: bool) {
         self.multi_vcpu = multi;
     }
@@ -967,7 +965,10 @@ impl PageTableManager {
     /// PARENT's last mapping syscall, which says nothing about this image. Left
     /// inherited it reads `false` whenever the parent's last stage-1 edit was
     /// not an exclusive one, and `alloc_table`'s last-resort sweep is then
-    /// refused while the child is publishing its own mappings.
+    /// refused while the child is publishing its own mappings: `cpython`
+    /// `concurrent_futures` reached `OutOfTables` at `in_use=438 free=0
+    /// capacity=440 exclusive=false reclaim_pending=true` — a pool with
+    /// reclaimable tables and no permission to reclaim them.
     pub fn declare_offline_private_image(&mut self) {
         self.stage1_exclusive = true;
         self.offline_private_image = true;
@@ -1165,7 +1166,7 @@ impl PageTableManager {
                 reclaim_pending: self.reclaim_pending,
                 dirty_len: self.dirty.len(),
                 replaced_valid: false,
-                first_written: HashSet::new(),
+                first_written: hashbrown::HashSet::new(),
             });
         }
     }
@@ -1879,7 +1880,10 @@ impl PageTableManager {
                 // silently repoint a private overlay back at the SHARED page).
                 // Only an EMPTY descriptor (no address recorded — see
                 // `records_output`) is rebuilt from the identity VA,
-                // preserving the historical arena behaviour.
+                // preserving the historical arena behaviour. `desc != 0` is
+                // NOT that test: an invalidated-then-split empty block once
+                // left `index * stride | flags` children here, and this branch
+                // published them as VALID leaves at IPA 0x5000.
                 let previously_valid = desc & VALID != 0;
                 let new_desc = match op {
                     PtOp::Invalidate | PtOp::Retire => {
@@ -1948,8 +1952,9 @@ impl PageTableManager {
                     | PtOp::ReadWrite { .. }
                     | PtOp::KernelReadOnly { .. } => self.desc_for(op, block_start, level),
                 };
-                // A valid leaf whose output lies in the excluded / forbidden window
-                // would expose distributor/redistributors as memory.
+                // A valid leaf whose output lies in the in-kernel GIC's window
+                // would expose the distributor or a redistributor as memory,
+                // whether the output was rebuilt from the identity VA or kept.
                 if new_desc & VALID != 0 && self.layout.ipa_overlaps_excluded(new_desc & mask, span)
                 {
                     return Err(PageTableError::GicWindowOutput);
@@ -2050,7 +2055,12 @@ impl PageTableManager {
     /// the leaves and KEEPS the sub-table — correct for the low-VA arena, whose
     /// pages are reused in place), a high-VA alias is torn down completely, so
     /// its dedicated per-2-MiB L3 table (one per `mmap(MAP_SHARED, fd)`, which
-    /// each takes its own 2 MiB alias block) must be freed.
+    /// each takes its own 2 MiB alias block) must be freed — otherwise the
+    /// 440-entry spare pool leaks one table per alias and a churning guest
+    /// (CPython multiprocessing maps+unmaps 400+ SemLock/Pool shm files) hits
+    /// OutOfTables. Caller must hold the alias region exclusively here (this is
+    /// the munmap path, PMR-gated under multi-vCPU); reclaim is additionally
+    /// gated single-vCPU/PMR inside (see `reclaim_invalid_tables`).
     pub fn unmap_aliased(
         &mut self,
         va: u64,
@@ -2115,6 +2125,16 @@ impl PageTableManager {
     /// `reclaim_invalid_tables`, but driven by the table graph rather than by a
     /// VA range, so a caller that has no range in hand (`alloc_table`) can still
     /// recover the pool.
+    ///
+    /// Bounded by the number of LIVE tables, not by the address space: at most
+    /// `capacity` tables, each a 512-descriptor scan. That is trivial as a
+    /// one-shot and unaffordable per edit, which is exactly why it lives here.
+    ///
+    /// EXCLUSIVITY IS REQUIRED. Freeing a table only makes it reusable, and
+    /// handing a page back out while a sibling vCPU may hold a stale cached walk
+    /// reaching it is the same break-before-make hazard that gates the eager
+    /// paths. Under `stage1_exclusive` there is no such sibling. Returns whether
+    /// anything was freed.
     fn reclaim_all_invalid_tables(&mut self) -> bool {
         if !self.stage1_exclusive || !self.reclaim_pending {
             return false;
@@ -2205,6 +2225,21 @@ impl PageTableManager {
     /// descriptors at `level` covering `[table_va, table_va + 512 * span)`,
     /// records nothing a rebuild could not reproduce — so freeing it (and
     /// zeroing the parent entry) loses no information.
+    ///
+    /// "All entries VALID-clear" is NOT that test. An invalid leaf that
+    /// retains a non-identity output is the normal shape of every
+    /// armed-but-untouched sparse-arena page, of every `PROT_NONE`/
+    /// `MADV_DONTNEED` page whose frame the mm still owns, and of every
+    /// pending materialization receipt: the next protection commit
+    /// republishes exactly that output in place. Freeing such a table and
+    /// re-splitting the emptied parent later handed those pages fabricated
+    /// outputs (`cpython-concurrent_futures`' fork child validator: "stage-1
+    /// VA 0x6008405000 resolves to IPA 0x5000, expected 0x9c19205000"; the
+    /// parent had been reading and writing IPA 0x5000 silently).
+    ///
+    /// Reclaimable entries are: empty (no output), identity (a rebuild yields
+    /// the same address), or RETIRED by `munmap` (the lease is gone; the
+    /// retained address is only a reuse signal).
     fn table_reclaimable(&self, table_loc: TableLocation, table_va: u64, level: usize) -> bool {
         let (span, mask) = Self::level_span(level);
         (0..512usize).all(|i| {
@@ -2270,7 +2305,20 @@ impl PageTableManager {
     }
 
     /// Build a fresh VA→IPA translation for `[va, va+len)` for EL0, creating
-    /// any missing L1/L2/L3 sub-tables.
+    /// any missing L1/L2/L3 sub-tables. This is the dynamic counterpart of the
+    /// boot Rosetta alias: it maps high guest VAs (which can't be
+    /// identity-mapped — HVF's IPA is only 40 bits) down to a low IPA the caller
+    /// has `hv_vm_map`'d. Uses 2 MiB blocks when `va`/`ipa`/`len` are 2 MiB
+    /// aligned, else 4 KiB pages. The target VA range must be previously
+    /// unmapped (high space the boot tables never populate). Always Ok(true).
+    ///
+    /// `writable`: when false the leaf is built AP=RO (read-only at EL0/EL1)
+    /// while PRESERVING the IPA output address — so a guest store to a
+    /// SHM_RDONLY shmat alias raises a stage-1 permission abort (SIGSEGV),
+    /// matching Linux. The output address must stay the low IPA (NOT VA&mask),
+    /// because an alias is non-identity (VA != IPA); set_readonly/apply would
+    /// rebuild it from the VA and destroy the mapping, which is why writability
+    /// is threaded in HERE instead.
     pub fn map_aliased(
         &mut self,
         va: u64,
@@ -2298,6 +2346,11 @@ impl PageTableManager {
     }
 
     /// Build a per-mm VA→IPA translation whose TLB entries are ASID-scoped.
+    ///
+    /// HVPatch uses this for private demand-materialized mmap extents. Their
+    /// output lives in a VM-global IPA arena, but the semantic translation is
+    /// owned by exactly one mm and must therefore carry nG from its first
+    /// publication. Shared aliases keep using [`Self::map_aliased`].
     pub fn map_private_aliased(
         &mut self,
         va: u64,
@@ -2320,7 +2373,9 @@ impl PageTableManager {
     }
 
     /// Repoint an EL1-only Carrick control-page range while preserving the
-    /// kernel-hole execution regime: AP=00, UXN=1, PXN=0.
+    /// kernel-hole execution regime: AP=00, UXN=1, PXN=0. Using the ordinary
+    /// user alias flags here sets PXN and makes the entry trampoline/vector
+    /// page unexecutable at EL1 under FEAT_PAN3.
     pub fn map_kernel_aliased(
         &mut self,
         va: u64,
@@ -2340,7 +2395,10 @@ impl PageTableManager {
     }
 
     /// Repoint existing 4 KiB leaves to a new linear IPA while preserving every
-    /// non-address attribute: validity, AP, AF, shareability, PXN and UXN.
+    /// non-address attribute: validity, AP, AF, shareability, PXN and UXN.  Frame
+    /// COW uses this before selectively granting write to the semantic pages
+    /// which are currently writable.  That matters when one 16 KiB host
+    /// compound straddles a `brk`, `mprotect`, or partial-unmap boundary.
     pub fn repoint_preserving_attributes(
         &mut self,
         va: u64,
@@ -2375,6 +2433,9 @@ impl PageTableManager {
     }
 
     /// Grant EL0/EL1 write access without changing validity or execute policy.
+    /// The caller has already established that these exact semantic pages are
+    /// writable; preserving UXN/PXN avoids reintroducing execute permission on
+    /// a page whose post-fork `mprotect` state differs from its boot mapping.
     pub fn set_writable_preserving_attributes(
         &mut self,
         va: u64,
@@ -2423,6 +2484,24 @@ impl PageTableManager {
         (last - first) / gran + 1
     }
 
+    /// Build a VA→IPA alias translation using the COARSEST leaf the geometry
+    /// admits at every step: 1 GiB L1 blocks, then 2 MiB L2 blocks, then 4 KiB
+    /// L3 pages only at the edges.
+    ///
+    /// `mmap` establishes a VMA; it must not do work proportional to the
+    /// mapping's size. A block leaf maps a naturally aligned VA span onto an
+    /// equally aligned output, so it is expressible exactly when the VA and the
+    /// IPA are *congruent* modulo the block size — congruence, not either
+    /// address's own alignment, is what decides whether coarse leaves are
+    /// usable. (Masking an unaligned output into a block descriptor would
+    /// silently map the wrong bytes, so the choice is made per step and never
+    /// forced.)
+    ///
+    /// The build is also all-or-nothing. Running out of spare tables partway
+    /// used to leave a half-built mapping that the guest re-faults on forever —
+    /// an apparent hang rather than an error — so the table budget is checked
+    /// UP FRONT and an unsatisfiable build is refused whole, which the callers
+    /// lower to a guest `ENOMEM` the way Linux does.
     fn map_aliased_with_flags(
         &mut self,
         va: u64,
@@ -2443,16 +2522,27 @@ impl PageTableManager {
         }
         let end = va.checked_add(len).ok_or(PageTableError::BadAddress)?;
 
+        // Upper-bound the new tables this build can need, so an unsatisfiable
+        // one is refused before a single descriptor is written. Coarse leaves
+        // need no table at their own level, so only the levels ABOVE the leaf
+        // count. When VA and IPA are incongruent mod 2 MiB no block leaf is
+        // expressible anywhere and the build is page-granular throughout —
+        // which is what makes the budget check load-bearing rather than
+        // theoretical.
         let congruent = (va & (TWO_MIB - 1)) == (ipa & (TWO_MIB - 1));
         let l1_tables = Self::spans_touched(va, end, L1_SPAN);
         let l2_tables = Self::spans_touched(va, end, ONE_GIB);
         let l3_tables = if congruent {
+            // Only the two unaligned edges fall to pages.
             Self::spans_touched(va, end, TWO_MIB).min(2)
         } else {
             Self::spans_touched(va, end, TWO_MIB)
         };
         let needed = l1_tables + l2_tables + l3_tables;
         if needed > self.spare_tables_available() {
+            // The budget is checked UP FRONT (see above), so this path returns
+            // before `alloc_table` is ever called and its last-resort sweep
+            // would never run. Take the same one-shot reclaim here, then re-ask.
             self.reclaim_all_invalid_tables();
             if source.is_none() && needed > self.spare_tables_available() {
                 return Err(PageTableError::OutOfTables);
@@ -2486,6 +2576,10 @@ impl PageTableManager {
         Ok(true)
     }
 
+    /// Descend from L0 to the table at `target_level` (1, 2, or 3), allocating
+    /// any missing intermediate table from the spare pool. Returns the table's
+    /// location. Errors if an existing block sits on the path (never the case
+    /// for the high alias space).
     fn descend_creating(
         &mut self,
         va: u64,
@@ -2493,7 +2587,7 @@ impl PageTableManager {
         mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<TableLocation, PageTableError> {
         let idx = indices(va);
-        let mut table_loc = TableLocation::new(0, 0);
+        let mut table_loc = TableLocation::new(0, 0); // L0 at byte offset 0 in arena 0
         #[allow(clippy::needless_range_loop)]
         for level in 0..target_level {
             let entry_loc = table_loc.entry(idx[level]);
@@ -2505,6 +2599,12 @@ impl PageTableManager {
                 continue;
             }
             if valid {
+                // A valid BLOCK leaf covering this VA. Split it into a finer
+                // sub-table (preserving its mapping + validity) so we can
+                // descend and install a sub-range — e.g. a finer mapping inside
+                // a 2 MiB block an earlier alias mapping created (the case a
+                // forked child hits when it maps inside a block its parent's
+                // cloned tables already established). Mirrors `leaf_offset`.
                 self.split_block(entry_loc, level, source.as_deref_mut())?;
                 let desc2 = self.read_desc(entry_loc);
                 table_loc = self.pa_to_loc(desc2 & PA_MASK_TABLE)?;
@@ -2518,6 +2618,7 @@ impl PageTableManager {
     }
 
     /// True iff the leaf for `va` (block or page) is valid. Test/diagnostic.
+    #[cfg(test)]
     pub fn is_valid(&mut self, va: u64) -> bool {
         match self.leaf_offset(va, false, None) {
             Ok((loc, _)) => self.read_desc(loc) & VALID != 0,
@@ -2526,6 +2627,7 @@ impl PageTableManager {
     }
 
     /// AP[2:1] of the leaf for `va`. Test/diagnostic.
+    #[cfg(test)]
     pub fn ap_bits(&mut self, va: u64) -> u64 {
         match self.leaf_offset(va, false, None) {
             Ok((loc, _)) => self.read_desc(loc) & AP_MASK,
@@ -2534,6 +2636,7 @@ impl PageTableManager {
     }
 
     /// `unmap_aliased` returning exact traversal steps for algorithmic verification.
+    #[cfg(test)]
     pub fn unmap_aliased_counting(
         &mut self,
         va: u64,
