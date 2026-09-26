@@ -12,6 +12,7 @@
 //!
 //! 4 KiB translation granule, 40-bit IPA, AArch64 long-descriptor format.
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -428,7 +429,7 @@ fn discover_spare_pages<'a>(
 }
 
 /// Location of a descriptor within a possibly multi-arena page-table structure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct TableLocation {
     pub arena: usize,
     pub offset: usize,
@@ -583,22 +584,92 @@ pub fn const_resolver<F: Fn(u64) -> Option<*const u8>>(f: F) -> ConstFnResolver<
     ConstFnResolver(f)
 }
 
+impl HostArenaResolver for Arc<dyn HostArenaResolver + Send + Sync> {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        (**self).host_ptr_for_base(base)
+    }
+
+    fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+        (**self).host_const_ptr_for_base(base)
+    }
+
+    fn record_populated_prefix(&self, base: u64, prefix: usize) {
+        (**self).record_populated_prefix(base, prefix);
+    }
+}
+
+impl HostArenaResolver for &Arc<dyn HostArenaResolver + Send + Sync> {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        (***self).host_ptr_for_base(base)
+    }
+
+    fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+        (***self).host_const_ptr_for_base(base)
+    }
+
+    fn record_populated_prefix(&self, base: u64, prefix: usize) {
+        (***self).record_populated_prefix(base, prefix);
+    }
+}
+
+/// Storage kind for a stage-1 translation table arena.
 #[derive(Debug)]
-struct TableArena {
-    base: u64,
-    bytes: Vec<u8>,
-    next_free: u64,
-    capacity: usize,
+pub enum TableArenaStorage {
+    /// Owned software buffer used for offline construction, boot images, and detached snapshots.
+    Owned(Vec<u8>),
+    /// Live hardware-visible backing. No software shadow bytes are stored; reads and
+    /// observation query live host memory directly.
+    Live,
+}
+
+#[derive(Debug)]
+pub struct TableArena {
+    pub base: u64,
+    pub storage: TableArenaStorage,
+    pub next_free: u64,
+    pub capacity: usize,
+}
+
+impl TableArena {
+    #[inline]
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        matches!(self.storage, TableArenaStorage::Live)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn allocated_span(&self) -> u64 {
+        match self.storage {
+            TableArenaStorage::Owned(ref bytes) => (bytes.len() as u64).max(self.next_free),
+            TableArenaStorage::Live => self.next_free,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn current_pages(&self) -> usize {
+        match self.storage {
+            TableArenaStorage::Owned(ref bytes) => bytes.len() / PT_PAGE as usize,
+            TableArenaStorage::Live => (self.next_free as usize) / PT_PAGE as usize,
+        }
+    }
 }
 
 impl Clone for TableArena {
     fn clone(&self) -> Self {
-        let mut bytes = Vec::with_capacity(self.capacity);
-        let prefix_len = (self.next_free as usize).min(self.bytes.len());
-        bytes.extend_from_slice(&self.bytes[..prefix_len]);
+        let storage = match self.storage {
+            TableArenaStorage::Owned(ref bytes) => {
+                let mut new_bytes = Vec::with_capacity(self.capacity);
+                let prefix_len = (self.next_free as usize).min(bytes.len());
+                new_bytes.extend_from_slice(&bytes[..prefix_len]);
+                TableArenaStorage::Owned(new_bytes)
+            }
+            TableArenaStorage::Live => TableArenaStorage::Live,
+        };
         Self {
             base: self.base,
-            bytes,
+            storage,
             next_free: self.next_free,
             capacity: self.capacity,
         }
@@ -608,33 +679,35 @@ impl Clone for TableArena {
         self.base = source.base;
         self.next_free = source.next_free;
         self.capacity = source.capacity;
-        self.bytes.clear();
-        if self.bytes.capacity() < source.capacity {
-            self.bytes.reserve(source.capacity);
+        match (&mut self.storage, &source.storage) {
+            (TableArenaStorage::Owned(my_bytes), TableArenaStorage::Owned(src_bytes)) => {
+                my_bytes.clear();
+                if my_bytes.capacity() < source.capacity {
+                    my_bytes.reserve(source.capacity);
+                }
+                let prefix_len = (source.next_free as usize).min(src_bytes.len());
+                my_bytes.extend_from_slice(&src_bytes[..prefix_len]);
+            }
+            (dest_storage, TableArenaStorage::Live) => {
+                *dest_storage = TableArenaStorage::Live;
+            }
+            (dest_storage, TableArenaStorage::Owned(src_bytes)) => {
+                let mut new_bytes = Vec::with_capacity(source.capacity);
+                let prefix_len = (source.next_free as usize).min(src_bytes.len());
+                new_bytes.extend_from_slice(&src_bytes[..prefix_len]);
+                *dest_storage = TableArenaStorage::Owned(new_bytes);
+            }
         }
-        let prefix_len = (source.next_free as usize).min(source.bytes.len());
-        self.bytes.extend_from_slice(&source.bytes[..prefix_len]);
     }
 }
 
-/// Mutable editor over a copy of the page-table region bytes.
+/// Mutable editor over stage-1 page-table descriptors.
 ///
-/// `Clone` is used by `fork`: the child needs its OWN manager (it gets a
-/// private copy of the page-table backing) but MUST inherit the parent's
-/// `next_free`/`free_tables` — a fresh manager would reset the bump cursor and
-/// re-hand-out table pages already live in the copied backing, corrupting it.
-///
-/// `Clone` is implemented by hand ONLY to give `clone_from` an allocation-reusing
-/// body; `clone` itself is the field-wise copy `#[derive(Clone)]` would have
-/// produced. The 1.75 MiB `LINUX_PAGE_TABLES_SIZE` image is large enough that
-/// the system allocator serves it from a fresh `mmap`, so every snapshot costs a
-/// host `mmap`, a zero-fill fault per 16 KiB page, and a `munmap`/`madvise` on
-/// drop. The frame-COW handler takes such a snapshot on EVERY fault as its
-/// rollback pre-image, so reusing one buffer removes that host-VM churn from the
-/// COW path without weakening the snapshot (it is still the complete
-/// pre-transaction image).
+/// For offline images, descriptors are owned in memory (`TableArenaStorage::Owned`).
+/// For live address spaces, hardware-visible memory is the authoritative storage
+/// (`TableArenaStorage::Live`), with uncommitted transaction writes overlaid in `staged`.
 pub struct PageTableManager {
-    arenas: Vec<TableArena>,
+    pub arenas: Vec<TableArena>,
     layout: PageTableLayoutConfig,
     /// New or rebuilt terminal descriptors must carry nG. Derived from the
     /// canonical low user leaf so a rebased/cloned HVPatch table retains its
@@ -673,6 +746,10 @@ pub struct PageTableManager {
     /// break-before-make ordering that keeps a concurrent sibling walk safe
     /// without quiescing.
     dirty: Vec<(TableLocation, bool)>,
+    /// Uncommitted writes overlaid during active transactions before sync_to_host.
+    staged: hashbrown::HashMap<TableLocation, (u64, bool)>,
+    /// Live host backing resolver for hardware-visible page table memory.
+    resolver: Option<Arc<dyn HostArenaResolver + Send + Sync>>,
     /// Pre-images of every descriptor word written since [`Self::begin_undo`],
     /// in write order, with the scalar state to restore alongside them.
     undo: Option<UndoJournal>,
@@ -707,17 +784,23 @@ struct UndoJournal {
 
 impl Clone for PageTableManager {
     fn clone(&self) -> Self {
-        Self {
-            arenas: self.arenas.clone(),
-            layout: self.layout,
-            asid_scoped_leaves: self.asid_scoped_leaves,
-            free_tables: self.free_tables.clone(),
-            multi_vcpu: self.multi_vcpu,
-            offline_private_image: self.offline_private_image,
-            stage1_exclusive: self.stage1_exclusive,
-            reclaim_pending: self.reclaim_pending,
-            dirty: self.dirty.clone(),
-            undo: self.undo.clone(),
+        if self.is_live() {
+            self.snapshot_image()
+        } else {
+            Self {
+                arenas: self.arenas.clone(),
+                layout: self.layout,
+                asid_scoped_leaves: self.asid_scoped_leaves,
+                free_tables: self.free_tables.clone(),
+                multi_vcpu: self.multi_vcpu,
+                offline_private_image: self.offline_private_image,
+                stage1_exclusive: self.stage1_exclusive,
+                reclaim_pending: self.reclaim_pending,
+                dirty: self.dirty.clone(),
+                staged: self.staged.clone(),
+                resolver: self.resolver.clone(),
+                undo: self.undo.clone(),
+            }
         }
     }
 
@@ -726,16 +809,22 @@ impl Clone for PageTableManager {
     /// allocations differ. `Vec::clone_from` keeps the destination's capacity,
     /// which is the entire point on the 1.75 MiB table image.
     fn clone_from(&mut self, source: &Self) {
-        self.arenas.clone_from(&source.arenas);
-        self.layout = source.layout;
-        self.asid_scoped_leaves = source.asid_scoped_leaves;
-        self.free_tables.clone_from(&source.free_tables);
-        self.multi_vcpu = source.multi_vcpu;
-        self.offline_private_image = source.offline_private_image;
-        self.stage1_exclusive = source.stage1_exclusive;
-        self.reclaim_pending = source.reclaim_pending;
-        self.dirty.clone_from(&source.dirty);
-        self.undo.clone_from(&source.undo);
+        if source.is_live() {
+            source.snapshot_into(self);
+        } else {
+            self.arenas.clone_from(&source.arenas);
+            self.layout = source.layout;
+            self.asid_scoped_leaves = source.asid_scoped_leaves;
+            self.free_tables.clone_from(&source.free_tables);
+            self.multi_vcpu = source.multi_vcpu;
+            self.offline_private_image = source.offline_private_image;
+            self.stage1_exclusive = source.stage1_exclusive;
+            self.reclaim_pending = source.reclaim_pending;
+            self.dirty.clone_from(&source.dirty);
+            self.staged.clone_from(&source.staged);
+            self.resolver = source.resolver.clone();
+            self.undo.clone_from(&source.undo);
+        }
     }
 }
 
@@ -757,7 +846,7 @@ impl PageTableManager {
         Self {
             arenas: vec![TableArena {
                 base,
-                bytes,
+                storage: TableArenaStorage::Owned(bytes),
                 next_free,
                 capacity,
             }],
@@ -769,8 +858,192 @@ impl PageTableManager {
             stage1_exclusive: false,
             reclaim_pending: false,
             dirty: Vec::new(),
+            staged: hashbrown::HashMap::new(),
+            resolver: None,
             undo: None,
         }
+    }
+
+    pub fn new_live(
+        base: u64,
+        layout: PageTableLayoutConfig,
+        primary_capacity: usize,
+        resolver: Arc<dyn HostArenaResolver + Send + Sync>,
+    ) -> Self {
+        let asid_scoped_leaves = if let Some(host_ptr) = resolver.host_const_ptr_for_base(base) {
+            let walk = unsafe {
+                walk_descriptors_host(host_ptr, primary_capacity, base, layout.user_leaf_check_va)
+            };
+            terminal_descriptor(walk) & NON_GLOBAL != 0
+        } else {
+            false
+        };
+        Self {
+            arenas: vec![TableArena {
+                base,
+                storage: TableArenaStorage::Live,
+                next_free: SPARE_START_OFFSET,
+                capacity: primary_capacity,
+            }],
+            layout,
+            asid_scoped_leaves,
+            free_tables: Vec::new(),
+            multi_vcpu: false,
+            offline_private_image: false,
+            stage1_exclusive: false,
+            reclaim_pending: false,
+            dirty: Vec::new(),
+            staged: hashbrown::HashMap::new(),
+            resolver: Some(resolver),
+            undo: None,
+        }
+    }
+
+    /// True if this manager is bound to live hardware-visible memory.
+    pub fn is_live(&self) -> bool {
+        self.arenas.first().is_some_and(|a| a.is_live())
+    }
+
+    /// Convert this manager to live backing authority, discarding any software shadow buffers.
+    pub fn make_live(&mut self, resolver: Arc<dyn HostArenaResolver + Send + Sync>) {
+        self.resolver = Some(resolver);
+        for arena in &mut self.arenas {
+            arena.storage = TableArenaStorage::Live;
+        }
+        self.staged.clear();
+        self.dirty.clear();
+        self.offline_private_image = false;
+    }
+
+    /// Bind or update the host arena resolver for this live manager.
+    pub fn bind_resolver(&mut self, resolver: Arc<dyn HostArenaResolver + Send + Sync>) {
+        self.resolver = Some(resolver);
+    }
+
+    /// Snapshot this manager into `target`, reusing `target`'s existing buffers.
+    pub fn snapshot_into(&self, target: &mut PageTableManager) {
+        target.layout = self.layout;
+        target.asid_scoped_leaves = self.asid_scoped_leaves;
+        target.free_tables.clear();
+        target.free_tables.extend_from_slice(&self.free_tables);
+        target.multi_vcpu = self.multi_vcpu;
+        target.offline_private_image = true;
+        target.stage1_exclusive = true;
+        target.reclaim_pending = self.reclaim_pending;
+        target.dirty.clear();
+        target.dirty.extend_from_slice(&self.dirty);
+        target.undo = self.undo.clone();
+        target.staged.clear();
+        target.resolver = None;
+
+        while target.arenas.len() > self.arenas.len() {
+            target.arenas.pop();
+        }
+        while target.arenas.len() < self.arenas.len() {
+            let i = target.arenas.len();
+            let src = &self.arenas[i];
+            let mut bytes = Vec::with_capacity(src.capacity);
+            bytes.resize(src.next_free as usize, 0);
+            target.arenas.push(TableArena {
+                base: src.base,
+                storage: TableArenaStorage::Owned(bytes),
+                next_free: src.next_free,
+                capacity: src.capacity,
+            });
+        }
+
+        for (i, src_arena) in self.arenas.iter().enumerate() {
+            let target_arena = &mut target.arenas[i];
+            target_arena.base = src_arena.base;
+            target_arena.next_free = src_arena.next_free;
+            target_arena.capacity = src_arena.capacity;
+
+            let prefix_len = src_arena.next_free as usize;
+            match (&mut target_arena.storage, &src_arena.storage) {
+                (TableArenaStorage::Owned(dst_bytes), TableArenaStorage::Owned(src_bytes)) => {
+                    dst_bytes.clear();
+                    if dst_bytes.capacity() < src_arena.capacity {
+                        dst_bytes.reserve(src_arena.capacity);
+                    }
+                    let copy_len = prefix_len.min(src_bytes.len());
+                    dst_bytes.extend_from_slice(&src_bytes[..copy_len]);
+                    if dst_bytes.len() < prefix_len {
+                        dst_bytes.resize(prefix_len, 0);
+                    }
+                }
+                (TableArenaStorage::Owned(dst_bytes), TableArenaStorage::Live) => {
+                    dst_bytes.clear();
+                    if dst_bytes.capacity() < src_arena.capacity {
+                        dst_bytes.reserve(src_arena.capacity);
+                    }
+                    dst_bytes.resize(prefix_len, 0);
+                    if let Some(ref resolver) = self.resolver
+                        && let Some(host) = resolver.host_const_ptr_for_base(src_arena.base)
+                    {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                host,
+                                dst_bytes.as_mut_ptr(),
+                                prefix_len,
+                            );
+                        }
+                    }
+                }
+                (dest_storage, TableArenaStorage::Live) => {
+                    let mut dst_bytes = Vec::with_capacity(src_arena.capacity);
+                    dst_bytes.resize(prefix_len, 0);
+                    if let Some(ref resolver) = self.resolver
+                        && let Some(host) = resolver.host_const_ptr_for_base(src_arena.base)
+                    {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                host,
+                                dst_bytes.as_mut_ptr(),
+                                prefix_len,
+                            );
+                        }
+                    }
+                    *dest_storage = TableArenaStorage::Owned(dst_bytes);
+                }
+                (dest_storage, TableArenaStorage::Owned(src_bytes)) => {
+                    let mut dst_bytes = Vec::with_capacity(src_arena.capacity);
+                    let copy_len = prefix_len.min(src_bytes.len());
+                    dst_bytes.extend_from_slice(&src_bytes[..copy_len]);
+                    if dst_bytes.len() < prefix_len {
+                        dst_bytes.resize(prefix_len, 0);
+                    }
+                    *dest_storage = TableArenaStorage::Owned(dst_bytes);
+                }
+            }
+
+            if let TableArenaStorage::Owned(ref mut dst_bytes) = target_arena.storage {
+                for (loc, (desc, _)) in &self.staged {
+                    if loc.arena == i && loc.offset + 8 <= dst_bytes.len() {
+                        dst_bytes[loc.offset..loc.offset + 8].copy_from_slice(&desc.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Snapshot this manager into a new owned PageTableManager image.
+    pub fn snapshot_image(&self) -> PageTableManager {
+        let mut target = PageTableManager {
+            arenas: Vec::with_capacity(self.arenas.len()),
+            layout: self.layout,
+            asid_scoped_leaves: self.asid_scoped_leaves,
+            free_tables: Vec::new(),
+            multi_vcpu: self.multi_vcpu,
+            offline_private_image: true,
+            stage1_exclusive: true,
+            reclaim_pending: self.reclaim_pending,
+            dirty: Vec::new(),
+            staged: hashbrown::HashMap::new(),
+            resolver: None,
+            undo: None,
+        };
+        self.snapshot_into(&mut target);
+        target
     }
 
     /// Guest-physical address of the L0 table represented by this image.
@@ -805,16 +1078,13 @@ impl PageTableManager {
     }
 
     fn total_pages(&self) -> usize {
-        self.arenas
-            .iter()
-            .map(|a| a.bytes.len() / PT_PAGE as usize)
-            .sum()
+        self.arenas.iter().map(|a| a.current_pages()).sum()
     }
 
     fn loc_to_page_index(&self, loc: TableLocation) -> usize {
         let prior: usize = self.arenas[..loc.arena]
             .iter()
-            .map(|a| a.bytes.len() / PT_PAGE as usize)
+            .map(|a| a.current_pages())
             .sum();
         prior + loc.offset / PT_PAGE as usize
     }
@@ -869,7 +1139,7 @@ impl PageTableManager {
                 if level > 3
                     || table_loc.offset % PT_PAGE as usize != 0
                     || table_loc.offset + PT_PAGE as usize
-                        > self.arenas[table_loc.arena].bytes.len()
+                        > self.arenas[table_loc.arena].allocated_span() as usize
                 {
                     return Err(PageTableError::BadAddress);
                 }
@@ -891,7 +1161,7 @@ impl PageTableManager {
                     let child_loc = self.pa_to_loc(child_pa)?;
                     if !child_loc.offset.is_multiple_of(PT_PAGE as usize)
                         || child_loc.offset + PT_PAGE as usize
-                            > self.arenas[child_loc.arena].bytes.len()
+                            > self.arenas[child_loc.arena].allocated_span() as usize
                     {
                         return Err(PageTableError::BadAddress);
                     }
@@ -904,7 +1174,8 @@ impl PageTableManager {
             for &table_pa in &self.free_tables {
                 let loc = self.pa_to_loc(table_pa)?;
                 if !loc.offset.is_multiple_of(PT_PAGE as usize)
-                    || loc.offset + PT_PAGE as usize > self.arenas[loc.arena].bytes.len()
+                    || loc.offset + PT_PAGE as usize
+                        > self.arenas[loc.arena].allocated_span() as usize
                 {
                     return Err(PageTableError::BadAddress);
                 }
@@ -958,17 +1229,6 @@ impl PageTableManager {
     /// Declare this image an OFFLINE PRIVATE copy: sole owner, no hardware
     /// walker can reach it, so freeing a spare sub-table for reuse cannot race
     /// a stale cached walk.
-    ///
-    /// `clone()` copies `stage1_exclusive` because the field describes the
-    /// EDITOR, and for a live manager the editor is the calling vCPU thread. An
-    /// offline fork copy has no such editor — the inherited value describes the
-    /// PARENT's last mapping syscall, which says nothing about this image. Left
-    /// inherited it reads `false` whenever the parent's last stage-1 edit was
-    /// not an exclusive one, and `alloc_table`'s last-resort sweep is then
-    /// refused while the child is publishing its own mappings: `cpython`
-    /// `concurrent_futures` reached `OutOfTables` at `in_use=438 free=0
-    /// capacity=440 exclusive=false reclaim_pending=true` — a pool with
-    /// reclaimable tables and no permission to reclaim them.
     pub fn declare_offline_private_image(&mut self) {
         self.stage1_exclusive = true;
         self.offline_private_image = true;
@@ -989,12 +1249,11 @@ impl PageTableManager {
             return false;
         }
         let primary = &self.arenas[0];
-        if pa >= primary.base + SPARE_START_OFFSET && pa < primary.base + primary.bytes.len() as u64
-        {
+        if pa >= primary.base + SPARE_START_OFFSET && pa < primary.base + primary.next_free {
             return true;
         }
         for arena in &self.arenas[1..] {
-            if pa >= arena.base && pa < arena.base + arena.bytes.len() as u64 {
+            if pa >= arena.base && pa < arena.base + arena.next_free {
                 return true;
             }
         }
@@ -1006,16 +1265,25 @@ impl PageTableManager {
     /// image, so no hardware walk cache can still reference the page.
     fn free_table(&mut self, pa: u64) {
         if let Ok(loc) = self.pa_to_loc(pa) {
-            // Bulk zeroing bypasses `write_desc`, so journal the page word by
-            // word; coalescing is rare and a missed pre-image here would be an
-            // unrecoverable rollback.
             if self.undo.is_some() {
                 for off in (loc.offset..loc.offset + PT_PAGE as usize).step_by(8) {
                     self.note_undo_unlinked(TableLocation::new(loc.arena, off));
                 }
             }
-            for b in &mut self.arenas[loc.arena].bytes[loc.offset..loc.offset + PT_PAGE as usize] {
-                *b = 0;
+            let arena = &mut self.arenas[loc.arena];
+            match arena.storage {
+                TableArenaStorage::Owned(ref mut bytes) => {
+                    for b in &mut bytes[loc.offset..loc.offset + PT_PAGE as usize] {
+                        *b = 0;
+                    }
+                }
+                TableArenaStorage::Live => {
+                    for off in (loc.offset..loc.offset + PT_PAGE as usize).step_by(8) {
+                        let word_loc = TableLocation::new(loc.arena, off);
+                        self.staged.insert(word_loc, (0, false));
+                        self.dirty.push((word_loc, false));
+                    }
+                }
             }
             self.free_tables.push(pa);
         }
@@ -1023,32 +1291,89 @@ impl PageTableManager {
 
     /// Borrow the (possibly edited) table-region bytes of the primary arena.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.arenas[0].bytes
+        match self.arenas[0].storage {
+            TableArenaStorage::Owned(ref bytes) => bytes,
+            TableArenaStorage::Live => &[],
+        }
     }
 
     /// Consume the manager, returning the (possibly edited) table-region bytes of the primary arena.
     /// Used by the boot-time ELF read-only-span pass, which edits the pristine
     /// `stage1_identity_page_tables` image before it is mapped into the guest.
     pub fn into_bytes(mut self) -> Vec<u8> {
-        let mut primary = self.arenas.remove(0);
-        if primary.bytes.len() < primary.capacity {
-            primary.bytes.resize(primary.capacity, 0);
+        let primary = self.arenas.remove(0);
+        let mut bytes = match primary.storage {
+            TableArenaStorage::Owned(bytes) => bytes,
+            TableArenaStorage::Live => {
+                let mut bytes = Vec::with_capacity(primary.capacity);
+                bytes.resize(primary.next_free as usize, 0);
+                if let Some(ref resolver) = self.resolver
+                    && let Some(host) = resolver.host_const_ptr_for_base(primary.base)
+                {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            host,
+                            bytes.as_mut_ptr(),
+                            primary.next_free as usize,
+                        );
+                    }
+                }
+                bytes
+            }
+        };
+        if bytes.len() < primary.capacity {
+            bytes.resize(primary.capacity, 0);
         }
-        primary.bytes
+        bytes
     }
 
     fn read_desc(&self, loc: TableLocation) -> u64 {
-        let mut a = [0u8; 8];
-        a.copy_from_slice(&self.arenas[loc.arena].bytes[loc.offset..loc.offset + 8]);
-        u64::from_le_bytes(a)
+        if let Some(&(desc, _)) = self.staged.get(&loc) {
+            return desc;
+        }
+        let arena = &self.arenas[loc.arena];
+        match arena.storage {
+            TableArenaStorage::Owned(ref bytes) => {
+                if loc.offset + 8 <= bytes.len() {
+                    let mut a = [0u8; 8];
+                    a.copy_from_slice(&bytes[loc.offset..loc.offset + 8]);
+                    u64::from_le_bytes(a)
+                } else {
+                    0
+                }
+            }
+            TableArenaStorage::Live => {
+                let Some(ref resolver) = self.resolver else {
+                    return 0;
+                };
+                let Some(host) = resolver.host_const_ptr_for_base(arena.base) else {
+                    return 0;
+                };
+                use core::sync::atomic::{AtomicU64, Ordering};
+                unsafe {
+                    let slot = host.add(loc.offset).cast::<AtomicU64>();
+                    (*slot).load(Ordering::Acquire)
+                }
+            }
+        }
     }
 
     /// Write a leaf/child descriptor (a block, page, or sub-table entry that is
     /// not itself newly pointing the walker at a fresh table).
     fn write_desc(&mut self, loc: TableLocation, desc: u64) {
         self.note_undo(loc);
-        self.arenas[loc.arena].bytes[loc.offset..loc.offset + 8]
-            .copy_from_slice(&desc.to_le_bytes());
+        let arena = &mut self.arenas[loc.arena];
+        match arena.storage {
+            TableArenaStorage::Owned(ref mut bytes) => {
+                if loc.offset + 8 > bytes.len() {
+                    bytes.resize(loc.offset + 8, 0);
+                }
+                bytes[loc.offset..loc.offset + 8].copy_from_slice(&desc.to_le_bytes());
+            }
+            TableArenaStorage::Live => {
+                self.staged.insert(loc, (desc, false));
+            }
+        }
         self.dirty.push((loc, false));
     }
 
@@ -1083,8 +1408,18 @@ impl PageTableManager {
     /// entries are visible.
     fn write_table_desc(&mut self, loc: TableLocation, desc: u64) {
         self.note_undo(loc);
-        self.arenas[loc.arena].bytes[loc.offset..loc.offset + 8]
-            .copy_from_slice(&desc.to_le_bytes());
+        let arena = &mut self.arenas[loc.arena];
+        match arena.storage {
+            TableArenaStorage::Owned(ref mut bytes) => {
+                if loc.offset + 8 > bytes.len() {
+                    bytes.resize(loc.offset + 8, 0);
+                }
+                bytes[loc.offset..loc.offset + 8].copy_from_slice(&desc.to_le_bytes());
+            }
+            TableArenaStorage::Live => {
+                self.staged.insert(loc, (desc, true));
+            }
+        }
         self.dirty.push((loc, true));
     }
 
@@ -1101,10 +1436,6 @@ impl PageTableManager {
         resolver: impl HostArenaResolver,
     ) -> Result<(), PageTableError> {
         use core::sync::atomic::{AtomicU64, Ordering, fence};
-        // Resolve once per touched arena for this publication only. Resolving
-        // each descriptor repeats the carrier's mapping search thousands of
-        // times. Preflight also keeps a missing extension from publishing half
-        // an edit or consuming its retry journal.
         let mut inline_hosts = [None; 8];
         let mut overflow_hosts;
         let hosts = if self.arenas.len() <= inline_hosts.len() {
@@ -1123,26 +1454,32 @@ impl PageTableManager {
                 );
             }
         }
-        for (loc, is_ptr) in self.dirty.drain(..) {
+        let dirty = core::mem::take(&mut self.dirty);
+        for (loc, is_ptr) in dirty {
             let arena = &self.arenas[loc.arena];
-            let mut a = [0u8; 8];
-            a.copy_from_slice(&arena.bytes[loc.offset..loc.offset + 8]);
-            let v = u64::from_le_bytes(a);
+            let v = if let Some(&(staged_desc, _)) = self.staged.get(&loc) {
+                staged_desc
+            } else {
+                match arena.storage {
+                    TableArenaStorage::Owned(ref bytes) => {
+                        let mut a = [0u8; 8];
+                        a.copy_from_slice(&bytes[loc.offset..loc.offset + 8]);
+                        u64::from_le_bytes(a)
+                    }
+                    TableArenaStorage::Live => self.read_desc(loc),
+                }
+            };
             if is_ptr {
-                // Ensure the child-table entries written earlier are globally
-                // visible before the pointer that exposes them.
                 fence(Ordering::SeqCst);
             }
-            // Every dirty arena was resolved before the first store.
             let host = hosts[loc.arena].ok_or(PageTableError::UnresolvedArena(arena.base))?;
-            // Offsets are 8-byte aligned (index*8), so this is a single atomic
-            // store the guest walker observes whole.
             unsafe {
                 let slot = host.add(loc.offset) as *mut AtomicU64;
                 (*slot).store(v, Ordering::SeqCst);
             }
         }
         fence(Ordering::SeqCst);
+        self.staged.clear();
         for (i, host) in hosts.iter().enumerate() {
             if host.is_some() {
                 resolver.record_populated_prefix(
@@ -1205,11 +1542,18 @@ impl PageTableManager {
             return Vec::new();
         };
         for &(loc, previous) in journal.words.iter().rev() {
+            self.staged.remove(&loc);
             let arena = &mut self.arenas[loc.arena];
-            arena.bytes[loc.offset..loc.offset + 8].copy_from_slice(&previous.to_le_bytes());
+            match arena.storage {
+                TableArenaStorage::Owned(ref mut bytes) => {
+                    if loc.offset + 8 <= bytes.len() {
+                        bytes[loc.offset..loc.offset + 8].copy_from_slice(&previous.to_le_bytes());
+                    }
+                }
+                TableArenaStorage::Live => {}
+            }
             fence(Ordering::SeqCst);
             if let Some(host) = resolver.host_ptr_for_base(arena.base) {
-                // SAFETY: offsets are 8-byte aligned and within the arena.
                 unsafe {
                     let slot = host.add(loc.offset).cast::<AtomicU64>();
                     (*slot).store(previous, Ordering::Release);
@@ -1220,7 +1564,9 @@ impl PageTableManager {
         for (i, &next_free) in journal.arena_next_frees.iter().enumerate() {
             if i < self.arenas.len() {
                 self.arenas[i].next_free = next_free;
-                self.arenas[i].bytes.truncate(next_free as usize);
+                if let TableArenaStorage::Owned(ref mut bytes) = self.arenas[i].storage {
+                    bytes.truncate(next_free as usize);
+                }
             }
         }
         self.free_tables = journal.free_tables;
@@ -1248,11 +1594,18 @@ impl PageTableManager {
 
         for arena in &self.arenas {
             if let Some(host) = resolver.host_ptr_for_base(arena.base) {
-                let prefix_len = (arena.next_free as usize).min(arena.bytes.len());
-                unsafe {
-                    core::ptr::copy_nonoverlapping(arena.bytes.as_ptr(), host, prefix_len);
+                match arena.storage {
+                    TableArenaStorage::Owned(ref bytes) => {
+                        let prefix_len = (arena.next_free as usize).min(bytes.len());
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(bytes.as_ptr(), host, prefix_len);
+                        }
+                        resolver.record_populated_prefix(arena.base, prefix_len);
+                    }
+                    TableArenaStorage::Live => {
+                        resolver.record_populated_prefix(arena.base, arena.next_free as usize);
+                    }
                 }
-                resolver.record_populated_prefix(arena.base, prefix_len);
             }
         }
         fence(Ordering::SeqCst);
@@ -1268,7 +1621,7 @@ impl PageTableManager {
     /// Location of a PA known to live inside one of the page-table arenas.
     fn pa_to_loc(&self, pa: u64) -> Result<TableLocation, PageTableError> {
         for (i, arena) in self.arenas.iter().enumerate() {
-            let end = arena.base + arena.bytes.len() as u64;
+            let end = arena.base + arena.allocated_span();
             if pa >= arena.base && pa < end {
                 return Ok(TableLocation::new(i, (pa - arena.base) as usize));
             }
@@ -1323,11 +1676,17 @@ impl PageTableManager {
             if self.arenas.iter().any(|mine| mine.base == arena.base) {
                 continue;
             }
-            let mut bytes = Vec::with_capacity(arena.capacity);
-            bytes.resize(PT_PAGE as usize, 0);
+            let storage = match self.arenas[0].storage {
+                TableArenaStorage::Owned(_) => {
+                    let mut bytes = Vec::with_capacity(arena.capacity);
+                    bytes.resize(PT_PAGE as usize, 0);
+                    TableArenaStorage::Owned(bytes)
+                }
+                TableArenaStorage::Live => TableArenaStorage::Live,
+            };
             self.arenas.push(TableArena {
                 base: arena.base,
-                bytes,
+                storage,
                 next_free: PT_PAGE,
                 capacity: arena.capacity,
             });
@@ -1356,7 +1715,7 @@ impl PageTableManager {
         #[allow(clippy::needless_range_loop)]
         for level in 0..4usize {
             let entry_loc = table_loc.entry(idx[level]);
-            if entry_loc.offset + 8 > self.arenas[entry_loc.arena].bytes.len() {
+            if entry_loc.offset + 8 > self.arenas[entry_loc.arena].allocated_span() as usize {
                 break;
             }
             let desc = self.read_desc(entry_loc);
@@ -1459,7 +1818,7 @@ impl PageTableManager {
         #[allow(clippy::needless_range_loop)]
         for level in 0..4usize {
             let entry_loc = table_loc.entry(idx[level]);
-            if entry_loc.offset + 8 > self.arenas[entry_loc.arena].bytes.len() {
+            if entry_loc.offset + 8 > self.arenas[entry_loc.arena].allocated_span() as usize {
                 return None;
             }
             let desc = self.read_desc(entry_loc);
@@ -1512,8 +1871,10 @@ impl PageTableManager {
             let off = self.arenas[0].next_free;
             self.arenas[0].next_free += PT_PAGE;
             let needed = self.arenas[0].next_free as usize;
-            if self.arenas[0].bytes.len() < needed {
-                self.arenas[0].bytes.resize(needed, 0);
+            if let TableArenaStorage::Owned(ref mut bytes) = self.arenas[0].storage
+                && bytes.len() < needed
+            {
+                bytes.resize(needed, 0);
             }
             return Ok(self.arenas[0].base + off);
         }
@@ -1522,8 +1883,10 @@ impl PageTableManager {
                 let off = arena.next_free;
                 arena.next_free += PT_PAGE;
                 let needed = arena.next_free as usize;
-                if arena.bytes.len() < needed {
-                    arena.bytes.resize(needed, 0);
+                if let TableArenaStorage::Owned(ref mut bytes) = arena.storage
+                    && bytes.len() < needed
+                {
+                    bytes.resize(needed, 0);
                 }
                 return Ok(arena.base + off);
             }
@@ -1538,11 +1901,17 @@ impl PageTableManager {
         {
             let base = gpa.0;
             let capacity = self.layout.extension_arena_capacity;
-            let mut bytes = Vec::with_capacity(capacity);
-            bytes.resize(PT_PAGE as usize, 0);
+            let storage = match self.arenas[0].storage {
+                TableArenaStorage::Owned(_) => {
+                    let mut bytes = Vec::with_capacity(capacity);
+                    bytes.resize(PT_PAGE as usize, 0);
+                    TableArenaStorage::Owned(bytes)
+                }
+                TableArenaStorage::Live => TableArenaStorage::Live,
+            };
             let arena = TableArena {
                 base,
-                bytes,
+                storage,
                 next_free: PT_PAGE,
                 capacity,
             };
@@ -3100,7 +3469,10 @@ mod tests {
 
         let mut recycled = manager();
         let capacity_before = recycled.arenas[0].capacity;
-        let buf_cap_before = recycled.arenas[0].bytes.capacity();
+        let buf_cap_before = match recycled.arenas[0].storage {
+            TableArenaStorage::Owned(ref bytes) => bytes.capacity(),
+            TableArenaStorage::Live => 0,
+        };
         recycled.clone_from(&source);
 
         let fresh = source.clone();
@@ -3108,8 +3480,12 @@ mod tests {
         assert_eq!(recycled.base(), fresh.base());
         assert_eq!(recycled.pool_stats(), fresh.pool_stats());
         assert_eq!(recycled.arenas[0].capacity, capacity_before);
+        let buf_cap_after = match recycled.arenas[0].storage {
+            TableArenaStorage::Owned(ref bytes) => bytes.capacity(),
+            TableArenaStorage::Live => 0,
+        };
         assert!(
-            recycled.arenas[0].bytes.capacity() >= buf_cap_before,
+            buf_cap_after >= buf_cap_before,
             "both managers cover the same region, so no reallocation is needed"
         );
     }
@@ -3127,7 +3503,11 @@ mod tests {
             "source should only be partially populated: populated={populated} vs cap={}",
             source.arenas[0].capacity
         );
-        assert_eq!(source.arenas[0].bytes.len(), populated as usize);
+        let src_len = match source.arenas[0].storage {
+            TableArenaStorage::Owned(ref bytes) => bytes.len(),
+            TableArenaStorage::Live => 0,
+        };
+        assert_eq!(src_len, populated as usize);
 
         assert!(
             source
@@ -3141,10 +3521,18 @@ mod tests {
 
         let cloned = source.clone();
         assert_eq!(cloned.copied_bytes(), populated);
-        assert_eq!(cloned.arenas[0].bytes.len(), populated as usize);
+        let cloned_len = match cloned.arenas[0].storage {
+            TableArenaStorage::Owned(ref bytes) => bytes.len(),
+            TableArenaStorage::Live => 0,
+        };
+        assert_eq!(cloned_len, populated as usize);
         assert_eq!(cloned.arenas[0].capacity, source.arenas[0].capacity);
+        let cloned_cap = match cloned.arenas[0].storage {
+            TableArenaStorage::Owned(ref bytes) => bytes.capacity(),
+            TableArenaStorage::Live => 0,
+        };
         assert!(
-            cloned.arenas[0].bytes.capacity() >= source.arenas[0].capacity,
+            cloned_cap >= source.arenas[0].capacity,
             "cloned arena must preserve full allocation capacity"
         );
         assert_eq!(
@@ -4012,14 +4400,14 @@ mod tests {
         assert!(!mgr.is_valid(invalid_va));
         assert!(mgr.dirty.iter().any(|(_, is_pointer)| *is_pointer));
         for level in 0..3 {
-            for descriptor in walk_descriptors(&mgr.arenas[0].bytes, new_base, alias_va)
+            for descriptor in walk_descriptors(mgr.as_bytes(), new_base, alias_va)
                 .into_iter()
                 .take(level + 1)
             {
                 if descriptor & VALID != 0 && descriptor & TYPE_BITS == TYPE_TABLE_OR_PAGE {
                     let pa = descriptor & PA_MASK_TABLE;
                     assert!(
-                        (new_base..new_base + mgr.arenas[0].bytes.len() as u64).contains(&pa),
+                        (new_base..new_base + mgr.as_bytes().len() as u64).contains(&pa),
                         "level {level} table pointer 0x{pa:x} stayed under old base 0x{old_base:x}"
                     );
                 }
@@ -4452,11 +4840,8 @@ mod tests {
             .dirty
             .iter()
             .map(|(loc, _)| {
-                let bytes = &mgr.arenas[loc.arena].bytes[loc.offset..loc.offset + 8];
-                (
-                    loc.offset / 8,
-                    u64::from_le_bytes(bytes.try_into().unwrap()),
-                )
+                let word = mgr.read_desc(*loc);
+                (loc.offset / 8, word)
             })
             .collect();
         unsafe {
@@ -4643,7 +5028,7 @@ mod tests {
 
         parent.arenas.push(TableArena {
             base: ext2_base.0,
-            bytes: vec![0u8; SPARE_START_OFFSET as usize],
+            storage: TableArenaStorage::Owned(vec![0u8; SPARE_START_OFFSET as usize]),
             next_free: SPARE_START_OFFSET,
             capacity: LINUX_PAGE_TABLES_SIZE as usize,
         });
@@ -4750,5 +5135,240 @@ mod tests {
         assert_eq!(leaf_before & VALID, 1);
         assert_eq!(leaf_after & VALID, 1);
         assert_eq!(leaf_after & AP_MASK, leaf_before & AP_MASK);
+    }
+
+    struct MockLiveResolver {
+        arenas: std::sync::Mutex<hashbrown::HashMap<u64, Vec<u8>>>,
+        populated: std::sync::Mutex<hashbrown::HashMap<u64, usize>>,
+    }
+
+    impl MockLiveResolver {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                arenas: std::sync::Mutex::new(hashbrown::HashMap::new()),
+                populated: std::sync::Mutex::new(hashbrown::HashMap::new()),
+            })
+        }
+
+        fn register_arena(&self, base: u64, size: usize) {
+            let mut arenas = self.arenas.lock().unwrap();
+            arenas.insert(base, vec![0u8; size]);
+        }
+
+        fn write_word(&self, base: u64, offset: usize, value: u64) {
+            let mut arenas = self.arenas.lock().unwrap();
+            let buf = arenas.get_mut(&base).expect("arena must exist");
+            buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn read_word(&self, base: u64, offset: usize) -> u64 {
+            let arenas = self.arenas.lock().unwrap();
+            let buf = arenas.get(&base).expect("arena must exist");
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&buf[offset..offset + 8]);
+            u64::from_le_bytes(bytes)
+        }
+    }
+
+    impl HostArenaResolver for MockLiveResolver {
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            let mut arenas = self.arenas.lock().unwrap();
+            arenas.get_mut(&base).map(|buf| buf.as_mut_ptr())
+        }
+
+        fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+            let arenas = self.arenas.lock().unwrap();
+            arenas.get(&base).map(|buf| buf.as_ptr())
+        }
+
+        fn record_populated_prefix(&self, base: u64, prefix_len: usize) {
+            self.populated.lock().unwrap().insert(base, prefix_len);
+        }
+    }
+
+    impl HostArenaResolver for &MockLiveResolver {
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            (*self).host_ptr_for_base(base)
+        }
+
+        fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+            (*self).host_const_ptr_for_base(base)
+        }
+
+        fn record_populated_prefix(&self, base: u64, prefix_len: usize) {
+            (*self).record_populated_prefix(base, prefix_len);
+        }
+    }
+
+    #[test]
+    fn live_leaf_revoke_and_repoint_is_observed_by_host_translation_and_snapshot() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let mut mgr = hvpatch_manager();
+        let va = 0x50_0000;
+        let ipa = 0x80_0000;
+        mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
+        unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) };
+
+        mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        assert!(mgr.is_live());
+        assert_eq!(mgr.translate(va), Some(ipa));
+
+        let snap = mgr.snapshot_image();
+        assert_eq!(snap.translate(va), Some(ipa));
+
+        // Walk to find the leaf descriptor's offset in the primary arena
+        let walk = mgr.debug_walk(va);
+        let leaf_desc = walk[3];
+        assert_ne!(leaf_desc & VALID, 0);
+
+        // Find the leaf entry offset in arena 0
+        let mut leaf_offset = None;
+        for offset in (0..mgr.arenas[0].allocated_span() as usize).step_by(8) {
+            if resolver.read_word(LINUX_PAGE_TABLES_BASE, offset) == leaf_desc {
+                leaf_offset = Some(offset);
+                break;
+            }
+        }
+        let leaf_offset = leaf_offset.expect("leaf entry must exist in hardware arena");
+
+        // Simulate guest revoking the leaf descriptor in hardware
+        resolver.write_word(LINUX_PAGE_TABLES_BASE, leaf_offset, 0);
+
+        // Host translation and snapshot must observe the revocation immediately
+        assert_eq!(
+            mgr.translate(va),
+            None,
+            "live translation must observe revocation"
+        );
+        assert_eq!(
+            mgr.snapshot_image().translate(va),
+            None,
+            "live snapshot must observe revocation"
+        );
+
+        // Simulate guest repointing the leaf descriptor to a new IPA
+        let new_ipa = 0x90_0000;
+        let new_desc = (leaf_desc & !PA_MASK_TABLE) | (new_ipa & PA_MASK_TABLE);
+        resolver.write_word(LINUX_PAGE_TABLES_BASE, leaf_offset, new_desc);
+
+        // Host translation and snapshot must observe the repointed IPA
+        assert_eq!(mgr.translate(va), Some(new_ipa));
+        assert_eq!(mgr.snapshot_image().translate(va), Some(new_ipa));
+    }
+
+    #[test]
+    fn live_host_permission_edit_preserves_independently_updated_output() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let mut mgr = hvpatch_manager();
+        let va = 0x50_0000;
+        let ipa = 0x80_0000;
+        mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
+        unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) };
+
+        mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+
+        let walk = mgr.debug_walk(va);
+        let leaf_desc = walk[3];
+        let mut leaf_offset = None;
+        for offset in (0..mgr.arenas[0].allocated_span() as usize).step_by(8) {
+            if resolver.read_word(LINUX_PAGE_TABLES_BASE, offset) == leaf_desc {
+                leaf_offset = Some(offset);
+                break;
+            }
+        }
+        let leaf_offset = leaf_offset.expect("leaf offset");
+
+        // Guest independently repoints the leaf in hardware before host permission edit
+        let updated_ipa = 0x88_0000;
+        let updated_desc = (leaf_desc & !PA_MASK_TABLE) | (updated_ipa & PA_MASK_TABLE);
+        resolver.write_word(LINUX_PAGE_TABLES_BASE, leaf_offset, updated_desc);
+
+        // Host edits permission to readonly
+        mgr.set_readonly(va, 0x1000, false, None)
+            .expect("set readonly");
+        unsafe { mgr.sync_to_host(&*resolver).expect("sync readonly") };
+
+        // Output IPA should be updated_ipa and permission should be RO (AP_RO = 1 << 7)
+        let hw_desc = resolver.read_word(LINUX_PAGE_TABLES_BASE, leaf_offset);
+        assert_eq!(hw_desc & PA_MASK_TABLE, updated_ipa);
+        assert_eq!(hw_desc & (1 << 7), 1 << 7, "AP must be RO");
+        assert_eq!(mgr.translate(va), Some(updated_ipa));
+    }
+
+    #[test]
+    fn live_rollback_undo_restores_preimage_without_resurrecting_stale_bytes() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let mut mgr = hvpatch_manager();
+        let va = 0x50_0000;
+        let ipa_a = 0x80_0000;
+        mgr.map_aliased(va, ipa_a, 0x1000, false, None)
+            .expect("map");
+        unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) };
+
+        mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        assert_eq!(mgr.translate(va), Some(ipa_a));
+
+        // Begin transaction
+        mgr.begin_undo();
+
+        // Mutate to ipa_b
+        let ipa_b = 0x90_0000;
+        mgr.map_aliased(va, ipa_b, 0x1000, false, None)
+            .expect("remap to B");
+        assert_eq!(
+            mgr.translate(va),
+            Some(ipa_b),
+            "staged write visible in transaction"
+        );
+
+        // Rollback
+        unsafe { mgr.rollback_undo(&*resolver, None) };
+        assert_eq!(mgr.translate(va), Some(ipa_a), "restores preimage A");
+        assert_eq!(mgr.snapshot_image().translate(va), Some(ipa_a));
+    }
+
+    #[test]
+    fn two_live_roots_using_identical_vas_stay_distinct() {
+        let root1_base = 0x9a00_0000;
+        let root2_base = 0x9b00_0000;
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(root1_base, LINUX_PAGE_TABLES_SIZE as usize);
+        resolver.register_arena(root2_base, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let mut mgr1 = hvpatch_manager();
+        mgr1.rebase(root1_base, None).expect("rebase 1");
+        let mut mgr2 = hvpatch_manager();
+        mgr2.rebase(root2_base, None).expect("rebase 2");
+
+        let va = 0x40_0000;
+        let ipa1 = 0x1000;
+        let ipa2 = 0x2000;
+
+        mgr1.map_aliased(va, ipa1, 0x1000, false, None)
+            .expect("map 1");
+        mgr2.map_aliased(va, ipa2, 0x1000, false, None)
+            .expect("map 2");
+
+        unsafe {
+            mgr1.restore_quiesced_snapshot_to_host(&*resolver);
+            mgr2.restore_quiesced_snapshot_to_host(&*resolver);
+        }
+
+        mgr1.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        mgr2.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+
+        assert_eq!(mgr1.translate(va), Some(ipa1));
+        assert_eq!(mgr2.translate(va), Some(ipa2));
+
+        let snap1 = mgr1.snapshot_image();
+        let snap2 = mgr2.snapshot_image();
+        assert_eq!(snap1.translate(va), Some(ipa1));
+        assert_eq!(snap2.translate(va), Some(ipa2));
     }
 }

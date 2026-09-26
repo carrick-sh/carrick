@@ -1499,7 +1499,7 @@ impl HvfTaskState {
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
         let cow_armed = std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
         let cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        Self {
+        let task = Self {
             #[cfg(not(test))]
             custody: std::sync::Arc::new(CarrierVmCustody::new()),
             mappings: TaskMappingIndex::new(),
@@ -1532,7 +1532,10 @@ impl HvfTaskState {
             fail_next_begin_exec_inventory: false,
             cow_rollback_scratch: None,
             registration: None,
-        }
+        };
+        let resolver = MmAccessLiveResolver::new(&task.mm_access, task.custody_arc());
+        task.mm_access.set_live_resolver(resolver);
+        task
     }
 
     fn audit_neutral(&self) -> Result<(), TrapError> {
@@ -1639,6 +1642,8 @@ impl HvfTaskState {
                 std::sync::Arc::clone(&self.cow_armed),
                 std::sync::Arc::clone(&self.cow_deferred_publications),
             );
+            let resolver = MmAccessLiveResolver::new(&self.mm_access, self.custody_arc());
+            self.mm_access.set_live_resolver(resolver);
         }
         self.frame_inventory
             .begin_exec_inventory(retired, replacement)
@@ -5211,6 +5216,16 @@ impl HvpatchTaskRegistration {
                             });
                     }
                 }
+                #[cfg(not(test))]
+                let custody = std::sync::Arc::clone(&self.custody);
+                #[cfg(test)]
+                let custody = task_mm
+                    .foreign_mm_transport
+                    .as_ref()
+                    .map(|t| std::sync::Arc::clone(&t.custody))
+                    .unwrap_or_else(|| std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc()));
+                let resolver = MmAccessLiveResolver::new(&access, custody);
+                access.set_live_resolver(resolver);
                 access
             }))
         };

@@ -329,6 +329,9 @@ pub(crate) struct MmAccessState {
     >,
     pub(crate) identity:
         parking_lot::RwLock<Option<(carrick_hal::ForeignMmId, CarrierForeignMmBinding)>>,
+    pub(crate) live_resolver: parking_lot::RwLock<
+        Option<std::sync::Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>>,
+    >,
     pub(crate) page_tables: parking_lot::RwLock<carrick_aarch64::Stage1Authority>,
     pub(crate) protections: std::sync::Arc<MemoryProtections>,
     pub(crate) frame_inventory: HvpatchFrameInventoryState,
@@ -345,6 +348,69 @@ pub(crate) struct MmAccessState {
         parking_lot::Mutex<Option<carrick_mmu_core::aarch64::PageTableManager>>,
     #[cfg(test)]
     pub(crate) foreign_cow_failpoint: std::sync::atomic::AtomicU8,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct MmAccessLiveResolver {
+    mm_access: std::sync::Weak<MmAccessState>,
+    custody: std::sync::Arc<CarrierVmCustody>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MmAccessLiveResolver {
+    pub(crate) fn new(
+        mm_access: &std::sync::Arc<MmAccessState>,
+        custody: std::sync::Arc<CarrierVmCustody>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            mm_access: std::sync::Arc::downgrade(mm_access),
+            custody,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolver {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        let state = self.mm_access.upgrade()?;
+        // 1. Direct structural owner lookup (O(1))
+        if let Some(ptr) = state
+            .structural_owner_host_ptr(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+        {
+            return Some(ptr);
+        }
+        // 2. Global frame host owner directory lookup (O(1))
+        let key = (base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE);
+        let owners = self.custody.global_frame_host_owners.lock();
+        if let Some(owner) = owners.get(&key).and_then(GlobalFrameOwnerEntry::live_owner) {
+            return Some(owner.ptr());
+        }
+        // 3. Extent lookup in frame inventory
+        let inventory = state.frame_inventory.ledger.lock();
+        if let Some((&logical, extent)) = inventory.extents.range(..=(base, u64::MAX)).next_back() {
+            if base >= logical.0 && base < logical.0.saturating_add(logical.1) {
+                let s2_key = (extent.stage2_base, extent.stage2_length);
+                let expected = extent.stage2_owner;
+                if let Some(owner) = owners
+                    .get(&s2_key)
+                    .and_then(GlobalFrameOwnerEntry::live_owner)
+                {
+                    if owner.generation() != 0
+                        && owner.generation() == expected.generation
+                        && owner.host_addr() == expected.host_addr
+                    {
+                        let offset = (base - s2_key.0) as usize;
+                        return Some(unsafe { owner.ptr().add(offset) });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn record_populated_prefix(&self, base: u64, prefix_len: usize) {
+        let _ = (base, prefix_len);
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -374,6 +440,7 @@ impl MmAccessState {
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
             copy_owner_pins: std::sync::atomic::AtomicU64::new(0),
             identity: parking_lot::RwLock::new(None),
+            live_resolver: parking_lot::RwLock::new(None),
             page_tables: parking_lot::RwLock::new(page_tables),
             protections,
             frame_inventory: HvpatchFrameInventoryState::new(frame_inventory),
@@ -418,6 +485,9 @@ impl MmAccessState {
         );
         let snapshot = CarrierForeignMmSnapshot::capture(snapshot);
         state.install_identity(snapshot.mm, snapshot.binding);
+        let resolver =
+            MmAccessLiveResolver::new(&state, legacy_test_carrier_vm_custody_arc().clone());
+        state.set_live_resolver(resolver);
         state
     }
 
@@ -433,12 +503,23 @@ impl MmAccessState {
         self.page_tables.read().clone()
     }
 
+    pub(crate) fn set_live_resolver(
+        &self,
+        resolver: std::sync::Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>,
+    ) {
+        *self.live_resolver.write() = Some(std::sync::Arc::clone(&resolver));
+        self.page_tables.read().bind_live_backing(resolver);
+    }
+
     pub(crate) fn bind_page_tables_authority(&self, page_tables: carrick_aarch64::Stage1Authority) {
         let previous = {
             let mut slot = self.page_tables.write();
             std::mem::replace(&mut *slot, page_tables.clone())
         };
         page_tables.adopt_unshared_predecessor(&previous);
+        if let Some(ref resolver) = *self.live_resolver.read() {
+            page_tables.bind_live_backing(std::sync::Arc::clone(resolver));
+        }
         if cow_refusal_diagnostics_enabled() && !previous.shares_exact_authority(&page_tables) {
             let old_root = previous.root_base();
             let new_root = page_tables.root_base();
@@ -3297,6 +3378,9 @@ pub mod foreign_cow_test_support {
                 std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
                 std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             );
+            let resolver =
+                MmAccessLiveResolver::new(&state, std::sync::Arc::clone(&custody.custody));
+            state.set_live_resolver(resolver);
             let transport = CarrierForeignMmTransport {
                 custody: custody.custody,
                 ..CarrierForeignMmTransport::new()
