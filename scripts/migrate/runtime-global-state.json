@@ -3124,6 +3124,14 @@
     {
       "kind": "thread_local",
       "file": "crates/carrick-vfs/src/fs_backend/host.rs",
+      "symbol": "TEST_HOST_PARENT_FSTAT_COUNT",
+      "fingerprint": "95a16dcfe8df280d1c28092ee6e1e4003d53e86867fa7a4f9b78034ec358d3b5",
+      "classification": "test_only",
+      "rationale": "Thread-local counter of authenticated parent fstat calls for kernel.vfs.host-namespace-mutation-work. Enabled only by cfg(test) or test-support; records measurement state and carries no guest or container authority."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
       "symbol": "TEST_HOST_STAT_COUNT",
       "fingerprint": "712d14044c7f4dda953e972e8bb2de6d30b6196075cd683f99162be6cdf21782",
       "classification": "test_only",
