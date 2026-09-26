@@ -10115,3 +10115,62 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
 }
 
 mod syscall_writes;
+
+#[test]
+fn live_resolver_records_extension_prefix_before_pool_reuse() {
+    use carrick_mmu_core::aarch64::HostArenaResolver;
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = CarrierForeignMmTransport::new();
+    let installed = install_mm(
+        &transport,
+        302,
+        0x9a00_7900_0000,
+        0x9b00_7900_0000,
+        *b"test",
+    );
+    let pool = Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        1,
+    ));
+    let handle = pool.allocate_slot().expect("extension slot");
+    let base = handle.ipa();
+    let len = handle.len();
+    let ptr = handle.as_mut_ptr();
+    let mut lease = GlobalFrameStage2Lease::fixed(base, len as u64);
+    lease.mark_test_mapped_without_backend();
+    let owner = StructuralBackingOwner::new_pooled_root_in(
+        &transport.custody,
+        handle,
+        lease,
+        3,
+        next_structural_epoch().expect("epoch"),
+        base,
+        len,
+    )
+    .expect("extension structural owner");
+    installed.state.install_structural_owner(Arc::clone(&owner));
+    let resolver = MmAccessLiveResolver::new(&installed.state, Arc::clone(&transport.custody));
+    assert_eq!(resolver.host_ptr_for_range(base, 0x2000), Some(ptr));
+    unsafe { ptr.add(0x1000).write(0xab) };
+    resolver.record_populated_prefix(base, 0x2000);
+    owner
+        .retained
+        .owner_retired
+        .store(true, std::sync::atomic::Ordering::Release);
+    retry_structural_backing_identities_in_using(
+        &transport.custody,
+        &[owner.record_identity()],
+        &mut unmap_global_frame_stage2_record,
+        &mut release_retired_stage2_ipa,
+    )
+    .expect("retire extension backing");
+    installed.state.release_structural_owner_at(base, len);
+    let reissued = pool
+        .allocate_slot_at(base)
+        .expect("reissued extension slot");
+    assert_eq!(reissued.as_mut_ptr(), ptr);
+    assert_eq!(
+        unsafe { reissued.as_ptr().add(0x1000).read() },
+        0,
+        "a recorded extension prefix must be zeroed before pool reissue"
+    );
+}

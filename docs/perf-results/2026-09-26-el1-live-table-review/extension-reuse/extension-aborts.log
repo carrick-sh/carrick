@@ -1,0 +1,4 @@
+OK: shard runtime.json valid (226 aborts: 221 carrier_fault, 5 typed_error_debt)
+OK: shard hvf.json valid (174 aborts: 174 carrier_fault, 0 typed_error_debt)
+OK: shard vcpu-loop.json valid (157 aborts: 157 carrier_fault, 0 typed_error_debt)
+OK: shard other.json valid (49 aborts: 49 carrier_fault, 0 typed_error_debt)

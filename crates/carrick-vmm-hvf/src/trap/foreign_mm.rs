@@ -526,7 +526,35 @@ unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolve
     }
 
     fn record_populated_prefix(&self, base: u64, prefix_len: usize) {
-        let _ = (base, prefix_len);
+        let Some(state) = self.mm_access.upgrade() else {
+            return;
+        };
+        let owners = state.structural_owners.read();
+        let Some((&(owner_base, owner_len), owner)) =
+            owners.range(..=(base, usize::MAX)).next_back()
+        else {
+            return;
+        };
+        let Some(prefix_end) = base
+            .checked_sub(owner_base)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|offset| offset.checked_add(prefix_len))
+        else {
+            return;
+        };
+        if owner.epoch.raw() != 0
+            && owner.len() == owner_len
+            && prefix_end <= owner_len
+            && !owner
+                .retained
+                .owner_retired
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // The authority's access/retirement exclusion spans descriptor
+            // publication and this update. Retained pool handles alone do not
+            // delay reuse, so track every live extension's written high-water.
+            owner.record_populated_prefix(prefix_end);
+        }
     }
 }
 
@@ -811,12 +839,16 @@ impl MmAccessState {
         expected_root_slot: (u64, u64),
         unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
     ) -> Result<RetiredMmRootStage2, TrapError> {
-        let mut slot = self.mm_root_stage2.lock();
         // Keep the authority identity and its descriptor-access guard alive
         // through backend retirement and pool release. A cached owner Arc keeps
         // storage resident, but does not stop a pooled slot being reissued.
         let page_tables = self.page_tables.read();
         page_tables.with_retirement_exclusion(|manager| {
+            // Descriptor publication records the root high-water mark while
+            // holding this authority, then takes mm_root_stage2. Match that
+            // order so retirement cannot wait for the publisher while holding
+            // the root-slot lock the publisher needs.
+            let mut slot = self.mm_root_stage2.lock();
             let authority = slot.as_ref().ok_or_else(|| {
                 TrapError::Hypervisor(format!(
                     "stage-1 root slot ({:#x}, {:#x}) has no exact structural stage-2 authority",
