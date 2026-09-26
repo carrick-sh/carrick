@@ -1030,12 +1030,13 @@ fn foreign_cow_write_keeps_the_shared_parent_owner_unchanged() {
         &RetainedForeignMmBacking {
             extents: vec![RetainedForeignExtent {
                 key: old_key,
-                owner: RetainedPhysicalOwner::Global(
-                    global_frame_host_owners().lock()[&old_key]
+                owner: RetainedPhysicalOwner::Global {
+                    pin: global_frame_host_owners().lock()[&old_key]
                         .owner()
                         .pin()
                         .expect("pin shared parent owner"),
-                ),
+                    len: old_key.1 as usize,
+                },
             }],
         },
         old_key.0,
@@ -6968,10 +6969,14 @@ fn releasable_stage2_lease_lifecycle_and_deterministic_allocator_reuse() {
         .cloned()
         .expect("global frame host owner must be registered");
 
-    let holder1 =
-        RetainedPhysicalOwner::Global(owner.owner().pin().expect("pin first retained owner"));
-    let holder2 =
-        RetainedPhysicalOwner::Global(owner.owner().pin().expect("pin second retained owner"));
+    let holder1 = RetainedPhysicalOwner::Global {
+        pin: owner.owner().pin().expect("pin first retained owner"),
+        len: size,
+    };
+    let holder2 = RetainedPhysicalOwner::Global {
+        pin: owner.owner().pin().expect("pin second retained owner"),
+        len: size,
+    };
 
     let extent1 = RetainedForeignExtent {
         key: (allocated_ipa, size as u64),
@@ -9760,7 +9765,8 @@ fn live_resolver_retains_exact_owner_pin_and_rejects_nonmatching_generation_and_
     let root = 0x9a00_7700_0000;
     let data_ipa = 0x9b00_7700_0000;
     let ext_ipa = 0x9a00_7720_0000;
-    let installed = install_mm(&transport, 300, root, data_ipa, *b"test");
+    let mut installed = install_mm(&transport, 300, root, data_ipa, *b"test");
+    installed.owners.0.push((ext_ipa, 4096));
 
     // Add an extension arena to the frame inventory
     let ext_bytes = vec![0_u8; 4096];
@@ -9799,21 +9805,118 @@ fn live_resolver_retains_exact_owner_pin_and_rejects_nonmatching_generation_and_
     );
 
     // 2. Extension lookup resolves and caches exact retained owner
-    let ext_ptr = resolver.host_ptr_for_base(ext_ipa);
+    let ext_ptr = resolver.host_ptr_for_range(ext_ipa, 4096);
     assert!(ext_ptr.is_some(), "valid extension base must resolve");
     assert!(
         resolver.retained_owners.read().contains_key(&ext_ipa),
         "resolver must cache retained extension owner"
     );
 
-    // 3. Unmapped base returns None
+    // 3. Nonzero offset within valid bounds resolves
+    let offset_ptr = resolver.host_const_ptr_for_range(ext_ipa + 64, 8);
+    assert!(
+        offset_ptr.is_some(),
+        "nonzero offset within bounds must resolve"
+    );
+
+    // 4. Length failure on existing key: requested length exceeds backing length
+    assert!(
+        resolver.host_const_ptr_for_range(ext_ipa, 4097).is_none(),
+        "requested length exceeding 4096 on existing key must fail closed"
+    );
+    assert!(
+        resolver.host_const_ptr_for_range(ext_ipa, 8192).is_none(),
+        "requested length 8192 on 4096-byte existing key must fail closed"
+    );
+
+    // 5. Unmapped base returns None
     assert!(
         resolver.host_ptr_for_base(0x1234_5678_0000).is_none(),
         "unmapped base must return None"
     );
 
-    // 4. Nonmatching generation (e.g. generation 0 in ledger) fails closed
-    let zero_gen_ipa = 0x9a00_7740_0000;
+    // 6. Generation mismatch on existing exact directory key fails closed
+    installed
+        .state
+        .frame_inventory
+        .ledger
+        .lock()
+        .extents
+        .get_mut(&(ext_ipa, 4096))
+        .unwrap()
+        .stage2_owner
+        .generation = ext_generation + 1000;
+    // Clear cache to test slow-path generation authentication
+    resolver.retained_owners.write().remove(&ext_ipa);
+    assert!(
+        resolver.host_ptr_for_base(ext_ipa).is_none(),
+        "existing key with mismatched generation must fail closed"
+    );
+
+    // 7. Generation 0 on existing exact directory key fails closed
+    installed
+        .state
+        .frame_inventory
+        .ledger
+        .lock()
+        .extents
+        .get_mut(&(ext_ipa, 4096))
+        .unwrap()
+        .stage2_owner
+        .generation = 0;
+    assert!(
+        resolver.host_ptr_for_base(ext_ipa).is_none(),
+        "existing key with generation 0 must fail closed"
+    );
+}
+
+#[test]
+fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
+    use carrick_mmu_core::aarch64::HostArenaResolver;
+    use std::sync::atomic::Ordering;
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let root = 0x9a00_7800_0000;
+    let root_slot = (root, 0x20_0000_u64);
+    let data_ipa = 0x9b00_7800_0000;
+    let ext_ipa = 0x9a00_7820_0000;
+    let mut installed = install_mm(&transport, 301, root, data_ipa, *b"test");
+    installed.owners.0.push((ext_ipa, 4096));
+
+    // 1. Install real pooled root structural owner in custody and state
+    let root_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        root_slot.1 as usize,
+        crate::host_mapping::HostMappingKind::PerMmKernelState,
+    )
+    .expect("root test mapping");
+    let root_epoch = next_structural_epoch().expect("root structural epoch");
+    let root_lease = GlobalFrameStage2Lease::fixed(root_slot.0, root_slot.1);
+    let root_owner = StructuralBackingOwner::new(
+        root_mapping,
+        root_lease,
+        root_epoch,
+        root_slot.0,
+        root_slot.1 as usize,
+    )
+    .expect("create root structural owner");
+    installed
+        .state
+        .install_structural_mapping_authority(Some(root_slot), Arc::clone(&root_owner))
+        .expect("install root structural authority");
+    installed
+        .state
+        .frame_inventory
+        .ledger
+        .lock()
+        .extents
+        .remove(&(root, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE));
+
+    // Add global extension arena to frame inventory
+    let ext_bytes = vec![0_u8; 4096];
+    let (ext_generation, ext_host) = install_owner(ext_ipa, &ext_bytes);
+    let ext_mapping = carrick_hal::MappingId::from_kernel_allocation(nonzero(301 * 10 + 5));
+    let ext_frame = carrick_hal::FrameId::from_kernel_allocation(nonzero(301 * 10 + 6));
     installed
         .state
         .frame_inventory
@@ -9821,58 +9924,168 @@ fn live_resolver_retains_exact_owner_pin_and_rejects_nonmatching_generation_and_
         .lock()
         .extents
         .insert(
-            (zero_gen_ipa, 4096),
+            (ext_ipa, 4096),
             InventoryExtent {
                 frame: ext_frame,
                 mapping: ext_mapping,
-                backing: InventoryBackingIdentity::Private(300 * 10 + 8),
-                stage2_base: zero_gen_ipa,
+                backing: InventoryBackingIdentity::Private(301 * 10 + 7),
+                stage2_base: ext_ipa,
                 stage2_length: 4096,
                 stage2_owner: InventoryStage2OwnerIdentity {
                     host_addr: ext_host,
-                    generation: 0,
+                    generation: ext_generation,
                 },
             },
         );
+
+    let resolver = MmAccessLiveResolver::new(&installed.state, Arc::clone(&transport.custody));
+
+    // 2. Populate resolver cache
+    assert!(resolver.host_ptr_for_base(root).is_some());
+    assert!(resolver.host_ptr_for_base(ext_ipa).is_some());
+    assert!(resolver.retained_owners.read().contains_key(&root));
+    assert!(resolver.retained_owners.read().contains_key(&ext_ipa));
+
+    // 3. Exercise real pooled-root retirement path: retire_mm_root_stage2_in -> release_pooled_root_slot
+    let retired_root = installed
+        .state
+        .retire_mm_root_stage2_in(&transport.custody, root_slot)
+        .expect("retire pooled root slot via real path");
+    assert_eq!(retired_root.proof.root_slot_base(), root_slot.0);
+    assert_eq!(retired_root.proof.root_slot_size(), root_slot.1);
     assert!(
-        resolver.host_ptr_for_base(zero_gen_ipa).is_none(),
-        "generation 0 in ledger must be rejected"
+        root_owner.retained.owner_retired.load(Ordering::Acquire),
+        "owner must be marked retired by retirement transaction"
     );
 
-    // 5. Tampered host_addr/generation mismatch in ledger fails closed
-    let mismatch_ipa = 0x9a00_7760_0000;
+    // Querying cached retired pooled root must fail closed and evict from cache
+    assert!(
+        resolver.host_ptr_for_base(root).is_none(),
+        "querying cached retired pooled root must fail closed"
+    );
+    assert!(
+        !resolver.retained_owners.read().contains_key(&root),
+        "retired pooled root must be evicted from cache"
+    );
+
+    // 4. Same-slot reissue with new generation and structural authority
+    let root_mapping2 = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        root_slot.1 as usize,
+        crate::host_mapping::HostMappingKind::PerMmKernelState,
+    )
+    .expect("root test mapping 2");
+    let root_epoch2 = next_structural_epoch().expect("root structural epoch 2");
+    let root_lease2 = GlobalFrameStage2Lease::fixed(root_slot.0, root_slot.1);
+    let root_owner2 = StructuralBackingOwner::new(
+        root_mapping2,
+        root_lease2,
+        root_epoch2,
+        root_slot.0,
+        root_slot.1 as usize,
+    )
+    .expect("create root structural owner 2");
+
+    // Re-insert stale retired root owner into old resolver cache to simulate same-slot race
+    resolver.retained_owners.write().insert(
+        root,
+        (
+            root,
+            RetainedPhysicalOwner::Structural(Arc::clone(&root_owner)),
+        ),
+    );
+    // Install reissued root slot in live state
+    installed
+        .state
+        .install_structural_mapping_authority(Some(root_slot), Arc::clone(&root_owner2))
+        .expect("install reissued root authority");
+
+    // Stale cached entry must be rejected and evicted, and new reissued owner returned
+    let reissued_ptr = resolver.host_ptr_for_base(root);
+    assert!(
+        reissued_ptr.is_some(),
+        "reissued root slot with new owner must resolve via slow path"
+    );
+    assert_eq!(
+        resolver.retained_owners.read()[&root].1.generation(),
+        root_epoch2.raw(),
+        "resolver cache must be updated to new reissued owner generation"
+    );
+
+    // 5. Interval after lookup and before access:
+    // When a caller retrieves a valid pointer:
+    let looked_up_ptr = resolver.host_ptr_for_base(root);
+    assert!(looked_up_ptr.is_some());
+    // In production execution:
+    // - Descriptor loads/stores occur under the Stage1Authority inner lock / task vCPU lease.
+    // - Root retirement requires CarrierVmCustody and task quiescence (execve/exit/detach).
+    // If retirement occurs during a quiescence transition:
+    root_owner2
+        .retained
+        .owner_retired
+        .store(true, Ordering::Release);
+    // Subsequent lookup fails closed and evicts the entry:
+    assert!(
+        resolver.host_ptr_for_base(root).is_none(),
+        "subsequent lookup after retirement must fail closed"
+    );
+    assert!(
+        !resolver.retained_owners.read().contains_key(&root),
+        "retired owner evicted from cache"
+    );
+
+    // 6. Extension replacement with new generation rejects stale cached owner
+    assert!(resolver.host_ptr_for_base(ext_ipa).is_some());
+    assert!(resolver.retained_owners.read().contains_key(&ext_ipa));
     installed
         .state
         .frame_inventory
         .ledger
         .lock()
         .extents
-        .insert(
-            (mismatch_ipa, 4096),
-            InventoryExtent {
-                frame: ext_frame,
-                mapping: ext_mapping,
-                backing: InventoryBackingIdentity::Private(300 * 10 + 9),
-                stage2_base: mismatch_ipa,
-                stage2_length: 4096,
-                stage2_owner: InventoryStage2OwnerIdentity {
-                    host_addr: ext_host,
-                    generation: 999_999, // mismatch
-                },
-            },
-        );
+        .get_mut(&(ext_ipa, 4096))
+        .unwrap()
+        .stage2_owner
+        .generation = ext_generation + 1;
     assert!(
-        resolver.host_ptr_for_base(mismatch_ipa).is_none(),
-        "mismatched generation must fail closed"
+        resolver.host_ptr_for_base(ext_ipa).is_none(),
+        "stale cached generation must fail closed when live authority generation changed"
+    );
+    assert!(
+        !resolver.retained_owners.read().contains_key(&ext_ipa),
+        "stale cached extension must be evicted from cache"
     );
 
-    // 6. Drop state (retired binding) -> resolution of new bases fails closed
+    // 7. Extension removal from live ledger invalidates cached resolver lookup
+    installed
+        .state
+        .frame_inventory
+        .ledger
+        .lock()
+        .extents
+        .get_mut(&(ext_ipa, 4096))
+        .unwrap()
+        .stage2_owner
+        .generation = ext_generation;
+    assert!(resolver.host_ptr_for_base(ext_ipa).is_some());
+    installed
+        .state
+        .frame_inventory
+        .ledger
+        .lock()
+        .extents
+        .remove(&(ext_ipa, 4096));
+    assert!(
+        resolver.host_ptr_for_base(ext_ipa).is_none(),
+        "querying cached extension after removal from live authority must fail closed"
+    );
+
+    // 8. Dropping state invalidates cached root lookup on old resolver
     let state_weak = Arc::downgrade(&installed.state);
     drop(installed);
     assert!(state_weak.upgrade().is_none(), "state must be dropped");
     assert!(
-        resolver.host_ptr_for_base(0x9a00_8800_0000).is_none(),
-        "retired binding must return None on new base"
+        resolver.host_ptr_for_base(root).is_none(),
+        "querying cached root on retired resolver after state drop must fail closed"
     );
 }
 

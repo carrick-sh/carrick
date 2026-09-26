@@ -374,11 +374,55 @@ impl MmAccessLiveResolver {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolver {
-    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
-        // Fast path: cached retained owner with 0 new allocations or locks
-        if let Some((extent_base, owner)) = self.retained_owners.read().get(&base) {
-            let offset = usize::try_from(base.checked_sub(*extent_base)?).ok()?;
-            return owner.ptr_for_offset(offset, 8);
+    fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
+        let requested_len = len.max(8);
+        // Fast path: cached retained owner with live state & retirement check
+        let cached_valid = {
+            let guard = self.retained_owners.read();
+            if let Some(&(extent_base, ref owner)) = guard.get(&base) {
+                if !owner.is_retired() {
+                    if let Some(state) = self.mm_access.upgrade() {
+                        let still_valid = match owner {
+                            RetainedPhysicalOwner::Structural(s) => state
+                                .structural_owners
+                                .read()
+                                .get(&(extent_base, s.len()))
+                                .is_some_and(|live| {
+                                    std::sync::Arc::ptr_eq(live, s)
+                                        && live.epoch.raw() == owner.generation()
+                                        && !live
+                                            .retained
+                                            .owner_retired
+                                            .load(std::sync::atomic::Ordering::Acquire)
+                                }),
+                            RetainedPhysicalOwner::Global { .. } => state
+                                .frame_inventory
+                                .ledger
+                                .lock()
+                                .extents
+                                .range(..=(extent_base, u64::MAX))
+                                .next_back()
+                                .is_some_and(|(_, ext)| {
+                                    ext.stage2_base == extent_base
+                                        && ext.stage2_owner.generation == owner.generation()
+                                        && ext.stage2_owner.host_addr == (owner.ptr() as usize)
+                                }),
+                        };
+                        if still_valid {
+                            let offset = usize::try_from(base.checked_sub(extent_base)?).ok()?;
+                            if let Some(ptr) = owner.ptr_for_offset(offset, requested_len) {
+                                return Some(ptr);
+                            }
+                        }
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        };
+        if !cached_valid {
+            self.retained_owners.write().remove(&base);
         }
 
         // Slow path: authenticate state, ledger generation/bounds, and pin exact owner
@@ -391,13 +435,19 @@ unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolve
         {
             if base >= owner_base
                 && base
-                    .checked_add(8)
+                    .checked_add(requested_len as u64)
                     .is_some_and(|end| end <= owner_base + owner_len as u64)
             {
-                if owner.epoch.raw() != 0 && owner.len() == owner_len {
+                if !owner
+                    .retained
+                    .owner_retired
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    && owner.epoch.raw() != 0
+                    && owner.len() == owner_len
+                {
                     let offset = usize::try_from(base - owner_base).ok()?;
                     let retained = RetainedPhysicalOwner::Structural(std::sync::Arc::clone(owner));
-                    let ptr = retained.ptr_for_offset(offset, 8)?;
+                    let ptr = retained.ptr_for_offset(offset, requested_len)?;
                     drop(structural);
                     self.retained_owners
                         .write()
@@ -414,12 +464,17 @@ unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolve
             let logical_end = logical.0.saturating_add(logical.1);
             let stage2_end = extent.stage2_base.saturating_add(extent.stage2_length);
             if base >= logical.0
-                && base.checked_add(8).is_some_and(|end| end <= logical_end)
+                && base
+                    .checked_add(requested_len as u64)
+                    .is_some_and(|end| end <= logical_end)
                 && base >= extent.stage2_base
-                && base.checked_add(8).is_some_and(|end| end <= stage2_end)
+                && base
+                    .checked_add(requested_len as u64)
+                    .is_some_and(|end| end <= stage2_end)
             {
                 let expected = extent.stage2_owner;
                 if expected.generation != 0 {
+                    let size = usize::try_from(extent.stage2_length).ok()?;
                     if let Some(pin) = pin_exact_live_global_frame_owner_in(
                         &self.custody,
                         extent.stage2_base,
@@ -428,8 +483,8 @@ unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolve
                         expected.generation,
                     ) {
                         let offset = usize::try_from(base - extent.stage2_base).ok()?;
-                        let retained = RetainedPhysicalOwner::Global(pin);
-                        let ptr = retained.ptr_for_offset(offset, 8)?;
+                        let retained = RetainedPhysicalOwner::Global { pin, len: size };
+                        let ptr = retained.ptr_for_offset(offset, requested_len)?;
                         self.retained_owners
                             .write()
                             .insert(base, (extent.stage2_base, retained));
@@ -442,14 +497,18 @@ unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolve
                         .get(&(extent.stage2_base, size))
                         .cloned()
                     {
-                        if owner.epoch.raw() != 0
+                        if !owner
+                            .retained
+                            .owner_retired
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            && owner.epoch.raw() != 0
                             && owner.epoch.raw() == expected.generation
                             && owner.ptr() as usize == expected.host_addr
                             && owner.len() == size
                         {
                             let offset = usize::try_from(base - extent.stage2_base).ok()?;
                             let retained = RetainedPhysicalOwner::Structural(owner);
-                            let ptr = retained.ptr_for_offset(offset, 8)?;
+                            let ptr = retained.ptr_for_offset(offset, requested_len)?;
                             self.retained_owners
                                 .write()
                                 .insert(base, (extent.stage2_base, retained));
@@ -460,6 +519,10 @@ unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolve
             }
         }
         None
+    }
+
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        self.host_ptr_for_range(base, 8)
     }
 
     fn record_populated_prefix(&self, base: u64, prefix_len: usize) {
@@ -562,7 +625,10 @@ impl MmAccessState {
         resolver: std::sync::Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>,
     ) {
         *self.live_resolver.write() = Some(std::sync::Arc::clone(&resolver));
-        self.page_tables.read().bind_live_backing(resolver);
+        // SAFETY: `resolver` is authenticated by the caller/live state.
+        unsafe {
+            self.page_tables.read().bind_live_backing(resolver);
+        }
     }
 
     pub(crate) fn bind_page_tables_authority(&self, page_tables: carrick_aarch64::Stage1Authority) {
@@ -572,7 +638,10 @@ impl MmAccessState {
         };
         page_tables.adopt_unshared_predecessor(&previous);
         if let Some(ref resolver) = *self.live_resolver.read() {
-            page_tables.bind_live_backing(std::sync::Arc::clone(resolver));
+            // SAFETY: `resolver` was authenticated when stored in `self.live_resolver`.
+            unsafe {
+                page_tables.bind_live_backing(std::sync::Arc::clone(resolver));
+            }
         }
         if cow_refusal_diagnostics_enabled() && !previous.shares_exact_authority(&page_tables) {
             let old_root = previous.root_base();
@@ -850,14 +919,15 @@ impl MmAccessState {
                     owner.generation() != 0
                         && owner.generation() == expected.generation
                         && owner.host_addr() == expected.host_addr
-                        && owner.length() == owner_key.1
                 })
                 .cloned()
             {
                 let pin = global
                     .pin()
                     .map_err(|_| carrick_hal::ForeignMmTransportError::OwnerStale)?;
-                RetainedPhysicalOwner::Global(pin)
+                let len = usize::try_from(owner_key.1)
+                    .map_err(|_| carrick_hal::ForeignMmTransportError::OwnerStale)?;
+                RetainedPhysicalOwner::Global { pin, len }
             } else if let Ok(size) = usize::try_from(owner_key.1)
                 && let Some(structural) = structural_owners
                     .get(&(owner_key.0, size))
@@ -888,7 +958,10 @@ impl MmAccessState {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) enum RetainedPhysicalOwner {
-    Global(GlobalFrameOwnerPin),
+    Global {
+        pin: GlobalFrameOwnerPin,
+        len: usize,
+    },
     Structural(std::sync::Arc<StructuralBackingOwner>),
 }
 
@@ -896,27 +969,37 @@ pub(crate) enum RetainedPhysicalOwner {
 impl RetainedPhysicalOwner {
     pub(crate) fn ptr(&self) -> *mut u8 {
         match self {
-            Self::Global(pin) => pin.owner().ptr(),
+            Self::Global { pin, .. } => pin.owner().ptr(),
             Self::Structural(owner) => owner.ptr(),
         }
     }
 
     pub(crate) fn len(&self) -> usize {
         match self {
-            Self::Global(pin) => pin.owner().len(),
+            Self::Global { len, .. } => *len,
             Self::Structural(owner) => owner.len(),
         }
     }
 
     pub(crate) fn generation(&self) -> u64 {
         match self {
-            Self::Global(pin) => pin.owner().generation(),
+            Self::Global { pin, .. } => pin.owner().generation(),
             Self::Structural(owner) => owner.epoch.raw(),
         }
     }
 
+    pub(crate) fn is_retired(&self) -> bool {
+        match self {
+            Self::Global { pin, .. } => pin.owner().is_retired(),
+            Self::Structural(owner) => owner
+                .retained
+                .owner_retired
+                .load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
     pub(crate) fn ptr_for_offset(&self, offset: usize, requested_len: usize) -> Option<*mut u8> {
-        if self.generation() == 0 {
+        if self.generation() == 0 || self.is_retired() {
             return None;
         }
         if offset.checked_add(requested_len)? > self.len() {
@@ -1545,7 +1628,10 @@ pub(crate) fn materialize_foreign_pristine_write(
     });
     lease_guard.backing.extents.push(RetainedForeignExtent {
         key,
-        owner: RetainedPhysicalOwner::Global(pin),
+        owner: RetainedPhysicalOwner::Global {
+            pin,
+            len: key.1 as usize,
+        },
     });
     for region in published.extension_regions {
         let owner = region.structural_owner.unwrap_or_else(|| {
@@ -1659,7 +1745,10 @@ pub(crate) fn materialize_foreign_private_file_write(
     });
     lease_guard.backing.extents.push(RetainedForeignExtent {
         key,
-        owner: RetainedPhysicalOwner::Global(pin),
+        owner: RetainedPhysicalOwner::Global {
+            pin,
+            len: key.1 as usize,
+        },
     });
     for region in published.extension_regions {
         let owner = region.structural_owner.unwrap_or_else(|| {
@@ -2021,18 +2110,47 @@ pub(crate) fn perform_foreign_cow_transaction(
         .map_err(|_| carrick_hal::ForeignMmTransportError::OwnerStale)?;
         unsafe { page_table_extent.owner.ptr().add(offset) }
     };
-    let resolve_page_table_host = |base: u64| -> Option<*mut u8> {
-        lease_guard
-            .backing
-            .extent_for(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
-            .ok()
-            .and_then(|extent| {
-                let offset = usize::try_from(base.saturating_sub(extent.key.0)).ok()?;
-                Some(unsafe { extent.owner.ptr().add(offset) })
-            })
-            .or_else(|| {
-                (base == requested.binding.stage1_root.raw()).then_some(page_table_host_ptr)
-            })
+    #[derive(Copy, Clone)]
+    struct ForeignMmPageTableResolver<'a> {
+        backing: &'a RetainedForeignMmBacking,
+        root_ipa: u64,
+        root_host: *mut u8,
+    }
+
+    unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for ForeignMmPageTableResolver<'_> {
+        fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
+            let needed = len.max(8);
+            self.backing
+                .extent_for(base, needed)
+                .ok()
+                .and_then(|extent| {
+                    let offset = usize::try_from(base.saturating_sub(extent.key.0)).ok()?;
+                    Some(unsafe { extent.owner.ptr().add(offset) })
+                })
+                .or_else(|| {
+                    (base == self.root_ipa
+                        && len <= carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+                        .then_some(self.root_host)
+                })
+        }
+
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            self.host_ptr_for_range(base, 0)
+        }
+
+        fn host_const_ptr_for_range(&self, base: u64, len: usize) -> Option<*const u8> {
+            self.host_ptr_for_range(base, len).map(|p| p.cast_const())
+        }
+
+        fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+            self.host_ptr_for_base(base).map(|p| p.cast_const())
+        }
+    }
+
+    let resolve_page_table_host = ForeignMmPageTableResolver {
+        backing: &lease_guard.backing,
+        root_ipa: requested.binding.stage1_root.raw(),
+        root_host: page_table_host_ptr,
     };
     let mut recycled = lease.state.cow_rollback_scratch.lock().take();
     let mut rollback = None;
@@ -2042,10 +2160,10 @@ pub(crate) fn perform_foreign_cow_transaction(
         carrick_hal::ForeignMmTransportError::AuthorityUnavailable,
         || Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable),
         |tables| {
-            rollback = Some(HvfVmState::rollback_pre_image(
-                &mut recycled,
-                tables.manager,
-            ));
+            rollback = Some(
+                HvfVmState::rollback_pre_image(&mut recycled, tables.manager)
+                    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?,
+            );
             HvfVmState::refresh_stage1_exclusivity(tables.manager);
             tables
                 .repoint_preserving_attributes(span.va, new_ipa, span.len as u64)
@@ -2116,7 +2234,9 @@ pub(crate) fn perform_foreign_cow_transaction(
         if let Some(snapshot) = rollback.take() {
             let recycled_manager = unsafe {
                 page_tables_authority.restore_image_and_host(snapshot, 8, resolve_page_table_host)
-            };
+            }
+            .ok()
+            .flatten();
             *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
             if invalidator
                 .invalidate_exact_asid(binding, deadline)
@@ -2141,7 +2261,9 @@ pub(crate) fn perform_foreign_cow_transaction(
     if let Err(error) = invalidator.invalidate_exact_asid(binding, deadline) {
         let recycled_manager = unsafe {
             page_tables_authority.restore_image_and_host(rollback, 9, resolve_page_table_host)
-        };
+        }
+        .ok()
+        .flatten();
         *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
         if invalidator
             .invalidate_exact_asid(binding, deadline)
@@ -2157,7 +2279,9 @@ pub(crate) fn perform_foreign_cow_transaction(
     if let Err(error) = foreign_cow_failpoint(&lease.state, 4) {
         let recycled_manager = unsafe {
             page_tables_authority.restore_image_and_host(rollback, 10, resolve_page_table_host)
-        };
+        }
+        .ok()
+        .flatten();
         *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
         if invalidator
             .invalidate_exact_asid(binding, deadline)
@@ -2254,7 +2378,9 @@ pub(crate) fn perform_foreign_cow_transaction(
                 });
             let recycled_manager = unsafe {
                 page_tables_authority.restore_image_and_host(rollback, 11, resolve_page_table_host)
-            };
+            }
+            .ok()
+            .flatten();
             *lease.state.cow_rollback_scratch.lock() = recycled_manager;
             if invalidator
                 .invalidate_exact_asid(binding, deadline)
@@ -2479,7 +2605,10 @@ pub(crate) fn perform_foreign_cow_transaction(
     });
     lease_guard.backing.extents.push(RetainedForeignExtent {
         key: (new_physical_ipa, CowArmedRanges::COMPOUND_SIZE),
-        owner: RetainedPhysicalOwner::Global(new_owner_pin),
+        owner: RetainedPhysicalOwner::Global {
+            pin: new_owner_pin,
+            len: CowArmedRanges::COMPOUND_SIZE as usize,
+        },
     });
     lease_guard.retained = committed.clone();
     Ok(CarrierForeignCowReceipt {
@@ -3614,10 +3743,14 @@ pub mod foreign_cow_test_support {
                         .flatten()
                         .ok_or_else(|| "fixture data translation absent".to_owned())?;
                     let mut ledger = self.state.frame_inventory.ledger.lock();
+                    let key = *ledger
+                        .extents
+                        .containing(ipa)
+                        .ok_or_else(|| "fixture data extent absent".to_owned())?
+                        .0;
                     let extent = ledger
                         .extents
-                        .values_mut()
-                        .find(|e| e.stage2_base <= ipa && ipa - e.stage2_base < e.stage2_length)
+                        .get_mut(&key)
                         .ok_or_else(|| "fixture data extent absent".to_owned())?;
                     extent.stage2_owner.generation = extent
                         .stage2_owner
@@ -3668,7 +3801,9 @@ pub mod foreign_cow_test_support {
                 6 => {
                     let authority = self.state.page_tables_authority();
                     let image = authority.snapshot_image().ok_or("absent")?;
-                    authority.restore_image(image, 0);
+                    authority
+                        .restore_image(image, 0)
+                        .map_err(|e| format!("restore image failed: {e:?}"))?;
                     Ok(())
                 }
                 7 => {
@@ -3689,10 +3824,8 @@ pub mod foreign_cow_test_support {
                 self.state.page_tables_authority().edit(
                     || Err("fixture page tables absent".to_owned()),
                     |editor| {
-                        unsafe {
-                            editor.sync_to_host(|base| (base == root.0).then_some(owner.ptr()))
-                        }
-                        .map_err(|e| format!("publish fixture leaf: {e:?}"))
+                        unsafe { editor.sync_to_host((root.0, owner.ptr())) }
+                            .map_err(|e| format!("publish fixture leaf: {e:?}"))
                     },
                 )?;
             }

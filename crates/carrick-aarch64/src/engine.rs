@@ -68,6 +68,36 @@ pub fn reserve_hvpatch_process_apertures(
     )
 }
 
+struct EngineHostResolver<'a, V> {
+    vm: &'a V,
+    pt_base: u64,
+    host: *mut u8,
+    size: usize,
+}
+
+unsafe impl<V: Aarch64Vmm> carrick_mmu_core::aarch64::HostArenaResolver
+    for EngineHostResolver<'_, V>
+{
+    fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
+        let needed = len.max(self.size);
+        self.vm
+            .host_ptr(base, needed)
+            .or_else(|| (base == self.pt_base && len <= self.size).then_some(self.host))
+    }
+
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        self.host_ptr_for_range(base, 0)
+    }
+
+    fn host_const_ptr_for_range(&self, base: u64, len: usize) -> Option<*const u8> {
+        self.host_ptr_for_range(base, len).map(|p| p.cast_const())
+    }
+
+    fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+        self.host_ptr_for_base(base).map(|p| p.cast_const())
+    }
+}
+
 /// The generic aarch64 trap engine. Owns the VM, the (one) vCPU, the
 /// pending-syscall resume PC, and the SA_RESTART syscall-number stash.
 /// Per-backend behaviour is reached only through the [`Aarch64Vmm`] /
@@ -1042,12 +1072,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                             // SAFETY: `host` backs the live page-table region for the whole process
                             // lifetime; the manager writes only 8-byte-aligned descriptor slots
                             // within `[host, host + size)`.
+                            let resolver = EngineHostResolver {
+                                vm: &self.vm,
+                                pt_base,
+                                host,
+                                size,
+                            };
                             unsafe {
-                                editor.sync_to_host(|base| {
-                                    self.vm
-                                        .host_ptr(base, size)
-                                        .or_else(|| (base == pt_base).then_some(host))
-                                })
+                                editor.sync_to_host(resolver)
                             }
                             .map_err(|error| {
                                 MemoryError::HostMap(format!(
@@ -1154,12 +1186,16 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .vm
             .host_ptr(pt_base, size)
             .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
+        let resolver = EngineHostResolver {
+            vm: &self.vm,
+            pt_base,
+            host,
+            size,
+        };
         unsafe {
-            self.page_tables.rollback_undo(|base| {
-                self.vm
-                    .host_ptr(base, size)
-                    .or_else(|| (base == pt_base).then_some(host))
-            });
+            self.page_tables
+                .rollback_undo(resolver)
+                .map_err(|e| MemoryError::HostMap(format!("stage-1 rollback failed: {e}")))?;
         }
         self.run_stage1_maintenance()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
@@ -1201,17 +1237,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 }
                 // SAFETY: `host_ptr` resolved the complete live page-table mapping at
                 // `pt_base`, and the manager's base/length were checked above.
-                unsafe {
-                    manager.debug_walk_host(
-                        |base| {
-                            self.vm
-                                .host_ptr(base, size)
-                                .or_else(|| (base == pt_base).then_some(host))
-                        },
-                        va,
-                    )
-                }
-                .map_err(|error| {
+                let resolver = EngineHostResolver {
+                    vm: &self.vm,
+                    pt_base,
+                    host,
+                    size,
+                };
+                unsafe { manager.debug_walk_host(resolver, va) }.map_err(|error| {
                     MemoryError::HostMap(format!(
                         "debug walk stage-1 page tables failed: {error:?}"
                     ))
@@ -5296,7 +5328,7 @@ mod tests {
                 || unreachable!(),
                 |editor| {
                     assert!(editor.has_arena_source());
-                    editor.restore_image(snapshot, 6, 0);
+                    editor.restore_image(snapshot, 6, 0)?;
                     assert!(editor.has_arena_source());
                     Ok::<(), PageTableError>(())
                 },

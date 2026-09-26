@@ -1376,13 +1376,40 @@ impl HvfTaskState {
             ));
         }
 
-        let page_table_resolver = |base: u64| -> Option<*mut u8> {
-            mappings
-                .iter()
-                .find(|m| m.ipa == base)
-                .map(|m| m.physical_host_addr)
+        #[derive(Copy, Clone)]
+        struct PlanResolver<'a> {
+            mappings: &'a [ProcessMappingDesc],
+        }
+        unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for PlanResolver<'_> {
+            fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
+                self.mappings
+                    .iter()
+                    .find(|m| m.ipa == base && len <= m.physical_size as usize)
+                    .map(|m| m.physical_host_addr)
+            }
+
+            fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+                self.host_ptr_for_range(base, 0)
+            }
+
+            fn host_const_ptr_for_range(&self, base: u64, len: usize) -> Option<*const u8> {
+                self.host_ptr_for_range(base, len).map(|p| p.cast_const())
+            }
+
+            fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+                self.host_ptr_for_base(base).map(|p| p.cast_const())
+            }
+        }
+        let page_table_resolver = PlanResolver {
+            mappings: &mappings,
         };
-        unsafe { page_tables.restore_quiesced_snapshot_to_host(page_table_resolver) };
+        unsafe { page_tables.restore_quiesced_snapshot_to_host(page_table_resolver) }.map_err(
+            |e| {
+                TrapError::Hypervisor(format!(
+                    "failed to restore quiesced stage-1 snapshot to host: {e:?}"
+                ))
+            },
+        )?;
         let copied_bytes = page_tables.copied_bytes();
         for mapping in &mappings {
             if let ProcessMappingHost::PooledRootSlot { ref handle } = mapping.host {

@@ -821,26 +821,29 @@ pub(super) fn publish_replacing(
                 // The owned resolver drops its pins before retirement. Exact-MM
                 // exclusion remains held through descriptor restore and TLBI.
                 unsafe {
-                    editor.rollback_undo_retiring(resolver, |popped| {
-                        flush_stage1()?;
-                        let journal = extension_regions
-                            .iter()
-                            .filter_map(|region| {
-                                region
-                                    .structural_owner
-                                    .as_ref()
-                                    .map(|owner| (owner.physical_ipa, std::sync::Arc::clone(owner)))
-                            })
-                            .collect();
-                        context.state.retire_rolled_back_arenas(
-                            &context.custody,
-                            popped,
-                            &journal,
-                            &mut unmap_global_frame_stage2_record,
-                            &mut release_retired_stage2_ipa,
-                        )?;
-                        Ok::<(), TrapError>(())
-                    })?;
+                    editor.rollback_undo_retiring(
+                        resolver,
+                        |e| TrapError::Hypervisor(format!("failed to rollback stage1 undo: {e:?}")),
+                        |popped| {
+                            flush_stage1()?;
+                            let journal = extension_regions
+                                .iter()
+                                .filter_map(|region| {
+                                    region.structural_owner.as_ref().map(|owner| {
+                                        (owner.physical_ipa, std::sync::Arc::clone(owner))
+                                    })
+                                })
+                                .collect();
+                            context.state.retire_rolled_back_arenas(
+                                &context.custody,
+                                popped,
+                                &journal,
+                                &mut unmap_global_frame_stage2_record,
+                                &mut release_retired_stage2_ipa,
+                            )?;
+                            Ok::<(), TrapError>(())
+                        },
+                    )?;
                 }
                 Ok::<(), TrapError>(())
             },

@@ -118,7 +118,7 @@ fn observe_resident(
         let extent = inner.backing.extent_for(physical, chunk)?;
         let within = usize::try_from(physical - extent.key.0).map_err(|_| Error::OwnerStale)?;
         let tracker = match &extent.owner {
-            RetainedPhysicalOwner::Global(pin) => &pin.owner().mapping.code_content,
+            RetainedPhysicalOwner::Global { pin, .. } => &pin.owner().mapping.code_content,
             RetainedPhysicalOwner::Structural(owner) => &owner.retained.mapping.code_content,
         };
         content.push(tracker.observe(within, chunk).map_err(|_| Error::Retry)?);

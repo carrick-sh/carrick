@@ -217,7 +217,10 @@ impl Stage1Authority {
     }
 
     /// Bind a live host arena resolver, making hardware-visible backing authoritative.
-    pub fn bind_live_backing(&self, resolver: Arc<dyn HostArenaResolver + Send + Sync>) {
+    ///
+    /// # Safety
+    /// `resolver` must uphold the safety contracts of `HostArenaResolver`.
+    pub unsafe fn bind_live_backing(&self, resolver: Arc<dyn HostArenaResolver + Send + Sync>) {
         let mut inner = self.inner.lock();
         inner.host_resolver = Some(Arc::clone(&resolver));
         if let Some(manager) = inner.manager.as_mut() {
@@ -245,11 +248,8 @@ impl Stage1Authority {
     }
 
     /// Set the inner manager directly. Used primarily for test harnesses.
-    pub fn set_manager(&self, mut manager: PageTableManager) {
+    pub fn set_manager(&self, manager: PageTableManager) {
         let mut inner = self.inner.lock();
-        if let Some(ref resolver) = inner.host_resolver {
-            unsafe { manager.make_live(Arc::clone(resolver)) };
-        }
         *inner.manager = Some(manager);
     }
 
@@ -421,13 +421,16 @@ impl Stage1Authority {
     /// # Safety
     ///
     /// `resolver` must return valid host pointers for all touched page table arenas.
-    pub unsafe fn rollback_undo(&self, resolver: impl HostArenaResolver) -> Vec<u64> {
+    pub unsafe fn rollback_undo(
+        &self,
+        resolver: impl HostArenaResolver,
+    ) -> Result<Vec<u64>, PageTableError> {
         let mut inner = self.inner.lock();
         let inner = &mut *inner;
         if let Some(manager) = inner.manager.as_mut() {
             unsafe { manager.rollback_undo(resolver, inner.arena_source.as_deref_mut()) }
         } else {
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 
@@ -596,7 +599,7 @@ impl Stage1Authority {
         &self,
         mut image: PageTableManager,
         site: u32,
-    ) -> Option<PageTableManager> {
+    ) -> Result<Option<PageTableManager>, PageTableError> {
         let authority = self.authority_id();
         let mut inner = self.inner.lock();
         if let Some(live) = inner.manager.as_ref() {
@@ -607,11 +610,11 @@ impl Stage1Authority {
         }
         if let Some(ref resolver) = inner.host_resolver {
             unsafe {
-                image.restore_quiesced_snapshot_to_host(resolver);
+                image.restore_quiesced_snapshot_to_host(resolver)?;
                 image.make_live(Arc::clone(resolver));
             }
         }
-        inner.manager.replace(image)
+        Ok(inner.manager.replace(image))
     }
 
     /// Like [`Self::restore_image`], but also restores quiesced table descriptors to host memory.
@@ -629,7 +632,7 @@ impl Stage1Authority {
         mut image: PageTableManager,
         site: u32,
         resolve_page_table_host: H,
-    ) -> Option<PageTableManager>
+    ) -> Result<Option<PageTableManager>, PageTableError>
     where
         H: HostArenaResolver,
     {
@@ -641,11 +644,11 @@ impl Stage1Authority {
             let after = before;
             carrick_observability::probes::stage1_arena_replace(site, before, after, authority);
         }
-        unsafe { image.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
+        unsafe { image.restore_quiesced_snapshot_to_host(resolve_page_table_host)? };
         if let Some(ref resolver) = inner.host_resolver {
             unsafe { image.make_live(Arc::clone(resolver)) };
         }
-        inner.manager.replace(image)
+        Ok(inner.manager.replace(image))
     }
 
     /// Replace the stage-1 authority for `execve`.
@@ -1036,7 +1039,10 @@ impl<'a> Stage1Editor<'a> {
     /// # Safety
     ///
     /// `resolver` must return valid host pointers for all page table arenas.
-    pub unsafe fn rollback_undo(&mut self, resolver: impl HostArenaResolver) -> Vec<u64> {
+    pub unsafe fn rollback_undo(
+        &mut self,
+        resolver: impl HostArenaResolver,
+    ) -> Result<Vec<u64>, PageTableError> {
         unsafe {
             self.manager
                 .rollback_undo(resolver, self.arena_source.as_deref_mut())
@@ -1051,12 +1057,20 @@ impl<'a> Stage1Editor<'a> {
     /// `resolver` must provide live writable arena pointers. The caller must
     /// hold mutation exclusion and make `retire` flush stale translations and
     /// retire every supplied arena's backing before returning success.
-    pub unsafe fn rollback_undo_retiring<E>(
+    pub unsafe fn rollback_undo_retiring<E, F>(
         &mut self,
         resolver: impl HostArenaResolver,
-        retire: impl FnOnce(&[u64]) -> Result<(), E>,
-    ) -> Result<Vec<u64>, E> {
-        let popped = unsafe { self.manager.rollback_undo(resolver, None) };
+        map_err: impl FnOnce(PageTableError) -> E,
+        retire: F,
+    ) -> Result<Vec<u64>, E>
+    where
+        F: FnOnce(&[u64]) -> Result<(), E>,
+    {
+        let popped = unsafe {
+            self.manager
+                .rollback_undo(resolver, None)
+                .map_err(map_err)?
+        };
         retire(&popped)?;
         if let Some(source) = self.arena_source.as_deref_mut() {
             for &base in &popped {
@@ -1068,18 +1082,24 @@ impl<'a> Stage1Editor<'a> {
 
     /// Restore a pre-transaction image over the live manager, adopting extension arenas,
     /// preserving the arena source, restoring descriptors to hardware memory, and firing `stage1_arena_replace`.
-    pub fn restore_image(&mut self, mut image: PageTableManager, site: u32, authority: u64) {
+    pub fn restore_image(
+        &mut self,
+        mut image: PageTableManager,
+        site: u32,
+        authority: u64,
+    ) -> Result<(), PageTableError> {
         let before = u32::from(self.arena_source.is_some());
         image.adopt_live_extension_state(self.manager);
         let after = before;
         carrick_observability::probes::stage1_arena_replace(site, before, after, authority);
         if let Some(resolver) = self.manager.resolver().cloned() {
             unsafe {
-                image.restore_quiesced_snapshot_to_host(&resolver);
+                image.restore_quiesced_snapshot_to_host(&resolver)?;
                 image.make_live(resolver);
             }
         }
         *self.manager = image;
+        Ok(())
     }
 }
 
@@ -1168,7 +1188,7 @@ mod tests {
         assert!(failed.is_err());
         let after_error = observed_generation(&authority);
         assert_ne!(after_error, original);
-        authority.restore_image(image, 0);
+        authority.restore_image(image, 0).unwrap();
         let after_restore = observed_generation(&authority);
         assert_ne!(after_restore, original);
         assert_ne!(after_restore, after_error);
@@ -1384,15 +1404,7 @@ mod tests {
         let mut host_arena1 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
         let p0 = host_arena0.as_mut_ptr();
         let p1 = host_arena1.as_mut_ptr();
-        let resolver = move |base: u64| {
-            if base == LINUX_PAGE_TABLES_BASE {
-                Some(p0)
-            } else if base == ext_base.0 {
-                Some(p1)
-            } else {
-                None
-            }
-        };
+        let resolver = [(LINUX_PAGE_TABLES_BASE, p0), (ext_base.0, p1)];
 
         authority
             .edit(
@@ -1414,15 +1426,23 @@ mod tests {
 
                     let popped = if retire_first {
                         let result = unsafe {
-                            editor.rollback_undo_retiring(resolver, |bases| {
-                                assert_eq!(bases, &[ext_base.0]);
-                                assert!(
-                                    returned.lock().unwrap().is_empty(),
-                                    "arena address escaped before backing retirement"
-                                );
-                                assert!(available.lock().unwrap().is_empty());
-                                if fail_retirement { Err(()) } else { Ok(()) }
-                            })
+                            editor.rollback_undo_retiring(
+                                resolver,
+                                |e| e,
+                                |bases| {
+                                    assert_eq!(bases, &[ext_base.0]);
+                                    assert!(
+                                        returned.lock().unwrap().is_empty(),
+                                        "arena address escaped before backing retirement"
+                                    );
+                                    assert!(available.lock().unwrap().is_empty());
+                                    if fail_retirement {
+                                        Err(PageTableError::UnresolvedArena(ext_base.0))
+                                    } else {
+                                        Ok(())
+                                    }
+                                },
+                            )
                         };
                         if fail_retirement {
                             assert!(result.is_err());
@@ -1432,7 +1452,7 @@ mod tests {
                         }
                         result.unwrap()
                     } else {
-                        unsafe { editor.rollback_undo(resolver) }
+                        unsafe { editor.rollback_undo(resolver).unwrap() }
                     };
                     assert_eq!(popped, vec![ext_base.0], "rollback popped extension arena");
                     assert_eq!(editor.pool_stats().3, 1, "manager restored to 1 arena");
@@ -1614,13 +1634,7 @@ mod tests {
 
         let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
         let p0 = host_arena0.as_mut_ptr();
-        let resolver = move |base: u64| {
-            if base == LINUX_PAGE_TABLES_BASE {
-                Some(p0)
-            } else {
-                None
-            }
-        };
+        let resolver = (LINUX_PAGE_TABLES_BASE, p0);
 
         let va = 0x40_0000;
         authority
@@ -1652,7 +1666,7 @@ mod tests {
         // Rollback via Stage1Authority::rollback_undo
         let before_rollback = observed_generation(&authority);
         unsafe {
-            authority.rollback_undo(resolver);
+            authority.rollback_undo(resolver).unwrap();
         }
         assert_ne!(observed_generation(&authority), before_rollback);
 
@@ -1740,8 +1754,11 @@ mod tests {
             base: LINUX_PAGE_TABLES_BASE,
         });
 
-        authority
-            .bind_live_backing(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        unsafe {
+            authority.bind_live_backing(
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>
+            );
+        }
 
         let va = 0x50_0000;
         let ipa1 = 0x80_0000;
@@ -1779,7 +1796,7 @@ mod tests {
         });
 
         // Restore snapshot 1
-        authority.restore_image(snap1, 1);
+        authority.restore_image(snap1, 1).unwrap();
 
         // Hardware memory and live translation must now reflect ipa1
         authority.with_manager(|mgr| {
@@ -1802,10 +1819,45 @@ mod tests {
         let manager = test_manager();
         let authority = Stage1Authority::new_with_manager(Some(manager));
         let resolver = Arc::new(FailingResolver);
-        authority.bind_live_backing(resolver);
+        unsafe {
+            authority.bind_live_backing(resolver);
+        }
 
         // Snapshot must fail closed and return None
         assert!(authority.snapshot_image().is_none());
         assert!(authority.snapshot_image_recycled().is_none());
+    }
+
+    #[test]
+    fn stage1_authority_restore_and_rollback_fail_and_preserve_on_unresolved_arena() {
+        let manager = test_manager();
+        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let snap = authority.snapshot_image().expect("initial snapshot");
+
+        // Attempt restore with a failing resolver
+        let res = unsafe { authority.restore_image_and_host(snap, 0, FailingResolver) };
+        assert!(matches!(res, Err(PageTableError::UnresolvedArena(_))));
+        assert!(
+            authority.is_present(),
+            "manager remains present after failed restore"
+        );
+
+        // Attempt rollback with failing resolver
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    editor.begin_undo();
+                    editor.set_readonly(0x40_0000, 0x1000, false).unwrap();
+                    let rollback_res = unsafe { editor.rollback_undo(FailingResolver) };
+                    assert!(matches!(
+                        rollback_res,
+                        Err(PageTableError::UnresolvedArena(_))
+                    ));
+                    assert!(editor.undo_is_open(), "undo journal preserved on failure");
+                    Ok::<(), ()>(())
+                },
+            )
+            .unwrap();
     }
 }
