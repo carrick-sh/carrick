@@ -847,24 +847,24 @@ fn el1_sched_mm_occupancy_two_processes() {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MmOccupancyRoleReport {
-    pub role: String,
-    pub writers: usize,
-    pub forks: u64,
-    pub edits: u64,
-    pub edit_failures: u64,
-    pub torn: u64,
-    pub snapshot_changes: u64,
-    pub child_failures: u64,
-    pub join_failures: u64,
-    pub ok: bool,
+struct MmOccupancyRoleReport {
+    role: String,
+    writers: usize,
+    forks: u64,
+    edits: u64,
+    edit_failures: u64,
+    torn: u64,
+    snapshot_changes: u64,
+    child_failures: u64,
+    join_failures: u64,
+    ok: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MmOccupancyReport {
-    pub parent: MmOccupancyRoleReport,
-    pub child: MmOccupancyRoleReport,
-    pub child_ok: bool,
+struct MmOccupancyReport {
+    parent: MmOccupancyRoleReport,
+    child: MmOccupancyRoleReport,
+    child_ok: bool,
 }
 
 fn parse_role_line(
@@ -998,8 +998,10 @@ fn parse_role_line(
     let join_failures = join_failures.ok_or_else(|| "missing join_failures counter".to_string())?;
     let ok = ok.ok_or_else(|| "missing ok flag".to_string())?;
 
-    if writers == 0 {
-        return Err("writers must be non-zero".to_string());
+    if writers < 4 || (writers % 2) != 0 {
+        return Err(format!(
+            "writers must be at least 4 and even, saw {writers}"
+        ));
     }
     if forks != expected_forks {
         return Err(format!(
@@ -1044,7 +1046,7 @@ fn parse_role_line(
     })
 }
 
-pub fn validate_mm_occupancy_stdout(
+fn validate_mm_occupancy_stdout(
     stdout: &str,
     expected_forks: u64,
 ) -> Result<MmOccupancyReport, String> {
@@ -1257,6 +1259,32 @@ mm-occupancy child_ok=true
     assert!(
         validate_mm_occupancy_stdout(stdout, 150).is_err(),
         "spurious ok substring with ok=false must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_odd_writers() {
+    let stdout = "\
+mm-occupancy parent writers=7 forks=150 edits=42 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "odd writer counts must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_insufficient_writers() {
+    let stdout = "\
+mm-occupancy parent writers=2 forks=150 edits=42 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "writer counts below four must be rejected"
     );
 }
 
