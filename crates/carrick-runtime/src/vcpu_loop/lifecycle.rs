@@ -1905,7 +1905,7 @@ pub(crate) mod tests {
     {
         let pid = 43;
         let dispatcher = SyscallDispatcher::new();
-        let parent_context = dispatcher.capture_one_task_context().unwrap();
+        let _parent_context = dispatcher.capture_one_task_context().unwrap();
         let (runtime, scheduler, kernel, root, process, root_generation) =
             test_carrier_graph_with_dispatcher!(pid, dispatcher);
         let root_authority = runtime
@@ -1994,10 +1994,11 @@ pub(crate) mod tests {
         assert_eq!(ops.aborts, 1);
         assert_eq!(ops.parent_rollbacks, 1);
         assert_eq!(ops.parent_commits, 0);
-        assert_eq!(
-            ops.request_parent_mm,
-            Some(parent_context.shared().mm().id().raw())
-        );
+        // The fork's parent is the carrier graph's root; the context captured
+        // from the dispatcher before the graph was built is a separate
+        // kernel's, whose MM id only matched while MM ids were
+        // numbered per kernel.
+        assert_eq!(ops.request_parent_mm, Some(root.shared().mm().id().raw()));
         assert!(ops.request_child_mm.is_some());
         assert_ne!(ops.request_parent_mm, ops.request_child_mm);
     }
