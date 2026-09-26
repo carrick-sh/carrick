@@ -283,3 +283,18 @@ This is one personality-boundary increment, not migration completion. Signal,
 timer, VFS and other substrate/personality separation, live memory authority,
 signed gates, paired workloads and all later stages remain open. The initial
 snapshot and signed first-touch witnesses remain unmodified and unresolved.
+
+At `0c4ec58f4`, the integrated `just lint-domains` exited zero with both
+substrate cores checked. The cross-platform authority profiles remain pending
+as documented. Its full receipt is
+`docs/perf-results/2026-09-26-el1-boundary-review/personality-integrated-lint.log`.
+
+The first live-table candidate `6a538d49f` is deliberately not integrated. The
+worker reports the snapshot witness and serial runtime suite green, but source
+review found missing live backing silently treated as zero descriptors/empty
+snapshots, insufficient retained ownership and generation/bounds checks in the
+resolver, non-atomic byte copying of live descriptors, and restore paths that
+discard snapshot bytes when rebinding. Review round 1 requires explicit errors,
+a sound backing lifetime, live-bound restore controls and root/extension
+retirement tests without weakening current-read budgets. A single green
+snapshot test is not acceptance of live stage-1 authority.
