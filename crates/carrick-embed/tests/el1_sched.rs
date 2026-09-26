@@ -771,7 +771,7 @@ fn el1_sched_two_processes_share_vcpus() {
             claims < 0.01,
             "two processes' handoffs went through host run queues: {claims:.3} per round trip"
         );
-        // Measured 7.5 per round trip at 1d (each turn of a vCPU between
+        // Measured 6.2-6.4 per round trip at 1d (each turn of a vCPU between
         // the two address spaces goes through its executor); bounded well
         // above that so only a structural regression fails here.
         assert!(
