@@ -4420,13 +4420,19 @@ impl Scheduler {
         };
         flush_requested.store(ResidencyFlushRequest::Requested, Ordering::Release);
         self.executors.wake_guest_idle_executor(executor);
-        if let Some(cpu) = bound_cpu {
-            if let Some(guest_cpu) = self.queue.inner.cpus.get(cpu.as_usize()) {
-                guest_cpu.nudge();
-            }
-        } else {
-            self.queue.inner.changed.notify_all();
+        if let Some(cpu) = bound_cpu
+            && let Some(guest_cpu) = self.queue.inner.cpus.get(cpu.as_usize())
+        {
+            guest_cpu.nudge();
         }
+        // A spare parks in `park_spare`, which checks the flag under the
+        // queue state lock and then waits on `changed`: notify under that
+        // lock, or a request landing between its check and its wait is lost
+        // and the loader waiting for the flush times out. The placement read
+        // above can also be stale (a borrowed CPU returned meanwhile), so a
+        // spare is always notified.
+        let _state = self.queue.inner.state.lock();
+        self.queue.inner.changed.notify_all();
     }
 
     pub fn settle_blocked(
