@@ -1,0 +1,23 @@
+{
+  "sha256": "6378fcc861238f66e867b2baed0f263d0ef3e4229ae5f3372e8db915e267d5ca",
+  "results": [
+    {
+      "case": "custom_lib_path",
+      "exit": 0,
+      "stdout": "personality boundary checked: 1 substrate crate(s) clean\n  [PASS] crate `carrick-sched-core` (shipped deps: [], dev deps: [], scanned files: 0)\n",
+      "stderr": ""
+    },
+    {
+      "case": "optional_transitive",
+      "exit": 1,
+      "stdout": "",
+      "stderr": "substrate boundary violations detected (1 violation(s)):\n  [DEP] crate `carrick-sched-core` reaches forbidden personality crate `carrick-abi` via normal edge: carrick-sched-core -> bridge -> carrick-abi\n"
+    },
+    {
+      "case": "unresolved_registry",
+      "exit": 0,
+      "stdout": "personality boundary checked: 1 substrate crate(s) clean\n  [PASS] crate `carrick-sched-core` (shipped deps: [\"unknown_bridge\"], dev deps: [], scanned files: 1)\n",
+      "stderr": ""
+    }
+  ]
+}
