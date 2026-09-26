@@ -3402,6 +3402,14 @@
       "rationale": "Carrier-wide hook in crates/carrick-kernel/src/el1_zone.rs through which the kernel hands a zone thread back to its host continuation; each start of the persistent executor pool registers its own scheduler's publisher (a carrier may run several containers in turn), and the zone tables it serves are per carrier VM."
     },
     {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/ids.rs",
+      "symbol": "CARRIER_MM_IDS",
+      "fingerprint": "db15e3d493982cb11591b2d88a7d6de71eb5deb0650ee8aa29b537383473f0b4",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide monotonic source of MmIds in crates/carrick-kernel/src/kernel/ids.rs: MM identities must be unique across every kernel (container) in one carrier process, because the EL1 zone occupancy words and published address spaces key on them and all containers share the carrier VM; carrier scope by design, never reset."
+    },
+    {
       "kind": "thread_local",
       "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
       "symbol": "PENDING_ADOPTION",

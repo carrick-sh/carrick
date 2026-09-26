@@ -1146,7 +1146,8 @@ fn thread_execution_rejects_same_key_lease_from_another_kernel() {
     let foreign_lease = other.thread().claim_runnable(executor).unwrap();
 
     assert_eq!(context.thread().key(), other.thread().key());
-    assert_eq!(context.shared().mm().id(), other.shared().mm().id());
+    // MM ids are carrier-unique (`ObjectIdRegistry::mm_id`); the thread key still collides.
+    assert_ne!(context.shared().mm().id(), other.shared().mm().id());
     assert_eq!(
         context.thread().execution_state(),
         other.thread().execution_state()

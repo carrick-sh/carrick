@@ -226,6 +226,9 @@ pub enum InvalidLinuxSignal {
 #[error("file slot {0} is negative")]
 pub struct InvalidFileSlot(i32);
 
+/// The carrier-wide source of [`MmId`]s ([`ObjectIdRegistry::mm_id`]).
+static CARRIER_MM_IDS: ObjectIdRegistry = ObjectIdRegistry::new();
+
 /// Monotonic source for object identities that are never reused by one kernel.
 #[derive(Debug)]
 pub struct ObjectIdRegistry {
@@ -263,8 +266,16 @@ impl ObjectIdRegistry {
         self.allocate().map(ThreadSerial::from_registry_allocation)
     }
 
+    /// MM identities are unique across every kernel in the carrier process,
+    /// not only within this one: the EL1 zone's occupancy words and
+    /// published address spaces key on them, and one carrier runs several
+    /// containers (kernels) whose vCPUs share that table. A per-kernel
+    /// counter gave two containers' first MMs the same key, so a pause of
+    /// one counted the other's vCPUs (the concurrent container gate).
     pub fn mm_id(&self) -> Result<MmId, ObjectIdError> {
-        self.allocate().map(MmId::from_registry_allocation)
+        CARRIER_MM_IDS
+            .allocate()
+            .map(MmId::from_registry_allocation)
     }
 
     pub fn file_table_id(&self) -> Result<FileTableId, ObjectIdError> {
@@ -374,9 +385,12 @@ mod tests {
         let task = ids.task_serial().expect("task serial");
         let thread = ids.thread_serial().expect("thread serial");
         let mm = ids.mm_id().expect("mm ID");
+        let other_kernel_mm = ObjectIdRegistry::new().mm_id().expect("mm ID");
 
         assert_eq!(task.raw(), 1);
         assert_eq!(thread.raw(), 2);
-        assert_eq!(mm.raw(), 3);
+        // MM ids come from one carrier-wide source: another kernel's never
+        // equals this one's.
+        assert_ne!(mm, other_kernel_mm);
     }
 }

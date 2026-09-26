@@ -2656,7 +2656,8 @@ mod tests {
         let foreign_execution = execution_lease(&other, 125);
 
         assert_eq!(root.thread().key(), other.thread().key());
-        assert_eq!(root.shared().mm().id(), other.shared().mm().id());
+        // MM ids are carrier-unique (`ObjectIdRegistry::mm_id`); the thread key still collides.
+        assert_ne!(root.shared().mm().id(), other.shared().mm().id());
         assert_eq!(
             root.thread().execution_state(),
             other.thread().execution_state()
@@ -2762,7 +2763,8 @@ mod tests {
         let foreign_execution = execution_lease(&other, 126);
 
         assert_eq!(root.thread().key(), other.thread().key());
-        assert_eq!(root.shared().mm().id(), other.shared().mm().id());
+        // MM ids are carrier-unique (`ObjectIdRegistry::mm_id`); the thread key still collides.
+        assert_ne!(root.shared().mm().id(), other.shared().mm().id());
         assert_eq!(
             root.thread().execution_state(),
             other.thread().execution_state()
