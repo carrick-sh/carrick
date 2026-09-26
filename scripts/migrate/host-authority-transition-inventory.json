@@ -14254,18 +14254,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:4487 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:4507 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 190963,
-      "byte_start": 190938,
+      "byte_end": 192083,
+      "byte_start": 192058,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 4487,
-      "line_end": 4487,
-      "line_start": 4487
+      "line": 4507,
+      "line_end": 4507,
+      "line_start": 4507
     }
   },
   {
@@ -14281,18 +14281,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor/pool.rs:980 in `start`, `std::thread::Builder::new` acts only on the bounded carrier-owned persistent executor thread used by `start` at line 2878; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor/pool.rs:984 in `start`, `std::thread::Builder::new` acts only on the bounded carrier-owned persistent executor thread used by `start` at line 2878; no guest identity selects its host target.",
     "review_id": "HA-000588",
     "source": {
-      "byte_end": 34496,
-      "byte_start": 34471,
+      "byte_end": 34735,
+      "byte_start": 34710,
       "column": 30,
       "column_end": 55,
       "column_start": 30,
       "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
-      "line": 980,
-      "line_end": 980,
-      "line_start": 980
+      "line": 984,
+      "line_end": 984,
+      "line_start": 984
     }
   },
   {
