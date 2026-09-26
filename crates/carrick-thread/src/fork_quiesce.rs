@@ -839,7 +839,8 @@ pub struct PtQuiesce {
     quiescing: AtomicBool,
     /// The pause is kicking and draining other vCPUs of the MM.
     draining: AtomicBool,
-    lock: Mutex<()>,
+    /// Executors parked at guest entry behind the fence ([`Self::park`]).
+    parked_entrants: Mutex<usize>,
     cv: Condvar,
 }
 
@@ -855,7 +856,7 @@ impl PtQuiesce {
             coordinator: AtomicBool::new(false),
             quiescing: AtomicBool::new(false),
             draining: AtomicBool::new(false),
-            lock: Mutex::new(()),
+            parked_entrants: Mutex::new(0),
             cv: Condvar::new(),
         }
     }
@@ -889,8 +890,31 @@ impl PtQuiesce {
     /// ends, keeping its vCPU. Called at the lock-safe run-loop top.
     pub fn park(&self) {
         #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-        let mut g = self.lock.lock().unwrap();
+        let mut g = self.parked_entrants.lock().unwrap();
+        *g += 1;
         while self.quiescing.load(Ordering::SeqCst) {
+            #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
+            let next = self.cv.wait(g).unwrap();
+            g = next;
+        }
+        *g -= 1;
+        if *g == 0 {
+            self.cv.notify_all();
+        }
+    }
+
+    /// A newly elected coordinator, before it raises the fence: let every
+    /// executor parked at guest entry behind the previous pause leave the
+    /// park first. Without this a hot editor that re-elects the moment its
+    /// pause ends keeps the fence up nearly all the time and the MM's other
+    /// vCPUs never re-enter the guest (the census used to give them that
+    /// window through its admission lock). Terminates: only the coordinator
+    /// raises the fence, so while it waits here every parked executor's
+    /// condition is already false and it was woken by the previous `end`.
+    pub fn await_parked_entrants(&self) {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
+        let mut g = self.parked_entrants.lock().unwrap();
+        while *g > 0 {
             #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
             let next = self.cv.wait(g).unwrap();
             g = next;
@@ -909,7 +933,7 @@ impl PtQuiesce {
     /// silent carrier-wide stop to a typed, probed, guest-visible failure.
     pub fn park_until(&self, deadline: Instant) -> bool {
         #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-        let mut g = self.lock.lock().unwrap();
+        let mut g = self.parked_entrants.lock().unwrap();
         loop {
             if !self.quiescing.load(Ordering::SeqCst) {
                 return true;
@@ -929,7 +953,7 @@ impl PtQuiesce {
     /// Coordinator: end the pause, wake parked threads, drop coordinator.
     pub fn end(&self) {
         #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-        let _held = self.lock.lock().unwrap();
+        let _held = self.parked_entrants.lock().unwrap();
         self.draining.store(false, Ordering::SeqCst);
         self.quiescing.store(false, Ordering::SeqCst);
         self.coordinator.store(false, Ordering::SeqCst);
@@ -1420,6 +1444,41 @@ mod tests {
                     "frame_registry_lock held across another .lock() call"
                 );
             }
+        }
+    }
+
+    /// Starvation guard for `kernel.mm.address-space-occupancy`: an executor
+    /// parked at guest entry behind a pause leaves the park before the next
+    /// coordinator raises the fence again, however quickly it re-elects.
+    #[test]
+    fn a_parked_entrant_leaves_before_the_next_fence_is_raised() {
+        let barrier = Arc::new(PtQuiesce::new());
+        for _ in 0..64 {
+            assert!(barrier.try_become_coordinator());
+            barrier.set_quiescing();
+            let (left_tx, left_rx) = std::sync::mpsc::channel();
+            let entrant = {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.park();
+                    left_tx.send(()).unwrap();
+                })
+            };
+            while *barrier.parked_entrants.lock().unwrap() == 0 {
+                std::thread::yield_now();
+            }
+            barrier.end();
+            // The same editor re-elects at once, as a hot mmap loop does.
+            assert!(barrier.try_become_coordinator());
+            barrier.await_parked_entrants();
+            barrier.set_quiescing();
+            let left = left_rx.recv_timeout(Duration::from_secs(5));
+            barrier.end();
+            entrant.join().unwrap();
+            assert!(
+                left.is_ok(),
+                "the parked entrant was held behind the next fence"
+            );
         }
     }
 
