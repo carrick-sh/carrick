@@ -204,3 +204,13 @@ Boundary review now has reproduced negative evidence, not just source concerns:
 Integration is withheld until those cases reject. MMU extraction finished its
 initial worker turn at `ea0230092`; the three documented review corrections
 were sent as round 1 to the same worker. Neither candidate is integrated yet.
+
+The next storage requirement now has a failing runtime witness:
+`stage1_snapshot_observes_live_leaf_after_guest_publication` under
+`kernel.fork.stage1-image`. After live-leaf revocation, a host fork/rollback
+snapshot still translates that page (expected no translation). The existing
+fork allocation and work budgets are unchanged. The contract wording now names
+private stage-1 state rather than requiring an authoritative software shadow;
+its runtime binding adds the live-snapshot control. This new red is intentional
+and remains open alongside signed first-touch. The earlier 622-test green
+receipt still belongs only to `28a096160`.

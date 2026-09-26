@@ -300,7 +300,7 @@ contracts = ["kernel.mm.native-code-content"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs"
-contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain", "kernel.mm.current-read-reuse"]
+contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain", "kernel.mm.current-read-reuse", "kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/instruction_read.rs"
@@ -569,4 +569,4 @@ contracts = ["kernel.mm.current-read-reuse"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs"
-contracts = ["kernel.mm.current-read-reuse", "kernel.mm.native-syscall-buffers"]
+contracts = ["kernel.mm.current-read-reuse", "kernel.mm.native-syscall-buffers", "kernel.fork.stage1-image"]

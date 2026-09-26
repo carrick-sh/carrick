@@ -3371,6 +3371,16 @@ pub mod foreign_cow_test_support {
                 .load(std::sync::atomic::Ordering::Relaxed)
         }
 
+        /// Inspect the image the host would retain for fork or rollback.
+        pub fn stage1_snapshot_translation_for_test(&self, va: u64) -> Result<Option<u64>, String> {
+            let snapshot = self
+                .state
+                .page_tables_authority()
+                .snapshot_image()
+                .ok_or("fixture stage-1 image absent")?;
+            Ok(snapshot.translate(va))
+        }
+
         /// Model an EL1 publication in the actual retained page-table backing,
         /// without editing the host's software image. This fixture has one root
         /// arena; refuse any walk that leaves it rather than guessing an owner.

@@ -78,3 +78,16 @@ and copied `live`. The test also checks new preparation and unchanged output on
 rejection. This is a migration prerequisite: EL1 leaf publication cannot safely
 coexist with software-shadow read authority. It does not assert that an EL1
 fault writer was already running in the tested product.
+
+## Live snapshot red witness
+
+`live-snapshot-red.log` is a second VM-free witness under
+`kernel.fork.stage1-image`. A production carrier fixture first checks that the
+host image sees its valid live page, invalidates that leaf only in the retained
+hardware backing under the current-MM mutation authority, then takes the host
+fork/rollback image. The image incorrectly translates the revoked address to
+IPA `665719930880`; expected `None`. The test fails its semantic assertion,
+not setup or compilation. Runtime implementation at this point is `cc270b3f0`
+plus only the test/helper and contract changes. It does not claim guest fault
+service is enabled. This red remains open until live storage and snapshots use
+one authority; read-window correction alone did not solve it.

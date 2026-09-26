@@ -980,6 +980,57 @@ fn current_read_window_uses_live_leaf_after_guest_publication() {
     );
 }
 
+/// Fork and rollback images must capture the same leaves hardware observes.
+/// A software image that predates EL1 publication can resurrect a revoked page.
+#[test]
+fn stage1_snapshot_observes_live_leaf_after_guest_publication() {
+    let (kernel, root) = bootstrap(39_620);
+    let tid = ThreadId::synthetic_for_tests(39_621);
+    let fixture = real_production_cow_fixture(
+        &kernel,
+        &root,
+        39_621,
+        0x9a07_0000_0000,
+        0x9b07_0000_0000,
+        tid,
+    );
+    let execution = execution_lease(&fixture.child, 39_621);
+    fixture
+        .child
+        .copy_current_from(&execution, GuestVa(TEST_VA), b"live")
+        .unwrap();
+    let current = fixture.child.current_mm(&execution).unwrap();
+    let snapshot_translation = carrick_kernel::kernel::MmAccessAuthority::new()
+        .with_current_mutation(&current, tid, |_| {
+            assert!(
+                fixture
+                    .carrier
+                    .stage1_snapshot_translation_for_test(TEST_VA)
+                    .unwrap()
+                    .is_some()
+            );
+            fixture
+                .carrier
+                .invalidate_live_leaf_without_shadow_for_test(TEST_VA)
+                .unwrap();
+            Ok(fixture
+                .carrier
+                .stage1_snapshot_translation_for_test(TEST_VA)
+                .unwrap())
+        })
+        .unwrap();
+    drop(current);
+    fixture
+        .child
+        .thread()
+        .yield_from_executor(execution)
+        .unwrap();
+    assert_eq!(
+        snapshot_translation, None,
+        "fork/rollback snapshot resurrected a revoked live leaf"
+    );
+}
+
 #[test]
 fn current_read_window_rejects_vma_revocation_and_cow_replacement() {
     let (kernel, root) = bootstrap(39_500);
