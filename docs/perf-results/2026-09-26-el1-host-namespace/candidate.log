@@ -1,0 +1,27 @@
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.55s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vfs-b64f878273ffc91e)
+
+running 1 test
+test vfs::rootfs::tests::serial_host::test_namespace_mutation_work ... MEASUREMENTS:
+scale_point=1 op=rename_same_dir opens=0 dentry_opens=0 backend_stats=4 parent_fstats=4 total_metadata=8
+scale_point=1 op=rename_cross_dir opens=0 dentry_opens=0 backend_stats=4 parent_fstats=4 total_metadata=8
+scale_point=1 op=unlink opens=0 dentry_opens=0 backend_stats=2 parent_fstats=2 total_metadata=4
+scale_point=1 op=rename_cold opens=0 dentry_opens=2 backend_stats=4 parent_fstats=4 total_metadata=8
+scale_point=1 op=rename_warm_after_cold opens=0 dentry_opens=0 backend_stats=4 parent_fstats=4 total_metadata=8
+scale_point=1 op=unlink_cold opens=0 dentry_opens=2 backend_stats=2 parent_fstats=2 total_metadata=4
+scale_point=1 op=unlink_warm_after_cold opens=0 dentry_opens=0 backend_stats=2 parent_fstats=2 total_metadata=4
+scale_point=8 op=rename_same_dir opens=0 dentry_opens=0 backend_stats=32 parent_fstats=32 total_metadata=64
+scale_point=8 op=rename_cross_dir opens=0 dentry_opens=0 backend_stats=32 parent_fstats=32 total_metadata=64
+scale_point=8 op=unlink opens=0 dentry_opens=0 backend_stats=16 parent_fstats=16 total_metadata=32
+scale_point=32 op=rename_same_dir opens=0 dentry_opens=0 backend_stats=128 parent_fstats=128 total_metadata=256
+scale_point=32 op=rename_cross_dir opens=0 dentry_opens=0 backend_stats=128 parent_fstats=128 total_metadata=256
+scale_point=32 op=unlink opens=0 dentry_opens=0 backend_stats=64 parent_fstats=64 total_metadata=128
+scale_point=128 op=rename_same_dir opens=0 dentry_opens=0 backend_stats=512 parent_fstats=512 total_metadata=1024
+scale_point=128 op=rename_cross_dir opens=0 dentry_opens=0 backend_stats=512 parent_fstats=512 total_metadata=1024
+scale_point=128 op=unlink opens=0 dentry_opens=0 backend_stats=256 parent_fstats=256 total_metadata=512
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 290 filtered out; finished in 0.13s
+
