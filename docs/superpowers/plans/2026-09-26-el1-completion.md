@@ -198,3 +198,9 @@ saved FAR and the EL0 sync hook currently selects SVC only; fault entry must
 preserve fault address and ELR/SPSR before nested EL1 work. Existing sparse
 materialization and fixed pre-mapped frame pooling are host venue mechanisms,
 not proof of the required EL1 allocator or elastic extent return.
+
+Boundary review now has reproduced negative evidence, not just source concerns:
+[four false passes in the initial checker](../../perf-results/2026-09-26-el1-boundary-review/README.md).
+Integration is withheld until those cases reject. MMU extraction finished its
+initial worker turn at `ea0230092`; the three documented review corrections
+were sent as round 1 to the same worker. Neither candidate is integrated yet.
