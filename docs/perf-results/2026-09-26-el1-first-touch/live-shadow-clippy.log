@@ -1,0 +1,53 @@
+    Checking zerocopy v0.8.48
+    Checking getrandom v0.3.4
+    Checking carrick-fatal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-fatal)
+    Checking carrick-sched-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-sched-core)
+    Checking carrick-inotify-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-inotify-core)
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1-image)
+    Checking carrick-kernel-arena v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel-arena)
+    Checking carrick-portable v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-portable)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host-bsd)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+    Checking tempfile v3.27.0
+    Checking num-traits v0.2.19
+   Compiling carrick-el1 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+    Checking rand_core v0.9.5
+    Checking carrick-host v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host)
+    Checking carrick-el1-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1-abi)
+    Checking wait-timeout v0.2.1
+    Checking quick-error v1.2.3
+    Checking bit-vec v0.8.0
+    Checking fnv v1.0.7
+    Checking rand_xorshift v0.4.0
+    Checking rand v0.9.4
+    Checking rusty-fork v0.3.1
+    Checking unarray v0.1.4
+    Checking carrick-test-support v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-test-support)
+    Checking static_assertions v1.1.0
+    Checking chrono v0.4.44
+    Checking bit-set v0.8.0
+    Checking oci-client v0.15.0
+    Checking carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-abi)
+    Checking carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-guest-mem)
+    Checking dof v0.4.0
+    Checking ppv-lite86 v0.2.21
+    Checking rand_chacha v0.9.0
+    Checking proptest v1.11.0
+    Checking usdt-impl v0.6.0
+    Checking usdt v0.6.0
+    Checking carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-signal-core)
+    Checking carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-timer-core)
+    Checking carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+    Checking carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-observability)
+    Checking carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-spec)
+    Checking carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-image)
+    Checking carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-hal)
+    Checking carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-thread)
+    Checking carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-aarch64)
+    Checking carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-conformance-contract)
+    Checking carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vfs)
+    Checking carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel-example)
+    Checking carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+    Checking native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/experiments/native-syscall-slice)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 32.64s
