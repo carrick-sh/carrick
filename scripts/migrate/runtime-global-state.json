@@ -3372,10 +3372,10 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "symbol": "start_run_queue_guard::STARTED",
-      "fingerprint": "562bdb9137aac6edc09d5303afe698346da6e5682cc3571928f60952a570e9f3",
+      "symbol": "GUEST_SCHEDULER",
+      "fingerprint": "251d655ecc801957aefbd83859fd2b60a9368d939cbc385c9ae9ce46a071b524",
       "classification": "carrier_infra",
-      "rationale": "Once-guard in crates/carrick-kernel/src/el1_zone.rs for the carrier's single EL1 run-queue guard thread, which kicks slots whose in-guest run queue stayed non-empty."
+      "rationale": "Carrier-wide switch in crates/carrick-kernel/src/el1_zone.rs, set once when the persistent executor pool starts: whether the carrier VM has the in-kernel GIC the in-guest scheduler needs (EL1 plan 1c); without it the zone stays off."
     },
     {
       "kind": "static",
