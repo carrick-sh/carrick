@@ -298,3 +298,11 @@ discard snapshot bytes when rebinding. Review round 1 requires explicit errors,
 a sound backing lifetime, live-bound restore controls and root/extension
 retirement tests without weakening current-read budgets. A single green
 snapshot test is not acceptance of live stage-1 authority.
+
+`RUSTC_WRAPPER= just test-integration` on `b95b3bfb0` exited zero: 465 tests
+passed across 15 result groups, with no failures or ignored tests. The three
+guest-running shard entries were filtered by the existing host-only recipe.
+This covers the runtime/kernel integration, syscall-process, prepare compile-fail
+contract, CLI/trace, engine/image and probe-inventory consistency suites. Receipt:
+`docs/perf-results/2026-09-26-el1-boundary-review/personality-integrated-host-integration.log`.
+It does not replace the still-red snapshot library test or signed memory gates.
