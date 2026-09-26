@@ -362,6 +362,26 @@ pub fn place_service(
     false
 }
 
+/// Take a service record the host could not place (host-owned): free it and
+/// return the exact row it stood for. `None` for any other record.
+pub fn take_unplaced_service(
+    record: RecordRef,
+) -> Option<(
+    crate::kernel::ThreadKey,
+    crate::kernel::objects::ExecutionGeneration,
+)> {
+    let zone = zone_tables()?;
+    let rec = zone.live(record)?;
+    if rec.handback() != Some(Handback::Service)
+        || !matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. })
+    {
+        return None;
+    }
+    let key = service_key(record);
+    zone.free_record(record.id);
+    key
+}
+
 /// The exact runnable generation a service record names.
 pub fn service_key(
     record: RecordRef,
@@ -526,13 +546,10 @@ fn settle_vacated(
             if keep_unplaced && zone.requeue_on(fallback, record) {
                 continue;
             }
-            // A spare's slot: every bound executor's slot is live or waits
-            // for its executor's return, so a service thread always has a
-            // slot; one with none would strand its thread's held row.
-            carrick_fatal::carrick_fatal!(
-                "el1_zone::retire_slot",
-                "no vCPU slot can take service record {record:?} vacated for {fallback:?}"
-            );
+            // No slot runs an executor that could take it (every one is
+            // stopped in a host call, say): its thread's held row goes to a
+            // host run queue (`Scheduler::publish_zone_handback`).
+            publish_handback(zone.record_ref(record));
         } else {
             publish_handback(zone.record_ref(record));
         }

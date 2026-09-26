@@ -1558,6 +1558,13 @@ impl RunQueueInner {
         {
             return;
         }
+        self.release_zone_row(key);
+    }
+
+    /// Move the held row of `key` to a host run queue: no vCPU slot can take
+    /// a service thread for it (EL1 plan 1d; the fallback when every slot
+    /// that could is stopped).
+    fn release_zone_row(&self, key: QueueKey) {
         let Some(row) = self.shard(key).lock().zone_held.remove(&key) else {
             return;
         };
@@ -3629,6 +3636,14 @@ impl Scheduler {
     /// wait becomes ready and the thread runnable (or, if it is still
     /// running and about to settle, kicked so it settles promptly).
     pub fn publish_zone_handback(&self, record: carrick_el1_abi::RecordRef) {
+        // A service record no vCPU slot would take: its thread's held row
+        // goes to a host run queue instead, where any executor claims it.
+        if let Some((thread, generation)) = crate::el1_zone::take_unplaced_service(record) {
+            self.queue
+                .inner
+                .release_zone_row(QueueKey { thread, generation });
+            return;
+        }
         let Some(key) = crate::el1_zone::thread_key_of(record) else {
             return;
         };
