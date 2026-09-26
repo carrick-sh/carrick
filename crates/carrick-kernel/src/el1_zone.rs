@@ -413,37 +413,6 @@ fn publish_handback(record: RecordRef) {
     }
 }
 
-/// Before the executor of `slot` installs address space `mm` there (0: none,
-/// while it waits in the guest), move every queued thread of another address
-/// space to a slot that runs it, or else back to its host continuation.
-pub fn evict_foreign(slot: SlotId, mm: u64) {
-    let Some(zone) = zone() else {
-        return;
-    };
-    relocate(zone, slot, Some(mm));
-}
-
-fn relocate(zone: &ZoneTables, slot: SlotId, mm: Option<u64>) {
-    let mut handed = Vec::new();
-    let mut placements = Vec::new();
-    zone.relocate(
-        slot,
-        mm,
-        &mut |record, discard| handed.push((record, discard)),
-        &mut |placement| placements.push(placement),
-    );
-    for placement in placements {
-        deliver_placement(Some(placement));
-    }
-    for (record, discard) in handed {
-        if discard {
-            zone.free_record(record);
-        } else {
-            publish_handback(zone.record_ref(record));
-        }
-    }
-}
-
 /// The executor of `slot`, stopped: hand every queued thread the host asked
 /// for while EL1 held it to its host continuation (a signal, an exit or
 /// exec drain acts on it there).

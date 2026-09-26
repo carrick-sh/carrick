@@ -1160,10 +1160,10 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         let frame = carrick_el1_abi::prepare_idle_entry(usize::from(slot.raw()))
             .ok_or_else(|| TrapError::Hypervisor("idle entry without the EL1 region".into()))?;
         carrick_vmm_hvf::vcpu_kick::bind_zone_slot_vcpu(usize::from(slot.raw()), self.raw_vcpu_id);
-        // No address space is installed while it waits: EL1 runs only threads
-        // that need this executor here, and steals none it could not run.
+        // No address space is installed while it waits: every thread EL1
+        // finds for it (queued here or stolen) leaves the vCPU for this
+        // executor, which loads it.
         zone.publish_slot(slot, 0, self.bound_cpu, 0);
-        carrick_kernel::el1_zone::evict_foreign(slot, 0);
         let lifecycle = self
             .lifecycle
             .as_mut()
@@ -1288,10 +1288,10 @@ fn publish_zone_slot(
                 "EL1 zone slot {slot} still held threads when a task was loaded on it"
             );
         }
+        // Threads queued here for another address space stay: EL1 leaves
+        // the vCPU for this executor when one reaches the head, and the
+        // executor loads it.
         zone.publish_slot(zone_slot, mm, bound_cpu, affinity);
-        // Threads queued here for another address space cannot run on this
-        // one: they go where they can.
-        carrick_kernel::el1_zone::evict_foreign(zone_slot, mm);
     }
     carrick_el1_abi::publish_zone_identity(slot, mm, serial);
 }

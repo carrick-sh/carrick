@@ -1495,6 +1495,17 @@ fn next_runnable<F: PersistentExecutor>(
         carrick_kernel::el1_zone::retire_slot(slot);
     }
     if let Some(record) = zone.take_service_head(slot) {
+        if zone.record(record).handback() != Some(carrick_el1_abi::Handback::Service) {
+            // A thread ready at EL0 in another address space: this executor
+            // loads it, exactly as the thread it took off its vCPU.
+            let taken = scheduler.adopt_zone_handback(registration, zone.record_ref(record))?;
+            if taken.is_none() {
+                zone.counters
+                    .lost_adoptions
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Ok(taken);
+        }
         let key = carrick_kernel::el1_zone::service_key(zone.record_ref(record));
         zone.free_record(record);
         let taken = match key {

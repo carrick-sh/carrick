@@ -959,8 +959,8 @@ fn host_placement_respects_address_spaces_and_owes_resched_sgis() {
 }
 
 /// Stealing never takes a home record (its thread must run where the host
-/// loaded it) and never a thread the thief's address space cannot run; a
-/// service thread moves to the thief's queue for it to serve.
+/// loaded it); a service thread, or a thread of an address space the thief
+/// does not run, moves to the thief's queue for its executor to take.
 #[test]
 fn stealing_takes_only_what_the_thief_may_run() {
     let zone = zone();
@@ -981,7 +981,9 @@ fn stealing_takes_only_what_the_thief_may_run() {
     let placed = zone.place_from_host(service).unwrap();
     assert_eq!(placed.slot, THIRD, "the idle slot is chosen first");
     assert!(zone.head_needs_host(THIRD));
-    // An idle slot of another address space takes neither EL0 thread.
+    // An idle slot of another address space steals too: a service thread,
+    // or an EL0 thread of MM, goes to its own queue, where it leaves the vCPU
+    // for its executor, which loads it (EL1 does not switch address spaces).
     let foreign = SlotId::new(11);
     assert!(zone.reset_slot(foreign));
     zone.publish_slot(foreign, MM + 7, Some(3), 0);
@@ -990,24 +992,24 @@ fn stealing_takes_only_what_the_thief_may_run() {
     let ready = park(&zone, 6, 0x8004);
     let (woken, _) = wake_effects(&zone, 0x8004, 1, SLOT);
     assert_eq!(woken.unwrap(), [ready]);
-    let ready_slot = match zone.record(ready).claim() {
-        Claim::Queued { slot, .. } => slot,
-        other => panic!("{other:?}"),
-    };
-    // It takes the service thread (any vCPU may serve one) onto its own
-    // queue, but not the EL0 thread of MM.
+    assert!(matches!(zone.record(ready).claim(), Claim::Queued { .. }));
     assert_eq!(zone.steal(foreign), None);
     assert!(zone.head_needs_host(foreign));
-    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 1);
     assert_eq!(zone.steal(foreign), None);
     assert_eq!(
         zone.record(ready).claim(),
         Claim::Queued {
-            slot: ready_slot,
+            slot: foreign,
             seq: 1
-        }
+        },
+        "the EL0 thread of another address space waits for the thief's executor"
     );
-    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 1);
+    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 2);
+    // Its executor takes both from the head, the EL0 one to load.
+    zone.leave_guest(foreign, &HostWait);
+    assert!(zone.take_service_head(foreign).is_some());
+    assert_eq!(zone.take_service_head(foreign), Some(ready));
+    assert_eq!(zone.counters.foreign_adoptions.load(Ordering::Relaxed), 1);
 }
 
 /// The executor sweeps records of retired threads off its run queue at an
