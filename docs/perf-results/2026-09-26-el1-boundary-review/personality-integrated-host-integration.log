@@ -1,0 +1,825 @@
+   Compiling syn v2.0.117
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1-image)
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling const_format_proc_macros v0.2.34
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+   Compiling carrick-el1 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1)
+   Compiling const_format v0.2.36
+   Compiling synstructure v0.13.2
+   Compiling pest_generator v2.8.6
+   Compiling darling_core v0.20.11
+   Compiling proc-macro-error2 v2.0.1
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.5
+   Compiling scroll_derive v0.13.1
+   Compiling tokio-macros v2.7.0
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling pest_derive v2.8.6
+   Compiling tracing-attributes v0.1.31
+   Compiling tokio v1.52.3
+   Compiling dtrace-parser v0.3.0
+   Compiling scroll v0.13.0
+   Compiling futures-macro v0.3.32
+   Compiling getset v0.1.6
+   Compiling zerofrom v0.1.8
+   Compiling goblin v0.10.5
+   Compiling zerocopy v0.8.48
+   Compiling yoke v0.8.2
+   Compiling strum_macros v0.27.2
+   Compiling futures-util v0.3.32
+   Compiling tracing v0.1.44
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling darling_macro v0.20.11
+   Compiling darling v0.20.11
+   Compiling clap_derive v4.6.1
+   Compiling tracing-subscriber v0.3.23
+   Compiling derive_builder_core v0.20.2
+   Compiling tinystr v0.8.3
+   Compiling icu_locale_core v2.2.0
+   Compiling serde v1.0.228
+   Compiling potential_utf v0.1.5
+   Compiling icu_provider v2.2.0
+   Compiling icu_collections v2.2.0
+   Compiling derive_builder_macro v0.20.2
+   Compiling serde_tokenstream v0.2.3
+   Compiling icu_properties v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling usdt-impl v0.6.0
+   Compiling derive_builder v0.20.2
+   Compiling serde_urlencoded v0.7.1
+   Compiling chrono v0.4.44
+   Compiling oci-spec v0.8.4
+   Compiling olpc-cjson v0.1.4
+   Compiling usdt-macro v0.6.0
+   Compiling usdt-attr-macro v0.6.0
+   Compiling jwt v0.16.0
+   Compiling hyper v1.9.0
+   Compiling tower v0.5.3
+   Compiling idna_adapter v1.2.2
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-guest-mem)
+   Compiling idna v1.1.0
+   Compiling dof v0.4.0
+   Compiling tokio-rustls v0.26.4
+   Compiling url v2.5.8
+   Compiling hyper-util v0.1.20
+   Compiling tokio-util v0.7.18
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling tower-http v0.6.10
+   Compiling toml_edit v0.22.27
+   Compiling usdt v0.6.0
+   Compiling hickory-proto v0.26.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling hyper-rustls v0.27.9
+   Compiling clap v4.6.1
+   Compiling rand_chacha v0.9.0
+   Compiling reqwest v0.12.28
+   Compiling proptest v1.11.0
+   Compiling toml v0.8.23
+   Compiling oci-client v0.15.0
+   Compiling carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-timer-core)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+   Compiling carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-signal-core)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-observability)
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-spec)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-hal)
+   Compiling carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-image)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vfs)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-aarch64)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 28.67s
+     Running tests/integration/main.rs (target/debug/deps/integration-c4e62132181cc038)
+
+running 71 tests
+test oci_layout::rejects_unsafe_digests_for_blob_paths ... ok
+test io_wait::kqueue_wait_still_observes_readable_socket_with_listener_write_interest ... ok
+test syscall_net_epoll::epoll_edge_triggered_eventfd_reports_only_new_readiness ... ok
+test syscall_net_epoll::epoll_edge_triggered_ready_overflow_is_returned_on_next_wait ... ok
+test syscall_net_epoll::epoll_et_read_growth_does_not_rearm_latched_read_level ... ok
+test syscall_net_epoll::blocking_eventfd_read_waits_until_writer_updates_counter ... ok
+test syscall_net_epoll::close_of_added_fd_auto_removes_it_from_epoll_interest ... ok
+test syscall_net_epoll::epoll_event_matches_aarch64_c_abi_layout ... ok
+test syscall_net_epoll::epoll_reports_eventfd_readiness_with_packed_events ... ok
+test syscall_net_epoll::epoll_latched_host_edge_parks_on_kqueue_edge_not_timeout_backstop ... ok
+test syscall_net_epoll::epoll_reports_timerfd_readiness_with_packed_event ... ok
+test syscall_net_epoll::epoll_latched_eof_hup_disarms_kqueue_and_leaves_fd_not_readable ... ok
+test syscall_net_epoll::epoll_timed_wait_blocks_after_edge_event_was_already_reported ... ok
+test syscall_net_epoll::epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready ... ok
+test syscall_net_epoll::fcntl_getpipe_size_reports_bootstrap_pipe_capacity ... ok
+test syscall_net_epoll::eventfd2_read_write_round_trip_uses_packed_counter ... ok
+test io_wait::kqueue_wait_wakes_when_peer_writes_after_registration ... ok
+test syscall_net_epoll::fionbio_updates_pipe_status_flags_and_host_nonblocking_mode ... ok
+test syscall_net_epoll::fionread_and_fionbio_bootstrap_succeed_for_valid_fds ... ok
+test syscall_net_epoll::pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close ... ok
+test syscall_net_epoll::epoll_wakes_accepted_socket_after_peer_write ... ok
+test syscall_net_epoll::pipe2_writes_packed_fd_pair_and_round_trips_bytes ... ok
+test syscall_net_epoll::ppoll_reports_epoll_fd_readiness_when_registered_fd_is_ready ... ok
+test syscall_net_epoll::pselect6_invalid_fd_returns_ebadf ... ok
+test syscall_net_epoll::ppoll_reports_eventfd_pipe_and_invalid_fd_readiness ... ok
+test syscall_net_epoll::pselect6_empty_zero_timeout_returns_without_wait_handoff ... ok
+test syscall_net_epoll::pselect6_reports_eventfd_pipe_and_write_readiness ... ok
+test syscall_net_epoll::timerfd_gettime_writes_packed_itimerspec_for_armed_timer ... ok
+test syscall_net_epoll::pipe2_fd_fill_fails_fast_with_emfile ... ok
+test syscall_net_epoll::siocgifname_on_socket_maps_interface_index_to_name ... ok
+test syscall_net_epoll::timerfd_settime_read_round_trip_uses_packed_records ... ok
+test syscall_signal::rt_sigaction_sig_dfl_resets_host_disposition_for_job_control ... ok
+test syscall_signal::kill_tkill_tgkill_validate_logical_targets_and_queue_exact_thread_signals ... ok
+test syscall_net_epoll::x86_64_epoll_uses_packed_event_layout ... ok
+test syscall_signal::fasync_self_owner_delivers_io_signal_to_sigtimedwait ... ok
+test syscall_signal::rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos ... ok
+test syscall_net_epoll::threaded_epoll_wait_wakes_when_peer_thread_writes_to_accepted_socket ... ok
+test syscall_signal::rt_signal_stubs_zero_old_state ... ok
+test syscall_signal::rt_sigsuspend_restores_nondefault_mask_when_no_handler_runs ... ok
+test syscall_signal::rt_sigsuspend_applies_mask_then_returns_eintr_on_pending_signal ... ok
+test syscall_signal::sigaltstack_bootstrap_zeroes_old_stack_and_validates_new ... ok
+test syscall_thread::clone_thread_variant_exists ... ok
+test syscall_signal::rt_sigsuspend_stays_parked_for_pending_default_ignored_sigchld ... ok
+test syscall_signal::rt_sigtimedwait_writes_full_siginfo_from_queued_payload ... ok
+test syscall_thread::clone_fork_flags_still_fork ... ok
+test syscall_signal::signalfd_read_drains_pending_masked_signals ... ok
+test syscall_thread::clone_with_pthread_flags_emits_clone_thread ... ok
+test syscall_thread::futex_lock_pi_private_uncontended_records_owner_tid ... ok
+test syscall_thread::futex_cmp_requeue_matching_val3_no_waiters_returns_zero ... ok
+test syscall_thread::futex_trylock_pi_private_owned_by_self_is_deadlock ... ok
+test syscall_thread::futex_requeue_private_no_waiters_returns_zero ... ok
+test syscall_thread::futex_wait_value_mismatch_returns_eagain ... ok
+test syscall_thread::futex_wait_matching_value_blocks_via_outcome ... ok
+test syscall_thread::futex_unlock_pi_private_owned_by_self_clears_word ... ok
+test syscall_thread::gettid_returns_per_thread_tid_not_pid ... ok
+test syscall_thread::sched_getparam_accepts_live_sibling_tid ... ok
+test syscall_thread::futex_wake_returns_count_and_advances_table ... ok
+test syscall_thread::sched_getscheduler_accepts_live_sibling_tid ... ok
+test syscall_thread::tgkill_to_masked_sibling_queues_without_signalthread ... ok
+test syscall_thread::sched_getscheduler_unknown_sibling_tid_is_esrch ... ok
+test syscall_thread::set_tid_address_records_clear_child_tid_and_returns_tid ... ok
+test syscall_thread::tgkill_to_sibling_emits_signalthread ... ok
+test syscall_thread::tgkill_to_self_raises_locally ... ok
+test syscall_thread::tgkill_to_retired_sibling_returns_esrch_before_runtime_withdrawal ... ok
+test syscall_thread::tgkill_to_sibling_uses_kernel_pending_without_siginfo_sidecar ... ok
+test syscall_thread::thread_exit_variant_exists ... ok
+test syscall_thread::tkill_to_unknown_tid_is_esrch ... ok
+test syscall_net_epoll::epoll_et_unread_data_does_not_spin_and_waits_for_next_edge ... ok
+test oci_layout::normalizes_short_docker_hub_references ... ok
+test oci_layout::computes_content_addressed_storage_paths ... ok
+test oci_layout::loads_pull_summary_from_image_store ... ok
+
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+   Compiling tokio v1.52.3
+   Compiling goblin v0.10.5
+   Compiling darling_core v0.20.11
+   Compiling tracing v0.1.44
+   Compiling carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-signal-core)
+   Compiling proptest v1.11.0
+   Compiling hickory-proto v0.26.1
+   Compiling darling_macro v0.20.11
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling derive_builder_macro v0.20.2
+   Compiling dof v0.4.0
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+   Compiling derive_builder v0.20.2
+   Compiling hyper v1.9.0
+   Compiling tower v0.5.3
+   Compiling tokio-rustls v0.26.4
+   Compiling tokio-util v0.7.18
+   Compiling oci-spec v0.8.4
+   Compiling usdt-impl v0.6.0
+   Compiling tower-http v0.6.10
+   Compiling hyper-util v0.1.20
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-hal)
+   Compiling usdt v0.6.0
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-observability)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host-bsd)
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-thread)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-conformance-contract)
+   Compiling oci-client v0.15.0
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-spec)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vfs)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.96s
+     Running tests/integration/main.rs (target/debug/deps/integration-4d11b9df745ecee9)
+
+running 242 tests
+test address_space::zero_fills_memory_past_file_backing ... ok
+test address_space::rejects_overlapping_regions ... ok
+test compat_report::aggregates_unhandled_syscalls_by_name_and_number ... ok
+test compat_report::renders_machine_parseable_json ... ok
+test compat_report::syscall_entry_name_is_borrowed_not_allocated ... ok
+test concurrency_contracts::dispatcher_and_reporter_are_send_sync ... ok
+test address_space::builds_linux_initial_stack_with_argv_envp_and_auxv ... ok
+test compat_report::summary_counts_invocations_and_distinct_categories ... ok
+test concurrency_contracts::compat_reporter_records_from_shared_threads ... ok
+test address_space::load_elf_from_host_maps_pt_interp_at_base_and_sets_at_base ... ok
+test address_space::load_elf_from_rootfs_maps_pt_interp_at_base_and_sets_at_base ... ok
+test address_space::dispatcher_can_write_from_loaded_guest_memory ... ok
+test concurrency_contracts::shared_dispatcher_reports_unknown_syscalls_without_serialized_fallback ... ok
+test concurrency_contracts::shared_dispatcher_routes_sibling_thread_signals ... ok
+test concurrency_contracts::shared_dispatcher_services_execve_request_without_serialized_fallback ... ok
+test concurrency_contracts::shared_dispatcher_services_fd_table_open_read_close ... ok
+test concurrency_contracts::shared_dispatcher_opens_rootfs_file_without_serialized_fallback ... ok
+test concurrency_contracts::shared_dispatcher_services_credential_state ... ok
+test concurrency_contracts::shared_dispatcher_services_memory_state ... ok
+test concurrency_contracts::shared_dispatcher_services_process_state ... ok
+test concurrency_contracts::shared_dispatcher_services_stdio_write_buffers ... ok
+test concurrency_contracts::shared_dispatcher_services_nested_pipe_redirect_syscalls ... ok
+test concurrency_contracts::shared_dispatcher_services_thread_lifecycle_syscalls ... ok
+test concurrency_contracts::shared_dispatcher_services_syscalls_from_multiple_host_threads ... ok
+test concurrency_contracts::shared_dispatcher_services_readonly_fs_state ... ok
+test concurrency_contracts::shared_dispatcher_services_thread_registry_and_futex_syscalls ... ok
+test elf_inspector::creates_load_plan_for_pt_load_segments ... ok
+test elf_inspector::inspects_minimal_aarch64_linux_elf ... ok
+test elf_inspector::rejects_non_elf_input ... ok
+test public_backend_surface::a_backend_boots_a_root_and_forks_through_public_kernel_operations ... ok
+test elf_inspector::load_plan_derives_linux_auxv_program_header_metadata ... ok
+test public_backend_surface::the_carrier_process_double_is_usable_through_the_trait_from_outside ... ok
+test public_backend_surface::hal_null_bridges_boot_a_dispatcher_that_serves_a_syscall ... ok
+test rootfs_overlay::rejects_paths_that_escape_root ... ok
+test rootfs_overlay::read_link_preserves_symlink_target_text ... ok
+test rootfs_overlay::applies_oci_whiteout_files ... ok
+test rootfs_overlay::follows_relative_symlinks_within_rootfs ... ok
+test rootfs_overlay::applies_opaque_directory_whiteout ... ok
+test rootfs_overlay::reads_file_from_uppermost_layer ... ok
+test rootfs_overlay::symlink_with_parent_dir_in_target_resolves_across_layers ... ok
+test syscall_creds::capget_writes_docker_default_capability_sets ... ok
+test rootfs_streaming::rejects_path_escape ... ok
+test syscall_creds::capset_accepts_empty_sets_and_rejects_nonempty_sets ... ok
+test rootfs_streaming::skips_special_file ... ok
+test syscall_creds::getcpu_writes_bootstrap_cpu_and_numa_node ... ok
+test syscall_creds::futex_wait_and_wake_cover_bootstrap_private_operations ... ok
+test syscall_creds::getrusage_bootstrap_zeros_rusage_for_self_and_validates_who ... ok
+test rootfs_streaming::extracts_file_dir_symlink_with_mode ... ok
+test syscall_creds::membarrier_query_reports_supported_commands ... ok
+test syscall_creds::personality_query_and_set_round_trip_bootstrap_flags ... ok
+test rootfs_streaming::later_layer_overrides_and_whiteout_deletes ... ok
+test syscall_creds::prctl_no_new_privs_keepcaps_subreaper_timerslack_round_trip ... ok
+test syscall_creds::prctl_handles_bootstrap_process_controls ... ok
+test rootfs_streaming::opaque_whiteout_clears_dir ... ok
+test syscall_creds::prlimit64_and_getrlimit_round_trip_per_resource ... ok
+test syscall_creds::prlimit64_writes_packed_rlimit ... ok
+test syscall_creds::process_identity_syscalls_return_bootstrap_ids ... ok
+test syscall_creds::set_tid_address_and_robust_list_are_bootstrap_successes ... ok
+test syscall_creds::rseq_reports_clean_bootstrap_fallback ... ok
+test syscall_creds::scheduler_bootstrap_yields_and_writes_current_affinity ... ok
+test syscall_creds::setpriority_getpriority_round_trip_reports_kernel_abi_nice ... ok
+test syscall_creds::uname_writes_packed_linux_utsname ... ok
+test syscall_fs_dir::getdents64_lists_rootfs_directory_entries ... ok
+test syscall_fs_dir::bind_mount_directory_inotify_reports_child_file_write_name ... ok
+test syscall_creds::umask_setpriority_getpriority_sysinfo_bootstrap_stubs ... ok
+test syscall_fs_dir::bind_mount_directory_inotify_reports_created_child_name ... ok
+test syscall_fs_dir::inotify_init1_splits_status_and_descriptor_flags ... ok
+test syscall_fs_dir::inotify_init_add_watch_read_dispatch_plumbing ... ok
+test syscall_fs_dir::bind_mount_create_stamps_guest_owner_on_files_and_directories ... ok
+test syscall_fs_dir::inotify_add_watch_under_bind_mount_uses_host_vnode ... ok
+test syscall_fs_dir::bind_mount_cwd_relative_stat_open_mkdir_and_inotify_use_host_tree ... ok
+test syscall_fs_dir::host_overlay_directory_inotify_reports_created_child_name ... ok
+test syscall_fs_dir::linkat_reports_eexist_enoent_and_links_into_writable_overlay ... ok
+test syscall_fs_dir::mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise ... ok
+test syscall_fs_dir::linkat_and_unlinkat_under_bind_mount_use_host_tree ... ok
+test syscall_fs_dir::mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise ... ok
+test syscall_fs_dir::renameat2_exchange_swaps_content_and_rejects_invalid_flag_combos ... ok
+test syscall_fs_dir::renameat_renames_known_sources_into_overlay_and_enoent_otherwise ... ok
+test syscall_fs_dir::symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths ... ok
+test syscall_fs_dir::mkdirat_under_bind_mount_creates_host_directory_for_openat_children ... ok
+test syscall_fs_dir::unlinkat_removes_files_on_overlay_and_validates_directory_kind ... ok
+test syscall_fs_dir::renameat_under_bind_mount_moves_host_entries ... ok
+test syscall_fs_meta::dev_fd_opens_descriptor_like_proc_self_fd ... ok
+test syscall_fs_dir::symlinkat_and_readlinkat_under_bind_mount_use_host_tree ... ok
+test syscall_fs_meta::fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args ... ok
+test syscall_fs_meta::fallocate_grows_open_files_on_writable_overlay_and_validates_arguments ... ok
+test syscall_fs_meta::ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds ... ok
+test syscall_fs_meta::fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args ... ok
+test syscall_fs_meta::ftruncate_rejects_unbounded_in_memory_file_growth ... ok
+test syscall_fs_meta::chmod_and_fchmod_under_bind_mount_update_host_mode ... ok
+test syscall_fs_meta::fchownat_at_empty_path_records_owner_like_fchown ... ok
+test syscall_fs_meta::missing_sys_file_records_compat_report_entry ... ok
+test syscall_fs_meta::openat_reads_synthetic_proc_maps_and_cpuinfo ... ok
+test syscall_fs_meta::proc_self_auxv_refreshes_when_image_state_is_updated ... ok
+test syscall_fs_meta::non_root_chown_under_bind_mount_to_root_returns_eperm ... ok
+test syscall_fs_meta::missing_proc_file_records_compat_report_entry ... ok
+test syscall_fs_meta::proc_self_fd_directory_lists_open_fds ... ok
+test syscall_fs_meta::guest_can_override_synthetic_etc_services_via_unlink_then_recreate ... ok
+test syscall_fs_meta::proc_self_fdinfo_renders_pos_flags_ino ... ok
+test syscall_fs_meta::proc_self_fd_readlink_synthesizes_anon_inode_target ... ok
+test syscall_fs_meta::proc_self_magic_links_readlink_and_lstat ... ok
+test syscall_fs_meta::proc_self_oom_score_adj_is_writable ... ok
+test syscall_fs_meta::readlinkat_reads_rootfs_symlink_target_without_nul ... ok
+test syscall_fs_meta::readlinkat_reports_synthetic_proc_self_exe ... ok
+test syscall_fs_meta::synthetic_proc_files_write_regular_packed_stat_records ... ok
+test syscall_fs_meta::utimensat_sets_times_on_writable_overlay_and_validates_timestamps ... ok
+test syscall_fs_meta::truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing ... ok
+test syscall_fs_meta::xattr_family_dispatches_per_target_on_in_memory_backend ... ok
+test syscall_fs_meta::synthetic_sys_surface_serves_common_cpu_and_mm_files ... ok
+test syscall_fs_meta::utimensat_under_bind_mount_updates_host_times ... ok
+test syscall_fs_meta::root_chown_under_bind_mount_records_guest_owner_without_host_chown ... ok
+test syscall_fs_open::close_range_frees_pty_master_entry ... ok
+test syscall_fs_open::dup3_installs_requested_fd_and_cloexec_is_per_descriptor ... ok
+test syscall_fs_meta::synthetic_proc_surface_serves_common_process_and_system_files ... ok
+test syscall_fs_open::dup_shares_rootfs_file_offset_with_original_fd ... ok
+test syscall_fs_open::fcntl_async_io_setup_retains_o_async_and_round_trips_owner_and_sig ... ok
+test syscall_fs_open::fcntl_gets_and_sets_descriptor_and_status_flags ... ok
+test syscall_fs_open::fcntl_on_bare_stdio_succeeds_not_ebadf ... ok
+test syscall_fs_open::ioctl_tcgets2_is_recognized_and_mirrors_tcgets ... ok
+test syscall_fs_open::memory_overlay_open_uses_single_backend_snapshot_for_shared_file ... ok
+test syscall_fs_open::flock_accepts_bootstrap_advisory_locks_on_open_files ... ok
+test syscall_fs_open::fcntl_setlease_wrlck_conflicts_with_a_second_opener ... ok
+test syscall_fs_open::ioctl_writes_packed_winsize_and_reports_unknown_requests ... ok
+test syscall_fs_open::memory_overlay_regular_open_skips_fifo_probe_when_backend_cannot_have_fifos ... ok
+test syscall_fs_open::open_o_tmpfile_creates_anonymous_writable_file ... ok
+test syscall_fs_open::memory_overlay_regular_open_skips_legacy_kind_lookups ... ok
+test syscall_fs_open::open_o_tmpfile_materializes_via_proc_self_fd_linkat ... ok
+test syscall_fs_open::ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files ... ok
+test syscall_fs_open::openat2_reads_open_how_and_opens_readonly_rootfs_paths ... ok
+test syscall_fs_open::openat_read_close_round_trip_through_rootfs_fd ... ok
+test syscall_fs_open::openat_missing_rootfs_file_returns_enoent ... ok
+test syscall_fs_open::open_o_tmpfile_materialize_preserves_setuid_setgid_host_backend ... ok
+test syscall_fs_open::tiocgpgrp_on_real_tty_uses_host_value_not_bootstrap ... ok
+test syscall_fs_open::tiocgsid_on_real_tty_uses_host_value_not_bootstrap ... ok
+test syscall_fs_open::tiocspgrp_on_real_tty_calls_host_not_fake ... ok
+test syscall_fs_open::small_write_to_large_overlay_file_does_not_rewrite_whole_file ... ok
+test syscall_fs_open::x86_private_dup2_installs_requested_fd_and_allows_same_fd_noop ... ok
+test syscall_fs_pty::ptmx_tiocgptn_returns_index_and_tcgets_succeeds ... ok
+test syscall_fs_open::tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls ... ok
+test syscall_fs_pty::closing_ptmx_master_removes_pts_entry ... ok
+test syscall_fs_pty::pty_master_slave_data_roundtrip ... ok
+test syscall_fs_rw::f_getfl_strips_creation_only_open_flags ... ok
+test syscall_fs_rw::lseek_repositions_rootfs_file_reads ... ok
+test syscall_fs_pty::tiocswinsz_on_pty_master_succeeds_via_slave ... ok
+test syscall_fs_rw::fsync_family_flushes_host_backed_files ... ok
+test syscall_fs_rw::copy_file_range_uses_darwin_fast_path_for_whole_host_files ... ok
+test syscall_fs_rw::pread64_reads_from_offset_without_changing_file_offset ... ok
+test syscall_fs_rw::preadv_reads_from_offset_across_iovecs_without_changing_file_offset ... ok
+test syscall_fs_rw::pwritev_bootstrap_validates_iovecs_and_reports_stream_errors ... ok
+test syscall_fs_rw::pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds ... ok
+test syscall_fs_rw::preadv_host_file_preserves_offset_with_borrowed_iovecs ... ok
+test syscall_fs_rw::pwritev_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr ... ok
+test syscall_fs_rw::pwritev_host_file_reports_efault_when_fallback_payload_is_unreadable ... ok
+test syscall_fs_rw::readv_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr ... ok
+test syscall_fs_rw::pwritev_host_file_reads_each_guest_iovec_once ... ok
+test syscall_fs_rw::pwritev_host_file_uses_guest_host_ptrs_without_payload_reads ... ok
+test syscall_fs_rw::readv_host_file_uses_guest_host_ptrs_for_writable_iovecs ... ok
+test syscall_fs_rw::readv_reads_file_across_packed_iovecs ... ok
+test syscall_fs_rw::readv_reads_host_pipe_across_packed_iovecs ... ok
+test syscall_fs_rw::readv_host_write_admission_failure_does_not_consume_file_input ... ok
+test syscall_fs_rw::sendfile_copies_rootfs_file_to_stdout_and_updates_offset_pointer ... ok
+test syscall_fs_rw::sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe ... ok
+test syscall_fs_rw::sendfile_null_offset_advances_host_backed_file_across_calls ... ok
+test syscall_fs_rw::splice_moves_bytes_between_rootfs_files_pipes_and_stdout ... ok
+test syscall_fs_rw::splice_moves_bytes_between_sockets_and_pipes ... ok
+test syscall_fs_rw::write_syscall_reads_guest_memory_and_writes_stdout ... ok
+test syscall_fs_rw::write_syscall_rejects_bad_guest_pointer_with_efault ... ok
+test syscall_fs_rw::writev_writes_host_pipe_from_packed_iovecs ... ok
+test syscall_fs_rw::writev_writes_stdout_from_packed_iovecs ... ok
+test syscall_fs_stat::faccessat2_dotdot_after_missing_intermediate_returns_enoent ... ok
+test syscall_fs_stat::cwd_and_access_syscalls_use_rootfs_state ... ok
+test syscall_fs_stat::faccessat2_follows_dangling_symlinks_unless_nofollow_is_set ... ok
+test syscall_fs_stat::fstat_and_statx_empty_path_agree_for_anonymous_fd_kinds ... ok
+test syscall_fs_stat::faccessat2_supports_bootstrap_access_flags_and_fd_checks ... ok
+test syscall_fs_stat::fstatfs_writes_packed_linux_statfs_for_open_fd ... ok
+test syscall_fs_stat::fstat_pty_reports_char_device ... ok
+test syscall_fs_stat::newfstatat_and_fstat_write_typed_linux_stat ... ok
+test syscall_fs_stat::statfs_writes_packed_linux_statfs_for_rootfs_path ... ok
+test syscall_fs_stat::statx_writes_basic_rootfs_fd_and_symlink_metadata ... ok
+test syscall_fs_stat::x86_stat_writes_x8664_stat_layout ... ok
+test syscall_mem::brk_tracks_heap_within_runtime_arena ... ok
+test syscall_mem::dispatcher_mmap_uses_configured_16k_linux_page_size ... ok
+test syscall_fs_stat::host_overlay_statfs_and_fstatfs_report_the_backing_volume ... ok
+test syscall_mem::linear_memory_bounds_reads ... ok
+test syscall_fs_stat::host_stat_following_symlink_reports_target_inode ... ok
+test syscall_mem::madvise_accepts_common_advice_for_mapped_ranges ... ok
+test syscall_mem::madvise_dontdump_and_dodump_are_accepted_and_flip_the_vma_dump_policy ... ok
+test syscall_mem::mm_lock_msync_mincore_stubs_validate_args_and_succeed ... ok
+test syscall_mem::mmap_anonymous_fixed_mapping_zeroes_guest_memory_and_mprotect_munmap_are_noops ... ok
+test syscall_mem::mmap_anonymous_reservations_fit_in_runtime_arena ... ok
+test syscall_mem::mmap_maps_file_bytes_into_guest_memory_arena ... ok
+test syscall_mem::mmap_non_fixed_hint_does_not_overlap_existing_bump_allocation ... ok
+test syscall_mem::mmap_rejects_unknown_map_flag_bits ... ok
+test syscall_mem::mmap_out_of_bounds_hint_relocated_advisory ... ok
+test syscall_mem::mmap_without_hint_uses_next_page_granular_address ... ok
+test syscall_mem::mprotect_rounds_length_to_configured_16k_linux_page_size ... ok
+test syscall_mem::mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem ... ok
+test syscall_mem::mremap_rounds_old_size_to_configured_16k_linux_page_size_when_moving ... ok
+test syscall_net_tcp::ipv6_multicast_if_index_zero_is_accepted_and_reads_back ... ok
+test syscall_net_tcp::loopback_tcp_echo_round_trip ... ok
+test syscall_net_tcp::signalfd4_and_tee_return_einval_not_enosys_stub ... ok
+test syscall_net_tcp::so_reuseport_and_bufsize_report_guest_values_not_host_widening ... ok
+test syscall_net_tcp::netlink_getsockopt_so_type_reports_guest_type_not_hardcoded_raw ... ok
+test syscall_net_tcp::socket_syscalls_dispatch_to_real_host_handlers ... ok
+test syscall_net_unix::epoll_del_of_one_dup_keeps_readiness_for_the_shared_host_socket ... ok
+test syscall_net_unix::getsockopt_so_peercred_returns_linux_ucred_from_local_peercred ... ok
+test syscall_net_unix::msg_more_and_cork_coalescing ... ok
+test syscall_net_unix::so_passcred_set_get_round_trips ... ok
+test syscall_net_unix::so_peercred_unrecorded_peer_returns_fallback_zeros_and_all_ones ... ok
+test syscall_net_unix::unix_connect_checks_guest_path_before_host_hash_path ... ok
+test syscall_net_unix::unix_pathname_stream_listener_accepts_local_client ... ok
+test syscall_net_unix::unix_bind_existing_guest_socket_path_returns_eaddrinuse ... ok
+test syscall_net_unix::getsockname_returns_the_guest_unix_path_not_the_host_translation ... ok
+test syscall_table::aarch64_syscall_table_is_sorted_for_binary_search ... ok
+test syscall_table::authority_partition_matches_host_boundary_rules ... ok
+test syscall_table::bringup_manifest_entries_have_a_handler_owner ... ok
+test syscall_net_unix::unix_relative_socket_getsockname_can_be_chmodded ... ok
+test syscall_table::manifest_records_group_handler_and_compatibility_notes ... ok
+test syscall_table::names_linux_aarch64_bringup_syscalls ... ok
+test syscall_table::unknown_syscalls_are_explicit ... ok
+test syscall_net_unix::unix_relative_socket_under_bind_mount_can_be_chmodded ... ok
+test syscall_time::clock_getres_writes_packed_linux_timespec ... ok
+test syscall_time::adjtimex_and_clock_adjtime_return_eperm ... ok
+test syscall_time::clock_nanosleep_accepts_relative_and_absolute_timespecs ... ok
+test syscall_time::clock_gettime_writes_packed_linux_timespec ... ok
+test syscall_time::clock_settime_bootstrap_returns_eperm_before_validating_arguments ... ok
+test syscall_time::getitimer_setitimer_bootstrap_validate_args_and_zero_output ... ok
+test syscall_time::gettimeofday_writes_packed_linux_timeval_and_timezone ... ok
+test syscall_time::nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs ... ok
+test syscall_time::relative_sleeps_carry_remaining_time_pointer_for_eintr ... ok
+test syscall_time::sysinfo_reports_uptime_not_epoch_time ... ok
+test syscall_table::dispatch_declares_no_abi_constants ... ok
+test syscall_time::timer_create_accepts_thread_cpu_sigev_thread_id_for_same_process_thread ... ok
+test syscall_time::timer_create_rejects_thread_cpu_sigev_thread_id ... ok
+test syscall_time::times_bootstrap_writes_tms_and_returns_monotonic_clock ... ok
+test syscall_fs_rw::sendfile_host_files_completes_a_request_larger_than_the_staging_buffer ... ok
+test syscall_fs_dir::bind_mount_repeated_relative_stat_after_guest_mkdir_uses_host_tree ... ok
+test syscall_fs_open::small_write_to_large_rootfs_file_does_not_copy_up_whole_file ... ok
+test syscall_fs_rw::sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise ... ok
+test address_space::loaded_elf_initial_stack_can_report_16k_pages ... ok
+test address_space::loaded_elf_initial_stack_includes_linux_auxv ... ok
+test address_space::loads_static_linux_fixture_into_guest_address_space ... ok
+
+test result: ok. 242 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.41s
+
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s
+     Running tests/io_blocking_guard.rs (target/debug/deps/io_blocking_guard-aae8a54c1cfecf96)
+
+running 1 test
+test no_unguarded_blocking_host_io_in_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.63s
+     Running tests/syscall_process.rs (target/debug/deps/syscall_process-44da89d330409fe6)
+
+running 9 tests
+test syscall_request_can_be_built_from_a_raw_syscall ... ok
+test job_control_queries_answer_from_the_kernel_graph ... ok
+test privileged_op_stubs_return_eperm ... ok
+test seccomp_filter_blocks_the_targeted_syscall_with_errno ... ok
+test unhandled_named_syscall_surfaces_by_name_in_compat_report ... ok
+test exit_group_syscall_requests_process_exit ... ok
+test getrandom_fills_guest_buffer ... ok
+test unknown_syscall_returns_enosys_and_records_report_entry ... ok
+test exit_syscall_requests_process_exit ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+   Doc-tests carrick_runtime
+
+running 1 test
+test crates/carrick-runtime/src/prepare.rs - prepare::PreparedRun::execute (line 827) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-engine)
+   Compiling carrick-cli v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.68s
+     Running tests/trace_profile.rs (target/debug/deps/trace_profile-ee47801ddc19971e)
+
+running 26 tests
+test amp1_rejects_a_program_digest_mismatch ... ok
+test amp1_rejects_a_missing_drop_section ... ok
+test amp1_rejects_a_wrong_backend_capture ... ok
+test amp1_rejects_a_truncated_capture ... ok
+test amp1_accepts_a_complete_amplification_capture ... ok
+test amp1_requires_a_qualified_terminal_roster_in_both_scopes ... ok
+test amp1_rejects_a_declared_join_that_never_armed ... ok
+test completed_inotify_profile_accepts_original_workload_population ... ok
+test amp1_accepts_the_inherited_service_ends_every_threaded_guest_produces ... ok
+test completed_inotify_profile_is_listed ... ok
+test completed_inotify_profile_rejects_incomplete_or_inconsistent_evidence ... ok
+test hvpatch_alias_sharing_trace_fails_closed ... ok
+HVPATCHALIAS validation: ok
+test amp1_rejects_corrupt_amplification_records ... ok
+test hvpatch_carrier_low_rate_requires_a_retained_raw_capture ... ok
+test amp1_rejects_nonzero_drop_counters_from_either_source ... ok
+test hvpatch_carrier_low_rate_accepts_only_a_closed_complete_stack_population ... ok
+test native_amplification_program_scopes_bounds_and_sections_are_pinned ... ok
+test trace_profile_keeps_raw_and_summary_outputs_distinct ... ok
+test trace_profile_argument_relationships_are_enforced ... ok
+test amplification_ledger_requires_the_in_band_consumer_drop_record ... ok
+HVPATCHALIAS validation: incomplete companion capture
+HVPATCHALIAS validation: missing or duplicate completion
+HVPATCHALIAS validation: provider error
+HVPATCHALIAS validation: timeout
+test hvpatch_alias_sharing_saved_capture_validator_fails_closed ... ok
+test amplification_ledger_publishes_a_canonical_ledger_from_an_authenticated_capture ... ok
+test amplification_ledger_refuses_a_capture_that_is_not_evidence ... ok
+test amplification_compare_reports_exact_zeros_for_identical_censuses ... ok
+test amplification_compare_refuses_every_capture_determinant_drift ... ok
+test amplification_ledger_publishes_deterministically_and_never_clobbers ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.67s
+
+   Compiling carrick-cli v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running tests/fs_backend_flag.rs (target/debug/deps/fs_backend_flag-16e68dafe78f7bd5)
+
+running 2 tests
+test run_with_fs_memory_is_a_usage_error ... ok
+test run_help_does_not_offer_fs_memory ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
+   Compiling carrick-cli v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.35s
+     Running tests/cli.rs (target/debug/deps/cli-173f0fcb3c0a1003)
+
+running 19 tests
+test logs_replays_captured_output_for_a_container ... ok
+test network_cli_connects_and_disconnects_container_resources ... ok
+test network_cli_manages_docker_style_resources ... ok
+test native_code_mode_flag_is_not_public_policy ... ok
+test exec_backend_hvf_environment_value_has_migration_guidance ... ok
+test inspect_elf_command_prints_json_metadata ... ok
+test plan_elf_load_command_prints_segment_plan ... ok
+test resource_cli_prune_honors_filters ... ok
+test exec_backend_help_lists_only_portable_values ... ok
+test volume_cli_manages_docker_style_resources ... ok
+test dispatch_syscall_cli_exercises_write_path ... ok
+test removed_auto_exec_backend_has_migration_guidance ... ok
+test network_cli_accepts_docker_resource_commands ... ok
+test rootfs_cli_lists_and_reads_composed_layers ... ok
+test help_output_snapshots ... ok
+test volume_cli_accepts_docker_resource_commands ... ok
+test logs_unknown_container_errors ... ok
+test shared_run_args_accepted_across_verbs ... ok
+test load_elf_command_prints_address_space_summary ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-observability)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.71s
+     Running unittests src/lib.rs (target/debug/deps/carrick_engine-daadfaf42f3be441)
+
+running 32 tests
+test tests::execution_backend_flows_into_run_spec ... ok
+test tests::bare_env_key_imports_from_the_host_env_snapshot ... ok
+test tests::dns_overrides_resolve_into_run_spec ... ok
+test tests::extra_hosts_resolve_into_run_spec ... ok
+test tests::amd64_guest_on_arm_host_tracks_rosetta_presence ... ok
+test tests::bare_env_key_without_a_host_env_imports_nothing ... ok
+test tests::cleared_entrypoint_runs_cmd_only ... ok
+test tests::bridge_network_resolves_into_run_spec ... ok
+test tests::hostname_resolves_into_run_spec ... ok
+test tests::native_platform_is_always_runnable ... ok
+test tests::named_user_is_deferred_to_prepared_image_root ... ok
+test tests::a_pinned_ipv4_in_the_bridge_placeholder_range_is_rejected ... ok
+test tests::numeric_user_produces_no_warning ... ok
+test tests::relative_workdir_resolves_against_image_workingdir ... ok
+test tests::request_platform_defaults_to_host_native ... ok
+test tests::run_request_default_is_a_runnable_docker_shaped_baseline ... ok
+test tests::resolve_run_spec_parity_pin ... ok
+test tests::resolve_seccomp_policy_is_last_wins_and_rejects_unknown_options ... ok
+test tests::run_spec_seccomp_policy_defaults_to_container_default ... ok
+test tests::security_opt_seccomp_unconfined_opts_out ... ok
+test tests::static_bridge_ipv4_resolves_into_run_spec ... ok
+test tests::stdio_mode_flows_from_request_into_run_spec ... ok
+test tests::test_merge_argv_cmd_override ... ok
+test tests::test_merge_argv_entrypoint_override ... ok
+test tests::test_merge_argv_no_override ... ok
+test tests::test_merge_workdir ... ok
+test tests::unnamed_bridge_container_needs_an_explicit_bridge_namespace_id ... ok
+test tests::user_absent_defaults_root ... ok
+test tests::user_numeric_uid_and_gid ... ok
+test tests::test_merge_env_variables ... ok
+test tests::user_numeric_uid_defaults_gid_zero ... ok
+test tests::host_elf_resolves_into_run_spec ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests carrick_engine
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Compiling syn v2.0.117
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling const_format_proc_macros v0.2.34
+   Compiling tempfile v3.27.0
+   Compiling const_format v0.2.36
+   Compiling synstructure v0.13.2
+   Compiling darling_core v0.20.11
+   Compiling proc-macro-error2 v2.0.1
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.5
+   Compiling serde_derive v1.0.228
+   Compiling tokio-macros v2.7.0
+   Compiling futures-macro v0.3.32
+   Compiling tracing-attributes v0.1.31
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling zerocopy-derive v0.8.48
+   Compiling tokio v1.52.3
+   Compiling getset v0.1.6
+   Compiling futures-util v0.3.32
+   Compiling strum_macros v0.27.2
+   Compiling zerofrom v0.1.8
+   Compiling tracing v0.1.44
+   Compiling zerocopy v0.8.48
+   Compiling yoke v0.8.2
+   Compiling darling_macro v0.20.11
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling icu_collections v2.2.0
+   Compiling serde v1.0.228
+   Compiling icu_locale_core v2.2.0
+   Compiling derive_builder_macro v0.20.2
+   Compiling derive_builder v0.20.2
+   Compiling serde_urlencoded v0.7.1
+   Compiling olpc-cjson v0.1.4
+   Compiling chrono v0.4.44
+   Compiling jwt v0.16.0
+   Compiling oci-spec v0.8.4
+   Compiling icu_provider v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling icu_properties v2.2.0
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling hyper v1.9.0
+   Compiling tower v0.5.3
+   Compiling tokio-rustls v0.26.4
+   Compiling tokio-util v0.7.18
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-guest-mem)
+   Compiling url v2.5.8
+   Compiling tower-http v0.6.10
+   Compiling hyper-util v0.1.20
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling oci-client v0.15.0
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-spec)
+   Compiling carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-image)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.56s
+     Running unittests src/lib.rs (target/debug/deps/carrick_image-ba9117a6f5608a50)
+
+running 33 tests
+test auth::tests::canonical_key_collapses_hub_spellings ... ok
+test tests::default_target_is_host_native ... ok
+test tests::layer_summaries_are_reordered_to_manifest_order ... ok
+test tests::accepts_arm64_v8_variant ... ok
+test auth::tests::creds_store_only_entry_is_none_not_a_panic ... ok
+test auth::tests::auth_for_uses_username_password_fields ... ok
+test auth::tests::auth_for_decodes_inline_base64_splitting_on_first_colon ... ok
+test tests::layers_are_reordered_to_manifest_order ... ok
+test tests::load_real_kaniko_archive_if_present ... ok
+test tests::oci_config_without_stop_signal_is_none ... ok
+test auth::tests::write_then_resolve_round_trips_with_0600 ... ok
+test auth::tests::write_login_preserves_other_registries ... ok
+test tests::override_arm64_v8_matches_unspecified_entry ... ok
+test tests::override_selects_amd64_when_only_amd64_present ... ok
+test tests::parse_platform_target_rejects_garbage ... ok
+test tests::parse_platform_target_with_variant ... ok
+test tests::load_docker_archive_missing_manifest_is_an_error ... ok
+test tests::picks_linux_arm64_from_multi_arch_index ... ok
+test tests::parse_platform_target_without_variant ... ok
+test tests::pull_policy_follows_docker_semantics ... ok
+test tests::rejects_arm64_v7_variant ... ok
+test tests::returns_none_when_no_linux_arm64_present ... ok
+test tests::skips_entry_with_no_platform_block ... ok
+test tests::tag_moved_only_when_registry_digest_differs ... ok
+test tests::test_parse_oci_config_json ... ok
+test tests::list_images_reports_repo_tag_id_and_size ... ok
+test tests::load_docker_archive_can_target_non_default_platform ... ok
+test tests::load_docker_archive_plain_tar_layer_gets_tar_media_type ... ok
+test tests::load_docker_archive_ingests_blobs_and_summary ... ok
+test tests::remove_image_by_spec_accepts_ref_or_id ... ok
+test tests::tag_image_creates_a_new_ref_sharing_blobs ... ok
+test tests::load_docker_archive_tags_every_repo_tag ... ok
+test tests::remove_image_then_gc_reclaims_unreferenced_blobs ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+   Doc-tests carrick_image
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Compiling zerocopy v0.8.48
+   Compiling darling_core v0.20.11
+   Compiling chrono v0.4.44
+   Compiling darling_macro v0.20.11
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling derive_builder_macro v0.20.2
+   Compiling derive_builder v0.20.2
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-guest-mem)
+   Compiling dof v0.4.0
+   Compiling oci-spec v0.8.4
+   Compiling usdt-impl v0.6.0
+   Compiling usdt v0.6.0
+   Compiling oci-client v0.15.0
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+   Compiling carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-signal-core)
+   Compiling carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-timer-core)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-observability)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-hal)
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-spec)
+   Compiling carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-image)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vfs)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-aarch64)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-embed)
+   Compiling carrick-conformance-next v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-conformance-next)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 35.73s
+     Running tests/probes_shard_0.rs (target/debug/deps/probes_shard_0-81735ef66f73973e)
+
+running 11 tests
+test common::empty_stdin_transport_is_an_eof_fifo ... ok
+test common::cached_probe_selection_honors_requested_filter_and_lane_classification ... ok
+test test_probe_binary_locator_and_gap_counts ... ok
+test test_shard_0_expected_gaps_derivation ... ok
+test common::retained_probe_manifest_matches_classification ... ok
+test common::special_policy_names_are_unique_in_the_generic_shard_union ... ok
+test test_normalization ... ok
+test test_shard_0_inventory ... ok
+test test_cache_freshness_and_hashing ... ok
+test test_shard_0_cached_oracles_are_complete ... ok
+test common::special_probe_container_lowers_required_privileges ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.18s
+
+     Running tests/probes_shard_1.rs (target/debug/deps/probes_shard_1-1792de78d6e9b791)
+
+running 9 tests
+test common::empty_stdin_transport_is_an_eof_fifo ... ok
+test common::cached_probe_selection_honors_requested_filter_and_lane_classification ... ok
+test common::retained_probe_manifest_matches_classification ... ok
+test common::special_policy_names_are_unique_in_the_generic_shard_union ... ok
+test test_normalize_output ... ok
+test test_shard_1_inventory_count_and_sorted ... ok
+test test_cache_freshness_and_validation ... ok
+test test_shard_1_cached_oracles_are_complete ... ok
+test common::special_probe_container_lowers_required_privileges ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.17s
+
+     Running tests/probes_shard_2.rs (target/debug/deps/probes_shard_2-24def6e089dd9991)
+
+running 9 tests
+test common::empty_stdin_transport_is_an_eof_fifo ... ok
+test common::cached_probe_selection_honors_requested_filter_and_lane_classification ... ok
+test common::retained_probe_manifest_matches_classification ... ok
+test common::special_policy_names_are_unique_in_the_generic_shard_union ... ok
+test test_normalization_rules ... ok
+test test_shard_2_inventory_definition ... ok
+test test_shard_2_cached_oracles_are_complete ... ok
+test test_shard_2_cache_freshness ... ok
+test common::special_probe_container_lowers_required_privileges ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.17s
+
