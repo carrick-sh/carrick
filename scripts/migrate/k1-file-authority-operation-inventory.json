@@ -15794,7 +15794,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread.rs",
-      "line": 2764,
+      "line": 2784,
       "categories": [
         "lifecycle"
       ],
