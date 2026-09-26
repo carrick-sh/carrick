@@ -810,7 +810,7 @@ fn el1_sched_host_woken_thread_preempts_a_compute_loop() {
     }
 }
 
-/// Contract `kernel.mm.address-space-occupancy` (EL1 increment 2, step 1):
+/// Contract `kernel.mm.address-space-occupancy` (EL1 increment 2, first-touch checkpoint):
 /// two live processes, each running twice as many writer threads as guest
 /// CPUs (pairs handing a turn off through private futexes, so EL1 switches
 /// them on shared vCPUs, each writing and reading back its own page), an
@@ -857,4 +857,68 @@ fn el1_sched_mm_occupancy_two_processes() {
         );
     }
     assert!(stdout.contains("mm-occupancy child_ok=true"), "{stdout:?}");
+}
+
+/// Contract `kernel.el1.anonymous-first-touch` (EL1 increment 2, first-touch checkpoint):
+/// two live fork-related processes freshly touch private anonymous memory at the
+/// same inherited virtual range across 256, 1024, and 4096 pages per process.
+///
+/// Semantics: each process verifies initial zero-fill, writes distinct role values,
+/// reads them back, and verifies they remain intact after both processes have written.
+///
+/// Structural invariant: anonymous first-touch faults must be serviced in guest EL1
+/// without per-page host fault service exits. The measured incremental host-exit slope
+/// across scales must be < 0.125 exits per added page (both processes count).
+///
+/// This witness is expected to be red while faults are serviced by the host.
+/// Only a recorded signed run establishes the measured failure.
+#[test]
+fn el1_memory_first_touch_stays_in_guest() {
+    const SCALES: [u64; 3] = [256, 1024, 4096];
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for pages in SCALES {
+        let measured = run_fixture(
+            &carrier,
+            &["first-touch", &pages.to_string()],
+            Duration::from_secs(120),
+        );
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched first-touch pages={pages} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+            measured.exits,
+            measured.cpu_ns,
+            measured.wall.as_millis(),
+            measured.zone,
+            stdout.trim()
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            stdout.contains(&format!("first-touch child pages={pages} ok=true"))
+                && stdout.contains(&format!(
+                    "first-touch parent pages={pages} child_ok=true ok=true"
+                )),
+            "both processes must complete first-touch at scale {pages}: {stdout:?}"
+        );
+        runs.push((pages, measured.exits, measured.cpu_ns));
+    }
+
+    for pair in runs.windows(2) {
+        let (p0, exits0, _cpu0) = pair[0];
+        let (p1, exits1, _cpu1) = pair[1];
+        let added_pages = 2.0 * (p1 as f64 - p0 as f64);
+        let exit_slope = (exits1 as f64 - exits0 as f64) / added_pages;
+        println!(
+            "el1-sched first-touch slope {p0}->{p1} pages (added={added_pages}): \
+             exits_diff={} slope={exit_slope:.4} exits/page",
+            exits1 as i64 - exits0 as i64,
+        );
+        assert!(
+            exit_slope < 0.125,
+            "first-touch host-exit slope across scale {p0} -> {p1} was {exit_slope:.4} exits/page \
+             (both processes count, added={added_pages}); contract ceiling is <0.125 exits per added page"
+        );
+    }
 }

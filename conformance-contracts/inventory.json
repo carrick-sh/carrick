@@ -2954,6 +2954,7 @@
       "authority": "hybrid",
       "contracts": [
         "kernel.el1.address-space-switch",
+        "kernel.el1.anonymous-first-touch",
         "kernel.el1.zone-entry-at-open",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.backing-maintenance-lookup",
@@ -3030,6 +3031,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.address-space-switch",
+        "kernel.el1.anonymous-first-touch",
         "kernel.el1.files.cross-process-readers",
         "kernel.el1.guest-run-queue",
         "kernel.fork.filetable",
@@ -3073,6 +3075,7 @@
       "authority": "hybrid",
       "contracts": [
         "kernel.el1.address-space-switch",
+        "kernel.el1.anonymous-first-touch",
         "kernel.el1.zone-entry-at-open",
         "kernel.fork.mappings",
         "kernel.mm.address-space-occupancy",
