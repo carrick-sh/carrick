@@ -1,0 +1,60 @@
+schema_version = 1
+id = "kernel.el1.guest-scheduler"
+title = "Guest threads are scheduled across vCPUs inside the guest: blocking handoffs, timed futex waits, preemption and idle need no host exit, and the host still reaches every thread parked on an idle vCPU"
+guest_surfaces = [
+  "syscall:futex",
+  "syscall:exit_group",
+  "syscall:execve",
+  "syscall:tgkill",
+  "syscall:rt_sigreturn",
+  "syscall:sched_setaffinity",
+  "scheduler:preemption",
+  "scheduler:vcpu-kick",
+  "scheduler:el1-interrupts",
+  "signal:asynchronous-delivery",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 futex: FUTEX_WAIT returns 0 when woken, EAGAIN when the word differs, EINTR on a signal, ETIMEDOUT when its relative timeout (CLOCK_MONOTONIC) expires, never before it; FUTEX_WAKE returns the number of waiters woken",
+  "man 2 sched_setaffinity: a thread runs only on CPUs in its affinity mask",
+  "man 7 sched: SCHED_OTHER threads that share a CPU are time-sliced; a runnable thread is not starved by a thread that never blocks",
+  "man 2 exit_group / man 2 execve: every other thread terminates",
+  "man 7 signal: an asynchronous signal is delivered to a thread on its next return to user mode, including one blocked in a wait",
+  "Linux arm64 sigcontext: `pstate` is the interrupted EL0 PSTATE; Carrick has always shown it with DAIF 0x3c0, and the EL1 kernel's EL0 interrupt unmask must not change what the guest reads",
+  "Arm ARM: WFI wakes on a pending interrupt even with PSTATE.I set; ICC_SGI1R_EL1 routes an SGI by Aff3.Aff2.Aff1 and a target list of Aff0; the EL1 virtual timer asserts its PPI while CNTV_CTL_EL0 is enabled and CNTVCT >= CNTV_CVAL",
+  "Hypervisor.framework hv_gic.h: with the in-kernel GIC, SGIs, the virtual timer PPI and WFI are handled in the hypervisor (qualified by the EL1 scheduler spike, spike/el1-scheduler c9897ae4c: zero exits to the VMM)",
+]
+fixture = "embed:el1-sched pinned-pingpong|timed-wait|compute-pair|idle-carrier|wfi-signal|pstate|exit-group|exec; unit:carrick-sched-core; unit:carrick-el1::sched; unit:vector-page-interpreter"
+scale_points = [2000, 22000, 300, 3300, 200, 1200]
+rationale = "EL1 increment 1c. Before it, EL1 switched a vCPU between threads of one process only when a woken thread was queued on the waker's own vCPU, ignoring the woken thread's affinity; a handoff to a thread on another vCPU, every timed futex wait (433 host exits per 200 1 ms waits, lateness p50 282 us) and every wait with nothing runnable left the guest, and a thread queued behind a syscall-free loop was freed by a host thread polling every 2 ms. Now each vCPU slot has a run-queue lock and a state other vCPUs read (Host, Running, IdleSpin, IdleWfi). EL1 queues a woken thread on another slot only under that slot's lock while it is in the guest; the executor sets Host under the same lock before it drains the slot at an exit, so no thread is stranded on a slot nobody runs (VM-free contention test). The record EL1 creates for the thread the host loaded on a slot is that slot's home record and runs only there, because the host believes the thread runs there; the executor unhomes it when it settles the thread. A wake places each waiter on its home slot, else on an idle slot of the same address space its affinity allows, else on the waker's own queue, all or nothing as in 1b. A wait with nothing runnable idles the vCPU in EL1: it polls its queue for 20 us, then parks in WFI with IRQs masked and acknowledges by polling ICC_IAR1_EL1; a waker sends the reschedule SGI 14 to a slot that is running or in WFI. The loaded thread's relative FUTEX_WAIT_PRIVATE timeout ends on its slot's virtual timer with ETIMEDOUT; at an exit the executor hands a pending deadline to the host continuation. Every served return to EL0 clears PSTATE.I, and an interrupt taken at EL0 enters the EL1 image through the vector's EL0 IRQ hook, so the timer preempts a loop that never makes a syscall once a queued thread has waited a 2 ms slice, and the kick SGI leaves through hvc #4. The guest never sees the unmask: signal frames and core notes show DAIF 0x3c0 as before (el0_visible_pstate). The host reaches a thread parked on a WFI-parked vCPU by hv_vcpus_exit: the kick lands in EL1 code, the run loop resumes it with the kick SGI pending, and the idle loop leaves through the new hvc #5 idle exit; the executor then settles the thread, whose zone wait takes the signal, exit or exec drain. The 2 ms run-queue guard thread is deleted. The zone runs only with the in-kernel GIC; CARRICK_HVF_GIC=0 and CARRICK_EL1_FUTEX=0 restore the host futex paths."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-sched-core::tests (el1_wake_places_a_floating_thread_on_an_idle_slot, enter_idle_refuses_wfi_with_a_queued_thread, a_home_record_runs_only_on_its_home_slot, el1_honours_affinity_for_floating_threads, the_slot_timer_ends_a_timed_park_once, a_preempted_thread_resumes_without_a_result, a_tick_migrates_queued_threads_to_idle_slots, cross_slot_wakes_never_strand_a_thread_on_a_stopped_slot); carrick-el1::sched::tests (a_wait_with_nothing_runnable_idles_until_host_work, an_idle_vcpu_parks_in_wfi_after_its_spin, a_timed_wait_ends_in_guest_with_etimedout, timed_waits_this_vcpu_cannot_keep_forward, a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to, the_virtual_timer_preempts_a_compute_loop, a_kick_taken_at_el0_forwards); carrick-mem::memory::el1_hook_kick (gic_kick_taken_at_el0_leaves_through_the_kick_exit, gic_el0_irq_hook_returns_exactly_and_loses_no_kick, idle_action_leaves_through_the_idle_exit, gic_mode_vector_page_routes_el0_interrupts_to_el1); carrick-hal::aarch64_arch::tests::aarch64_sigframe_shows_the_guest_its_historical_daif"
+embed = "carrick-embed::el1_sched (signed; el1_sched_cross_vcpu_handoff_has_no_host_exits: affine exits per round trip < 0.01 at 5 us and 200 us of work per turn, cross-vCPU wakes and WFI SGIs per round trip; el1_sched_timed_wait_times_out_in_guest: exits per wait < 0.01, every result ETIMEDOUT, none early; el1_sched_preemption_reaches_compute_loops: both syscall-free loops progress with in-guest preemptions; el1_sched_idle_carrier_costs_no_host_cpu: < 1% of a core idle, vCPUs in WFI; el1_sched_signal_reaches_a_wfi_parked_vcpu; el1_sched_exit_group_with_parked_threads and el1_sched_exec_from_a_sibling_with_parked_threads with WFI-parked siblings; el1_sched_pstate_seen_by_the_guest_is_unchanged)"
+ecosystem = [
+  "go:build",
+  "go:testing",
+  "go:sync",
+  "go:time",
+  "cpython:threading",
+  "ltp:futex_cmp_requeue01",
+  "ltp:futex_cmp_requeue02",
+  "ltp:futex_wait01",
+  "ltp:futex_wait02",
+  "ltp:futex_wait03",
+  "ltp:futex_wait04",
+  "ltp:futex_wait05",
+  "ltp:futex_wait_bitset01",
+  "ltp:futex_waitv01",
+  "ltp:futex_waitv02",
+  "ltp:futex_waitv03",
+  "ltp:futex_wake01",
+  "ltp:futex_wake02",
+  "ltp:futex_wake03",
+  "ltp:futex_wake04",
+]
+
+[bindings.unresolved]
+docker = "The fixture asserts the Linux results directly (0 on a wake, ETIMEDOUT not before the deadline, EINTR on a signal, exit_group status, the exec successor's output, the ucontext PSTATE the guest has always read); a generic Docker probe was not blessed in this session. The LTP futex rows and the ecosystem rows compare against the cached Docker oracle."
+embed_structural = "Host exits are read through carrick_embed::vcpu_run_exits_total(), carrier CPU through getrusage of the test process, and in-guest work (cross-vCPU wakes, SGIs, preemptions, timeouts, idle entries, WFIs, idle exits) through the zone counters in shared EL1 memory; no WorkObservation metric is registered for them."
