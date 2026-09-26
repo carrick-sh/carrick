@@ -465,7 +465,7 @@ impl Scheduler {
 }
 
 impl ExecutorDirectory {
-    fn deliver_kick_to(&self, executor: ExecutorId) {
+    pub(super) fn deliver_kick_to(&self, executor: ExecutorId) {
         let kick = self
             .state
             .lock()
@@ -521,6 +521,17 @@ impl RunQueueInner {
             }
         }
         false
+    }
+
+    /// Whether `executor` holds a lent CPU whose owner is ready to return.
+    pub(super) fn lent_cpu_wanted_back(&self, executor: ExecutorId) -> bool {
+        if self.handoff_slots.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        self.state.lock().handoffs.values().any(|slot| {
+            slot.owner.as_ref().map(|owner| owner.id) == Some(executor)
+                && slot.waiters.values().any(|wait| wait.ready)
+        })
     }
 
     pub(super) fn release_handoff(&self, executor: ExecutorId, only_if_returning: bool) -> bool {

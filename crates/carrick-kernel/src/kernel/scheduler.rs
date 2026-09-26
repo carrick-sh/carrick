@@ -4324,6 +4324,14 @@ impl Scheduler {
             self.queue.inner.finish_claim();
             return Err(error);
         }
+        // A spare running on a lent CPU whose owner became ready to return
+        // before this binding existed was not kickable then: kick it now, so
+        // the quantum it starts ends at once and the CPU goes back (the owner
+        // marks itself ready, then kicks a bound borrower; this binds, then
+        // looks for a ready owner, so one of the two sees the other).
+        if self.queue.inner.lent_cpu_wanted_back(executor.id) {
+            self.executors.deliver_kick_to(executor.id);
+        }
         let bound_cpu = executor.bound_cpu().unwrap_or(GuestCpuId::new(0));
         row.thread.set_last_cpu(bound_cpu);
         let thread_id = SchedThreadId::new(row.thread.key().serial.raw());
@@ -4370,6 +4378,14 @@ impl Scheduler {
             active_claim: true,
             guest_cpu: bound_cpu,
         })
+    }
+
+    /// Give the CPU `executor` borrowed back to its host-waiting owner if
+    /// that owner is ready to return (EL1 plan 1d: an executor claims zone
+    /// work before it would reach the run queue's own check). True if it
+    /// did: `executor` holds no CPU now.
+    pub fn release_lent_cpu_if_returning(&self, executor: &ExecutorRegistration) -> bool {
+        self.queue.inner.release_handoff(executor.id, true)
     }
 
     pub fn poke_executor_control(&self) {
@@ -7696,6 +7712,62 @@ mod tests {
             woken > 0,
             "the returning owner never woke the guest-idle borrower"
         );
+    }
+
+    /// A spare that borrowed a host waiter's CPU gives it back before it
+    /// claims more work once the owner is ready to return (EL1 plan 1d:
+    /// zone work is claimed before the run queue's own release check).
+    /// `go-testing` wedged with the returning owner in `resume` and the
+    /// spare running a thread it claimed from the zone on the lent CPU.
+    #[test]
+    fn a_spare_returns_a_lent_cpu_before_claiming_more_work() {
+        let (kernel, context) = bootstrap(12_405);
+        publish(&context, 48);
+        let scheduler = scheduler_with_cpus(kernel, 1);
+        let owner = scheduler
+            .register_executor_bound(
+                Arc::new(RecordingKick::default()),
+                Some(GuestCpuId::new(0)),
+                false,
+            )
+            .unwrap();
+        let borrower = scheduler
+            .register_executor_bound(Arc::new(RecordingKick::default()), None, true)
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let running = scheduler.take(&owner).unwrap();
+        let token = scheduler.begin_host_wait(&running, &owner).unwrap();
+        assert!(scheduler.try_take(&borrower).unwrap().is_none());
+        assert!(
+            borrower.bound_cpu().is_some(),
+            "the spare holds the lent CPU"
+        );
+        assert!(
+            !scheduler.release_lent_cpu_if_returning(&borrower),
+            "the owner is still in its host call"
+        );
+        let borrower_side = {
+            let scheduler = Arc::clone(&scheduler);
+            thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    if scheduler.release_lent_cpu_if_returning(&borrower) {
+                        return (true, borrower.bound_cpu());
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return (false, borrower.bound_cpu());
+                    }
+                    thread::yield_now();
+                }
+            })
+        };
+        // The owner returns; it gets its CPU back once the spare releases it.
+        drop(token);
+        let (released, cpu) = borrower_side.join().unwrap();
+        assert!(released, "the spare never gave the CPU back");
+        assert_eq!(cpu, None);
+        assert_eq!(owner.bound_cpu(), Some(GuestCpuId::new(0)));
+        scheduler.settle_exited(running).unwrap();
     }
 
     #[test]

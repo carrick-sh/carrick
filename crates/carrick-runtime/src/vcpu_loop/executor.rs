@@ -1479,6 +1479,15 @@ fn next_runnable<F: PersistentExecutor>(
         }
         return Ok(Some(scheduler.take(registration)?));
     };
+    if scheduler.release_lent_cpu_if_returning(registration) {
+        // The CPU this spare borrowed goes back to its returning owner before
+        // the spare claims anything more; the thread it owes an adoption
+        // goes back to its host continuation for another executor.
+        if let Some(record) = crate::vcpu_loop::zone::take_pending_adoption() {
+            scheduler.publish_zone_handback(record);
+        }
+        return Ok(None);
+    }
     if let Some(record) = crate::vcpu_loop::zone::take_pending_adoption() {
         if let Some(running) = scheduler.adopt_zone_handback(registration, record)? {
             return Ok(Some(running));
