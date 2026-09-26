@@ -717,13 +717,15 @@ impl HvpatchRuntimeDirectory {
         *pool = Some(started);
         let ptr = carrick_vmm_hvf::read_el1_region_host_ptr();
         carrick_kernel::el1_delegation::record_el1_region_host_ptr(ptr);
-        // The in-guest scheduler zone reaches a vCPU slot through its
-        // executor's vCPU, and a guard bounds how long a woken thread waits
-        // on a slot whose running thread neither blocks nor syscalls.
+        // The in-guest scheduler needs the in-kernel GIC (the virtual timer
+        // preempts and SGIs wake idle vCPUs in the guest); the zone reaches a
+        // vCPU slot from the host through its executor's vCPU.
+        carrick_kernel::el1_zone::enable(
+            carrick_vmm_hvf::gic::interrupt_model() == carrick_vmm_hvf::gic::InterruptModel::Gic,
+        );
         carrick_kernel::el1_zone::register_slot_kicker(Box::new(|slot| {
             carrick_vmm_hvf::vcpu_kick::kick_zone_slot(usize::from(slot.raw()));
         }));
-        carrick_kernel::el1_zone::start_run_queue_guard();
         crate::el1_census::init_from_env();
         Ok(true)
     }

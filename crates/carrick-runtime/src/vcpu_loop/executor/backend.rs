@@ -61,6 +61,8 @@ pub(crate) struct HvpatchPersistentExecutor {
     owner_thread_port: u32,
     residency_generation: ResidencyGeneration,
     resident_task: Option<HvpatchResidentTaskRecord>,
+    /// The guest CPU the executor is bound to, as last noted.
+    bound_cpu: Option<u32>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -405,6 +407,7 @@ impl PersistentExecutorFactory for HvpatchPersistentExecutorFactory {
             owner_thread_port,
             residency_generation: ResidencyGeneration::INITIAL,
             resident_task: None,
+            bound_cpu: None,
         })
     }
 }
@@ -419,6 +422,10 @@ pub(crate) trait PersistentExecutor: 'static {
     type TaskBinding: PersistentTaskBinding + Send + Sync + 'static;
 
     fn load(&mut self, task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError>;
+
+    /// The guest CPU this executor is bound to (`None`: a spare), noted
+    /// before each load: the in-guest scheduler places threads by it.
+    fn note_bound_cpu(&mut self, _cpu: Option<u32>) {}
 
     fn run_until_boundary(
         &mut self,
@@ -729,12 +736,18 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 self.raw_vcpu_id,
                 task.binding().identity().mm.raw(),
                 task.thread_key().serial.raw(),
+                self.bound_cpu,
+                task.lease().affinity_mask(),
             );
         }
         asid_load.mark_resident().map_err(|error| {
             self.clear_live_current_task();
             TrapError::Hypervisor(format!("HVPatch ASID residence commit failed: {error}"))
         })
+    }
+
+    fn note_bound_cpu(&mut self, cpu: Option<u32>) {
+        self.bound_cpu = cpu;
     }
 
     fn run_until_boundary(
@@ -808,10 +821,15 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         // installs the close-on-exec successor (`replace_resources`).
         // The successor image is a new address space: its zone key follows.
         if let Some(slot) = self.live_mailbox_slot()
-            && carrick_kernel::el1_zone::zone().is_some()
+            && let Some(zone) = carrick_kernel::el1_zone::zone()
         {
             let (_, serial) = carrick_el1_abi::current_task_snapshot(slot).unwrap_or_default();
-            carrick_el1_abi::publish_zone_identity(slot, binding.identity().mm.raw(), serial);
+            let mm = binding.identity().mm.raw();
+            if let Some(zone_slot) = carrick_el1_abi::SlotId::from_index(slot) {
+                let affinity = zone.slot(zone_slot).affinity();
+                zone.publish_slot(zone_slot, mm, self.bound_cpu, affinity);
+            }
+            carrick_el1_abi::publish_zone_identity(slot, mm, serial);
         }
         self.binding = Some(binding);
         Ok(())
@@ -1180,19 +1198,27 @@ impl HvpatchPersistentExecutor {
 /// slot's EL1 scheduler state must be empty: the previous residency's last
 /// exit settled it.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn publish_zone_slot(slot: usize, vcpu: u64, mm: u64, serial: u64) {
+fn publish_zone_slot(
+    slot: usize,
+    vcpu: u64,
+    mm: u64,
+    serial: u64,
+    bound_cpu: Option<u32>,
+    affinity: u64,
+) {
     carrick_vmm_hvf::vcpu_kick::bind_zone_slot_vcpu(slot, vcpu);
     let Some(zone) = carrick_kernel::el1_zone::zone() else {
         carrick_el1_abi::publish_zone_identity(slot, 0, serial);
         return;
     };
-    if let Some(zone_slot) = carrick_el1_abi::SlotId::from_index(slot)
-        && !zone.reset_slot(zone_slot)
-    {
-        carrick_fatal!(
-            "vcpu_loop::el1_zone",
-            "EL1 zone slot {slot} still held threads when a task was loaded on it"
-        );
+    if let Some(zone_slot) = carrick_el1_abi::SlotId::from_index(slot) {
+        if !zone.reset_slot(zone_slot) {
+            carrick_fatal!(
+                "vcpu_loop::el1_zone",
+                "EL1 zone slot {slot} still held threads when a task was loaded on it"
+            );
+        }
+        zone.publish_slot(zone_slot, mm, bound_cpu, affinity);
     }
     carrick_el1_abi::publish_zone_identity(slot, mm, serial);
 }

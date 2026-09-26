@@ -132,7 +132,9 @@ pub fn build_sigframe<E: RegAccess + CurrentMmMemory>(
     //     which is exactly Go's async-preemption (SIGURG) corruption.
     //
     // The engine pre-selected the authoritative source into `pstate_source`.
-    frame.saved_spsr = p.pstate_source;
+    // The guest sees it with DAIF set, as Carrick has always run EL0: the
+    // in-guest scheduler's EL0 interrupt unmask is not guest state.
+    frame.saved_spsr = crate::aarch64::el0_visible_pstate(p.pstate_source);
 
     // A queued siginfo (rt_sigqueueinfo / sigqueue) wins over synthesis: it
     // carries the caller's si_value payload and the kernel-set si_code

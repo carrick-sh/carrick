@@ -8,7 +8,8 @@
 //! venues. The ownership protocol of a parked thread is in
 //! `carrick_sched_core`; this module is the host's side of it:
 //!
-//! - [`zone`]: the tables, when the carrier maps the EL1 region and the
+//! - [`zone`]: the tables, when the carrier maps the EL1 region, schedules
+//!   threads in the guest (it has the in-kernel GIC, [`enable`]) and the
 //!   `CARRICK_EL1_FUTEX=0` bisection hatch is not set.
 //! - [`claim`]: take a parked thread for a signal, a timeout, a control wake
 //!   or a cancellation; a thread EL1 holds is reached by kicking its vCPU
@@ -45,9 +46,20 @@ fn hatch_enabled() -> bool {
     })
 }
 
+static GUEST_SCHEDULER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The carrier schedules threads in the guest: its VM has the interrupt
+/// controller the in-guest scheduler needs (virtual timer and SGIs taken at
+/// EL1). Without it (`CARRICK_HVF_GIC=0`, other backends) the zone is off,
+/// exactly as with `CARRICK_EL1_FUTEX=0`: a woken thread could otherwise
+/// wait behind a running one with nothing to preempt it.
+pub fn enable(guest_interrupts: bool) {
+    GUEST_SCHEDULER.store(guest_interrupts, std::sync::atomic::Ordering::Release);
+}
+
 /// The zone tables, if this carrier serves private futexes in the zone.
 pub fn zone() -> Option<&'static ZoneTables> {
-    if !hatch_enabled() {
+    if !hatch_enabled() || !GUEST_SCHEDULER.load(std::sync::atomic::Ordering::Acquire) {
         return None;
     }
     zone_tables()
@@ -70,56 +82,6 @@ pub fn kick_slot(slot: SlotId) {
     carrick_el1_abi::mark_pending_host_work(usize::from(slot.raw()));
     if let Some(kicker) = SLOT_KICKER.get() {
         kicker(slot);
-    }
-}
-
-/// How long a woken thread may wait on a vCPU slot's run queue before the
-/// guard forces that slot's vCPU out, handing the thread to the host
-/// scheduler: at most two guard periods.
-const RUN_QUEUE_GUARD_PERIOD: std::time::Duration = std::time::Duration::from_millis(2);
-
-/// The vCPU slots the guard watches (one per syscall-mailbox slot).
-const GUARD_SLOTS: usize = carrick_el1_abi::EL1_STACK_SLOTS as usize;
-
-/// Start the carrier's run-queue guard (once per process). EL1 queues a
-/// woken thread behind the thread that woke it, which normally blocks in a
-/// served futex wait next (the handoff) or makes a syscall EL1 forwards
-/// (whose exit hands the queued thread to the host). A waker that does
-/// neither would hold it indefinitely: the guard sees a slot whose queue has
-/// been non-empty since the same instant for a whole period and kicks it.
-pub fn start_run_queue_guard() {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    STARTED.get_or_init(|| {
-        let _ = std::thread::Builder::new()
-            .name("carrick-el1-zone-guard".to_owned())
-            .spawn(run_queue_guard);
-    });
-}
-
-fn run_queue_guard() {
-    let mut seen = [0_u64; GUARD_SLOTS];
-    loop {
-        let Some(zone) = zone() else {
-            seen = [0; GUARD_SLOTS];
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            continue;
-        };
-        for (index, last) in seen.iter_mut().enumerate() {
-            let Some(slot) = SlotId::from_index(index) else {
-                continue;
-            };
-            let s = zone.slot(slot);
-            if s.queued() == 0 {
-                *last = 0;
-                continue;
-            }
-            let since = s.queued_since();
-            if since != 0 && *last == since {
-                kick_slot(slot);
-            }
-            *last = since;
-        }
-        std::thread::sleep(RUN_QUEUE_GUARD_PERIOD);
     }
 }
 

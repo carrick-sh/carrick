@@ -76,6 +76,61 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
     }
 }
 
+/// Handle an interrupt taken while EL0 ran (the vector's EL0 IRQ hook marks
+/// such a frame with `esr == 0`). `Served` returns to EL0, possibly as
+/// another thread; `Forward` leaves through the host at this EL0 boundary.
+pub fn dispatch_irq(frame: &mut TrapFrame, counters: &Counters) -> Action {
+    #[cfg(target_os = "none")]
+    {
+        let current_tasks =
+            unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
+        let zone = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+        dispatch_irq_with_regions(
+            frame,
+            counters,
+            current_tasks,
+            Zone {
+                tables: zone,
+                cpu: &mut sched::HardwareCpu,
+                user: &sched::HardwareUserWord,
+            },
+        )
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (frame, counters);
+        Action::Forward
+    }
+}
+
+/// [`dispatch_irq`] with explicitly supplied tables (EL1 and host tests).
+pub fn dispatch_irq_with_regions<C, U>(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    zone: Zone<'_, C, U>,
+) -> Action
+where
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+{
+    let (Some(task), Some(slot)) = (
+        current_tasks.get(frame.slot as usize),
+        SlotId::from_index(frame.slot as usize),
+    ) else {
+        return Action::Forward;
+    };
+    sched::Sched {
+        zone: zone.tables,
+        slot,
+        task,
+        cpu: zone.cpu,
+        user: zone.user,
+        counters,
+    }
+    .serve_irq(frame)
+}
+
 /// The in-guest scheduler's tables and the CPU and user-memory access an
 /// in-guest switch uses ([`sched`]).
 pub struct Zone<'a, C: sched::ThreadCpu, U: sched::UserWord> {
@@ -124,20 +179,33 @@ where
         let queued = zone.tables.slot(zslot).queued() != 0;
         if sched::is_served_futex_op(frame) {
             let orig_x0 = frame.x[0];
-            if let Some(served) =
-                sched::serve_futex(frame, zslot, task, zone.tables, zone.cpu, zone.user)
-            {
-                counters.served[sched::SYS_FUTEX].fetch_add(1, Ordering::Relaxed);
-                // After a switch the frame is the switched-in thread's, whose
-                // own futex argument serve_futex recorded.
-                if !served.switched {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+            let mut sched = sched::Sched {
+                zone: zone.tables,
+                slot: zslot,
+                task,
+                cpu: zone.cpu,
+                user: zone.user,
+                counters,
+            };
+            match sched.serve_futex(frame) {
+                Some(sched::Served::Returned { switched }) => {
+                    counters.served[sched::SYS_FUTEX].fetch_add(1, Ordering::Relaxed);
+                    // After a switch the frame is the switched-in thread's,
+                    // whose own futex argument the switch recorded.
+                    if !switched {
+                        task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                    }
+                    if task.has_pending_host_work() {
+                        task.served_with_work.store(1, Ordering::Release);
+                        return Action::ServedWithWork;
+                    }
+                    return Action::Served;
                 }
-                if task.has_pending_host_work() {
-                    task.served_with_work.store(1, Ordering::Release);
-                    return Action::ServedWithWork;
+                Some(sched::Served::Idle) => {
+                    counters.served[sched::SYS_FUTEX].fetch_add(1, Ordering::Relaxed);
+                    return Action::Idle;
                 }
-                return Action::Served;
+                None => {}
             }
         } else if queued {
             let nr = frame.x[8] as usize;

@@ -114,6 +114,10 @@ pub const GIC_KICK_INTID: u32 = 15;
 pub const GIC_VTIMER_INTID: u32 = 27;
 /// What `ICC_IAR1_EL1` returns when no interrupt is pending.
 pub const GIC_SPURIOUS_INTID: u32 = 1023;
+/// GIC INTID of the reschedule SGI one vCPU's EL1 sends another when it
+/// queues a thread there (EL1 plan 1c): it ends the target's WFI, or makes
+/// a running target look at its run queue.
+pub const GIC_RESCHED_INTID: u32 = 14;
 
 /// Magic bytes at offset 0 of the EL1 image header: `CEL1`.
 pub const IMAGE_MAGIC: [u8; 4] = *b"CEL1";
@@ -204,6 +208,10 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::size_of::<ZoneTables>() as u64,
         core::mem::align_of::<ZoneTables>() as u64,
         core::mem::size_of::<ZoneRecord>() as u64,
+        core::mem::size_of::<carrick_sched_core::ZoneSlot>() as u64,
+        GIC_RESCHED_INTID as u64,
+        GIC_KICK_INTID as u64,
+        GIC_VTIMER_INTID as u64,
         core::mem::size_of::<ThreadCtx>() as u64,
         carrick_sched_core::THREAD_CTX_V_OFFSET as u64,
         carrick_sched_core::THREAD_CTX_FPSR_OFFSET as u64,
@@ -302,6 +310,11 @@ pub enum Action {
     /// Syscall was serviced at EL1, but return-to-user host work is pending; take the forward path
     /// with the completed result in frame.x0 to deliver to the host without replaying the syscall.
     ServedWithWork = 2,
+    /// The syscall parked its thread, nothing else was runnable, and host
+    /// work arrived while the vCPU idled in EL1: leave through the host with
+    /// no thread on the vCPU (`hvc #5`). The parked thread's context is in its
+    /// zone record.
+    Idle = 3,
 }
 
 /// Register trap frame saved by the exception vector before calling `carrick_el1_syscall`.
@@ -990,8 +1003,8 @@ pub const EL1_NAME_CACHE_SIZE: u64 = 0x1_0000;
 
 pub use carrick_sched_core::{
     BoundedSpin, Claim, CurrentHandback, Exhausted, Handback, HostClaim, LockWait, RecordId,
-    RecordRef, SlotDrain, SlotId, ThreadCtx, ThreadIdentity, WakeRefusal, Waker,
-    ZONE_RUNQ_CAPACITY, ZoneRecord, ZoneTables,
+    RecordRef, SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects,
+    WakeRefusal, Waker, ZONE_RUNQ_CAPACITY, ZoneRecord, ZoneTables,
 };
 
 /// Byte offset of the in-guest scheduler's tables ([`ZoneTables`]: futex

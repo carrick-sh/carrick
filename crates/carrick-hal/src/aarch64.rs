@@ -63,12 +63,39 @@ pub fn is_aarch64_hvc_kick(syndrome: u64) -> bool {
     is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == AARCH64_HVC_KICK_IMM
 }
 
+/// The DAIF bits of every EL0 PSTATE Carrick shows the guest: all four
+/// masked (`0x3c0`), as Carrick has always run guest EL0. Under the in-kernel
+/// GIC (EL1 plan 1c) EL0 runs with `I` clear so the virtual timer and SGIs
+/// reach Carrick's EL1 kernel; the guest never sees that bit, because every
+/// PSTATE it can read (a signal frame's `pstate`, a core file's `pstate`)
+/// passes through [`el0_visible_pstate`].
+pub const AARCH64_EL0_VISIBLE_DAIF: u64 = 0x3c0;
+
+/// The guest-visible form of an interrupted EL0 PSTATE: its NZCV and other
+/// fields as they are, DAIF as [`AARCH64_EL0_VISIBLE_DAIF`].
+pub const fn el0_visible_pstate(pstate: u64) -> u64 {
+    pstate | AARCH64_EL0_VISIBLE_DAIF
+}
+
+/// HVC immediate of the EL1 vector's idle exit (`hvc #5`, EL1 plan 1c): the
+/// vCPU's thread parked in the in-guest scheduler, nothing else was runnable,
+/// and host work arrived while the vCPU idled. No thread is on the vCPU; the
+/// parked thread's context is in its zone record.
+pub const AARCH64_HVC_IDLE_IMM: u64 = 5;
+
+/// True for the EL1 vector's `hvc #5` idle exit.
+pub fn is_aarch64_hvc_idle(syndrome: u64) -> bool {
+    is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == AARCH64_HVC_IDLE_IMM
+}
+
 /// True for syscall-shaped traps a host can dispatch identically: EL0 `svc #0`
 /// (`EC = 0x15`) and an EL1 vector's `hvc #2` re-trap (`EC = 0x16`). Both
 /// deliver the syscall ABI registers unchanged.
 pub fn is_aarch64_syscall_exception(syndrome: u64) -> bool {
     is_aarch64_svc_exception(syndrome)
-        || (is_aarch64_hvc_exception(syndrome) && !is_aarch64_hvc_kick(syndrome))
+        || (is_aarch64_hvc_exception(syndrome)
+            && !is_aarch64_hvc_kick(syndrome)
+            && !is_aarch64_hvc_idle(syndrome))
 }
 
 /// Whether a captured vCPU PC is genuine guest userspace (EL0) or inside

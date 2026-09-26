@@ -381,8 +381,9 @@ mod tests {
         e.sp = 0x20_0000; // 16-aligned user stack
         e.elr_el1 = 0xDEAD_BEE0; // becomes saved_pc (interrupted_pc == None)
         // EL0t PSTATE: mode bits [3:0] == 0, NZCV all set to prove the condition
-        // flags survive verbatim through the frame.
-        let pstate = 0xF000_0000u64;
+        // flags survive verbatim through the frame, DAIF set as Carrick always
+        // shows the guest.
+        let pstate = 0xF000_03C0u64;
         for i in 0..32 {
             e.vregs[i] = ((i as u128) << 64) | 0xCAFE_F00D_ABCD;
         }
@@ -419,6 +420,26 @@ mod tests {
             "uc_sigmask must round-trip for the caller's resmask"
         );
         assert_eq!(e.vregs, saved_vregs, "V0..V31 must round-trip");
+    }
+
+    /// EL0 runs with IRQs unmasked under the in-kernel GIC (the in-guest
+    /// scheduler's timer and SGIs); the frame the guest reads shows DAIF set
+    /// as it always has, and rt_sigreturn restores what the guest's frame
+    /// says.
+    #[test]
+    fn aarch64_sigframe_shows_the_guest_its_historical_daif() {
+        let mut e = empty_engine();
+        e.sp = 0x20_0000;
+        e.elr_el1 = 0xDEAD_BEE0;
+        let unmasked = 0x6000_0340u64;
+        Aarch64GuestArch::build_sigframe(&mut e, inject_params(unmasked))
+            .expect("build_sigframe writes the frame");
+        e.x = [0; 31];
+        Aarch64GuestArch::restore_sigframe(&mut e, true).expect("restore_sigframe");
+        assert_eq!(
+            e.spsr_el1, 0x6000_03C0,
+            "NZCV kept, DAIF as the guest saw it"
+        );
     }
 
     #[test]

@@ -635,6 +635,14 @@ impl ThreadExecutionLease {
             .map(|thread| thread.resources().files().id())
     }
 
+    /// The leased thread's CPU affinity as a mask of guest CPUs 0-63 (0 when
+    /// the thread is gone), for the in-guest scheduler's placement.
+    pub fn affinity_mask(&self) -> u64 {
+        self.owner
+            .upgrade()
+            .map_or(0, |thread| thread.affinity().words()[0])
+    }
+
     /// Exact address-space authority carried by the architectural snapshot.
     ///
     /// Continuations must derive MM and ASID generations from this non-cloneable
