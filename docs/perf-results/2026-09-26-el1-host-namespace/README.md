@@ -22,3 +22,5 @@ preserved and no semantic inventory changes.
 
 This is source integration only. Full domain lint, signed differential,
 openat work, native controls, workload timing and Stage 2a closure remain open.
+
+Full `just lint-domains` passes on `f664e7e02` after reviewing and registering the test-only parent-fstat counter. Signed differential and workload acceptance remain open.

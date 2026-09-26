@@ -373,3 +373,5 @@ This candidate remains unintegrated pending live-owner access/retirement
 exclusion and snapshot recovery. No fourth worker review is authorized;
 remaining corrections belong to the director. The original goal scope,
 first-touch structural red, signed gates, and workload objective remain open.
+
+Namespace integration follow-up: domain lint initially rejected the missing test-only counter ledger entry. Reviewed and registered it in `f664e7e02`; the full `just lint-domains` rerun exits zero. The memory worker is now terminal at `55bdfc220`; its product code equals candidate `22323a343` and only four inventories differ. Its final output contains waiting statements, so acceptance continues to rely on director evidence, not that report.
