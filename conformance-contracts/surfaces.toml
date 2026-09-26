@@ -130,7 +130,7 @@ contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.vm-lifetime", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler"]
+contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.vm-lifetime", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/dispatcher.rs"
@@ -194,7 +194,7 @@ contracts = ["kernel.inotify.readiness"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/scheduler/host_wait.rs"
-contracts = ["kernel.scheduler.host-wait-handoff", "kernel.scheduler.preemption-lifecycle"]
+contracts = ["kernel.scheduler.host-wait-handoff", "kernel.scheduler.preemption-lifecycle", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/scheduler.rs"
@@ -203,6 +203,7 @@ contracts = [
   "kernel.scheduler.runnable-progress",
   "kernel.scheduler.preemption-lifecycle",
   "kernel.scheduler.preemption-cost",
+  "kernel.el1.guest-run-queue",
 ]
 
 [[surfaces]]
@@ -384,7 +385,7 @@ contracts = ["kernel.wait.process-group"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs"
-contracts = ["kernel.el1.files.cross-process-readers"]
+contracts = ["kernel.el1.files.cross-process-readers", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "fixtures/embed-zone-readers/src/main.rs"
@@ -452,11 +453,11 @@ contracts = ["kernel.vcpu.vm-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor.rs"
-contracts = ["kernel.vcpu.vm-lifetime"]
+contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs"
-contracts = ["kernel.vcpu.vm-lifetime"]
+contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_vcpu_lifetime.rs"
@@ -464,7 +465,7 @@ contracts = ["kernel.vcpu.vm-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/gic.rs"
-contracts = ["kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler"]
+contracts = ["kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_gic.rs"
@@ -480,7 +481,7 @@ contracts = ["kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/lib.rs"
-contracts = ["kernel.el1.gic"]
+contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "fixtures/linux-aarch64-hello/src/el1_vtimer_loop.rs"
@@ -492,15 +493,15 @@ contracts = ["kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/lib.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
+contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/tests.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
+contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/sched.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
+contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/sched/hw.rs"
@@ -512,15 +513,15 @@ contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/el1_zone.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
+contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/zone.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
+contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_sched.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
+contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/sigframe.rs"
@@ -532,4 +533,4 @@ contracts = ["kernel.el1.guest-scheduler"]
 
 [[surfaces]]
 path = "fixtures/embed-el1-sched/src/main.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
+contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]

@@ -890,6 +890,7 @@
         "kernel.el1.files.cross-process-readers",
         "kernel.el1.files.path-mutation",
         "kernel.el1.files.shared-inode",
+        "kernel.el1.guest-run-queue",
         "kernel.el1.inotify",
         "kernel.el1.zone-entry-at-open",
         "kernel.inotify.readiness",
@@ -915,6 +916,7 @@
         "kernel.el1.files.cross-process-readers",
         "kernel.el1.files.path-mutation",
         "kernel.el1.files.shared-inode",
+        "kernel.el1.guest-run-queue",
         "kernel.el1.inotify",
         "kernel.el1.transparent",
         "kernel.el1.zone-entry-at-open",
@@ -1339,6 +1341,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.futex-handoff",
+        "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler"
       ],
       "claims": [],
@@ -1396,6 +1399,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.futex-handoff",
+        "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
         "kernel.futex.contention",
         "kernel.futex.requeue"
@@ -1718,6 +1722,7 @@
       "handler": "process",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler"
       ],
       "claims": [],
@@ -1840,6 +1845,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.futex-handoff",
+        "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler"
       ],
       "claims": [],
@@ -3019,6 +3025,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.files.cross-process-readers",
+        "kernel.el1.guest-run-queue",
         "kernel.fork.filetable",
         "kernel.fork.mappings",
         "kernel.fork.stage1-image",
@@ -3039,6 +3046,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.futex-handoff",
+        "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
         "kernel.time.realtime-calibration"
       ],
@@ -3360,6 +3368,7 @@
       "authority": "guest",
       "contracts": [
         "kernel.el1.files.cross-process-readers",
+        "kernel.el1.guest-run-queue",
         "kernel.fork.stage1-image",
         "kernel.signal.lease-gap",
         "kernel.wait.process-group"
