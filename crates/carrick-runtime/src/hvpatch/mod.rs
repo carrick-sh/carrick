@@ -34,7 +34,7 @@ mod mm_resources;
 mod patcher;
 mod stage1_mm;
 
-pub(crate) use asid::{AsidGeneration, AsidLoad, InvalidationAck};
+pub(crate) use asid::{AsidGeneration, AsidLoad, BroadcastInvalidation};
 use mm_resources::MmResources;
 pub(crate) use mm_resources::{
     ExecMmDispositionKind, ExecMmReservation, ExecSettlementEnrollment, ExecSettlementSubscription,
@@ -43,8 +43,8 @@ pub(crate) use mm_resources::{
 #[cfg(test)]
 pub(crate) use stage1_mm::Stage1MmPool;
 pub(crate) use stage1_mm::{
-    CowInvalidationError, CowInvalidationObserver, CowInvalidationTicket, PreparedStage1Mm,
-    Stage1MmLease, Stage1MmRetirement, Stage1RootRetirementReceipt, Stage1RootRetirementTicket,
+    CowInvalidationObserver, PreparedStage1Mm, Stage1MmLease, Stage1MmRetirement,
+    Stage1RootRetirementReceipt, Stage1RootRetirementTicket,
 };
 
 /// Installation permission kept private to the HVPatch bootstrap/lifecycle
@@ -206,12 +206,9 @@ impl PreparedProcessExec {
         self.reservation.disposition()
     }
 
-    pub(crate) fn begin_replacement_load(
-        &self,
-        executor: carrick_kernel::kernel::objects::ExecutorId,
-    ) -> Result<AsidLoad, String> {
+    pub(crate) fn begin_replacement_load(&self) -> Result<AsidLoad, String> {
         self.reservation
-            .begin_replacement_asid_load(executor)
+            .begin_replacement_asid_load()
             .map_err(|error| error.to_string())
     }
 }
@@ -1712,7 +1709,7 @@ mod tests {
         assert!(
             retirement
                 .retirement()
-                .is_none_or(|r| r.pending().is_empty())
+                .is_none_or(|r| !r.needs_invalidation())
         );
         retirement.complete_for_test().unwrap();
     }
@@ -2152,11 +2149,7 @@ mod tests {
             "a failed exec must leave Kernel on the predecessor MM",
         );
 
-        let executor = carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(
-            crate::thread::ThreadId::synthetic_for_tests(19_999),
-        )
-        .expect("test executor");
-        let predecessor_load = old_lease.begin_asid_load(executor);
+        let predecessor_load = old_lease.begin_asid_load();
         assert!(
             predecessor_load.is_ok(),
             "rollback must leave predecessor residency open and non-retired",
@@ -2242,12 +2235,8 @@ mod tests {
         let replacement_root = prepared
             .replacement_root_slot()
             .expect("replacement root slot");
-        let executor = carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(
-            crate::thread::ThreadId::synthetic_for_tests(10_002),
-        )
-        .expect("test executor");
         let replacement_load = prepared
-            .begin_replacement_load(executor)
+            .begin_replacement_load()
             .expect("replacement load admission");
         let armed = process
             .arm_exec_no_return(prepared, test_vma_source())

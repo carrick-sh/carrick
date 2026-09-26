@@ -247,7 +247,6 @@ fn same_mm_readers_remain_simultaneously_admitted_at_all_scales() {
         let held = dispatcher.mm_residents_for_test();
         assert_eq!(held.len(), scale as usize);
         assert_eq!(held.tids().len(), scale as usize);
-        assert!(held.hardware_invalidation_tids().is_empty());
         assert!(held.any_in_guest());
         held.kick_all_in_guest();
         assert!(scopes.iter().all(NativeExecution::stop_requested));

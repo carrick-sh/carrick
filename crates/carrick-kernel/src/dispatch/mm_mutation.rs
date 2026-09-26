@@ -187,15 +187,18 @@ impl<'authority> MmMutationGuard<'authority> {
 }
 
 impl carrick_hal::ForeignMmInvalidator for MmMutationGuard<'_> {
+    /// Publication is immediate: the guard holds the target MM's fence, and
+    /// each vCPU services the invalidation before it runs the MM again, so
+    /// nothing is waited for and the deadline is not consulted.
     fn invalidate_exact_asid(
         &mut self,
         binding: carrick_hal::ForeignMmBinding,
-        deadline: std::time::Instant,
+        _deadline: std::time::Instant,
     ) -> Result<(), carrick_hal::ForeignMmTransportError> {
         self.foreign_authority
             .as_deref_mut()
             .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?
-            .publish_foreign_cow_invalidation(binding, deadline)
+            .publish_foreign_cow_invalidation(binding)
             .map_err(|_| carrick_hal::ForeignMmTransportError::AuthorityUnavailable)
     }
 }

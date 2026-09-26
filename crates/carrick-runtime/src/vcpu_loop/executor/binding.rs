@@ -18,8 +18,7 @@ use crate::vcpu_loop::{HvpatchProcessFailpoint, check_hvpatch_process_failpoint}
 #[cfg(test)]
 use carrick_kernel::kernel::SchedulerError;
 use carrick_kernel::kernel::objects::{
-    ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState, ThreadExecutionLease,
-    ThreadKey,
+    ExecutionFailure, ExecutionGeneration, MigratableTaskState, ThreadExecutionLease, ThreadKey,
 };
 use carrick_kernel::kernel::{MmId, Scheduler, SubmissionAuthority};
 
@@ -339,7 +338,6 @@ pub(crate) struct PendingExecReplacement {
 pub(crate) struct HvpatchQuantumControl<'a, 'lease> {
     pub(crate) need_resched: &'a AtomicBool,
     pub(crate) submission: &'a mut ExecutorSubmissionContext<'lease>,
-    pub(crate) executor_id: Option<ExecutorId>,
     pub(crate) binding: Option<&'a Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
     pub(crate) cow_invalidation_observer: Option<&'a crate::hvpatch::CowInvalidationObserver>,
 }
@@ -348,15 +346,10 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
     pub(crate) fn cow_invalidation_binding(
         &self,
     ) -> Option<(
-        ExecutorId,
         &Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
         &crate::hvpatch::CowInvalidationObserver,
     )> {
-        Some((
-            self.executor_id?,
-            self.binding?,
-            self.cow_invalidation_observer?,
-        ))
+        Some((self.binding?, self.cow_invalidation_observer?))
     }
 
     #[cfg(test)]
@@ -367,7 +360,6 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
         Self {
             need_resched,
             submission,
-            executor_id: None,
             binding: None,
             cow_invalidation_observer: None,
         }

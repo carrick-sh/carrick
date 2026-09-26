@@ -217,7 +217,6 @@ impl DispatchMmAuthority {
             slot,
             self.mm_id,
             &self.pt_quiesce,
-            None,
             crate::kernel::mm_occupancy::PauseEndpoint::Registered { registry, tid },
         )
     }
@@ -258,26 +257,39 @@ impl DispatchMmAuthority {
 /// An executor's admission to one exact dispatch MM.
 ///
 /// CLONE_VM dispatchers share the same [`DispatchMmAuthority`]. A thread's
-/// admission occupies its vCPU's execution slot with the MM
-/// ([`crate::kernel::MmOccupancy`]) for as long as it holds this token and
-/// is not released for a host wait; an editor's admission (a host-side
-/// mutation with no guest execution of its own) occupies nothing. Holding
-/// this token says the caller may execute on that MM; it does not itself
-/// grant mutation authority.
+/// admission lasts from its first quantum to its suspension (less blocking
+/// host waits) and carries its crash safe-point participation. While its
+/// task is loaded on a vCPU, the admission also occupies that vCPU's
+/// execution slot with the MM ([`crate::kernel::MmOccupancy`]): the
+/// executor occupies at the start of each resident stretch
+/// ([`Self::occupy_slot`]) and vacates when it unloads the task
+/// ([`Self::vacate_slot`]), since an executor may preempt a task at a
+/// syscall boundary and load another on the same vCPU while the first stays
+/// admitted. An editor's admission (a host-side mutation with no guest
+/// execution of its own) occupies nothing. Holding this token says the
+/// caller may execute on that MM; it does not itself grant mutation
+/// authority.
 pub struct MmExecutorParticipation {
     pub(in crate::dispatch) authority: Arc<DispatchMmAuthority>,
     pub(in crate::dispatch) admission: MmExecutorAdmissionRecipe,
     pub(in crate::dispatch) occupancy: ExecutorOccupancy,
 }
 
-/// Whether an admitted executor currently occupies its slot.
+/// The admission's state.
 pub(in crate::dispatch) enum ExecutorOccupancy {
     /// An editor: no guest execution, no slot.
     Editor,
-    /// A thread executor running (or stopped at an exit of) the MM.
-    Occupying(crate::kernel::MmOccupancy),
-    /// Released for a host wait; re-entered with the same recipe.
-    Released,
+    /// A thread executor, occupying `occupancy`'s slot while its task is
+    /// loaded on a vCPU.
+    Admitted {
+        _crash: Option<crate::kernel::objects::CrashSafePointParticipation>,
+        occupancy: Option<crate::kernel::MmOccupancy>,
+    },
+    /// Released for a blocking host wait on the vCPU of `slot` (if it
+    /// occupied one); re-entered with the same recipe.
+    Released {
+        slot: Option<crate::kernel::ExecutionSlot>,
+    },
 }
 
 #[derive(Clone)]
@@ -285,99 +297,146 @@ pub(in crate::dispatch) enum MmExecutorAdmissionRecipe {
     NativeThread {
         thread: crate::kernel::ThreadRef,
         state: Arc<super::native_execution::NativeExecutorState>,
-        slot: crate::kernel::ExecutionSlot,
     },
     Anonymous,
     AnonymousWithPauseEndpoint {
         registry: Arc<dyn carrick_hal::VcpuRegistry>,
         tid: carrick_hal::ThreadId,
-        slot: crate::kernel::ExecutionSlot,
     },
     Thread {
         thread: crate::kernel::ThreadRef,
         registry: Arc<dyn carrick_hal::VcpuRegistry>,
         tid: carrick_hal::ThreadId,
-        slot: crate::kernel::ExecutionSlot,
     },
 }
 
 impl MmExecutorAdmissionRecipe {
+    fn thread(&self) -> Option<&crate::kernel::ThreadRef> {
+        match self {
+            Self::NativeThread { thread, .. } | Self::Thread { thread, .. } => Some(thread),
+            Self::Anonymous | Self::AnonymousWithPauseEndpoint { .. } => None,
+        }
+    }
+
+    fn endpoint(&self) -> Option<crate::kernel::mm_occupancy::PauseEndpoint> {
+        use crate::kernel::mm_occupancy::PauseEndpoint;
+        match self {
+            Self::Anonymous => None,
+            Self::NativeThread { state, .. } => Some(PauseEndpoint::Native(Arc::clone(state))),
+            Self::AnonymousWithPauseEndpoint { registry, tid }
+            | Self::Thread { registry, tid, .. } => Some(PauseEndpoint::Registered {
+                registry: Arc::clone(registry),
+                tid: *tid,
+            }),
+        }
+    }
+
+    fn occupy(
+        &self,
+        authority: &Arc<DispatchMmAuthority>,
+        slot: crate::kernel::ExecutionSlot,
+    ) -> Result<Option<crate::kernel::MmOccupancy>, crate::kernel::MmOccupancyError> {
+        let Some(endpoint) = self.endpoint() else {
+            return Ok(None);
+        };
+        crate::kernel::MmOccupancy::install(slot, authority.mm_id, &authority.pt_quiesce, endpoint)
+            .map(Some)
+    }
+
+    /// Admit, occupying `slot` when given.
     pub(in crate::dispatch) fn enter(
         &self,
         authority: &Arc<DispatchMmAuthority>,
+        slot: Option<crate::kernel::ExecutionSlot>,
     ) -> Result<ExecutorOccupancy, crate::kernel::MmOccupancyError> {
-        use crate::kernel::mm_occupancy::PauseEndpoint;
-        let (slot, thread, endpoint) = match self {
-            Self::Anonymous => return Ok(ExecutorOccupancy::Editor),
-            Self::NativeThread {
-                thread,
-                state,
-                slot,
-            } => (
-                *slot,
-                Some(thread.clone()),
-                PauseEndpoint::Native(Arc::clone(state)),
-            ),
-            Self::AnonymousWithPauseEndpoint {
-                registry,
-                tid,
-                slot,
-            } => (
-                *slot,
-                None,
-                PauseEndpoint::Registered {
-                    registry: Arc::clone(registry),
-                    tid: *tid,
-                },
-            ),
-            Self::Thread {
-                thread,
-                registry,
-                tid,
-                slot,
-            } => (
-                *slot,
-                Some(thread.clone()),
-                PauseEndpoint::Registered {
-                    registry: Arc::clone(registry),
-                    tid: *tid,
-                },
-            ),
+        if matches!(self, Self::Anonymous) {
+            return Ok(ExecutorOccupancy::Editor);
+        }
+        let occupancy = match slot {
+            Some(slot) => self.occupy(authority, slot)?,
+            None => None,
         };
-        crate::kernel::MmOccupancy::install(
-            slot,
-            authority.mm_id,
-            &authority.pt_quiesce,
-            thread,
-            endpoint,
-        )
-        .map(ExecutorOccupancy::Occupying)
+        let crash = match self.thread() {
+            // On error, `occupancy` drops and vacates the slot.
+            Some(thread) => Some(thread.enter_crash_safe_point_participation().map_err(
+                |error| {
+                    match error {
+                    crate::kernel::objects::CrashSafePointParticipationError::AlreadyActive {
+                        thread,
+                    } => crate::kernel::MmOccupancyError::CrashParticipationAlreadyActive {
+                        thread,
+                    },
+                    crate::kernel::objects::CrashSafePointParticipationError::IdentityExhausted {
+                        thread,
+                    } => crate::kernel::MmOccupancyError::CrashParticipationIdentityExhausted {
+                        thread,
+                    },
+                }
+                },
+            )?),
+            None => None,
+        };
+        Ok(ExecutorOccupancy::Admitted {
+            _crash: crash,
+            occupancy,
+        })
     }
 }
 
 impl MmExecutorParticipation {
-    /// The execution slot this executor occupies, if it is a thread executor
-    /// currently admitted. A pause never waits for its own caller.
-    pub(crate) fn occupied_slot(&self) -> Option<crate::kernel::ExecutionSlot> {
+    /// The slot this executor occupies now: `None` for an editor, for an
+    /// admitted thread whose task is not loaded, or while released.
+    pub fn current_slot(&self) -> Option<crate::kernel::ExecutionSlot> {
         match &self.occupancy {
-            ExecutorOccupancy::Occupying(occupancy) => Some(occupancy.slot()),
-            ExecutorOccupancy::Editor => None,
-            ExecutorOccupancy::Released => {
-                tracing::error!("MM executor participation used while temporarily released");
-                carrick_fatal!(
-                    "dispatch::mm_executor_participation",
-                    "MM executor participation used while temporarily released"
-                )
-            }
+            ExecutorOccupancy::Admitted {
+                occupancy: Some(occupancy),
+                ..
+            } => Some(occupancy.slot()),
+            _ => None,
         }
     }
 
-    /// The slot this executor occupies now: `None` for an editor or while
-    /// released for a host wait.
-    pub fn current_slot(&self) -> Option<crate::kernel::ExecutionSlot> {
-        match &self.occupancy {
-            ExecutorOccupancy::Occupying(occupancy) => Some(occupancy.slot()),
-            ExecutorOccupancy::Editor | ExecutorOccupancy::Released => None,
+    /// The slot a pause must not wait for: the caller's own. Fatal while
+    /// released for a host wait (no stage-1 work is admitted then).
+    pub(crate) fn occupied_slot(&self) -> Option<crate::kernel::ExecutionSlot> {
+        if let ExecutorOccupancy::Released { .. } = &self.occupancy {
+            tracing::error!("MM executor participation used while temporarily released");
+            carrick_fatal!(
+                "dispatch::mm_executor_participation",
+                "MM executor participation used while temporarily released"
+            )
+        }
+        self.current_slot()
+    }
+
+    /// The admitted thread's task is loaded on the vCPU of `slot`: occupy it
+    /// with the MM (a no-op while it already does). Called before the
+    /// executor runs the task's guest code.
+    pub fn occupy_slot(
+        &mut self,
+        slot: crate::kernel::ExecutionSlot,
+    ) -> Result<(), crate::kernel::MmOccupancyError> {
+        let ExecutorOccupancy::Admitted { occupancy, .. } = &mut self.occupancy else {
+            return Ok(());
+        };
+        if occupancy
+            .as_ref()
+            .is_some_and(|current| current.slot() == slot)
+        {
+            return Ok(());
+        }
+        // A slot left over from another vCPU is vacated first: one thread's
+        // task is loaded on one vCPU at a time.
+        drop(occupancy.take());
+        *occupancy = self.admission.occupy(&self.authority, slot)?;
+        Ok(())
+    }
+
+    /// The executor unloads the task from its vCPU: vacate the slot, keeping
+    /// the admission.
+    pub fn vacate_slot(&mut self) {
+        if let ExecutorOccupancy::Admitted { occupancy, .. } = &mut self.occupancy {
+            drop(occupancy.take());
         }
     }
 
@@ -414,16 +473,17 @@ impl MmExecutorParticipation {
     }
 
     pub(in crate::dispatch) fn is_released(&self) -> bool {
-        matches!(self.occupancy, ExecutorOccupancy::Released)
+        matches!(self.occupancy, ExecutorOccupancy::Released { .. })
     }
 
     pub(in crate::dispatch) fn leave_temporarily(&mut self) -> Result<(), DispatchError> {
         if self.is_released() {
             return Err(DispatchError::MmExecutorParticipationUnavailable);
         }
+        let slot = self.current_slot();
         drop(std::mem::replace(
             &mut self.occupancy,
-            ExecutorOccupancy::Released,
+            ExecutorOccupancy::Released { slot },
         ));
         Ok(())
     }
@@ -431,14 +491,14 @@ impl MmExecutorParticipation {
     pub(in crate::dispatch) fn reenter_exact(
         &mut self,
     ) -> Result<(), crate::kernel::MmOccupancyError> {
-        if !self.is_released() {
+        let ExecutorOccupancy::Released { slot } = self.occupancy else {
             tracing::error!("MM executor re-entry attempted while participation is present");
             carrick_fatal!(
                 "dispatch::mm_executor_participation",
                 "MM executor re-entry attempted while participation is present"
             );
-        }
-        self.occupancy = self.admission.enter(&self.authority)?;
+        };
+        self.occupancy = self.admission.enter(&self.authority, slot)?;
         Ok(())
     }
 }

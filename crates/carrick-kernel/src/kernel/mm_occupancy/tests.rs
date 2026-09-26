@@ -73,7 +73,6 @@ impl Vcpu {
             slot.slot(),
             mm,
             fence,
-            None,
             self.registry.clone(),
             self.tid,
         )
@@ -135,8 +134,8 @@ fn a_pause_of_z_drains_a_vcpu_switched_from_y_to_z() {
 /// every vCPU running it, whichever process's thread its executor loaded.
 #[test]
 fn every_vcpu_running_an_mm_is_counted_whatever_process_it_loaded() {
-    let (_parent_kernel, parent) = bootstrap_thread(41_100);
-    let (_child_kernel, child) = bootstrap_thread(41_200);
+    let (_parent_kernel, _parent) = bootstrap_thread(41_100);
+    let (_child_kernel, _child) = bootstrap_thread(41_200);
     let shared = mm(41_101);
     let shared_fence = fence();
     let (a, b) = (
@@ -148,7 +147,6 @@ fn every_vcpu_running_an_mm_is_counted_whatever_process_it_loaded() {
         a.slot(),
         shared,
         &shared_fence,
-        Some(parent.thread().clone()),
         parent_vcpu.registry.clone(),
         parent_vcpu.tid,
     )
@@ -157,7 +155,6 @@ fn every_vcpu_running_an_mm_is_counted_whatever_process_it_loaded() {
         b.slot(),
         shared,
         &shared_fence,
-        Some(child.thread().clone()),
         child_vcpu.registry.clone(),
         child_vcpu.tid,
     )
@@ -196,7 +193,7 @@ fn rejected_install_preserves_live_pause_endpoint() {
     let registry_contracts = ContractRegistry::load(root).unwrap();
     let mut observations = Vec::new();
     for scale in [1, 8, 32, 128] {
-        let (_kernel, context) = bootstrap_thread(41_300 + scale);
+        let (_kernel, _context) = bootstrap_thread(41_300 + scale);
         let space = mm(41_300 + scale as u64);
         let space_fence = fence();
         let slot = HostExecutionSlot::allocate().unwrap();
@@ -206,7 +203,6 @@ fn rejected_install_preserves_live_pause_endpoint() {
             slot.slot(),
             space,
             &space_fence,
-            Some(context.thread().clone()),
             running.registry.clone(),
             running.tid,
         )
@@ -219,7 +215,6 @@ fn rejected_install_preserves_live_pause_endpoint() {
                     slot.slot(),
                     mm(41_999),
                     &fence(),
-                    Some(context.thread().clone()),
                     displaced.registry.clone(),
                     displaced.tid,
                 ),
@@ -270,13 +265,6 @@ fn rejected_install_preserves_live_pause_endpoint() {
         assert!(!residents(space, &space_fence, None).any_in_guest());
         drop(original);
         assert_eq!(occupant_count_for_probe(space, &space_fence), 0);
-        assert!(
-            context
-                .thread()
-                .enter_crash_safe_point_participation()
-                .is_ok(),
-            "the vacated occupancy released its crash participation"
-        );
     }
     evaluate(
         registry_contracts
@@ -326,7 +314,6 @@ fn rejected_install_still_drains_original_before_granting_mutation() {
         slot.slot(),
         space,
         &space_fence,
-        None,
         registry.clone(),
         tid,
     )
@@ -334,14 +321,7 @@ fn rejected_install_still_drains_original_before_granting_mutation() {
     flag.enter_guest();
     let wrong = Arc::new(carrick_hal::GenericVcpuRegistry::new());
     assert!(matches!(
-        MmOccupancy::install_registered_for_test(
-            slot.slot(),
-            space,
-            &space_fence,
-            None,
-            wrong,
-            tid
-        ),
+        MmOccupancy::install_registered_for_test(slot.slot(), space, &space_fence, wrong, tid),
         Err(MmOccupancyError::SlotBusy { .. })
     ));
     let pause = crate::dispatch::mm_quiesce::acquire_pt_pause(
@@ -365,29 +345,70 @@ fn rejected_install_still_drains_original_before_granting_mutation() {
 
 #[test]
 fn failed_crash_participation_vacates_the_slot() {
-    let (_kernel, context) = bootstrap_thread(41_700);
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().expect("task context");
     let thread = context.thread().clone();
     let _outside = thread
         .enter_crash_safe_point_participation()
         .expect("outside participation");
-    let space = mm(41_700);
-    let space_fence = fence();
     let slot = HostExecutionSlot::allocate().unwrap();
     let vcpu = Vcpu::new(41_701);
     assert!(matches!(
-        MmOccupancy::install_registered_for_test(
-            slot.slot(),
-            space,
-            &space_fence,
+        dispatcher.enter_mm_executor_for_thread(
             Some(thread.clone()),
             vcpu.registry.clone(),
             vcpu.tid,
+            slot.slot(),
         ),
         Err(MmOccupancyError::CrashParticipationAlreadyActive { thread: rejected })
             if rejected == thread.key()
     ));
-    assert_eq!(occupant_count_for_probe(space, &space_fence), 0);
-    assert!(vcpu.occupy(&slot, space, &space_fence).is_ok());
+    assert_eq!(dispatcher.mm_occupancy_probe()(), 0);
+    assert!(
+        dispatcher
+            .enter_mm_executor_for_thread(None, vcpu.registry.clone(), vcpu.tid, slot.slot())
+            .is_ok(),
+        "the refused admission left the slot vacant"
+    );
+}
+
+/// An admitted thread whose task leaves its vCPU (an executor preempted it
+/// at a syscall boundary) vacates the slot but stays admitted, so another
+/// task can be loaded on that vCPU; it re-occupies whichever vCPU loads it.
+#[test]
+fn an_unloaded_admission_vacates_its_slot_and_reoccupies_where_it_is_loaded() {
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().expect("task context");
+    let (first, second) = (
+        HostExecutionSlot::allocate().unwrap(),
+        HostExecutionSlot::allocate().unwrap(),
+    );
+    let vcpu = Vcpu::new(41_750);
+    let mut admitted = dispatcher
+        .enter_mm_executor_for_thread(
+            Some(context.thread().clone()),
+            vcpu.registry.clone(),
+            vcpu.tid,
+            first.slot(),
+        )
+        .expect("admitted on the first vCPU");
+    assert_eq!(admitted.current_slot(), Some(first.slot()));
+    admitted.vacate_slot();
+    assert_eq!(admitted.current_slot(), None);
+    assert!(context.thread().is_crash_safe_point_participant());
+    let other = Vcpu::new(41_751);
+    let next = dispatcher
+        .enter_mm_executor_for_thread(None, other.registry.clone(), other.tid, first.slot())
+        .expect("another task loads on the vacated vCPU");
+    admitted
+        .occupy_slot(second.slot())
+        .expect("reloaded elsewhere");
+    assert_eq!(admitted.current_slot(), Some(second.slot()));
+    assert_eq!(dispatcher.mm_occupancy_probe()(), 2);
+    drop(next);
+    drop(admitted);
+    assert_eq!(dispatcher.mm_occupancy_probe()(), 0);
+    assert!(!context.thread().is_crash_safe_point_participant());
 }
 
 #[test]

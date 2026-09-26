@@ -247,9 +247,8 @@ impl SyscallDispatcher {
         let admission = MmExecutorAdmissionRecipe::NativeThread {
             thread: context.thread().clone(),
             state: Arc::clone(&state),
-            slot: slot.slot(),
         };
-        let occupancy = admission.enter(&authority)?;
+        let occupancy = admission.enter(&authority, Some(slot.slot()))?;
         let participant = MmExecutorParticipation {
             authority,
             admission,

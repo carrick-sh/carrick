@@ -665,8 +665,8 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             .inspect_backend::<HvpatchTaskEngineBindingState, _>(|state| {
                 state.preflight_runtime_projection(cpu)
             })?;
-        let mut asid_load = task.binding().begin_asid_load(self.executor_id)?;
-        let cow_invalidation_observer = task.binding().cow_invalidation_observer(self.executor_id);
+        let mut asid_load = task.binding().begin_asid_load()?;
+        let cow_invalidation_observer = task.binding().cow_invalidation_observer();
         asid_load.arm_hardware_dirty().map_err(|error| {
             TrapError::Hypervisor(format!("HVPatch ASID hardware arm failed: {error}"))
         })?;
@@ -790,7 +790,6 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         let mut control = HvpatchQuantumControl {
             need_resched,
             submission,
-            executor_id: Some(self.executor_id),
             binding: Some(
                 self.binding
                     .as_ref()
@@ -877,6 +876,12 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         &mut self,
         mut lease: ThreadExecutionLease,
     ) -> Result<SavedRunnable, ExecutorSaveError> {
+        // The task leaves this vCPU: it no longer occupies the vCPU's
+        // execution slot, even if it stays admitted (preempted at a syscall
+        // boundary) or its registers stay resident here.
+        if let Some(binding) = self.binding.as_ref() {
+            binding.quantum().end_residency();
+        }
         let Some(engine) = self.current.as_mut() else {
             return Err(ExecutorSaveError::new(
                 TrapError::Hypervisor("HVPatch save without loaded engine".into()),

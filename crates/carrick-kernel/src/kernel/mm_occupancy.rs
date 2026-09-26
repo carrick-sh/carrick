@@ -4,10 +4,10 @@
 //!
 //! A vCPU slot ([`ExecutionSlot`]: the zone slot of the vCPU's mailbox lease,
 //! or a host-only slot for a vCPU without one) is occupied by an address
-//! space for as long as an executor runs guest code of that MM on it, or is
-//! stopped at an exit of such code: from admission of a task's quantum to
-//! its suspension, less any blocking host wait (which vacates, as the thread
-//! cannot run guest code meanwhile). The readers:
+//! space for as long as an executor has a task of that MM loaded on the vCPU
+//! (running its guest code or stopped at an exit of it): from the start of
+//! each resident stretch to the unload, less any blocking host wait (the
+//! thread cannot run guest code meanwhile). The readers:
 //!
 //! - a stage-1 page-table pause raises the MM's fence (its
 //!   [`carrick_thread::fork_quiesce::PtQuiesce`]), then kicks every occupied
@@ -49,9 +49,7 @@ pub use carrick_sched_core::{ExecutionSlot, SlotId as ZoneSlotId};
 use parking_lot::Mutex;
 
 use super::MmId;
-use super::objects::{
-    CrashSafePointParticipation, CrashSafePointParticipationError, ThreadKey, ThreadRef,
-};
+use super::objects::ThreadKey;
 
 static TABLE: Occupancy = Occupancy::new();
 
@@ -231,16 +229,12 @@ pub fn execution_slot_for_current_thread(
 }
 
 /// One slot occupied by one MM, for as long as this lives. Vacated on every
-/// exit path (suspension, host wait, error, unwind): an abandoned occupancy
-/// would make every later pause of the MM wait for a vCPU that never runs it.
-///
-/// A thread's occupancy also carries its crash safe-point participation, so
-/// "this thread takes part in guest execution" is one fact read by both the
-/// pause and the crash quorum.
+/// exit path (unload, suspension, host wait, error, unwind): an abandoned
+/// occupancy would make every later pause of the MM wait for a vCPU that
+/// never runs it, and refuse the next task loaded on the vCPU.
 pub struct MmOccupancy {
     slot: ExecutionSlot,
     mm: MmId,
-    crash_participation: Option<CrashSafePointParticipation>,
     _not_sync: std::marker::PhantomData<Cell<()>>,
 }
 
@@ -251,50 +245,31 @@ impl MmOccupancy {
         slot: ExecutionSlot,
         mm: MmId,
         fence: &MmFence,
-        thread: Option<ThreadRef>,
         endpoint: PauseEndpoint,
     ) -> Result<Self, MmOccupancyError> {
-        {
-            let mut port = PORTS[slot.index()].lock();
-            if let Some(running) = port.as_ref() {
-                return Err(MmOccupancyError::SlotBusy {
-                    slot,
-                    running: running.mm.raw(),
-                });
-            }
-            TABLE
-                .install(slot, key(mm))
-                .map_err(|busy| MmOccupancyError::SlotBusy {
-                    slot,
-                    running: busy.running.raw(),
-                })?;
-            *port = Some(Port {
-                mm,
-                fence: Arc::clone(fence),
-                endpoint,
+        let mut port = PORTS[slot.index()].lock();
+        if let Some(running) = port.as_ref() {
+            return Err(MmOccupancyError::SlotBusy {
+                slot,
+                running: running.mm.raw(),
             });
         }
-        let mut occupancy = Self {
+        TABLE
+            .install(slot, key(mm))
+            .map_err(|busy| MmOccupancyError::SlotBusy {
+                slot,
+                running: busy.running.raw(),
+            })?;
+        *port = Some(Port {
+            mm,
+            fence: Arc::clone(fence),
+            endpoint,
+        });
+        Ok(Self {
             slot,
             mm,
-            crash_participation: None,
             _not_sync: std::marker::PhantomData,
-        };
-        if let Some(thread) = thread {
-            // On error, `occupancy` drops and vacates the slot.
-            occupancy.crash_participation =
-                Some(thread.enter_crash_safe_point_participation().map_err(
-                    |error| match error {
-                        CrashSafePointParticipationError::AlreadyActive { thread } => {
-                            MmOccupancyError::CrashParticipationAlreadyActive { thread }
-                        }
-                        CrashSafePointParticipationError::IdentityExhausted { thread } => {
-                            MmOccupancyError::CrashParticipationIdentityExhausted { thread }
-                        }
-                    },
-                )?);
-        }
-        Ok(occupancy)
+        })
     }
 
     pub fn slot(&self) -> ExecutionSlot {
@@ -332,23 +307,15 @@ impl MmOccupancy {
         slot: ExecutionSlot,
         mm: MmId,
         fence: &MmFence,
-        thread: Option<ThreadRef>,
         registry: Arc<dyn carrick_hal::VcpuRegistry>,
         tid: carrick_hal::ThreadId,
     ) -> Result<Self, MmOccupancyError> {
-        Self::install(
-            slot,
-            mm,
-            fence,
-            thread,
-            PauseEndpoint::Registered { registry, tid },
-        )
+        Self::install(slot, mm, fence, PauseEndpoint::Registered { registry, tid })
     }
 }
 
 impl Drop for MmOccupancy {
     fn drop(&mut self) {
-        drop(self.crash_participation.take());
         let mut port = PORTS[self.slot.index()].lock();
         if port.as_ref().is_none_or(|port| port.mm != self.mm)
             || !TABLE.vacate(self.slot, key(self.mm))
@@ -405,17 +372,6 @@ impl MmResidents {
     #[cfg(test)]
     pub(crate) fn tids(&self) -> Vec<carrick_hal::ThreadId> {
         self.endpoints().map(PauseEndpoint::tid).collect()
-    }
-
-    /// Endpoints that can acknowledge a hardware ASID invalidation phase.
-    /// Native endpoints have no hardware translation cache.
-    pub(crate) fn hardware_invalidation_tids(&self) -> Vec<carrick_hal::ThreadId> {
-        self.endpoints()
-            .filter_map(|endpoint| match endpoint {
-                PauseEndpoint::Registered { tid, .. } => Some(*tid),
-                PauseEndpoint::Native(_) => None,
-            })
-            .collect()
     }
 
     pub(crate) fn any_in_guest(&self) -> bool {

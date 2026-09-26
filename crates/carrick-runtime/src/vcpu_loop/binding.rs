@@ -435,6 +435,9 @@ pub(crate) trait ProductionHvpatchLoopPoll: Send {
 
     fn after_terminal_settlement(&mut self);
 
+    /// The executor unloaded this task from its vCPU.
+    fn end_residency(&mut self);
+
     /// The scheduler settled this thread against a target the kernel graph
     /// says is TERMINAL: no successor exists, so nothing will run this job
     /// again and no other publisher is left for it.
@@ -3422,6 +3425,18 @@ where
             }
         }
 
+        // The task is loaded on this vCPU: it occupies the vCPU's execution
+        // slot with its MM from here until the executor unloads it
+        // (`end_residency`), even across syscall boundaries that preempt it.
+        if let Some(participation) = self.state.guest_execution.as_mut() {
+            let slot =
+                carrick_kernel::kernel::execution_slot_for_current_thread(engine.mailbox_slot())
+                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            participation
+                .occupy_slot(slot)
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        }
+
         // Exec/exit can force a blocked vfork parent runnable solely so it can
         // retire its exact logical result. Do not resume the old continuation
         // or touch guest state after that terminal ownership transition.
@@ -3834,7 +3849,6 @@ where
         let entered_guest = quiesce::enter_hvpatch_guest_or_service_invalidation(
             &self.state.in_guest,
             &pt_quiesce,
-            self.state.this_tid,
             engine,
             control,
         )?;
@@ -4346,6 +4360,12 @@ where
         }
     }
 
+    fn end_residency(&mut self) {
+        if let Some(participation) = self.state.guest_execution.as_mut() {
+            participation.vacate_slot();
+        }
+    }
+
     fn after_terminal_settlement(&mut self) {
         self.publish_terminal_result();
     }
@@ -4361,6 +4381,9 @@ where
     }
 
     fn after_executor_failure_settlement(&mut self) -> continuation::ExecutorFailureSettlement {
+        // The failed executor will not run this task again: its vCPU must not
+        // stay occupied by it.
+        self.end_residency();
         if self.terminal_settlement.is_published() {
             return continuation::ExecutorFailureSettlement::AlreadyPublished;
         }
@@ -4735,6 +4758,12 @@ impl<E: 'static> continuation::PersistentQuantumJob for HvpatchLoopJob<E> {
     fn after_terminal_settlement(&mut self) {
         if let Some(production) = self.production.as_mut() {
             production.after_terminal_settlement();
+        }
+    }
+
+    fn end_residency(&mut self) {
+        if let Some(production) = self.production.as_mut() {
+            production.end_residency();
         }
     }
 

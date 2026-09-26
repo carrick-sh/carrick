@@ -808,3 +808,52 @@ fn el1_sched_host_woken_thread_preempts_a_compute_loop() {
         );
     }
 }
+
+/// Contract `kernel.mm.address-space-occupancy` (EL1 increment 2, step 1):
+/// two live processes, each running twice as many writer threads as guest
+/// CPUs (pairs handing a turn off through private futexes, so EL1 switches
+/// them on shared vCPUs, each writing and reading back its own page), an
+/// editor churning `mmap`/`mprotect`/`madvise`/`munmap` (stage-1 pauses of
+/// its MM, which must drain every vCPU running it), and a forker that forks
+/// while the writers run (fork's COW pause must drain every writer's vCPU:
+/// a vCPU it missed keeps a writable translation, and the child would see
+/// the parent's later writes) and vforks (a second process on the same MM).
+/// Every page reads back what its writer wrote, every fork child sees a
+/// stable snapshot, and every child exits 0.
+#[test]
+fn el1_sched_mm_occupancy_two_processes() {
+    const FORKS: u64 = 150;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["mm-occupancy", &FORKS.to_string()],
+        Duration::from_secs(240),
+    );
+    let stdout = measured.result.stdout_utf8();
+    println!(
+        "el1-sched mm-occupancy exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+        measured.exits,
+        measured.cpu_ns,
+        measured.wall.as_millis(),
+        measured.zone,
+        stdout.trim()
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    for role in ["parent", "child"] {
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("mm-occupancy {role} ")))
+            .unwrap_or_else(|| panic!("no {role} line: {stdout:?}"));
+        assert!(
+            line.contains(&format!("forks={FORKS} "))
+                && line.contains(" torn=0 ")
+                && line.contains(" snapshot_changes=0 ")
+                && line.contains(" child_failures=0 ")
+                && line.ends_with("ok=true"),
+            "{role}: {line}"
+        );
+    }
+    assert!(stdout.contains("mm-occupancy child_ok=true"), "{stdout:?}");
+}

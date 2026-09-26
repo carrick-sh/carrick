@@ -72,18 +72,24 @@ pub(super) fn enter_guest_or_park(
     false
 }
 
+/// Enter the guest for the loaded task, or park while its MM is paused.
+///
+/// The in-guest flag is stored before the fence is read (the occupancy
+/// ordering in `carrick_kernel::kernel::mm_occupancy`). Before the vCPU runs
+/// the MM, any foreign-COW invalidation published for it and not yet covered
+/// by a broadcast is serviced here, on this vCPU: a vCPU that ran the MM
+/// before the publication may still cache its old translations, and one
+/// broadcast `TLBI ASIDE1IS` removes them from every PE.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn enter_hvpatch_guest_or_service_invalidation(
     in_guest: &carrick_hal::InGuestFlag,
     barrier: &crate::fork_quiesce::PtQuiesce,
-    tid: carrick_hal::ThreadId,
     engine: &mut dyn std::any::Any,
     control: &crate::vcpu_loop::executor::HvpatchQuantumControl<'_, '_>,
 ) -> Result<bool, carrick_hal::TrapError> {
     enter_hvpatch_guest_or_service_invalidation_inner(
         in_guest,
         barrier,
-        tid,
         control.cow_invalidation_binding(),
         |asid| {
             let engine = engine
@@ -102,29 +108,22 @@ pub(super) fn enter_hvpatch_guest_or_service_invalidation(
 fn enter_hvpatch_guest_or_service_invalidation_inner(
     in_guest: &carrick_hal::InGuestFlag,
     barrier: &crate::fork_quiesce::PtQuiesce,
-    tid: carrick_hal::ThreadId,
     cow_binding: Option<(
-        carrick_kernel::kernel::objects::ExecutorId,
         &Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
         &crate::hvpatch::CowInvalidationObserver,
     )>,
     mut invalidate: impl FnMut(u16) -> Result<(), carrick_hal::TrapError>,
 ) -> Result<bool, carrick_hal::TrapError> {
     in_guest.enter_guest();
-    // A resident executor can have been inactive when a foreign COW was
-    // published, so task-load service alone is insufficient. Marking in_guest
-    // first closes the race with a new pause: a coordinator must now drain us
-    // before it can edit/publish, while an older deferred generation can be
-    // serviced immediately on this exact loaded owner vCPU.
     if !barrier.is_quiescing() {
-        if let Some((_executor, binding, observer)) = cow_binding {
+        if let Some((binding, observer)) = cow_binding {
             binding.service_pending_cow_invalidation(observer, |generation| {
                 invalidate(generation.raw())
             })?;
         } else {
             #[cfg(not(test))]
             return Err(carrick_hal::TrapError::Hypervisor(
-                "HVPatch guest entry lacks exact executor/MM invalidation binding".to_owned(),
+                "HVPatch guest entry lacks its MM invalidation binding".to_owned(),
             ));
         }
         if !barrier.is_quiescing() {
@@ -132,49 +131,7 @@ fn enter_hvpatch_guest_or_service_invalidation_inner(
         }
     }
     in_guest.leave_guest();
-    let (executor, binding, _observer) = cow_binding.ok_or_else(|| {
-        carrick_hal::TrapError::Hypervisor(
-            "quiesced HVPatch executor lacks exact invalidation binding".to_owned(),
-        )
-    })?;
-    let identity = binding.foreign_stage1_identity();
-    let mut failure = None;
-    barrier.park_servicing_exact_invalidation(identity, tid, |request| {
-        let result = (|| {
-            if request.identity().stage1() != identity {
-                return Err(carrick_hal::TrapError::Hypervisor(
-                    "foreign COW invalidation named another MM/ASID generation".to_owned(),
-                ));
-            }
-            let ticket = binding.pending_cow_invalidation(executor).ok_or_else(|| {
-                carrick_hal::TrapError::Hypervisor(
-                    "active target executor lacked its foreign COW invalidation ticket".to_owned(),
-                )
-            })?;
-            let ticket_identity =
-                carrick_hal::ForeignCowInvalidationIdentity::new(identity, ticket.generation());
-            if ticket_identity != request.identity() {
-                return Err(carrick_hal::TrapError::Hypervisor(
-                    "active target executor observed a stale foreign COW invalidation phase"
-                        .to_owned(),
-                ));
-            }
-            invalidate(request.identity().stage1().binding().asid().raw_for_probe())?;
-            binding
-                .acknowledge_cow_invalidation(executor, ticket)
-                .map_err(|error| carrick_hal::TrapError::Hypervisor(error.to_string()))
-        })();
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                failure = Some(error);
-                Err(())
-            }
-        }
-    });
-    if let Some(error) = failure {
-        return Err(error);
-    }
+    barrier.park();
     Ok(false)
 }
 
@@ -182,8 +139,6 @@ fn enter_hvpatch_guest_or_service_invalidation_inner(
 pub(crate) fn enter_hvpatch_guest_or_service_invalidation_for_test(
     in_guest: &carrick_hal::InGuestFlag,
     barrier: &crate::fork_quiesce::PtQuiesce,
-    tid: carrick_hal::ThreadId,
-    executor: carrick_kernel::kernel::objects::ExecutorId,
     binding: &Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
     observer: &crate::hvpatch::CowInvalidationObserver,
     invalidate: impl FnMut(u16) -> Result<(), carrick_hal::TrapError>,
@@ -191,8 +146,7 @@ pub(crate) fn enter_hvpatch_guest_or_service_invalidation_for_test(
     enter_hvpatch_guest_or_service_invalidation_inner(
         in_guest,
         barrier,
-        tid,
-        Some((executor, binding, observer)),
+        Some((binding, observer)),
         invalidate,
     )
 }
@@ -1989,7 +1943,7 @@ mod pt_pause_tests {
 
         fn enter_with_pause_endpoint(
             &self,
-            thread: Option<carrick_kernel::kernel::ThreadRef>,
+            _thread: Option<carrick_kernel::kernel::ThreadRef>,
             registry: Arc<dyn VcpuRegistry>,
             tid: ThreadId,
         ) -> Result<TestOccupant, carrick_kernel::kernel::MmOccupancyError> {
@@ -1998,7 +1952,6 @@ mod pt_pause_tests {
                 slot.slot(),
                 self.mm,
                 &self.barrier,
-                thread,
                 registry,
                 tid,
             )?;
@@ -2020,8 +1973,12 @@ mod pt_pause_tests {
             .expect("test exact-MM occupancy")
     }
 
+    /// A foreign COW of an MM with a vCPU running it pauses that vCPU and
+    /// publishes the invalidation without waiting for anyone: the paused
+    /// vCPU parks, and the first vCPU that runs the MM next services the
+    /// publication with one broadcast for every vCPU that ran it before.
     #[test]
-    fn foreign_cow_active_target_acks_then_inactive_caller_resident_defers_to_reentry() {
+    fn foreign_cow_pauses_the_active_target_and_defers_invalidation_to_the_next_entry() {
         let _test_lock = foreign_cow_handshake_test_lock();
         let barrier = Arc::clone(pt_barrier());
         assert!(!barrier.is_quiescing());
@@ -2029,27 +1986,28 @@ mod pt_pause_tests {
         let census = TestMm::new(&barrier, 1_703);
         let active_tid = tid(1_701);
         let caller_tid = tid(1_702);
-        let active_flag = carrick_hal::InGuestFlag::for_guest_thread();
-        register_for_test(&registry, active_tid, &active_flag);
+        let active_flag = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
+        assert!(matches!(
+            registry.subscribe_register(
+                active_tid,
+                Box::new(LeaveGuestOnKick(Arc::clone(&active_flag))),
+                &active_flag,
+                Arc::new(|| {}),
+            ),
+            carrick_hal::VcpuRegistrationEnrollment::Registered
+        ));
         let _active_participation = enter_for_test(&census, &registry, active_tid);
+        active_flag.enter_guest();
 
         let (_pool, stage1) = crate::hvpatch::Stage1MmPool::new_root_for_tests(0x8000, 1)
             .expect("one-slot target stage-1 pool");
-        let active_executor =
-            carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(active_tid)
-                .expect("active executor identity");
-        let caller_executor =
-            carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(caller_tid)
-                .expect("caller executor identity");
-        for executor in [active_executor, caller_executor] {
-            stage1
-                .begin_asid_load(executor)
-                .expect("record exact target residency")
-                .mark_resident()
-                .expect("publish exact target residency");
-        }
-        let caller_observer = stage1.cow_invalidation_observer(caller_executor);
-        let mm = carrick_kernel::kernel::MmId::from_raw_u64(1_703).expect("test MM");
+        stage1
+            .begin_asid_load()
+            .expect("record target install")
+            .mark_resident()
+            .expect("publish target install");
+        let observer = stage1.cow_invalidation_observer();
+        let mm = census.mm;
         let coordinator =
             Arc::new(carrick_kernel::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
         let authority = carrick_kernel::dispatch::mm_mutation::ForeignMmMutationAuthority::new(
@@ -2061,29 +2019,10 @@ mod pt_pause_tests {
         let identity = stage1.foreign_stage1_identity(
             carrick_hal::ForeignMmId::from_kernel_allocation(mm.nonzero()),
         );
-        let worker_stage1 = Arc::clone(&stage1);
-        let worker = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while !barrier.is_quiescing() {
-                assert!(Instant::now() < deadline, "target pause was never raised");
-                std::thread::yield_now();
-            }
-            barrier.park_servicing_exact_invalidation(identity, active_tid, |request| {
-                let ticket = worker_stage1
-                    .pending_cow_invalidation(active_executor)
-                    .expect("active owner has exact target ticket");
-                assert_eq!(
-                    request.identity(),
-                    carrick_hal::ForeignCowInvalidationIdentity::new(identity, ticket.generation(),)
-                );
-                worker_stage1
-                    .acknowledge_cow_invalidation(active_executor, ticket)
-                    .map_err(|_| ())
-            });
-        });
 
         authority
             .with_guard(caller_tid, |mutation| {
+                assert!(!active_flag.is_in_guest(), "the pause drained the target");
                 mutation.with_host_alias(|invalidator| {
                     carrick_hal::ForeignMmInvalidator::invalidate_exact_asid(
                         invalidator,
@@ -2093,23 +2032,19 @@ mod pt_pause_tests {
                 })
             })
             .expect("acquire exact foreign-MM pause")
-            .expect("active target owner acknowledges while remaining paused");
-        worker.join().expect("active target owner resumes");
-
-        assert!(stage1.pending_cow_invalidation(active_executor).is_none());
-        assert!(
-            stage1.pending_cow_invalidation(caller_executor).is_some(),
-            "foreign caller must not be awaited as an active target self-command"
-        );
+            .expect("publication never waits for a vCPU");
+        assert!(!barrier.is_quiescing());
+        assert!(stage1.cow_invalidation_pending());
         let preentry_calls = AtomicUsize::new(0);
         stage1
-            .service_pending_cow_invalidation(&caller_observer, |_| {
+            .service_pending_cow_invalidation(&observer, |_| {
                 preentry_calls.fetch_add(1, Ordering::SeqCst);
                 Ok::<(), ()>(())
             })
-            .expect("inactive caller-resident services before next target entry");
+            .expect("the next entry services before it runs the MM");
         assert_eq!(preentry_calls.load(Ordering::SeqCst), 1);
-        assert!(stage1.pending_cow_invalidation(caller_executor).is_none());
+        assert!(!stage1.cow_invalidation_pending());
+        registry.unregister(active_tid);
     }
 
     #[test]
@@ -2122,15 +2057,12 @@ mod pt_pause_tests {
         let (_pool, stage1) = crate::hvpatch::Stage1MmPool::new_root_for_tests(0x8000, 1)
             .expect("one-slot target stage-1 pool");
         let caller_tid = tid(1_711);
-        let caller_executor =
-            carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(caller_tid)
-                .expect("caller executor identity");
         stage1
-            .begin_asid_load(caller_executor)
+            .begin_asid_load()
             .expect("record inactive target residency on caller worker")
             .mark_resident()
             .expect("publish inactive target residency");
-        let observer = stage1.cow_invalidation_observer(caller_executor);
+        let observer = stage1.cow_invalidation_observer();
         let mm = carrick_kernel::kernel::MmId::from_raw_u64(1_712).expect("test MM");
         let coordinator =
             Arc::new(carrick_kernel::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
@@ -2156,7 +2088,7 @@ mod pt_pause_tests {
             })
             .expect("sole target-MM exclusion")
             .expect("full-occupancy caller must not wait on its own target command");
-        assert!(stage1.pending_cow_invalidation(caller_executor).is_some());
+        assert!(stage1.cow_invalidation_pending());
 
         let hardware_calls = AtomicUsize::new(0);
         stage1

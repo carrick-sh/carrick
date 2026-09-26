@@ -136,38 +136,6 @@ impl ForeignCowInvalidationGeneration {
     }
 }
 
-/// Complete typed identity of one target-MM COW invalidation publication.
-///
-/// ```compile_fail
-/// # use carrick_hal::{ForeignAsidGeneration, ForeignCowInvalidationIdentity,
-/// #     ForeignStage1Identity};
-/// # fn swapped(stage1: ForeignStage1Identity, asid: ForeignAsidGeneration) {
-/// let _ = ForeignCowInvalidationIdentity::new(stage1, asid);
-/// # }
-/// ```
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ForeignCowInvalidationIdentity {
-    stage1: ForeignStage1Identity,
-    generation: ForeignCowInvalidationGeneration,
-}
-
-impl ForeignCowInvalidationIdentity {
-    pub const fn new(
-        stage1: ForeignStage1Identity,
-        generation: ForeignCowInvalidationGeneration,
-    ) -> Self {
-        Self { stage1, generation }
-    }
-
-    pub const fn stage1(self) -> ForeignStage1Identity {
-        self.stage1
-    }
-
-    pub const fn generation(self) -> ForeignCowInvalidationGeneration {
-        self.generation
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct ForeignOwnerGeneration(NonZeroU64);

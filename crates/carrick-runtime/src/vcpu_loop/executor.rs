@@ -166,7 +166,7 @@ where
                 &commands,
             ),
             Ok(WorkerCommand::Stop) | Err(_) => Ok(()),
-            Ok(WorkerCommand::Initialize | WorkerCommand::InvalidateAsid { .. }) => {
+            Ok(WorkerCommand::Initialize) => {
                 Err("executor received duplicate initialize".to_owned())
             }
         }
@@ -271,16 +271,8 @@ where
         receipts,
         control,
     } = runtime;
-    // A Stop consumed while an ASID acknowledgement wait was servicing this
-    // executor's own command channel is honored HERE, after the terminal that
-    // consumed it has fully settled.
-    let mut deferred_stop = false;
     loop {
-        if deferred_stop {
-            return Ok(());
-        }
-        if service_owner_thread_commands(backend, registration.id(), commands, boundary, receipts)?
-        {
+        if service_owner_thread_commands(commands)? {
             return Ok(());
         }
         let taken = match next_runnable(scheduler, backend, registration, kick) {
@@ -905,9 +897,8 @@ where
                 backend,
                 boundary,
                 receipts,
-                commands,
             ) {
-                Ok(stop_seen) => deferred_stop |= stop_seen,
+                Ok(()) => {}
                 Err(error) => {
                     let settlement = match settlement_authority {
                         SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
@@ -1092,9 +1083,8 @@ where
                     backend,
                     boundary,
                     receipts,
-                    commands,
                 ) {
-                    Ok(stop_seen) => deferred_stop |= stop_seen,
+                    Ok(()) => {}
                     Err(error) => {
                         tracing::error!(
                             executor = ?executor_id,
