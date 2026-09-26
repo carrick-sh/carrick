@@ -1,0 +1,52 @@
+{
+  "base_head": "5d612ffb5",
+  "candidate_source_sha256": {
+    "crates/carrick-vfs/src/vfs/rootfs.rs": "c04d8695c82b999b9263e75d4ddf2c642bf9a516deb1c321dc3c4cdb844e7122",
+    "crates/carrick-vfs/src/fs_backend/host.rs": "0827fd69b4b67e4a4db9f12da9b8bf8661798b7db6b0cb200d7ba0007f35c905",
+    "crates/carrick-vfs/src/vfs/namespace_mutation.rs": "ac27e3eaa294d91fd7d1d30377f579665bd5d52188e50c0ce6b785842a9afad3"
+  },
+  "results": [
+    {
+      "arm": "base",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-vfs",
+        "--lib",
+        "vfs::rootfs::tests::serial_host::test_namespace_mutation_work",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exit_code": 101,
+      "source_sha256": {
+        "crates/carrick-vfs/src/vfs/rootfs.rs": "ab78745c69309f8cf46e6f7d1450a734808489ef35a7c24e5d81a5d3a9211e2c",
+        "crates/carrick-vfs/src/fs_backend/host.rs": "0827fd69b4b67e4a4db9f12da9b8bf8661798b7db6b0cb200d7ba0007f35c905",
+        "crates/carrick-vfs/src/vfs/namespace_mutation.rs": "0aafb7497bb8e0aa14c17f6bf245913a5a670ba9079cf82aa0f8a4d74505083c"
+      },
+      "witness_sha256": "0be24f203d3cb9f21eedae3a3d226d187ef0e67e81329f6e2a3891e55857cd4a"
+    },
+    {
+      "arm": "candidate",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-vfs",
+        "--lib",
+        "vfs::rootfs::tests::serial_host::test_namespace_mutation_work",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "source_sha256": {
+        "crates/carrick-vfs/src/vfs/rootfs.rs": "fec1e7fb09adcb21078e00aa950460400964ee78c25bc7248b8e8628dbb31225",
+        "crates/carrick-vfs/src/fs_backend/host.rs": "0827fd69b4b67e4a4db9f12da9b8bf8661798b7db6b0cb200d7ba0007f35c905",
+        "crates/carrick-vfs/src/vfs/namespace_mutation.rs": "ac27e3eaa294d91fd7d1d30377f579665bd5d52188e50c0ce6b785842a9afad3"
+      },
+      "witness_sha256": "0be24f203d3cb9f21eedae3a3d226d187ef0e67e81329f6e2a3891e55857cd4a"
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host-bsd)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.44s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vfs-b64f878273ffc91e)
+
+running 1 test
+test vfs::rootfs::tests::serial_host::test_namespace_mutation_work ... MEASUREMENTS:
+scale_point=1 op=rename_same_dir opens=0 dentry_opens=0 backend_stats=5 parent_fstats=4 total_metadata=9
+scale_point=1 op=rename_cross_dir opens=2 dentry_opens=0 backend_stats=5 parent_fstats=4 total_metadata=9
+scale_point=1 op=unlink opens=0 dentry_opens=0 backend_stats=1 parent_fstats=2 total_metadata=3
+scale_point=1 op=rename_cold opens=2 dentry_opens=2 backend_stats=5 parent_fstats=4 total_metadata=9
+scale_point=1 op=rename_warm_after_cold opens=2 dentry_opens=0 backend_stats=5 parent_fstats=4 total_metadata=9
+scale_point=1 op=unlink_cold opens=2 dentry_opens=2 backend_stats=1 parent_fstats=2 total_metadata=3
+scale_point=1 op=unlink_warm_after_cold opens=0 dentry_opens=0 backend_stats=1 parent_fstats=2 total_metadata=3
+scale_point=8 op=rename_same_dir opens=21 dentry_opens=0 backend_stats=40 parent_fstats=32 total_metadata=72
+scale_point=8 op=rename_cross_dir opens=30 dentry_opens=0 backend_stats=40 parent_fstats=32 total_metadata=72
+scale_point=8 op=unlink opens=0 dentry_opens=0 backend_stats=8 parent_fstats=16 total_metadata=24
+scale_point=32 op=rename_same_dir opens=93 dentry_opens=0 backend_stats=160 parent_fstats=128 total_metadata=288
+scale_point=32 op=rename_cross_dir opens=126 dentry_opens=0 backend_stats=160 parent_fstats=128 total_metadata=288
+scale_point=32 op=unlink opens=0 dentry_opens=0 backend_stats=32 parent_fstats=64 total_metadata=96
+scale_point=128 op=rename_same_dir opens=381 dentry_opens=0 backend_stats=640 parent_fstats=512 total_metadata=1152
+scale_point=128 op=rename_cross_dir opens=510 dentry_opens=0 backend_stats=640 parent_fstats=512 total_metadata=1152
+scale_point=128 op=unlink opens=0 dentry_opens=0 backend_stats=128 parent_fstats=256 total_metadata=384
+
+
+thread 'vfs::rootfs::tests::serial_host::test_namespace_mutation_work' (11280624) panicked at crates/carrick-vfs/src/vfs/rootfs.rs:2682:17:
+rename_same_dir at scale 1 issued 9 total metadata calls (budget <= 8)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    vfs::rootfs::tests::serial_host::test_namespace_mutation_work
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 290 filtered out; finished in 0.13s
+
+error: test failed, to rerun pass `-p carrick-vfs --lib`
