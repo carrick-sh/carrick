@@ -3371,6 +3371,44 @@ pub mod foreign_cow_test_support {
                 .load(std::sync::atomic::Ordering::Relaxed)
         }
 
+        /// Model an EL1 publication in the actual retained page-table backing,
+        /// without editing the host's software image. This fixture has one root
+        /// arena; refuse any walk that leaves it rather than guessing an owner.
+        pub fn invalidate_live_leaf_without_shadow_for_test(&self, va: u64) -> Result<(), String> {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            if !(self.data_va..self.data_va + self.data_len).contains(&va) {
+                return Err("fixture address outside data range".into());
+            }
+            let root = self.original_extents[0];
+            let owners = self.transport.custody.global_frame_host_owners.lock();
+            let owner = owners
+                .get(&root)
+                .and_then(GlobalFrameOwnerEntry::live_owner)
+                .ok_or_else(|| "fixture root owner absent".to_owned())?;
+            let mut table = root.0;
+            for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
+                let slot = table
+                    .checked_add(((va >> shift) & 0x1ff) * 8)
+                    .and_then(|ipa| ipa.checked_sub(root.0))
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .filter(|offset| offset.checked_add(8).is_some_and(|end| end <= owner.len()))
+                    .ok_or_else(|| "fixture walk left retained root arena".to_owned())?;
+                // SAFETY: the live owner lock retains the mapping, and the
+                // checked slot is an aligned descriptor within that mapping.
+                let descriptor = unsafe { &*owner.ptr().add(slot).cast::<AtomicU64>() };
+                let value = descriptor.load(Ordering::Acquire);
+                if value & 3 != 3 {
+                    return Err("fixture expected a table or terminal page descriptor".into());
+                }
+                if level == 3 {
+                    descriptor.store(value & !1, Ordering::Release);
+                    return Ok(());
+                }
+                table = value & 0x0000_ffff_ffff_f000;
+            }
+            Err("fixture walk did not reach its terminal page".into())
+        }
+
         /// Counts actual terminal-leaf validations performed during activation.
         pub fn native_activation_leaf_checks_for_test(&self) -> u64 {
             self.state
@@ -3476,7 +3514,27 @@ pub mod foreign_cow_test_support {
                     Ok(())
                 }
                 _ => Err("unknown fixture denial".into()),
+            }?;
+            if matches!(kind, 0 | 2 | 4 | 5) {
+                // A real host mutation publishes to the backing walked by the
+                // hardware. Shadow-only edits do not revoke a live mapping.
+                let root = self.original_extents[0];
+                let owners = self.transport.custody.global_frame_host_owners.lock();
+                let owner = owners
+                    .get(&root)
+                    .and_then(GlobalFrameOwnerEntry::live_owner)
+                    .ok_or("fixture root owner absent")?;
+                self.state.page_tables_authority().edit(
+                    || Err("fixture page tables absent".to_owned()),
+                    |editor| {
+                        unsafe {
+                            editor.sync_to_host(|base| (base == root.0).then_some(owner.ptr()))
+                        }
+                        .map_err(|e| format!("publish fixture leaf: {e:?}"))
+                    },
+                )?;
             }
+            Ok(())
         }
 
         pub fn set_source_guest_writable_for_test(&self, writable: bool) -> Result<(), String> {
