@@ -141,6 +141,11 @@ pub trait ExecutorKick: Send + Sync + std::fmt::Debug {
     }
 
     fn current_binding(&self) -> Option<ExecutorBinding>;
+
+    /// Force the executor's vCPU out of the guest if the executor waits
+    /// there for work (EL1 plan 1d: an idle executor waits in the guest's
+    /// scheduler, not on a host condvar), so it re-reads its control state.
+    fn wake_from_guest_idle(&self) {}
 }
 
 pub trait DiscardRecorder: Send + Sync {
@@ -636,6 +641,34 @@ impl ExecutorDirectory {
             .map(|entry| Arc::clone(&entry.kick));
         kick.is_some_and(|kick| kick.deliver_exact(token))
     }
+
+    /// Wake the executors waiting in the guest: those bound to `cpu`, or
+    /// every one.
+    fn wake_guest_idle(&self, cpu: Option<GuestCpuId>) {
+        let kicks: Vec<_> = self
+            .state
+            .lock()
+            .entries
+            .values()
+            .filter(|entry| cpu.is_none() || entry.placement.lock().cpu == cpu)
+            .map(|entry| Arc::clone(&entry.kick))
+            .collect();
+        for kick in kicks {
+            kick.wake_from_guest_idle();
+        }
+    }
+
+    fn wake_guest_idle_executor(&self, executor: ExecutorId) {
+        let kick = self
+            .state
+            .lock()
+            .entries
+            .get(&executor)
+            .map(|entry| Arc::clone(&entry.kick));
+        if let Some(kick) = kick {
+            kick.wake_from_guest_idle();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -836,6 +869,11 @@ struct QueueKeyShard {
     /// The one row a wake enqueued for a gated key, held until that key is
     /// published (or, for an admission gate, until its authority is released).
     deferred: BTreeMap<QueueKey, QueueRow>,
+    /// Claimable rows of threads the guest schedules (EL1 plan 1d): on no
+    /// CPU queue. A service record in an EL1 run queue names each; the
+    /// executor of the vCPU EL1 runs it on claims it by exact key
+    /// ([`Scheduler::take_zone`]). Counted in `total_queued`.
+    zone_held: BTreeMap<QueueKey, QueueRow>,
 }
 
 impl QueueKeyShard {
@@ -928,6 +966,15 @@ impl EnqueueOutcome {
     }
 }
 
+/// Wakes executors waiting in the guest ([`ExecutorKick::wake_from_guest_idle`]).
+struct GuestIdleWaker(Box<dyn Fn(Option<GuestCpuId>) + Send + Sync>);
+
+impl std::fmt::Debug for GuestIdleWaker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GuestIdleWaker")
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RunQueueInner {
     /// Lifecycle ONLY. Never taken to enqueue, claim, finish a claim or
@@ -970,6 +1017,13 @@ pub(crate) struct RunQueueInner {
     online: Vec<AtomicUsize>,
     policy: Arc<dyn SchedulingPolicy>,
     event_sequence: Arc<AtomicU64>,
+    /// Threads whose next claimable row an executor adopts itself (it took
+    /// the thread off its vCPU at an exit): the row is held for it, not
+    /// placed in the guest.
+    zone_adopt: Mutex<BTreeSet<ThreadKey>>,
+    /// Wake executors that wait in the guest (bound to a CPU, or all); set
+    /// by the scheduler that owns the executor directory.
+    guest_idle_waker: std::sync::OnceLock<GuestIdleWaker>,
     #[cfg(any(test, feature = "test-support"))]
     close_census_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -1104,6 +1158,13 @@ impl RunQueueInner {
     fn nudge_all_cpus(&self) {
         for cpu in &self.cpus {
             cpu.nudge();
+        }
+        self.wake_guest_idle(None);
+    }
+
+    fn wake_guest_idle(&self, cpu: Option<GuestCpuId>) {
+        if let Some(waker) = self.guest_idle_waker.get() {
+            (waker.0)(cpu);
         }
     }
 
@@ -1292,6 +1353,9 @@ impl RunQueueInner {
             }
             _ => {}
         }
+        if crate::el1_zone::schedules_in_guest() {
+            return Ok(self.enqueue_zone(row));
+        }
         let affinity = row.thread.affinity();
         let target = target_cpu
             .filter(|cpu| cpu.as_usize() < self.cpus.len() && affinity.is_allowed(*cpu))
@@ -1332,6 +1396,7 @@ impl RunQueueInner {
             local.waiters > 0
         };
         cpu.idle_condvar.notify_one();
+        self.wake_guest_idle(Some(cpu.id));
         if !waiter_present {
             // Nobody is parked on the target CPU, so its executor is busy with
             // a task and this row would wait behind it. Go's `wakep`: hand it
@@ -1358,6 +1423,9 @@ impl RunQueueInner {
     fn publish(&self, row: QueueRow) -> Result<EnqueueOutcome, RunQueueError> {
         if self.lifecycle() == QueueLifecycle::Closed {
             return Err(RunQueueError::Closed);
+        }
+        if crate::el1_zone::schedules_in_guest() {
+            return Ok(self.publish_zone(row));
         }
         let key = row.key;
         let affinity = row.thread.affinity();
@@ -1396,6 +1464,7 @@ impl RunQueueInner {
             local.waiters > 0
         };
         cpu.idle_condvar.notify_one();
+        self.wake_guest_idle(Some(cpu.id));
         if !waiter_present {
             self.wake_idle_cpu(cpu.id);
         }
@@ -1408,6 +1477,105 @@ impl RunQueueInner {
             kind: SchedulingEventKind::Runnable,
         });
         Ok(EnqueueOutcome::Claimable)
+    }
+
+    /// [`Self::enqueue`] for a thread the guest schedules (EL1 plan 1d): the
+    /// claimable row is held off every CPU queue and a service record in an
+    /// EL1 run queue names it.
+    fn enqueue_zone(&self, row: QueueRow) -> EnqueueOutcome {
+        let key = row.key;
+        let thread = Arc::clone(&row.thread);
+        {
+            let mut shard = self.shard(key).lock();
+            if shard.queued.contains(&key) {
+                return EnqueueOutcome::Coalesced;
+            }
+            shard.queued.insert(key);
+            if shard.gated(key) {
+                shard.deferred.insert(key, row);
+                return EnqueueOutcome::Deferred;
+            }
+            shard.zone_held.insert(key, row);
+            self.total_queued.fetch_add(1, Ordering::SeqCst);
+        }
+        self.place_zone_row(&thread, key);
+        self.note_zone_runnable(&thread);
+        EnqueueOutcome::Claimable
+    }
+
+    fn note_zone_runnable(&self, thread: &Thread) {
+        let sequence = self.event_sequence.fetch_add(1, Ordering::Relaxed);
+        self.policy.on_event(&SchedulingEvent {
+            sequence,
+            thread: SchedThreadId::new(thread.key().serial.raw()),
+            process: SchedProcessId::new(thread.task_key().serial.raw()),
+            cpu: None,
+            kind: SchedulingEventKind::Runnable,
+        });
+    }
+
+    /// [`Self::publish`] for a thread the guest schedules.
+    fn publish_zone(&self, row: QueueRow) -> EnqueueOutcome {
+        let key = row.key;
+        let thread = Arc::clone(&row.thread);
+        {
+            let mut shard = self.shard(key).lock();
+            Self::retire_gates(&mut shard, key);
+            let publishable = if let Some(held) = shard.deferred.remove(&key) {
+                held
+            } else if shard.queued.contains(&key) {
+                return EnqueueOutcome::Coalesced;
+            } else {
+                shard.queued.insert(key);
+                row
+            };
+            shard.zone_held.insert(key, publishable);
+            self.total_queued.fetch_add(1, Ordering::SeqCst);
+        }
+        self.place_zone_row(&thread, key);
+        self.note_zone_runnable(&thread);
+        EnqueueOutcome::Claimable
+    }
+
+    /// Queue the held row's thread in the guest, unless the executor that
+    /// woke it adopts it itself. With no record to spare it goes to a CPU
+    /// queue, whose executor takes it on the host (and is woken for it).
+    fn place_zone_row(&self, thread: &Thread, key: QueueKey) {
+        if self.zone_adopt.lock().remove(&key.thread) {
+            return;
+        }
+        if crate::el1_zone::place_service(key.thread, key.generation, thread.affinity().words()[0])
+        {
+            return;
+        }
+        let Some(row) = self.shard(key).lock().zone_held.remove(&key) else {
+            return;
+        };
+        let target = self.select_cpu(&row.thread);
+        let cpu = &self.cpus[target.as_usize().min(self.cpus.len().saturating_sub(1))];
+        {
+            let mut local = cpu.state.lock();
+            local.rows.push_back(row);
+            cpu.depth.store(local.rows.len(), Ordering::Release);
+            local.wake_ticket = local.wake_ticket.wrapping_add(1);
+        }
+        cpu.idle_condvar.notify_one();
+        self.wake_guest_idle(Some(cpu.id));
+    }
+
+    /// Take the held row of exact `key` for a claim (EL1 plan 1d).
+    fn take_zone_row(&self, key: QueueKey) -> Option<QueueRow> {
+        let row = {
+            let mut shard = self.shard(key).lock();
+            let row = shard.zone_held.remove(&key)?;
+            shard.queued.remove(&key);
+            row
+        };
+        // The claim is counted before the queue total drops (`finish_removal`).
+        self.claimed.fetch_add(1, Ordering::SeqCst);
+        self.claim_boundaries.fetch_add(1, Ordering::SeqCst);
+        self.total_queued.fetch_sub(1, Ordering::SeqCst);
+        Some(row)
     }
 
     /// Nudge one idle CPU other than `origin` so it re-runs its steal scan —
@@ -1510,6 +1678,7 @@ impl RunQueueInner {
     /// accounted BEFORE the queue depth drops, so a concurrent `drain_ready`
     /// can never observe a moment where the row is in neither count.
     fn finish_removal(&self, local: &mut GuestCpuLocalState, cpu: &GuestCpu, key: QueueKey) {
+        crate::el1_zone::count_host_queue_claim();
         self.claimed.fetch_add(1, Ordering::SeqCst);
         self.claim_boundaries.fetch_add(1, Ordering::SeqCst);
         self.shard(key).lock().queued.remove(&key);
@@ -1679,6 +1848,15 @@ impl RunQueueInner {
         }
         demands
     }
+}
+
+/// What one pass of `take_row_bound` found.
+enum BoundTake {
+    Row(QueueRow),
+    /// A host-wait slot was released: scan again.
+    Released,
+    /// Nothing to take; a blocking caller would park here.
+    WouldPark,
 }
 
 #[derive(Debug)]
@@ -2144,6 +2322,8 @@ impl RunQueue {
                 cpus,
                 policy,
                 event_sequence,
+                zone_adopt: Mutex::new(BTreeSet::new()),
+                guest_idle_waker: std::sync::OnceLock::new(),
                 #[cfg(any(test, feature = "test-support"))]
                 close_census_gate: Mutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
@@ -2183,6 +2363,19 @@ impl RunQueue {
             drop(local);
             self.inner.settle_close_if_closing();
             return true;
+        }
+        // A row the guest schedules is on no CPU queue but counted; its
+        // service record is discarded when an executor reaches it.
+        {
+            let mut shard = self.inner.shard(key).lock();
+            if shard.zone_held.remove(&key).is_some() {
+                shard.queued.remove(&key);
+                RunQueueInner::retire_gates(&mut shard, key);
+                drop(shard);
+                self.inner.total_queued.fetch_sub(1, Ordering::SeqCst);
+                self.inner.settle_close_if_closing();
+                return true;
+            }
         }
         // A row deferred behind a gate is on no CPU queue and was never
         // counted, so removing it touches only the shard.
@@ -2253,8 +2446,31 @@ impl RunQueue {
             if executor.is_spare() {
                 self.park_spare(executor)?;
             }
-            if let Some(row) = self.take_row_bound(executor, auditors)? {
-                return Ok(row);
+            match self.take_row_bound(executor, auditors, false)? {
+                BoundTake::Row(row) => return Ok(row),
+                BoundTake::Released | BoundTake::WouldPark => {}
+            }
+        }
+    }
+
+    /// [`Self::take_row`] that returns `None` where it would park: an
+    /// executor that waits in the guest (EL1 plan 1d) parks there instead.
+    fn try_take_row(
+        &self,
+        executor: &ExecutorRegistration,
+        auditors: Option<&crate::observe::AuditorChain>,
+    ) -> Result<Option<QueueRow>, RunQueueError> {
+        loop {
+            if executor.in_host_wait() {
+                return Err(RunQueueError::ExecutorBusy);
+            }
+            if executor.is_spare() {
+                self.park_spare(executor)?;
+            }
+            match self.take_row_bound(executor, auditors, true)? {
+                BoundTake::Row(row) => return Ok(Some(row)),
+                BoundTake::Released => {}
+                BoundTake::WouldPark => return Ok(None),
             }
         }
     }
@@ -2263,7 +2479,8 @@ impl RunQueue {
         &self,
         executor: &ExecutorRegistration,
         auditors: Option<&crate::observe::AuditorChain>,
-    ) -> Result<Option<QueueRow>, RunQueueError> {
+        nonblocking: bool,
+    ) -> Result<BoundTake, RunQueueError> {
         let index = executor
             .bound_cpu()
             .map(|cpu| cpu.as_usize())
@@ -2276,7 +2493,7 @@ impl RunQueue {
         loop {
             let transferred = executor.placement.lock().slot.is_some();
             if transferred && self.inner.release_handoff(executor.id, true) {
-                return Ok(None);
+                return Ok(BoundTake::Released);
             }
             if executor.flush_requested() {
                 return Err(RunQueueError::FlushRequested);
@@ -2291,10 +2508,10 @@ impl RunQueue {
             }
 
             if let Some(row) = self.inner.pop_local(&cpu) {
-                return Ok(Some(self.claim_taken(&mut idle, cpu.id, row)));
+                return Ok(BoundTake::Row(self.claim_taken(&mut idle, cpu.id, row)));
             }
             if let Some(row) = self.inner.try_steal(cpu.id) {
-                return Ok(Some(self.claim_taken(&mut idle, cpu.id, row)));
+                return Ok(BoundTake::Row(self.claim_taken(&mut idle, cpu.id, row)));
             }
 
             if self.inner.lifecycle() != QueueLifecycle::Open
@@ -2318,14 +2535,14 @@ impl RunQueue {
             // the final park predicate. Never lock lifecycle under cpu.state.
             let transferred = executor.placement.lock().slot.is_some();
             if transferred && self.inner.release_handoff(executor.id, true) {
-                return Ok(None);
+                return Ok(BoundTake::Released);
             }
             if let Some(row) = self
                 .inner
                 .pop_local(&cpu)
                 .or_else(|| self.inner.try_steal(cpu.id))
             {
-                return Ok(Some(self.claim_taken(&mut idle, cpu.id, row)));
+                return Ok(BoundTake::Row(self.claim_taken(&mut idle, cpu.id, row)));
             }
 
             #[cfg(any(test, feature = "test-support"))]
@@ -2334,6 +2551,11 @@ impl RunQueue {
                 resume.wait();
             }
 
+            if nonblocking {
+                // The caller waits in the guest, where a wake reaches it by
+                // `wake_from_guest_idle`; it re-scans when it leaves.
+                return Ok(BoundTake::WouldPark);
+            }
             let mut local = cpu.state.lock();
             if !local.rows.is_empty() || local.wake_ticket != ticket {
                 drop(local);
@@ -2352,6 +2574,7 @@ impl RunQueue {
             if let Some(auditors) = auditors {
                 auditors.executor_parked(executor.id, cpu.id, None);
             }
+            crate::el1_zone::count_host_executor_park();
             while local.rows.is_empty()
                 && local.wake_ticket == ticket
                 && self.inner.lifecycle() == QueueLifecycle::Open
@@ -2511,27 +2734,96 @@ impl RunQueue {
     ) -> Result<QueueClaim, RunQueueError> {
         loop {
             let row = self.take_row(executor, auditors)?;
-            let observed_state = row.thread.execution_diagnostic();
-            if row.thread.key() != row.key.thread
-                || row.thread.execution_state().generation() != Some(row.key.generation)
-                || !matches!(
-                    row.thread.execution_state(),
-                    super::objects::ThreadExecutionState::Runnable { .. }
-                )
-            {
+            if let Some(claim) = self.claim_row(executor, row, recorder, auditors) {
+                return Ok(claim);
+            }
+        }
+    }
+
+    /// [`Self::take`] that returns `None` where it would park.
+    pub(crate) fn try_take(
+        &self,
+        executor: &ExecutorRegistration,
+        recorder: Option<&dyn DiscardRecorder>,
+        auditors: Option<&crate::observe::AuditorChain>,
+    ) -> Result<Option<QueueClaim>, RunQueueError> {
+        loop {
+            let Some(row) = self.try_take_row(executor, auditors)? else {
+                return Ok(None);
+            };
+            if let Some(claim) = self.claim_row(executor, row, recorder, auditors) {
+                return Ok(Some(claim));
+            }
+        }
+    }
+
+    /// Claim the held row of exact `key` (EL1 plan 1d: the thread a service
+    /// record names, or one its executor adopts). `None`: the row is gone
+    /// (the generation retired) or no longer claimable.
+    pub(crate) fn take_zone(
+        &self,
+        executor: &ExecutorRegistration,
+        key: QueueKey,
+        recorder: Option<&dyn DiscardRecorder>,
+        auditors: Option<&crate::observe::AuditorChain>,
+    ) -> Option<QueueClaim> {
+        let row = self.inner.take_zone_row(key)?;
+        self.claim_row(executor, row, recorder, auditors)
+    }
+
+    /// Validate a row taken off a queue and claim its thread's lease. `None`:
+    /// the row was stale and is discarded (its claim finished).
+    fn claim_row(
+        &self,
+        executor: &ExecutorRegistration,
+        row: QueueRow,
+        recorder: Option<&dyn DiscardRecorder>,
+        auditors: Option<&crate::observe::AuditorChain>,
+    ) -> Option<QueueClaim> {
+        let observed_state = row.thread.execution_diagnostic();
+        if row.thread.key() != row.key.thread
+            || row.thread.execution_state().generation() != Some(row.key.generation)
+            || !matches!(
+                row.thread.execution_state(),
+                super::objects::ThreadExecutionState::Runnable { .. }
+            )
+        {
+            if let Some(recorder) = recorder {
+                recorder.record_discard(
+                    executor.id,
+                    row.key.thread,
+                    row.key.generation,
+                    observed_state,
+                    "stale_row_generation_or_state_mismatch".to_owned(),
+                );
+            }
+            // A discarded row is a wake that never reaches its target, so
+            // it is reported on the SAME auditor surface as a rejected
+            // wake. The `DiscardRecorder` stays: it is the diagnostic
+            // transcript, while this is the invariant surface.
+            if let Some(auditors) = auditors {
+                auditors.wake_rejected(
+                    row.thread.task_key(),
+                    crate::observe::WakeRejectionReason::StaleGeneration,
+                );
+            }
+            self.inner.finish_claim();
+            return None;
+        }
+        let lease = match row.thread.claim_runnable(executor.id) {
+            Ok(lease) if lease.generation() == row.key.generation => lease,
+            Ok(lease) => {
+                let lease_generation = lease.generation();
                 if let Some(recorder) = recorder {
                     recorder.record_discard(
                         executor.id,
                         row.key.thread,
                         row.key.generation,
                         observed_state,
-                        "stale_row_generation_or_state_mismatch".to_owned(),
+                        format!("lease_generation_mismatch (lease={lease_generation:?})"),
                     );
                 }
-                // A discarded row is a wake that never reaches its target, so
-                // it is reported on the SAME auditor surface as a rejected
-                // wake. The `DiscardRecorder` stays: it is the diagnostic
-                // transcript, while this is the invariant surface.
+                drop(lease);
                 if let Some(auditors) = auditors {
                     auditors.wake_rejected(
                         row.thread.task_key(),
@@ -2539,47 +2831,23 @@ impl RunQueue {
                     );
                 }
                 self.inner.finish_claim();
-                continue;
+                return None;
             }
-            let lease = match row.thread.claim_runnable(executor.id) {
-                Ok(lease) if lease.generation() == row.key.generation => lease,
-                Ok(lease) => {
-                    let lease_generation = lease.generation();
-                    if let Some(recorder) = recorder {
-                        recorder.record_discard(
-                            executor.id,
-                            row.key.thread,
-                            row.key.generation,
-                            observed_state,
-                            format!("lease_generation_mismatch (lease={lease_generation:?})"),
-                        );
-                    }
-                    drop(lease);
-                    if let Some(auditors) = auditors {
-                        auditors.wake_rejected(
-                            row.thread.task_key(),
-                            crate::observe::WakeRejectionReason::StaleGeneration,
-                        );
-                    }
-                    self.inner.finish_claim();
-                    continue;
+            Err(error) => {
+                if let Some(recorder) = recorder {
+                    recorder.record_discard(
+                        executor.id,
+                        row.key.thread,
+                        row.key.generation,
+                        observed_state,
+                        format!("claim_error: {error}"),
+                    );
                 }
-                Err(error) => {
-                    if let Some(recorder) = recorder {
-                        recorder.record_discard(
-                            executor.id,
-                            row.key.thread,
-                            row.key.generation,
-                            observed_state,
-                            format!("claim_error: {error}"),
-                        );
-                    }
-                    self.inner.finish_claim();
-                    continue;
-                }
-            };
-            return Ok(QueueClaim { row, lease });
-        }
+                self.inner.finish_claim();
+                return None;
+            }
+        };
+        Some(QueueClaim { row, lease })
     }
 
     pub fn close(&self) {
@@ -2992,10 +3260,21 @@ impl Scheduler {
             clock,
             Arc::clone(&event_sequence),
         )));
+        let executors = Arc::new(ExecutorDirectory::default());
+        let queue = RunQueue::new(policy, event_sequence);
+        let directory = Arc::downgrade(&executors);
+        let _ = queue
+            .inner
+            .guest_idle_waker
+            .set(GuestIdleWaker(Box::new(move |cpu| {
+                if let Some(directory) = directory.upgrade() {
+                    directory.wake_guest_idle(cpu);
+                }
+            })));
         Self {
             kernel,
-            queue: RunQueue::new(policy, event_sequence),
-            executors: Arc::new(ExecutorDirectory::default()),
+            queue,
+            executors,
             preemption,
             preemption_condvar,
             snapshot_count: AtomicU64::new(0),
@@ -3940,9 +4219,90 @@ impl Scheduler {
         self.executors.authenticate(executor)?;
         let recorder = self.discard_recorder.lock().clone();
         let auditors = self.kernel.auditors();
-        let QueueClaim { row, lease } =
-            self.queue
-                .take(executor, recorder.as_deref(), Some(&auditors))?;
+        let claim = self
+            .queue
+            .take(executor, recorder.as_deref(), Some(&auditors))?;
+        self.finish_take(executor, claim)
+    }
+
+    /// [`Self::take`] that returns `None` instead of parking: the executor
+    /// waits in the guest's scheduler (EL1 plan 1d), where the wakes that
+    /// would have ended a park reach it by `wake_from_guest_idle`.
+    pub fn try_take(
+        &self,
+        executor: &ExecutorRegistration,
+    ) -> Result<Option<RunnableThread>, RunQueueError> {
+        self.executors.authenticate(executor)?;
+        let recorder = self.discard_recorder.lock().clone();
+        let auditors = self.kernel.auditors();
+        match self
+            .queue
+            .try_take(executor, recorder.as_deref(), Some(&auditors))?
+        {
+            Some(claim) => self.finish_take(executor, claim).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Claim the exact runnable generation `key` of a thread the guest
+    /// schedules, for the executor whose vCPU EL1 runs it on (EL1 plan 1d).
+    /// `None`: that generation is no longer runnable (it retired, or a
+    /// racing wake coalesced it elsewhere).
+    pub fn take_zone(
+        &self,
+        executor: &ExecutorRegistration,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+    ) -> Result<Option<RunnableThread>, RunQueueError> {
+        let key = QueueKey { thread, generation };
+        self.executors.authenticate(executor)?;
+        let recorder = self.discard_recorder.lock().clone();
+        let auditors = self.kernel.auditors();
+        match self
+            .queue
+            .take_zone(executor, key, recorder.as_deref(), Some(&auditors))
+        {
+            Some(claim) => self.finish_take(executor, claim).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The executor took zone thread `record` off its vCPU at an exit (the
+    /// thread EL1 ran there exited to the host): make the thread runnable
+    /// and claim it for this executor directly, with no queue and no other
+    /// executor involved. `None`: a racing wake or retirement took it.
+    pub fn adopt_zone_handback(
+        &self,
+        executor: &ExecutorRegistration,
+        record: carrick_el1_abi::RecordRef,
+    ) -> Result<Option<RunnableThread>, RunQueueError> {
+        let Some(key) = crate::el1_zone::thread_key_of(record) else {
+            return Ok(None);
+        };
+        let Some(thread) = self.kernel.exact_thread_for_scheduler(key) else {
+            return Ok(None);
+        };
+        self.queue.inner.zone_adopt.lock().insert(key);
+        let _ = thread.publish_zone_ready(record);
+        let _ = self.wake(key);
+        let held = self.queue.inner.zone_adopt.lock().remove(&key);
+        if held {
+            // The wake did not queue a row (it coalesced or was refused):
+            // someone else owns this thread's next run.
+            return Ok(None);
+        }
+        let Some(generation) = thread.execution_state().generation() else {
+            return Ok(None);
+        };
+        self.take_zone(executor, key, generation)
+    }
+
+    fn finish_take(
+        &self,
+        executor: &ExecutorRegistration,
+        claim: QueueClaim,
+    ) -> Result<RunnableThread, RunQueueError> {
+        let QueueClaim { row, lease } = claim;
         let binding = ExecutorBinding {
             executor: executor.id,
             executor_epoch: lease.executor_epoch(),
@@ -4018,6 +4378,7 @@ impl Scheduler {
             }
         };
         flush_requested.store(ResidencyFlushRequest::Requested, Ordering::Release);
+        self.executors.wake_guest_idle_executor(executor);
         if let Some(cpu) = bound_cpu {
             if let Some(guest_cpu) = self.queue.inner.cpus.get(cpu.as_usize()) {
                 guest_cpu.nudge();

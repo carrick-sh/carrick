@@ -16,6 +16,9 @@ fn el1_inotify09_probe() {
     reset_el1_counters();
     carrick_kernel::el1_delegation::reset_delegation_counts();
     let start = std::time::Instant::now();
+    // inotify09 completes in a few seconds; a wedge is reported (zone census,
+    // post-mortem) and reaped instead of waiting out LTP's own timeout.
+    let watchdog = common::Watchdog::start(std::time::Duration::from_secs(60));
     let result = common::run_or_fail(
         ContainerBuilder::from_image("localhost:5050/ltp:arm64")
             .pull_policy(PullPolicy::Missing)
@@ -23,6 +26,7 @@ fn el1_inotify09_probe() {
             .run_blocking(),
     );
     let wall = start.elapsed();
+    watchdog.disarm();
     let err = result.stderr_utf8();
     for line in err.lines().filter(|l| {
         l.contains("fuzzy_sync")

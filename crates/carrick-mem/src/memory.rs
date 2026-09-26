@@ -3546,10 +3546,12 @@ pub fn stage1_hvpatch_page_tables() -> Vec<u8> {
     bytes
 }
 
-/// Build the carrier-owned stage-1 translation root for scoped EL1 maintenance.
+/// Build the carrier-owned stage-1 translation root for scoped EL1 maintenance
+/// and for a vCPU running the EL1 scheduler with no thread (EL1 plan 1d).
 ///
 /// Translates the kernel hole (`LINUX_KERNEL_REGION_BASE`, covering the EL1 maintenance
-/// trampoline, vectors, and mailbox) with `KERNEL_BLOCK_FLAGS | NON_GLOBAL`.
+/// trampoline, vectors, and mailbox) and the EL1 region with
+/// `KERNEL_BLOCK_FLAGS | NON_GLOBAL`, under ASID 0.
 pub fn stage1_carrier_maintenance_page_tables() -> Vec<u8> {
     const NON_GLOBAL: u64 = 1 << 11;
     const KERNEL_BLOCK_FLAGS: u64 = ((1u64 << 54) | (1 << 10) | (0b11 << 8)) | 0b01;
@@ -3581,6 +3583,19 @@ pub fn stage1_carrier_maintenance_page_tables() -> Vec<u8> {
         (LINUX_KERNEL_REGION_BASE & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS | NON_GLOBAL;
     let l2_off = 0x2000;
     bytes[l2_off..l2_off + 8].copy_from_slice(&kernel_block_desc.to_le_bytes());
+
+    // The EL1 region (image, stacks, current tasks, zone tables), identity
+    // mapped kernel-only: a vCPU with no thread runs the EL1 scheduler on
+    // this root (EL1 plan 1d), so no process's tables need outlive its own
+    // threads to keep an idle vCPU's translations valid.
+    let el1_first = ((LINUX_EL1_KERNEL_BASE - LINUX_KERNEL_REGION_BASE) >> 21) as usize;
+    let el1_blocks = (LINUX_EL1_KERNEL_SIZE >> 21) as usize;
+    for index in el1_first..el1_first + el1_blocks {
+        let pa = LINUX_KERNEL_REGION_BASE + ((index as u64) << 21);
+        let desc = (pa & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS | NON_GLOBAL;
+        let off = l2_off + index * 8;
+        bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
+    }
 
     bytes
 }
@@ -4921,7 +4936,7 @@ pub fn el1_idle_entry_va() -> u64 {
 /// [`carrick_el1_abi::TrapFrame`] the EL1 hooks save (and the idle entry
 /// starts from): the stack top minus 0x120.
 pub fn el1_slot_frame_va(slot: usize) -> u64 {
-    carrick_el1_abi::EL1_STACKS_BASE + carrick_el1_abi::EL1_STACK_SIZE * (slot as u64 + 1) - 0x120
+    carrick_el1_abi::el1_slot_frame_va(slot)
 }
 
 fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -> Vec<u8> {

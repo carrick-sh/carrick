@@ -540,8 +540,8 @@ fn dispatch_zone_futex(
         LINUX_FUTEX_WAKE => {
             let woken = crate::el1_zone::wake(zone, mm, address, bitset, value);
             DispatchOutcome::ZoneFutexWoken {
-                value: woken.len() as i64,
-                woken,
+                value: i64::from(woken.count),
+                woken: woken.handed,
             }
         }
         LINUX_FUTEX_WAIT => {

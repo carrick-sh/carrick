@@ -283,8 +283,14 @@ where
         {
             return Ok(());
         }
-        let mut running = match scheduler.take(registration) {
-            Ok(running) => running,
+        let taken = match next_runnable(scheduler, backend, registration, kick) {
+            Ok(taken) => Ok(taken),
+            Err(NextError::Queue(error)) => Err(error),
+            Err(NextError::Fatal(error)) => return Err(error),
+        };
+        let mut running = match taken {
+            Ok(Some(running)) => running,
+            Ok(None) => continue,
             Err(carrick_kernel::kernel::RunQueueError::FlushRequested) => {
                 backend
                     .flush_resident_task()
@@ -1430,6 +1436,102 @@ where
         if yielded_or_preempted {
             std::thread::yield_now();
         }
+    }
+}
+
+enum NextError {
+    Queue(carrick_kernel::kernel::RunQueueError),
+    Fatal(String),
+}
+
+impl From<carrick_kernel::kernel::RunQueueError> for NextError {
+    fn from(error: carrick_kernel::kernel::RunQueueError) -> Self {
+        Self::Queue(error)
+    }
+}
+
+/// The next thread this executor runs (EL1 plan 1d), or `None` to go round
+/// the loop again (host work arrived, or a claim went stale).
+///
+/// Where the guest schedules threads, an executor is its vCPU's driver: it
+/// claims the thread it took off its vCPU at the last exit, then a queued
+/// thread EL1 sent it (a service record at the head of its run queue), then
+/// any host run-queue row; with none, it waits in the guest's scheduler,
+/// not on a host condvar, until its vCPU leaves for the host again.
+/// Elsewhere it parks on the host run queue as before.
+fn next_runnable<F: PersistentExecutor>(
+    scheduler: &Arc<Scheduler>,
+    backend: &mut F,
+    registration: &carrick_kernel::kernel::ExecutorRegistration,
+    kick: &WorkerKick,
+) -> Result<Option<carrick_kernel::kernel::RunnableThread>, NextError> {
+    let zone = backend
+        .zone_slot()
+        .and_then(|slot| Some((carrick_kernel::el1_zone::zone()?, slot)));
+    let Some((zone, slot)) = zone.filter(|_| carrick_kernel::el1_zone::schedules_in_guest()) else {
+        // The hatch (or no guest scheduler): a thread taken off the vCPU at
+        // the last exit goes back to its host continuation.
+        if let Some(record) = crate::vcpu_loop::zone::take_pending_adoption() {
+            scheduler.publish_zone_handback(record);
+        }
+        if let Some((_, slot)) = zone {
+            carrick_kernel::el1_zone::drain_to_host(slot);
+        }
+        return Ok(Some(scheduler.take(registration)?));
+    };
+    if let Some(record) = crate::vcpu_loop::zone::take_pending_adoption() {
+        if let Some(running) = scheduler.adopt_zone_handback(registration, record)? {
+            return Ok(Some(running));
+        }
+        zone.counters
+            .lost_adoptions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    zone.sweep_cancelled(slot);
+    carrick_kernel::el1_zone::hand_back_wanted(slot);
+    if registration.is_spare() {
+        // A spare may park on the host for a guest CPU to be lent to it:
+        // nothing may wait on its stopped vCPU meanwhile.
+        carrick_kernel::el1_zone::retire_slot(slot);
+    }
+    if let Some(record) = zone.take_service_head(slot) {
+        let key = carrick_kernel::el1_zone::service_key(zone.record_ref(record));
+        zone.free_record(record);
+        let taken = match key {
+            Some((thread, generation)) => scheduler.take_zone(registration, thread, generation)?,
+            None => None,
+        };
+        if taken.is_none() {
+            zone.counters
+                .stale_services
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return Ok(taken);
+    }
+    if let Some(running) = scheduler.try_take(registration)? {
+        return Ok(Some(running));
+    }
+    // Publish the wait, then look once more: a wake either sees the flag
+    // and forces the vCPU out, or published its work before this scan.
+    kick.set_guest_idle(true);
+    carrick_kernel::el1_delegation::clear_pending_host_work(usize::from(slot.raw()));
+    match scheduler.try_take(registration) {
+        Ok(Some(running)) => {
+            kick.set_guest_idle(false);
+            return Ok(Some(running));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            kick.set_guest_idle(false);
+            return Err(error.into());
+        }
+    }
+    backend.note_bound_cpu(registration.bound_cpu().map(|cpu| cpu.as_u32()));
+    let waited = backend.wait_in_guest();
+    kick.set_guest_idle(false);
+    match waited.map_err(|error| NextError::Fatal(error.to_string()))? {
+        GuestIdleExit::Idle => Ok(None),
+        GuestIdleExit::Unsupported => Ok(Some(scheduler.take(registration)?)),
     }
 }
 

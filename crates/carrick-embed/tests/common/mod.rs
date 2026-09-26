@@ -151,6 +151,22 @@ impl Watchdog {
                 eprintln!(
                     "WATCHDOG: timeout ({timeout:?}) exceeded for CARRICK_RUN_ID={run_id}; reaping with scripts/sudo/kill.sh"
                 );
+                // The in-guest scheduler's state is the post-mortem of a
+                // wedge in a carrier that schedules threads at EL1.
+                if let Some(zone) = carrick_el1_abi::zone_tables() {
+                    let mut census = String::new();
+                    let _ = zone.write_census(&mut census);
+                    eprintln!("WATCHDOG zone census:\n{census}");
+                }
+                // The kernel graph's view of the wedge: the runner answers a
+                // latched abort with a post-mortem (written under
+                // CARRICK_POSTMORTEM_DIR when set) before the reap.
+                carrick_kernel::kernel::debug::request_abort(
+                    carrick_kernel::kernel::debug::AbortReason::DebugRequest {
+                        run_id: run_id.clone(),
+                    },
+                );
+                std::thread::sleep(std::time::Duration::from_secs(8));
                 let kill_script = repo_root().join("scripts/sudo/kill.sh");
                 let _ = std::process::Command::new(kill_script)
                     .arg(&run_id)

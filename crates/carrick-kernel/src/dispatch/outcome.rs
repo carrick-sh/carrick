@@ -687,11 +687,12 @@ pub enum DispatchOutcome {
         timeout: Option<Duration>,
         index: u32,
     },
-    /// A host wake (or requeue) on a zone process's private futex claimed
-    /// `woken`; the syscall returns `value`.
+    /// A host wake (or requeue) on a zone process's private futex woke
+    /// `value` waiters; `woken` are those it made host-owned (the others it
+    /// queued in the guest).
     ///
-    /// Backend: hand every woken record back to its thread, then complete
-    /// with `value`.
+    /// Backend: hand every record in `woken` back to its thread, then
+    /// complete with `value`.
     ZoneFutexWoken {
         value: i64,
         #[serde(skip)]

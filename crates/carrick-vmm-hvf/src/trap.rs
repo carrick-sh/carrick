@@ -7454,6 +7454,29 @@ impl HvfInner {
         let mut consecutive_el1_resumes_without_progress: u32 = 0;
         loop {
             crate::gic::service_vtimer_probe(vcpu, mailbox)?;
+            // A host placement queued a thread on this slot, or threads wait
+            // here with no slice timer armed (queued while the slot was at a
+            // host exit): the in-guest scheduler needs the reschedule SGI the
+            // host cannot send (EL1 plan 1d).
+            if let (Some(slot), Some(zone)) = (
+                mailbox
+                    .leased_slot()
+                    .and_then(|slot| carrick_el1_abi::SlotId::from_index(usize::from(slot.raw()))),
+                carrick_el1_abi::zone_tables(),
+            ) {
+                if zone.take_resched(slot)
+                    || (zone.slot(slot).queued() != 0 && zone.slot(slot).timer_cval() == 0)
+                {
+                    crate::gic::arm_resched(vcpu)?;
+                    // A host resume of EL0 carries the thread's saved PSTATE,
+                    // IRQs masked as Carrick has always run EL0: only EL1's
+                    // served returns unmask. Unmask here, or a thread that
+                    // makes no EL1-served syscall would never take the SGI
+                    // (nor the slice timer it starts) and a queued thread
+                    // would wait behind it forever.
+                    crate::gic::unmask_el0_irqs(vcpu)?;
+                }
+            }
             // The engine accounts the guest CPU time via `guest_cpu::timed_run`
             // around its `vcpu.run()` call, so do NOT double-account here.
             vcpu.run().map_err(hvf_error)?;

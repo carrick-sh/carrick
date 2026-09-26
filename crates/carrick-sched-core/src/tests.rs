@@ -254,10 +254,24 @@ fn host_claims_parked_but_is_refused_by_el1_held() {
         HostClaim::AlreadyHost
     );
 
+    // Queued, not running: the host takes it off the run queue, and it keeps
+    // its wake's result (the signal acts after it resumes).
     let b = park(&zone, 2, 0x1000);
     let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
     assert_eq!(
         zone.claim_for_host(zone.record_ref(b), None, Handback::Signal, &HostWait),
+        HostClaim::Claimed
+    );
+    assert_eq!(zone.record(b).handback(), Some(Handback::Woken));
+    assert_eq!(zone.runnable_head(SLOT), None);
+    assert_eq!(zone.switch_in(SLOT), None);
+
+    // Running on a vCPU: refused, the slot is kicked.
+    let c = park(&zone, 3, 0x1000);
+    let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
+    assert_eq!(zone.switch_in(SLOT), Some(c));
+    assert_eq!(
+        zone.claim_for_host(zone.record_ref(c), None, Handback::Signal, &HostWait),
         HostClaim::El1Held { slot: SLOT }
     );
 }
@@ -353,9 +367,9 @@ fn records_are_reused_with_a_new_incarnation() {
 }
 
 /// The ownership invariant under contention: an EL1 waker and host
-/// claimants (signals) race for the same parked records; every record ends
-/// with exactly one owner, and no record is both on a run queue and host
-/// owned.
+/// claimants (signals) race for the same parked records (and take queued
+/// ones off the run queue); every record ends with exactly one owner, and no
+/// record is both on a run queue and host owned.
 #[test]
 fn concurrent_el1_wakes_and_host_claims_give_each_record_one_owner() {
     const ROUNDS: usize = 2_000;
@@ -402,11 +416,13 @@ fn concurrent_el1_wakes_and_host_claims_give_each_record_one_owner() {
                 other => panic!("round {round}: record left {other:?}"),
             }
         }
-        assert_eq!(queued, el1_woken.len(), "round {round}");
+        // A host claim may also take a thread EL1 woke off the run queue:
+        // every queued record is on the queue, none host owned is.
+        assert!(queued <= el1_woken.len(), "round {round}");
         assert_eq!(host, host_claimed, "round {round}");
         assert_eq!(queued + host, records.len(), "round {round}");
-        // Clean up for the next round.
-        let _ = drain(&zone, SLOT);
+        let (drained, _, _) = drain(&zone, SLOT);
+        assert_eq!(drained.len(), queued, "round {round}");
         for record in &records {
             zone.unlink_all(*record, &HostWait);
             zone.free_record(*record);
@@ -422,17 +438,13 @@ fn a_cancelled_record_is_discarded_not_run() {
     let a = park(&zone, 1, 0x1000);
     let b = park(&zone, 2, 0x1000);
     let _ = wake(&zone, 0x1000, 2, Waker::El1 { slot: SLOT }).unwrap();
-    for r in [a, b] {
-        assert!(matches!(
-            zone.claim_for_host(zone.record_ref(r), None, Handback::Cancelled, &HostWait),
-            HostClaim::El1Held { .. }
-        ));
-    }
+    // The host retired `a`'s thread while EL1 held it (a vCPU was running
+    // it when the claim was refused; it is queued again since).
     zone.record(a).request_cancel();
     assert_eq!(
         zone.runnable_head(SLOT),
-        None,
-        "the cancelled head is not run"
+        Some(b),
+        "the cancelled head is skipped, not run"
     );
     let (woken, discarded, _) = drain(&zone, SLOT);
     assert_eq!(discarded, [a]);
@@ -996,4 +1008,127 @@ fn stealing_takes_only_what_the_thief_may_run() {
         }
     );
     assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 1);
+}
+
+/// The executor sweeps records of retired threads off its run queue at an
+/// exit, and takes a service thread from the head.
+#[test]
+fn an_executor_sweeps_cancelled_records_and_takes_its_service_head() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let a = park(&zone, 1, 0x1000);
+    let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
+    zone.record(a).request_cancel();
+    let service = zone.alloc_host_runnable(identity(2)).unwrap();
+    assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(SLOT));
+    zone.leave_guest(SLOT, &HostWait);
+    assert_eq!(
+        zone.take_service_head(SLOT),
+        None,
+        "a cancelled record is first"
+    );
+    assert_eq!(zone.sweep_cancelled(SLOT), 1);
+    assert_eq!(zone.record(a).claim(), Claim::Free);
+    assert_eq!(zone.take_service_head(SLOT), Some(service));
+    assert_eq!(zone.record(service).claim(), Claim::Host { seq: 1 });
+    assert_eq!(zone.slot(SLOT).queued(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// EL1 plan 1d: the host places ready threads in the guest, never through a
+// host-owned state a claimant could take for runnable.
+
+fn host_wake(
+    zone: &ZoneTables,
+    uaddr: u64,
+    count: u32,
+    place: bool,
+) -> (u32, Vec<RecordId>, Vec<HostPlacement>) {
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, uaddr), &HostWait)
+        .unwrap();
+    let mut handed = Vec::new();
+    let mut placed = Vec::new();
+    let n = zone.wake_host(
+        &guard,
+        MM,
+        uaddr,
+        u32::MAX,
+        count,
+        place,
+        &mut |record| handed.push(record),
+        &mut |placement| placed.push(placement),
+    );
+    (n, handed, placed)
+}
+
+#[test]
+fn a_host_wake_queues_the_waiter_in_the_guest_directly() {
+    let zone = zone();
+    enter(&zone, OTHER, 1);
+    let a = park(&zone, 1, 0x1000);
+    let (n, handed, placed) = host_wake(&zone, 0x1000, 1, true);
+    assert_eq!(n, 1);
+    assert!(handed.is_empty(), "placed, not handed back");
+    assert_eq!(placed.len(), 1);
+    assert_eq!(placed[0].slot, OTHER);
+    assert!(matches!(zone.record(a).claim(), Claim::Queued { slot, .. } if slot == OTHER));
+    assert_eq!(zone.record(a).handback(), Some(Handback::Woken));
+    assert_eq!(zone.record(a).entry_count(), 0);
+    assert_eq!(zone.counters.host_wakes.load(Ordering::Relaxed), 0);
+
+    // No slot in the guest runs its address space: host owned, handed back.
+    let b = park(&zone, 2, 0x2000);
+    zone.leave_guest(OTHER, &HostWait);
+    let (n, handed, placed) = host_wake(&zone, 0x2000, 1, true);
+    assert_eq!((n, handed.as_slice(), placed.len()), (1, [b].as_slice(), 0));
+    assert!(matches!(zone.record(b).claim(), Claim::Host { .. }));
+
+    // The hatch (`place` false) never queues in the guest.
+    zone.enter_guest(OTHER);
+    let c = park(&zone, 3, 0x3000);
+    let (_, handed, placed) = host_wake(&zone, 0x3000, 1, false);
+    assert_eq!((handed.as_slice(), placed.len()), ([c].as_slice(), 0));
+}
+
+#[test]
+fn relocation_moves_queued_threads_between_run_queues_without_host_ownership() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    let a = park(&zone, 1, 0x1000);
+    let b = park(&zone, 2, 0x1000);
+    let _ = wake(&zone, 0x1000, 2, Waker::El1 { slot: SLOT }).unwrap();
+    zone.leave_guest(SLOT, &HostWait);
+    let mut handed = Vec::new();
+    let mut placed = Vec::new();
+    let moved = zone.relocate(
+        SLOT,
+        None,
+        &mut |record, discard| handed.push((record, discard)),
+        &mut |placement| placed.push(placement),
+    );
+    assert_eq!(moved, 2);
+    assert!(handed.is_empty());
+    assert_eq!(placed.len(), 2);
+    for record in [a, b] {
+        assert!(matches!(zone.record(record).claim(), Claim::Queued { slot, .. } if slot == OTHER));
+    }
+    assert_eq!(zone.runnable_head(SLOT), None);
+    assert_eq!(zone.runnable_head(OTHER), Some(a));
+
+    // Nowhere to go: host owned and handed back, a retired thread discarded.
+    zone.leave_guest(OTHER, &HostWait);
+    zone.record(b).request_cancel();
+    let moved = zone.relocate(
+        OTHER,
+        None,
+        &mut |record, discard| handed.push((record, discard)),
+        &mut |placement| placed.push(placement),
+    );
+    assert_eq!(moved, 2);
+    assert_eq!(handed, [(a, false), (b, true)]);
+    assert!(matches!(zone.record(a).claim(), Claim::Host { .. }));
+    assert_eq!(zone.record(a).handback(), Some(Handback::Woken));
+    assert_eq!(zone.record(b).handback(), Some(Handback::Cancelled));
 }

@@ -86,6 +86,15 @@ struct ZoneCounts {
     wfi_entries: u64,
     idle_exits: u64,
     misplaced: u64,
+    steals: u64,
+    service_exits: u64,
+    service_placements: u64,
+    ready_placements: u64,
+    service_adoptions: u64,
+    exit_adoptions: u64,
+    host_handbacks: u64,
+    host_queue_claims: u64,
+    host_executor_parks: u64,
 }
 
 impl ZoneCounts {
@@ -114,6 +123,15 @@ impl ZoneCounts {
             wfi_entries: load(&counters.el1_wfi_entries),
             idle_exits: load(&counters.el1_idle_exits),
             misplaced: load(&counters.el1_misplaced),
+            steals: load(&counters.el1_steals),
+            service_exits: load(&counters.el1_service_exits),
+            service_placements: load(&counters.host_service_placements),
+            ready_placements: load(&counters.host_ready_placements),
+            service_adoptions: load(&counters.service_adoptions),
+            exit_adoptions: load(&counters.exit_adoptions),
+            host_handbacks: load(&counters.host_handbacks),
+            host_queue_claims: load(&counters.host_queue_claims),
+            host_executor_parks: load(&counters.host_executor_parks),
         }
     }
 
@@ -133,6 +151,15 @@ impl ZoneCounts {
             wfi_entries: self.wfi_entries - before.wfi_entries,
             idle_exits: self.idle_exits - before.idle_exits,
             misplaced: self.misplaced - before.misplaced,
+            steals: self.steals - before.steals,
+            service_exits: self.service_exits - before.service_exits,
+            service_placements: self.service_placements - before.service_placements,
+            ready_placements: self.ready_placements - before.ready_placements,
+            service_adoptions: self.service_adoptions - before.service_adoptions,
+            exit_adoptions: self.exit_adoptions - before.exit_adoptions,
+            host_handbacks: self.host_handbacks - before.host_handbacks,
+            host_queue_claims: self.host_queue_claims - before.host_queue_claims,
+            host_executor_parks: self.host_executor_parks - before.host_executor_parks,
         }
     }
 }
@@ -307,17 +334,11 @@ fn el1_sched_exit_group_with_parked_threads() {
             "exit_group did not reach threads parked in the zone: {:?}",
             measured.zone
         );
-        // Part (e) of `kernel.el1.guest-scheduler`: the siblings parked with
-        // nothing to switch to idled their vCPUs in EL1, and exit_group's
-        // kicks forced those vCPUs out. Whether an idle vCPU reached WFI or
-        // was still polling (or stealing the handing-off pair's threads,
-        // EL1 plan 1d) when the kick came is timing; the WFI path itself is
-        // `el1_sched_signal_reaches_a_wfi_parked_vcpu`.
-        assert!(
-            measured.zone.idle_entries > 0 && measured.zone.idle_exits > 0,
-            "exit_group did not reach threads on idle vCPUs: {:?}",
-            measured.zone
-        );
+        // Part (e) of `kernel.el1.guest-scheduler`: exit_group reached the
+        // siblings parked in the zone (the control claims above). Since EL1
+        // plan 1d an idle vCPU is an executor waiting in the guest with no
+        // thread, so a parked sibling holds no vCPU to force out; the WFI
+        // path itself is `el1_sched_signal_reaches_a_wfi_parked_vcpu`.
     }
 }
 
@@ -342,11 +363,9 @@ fn el1_sched_exec_from_a_sibling_with_parked_threads() {
             "the exec drain did not reach threads parked in the zone: {:?}",
             measured.zone
         );
-        assert!(
-            measured.zone.wfi_entries > 0 && measured.zone.idle_exits > 0,
-            "the exec drain did not reach threads on vCPUs parked in WFI: {:?}",
-            measured.zone
-        );
+        // Since EL1 plan 1d an idle vCPU is an executor waiting in the guest
+        // with no thread: the drain reaches the parked siblings through their
+        // records (the control claims above), not through their vCPUs.
         assert_eq!(measured.result.stdout_utf8(), "exec-child ok\n");
     }
 }
@@ -538,6 +557,14 @@ fn el1_sched_idle_carrier_costs_no_host_cpu() {
             stdout.trim()
         );
         assert!(measured.result.success(), "{}", describe(&measured));
+        if measured.cpu_ns > measured.wall.as_nanos() as u64 / 2
+            && let Some(zone) = carrick_el1_abi::zone_tables()
+        {
+            // A busy idle carrier: what the vCPUs hold is the evidence.
+            let mut census = String::new();
+            let _ = zone.write_census(&mut census);
+            println!("el1-sched idle-carrier busy; zone census:\n{census}");
+        }
         assert!(
             measured.zone.wfi_entries > 0 && measured.zone.idle_entries >= 4,
             "the blocked threads did not idle their vCPUs in WFI: {:?}",
@@ -611,4 +638,102 @@ fn el1_sched_pstate_seen_by_the_guest_is_unchanged() {
         stdout.contains("sync_daif=0x3c0 async_daif=0x3c0 sync_el=0 async_el=0"),
         "{stdout:?}"
     );
+}
+
+/// Contract `kernel.el1.guest-run-queue` (EL1 plan 1d), part (a): a thread
+/// blocked in a host-served syscall (a pipe `read`) is resumed by the guest's
+/// scheduler. Two threads hand a byte back and forth over two pipes, so every
+/// turn blocks one in a host read and completes it from the other. The
+/// completed read becomes a service record in an EL1 run queue, and the
+/// executor of the vCPU EL1 runs it on serves it: no host run queue holds
+/// the thread and no host executor parks on a run-queue condvar waiting for
+/// it. Over the difference of a long and a short run, host run-queue claims
+/// and host executor parks per round trip must be zero in steady state
+/// (below 0.01), and every round trip is served through service records.
+/// Red: the same binary with `CARRICK_EL1_SCHED=0`, where completions go to
+/// host run queues (about two claims and two parks per round trip).
+#[test]
+fn el1_sched_host_blocked_read_resumes_by_guest_scheduling() {
+    const SHORT: u64 = 1_000;
+    const LONG: u64 = 6_000;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for iters in [SHORT, LONG, SHORT, LONG] {
+        let measured = run_fixture(
+            &carrier,
+            &["pipe-pingpong", &iters.to_string()],
+            Duration::from_secs(120),
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched pipe-pingpong iters={iters} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+            measured.exits,
+            measured.cpu_ns,
+            measured.wall.as_millis(),
+            measured.zone,
+            stdout.trim()
+        );
+        runs.push((
+            iters,
+            measured.zone,
+            measured.cpu_ns,
+            field(&stdout, "rt_p50_ns"),
+        ));
+    }
+    let span = (LONG - SHORT) as f64;
+    for pair in runs.chunks(2) {
+        let (short, long) = (&pair[0], &pair[1]);
+        let per = |f: fn(&ZoneCounts) -> u64| (f(&long.1) as f64 - f(&short.1) as f64) / span;
+        let claims = per(|z| z.host_queue_claims);
+        let parks = per(|z| z.host_executor_parks);
+        let services = per(|z| z.service_adoptions);
+        let cpu = (long.2 as f64 - short.2 as f64) / span;
+        println!(
+            "el1-sched host-blocked-read host_queue_claims_per_rt={claims:.4} \
+             host_executor_parks_per_rt={parks:.4} service_adoptions_per_rt={services:.3} \
+             carrier_cpu_ns_per_rt={cpu:.0} rt_p50_ns={:.0}",
+            long.3
+        );
+        assert!(
+            claims < 0.01 && parks < 0.01,
+            "a thread blocked in a host read went through host run queues: \
+             {claims:.3} claims and {parks:.3} executor parks per round trip"
+        );
+        assert!(
+            services >= 1.0,
+            "completed host reads were not served through the guest's run queues \
+             ({services:.3} service adoptions per round trip)"
+        );
+    }
+}
+
+/// Part (a) continued: a thread whose host-served `read` completes, queued
+/// on a vCPU that runs a thread computing without syscalls (both pinned to
+/// one guest CPU), gets that vCPU within the in-guest scheduler's slice. The
+/// host cannot send the reschedule SGI; its placement forces the vCPU out and
+/// the run loop raises it (with IRQs unmasked at EL0) so the slice starts.
+#[test]
+fn el1_sched_host_woken_thread_preempts_a_compute_loop() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    for _ in 0..3 {
+        let measured = run_fixture(&carrier, &["pipe-compute", "300"], Duration::from_secs(60));
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched pipe-compute exits={} zone={:?} {}",
+            measured.exits,
+            measured.zone,
+            stdout.trim()
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        let first = field(&stdout, "b_first_ms");
+        assert!(
+            (0.0..100.0).contains(&first),
+            "the woken thread waited {first} ms behind a computing one"
+        );
+    }
 }

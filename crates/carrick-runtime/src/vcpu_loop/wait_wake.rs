@@ -688,14 +688,26 @@ impl HvpatchRuntimeDirectory {
         if pool.is_some() {
             return Ok(false);
         }
-        // The scheduler's `P` count is the guest CPU count; the `M` count is
-        // still host parallelism, and the executors bind to the `P`s
-        // round-robin. Cutting `M` to `P` is the design's steady state and it
-        // no longer wedges — see `ExecutorPoolConfig` for the 2026-09-08
-        // measurement that retired that claim, and for why the timing
-        // comparison that replaced it is not yet conclusive.
-        // `CARRICK_BOUND_EXECUTORS` is the exact hatch that settles it without
-        // a rebuild.
+        let ptr = carrick_vmm_hvf::read_el1_region_host_ptr();
+        carrick_kernel::el1_delegation::record_el1_region_host_ptr(ptr);
+        // Before any executor starts: an executor that finds no guest
+        // scheduler parks on the host run queue, and would stay there once
+        // the guest schedules. The in-guest scheduler needs the in-kernel GIC (the virtual timer
+        // preempts and SGIs wake idle vCPUs in the guest); the zone reaches a
+        // vCPU slot from the host through its executor's vCPU.
+        carrick_kernel::el1_zone::enable(
+            carrick_vmm_hvf::gic::interrupt_model() == carrick_vmm_hvf::gic::InterruptModel::Gic,
+        );
+        carrick_kernel::el1_zone::register_slot_kicker(Box::new(|slot| {
+            carrick_vmm_hvf::vcpu_kick::kick_zone_slot(usize::from(slot.raw()));
+        }));
+        let scheduler = Arc::downgrade(&services.scheduler);
+        carrick_kernel::el1_zone::register_handback_publisher(Box::new(move |record| {
+            if let Some(scheduler) = scheduler.upgrade() {
+                scheduler.publish_zone_handback(record);
+            }
+        }));
+        // One `M` per `P` (guest CPU): see `ExecutorPoolConfig`.
         let bound_workers = executor::configured_bound_executors(services.scheduler.cpu_count());
         let spare_executors = executor::configured_spare_executors(services.scheduler.cpu_count());
         let factory = Arc::new(executor::HvpatchPersistentExecutorFactory::new(authority));
@@ -715,18 +727,8 @@ impl HvpatchRuntimeDirectory {
             .map_err(|error| RuntimeError::Configuration(error.to_string()))
         })?;
         *pool = Some(started);
-        let ptr = carrick_vmm_hvf::read_el1_region_host_ptr();
-        carrick_kernel::el1_delegation::record_el1_region_host_ptr(ptr);
-        // The in-guest scheduler needs the in-kernel GIC (the virtual timer
-        // preempts and SGIs wake idle vCPUs in the guest); the zone reaches a
-        // vCPU slot from the host through its executor's vCPU.
-        carrick_kernel::el1_zone::enable(
-            carrick_vmm_hvf::gic::interrupt_model() == carrick_vmm_hvf::gic::InterruptModel::Gic,
-        );
-        carrick_kernel::el1_zone::register_slot_kicker(Box::new(|slot| {
-            carrick_vmm_hvf::vcpu_kick::kick_zone_slot(usize::from(slot.raw()));
-        }));
         crate::el1_census::init_from_env();
+        crate::el1_census::spawn_zone_census_reporter();
         Ok(true)
     }
 

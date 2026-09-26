@@ -469,6 +469,19 @@ pub(crate) trait PersistentExecutor: 'static {
         Ok(())
     }
 
+    /// Wait for work in the guest (EL1 plan 1d): with no task loaded, run
+    /// this executor's vCPU in the EL1 scheduler until it leaves for the
+    /// host. `Unsupported`: the backend has no guest scheduler; the executor
+    /// parks on the host run queue instead.
+    fn wait_in_guest(&mut self) -> Result<GuestIdleExit, TrapError> {
+        Ok(GuestIdleExit::Unsupported)
+    }
+
+    /// The EL1 zone slot this executor's vCPU leases, if any.
+    fn zone_slot(&self) -> Option<carrick_el1_abi::SlotId> {
+        None
+    }
+
     #[cfg(test)]
     fn residency_generation(&self) -> super::residency::ResidencyGeneration {
         super::residency::ResidencyGeneration::INITIAL
@@ -483,6 +496,16 @@ pub(crate) trait PersistentExecutor: 'static {
             "persistent executor does not support resident snapshot".to_owned(),
         ))
     }
+}
+
+/// How an executor's wait in the guest ended ([`PersistentExecutor::wait_in_guest`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GuestIdleExit {
+    /// The vCPU left for the host: host work (a control request, a kick), or
+    /// a queued thread that needs this executor.
+    Idle,
+    /// No guest scheduler on this backend or carrier.
+    Unsupported,
 }
 
 pub struct ExactHardwareKick {
@@ -1119,6 +1142,53 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         Ok(())
     }
 
+    fn wait_in_guest(&mut self) -> Result<GuestIdleExit, TrapError> {
+        if carrick_kernel::el1_zone::zone().is_none() {
+            return Ok(GuestIdleExit::Unsupported);
+        }
+        if self.current.is_some() || self.binding.is_some() {
+            return Err(TrapError::Hypervisor(
+                "HVPatch executor waited in the guest with a task loaded".into(),
+            ));
+        }
+        // The idle entry overwrites the vCPU's registers: a task still
+        // resident on them is saved first.
+        self.flush_resident_task()?;
+        let (Some(slot), Some(zone)) = (self.zone_slot(), carrick_kernel::el1_zone::zone()) else {
+            return Ok(GuestIdleExit::Unsupported);
+        };
+        let frame = carrick_el1_abi::prepare_idle_entry(usize::from(slot.raw()))
+            .ok_or_else(|| TrapError::Hypervisor("idle entry without the EL1 region".into()))?;
+        carrick_vmm_hvf::vcpu_kick::bind_zone_slot_vcpu(usize::from(slot.raw()), self.raw_vcpu_id);
+        // No address space is installed while it waits: EL1 runs only threads
+        // that need this executor here, and steals none it could not run.
+        zone.publish_slot(slot, 0, self.bound_cpu, 0);
+        carrick_kernel::el1_zone::evict_foreign(slot, 0);
+        let lifecycle = self
+            .lifecycle
+            .as_mut()
+            .ok_or_else(|| TrapError::Hypervisor("HVPatch executor lost idle lifecycle".into()))?;
+        let vcpu = self
+            .vcpu
+            .as_mut()
+            .ok_or_else(|| TrapError::Hypervisor("HVPatch executor lost worker vCPU".into()))?;
+        zone.enter_guest(slot);
+        let exit =
+            carrick_vmm_hvf::hvf_aarch64_engine::run_worker_idle_entry(lifecycle, vcpu, frame);
+        zone.leave_guest(slot, &carrick_kernel::el1_zone::HostLockWait);
+        match exit? {
+            carrick_aarch64::Aarch64Exit::Halt => Ok(GuestIdleExit::Idle),
+            other => Err(TrapError::Hypervisor(format!(
+                "a vCPU waiting in the guest left at EL0 ({other:?}) with no address space installed"
+            ))),
+        }
+    }
+
+    fn zone_slot(&self) -> Option<carrick_el1_abi::SlotId> {
+        self.live_mailbox_slot()
+            .and_then(carrick_el1_abi::SlotId::from_index)
+    }
+
     fn flush_resident_task(&mut self) -> Result<(), TrapError> {
         if let Some(resident) = self.resident_task.take() {
             let vcpu = self.vcpu.as_ref().ok_or_else(|| {
@@ -1194,9 +1264,9 @@ impl HvpatchPersistentExecutor {
 
 /// Publish the zone identity of the task just loaded on mailbox `slot`: its
 /// process's zone key (0 when the zone is off, so EL1 forwards every futex
-/// operation), its thread serial, and the slot's vCPU for zone kicks. The
-/// slot's EL1 scheduler state must be empty: the previous residency's last
-/// exit settled it.
+/// operation), its thread serial, and the slot's vCPU for zone kicks. No
+/// thread may be switched in on the slot (the previous residency's last exit
+/// settled it); queued threads of another address space are moved away.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn publish_zone_slot(
     slot: usize,
@@ -1219,6 +1289,9 @@ fn publish_zone_slot(
             );
         }
         zone.publish_slot(zone_slot, mm, bound_cpu, affinity);
+        // Threads queued here for another address space cannot run on this
+        // one: they go where they can.
+        carrick_kernel::el1_zone::evict_foreign(zone_slot, mm);
     }
     carrick_el1_abi::publish_zone_identity(slot, mm, serial);
 }
