@@ -349,18 +349,9 @@ impl InventoryExtentMap {
     }
 
     /// Values may be edited in place; keys, and so the index, cannot be.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
     pub(crate) fn get_mut(&mut self, key: &(u64, u64)) -> Option<&mut InventoryExtent> {
         self.extents.get_mut(key)
-    }
-
-    /// Values may be edited in place; keys, and so the index, cannot be.
-    #[cfg(any(test, feature = "foreign-cow-test-support"))]
-    #[allow(dead_code)]
-    pub(crate) fn values_mut(
-        &mut self,
-    ) -> std::collections::btree_map::ValuesMut<'_, (u64, u64), InventoryExtent> {
-        self.extents.values_mut()
     }
 
     /// The first extent, in `(start, length)` key order, whose logical IPA
@@ -2408,13 +2399,16 @@ impl HvfVmState {
     pub(crate) fn rollback_pre_image(
         scratch: &mut Option<carrick_mmu_core::aarch64::PageTableManager>,
         manager: &carrick_mmu_core::aarch64::PageTableManager,
-    ) -> carrick_mmu_core::aarch64::PageTableManager {
+    ) -> Result<
+        carrick_mmu_core::aarch64::PageTableManager,
+        carrick_mmu_core::aarch64::PageTableError,
+    > {
         match scratch.take() {
             Some(mut reused) => {
-                reused.clone_from(manager);
-                reused
+                manager.snapshot_into(&mut reused)?;
+                Ok(reused)
             }
-            None => manager.clone(),
+            None => manager.snapshot_image(),
         }
     }
 

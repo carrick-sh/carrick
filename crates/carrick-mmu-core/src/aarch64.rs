@@ -486,16 +486,28 @@ pub trait TableArenaSource: core::fmt::Debug + Send + 'static {
 ///
 /// # Safety
 /// Implementations must guarantee:
-/// - If `host_ptr_for_base(base)` returns `Some(ptr)`, `ptr` points to valid, resident
-///   host memory of at least the arena's capacity, aligned to at least 8 bytes.
-/// - If `host_const_ptr_for_base(base)` returns `Some(ptr)`, `ptr` points to valid, resident
-///   host memory of at least the arena's capacity, aligned to at least 8 bytes.
+/// - If `host_ptr_for_range(base, len)` / `host_ptr_for_base(base)` returns `Some(ptr)`,
+///   `ptr` points to valid, resident host memory of at least `len` bytes (or arena capacity),
+///   aligned to at least 8 bytes.
+/// - If `host_const_ptr_for_range(base, len)` / `host_const_ptr_for_base(base)` returns `Some(ptr)`,
+///   `ptr` points to valid, resident host memory of at least `len` bytes (or arena capacity),
+///   aligned to at least 8 bytes.
 /// - The host memory must remain valid and resident for the duration of the access or be
 ///   protected by retained ownership/pins within the resolver.
 pub unsafe trait HostArenaResolver {
+    /// Return the writable host pointer for the arena at `base` covering at least `len` bytes.
+    fn host_ptr_for_range(&self, base: u64, _len: usize) -> Option<*mut u8> {
+        self.host_ptr_for_base(base)
+    }
+
     /// Return the writable host pointer for the arena with guest-physical base `base`.
     fn host_ptr_for_base(&self, _base: u64) -> Option<*mut u8> {
         None
+    }
+
+    /// Return the readable host pointer for the arena at `base` covering at least `len` bytes.
+    fn host_const_ptr_for_range(&self, base: u64, len: usize) -> Option<*const u8> {
+        self.host_ptr_for_range(base, len).map(|p| p.cast_const())
     }
 
     /// Return the readable host pointer for the arena with guest-physical base `base`.
@@ -518,6 +530,10 @@ unsafe impl HostArenaResolver for (u64, *mut u8) {
 }
 
 unsafe impl HostArenaResolver for (u64, *const u8) {
+    fn host_const_ptr_for_range(&self, base: u64, _len: usize) -> Option<*const u8> {
+        (self.0 == base).then_some(self.1)
+    }
+
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         (self.0 == base).then_some(self.1)
     }
@@ -542,39 +558,46 @@ unsafe impl HostArenaResolver for &[(u64, *mut u8)] {
 }
 
 unsafe impl<const N: usize> HostArenaResolver for [(u64, *const u8); N] {
+    fn host_const_ptr_for_range(&self, base: u64, _len: usize) -> Option<*const u8> {
+        self.iter().find_map(|&(b, p)| (b == base).then_some(p))
+    }
+
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
     }
 }
 
 unsafe impl<const N: usize> HostArenaResolver for &[(u64, *const u8); N] {
+    fn host_const_ptr_for_range(&self, base: u64, _len: usize) -> Option<*const u8> {
+        self.iter().find_map(|&(b, p)| (b == base).then_some(p))
+    }
+
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
     }
 }
 
 unsafe impl HostArenaResolver for &[(u64, *const u8)] {
+    fn host_const_ptr_for_range(&self, base: u64, _len: usize) -> Option<*const u8> {
+        self.iter().find_map(|&(b, p)| (b == base).then_some(p))
+    }
+
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
     }
 }
 
-unsafe impl<F> HostArenaResolver for F
-where
-    F: Fn(u64) -> Option<*mut u8>,
-{
-    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
-        (self)(base)
-    }
-}
-
 #[derive(Copy, Clone, Debug)]
-pub struct ConstFnResolver<F>(pub F);
+pub struct ConstFnResolver<F>(F);
 
 unsafe impl<F> HostArenaResolver for ConstFnResolver<F>
 where
     F: Fn(u64) -> Option<*const u8>,
 {
+    fn host_const_ptr_for_range(&self, base: u64, _len: usize) -> Option<*const u8> {
+        (self.0)(base)
+    }
+
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         (self.0)(base)
     }
@@ -584,18 +607,34 @@ unsafe impl<F> HostArenaResolver for &ConstFnResolver<F>
 where
     F: Fn(u64) -> Option<*const u8>,
 {
+    fn host_const_ptr_for_range(&self, base: u64, _len: usize) -> Option<*const u8> {
+        (self.0)(base)
+    }
+
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         (self.0)(base)
     }
 }
 
-pub fn const_resolver<F: Fn(u64) -> Option<*const u8>>(f: F) -> ConstFnResolver<F> {
+/// Wrap a closure as a `HostArenaResolver`.
+///
+/// # Safety
+/// The provided closure `f` must return valid host pointers adhering to `HostArenaResolver`.
+pub unsafe fn const_resolver<F: Fn(u64) -> Option<*const u8>>(f: F) -> ConstFnResolver<F> {
     ConstFnResolver(f)
 }
 
 unsafe impl HostArenaResolver for Arc<dyn HostArenaResolver + Send + Sync> {
+    fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
+        (**self).host_ptr_for_range(base, len)
+    }
+
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         (**self).host_ptr_for_base(base)
+    }
+
+    fn host_const_ptr_for_range(&self, base: u64, len: usize) -> Option<*const u8> {
+        (**self).host_const_ptr_for_range(base, len)
     }
 
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
@@ -608,8 +647,16 @@ unsafe impl HostArenaResolver for Arc<dyn HostArenaResolver + Send + Sync> {
 }
 
 unsafe impl HostArenaResolver for &Arc<dyn HostArenaResolver + Send + Sync> {
+    fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
+        (***self).host_ptr_for_range(base, len)
+    }
+
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         (***self).host_ptr_for_base(base)
+    }
+
+    fn host_const_ptr_for_range(&self, base: u64, len: usize) -> Option<*const u8> {
+        (***self).host_const_ptr_for_range(base, len)
     }
 
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
@@ -810,78 +857,6 @@ struct UndoJournal {
     first_written: hashbrown::HashSet<(usize, usize)>,
 }
 
-impl Clone for PageTableManager {
-    fn clone(&self) -> Self {
-        if self.is_live() {
-            self.snapshot_image().unwrap_or_else(|_| Self {
-                arenas: self.arenas.clone(),
-                layout: self.layout,
-                asid_scoped_leaves: self.asid_scoped_leaves,
-                free_tables: self.free_tables.clone(),
-                multi_vcpu: self.multi_vcpu,
-                offline_private_image: self.offline_private_image,
-                stage1_exclusive: self.stage1_exclusive,
-                reclaim_pending: self.reclaim_pending,
-                dirty: self.dirty.clone(),
-                staged: self.staged.clone(),
-                resolver: self.resolver.clone(),
-                undo: self.undo.clone(),
-            })
-        } else {
-            Self {
-                arenas: self.arenas.clone(),
-                layout: self.layout,
-                asid_scoped_leaves: self.asid_scoped_leaves,
-                free_tables: self.free_tables.clone(),
-                multi_vcpu: self.multi_vcpu,
-                offline_private_image: self.offline_private_image,
-                stage1_exclusive: self.stage1_exclusive,
-                reclaim_pending: self.reclaim_pending,
-                dirty: self.dirty.clone(),
-                staged: self.staged.clone(),
-                resolver: self.resolver.clone(),
-                undo: self.undo.clone(),
-            }
-        }
-    }
-
-    /// Overwrite `self` with `source`, reusing `self`'s buffers. Every field is
-    /// copied, so the result is indistinguishable from `clone()`; only the
-    /// allocations differ. `Vec::clone_from` keeps the destination's capacity,
-    /// which is the entire point on the 1.75 MiB table image.
-    fn clone_from(&mut self, source: &Self) {
-        if source.is_live() {
-            if source.snapshot_into(self).is_err() {
-                self.arenas.clone_from(&source.arenas);
-                self.layout = source.layout;
-                self.asid_scoped_leaves = source.asid_scoped_leaves;
-                self.free_tables.clone_from(&source.free_tables);
-                self.multi_vcpu = source.multi_vcpu;
-                self.offline_private_image = source.offline_private_image;
-                self.stage1_exclusive = source.stage1_exclusive;
-                self.reclaim_pending = source.reclaim_pending;
-                self.dirty.clone_from(&source.dirty);
-                self.staged.clone_from(&source.staged);
-                self.resolver = source.resolver.clone();
-                self.undo.clone_from(&source.undo);
-            }
-        } else {
-            self.arenas.clone_from(&source.arenas);
-            self.layout = source.layout;
-            self.asid_scoped_leaves = source.asid_scoped_leaves;
-            self.free_tables.clone_from(&source.free_tables);
-            self.multi_vcpu = source.multi_vcpu;
-            self.offline_private_image = source.offline_private_image;
-            self.stage1_exclusive = source.stage1_exclusive;
-            self.reclaim_pending = source.reclaim_pending;
-            self.dirty.clone_from(&source.dirty);
-            self.staged.clone_from(&source.staged);
-            self.resolver = source.resolver.clone();
-            self.undo.clone_from(&source.undo);
-        }
-    }
-}
-
 impl PageTableManager {
     /// Caller-supplied layout constraints retained by this image.
     pub fn layout(&self) -> PageTableLayoutConfig {
@@ -929,7 +904,7 @@ impl PageTableManager {
         resolver: Arc<dyn HostArenaResolver + Send + Sync>,
     ) -> Result<Self, PageTableError> {
         let host_ptr = resolver
-            .host_const_ptr_for_base(base)
+            .host_const_ptr_for_range(base, primary_capacity)
             .ok_or(PageTableError::UnresolvedArena(base))?;
         let walk = unsafe {
             walk_descriptors_host(host_ptr, primary_capacity, base, layout.user_leaf_check_va)
@@ -981,7 +956,10 @@ impl PageTableManager {
     }
 
     /// Bind or update the host arena resolver for this live manager.
-    pub fn bind_resolver(&mut self, resolver: Arc<dyn HostArenaResolver + Send + Sync>) {
+    ///
+    /// # Safety
+    /// `resolver` must uphold the safety contracts of `HostArenaResolver`.
+    pub unsafe fn bind_resolver(&mut self, resolver: Arc<dyn HostArenaResolver + Send + Sync>) {
         self.resolver = Some(resolver);
     }
 
@@ -996,8 +974,8 @@ impl PageTableManager {
         target.free_tables.clear();
         target.free_tables.extend_from_slice(&self.free_tables);
         target.multi_vcpu = self.multi_vcpu;
-        target.offline_private_image = true;
-        target.stage1_exclusive = true;
+        target.offline_private_image = self.offline_private_image;
+        target.stage1_exclusive = self.stage1_exclusive;
         target.reclaim_pending = self.reclaim_pending;
         target.dirty.clear();
         target.dirty.extend_from_slice(&self.dirty);
@@ -1051,7 +1029,7 @@ impl PageTableManager {
                         .as_ref()
                         .ok_or(PageTableError::UnresolvedArena(src_arena.base))?;
                     let host = resolver
-                        .host_const_ptr_for_base(src_arena.base)
+                        .host_const_ptr_for_range(src_arena.base, prefix_len)
                         .ok_or(PageTableError::UnresolvedArena(src_arena.base))?;
                     let words = prefix_len / 8;
                     for w in 0..words {
@@ -1068,7 +1046,7 @@ impl PageTableManager {
                         .as_ref()
                         .ok_or(PageTableError::UnresolvedArena(src_arena.base))?;
                     let host = resolver
-                        .host_const_ptr_for_base(src_arena.base)
+                        .host_const_ptr_for_range(src_arena.base, prefix_len)
                         .ok_or(PageTableError::UnresolvedArena(src_arena.base))?;
                     let words = prefix_len / 8;
                     for w in 0..words {
@@ -1391,7 +1369,7 @@ impl PageTableManager {
                     .as_ref()
                     .ok_or(PageTableError::UnresolvedArena(primary.base))?;
                 let host = resolver
-                    .host_const_ptr_for_base(primary.base)
+                    .host_const_ptr_for_range(primary.base, prefix_len)
                     .ok_or(PageTableError::UnresolvedArena(primary.base))?;
                 let words = prefix_len / 8;
                 for w in 0..words {
@@ -1427,7 +1405,12 @@ impl PageTableManager {
                 let Some(ref resolver) = self.resolver else {
                     return Err(PageTableError::UnresolvedArena(arena.base));
                 };
-                let Some(host) = resolver.host_const_ptr_for_base(arena.base) else {
+                let requested_len = loc
+                    .offset
+                    .checked_add(8)
+                    .ok_or(PageTableError::BadAddress)?;
+                let Some(host) = resolver.host_const_ptr_for_range(arena.base, requested_len)
+                else {
                     return Err(PageTableError::UnresolvedArena(arena.base));
                 };
                 use core::sync::atomic::{AtomicU64, Ordering};
@@ -1531,11 +1514,12 @@ impl PageTableManager {
         };
         for (loc, _) in &self.dirty {
             if hosts[loc.arena].is_none() {
-                let base = self.arenas[loc.arena].base;
+                let arena = &self.arenas[loc.arena];
+                let span = (arena.allocated_span() as usize).min(arena.capacity);
                 hosts[loc.arena] = Some(
                     resolver
-                        .host_ptr_for_base(base)
-                        .ok_or(PageTableError::UnresolvedArena(base))?,
+                        .host_ptr_for_range(arena.base, span)
+                        .ok_or(PageTableError::UnresolvedArena(arena.base))?,
                 );
             }
         }
@@ -1620,11 +1604,29 @@ impl PageTableManager {
         &mut self,
         resolver: impl HostArenaResolver,
         mut source: Option<&mut dyn TableArenaSource>,
-    ) -> Vec<u64> {
+    ) -> Result<Vec<u64>, PageTableError> {
         use core::sync::atomic::{AtomicU64, Ordering, fence};
 
-        let Some(journal) = self.undo.take() else {
-            return Vec::new();
+        let Some(ref journal) = self.undo else {
+            return Ok(Vec::new());
+        };
+
+        // Pre-validate that all touched arenas resolve before modifying recoverable state.
+        for &(loc, _) in &journal.words {
+            if loc.arena < self.arenas.len() {
+                let arena = &self.arenas[loc.arena];
+                if resolver
+                    .host_ptr_for_range(arena.base, loc.offset + 8)
+                    .is_none()
+                {
+                    return Err(PageTableError::UnresolvedArena(arena.base));
+                }
+            }
+        }
+
+        let journal = match self.undo.take() {
+            Some(j) => j,
+            None => return Ok(Vec::new()),
         };
         for &(loc, previous) in journal.words.iter().rev() {
             self.staged.remove(&loc);
@@ -1638,7 +1640,7 @@ impl PageTableManager {
                 TableArenaStorage::Live => {}
             }
             fence(Ordering::SeqCst);
-            if let Some(host) = resolver.host_ptr_for_base(arena.base) {
+            if let Some(host) = resolver.host_ptr_for_range(arena.base, loc.offset + 8) {
                 unsafe {
                     let slot = host.add(loc.offset).cast::<AtomicU64>();
                     (*slot).store(previous, Ordering::Release);
@@ -1667,33 +1669,39 @@ impl PageTableManager {
                 source.return_arena(SubstrateGpa(arena.base));
             }
         }
-        popped
+        Ok(popped)
     }
 
     /// Replace the live host backing with this manager's complete image across all arenas.
     ///
     /// # Safety
     /// `resolver` must return writable mappings for all attached arenas.
-    pub unsafe fn restore_quiesced_snapshot_to_host(&self, resolver: impl HostArenaResolver) {
+    pub unsafe fn restore_quiesced_snapshot_to_host(
+        &self,
+        resolver: impl HostArenaResolver,
+    ) -> Result<(), PageTableError> {
         use core::sync::atomic::{Ordering, fence};
 
         for arena in &self.arenas {
-            if let Some(host) = resolver.host_ptr_for_base(arena.base) {
-                match arena.storage {
-                    TableArenaStorage::Owned(ref bytes) => {
-                        let prefix_len = (arena.next_free as usize).min(bytes.len());
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(bytes.as_ptr(), host, prefix_len);
-                        }
-                        resolver.record_populated_prefix(arena.base, prefix_len);
+            let prefix_len = (arena.next_free as usize).min(arena.capacity);
+            let host = resolver
+                .host_ptr_for_range(arena.base, prefix_len)
+                .ok_or(PageTableError::UnresolvedArena(arena.base))?;
+            match arena.storage {
+                TableArenaStorage::Owned(ref bytes) => {
+                    let copy_len = prefix_len.min(bytes.len());
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), host, copy_len);
                     }
-                    TableArenaStorage::Live => {
-                        resolver.record_populated_prefix(arena.base, arena.next_free as usize);
-                    }
+                    resolver.record_populated_prefix(arena.base, copy_len);
+                }
+                TableArenaStorage::Live => {
+                    resolver.record_populated_prefix(arena.base, prefix_len);
                 }
             }
         }
         fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Record the populated prefix across all arenas using `recorder`.
@@ -1852,7 +1860,7 @@ impl PageTableManager {
         for level in 0..4_usize {
             let off = table_off + idx[level] * 8;
             let host = resolver
-                .host_const_ptr_for_base(current_base)
+                .host_const_ptr_for_range(current_base, off + 8)
                 .ok_or(PageTableError::UnresolvedArena(current_base))?;
             let desc = unsafe {
                 let slot = host.add(off).cast::<AtomicU64>();
@@ -3121,6 +3129,7 @@ impl PageTableManager {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic)]
     use super::*;
     use alloc::boxed::Box;
     use alloc::vec;
@@ -3374,7 +3383,7 @@ mod tests {
                 .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, false, None)
                 .ok();
 
-            let oracle = journalled.clone();
+            let oracle = journalled.snapshot_image().expect("snapshot oracle");
             journalled.begin_undo();
             assert!(journalled.undo_is_open());
             for edit in edits.iter().take(length) {
@@ -3382,7 +3391,9 @@ mod tests {
             }
             let mut host = journalled.as_bytes().to_vec();
             unsafe {
-                journalled.rollback_undo((journalled.base(), host.as_mut_ptr()), None);
+                journalled
+                    .rollback_undo((journalled.base(), host.as_mut_ptr()), None)
+                    .unwrap();
             };
 
             assert!(
@@ -3464,7 +3475,7 @@ mod tests {
         mgr.begin_undo();
         mgr.set_readonly(LINUX_HEAP_BASE, 0x4000, false, None)
             .expect("protect heap");
-        let after = mgr.clone();
+        let after = mgr.snapshot_image().expect("snapshot after");
         mgr.commit_undo();
         assert!(!mgr.undo_is_open());
         assert_eq!(mgr.as_bytes(), after.as_bytes());
@@ -3561,7 +3572,7 @@ mod tests {
     }
 
     #[test]
-    fn clone_from_reproduces_clone_and_keeps_the_buffer() {
+    fn snapshot_into_reproduces_snapshot_and_keeps_the_buffer() {
         let mut source = manager();
         source
             .map_private_aliased(LINUX_HEAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, true, None)
@@ -3573,9 +3584,9 @@ mod tests {
             TableArenaStorage::Owned(ref bytes) => bytes.capacity(),
             TableArenaStorage::Live => 0,
         };
-        recycled.clone_from(&source);
+        source.snapshot_into(&mut recycled).expect("snapshot_into");
 
-        let fresh = source.clone();
+        let fresh = source.snapshot_image().expect("snapshot_image");
         assert_eq!(recycled.as_bytes(), fresh.as_bytes());
         assert_eq!(recycled.base(), fresh.base());
         assert_eq!(recycled.pool_stats(), fresh.pool_stats());
@@ -3591,7 +3602,7 @@ mod tests {
     }
 
     #[test]
-    fn clone_copies_only_populated_prefix_and_preserves_capacity() {
+    fn snapshot_copies_only_populated_prefix_and_preserves_capacity() {
         let mut source = manager();
         source
             .map_private_aliased(LINUX_HEAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, true, None)
@@ -3619,7 +3630,7 @@ mod tests {
             PageTableError::BadAddress
         );
 
-        let cloned = source.clone();
+        let cloned = source.snapshot_image().expect("snapshot_image");
         assert_eq!(cloned.copied_bytes(), populated);
         let cloned_len = match cloned.arenas[0].storage {
             TableArenaStorage::Owned(ref bytes) => bytes.len(),
@@ -4170,7 +4181,7 @@ mod tests {
         let (parent_in_use, _, _, _) = parent.pool_stats();
         assert!(parent_in_use >= 2, "two splits allocated >=2 tables");
 
-        let mut child = parent.clone();
+        let mut child = parent.snapshot_image().expect("snapshot child");
         assert_eq!(child.pool_stats(), parent.pool_stats(), "cursor preserved");
         assert!(!child.is_valid(LINUX_MMAP_BASE + 0x10_0000));
         assert!(child.is_valid(LINUX_MMAP_BASE + 0x10_0000 + 0x1000));
@@ -4390,14 +4401,14 @@ mod tests {
             "and it is refused with a teardown still pending"
         );
 
-        let mut inherited = parent.clone();
+        let mut inherited = parent.snapshot_image().expect("snapshot inherited");
         assert_eq!(
             inherited.set_prot_none(block, 0x1000, None),
             Err(PageTableError::OutOfTables),
             "the inherited marker keeps refusing the sweep"
         );
 
-        let mut offline = parent.clone();
+        let mut offline = parent.snapshot_image().expect("snapshot offline");
         offline.declare_offline_private_image();
         assert_eq!(
             offline.set_prot_none(block, 0x1000, None),
@@ -4468,7 +4479,11 @@ mod tests {
         let snapshot = manager();
         let mut live = vec![0xa5; snapshot.arenas[0].capacity];
 
-        unsafe { snapshot.restore_quiesced_snapshot_to_host((snapshot.base(), live.as_mut_ptr())) };
+        unsafe {
+            snapshot
+                .restore_quiesced_snapshot_to_host((snapshot.base(), live.as_mut_ptr()))
+                .unwrap()
+        };
 
         assert_eq!(&live[..snapshot.as_bytes().len()], snapshot.as_bytes());
         assert!(
@@ -4829,7 +4844,7 @@ mod tests {
             available: Arc::new(Mutex::new(vec![ext_base])),
             returned: Arc::new(Mutex::new(Vec::new())),
         };
-        let image = live.clone();
+        let image = live.snapshot_image().expect("snapshot live");
 
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let va = LINUX_MMAP_BASE + 600 * TWO_MIB + 0x1000;
@@ -4896,7 +4911,7 @@ mod tests {
             (mgr.base(), host_arena0.as_mut_ptr()),
             (ext_base.0, host_arena1.as_mut_ptr()),
         ];
-        unsafe { mgr.rollback_undo(&resolver[..], Some(&mut source)) };
+        unsafe { mgr.rollback_undo(&resolver[..], Some(&mut source)).unwrap() };
         assert_eq!(mgr.pool_stats().3, 1, "pool reports 1 arena after rollback");
         assert_eq!(
             returned.lock().unwrap().as_slice(),
@@ -4947,12 +4962,19 @@ mod tests {
                 (loc.offset / 8, word)
             })
             .collect();
+        struct CountingResolver<'a> {
+            calls: &'a Cell<usize>,
+            ptr: *mut u8,
+        }
+        unsafe impl HostArenaResolver for CountingResolver<'_> {
+            fn host_ptr_for_base(&self, _base: u64) -> Option<*mut u8> {
+                self.calls.set(self.calls.get() + 1);
+                Some(self.ptr)
+            }
+        }
         unsafe {
-            mgr.sync_to_host(|_| {
-                calls.set(calls.get() + 1);
-                Some(ptr)
-            })
-            .unwrap();
+            mgr.sync_to_host(CountingResolver { calls: &calls, ptr })
+                .unwrap();
         }
         for (offset, word) in expected {
             assert_eq!(host[offset], word);
@@ -5036,8 +5058,35 @@ mod tests {
         assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas");
 
         let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
-        let resolver = [(mgr.base(), host_arena0.as_mut_ptr())];
-        unsafe { mgr.rollback_undo(&resolver[..], Some(&mut source)) };
+        let mut host_arena1 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+        // Partial resolver missing extension arena must fail closed and preserve journal
+        let partial_resolver = [(mgr.base(), host_arena0.as_mut_ptr())];
+        let rollback_err = unsafe { mgr.rollback_undo(&partial_resolver[..], Some(&mut source)) };
+        assert_eq!(
+            rollback_err,
+            Err(PageTableError::UnresolvedArena(ext_base.0)),
+            "rollback_undo with missing extension arena must fail closed"
+        );
+        assert!(
+            mgr.undo_is_open(),
+            "journal must be preserved on rollback failure"
+        );
+        assert!(
+            returned.lock().unwrap().is_empty(),
+            "no arenas returned on failure"
+        );
+        assert_eq!(mgr.pool_stats().3, 2, "arenas preserved on failure");
+
+        // Full resolver succeeds and pops extension arena
+        let full_resolver = [
+            (mgr.base(), host_arena0.as_mut_ptr()),
+            (ext_base.0, host_arena1.as_mut_ptr()),
+        ];
+        let popped = unsafe {
+            mgr.rollback_undo(&full_resolver[..], Some(&mut source))
+                .unwrap()
+        };
+        assert_eq!(popped, vec![ext_base.0]);
         assert_eq!(returned.lock().unwrap().as_slice(), &[ext_base]);
         assert_eq!(mgr.pool_stats().3, 1, "pool reports 1 arena after rollback");
     }
@@ -5071,28 +5120,33 @@ mod tests {
             (ext_base.0, host_arena1.as_mut_ptr()),
         ];
         unsafe {
-            mgr.restore_quiesced_snapshot_to_host(&full_resolver[..]);
+            mgr.restore_quiesced_snapshot_to_host(&full_resolver[..])
+                .unwrap();
         };
 
-        let partial_resolver = crate::aarch64::const_resolver(|base: u64| -> Option<*const u8> {
-            if base == mgr.base() {
-                Some(host_arena0.as_ptr())
-            } else {
-                None
-            }
-        });
+        let partial_resolver = unsafe {
+            crate::aarch64::const_resolver(|base: u64| -> Option<*const u8> {
+                if base == mgr.base() {
+                    Some(host_arena0.as_ptr())
+                } else {
+                    None
+                }
+            })
+        };
         let res = unsafe { mgr.debug_walk_host(partial_resolver, va) };
         assert_eq!(res, Err(PageTableError::UnresolvedArena(ext_base.0)));
 
-        let good_resolver = crate::aarch64::const_resolver(|base: u64| -> Option<*const u8> {
-            if base == mgr.base() {
-                Some(host_arena0.as_ptr())
-            } else if base == ext_base.0 {
-                Some(host_arena1.as_ptr())
-            } else {
-                None
-            }
-        });
+        let good_resolver = unsafe {
+            crate::aarch64::const_resolver(|base: u64| -> Option<*const u8> {
+                if base == mgr.base() {
+                    Some(host_arena0.as_ptr())
+                } else if base == ext_base.0 {
+                    Some(host_arena1.as_ptr())
+                } else {
+                    None
+                }
+            })
+        };
         let walk = unsafe { mgr.debug_walk_host(good_resolver, va).unwrap() };
         assert_eq!(walk, mgr.debug_walk(va));
     }
@@ -5121,7 +5175,7 @@ mod tests {
             .expect("allocates first extension arena");
         assert_eq!(parent.pool_stats().3, 2, "parent has 2 arenas");
 
-        let mut child2 = parent.clone();
+        let mut child2 = parent.snapshot_image().expect("snapshot child2");
         let child_root = 0x50_0000_0000;
         assert_eq!(
             child2.rebase(child_root, None).unwrap_err(),
@@ -5137,7 +5191,7 @@ mod tests {
         });
         assert_eq!(parent.pool_stats().3, 3, "parent has 3 arenas");
 
-        let mut child = parent.clone();
+        let mut child = parent.snapshot_image().expect("snapshot child");
 
         assert_eq!(
             child.rebase(child_root, None).unwrap_err(),
@@ -5274,14 +5328,30 @@ mod tests {
     }
 
     unsafe impl HostArenaResolver for MockLiveResolver {
-        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
             let mut arenas = self.arenas.lock().unwrap();
-            arenas.get_mut(&base).map(|buf| buf.as_mut_ptr())
+            let buf = arenas.get_mut(&base)?;
+            if len > buf.len() {
+                return None;
+            }
+            Some(buf.as_mut_ptr())
+        }
+
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            self.host_ptr_for_range(base, 0)
+        }
+
+        fn host_const_ptr_for_range(&self, base: u64, len: usize) -> Option<*const u8> {
+            let arenas = self.arenas.lock().unwrap();
+            let buf = arenas.get(&base)?;
+            if len > buf.len() {
+                return None;
+            }
+            Some(buf.as_ptr())
         }
 
         fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
-            let arenas = self.arenas.lock().unwrap();
-            arenas.get(&base).map(|buf| buf.as_ptr())
+            self.host_const_ptr_for_range(base, 0)
         }
 
         fn record_populated_prefix(&self, base: u64, prefix_len: usize) {
@@ -5290,8 +5360,16 @@ mod tests {
     }
 
     unsafe impl HostArenaResolver for &MockLiveResolver {
+        fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
+            (*self).host_ptr_for_range(base, len)
+        }
+
         fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
             (*self).host_ptr_for_base(base)
+        }
+
+        fn host_const_ptr_for_range(&self, base: u64, len: usize) -> Option<*const u8> {
+            (*self).host_const_ptr_for_range(base, len)
         }
 
         fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
@@ -5312,7 +5390,7 @@ mod tests {
         let va = 0x50_0000;
         let ipa = 0x80_0000;
         mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
-        unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) };
+        unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver).unwrap() };
 
         unsafe { mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>) };
         assert!(mgr.is_live());
@@ -5373,7 +5451,7 @@ mod tests {
         let va = 0x50_0000;
         let ipa = 0x80_0000;
         mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
-        unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) };
+        unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver).unwrap() };
 
         unsafe { mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>) };
 
@@ -5415,7 +5493,7 @@ mod tests {
         let ipa_a = 0x80_0000;
         mgr.map_aliased(va, ipa_a, 0x1000, false, None)
             .expect("map");
-        unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) };
+        unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver).unwrap() };
 
         unsafe { mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>) };
         assert_eq!(mgr.translate(va), Some(ipa_a));
@@ -5434,7 +5512,7 @@ mod tests {
         );
 
         // Rollback
-        unsafe { mgr.rollback_undo(&*resolver, None) };
+        unsafe { mgr.rollback_undo(&*resolver, None).unwrap() };
         assert_eq!(mgr.translate(va), Some(ipa_a), "restores preimage A");
         assert_eq!(
             mgr.snapshot_image().expect("snapshot").translate(va),
@@ -5465,8 +5543,8 @@ mod tests {
             .expect("map 2");
 
         unsafe {
-            mgr1.restore_quiesced_snapshot_to_host(&*resolver);
-            mgr2.restore_quiesced_snapshot_to_host(&*resolver);
+            mgr1.restore_quiesced_snapshot_to_host(&*resolver).unwrap();
+            mgr2.restore_quiesced_snapshot_to_host(&*resolver).unwrap();
         }
 
         unsafe {
@@ -5526,7 +5604,7 @@ mod tests {
         let va = 0x60_0000;
         let ipa = 0x70_0000;
         mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
-        unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) };
+        unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver).unwrap() };
         unsafe { mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>) };
 
         let walk = mgr.debug_walk(va);
@@ -5573,7 +5651,7 @@ mod tests {
             .insert(LINUX_PAGE_TABLES_BASE, garbage);
 
         // Restore snapshot to host
-        unsafe { snap.restore_quiesced_snapshot_to_host(&*resolver) };
+        unsafe { snap.restore_quiesced_snapshot_to_host(&*resolver).unwrap() };
 
         // Verify host memory matches snapshot
         let host_bytes = resolver
@@ -5584,5 +5662,132 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(&host_bytes[..snap.as_bytes().len()], snap.as_bytes());
+    }
+
+    #[test]
+    fn snapshot_failure_must_not_clone_live_authority() {
+        let resolver = MockLiveResolver::new();
+        // Do not register backing for LINUX_PAGE_TABLES_BASE
+        let mut mgr = hvpatch_manager();
+        unsafe {
+            mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        }
+        assert!(mgr.is_live());
+        assert_eq!(
+            mgr.snapshot_image().unwrap_err(),
+            PageTableError::UnresolvedArena(LINUX_PAGE_TABLES_BASE)
+        );
+
+        let mut target = hvpatch_manager();
+        assert_eq!(
+            mgr.snapshot_into(&mut target).unwrap_err(),
+            PageTableError::UnresolvedArena(LINUX_PAGE_TABLES_BASE)
+        );
+
+        // When backing is available, snapshot_image produces an Owned offline snapshot
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+        let clone = mgr.snapshot_image().expect("snapshot image");
+        assert!(
+            !clone.is_live(),
+            "cloned snapshot from live manager must NOT be live"
+        );
+    }
+
+    #[test]
+    fn restore_quiesced_snapshot_to_host_fails_and_preserves_on_missing_root_or_extension() {
+        use std::sync::{Arc, Mutex};
+
+        let mut mgr = hvpatch_manager();
+        exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let ext_base = SubstrateGpa(0xb0_0000_0000);
+        let mut source = TestArenaSource {
+            id: TableArenaSourceId(ext_base),
+            available: Arc::new(Mutex::new(vec![ext_base])),
+            returned: Arc::new(Mutex::new(Vec::new())),
+        };
+        let va = LINUX_MMAP_BASE + 600 * TWO_MIB + 0x1000;
+        mgr.set_rw(va, 0x1000, false, Some(&mut source))
+            .expect("grows into extension arena");
+        assert_eq!(mgr.arenas.len(), 2);
+
+        let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+        let mut host_arena1 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+
+        // 1. Missing root arena fails closed
+        let missing_root = [(ext_base.0, host_arena1.as_mut_ptr())];
+        let err_root = unsafe { mgr.restore_quiesced_snapshot_to_host(&missing_root[..]) };
+        assert_eq!(
+            err_root,
+            Err(PageTableError::UnresolvedArena(mgr.base())),
+            "missing root arena must fail closed"
+        );
+
+        // 2. Missing extension arena fails closed
+        let missing_ext = [(mgr.base(), host_arena0.as_mut_ptr())];
+        let err_ext = unsafe { mgr.restore_quiesced_snapshot_to_host(&missing_ext[..]) };
+        assert_eq!(
+            err_ext,
+            Err(PageTableError::UnresolvedArena(ext_base.0)),
+            "missing extension arena must fail closed"
+        );
+
+        // 3. Complete resolver succeeds
+        let full = [
+            (mgr.base(), host_arena0.as_mut_ptr()),
+            (ext_base.0, host_arena1.as_mut_ptr()),
+        ];
+        assert!(unsafe { mgr.restore_quiesced_snapshot_to_host(&full[..]) }.is_ok());
+    }
+
+    #[test]
+    fn short_backing_and_nonzero_offset_range_safety_without_ub() {
+        let resolver = MockLiveResolver::new();
+        // Provide only 4096 bytes of backing (short backing)
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, 4096);
+
+        // new_live with primary capacity 65536 > 4096 must fail safely
+        let new_res = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                65536,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+        };
+        assert_eq!(
+            new_res.err(),
+            Some(PageTableError::UnresolvedArena(LINUX_PAGE_TABLES_BASE)),
+            "new_live with capacity exceeding short backing must fail"
+        );
+
+        // make_live on an existing manager attaches the short resolver
+        let mut mgr = hvpatch_manager();
+        unsafe {
+            mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        }
+
+        // Reading at offset 0 (0..8 <= 4096) resolves
+        let loc0 = TableLocation::new(0, 0);
+        assert!(mgr.read_desc(loc0).is_ok());
+
+        // Reading at nonzero offset within 4096 (e.g. 2048..2056 <= 4096) resolves
+        let loc2048 = TableLocation::new(0, 2048);
+        assert!(mgr.read_desc(loc2048).is_ok());
+
+        // Reading at offset 4096 (4096..4104 > 4096) fails closed without UB
+        let loc4096 = TableLocation::new(0, 4096);
+        assert_eq!(
+            mgr.read_desc(loc4096).err(),
+            Some(PageTableError::UnresolvedArena(LINUX_PAGE_TABLES_BASE)),
+            "read_desc at offset exceeding short backing must fail closed"
+        );
+
+        // Snapshot requests prefix_len (e.g. 65536 > 4096) and fails safely
+        assert_eq!(
+            mgr.snapshot_image().err(),
+            Some(PageTableError::UnresolvedArena(LINUX_PAGE_TABLES_BASE)),
+            "snapshot_image on short backing must fail closed"
+        );
     }
 }

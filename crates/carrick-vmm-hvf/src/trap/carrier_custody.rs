@@ -2049,7 +2049,10 @@ mod carrier_vm_custody_tests {
         let mut backing = super::RetainedForeignMmBacking {
             extents: vec![super::RetainedForeignExtent {
                 key,
-                owner: super::RetainedPhysicalOwner::Global(pin),
+                owner: super::RetainedPhysicalOwner::Global {
+                    pin,
+                    len: key.1 as usize,
+                },
             }],
         };
         let mut unmap_calls = 0_u32;

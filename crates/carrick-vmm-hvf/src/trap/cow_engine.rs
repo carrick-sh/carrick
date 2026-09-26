@@ -1514,18 +1514,10 @@ impl HvfVmState {
                 || Err(()),
                 |editor| {
                     let manager_base = editor.base();
-                    let page_table_resolver = |base: u64| {
-                        (base == manager_base)
-                            .then_some(page_table_host)
-                            .or_else(|| {
-                                self.host_ptr(
-                                    base,
-                                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                                )
-                            })
-                    };
+                    let page_table_resolver =
+                        self.page_table_resolver(manager_base, Some(page_table_host));
                     // SAFETY: the COW quiesce and topology guards remain held.
-                    unsafe { editor.rollback_undo(page_table_resolver) };
+                    let _ = unsafe { editor.rollback_undo(page_table_resolver) };
                     Ok::<(), ()>(())
                 },
             );
@@ -2715,20 +2707,12 @@ impl HvfTaskState {
                 || Err(()),
                 |manager| {
                     let manager_base = manager.base();
-                    let page_table_resolver = |base: u64| {
-                        (base == manager_base)
-                            .then_some(page_table_host)
-                            .or_else(|| {
-                                self.host_ptr_for_ipa(
-                                    base,
-                                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                                )
-                            })
-                    };
+                    let page_table_resolver =
+                        self.page_table_resolver(manager_base, Some(page_table_host));
                     // SAFETY: the COW quiesce and topology guards remain held;
                     // no vCPU can walk or edit this mm while the journalled
                     // pre-images are replayed into its live backing.
-                    unsafe { manager.rollback_undo(page_table_resolver) };
+                    let _ = unsafe { manager.rollback_undo(page_table_resolver) };
                     Ok::<(), ()>(())
                 },
             );

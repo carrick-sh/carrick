@@ -247,6 +247,17 @@
     },
     {
       "file": "crates/carrick-mem/src/memory.rs",
+      "function": "AddressSpace::with_stage1_page_tables_from",
+      "ordinal_in_function": 1,
+      "fingerprint": "cac8d25c017ce343d7a62f242b5422ba8aafd2554f9e92d5cd2c221ff5622039",
+      "verdict": "carrier_fault",
+      "failure_domain": "mem::load_elf",
+      "rationale": "Failure to serialize stage-1 identity page tables during ELF loading leaves address space without valid page tables.",
+      "sink": "fatal",
+      "domain": "mem::load_elf"
+    },
+    {
+      "file": "crates/carrick-mem/src/memory.rs",
       "function": "stage1_identity_page_tables",
       "ordinal_in_function": 1,
       "fingerprint": "f7d80cf1b8a0cc34507e0a874097c86cc52d0212a874ec5bb09a89ea5c2e2d06",
@@ -264,6 +275,17 @@
       "verdict": "carrier_fault",
       "failure_domain": "mem::stage1_tables",
       "rationale": "Failure to apply PROT_NONE to heap region in initial stage-1 page tables leaves heap unmapped or unprotected.",
+      "sink": "fatal",
+      "domain": "mem::stage1_tables"
+    },
+    {
+      "file": "crates/carrick-mem/src/memory.rs",
+      "function": "stage1_identity_page_tables",
+      "ordinal_in_function": 3,
+      "fingerprint": "be3df2a03c6495ef9be3bc8065d5246d0c159f276b188be4eb475bd1933dcdf8",
+      "verdict": "carrier_fault",
+      "failure_domain": "mem::stage1_tables",
+      "rationale": "Failure to serialize stage-1 identity page tables during initialization leaves boot process without valid identity mapping.",
       "sink": "fatal",
       "domain": "mem::stage1_tables"
     },

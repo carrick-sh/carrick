@@ -1280,24 +1280,32 @@ pub(crate) struct HvfPageTableResolver<'a> {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl<'a> carrick_mmu_core::aarch64::HostArenaResolver for HvfPageTableResolver<'a> {
-    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+    fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
+        let needed = len.max(8);
         self.primary_host
-            .filter(|_| base == self.manager_base)
+            .filter(|_| {
+                base == self.manager_base
+                    && len <= carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize
+            })
             // Extension arenas are published as structural owners keyed by
             // exactly (base, 2 MiB): O(1). The mapping-row scan below is
             // O(rows) and made every page-table edit of a process with
             // thousands of mappings quadratic (pagetablegrow spent minutes
             // in `live_pt_debug_walk`); it stays only as the last resort.
-            .or_else(|| {
-                self.task.mm_access.structural_owner_host_ptr(
-                    base,
-                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                )
-            })
-            .or_else(|| {
-                self.task
-                    .host_ptr_for_ipa(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
-            })
+            .or_else(|| self.task.mm_access.structural_owner_host_ptr(base, needed))
+            .or_else(|| self.task.host_ptr_for_ipa(base, needed))
+    }
+
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        self.host_ptr_for_range(base, 0)
+    }
+
+    fn host_const_ptr_for_range(&self, base: u64, len: usize) -> Option<*const u8> {
+        self.host_ptr_for_range(base, len).map(|p| p.cast_const())
+    }
+
+    fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+        self.host_ptr_for_base(base).map(|p| p.cast_const())
     }
 
     fn record_populated_prefix(&self, base: u64, prefix: usize) {
