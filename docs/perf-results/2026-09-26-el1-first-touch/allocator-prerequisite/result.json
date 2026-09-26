@@ -1,0 +1,16 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "--manifest-path",
+    "target/el1-completion/allocator-prerequisite/Cargo.toml",
+    "--test",
+    "reservation",
+    "--",
+    "--nocapture"
+  ],
+  "exit_code": 101,
+  "scope": "Dormant allocator prerequisite; no guest execution and no pointer dereference",
+  "source_head": "1b50d2a5ed9237eddb3e8ad9dc141d99082b3642"
+}
