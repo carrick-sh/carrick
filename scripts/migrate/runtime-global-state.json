@@ -3416,6 +3416,14 @@
       "fingerprint": "59a1aeac5323936cf6068660fe5ec9df9d56c8865c8f60d77947254f0ff8facb",
       "classification": "carrier_infra",
       "rationale": "Per-executor-thread slot in crates/carrick-runtime/src/vcpu_loop/zone.rs holding the one zone thread EL1 ran on this executor's vCPU that exited to the host (EL1 plan 1d); the executor claims it before its next run, so it never outlives one exit and belongs to exactly one executor thread."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
+      "symbol": "DRIVEN_ZONE_SLOT",
+      "fingerprint": "177e888108131b293f8547b9a19fd5342add7f305f239d3db5035946b7cf7726",
+      "classification": "carrier_infra",
+      "rationale": "Per-executor-thread record in crates/carrick-runtime/src/vcpu_loop/executor/backend.rs of the EL1 zone slot the executor drives now (EL1 plan 1d): a slot follows its vCPU's mailbox lease, which a task can carry, so an executor that moves to another slot leaves the one it drove; it names only this host thread's own vCPU and selects no container state."
     }
   ]
 }
