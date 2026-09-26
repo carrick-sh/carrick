@@ -19,3 +19,19 @@ used. The worker tree was not modified by this check.
 Revalidate against the final revision and require explicit failure at the
 snapshot boundary; a silent shared-state fallback does not satisfy fork-image
 isolation. Existing allocation and work budgets remain unchanged.
+
+## Safe resolver replacement remains exposed
+
+The same frozen source accepts `safe-rebind-compile-only.rs` under `cargo check
+--offline --manifest-path target/el1-completion/live-review-repro/Cargo.toml
+--example safe_rebind` (exit zero; log retained). The function uses no unsafe
+block. Given an existing live manager, it installs a closure returning a dangling
+pointer through safe `bind_resolver`, then calls safe `try_translate`.
+`HostArenaResolver` supplies a blanket unsafe implementation for arbitrary
+closures; the live `read_desc` dereferences the returned pointer as AtomicU64.
+Unsafe constructors therefore do not close the later replacement path.
+
+This witness was compiled only, never executed. It demonstrates the missing
+caller obligation at the public API boundary, not an observed runtime crash.
+Recheck against the worker final revision. The fix must cover every resolver
+installation/consumption path, not only `new_live` and `make_live`.
