@@ -2548,6 +2548,17 @@
       "rationale": "Host timed out after 30 s waiting for an in-zone inotify instance lock; guest critical sections are bounded, so this is a dead vCPU or lock-protocol violation.",
       "sink": "fatal",
       "domain": "el1_inotify"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "function": "retire_slot",
+      "ordinal_in_function": 1,
+      "fingerprint": "cf3b939a25bc5c3dc00c91207648849ed45a44f3aa3e544174e95fce2d88ee02",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_zone::retire_slot",
+      "rationale": "A spare executor retiring its vCPU slot found a service record (the only guest-side stand-in for a thread whose host row stays held) that no live slot will take. Every bound executor's slot is live and allows every CPU a thread may name, so this means the slot table lost its drivers; dropping the record would strand the thread's held row, which no host run queue or executor would ever claim again.",
+      "sink": "fatal",
+      "domain": "el1_zone::retire_slot"
     }
   ]
 }
