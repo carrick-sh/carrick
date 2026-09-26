@@ -841,8 +841,37 @@ pub struct PtQuiesce {
     draining: AtomicBool,
     /// Executors parked at guest entry behind the fence ([`Self::park`]).
     parked_entrants: Mutex<usize>,
+    /// Pauses ended so far: a parked entrant woken by an `end` tells a
+    /// refusal (the fence was raised again) from a spurious wake-up.
+    pauses_ended: AtomicU64,
+    /// An entrant was refused [`ENTRANT_REFUSAL_LIMIT`] times: the next
+    /// coordinator lets every parked entrant leave before it raises the fence.
+    starving: AtomicBool,
     cv: Condvar,
 }
+
+/// How many times an executor parked at guest entry may wake at the end of a
+/// pause and find the next pause's fence already raised before the next
+/// coordinator must let it in (bounded waiting). It orders entry only; no
+/// guest-visible result depends on it. It counts refusals Carrick imposed on
+/// an entrant that was running, not pauses or time, so an entrant the HOST
+/// has not scheduled does not stall the editor on host scheduling latency.
+///
+/// Measured on the signed binary: with no bound a hot mmap/touch/munmap
+/// editor re-elects the instant its pause ends and the MM's other vCPUs
+/// starve (windowcoherence's sibling-handoff scenario, 1500 thread spawns
+/// beside two such editors: 51 s against a 45 s budget; the census base took
+/// 34 s). Waiting before EVERY pause (6.2 s there) made each pause wait for
+/// every parked executor's host thread to be scheduled: under the served-lseek
+/// burst fixture's host oversubscription a round took 35 s instead of 3 s and
+/// its worker served under its 1M-lseek floor. Bounding by pauses bypassed
+/// (4 or 16) or by parked time (a 1 ms threshold as in Go's `sync.Mutex`
+/// starvation mode) still counted host scheduling delay: the burst floor
+/// failed at 4 and 16 pauses, and sibling-handoff took 10 s at 250 us and
+/// 44 s at 1 ms. Four refusals: sibling-handoff 6.0 s, burst 2.0M-4.0M lseeks
+/// per round (median 3.0M, as with no bound); two refusals failed the burst
+/// floor.
+pub const ENTRANT_REFUSAL_LIMIT: u64 = 4;
 
 impl Default for PtQuiesce {
     fn default() -> Self {
@@ -857,6 +886,8 @@ impl PtQuiesce {
             quiescing: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             parked_entrants: Mutex::new(0),
+            pauses_ended: AtomicU64::new(0),
+            starving: AtomicBool::new(false),
             cv: Condvar::new(),
         }
     }
@@ -892,10 +923,20 @@ impl PtQuiesce {
         #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut g = self.parked_entrants.lock().unwrap();
         *g += 1;
+        let mut seen = self.pauses_ended.load(Ordering::SeqCst);
+        let mut refused_wakes = 0u64;
         while self.quiescing.load(Ordering::SeqCst) {
             #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
             let next = self.cv.wait(g).unwrap();
             g = next;
+            let ended = self.pauses_ended.load(Ordering::SeqCst);
+            if ended != seen && self.quiescing.load(Ordering::SeqCst) {
+                refused_wakes += 1;
+                if refused_wakes >= ENTRANT_REFUSAL_LIMIT {
+                    self.starving.store(true, Ordering::SeqCst);
+                }
+            }
+            seen = ended;
         }
         *g -= 1;
         if *g == 0 {
@@ -903,15 +944,19 @@ impl PtQuiesce {
         }
     }
 
-    /// A newly elected coordinator, before it raises the fence: let every
-    /// executor parked at guest entry behind the previous pause leave the
-    /// park first. Without this a hot editor that re-elects the moment its
-    /// pause ends keeps the fence up nearly all the time and the MM's other
-    /// vCPUs never re-enter the guest (the census used to give them that
-    /// window through its admission lock). Terminates: only the coordinator
-    /// raises the fence, so while it waits here every parked executor's
-    /// condition is already false and it was woken by the previous `end`.
-    pub fn await_parked_entrants(&self) {
+    /// A newly elected coordinator, before it raises the fence: if an entrant
+    /// was refused [`ENTRANT_REFUSAL_LIMIT`] times, let every executor parked at guest
+    /// entry behind the previous pause leave the park first. Without this a
+    /// hot editor that re-elects the moment its pause ends keeps the fence up
+    /// nearly all the time and the MM's other vCPUs never re-enter the guest
+    /// (the census used to give them that window through its admission lock).
+    /// Terminates: only the coordinator raises the fence, so while it waits
+    /// here every parked executor's condition is already false and it was
+    /// woken by the previous `end`.
+    pub fn await_starving_entrants(&self) {
+        if !self.starving.load(Ordering::SeqCst) {
+            return;
+        }
         #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut g = self.parked_entrants.lock().unwrap();
         while *g > 0 {
@@ -919,6 +964,7 @@ impl PtQuiesce {
             let next = self.cv.wait(g).unwrap();
             g = next;
         }
+        self.starving.store(false, Ordering::SeqCst);
     }
 
     /// Bounded `park`, for a caller that may hold ANOTHER process-wide
@@ -954,6 +1000,7 @@ impl PtQuiesce {
     pub fn end(&self) {
         #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let _held = self.parked_entrants.lock().unwrap();
+        self.pauses_ended.fetch_add(1, Ordering::SeqCst);
         self.draining.store(false, Ordering::SeqCst);
         self.quiescing.store(false, Ordering::SeqCst);
         self.coordinator.store(false, Ordering::SeqCst);
@@ -1448,36 +1495,46 @@ mod tests {
     }
 
     /// Starvation guard for `kernel.mm.address-space-occupancy`: an executor
-    /// parked at guest entry behind a pause leaves the park before the next
-    /// coordinator raises the fence again, however quickly it re-elects.
+    /// parked at guest entry behind back-to-back pauses gets in once it has
+    /// been refused [`ENTRANT_REFUSAL_LIMIT`] times, however quickly the
+    /// editor re-elects.
     #[test]
-    fn a_parked_entrant_leaves_before_the_next_fence_is_raised() {
-        let barrier = Arc::new(PtQuiesce::new());
-        for _ in 0..64 {
+    fn a_starving_entrant_leaves_before_the_next_fence_is_raised() {
+        for _ in 0..16 {
+            let barrier = Arc::new(PtQuiesce::new());
             assert!(barrier.try_become_coordinator());
             barrier.set_quiescing();
-            let (left_tx, left_rx) = std::sync::mpsc::channel();
+            let left = Arc::new(AtomicBool::new(false));
             let entrant = {
-                let barrier = Arc::clone(&barrier);
+                let (barrier, left) = (Arc::clone(&barrier), Arc::clone(&left));
                 std::thread::spawn(move || {
                     barrier.park();
-                    left_tx.send(()).unwrap();
+                    left.store(true, Ordering::SeqCst);
                 })
             };
             while *barrier.parked_entrants.lock().unwrap() == 0 {
                 std::thread::yield_now();
             }
-            barrier.end();
-            // The same editor re-elects at once, as a hot mmap loop does.
-            assert!(barrier.try_become_coordinator());
-            barrier.await_parked_entrants();
-            barrier.set_quiescing();
-            let left = left_rx.recv_timeout(Duration::from_secs(5));
+            // A hot editor: each edit holds the fence briefly, then the
+            // editor ends the pause and re-elects at once.
+            let parked_at = Instant::now();
+            let give_up = parked_at + Duration::from_secs(2);
+            while !left.load(Ordering::SeqCst) && Instant::now() < give_up {
+                let edit = Instant::now();
+                while edit.elapsed() < Duration::from_micros(50) {
+                    std::hint::spin_loop();
+                }
+                barrier.end();
+                assert!(barrier.try_become_coordinator());
+                barrier.await_starving_entrants();
+                barrier.set_quiescing();
+            }
+            let waited = parked_at.elapsed();
             barrier.end();
             entrant.join().unwrap();
             assert!(
-                left.is_ok(),
-                "the parked entrant was held behind the next fence"
+                waited < Duration::from_millis(500),
+                "the parked entrant was held behind back-to-back fences for {waited:?}"
             );
         }
     }
