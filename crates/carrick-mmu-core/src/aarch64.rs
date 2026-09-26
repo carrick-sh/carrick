@@ -483,7 +483,16 @@ pub trait TableArenaSource: core::fmt::Debug + Send + 'static {
 }
 
 /// Resolves the host backing pointer for a stage-1 table arena base address.
-pub trait HostArenaResolver {
+///
+/// # Safety
+/// Implementations must guarantee:
+/// - If `host_ptr_for_base(base)` returns `Some(ptr)`, `ptr` points to valid, resident
+///   host memory of at least the arena's capacity, aligned to at least 8 bytes.
+/// - If `host_const_ptr_for_base(base)` returns `Some(ptr)`, `ptr` points to valid, resident
+///   host memory of at least the arena's capacity, aligned to at least 8 bytes.
+/// - The host memory must remain valid and resident for the duration of the access or be
+///   protected by retained ownership/pins within the resolver.
+pub unsafe trait HostArenaResolver {
     /// Return the writable host pointer for the arena with guest-physical base `base`.
     fn host_ptr_for_base(&self, _base: u64) -> Option<*mut u8> {
         None
@@ -502,55 +511,55 @@ pub trait HostArenaResolver {
     fn record_populated_prefix(&self, _base: u64, _prefix: usize) {}
 }
 
-impl HostArenaResolver for (u64, *mut u8) {
+unsafe impl HostArenaResolver for (u64, *mut u8) {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         (self.0 == base).then_some(self.1)
     }
 }
 
-impl HostArenaResolver for (u64, *const u8) {
+unsafe impl HostArenaResolver for (u64, *const u8) {
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         (self.0 == base).then_some(self.1)
     }
 }
 
-impl<const N: usize> HostArenaResolver for [(u64, *mut u8); N] {
+unsafe impl<const N: usize> HostArenaResolver for [(u64, *mut u8); N] {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
     }
 }
 
-impl<const N: usize> HostArenaResolver for &[(u64, *mut u8); N] {
+unsafe impl<const N: usize> HostArenaResolver for &[(u64, *mut u8); N] {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
     }
 }
 
-impl HostArenaResolver for &[(u64, *mut u8)] {
+unsafe impl HostArenaResolver for &[(u64, *mut u8)] {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
     }
 }
 
-impl<const N: usize> HostArenaResolver for [(u64, *const u8); N] {
+unsafe impl<const N: usize> HostArenaResolver for [(u64, *const u8); N] {
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
     }
 }
 
-impl<const N: usize> HostArenaResolver for &[(u64, *const u8); N] {
+unsafe impl<const N: usize> HostArenaResolver for &[(u64, *const u8); N] {
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
     }
 }
 
-impl HostArenaResolver for &[(u64, *const u8)] {
+unsafe impl HostArenaResolver for &[(u64, *const u8)] {
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         self.iter().find_map(|&(b, p)| (b == base).then_some(p))
     }
 }
 
-impl<F> HostArenaResolver for F
+unsafe impl<F> HostArenaResolver for F
 where
     F: Fn(u64) -> Option<*mut u8>,
 {
@@ -562,7 +571,7 @@ where
 #[derive(Copy, Clone, Debug)]
 pub struct ConstFnResolver<F>(pub F);
 
-impl<F> HostArenaResolver for ConstFnResolver<F>
+unsafe impl<F> HostArenaResolver for ConstFnResolver<F>
 where
     F: Fn(u64) -> Option<*const u8>,
 {
@@ -571,7 +580,7 @@ where
     }
 }
 
-impl<F> HostArenaResolver for &ConstFnResolver<F>
+unsafe impl<F> HostArenaResolver for &ConstFnResolver<F>
 where
     F: Fn(u64) -> Option<*const u8>,
 {
@@ -584,7 +593,7 @@ pub fn const_resolver<F: Fn(u64) -> Option<*const u8>>(f: F) -> ConstFnResolver<
     ConstFnResolver(f)
 }
 
-impl HostArenaResolver for Arc<dyn HostArenaResolver + Send + Sync> {
+unsafe impl HostArenaResolver for Arc<dyn HostArenaResolver + Send + Sync> {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         (**self).host_ptr_for_base(base)
     }
@@ -598,7 +607,7 @@ impl HostArenaResolver for Arc<dyn HostArenaResolver + Send + Sync> {
     }
 }
 
-impl HostArenaResolver for &Arc<dyn HostArenaResolver + Send + Sync> {
+unsafe impl HostArenaResolver for &Arc<dyn HostArenaResolver + Send + Sync> {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         (***self).host_ptr_for_base(base)
     }
@@ -755,6 +764,25 @@ pub struct PageTableManager {
     undo: Option<UndoJournal>,
 }
 
+impl core::fmt::Debug for PageTableManager {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageTableManager")
+            .field("arenas", &self.arenas)
+            .field("layout", &self.layout)
+            .field("asid_scoped_leaves", &self.asid_scoped_leaves)
+            .field("free_tables", &self.free_tables)
+            .field("multi_vcpu", &self.multi_vcpu)
+            .field("offline_private_image", &self.offline_private_image)
+            .field("stage1_exclusive", &self.stage1_exclusive)
+            .field("reclaim_pending", &self.reclaim_pending)
+            .field("dirty", &self.dirty)
+            .field("staged", &self.staged)
+            .field("is_live", &self.is_live())
+            .field("undo", &self.undo)
+            .finish()
+    }
+}
+
 /// Pre-transaction state captured by [`PageTableManager::begin_undo`].
 #[derive(Clone, Debug, Default)]
 struct UndoJournal {
@@ -785,7 +813,20 @@ struct UndoJournal {
 impl Clone for PageTableManager {
     fn clone(&self) -> Self {
         if self.is_live() {
-            self.snapshot_image()
+            self.snapshot_image().unwrap_or_else(|_| Self {
+                arenas: self.arenas.clone(),
+                layout: self.layout,
+                asid_scoped_leaves: self.asid_scoped_leaves,
+                free_tables: self.free_tables.clone(),
+                multi_vcpu: self.multi_vcpu,
+                offline_private_image: self.offline_private_image,
+                stage1_exclusive: self.stage1_exclusive,
+                reclaim_pending: self.reclaim_pending,
+                dirty: self.dirty.clone(),
+                staged: self.staged.clone(),
+                resolver: self.resolver.clone(),
+                undo: self.undo.clone(),
+            })
         } else {
             Self {
                 arenas: self.arenas.clone(),
@@ -810,7 +851,20 @@ impl Clone for PageTableManager {
     /// which is the entire point on the 1.75 MiB table image.
     fn clone_from(&mut self, source: &Self) {
         if source.is_live() {
-            source.snapshot_into(self);
+            if source.snapshot_into(self).is_err() {
+                self.arenas.clone_from(&source.arenas);
+                self.layout = source.layout;
+                self.asid_scoped_leaves = source.asid_scoped_leaves;
+                self.free_tables.clone_from(&source.free_tables);
+                self.multi_vcpu = source.multi_vcpu;
+                self.offline_private_image = source.offline_private_image;
+                self.stage1_exclusive = source.stage1_exclusive;
+                self.reclaim_pending = source.reclaim_pending;
+                self.dirty.clone_from(&source.dirty);
+                self.staged.clone_from(&source.staged);
+                self.resolver = source.resolver.clone();
+                self.undo.clone_from(&source.undo);
+            }
         } else {
             self.arenas.clone_from(&source.arenas);
             self.layout = source.layout;
@@ -864,21 +918,24 @@ impl PageTableManager {
         }
     }
 
-    pub fn new_live(
+    /// Create a live PageTableManager bound to hardware-visible memory via `resolver`.
+    ///
+    /// # Safety
+    /// `resolver` must return valid, resident, 8-byte aligned host backing pointers.
+    pub unsafe fn new_live(
         base: u64,
         layout: PageTableLayoutConfig,
         primary_capacity: usize,
         resolver: Arc<dyn HostArenaResolver + Send + Sync>,
-    ) -> Self {
-        let asid_scoped_leaves = if let Some(host_ptr) = resolver.host_const_ptr_for_base(base) {
-            let walk = unsafe {
-                walk_descriptors_host(host_ptr, primary_capacity, base, layout.user_leaf_check_va)
-            };
-            terminal_descriptor(walk) & NON_GLOBAL != 0
-        } else {
-            false
+    ) -> Result<Self, PageTableError> {
+        let host_ptr = resolver
+            .host_const_ptr_for_base(base)
+            .ok_or(PageTableError::UnresolvedArena(base))?;
+        let walk = unsafe {
+            walk_descriptors_host(host_ptr, primary_capacity, base, layout.user_leaf_check_va)
         };
-        Self {
+        let asid_scoped_leaves = terminal_descriptor(walk) & NON_GLOBAL != 0;
+        Ok(Self {
             arenas: vec![TableArena {
                 base,
                 storage: TableArenaStorage::Live,
@@ -896,7 +953,7 @@ impl PageTableManager {
             staged: hashbrown::HashMap::new(),
             resolver: Some(resolver),
             undo: None,
-        }
+        })
     }
 
     /// True if this manager is bound to live hardware-visible memory.
@@ -904,8 +961,16 @@ impl PageTableManager {
         self.arenas.first().is_some_and(|a| a.is_live())
     }
 
+    /// Borrow the installed host arena resolver, if bound.
+    pub fn resolver(&self) -> Option<&Arc<dyn HostArenaResolver + Send + Sync>> {
+        self.resolver.as_ref()
+    }
+
     /// Convert this manager to live backing authority, discarding any software shadow buffers.
-    pub fn make_live(&mut self, resolver: Arc<dyn HostArenaResolver + Send + Sync>) {
+    ///
+    /// # Safety
+    /// `resolver` must return valid, resident, 8-byte aligned host backing pointers.
+    pub unsafe fn make_live(&mut self, resolver: Arc<dyn HostArenaResolver + Send + Sync>) {
         self.resolver = Some(resolver);
         for arena in &mut self.arenas {
             arena.storage = TableArenaStorage::Live;
@@ -921,7 +986,11 @@ impl PageTableManager {
     }
 
     /// Snapshot this manager into `target`, reusing `target`'s existing buffers.
-    pub fn snapshot_into(&self, target: &mut PageTableManager) {
+    ///
+    /// Descriptors from live hardware backing are read atomically word-by-word with acquire ordering.
+    pub fn snapshot_into(&self, target: &mut PageTableManager) -> Result<(), PageTableError> {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
         target.layout = self.layout;
         target.asid_scoped_leaves = self.asid_scoped_leaves;
         target.free_tables.clear();
@@ -977,31 +1046,35 @@ impl PageTableManager {
                         dst_bytes.reserve(src_arena.capacity);
                     }
                     dst_bytes.resize(prefix_len, 0);
-                    if let Some(ref resolver) = self.resolver
-                        && let Some(host) = resolver.host_const_ptr_for_base(src_arena.base)
-                    {
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                host,
-                                dst_bytes.as_mut_ptr(),
-                                prefix_len,
-                            );
-                        }
+                    let resolver = self
+                        .resolver
+                        .as_ref()
+                        .ok_or(PageTableError::UnresolvedArena(src_arena.base))?;
+                    let host = resolver
+                        .host_const_ptr_for_base(src_arena.base)
+                        .ok_or(PageTableError::UnresolvedArena(src_arena.base))?;
+                    let words = prefix_len / 8;
+                    for w in 0..words {
+                        let slot = unsafe { host.add(w * 8).cast::<AtomicU64>() };
+                        let desc = unsafe { (*slot).load(Ordering::Acquire) };
+                        dst_bytes[w * 8..(w + 1) * 8].copy_from_slice(&desc.to_le_bytes());
                     }
                 }
                 (dest_storage, TableArenaStorage::Live) => {
                     let mut dst_bytes = Vec::with_capacity(src_arena.capacity);
                     dst_bytes.resize(prefix_len, 0);
-                    if let Some(ref resolver) = self.resolver
-                        && let Some(host) = resolver.host_const_ptr_for_base(src_arena.base)
-                    {
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                host,
-                                dst_bytes.as_mut_ptr(),
-                                prefix_len,
-                            );
-                        }
+                    let resolver = self
+                        .resolver
+                        .as_ref()
+                        .ok_or(PageTableError::UnresolvedArena(src_arena.base))?;
+                    let host = resolver
+                        .host_const_ptr_for_base(src_arena.base)
+                        .ok_or(PageTableError::UnresolvedArena(src_arena.base))?;
+                    let words = prefix_len / 8;
+                    for w in 0..words {
+                        let slot = unsafe { host.add(w * 8).cast::<AtomicU64>() };
+                        let desc = unsafe { (*slot).load(Ordering::Acquire) };
+                        dst_bytes[w * 8..(w + 1) * 8].copy_from_slice(&desc.to_le_bytes());
                     }
                     *dest_storage = TableArenaStorage::Owned(dst_bytes);
                 }
@@ -1024,10 +1097,11 @@ impl PageTableManager {
                 }
             }
         }
+        Ok(())
     }
 
     /// Snapshot this manager into a new owned PageTableManager image.
-    pub fn snapshot_image(&self) -> PageTableManager {
+    pub fn snapshot_image(&self) -> Result<PageTableManager, PageTableError> {
         let mut target = PageTableManager {
             arenas: Vec::with_capacity(self.arenas.len()),
             layout: self.layout,
@@ -1042,8 +1116,8 @@ impl PageTableManager {
             resolver: None,
             undo: None,
         };
-        self.snapshot_into(&mut target);
-        target
+        self.snapshot_into(&mut target)?;
+        Ok(target)
     }
 
     /// Guest-physical address of the L0 table represented by this image.
@@ -1153,7 +1227,7 @@ impl PageTableManager {
                 }
                 for index in 0..512usize {
                     let entry_loc = table_loc.entry(index);
-                    let descriptor = self.read_desc(entry_loc);
+                    let descriptor = self.read_desc(entry_loc)?;
                     if descriptor & VALID == 0 || descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
                         continue;
                     }
@@ -1202,7 +1276,7 @@ impl PageTableManager {
             self.write_table_desc(
                 entry_loc,
                 (descriptor & !PA_MASK_TABLE) | (child_pa & PA_MASK_TABLE),
-            );
+            )?;
         }
         for (i, &base) in new_bases.iter().enumerate() {
             self.arenas[i].base = base;
@@ -1261,13 +1335,14 @@ impl PageTableManager {
     }
 
     /// Zero a freed spare sub-table and return it to the reusable free list.
+    /// Zero a freed spare sub-table and return it to the reusable free list.
     /// Only reached from `try_coalesce`, which is gated on an offline private
     /// image, so no hardware walk cache can still reference the page.
-    fn free_table(&mut self, pa: u64) {
+    fn free_table(&mut self, pa: u64) -> Result<(), PageTableError> {
         if let Ok(loc) = self.pa_to_loc(pa) {
             if self.undo.is_some() {
                 for off in (loc.offset..loc.offset + PT_PAGE as usize).step_by(8) {
-                    self.note_undo_unlinked(TableLocation::new(loc.arena, off));
+                    self.note_undo_unlinked(TableLocation::new(loc.arena, off))?;
                 }
             }
             let arena = &mut self.arenas[loc.arena];
@@ -1287,6 +1362,7 @@ impl PageTableManager {
             }
             self.free_tables.push(pa);
         }
+        Ok(())
     }
 
     /// Borrow the (possibly edited) table-region bytes of the primary arena.
@@ -1300,23 +1376,28 @@ impl PageTableManager {
     /// Consume the manager, returning the (possibly edited) table-region bytes of the primary arena.
     /// Used by the boot-time ELF read-only-span pass, which edits the pristine
     /// `stage1_identity_page_tables` image before it is mapped into the guest.
-    pub fn into_bytes(mut self) -> Vec<u8> {
+    pub fn into_bytes(mut self) -> Result<Vec<u8>, PageTableError> {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
         let primary = self.arenas.remove(0);
         let mut bytes = match primary.storage {
             TableArenaStorage::Owned(bytes) => bytes,
             TableArenaStorage::Live => {
                 let mut bytes = Vec::with_capacity(primary.capacity);
-                bytes.resize(primary.next_free as usize, 0);
-                if let Some(ref resolver) = self.resolver
-                    && let Some(host) = resolver.host_const_ptr_for_base(primary.base)
-                {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            host,
-                            bytes.as_mut_ptr(),
-                            primary.next_free as usize,
-                        );
-                    }
+                let prefix_len = primary.next_free as usize;
+                bytes.resize(prefix_len, 0);
+                let resolver = self
+                    .resolver
+                    .as_ref()
+                    .ok_or(PageTableError::UnresolvedArena(primary.base))?;
+                let host = resolver
+                    .host_const_ptr_for_base(primary.base)
+                    .ok_or(PageTableError::UnresolvedArena(primary.base))?;
+                let words = prefix_len / 8;
+                for w in 0..words {
+                    let slot = unsafe { host.add(w * 8).cast::<AtomicU64>() };
+                    let desc = unsafe { (*slot).load(Ordering::Acquire) };
+                    bytes[w * 8..(w + 1) * 8].copy_from_slice(&desc.to_le_bytes());
                 }
                 bytes
             }
@@ -1324,12 +1405,12 @@ impl PageTableManager {
         if bytes.len() < primary.capacity {
             bytes.resize(primary.capacity, 0);
         }
-        bytes
+        Ok(bytes)
     }
 
-    fn read_desc(&self, loc: TableLocation) -> u64 {
+    fn read_desc(&self, loc: TableLocation) -> Result<u64, PageTableError> {
         if let Some(&(desc, _)) = self.staged.get(&loc) {
-            return desc;
+            return Ok(desc);
         }
         let arena = &self.arenas[loc.arena];
         match arena.storage {
@@ -1337,22 +1418,22 @@ impl PageTableManager {
                 if loc.offset + 8 <= bytes.len() {
                     let mut a = [0u8; 8];
                     a.copy_from_slice(&bytes[loc.offset..loc.offset + 8]);
-                    u64::from_le_bytes(a)
+                    Ok(u64::from_le_bytes(a))
                 } else {
-                    0
+                    Ok(0)
                 }
             }
             TableArenaStorage::Live => {
                 let Some(ref resolver) = self.resolver else {
-                    return 0;
+                    return Err(PageTableError::UnresolvedArena(arena.base));
                 };
                 let Some(host) = resolver.host_const_ptr_for_base(arena.base) else {
-                    return 0;
+                    return Err(PageTableError::UnresolvedArena(arena.base));
                 };
                 use core::sync::atomic::{AtomicU64, Ordering};
                 unsafe {
                     let slot = host.add(loc.offset).cast::<AtomicU64>();
-                    (*slot).load(Ordering::Acquire)
+                    Ok((*slot).load(Ordering::Acquire))
                 }
             }
         }
@@ -1360,8 +1441,8 @@ impl PageTableManager {
 
     /// Write a leaf/child descriptor (a block, page, or sub-table entry that is
     /// not itself newly pointing the walker at a fresh table).
-    fn write_desc(&mut self, loc: TableLocation, desc: u64) {
-        self.note_undo(loc);
+    fn write_desc(&mut self, loc: TableLocation, desc: u64) -> Result<(), PageTableError> {
+        self.note_undo(loc)?;
         let arena = &mut self.arenas[loc.arena];
         match arena.storage {
             TableArenaStorage::Owned(ref mut bytes) => {
@@ -1375,13 +1456,14 @@ impl PageTableManager {
             }
         }
         self.dirty.push((loc, false));
+        Ok(())
     }
 
     /// Record one walker-visible descriptor word's pre-image while a journal
     /// is open, noting whether it replaced a VALID descriptor.
-    fn note_undo(&mut self, loc: TableLocation) {
+    fn note_undo(&mut self, loc: TableLocation) -> Result<(), PageTableError> {
         if self.undo.is_some() {
-            let previous = self.read_desc(loc);
+            let previous = self.read_desc(loc)?;
             if let Some(journal) = self.undo.as_mut() {
                 journal.words.push((loc, previous));
                 if journal.first_written.insert((loc.arena, loc.offset)) {
@@ -1389,25 +1471,27 @@ impl PageTableManager {
                 }
             }
         }
+        Ok(())
     }
 
     /// Record a pre-image for a word in an unlinked table page being zeroed
     /// for reuse. Rollback needs the word; TLB maintenance accounting does not,
     /// because nothing reachable from the live tree points at that page.
-    fn note_undo_unlinked(&mut self, loc: TableLocation) {
+    fn note_undo_unlinked(&mut self, loc: TableLocation) -> Result<(), PageTableError> {
         if self.undo.is_some() {
-            let previous = self.read_desc(loc);
+            let previous = self.read_desc(loc)?;
             if let Some(journal) = self.undo.as_mut() {
                 journal.words.push((loc, previous));
             }
         }
+        Ok(())
     }
 
     /// Write a table descriptor that exposes a (freshly populated) sub-table to
     /// the walker. Tagged so the host sync orders it AFTER the sub-table's
     /// entries are visible.
-    fn write_table_desc(&mut self, loc: TableLocation, desc: u64) {
-        self.note_undo(loc);
+    fn write_table_desc(&mut self, loc: TableLocation, desc: u64) -> Result<(), PageTableError> {
+        self.note_undo(loc)?;
         let arena = &mut self.arenas[loc.arena];
         match arena.storage {
             TableArenaStorage::Owned(ref mut bytes) => {
@@ -1421,6 +1505,7 @@ impl PageTableManager {
             }
         }
         self.dirty.push((loc, true));
+        Ok(())
     }
 
     /// Replay this edit's descriptor stores to the host page-table backing as
@@ -1466,7 +1551,7 @@ impl PageTableManager {
                         a.copy_from_slice(&bytes[loc.offset..loc.offset + 8]);
                         u64::from_le_bytes(a)
                     }
-                    TableArenaStorage::Live => self.read_desc(loc),
+                    TableArenaStorage::Live => self.read_desc(loc)?,
                 }
             };
             if is_ptr {
@@ -1659,9 +1744,11 @@ impl PageTableManager {
 
     /// Write one descriptor into the table at `pa` and mark it dirty for sync_to_host.
     /// Test helper for verifying table descriptor sync.
+    /// Write one descriptor into the table at `pa` and mark it dirty for sync_to_host.
+    /// Test helper for verifying table descriptor sync.
     pub fn write_desc_for_test(&mut self, pa: u64, desc: u64) -> Result<(), PageTableError> {
         let loc = self.pa_to_loc(pa)?;
-        self.write_desc(loc, desc);
+        self.write_desc(loc, desc)?;
         Ok(())
     }
 
@@ -1703,12 +1790,8 @@ impl PageTableManager {
         (self.multi_vcpu, self.stage1_exclusive, self.reclaim_pending)
     }
 
-    /// Read-only descriptor walk for `va`, for `carrick trace` diagnostics:
-    /// returns `[L0, L1, L2, L3]` descriptors as the MANAGER sees them in its
-    /// own `bytes` (not the host backing), stopping (rest 0) at the first
-    /// non-table or out-of-range link. Lets a trace compare the manager's view
-    /// across e.g. parent vs forked child.
-    pub fn debug_walk(&self, va: u64) -> [u64; 4] {
+    /// Read-only descriptor walk for `va`, returning `[L0, L1, L2, L3]` descriptors.
+    pub fn try_debug_walk(&self, va: u64) -> Result<[u64; 4], PageTableError> {
         let idx = indices(va);
         let mut out = [0u64; 4];
         let mut table_loc = TableLocation::new(0, 0);
@@ -1718,7 +1801,7 @@ impl PageTableManager {
             if entry_loc.offset + 8 > self.arenas[entry_loc.arena].allocated_span() as usize {
                 break;
             }
-            let desc = self.read_desc(entry_loc);
+            let desc = self.read_desc(entry_loc)?;
             out[level] = desc;
             if level == 3 {
                 break;
@@ -1733,7 +1816,16 @@ impl PageTableManager {
                 Err(_) => break,
             }
         }
-        out
+        Ok(out)
+    }
+
+    /// Read-only descriptor walk for `va`, for `carrick trace` diagnostics:
+    /// returns `[L0, L1, L2, L3]` descriptors as the MANAGER sees them in its
+    /// own `bytes` (not the host backing), stopping (rest 0) at the first
+    /// non-table or out-of-range link. Lets a trace compare the manager's view
+    /// across e.g. parent vs forked child.
+    pub fn debug_walk(&self, va: u64) -> [u64; 4] {
+        self.try_debug_walk(va).unwrap_or([0u64; 4])
     }
 
     /// Read-only descriptor walk over the LIVE host backing that the hardware
@@ -1787,6 +1879,16 @@ impl PageTableManager {
         Ok(out)
     }
 
+    /// Translate a guest VA to its stage-1 output address, returning error on failed resolution.
+    pub fn try_translate(&self, va: u64) -> Result<Option<u64>, PageTableError> {
+        self.try_translate_with_invalid_leaf(va, false)
+    }
+
+    /// Resolve the output address retained in a block/page whose valid bit may have been cleared.
+    pub fn try_translate_retained_output(&self, va: u64) -> Result<Option<u64>, PageTableError> {
+        self.try_translate_with_invalid_leaf(va, true)
+    }
+
     /// Translate a guest VA to its stage-1 output address (the IPA carrick handed
     /// `hv_vm_map`), walking this manager's live descriptors exactly as the MMU
     /// would. Returns `None` if any level is invalid/out-of-range. Handles L3
@@ -1796,7 +1898,7 @@ impl PageTableManager {
     /// when alias regions overlap (16 KiB host rounding) or are non-linearly
     /// aliased.
     pub fn translate(&self, va: u64) -> Option<u64> {
-        self.translate_with_invalid_leaf(va, false)
+        self.try_translate(va).ok().flatten()
     }
 
     /// Resolve the output address retained in a block/page whose valid bit may
@@ -1809,24 +1911,28 @@ impl PageTableManager {
     /// Clearing VALID deliberately preserves that output address; this typed
     /// lookup exposes it without making the descriptor guest-accessible.
     pub fn translate_retained_output(&self, va: u64) -> Option<u64> {
-        self.translate_with_invalid_leaf(va, true)
+        self.try_translate_retained_output(va).ok().flatten()
     }
 
-    fn translate_with_invalid_leaf(&self, va: u64, allow_invalid_leaf: bool) -> Option<u64> {
+    fn try_translate_with_invalid_leaf(
+        &self,
+        va: u64,
+        allow_invalid_leaf: bool,
+    ) -> Result<Option<u64>, PageTableError> {
         let idx = indices(va);
         let mut table_loc = TableLocation::new(0, 0);
         #[allow(clippy::needless_range_loop)]
         for level in 0..4usize {
             let entry_loc = table_loc.entry(idx[level]);
             if entry_loc.offset + 8 > self.arenas[entry_loc.arena].allocated_span() as usize {
-                return None;
+                return Ok(None);
             }
-            let desc = self.read_desc(entry_loc);
+            let desc = self.read_desc(entry_loc)?;
             if desc & VALID == 0 {
                 if !allow_invalid_leaf {
-                    return None;
+                    return Ok(None);
                 }
-                return match level {
+                return Ok(match level {
                     1 if desc & PA_MASK_1GIB != 0 => {
                         Some((desc & PA_MASK_1GIB) | (va & ((1u64 << 30) - 1)))
                     }
@@ -1835,26 +1941,29 @@ impl PageTableManager {
                     }
                     3 if desc & PA_MASK_4KIB != 0 => Some((desc & PA_MASK_4KIB) | (va & 0xFFF)),
                     _ => None,
-                };
+                });
             }
             let is_table_or_page = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
             if level == 3 {
                 // L3 leaf must be a page (TYPE_TABLE_OR_PAGE); 0b01 is invalid here.
-                return is_table_or_page.then_some((desc & PA_MASK_4KIB) | (va & 0xFFF));
+                return Ok(is_table_or_page.then_some((desc & PA_MASK_4KIB) | (va & 0xFFF)));
             }
             if is_table_or_page {
                 // Table descriptor: descend to the next level.
-                table_loc = self.pa_to_loc(desc & PA_MASK_TABLE).ok()?;
+                table_loc = match self.pa_to_loc(desc & PA_MASK_TABLE) {
+                    Ok(loc) => loc,
+                    Err(_) => return Ok(None),
+                };
             } else {
                 // Block descriptor (TYPE_BLOCK) terminates the walk at L1/L2.
-                return match level {
+                return Ok(match level {
                     1 => Some((desc & PA_MASK_1GIB) | (va & ((1u64 << 30) - 1))),
                     2 => Some((desc & PA_MASK_2MIB) | (va & ((1u64 << 21) - 1))),
                     _ => None, // L0 block is not architecturally valid here
-                };
+                });
             }
         }
-        None
+        Ok(None)
     }
 
     /// Carve a zeroed table page: reuse a coalesced one if available, else bump
@@ -1930,7 +2039,7 @@ impl PageTableManager {
         level: usize,
         source: Option<&mut dyn TableArenaSource>,
     ) -> Result<(), PageTableError> {
-        let block = self.read_desc(parent_loc);
+        let block = self.read_desc(parent_loc)?;
         let (parent_pa_mask, child_pa_mask, child_stride, child_is_page) = match level {
             1 => (PA_MASK_1GIB, PA_MASK_2MIB, 1u64 << 21, false),
             2 => (PA_MASK_2MIB, PA_MASK_4KIB, 1u64 << 12, true),
@@ -1952,7 +2061,7 @@ impl PageTableManager {
         for i in 0..512u64 {
             let child_loc = table_loc.entry(i as usize);
             if parent_empty {
-                self.write_desc(child_loc, 0);
+                self.write_desc(child_loc, 0)?;
                 continue;
             }
             let child_pa = base_pa + i * child_stride;
@@ -1960,9 +2069,9 @@ impl PageTableManager {
             if !parent_valid {
                 desc &= !VALID;
             }
-            self.write_desc(child_loc, desc);
+            self.write_desc(child_loc, desc)?;
         }
-        self.write_table_desc(parent_loc, (table_pa & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE);
+        self.write_table_desc(parent_loc, (table_pa & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE)?;
         Ok(())
     }
 
@@ -1983,7 +2092,7 @@ impl PageTableManager {
             if level == 3 {
                 return Ok((entry_loc, 3));
             }
-            let desc = self.read_desc(entry_loc);
+            let desc = self.read_desc(entry_loc)?;
             let valid = desc & VALID != 0;
             let is_table = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
             if is_table && valid {
@@ -1997,7 +2106,7 @@ impl PageTableManager {
                 return Err(PageTableError::BadAddress);
             }
             self.split_block(entry_loc, level, source.as_deref_mut())?;
-            let desc2 = self.read_desc(entry_loc);
+            let desc2 = self.read_desc(entry_loc)?;
             table_loc = self.pa_to_loc(desc2 & PA_MASK_TABLE)?;
         }
         Err(PageTableError::BadAddress)
@@ -2005,7 +2114,7 @@ impl PageTableManager {
 
     /// Next-level table PA if the entry at `loc` is a valid table descriptor.
     fn child_table_pa(&self, loc: TableLocation) -> Option<u64> {
-        let d = self.read_desc(loc);
+        let d = self.read_desc(loc).ok()?;
         if d & VALID != 0 && d & TYPE_BITS == TYPE_TABLE_OR_PAGE {
             Some(d & PA_MASK_TABLE)
         } else {
@@ -2027,7 +2136,7 @@ impl PageTableManager {
         child_stride: u64,
         child_type: u64,
     ) -> Option<(u64, u64)> {
-        let e0 = self.read_desc(table_loc);
+        let e0 = self.read_desc(table_loc).ok()?;
         if e0 & VALID == 0 || e0 & TYPE_BITS != child_type {
             return None;
         }
@@ -2038,7 +2147,7 @@ impl PageTableManager {
         }
         let attrs = e0 & !child_pa_mask & !TYPE_BITS;
         for i in 0..512usize {
-            let d = self.read_desc(table_loc.entry(i));
+            let d = self.read_desc(table_loc.entry(i)).ok()?;
             if d & VALID == 0
                 || d & TYPE_BITS != child_type
                 || (d & child_pa_mask) != base_pa + (i as u64) * child_stride
@@ -2083,8 +2192,8 @@ impl PageTableManager {
                 && let Some((base, attrs)) =
                     self.uniform_block(l3_loc, PA_MASK_4KIB, 1 << 12, TYPE_TABLE_OR_PAGE)
             {
-                self.write_desc(l2_entry, (base & PA_MASK_2MIB) | attrs | TYPE_BLOCK);
-                self.free_table(l3_pa);
+                let _ = self.write_desc(l2_entry, (base & PA_MASK_2MIB) | attrs | TYPE_BLOCK);
+                let _ = self.free_table(l3_pa);
                 coalesced = true;
             }
         }
@@ -2096,8 +2205,8 @@ impl PageTableManager {
             && let Some((base, attrs)) =
                 self.uniform_block(l2_loc, PA_MASK_2MIB, 1 << 21, TYPE_BLOCK)
         {
-            self.write_desc(l1_entry, (base & PA_MASK_1GIB) | attrs | TYPE_BLOCK);
-            self.free_table(l2_pa);
+            let _ = self.write_desc(l1_entry, (base & PA_MASK_1GIB) | attrs | TYPE_BLOCK);
+            let _ = self.free_table(l2_pa);
             coalesced = true;
         }
         coalesced
@@ -2212,7 +2321,7 @@ impl PageTableManager {
             let (span, mask) = Self::level_span(level);
             let block_start = cur & mask;
             let block_end = block_start + span;
-            let desc = self.read_desc(off);
+            let desc = self.read_desc(off)?;
             let empty = !Self::records_output(desc, level);
             let already = match op {
                 // An EMPTY descriptor is already as invalid as it can be, and
@@ -2238,21 +2347,6 @@ impl PageTableManager {
             } else if block_start >= va && block_end <= end {
                 // The whole covering block is inside the range and needs the
                 // change: edit it in place at this level (no split).
-                //
-                // Protection edits are IN PLACE (flip VALID/AP/UXN, keep the
-                // descriptor's output address and remaining attributes). For
-                // identity pages this is bit-identical to rebuilding from the
-                // VA; for a NON-identity leaf — a `map_aliased` alias (e.g. a
-                // PROT_NONE `MAP_SHARED` file mapping) or a `repoint_private`
-                // private-overlay leaf — it preserves the recorded IPA instead
-                // of clobbering it with a meaningless identity PA (which would
-                // silently repoint a private overlay back at the SHARED page).
-                // Only an EMPTY descriptor (no address recorded — see
-                // `records_output`) is rebuilt from the identity VA,
-                // preserving the historical arena behaviour. `desc != 0` is
-                // NOT that test: an invalidated-then-split empty block once
-                // left `index * stride | flags` children here, and this branch
-                // published them as VALID leaves at IPA 0x5000.
                 let previously_valid = desc & VALID != 0;
                 let new_desc = match op {
                     PtOp::Invalidate | PtOp::Retire => {
@@ -2329,7 +2423,7 @@ impl PageTableManager {
                     return Err(PageTableError::GicWindowOutput);
                 }
                 if new_desc != desc {
-                    self.write_desc(off, new_desc);
+                    self.write_desc(off, new_desc)?;
                     changed = true;
                     if previously_valid {
                         flush_required = true;
@@ -2343,7 +2437,7 @@ impl PageTableManager {
                 // split itself mutates the tables (parent → table pointer + a
                 // new sub-table), so it must be synced even if the subsequent
                 // in-range edits all happen to be no-ops.
-                let block = self.read_desc(off);
+                let block = self.read_desc(off)?;
                 let parent_valid = block & VALID != 0;
                 self.split_block(off, level, source.as_deref_mut())?;
                 changed = true;
@@ -2536,14 +2630,14 @@ impl PageTableManager {
                         && let Ok(l3_loc) = self.pa_to_loc(l3_pa)
                         && self.table_reclaimable(l3_loc, l3_table_va, 3)
                     {
-                        self.write_desc(l2_entry, 0);
-                        self.free_table(l3_pa);
+                        let _ = self.write_desc(l2_entry, 0);
+                        let _ = self.free_table(l3_pa);
                         freed = true;
                     }
                 }
                 if self.is_spare_table(l2_pa) && self.table_reclaimable(l2_loc, l2_table_va, 2) {
-                    self.write_desc(l1_entry, 0);
-                    self.free_table(l2_pa);
+                    let _ = self.write_desc(l1_entry, 0);
+                    let _ = self.free_table(l2_pa);
                     freed = true;
                 }
             }
@@ -2572,8 +2666,8 @@ impl PageTableManager {
                 && let Ok(l3_loc) = self.pa_to_loc(l3_pa)
                 && self.table_reclaimable(l3_loc, va & !((1 << 21) - 1), 3)
             {
-                self.write_desc(l2_entry, 0);
-                self.free_table(l3_pa);
+                let _ = self.write_desc(l2_entry, 0);
+                let _ = self.free_table(l3_pa);
                 freed = true;
             }
         }
@@ -2583,8 +2677,8 @@ impl PageTableManager {
             && let Ok(l2_loc) = self.pa_to_loc(l2_pa)
             && self.table_reclaimable(l2_loc, va & !((1 << 30) - 1), 2)
         {
-            self.write_desc(l1_entry, 0);
-            self.free_table(l2_pa);
+            let _ = self.write_desc(l1_entry, 0);
+            let _ = self.free_table(l2_pa);
             freed = true;
         }
         freed
@@ -2612,7 +2706,10 @@ impl PageTableManager {
     fn table_reclaimable(&self, table_loc: TableLocation, table_va: u64, level: usize) -> bool {
         let (span, mask) = Self::level_span(level);
         (0..512usize).all(|i| {
-            let desc = self.read_desc(table_loc.entry(i));
+            let desc = match self.read_desc(table_loc.entry(i)) {
+                Ok(d) => d,
+                Err(_) => return false,
+            };
             if desc & VALID != 0 {
                 return false;
             }
@@ -2791,10 +2888,10 @@ impl PageTableManager {
             if level != 3 {
                 return Err(PageTableError::BadAddress);
             }
-            let descriptor = self.read_desc(loc);
+            let descriptor = self.read_desc(loc)?;
             let replacement = (descriptor & !PA_MASK_4KIB) | (page_ipa & PA_MASK_4KIB);
             if replacement != descriptor {
-                self.write_desc(loc, replacement);
+                self.write_desc(loc, replacement)?;
                 changed = true;
             }
         }
@@ -2820,13 +2917,13 @@ impl PageTableManager {
             if level != 3 {
                 return Err(PageTableError::BadAddress);
             }
-            let descriptor = self.read_desc(loc);
+            let descriptor = self.read_desc(loc)?;
             if descriptor & VALID == 0 {
                 continue;
             }
             let replacement = (descriptor & !AP_MASK) | AP_RW;
             if replacement != descriptor {
-                self.write_desc(loc, replacement);
+                self.write_desc(loc, replacement)?;
                 changed = true;
             }
         }
@@ -2939,7 +3036,7 @@ impl PageTableManager {
             let flags = if level == 3 { page_flags } else { block_flags };
             let table_loc = self.descend_creating(cursor, level, source.as_deref_mut())?;
             let idx = indices(cursor);
-            self.write_desc(table_loc.entry(idx[level]), (out & mask) | flags);
+            self.write_desc(table_loc.entry(idx[level]), (out & mask) | flags)?;
             cursor += span;
         }
         Ok(true)
@@ -2960,7 +3057,7 @@ impl PageTableManager {
         #[allow(clippy::needless_range_loop)]
         for level in 0..target_level {
             let entry_loc = table_loc.entry(idx[level]);
-            let desc = self.read_desc(entry_loc);
+            let desc = self.read_desc(entry_loc)?;
             let valid = desc & VALID != 0;
             let is_table = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
             if valid && is_table {
@@ -2975,13 +3072,13 @@ impl PageTableManager {
                 // forked child hits when it maps inside a block its parent's
                 // cloned tables already established). Mirrors `leaf_offset`.
                 self.split_block(entry_loc, level, source.as_deref_mut())?;
-                let desc2 = self.read_desc(entry_loc);
+                let desc2 = self.read_desc(entry_loc)?;
                 table_loc = self.pa_to_loc(desc2 & PA_MASK_TABLE)?;
                 continue;
             }
             let pa = self.alloc_table(source.as_deref_mut())?;
             table_loc = self.pa_to_loc(pa)?;
-            self.write_table_desc(entry_loc, (pa & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE);
+            self.write_table_desc(entry_loc, (pa & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE)?;
         }
         Ok(table_loc)
     }
@@ -2990,7 +3087,7 @@ impl PageTableManager {
     #[cfg(test)]
     pub fn is_valid(&mut self, va: u64) -> bool {
         match self.leaf_offset(va, false, None) {
-            Ok((loc, _)) => self.read_desc(loc) & VALID != 0,
+            Ok((loc, _)) => self.read_desc(loc).map(|d| d & VALID != 0).unwrap_or(false),
             Err(_) => false,
         }
     }
@@ -2999,7 +3096,7 @@ impl PageTableManager {
     #[cfg(test)]
     pub fn ap_bits(&mut self, va: u64) -> u64 {
         match self.leaf_offset(va, false, None) {
-            Ok((loc, _)) => self.read_desc(loc) & AP_MASK,
+            Ok((loc, _)) => self.read_desc(loc).map(|d| d & AP_MASK).unwrap_or(0),
             Err(_) => 0,
         }
     }
@@ -3427,8 +3524,11 @@ mod tests {
 
         mgr.unmap_aliased(carrick_mem::memory::LINUX_NULL_GUARD_END, 0x1000, None)
             .expect("remove the low detection leaf");
-        let mut reconstructed =
-            PageTableManager::new(mgr.into_bytes(), LINUX_PAGE_TABLES_BASE, test_layout());
+        let mut reconstructed = PageTableManager::new(
+            mgr.into_bytes().unwrap(),
+            LINUX_PAGE_TABLES_BASE,
+            test_layout(),
+        );
         reconstructed
             .map_aliased(shared_va, shared_ipa, 0x4000, true, None)
             .expect("publish alias after reconstructing the editor");
@@ -4358,7 +4458,7 @@ mod tests {
         let mut mgr = manager();
         let va = LINUX_MMAP_BASE + 0x40_0000;
         mgr.set_prot_none(va, 0x1000, None).unwrap();
-        let bytes = mgr.into_bytes();
+        let bytes = mgr.into_bytes().unwrap();
         let mut mgr2 = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE, test_layout());
         assert!(!mgr2.is_valid(va), "edit survived round-trip through bytes");
     }
@@ -4425,8 +4525,11 @@ mod tests {
         let (used, _, _, _) = boot.pool_stats();
         assert!(used >= 1, "boot edit allocated spare table(s)");
 
-        let mut rebuilt =
-            PageTableManager::new(boot.into_bytes(), LINUX_PAGE_TABLES_BASE, test_layout());
+        let mut rebuilt = PageTableManager::new(
+            boot.into_bytes().unwrap(),
+            LINUX_PAGE_TABLES_BASE,
+            test_layout(),
+        );
         let (rebuilt_used, _, _, _) = rebuilt.pool_stats();
         assert_eq!(rebuilt_used, used, "cursor re-discovered, not reset");
         assert_eq!(rebuilt.ap_bits(ro_va), AP_RO);
@@ -4515,7 +4618,7 @@ mod tests {
 
         mgr.set_rw(LINUX_HEAP_BASE, 0x1000, false, None)
             .expect("grow heap page to RW");
-        let bytes_after_grow = mgr.into_bytes();
+        let bytes_after_grow = mgr.into_bytes().unwrap();
         let walk_grow = |va| {
             terminal_descriptor(walk_descriptors(
                 &bytes_after_grow,
@@ -4549,7 +4652,7 @@ mod tests {
         mgr2.set_multi_vcpu(true);
         mgr2.set_prot_none(LINUX_HEAP_BASE, 0x1000, None)
             .expect("shrink heap page to PROT_NONE");
-        let bytes_after_shrink = mgr2.into_bytes();
+        let bytes_after_shrink = mgr2.into_bytes().unwrap();
         let walk_shrink = |va| {
             terminal_descriptor(walk_descriptors(
                 &bytes_after_shrink,
@@ -4840,7 +4943,7 @@ mod tests {
             .dirty
             .iter()
             .map(|(loc, _)| {
-                let word = mgr.read_desc(*loc);
+                let word = mgr.read_desc(*loc).unwrap();
                 (loc.offset / 8, word)
             })
             .collect();
@@ -5170,7 +5273,7 @@ mod tests {
         }
     }
 
-    impl HostArenaResolver for MockLiveResolver {
+    unsafe impl HostArenaResolver for MockLiveResolver {
         fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
             let mut arenas = self.arenas.lock().unwrap();
             arenas.get_mut(&base).map(|buf| buf.as_mut_ptr())
@@ -5186,7 +5289,7 @@ mod tests {
         }
     }
 
-    impl HostArenaResolver for &MockLiveResolver {
+    unsafe impl HostArenaResolver for &MockLiveResolver {
         fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
             (*self).host_ptr_for_base(base)
         }
@@ -5211,11 +5314,11 @@ mod tests {
         mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
         unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) };
 
-        mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        unsafe { mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>) };
         assert!(mgr.is_live());
         assert_eq!(mgr.translate(va), Some(ipa));
 
-        let snap = mgr.snapshot_image();
+        let snap = mgr.snapshot_image().expect("snapshot");
         assert_eq!(snap.translate(va), Some(ipa));
 
         // Walk to find the leaf descriptor's offset in the primary arena
@@ -5243,7 +5346,7 @@ mod tests {
             "live translation must observe revocation"
         );
         assert_eq!(
-            mgr.snapshot_image().translate(va),
+            mgr.snapshot_image().expect("snapshot").translate(va),
             None,
             "live snapshot must observe revocation"
         );
@@ -5255,7 +5358,10 @@ mod tests {
 
         // Host translation and snapshot must observe the repointed IPA
         assert_eq!(mgr.translate(va), Some(new_ipa));
-        assert_eq!(mgr.snapshot_image().translate(va), Some(new_ipa));
+        assert_eq!(
+            mgr.snapshot_image().expect("snapshot").translate(va),
+            Some(new_ipa)
+        );
     }
 
     #[test]
@@ -5269,7 +5375,7 @@ mod tests {
         mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
         unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) };
 
-        mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        unsafe { mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>) };
 
         let walk = mgr.debug_walk(va);
         let leaf_desc = walk[3];
@@ -5311,7 +5417,7 @@ mod tests {
             .expect("map");
         unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) };
 
-        mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        unsafe { mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>) };
         assert_eq!(mgr.translate(va), Some(ipa_a));
 
         // Begin transaction
@@ -5330,7 +5436,10 @@ mod tests {
         // Rollback
         unsafe { mgr.rollback_undo(&*resolver, None) };
         assert_eq!(mgr.translate(va), Some(ipa_a), "restores preimage A");
-        assert_eq!(mgr.snapshot_image().translate(va), Some(ipa_a));
+        assert_eq!(
+            mgr.snapshot_image().expect("snapshot").translate(va),
+            Some(ipa_a)
+        );
     }
 
     #[test]
@@ -5360,15 +5469,120 @@ mod tests {
             mgr2.restore_quiesced_snapshot_to_host(&*resolver);
         }
 
-        mgr1.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
-        mgr2.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        unsafe {
+            mgr1.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+            mgr2.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        }
 
         assert_eq!(mgr1.translate(va), Some(ipa1));
         assert_eq!(mgr2.translate(va), Some(ipa2));
 
-        let snap1 = mgr1.snapshot_image();
-        let snap2 = mgr2.snapshot_image();
+        let snap1 = mgr1.snapshot_image().expect("snap1");
+        let snap2 = mgr2.snapshot_image().expect("snap2");
         assert_eq!(snap1.translate(va), Some(ipa1));
         assert_eq!(snap2.translate(va), Some(ipa2));
+    }
+
+    #[test]
+    fn failed_resolution_errors_on_translate_debug_walk_and_snapshot() {
+        let resolver = MockLiveResolver::new();
+        // Do NOT register LINUX_PAGE_TABLES_BASE arena -> resolution fails
+
+        let mut mgr = hvpatch_manager();
+        unsafe {
+            mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        }
+
+        let va = 0x50_0000;
+        assert_eq!(
+            mgr.try_translate(va),
+            Err(PageTableError::UnresolvedArena(LINUX_PAGE_TABLES_BASE))
+        );
+        assert_eq!(
+            mgr.try_debug_walk(va),
+            Err(PageTableError::UnresolvedArena(LINUX_PAGE_TABLES_BASE))
+        );
+        assert_eq!(
+            mgr.snapshot_image().unwrap_err(),
+            PageTableError::UnresolvedArena(LINUX_PAGE_TABLES_BASE)
+        );
+        let mut target = hvpatch_manager();
+        assert_eq!(
+            mgr.snapshot_into(&mut target).unwrap_err(),
+            PageTableError::UnresolvedArena(LINUX_PAGE_TABLES_BASE)
+        );
+        assert_eq!(
+            mgr.into_bytes().unwrap_err(),
+            PageTableError::UnresolvedArena(LINUX_PAGE_TABLES_BASE)
+        );
+    }
+
+    #[test]
+    fn live_atomic_snapshot_observes_concurrent_leaf_mutations_without_stale_shadow() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let mut mgr = hvpatch_manager();
+        let va = 0x60_0000;
+        let ipa = 0x70_0000;
+        mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
+        unsafe { mgr.restore_quiesced_snapshot_to_host(&*resolver) };
+        unsafe { mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>) };
+
+        let walk = mgr.debug_walk(va);
+        let leaf_desc = walk[3];
+        let mut leaf_offset = None;
+        for offset in (0..mgr.arenas[0].allocated_span() as usize).step_by(8) {
+            if resolver.read_word(LINUX_PAGE_TABLES_BASE, offset) == leaf_desc {
+                leaf_offset = Some(offset);
+                break;
+            }
+        }
+        let leaf_offset = leaf_offset.expect("leaf offset");
+
+        // Concurrent atomic update in guest hardware backing
+        let new_ipa = 0x75_0000;
+        let new_desc = (leaf_desc & !PA_MASK_TABLE) | (new_ipa & PA_MASK_TABLE);
+        resolver.write_word(LINUX_PAGE_TABLES_BASE, leaf_offset, new_desc);
+
+        // Snapshot into existing target
+        let mut snap_target = hvpatch_manager();
+        mgr.snapshot_into(&mut snap_target).expect("snapshot_into");
+        assert_eq!(snap_target.translate(va), Some(new_ipa));
+    }
+
+    #[test]
+    fn live_bound_restore_image_writes_descriptors_to_hardware_memory() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let mut mgr = hvpatch_manager();
+        let va = 0x50_0000;
+        let ipa = 0x80_0000;
+        mgr.map_aliased(va, ipa, 0x1000, false, None).expect("map");
+
+        // Snapshot image
+        let snap = mgr.snapshot_image().expect("snapshot");
+
+        // Overwrite resolver memory with garbage
+        let garbage = vec![0xcc; LINUX_PAGE_TABLES_SIZE as usize];
+        resolver
+            .arenas
+            .lock()
+            .unwrap()
+            .insert(LINUX_PAGE_TABLES_BASE, garbage);
+
+        // Restore snapshot to host
+        unsafe { snap.restore_quiesced_snapshot_to_host(&*resolver) };
+
+        // Verify host memory matches snapshot
+        let host_bytes = resolver
+            .arenas
+            .lock()
+            .unwrap()
+            .get(&LINUX_PAGE_TABLES_BASE)
+            .unwrap()
+            .clone();
+        assert_eq!(&host_bytes[..snap.as_bytes().len()], snap.as_bytes());
     }
 }

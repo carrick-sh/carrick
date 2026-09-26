@@ -356,6 +356,7 @@ impl InventoryExtentMap {
 
     /// Values may be edited in place; keys, and so the index, cannot be.
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
+    #[allow(dead_code)]
     pub(crate) fn values_mut(
         &mut self,
     ) -> std::collections::btree_map::ValuesMut<'_, (u64, u64), InventoryExtent> {

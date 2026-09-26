@@ -221,7 +221,7 @@ impl Stage1Authority {
         let mut inner = self.inner.lock();
         inner.host_resolver = Some(Arc::clone(&resolver));
         if let Some(manager) = inner.manager.as_mut() {
-            manager.make_live(resolver);
+            unsafe { manager.make_live(resolver) };
         }
     }
 
@@ -248,7 +248,7 @@ impl Stage1Authority {
     pub fn set_manager(&self, mut manager: PageTableManager) {
         let mut inner = self.inner.lock();
         if let Some(ref resolver) = inner.host_resolver {
-            manager.make_live(Arc::clone(resolver));
+            unsafe { manager.make_live(Arc::clone(resolver)) };
         }
         *inner.manager = Some(manager);
     }
@@ -340,7 +340,7 @@ impl Stage1Authority {
     pub fn snapshot_image(&self) -> Option<PageTableManager> {
         let guard = self.inner.lock();
         let source = guard.manager.as_ref()?;
-        Some(source.snapshot_image())
+        source.snapshot_image().ok()
     }
 
     /// Snapshot the current image into a recycled buffer when the pool holds
@@ -351,13 +351,17 @@ impl Stage1Authority {
         let guard = self.inner.lock();
         let source = guard.manager.as_ref()?;
         match guard.image_pool.take() {
-            Some(mut image) => {
-                source.snapshot_into(&mut image);
-                Some((image, false))
-            }
+            Some(mut image) => match source.snapshot_into(&mut image) {
+                Ok(()) => Some((image, false)),
+                Err(_) => {
+                    let snap = source.snapshot_image().ok()?;
+                    Some((snap, true))
+                }
+            },
             None => {
+                let snap = source.snapshot_image().ok()?;
                 guard.image_pool.record_fresh_allocation();
-                Some((source.snapshot_image(), true))
+                Some((snap, true))
             }
         }
     }
@@ -448,7 +452,7 @@ impl Stage1Authority {
         if inner.manager.is_none() {
             let mut manager = builder()?;
             if let Some(ref resolver) = inner.host_resolver {
-                manager.make_live(Arc::clone(resolver));
+                unsafe { manager.make_live(Arc::clone(resolver)) };
             }
             let had_source = inner.arena_source.is_some();
             carrick_observability::probes::stage1_arena_install(
@@ -524,7 +528,7 @@ impl Stage1Authority {
             match eager_builder() {
                 Ok(mut manager) => {
                     if let Some(ref resolver) = inner.host_resolver {
-                        manager.make_live(Arc::clone(resolver));
+                        unsafe { manager.make_live(Arc::clone(resolver)) };
                     }
                     carrick_observability::probes::stage1_arena_install(2, 1, 0, authority);
                     inner.arena_source = Some(source);
@@ -556,7 +560,7 @@ impl Stage1Authority {
         if inner.manager.is_none() {
             let mut manager = builder()?;
             if let Some(ref resolver) = inner.host_resolver {
-                manager.make_live(Arc::clone(resolver));
+                unsafe { manager.make_live(Arc::clone(resolver)) };
             }
             let had_source = inner.arena_source.is_some();
             carrick_observability::probes::stage1_arena_install(
@@ -587,11 +591,7 @@ impl Stage1Authority {
     ///
     /// Adopts live extension arenas from the active manager into `image`, retains
     /// this authority's arena source, fires `stage1_arena_replace(site, before, after, authority)`,
-    /// and replaces the manager. Returns the replaced manager.
-    ///
-    /// Note: `stage1_arena_replace` probes fire `before == after` by construction because the
-    /// `TableArenaSource` is exclusively owned by this `Stage1Authority` and is invariant
-    /// across manager image restores.
+    /// restores quiesced descriptors to live host memory, and replaces the manager. Returns the replaced manager.
     pub fn restore_image(
         &self,
         mut image: PageTableManager,
@@ -606,7 +606,10 @@ impl Stage1Authority {
             carrick_observability::probes::stage1_arena_replace(site, before, after, authority);
         }
         if let Some(ref resolver) = inner.host_resolver {
-            image.make_live(Arc::clone(resolver));
+            unsafe {
+                image.restore_quiesced_snapshot_to_host(resolver);
+                image.make_live(Arc::clone(resolver));
+            }
         }
         inner.manager.replace(image)
     }
@@ -640,7 +643,7 @@ impl Stage1Authority {
         }
         unsafe { image.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
         if let Some(ref resolver) = inner.host_resolver {
-            image.make_live(Arc::clone(resolver));
+            unsafe { image.make_live(Arc::clone(resolver)) };
         }
         inner.manager.replace(image)
     }
@@ -763,7 +766,7 @@ impl Stage1Authority {
             if let Some(ref resolver) = resolver_opt
                 && let Some(mgr) = new_guard.manager.as_mut()
             {
-                mgr.make_live(Arc::clone(resolver));
+                unsafe { mgr.make_live(Arc::clone(resolver)) };
             }
             let after = u32::from(new_guard.arena_source.is_some());
             carrick_observability::probes::stage1_arena_replace(12, before, after, authority);
@@ -1064,12 +1067,18 @@ impl<'a> Stage1Editor<'a> {
     }
 
     /// Restore a pre-transaction image over the live manager, adopting extension arenas,
-    /// preserving the arena source, and firing `stage1_arena_replace`.
+    /// preserving the arena source, restoring descriptors to hardware memory, and firing `stage1_arena_replace`.
     pub fn restore_image(&mut self, mut image: PageTableManager, site: u32, authority: u64) {
         let before = u32::from(self.arena_source.is_some());
         image.adopt_live_extension_state(self.manager);
         let after = before;
         carrick_observability::probes::stage1_arena_replace(site, before, after, authority);
+        if let Some(resolver) = self.manager.resolver().cloned() {
+            unsafe {
+                image.restore_quiesced_snapshot_to_host(&resolver);
+                image.make_live(resolver);
+            }
+        }
         *self.manager = image;
     }
 }
@@ -1688,5 +1697,115 @@ mod tests {
                 },
             )
             .expect("verify");
+    }
+
+    struct BufferResolver {
+        buf: std::sync::Mutex<Vec<u8>>,
+        base: u64,
+    }
+
+    unsafe impl HostArenaResolver for BufferResolver {
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            if base == self.base {
+                Some(self.buf.lock().unwrap().as_mut_ptr())
+            } else {
+                None
+            }
+        }
+        fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+            if base == self.base {
+                Some(self.buf.lock().unwrap().as_ptr())
+            } else {
+                None
+            }
+        }
+    }
+
+    unsafe impl HostArenaResolver for &BufferResolver {
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            (*self).host_ptr_for_base(base)
+        }
+        fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+            (*self).host_const_ptr_for_base(base)
+        }
+    }
+
+    #[test]
+    fn stage1_authority_live_restore_and_rollback_updates_hardware_backing() {
+        let manager = test_manager();
+        let authority = Stage1Authority::new_with_manager(Some(manager));
+
+        let resolver = Arc::new(BufferResolver {
+            buf: std::sync::Mutex::new(vec![0u8; LINUX_PAGE_TABLES_SIZE as usize]),
+            base: LINUX_PAGE_TABLES_BASE,
+        });
+
+        authority
+            .bind_live_backing(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+
+        let va = 0x50_0000;
+        let ipa1 = 0x80_0000;
+        let ipa2 = 0x90_0000;
+
+        // Map initial translation to ipa1
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    editor.map_aliased(va, ipa1, 0x1000, true).expect("map 1");
+                    unsafe { editor.sync_to_host(&*resolver).expect("sync 1") };
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .expect("edit 1");
+
+        // Take snapshot image
+        let snap1 = authority.snapshot_image().expect("snapshot 1");
+
+        // Map translation to ipa2
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    editor.map_aliased(va, ipa2, 0x1000, true).expect("map 2");
+                    unsafe { editor.sync_to_host(&*resolver).expect("sync 2") };
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .expect("edit 2");
+
+        authority.with_manager(|mgr| {
+            assert_eq!(mgr.translate(va), Some(ipa2));
+        });
+
+        // Restore snapshot 1
+        authority.restore_image(snap1, 1);
+
+        // Hardware memory and live translation must now reflect ipa1
+        authority.with_manager(|mgr| {
+            assert_eq!(mgr.translate(va), Some(ipa1));
+        });
+    }
+
+    struct FailingResolver;
+    unsafe impl HostArenaResolver for FailingResolver {
+        fn host_ptr_for_base(&self, _base: u64) -> Option<*mut u8> {
+            None
+        }
+        fn host_const_ptr_for_base(&self, _base: u64) -> Option<*const u8> {
+            None
+        }
+    }
+
+    #[test]
+    fn stage1_authority_snapshot_fails_on_unresolved_live_backing() {
+        let manager = test_manager();
+        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let resolver = Arc::new(FailingResolver);
+        authority.bind_live_backing(resolver);
+
+        // Snapshot must fail closed and return None
+        assert!(authority.snapshot_image().is_none());
+        assert!(authority.snapshot_image_recycled().is_none());
     }
 }

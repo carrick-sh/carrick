@@ -2445,7 +2445,15 @@ impl AddressSpace {
                 // degrades to the historical (writable) behaviour.
                 let _ = mgr.set_readonly(start, len, span.exec, None);
             }
-            mgr.into_bytes()
+            match mgr.into_bytes() {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    carrick_fatal!(
+                        "mem::load_elf",
+                        "failed to serialize stage-1 page tables: {err}"
+                    );
+                }
+            }
         };
         let start = LINUX_PAGE_TABLES_BASE;
         let end =
@@ -3506,7 +3514,15 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
             heap_size
         );
     }
-    mgr.into_bytes()
+    match mgr.into_bytes() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            carrick_fatal!(
+                "mem::stage1_tables",
+                "failed to serialize stage-1 identity page tables: {err}"
+            );
+        }
+    }
 }
 
 /// Build the per-mm HVPatch stage-1 image.

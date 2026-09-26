@@ -1279,7 +1279,7 @@ pub(crate) struct HvfPageTableResolver<'a> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl<'a> carrick_mmu_core::aarch64::HostArenaResolver for HvfPageTableResolver<'a> {
+unsafe impl<'a> carrick_mmu_core::aarch64::HostArenaResolver for HvfPageTableResolver<'a> {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         self.primary_host
             .filter(|_| base == self.manager_base)

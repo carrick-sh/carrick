@@ -1056,7 +1056,7 @@ struct PinnedStage1Arenas {
         std::collections::BTreeMap<u64, (std::sync::Arc<StructuralBackingOwner>, CarrierStage2Pin)>,
     relocated_primary: Option<(u64, GlobalFrameOwnerPin)>,
 }
-impl carrick_mmu_core::aarch64::HostArenaResolver for PinnedStage1Arenas {
+unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for PinnedStage1Arenas {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         <&Self as carrick_mmu_core::aarch64::HostArenaResolver>::host_ptr_for_base(&self, base)
     }
@@ -1066,7 +1066,7 @@ impl carrick_mmu_core::aarch64::HostArenaResolver for PinnedStage1Arenas {
         );
     }
 }
-impl carrick_mmu_core::aarch64::HostArenaResolver for &PinnedStage1Arenas {
+unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for &PinnedStage1Arenas {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         self.structural
             .get(&base)
