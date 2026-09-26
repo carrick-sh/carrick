@@ -684,7 +684,9 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
             ))
         },
     )?;
-    let table_bytes = page_tables.into_bytes();
+    let table_bytes = page_tables.into_bytes().map_err(|error| {
+        TrapError::Hypervisor(format!("execve stage1 into_bytes failed: {error:?}"))
+    })?;
     {
         let table = &mut global.mappings[table_index];
         if table.ipa_start != root || table_bytes.len() > table.mapped_size as usize {

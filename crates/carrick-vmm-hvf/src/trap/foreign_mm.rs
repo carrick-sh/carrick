@@ -354,6 +354,8 @@ pub(crate) struct MmAccessState {
 pub(crate) struct MmAccessLiveResolver {
     mm_access: std::sync::Weak<MmAccessState>,
     custody: std::sync::Arc<CarrierVmCustody>,
+    pub(crate) retained_owners:
+        parking_lot::RwLock<std::collections::BTreeMap<u64, (u64, RetainedPhysicalOwner)>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -365,42 +367,94 @@ impl MmAccessLiveResolver {
         std::sync::Arc::new(Self {
             mm_access: std::sync::Arc::downgrade(mm_access),
             custody,
+            retained_owners: parking_lot::RwLock::new(std::collections::BTreeMap::new()),
         })
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolver {
+unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolver {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        // Fast path: cached retained owner with 0 new allocations or locks
+        if let Some((extent_base, owner)) = self.retained_owners.read().get(&base) {
+            let offset = usize::try_from(base.checked_sub(*extent_base)?).ok()?;
+            return owner.ptr_for_offset(offset, 8);
+        }
+
+        // Slow path: authenticate state, ledger generation/bounds, and pin exact owner
         let state = self.mm_access.upgrade()?;
-        // 1. Direct structural owner lookup (O(1))
-        if let Some(ptr) = state
-            .structural_owner_host_ptr(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+
+        // 1. Direct structural owner lookup
+        let structural = state.structural_owners.read();
+        if let Some((&(owner_base, owner_len), owner)) =
+            structural.range(..=(base, usize::MAX)).next_back()
         {
-            return Some(ptr);
+            if base >= owner_base
+                && base
+                    .checked_add(8)
+                    .is_some_and(|end| end <= owner_base + owner_len as u64)
+            {
+                if owner.epoch.raw() != 0 && owner.len() == owner_len {
+                    let offset = usize::try_from(base - owner_base).ok()?;
+                    let retained = RetainedPhysicalOwner::Structural(std::sync::Arc::clone(owner));
+                    let ptr = retained.ptr_for_offset(offset, 8)?;
+                    drop(structural);
+                    self.retained_owners
+                        .write()
+                        .insert(base, (owner_base, retained));
+                    return Some(ptr);
+                }
+            }
         }
-        // 2. Global frame host owner directory lookup (O(1))
-        let key = (base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE);
-        let owners = self.custody.global_frame_host_owners.lock();
-        if let Some(owner) = owners.get(&key).and_then(GlobalFrameOwnerEntry::live_owner) {
-            return Some(owner.ptr());
-        }
-        // 3. Extent lookup in frame inventory
+        drop(structural);
+
+        // 2. Extent lookup in frame inventory ledger with owner generation authentication
         let inventory = state.frame_inventory.ledger.lock();
         if let Some((&logical, extent)) = inventory.extents.range(..=(base, u64::MAX)).next_back() {
-            if base >= logical.0 && base < logical.0.saturating_add(logical.1) {
-                let s2_key = (extent.stage2_base, extent.stage2_length);
+            let logical_end = logical.0.saturating_add(logical.1);
+            let stage2_end = extent.stage2_base.saturating_add(extent.stage2_length);
+            if base >= logical.0
+                && base.checked_add(8).is_some_and(|end| end <= logical_end)
+                && base >= extent.stage2_base
+                && base.checked_add(8).is_some_and(|end| end <= stage2_end)
+            {
                 let expected = extent.stage2_owner;
-                if let Some(owner) = owners
-                    .get(&s2_key)
-                    .and_then(GlobalFrameOwnerEntry::live_owner)
-                {
-                    if owner.generation() != 0
-                        && owner.generation() == expected.generation
-                        && owner.host_addr() == expected.host_addr
+                if expected.generation != 0 {
+                    if let Some(pin) = pin_exact_live_global_frame_owner_in(
+                        &self.custody,
+                        extent.stage2_base,
+                        extent.stage2_length,
+                        expected.host_addr,
+                        expected.generation,
+                    ) {
+                        let offset = usize::try_from(base - extent.stage2_base).ok()?;
+                        let retained = RetainedPhysicalOwner::Global(pin);
+                        let ptr = retained.ptr_for_offset(offset, 8)?;
+                        self.retained_owners
+                            .write()
+                            .insert(base, (extent.stage2_base, retained));
+                        return Some(ptr);
+                    }
+                    let size = usize::try_from(extent.stage2_length).ok()?;
+                    if let Some(owner) = state
+                        .structural_owners
+                        .read()
+                        .get(&(extent.stage2_base, size))
+                        .cloned()
                     {
-                        let offset = (base - s2_key.0) as usize;
-                        return Some(unsafe { owner.ptr().add(offset) });
+                        if owner.epoch.raw() != 0
+                            && owner.epoch.raw() == expected.generation
+                            && owner.ptr() as usize == expected.host_addr
+                            && owner.len() == size
+                        {
+                            let offset = usize::try_from(base - extent.stage2_base).ok()?;
+                            let retained = RetainedPhysicalOwner::Structural(owner);
+                            let ptr = retained.ptr_for_offset(offset, 8)?;
+                            self.retained_owners
+                                .write()
+                                .insert(base, (extent.stage2_base, retained));
+                            return Some(ptr);
+                        }
                     }
                 }
             }
@@ -859,6 +913,20 @@ impl RetainedPhysicalOwner {
             Self::Global(pin) => pin.owner().generation(),
             Self::Structural(owner) => owner.epoch.raw(),
         }
+    }
+
+    pub(crate) fn ptr_for_offset(&self, offset: usize, requested_len: usize) -> Option<*mut u8> {
+        if self.generation() == 0 {
+            return None;
+        }
+        if offset.checked_add(requested_len)? > self.len() {
+            return None;
+        }
+        let ptr = self.ptr();
+        if (ptr as usize + offset) % 8 != 0 {
+            return None;
+        }
+        Some(unsafe { ptr.add(offset) })
     }
 }
 

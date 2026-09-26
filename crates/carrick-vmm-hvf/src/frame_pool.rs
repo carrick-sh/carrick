@@ -582,7 +582,7 @@ impl PooledRootSlotHandle {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl carrick_mmu_core::aarch64::HostArenaResolver for &PooledRootSlotHandle {
+unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for &PooledRootSlotHandle {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         (base == self.ipa()).then_some(self.as_mut_ptr())
     }

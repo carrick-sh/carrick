@@ -9752,4 +9752,128 @@ fn native_code_content_syscall_copy_revokes_physical_dependencies() {
     );
 }
 
+#[test]
+fn live_resolver_retains_exact_owner_pin_and_rejects_nonmatching_generation_and_length() {
+    use carrick_mmu_core::aarch64::HostArenaResolver;
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = CarrierForeignMmTransport::new();
+    let root = 0x9a00_7700_0000;
+    let data_ipa = 0x9b00_7700_0000;
+    let ext_ipa = 0x9a00_7720_0000;
+    let installed = install_mm(&transport, 300, root, data_ipa, *b"test");
+
+    // Add an extension arena to the frame inventory
+    let ext_bytes = vec![0_u8; 4096];
+    let (ext_generation, ext_host) = install_owner(ext_ipa, &ext_bytes);
+    let ext_mapping = carrick_hal::MappingId::from_kernel_allocation(nonzero(300 * 10 + 5));
+    let ext_frame = carrick_hal::FrameId::from_kernel_allocation(nonzero(300 * 10 + 6));
+    installed
+        .state
+        .frame_inventory
+        .ledger
+        .lock()
+        .extents
+        .insert(
+            (ext_ipa, 4096),
+            InventoryExtent {
+                frame: ext_frame,
+                mapping: ext_mapping,
+                backing: InventoryBackingIdentity::Private(300 * 10 + 7),
+                stage2_base: ext_ipa,
+                stage2_length: 4096,
+                stage2_owner: InventoryStage2OwnerIdentity {
+                    host_addr: ext_host,
+                    generation: ext_generation,
+                },
+            },
+        );
+
+    let resolver = MmAccessLiveResolver::new(&installed.state, Arc::clone(&transport.custody));
+
+    // 1. Valid root lookup resolves and caches exact retained owner
+    let ptr = resolver.host_ptr_for_base(root);
+    assert!(ptr.is_some(), "valid root base must resolve");
+    assert!(
+        resolver.retained_owners.read().contains_key(&root),
+        "resolver must cache retained root owner"
+    );
+
+    // 2. Extension lookup resolves and caches exact retained owner
+    let ext_ptr = resolver.host_ptr_for_base(ext_ipa);
+    assert!(ext_ptr.is_some(), "valid extension base must resolve");
+    assert!(
+        resolver.retained_owners.read().contains_key(&ext_ipa),
+        "resolver must cache retained extension owner"
+    );
+
+    // 3. Unmapped base returns None
+    assert!(
+        resolver.host_ptr_for_base(0x1234_5678_0000).is_none(),
+        "unmapped base must return None"
+    );
+
+    // 4. Nonmatching generation (e.g. generation 0 in ledger) fails closed
+    let zero_gen_ipa = 0x9a00_7740_0000;
+    installed
+        .state
+        .frame_inventory
+        .ledger
+        .lock()
+        .extents
+        .insert(
+            (zero_gen_ipa, 4096),
+            InventoryExtent {
+                frame: ext_frame,
+                mapping: ext_mapping,
+                backing: InventoryBackingIdentity::Private(300 * 10 + 8),
+                stage2_base: zero_gen_ipa,
+                stage2_length: 4096,
+                stage2_owner: InventoryStage2OwnerIdentity {
+                    host_addr: ext_host,
+                    generation: 0,
+                },
+            },
+        );
+    assert!(
+        resolver.host_ptr_for_base(zero_gen_ipa).is_none(),
+        "generation 0 in ledger must be rejected"
+    );
+
+    // 5. Tampered host_addr/generation mismatch in ledger fails closed
+    let mismatch_ipa = 0x9a00_7760_0000;
+    installed
+        .state
+        .frame_inventory
+        .ledger
+        .lock()
+        .extents
+        .insert(
+            (mismatch_ipa, 4096),
+            InventoryExtent {
+                frame: ext_frame,
+                mapping: ext_mapping,
+                backing: InventoryBackingIdentity::Private(300 * 10 + 9),
+                stage2_base: mismatch_ipa,
+                stage2_length: 4096,
+                stage2_owner: InventoryStage2OwnerIdentity {
+                    host_addr: ext_host,
+                    generation: 999_999, // mismatch
+                },
+            },
+        );
+    assert!(
+        resolver.host_ptr_for_base(mismatch_ipa).is_none(),
+        "mismatched generation must fail closed"
+    );
+
+    // 6. Drop state (retired binding) -> resolution of new bases fails closed
+    let state_weak = Arc::downgrade(&installed.state);
+    drop(installed);
+    assert!(state_weak.upgrade().is_none(), "state must be dropped");
+    assert!(
+        resolver.host_ptr_for_base(0x9a00_8800_0000).is_none(),
+        "retired binding must return None on new base"
+    );
+}
+
 mod syscall_writes;
