@@ -454,3 +454,115 @@ fn a_vcpu_without_a_mailbox_keeps_one_host_slot_per_thread() {
         .unwrap();
     assert_ne!(other, first);
 }
+
+/// Private tables for a publication test (the zone's live in the EL1 region).
+fn space_tables() -> (&'static AddressSpaces, &'static Occupancy) {
+    (
+        Box::leak(Box::new(AddressSpaces::new())),
+        Box::leak(Box::new(Occupancy::new())),
+    )
+}
+
+/// Contract `kernel.el1.address-space-switch`: a published address space's
+/// gate follows the MM's fence, so guest EL1 cannot install it while a pause
+/// of the MM is in force (raised before the pause scans the occupancy
+/// table), and a publication made during a pause starts raised.
+#[test]
+fn a_published_gate_follows_the_mm_fence() {
+    let (spaces, occupancy) = space_tables();
+    let mm_fence = fence();
+    let publication = publish_for_test(spaces, occupancy, mm(42_001), &mm_fence, 0x1000).unwrap();
+    let index = spaces.find(42_001).unwrap();
+    assert_eq!(spaces.gate(index), 0, "open once published");
+    assert!(spaces.grant(index, 42_001).is_some());
+
+    mm_fence.set_quiescing();
+    assert_eq!(spaces.gate(index), 1, "raised with the fence");
+    assert!(spaces.grant(index, 42_001).is_none());
+    mm_fence.end();
+    assert_eq!(spaces.gate(index), 0, "lowered when the pause ends");
+
+    // Published while a pause is in force: raised until that pause ends.
+    let other_fence = fence();
+    other_fence.set_quiescing();
+    let other = publish_for_test(spaces, occupancy, mm(42_002), &other_fence, 0x2000).unwrap();
+    let other_index = spaces.find(42_002).unwrap();
+    assert_eq!(spaces.gate(other_index), 1);
+    other_fence.end();
+    assert_eq!(spaces.gate(other_index), 0);
+
+    // One publication per MM.
+    assert!(publish_for_test(spaces, occupancy, mm(42_001), &mm_fence, 0x1000).is_none());
+    drop(other);
+    drop(publication);
+}
+
+/// Retirement: closing the gate refuses every later install, and dropping
+/// the publication frees the entry and unbinds the fence, after no vCPU in
+/// the guest holds the space.
+#[test]
+fn a_retired_publication_is_closed_unbound_and_freed() {
+    let (spaces, occupancy) = space_tables();
+    let mm_fence = fence();
+    let publication = publish_for_test(spaces, occupancy, mm(42_101), &mm_fence, 0x3000).unwrap();
+    let index = spaces.find(42_101).unwrap();
+    publication.close();
+    assert!(spaces.grant(index, 42_101).is_none(), "closed for good");
+    mm_fence.set_quiescing();
+    mm_fence.end();
+    assert!(
+        spaces.grant(index, 42_101).is_none(),
+        "a pause does not reopen it"
+    );
+    drop(publication);
+    assert_eq!(spaces.find(42_101), None, "freed");
+    assert!(
+        mm_fence.unbind_mirror().is_none(),
+        "the fence no longer raises it"
+    );
+    let again = publish_for_test(spaces, occupancy, mm(42_102), &mm_fence, 0x4000).unwrap();
+    assert!(
+        spaces.find(42_102).is_some(),
+        "the MM's fence can be bound again"
+    );
+    drop(again);
+}
+
+/// Contract `kernel.el1.address-space-switch`: a zone vCPU a pause found
+/// running the MM is drained once guest EL1 moved it off the MM, even while
+/// it stays in the guest. The executor's port names the thread it loaded,
+/// whose in-guest flag stays set across what EL1 runs there; with the MM's
+/// gate raised EL1 cannot put the MM back, so the word leaving it is final.
+/// (A drain that read only the flag hung the first signed two-process run:
+/// the vCPU it waited for was idling in WFI on the maintenance root.)
+#[test]
+fn a_zone_vcpu_moved_off_the_mm_is_drained_while_it_stays_in_guest() {
+    let (_, occupancy) = space_tables();
+    let space = mm(42_201);
+    let slot = ExecutionSlot::zone(ZoneSlotId::new(3));
+    let vcpu = Vcpu::new(42_201);
+    assert!(occupancy.replace(slot, 0, space.raw()));
+    vcpu.flag.enter_guest();
+    let residents = MmResidents {
+        members: vec![Resident::zone(
+            occupancy,
+            slot,
+            space,
+            PauseEndpoint::Registered {
+                registry: vcpu.registry.clone(),
+                tid: vcpu.tid,
+            },
+        )],
+    };
+    assert!(residents.any_in_guest(), "runs the MM in the guest");
+
+    // EL1 switched to the maintenance root; the vCPU stays in the guest.
+    assert!(occupancy.replace(slot, space.raw(), 0));
+    assert!(!residents.any_in_guest(), "off the MM: drained");
+
+    // Or EL1 moved it to another address space.
+    assert!(occupancy.replace(slot, 0, mm(42_202).raw()));
+    assert!(!residents.any_in_guest(), "another space is not the MM's");
+    assert_eq!(occupancy.vacate_any(slot), mm(42_202).raw());
+    vcpu.flag.leave_guest();
+}

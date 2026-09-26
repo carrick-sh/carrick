@@ -239,6 +239,19 @@ fn needs_clock_entry_latch(native_nr: u64, esr: u64) -> bool {
 }
 
 impl Aarch64Vcpu for HvfAarch64Vcpu {
+    fn el1_switchable_roots(&self) -> Option<(u64, u64)> {
+        use applevisor::prelude::SysReg;
+        const EN_TSO: u64 = 1 << 1;
+        let live = self.live().ok()?;
+        let ttbr0 = live.inner.get_sys_reg(SysReg::TTBR0_EL1).ok()?;
+        let ttbr1 = live.inner.get_sys_reg(SysReg::TTBR1_EL1).ok()?;
+        let actlr = live.inner.get_sys_reg(SysReg::ACTLR_EL1).ok()?;
+        // Rosetta's x86 half (a TTBR1 of its own) and its hardware TSO are
+        // task state an EL1 switch does not carry: such a process is never
+        // switched to by EL1.
+        (ttbr0 != 0 && ttbr1 == ttbr0 && actlr & EN_TSO == 0).then_some((ttbr0, ttbr1))
+    }
+
     fn mailbox_slot(&self) -> Option<usize> {
         self.live()
             .ok()
@@ -1418,6 +1431,14 @@ pub fn run_worker_idle_entry(
         )
         .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
     exit
+}
+
+/// The carrier's maintenance root as `TTBR0_EL1`/`TTBR1_EL1` hold it (ASID
+/// 0, the kernel hole and the EL1 region only): what a vCPU with no address
+/// space installed runs. Guest EL1 switches between address spaces through
+/// it (EL1 increment 2).
+pub fn carrier_maintenance_ttbr(vmm: &HvfAarch64Vmm) -> Result<u64, TrapError> {
+    Ok(vmm.state.carrier_maintenance_root()?.raw())
 }
 
 /// Service an exact-ASID generation on a loaded owner vCPU without detaching

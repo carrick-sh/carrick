@@ -44,6 +44,18 @@ fn identity(tid: u64) -> ThreadIdentity {
     }
 }
 
+/// What the host publishes when it loads a thread of `mm` on `slot`: the
+/// slot's scheduling facts and its occupancy word (the executor installs the
+/// loaded task's address space before it runs the vCPU).
+fn host_publish(zone: &ZoneTables, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
+    zone.publish_slot(slot, mm, cpu, affinity);
+    let here = carrick_sched_core::ExecutionSlot::zone(slot);
+    zone.occupancy.vacate_any(here);
+    if mm != 0 {
+        assert!(zone.occupancy.replace(here, 0, mm));
+    }
+}
+
 fn counters() -> &'static Counters {
     Box::leak(Box::new(Counters::default()))
 }
@@ -60,7 +72,7 @@ fn serve_on(
     // The host publishes the loaded thread's address space on the slot at
     // every load; EL1 places woken threads by it.
     if zone.slot(slot).mm() == 0 {
-        zone.publish_slot(slot, task.zone_mm.load(Ordering::Relaxed), None, 0);
+        host_publish(zone, slot, task.zone_mm.load(Ordering::Relaxed), None, 0);
     }
     Sched {
         zone,
@@ -375,7 +387,7 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
     let counters = counters();
     for slot in [SLOT, OTHER] {
         assert!(zone.reset_slot(slot));
-        zone.publish_slot(slot, MM, None, 0);
+        host_publish(&zone, slot, MM, None, 0);
         zone.enter_guest(slot);
     }
     // B, the thread the host loaded on OTHER, waits with nothing runnable:
@@ -612,7 +624,7 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
         CurrentTask::new(),
         task_for(101),
     ];
-    zone.publish_slot(SLOT, MM, None, 0);
+    host_publish(&zone, SLOT, MM, None, 0);
     let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
     let counters = Counters::default();
     // fd 3 of the task's file table is a delegated file EL1 serves lseek on.
@@ -697,7 +709,7 @@ fn a_park_before_a_host_runnable_thread_leaves_for_the_host() {
     let word = AtomicU32::new(0);
     let uaddr = word.as_ptr() as u64;
     let task = task_for(101);
-    zone.publish_slot(SLOT, MM, Some(0), 0);
+    host_publish(&zone, SLOT, MM, Some(0), 0);
     zone.enter_guest(SLOT);
     let service = host_runnable(&zone, SLOT, 303);
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_PRIVATE, 0);
@@ -722,7 +734,7 @@ fn a_slice_ending_before_a_host_runnable_thread_leaves_for_the_host() {
     let zone = zone();
     let task = task_for(101);
     let counters = counters();
-    zone.publish_slot(SLOT, MM, Some(0), 0);
+    host_publish(&zone, SLOT, MM, Some(0), 0);
     zone.enter_guest(SLOT);
     let service = host_runnable(&zone, SLOT, 303);
     let (mut frame, mut cpu) = live(0xA, 0x1000, FUTEX_WAKE_PRIVATE, 1);
@@ -836,7 +848,7 @@ fn an_idle_vcpu_steals_a_queued_thread() {
     assert_eq!(zone.record(b).claim(), Claim::Queued { slot: SLOT, seq: 1 });
     // Another slot of the same address space enters idle.
     let other = SlotId::new(6);
-    zone.publish_slot(other, MM, Some(1), 0);
+    host_publish(&zone, other, MM, Some(1), 0);
     zone.enter_guest(other);
     let idle_task = CurrentTask::new();
     idle_task.zone_mm.store(MM, Ordering::Relaxed);
@@ -860,4 +872,270 @@ fn an_idle_vcpu_steals_a_queued_thread() {
     assert_eq!(zone.slot(SLOT).queued(), 0);
     assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 1);
     assert_eq!(idle_cpu.wfis, 0);
+}
+
+// ---------------------------------------------------------------------------
+// EL1 increment 2, step 2: switching address spaces in the guest
+// (contract `kernel.el1.address-space-switch`).
+
+/// The other process of the two-process cases.
+const OTHER_MM: u64 = 9;
+const IDLE_TTBR: u64 = 0x0000_0000_4000_0000;
+const TTBR_MM: u64 = (7 << 48) | 0x7000_0000;
+const TTBR_OTHER: u64 = (9 << 48) | 0x9000_0000;
+
+/// Publish `mm` (open) with `ttbr` the way the host does at its first load.
+fn publish_space(zone: &ZoneTables, mm: u64, ttbr: u64) -> carrick_sched_core::SpaceIndex {
+    zone.spaces.set_idle_ttbr(IDLE_TTBR);
+    let index = zone.spaces.publish_closed(mm, ttbr, ttbr).unwrap();
+    zone.spaces.open(index);
+    index
+}
+
+/// Park thread `tid` of `mm` on `uaddr`, then wake it from the host into the
+/// guest: it is queued, ready at EL0, on a slot in the guest that may run it
+/// (here the only one, `SLOT`).
+fn queue_foreign(zone: &ZoneTables, tid: u64, mm: u64, uaddr: u64, ctx: ThreadCtx) -> RecordId {
+    let guard = zone
+        .lock(ZoneTables::bucket_of(mm, uaddr), &HostWait)
+        .unwrap();
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            mm,
+            ..identity(tid)
+        })
+        .unwrap();
+    // SAFETY: freshly allocated and unpublished.
+    unsafe { *zone.record(record).ctx_mut() = ctx };
+    let seq = zone.next_seq(record);
+    zone.enqueue(&guard, record, seq, mm, uaddr, u32::MAX, 0)
+        .unwrap();
+    zone.publish_park(record, seq);
+    let mut placed = 0;
+    let woken = zone.wake_host(
+        &guard,
+        mm,
+        uaddr,
+        u32::MAX,
+        1,
+        true,
+        &mut |_| panic!("no slot could run the woken thread"),
+        &mut |_| placed += 1,
+    );
+    drop(guard);
+    assert_eq!((woken, placed), (1, 1));
+    record
+}
+
+/// The loaded thread A (address space 7) waits while a thread B of another
+/// process (address space 9) is queued on its vCPU: EL1 parks A and runs B
+/// in B's address space, with no host exit. The vCPU goes to the maintenance
+/// root, publishes 9 in its occupancy slot, reads 9's gate, then installs 9's
+/// roots. B's wait then hands the vCPU back to A in 7 the same way.
+#[test]
+fn a_futex_wait_switches_the_vcpu_to_another_process_in_guest() {
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    publish_space(&zone, OTHER_MM, TTBR_OTHER);
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let a_word = AtomicU32::new(0);
+    let b_word = AtomicU32::new(0);
+    let (a_addr, b_addr) = (a_word.as_ptr() as u64, b_word.as_ptr() as u64);
+    let b = queue_foreign(&zone, 202, OTHER_MM, b_addr, thread_ctx(0xB, b_addr));
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, a_addr, FUTEX_WAIT_PRIVATE, 0);
+    cpu.ttbr = (TTBR_MM, TTBR_MM);
+
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
+    assert_eq!(frame.elr, 0xB << 12, "B runs");
+    assert_eq!(zone.slot(SLOT).current(), Some(b));
+    assert_eq!(
+        cpu.translations,
+        [(IDLE_TTBR, IDLE_TTBR), (TTBR_OTHER, TTBR_OTHER)],
+        "maintenance root, then B's roots"
+    );
+    assert_eq!(zone.installed_space(SLOT), OTHER_MM);
+    assert_eq!(zone.slot(SLOT).mm(), MM, "the executor still has A loaded");
+    assert_eq!(task.zone_mm.load(Ordering::Relaxed), OTHER_MM);
+    assert_eq!(task.task_id.load(Ordering::Relaxed), 202);
+    assert_eq!(zone.counters.el1_space_switches.load(Ordering::Relaxed), 1);
+
+    // A is woken from another vCPU of its process (here the host) onto its
+    // home slot; B waits and the vCPU goes back to A in address space 7.
+    {
+        let guard = zone
+            .lock(ZoneTables::bucket_of(MM, a_addr), &HostWait)
+            .unwrap();
+        let woken = zone.wake_host(
+            &guard,
+            MM,
+            a_addr,
+            u32::MAX,
+            1,
+            true,
+            &mut |_| panic!("A's home slot is in the guest"),
+            &mut |_| {},
+        );
+        assert_eq!(woken, 1);
+    }
+    set_op(&mut frame, b_addr, FUTEX_WAIT_PRIVATE, 0);
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
+    assert_eq!(frame.elr, 0xA << 12, "A runs again");
+    assert_eq!(cpu.ttbr, (TTBR_MM, TTBR_MM));
+    assert_eq!(zone.installed_space(SLOT), MM);
+    assert_eq!(task.zone_mm.load(Ordering::Relaxed), MM);
+    assert_eq!(zone.counters.el1_space_switches.load(Ordering::Relaxed), 2);
+    assert!(
+        cpu.asid_invalidations.is_empty(),
+        "no TLB flush on a switch"
+    );
+}
+
+/// A raised gate (a page-table pause of B's address space, or its ASID
+/// retiring) refuses the install: B goes back to the head of the run queue,
+/// the vCPU holds no address space and leaves for its executor, which takes
+/// B ([`ZoneTables::take_service_head`]) and loads it through the host.
+#[test]
+fn a_raised_gate_sends_the_thread_to_its_executor() {
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    let other = publish_space(&zone, OTHER_MM, TTBR_OTHER);
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let a_word = AtomicU32::new(0);
+    let b_word = AtomicU32::new(0);
+    let (a_addr, b_addr) = (a_word.as_ptr() as u64, b_word.as_ptr() as u64);
+    let b = queue_foreign(&zone, 202, OTHER_MM, b_addr, thread_ctx(0xB, b_addr));
+    zone.spaces.raise(other);
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, a_addr, FUTEX_WAIT_PRIVATE, 0);
+    assert_eq!(
+        serve(&mut frame, &task, &zone, &mut cpu),
+        Some(Served::Idle)
+    );
+    assert!(matches!(
+        zone.record(b).claim(),
+        Claim::Queued { slot, .. } if slot == SLOT
+    ));
+    assert_eq!(zone.slot(SLOT).current(), None);
+    // The placement hint already saw the gate raised, so EL1 never left A's
+    // space: the vCPU still holds exactly the space its root translates.
+    assert_eq!(zone.installed_space(SLOT), MM);
+    assert!(cpu.translations.is_empty());
+    assert_eq!(
+        zone.take_service_head(SLOT),
+        Some(b),
+        "the executor takes B"
+    );
+
+    // The gate raised between the hint and the install (the Dekker case):
+    // the install is refused after the slot was published, and the slot is
+    // emptied again (the vCPU is on the maintenance root by then).
+    zone.spaces.lower(other);
+    assert!(zone.spaces.is_open(OTHER_MM));
+    let here = carrick_sched_core::ExecutionSlot::zone(SLOT);
+    zone.occupancy.vacate_any(here);
+    let index = zone.spaces.find(OTHER_MM).unwrap();
+    zone.spaces.raise(index);
+    assert_eq!(zone.install_space(SLOT, OTHER_MM), None);
+    assert_eq!(zone.installed_space(SLOT), 0, "nothing installed");
+    assert_eq!(zone.slot(SLOT).mm(), MM, "the executor still has A loaded");
+    assert_eq!(zone.counters.el1_space_refusals.load(Ordering::Relaxed), 1);
+}
+
+/// A foreign-COW publication for B's address space is covered by one
+/// broadcast invalidation of its ASID before its roots are installed, once.
+#[test]
+fn an_owed_cow_invalidation_runs_before_the_install() {
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    let other = publish_space(&zone, OTHER_MM, TTBR_OTHER);
+    zone.spaces.note_cow(other);
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let a_word = AtomicU32::new(0);
+    let b_word = AtomicU32::new(0);
+    let (a_addr, b_addr) = (a_word.as_ptr() as u64, b_word.as_ptr() as u64);
+    queue_foreign(&zone, 202, OTHER_MM, b_addr, thread_ctx(0xB, b_addr));
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, a_addr, FUTEX_WAIT_PRIVATE, 0);
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
+    assert_eq!(cpu.asid_invalidations, [TTBR_OTHER]);
+    assert_eq!(zone.spaces.grant(other, OTHER_MM).unwrap().cow_owed, None);
+    assert_eq!(
+        zone.counters.el1_cow_invalidations.load(Ordering::Relaxed),
+        1
+    );
+}
+
+/// A vCPU that parks in WFI holds no address space: it switches to the
+/// maintenance root and empties its occupancy slot, so no pause of the
+/// process it ran kicks it; the wake reinstalls the space.
+#[test]
+fn a_vcpu_in_wfi_holds_no_address_space() {
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    host_publish(&zone, SLOT, MM, None, 0);
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    cpu.ttbr = (TTBR_MM, TTBR_MM);
+    let ts = libc_timespec(0, 5_000_000);
+    frame.x[3] = &ts as *const [u64; 2] as u64;
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
+    assert!(cpu.wfis >= 1);
+    assert_eq!(
+        cpu.translations,
+        [(IDLE_TTBR, IDLE_TTBR), (TTBR_MM, TTBR_MM)],
+        "left for WFI, reinstalled for the timeout"
+    );
+    assert_eq!(zone.installed_space(SLOT), MM);
+}
+
+/// A vCPU in the idle entry (its executor has no task loaded) runs no
+/// thread itself and switches no address space: a thread woken with only
+/// such a vCPU in the guest goes to its host continuation, whose executor
+/// loads it. (Running threads from the idle entry lost a host control claim
+/// raced against the idle exit: exit_group waited forever on a sibling.)
+#[test]
+fn the_idle_entry_runs_no_thread_itself() {
+    let zone = zone();
+    publish_space(&zone, OTHER_MM, TTBR_OTHER);
+    let idle = SlotId::new(6);
+    host_publish(&zone, idle, 0, None, 0);
+    zone.enter_guest(idle);
+    let b_word = AtomicU32::new(0);
+    let b_addr = b_word.as_ptr() as u64;
+    let guard = zone
+        .lock(ZoneTables::bucket_of(OTHER_MM, b_addr), &HostWait)
+        .unwrap();
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            mm: OTHER_MM,
+            ..identity(202)
+        })
+        .unwrap();
+    // SAFETY: freshly allocated and unpublished.
+    unsafe { *zone.record(record).ctx_mut() = thread_ctx(0xB, b_addr) };
+    let seq = zone.next_seq(record);
+    zone.enqueue(&guard, record, seq, OTHER_MM, b_addr, u32::MAX, 0)
+        .unwrap();
+    zone.publish_park(record, seq);
+    let (mut handed, mut placed) = (0, 0);
+    let woken = zone.wake_host(
+        &guard,
+        OTHER_MM,
+        b_addr,
+        u32::MAX,
+        1,
+        true,
+        &mut |_| handed += 1,
+        &mut |_| placed += 1,
+    );
+    drop(guard);
+    assert_eq!((woken, handed, placed), (1, 1, 0), "handed to the host");
+    assert_eq!(zone.installed_space(idle), 0);
+    assert!(!zone.executor_has_task(idle));
 }

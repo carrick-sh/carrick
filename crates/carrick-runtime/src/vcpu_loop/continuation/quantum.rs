@@ -344,6 +344,33 @@ impl HvpatchTaskBinding {
             .service_pending_cow_invalidation(observer, invalidate)
     }
 
+    /// Publish the task's address space for guest EL1 to install on a vCPU
+    /// itself (EL1 increment 2), once per address space: `publish` makes the
+    /// publication from the loaded task's roots.
+    pub(crate) fn publish_address_space(
+        &self,
+        publish: impl FnOnce(u64) -> Option<carrick_kernel::kernel::AddressSpacePublication>,
+    ) {
+        if let Some(stage1_mm) = self.stage1_mm.as_ref() {
+            stage1_mm.publish_address_space(publish);
+        }
+    }
+
+    /// The task's `TTBR0_EL1` (its address space's root and ASID), from its
+    /// stage-1 lease.
+    pub(crate) fn stage1_ttbr0(&self) -> Option<u64> {
+        self.stage1_mm
+            .as_ref()
+            .map(|stage1_mm| stage1_mm.binding().ttbr0.raw())
+    }
+
+    /// Guest EL1 may never install the task's address space again.
+    pub(crate) fn withdraw_address_space(&self) {
+        if let Some(stage1_mm) = self.stage1_mm.as_ref() {
+            stage1_mm.withdraw_address_space();
+        }
+    }
+
     pub(crate) fn cow_invalidation_observer(&self) -> crate::hvpatch::CowInvalidationObserver {
         self.stage1_mm
             .as_ref()

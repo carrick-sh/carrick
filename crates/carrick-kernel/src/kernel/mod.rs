@@ -95,8 +95,8 @@ pub use ids::{
     ObjectIdRegistry, ProcessGroupId, SessionId, SighandId, TaskId, TaskSerial, ThreadSerial,
 };
 pub use mm_occupancy::{
-    ExecutionSlot, HostExecutionSlot, MmOccupancy, MmOccupancyError,
-    execution_slot_for_current_thread,
+    AddressSpacePublication, ExecutionSlot, HostExecutionSlot, MmOccupancy, MmOccupancyError,
+    execution_slot_for_current_thread, note_foreign_cow, publish_address_space, publish_idle_root,
 };
 pub use netns::{NetNs, UtsNs};
 pub use objects::{

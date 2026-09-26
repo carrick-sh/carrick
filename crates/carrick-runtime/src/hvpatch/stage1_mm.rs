@@ -134,6 +134,24 @@ pub(crate) struct Stage1MmLease {
     cow_invalidation: Mutex<u64>,
     #[cfg(test)]
     cow_invalidation_slow_paths: AtomicU64,
+    /// The address space's publication for guest EL1 to install on a vCPU
+    /// itself (EL1 increment 2), made at the first load that can.
+    space: Mutex<AddressSpaceState>,
+    /// The publication is settled (made, or refused for good): the fast
+    /// path of every later load.
+    space_settled: std::sync::atomic::AtomicBool,
+}
+
+/// Whether guest EL1 may install a lease's address space.
+#[derive(Debug, Default)]
+enum AddressSpaceState {
+    #[default]
+    Unpublished,
+    Published(carrick_kernel::kernel::AddressSpacePublication),
+    /// Never published (the zone is off, the hatch is set, the table was
+    /// full, or the process runs in a memory model an EL1 switch does not
+    /// carry), or its ASID is retiring.
+    Never,
 }
 
 /// The MM's foreign-COW invalidation state as seen by a vCPU about to run
@@ -225,11 +243,54 @@ impl Stage1MmLease {
             cow_invalidation: Mutex::new(0),
             #[cfg(test)]
             cow_invalidation_slow_paths: AtomicU64::new(0),
+            space: Mutex::new(AddressSpaceState::Unpublished),
+            space_settled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     pub(crate) fn binding(&self) -> MmBinding {
         self.state.binding()
+    }
+
+    /// Publish this address space for guest EL1, once, while the lease is
+    /// live: `publish` makes the publication from the lease's `TTBR0` value
+    /// (`None` refuses it for good). One atomic load once settled.
+    pub(crate) fn publish_address_space(
+        &self,
+        publish: impl FnOnce(u64) -> Option<carrick_kernel::kernel::AddressSpacePublication>,
+    ) {
+        if self
+            .space_settled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let lifecycle = self.lifecycle.lock();
+        let mut space = self.space.lock();
+        if !matches!(*space, AddressSpaceState::Unpublished) {
+            return;
+        }
+        *space = if *lifecycle == Stage1MmLeaseLifecycle::Live {
+            publish(self.binding().ttbr0.raw())
+                .map_or(AddressSpaceState::Never, AddressSpaceState::Published)
+        } else {
+            AddressSpaceState::Never
+        };
+        self.space_settled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Guest EL1 may never install this address space again (a thread of it
+    /// asked for a memory model an EL1 switch does not carry). A vCPU EL1
+    /// already switched to it is drained before this returns.
+    pub(crate) fn withdraw_address_space(&self) {
+        let withdrawn = {
+            let mut space = self.space.lock();
+            self.space_settled
+                .store(true, std::sync::atomic::Ordering::Release);
+            std::mem::replace(&mut *space, AddressSpaceState::Never)
+        };
+        drop(withdrawn);
     }
 
     pub(crate) fn root_slot(&self) -> Option<Stage1RootSlot> {
@@ -720,6 +781,23 @@ impl PreparedStage1MmRetirement {
         *lifecycle = Stage1MmLeaseLifecycle::Retired;
         drop(lifecycle);
         self.finished = true;
+        // The ASID is retiring: guest EL1 may not install the address space
+        // from here on. The publication is dropped (every vCPU EL1 put on the
+        // space drained, the entry freed) before the ASID is invalidated for
+        // reuse ([`Stage1MmRetirement::retire_address_space`]).
+        let space = {
+            let mut space = self.lease.space.lock();
+            self.lease
+                .space_settled
+                .store(true, std::sync::atomic::Ordering::Release);
+            match std::mem::replace(&mut *space, AddressSpaceState::Never) {
+                AddressSpaceState::Published(publication) => {
+                    publication.close();
+                    Some(publication)
+                }
+                AddressSpaceState::Unpublished | AddressSpaceState::Never => None,
+            }
+        };
         let root_retirement_nonce = self.root_slot.map(|_| {
             NEXT_ROOT_RETIREMENT_NONCE
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -741,6 +819,7 @@ impl PreparedStage1MmRetirement {
             root_retirement_nonce,
             root_ticket_issued: false,
             extension_slots,
+            space: Mutex::new(space),
         }
     }
 }
@@ -917,9 +996,19 @@ pub(crate) struct Stage1MmRetirement {
     root_retirement_nonce: Option<u64>,
     root_ticket_issued: bool,
     extension_slots: Vec<Stage1RootSlot>,
+    /// The closed publication of the retiring address space, if it had one.
+    space: Mutex<Option<carrick_kernel::kernel::AddressSpacePublication>>,
 }
 
 impl Stage1MmRetirement {
+    /// Before the retired ASID is invalidated for reuse: no vCPU in the guest
+    /// has the address space installed by EL1 any more, and its published
+    /// entry is freed.
+    pub(crate) fn retire_address_space(&self) {
+        let space = self.space.lock().take();
+        drop(space);
+    }
+
     pub(crate) fn asid_generation(&self) -> AsidGeneration {
         self.residency.generation()
     }

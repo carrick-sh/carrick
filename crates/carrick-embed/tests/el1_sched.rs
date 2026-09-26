@@ -771,11 +771,12 @@ fn el1_sched_two_processes_share_vcpus() {
             claims < 0.01,
             "two processes' handoffs went through host run queues: {claims:.3} per round trip"
         );
-        // Measured 6.2-6.4 per round trip at 1d (each turn of a vCPU between
-        // the two address spaces goes through its executor); bounded well
-        // above that so only a structural regression fails here.
+        // 6.2-6.4 per round trip at 1d, where each turn of a vCPU between
+        // the two address spaces went through its executor. EL1 now switches
+        // TTBR0/TTBR1 itself (contract `kernel.el1.address-space-switch`), so
+        // a turn costs no exit.
         assert!(
-            exits < 20.0,
+            exits < 1.0,
             "two processes sharing vCPUs cost {exits:.3} host exits per round trip"
         );
     }

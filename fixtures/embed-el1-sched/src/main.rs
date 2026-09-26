@@ -20,9 +20,9 @@
 //! - `timed-wait <iters>`: `FUTEX_WAIT_PRIVATE` with a 1 ms relative timeout
 //!   and no waker, `iters` times: every result must be `ETIMEDOUT`; prints the
 //!   lateness past the deadline.
-//! - `compute-pair <ms>`: the main thread wakes a sibling parked in a host
-//!   served wait onto its own vCPU, then both compute without a syscall for
-//!   `<ms>`; prints how far each got.
+//! - `compute-pair <ms>`: both threads pinned to guest CPU 0; the main
+//!   thread wakes a sibling parked in a host served wait onto its own vCPU,
+//!   then both compute without a syscall for `<ms>`; prints how far each got.
 //! - `idle-carrier <ms>`: four threads parked in untimed futex waits while the
 //!   main thread waits `<ms>` with a timeout: the carrier has nothing to run.
 //! - `wfi-signal <rounds>`: a thread parked in an untimed futex wait on an
@@ -582,7 +582,11 @@ fn futex_wait_bitset_until(word: &AtomicU32, expected: u32, after: Duration) -> 
 /// host-served wait, the main thread wakes it in-guest (so it is queued on
 /// the main thread's vCPU) and both then count for `ms` without a syscall.
 fn compute_pair(ms: u64) -> i32 {
+    // Both on guest CPU 0: since EL1 increment 2 an idle vCPU installs a
+    // published address space itself and would take the woken sibling, so
+    // the pair shares a vCPU only when pinned.
     let b = std::thread::spawn(|| {
+        pin(0);
         CP_READY.store(1, Ordering::Release);
         let _ = futex_wake(&CP_READY, 1);
         while CP_PARK.load(Ordering::Acquire) == 0 {
@@ -592,6 +596,7 @@ fn compute_pair(ms: u64) -> i32 {
             CP_B.bump();
         }
     });
+    pin(0);
     if !wait_until_changed(&CP_READY, 0, Duration::from_secs(10)) {
         println!("compute-pair sibling never started");
         return 1;

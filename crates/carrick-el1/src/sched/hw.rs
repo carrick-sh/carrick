@@ -220,6 +220,44 @@ impl ThreadCpu for HardwareCpu {
         }
     }
 
+    fn set_translation(&mut self, ttbr0: u64, ttbr1: u64) {
+        // SAFETY: the translation roots of this vCPU. EL1 runs from the EL1
+        // region, which every root the host publishes (and the maintenance
+        // root) maps identically, so the next fetch translates either way;
+        // the `isb` makes the new roots govern everything after it. No TLB
+        // maintenance: each address space has its own ASID (TCR_EL1.AS),
+        // and a retired ASID is invalidated everywhere before it is reused.
+        unsafe {
+            core::arch::asm!(
+                "msr ttbr0_el1, {a}",
+                "msr ttbr1_el1, {b}",
+                "isb",
+                a = in(reg) ttbr0,
+                b = in(reg) ttbr1,
+                // Not `nomem`: every access after the switch translates
+                // through the new roots and must not move before it.
+                options(nostack)
+            );
+        }
+    }
+
+    fn invalidate_asid(&mut self, ttbr0: u64) {
+        // SAFETY: TLBI ASIDE1IS takes the ASID in bits 63:48, as TTBR0_EL1
+        // holds it; the prior table stores are made visible first, and the
+        // invalidation completes on every PE of the Inner Shareable domain
+        // before the `isb`.
+        unsafe {
+            core::arch::asm!(
+                "dsb ishst",
+                "tlbi aside1is, {asid}",
+                "dsb ish",
+                "isb",
+                asid = in(reg) ttbr0 & (0xffff << 48),
+                options(nostack)
+            );
+        }
+    }
+
     fn now(&self) -> u64 {
         let value: u64;
         // SAFETY: reading the virtual counter.

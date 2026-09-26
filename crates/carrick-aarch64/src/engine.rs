@@ -3070,6 +3070,10 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
+    fn el1_switchable_roots(&self) -> Option<(u64, u64)> {
+        self.vcpu.el1_switchable_roots()
+    }
+
     fn fd_ceiling_publisher(&self) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
         self.vm.fd_ceiling_publisher()
     }

@@ -19,6 +19,18 @@ impl LockWait for HostWait {
     }
 }
 
+/// The host loading a task of `mm` on `slot` (or leaving it idle with 0):
+/// its published slot state and, as the host's occupancy authority does,
+/// the slot's occupancy word.
+fn host_publish(zone: &ZoneTables, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
+    zone.publish_slot(slot, mm, cpu, affinity);
+    let here = ExecutionSlot::zone(slot);
+    zone.occupancy.vacate_any(here);
+    if mm != 0 {
+        assert!(zone.occupancy.replace(here, 0, mm));
+    }
+}
+
 /// A zeroed zone on the heap: all-zero is the valid empty state, exactly as
 /// the host maps it in the EL1 region.
 fn zone() -> Box<ZoneTables> {
@@ -72,7 +84,7 @@ fn wake(
     if let Waker::El1 { slot } = waker
         && zone.slot(slot).mm() == 0
     {
-        zone.publish_slot(slot, MM, None, 0);
+        host_publish(zone, slot, MM, None, 0);
     }
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, uaddr), &HostWait)
@@ -202,7 +214,7 @@ fn el1_refuses_multi_entry_waiters() {
 fn el1_wakes_any_count_and_exactly_that_many() {
     let zone = zone();
     let parked: Vec<_> = (0..20).map(|tid| park(&zone, 200 + tid, 0x5000)).collect();
-    zone.publish_slot(SLOT, MM, None, 0);
+    host_publish(&zone, SLOT, MM, None, 0);
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, 0x5000), &HostWait)
         .unwrap();
@@ -461,7 +473,7 @@ const OTHER: SlotId = SlotId::new(5);
 /// and entered.
 fn enter(zone: &ZoneTables, slot: SlotId, cpu: u32) {
     assert!(zone.reset_slot(slot));
-    zone.publish_slot(slot, MM, Some(cpu), 0);
+    host_publish(zone, slot, MM, Some(cpu), 0);
     zone.enter_guest(slot);
 }
 
@@ -902,12 +914,12 @@ fn host_placement_respects_address_spaces_and_owes_resched_sgis() {
     // in the guest); THIRD runs another process.
     enter(&zone, SLOT, 0);
     assert!(zone.reset_slot(OTHER));
-    zone.publish_slot(OTHER, 0, Some(1), 0);
+    host_publish(&zone, OTHER, 0, Some(1), 0);
     zone.enter_guest(OTHER);
     assert!(!zone.enter_idle(OTHER, false));
     assert!(zone.enter_idle(OTHER, true));
     assert!(zone.reset_slot(THIRD));
-    zone.publish_slot(THIRD, MM + 1, Some(2), 0);
+    host_publish(&zone, THIRD, MM + 1, Some(2), 0);
     zone.enter_guest(THIRD);
 
     let service = service_record(&zone, 1);
@@ -971,7 +983,7 @@ fn stealing_takes_only_what_the_thief_may_run() {
     let (woken, _) = wake_effects(&zone, 0x8000, 1, SLOT);
     assert_eq!(woken.unwrap(), [home]);
     assert!(zone.reset_slot(THIRD));
-    zone.publish_slot(THIRD, MM, Some(2), 0);
+    host_publish(&zone, THIRD, MM, Some(2), 0);
     zone.enter_guest(THIRD);
     assert!(!zone.enter_idle(THIRD, false));
     assert_eq!(zone.steal(THIRD), None, "a home record is not stolen");
@@ -986,7 +998,7 @@ fn stealing_takes_only_what_the_thief_may_run() {
     // for its executor, which loads it (EL1 does not switch address spaces).
     let foreign = SlotId::new(11);
     assert!(zone.reset_slot(foreign));
-    zone.publish_slot(foreign, MM + 7, Some(3), 0);
+    host_publish(&zone, foreign, MM + 7, Some(3), 0);
     zone.enter_guest(foreign);
     assert!(!zone.enter_idle(foreign, false));
     let ready = park(&zone, 6, 0x8004);
@@ -1176,4 +1188,155 @@ fn only_the_executor_still_driving_a_slot_vacates_it() {
     assert_eq!(taken, [service]);
     assert_eq!(zone.runnable_head(SLOT), None);
     assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(OTHER));
+}
+
+/// Contract `kernel.el1.address-space-switch`: the Dekker pair between EL1
+/// installing an address space on its vCPU (publish the slot's occupancy
+/// word, then read the space's gate) and a page-table pause of that space
+/// (raise the gate, then scan the occupancy words and wait for each vCPU
+/// found to leave the space). More vCPUs than a pause can keep up with
+/// switch between two published spaces through the maintenance root, as
+/// EL1 does; any vCPU that runs `Y` while the pauser believes `Y` drained is
+/// a violation. With `check_gate` false (the negative control) the install
+/// skips the gate read.
+fn el1_installs_race_pauses(check_gate: bool) -> (u32, u32) {
+    const VCPUS: usize = 6;
+    const ROUNDS: u32 = 3_000;
+    const MIN_ENTRIES: u32 = 50_000;
+    const Y: u64 = 0x1111;
+    const Z: u64 = 0x2222;
+    let zone: Arc<ZoneTables> = Arc::from(zone());
+    zone.spaces.set_idle_ttbr(0x4000_0000);
+    for key in [Y, Z] {
+        let index = zone
+            .spaces
+            .publish_closed(key, key << 12, key << 12)
+            .unwrap();
+        zone.spaces.open(index);
+    }
+    let y = zone.spaces.find(Y).unwrap();
+    let drained = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let violations = Arc::new(core::sync::atomic::AtomicU32::new(0));
+    let entries = Arc::new(core::sync::atomic::AtomicU32::new(0));
+    let mut vcpus = Vec::new();
+    for id in 0..VCPUS {
+        let (zone, drained, stop, violations, entries) = (
+            zone.clone(),
+            drained.clone(),
+            stop.clone(),
+            violations.clone(),
+            entries.clone(),
+        );
+        vcpus.push(std::thread::spawn(move || {
+            let slot = SlotId::new(id as u8);
+            let here = ExecutionSlot::zone(slot);
+            let mut turn = id;
+            while !stop.load(Ordering::Relaxed) {
+                turn += 1;
+                let to = if turn % 2 == 0 { Y } else { Z };
+                // To the maintenance root: the slot holds nothing.
+                zone.release_space(slot);
+                let installed = if check_gate {
+                    zone.install_space(slot, to).is_some()
+                } else {
+                    let from = zone.occupancy.running_raw(here);
+                    zone.occupancy.replace(here, from, to)
+                };
+                if !installed {
+                    continue;
+                }
+                if to == Y {
+                    entries.fetch_add(1, Ordering::Relaxed);
+                    for _ in 0..3 {
+                        if drained.load(Ordering::SeqCst) {
+                            violations.fetch_add(1, Ordering::Relaxed);
+                        }
+                        for _ in 0..16 {
+                            core::hint::spin_loop();
+                        }
+                    }
+                }
+            }
+            zone.release_space(slot);
+        }));
+    }
+    let mut rounds = 0;
+    while rounds < ROUNDS || entries.load(Ordering::Relaxed) < MIN_ENTRIES {
+        rounds += 1;
+        zone.spaces.raise(y);
+        let mut pending = Vec::new();
+        zone.occupancy
+            .for_each_running(AddressSpaceKey::from_raw(Y).unwrap(), |slot| {
+                pending.push(slot)
+            });
+        // A pause kicks each vCPU found and waits for it to leave the guest;
+        // here a vCPU leaves `Y` by itself at its next turn.
+        for slot in pending {
+            while zone.occupancy.running_raw(slot) == Y {
+                core::hint::spin_loop();
+            }
+        }
+        drained.store(true, Ordering::SeqCst);
+        for _ in 0..500 {
+            core::hint::spin_loop();
+        }
+        drained.store(false, Ordering::SeqCst);
+        zone.spaces.lower(y);
+        for _ in 0..200 {
+            core::hint::spin_loop();
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for vcpu in vcpus {
+        vcpu.join().unwrap();
+    }
+    (
+        entries.load(Ordering::Relaxed),
+        violations.load(Ordering::Relaxed),
+    )
+}
+
+#[test]
+fn a_pause_never_misses_an_el1_address_space_install() {
+    let (entries, violations) = el1_installs_race_pauses(true);
+    assert!(entries > 0, "the vCPUs ran the paused space between pauses");
+    assert_eq!(violations, 0);
+}
+
+/// Negative control: an install that does not read the gate is caught.
+#[test]
+fn an_install_that_skips_the_gate_is_caught() {
+    let (_, violations) = el1_installs_race_pauses(false);
+    assert!(violations > 0, "the stress must detect a missing gate read");
+}
+
+/// Retirement closes the gate for good: no install after it, and one
+/// published before it is visible to the scan that follows.
+#[test]
+fn a_closed_space_is_never_installed_again() {
+    let zone = zone();
+    zone.spaces.set_idle_ttbr(0x4000_0000);
+    let index = zone.spaces.publish_closed(MM, 0x7000, 0x7000).unwrap();
+    assert_eq!(
+        zone.install_space(SLOT, MM),
+        None,
+        "closed while publishing"
+    );
+    zone.spaces.open(index);
+    assert!(zone.install_space(SLOT, MM).is_some());
+    zone.spaces.close(index);
+    let mut found = Vec::new();
+    zone.occupancy
+        .for_each_running(AddressSpaceKey::from_raw(MM).unwrap(), |slot| {
+            found.push(slot)
+        });
+    assert_eq!(
+        found,
+        [ExecutionSlot::zone(SLOT)],
+        "the scan sees the earlier install"
+    );
+    zone.release_space(SLOT);
+    assert_eq!(zone.install_space(SLOT, MM), None);
+    assert_eq!(zone.installed_space(SLOT), 0);
 }

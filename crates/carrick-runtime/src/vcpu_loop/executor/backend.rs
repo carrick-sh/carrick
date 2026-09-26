@@ -392,6 +392,11 @@ impl PersistentExecutorFactory for HvpatchPersistentExecutorFactory {
     type Executor = HvpatchPersistentExecutor;
     fn create(&self, executor: ExecutorId) -> Result<Self::Executor, TrapError> {
         let (lifecycle, vcpu) = self.authority.create_executor_parts()?;
+        // Guest EL1 switches a vCPU between address spaces through the
+        // carrier's maintenance root (EL1 increment 2).
+        carrick_kernel::kernel::publish_idle_root(
+            carrick_vmm_hvf::hvf_aarch64_engine::carrier_maintenance_ttbr(&lifecycle)?,
+        );
         let raw_vcpu_id = carrick_vmm_hvf::hvf_aarch64_engine::persistent_vcpu_identity(&vcpu);
         let owner_thread_port = current_owner_thread_port();
         Ok(HvpatchPersistentExecutor {
@@ -1175,6 +1180,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             .lifecycle
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("HVPatch executor lost idle lifecycle".into()))?;
+        carrick_kernel::kernel::publish_idle_root(
+            carrick_vmm_hvf::hvf_aarch64_engine::carrier_maintenance_ttbr(lifecycle)?,
+        );
         let vcpu = self
             .vcpu
             .as_mut()

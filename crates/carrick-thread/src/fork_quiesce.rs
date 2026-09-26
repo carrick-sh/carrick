@@ -832,6 +832,33 @@ pub fn pt_barrier() -> &'static Arc<PtQuiesce> {
     B.get_or_init(|| Arc::new(PtQuiesce::new()))
 }
 
+/// A copy of an MM's fence outside the host (EL1 increment 2): the gate of
+/// the MM's published address space in the shared EL1 region, which guest
+/// EL1 reads before it installs the space on a vCPU itself. Raised with the
+/// fence, before the pause scans which vCPUs run the MM; lowered when it
+/// ends.
+pub trait FenceMirror: Send + Sync {
+    fn raise(&self);
+    fn lower(&self);
+}
+
+/// The mirror a [`PtQuiesce`] raises, and whether its fence is raised now.
+#[derive(Default)]
+struct MirrorState {
+    mirror: Option<Arc<dyn FenceMirror>>,
+    raised: bool,
+}
+
+impl std::fmt::Debug for MirrorState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MirrorState")
+            .field("bound", &self.mirror.is_some())
+            .field("raised", &self.raised)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct PtQuiesce {
     coordinator: AtomicBool,
@@ -847,6 +874,9 @@ pub struct PtQuiesce {
     /// An entrant was refused [`ENTRANT_REFUSAL_LIMIT`] times: the next
     /// coordinator lets every parked entrant leave before it raises the fence.
     starving: AtomicBool,
+    /// The fence's copy in the shared EL1 region, when the MM's address
+    /// space is published there ([`Self::bind_mirror`]).
+    mirror: parking_lot::Mutex<MirrorState>,
     cv: Condvar,
 }
 
@@ -888,8 +918,36 @@ impl PtQuiesce {
             parked_entrants: Mutex::new(0),
             pauses_ended: AtomicU64::new(0),
             starving: AtomicBool::new(false),
+            mirror: parking_lot::Mutex::new(MirrorState::default()),
             cv: Condvar::new(),
         }
+    }
+
+    /// Raise `mirror` with this fence from now on (it is raised at once if a
+    /// pause is in force). False if a mirror is already bound. A pause
+    /// raises the mirror after it raises the fence and before it scans
+    /// which vCPUs run the MM, under the same lock as this binding, so a
+    /// pause the binding misses raises the mirror itself before its scan.
+    pub fn bind_mirror(&self, mirror: Arc<dyn FenceMirror>) -> bool {
+        let mut state = self.mirror.lock();
+        if state.mirror.is_some() {
+            return false;
+        }
+        if state.raised {
+            mirror.raise();
+        }
+        state.mirror = Some(mirror);
+        true
+    }
+
+    /// Stop raising the bound mirror (lowering it if a pause is in force).
+    pub fn unbind_mirror(&self) -> Option<Arc<dyn FenceMirror>> {
+        let mut state = self.mirror.lock();
+        let mirror = state.mirror.take()?;
+        if state.raised {
+            mirror.lower();
+        }
+        Some(mirror)
     }
 
     pub fn is_quiescing(&self) -> bool {
@@ -905,6 +963,13 @@ impl PtQuiesce {
 
     pub fn set_quiescing(&self) {
         self.quiescing.store(true, Ordering::SeqCst);
+        let mut state = self.mirror.lock();
+        if !state.raised {
+            state.raised = true;
+            if let Some(mirror) = state.mirror.as_ref() {
+                mirror.raise();
+            }
+        }
     }
 
     /// The coordinator must drain other vCPUs of the MM: host waits of the
@@ -998,6 +1063,15 @@ impl PtQuiesce {
 
     /// Coordinator: end the pause, wake parked threads, drop coordinator.
     pub fn end(&self) {
+        {
+            let mut state = self.mirror.lock();
+            if state.raised {
+                state.raised = false;
+                if let Some(mirror) = state.mirror.as_ref() {
+                    mirror.lower();
+                }
+            }
+        }
         #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let _held = self.parked_entrants.lock().unwrap();
         self.pauses_ended.fetch_add(1, Ordering::SeqCst);
@@ -1571,5 +1645,37 @@ mod tests {
             executor_b_not_quiescing,
             "fork in MM A must not report quiescing on executor bound to MM B"
         );
+    }
+
+    struct CountingMirror(AtomicI32);
+    impl FenceMirror for CountingMirror {
+        fn raise(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn lower(&self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// EL1 increment 2: a bound mirror is raised with the fence (also when
+    /// bound mid-pause) and lowered when the pause ends or it is unbound.
+    #[test]
+    fn a_bound_mirror_follows_the_fence() {
+        let barrier = PtQuiesce::new();
+        let mirror = Arc::new(CountingMirror(AtomicI32::new(0)));
+        assert!(barrier.bind_mirror(mirror.clone()));
+        assert!(!barrier.bind_mirror(mirror.clone()), "one mirror per fence");
+        barrier.set_quiescing();
+        assert_eq!(mirror.0.load(Ordering::SeqCst), 1);
+        barrier.end();
+        assert_eq!(mirror.0.load(Ordering::SeqCst), 0);
+        barrier.unbind_mirror();
+        barrier.set_quiescing();
+        assert!(barrier.bind_mirror(mirror.clone()));
+        assert_eq!(mirror.0.load(Ordering::SeqCst), 1, "bound mid-pause");
+        assert!(barrier.unbind_mirror().is_some());
+        assert_eq!(mirror.0.load(Ordering::SeqCst), 0, "unbound mid-pause");
+        barrier.end();
+        assert_eq!(mirror.0.load(Ordering::SeqCst), 0);
     }
 }
