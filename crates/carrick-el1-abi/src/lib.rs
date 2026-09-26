@@ -219,7 +219,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         carrick_sched_core::ZONE_ENTRIES as u64,
         carrick_sched_core::ZONE_BUCKETS as u64,
         carrick_sched_core::ZONE_SLOTS as u64,
-        carrick_sched_core::ZONE_RUNQ_CAPACITY as u64,
+        carrick_sched_core::ZONE_SLOT_WORDS as u64,
+        core::mem::size_of::<carrick_sched_core::ZoneCounters>() as u64,
         EL1_STACK_SLOTS,
         core::mem::size_of::<FdMapSlot>() as u64,
         core::mem::offset_of!(FdMapSlot, handle) as u64,
@@ -1002,9 +1003,9 @@ pub const EL1_NAME_CACHE_BASE: u64 = EL1_REGION_BASE + EL1_NAME_CACHE_OFFSET;
 pub const EL1_NAME_CACHE_SIZE: u64 = 0x1_0000;
 
 pub use carrick_sched_core::{
-    BoundedSpin, Claim, CurrentHandback, Exhausted, Handback, HostClaim, LockWait, RecordId,
-    RecordRef, SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects,
-    WakeRefusal, Waker, ZONE_RUNQ_CAPACITY, ZoneRecord, ZoneTables,
+    BoundedSpin, Claim, CurrentHandback, Exhausted, Handback, HostClaim, HostPlacement, LockWait,
+    RecordId, RecordRef, SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx, ThreadIdentity,
+    WakeEffects, WakeRefusal, Waker, ZoneRecord, ZoneTables,
 };
 
 /// Byte offset of the in-guest scheduler's tables ([`ZoneTables`]: futex

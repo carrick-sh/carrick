@@ -76,9 +76,18 @@ enum KickFate {
 enum Image {
     /// Serve the syscall (or interrupt) unless host work is pending.
     Serve,
-    /// The syscall parks its thread and the idle vCPU leaves for the host.
+    /// The syscall parks its thread and the idle vCPU leaves for the host
+    /// (for an interrupt: the running thread is preempted and the next one
+    /// needs its executor, EL1 plan 1d).
     Idle,
+    /// The idle entry switches a queued thread in: the frame becomes its
+    /// EL0 state (`SWITCHED_ELR`, x0 = `SWITCHED_X0`) and the image serves.
+    SwitchIn,
 }
+
+/// The EL0 PC and x0 of the thread [`Image::SwitchIn`] loads.
+const SWITCHED_ELR: u64 = 0x4000_2000;
+const SWITCHED_X0: u64 = 0x7777;
 
 /// Small independent interpreter of the vector page's instruction subset.
 /// Unknown instructions fail closed.
@@ -110,7 +119,7 @@ impl Machine {
         let mut bytes = vec![0u8; LINUX_EL1_VECTORS_SIZE as usize];
         write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, CAPTURE, irq);
         if irq == El1IrqMode::Gic {
-            write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);
+            let _ = write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);
         }
         bytes
     }
@@ -211,8 +220,13 @@ impl Machine {
         let pending = self.read(Self::pending_host_work_addr()) != 0;
         self.regs[0] = if pending {
             1
-        } else if !irq && self.image == Image::Idle {
+        } else if self.image == Image::Idle {
             IDLE
+        } else if self.image == Image::SwitchIn {
+            self.mem.insert(frame, SWITCHED_X0);
+            self.mem.insert(frame + 248, SWITCHED_ELR);
+            self.mem.insert(frame + 256, EL0_DAIF_MASKED);
+            0
         } else {
             if !irq {
                 self.mem.insert(frame, 0x5E4E);
@@ -617,5 +631,71 @@ fn gic_mode_vector_page_routes_el0_interrupts_to_el1() {
         off[AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET / 4],
         AARCH64_HVC_KICK_OPCODE,
         "no EL1 kernel, no EL1 interrupt entry"
+    );
+}
+
+/// EL1 plan 1d: an interrupt whose handler preempts the running thread for a
+/// thread that needs its executor leaves through the idle exit, with SP_EL1
+/// back on the mailbox slot and no EL0 state resumed.
+#[test]
+fn gic_irq_hook_idle_action_leaves_through_the_idle_exit() {
+    let mut m = Machine {
+        image: Image::Idle,
+        ..Machine::el0_irq()
+    };
+    assert_eq!(
+        m.run(None),
+        Exit::Idle {
+            sp: LINUX_SYSCALL_MAILBOX_BASE + SLOT * 256
+        }
+    );
+    assert_eq!(m.irq_frames, 1);
+}
+
+/// The idle entry (EL1 plan 1d): an executor with no thread starts the vCPU
+/// at the EL0 IRQ hook's call into the image, with `x16` at a frame whose
+/// syndrome and ELR are 0. A thread the image switches in is entered at EL0
+/// with exactly the frame's state (IRQs unmasked, GIC mode); with nothing
+/// to run the vCPU leaves through the idle exit.
+#[test]
+fn the_idle_entry_runs_a_switched_in_thread_or_leaves_idle() {
+    let entry = (el1_idle_entry_va() - LINUX_EL1_VECTORS_BASE) as usize;
+    assert!(
+        (EL0_IRQ_HOOK_OFFSET..EL0_IRQ_HOOK_OFFSET + 0x1000).contains(&entry),
+        "the idle entry is inside the EL0 IRQ hook"
+    );
+    let frame = el1_slot_frame_va(SLOT as usize);
+    let idle_machine = |image: Image| {
+        let mut m = Machine {
+            image,
+            pc: entry,
+            ..Machine::el0_irq()
+        };
+        m.regs[16] = frame;
+        m.mem.insert(frame + 272, SLOT);
+        m.mem.insert(frame + 264, 0);
+        m.mem.insert(frame + 248, 0);
+        m
+    };
+    let mut m = idle_machine(Image::SwitchIn);
+    assert_eq!(
+        m.run(None),
+        Exit::Eret {
+            spsr: EL0_DAIF_MASKED & !PSTATE_I,
+            elr: SWITCHED_ELR
+        }
+    );
+    assert_eq!(m.regs[0], SWITCHED_X0, "x0 comes from the frame");
+    assert_eq!(
+        m.sp,
+        LINUX_SYSCALL_MAILBOX_BASE + SLOT * 256,
+        "SP_EL1 is back on the mailbox slot at EL0"
+    );
+    let mut m = idle_machine(Image::Idle);
+    assert_eq!(
+        m.run(None),
+        Exit::Idle {
+            sp: LINUX_SYSCALL_MAILBOX_BASE + SLOT * 256
+        }
     );
 }

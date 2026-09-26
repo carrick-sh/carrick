@@ -5,7 +5,7 @@ extern crate std;
 use super::*;
 use carrick_el1_abi::{
     Claim, Counters, DelegatedFile, DelegatedInotify, DelegatedOpenFile, El1TaskId, FdMapSlot,
-    InotifyNameCache,
+    Handback, InotifyNameCache, RecordId,
 };
 use carrick_sched_core::LockWait;
 use core::sync::atomic::AtomicU32;
@@ -57,6 +57,11 @@ fn serve_on(
     cpu: &mut FakeCpu,
     counters: &Counters,
 ) -> Option<Served> {
+    // The host publishes the loaded thread's address space on the slot at
+    // every load; EL1 places woken threads by it.
+    if zone.slot(slot).mm() == 0 {
+        zone.publish_slot(slot, task.zone_mm.load(Ordering::Relaxed), None, 0);
+    }
     Sched {
         zone,
         slot,
@@ -593,10 +598,11 @@ fn threads_of_another_process_are_not_woken() {
     assert!(matches!(zone.record(b).claim(), Claim::Parked { .. }));
 }
 
-/// While a woken thread waits on the run queue, any other syscall leaves
-/// through the host (which takes the woken thread at that exit).
+/// A woken thread waiting on the run queue no longer sends the running
+/// thread's other syscalls to the host (EL1 plan 1d; 1b-1c forwarded them so
+/// the host could take the queued thread): a servable one is served.
 #[test]
-fn queued_threads_send_other_syscalls_to_the_host() {
+fn queued_threads_do_not_send_other_syscalls_to_the_host() {
     let zone = zone();
     let word = AtomicU32::new(0);
     let uaddr = word.as_ptr() as u64;
@@ -606,11 +612,28 @@ fn queued_threads_send_other_syscalls_to_the_host() {
         CurrentTask::new(),
         task_for(101),
     ];
-    let _b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
+    zone.publish_slot(SLOT, MM, None, 0);
+    let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
     let counters = Counters::default();
+    // fd 3 of the task's file table is a delegated file EL1 serves lseek on.
     let fd_map = [FdMapSlot::new()];
+    fd_map[0].set(5, 3, 1, 42);
     let objects = [DelegatedFile::new()];
     let opens = [DelegatedOpenFile::new()];
+    opens[0]
+        .state
+        .store(carrick_el1_abi::DELEGATED_STATE_GUEST, Ordering::Relaxed);
+    opens[0].inode_handle.store(1, Ordering::Relaxed);
+    objects[0]
+        .state
+        .store(carrick_el1_abi::DELEGATED_STATE_GUEST, Ordering::Relaxed);
+    objects[0].generation.store(42, Ordering::Relaxed);
+    opens[0].generation.store(42, Ordering::Relaxed);
+    opens[0].inode_generation.store(42, Ordering::Relaxed);
+    objects[0].size.store(100, Ordering::Relaxed);
+    opens[0]
+        .flags
+        .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
     let inotify = [DelegatedInotify::new()];
     let names = InotifyNameCache::new();
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
@@ -634,11 +657,207 @@ fn queued_threads_send_other_syscalls_to_the_host() {
     };
     assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
     assert_eq!(counters.served[SYS_FUTEX].load(Ordering::Relaxed), 1);
+    assert_eq!(zone.record(b).claim(), Claim::Queued { slot: SLOT, seq: 1 });
+    frame.x[0] = 3;
+    frame.x[1] = 50;
+    frame.x[2] = 0;
     frame.x[8] = 62; // lseek
-    assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Forward);
-    assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 1);
+    assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
+    assert_eq!(frame.x[0], 50);
+    assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 0);
     // A pending host kick forwards even a servable futex call.
     tasks[3].mark_pending_host_work();
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
     assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Forward);
+}
+
+// ---------------------------------------------------------------------------
+// EL1 plan 1d: host-runnable threads, the idle entry and stealing.
+
+/// A thread the host made runnable (a completed host wait): host-owned with
+/// `Service`, queued on `slot` by host placement.
+fn host_runnable(zone: &ZoneTables, slot: SlotId, tid: u64) -> RecordId {
+    let record = zone.alloc_record(identity(tid)).unwrap();
+    let seq = zone.next_seq(record);
+    zone.publish_park(record, seq);
+    assert_eq!(
+        zone.claim_for_host(zone.record_ref(record), None, Handback::Service, &HostWait),
+        carrick_el1_abi::HostClaim::Claimed
+    );
+    assert_eq!(zone.place_from_host(record).map(|p| p.slot), Some(slot));
+    record
+}
+
+/// A wait with a host-runnable thread at the head of the run queue parks
+/// the waiter and leaves for the host with no thread on the vCPU: EL1 never
+/// runs that thread at EL0.
+#[test]
+fn a_park_before_a_host_runnable_thread_leaves_for_the_host() {
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    zone.publish_slot(SLOT, MM, Some(0), 0);
+    zone.enter_guest(SLOT);
+    let service = host_runnable(&zone, SLOT, 303);
+    let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    assert_eq!(
+        serve(&mut frame, &task, &zone, &mut cpu),
+        Some(Served::Idle)
+    );
+    assert_eq!(zone.slot(SLOT).current(), None);
+    let own = zone.slot(SLOT).host_record().unwrap();
+    assert!(matches!(zone.record(own).claim(), Claim::Parked { .. }));
+    assert!(zone.head_needs_host(SLOT));
+    assert_eq!(zone.runnable_head(SLOT), Some(service));
+    assert_eq!(zone.counters.el1_service_exits.load(Ordering::Relaxed), 1);
+    assert_eq!(cpu.wfis, 0, "it did not idle");
+}
+
+/// The slice of a running thread ends with a host-runnable thread queued:
+/// the running thread goes to the tail with its registers (as preempted)
+/// and the vCPU leaves through the idle exit.
+#[test]
+fn a_slice_ending_before_a_host_runnable_thread_leaves_for_the_host() {
+    let zone = zone();
+    let task = task_for(101);
+    let counters = counters();
+    zone.publish_slot(SLOT, MM, Some(0), 0);
+    zone.enter_guest(SLOT);
+    let service = host_runnable(&zone, SLOT, 303);
+    let (mut frame, mut cpu) = live(0xA, 0x1000, FUTEX_WAKE_PRIVATE, 1);
+    frame.x[5] = 0x5555;
+    let running = (frame, cpu.regs.clone());
+    let slice = cpu.freq / 1000 * 2;
+    let irq = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
+        Sched {
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu,
+            user: &HardwareUserWord,
+            counters,
+        }
+        .serve_irq(frame)
+    };
+    // The reschedule SGI the host placement owed starts the slice.
+    cpu.pending.push_back(GIC_RESCHED_INTID);
+    assert_eq!(irq(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
+    assert_eq!(cpu.timer, Some(cpu.now + slice), "the slice timer is armed");
+    cpu.now += slice;
+    assert_eq!(irq(&mut frame, &mut cpu), carrick_el1_abi::Action::Idle);
+    let own = zone.slot(SLOT).host_record().unwrap();
+    assert_eq!(zone.runnable_head(SLOT), Some(service));
+    assert!(matches!(zone.record(own).claim(), Claim::Queued { .. }));
+    assert_eq!(zone.record(own).handback(), Some(Handback::Resumed));
+    // SAFETY: the record is queued on this slot, which the test owns.
+    let saved = unsafe { *zone.record(own).ctx_mut() };
+    assert_eq!(saved.x, running.0.x);
+    assert_eq!(saved.pc, running.0.elr);
+    assert_eq!(saved.v, running.1.v);
+}
+
+/// The idle entry: an executor with no thread starts its vCPU in the
+/// scheduler. With a woken thread queued it runs that thread (the frame
+/// becomes its registers); with a host-runnable one it leaves at once; with
+/// nothing it idles until host work arrives.
+#[test]
+fn the_idle_entry_runs_a_queued_thread_or_leaves_for_the_host() {
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let counters = counters();
+    let waker = task_for(101);
+    // A thread of MM parked; the slot the waker runs on wakes it.
+    let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
+    let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
+    assert_eq!(serve(&mut frame, &waker, &zone, &mut cpu), RETURNED);
+    assert_eq!(zone.record(b).claim(), Claim::Queued { slot: SLOT, seq: 1 });
+    // The executor of SLOT has no thread: it enters idle (same address
+    // space still installed).
+    let idle_task = CurrentTask::new();
+    idle_task.zone_mm.store(MM, Ordering::Relaxed);
+    let entry = |frame: &mut TrapFrame, cpu: &mut FakeCpu, task: &CurrentTask| {
+        Sched {
+            zone: &zone,
+            slot: SLOT,
+            task,
+            cpu,
+            user: &HardwareUserWord,
+            counters,
+        }
+        .serve_idle_entry(frame)
+    };
+    let mut idle_frame = TrapFrame {
+        slot: u64::from(SLOT.raw()),
+        ..TrapFrame::default()
+    };
+    let mut idle_cpu = FakeCpu::default();
+    assert_eq!(
+        entry(&mut idle_frame, &mut idle_cpu, &idle_task),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(idle_frame.elr, 0xB << 12, "B runs from the idle entry");
+    assert_eq!(idle_frame.x[0], 0, "its wait returns 0");
+    assert_eq!(zone.slot(SLOT).current(), Some(b));
+    // Later, with a host-runnable thread queued and nothing else, the idle
+    // entry leaves at once.
+    zone.clear_current(SLOT);
+    let service = host_runnable(&zone, SLOT, 303);
+    let mut idle_frame = TrapFrame {
+        slot: u64::from(SLOT.raw()),
+        ..TrapFrame::default()
+    };
+    assert_eq!(
+        entry(&mut idle_frame, &mut idle_cpu, &idle_task),
+        carrick_el1_abi::Action::Idle
+    );
+    assert_eq!(zone.runnable_head(SLOT), Some(service));
+    // Host work pending: it leaves without looking.
+    idle_task.mark_pending_host_work();
+    assert_eq!(
+        entry(&mut idle_frame, &mut idle_cpu, &idle_task),
+        carrick_el1_abi::Action::Idle
+    );
+}
+
+/// An idle vCPU takes a queued thread of its address space from another
+/// vCPU's run queue instead of waiting in WFI.
+#[test]
+fn an_idle_vcpu_steals_a_queued_thread() {
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let counters = counters();
+    let task = task_for(101);
+    let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
+    let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
+    assert_eq!(zone.record(b).claim(), Claim::Queued { slot: SLOT, seq: 1 });
+    // Another slot of the same address space enters idle.
+    let other = SlotId::new(6);
+    zone.publish_slot(other, MM, Some(1), 0);
+    zone.enter_guest(other);
+    let idle_task = CurrentTask::new();
+    idle_task.zone_mm.store(MM, Ordering::Relaxed);
+    let mut idle_frame = TrapFrame {
+        slot: u64::from(other.raw()),
+        ..TrapFrame::default()
+    };
+    let mut idle_cpu = FakeCpu::default();
+    let action = Sched {
+        zone: &zone,
+        slot: other,
+        task: &idle_task,
+        cpu: &mut idle_cpu,
+        user: &HardwareUserWord,
+        counters,
+    }
+    .serve_idle_entry(&mut idle_frame);
+    assert_eq!(action, carrick_el1_abi::Action::Served);
+    assert_eq!(idle_frame.elr, 0xB << 12);
+    assert_eq!(zone.slot(other).current(), Some(b));
+    assert_eq!(zone.slot(SLOT).queued(), 0);
+    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 1);
+    assert_eq!(idle_cpu.wfis, 0);
 }

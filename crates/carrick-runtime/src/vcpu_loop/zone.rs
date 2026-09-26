@@ -23,8 +23,7 @@ use super::exec::ProductionHvpatchPollError;
 use super::outcome::HvpatchLoopSuspension;
 use super::*;
 use carrick_el1_abi::{
-    CurrentHandback, Handback, RecordId, RecordRef, SlotId, ThreadCtx, ThreadIdentity,
-    ZONE_RUNQ_CAPACITY, ZoneTables,
+    CurrentHandback, Handback, RecordId, RecordRef, SlotId, ThreadCtx, ThreadIdentity, ZoneTables,
 };
 use carrick_hal::threaded::GuestCpuState;
 use carrick_kernel::el1_zone::HostLockWait;
@@ -170,16 +169,18 @@ where
         if s.current().is_none() && s.queued() == 0 && s.host_record().is_none() {
             return Ok(None);
         }
-        let mut woken = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-        let mut discarded = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-        let drain = zone.drain_slot(slot, &mut woken, &mut discarded);
-        for record in &discarded[..drain.discarded] {
-            zone.free_record(*record);
-        }
+        let mut handed_back: Vec<RecordId> = Vec::new();
+        let drain = zone.drain_slot(slot, &mut |record, discard| {
+            if discard {
+                zone.free_record(record);
+            } else {
+                handed_back.push(record);
+            }
+        });
         // This job's own record, if it was queued here, settles below as
         // host-owned (ready); publishing it would only make the scheduler
         // kick this very executor.
-        let woken: Vec<RecordRef> = woken[..drain.woken]
+        let woken: Vec<RecordRef> = handed_back
             .iter()
             .filter(|id| Some(**id) != drain.host_record)
             .map(|id| zone.record_ref(*id))
@@ -464,7 +465,9 @@ where
             // The host needed it runnable (an exit or exec drain, or a
             // control action): its wait ends as a spurious wakeup.
             Some(Handback::Control) => Some(0),
-            Some(Handback::Cancelled) | None => {
+            // A service record names a thread the host made runnable; it is
+            // loaded from its own residency, never resumed from a zone wait.
+            Some(Handback::Cancelled | Handback::Service) | None => {
                 return Err(RuntimeError::Configuration(format!(
                     "EL1 zone resume of record {record:?} with handback {:?}",
                     rec.handback()
