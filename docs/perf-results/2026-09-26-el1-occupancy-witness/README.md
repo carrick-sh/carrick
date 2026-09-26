@@ -45,3 +45,8 @@ closure, EL1 memory acceptance, or a performance comparison: the Docker and
 Carrick runs used their respective default CPU populations. Full el1 suite,
 probe/smoke/full promotion, live-table authority, first-touch execution,
 elastic return and paired ecosystem measurements remain open.
+
+At `771e804d5`, integrated `RUSTC_WRAPPER= just lint-domains` exited zero. The
+host-authority census explicitly remains partial for Linux, FreeBSD and NetBSD
+profiles. The complete log is `integrated-lint.log`. Reconciliation preserved
+all 588 authority rows without position or content changes.
