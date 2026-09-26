@@ -826,18 +826,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:7717 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:7725 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000050",
     "source": {
-      "byte_end": 347826,
-      "byte_start": 347814,
+      "byte_end": 348310,
+      "byte_start": 348298,
       "column": 29,
       "column_end": 41,
       "column_start": 29,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 7717,
-      "line_end": 7717,
-      "line_start": 7717
+      "line": 7725,
+      "line_end": 7725,
+      "line_start": 7725
     }
   },
   {
@@ -1985,8 +1985,8 @@
     "rationale": "At crates/carrick-mem/src/memory.rs:2932 in `fill_random_bytes`, `std::fs::File::open` accesses only the fixed host entropy source used for guest stack randomization used by `fill_random_bytes`.",
     "review_id": "HA-000090",
     "source": {
-      "byte_end": 126837,
-      "byte_start": 126823,
+      "byte_end": 126732,
+      "byte_start": 126718,
       "column": 20,
       "column_end": 34,
       "column_start": 20,
@@ -5345,8 +5345,8 @@
     "rationale": "At crates/carrick-mem/src/memory.rs:1395 in `load_elf_for`, `std::fs::read` accesses only the selected guest executable image used by `load_elf_for`.",
     "review_id": "HA-000227",
     "source": {
-      "byte_end": 67377,
-      "byte_start": 67369,
+      "byte_end": 67272,
+      "byte_start": 67264,
       "column": 20,
       "column_end": 28,
       "column_start": 20,
@@ -5373,8 +5373,8 @@
     "rationale": "At crates/carrick-mem/src/memory.rs:1397 in `load_elf_for`, `std::fs::read` accesses only the selected guest interpreter image used by `load_elf_for`.",
     "review_id": "HA-000228",
     "source": {
-      "byte_end": 67486,
-      "byte_start": 67478,
+      "byte_end": 67381,
+      "byte_start": 67373,
       "column": 81,
       "column_end": 89,
       "column_start": 81,
@@ -13949,33 +13949,6 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
-      "resource": "carrier-owned EL1 zone run-queue guard thread used by `start_run_queue_guard`"
-    },
-    "expansion": null,
-    "operation": "std::thread::Builder::new",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/el1_zone.rs:93 in `start_run_queue_guard`, `std::thread::Builder::new` acts only on the carrier-owned EL1 zone run-queue guard thread used by `start_run_queue_guard`; no guest identity selects its host target.",
-    "review_id": "HA-000680",
-    "source": {
-      "byte_end": 3759,
-      "byte_start": 3734,
-      "column": 17,
-      "column_end": 42,
-      "column_start": 17,
-      "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "line": 93,
-      "line_end": 93,
-      "line_start": 93
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
       "resource": "current HVPatch timer helper and compatibility bootstrap seam used by `arm_itimer`"
     },
     "expansion": null,
@@ -14281,18 +14254,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:4462 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:4477 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 189357,
-      "byte_start": 189332,
+      "byte_end": 190115,
+      "byte_start": 190090,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 4462,
-      "line_end": 4462,
-      "line_start": 4462
+      "line": 4477,
+      "line_end": 4477,
+      "line_start": 4477
     }
   },
   {
@@ -14805,60 +14778,6 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
-      "resource": "current carrier EL1 zone run-queue guard thread (idle while the zone is off) used by `run_queue_guard`"
-    },
-    "expansion": null,
-    "operation": "std::thread::sleep",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/el1_zone.rs:104 in `run_queue_guard`, `std::thread::sleep` acts only on the current carrier EL1 zone run-queue guard thread (idle while the zone is off) used by `run_queue_guard`; no guest identity selects its host target.",
-    "review_id": "HA-000681",
-    "source": {
-      "byte_end": 4046,
-      "byte_start": 4028,
-      "column": 13,
-      "column_end": 31,
-      "column_start": 13,
-      "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "line": 104,
-      "line_end": 104,
-      "line_start": 104
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
-      "resource": "current carrier EL1 zone run-queue guard thread (between scans) used by `run_queue_guard`"
-    },
-    "expansion": null,
-    "operation": "std::thread::sleep",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/el1_zone.rs:122 in `run_queue_guard`, `std::thread::sleep` acts only on the current carrier EL1 zone run-queue guard thread (between scans) used by `run_queue_guard`; no guest identity selects its host target.",
-    "review_id": "HA-000682",
-    "source": {
-      "byte_end": 4617,
-      "byte_start": 4599,
-      "column": 9,
-      "column_end": 27,
-      "column_start": 9,
-      "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "line": 122,
-      "line_end": 122,
-      "line_start": 122
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
       "resource": "current HVPatch timer helper delay at line 190"
     },
     "expansion": null,
@@ -15113,8 +15032,8 @@
     "rationale": "At crates/carrick-runtime/src/vcpu_loop/crash.rs:448 in `capture_core_for_publication`, `std::thread::sleep` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
     "review_id": "HA-000614",
     "source": {
-      "byte_end": 18975,
-      "byte_start": 18957,
+      "byte_end": 19008,
+      "byte_start": 18990,
       "column": 17,
       "column_end": 35,
       "column_start": 17,
@@ -15716,18 +15635,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/el1_zone.rs:35 in `HostLockWait::wait`, `std::thread::yield_now` acts only on the current host thread waiting on an EL1 zone bucket lock held by EL1 or another host thread used by `HostLockWait::wait`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/el1_zone.rs:36 in `HostLockWait::wait`, `std::thread::yield_now` acts only on the current host thread waiting on an EL1 zone bucket lock held by EL1 or another host thread used by `HostLockWait::wait`; no guest identity selects its host target.",
     "review_id": "HA-000683",
     "source": {
-      "byte_end": 1622,
-      "byte_start": 1600,
+      "byte_end": 1699,
+      "byte_start": 1677,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "line": 35,
-      "line_end": 35,
-      "line_start": 35
+      "line": 36,
+      "line_end": 36,
+      "line_start": 36
     }
   },
   {
@@ -15905,18 +15824,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:1430 in `run_executor_loop`, `std::thread::yield_now` acts only on the current persistent executor host thread after one settled quantum used by `run_executor_loop` at line 3931; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:1431 in `run_executor_loop`, `std::thread::yield_now` acts only on the current persistent executor host thread after one settled quantum used by `run_executor_loop` at line 3931; no guest identity selects its host target.",
     "review_id": "HA-000638",
     "source": {
-      "byte_end": 64116,
-      "byte_start": 64094,
+      "byte_end": 64198,
+      "byte_start": 64176,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-      "line": 1430,
-      "line_end": 1430,
-      "line_start": 1430
+      "line": 1431,
+      "line_end": 1431,
+      "line_start": 1431
     }
   }
 ]
