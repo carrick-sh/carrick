@@ -306,3 +306,19 @@ This covers the runtime/kernel integration, syscall-process, prepare compile-fai
 contract, CLI/trace, engine/image and probe-inventory consistency suites. Receipt:
 `docs/perf-results/2026-09-26-el1-boundary-review/personality-integrated-host-integration.log`.
 It does not replace the still-red snapshot library test or signed memory gates.
+
+### Live authority review round 2
+
+Candidate `1dfe55a5d` remains unintegrated. The worker reports 623 serial
+runtime tests passing, but independent reruns against that committed MMU source
+still reproduce silent live-state fallback from failed snapshot cloning and
+compile the safe resolver-replacement witness. Final source still validates only
+eight bytes before callers add descriptor offsets, and caches structural owners
+without coordinating pooled-root retirement/reuse. Root and extension tests do
+not yet exercise cached entries after same-slot reuse. Exact rerun receipts are
+in `docs/perf-results/2026-09-26-el1-live-table-review/round1-final-*`.
+
+Review round 2 was sent to the same live-table worker with explicit failure,
+complete-range access, sound resolver installation, coordinated retirement and
+behavioral test requirements. Existing work budgets and full migration scope
+remain unchanged. No signed or performance acceptance is claimed.
