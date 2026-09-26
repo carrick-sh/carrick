@@ -1624,13 +1624,14 @@ impl PageTableManager {
             }
         }
 
-        let journal = match self.undo.take() {
-            Some(j) => j,
-            None => return Ok(Vec::new()),
-        };
+        // Resolution may be revoked after preflight. Keep the complete journal
+        // and staged entries until every host write succeeds: a partial restore
+        // must remain retryable and must not release newly attached arenas.
         for &(loc, previous) in journal.words.iter().rev() {
-            self.staged.remove(&loc);
             let arena = &mut self.arenas[loc.arena];
+            let host = resolver
+                .host_ptr_for_range(arena.base, loc.offset + 8)
+                .ok_or(PageTableError::UnresolvedArena(arena.base))?;
             match arena.storage {
                 TableArenaStorage::Owned(ref mut bytes) => {
                     if loc.offset + 8 <= bytes.len() {
@@ -1640,14 +1641,19 @@ impl PageTableManager {
                 TableArenaStorage::Live => {}
             }
             fence(Ordering::SeqCst);
-            if let Some(host) = resolver.host_ptr_for_range(arena.base, loc.offset + 8) {
-                unsafe {
-                    let slot = host.add(loc.offset).cast::<AtomicU64>();
-                    (*slot).store(previous, Ordering::Release);
-                }
+            unsafe {
+                let slot = host.add(loc.offset).cast::<AtomicU64>();
+                (*slot).store(previous, Ordering::Release);
             }
         }
         fence(Ordering::SeqCst);
+        let journal = match self.undo.take() {
+            Some(journal) => journal,
+            None => return Ok(Vec::new()),
+        };
+        for &(loc, _) in &journal.words {
+            self.staged.remove(&loc);
+        }
         for (i, &next_free) in journal.arena_next_frees.iter().enumerate() {
             if i < self.arenas.len() {
                 self.arenas[i].next_free = next_free;
@@ -3141,6 +3147,87 @@ mod tests {
         LINUX_PRIVATE_OVERLAY_BASE, LINUX_SHARED_FILE_BASE, mmap_arena_size,
         stage1_hvpatch_page_tables, stage1_identity_page_tables,
     };
+
+    mod rollback_revocation {
+        use super::*;
+        use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        struct Revocable {
+            words: Box<[AtomicU64]>,
+            calls: AtomicUsize,
+        }
+        // Backing remains resident and aligned for the whole test; only lookup availability changes.
+        unsafe impl HostArenaResolver for &Revocable {
+            fn host_ptr_for_range(&self, _: u64, len: usize) -> Option<*mut u8> {
+                assert!(len <= self.words.len() * 8);
+                (self.calls.fetch_add(1, Ordering::SeqCst) == 0)
+                    .then_some(self.words.as_ptr().cast_mut().cast())
+            }
+        }
+        #[test]
+        fn rollback_must_not_discard_journal_after_resolution_is_revoked() {
+            let base = 0x100000;
+            let mut manager = PageTableManager::new(
+                vec![0; 524288],
+                base,
+                PageTableLayoutConfig::new(0, 524288, 0, 0),
+            );
+            manager.begin_undo();
+            manager.write_desc_for_test(base, 0x1234).unwrap();
+            let backing = Revocable {
+                words: (0..65536).map(|_| AtomicU64::new(0)).collect(),
+                calls: AtomicUsize::new(0),
+            };
+            backing.words[0].store(0x1234, Ordering::SeqCst);
+            let result = unsafe { manager.rollback_undo(&backing, None) };
+            assert!(
+                result.is_err() && manager.undo_is_open(),
+                "rollback acknowledged success or discarded journal after resolution revocation: result={result:?}, journal={}, host={:#x}",
+                manager.undo_is_open(),
+                backing.words[0].load(Ordering::SeqCst)
+            );
+        }
+
+        struct CutoffBacking {
+            words: Box<[AtomicU64]>,
+            calls: AtomicUsize,
+            allowed: AtomicUsize,
+        }
+        unsafe impl HostArenaResolver for &CutoffBacking {
+            fn host_ptr_for_range(&self, _: u64, len: usize) -> Option<*mut u8> {
+                assert!(len <= self.words.len() * 8);
+                (self.calls.fetch_add(1, Ordering::SeqCst) < self.allowed.load(Ordering::SeqCst))
+                    .then_some(self.words.as_ptr().cast_mut().cast())
+            }
+        }
+        #[test]
+        fn partial_rollback_retains_a_retryable_journal() {
+            let base = 0x100000;
+            let mut manager = PageTableManager::new(
+                vec![0; 524288],
+                base,
+                PageTableLayoutConfig::new(0, 524288, 0, 0),
+            );
+            manager.begin_undo();
+            manager.write_desc_for_test(base, 0x1234).unwrap();
+            manager.write_desc_for_test(base + 8, 0x5678).unwrap();
+            let backing = CutoffBacking {
+                words: (0..65536).map(|_| AtomicU64::new(0)).collect(),
+                calls: AtomicUsize::new(0),
+                allowed: AtomicUsize::new(3),
+            };
+            backing.words[0].store(0x1234, Ordering::SeqCst);
+            backing.words[1].store(0x5678, Ordering::SeqCst);
+            assert!(unsafe { manager.rollback_undo(&backing, None) }.is_err());
+            assert!(manager.undo_is_open());
+            assert_eq!(backing.words[0].load(Ordering::SeqCst), 0x1234);
+            assert_eq!(backing.words[1].load(Ordering::SeqCst), 0);
+            backing.allowed.store(usize::MAX, Ordering::SeqCst);
+            assert!(unsafe { manager.rollback_undo(&backing, None) }.is_ok());
+            assert!(!manager.undo_is_open());
+            assert_eq!(backing.words[0].load(Ordering::SeqCst), 0);
+            assert_eq!(backing.words[1].load(Ordering::SeqCst), 0);
+        }
+    }
 
     fn test_layout() -> PageTableLayoutConfig {
         PageTableLayoutConfig {

@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-1d1f88d6a1eb2090)
+
+running 2 tests
+
+thread 'aarch64::tests::rollback_revocation::partial_rollback_retains_a_retryable_journal' (11452674) panicked at crates/carrick-mmu-core/src/aarch64.rs:3184:10:
+assertion failed: unsafe { manager.rollback_undo(&backing, None) }.is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'aarch64::tests::rollback_revocation::rollback_must_not_discard_journal_after_resolution_is_revoked' (11452675) panicked at crates/carrick-mmu-core/src/aarch64.rs:3165:10:
+rollback acknowledged success or discarded journal after resolution revocation: result=Ok([]), journal=false, host=0x1234
+test aarch64::tests::rollback_revocation::partial_rollback_retains_a_retryable_journal ... FAILED
+test aarch64::tests::rollback_revocation::rollback_must_not_discard_journal_after_resolution_is_revoked ... FAILED
+
+failures:
+
+failures:
+    aarch64::tests::rollback_revocation::partial_rollback_retains_a_retryable_journal
+    aarch64::tests::rollback_revocation::rollback_must_not_discard_journal_after_resolution_is_revoked
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 80 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-mmu-core --lib`
