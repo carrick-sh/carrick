@@ -1022,7 +1022,7 @@ pub enum DispatchError {
     #[error("fatal file authority error: {0:?}")]
     FileAuthorityFatal(crate::file_authority::AuthorityFatal),
     #[error("MM executor admission failed: {0}")]
-    MmExecutorAdmission(crate::kernel::GuestExecutorCensusError),
+    MmExecutorAdmission(crate::kernel::MmOccupancyError),
     #[error("MM mutation requires a page-table pause while a peer executor is active")]
     MmMutationPeerExecutor,
     #[error("caller-MM executor release requires an active executor participation")]

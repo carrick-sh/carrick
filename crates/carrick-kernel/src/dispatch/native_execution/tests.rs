@@ -20,15 +20,17 @@ fn settle(context: &KernelContext, executor: NativeExecutor, lease: ThreadExecut
 }
 
 #[test]
-fn stop_request_does_not_acknowledge_running_and_entry_takes_no_census_lock() {
+fn stop_request_does_not_acknowledge_running_and_entry_takes_no_occupancy_lock() {
     let (dispatcher, context, mut lease) = fixture(19401);
     let mut executor = dispatcher.admit_native_executor(&context, &lease).unwrap();
     let interrupt = executor.interrupt_handle();
-    let census = dispatcher.mm_executor_census();
+    let census = dispatcher.mm_occupancy_probe();
     for _ in 0..128 {
-        // Holding the census election here makes any hidden entry-time census
-        // acquisition deadlock. Its immutable membership already admits us.
-        let held = census.lock_for_frame_cow();
+        // Holding the MM's fence election here makes any hidden entry-time
+        // pause acquisition deadlock. Its occupancy already admits us.
+        let barrier = executor.participant.pt_quiesce().clone();
+        assert!(barrier.try_become_coordinator());
+        let held = dispatcher.mm_residents_for_test();
         let scope = dispatcher
             .enter_native_execution(&mut executor, &context, &mut lease)
             .unwrap();
@@ -41,10 +43,11 @@ fn stop_request_does_not_acknowledge_running_and_entry_takes_no_census_lock() {
         drop(scope);
         assert!(!held.any_in_guest());
         drop(held);
+        barrier.end();
         assert!(executor.take_stop_request());
     }
     settle(&context, executor, lease);
-    assert_eq!(census.participant_count_for_probe(), 0);
+    assert_eq!(census(), 0);
 }
 
 #[test]
@@ -72,19 +75,15 @@ fn raised_pause_refuses_entry_and_rolls_back_running() {
 fn real_mutation_drain_cannot_pass_until_execution_scope_ends() {
     let (dispatcher, context, mut lease) = fixture(19403);
     let mut executor = dispatcher.admit_native_executor(&context, &lease).unwrap();
-    let census = dispatcher.mm_executor_census();
     let barrier = executor.participant.pt_quiesce().clone();
+    let mm = executor.participant.mm_id();
     let tid = ThreadId::synthetic_for_tests(19404);
-    let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
-    let mut mutator = census
-        .enter_with_pause_endpoint(None, registry, tid)
-        .unwrap();
     let scope = dispatcher
         .enter_native_execution(&mut executor, &context, &mut lease)
         .unwrap();
     let result = try_acquire_pt_pause_for_test(
         &barrier,
-        &mut mutator,
+        mm,
         tid,
         PtPauseBudget {
             election: Duration::ZERO,
@@ -94,9 +93,9 @@ fn real_mutation_drain_cannot_pass_until_execution_scope_ends() {
     drop(result);
     assert!(scope.stop_requested());
     assert!(!barrier.is_quiescing()); // refusal rolls back the mutation request
-    assert!(census.lock_for_frame_cow().any_in_guest());
+    assert!(dispatcher.mm_residents_for_test().any_in_guest());
     drop(scope);
-    let pause = acquire_pt_pause(&barrier, &mut mutator, tid, PtPauseBudget::DEFAULT).unwrap();
+    let pause = acquire_pt_pause(&barrier, mm, tid, PtPauseBudget::DEFAULT).unwrap();
     assert!(barrier.is_quiescing());
     assert!(matches!(
         dispatcher.enter_native_execution(&mut executor, &context, &mut lease),
@@ -109,7 +108,6 @@ fn real_mutation_drain_cannot_pass_until_execution_scope_ends() {
             .enter_native_execution(&mut executor, &context, &mut lease)
             .unwrap(),
     );
-    drop(mutator);
     settle(&context, executor, lease);
 }
 
@@ -173,12 +171,7 @@ fn unwind_clears_running_before_admission_is_removed() {
     assert!(result.is_err());
     assert!(!executor.state.is_running());
     settle(&context, executor, lease);
-    assert_eq!(
-        dispatcher
-            .mm_executor_census()
-            .participant_count_for_probe(),
-        0
-    );
+    assert_eq!(dispatcher.mm_occupancy_probe()(), 0);
 }
 
 #[test]
@@ -187,12 +180,14 @@ fn replacing_dispatch_participation_cannot_detach_native_running_authority() {
     let mut executor = dispatcher.admit_native_executor(&context, &lease).unwrap();
     // The ordinary dispatch interface accepts a mutable participation. Moving
     // another admissible token into that slot must never authenticate native
-    // execution whose private flag is absent from the replacement census row.
+    // execution whose private flag is absent from the replacement slot's port.
+    let replacement_slot = crate::kernel::HostExecutionSlot::allocate().unwrap();
     let replacement = dispatcher
         .enter_mm_executor_for_thread(
             None,
             Arc::new(carrick_hal::GenericVcpuRegistry::new()),
             ThreadId::synthetic_for_tests(19410),
+            replacement_slot.slot(),
         )
         .unwrap();
     let original = std::mem::replace(executor.dispatch_participation(), replacement);
@@ -240,7 +235,7 @@ fn same_mm_readers_remain_simultaneously_admitted_at_all_scales() {
             .zip(&leases)
             .map(|(context, lease)| dispatcher.admit_native_executor(context, lease).unwrap())
             .collect();
-        let census = dispatcher.mm_executor_census();
+        let census = dispatcher.mm_occupancy_probe();
         let mut scopes = Vec::new();
         for ((executor, context), lease) in executors.iter_mut().zip(&contexts).zip(&mut leases) {
             scopes.push(
@@ -249,9 +244,9 @@ fn same_mm_readers_remain_simultaneously_admitted_at_all_scales() {
                     .unwrap(),
             );
         }
-        let held = census.lock_for_frame_cow();
-        assert_eq!(held.participant_count(), scale as usize);
-        assert_eq!(held.pause_endpoint_tids().len(), scale as usize);
+        let held = dispatcher.mm_residents_for_test();
+        assert_eq!(held.len(), scale as usize);
+        assert_eq!(held.tids().len(), scale as usize);
         assert!(held.hardware_invalidation_tids().is_empty());
         assert!(held.any_in_guest());
         held.kick_all_in_guest();
@@ -262,7 +257,7 @@ fn same_mm_readers_remain_simultaneously_admitted_at_all_scales() {
         for ((context, executor), lease) in contexts.iter().zip(executors).zip(leases) {
             settle(context, executor, lease);
         }
-        assert_eq!(census.participant_count_for_probe(), 0);
+        assert_eq!(census(), 0);
         root.thread().yield_from_executor(root_lease).unwrap();
     }
 }
@@ -276,10 +271,7 @@ fn memory_control_preserves_external_stops_and_rejects_wrong_lease() {
             let scope = dispatcher
                 .enter_native_execution(&mut executor, &context, &mut lease)
                 .unwrap();
-            dispatcher
-                .mm_executor_census()
-                .lock_for_frame_cow()
-                .kick_all_in_guest();
+            dispatcher.mm_residents_for_test().kick_all_in_guest();
             assert!(scope.stop_requested());
             drop(scope);
             assert!(executor.memory_pause_pending());

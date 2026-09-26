@@ -320,6 +320,26 @@ where
                 )
                 .map_err(|timeout| RuntimeError::Configuration(timeout.to_string()))?,
             );
+            // Every vCPU running this process's address space holds still for
+            // the snapshot, whatever thread its executor loaded: a thread of
+            // this process that EL1 ran on another process's vCPU (the MM is
+            // shared across a vfork) is kicked back to the host here, where
+            // the lease drain above cannot see it. The siblings have already
+            // suspended, so none waits at this pause for the quorum.
+            let _snapshot_pause = kernel
+                .dispatcher
+                .pause_current_mm_for_capture(
+                    self.guest_execution
+                        .as_ref()
+                        .and_then(carrick_kernel::dispatch::MmExecutorParticipation::current_slot),
+                    self.this_tid,
+                    carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
+                )
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "core capture could not pause its address space: {error:?}"
+                    ))
+                })?;
             lifecycle(1, 0);
 
             engine.prepare_core_snapshot().map_err(|error| {

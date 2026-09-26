@@ -552,7 +552,7 @@ impl<'a> PublicationContext<'a> {
             // SEGV_MAPERR (Go `runtime.persistentalloc1`, ~1 in 8 `go build`).
             // The quiesce is valid regardless of which equivalent authority
             // minted it: `KernelFrameCowAuthority::quiesce` routes through the
-            // `PtQuiesce` barrier and executor census OWNED BY THE SHARED
+            // `PtQuiesce` barrier (the MM's occupancy fence) OWNED BY THE SHARED
             // `DispatchMmAuthority` for this mm, so the guard covers the mm, not
             // an authority instance. The foreign-mm path (`for_foreign`) already
             // authenticates by these same semantic fields and no pointer.

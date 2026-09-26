@@ -254,7 +254,7 @@ pub struct SyscallCtx<'a, M: CurrentMmMemory> {
     /// tid-aware handlers fall back to pid-based answers.
     pub thread: Option<ThreadCtx<'a>>,
     pub execution_lease: Option<&'a crate::kernel::objects::ThreadExecutionLease>,
-    /// The caller's exact-MM executor census token. Present on the ordinary
+    /// The caller's exact-MM executor admission. Present on the ordinary
     /// single-threaded and production HVPatch routes so a handler can cross a
     /// typed boundary that temporarily removes only this caller from its MM's
     /// executor population. Mutation handlers deliberately do not receive it:

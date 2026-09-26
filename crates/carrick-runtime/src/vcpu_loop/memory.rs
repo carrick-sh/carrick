@@ -141,8 +141,6 @@ pub(crate) struct KernelFrameCowAuthority {
     pub(crate) kernel: Arc<carrick_kernel::kernel::Kernel>,
     pub(crate) mm: carrick_kernel::kernel::MmId,
     pub(crate) owner_inventory: Arc<dyn carrick_hal::FrameCowOwnerInventory>,
-    /// Exact-MM admission plus every participant's opaque pause endpoint.
-    pub(crate) guest_executors: Arc<carrick_kernel::kernel::GuestExecutorCensus>,
     pub(crate) tid: carrick_hal::ThreadId,
     pub(crate) identity: carrick_hal::FrameCowIdentity,
     pub(crate) pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
@@ -227,7 +225,6 @@ pub(crate) fn fixed_frame_cow_owner_inventory_for_test(
 pub(crate) fn kernel_frame_cow_authority_for_test(
     kernel: Arc<carrick_kernel::kernel::Kernel>,
     mm: carrick_kernel::kernel::MmId,
-    guest_executors: Arc<carrick_kernel::kernel::GuestExecutorCensus>,
     tid: carrick_hal::ThreadId,
     asid: u16,
     owner_inventory: Arc<dyn carrick_hal::FrameCowOwnerInventory>,
@@ -237,7 +234,6 @@ pub(crate) fn kernel_frame_cow_authority_for_test(
         kernel,
         mm,
         owner_inventory,
-        guest_executors,
         tid,
         identity: carrick_hal::FrameCowIdentity {
             linux_pid: tid.raw(),
@@ -261,7 +257,6 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         carrick_kernel::dispatch::mm_quiesce::acquire_frame_cow_quiesce(
             &self.pt_quiesce,
             self.mm,
-            &self.guest_executors,
             self.tid,
             carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
         )
@@ -1019,12 +1014,10 @@ mod tests {
             .expect("real production carrier snapshot");
         let projected = ProjectedForeignMmSnapshot::from_backend(mm, &backend_snapshot)
             .expect("typed real production carrier snapshot");
-        let census = dispatch_mm.foreign_cow_executor_census_for_test();
         let carrier_custody = ProductionCarrierForeignCowCustody::new();
         let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
             Arc::clone(kernel),
             mm,
-            census,
             caller_tid,
             projected.binding.asid().raw_for_probe(),
             carrier_custody.owner_inventory(),
@@ -1476,14 +1469,6 @@ mod tests {
         let registry = ThreadRegistry::new(tid);
         let futex = FutexTable::new();
         let reporter = CompatReporter::default();
-        let mut mutator = dispatcher
-            .mm_executor_census()
-            .enter_with_pause_endpoint(
-                None,
-                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
-                ThreadId::synthetic_for_tests(37002),
-            )
-            .unwrap();
         let mut completed = 0;
         for scale in [1, 8, 32, 128] {
             for _ in 0..scale {
@@ -1500,7 +1485,6 @@ mod tests {
                     // must refuse until the code reaches its checkpoint and exits.
                     let refusal = try_acquire_mutation_pause_for_test(
                         fixture.dispatch_mm.pt_quiesce(),
-                        &mut mutator,
                         ThreadId::synthetic_for_tests(37002),
                         fixture.child.shared().mm().id(),
                         dispatcher.mm_mutation_coordinator(),
@@ -1626,19 +1610,13 @@ mod tests {
             "revoked carrier data was executable"
         );
         drop(scope);
-        drop(mutator);
         drop(executor);
         fixture
             .child
             .thread()
             .yield_from_executor(execution)
             .unwrap();
-        assert_eq!(
-            dispatcher
-                .mm_executor_census()
-                .participant_count_for_probe(),
-            0
-        );
+        assert_eq!(dispatcher.mm_occupancy_probe()(), 0);
         root.thread().yield_from_executor(root_execution).unwrap();
     }
 
@@ -1753,12 +1731,7 @@ mod tests {
                 drop(executor);
                 context.thread().yield_from_executor(lease).unwrap();
             }
-            assert_eq!(
-                dispatcher
-                    .mm_executor_census()
-                    .participant_count_for_probe(),
-                0
-            );
+            assert_eq!(dispatcher.mm_occupancy_probe()(), 0);
             println!(
                 "native_carrier_cow scale={scale} completed={scale} hardware_ticket_retained=true"
             );
@@ -2307,15 +2280,7 @@ mod tests {
         let mut executor = dispatcher
             .admit_native_executor(&fixture.child, &execution)
             .unwrap();
-        let census = dispatcher.mm_executor_census();
         let mutator_tid = ThreadId::synthetic_for_tests(32_402);
-        let mut mutator = census
-            .enter_with_pause_endpoint(
-                None,
-                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
-                mutator_tid,
-            )
-            .unwrap();
         let barrier = fixture.dispatch_mm.pt_quiesce();
         let scope = dispatcher
             .enter_native_execution(&mut executor, &fixture.child, &mut execution)
@@ -2324,7 +2289,6 @@ mod tests {
             let active = prepared.activate(&scope).unwrap();
             let result = try_acquire_mutation_pause_for_test(
                 barrier,
-                &mut mutator,
                 mutator_tid,
                 mm,
                 dispatcher.mm_mutation_coordinator(),
@@ -2344,7 +2308,6 @@ mod tests {
         drop(scope);
         let pause = acquire_mutation_pause_for_test(
             barrier,
-            &mut mutator,
             mutator_tid,
             mm,
             dispatcher.mm_mutation_coordinator(),
@@ -2383,8 +2346,7 @@ mod tests {
         }
         drop(scope);
         drop(executor);
-        drop(mutator);
-        assert_eq!(census.participant_count_for_probe(), 0);
+        assert_eq!(dispatcher.mm_occupancy_probe()(), 0);
         fixture
             .child
             .thread()
@@ -3144,7 +3106,7 @@ mod tests {
             ),
             carrick_hal::VcpuRegistrationEnrollment::Registered
         ));
-        let census = fixture.dispatch_mm.foreign_cow_executor_census_for_test();
+        let target_mm = Arc::clone(&fixture.dispatch_mm);
         let endpoint: Arc<dyn VcpuRegistry> = registry.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
         let hardware_calls = Arc::new(AtomicUsize::new(0));
@@ -3152,9 +3114,11 @@ mod tests {
         let target_quiesce = Arc::clone(fixture.dispatch_mm.pt_quiesce());
         let worker_quiesce = Arc::clone(&target_quiesce);
         let worker = std::thread::spawn(move || {
-            let _participation = census
-                .enter_with_pause_endpoint(None, endpoint, active_tid)
-                .expect("production active target census participation");
+            let slot = carrick_kernel::kernel::HostExecutionSlot::allocate()
+                .expect("active target host slot");
+            let _participation = target_mm
+                .occupy_for_test(slot.slot(), endpoint, active_tid)
+                .expect("production active target occupancy");
             in_guest.enter_guest();
             ready_tx.send(()).expect("publish active target entry");
             let deadline = Instant::now() + Duration::from_secs(1);
@@ -3215,12 +3179,7 @@ mod tests {
             .thread()
             .yield_from_executor(native_lease)
             .unwrap();
-        assert_eq!(
-            native_dispatcher
-                .mm_executor_census()
-                .participant_count_for_probe(),
-            0
-        );
+        assert_eq!(native_dispatcher.mm_occupancy_probe()(), 0);
     }
 
     #[test]
@@ -3484,7 +3443,6 @@ mod tests {
         let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
             Arc::clone(&kernel),
             mm,
-            Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default()),
             tid,
             7,
             crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(current_owner),
@@ -3589,7 +3547,6 @@ mod tests {
         let proof_issuer = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
             Arc::clone(&kernel),
             mm,
-            Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default()),
             ThreadId::synthetic_for_tests(31_130),
             9,
             crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(current_owner),

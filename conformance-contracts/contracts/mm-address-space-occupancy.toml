@@ -1,0 +1,40 @@
+schema_version = 1
+id = "kernel.mm.address-space-occupancy"
+title = "One authority says which vCPUs run which address space: every pause, sole check, fork and crash snapshot of an MM reads the vCPU slots occupied by it, never the thread an executor loaded"
+guest_surfaces = [
+  "kernel:current-mm",
+  "scheduler:execution-admission",
+  "scheduler:page-table-quiescence",
+  "syscall:mmap",
+  "syscall:munmap",
+  "syscall:mprotect",
+  "syscall:madvise",
+  "syscall:clone",
+  "syscall:vfork",
+  "syscall:execve",
+  "syscall:exit_group",
+  "fault:first-touch",
+  "fault:cow",
+  "signal:core-dump",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 mprotect / man 2 munmap / man 2 mmap: once the call returns, every thread of the address space observes the new mapping; no thread runs on the old translation while it is being changed",
+  "man 2 fork: the child's address space is a copy of the parent's at the fork, while the parent's other threads (and a vfork child sharing the parent's memory) keep running on the shared one",
+  "man 2 vfork: the child shares the calling process's memory, including with the parent's other threads, until it calls execve or _exit",
+  "man 5 core: a core dump holds the memory and every thread's registers of the dumping process",
+  "Arm ARM D8.13: a TLBI ASIDE1IS invalidates, on every PE of the Inner Shareable domain, the stage-1 translations of that ASID; an address space's ASID is reusable only after its last translations are invalidated",
+]
+fixture = "unit:carrick-sched-core::occupancy (install/switch/vacate, host-only slots, Dekker fence stress with more installers than slots); unit:carrick-kernel::kernel::mm_occupancy (switched slot, two processes sharing an MM, rejected install, crash participation, unwind); embed:el1-sched mm-occupancy (two live processes, more threads than vCPUs, mmap/mprotect/munmap editors, fork and vfork, private futex handoffs)"
+scale_points = [8, 128, 400, 2000]
+rationale = "EL1 increment 2, step 1. Which vCPUs execute an address space used to be owned by executor participation: an exact-MM census of admitted THREADS (GuestExecutorCensus) that the page-table pause and the frame-COW sole check consulted, task-minted membership plus the per-process vCPU registry for fork and crash, and per-ExecutorId ASID residency for retirement. Every one keys on the thread an executor loaded, so a vCPU that EL1 switched to another address space would be invisible to the pause of that space: red-first, a pause of Z was granted against the census while a vCPU running Z was in guest (docs/perf-results/2026-09-26-mm-occupancy/red-census.log, base 3c52608b8). Now one table (carrick_sched_core::Occupancy, no_std and all-zero-valid so it can live in the shared EL1 region) holds, per vCPU execution slot (the zone slot of the vCPU's mailbox lease, or a host-only slot for a vCPU without one), the address space it runs. An executor occupies its slot from admission of a task's quantum to its suspension, less blocking host waits. A pause raises the MM's fence, then snapshots the slots running the MM and kicks and drains the ones in guest; an executor stores its in-guest flag and then reads the fence before every entry; all four accesses are SeqCst, so the pause either drains an entrant or the entrant sees the fence (Dekker; the VM-free stress runs more installers than slots switching address spaces on shared slots and counts any entry the pauser believed drained). A sole stage-1 proof is a pause whose snapshot held no other vCPU, and it holds the fence, so no admitted peer can enter behind it; editors (exec, fork parent, legacy dispatch) occupy nothing. Crash capture pauses the MM for its snapshot after the lease drain, so a thread of the dumping process that EL1 ran on another process's vCPU (the MM is shared across a vfork) is kicked back where the per-process registry cannot see it; fork's COW pause drains every vCPU running the parent's MM the same way. The table lives in host memory in this step; EL1 installing an address space itself is the next step and must publish the MM's fence in the shared region."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-sched-core::occupancy::tests (one_vcpu_runs_one_address_space, a_switched_slot_is_counted_for_the_address_space_it_runs, host_slots_are_distinct_from_zone_slots_and_reusable, a_pause_never_misses_a_vcpu_about_to_run_its_address_space); carrick-kernel::kernel::mm_occupancy::tests (a_pause_of_z_drains_a_vcpu_switched_from_y_to_z, every_vcpu_running_an_mm_is_counted_whatever_process_it_loaded, rejected_install_still_drains_original_before_granting_mutation, failed_crash_participation_vacates_the_slot, vacating_one_occupant_preserves_the_other_and_unwind_vacates, a_vcpu_without_a_mailbox_keeps_one_host_slot_per_thread)"
+
+[bindings.unresolved]
+embed = "The signed two-process binding (carrick-embed::el1_sched mm-occupancy) is not registered yet."
+docker = "The fixture asserts the Linux results directly (each writer reads back every value it wrote, every fork child and vfork child exits 0 through waitpid); the embed test is the differential against what Linux guarantees, and the mm-family LTP rows and go/cpython ecosystem rows compare against the cached Docker oracle."
+embed_structural = "Pause drains and kicks are USDT probes (pt-pause-begin/ready) with no registered WorkObservation metric."
+embed_timing = "No timing is claimed for the authority; the paired workload runs recorded in the design doc are uncontrolled."

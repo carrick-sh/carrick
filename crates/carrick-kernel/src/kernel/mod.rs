@@ -18,10 +18,10 @@ pub mod debug;
 pub mod exec;
 pub mod fd_ceiling;
 pub mod frame_inventory;
-pub mod guest_execution;
 pub mod identity_page;
 pub mod ids;
 pub mod mm_access;
+pub mod mm_occupancy;
 pub(crate) mod mm_proof;
 pub mod mm_transaction;
 pub mod netns;
@@ -89,14 +89,14 @@ pub use frame_inventory::{
     FrameInventoryAuthority, FrameInventoryError, FrameInventoryReserveError,
     FrameInventorySnapshot, FrameRow, MappingRow,
 };
-pub(crate) use guest_execution::ExactMmCensusGuard;
-pub use guest_execution::{
-    GuestExecutorCensus, GuestExecutorCensusError, GuestExecutorParticipation,
-};
 pub use ids::{
     ChildExitSignal, CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId,
     InvalidFileSlot, InvalidLinuxSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError,
     ObjectIdRegistry, ProcessGroupId, SessionId, SighandId, TaskId, TaskSerial, ThreadSerial,
+};
+pub use mm_occupancy::{
+    ExecutionSlot, HostExecutionSlot, MmOccupancy, MmOccupancyError,
+    execution_slot_for_current_thread,
 };
 pub use netns::{NetNs, UtsNs};
 pub use objects::{

@@ -590,23 +590,12 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mm_authority.rs",
-      "function": "MmExecutorParticipation::participation_mut",
-      "ordinal_in_function": 1,
-      "fingerprint": "7b4470815c28e947603f9a8a0f6a3e3c88132ea25b560702d3c2faf0890b1929",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mm_executor_participation",
-      "rationale": "Stage-1 authority attempted to use an executor token while its exact-MM census participation was temporarily absent; continuing would authorize mutation without accounting for the running caller.",
-      "sink": "fatal",
-      "domain": "dispatch::mm_executor_participation"
-    },
-    {
-      "file": "crates/carrick-kernel/src/dispatch/mm_authority.rs",
       "function": "MmExecutorParticipation::reenter_exact",
       "ordinal_in_function": 1,
-      "fingerprint": "943f7d94656f10965a4c99e51be6386f9eeb7897dbd1f700b560f343b6392cb4",
+      "fingerprint": "0c1dc19d0545d4310a4d154150f5a47459f3a73fbcdf0b488dcee60c07df4df0",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mm_executor_participation",
-      "rationale": "Exact-MM executor re-entry was attempted while the token still owned live participation; this is a corrupted release/re-entry state transition that could duplicate census identity.",
+      "rationale": "Exact-MM executor re-entry was attempted while the token still occupied its vCPU slot; this is a corrupted release/re-entry state transition that would install a second occupancy on one vCPU.",
       "sink": "fatal",
       "domain": "dispatch::mm_executor_participation"
     },
@@ -713,7 +702,7 @@
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::enter_mm_executor_inner",
       "ordinal_in_function": 1,
-      "fingerprint": "3941d164f4b56580856bb3e8315d65a6b9a336c4752757cb85ed73afb516700e",
+      "fingerprint": "1a3261cd954f03c95bc7f70e949c548b0ca8dacf4e8ebd8a97f38fc5a0fbb39b",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mm_executor_admission",
       "rationale": "Internal executor admission supplied a thread identity without its exact pause endpoint recipe; admitting that malformed identity would make page-table pause accounting incomplete.",
@@ -735,7 +724,7 @@
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::with_current_mm_executor_released_parts",
       "ordinal_in_function": 1,
-      "fingerprint": "aec14f8fcac8d70f0268871bd848dea211f665cc4ddd1607eec5a2b10fbdbdd6",
+      "fingerprint": "b664ffdf7d047c336c10b8e539b95f0da68ad94f33820123eba71313ee80daaa",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mm_executor_reentry",
       "rationale": "Caller-MM participation could not be re-admitted after the scoped foreign-MM operation; returning to guest execution without census membership would make subsequent page-table pauses unsound.",
@@ -746,7 +735,7 @@
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::with_current_mm_executor_released_parts",
       "ordinal_in_function": 2,
-      "fingerprint": "e7f64a9a585108ed19ee14193f54d892ddac09904721bc0ba326942b0aa90330",
+      "fingerprint": "337a3b10383e05b2ae4d89800f7464df5e9ce4b4a81ae7401d43b621275f1c7b",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mm_executor_reentry",
       "rationale": "Dispatcher, MM, thread, or running-lease identity drifted while unwinding a released operation; continuing the unwind after failed exact re-entry authentication could leave a live executor outside its authoritative census.",
@@ -1534,17 +1523,6 @@
       "rationale": "MmId raw value evaluated to zero in FrameInventoryAuthority::apply_with_receipt; violates NonZeroU64 MM identity invariant during inventory commit.",
       "sink": "fatal",
       "domain": "kernel::frame_inventory"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/guest_execution.rs",
-      "function": "<GuestExecutorParticipation as Drop>::drop",
-      "ordinal_in_function": 1,
-      "fingerprint": "984107163f58fe462c3c944b1fea4a1852277e4f5f59ec659cc0ee592634036f",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::guest_executor_census",
-      "rationale": "An exact guest-executor participation identity disappeared before its unique RAII guard dropped; continuing would undercount an admitted executor and permit unsafe stage-1 mutation.",
-      "sink": "fatal",
-      "domain": "kernel::guest_executor_census"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread.rs",
@@ -2548,6 +2526,39 @@
       "rationale": "Host timed out after 30 s waiting for an in-zone inotify instance lock; guest critical sections are bounded, so this is a dead vCPU or lock-protocol violation.",
       "sink": "fatal",
       "domain": "el1_inotify"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mm_authority.rs",
+      "function": "MmExecutorParticipation::occupied_slot",
+      "ordinal_in_function": 1,
+      "fingerprint": "3fd8ce814f17dc29b51561041ef8b1b05e29ba270a19f06c684f05db21405dbd",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_executor_participation",
+      "rationale": "An executor admission was used while released for a host wait; answering which slot it occupies would let a page-table pause skip or wait for the wrong vCPU.",
+      "sink": "fatal",
+      "domain": "dispatch::mm_executor_participation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "function": "<HostExecutionSlot as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "1f48d4dbbe291b74edca2b36e301979c0e391467744357300960e89bd5fb4495",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::mm_occupancy",
+      "rationale": "A host-only execution slot was freed while an address space still occupied it; reusing it would hand one vCPU's occupancy to another and let a pause miss or misattribute the running vCPU.",
+      "sink": "fatal",
+      "domain": "kernel::mm_occupancy"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "function": "<MmOccupancy as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "9a9fdd0e5b1b037efa484f060dc13841b46a967675df401e1d5a26e474b0c838",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::mm_occupancy",
+      "rationale": "A vCPU slot's occupancy no longer named the MM it was installed with when vacated; continuing would leave the occupancy authority untrue, so a page-table pause could run while that vCPU executes the MM.",
+      "sink": "fatal",
+      "domain": "kernel::mm_occupancy"
     }
   ]
 }

@@ -201,14 +201,14 @@ impl carrick_hal::ForeignMmInvalidator for MmMutationGuard<'_> {
 }
 
 /// Sealed exact-target binding installed alongside the foreign-MM carrier
-/// transport. It owns no page-table authority itself; each use drains the
-/// target dispatcher census and borrows the resulting linear guard.
+/// transport. It owns no page-table authority itself; each use pauses the
+/// target MM (draining every vCPU that runs it) and borrows the resulting
+/// linear guard.
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // Installed now; canonical process_vm consumer lands in Task 8.
 pub struct ForeignMmMutationAuthority {
     mm: MmId,
     coordinator: Arc<MmMutationCoordinator>,
-    census: Arc<crate::kernel::GuestExecutorCensus>,
     stage1: Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
     pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
 }
@@ -218,7 +218,6 @@ impl ForeignMmMutationAuthority {
     pub fn new(
         mm: MmId,
         coordinator: Arc<MmMutationCoordinator>,
-        census: Arc<crate::kernel::GuestExecutorCensus>,
         stage1: Arc<dyn carrick_hal::stage1_mm::Stage1MmProjection>,
         pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
     ) -> Self {
@@ -229,7 +228,6 @@ impl ForeignMmMutationAuthority {
         Self {
             mm,
             coordinator,
-            census,
             stage1,
             pt_quiesce,
         }
@@ -241,7 +239,6 @@ impl ForeignMmMutationAuthority {
     ) -> bool {
         self.mm == authority.mm_id
             && Arc::ptr_eq(&self.coordinator, &authority.mutation_coordinator)
-            && Arc::ptr_eq(&self.census, &authority.guest_executors)
             && Arc::ptr_eq(&self.pt_quiesce, &authority.pt_quiesce)
     }
 
@@ -257,7 +254,6 @@ impl ForeignMmMutationAuthority {
         let mut authority = super::mm_quiesce::acquire_foreign_mm_mutation_quiesce(
             &self.pt_quiesce,
             self.mm,
-            &self.census,
             Arc::clone(&self.coordinator),
             Arc::clone(&self.stage1),
             tid,
@@ -265,9 +261,6 @@ impl ForeignMmMutationAuthority {
         )
         .map_err(|error| match error {
             super::mm_quiesce::PtPauseError::TimedOut => ForeignMmMutationError::TimedOut,
-            super::mm_quiesce::PtPauseError::UnkickableExecutor => {
-                ForeignMmMutationError::UnkickableExecutor
-            }
         })?;
         let mut mutation = from_frame_cow(&mut authority);
         Ok(operation(&mut mutation))
@@ -279,8 +272,6 @@ impl ForeignMmMutationAuthority {
 pub enum ForeignMmMutationError {
     #[error("target-MM page-table exclusion timed out")]
     TimedOut,
-    #[error("target MM has an executor without a pause endpoint")]
-    UnkickableExecutor,
 }
 
 pub fn from_pt_pause<'authority>(

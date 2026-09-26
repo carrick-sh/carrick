@@ -6007,12 +6007,20 @@ mod container_policy_dispatch_tests {
         let child_dispatcher = dispatcher
             .fork_clone_with_prepared_mm(parent_mm_id, parent_mm_id, 100, 101, prepared)
             .expect("install shared fork mm");
+        // The parent runs the shared MM on a vCPU: a peer of the child's
+        // editor however their dispatchers differ.
+        let parent_slot = crate::kernel::HostExecutionSlot::allocate().unwrap();
         let parent_executor = dispatcher
-            .enter_mm_executor()
+            .enter_mm_executor_for_thread(
+                None,
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                carrick_hal::ThreadId::synthetic_for_tests(100),
+                parent_slot.slot(),
+            )
             .expect("admit parent MM executor");
         let mut child_executor = child_dispatcher
             .enter_mm_executor()
-            .expect("admit child MM executor");
+            .expect("admit child MM editor");
         let registry =
             crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(101));
         let futex = crate::thread::FutexTable::new();
@@ -6050,34 +6058,29 @@ mod container_policy_dispatch_tests {
         );
 
         drop(child_executor);
+        // A peer that occupies a vCPU while the sole authority is live finds
+        // the MM's fence raised, so it cannot enter the guest behind the proof.
         let mut sole_executor = dispatcher
             .enter_mm_executor()
-            .expect("readmit sole parent MM executor");
-        let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
-        let (admitted_tx, admitted_rx) = std::sync::mpsc::sync_channel(1);
-        let peer = std::thread::spawn(move || {
-            attempted_tx.send(()).expect("announce peer admission");
-            let peer = child_dispatcher
-                .enter_mm_executor()
-                .expect("admit peer after sole authority releases");
-            admitted_tx.send(()).expect("announce peer admitted");
-            peer
-        });
+            .expect("readmit sole parent MM editor");
+        let fence = Arc::clone(sole_executor.pt_quiesce());
         crate::dispatch::mm_quiesce::with_sole_mm_stage1(&mut sole_executor, |_authority| {
-            attempted_rx
-                .recv()
-                .expect("peer attempts exact-MM admission");
-            assert_eq!(
-                admitted_rx.recv_timeout(std::time::Duration::from_millis(25)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout),
-                "a peer entered while the sole-MM authority was live"
+            let peer = child_dispatcher
+                .enter_mm_executor_for_thread(
+                    None,
+                    Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                    carrick_hal::ThreadId::synthetic_for_tests(102),
+                    parent_slot.slot(),
+                )
+                .expect("a peer may occupy its vCPU");
+            assert!(
+                fence.is_quiescing(),
+                "a peer could enter the guest while the sole-MM authority was live"
             );
+            drop(peer);
         })
         .expect("sole executor must mint sealed MM authority");
-        admitted_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("peer enters after sole-MM authority releases");
-        drop(peer.join().expect("peer admission worker exits"));
+        assert!(!fence.is_quiescing(), "the sole authority lowers the fence");
     }
 
     #[test]

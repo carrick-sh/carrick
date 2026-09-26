@@ -80,6 +80,12 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod occupancy;
+
+pub use occupancy::{
+    AddressSpaceKey, EXECUTION_SLOTS, ExecutionSlot, HOST_EXECUTION_SLOTS, Occupancy, SlotBusy,
+};
+
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 

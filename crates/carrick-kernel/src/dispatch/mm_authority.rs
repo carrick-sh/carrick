@@ -1,4 +1,4 @@
-//! MM authority and executor census participation for syscall dispatch.
+//! MM authority and executor address-space occupancy for syscall dispatch.
 
 use std::sync::Arc;
 
@@ -25,7 +25,6 @@ pub struct DispatchMmAuthority {
     pub(crate) mem: Arc<mem::MemAuthority>,
     pub(crate) host_alias_transactions: Arc<HostAliasTransactions>,
     pub(crate) mutation_coordinator: Arc<mm_mutation::MmMutationCoordinator>,
-    pub(in crate::dispatch) guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
     pub(in crate::dispatch) pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
     pub(in crate::dispatch) fork_quiesce: Arc<carrick_thread::fork_quiesce::ForkQuiesce>,
     /// The `guest_realtime_epoch()` under which THIS MM's vvar
@@ -52,7 +51,6 @@ impl DispatchMmAuthority {
             mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
-            guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -65,7 +63,6 @@ impl DispatchMmAuthority {
             mem: self.mem.fork_private(),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
-            guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -86,7 +83,6 @@ impl DispatchMmAuthority {
             mem: Arc::clone(&self.mem),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
-            guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(
@@ -114,7 +110,6 @@ impl DispatchMmAuthority {
                 mem: Arc::new(forked_mem),
                 host_alias_transactions: Arc::new(HostAliasTransactions::new()),
                 mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
-                guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
                 pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
                 fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
                 // Never stamped: the child inherits the parent's vvar content
@@ -162,7 +157,6 @@ impl DispatchMmAuthority {
             )),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
-            guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -170,8 +164,8 @@ impl DispatchMmAuthority {
     }
 
     /// Production-shape MM authority for cross-layer foreign-COW tests. This
-    /// uses the real dispatch VMA authority, mutation coordinator, and executor
-    /// census; only the single test VMA is synthetic.
+    /// uses the real dispatch VMA authority, mutation coordinator, and
+    /// address-space fence; only the single test VMA is synthetic.
     #[cfg(any(test, feature = "test-support"))]
     pub fn foreign_cow_composition_for_test(
         mm_id: crate::kernel::MmId,
@@ -196,7 +190,6 @@ impl DispatchMmAuthority {
         let mutation = mm_mutation::ForeignMmMutationAuthority::new(
             mm_id,
             Arc::clone(&authority.mutation_coordinator),
-            Arc::clone(&authority.guest_executors),
             stage1,
             Arc::clone(&authority.pt_quiesce),
         );
@@ -211,9 +204,28 @@ impl DispatchMmAuthority {
         &self.fork_quiesce
     }
 
+    /// Occupy `slot` with this MM for a test executor whose vCPU is
+    /// registered in `registry` under `tid`.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn foreign_cow_executor_census_for_test(&self) -> Arc<crate::kernel::GuestExecutorCensus> {
-        Arc::clone(&self.guest_executors)
+    pub fn occupy_for_test(
+        &self,
+        slot: crate::kernel::ExecutionSlot,
+        registry: Arc<dyn carrick_hal::VcpuRegistry>,
+        tid: carrick_hal::ThreadId,
+    ) -> Result<crate::kernel::MmOccupancy, crate::kernel::MmOccupancyError> {
+        crate::kernel::MmOccupancy::install(
+            slot,
+            self.mm_id,
+            &self.pt_quiesce,
+            None,
+            crate::kernel::mm_occupancy::PauseEndpoint::Registered { registry, tid },
+        )
+    }
+
+    /// Occupied vCPU slots of this MM.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn occupant_count_for_probe(&self) -> i32 {
+        crate::kernel::mm_occupancy::occupant_count_for_probe(self.mm_id, &self.pt_quiesce)
     }
 
     // Test fixture reachable through `test-support`, so `cfg(test)` is not set
@@ -243,15 +255,29 @@ impl DispatchMmAuthority {
     }
 }
 
-/// Opaque participation in the executor census owned by one exact dispatch MM.
+/// An executor's admission to one exact dispatch MM.
 ///
-/// CLONE_VM dispatchers share the same [`DispatchMmAuthority`] and therefore
-/// the same census. Holding this token says the caller may execute on that MM;
-/// it does not itself grant mutation authority while a peer token exists.
+/// CLONE_VM dispatchers share the same [`DispatchMmAuthority`]. A thread's
+/// admission occupies its vCPU's execution slot with the MM
+/// ([`crate::kernel::MmOccupancy`]) for as long as it holds this token and
+/// is not released for a host wait; an editor's admission (a host-side
+/// mutation with no guest execution of its own) occupies nothing. Holding
+/// this token says the caller may execute on that MM; it does not itself
+/// grant mutation authority.
 pub struct MmExecutorParticipation {
     pub(in crate::dispatch) authority: Arc<DispatchMmAuthority>,
     pub(in crate::dispatch) admission: MmExecutorAdmissionRecipe,
-    pub(in crate::dispatch) participation: Option<crate::kernel::GuestExecutorParticipation>,
+    pub(in crate::dispatch) occupancy: ExecutorOccupancy,
+}
+
+/// Whether an admitted executor currently occupies its slot.
+pub(in crate::dispatch) enum ExecutorOccupancy {
+    /// An editor: no guest execution, no slot.
+    Editor,
+    /// A thread executor running (or stopped at an exit of) the MM.
+    Occupying(crate::kernel::MmOccupancy),
+    /// Released for a host wait; re-entered with the same recipe.
+    Released,
 }
 
 #[derive(Clone)]
@@ -259,16 +285,19 @@ pub(in crate::dispatch) enum MmExecutorAdmissionRecipe {
     NativeThread {
         thread: crate::kernel::ThreadRef,
         state: Arc<super::native_execution::NativeExecutorState>,
+        slot: crate::kernel::ExecutionSlot,
     },
     Anonymous,
     AnonymousWithPauseEndpoint {
         registry: Arc<dyn carrick_hal::VcpuRegistry>,
         tid: carrick_hal::ThreadId,
+        slot: crate::kernel::ExecutionSlot,
     },
     Thread {
         thread: crate::kernel::ThreadRef,
         registry: Arc<dyn carrick_hal::VcpuRegistry>,
         tid: carrick_hal::ThreadId,
+        slot: crate::kernel::ExecutionSlot,
     },
 }
 
@@ -276,38 +305,80 @@ impl MmExecutorAdmissionRecipe {
     pub(in crate::dispatch) fn enter(
         &self,
         authority: &Arc<DispatchMmAuthority>,
-    ) -> Result<crate::kernel::GuestExecutorParticipation, crate::kernel::GuestExecutorCensusError>
-    {
-        match self {
-            Self::Anonymous => authority.guest_executors.enter(None),
-            Self::NativeThread { thread, state } => authority
-                .guest_executors
-                .enter_native(thread.clone(), Arc::clone(state)),
-            Self::AnonymousWithPauseEndpoint { registry, tid } => authority
-                .guest_executors
-                .enter_with_pause_endpoint(None, Arc::clone(registry), *tid),
+    ) -> Result<ExecutorOccupancy, crate::kernel::MmOccupancyError> {
+        use crate::kernel::mm_occupancy::PauseEndpoint;
+        let (slot, thread, endpoint) = match self {
+            Self::Anonymous => return Ok(ExecutorOccupancy::Editor),
+            Self::NativeThread {
+                thread,
+                state,
+                slot,
+            } => (
+                *slot,
+                Some(thread.clone()),
+                PauseEndpoint::Native(Arc::clone(state)),
+            ),
+            Self::AnonymousWithPauseEndpoint {
+                registry,
+                tid,
+                slot,
+            } => (
+                *slot,
+                None,
+                PauseEndpoint::Registered {
+                    registry: Arc::clone(registry),
+                    tid: *tid,
+                },
+            ),
             Self::Thread {
                 thread,
                 registry,
                 tid,
-            } => authority.guest_executors.enter_with_pause_endpoint(
+                slot,
+            } => (
+                *slot,
                 Some(thread.clone()),
-                Arc::clone(registry),
-                *tid,
+                PauseEndpoint::Registered {
+                    registry: Arc::clone(registry),
+                    tid: *tid,
+                },
             ),
-        }
+        };
+        crate::kernel::MmOccupancy::install(
+            slot,
+            authority.mm_id,
+            &authority.pt_quiesce,
+            thread,
+            endpoint,
+        )
+        .map(ExecutorOccupancy::Occupying)
     }
 }
 
 impl MmExecutorParticipation {
-    pub(crate) fn participation_mut(&mut self) -> &mut crate::kernel::GuestExecutorParticipation {
-        self.participation.as_mut().unwrap_or_else(|| {
-            tracing::error!("MM executor participation used while temporarily released");
-            carrick_fatal!(
-                "dispatch::mm_executor_participation",
-                "MM executor participation used while temporarily released"
-            )
-        })
+    /// The execution slot this executor occupies, if it is a thread executor
+    /// currently admitted. A pause never waits for its own caller.
+    pub(crate) fn occupied_slot(&self) -> Option<crate::kernel::ExecutionSlot> {
+        match &self.occupancy {
+            ExecutorOccupancy::Occupying(occupancy) => Some(occupancy.slot()),
+            ExecutorOccupancy::Editor => None,
+            ExecutorOccupancy::Released => {
+                tracing::error!("MM executor participation used while temporarily released");
+                carrick_fatal!(
+                    "dispatch::mm_executor_participation",
+                    "MM executor participation used while temporarily released"
+                )
+            }
+        }
+    }
+
+    /// The slot this executor occupies now: `None` for an editor or while
+    /// released for a host wait.
+    pub fn current_slot(&self) -> Option<crate::kernel::ExecutionSlot> {
+        match &self.occupancy {
+            ExecutorOccupancy::Occupying(occupancy) => Some(occupancy.slot()),
+            ExecutorOccupancy::Editor | ExecutorOccupancy::Released => None,
+        }
     }
 
     pub fn mm_id(&self) -> crate::kernel::MmId {
@@ -342,26 +413,32 @@ impl MmExecutorParticipation {
         }
     }
 
+    pub(in crate::dispatch) fn is_released(&self) -> bool {
+        matches!(self.occupancy, ExecutorOccupancy::Released)
+    }
+
     pub(in crate::dispatch) fn leave_temporarily(&mut self) -> Result<(), DispatchError> {
-        let participation = self
-            .participation
-            .take()
-            .ok_or(DispatchError::MmExecutorParticipationUnavailable)?;
-        drop(participation);
+        if self.is_released() {
+            return Err(DispatchError::MmExecutorParticipationUnavailable);
+        }
+        drop(std::mem::replace(
+            &mut self.occupancy,
+            ExecutorOccupancy::Released,
+        ));
         Ok(())
     }
 
     pub(in crate::dispatch) fn reenter_exact(
         &mut self,
-    ) -> Result<(), crate::kernel::GuestExecutorCensusError> {
-        if self.participation.is_some() {
+    ) -> Result<(), crate::kernel::MmOccupancyError> {
+        if !self.is_released() {
             tracing::error!("MM executor re-entry attempted while participation is present");
             carrick_fatal!(
                 "dispatch::mm_executor_participation",
                 "MM executor re-entry attempted while participation is present"
             );
         }
-        self.participation = Some(self.admission.enter(&self.authority)?);
+        self.occupancy = self.admission.enter(&self.authority)?;
         Ok(())
     }
 }
@@ -434,7 +511,7 @@ mod mm_executor_release_tests {
         crate::kernel::KernelContext,
         ThreadExecutionLease,
         MmExecutorParticipation,
-        Arc<crate::kernel::GuestExecutorCensus>,
+        Arc<dyn Fn() -> i32 + Send + Sync>,
         carrick_hal::ThreadId,
     ) {
         let dispatcher = SyscallDispatcher::new();
@@ -446,9 +523,14 @@ mod mm_executor_release_tests {
         let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
         let endpoint: Arc<dyn carrick_hal::VcpuRegistry> = registry;
         let executor = dispatcher
-            .enter_mm_executor_for_thread(Some(context.thread().clone()), endpoint, tid)
+            .enter_mm_executor_for_thread(
+                Some(context.thread().clone()),
+                endpoint,
+                tid,
+                crate::kernel::execution_slot_for_current_thread(None).expect("host slot"),
+            )
             .expect("admit exact MM executor");
-        let census = dispatcher.mm_executor_census();
+        let census = dispatcher.mm_occupancy_probe();
         (dispatcher, context, lease, executor, census, tid)
     }
 
@@ -540,11 +622,7 @@ mod mm_executor_release_tests {
             };
             let result = dispatcher
                 .with_host_wait(&mut syscall, &scheduler, &registration, || {
-                    assert_eq!(
-                        census.participant_count_for_probe(),
-                        0,
-                        "host operation must not retain MM admission"
-                    );
+                    assert_eq!(census(), 0, "host operation must not retain MM admission");
                     assert!(registration.in_host_wait());
                     assert!(registration.bound_cpu().is_none());
                     73
@@ -553,14 +631,14 @@ mod mm_executor_release_tests {
             assert_eq!(result, 73);
             let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = dispatcher.with_host_wait(&mut syscall, &scheduler, &registration, || {
-                    assert_eq!(census.participant_count_for_probe(), 0);
+                    assert_eq!(census(), 0);
                     assert!(registration.in_host_wait());
                     panic!("injected host operation panic");
                 });
             }));
             assert!(unwind.is_err());
         }
-        assert_eq!(census.participant_count_for_probe(), 1);
+        assert_eq!(census(), 1);
         assert_eq!(
             registration.bound_cpu(),
             Some(carrick_hal::GuestCpuId::new(0))
@@ -635,11 +713,7 @@ mod mm_executor_release_tests {
             } else {
                 assert!(matches!(result, Ok(Err(DispatchError::HostWaitRetired))));
             }
-            assert_eq!(
-                census.participant_count_for_probe(),
-                0,
-                "retired thread cannot regain MM admission"
-            );
+            assert_eq!(census(), 0, "retired thread cannot regain MM admission");
             assert!(!registration.in_host_wait());
             assert_eq!(
                 registration.bound_cpu(),
@@ -670,16 +744,19 @@ mod mm_executor_release_tests {
 
             let value = dispatcher
                 .with_current_mm_executor_released(&mut syscall, || {
-                    assert_eq!(census.participant_count_for_probe(), 0);
+                    assert_eq!(census(), 0);
                     0x5eed_u64
                 })
                 .expect("release and restore exact caller MM executor");
             assert_eq!(value, 0x5eed);
         }
-        assert_eq!(census.participant_count_for_probe(), 1);
-        let exact = executor.participation_mut().lock_exact_mm();
-        assert_eq!(exact.pause_endpoint_tids(), vec![tid]);
-        drop(exact);
+        assert_eq!(census(), 1);
+        assert_eq!(
+            executor.occupied_slot(),
+            Some(crate::kernel::execution_slot_for_current_thread(None).expect("host slot")),
+            "re-entry occupies the exact same slot"
+        );
+        let _ = tid;
         context
             .thread()
             .validate_running_execution_lease(&lease)
@@ -707,13 +784,13 @@ mod mm_executor_release_tests {
 
             let operation = dispatcher
                 .with_current_mm_executor_released(&mut syscall, || {
-                    assert_eq!(census.participant_count_for_probe(), 0);
+                    assert_eq!(census(), 0);
                     Err::<(), LinuxErrno>(crate::linux_abi::LINUX_EFAULT)
                 })
                 .expect("boundary itself succeeds");
             assert_eq!(operation, Err(crate::linux_abi::LINUX_EFAULT));
         }
-        assert_eq!(census.participant_count_for_probe(), 1);
+        assert_eq!(census(), 1);
         context
             .thread()
             .validate_running_execution_lease(&lease)
@@ -740,13 +817,13 @@ mod mm_executor_release_tests {
 
             let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = dispatcher.with_current_mm_executor_released(&mut syscall, || -> () {
-                    assert_eq!(census.participant_count_for_probe(), 0);
+                    assert_eq!(census(), 0);
                     panic!("injected operation panic");
                 });
             }));
             assert!(panic.is_err(), "operation panic must resume after re-entry");
         }
-        assert_eq!(census.participant_count_for_probe(), 1);
+        assert_eq!(census(), 1);
         context
             .thread()
             .validate_running_execution_lease(&lease)
@@ -777,13 +854,13 @@ mod mm_executor_release_tests {
 
             let error = dispatcher
                 .with_current_mm_executor_released(&mut syscall, || {
-                    assert_eq!(census.participant_count_for_probe(), 0);
+                    assert_eq!(census(), 0);
                     dispatcher.replace_current_mm_for_test(replacement);
                 })
                 .expect_err("post-operation dispatcher binding drift must fail typed");
             assert!(matches!(error, DispatchError::MmExecutorBindingDrift));
         }
-        assert_eq!(census.participant_count_for_probe(), 1);
+        assert_eq!(census(), 1);
 
         dispatcher.replace_current_mm_for_test(original);
         settle_fixture(&context, lease, executor);

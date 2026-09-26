@@ -5721,17 +5721,16 @@ mod real {
         ///    `coordinator_tid` coordinator tid, `other_in_guest` other-in-guest
         ///    boolean (1 if any sibling is still walking tables at entry, 0
         ///    otherwise), `waiting_sibling_tid` exact waiting sibling tid or zero
-        ///    when complete, `executor_census` live executor census.
-        ///    `executor_census` is what the RAISE decision is keyed on
-        ///    (`kernel::guest_execution`); `waiting_sibling_tid` is the exact
+        ///    when complete, `executor_census` the vCPUs other than the
+        ///    coordinator's that run the MM (`kernel::mm_occupancy`), which
+        ///    the drain waits for; `waiting_sibling_tid` is the exact
         ///    waiting sibling lease identity observed at coordinator entry.
-        ///    A row with `waiting_sibling_tid == 0` and `executor_census > 1`
-        ///    represents a pause with a transient active executor participant
-        ///    without a sibling registration (for example, during
-        ///    census-before-registry admission or when registration admission
-        ///    was denied). Suspension drops both lease and census
-        ///    participation; parked suspended loops do not remain counted in
-        ///    the census.
+        ///    A row with `waiting_sibling_tid == 0` and `executor_census > 0`
+        ///    represents a pause with an occupied vCPU that has no sibling
+        ///    registration in guest (for example, during
+        ///    occupancy-before-registry admission or when registration
+        ///    admission was denied). Suspension drops both lease and slot
+        ///    occupancy; parked suspended loops do not remain counted.
         ///  * `pt__pause__ready`: all siblings left guest; the edit may proceed.
         ///    `spins` wait iterations, `wait_us` microseconds waited.
         ///  * `pt__pause__timeout`: the convergence deadline was hit. MUST never
