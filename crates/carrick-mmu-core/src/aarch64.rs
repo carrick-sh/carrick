@@ -1688,11 +1688,22 @@ impl PageTableManager {
     ) -> Result<(), PageTableError> {
         use core::sync::atomic::{Ordering, fence};
 
-        for arena in &self.arenas {
+        // Resolve the complete destination set before publishing any bytes.
+        // The caller's quiescence/ownership scope must keep these mappings valid
+        // through the copy pass; a second fallible lookup could reintroduce a
+        // partial restore. Scratch is linear in arenas, not descriptor words.
+        let destinations = self
+            .arenas
+            .iter()
+            .map(|arena| {
+                let prefix_len = (arena.next_free as usize).min(arena.capacity);
+                resolver
+                    .host_ptr_for_range(arena.base, prefix_len)
+                    .ok_or(PageTableError::UnresolvedArena(arena.base))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (arena, host) in self.arenas.iter().zip(destinations) {
             let prefix_len = (arena.next_free as usize).min(arena.capacity);
-            let host = resolver
-                .host_ptr_for_range(arena.base, prefix_len)
-                .ok_or(PageTableError::UnresolvedArena(arena.base))?;
             match arena.storage {
                 TableArenaStorage::Owned(ref bytes) => {
                     let copy_len = prefix_len.min(bytes.len());
@@ -5818,6 +5829,12 @@ mod tests {
             Err(PageTableError::UnresolvedArena(ext_base.0)),
             "missing extension arena must fail closed"
         );
+
+        assert!(
+            host_arena0.iter().all(|byte| *byte == 0),
+            "missing extension must not partially overwrite the root backing"
+        );
+        assert!(host_arena1.iter().all(|byte| *byte == 0));
 
         // 3. Complete resolver succeeds
         let full = [

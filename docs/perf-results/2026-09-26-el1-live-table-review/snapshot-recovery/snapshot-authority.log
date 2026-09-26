@@ -1,0 +1,28 @@
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-aarch64)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.67s
+     Running unittests src/lib.rs (target/debug/deps/carrick_aarch64-55226389751927e4)
+
+running 20 tests
+test engine::tests::stage1_authority_conflicting_lease_rejection ... ok
+test engine::tests::stage1_authority_source_survives_exec_while_shared ... ok
+test engine::tests::stage1_authority_deferred_install_on_one_clone_then_build_on_another ... ok
+test engine::tests::stage1_authority_sibling_lazy_build_sees_source ... ok
+test engine::tests::stage1_authority_source_survives_rollback ... ok
+test engine::tests::stage1_authority_source_survives_snapshot_image ... ok
+test stage1_authority::tests::image_generation_exhaustion_never_reenables_reuse ... ok
+test stage1_authority::tests::retiring_child_authority_returns_its_image_to_the_shared_pool ... ok
+test stage1_authority::tests::exec_replacement_drops_the_retired_source_so_the_replacement_lease_installs ... ok
+test stage1_authority::tests::stage1_authority_live_restore_and_rollback_updates_hardware_backing ... ok
+test stage1_authority::tests::stage1_authority_snapshot_fails_on_unresolved_live_backing ... ok
+test stage1_authority::tests::stage1_authority_restore_and_rollback_fail_and_preserve_on_unresolved_arena ... ok
+test stage1_authority::tests::stage1_authority_undo_journal_commit_and_rollback ... ok
+test stage1_authority::tests::concurrent_vfork_children_share_authority_and_detach_independently ... ok
+test stage1_authority::tests::vfork_shares_prevents_exclusive_path_even_if_called_as_first_or_only_child ... ok
+test stage1_authority::tests::rollback_retires_backing_before_returning_arena_to_source ... ok
+test stage1_authority::tests::image_generation_invalidates_edits_errors_restore_and_replacement ... ok
+test stage1_authority::tests::image_pool_is_bounded_and_exec_recycles_the_retired_image ... ok
+test stage1_authority::tests::rollback_returns_allocated_extension_arena_to_source ... ok
+test stage1_authority::tests::rollback_retirement_failure_quarantines_arena_address ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 54 filtered out; finished in 0.05s
+

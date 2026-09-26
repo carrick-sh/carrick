@@ -5328,7 +5328,7 @@ mod tests {
                 || unreachable!(),
                 |editor| {
                     assert!(editor.has_arena_source());
-                    editor.restore_image(snapshot, 6, 0)?;
+                    editor.restore_image(&mut Some(snapshot), 6, 0)?;
                     assert!(editor.has_arena_source());
                     Ok::<(), PageTableError>(())
                 },
