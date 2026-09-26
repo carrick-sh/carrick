@@ -375,3 +375,23 @@ remaining corrections belong to the director. The original goal scope,
 first-touch structural red, signed gates, and workload objective remain open.
 
 Namespace integration follow-up: domain lint initially rejected the missing test-only counter ledger entry. Reviewed and registered it in `f664e7e02`; the full `just lint-domains` rerun exits zero. The memory worker is now terminal at `55bdfc220`; its product code equals candidate `22323a343` and only four inventories differ. Its final output contains waiting statements, so acceptance continues to rely on director evidence, not that report.
+
+### Live-table source integration after director corrections
+
+Integrated the reviewed worker product and director corrections through
+`d51e1915a`. Corrections retain rollback journals, preserve caller-owned
+snapshot recovery, prevent partial restore on unresolved destinations, hold
+root retirement exclusion in publication lock order, and record live extension
+prefixes so pooled reuse zeroes written bytes. The final correction's serial
+HVF suite passes 564 tests with 3 existing ignores; Clippy and abort ledgers
+pass. Every reproduced defect has its red/green receipt under the live-table
+review directory. The worker's terminal `55bdfc220` changes only inventories
+relative to its product candidate; reconciliation was rerun on combined source.
+
+The previously red `stage1_snapshot_observes_live_leaf_after_guest_publication`
+now passes on the integrated source. Inventories preserve all 588 host-authority
+rows. Full CI and signed acceptance remain pending; the earlier withheld-source
+status is superseded by this integration, not by a claim of guest execution.
+After those gates, the critical path is EL1 metadata allocation, abort entry,
+elastic frame grant/return, and real guest first-touch service. Keep all later
+checkpoints and the per-workload native-Docker objective in scope.
