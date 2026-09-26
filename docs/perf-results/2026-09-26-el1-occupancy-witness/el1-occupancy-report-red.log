@@ -1,0 +1,67 @@
+running 14 tests
+test occupancy_report_accepts_valid_tight_report ... FAILED
+test occupancy_report_rejects_child_failures ... ok
+test occupancy_report_rejects_edit_failures ... FAILED
+test occupancy_report_rejects_failed_child_ok ... ok
+test occupancy_report_rejects_fork_count_mismatch ... ok
+test occupancy_report_rejects_join_failures ... FAILED
+test occupancy_report_rejects_legacy_missing_counters_transcript ... FAILED
+test occupancy_report_rejects_malformed_counter_values ... FAILED
+test occupancy_report_rejects_missing_child_ok ... ok
+test occupancy_report_rejects_missing_role_line ... ok
+test occupancy_report_rejects_snapshot_changes ... ok
+test occupancy_report_rejects_spurious_ok_substring ... FAILED
+test occupancy_report_rejects_torn_writes ... ok
+test occupancy_report_rejects_zero_edits ... FAILED
+
+failures:
+
+---- occupancy_report_accepts_valid_tight_report stdout ----
+
+thread 'occupancy_report_accepts_valid_tight_report' (10909504) panicked at crates/carrick-embed/tests/el1_sched.rs:935:5:
+assertion `left == right` failed
+  left: 0
+ right: 42
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- occupancy_report_rejects_edit_failures stdout ----
+
+thread 'occupancy_report_rejects_edit_failures' (10909506) panicked at crates/carrick-embed/tests/el1_sched.rs:973:5:
+edit failures must be rejected
+
+---- occupancy_report_rejects_join_failures stdout ----
+
+thread 'occupancy_report_rejects_join_failures' (10909509) panicked at crates/carrick-embed/tests/el1_sched.rs:986:5:
+worker join failures must be rejected
+
+---- occupancy_report_rejects_legacy_missing_counters_transcript stdout ----
+
+thread 'occupancy_report_rejects_legacy_missing_counters_transcript' (10909510) panicked at crates/carrick-embed/tests/el1_sched.rs:960:5:
+legacy unmetered transcript with missing counters must be rejected
+
+---- occupancy_report_rejects_malformed_counter_values stdout ----
+
+thread 'occupancy_report_rejects_malformed_counter_values' (10909511) panicked at crates/carrick-embed/tests/el1_sched.rs:1088:5:
+malformed counter values must be rejected
+
+---- occupancy_report_rejects_spurious_ok_substring stdout ----
+
+thread 'occupancy_report_rejects_spurious_ok_substring' (10909515) panicked at crates/carrick-embed/tests/el1_sched.rs:1101:5:
+spurious ok substring with ok=false must be rejected
+
+---- occupancy_report_rejects_zero_edits stdout ----
+
+thread 'occupancy_report_rejects_zero_edits' (10909517) panicked at crates/carrick-embed/tests/el1_sched.rs:947:5:
+zero parent edits must be rejected
+
+
+failures:
+    occupancy_report_accepts_valid_tight_report
+    occupancy_report_rejects_edit_failures
+    occupancy_report_rejects_join_failures
+    occupancy_report_rejects_legacy_missing_counters_transcript
+    occupancy_report_rejects_malformed_counter_values
+    occupancy_report_rejects_spurious_ok_substring
+    occupancy_report_rejects_zero_edits
+
+test result: FAILED. 7 passed; 7 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
