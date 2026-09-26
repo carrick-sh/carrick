@@ -426,3 +426,22 @@ Signed fork validation is running separately from `b6ce9ab26`, run ID
 signed acceptance. After it completes, preserve the exact signed artifact and
 receipt, then run the occupancy contract. Actual EL1 fault service remains the
 next implementation milestone, with no broader goal scope removed.
+
+### Signed live-table foundation proof
+
+The integrated memory source now passes the signed fork structural gate:
+three launch modes times four scales, fresh image counts bounded by two,
+complete work measurements, negative entitlement and zero scoped leftovers.
+The matching-image native fork controls also passed. The independent allocator
+witness remains necessary because image-pool misses omit buffer allocations.
+
+The two-process occupancy fixture passes native Docker and signed Carrick,
+then three disabled-feature controls on one unchanged frozen signed executable.
+Both processes complete 150 forks with positive editor work and zero failure
+counters. Exact artifacts, commands and logs are preserved in the
+[signed memory receipt](../../perf-results/2026-09-26-el1-live-table-review/signed-memory/README.md).
+No timing ratio or full migration acceptance is claimed. Public probe/smoke/full
+promotion and the first-touch structural red remain open. Next implementation
+work must establish EL1 metadata allocation/reclamation, fault entry and elastic
+frame grant/return, then service first-touch in the guest; all later checkpoints
+and inherited acceptance obligations remain in scope.

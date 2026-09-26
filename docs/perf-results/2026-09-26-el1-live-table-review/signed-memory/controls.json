@@ -1,0 +1,32 @@
+[
+  {
+    "label": "host-sched",
+    "env": {
+      "CARRICK_EL1_SCHED": "0"
+    },
+    "run_id": "el1-live-occupancy-host-sched-20260926",
+    "exit_code": 0,
+    "cleanup_exit": 0,
+    "sha256": "11cefa914d29b316630284c7d8294b0bfe918cc8b1efbc35dc90c2cfbe2303f9"
+  },
+  {
+    "label": "host-futex",
+    "env": {
+      "CARRICK_EL1_FUTEX": "0"
+    },
+    "run_id": "el1-live-occupancy-host-futex-20260926",
+    "exit_code": 0,
+    "cleanup_exit": 0,
+    "sha256": "11cefa914d29b316630284c7d8294b0bfe918cc8b1efbc35dc90c2cfbe2303f9"
+  },
+  {
+    "label": "no-gic",
+    "env": {
+      "CARRICK_HVF_GIC": "0"
+    },
+    "run_id": "el1-live-occupancy-no-gic-20260926",
+    "exit_code": 0,
+    "cleanup_exit": 0,
+    "sha256": "11cefa914d29b316630284c7d8294b0bfe918cc8b1efbc35dc90c2cfbe2303f9"
+  }
+]

@@ -1,0 +1,9 @@
+
+running 1 test
+test el1_sched_mm_occupancy_two_processes ... el1-sched mm-occupancy exits=138234 carrier_cpu_ns=3053196000 wall_ms=1499 zone=ZoneCounts { el1_parks: 16359, el1_switches: 13616, host_parks: 1936, signal_claims: 0, control_claims: 0, cross_wakes: 12063, sgis: 999, preemptions: 0, migrations: 0, timeouts: 169, idle_entries: 14979, wfi_entries: 1604, idle_exits: 2632, misplaced: 0, steals: 626, service_exits: 117, service_placements: 0, ready_placements: 0, service_adoptions: 0, exit_adoptions: 2126, host_handbacks: 3318, host_queue_claims: 13581, host_executor_parks: 391 } mm-occupancy parent writers=8 forks=150 edits=1193 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=1196 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 1.54s
+

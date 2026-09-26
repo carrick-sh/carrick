@@ -1,0 +1,32 @@
+{
+  "source_head": "5c1116d5552c2c86e386353f062b6d7129c0d2e3",
+  "image": "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+  "fixture_sha256": "f02bb98f4cda3d78b2543a292d03097df5b80603bc815f3cd5623411bf001d6b",
+  "exit_code": 0,
+  "container": "el1-live-occupancy-native-20260926",
+  "remaining_containers": 0,
+  "roles": {
+    "child": {
+      "writers": "20",
+      "forks": "150",
+      "edits": "9383",
+      "edit_failures": "0",
+      "torn": "0",
+      "snapshot_changes": "0",
+      "child_failures": "0",
+      "join_failures": "0",
+      "ok": "true"
+    },
+    "parent": {
+      "writers": "20",
+      "forks": "150",
+      "edits": "16867",
+      "edit_failures": "0",
+      "torn": "0",
+      "snapshot_changes": "0",
+      "child_failures": "0",
+      "join_failures": "0",
+      "ok": "true"
+    }
+  }
+}
