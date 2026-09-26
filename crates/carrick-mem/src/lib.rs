@@ -23,14 +23,14 @@
 //!   each carries the empirical reason it sits where it does.
 //!
 //! * **The stage-1 MMU + page tables** ([`memory::stage1_identity_page_tables`],
-//!   [`page_table`]). The load-bearing trick of the whole crate. The vCPU starts
+//!   [`carrick_mmu_core::aarch64`]). The load-bearing trick of the whole crate. The vCPU starts
 //!   MMU-off, where ARMv8 treats all memory as Device-nGnRnE and the
 //!   load/store-exclusive instructions (`ldaxr`/`stlxr`) every libc lock relies
 //!   on are architecturally prohibited. carrick installs a boot identity map and
 //!   flips `SCTLR_EL1.M=1` so guest memory becomes Normal cacheable and
 //!   exclusives work. The per-page access bits are shaped to dodge Apple
 //!   Silicon's FEAT_PAN3 check (see [`memory::stage1_identity_page_tables`]).
-//!   [`page_table`] then edits those tables at runtime to give guest
+//!   [`carrick_mmu_core::aarch64::PageTableManager`] then edits those tables at runtime to give guest
 //!   `mprotect`/`munmap`/`PROT_NONE` real, guest-visible semantics.
 //!
 //! * **ELF loading** ([`elf`], plus the loaders in [`memory`]). Parse the
@@ -72,7 +72,6 @@ pub mod arch_sysregs;
 pub mod elf;
 pub mod memory;
 pub mod page_geometry;
-pub mod page_table;
 pub mod pml4;
 pub mod protections;
 pub mod shared_aperture;

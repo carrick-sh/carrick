@@ -107,11 +107,11 @@ pub mod interactive_supervisor;
 // path so every `crate::linux_abi::…` / `carrick_runtime::linux_abi::…` site is
 // unchanged.
 pub use carrick_abi as linux_abi;
-// elf/memory/page_table/vdso were lifted into the leaf crate `carrick-mem`
+// elf/memory/vdso were lifted into the leaf crate `carrick-mem`
 // (build-graph A3). Re-exported under their original paths so every
-// `crate::memory::…` / `crate::elf::…` / `crate::page_table::…` / `crate::vdso::…`
+// `crate::memory::…` / `crate::elf::…` / `crate::vdso::…`
 // site (and the `carrick_runtime::*` ones) is unchanged.
-pub use carrick_mem::{elf, memory, page_table, vdso};
+pub use carrick_mem::{elf, memory, vdso};
 // The guest-virtual address domain the census records are keyed on. Exported
 // beside `xlat_census` so an out-of-crate aggregator keys its sets on the typed
 // address instead of degrading them to `u64` at the crate boundary.

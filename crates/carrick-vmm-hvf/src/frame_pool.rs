@@ -582,7 +582,7 @@ impl PooledRootSlotHandle {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl carrick_mem::page_table::HostArenaResolver for &PooledRootSlotHandle {
+impl carrick_mmu_core::aarch64::HostArenaResolver for &PooledRootSlotHandle {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         (base == self.ipa()).then_some(self.as_mut_ptr())
     }
@@ -778,7 +778,11 @@ mod tests {
         // Occupant A: initializes with prefix P (48 KiB).
         let mut bytes_a = vec![0u8; carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize];
         bytes_a[48 * 1024 - 1] = 1;
-        let mut mgr_a = crate::page_table::PageTableManager::new(bytes_a, s0_ipa);
+        let mut mgr_a = carrick_mmu_core::aarch64::PageTableManager::new(
+            bytes_a,
+            s0_ipa,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
         let prefix_a = mgr_a.copied_bytes() as usize;
         assert_eq!(prefix_a, 48 * 1024);
         s0.record_populated_prefix(prefix_a);
@@ -806,7 +810,11 @@ mod tests {
         // Occupant B publishes an image with smaller prefix P2 (32 KiB).
         let mut bytes_b = vec![0u8; carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize];
         bytes_b[32 * 1024 - 1] = 1;
-        let mut mgr_b = crate::page_table::PageTableManager::new(bytes_b, s0_ipa);
+        let mut mgr_b = carrick_mmu_core::aarch64::PageTableManager::new(
+            bytes_b,
+            s0_ipa,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
         let prefix_b = mgr_b.copied_bytes() as usize;
         assert_eq!(prefix_b, 32 * 1024);
         s1.record_populated_prefix(prefix_b);

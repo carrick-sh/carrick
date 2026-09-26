@@ -2335,7 +2335,9 @@ impl HvfVmState {
         self.frame_inventory.lock().retirement_commit.take()
     }
 
-    pub(crate) fn page_tables_snapshot(&self) -> Option<crate::page_table::PageTableManager> {
+    pub(crate) fn page_tables_snapshot(
+        &self,
+    ) -> Option<carrick_mmu_core::aarch64::PageTableManager> {
         self.page_tables_authority().snapshot_image()
     }
 
@@ -2388,7 +2390,9 @@ impl HvfVmState {
     /// Only exclusivity is refreshed. `multi_vcpu` gates the EAGER coalescing
     /// scan, which is a throughput decision this path must not silently flip
     /// (enabling it cost `go-net_http` 50 s -> over 200 s).
-    pub(crate) fn refresh_stage1_exclusivity(manager: &mut crate::page_table::PageTableManager) {
+    pub(crate) fn refresh_stage1_exclusivity(
+        manager: &mut carrick_mmu_core::aarch64::PageTableManager,
+    ) {
         manager.set_stage1_exclusive(
             carrick_hal::stage1_exclusive::current_thread_edits_exclusively(),
         );
@@ -2401,9 +2405,9 @@ impl HvfVmState {
     /// change is that a returned buffer is refilled in place instead of asking
     /// the allocator for another 1.75 MiB region. See `cow_rollback_scratch`.
     pub(crate) fn rollback_pre_image(
-        scratch: &mut Option<crate::page_table::PageTableManager>,
-        manager: &crate::page_table::PageTableManager,
-    ) -> crate::page_table::PageTableManager {
+        scratch: &mut Option<carrick_mmu_core::aarch64::PageTableManager>,
+        manager: &carrick_mmu_core::aarch64::PageTableManager,
+    ) -> carrick_mmu_core::aarch64::PageTableManager {
         match scratch.take() {
             Some(mut reused) => {
                 reused.clone_from(manager);

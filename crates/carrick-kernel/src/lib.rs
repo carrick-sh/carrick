@@ -136,9 +136,9 @@ pub use carrick_guest_mem::{GuestVa, GuestVaRange};
 // the leaf crate `carrick-host` (machine facts, __ulock, host shared mappings,
 // CPU accounting, libproc introspection).
 pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
-// elf/memory/page_table/vdso and the shared-aperture sub-allocator live in the
+// elf/memory/vdso and the shared-aperture sub-allocator live in the
 // leaf crate `carrick-mem`.
-pub use carrick_mem::{elf, memory, page_table, shared_aperture, vdso};
+pub use carrick_mem::{elf, memory, shared_aperture, vdso};
 // The syscall-compat reporter, the USDT probe provider and the VM lifecycle
 // probes are platform-neutral and live in carrick-observability.
 pub use carrick_observability::{compat, probes, vm_lifecycle};

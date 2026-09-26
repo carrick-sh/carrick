@@ -1047,7 +1047,7 @@ impl MmResources {
     pub(crate) fn table_arena_source(
         &self,
         task: TaskKey,
-    ) -> Result<Box<dyn carrick_mem::page_table::TableArenaSource>, MmResourcesError> {
+    ) -> Result<Box<dyn carrick_mmu_core::aarch64::TableArenaSource>, MmResourcesError> {
         let lease = self.lease(task)?;
         Ok(lease.table_arena_source(self.pool()))
     }
@@ -1055,7 +1055,7 @@ impl MmResources {
     pub(crate) fn table_arena_source_for_lease(
         &self,
         lease: &Arc<Stage1MmLease>,
-    ) -> Box<dyn carrick_mem::page_table::TableArenaSource> {
+    ) -> Box<dyn carrick_mmu_core::aarch64::TableArenaSource> {
         lease.table_arena_source(self.pool())
     }
 

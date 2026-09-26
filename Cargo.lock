@@ -311,6 +311,7 @@ dependencies = [
  "carrick-hal",
  "carrick-host",
  "carrick-mem",
+ "carrick-mmu-core",
  "carrick-observability",
  "libc",
  "parking_lot",
@@ -530,6 +531,7 @@ dependencies = [
  "carrick-fatal",
  "carrick-guest-mem",
  "carrick-mem",
+ "carrick-mmu-core",
  "carrick-signal-core",
  "carrick-timer-core",
  "libc",
@@ -627,6 +629,7 @@ dependencies = [
  "carrick-kernel",
  "carrick-kernel-arena",
  "carrick-mem",
+ "carrick-mmu-core",
  "carrick-observability",
  "carrick-portable",
  "carrick-sched-core",
@@ -691,12 +694,21 @@ dependencies = [
  "carrick-el1-image",
  "carrick-fatal",
  "carrick-guest-mem",
+ "carrick-mmu-core",
  "goblin",
  "libc",
  "parking_lot",
  "serde",
  "thiserror",
  "zerocopy",
+]
+
+[[package]]
+name = "carrick-mmu-core"
+version = "0.1.0"
+dependencies = [
+ "carrick-mem",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -747,6 +759,7 @@ dependencies = [
  "carrick-kernel",
  "carrick-kernel-arena",
  "carrick-mem",
+ "carrick-mmu-core",
  "carrick-observability",
  "carrick-portable",
  "carrick-runtime",
@@ -907,6 +920,7 @@ dependencies = [
  "carrick-host-bsd",
  "carrick-kernel-arena",
  "carrick-mem",
+ "carrick-mmu-core",
  "carrick-observability",
  "carrick-signal-core",
  "carrick-thread",
@@ -1549,6 +1563,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "foldhash",
+ "rustc-std-workspace-alloc",
 ]
 
 [[package]]
@@ -2745,6 +2760,12 @@ name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
+
+[[package]]
+name = "rustc-std-workspace-alloc"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9d441c3b2ebf55cebf796bfdc265d67fa09db17b7bb6bd4be75c509e1e8fec3"
 
 [[package]]
 name = "rustc_version"

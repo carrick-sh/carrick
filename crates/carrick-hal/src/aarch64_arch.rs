@@ -42,15 +42,19 @@ impl PageTableCodec for Aarch64Mmu {
         }
     }
 
-    type Manager = carrick_mem::page_table::PageTableManager;
-    type Error = carrick_mem::page_table::PageTableError;
+    type Manager = carrick_mmu_core::aarch64::PageTableManager;
+    type Error = carrick_mmu_core::aarch64::PageTableError;
 
     fn new_manager(bytes: Vec<u8>, base: u64) -> Self::Manager {
-        carrick_mem::page_table::PageTableManager::new(bytes, base)
+        carrick_mmu_core::aarch64::PageTableManager::new(
+            bytes,
+            base,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        )
     }
 
     fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
-        carrick_mem::page_table::walk_descriptors(bytes, base, va)
+        carrick_mmu_core::aarch64::walk_descriptors(bytes, base, va)
     }
 }
 

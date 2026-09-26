@@ -1834,14 +1834,14 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn publish_stage1_extension_arenas(
         &mut self,
-        manager: &carrick_mem::page_table::PageTableManager,
+        manager: &carrick_mmu_core::aarch64::PageTableManager,
     ) -> Result<(), TrapError> {
         self.state.publish_stage1_extension_arenas(manager)
     }
 
     fn retire_stage1_extension_arenas(
         &mut self,
-        manager: &mut carrick_mem::page_table::PageTableManager,
+        manager: &mut carrick_mmu_core::aarch64::PageTableManager,
     ) -> Result<(), TrapError> {
         self.state.retire_stage1_extension_arenas(manager)
     }
@@ -2111,7 +2111,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             .execve_rebuild(&mut live.inner, &mut live.mailbox, &plan)
     }
 
-    fn exec_page_tables(&self) -> Option<carrick_mem::page_table::PageTableManager> {
+    fn exec_page_tables(&self) -> Option<carrick_mmu_core::aarch64::PageTableManager> {
         self.state.page_tables_snapshot()
     }
 
@@ -2163,7 +2163,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     fn build_process_builder(
         &self,
         request: ProcessForkRequest,
-        page_tables: &mut carrick_mem::page_table::PageTableManager,
+        page_tables: &mut carrick_mmu_core::aarch64::PageTableManager,
         cow_ranges: &[carrick_aarch64::vmm::ForkCowRange],
     ) -> Result<Self::ProcessBuilder, TrapError> {
         self.state
@@ -2331,9 +2331,10 @@ mod task_only_materializer_tests {
 
     fn runtime_projection(root: u64, asid: u16) -> carrick_aarch64::Aarch64TaskRuntimeProjection {
         let initial_root = carrick_mem::memory::LINUX_PAGE_TABLES_BASE;
-        let mut manager = carrick_mem::page_table::PageTableManager::new(
+        let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             initial_root,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
         if root != initial_root {
             manager.rebase(root, None).expect("rebase test manager");

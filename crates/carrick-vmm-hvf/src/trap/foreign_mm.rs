@@ -342,7 +342,7 @@ pub(crate) struct MmAccessState {
     pub(crate) mutation_coordinator: parking_lot::Mutex<()>,
     pub(crate) cow_runtime: parking_lot::RwLock<Option<MmCowRuntimeBinding>>,
     pub(crate) cow_rollback_scratch:
-        parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
+        parking_lot::Mutex<Option<carrick_mmu_core::aarch64::PageTableManager>>,
     #[cfg(test)]
     pub(crate) foreign_cow_failpoint: std::sync::atomic::AtomicU8,
 }
@@ -2509,7 +2509,7 @@ unsafe impl carrick_hal::ForeignNativeDataSpan for CarrierNativeDataSpan {
                         .native_activation_leaf_checks
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let leaf =
-                        carrick_mem::page_table::terminal_descriptor(tables.debug_walk(cursor));
+                        carrick_mmu_core::aarch64::terminal_descriptor(tables.debug_walk(cursor));
                     let expected = self
                         .range
                         .initial_physical
@@ -3010,7 +3010,7 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
                 let mut cursor = start.raw();
                 while cursor < end {
                     let leaf =
-                        carrick_mem::page_table::terminal_descriptor(tables.debug_walk(cursor));
+                        carrick_mmu_core::aarch64::terminal_descriptor(tables.debug_walk(cursor));
                     if leaf & 1 == 0 || leaf & (0b11 << 6) != (0b01 << 6) {
                         return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
                     }
@@ -3591,7 +3591,7 @@ pub mod foreign_cow_test_support {
                 .state
                 .page_tables_authority()
                 .with_manager(|tables| {
-                    carrick_mem::page_table::terminal_descriptor(tables.debug_walk(self.data_va))
+                    carrick_mmu_core::aarch64::terminal_descriptor(tables.debug_walk(self.data_va))
                 })
                 .ok_or_else(|| "production carrier page tables are absent".to_owned())?;
             Ok(leaf & AP_MASK != AP_USER_RW)
@@ -3635,10 +3635,11 @@ pub mod foreign_cow_test_support {
         data_ipa: carrick_guest_mem::Gpa,
         data_va: u64,
         data_len: u64,
-    ) -> Result<crate::page_table::PageTableManager, String> {
-        let mut tables = carrick_mem::page_table::PageTableManager::new(
+    ) -> Result<carrick_mmu_core::aarch64::PageTableManager, String> {
+        let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
         tables
             .rebase(stage1_root.0, None)

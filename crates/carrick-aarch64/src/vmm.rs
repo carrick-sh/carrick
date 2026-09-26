@@ -25,7 +25,7 @@ use carrick_hal::{
     TrapError, VcpuKick, VcpuRegistry,
 };
 use carrick_mem::memory::AddressSpace;
-use carrick_mem::page_table::PageTableManager;
+use carrick_mmu_core::aarch64::PageTableManager;
 
 /// COW-inherit vs eager full-RAM copy at `fork(2)`. Re-exported from
 /// [`carrick_hal`] (the single canonical definition, shared with the x86 lane) so
@@ -1100,7 +1100,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         new_image: &AddressSpace,
     ) -> Result<(), TrapError>;
 
-    fn exec_page_tables(&self) -> Option<carrick_mem::page_table::PageTableManager> {
+    fn exec_page_tables(&self) -> Option<PageTableManager> {
         None
     }
 
@@ -1145,7 +1145,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     fn build_process_builder(
         &self,
         _request: ProcessForkRequest,
-        _page_tables: &mut carrick_mem::page_table::PageTableManager,
+        _page_tables: &mut PageTableManager,
         _cow_ranges: &[ForkCowRange],
     ) -> Result<Self::ProcessBuilder, TrapError> {
         Err(TrapError::Hypervisor(

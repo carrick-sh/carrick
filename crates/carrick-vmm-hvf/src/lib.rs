@@ -31,7 +31,7 @@
 // paths resolve unchanged inside carrick-vmm-hvf.
 pub use carrick_abi as linux_abi;
 pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
-pub use carrick_mem::{elf, memory, page_table, vdso};
+pub use carrick_mem::{elf, memory, vdso};
 
 // The syscall-compat reporter is platform-neutral; it lives in carrick-observability
 // (every backend shares it instead of the old HVF-impl-vs-Linux-stub cfg split).

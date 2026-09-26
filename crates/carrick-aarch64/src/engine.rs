@@ -36,7 +36,7 @@ use carrick_hal::{
     SyscallTrap, ThreadedEngine, TrapError,
 };
 use carrick_mem::memory::AddressSpace;
-use carrick_mem::page_table::{PageTableApplyOutcome, PageTableError, PageTableManager};
+use carrick_mmu_core::aarch64::{PageTableApplyOutcome, PageTableError, PageTableManager};
 
 pub use crate::stage1_authority::{ShareState, Stage1Authority, Stage1Editor};
 
@@ -2425,7 +2425,7 @@ fn apply_stage1_protection_edit(
     prot: u64,
     armed_cow: &[crate::vmm::ForkCowRange],
 ) -> Result<PageTableApplyOutcome, PageTableError> {
-    let mut source: Option<Box<dyn carrick_mem::page_table::TableArenaSource>> = None;
+    let mut source: Option<Box<dyn carrick_mmu_core::aarch64::TableArenaSource>> = None;
     let mut editor = crate::stage1_authority::Stage1Editor {
         manager: mgr,
         arena_source: &mut source,
@@ -3186,7 +3186,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn install_stage1_table_arena_source(
         &mut self,
-        source: Box<dyn carrick_mem::page_table::TableArenaSource>,
+        source: Box<dyn carrick_mmu_core::aarch64::TableArenaSource>,
     ) -> Result<(), TrapError> {
         let page_tables = self.page_tables.clone();
         page_tables.install_source_with_eager_builder(source, || {
@@ -3363,14 +3363,14 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // whose byte offset 0 is the PA `root`, and this frame holds the engine
         // borrow for the duration of the walk.
         Some((ttbr, unsafe {
-            carrick_mem::page_table::walk_descriptors_host(host.cast_const(), size, root, far)
+            carrick_mmu_core::aarch64::walk_descriptors_host(host.cast_const(), size, root, far)
         }))
     }
 
     fn resolve_stale_stage1_fault(
         &mut self,
         far: u64,
-        access: carrick_mem::page_table::LeafAccess,
+        access: carrick_mmu_core::aarch64::LeafAccess,
     ) -> Result<bool, TrapError> {
         // Read the HARDWARE-visible leaf, never the software model: the model
         // is exactly what stopped naming this page when the sibling committed
@@ -3378,8 +3378,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let Some((_ttbr, walk)) = self.diagnostic_fault_page_tables(far) else {
             return Ok(false);
         };
-        let leaf = carrick_mem::page_table::terminal_descriptor(walk);
-        if !carrick_mem::page_table::terminal_descriptor_permits_el0(leaf, access) {
+        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(walk);
+        if !carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(leaf, access) {
             return Ok(false);
         }
         const STALE_STAGE1_RETRY_BOUND: u32 = 4096;
@@ -3787,7 +3787,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                             ))
                         })?;
                         carrick_observability::probes::pt_alias_walk(range.va, walk, 1 << 4);
-                        let leaf = carrick_mem::page_table::terminal_descriptor(walk);
+                        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(walk);
                         const VALID: u64 = 1;
                         const NON_GLOBAL: u64 = 1 << 11;
                         const AP_MASK: u64 = 0b11 << 6;
@@ -4654,7 +4654,11 @@ mod tests {
     #[test]
     fn hvpatch_process_aperture_reservation_removes_both_identity_ranges() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let mut manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let mut manager = PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
         assert!(
             manager
                 .translate(carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE)
@@ -4684,7 +4688,11 @@ mod tests {
     #[test]
     fn shared_futex_high_alias_uses_live_stage1_backing_ipa() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let mut manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let mut manager = PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
         let guest_va = carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
         let backing_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
         manager
@@ -4769,7 +4777,7 @@ mod tests {
     #[test]
     fn stage1_protection_edit_fork_cow_downgrade_preserves_requested_exec_not_stale_arm() {
         use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
-        use carrick_mem::page_table::{
+        use carrick_mmu_core::aarch64::{
             LeafAccess, terminal_descriptor, terminal_descriptor_permits_el0,
         };
 
@@ -4789,7 +4797,11 @@ mod tests {
         // Must remove execution permission (UXN set) while keeping write trap armed (RO).
         // --------------------------------------------------------------------
         let bytes = carrick_mem::memory::stage1_hvpatch_page_tables();
-        let mut mgr = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let mut mgr = PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
 
         // Non-identity VA and IPA
         let base_va: u64 = 0x40_0088_c000;
@@ -4892,7 +4904,11 @@ mod tests {
         // Must grant execution permission (UXN clear) while keeping write trap armed (RO).
         // --------------------------------------------------------------------
         let bytes = carrick_mem::memory::stage1_hvpatch_page_tables();
-        let mut mgr = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let mut mgr = PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
 
         mgr.map_private_aliased(base_va, base_ipa, total_mapped_len, true, None)
             .expect("map initial non-identity pages");
@@ -4984,22 +5000,28 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct DummyArenaSource(carrick_mem::page_table::TableArenaSourceId);
-    impl carrick_mem::page_table::TableArenaSource for DummyArenaSource {
-        fn id(&self) -> carrick_mem::page_table::TableArenaSourceId {
+    struct DummyArenaSource(carrick_mmu_core::aarch64::TableArenaSourceId);
+    impl carrick_mmu_core::aarch64::TableArenaSource for DummyArenaSource {
+        fn id(&self) -> carrick_mmu_core::aarch64::TableArenaSourceId {
             self.0
         }
-        fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
+        fn take_arena(&mut self) -> Option<carrick_mmu_core::aarch64::SubstrateGpa> {
             None
         }
-        fn return_arena(&mut self, _base: carrick_guest_mem::Gpa) {}
+        fn return_arena(&mut self, _base: carrick_mmu_core::aarch64::SubstrateGpa) {}
     }
 
     #[test]
     fn replace_page_tables_authority_preserves_parent_manager_and_source_when_shared() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
-        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x1000));
+        let manager = PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
+            carrick_mmu_core::aarch64::SubstrateGpa(0x1000),
+        );
         let parent_authority = Stage1Authority::new_with_manager(Some(manager));
         parent_authority
             .install_source(Box::new(DummyArenaSource(source_id)))
@@ -5054,8 +5076,14 @@ mod tests {
     #[test]
     fn replace_page_tables_authority_preserves_parent_under_concurrent_vfork_children() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
-        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x1000));
+        let manager = PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
+            carrick_mmu_core::aarch64::SubstrateGpa(0x1000),
+        );
         let parent_authority = Stage1Authority::new_with_manager(Some(manager));
         parent_authority
             .install_source(Box::new(DummyArenaSource(source_id)))
@@ -5143,8 +5171,14 @@ mod tests {
     #[test]
     fn execve_sharing_governed_solely_by_authority_even_on_disagreement() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
-        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x1000));
+        let manager = PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
+            carrick_mmu_core::aarch64::SubstrateGpa(0x1000),
+        );
         let parent_authority = Stage1Authority::new_with_manager(Some(manager));
         parent_authority
             .install_source(Box::new(DummyArenaSource(source_id)))
@@ -5195,7 +5229,11 @@ mod tests {
     #[test]
     fn replace_page_tables_authority_retires_old_when_unshared() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let manager = PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
         let mut authority = Stage1Authority::new_with_manager(Some(manager));
         assert!(authority.is_exclusive());
 
@@ -5217,8 +5255,14 @@ mod tests {
     #[test]
     fn stage1_authority_source_survives_snapshot_image() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
-        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x2000));
+        let manager = PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
+            carrick_mmu_core::aarch64::SubstrateGpa(0x2000),
+        );
         let authority = Stage1Authority::new_with_manager(Some(manager));
         authority
             .install_source(Box::new(DummyArenaSource(source_id)))
@@ -5233,8 +5277,14 @@ mod tests {
     #[test]
     fn stage1_authority_source_survives_rollback() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
-        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x3000));
+        let manager = PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
+            carrick_mmu_core::aarch64::SubstrateGpa(0x3000),
+        );
         let authority = Stage1Authority::new_with_manager(Some(manager));
         authority
             .install_source(Box::new(DummyArenaSource(source_id)))
@@ -5259,8 +5309,14 @@ mod tests {
     #[test]
     fn stage1_authority_source_survives_exec_while_shared() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
-        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x4000));
+        let manager = PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
+            carrick_mmu_core::aarch64::SubstrateGpa(0x4000),
+        );
         let parent = Stage1Authority::new_with_manager(Some(manager));
         parent
             .install_source(Box::new(DummyArenaSource(source_id)))
@@ -5288,7 +5344,9 @@ mod tests {
     #[test]
     fn stage1_authority_sibling_lazy_build_sees_source() {
         let authority = Stage1Authority::new();
-        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x5000));
+        let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
+            carrick_mmu_core::aarch64::SubstrateGpa(0x5000),
+        );
         authority
             .install_source(Box::new(DummyArenaSource(source_id)))
             .expect("deferred install");
@@ -5306,6 +5364,7 @@ mod tests {
                     Ok::<PageTableManager, PageTableError>(PageTableManager::new(
                         bytes,
                         carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+                        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
                     ))
                 },
                 |editor| {
@@ -5325,7 +5384,9 @@ mod tests {
         let clone1 = Stage1Authority::new();
         let clone2 = clone1.clone();
 
-        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x6000));
+        let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
+            carrick_mmu_core::aarch64::SubstrateGpa(0x6000),
+        );
         clone1
             .install_source(Box::new(DummyArenaSource(source_id)))
             .expect("install on clone1");
@@ -5340,6 +5401,7 @@ mod tests {
                     Ok::<PageTableManager, PageTableError>(PageTableManager::new(
                         bytes,
                         carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+                        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
                     ))
                 },
                 |editor| {
@@ -5356,10 +5418,12 @@ mod tests {
     #[test]
     fn stage1_authority_conflicting_lease_rejection() {
         let authority = Stage1Authority::new();
-        let source_id1 =
-            carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x7000));
-        let source_id2 =
-            carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x8000));
+        let source_id1 = carrick_mmu_core::aarch64::TableArenaSourceId(
+            carrick_mmu_core::aarch64::SubstrateGpa(0x7000),
+        );
+        let source_id2 = carrick_mmu_core::aarch64::TableArenaSourceId(
+            carrick_mmu_core::aarch64::SubstrateGpa(0x8000),
+        );
 
         authority
             .install_source(Box::new(DummyArenaSource(source_id1)))

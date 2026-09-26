@@ -1,6 +1,6 @@
 # Carrick Crate Map
 
-Carrick is a 32-crate Cargo workspace. The product path is:
+Carrick is a 33-crate Cargo workspace. The product path is:
 
 ```text
 carrick-cli   -> carrick-engine -> { carrick-image, carrick-runtime -> carrick-kernel -> carrick-vfs } -> carrick-spec
@@ -38,7 +38,8 @@ Platform code is selected by Cargo features. The default feature is
 | `carrick-abi` | Linux ABI constants and wire structs, with compile-time layout/constant assertions. |
 | `carrick-guest-mem` | Guest-memory trait, memory error type, and syscall-frame hub types shared by handlers and VMM engines. |
 | `carrick-kernel-arena` | The per-run kernel arena: a file-backed `MAP_SHARED` region holding the Linux-visible cross-process delta (identity, leases, shared kernel objects) the host kernel cannot express, with no authority daemon -- processes operate on it via atomics and robust bucket locks. |
-| `carrick-mem` | Guest address-space construction: ELF layout, page tables, trampolines, VDSO/vvar, region helpers. |
+| `carrick-mem` | Guest address-space construction: ELF layout, boot identity/hvpatch tables, trampolines, VDSO/vvar, region helpers. |
+| `carrick-mmu-core` | `no_std` + `alloc` MMU management substrate and stage-1 page-table manipulation algorithms (AArch64 `PageTableManager`). |
 | `carrick-hal` | OS/VMM-neutral traits and shared types: trap contract, hypervisor traits, guest-arch tables, event/futex/threaded-loop/signal/timer surfaces. |
 | `carrick-thread` | Thread registry, private-futex park table, and fork/page-table quiesce barriers. |
 | `carrick-signal-core` | Platform-neutral pending-signal bookkeeping. |

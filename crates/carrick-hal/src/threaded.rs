@@ -2025,7 +2025,7 @@ pub struct ProcessForkRequest {
     pub plan: ForkProjectionPlan,
     pub child_tid: ThreadId,
     pub forking_tid: ThreadId,
-    pub table_arena_source: Option<Box<dyn carrick_mem::page_table::TableArenaSource>>,
+    pub table_arena_source: Option<Box<dyn carrick_mmu_core::aarch64::TableArenaSource>>,
 }
 
 impl ProcessForkRequest {
@@ -2853,7 +2853,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// primary stage-1 arena is exhausted.
     fn install_stage1_table_arena_source(
         &mut self,
-        _source: Box<dyn carrick_mem::page_table::TableArenaSource>,
+        _source: Box<dyn carrick_mmu_core::aarch64::TableArenaSource>,
     ) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "threaded backend has no stage-1 manager to install arena source".to_owned(),
@@ -2918,7 +2918,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     fn resolve_stale_stage1_fault(
         &mut self,
         _far: u64,
-        _access: carrick_mem::page_table::LeafAccess,
+        _access: carrick_mmu_core::aarch64::LeafAccess,
     ) -> Result<bool, TrapError> {
         Ok(false)
     }

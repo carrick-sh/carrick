@@ -352,7 +352,7 @@ impl MmAccessState {
     pub(super) fn publish_stage1_extension_arenas(
         &self,
         custody: &std::sync::Arc<CarrierVmCustody>,
-        manager: &carrick_mem::page_table::PageTableManager,
+        manager: &carrick_mmu_core::aarch64::PageTableManager,
         root_perms: applevisor::memory::MemPerms,
     ) -> Result<Vec<HvfMappedRegion>, TrapError> {
         let mut published = Vec::new();
@@ -363,7 +363,7 @@ impl MmAccessState {
     fn publish_stage1_extension_arenas_into(
         &self,
         custody: &std::sync::Arc<CarrierVmCustody>,
-        manager: &carrick_mem::page_table::PageTableManager,
+        manager: &carrick_mmu_core::aarch64::PageTableManager,
         root_perms: applevisor::memory::MemPerms,
         published: &mut Vec<HvfMappedRegion>,
     ) -> Result<(), TrapError> {
@@ -788,7 +788,7 @@ pub(super) fn publish_replacing(
                                     "sparse HVPatch mmap debug_walk_host failed: {e:?}"
                                 ))
                             })?;
-                            let leaf = carrick_mem::page_table::terminal_descriptor(live);
+                            let leaf = carrick_mmu_core::aarch64::terminal_descriptor(live);
                             if shadow != live
                                 || editor.translate(page) != context.foreign.as_ref().map(|_| expected_ipa)
                                 || editor.translate_retained_output(page) != Some(expected_ipa)
@@ -1056,17 +1056,17 @@ struct PinnedStage1Arenas {
         std::collections::BTreeMap<u64, (std::sync::Arc<StructuralBackingOwner>, CarrierStage2Pin)>,
     relocated_primary: Option<(u64, GlobalFrameOwnerPin)>,
 }
-impl carrick_mem::page_table::HostArenaResolver for PinnedStage1Arenas {
+impl carrick_mmu_core::aarch64::HostArenaResolver for PinnedStage1Arenas {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
-        <&Self as carrick_mem::page_table::HostArenaResolver>::host_ptr_for_base(&self, base)
+        <&Self as carrick_mmu_core::aarch64::HostArenaResolver>::host_ptr_for_base(&self, base)
     }
     fn record_populated_prefix(&self, base: u64, prefix: usize) {
-        <&Self as carrick_mem::page_table::HostArenaResolver>::record_populated_prefix(
+        <&Self as carrick_mmu_core::aarch64::HostArenaResolver>::record_populated_prefix(
             &self, base, prefix,
         );
     }
 }
-impl carrick_mem::page_table::HostArenaResolver for &PinnedStage1Arenas {
+impl carrick_mmu_core::aarch64::HostArenaResolver for &PinnedStage1Arenas {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         self.structural
             .get(&base)
@@ -1187,7 +1187,7 @@ impl MmAccessState {
 #[cfg(test)]
 mod arena_pin_tests {
     use super::*;
-    use carrick_mem::page_table::HostArenaResolver;
+    use carrick_mmu_core::aarch64::HostArenaResolver;
 
     #[test]
     fn publication_resolver_pins_exact_primary_owner_until_edit_finishes() {

@@ -22,6 +22,7 @@ carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-el1-image = { path = "../carrick-el1-image" }
 carrick-fatal.workspace = true
 carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-mmu-core = { path = "../carrick-mmu-core" }
 goblin.workspace = true
 libc.workspace = true
 parking_lot.workspace = true

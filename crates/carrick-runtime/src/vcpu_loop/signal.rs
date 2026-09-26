@@ -79,8 +79,8 @@ pub(crate) fn el0_fault_signal(esr: u64) -> Option<(i32, i32)> {
 /// `ESR_EL1`, for authenticating a possibly stale fault against the live
 /// stage-1 leaf. `None` for every other fault class (alignment, access-flag,
 /// address-size, external abort): those never resolve by retry.
-pub(crate) fn el0_fault_access(esr: u64) -> Option<carrick_mem::page_table::LeafAccess> {
-    use carrick_mem::page_table::LeafAccess;
+pub(crate) fn el0_fault_access(esr: u64) -> Option<carrick_mmu_core::aarch64::LeafAccess> {
+    use carrick_mmu_core::aarch64::LeafAccess;
     const WNR: u64 = 1 << 6;
     let ec = (esr >> 26) & 0x3f;
     let dfsc = esr & 0x3f;
@@ -270,11 +270,11 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
 
 fn apply_first_touch(
     prot: u64,
-    access: Option<carrick_mem::page_table::LeafAccess>,
+    access: Option<carrick_mmu_core::aarch64::LeafAccess>,
     protect: impl FnOnce() -> bool,
     commit: impl FnOnce(),
 ) -> Option<bool> {
-    use carrick_mem::page_table::LeafAccess;
+    use carrick_mmu_core::aarch64::LeafAccess;
     let required = match access {
         // Preserve the current protection lowering: any accessible leaf is
         // readable, including write-only and execute-only Linux requests.
@@ -312,7 +312,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
     engine: &mut E,
     address: u64,
-    access: Option<carrick_mem::page_table::LeafAccess>,
+    access: Option<carrick_mmu_core::aarch64::LeafAccess>,
     tid: carrick_kernel::kernel::LinuxTid,
     mutation: &mut carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
 ) -> Result<bool, TrapError> {
@@ -1266,7 +1266,7 @@ mod tests {
 #[cfg(test)]
 mod first_touch_access_tests {
     use super::*;
-    use carrick_mem::page_table::LeafAccess;
+    use carrick_mmu_core::aarch64::LeafAccess;
 
     #[test]
     fn denied_first_touch_does_not_edit_or_commit_residency() {
