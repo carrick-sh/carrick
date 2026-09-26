@@ -4,6 +4,7 @@ mod evaluate;
 mod inventory;
 mod model;
 mod observation;
+pub mod personality_boundary;
 mod registry;
 
 pub use evaluate::{ContractFailure, ContractPass, evaluate};
@@ -17,5 +18,9 @@ pub use model::{
 pub use observation::{
     Completeness, ContractObservation, ObservationError, SemanticAssertion, TimingDistribution,
     WorkSnapshot,
+};
+pub use personality_boundary::{
+    BoundaryConfig, BoundaryError, CrateAuditReport, DependencyViolation, SourceViolation,
+    check_substrate_boundary,
 };
 pub use registry::{ContractRegistry, RegistryError};

@@ -41,6 +41,7 @@ const FUTEX_WAKE_PRIVATE: u64 = 129;
 const FUTEX_WAIT_BITSET_PRIVATE: u64 = 128 | 9;
 const FUTEX_WAKE_BITSET_PRIVATE: u64 = 128 | 10;
 const EAGAIN: i64 = -11;
+const ETIMEDOUT_RESULT: u64 = (-110_i64) as u64;
 
 /// Bucket-lock spins before EL1 gives up and forwards.
 const EL1_ZONE_LOCK_SPINS: u32 = 1024;
@@ -441,7 +442,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 return Served::Idle;
             }
             let now = self.cpu.now();
-            let _ = zone.expire_timer(slot, now);
+            let _ = zone.expire_timer(slot, now, ETIMEDOUT_RESULT);
             if let Some(switched) = zone.switch_in_full(slot).or_else(|| zone.steal(slot)) {
                 zone.leave_idle(slot);
                 if self.load(frame, switched) {
@@ -514,7 +515,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         }
         let (zone, slot) = (self.zone, self.slot);
         let now = self.cpu.now();
-        let _ = zone.expire_timer(slot, now);
+        let _ = zone.expire_timer(slot, now, ETIMEDOUT_RESULT);
         if zone.slot(slot).queued() != 0 {
             let mut since = zone.slot(slot).queued_since();
             if since == 0 {

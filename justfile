@@ -156,6 +156,8 @@ lint-domains:
     python3 -m unittest scripts/migrate/tests/test_reconcile_rename.py scripts/tests/test_rehome_line_pinned_inventories.py
     python3 -m unittest scripts/tests/test_conformance_contract_policy.py
     cargo run -p carrick-conformance-contract --bin check-contracts -- --root .
+    cargo metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
+    cargo run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
     python3 -m unittest scripts/tests/test_check_contract_change.py
     python3 scripts/migrate/check-runtime-global-state.py --check
     python3 scripts/migrate/check-runtime-aborts.py --check
