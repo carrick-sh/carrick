@@ -1,0 +1,65 @@
+schema_version = 1
+id = "kernel.el1.guest-run-queue"
+title = "Where the guest schedules its threads, a thread the host makes runnable goes to an EL1 run queue and no host executor schedules it: host executors are per-vCPU drivers that wait in the guest"
+guest_surfaces = [
+  "syscall:futex",
+  "syscall:read",
+  "syscall:write",
+  "syscall:exit_group",
+  "syscall:execve",
+  "syscall:clone",
+  "syscall:wait4",
+  "syscall:tgkill",
+  "syscall:sched_setaffinity",
+  "scheduler:preemption",
+  "scheduler:vcpu-kick",
+  "scheduler:el1-interrupts",
+  "signal:asynchronous-delivery",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 read / man 7 pipe: a read of an empty pipe blocks until data arrives, then returns it; the blocked thread resumes",
+  "man 2 futex: FUTEX_WAKE returns the number of waiters woken, each of which returns 0 from FUTEX_WAIT",
+  "man 7 sched: SCHED_OTHER threads that share a CPU are time-sliced; a runnable thread is not starved by a thread that never blocks",
+  "man 2 sched_setaffinity: a thread runs only on CPUs in its affinity mask",
+  "man 2 exit_group / man 2 execve / man 2 wait4: every other thread terminates, the parent reaps the child's exit status",
+  "man 7 signal: an asynchronous signal is delivered to a thread on its next return to user mode, including one blocked in a wait",
+  "Arm ARM: an SGI made pending in a redistributor is taken when the PE's IRQs are unmasked; WFI wakes on a pending interrupt",
+]
+fixture = "embed:el1-sched pipe-pingpong|pipe-compute|two-process (and every 1c mode, which must keep passing); embed:zone-readers; unit:carrick-sched-core; unit:carrick-kernel::kernel::scheduler"
+scale_points = [1000, 6000, 500, 3000]
+rationale = "EL1 increment 1d. Before it, a thread the host made runnable (a completed host wait such as a pipe read, a host futex wake, a signal) went to a host run queue and an executor with no thread parked on a host condvar until the host scheduler handed it one: a pipe ping-pong blocked in host reads cost 2.0 host run-queue claims and 2.4 executor condvar parks per round trip. Now a host-runnable thread's row stays held and a service record stands for it in an EL1 run queue, on a vCPU slot whose executor runs it when EL1 reaches it; a host futex wake queues a thread ready at EL0 straight on a vCPU running its address space; a thread EL1 ran that exited to the host is its executor's to run next; and an executor with no thread waits in the guest's idle loop (steal, service threads, WFI) until its vCPU leaves for the host. The claim word stays the only owner of a thread: a host claim takes a queued (not running) thread off its run queue under that queue's lock, keeping its wake result or registers, and is refused only for a thread running on a vCPU; a record the host places in the guest moves by one compare-and-swap between EL1 states, never through host ownership, so no claimant takes a thread for runnable while EL1 may run it (the first version passed through Host and gave one thread two owners in the cross-process readers contract). A host-woken thread queued on a vCPU running a syscall-free loop gets that vCPU within the slice: the host arms the reschedule SGI on the next run and EL0 runs with IRQs unmasked while it is owed. A host waiter's CPU lent to a spare that waits in the guest is returned because the returning owner forces the spare's vCPU out. One executor per guest CPU is the default (CARRICK_BOUND_EXECUTORS the exact hatch); CARRICK_EL1_SCHED=0 restores host run queues and condvar parks. EL1 does not switch address spaces: two processes sharing vCPUs hand off through their executors (7.5 host exits per round trip, reported by el1_sched_two_processes_share_vcpus as the baseline for an in-guest address-space switch)."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-sched-core::tests (a_host_wake_queues_the_waiter_in_the_guest_directly, relocation_moves_queued_threads_between_run_queues_without_host_ownership, host_claims_parked_but_is_refused_by_el1_held, concurrent_el1_wakes_and_host_claims_give_each_record_one_owner, a_cancelled_record_is_discarded_not_run); carrick-kernel::kernel::scheduler::tests::a_returning_host_waiter_wakes_the_guest_idle_borrower_of_its_cpu"
+embed = "carrick-embed::el1_sched (signed; el1_sched_host_blocked_read_resumes_by_guest_scheduling: host run-queue claims and host executor parks per round trip < 0.01 over the difference of two run lengths, at least one service adoption per round trip, red with CARRICK_EL1_SCHED=0 at 2.0 claims and 2.4 parks; el1_sched_host_woken_thread_preempts_a_compute_loop; el1_sched_two_processes_share_vcpus: both processes complete every round trip with zero host run-queue claims, host exits per round trip reported and bounded; every 1c test); carrick-embed::el1_files (el1_files_cross_process_readers_contract at the default and 10 executors)"
+ecosystem = [
+  "go:build",
+  "go:testing",
+  "go:sync",
+  "go:time",
+  "go:os_signal",
+  "cpython:threading",
+  "cpython:subprocess",
+  "cpython:multiprocessing_spawn",
+  "ltp:futex_cmp_requeue01",
+  "ltp:futex_cmp_requeue02",
+  "ltp:futex_wait01",
+  "ltp:futex_wait02",
+  "ltp:futex_wait03",
+  "ltp:futex_wait04",
+  "ltp:futex_wait05",
+  "ltp:futex_wait_bitset01",
+  "ltp:futex_waitv01",
+  "ltp:futex_waitv02",
+  "ltp:futex_waitv03",
+  "ltp:futex_wake01",
+  "ltp:futex_wake02",
+  "ltp:futex_wake03",
+  "ltp:futex_wake04",
+]
+
+[bindings.unresolved]
+docker = "The fixture asserts the Linux results directly (bytes read back over the pipes, every futex round trip completed, the child's exit status through waitpid); a generic Docker probe was not blessed in this session. The LTP futex rows and the ecosystem rows compare against the cached Docker oracle."
+embed_structural = "Host run-queue claims, host executor parks, service adoptions and host exits are read through the zone counters in shared EL1 memory and carrick_embed::vcpu_run_exits_total(); no WorkObservation metric is registered for them."
