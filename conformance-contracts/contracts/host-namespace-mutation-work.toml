@@ -1,0 +1,31 @@
+schema_version = 1
+id = "kernel.vfs.host-namespace-mutation-work"
+title = "Host namespace mutation work bounds"
+guest_surfaces = [
+  "syscall:renameat2",
+  "syscall:unlinkat",
+  "syscall:rename",
+  "syscall:unlink",
+]
+semantic_authority = [
+  "man 2 renameat2",
+  "man 2 unlinkat",
+]
+fixture = "carrick-vfs::serial_host::test_namespace_mutation_work"
+scale_points = [1, 8, 32, 128]
+rationale = "Mutating namespace operations (renameat2, unlinkat) operate under an admitted namespace permit that resolves and holds parent directory descriptors. Admitted operations must not repeat host directory opens or whole-path walks from root. Warm parent operations must issue 0 host openat calls and at most bounded host backend/stat calls proportional to the admitted parent and leaf checks."
+
+[bindings]
+vm_free = "carrick-vfs::serial_host::test_namespace_mutation_work"
+
+[bindings.unresolved]
+embed_structural = "Signed embed structural binding pending higher-layer guest test bring-up."
+docker = "The fixture checks Linux namespace mutation semantics directly."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "host_backend_calls"
+base = 0
+per_unit = 8
+layers = ["vm-free"]
+rationale = "Warm namespace mutations under resolved parent descriptors require 0 host directory opens and only necessary descriptor-relative leaf existence and parent identity checks."

@@ -50,6 +50,13 @@ impl NamespaceMutationPermit<'_> {
             .map(|anchor| &anchor.resolved)
     }
 
+    pub fn parent_identity(&self, path: &str) -> Option<&NamespaceParentIdentity> {
+        self.anchors
+            .iter()
+            .find(|anchor| anchor.path == path)
+            .map(|anchor| &anchor.identity)
+    }
+
     pub fn topology_exclusive(&self) -> bool {
         self.topology_exclusive
     }
