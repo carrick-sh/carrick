@@ -444,6 +444,17 @@ impl MmExecutorParticipation {
         self.authority.mm_id
     }
 
+    /// Publish this MM's address space, whose translation roots are
+    /// `ttbr0`/`ttbr1`, for guest EL1 to install on a vCPU itself (EL1
+    /// increment 2): its gate follows this MM's fence.
+    pub fn publish_address_space(
+        &self,
+        ttbr0: u64,
+        ttbr1: u64,
+    ) -> Option<crate::kernel::AddressSpacePublication> {
+        crate::kernel::publish_address_space(self.mm_id(), self.pt_quiesce(), ttbr0, ttbr1)
+    }
+
     pub(crate) fn mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {
         Arc::clone(&self.authority.mutation_coordinator)
     }

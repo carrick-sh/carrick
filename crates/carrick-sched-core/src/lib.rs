@@ -81,10 +81,12 @@
 extern crate std;
 
 pub mod occupancy;
+pub mod spaces;
 
 pub use occupancy::{
     AddressSpaceKey, EXECUTION_SLOTS, ExecutionSlot, HOST_EXECUTION_SLOTS, Occupancy, SlotBusy,
 };
+pub use spaces::{ADDRESS_SPACES, AddressSpaces, GATE_CLOSED, SpaceGrant, SpaceIndex};
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -775,6 +777,15 @@ pub struct ZoneCounters {
     /// work. Zero in steady state where the guest schedules (EL1 plan 1d).
     pub host_queue_claims: AtomicU64,
     pub host_executor_parks: AtomicU64,
+    /// Address-space switches EL1 made on a vCPU itself (EL1 increment 2):
+    /// installs of another process's address space for a thread it
+    /// switched in, and installs it refused because the space's gate was
+    /// raised or closed (the thread then went to its executor).
+    pub el1_space_switches: AtomicU64,
+    pub el1_space_refusals: AtomicU64,
+    /// Broadcast ASID invalidations EL1 ran for a foreign-COW publication
+    /// before installing an address space.
+    pub el1_cow_invalidations: AtomicU64,
 }
 
 /// The zone: every table, as one `repr(C)` object in the shared EL1 region.
@@ -794,6 +805,11 @@ pub struct ZoneTables {
     pub counters: ZoneCounters,
     entries: [ZoneEntry; ZONE_ENTRIES],
     records: [ZoneRecord; ZONE_RECORDS],
+    /// Which address space each vCPU runs: the one occupancy authority
+    /// (EL1 increment 2), shared so EL1 publishes its own switches.
+    pub occupancy: Occupancy,
+    /// Address spaces EL1 may install itself, with their gates.
+    pub spaces: AddressSpaces,
 }
 
 /// How a bucket lock waits: EL1 gives up after a bounded spin (and forwards
@@ -1553,9 +1569,28 @@ impl ZoneTables {
 
     /// Whether `slot` may run `rec` at EL0 by the address space installed on
     /// it: a thread that needs its executor runs through the host on any
-    /// slot; any other only on a slot running its address space.
+    /// slot; any other on a slot running its address space, or on a slot
+    /// whose executor has a task loaded when EL1 may install the thread's
+    /// address space there (a hint: [`Self::install_space`] decides). A vCPU
+    /// in the idle entry (no task loaded) runs no thread itself; its
+    /// executor loads it.
     fn runs_mm_of(&self, slot: SlotId, rec: &ZoneRecord) -> bool {
-        rec.needs_host() || self.slot(slot).mm() == rec.mm.load(Ordering::Relaxed)
+        let mm = rec.mm.load(Ordering::Relaxed);
+        rec.needs_host() || self.installed_space(slot) == mm || self.may_switch_to(slot, mm)
+    }
+
+    /// Whether EL1 on `slot` may install address space `mm` itself: the
+    /// slot's executor has a task loaded (`publish_slot` with its MM) and
+    /// `mm` is published with its gate open (a hint; the install re-reads
+    /// the gate after publishing the slot).
+    fn may_switch_to(&self, slot: SlotId, mm: u64) -> bool {
+        self.slot(slot).mm() != 0 && self.spaces.is_open(mm)
+    }
+
+    /// Whether EL1 on `slot` runs for an executor with a task loaded (not
+    /// the idle entry), so it may switch the vCPU between address spaces.
+    pub fn executor_has_task(&self, slot: SlotId) -> bool {
+        self.slot(slot).mm() != 0
     }
 
     /// Whether slot `slot` may take `rec` now: in the guest (idle, unless
@@ -1867,10 +1902,95 @@ impl ZoneTables {
 
     /// Whether `slot` can run `rec` only through its executor: it needs host
     /// service, or it is ready at EL0 in an address space other than the one
-    /// installed on the slot (EL1 does not switch address spaces), which its
-    /// executor loads.
+    /// installed on the slot that EL1 may not install now (unpublished, a
+    /// pause of it is raised, or it is retiring), which its executor loads.
     fn needs_executor(&self, slot: SlotId, rec: &ZoneRecord) -> bool {
-        rec.needs_host() || self.slot(slot).mm() != rec.mm.load(Ordering::Relaxed)
+        let mm = rec.mm.load(Ordering::Relaxed);
+        rec.needs_host() || (self.installed_space(slot) != mm && !self.may_switch_to(slot, mm))
+    }
+
+    /// The address space installed on `slot`'s vCPU, by the occupancy
+    /// authority (0: none; the vCPU runs the carrier's maintenance root).
+    pub fn installed_space(&self, slot: SlotId) -> u64 {
+        self.occupancy.running_raw(ExecutionSlot::zone(slot))
+    }
+
+    /// EL1 on `slot`, running no thread: make `to` the address space
+    /// installed on the vCPU, the way every installer does (publish the
+    /// slot's occupancy word, then read the space's gate, both `SeqCst`; the
+    /// vCPU is in guest). The caller has already switched the vCPU to the
+    /// maintenance root, so the word never names a space other than the one
+    /// its translation root runs. `None`: the space is unpublished, paused or
+    /// retiring; the slot then holds no address space. On success the caller
+    /// installs the grant's roots before any EL0 of `to` runs.
+    pub fn install_space(&self, slot: SlotId, to: u64) -> Option<SpaceGrant> {
+        let index = self.spaces.find(to)?;
+        let here = ExecutionSlot::zone(slot);
+        let from = self.occupancy.running_raw(here);
+        if !self.occupancy.replace(here, from, to) {
+            return None;
+        }
+        let Some(grant) = self.spaces.grant(index, to) else {
+            self.occupancy.replace(here, to, 0);
+            self.counters
+                .el1_space_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        self.counters
+            .el1_space_switches
+            .fetch_add(1, Ordering::Relaxed);
+        Some(grant)
+    }
+
+    /// EL1 on `slot`, after switching the vCPU to the maintenance root:
+    /// no address space is installed on it any more.
+    pub fn release_space(&self, slot: SlotId) {
+        let here = ExecutionSlot::zone(slot);
+        let from = self.occupancy.running_raw(here);
+        if from != 0 {
+            self.occupancy.replace(here, from, 0);
+        }
+    }
+
+    /// EL1: `record`, switched in on `slot`, cannot run there (its address
+    /// space could not be installed): it goes back to the head of the run
+    /// queue, still queued, for the slot's executor to take
+    /// ([`Self::take_service_head`]).
+    pub fn unswitch(&self, slot: SlotId, record: RecordId) {
+        let rec = self.record(record);
+        let Claim::OnCpu { slot: owner, seq } = rec.claim() else {
+            return;
+        };
+        if owner != slot {
+            return;
+        }
+        let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+            return;
+        };
+        if !rec.cas(Claim::OnCpu { slot, seq }, Claim::Queued { slot, seq }) {
+            return;
+        }
+        let s = self.slot(slot);
+        if s.current.load(Ordering::Acquire) == record.raw() {
+            s.current.store(NIL, Ordering::Release);
+        }
+        self.push_front_locked(&guard, record);
+    }
+
+    /// Put `record` at the head of the run queue `guard` holds.
+    fn push_front_locked(&self, guard: &SlotGuard<'_>, record: RecordId) {
+        let s = self.slot(guard.slot);
+        let head = s.head.load(Ordering::Relaxed);
+        self.record(record).next.store(head, Ordering::Release);
+        s.head.store(record.raw(), Ordering::Release);
+        if head == NIL {
+            s.tail.store(record.raw(), Ordering::Release);
+            s.queued_since.store(0, Ordering::Release);
+        }
+        s.len.fetch_add(1, Ordering::AcqRel);
+        self.queued_map[guard.slot.index() / 64]
+            .fetch_or(1 << (guard.slot.index() % 64), Ordering::AcqRel);
     }
 
     /// Remove and return the head of `slot`'s run queue.
@@ -2896,9 +3016,11 @@ impl ZoneTables {
             }
             writeln!(
                 out,
-                "zone slot {index}: state={:?} mm={} cpu+1={} current={} host_record={} len={} queue={:?} resched={} timer_cval={}",
+                "zone slot {index}: state={:?} mm={} installed={} cpu+1={} current={} host_record={} len={} queue={:?} resched={} timer_cval={}",
                 s.state(),
                 s.mm(),
+                self.occupancy
+                    .running_raw(ExecutionSlot::zone(SlotId::new(index as u8))),
                 s.cpu.load(Ordering::Relaxed),
                 s.current.load(Ordering::Relaxed),
                 s.host_record.load(Ordering::Relaxed),
@@ -2933,6 +3055,28 @@ impl ZoneTables {
             c.host_queue_takes.load(Ordering::Relaxed),
             c.foreign_adoptions.load(Ordering::Relaxed),
         )?;
+        writeln!(
+            out,
+            "zone spaces: idle_ttbr={:#x} el1_space_switches={} el1_space_refusals={} el1_cow_invalidations={}",
+            self.spaces.idle_ttbr(),
+            c.el1_space_switches.load(Ordering::Relaxed),
+            c.el1_space_refusals.load(Ordering::Relaxed),
+            c.el1_cow_invalidations.load(Ordering::Relaxed),
+        )?;
+        for index in 0..ADDRESS_SPACES {
+            let Some(space) = SpaceIndex::from_index(index) else {
+                continue;
+            };
+            let key = self.spaces.key(space);
+            if key == 0 || key == u64::MAX {
+                continue;
+            }
+            writeln!(
+                out,
+                "zone space {index}: mm={key} gate={:#x}",
+                self.spaces.gate(space)
+            )?;
+        }
         for (index, record) in self.records.iter().enumerate().skip(1) {
             let claim = record.claim();
             if claim == Claim::Free {

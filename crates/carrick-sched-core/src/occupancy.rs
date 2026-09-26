@@ -154,6 +154,50 @@ impl Occupancy {
             .is_ok()
     }
 
+    /// Replace `slot`'s word `from` with `to` (either may be 0, no address
+    /// space): the in-guest shape of an address-space switch, by the vCPU's
+    /// own EL1. False if the slot does not hold `from`. A nonzero `to` sets
+    /// the scan hint before the caller reads `to`'s gate (module docs); a
+    /// zero `to` clears it as [`Self::vacate`] does.
+    pub fn replace(&self, slot: ExecutionSlot, from: u64, to: u64) -> bool {
+        let index = slot.index();
+        if self.running[index]
+            .compare_exchange(from, to, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        if to != 0 {
+            self.occupied[index / 64].fetch_or(1 << (index % 64), Ordering::SeqCst);
+        } else {
+            self.occupied[index / 64].fetch_and(!(1 << (index % 64)), Ordering::SeqCst);
+            if self.running[index].load(Ordering::SeqCst) != 0 {
+                self.occupied[index / 64].fetch_or(1 << (index % 64), Ordering::SeqCst);
+            }
+        }
+        true
+    }
+
+    /// Empty `slot` whatever address space it holds (the host, with the
+    /// vCPU out of the guest: EL1 may have switched it since the executor
+    /// installed its own). Returns what it held (0: nothing).
+    pub fn vacate_any(&self, slot: ExecutionSlot) -> u64 {
+        let index = slot.index();
+        let held = self.running[index].swap(0, Ordering::SeqCst);
+        if held != 0 {
+            self.occupied[index / 64].fetch_and(!(1 << (index % 64)), Ordering::SeqCst);
+            if self.running[index].load(Ordering::SeqCst) != 0 {
+                self.occupied[index / 64].fetch_or(1 << (index % 64), Ordering::SeqCst);
+            }
+        }
+        held
+    }
+
+    /// The raw word of `slot` (0: none).
+    pub fn running_raw(&self, slot: ExecutionSlot) -> u64 {
+        self.running[slot.index()].load(Ordering::SeqCst)
+    }
+
     /// `slot`'s vCPU no longer runs `space`; only while it is out of the
     /// guest. False if the slot did not run `space`.
     pub fn vacate(&self, slot: ExecutionSlot, space: AddressSpaceKey) -> bool {

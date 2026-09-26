@@ -339,6 +339,15 @@ pub trait Aarch64Vcpu {
         Ok(())
     }
 
+    /// The translation roots (`TTBR0_EL1`, `TTBR1_EL1`) of the task loaded on
+    /// this vCPU, when guest EL1 could install them itself on a vCPU running
+    /// another process's thread (EL1 increment 2): one root shared by both
+    /// halves and the default memory model, the state an EL1 switch leaves
+    /// alone. `None` by default (no guest scheduler on this backend).
+    fn el1_switchable_roots(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     /// A staged vCPU holds a task's registers as data and has never run, so it
     /// cannot execute stage-1 maintenance. It records `maintenance` and returns
     /// `true`; the task's first live executor discharges the debt before the

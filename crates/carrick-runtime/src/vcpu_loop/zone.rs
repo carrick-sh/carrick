@@ -84,11 +84,32 @@ pub(super) fn zone_ctx_from_state(
     ctx.v = s.vregs;
     ctx.fpsr = u64::from(s.fpsr);
     ctx.fpcr = u64::from(s.fpcr);
+    apply_zone_exit(
+        &mut ctx,
+        s.syscall_continuation.as_ref(),
+        (s.trap_pc, s.trap_pstate),
+        (s.elr_el1, s.spsr_el1),
+        exit,
+    )?;
+    Ok(ctx)
+}
+
+/// The resume point of a thread taken off a vCPU at `exit`: after (or at,
+/// to re-issue it) a forwarded syscall, from the mailbox continuation; at
+/// the EL0 instruction the vCPU stopped at (`trap`), or the EL0 state the
+/// EL1 vector trapped from (`vector`).
+fn apply_zone_exit(
+    ctx: &mut ThreadCtx,
+    continuation: Option<&carrick_hal::threaded::Aarch64SyscallContinuationV1>,
+    trap: (u64, u64),
+    vector: (u64, u64),
+    exit: ZoneExit,
+) -> Result<(), RuntimeError> {
     match exit {
         ZoneExit::Syscall { completed } => {
             // The mailbox capture used x16/x17 as scratch after saving them,
             // and holds the EL0 return state.
-            let continuation = s.syscall_continuation.as_ref().ok_or_else(|| {
+            let continuation = continuation.ok_or_else(|| {
                 RuntimeError::Configuration(
                     "EL1 zone capture at a syscall exit without its mailbox request".to_owned(),
                 )
@@ -108,16 +129,14 @@ pub(super) fn zone_ctx_from_state(
         ZoneExit::El0 => {
             // EL0t: the vCPU stopped in guest code. Otherwise it is in the EL1
             // vector, whose ELR/SPSR hold the EL0 state it trapped from.
-            if s.trap_pstate & 0xf == 0 {
-                ctx.pc = s.trap_pc;
-                ctx.pstate = s.trap_pstate;
+            if trap.1 & 0xf == 0 {
+                (ctx.pc, ctx.pstate) = trap;
             } else {
-                ctx.pc = s.elr_el1;
-                ctx.pstate = s.spsr_el1;
+                (ctx.pc, ctx.pstate) = vector;
             }
         }
     }
-    Ok(ctx)
+    Ok(())
 }
 
 /// Hand each host-owned zone thread (a host wake no vCPU could take) back
@@ -187,12 +206,12 @@ where
         let s = zone.slot(slot);
         let (current, own) = (s.current(), s.host_record());
         let state = match (current, own) {
-            (None, None) => return Ok(None),
+            (None, None) => return self.own_space_installed(zone, slot).map(|()| None),
             (Some(current), Some(own)) if current == own => {
                 // EL1 switched this job's own thread back in: it is simply
                 // running again, and its record is done.
                 zone.release_current(slot, current);
-                return Ok(None);
+                return self.own_space_installed(zone, slot).map(|()| None);
             }
             (Some(current), _) => {
                 // Another thread is on the vCPU. Take it off with its live
@@ -250,6 +269,11 @@ where
                 "EL1 zone slot {slot:?} ran another thread but never parked the loaded one"
             ))
         })?;
+        // EL1 may have switched the vCPU to another process's address space
+        // (EL1 increment 2): the settled thread keeps its own roots. EL1
+        // switches away only from a published space, whose two roots are
+        // the lease's `TTBR0` value.
+        let state = self.with_own_roots(zone, slot, control, state)?;
         // The thread settles into a host zone wait: its record stops being
         // this slot's home, and a deadline this slot's timer kept is the
         // host's to keep now.
@@ -266,6 +290,70 @@ where
         let request = SyscallRequest::new(98, carrick_observability::compat::SyscallArgs([0; 6]));
         let exit = self.settle_into_zone(control, state, own, seq, timeout, request)?;
         Ok(Some(exit))
+    }
+
+    /// The vCPU state `state` with this job's own translation roots, when the
+    /// address space installed on the vCPU is not the job's.
+    fn with_own_roots(
+        &self,
+        zone: &ZoneTables,
+        slot: SlotId,
+        control: &executor::HvpatchQuantumControl<'_, '_>,
+        state: GuestCpuState,
+    ) -> Result<GuestCpuState, ProductionHvpatchPollError> {
+        let installed = zone.installed_space(slot);
+        if self.state.zone_mm.is_none_or(|mm| mm == installed) {
+            return Ok(state);
+        }
+        let GuestCpuState::Aarch64V1(cpu) = &state else {
+            return Ok(state);
+        };
+        let ttbr0 = control
+            .binding
+            .and_then(|binding| binding.stage1_ttbr0())
+            .ok_or_else(|| {
+                RuntimeError::Configuration(format!(
+                    "EL1 zone slot {slot:?} switched address spaces under a task with no stage-1 lease"
+                ))
+            })?;
+        let mut cpu = (**cpu).clone();
+        cpu.ttbr0 = ttbr0;
+        cpu.ttbr1 = ttbr0;
+        Ok(GuestCpuState::from_aarch64_v1(cpu))
+    }
+
+    /// This job's own thread is on the vCPU again: EL1 installed its address
+    /// space before it ran it (EL1 increment 2), so the exit is this
+    /// thread's to handle. Anything else would let the host resolve a fault
+    /// or run a syscall against the wrong address space: fail loud.
+    fn own_space_installed(
+        &self,
+        zone: &ZoneTables,
+        slot: SlotId,
+    ) -> Result<(), ProductionHvpatchPollError> {
+        let installed = zone.installed_space(slot);
+        match self.state.zone_mm {
+            Some(mm) if mm != installed => Err(RuntimeError::Configuration(format!(
+                "EL1 zone slot {slot:?} returned the loaded thread of address space {mm} \
+                 with address space {installed} installed"
+            ))
+            .into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether the address space installed on this job's vCPU is its own:
+    /// EL1 stopped mid-operation on the vCPU (a stage-1 COW fault) while it
+    /// ran a thread it switched in from another process would have the
+    /// fault resolved in this job's address space.
+    pub(super) fn check_own_space_at_el1_fault(
+        &self,
+        engine: &E,
+    ) -> Result<(), ProductionHvpatchPollError> {
+        match zone_slot(engine) {
+            Some((zone, slot)) => self.own_space_installed(zone, slot),
+            None => Ok(()),
+        }
     }
 
     /// This job's thread is parked in the zone on `record` (park `seq`,

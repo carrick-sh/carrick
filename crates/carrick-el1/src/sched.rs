@@ -71,6 +71,12 @@ pub trait ThreadCpu {
     fn save(&mut self, frame: &TrapFrame, ctx: &mut ThreadCtx);
     /// Make `ctx` the running thread: fill `frame` and load live state.
     fn load(&mut self, frame: &mut TrapFrame, ctx: &ThreadCtx);
+    /// Install translation roots (`TTBR0_EL1`, `TTBR1_EL1`), effective for
+    /// everything after the call.
+    fn set_translation(&mut self, ttbr0: u64, ttbr1: u64);
+    /// Invalidate, on every PE, the stage-1 translations of the ASID in
+    /// `ttbr0` (`TLBI ASIDE1IS`), complete before the call returns.
+    fn invalidate_asid(&mut self, ttbr0: u64);
     /// The virtual counter (`CNTVCT_EL0`).
     fn now(&self) -> u64;
     /// The counter frequency (`CNTFRQ_EL0`), in Hz.
@@ -124,11 +130,13 @@ fn identity_of(task: &CurrentTask, affinity: u64) -> ThreadIdentity {
     }
 }
 
-/// Publish the switched-in thread as the slot's running task.
+/// Publish the switched-in thread as the slot's running task (its process
+/// too: EL1 may have switched the vCPU to another address space).
 fn publish_identity(task: &CurrentTask, id: ThreadIdentity) {
     task.task_id.store(id.tid, Ordering::Relaxed);
     task.thread_serial.store(id.serial, Ordering::Relaxed);
     task.file_table.store(id.file_table, Ordering::Relaxed);
+    task.zone_mm.store(id.mm, Ordering::Relaxed);
     task.generation.store(id.generation, Ordering::Release);
 }
 
@@ -309,8 +317,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// for the host when that thread needs its executor, or idle.
     fn run_next(&mut self, frame: &mut TrapFrame) -> Served {
         if let Some(switched) = self.zone.switch_in_full(self.slot) {
-            self.load(frame, switched);
-            return Served::Returned { switched: true };
+            if self.load(frame, switched) {
+                return Served::Returned { switched: true };
+            }
+            return self.service_exit();
         }
         if self.zone.head_needs_host(self.slot) {
             return self.service_exit();
@@ -328,10 +338,18 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         Served::Idle
     }
 
-    /// Make the switched-in thread the running one.
-    fn load(&mut self, frame: &mut TrapFrame, switched: SwitchedIn) {
+    /// Make the switched-in thread the running one, in its address space.
+    /// False: EL1 may not install that address space now (a pause of it is
+    /// raised, or it is unpublished or retiring); the thread went back to
+    /// the head of the run queue and the vCPU must leave for its executor
+    /// ([`Self::service_exit`]), which loads it.
+    fn load(&mut self, frame: &mut TrapFrame, switched: SwitchedIn) -> bool {
         let (zone, slot) = (self.zone, self.slot);
         let rec = zone.record(switched.record);
+        if !self.enter_space(rec.identity().mm) {
+            zone.unswitch(slot, switched.record);
+            return false;
+        }
         // SAFETY: switch_in_full made the record OnCpu on this slot.
         let ctx = unsafe { rec.ctx_mut() };
         self.cpu.load(frame, ctx);
@@ -344,6 +362,64 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             zone.slot(slot).restart_slice(self.cpu.now());
         }
         self.program_timer(true);
+        true
+    }
+
+    /// Run address space `mm` on this vCPU. Nothing to do when it is the one
+    /// installed. Otherwise the vCPU goes to the maintenance root first (so
+    /// the slot's occupancy word never names a space other than the one its
+    /// root translates), then publishes `mm` in the slot and reads `mm`'s
+    /// gate ([`ZoneTables::install_space`], the installer's half of the
+    /// Dekker pair with a page-table pause or ASID retirement), and only
+    /// then installs `mm`'s roots, after invalidating its ASID if a
+    /// foreign-COW publication is not yet covered.
+    fn enter_space(&mut self, mm: u64) -> bool {
+        let (zone, slot) = (self.zone, self.slot);
+        if mm != 0 && zone.installed_space(slot) == mm {
+            return true;
+        }
+        // Only for an executor with a task loaded: the idle entry runs no
+        // thread itself (its executor loads it), and switches nothing.
+        if mm == 0 || zone.spaces.idle_ttbr() == 0 || !zone.executor_has_task(slot) {
+            return false;
+        }
+        // Only away from a published space (one root for both halves, the
+        // default memory model: nothing an EL1 switch leaves behind), so the
+        // host can settle the thread it loaded here with that space's roots.
+        let installed = zone.installed_space(slot);
+        if installed != 0 && zone.spaces.find(installed).is_none() {
+            return false;
+        }
+        self.leave_space();
+        let Some(grant) = zone.install_space(slot, mm) else {
+            return false;
+        };
+        if let Some(published) = grant.cow_owed {
+            self.cpu.invalidate_asid(grant.ttbr0);
+            zone.spaces.cover_cow(grant.index, published);
+            zone.counters
+                .el1_cow_invalidations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.cpu.set_translation(grant.ttbr0, grant.ttbr1);
+        true
+    }
+
+    /// Run no address space on this vCPU: the maintenance root first, then
+    /// the slot's occupancy word. A vCPU that idles in WFI holds no process's
+    /// translations, so no pause of that process kicks it, and it walks no
+    /// page table a retiring address space frees.
+    fn leave_space(&mut self) {
+        let (zone, slot) = (self.zone, self.slot);
+        if zone.installed_space(slot) == 0 {
+            return;
+        }
+        let idle = zone.spaces.idle_ttbr();
+        if idle == 0 {
+            return;
+        }
+        self.cpu.set_translation(idle, idle);
+        zone.release_space(slot);
     }
 
     /// Nothing is runnable on this vCPU: poll, then park in WFI, until a
@@ -368,8 +444,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             let _ = zone.expire_timer(slot, now);
             if let Some(switched) = zone.switch_in_full(slot).or_else(|| zone.steal(slot)) {
                 zone.leave_idle(slot);
-                self.load(frame, switched);
-                return Served::Returned { switched: true };
+                if self.load(frame, switched) {
+                    return Served::Returned { switched: true };
+                }
+                return self.service_exit();
             }
             if zone.head_needs_host(slot) {
                 zone.leave_idle(slot);
@@ -379,6 +457,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 self.cpu.spin();
                 continue;
             }
+            // Park on the maintenance root: a vCPU in WFI holds no process's
+            // translations, so no pause or retirement of that process has
+            // to wake it (the next thread it runs installs its own space).
+            self.leave_space();
             if zone.enter_idle(slot, true) {
                 self.program_timer(false);
                 zone.counters
@@ -453,7 +535,13 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                         return carrick_el1_abi::Action::Idle;
                     }
                 } else if zone.slot(slot).queued() != 0 {
-                    self.preempt(frame);
+                    if !self.preempt(frame) {
+                        // The head's address space could not be installed:
+                        // the preempted thread is queued behind it and the
+                        // vCPU leaves for the executor, which loads the head.
+                        self.service_exit();
+                        return carrick_el1_abi::Action::Idle;
+                    }
                 } else {
                     zone.slot(slot).restart_slice(now);
                 }
@@ -495,16 +583,18 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     }
 
     /// Preempt the running thread: it goes to the tail of this vCPU's run
-    /// queue with its registers, and the head runs.
-    fn preempt(&mut self, frame: &mut TrapFrame) {
+    /// queue with its registers, and the head runs. False: the head's
+    /// address space could not be installed; the vCPU must leave for its
+    /// executor (both threads are queued).
+    fn preempt(&mut self, frame: &mut TrapFrame) -> bool {
         let (zone, slot) = (self.zone, self.slot);
         if zone.runnable_head(slot).is_none() {
-            return;
+            return true;
         }
         let fresh = zone.slot(slot).current().is_none();
         let affinity = zone.slot(slot).affinity();
         let Ok(prev) = zone.current_or_new(slot, identity_of(self.task, affinity)) else {
-            return;
+            return true;
         };
         // SAFETY: `prev` holds the running thread (a fresh home record, or
         // the switched-in OnCpu one): this vCPU is its only owner.
@@ -512,7 +602,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         match zone.switch_in_full(slot) {
             Some(switched) => {
                 zone.requeue_preempted(slot, prev);
-                self.load(frame, switched);
+                self.load(frame, switched)
             }
             None => {
                 // The head changed under us (it cannot: only this vCPU takes
@@ -520,6 +610,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 if fresh {
                     zone.discard_unpublished(slot, prev);
                 }
+                true
             }
         }
     }
@@ -613,6 +704,12 @@ pub struct FakeCpu {
     pub mpidr: u64,
     /// Negative control: a switch that forgets FP/SIMD.
     pub skip_fpsimd: bool,
+    /// The installed translation roots (`TTBR0_EL1`, `TTBR1_EL1`).
+    pub ttbr: (u64, u64),
+    /// Every `set_translation`, in order.
+    pub translations: std::vec::Vec<(u64, u64)>,
+    /// Every `TLBI ASIDE1IS` operand (the TTBR0 value), in order.
+    pub asid_invalidations: std::vec::Vec<u64>,
 }
 
 #[cfg(test)]
@@ -629,6 +726,9 @@ impl Default for FakeCpu {
             wfis: 0,
             mpidr: 0x8000_0003,
             skip_fpsimd: false,
+            ttbr: (0, 0),
+            translations: std::vec::Vec::new(),
+            asid_invalidations: std::vec::Vec::new(),
         }
     }
 }
@@ -663,6 +763,15 @@ impl ThreadCpu for FakeCpu {
             self.regs.fpsr = ctx.fpsr;
             self.regs.fpcr = ctx.fpcr;
         }
+    }
+
+    fn set_translation(&mut self, ttbr0: u64, ttbr1: u64) {
+        self.ttbr = (ttbr0, ttbr1);
+        self.translations.push((ttbr0, ttbr1));
+    }
+
+    fn invalidate_asid(&mut self, ttbr0: u64) {
+        self.asid_invalidations.push(ttbr0);
     }
 
     fn now(&self) -> u64 {

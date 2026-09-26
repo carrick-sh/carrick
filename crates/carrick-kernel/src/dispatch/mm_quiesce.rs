@@ -589,6 +589,14 @@ pub enum FrameCowExactMmGuard {
 }
 
 impl FrameCowExactMmGuard {
+    /// The MM whose fence this guard holds.
+    fn mm(&self) -> crate::kernel::MmId {
+        match self {
+            Self::Nested { _lease, .. } => _lease.mm,
+            Self::Sole { _guard, .. } | Self::Paused { _guard, .. } => _guard._lease.mm,
+        }
+    }
+
     #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
     pub(crate) fn mutation_identity(
         &self,
@@ -636,6 +644,9 @@ impl FrameCowExactMmGuard {
             return Err(ForeignCowInvalidationError::BindingMismatch);
         }
         stage1.publish_foreign_cow_invalidation();
+        // The guard holds the MM's fence (and so its published gate): guest
+        // EL1 cannot install the address space before it sees this too.
+        crate::kernel::note_foreign_cow(self.mm());
         Ok(())
     }
 }

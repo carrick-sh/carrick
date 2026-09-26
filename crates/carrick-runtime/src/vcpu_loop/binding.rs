@@ -3089,6 +3089,12 @@ where
                 engine
                     .set_memory_model(hardware_tso_for_debug(tso))
                     .map_err(RuntimeError::Trap)?;
+                // An EL1 switch does not carry the memory model: guest EL1
+                // must never run this process's threads on a vCPU it
+                // switched (EL1 increment 2).
+                if tso && let Some(binding) = control.binding {
+                    binding.withdraw_address_space();
+                }
                 let value = self
                     .state
                     .complete_returned(engine, &self.kernel.reporter, 0)?;
@@ -3435,6 +3441,19 @@ where
             participation
                 .occupy_slot(slot)
                 .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            // The first load of an address space that guest EL1 could
+            // install itself publishes it (its roots, its gate following
+            // this MM's fence), so EL1 can switch a vCPU running another
+            // process's thread to this process's threads without an exit.
+            if let Some(binding) = control.binding {
+                let participation = &*participation;
+                binding.publish_address_space(|lease_ttbr0| {
+                    let (ttbr0, ttbr1) = engine.el1_switchable_roots()?;
+                    (ttbr0 == lease_ttbr0)
+                        .then(|| participation.publish_address_space(ttbr0, ttbr1))
+                        .flatten()
+                });
+            }
         }
 
         // Exec/exit can force a blocked vfork parent runnable solely so it can
@@ -4008,6 +4027,7 @@ where
                 elr,
                 spsr,
             }) => {
+                self.check_own_space_at_el1_fault(engine)?;
                 // The engine's single COW resolver emits the exact TTBR +
                 // descriptor pair immediately before its typed trigger. Do not
                 // duplicate that pair here: the structural consumer joins and

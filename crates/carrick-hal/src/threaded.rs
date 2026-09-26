@@ -2676,6 +2676,14 @@ impl HvpatchVerifiedChildKernelBinding {
 }
 
 pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
+    /// The loaded task's translation roots (`TTBR0`, `TTBR1`) when guest EL1
+    /// may install them on a vCPU itself (EL1 increment 2): see
+    /// `carrick_aarch64::vmm::Aarch64Vcpu::el1_switchable_roots`. `None` on
+    /// every engine without an in-guest scheduler.
+    fn el1_switchable_roots(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Optional backend-owned sink for the carrier-global descriptor ceiling.
     /// Unsupported execution lanes leave the optimization disabled.
     fn fd_ceiling_publisher(&self) -> Option<Arc<dyn crate::FdCeilingPublisher>> {

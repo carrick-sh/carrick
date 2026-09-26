@@ -543,6 +543,10 @@ impl PoolControl {
         boundary: &WorkerBoundaryAudit,
         receipts: &ReceiptLog,
     ) -> Result<(), String> {
+        // Guest EL1 may have installed the address space on vCPUs itself:
+        // they are out of it (and its entry freed) before the ASID's
+        // translations are invalidated for reuse.
+        retirement.retire_address_space();
         if !retirement.needs_invalidation() {
             return Ok(());
         }
