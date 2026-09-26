@@ -1,0 +1,46 @@
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-personality-boundary/carrick/crates/carrick-conformance-contract)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.77s
+     Running unittests src/lib.rs (target/debug/deps/carrick_conformance_contract-a87a7a364c0059ca)
+
+running 25 tests
+test personality_boundary::tests::test_negative_macro_rules_definition_containing_symbol_rejected ... ok
+test personality_boundary::tests::test_negative_cfg_feature_containing_test_word_rejected ... ok
+test personality_boundary::tests::test_negative_cfg_any_test_and_prod_feature_rejected ... ok
+test personality_boundary::tests::test_negative_macro_rules_definition_containing_literal_rejected ... ok
+test personality_boundary::tests::test_negative_cfg_not_test_rejected ... ok
+test personality_boundary::tests::test_negative_macro_invocation_containing_literal_rejected ... ok
+test personality_boundary::tests::test_negative_missing_allowlisted_crate_rejected ... ok
+test personality_boundary::tests::test_negative_custom_lib_path_rejected ... ok
+test personality_boundary::tests::test_negative_unannotated_mod_tests_filename_rejected ... ok
+test personality_boundary::tests::test_negative_missing_transitive_node_rejected ... ok
+test personality_boundary::tests::test_positive_annotated_mod_arbitrary_name_allowed ... ok
+test personality_boundary::tests::test_negative_direct_dependency_rejected ... ok
+test personality_boundary::tests::test_negative_no_scanned_source_files_rejected ... ok
+test personality_boundary::tests::test_positive_cfg_all_test_and_foo_allowed ... ok
+test personality_boundary::tests::test_negative_target_conditioned_build_dependency_rejected ... ok
+test personality_boundary::tests::test_negative_renamed_alias_dependency_rejected ... ok
+test personality_boundary::tests::test_positive_prose_comments_allowed ... ok
+test personality_boundary::tests::test_inherited_test_module_and_production_filename ... ok
+test personality_boundary::tests::test_positive_test_only_oracle_assertions_allowed ... ok
+test personality_boundary::tests::test_positive_typed_caller_values_allowed ... ok
+test personality_boundary::tests::test_negative_missing_target_cannot_fall_back_to_other_source ... FAILED
+test personality_boundary::tests::test_negative_optional_transitive_dependency_rejected ... ok
+test personality_boundary::tests::test_negative_unresolved_registry_dependency_rejected ... ok
+test personality_boundary::tests::test_positive_dev_only_dependency_allowed ... ok
+test personality_boundary::tests::test_positive_fixture_substrate_passes ... ok
+
+failures:
+
+---- personality_boundary::tests::test_negative_missing_target_cannot_fall_back_to_other_source stdout ----
+
+thread 'personality_boundary::tests::test_negative_missing_target_cannot_fall_back_to_other_source' (10700974) panicked at crates/carrick-conformance-contract/src/personality_boundary.rs:1285:9:
+a missing production target must not be replaced by src/lib.rs
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    personality_boundary::tests::test_negative_missing_target_cannot_fall_back_to_other_source
+
+test result: FAILED. 24 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-conformance-contract --lib`

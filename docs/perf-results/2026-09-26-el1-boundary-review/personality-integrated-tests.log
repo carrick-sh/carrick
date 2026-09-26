@@ -1,0 +1,137 @@
+   Compiling carrick-sched-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-sched-core)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-el1-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1-abi)
+   Compiling carrick-el1 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.06s
+     Running unittests src/lib.rs (target/debug/deps/carrick_conformance_contract-a87a7a364c0059ca)
+
+running 26 tests
+test personality_boundary::tests::test_negative_macro_rules_definition_containing_symbol_rejected ... ok
+test personality_boundary::tests::test_negative_macro_rules_definition_containing_literal_rejected ... ok
+test personality_boundary::tests::test_negative_cfg_not_test_rejected ... ok
+test personality_boundary::tests::test_negative_cfg_any_test_and_prod_feature_rejected ... ok
+test personality_boundary::tests::test_negative_cfg_feature_containing_test_word_rejected ... ok
+test personality_boundary::tests::test_negative_macro_invocation_containing_literal_rejected ... ok
+test personality_boundary::tests::test_metadata_from_another_workspace_rejected ... ok
+test personality_boundary::tests::test_negative_custom_lib_path_rejected ... ok
+test personality_boundary::tests::test_negative_direct_dependency_rejected ... ok
+test personality_boundary::tests::test_negative_missing_allowlisted_crate_rejected ... ok
+test personality_boundary::tests::test_negative_unannotated_mod_tests_filename_rejected ... ok
+test personality_boundary::tests::test_positive_annotated_mod_arbitrary_name_allowed ... ok
+test personality_boundary::tests::test_positive_cfg_all_test_and_foo_allowed ... ok
+test personality_boundary::tests::test_negative_missing_transitive_node_rejected ... ok
+test personality_boundary::tests::test_positive_prose_comments_allowed ... ok
+test personality_boundary::tests::test_positive_test_only_oracle_assertions_allowed ... ok
+test personality_boundary::tests::test_negative_no_scanned_source_files_rejected ... ok
+test personality_boundary::tests::test_positive_typed_caller_values_allowed ... ok
+test personality_boundary::tests::test_negative_target_conditioned_build_dependency_rejected ... ok
+test personality_boundary::tests::test_negative_missing_target_cannot_fall_back_to_other_source ... ok
+test personality_boundary::tests::test_negative_optional_transitive_dependency_rejected ... ok
+test personality_boundary::tests::test_inherited_test_module_and_production_filename ... ok
+test personality_boundary::tests::test_negative_renamed_alias_dependency_rejected ... ok
+test personality_boundary::tests::test_negative_unresolved_registry_dependency_rejected ... ok
+test personality_boundary::tests::test_positive_dev_only_dependency_allowed ... ok
+test personality_boundary::tests::test_positive_fixture_substrate_passes ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1-5dacaf448aea3bd0)
+
+running 46 tests
+test file::tests::test_lseek_model ... ok
+test alloc::tests::test_bump_allocator ... ok
+test inotify::tests::a_short_read_of_a_non_inotify_fd_forwards ... ok
+test file::tests::test_write_and_pwrite64_model ... ok
+test file::tests::test_extension_gap_pages_tracked_in_zero_filled_mask ... ok
+test file::tests::test_fixup_fault_interception ... ok
+test file::tests::test_read_and_pread64_model ... ok
+test file::tests::test_efault_forward_semantics ... ok
+test file::tests::test_write_extension_zeroes_hole ... ok
+test lock::tests::test_spinlock_mutual_exclusion ... ok
+test inotify::tests::a_large_read_returns_every_whole_record_that_fits ... ok
+test inotify::tests::a_spilled_instance_forwards_reads_to_the_host ... ok
+test inotify::tests::an_unwritable_buffer_forwards_without_consuming_records ... ok
+test sched::tests::a_futex_wait_switches_the_vcpu_to_another_process_in_guest ... ok
+test sched::tests::a_slice_ending_before_a_host_runnable_thread_leaves_for_the_host ... ok
+test sched::tests::a_kick_taken_at_el0_forwards ... ok
+test sched::tests::a_futex_handoff_switches_threads_in_guest_and_preserves_state ... ok
+test sched::tests::a_vcpu_in_wfi_holds_no_address_space ... ok
+test sched::tests::a_wait_with_nothing_runnable_idles_until_host_work ... ok
+test sched::tests::a_park_before_a_host_runnable_thread_leaves_for_the_host ... ok
+test sched::tests::a_raised_gate_sends_the_thread_to_its_executor ... ok
+test sched::tests::a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to ... ok
+test sched::tests::an_idle_vcpu_parks_in_wfi_after_its_spin ... ok
+test sched::tests::a_switch_without_fpsimd_save_is_detected ... ok
+test sched::tests::an_idle_vcpu_steals_a_queued_thread ... ok
+test sched::tests::an_owed_cow_invalidation_runs_before_the_install ... ok
+test sched::tests::a_wait_on_a_changed_word_returns_eagain_without_parking ... ok
+test sched::tests::a_timed_wait_ends_in_guest_with_etimedout ... ok
+test sched::tests::the_idle_entry_runs_a_queued_thread_or_leaves_for_the_host ... ok
+test sched::tests::the_idle_entry_runs_no_thread_itself ... ok
+test tests::test_dispatch_forwards_all_and_counts ... ok
+test sched::tests::the_virtual_timer_preempts_a_compute_loop ... ok
+test sched::tests::threads_of_another_process_are_not_woken ... ok
+test sched::tests::queued_threads_do_not_send_other_syscalls_to_the_host ... ok
+test sched::tests::timed_waits_this_vcpu_cannot_keep_forward ... ok
+test sched::tests::unserved_futex_operations_forward ... ok
+test tests::test_dispatch_syscall_with_regions_exit_pending_work ... ok
+test tests::test_dispatch_syscall_with_regions_entry_pending_work ... ok
+test tests::test_concurrent_dispatch_increments ... ok
+test tests::test_dispatch_syscall_with_regions_served ... ok
+test tests::test_in_guest_read_queues_in_access_and_owes_an_observed_waiter_a_wake ... ok
+test tests::test_inotify_add_watch_write_rm_watch_read_served ... ok
+test tests::test_inotify_cache_miss_forwards ... ok
+test tests::test_stale_handle_interleaving_forwards ... ok
+test tests::test_two_open_files_share_one_inode_with_independent_offsets ... ok
+test tests::test_thread_sleep_survives_task_generation_bump ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/carrick_sched_core-9210e6f3e6636aa6)
+
+running 42 tests
+test occupancy::tests::a_switched_slot_is_counted_for_the_address_space_it_runs ... ok
+test spaces::tests::a_published_space_is_granted_only_while_its_gate_is_open ... ok
+test occupancy::tests::one_vcpu_runs_one_address_space ... ok
+test spaces::tests::a_cow_publication_is_owed_until_an_install_covers_it ... ok
+test spaces::tests::colliding_keys_probe_and_freed_entries_are_skipped_then_reused ... ok
+test occupancy::tests::host_slots_are_distinct_from_zone_slots_and_reusable ... ok
+test tests::a_host_load_starts_a_fresh_slice ... ok
+test tests::a_cancelled_record_is_discarded_not_run ... ok
+test tests::a_home_record_runs_only_on_its_home_slot ... ok
+test tests::a_host_wake_queues_the_waiter_in_the_guest_directly ... ok
+test tests::a_closed_space_is_never_installed_again ... ok
+test tests::a_service_record_is_never_switched_in ... ok
+test tests::a_preempted_thread_resumes_without_a_result ... ok
+test tests::a_tick_migrates_queued_threads_to_idle_slots ... ok
+test tests::a_timeout_claims_only_the_park_that_armed_it ... ok
+test tests::claim_word_round_trips ... ok
+test tests::an_executor_sweeps_cancelled_records_and_takes_its_service_head ... ok
+test tests::arbitrary_non_linux_caller_result_propagates_on_timer_expiration ... ok
+test tests::bitsets_select_waiters ... ok
+test tests::el1_honours_affinity_for_floating_threads ... ok
+test tests::drain_slot_hands_back_queued_and_reports_the_switched_in_record ... ok
+test tests::el1_refuses_multi_entry_waiters ... ok
+test tests::el1_wake_places_a_floating_thread_on_an_idle_slot ... ok
+test tests::el1_wake_queues_on_the_slot_and_switch_in_takes_it ... ok
+test tests::el1_wakes_any_count_and_exactly_that_many ... ok
+test tests::enter_idle_refuses_wfi_with_a_queued_thread ... ok
+test tests::host_claims_parked_but_is_refused_by_el1_held ... ok
+test tests::host_placement_respects_address_spaces_and_owes_resched_sgis ... ok
+test tests::only_the_executor_still_driving_a_slot_vacates_it ... ok
+test tests::records_are_reused_with_a_new_incarnation ... ok
+test tests::requeue_moves_waiters_to_the_new_address ... ok
+test tests::relocation_moves_queued_threads_between_run_queues_without_host_ownership ... ok
+test tests::slot_ids_encode_as_plus_one_words ... ok
+test tests::stealing_takes_only_what_the_thief_may_run ... ok
+test tests::run_queue_is_unbounded_fifo_and_survives_removal_from_the_middle ... ok
+test tests::the_slot_timer_ends_a_timed_park_once ... ok
+test tests::wake_is_fifo_and_counts_only_waiters_on_the_address ... ok
+test occupancy::tests::a_pause_never_misses_a_vcpu_about_to_run_its_address_space ... ok
+test tests::concurrent_el1_wakes_and_host_claims_give_each_record_one_owner ... ok
+test tests::cross_slot_wakes_never_strand_a_thread_on_a_stopped_slot ... ok
+test tests::a_pause_never_misses_an_el1_address_space_install ... ok
+test tests::an_install_that_skips_the_gate_is_caught ... ok
+
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+

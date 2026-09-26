@@ -46,7 +46,7 @@ cargo run -p carrick-conformance-contract --bin check-personality-boundary -- --
 ### Coverage and Verification Mechanics
 
 - **Explicit Substrate Allowlist:** Configured with an allowlist initially
-  containing `carrick-sched-core`. The checker fails closed if an allowlisted
+  containing `carrick-sched-core` and `carrick-mmu-core`. The checker fails closed if an allowlisted
   crate is missing from disk or metadata, ensuring missing components are never
   reported as passing.
 - **Authoritative Resolved Cargo Dependency Graph:**
@@ -98,9 +98,8 @@ cargo run -p carrick-conformance-contract --bin check-personality-boundary -- --
 As the EL1 migration proceeds, the substrate allowlist and boundary gate will
 expand across subsystems:
 
-1. **Increment 2 (MMU Core):** Parallel memory worker is introducing
-   `carrick-mmu-core`; the director will add it to the substrate allowlist upon
-   integration.
+1. **MMU Core:** The extracted `carrick-mmu-core` is now included in the gate.
+   Live-table ownership and guest fault service remain separate memory work.
 2. **Increment 3 (Signals & Timers):** Split `carrick-signal-core` and
    `carrick-timer-core` into platform-neutral bitset/timer substrate cores and
    distinct Linux personality mappings.

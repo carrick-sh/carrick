@@ -1,0 +1,65 @@
+{
+  "sha256": "5a367550fe7eabf04f26d77653a138eb1b8eb4dd5dfdf2c30744ac65d7bf7551",
+  "results": [
+    {
+      "case": "positive",
+      "stage": "checker",
+      "exit": 0,
+      "stdout": "personality boundary checked: 1 substrate crate(s) clean\n  [PASS] crate `carrick-sched-core` (shipped deps: [], dev deps: [], scanned files: 1)\n",
+      "stderr": ""
+    },
+    {
+      "case": "not_test",
+      "stage": "checker",
+      "exit": 1,
+      "stdout": "",
+      "stderr": "substrate boundary violations detected (1 violation(s)):\n  [SRC] /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/boundary-review/not_test/crates/carrick-sched-core/src/lib.rs:2:36: crate `carrick-sched-core`: forbidden code `-110` (hard-coded Linux errno literal (-110 / ETIMEDOUT) in production substrate source)\n"
+    },
+    {
+      "case": "production_test_filename",
+      "stage": "checker",
+      "exit": 1,
+      "stdout": "",
+      "stderr": "substrate boundary violations detected (1 violation(s)):\n  [SRC] /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/boundary-review/production_test_filename/crates/carrick-sched-core/src/tests.rs:1:25: crate `carrick-sched-core`: forbidden code `-110` (hard-coded Linux errno literal (-110 / ETIMEDOUT) in production substrate source)\n"
+    },
+    {
+      "case": "macro",
+      "stage": "checker",
+      "exit": 1,
+      "stdout": "",
+      "stderr": "substrate boundary violations detected (1 violation(s)):\n  [SRC] /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/boundary-review/macro/crates/carrick-sched-core/src/lib.rs:1:29: crate `carrick-sched-core`: forbidden code `-110_i64 inside macro_rules` (forbidden literal inside macro definition/invocation)\n"
+    },
+    {
+      "case": "missing_path",
+      "stage": "cargo-metadata",
+      "exit": 101,
+      "stderr": "error: failed to load manifest for workspace member `/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/boundary-review/missing_path/crates/carrick-sched-core`\nreferenced by workspace at `/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/boundary-review/missing_path/Cargo.toml`\n\nCaused by:\n  failed to load manifest for dependency `helper`\n\nCaused by:\n  failed to read `/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/boundary-review/missing_path/crates/missing/Cargo.toml`\n\nCaused by:\n  No such file or directory (os error 2)\n"
+    },
+    {
+      "case": "direct_forbidden",
+      "stage": "cargo-metadata",
+      "exit": 101,
+      "stderr": "error: no matching package named `carrick-abi` found\nlocation searched: crates.io index\nrequired by package `carrick-sched-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/boundary-review/direct_forbidden/crates/carrick-sched-core)`\nnote: offline mode (via `--offline`) can sometimes cause surprising resolution failures\nhelp: if this error is too confusing you may wish to retry without `--offline`\n"
+    },
+    {
+      "case": "custom_lib_path",
+      "stage": "checker",
+      "exit": 1,
+      "stdout": "",
+      "stderr": "substrate boundary violations detected (1 violation(s)):\n  [SRC] /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/boundary-review-round2/custom_lib_path/crates/carrick-sched-core/kernel.rs:1:22: crate `carrick-sched-core`: forbidden code `-110` (hard-coded Linux errno literal (-110 / ETIMEDOUT) in production substrate source)\n"
+    },
+    {
+      "case": "optional_transitive",
+      "stage": "checker",
+      "exit": 1,
+      "stdout": "",
+      "stderr": "substrate boundary violations detected (1 violation(s)):\n  [DEP] crate `carrick-sched-core` reaches forbidden personality crate `carrick-abi` via normal edge: carrick-sched-core -> bridge -> carrick-abi\n"
+    },
+    {
+      "case": "unresolved_registry",
+      "stage": "cargo-metadata",
+      "exit": 101,
+      "stderr": "error: no matching package named `unknown_bridge` found\nlocation searched: crates.io index\nrequired by package `carrick-sched-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/boundary-review-round2/unresolved_registry/crates/carrick-sched-core)`\nnote: offline mode (via `--offline`) can sometimes cause surprising resolution failures\nhelp: if this error is too confusing you may wish to retry without `--offline`\n"
+    }
+  ]
+}

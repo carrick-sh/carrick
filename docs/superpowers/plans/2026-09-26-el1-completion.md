@@ -258,3 +258,28 @@ Later test groups and integration tests were not reached; this is not CI green.
 The complete transcript is `docs/perf-results/2026-09-26-el1-first-touch/mmu-integrated-ci.log`.
 The red remains unchanged while the isolated live-table worker implements the
 shared storage authority.
+
+### Scheduler personality split and mechanical gate
+
+The reviewed scheduler split and checker are integrated as `26f104341` and
+`1bc6c8900`. The substrate accepts the timeout result from its Linux caller;
+both EL1 callsites still supply the existing -110 result. Three worker review
+rounds were required. Director review then replaced three scratch-dependent
+skipping tests with hermetic fixtures and proved two additional failures red
+first: missing target fallback and metadata from another workspace. Both are
+now rejected. The production checker consumes freshly generated locked/offline
+all-feature Cargo metadata, follows normal/build graph edges, and audits Cargo
+target source roots. The superseded lockfile/name-only walk is gone.
+
+Enforcement now covers `carrick-sched-core` and `carrick-mmu-core`. Integrated
+verification: 26 boundary tests, 46 EL1 tests and 42 scheduler tests passed;
+targeted all-target Clippy and CLI/embed test compilation passed. The real gate
+reports empty scheduler dependencies and MMU hashbrown/foldhash dependencies,
+with carrick-mem explicitly dev-only. Raw review and integrated receipts are in
+`docs/perf-results/2026-09-26-el1-boundary-review/`. The known-pattern source
+ratchet does not expand procedural macros or prove arbitrary encoded semantics.
+
+This is one personality-boundary increment, not migration completion. Signal,
+timer, VFS and other substrate/personality separation, live memory authority,
+signed gates, paired workloads and all later stages remain open. The initial
+snapshot and signed first-touch witnesses remain unmodified and unresolved.

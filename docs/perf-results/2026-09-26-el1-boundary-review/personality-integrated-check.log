@@ -1,0 +1,105 @@
+   Compiling syn v2.0.117
+    Checking carrick-sched-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-sched-core)
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1-image)
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling const_format_proc_macros v0.2.34
+    Checking carrick-el1-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1-abi)
+    Checking carrick-el1 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1)
+    Checking const_format v0.2.36
+   Compiling synstructure v0.13.2
+   Compiling pest_generator v2.8.6
+   Compiling darling_core v0.20.11
+   Compiling proc-macro-error2 v2.0.1
+   Compiling serde_derive v1.0.228
+   Compiling zerovec-derive v0.11.3
+   Compiling zerocopy-derive v0.8.48
+   Compiling displaydoc v0.2.5
+   Compiling tokio-macros v2.7.0
+   Compiling tracing-attributes v0.1.31
+   Compiling scroll_derive v0.13.1
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+    Checking tokio v1.52.3
+   Compiling pest_derive v2.8.6
+    Checking scroll v0.13.0
+   Compiling futures-macro v0.3.32
+    Checking goblin v0.10.5
+   Compiling dtrace-parser v0.3.0
+    Checking zerofrom v0.1.8
+    Checking tracing v0.1.44
+    Checking yoke v0.8.2
+   Compiling getset v0.1.6
+    Checking futures-util v0.3.32
+    Checking zerocopy v0.8.48
+   Compiling strum_macros v0.27.2
+    Checking zerovec v0.11.6
+    Checking zerotrie v0.2.4
+   Compiling clap_derive v4.6.1
+   Compiling darling_macro v0.20.11
+    Checking tracing-subscriber v0.3.23
+    Checking tinystr v0.8.3
+    Checking potential_utf v0.1.5
+    Checking icu_collections v2.2.0
+    Checking icu_locale_core v2.2.0
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+    Checking icu_provider v2.2.0
+    Checking serde v1.0.228
+    Checking icu_properties v2.2.0
+    Checking icu_normalizer v2.2.0
+   Compiling serde_repr v0.1.20
+    Checking serde_urlencoded v0.7.1
+   Compiling serde_tokenstream v0.2.3
+   Compiling usdt-impl v0.6.0
+    Checking clap v4.6.1
+   Compiling derive_builder_macro v0.20.2
+    Checking olpc-cjson v0.1.4
+    Checking chrono v0.4.44
+    Checking jwt v0.16.0
+    Checking toml_datetime v0.6.11
+    Checking serde_spanned v0.6.9
+    Checking bollard-stubs v1.47.1-rc.27.3.1
+    Checking derive_builder v0.20.2
+    Checking toml_edit v0.22.27
+    Checking idna_adapter v1.2.2
+    Checking oci-spec v0.8.4
+   Compiling usdt-macro v0.6.0
+   Compiling usdt-attr-macro v0.6.0
+    Checking idna v1.1.0
+    Checking hyper v1.9.0
+    Checking tokio-rustls v0.26.4
+    Checking url v2.5.8
+    Checking tower v0.5.3
+    Checking tokio-util v0.7.18
+    Checking hickory-proto v0.26.1
+    Checking tower-http v0.6.10
+    Checking hyper-util v0.1.20
+    Checking carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-abi)
+    Checking carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-guest-mem)
+    Checking dof v0.4.0
+    Checking toml v0.8.23
+    Checking usdt v0.6.0
+    Checking hyper-rustls v0.27.9
+    Checking hyperlocal v0.9.1
+    Checking reqwest v0.12.28
+    Checking oci-client v0.15.0
+    Checking carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-signal-core)
+    Checking carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+    Checking carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-timer-core)
+    Checking carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-observability)
+    Checking carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-spec)
+    Checking carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-image)
+    Checking bollard v0.18.1
+    Checking carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-hal)
+    Checking carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host-bsd)
+    Checking carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-thread)
+    Checking carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vfs)
+    Checking carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-aarch64)
+    Checking carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-conformance-contract)
+    Checking carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+    Checking carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+    Checking carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+    Checking carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-engine)
+    Checking carrick-embed v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-embed)
+    Checking carrick-cli v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 21.53s
