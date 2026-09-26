@@ -9877,7 +9877,10 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let transport = CarrierForeignMmTransport::new();
-    let root = 0x9a00_7800_0000;
+    let pool = Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        1,
+    ));
+    let root = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
     let root_slot = (root, 0x20_0000_u64);
     let data_ipa = 0x9b00_7800_0000;
     let ext_ipa = 0x9a00_7820_0000;
@@ -9885,16 +9888,16 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     installed.owners.0.push((ext_ipa, 4096));
 
     // 1. Install real pooled root structural owner in custody and state
-    let root_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-        root_slot.1 as usize,
-        crate::host_mapping::HostMappingKind::PerMmKernelState,
-    )
-    .expect("root test mapping");
+    let root_mapping = pool.allocate_slot_at(root).expect("allocate pooled root");
+    let original_host = root_mapping.as_mut_ptr();
     let root_epoch = next_structural_epoch().expect("root structural epoch");
-    let root_lease = GlobalFrameStage2Lease::fixed(root_slot.0, root_slot.1);
-    let root_owner = StructuralBackingOwner::new(
+    let mut root_lease = GlobalFrameStage2Lease::fixed(root_slot.0, root_slot.1);
+    root_lease.mark_mapped();
+    let root_owner = StructuralBackingOwner::new_pooled_root_in(
+        &transport.custody,
         root_mapping,
         root_lease,
+        3,
         root_epoch,
         root_slot.0,
         root_slot.1 as usize,
@@ -9947,10 +9950,30 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     assert!(resolver.retained_owners.read().contains_key(&ext_ipa));
 
     // 3. Exercise real pooled-root retirement path: retire_mm_root_stage2_in -> release_pooled_root_slot
+    let table_authority = installed.state.page_tables_authority();
+    let mut saw_unmap = false;
+    let mut retirement_excluded_access = false;
     let retired_root = installed
         .state
-        .retire_mm_root_stage2_in(&transport.custody, root_slot)
+        .retire_mm_root_stage2_in_using(&transport.custody, root_slot, &mut |_, _| {
+            saw_unmap = true;
+            retirement_excluded_access = table_authority.try_with_manager_until(
+                std::time::Instant::now(),
+                "busy",
+                "absent",
+                |_| Ok(()),
+            ) == Err("busy");
+            Ok(())
+        })
         .expect("retire pooled root slot via real path");
+    assert!(
+        saw_unmap,
+        "retirement must exercise the injected backend boundary"
+    );
+    assert!(
+        retirement_excluded_access,
+        "root retirement released the page-table access guard before retiring backing"
+    );
     assert_eq!(retired_root.proof.root_slot_base(), root_slot.0);
     assert_eq!(retired_root.proof.root_slot_size(), root_slot.1);
     assert!(
@@ -9969,16 +9992,22 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     );
 
     // 4. Same-slot reissue with new generation and structural authority
-    let root_mapping2 = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-        root_slot.1 as usize,
-        crate::host_mapping::HostMappingKind::PerMmKernelState,
-    )
-    .expect("root test mapping 2");
+    let root_mapping2 = pool
+        .allocate_slot_at(root)
+        .expect("reissue same pooled root");
+    assert_eq!(
+        root_mapping2.as_mut_ptr(),
+        original_host,
+        "actual slot backing is reused"
+    );
     let root_epoch2 = next_structural_epoch().expect("root structural epoch 2");
-    let root_lease2 = GlobalFrameStage2Lease::fixed(root_slot.0, root_slot.1);
-    let root_owner2 = StructuralBackingOwner::new(
+    let mut root_lease2 = GlobalFrameStage2Lease::fixed(root_slot.0, root_slot.1);
+    root_lease2.mark_test_mapped_without_backend();
+    let root_owner2 = StructuralBackingOwner::new_pooled_root_in(
+        &transport.custody,
         root_mapping2,
         root_lease2,
+        3,
         root_epoch2,
         root_slot.0,
         root_slot.1 as usize,
@@ -10011,14 +10040,10 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
         "resolver cache must be updated to new reissued owner generation"
     );
 
-    // 5. Interval after lookup and before access:
-    // When a caller retrieves a valid pointer:
-    let looked_up_ptr = resolver.host_ptr_for_base(root);
-    assert!(looked_up_ptr.is_some());
-    // In production execution:
-    // - Descriptor loads/stores occur under the Stage1Authority inner lock / task vCPU lease.
-    // - Root retirement requires CarrierVmCustody and task quiescence (execve/exit/detach).
-    // If retirement occurs during a quiescence transition:
+    // 5. A new lookup rejects a retired owner. This is deliberately only a
+    // re-lookup control: it does not prove access/retirement exclusion for a
+    // pointer returned before retirement, even though the slot stays mapped.
+    assert!(resolver.host_ptr_for_base(root).is_some());
     root_owner2
         .retained
         .owner_retired

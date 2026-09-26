@@ -1,0 +1,94 @@
+   Compiling memchr v2.8.0
+   Compiling ucd-trie v0.1.7
+   Compiling proc-macro2 v1.0.106
+    Checking bitflags v2.11.1
+   Compiling serde_core v1.0.228
+    Checking once_cell v1.21.4
+   Compiling zmij v1.0.21
+    Checking errno v0.3.14
+   Compiling libc v0.2.186
+    Checking unicode-ident v1.0.24
+   Compiling itoa v1.0.18
+    Checking typenum v1.20.0
+    Checking rustix v1.1.4
+    Checking getrandom v0.3.4
+   Compiling pest v2.8.6
+   Compiling quote v1.0.45
+    Checking fastrand v2.4.1
+   Compiling syn v2.0.117
+   Compiling syn v3.0.3
+   Compiling thread-id v5.1.0
+   Compiling byteorder v1.5.0
+    Checking mach2 v0.6.0
+    Checking generic-array v0.14.7
+    Checking serde_json v1.0.149
+    Checking pretty-hex v0.4.2
+    Checking tempfile v3.27.0
+    Checking carrick-kernel-arena v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-kernel-arena)
+    Checking carrick-host v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-host)
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking cpufeatures v0.2.17
+    Checking carrick-portable v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-portable)
+    Checking digest v0.10.7
+    Checking memmap2 v0.9.10
+    Checking utf8parse v0.2.2
+    Checking sha2 v0.10.9
+    Checking tracing-core v0.1.36
+    Checking anstyle-parse v1.0.0
+    Checking anstyle v1.0.14
+    Checking is_terminal_polyfill v1.70.2
+    Checking pin-project-lite v0.2.17
+    Checking colorchoice v1.0.5
+    Checking anstyle-query v1.1.5
+    Checking clap_lex v1.1.0
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-host-bsd)
+   Compiling pest_meta v2.8.6
+    Checking anstream v1.0.0
+    Checking strsim v0.11.1
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-vmm-hvf)
+    Checking applevisor-sys v1.0.0
+    Checking clap_builder v4.6.0
+    Checking hashbrown v0.17.1
+    Checking equivalent v1.0.2
+    Checking winnow v0.7.15
+    Checking applevisor v1.0.0
+    Checking toml_write v0.1.2
+    Checking indexmap v2.14.0
+   Compiling thiserror-impl v2.0.20
+    Checking thiserror v2.0.20
+   Compiling pest_generator v2.8.6
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling scroll_derive v0.13.1
+   Compiling tracing-attributes v0.1.31
+   Compiling clap_derive v4.6.1
+   Compiling pest_derive v2.8.6
+   Compiling dtrace-parser v0.3.0
+    Checking scroll v0.13.0
+    Checking tracing v0.1.44
+    Checking goblin v0.10.5
+    Checking zerocopy v0.8.48
+    Checking clap v4.6.1
+    Checking serde v1.0.228
+    Checking serde_spanned v0.6.9
+    Checking toml_datetime v0.6.11
+   Compiling usdt-impl v0.6.0
+   Compiling serde_tokenstream v0.2.3
+    Checking toml_edit v0.22.27
+   Compiling usdt-macro v0.6.0
+   Compiling usdt-attr-macro v0.6.0
+    Checking toml v0.8.23
+    Checking carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-abi)
+    Checking carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-guest-mem)
+    Checking dof v0.4.0
+    Checking usdt v0.6.0
+    Checking carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-timer-core)
+    Checking carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+    Checking carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-signal-core)
+    Checking carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-observability)
+    Checking carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-hal)
+    Checking carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-aarch64)
+    Checking carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-thread)
+    Checking carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-conformance-contract)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.49s
