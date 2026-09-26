@@ -1342,7 +1342,8 @@
       "contracts": [
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
-        "kernel.el1.guest-scheduler"
+        "kernel.el1.guest-scheduler",
+        "kernel.mm.address-space-occupancy"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -2951,6 +2952,7 @@
       "authority": "hybrid",
       "contracts": [
         "kernel.el1.zone-entry-at-open",
+        "kernel.mm.address-space-occupancy",
         "kernel.mm.backing-maintenance-lookup",
         "kernel.mm.current-read-reuse",
         "kernel.mm.native-data-activation",
@@ -3029,6 +3031,7 @@
         "kernel.fork.filetable",
         "kernel.fork.mappings",
         "kernel.fork.stage1-image",
+        "kernel.mm.address-space-occupancy",
         "kernel.mm.anonymous-discard-fork-reuse"
       ],
       "claims": [
@@ -3048,6 +3051,7 @@
         "kernel.el1.futex-handoff",
         "kernel.el1.guest-run-queue",
         "kernel.el1.guest-scheduler",
+        "kernel.mm.address-space-occupancy",
         "kernel.time.realtime-calibration"
       ],
       "claims": [],
@@ -3065,6 +3069,7 @@
       "contracts": [
         "kernel.el1.zone-entry-at-open",
         "kernel.fork.mappings",
+        "kernel.mm.address-space-occupancy",
         "kernel.mm.backing-maintenance-lookup",
         "kernel.mm.pt-pause-drain-acknowledgement",
         "kernel.mm.retained-fragment-query",
@@ -3121,6 +3126,7 @@
       "handler": "memory",
       "authority": "hybrid",
       "contracts": [
+        "kernel.mm.address-space-occupancy",
         "kernel.mm.current-read-reuse",
         "kernel.mm.native-data-activation",
         "kernel.mm.pt-pause-drain-acknowledgement"
@@ -3216,6 +3222,7 @@
       "handler": "memory",
       "authority": "hybrid",
       "contracts": [
+        "kernel.mm.address-space-occupancy",
         "kernel.mm.anonymous-discard",
         "kernel.mm.anonymous-discard-edges",
         "kernel.mm.anonymous-discard-fork-reuse",
