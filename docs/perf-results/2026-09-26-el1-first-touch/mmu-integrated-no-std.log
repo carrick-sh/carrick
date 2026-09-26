@@ -1,0 +1,4 @@
+    Checking foldhash v0.1.5
+    Checking hashbrown v0.15.5
+    Checking carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mmu-core)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.34s

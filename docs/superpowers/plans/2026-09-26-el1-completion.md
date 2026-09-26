@@ -231,3 +231,15 @@ This is portability groundwork only. The live snapshot witness and signed
 first-touch witness remain red. Live backing authority is the next bounded
 implementation; full CI, signed promotion, paired workloads and the remaining
 end-to-end stages are still open.
+
+At `d500a98ae`, integrated `just lint-domains` exited zero after inventory
+reconciliation. Its host-authority census explicitly remains partial: Linux,
+FreeBSD and NetBSD CLI/runtime profiles are pending. The EL1 and EL1 ABI library
+tests also passed (46 + 19). The corresponding MMU integration logs are preserved
+under `docs/perf-results/2026-09-26-el1-first-touch/mmu-integrated-*.log`.
+
+The live-table worker is running from `89c9fc55a` in the reused, isolated MMU
+worktree, preserving the failing snapshot witness. Personality review round 2
+requires resolved Cargo graph traversal: a path-only manifest walk cannot prove
+registry or Git transitive closure. Both are implementation work in progress;
+neither grants EL1 memory acceptance.

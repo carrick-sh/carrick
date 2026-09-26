@@ -1,0 +1,23 @@
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 28.46s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-0cfb194c69762993)
+
+running 5 tests
+test vcpu_loop::memory::tests::native_buffers::current_read_reuse_cost_contract ... ok
+test vcpu_loop::memory::tests::native_buffers::current_read_window_observes_changed_bytes_and_rejects_other_ranges_and_leases ... ok
+test vcpu_loop::memory::tests::native_buffers::current_read_window_rechecks_live_carrier_authorities ... ok
+test vcpu_loop::memory::tests::native_buffers::current_read_window_rejects_vma_revocation_and_cow_replacement ... ok
+test vcpu_loop::memory::tests::native_buffers::current_read_window_uses_live_leaf_after_guest_publication ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 626 filtered out; finished in 0.32s
+
