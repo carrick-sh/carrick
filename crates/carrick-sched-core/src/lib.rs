@@ -608,6 +608,10 @@ pub struct ZoneSlot {
     /// An executor drives this slot's vCPU (set when the host first loads or
     /// enters it): the host may queue a thread that needs its executor here.
     live: AtomicU32,
+    /// Host only: the executor that last published this slot (0: none). A
+    /// slot follows its mailbox lease, which a task can carry from one
+    /// executor to another; only the executor still driving it may vacate it.
+    driver: AtomicU64,
 }
 
 impl ZoneSlot {
@@ -1123,6 +1127,32 @@ impl ZoneTables {
         Some(record)
     }
 
+    /// The executor of `slot` is back from a blocking host wait: placements
+    /// may choose its slot again.
+    pub fn revive_slot(&self, slot: SlotId) {
+        if let Some(_guard) = self.slot_lock(slot, &SpinForever) {
+            self.slot(slot).live.store(1, Ordering::Release);
+        }
+    }
+
+    /// Queue the host-owned `record` back on `slot`, whether or not the slot
+    /// is live: a service thread no other slot will take waits for this
+    /// slot's executor.
+    pub fn requeue_on(&self, slot: SlotId, record: RecordId) -> bool {
+        let rec = self.record(record);
+        let Claim::Host { seq } = rec.claim() else {
+            return false;
+        };
+        let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+            return false;
+        };
+        if !rec.cas(Claim::Host { seq }, Claim::Queued { slot, seq }) {
+            return false;
+        }
+        self.push_locked(&guard, record, None);
+        true
+    }
+
     /// The executor of `slot` is about to wait on the host with its vCPU
     /// stopped (a spare with no guest CPU to run): it stops taking threads
     /// (no placement chooses it), and every thread queued there leaves:
@@ -1139,6 +1169,47 @@ impl ZoneTables {
         if let Some(_guard) = self.slot_lock(slot, &SpinForever) {
             s.live.store(0, Ordering::Release);
         }
+        self.vacate(slot, take, placed);
+    }
+
+    /// Record that executor `driver` publishes `slot` (it loaded a thread
+    /// there, or waits in the guest on it).
+    pub fn set_driver(&self, slot: SlotId, driver: u64) {
+        self.slot(slot).driver.store(driver, Ordering::Release);
+    }
+
+    /// Executor `driver` stopped driving `slot` (the mailbox lease went with
+    /// the task it unloaded): if nobody took the slot over since, it stops
+    /// taking threads and its queue leaves as for [`Self::retire_slot`].
+    /// False if another executor drives it now.
+    pub fn leave_slot(
+        &self,
+        slot: SlotId,
+        driver: u64,
+        take: &mut impl FnMut(RecordId),
+        placed: &mut impl FnMut(HostPlacement),
+    ) -> bool {
+        let s = self.slot(slot);
+        {
+            let Some(_guard) = self.slot_lock(slot, &SpinForever) else {
+                return false;
+            };
+            if s.driver.load(Ordering::Acquire) != driver || s.state().in_guest() {
+                return false;
+            }
+            s.live.store(0, Ordering::Release);
+            s.driver.store(0, Ordering::Release);
+        }
+        self.vacate(slot, take, placed);
+        true
+    }
+
+    fn vacate(
+        &self,
+        slot: SlotId,
+        take: &mut impl FnMut(RecordId),
+        placed: &mut impl FnMut(HostPlacement),
+    ) {
         // Threads ready at EL0 move straight to other slots; what stays needs
         // an executor (a service thread, or one the host asked for).
         let _ = self.relocate(

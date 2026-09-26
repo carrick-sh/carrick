@@ -143,6 +143,9 @@ impl HostWaitToken<'_> {
                     });
                 self.queue.changed.notify_all();
                 drop(state);
+                if let Some(kick) = self.executors.kick_of(self.registration.id) {
+                    kick.host_wait_ended();
+                }
 
                 let thread_id = SchedThreadId::new(self.binding.thread.serial.raw());
                 let dispatch_ctx = DispatchContext {
@@ -334,7 +337,7 @@ impl Scheduler {
         lease: &'a ThreadExecutionLease,
         registration: &ExecutorRegistration,
     ) -> Result<HostWaitToken<'a>, SchedulerError> {
-        let _transition = self.generation_transition.lock();
+        let transition = self.generation_transition.lock();
         self.executors.authenticate(registration)?;
         let thread = self
             .kernel
@@ -419,6 +422,13 @@ impl Scheduler {
             kind: SchedulingEventKind::Stop(SchedulingStopReason::HostWait),
         });
         self.recompute_demand();
+        drop(transition);
+        // Outside every scheduler lock: the executor moves the threads queued
+        // on its stopped vCPU elsewhere, which may hand some back to their
+        // host continuations.
+        if let Some(kick) = self.executors.kick_of(registration.id) {
+            kick.host_wait_began();
+        }
         Ok(HostWaitToken {
             queue: Arc::clone(&self.queue.inner),
             executors: Arc::clone(&self.executors),

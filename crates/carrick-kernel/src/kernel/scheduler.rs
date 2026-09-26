@@ -146,6 +146,14 @@ pub trait ExecutorKick: Send + Sync + std::fmt::Debug {
     /// there for work (EL1 plan 1d: an idle executor waits in the guest's
     /// scheduler, not on a host condvar), so it re-reads its control state.
     fn wake_from_guest_idle(&self) {}
+
+    /// The executor entered a blocking inline host wait (its guest CPU is
+    /// lent for the duration): nothing may wait on its stopped vCPU.
+    fn host_wait_began(&self) {}
+
+    /// The executor's blocking inline host wait ended and it has its guest
+    /// CPU back.
+    fn host_wait_ended(&self) {}
 }
 
 pub trait DiscardRecorder: Send + Sync {
@@ -659,15 +667,17 @@ impl ExecutorDirectory {
     }
 
     fn wake_guest_idle_executor(&self, executor: ExecutorId) {
-        let kick = self
-            .state
+        if let Some(kick) = self.kick_of(executor) {
+            kick.wake_from_guest_idle();
+        }
+    }
+
+    fn kick_of(&self, executor: ExecutorId) -> Option<Arc<dyn ExecutorKick>> {
+        self.state
             .lock()
             .entries
             .get(&executor)
-            .map(|entry| Arc::clone(&entry.kick));
-        if let Some(kick) = kick {
-            kick.wake_from_guest_idle();
-        }
+            .map(|entry| Arc::clone(&entry.kick))
     }
 }
 

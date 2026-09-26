@@ -424,6 +424,19 @@ impl ExecutorKick for WorkerKick {
         *self.binding.lock()
     }
 
+    fn host_wait_began(&self) {
+        // The hooks run on the executor's own thread, inside its quantum.
+        if let Some(slot) = super::backend::driven_zone_slot() {
+            carrick_kernel::el1_zone::park_slot_for_host_wait(slot);
+        }
+    }
+
+    fn host_wait_ended(&self) {
+        if let Some(slot) = super::backend::driven_zone_slot() {
+            carrick_kernel::el1_zone::revive_slot(slot);
+        }
+    }
+
     fn wake_from_guest_idle(&self) {
         if self.guest_idle.load(Ordering::SeqCst)
             && let Some(hardware) = self.hardware.lock().as_ref()

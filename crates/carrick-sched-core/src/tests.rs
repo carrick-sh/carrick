@@ -1147,3 +1147,33 @@ fn a_host_load_starts_a_fresh_slice() {
     assert!(zone.reset_slot(SLOT));
     assert_eq!(zone.slot(SLOT).queued_since(), 0);
 }
+
+/// A slot follows its mailbox lease, which a task carries between executors:
+/// the executor that stopped driving a slot vacates it (its queue leaves,
+/// no placement chooses it), unless another executor drives it now.
+#[test]
+fn only_the_executor_still_driving_a_slot_vacates_it() {
+    let zone = zone();
+    enter(&zone, OTHER, 1);
+    enter(&zone, SLOT, 0);
+    zone.set_driver(SLOT, 7);
+    let service = service_record(&zone, 5);
+    zone.leave_guest(SLOT, &HostWait);
+    zone.leave_guest(OTHER, &HostWait);
+    zone.enter_guest(OTHER);
+    // Queue a service thread on SLOT directly (its executor was about to take
+    // it when its lease moved away).
+    assert!(zone.requeue_on(SLOT, service));
+    let mut taken = Vec::new();
+    let mut placed = Vec::new();
+    // Another executor drives the slot now: nothing happens.
+    zone.set_driver(SLOT, 9);
+    assert!(!zone.leave_slot(SLOT, 7, &mut |r| taken.push(r), &mut |p| placed.push(p)));
+    assert_eq!(zone.runnable_head(SLOT), Some(service));
+    // The executor still driving it leaves: the queue goes, the slot is
+    // no longer live for placements.
+    assert!(zone.leave_slot(SLOT, 9, &mut |r| taken.push(r), &mut |p| placed.push(p)));
+    assert_eq!(taken, [service]);
+    assert_eq!(zone.runnable_head(SLOT), None);
+    assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(OTHER));
+}
