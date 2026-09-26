@@ -374,6 +374,19 @@ impl Stage1Authority {
         self.inner.lock().manager.as_ref().map(f)
     }
 
+    /// Exclude descriptor access while retiring its physical backing.
+    ///
+    /// Unlike `with_manager`, the callback also runs when no image is installed:
+    /// abandoned publication may still own backing that needs retirement. The
+    /// callback must not re-enter this authority.
+    pub fn with_retirement_exclusion<R>(
+        &self,
+        f: impl FnOnce(Option<&PageTableManager>) -> R,
+    ) -> R {
+        let inner = self.inner.lock();
+        f(inner.manager.as_ref())
+    }
+
     /// Execute a closure with a reference to the inner `PageTableManager` if acquired before deadline.
     pub fn try_with_manager_until<F, R, E>(
         &self,

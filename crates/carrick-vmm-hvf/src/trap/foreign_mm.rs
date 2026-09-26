@@ -773,88 +773,103 @@ impl MmAccessState {
         custody: &CarrierVmCustody,
         expected_root_slot: (u64, u64),
     ) -> Result<RetiredMmRootStage2, TrapError> {
-        let mut slot = self.mm_root_stage2.lock();
-        let authority = slot.as_ref().ok_or_else(|| {
-            TrapError::Hypervisor(format!(
-                "stage-1 root slot ({:#x}, {:#x}) has no exact structural stage-2 authority",
-                expected_root_slot.0, expected_root_slot.1
-            ))
-        })?;
-        if authority.root_slot != expected_root_slot {
-            return Err(TrapError::Hypervisor(format!(
-                "stage-1 root retirement coordinates mismatch: expected=({:#x}, {:#x}) authority=({:#x}, {:#x})",
-                expected_root_slot.0,
-                expected_root_slot.1,
-                authority.root_slot.0,
-                authority.root_slot.1
-            )));
-        }
-        if authority.owner.record_identity() != authority.record_identity
-            || (authority.owner.physical_ipa, authority.owner.physical_size)
-                != authority.physical_extent
-        {
-            return Err(TrapError::Hypervisor(
-                "stage-1 root structural owner identity drifted before retirement".to_owned(),
-            ));
-        }
-
-        let copied_bytes = self
-            .page_tables
-            .read()
-            .with_manager(|m| m.copied_bytes())
-            .unwrap_or(0);
-        authority
-            .owner
-            .record_populated_prefix(copied_bytes as usize);
-
-        authority
-            .owner
-            .retained
-            .owner_retired
-            .store(true, std::sync::atomic::Ordering::Release);
-        retry_structural_backing_identities_in_using(
+        self.retire_mm_root_stage2_in_using(
             custody,
-            &[authority.record_identity],
+            expected_root_slot,
             &mut unmap_global_frame_stage2_record,
-            &mut release_retired_stage2_ipa,
-        )?;
-        if let Some(snapshot) = custody.stage2_record_snapshot(authority.record_identity.record_id)
-        {
-            return Err(TrapError::Hypervisor(format!(
-                "stage-1 root structural record remained nonterminal: {snapshot:?}"
-            )));
-        }
-        // The record is terminal: the runtime may reissue this root slot the
-        // moment it holds the proof below, so a pooled slot goes back to the
-        // pool here rather than at the last `Arc` drop of the retained mapping.
-        authority.owner.release_pooled_root_slot();
+        )
+    }
 
-        let authority = slot.take().unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvpatch::mm_authority",
-                "stage-1 root authority disappeared before retirement completion: root_slot=(0x{:x}, 0x{:x})",
-                expected_root_slot.0,
-                expected_root_slot.1
-            );
-        });
-        let key = authority.physical_extent;
-        let owner = InventoryStage2OwnerIdentity {
-            host_addr: authority.owner.ptr() as usize,
-            generation: authority.owner.epoch().raw(),
-        };
-        let mut structural_owners = self.structural_owners.write();
-        if structural_owners
-            .get(&key)
-            .is_some_and(|owner| std::sync::Arc::ptr_eq(owner, &authority.owner))
-        {
-            structural_owners.remove(&key);
-        }
-        Ok(RetiredMmRootStage2 {
-            proof: HvpatchMmRootRetirementProof {
-                root_slot: expected_root_slot,
-            },
-            physical_extent: key,
-            owner,
+    fn retire_mm_root_stage2_in_using(
+        &self,
+        custody: &CarrierVmCustody,
+        expected_root_slot: (u64, u64),
+        unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    ) -> Result<RetiredMmRootStage2, TrapError> {
+        let mut slot = self.mm_root_stage2.lock();
+        // Keep the authority identity and its descriptor-access guard alive
+        // through backend retirement and pool release. A cached owner Arc keeps
+        // storage resident, but does not stop a pooled slot being reissued.
+        let page_tables = self.page_tables.read();
+        page_tables.with_retirement_exclusion(|manager| {
+            let authority = slot.as_ref().ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "stage-1 root slot ({:#x}, {:#x}) has no exact structural stage-2 authority",
+                    expected_root_slot.0, expected_root_slot.1
+                ))
+            })?;
+            if authority.root_slot != expected_root_slot {
+                return Err(TrapError::Hypervisor(format!(
+                    "stage-1 root retirement coordinates mismatch: expected=({:#x}, {:#x}) authority=({:#x}, {:#x})",
+                    expected_root_slot.0,
+                    expected_root_slot.1,
+                    authority.root_slot.0,
+                    authority.root_slot.1
+                )));
+            }
+            if authority.owner.record_identity() != authority.record_identity
+                || (authority.owner.physical_ipa, authority.owner.physical_size)
+                    != authority.physical_extent
+            {
+                return Err(TrapError::Hypervisor(
+                    "stage-1 root structural owner identity drifted before retirement".to_owned(),
+                ));
+            }
+
+            let copied_bytes = manager.map_or(0, |m| m.copied_bytes());
+            authority
+                .owner
+                .record_populated_prefix(copied_bytes as usize);
+
+            authority
+                .owner
+                .retained
+                .owner_retired
+                .store(true, std::sync::atomic::Ordering::Release);
+            retry_structural_backing_identities_in_using(
+                custody,
+                &[authority.record_identity],
+                unmap,
+                &mut release_retired_stage2_ipa,
+            )?;
+            if let Some(snapshot) = custody.stage2_record_snapshot(authority.record_identity.record_id)
+            {
+                return Err(TrapError::Hypervisor(format!(
+                    "stage-1 root structural record remained nonterminal: {snapshot:?}"
+                )));
+            }
+            // The record is terminal: the runtime may reissue this root slot the
+            // moment it holds the proof below, so a pooled slot goes back to the
+            // pool here rather than at the last `Arc` drop of the retained mapping.
+            authority.owner.release_pooled_root_slot();
+
+            let authority = slot.take().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "stage-1 root authority disappeared before retirement completion: root_slot=(0x{:x}, 0x{:x})",
+                    expected_root_slot.0,
+                    expected_root_slot.1
+                );
+            });
+            let key = authority.physical_extent;
+            let owner = InventoryStage2OwnerIdentity {
+                host_addr: authority.owner.ptr() as usize,
+                generation: authority.owner.epoch().raw(),
+            };
+            let mut structural_owners = self.structural_owners.write();
+            if structural_owners
+                .get(&key)
+                .is_some_and(|owner| std::sync::Arc::ptr_eq(owner, &authority.owner))
+            {
+                structural_owners.remove(&key);
+            }
+            Ok(RetiredMmRootStage2 {
+                proof: HvpatchMmRootRetirementProof {
+                    root_slot: expected_root_slot,
+                },
+                physical_extent: key,
+                owner,
+            })
         })
     }
 
