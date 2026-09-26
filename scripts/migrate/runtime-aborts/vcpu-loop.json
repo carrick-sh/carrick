@@ -1762,6 +1762,17 @@
       "rationale": "An EL1 zone slot still held threads (current, queued or host-owned) when the executor loaded a task on it: the previous residency's exit must have reconciled the slot, so a non-empty slot means a parked thread's only owner would be overwritten; continuing would lose that thread.",
       "sink": "fatal",
       "domain": "vcpu_loop::el1_zone"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
+      "function": "owe_adoption",
+      "ordinal_in_function": 1,
+      "fingerprint": "f7639f4dd360073109254a139828a534bc74f3724179446aaf8e663fd6aace49",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::el1_zone",
+      "rationale": "An executor was owed a second zone adoption before claiming the first. One vCPU exit takes at most one thread (the one EL1 ran there) off the vCPU, and the executor claims it before its next run; a second means the first thread's only owner, this executor, would be overwritten and that thread never run again.",
+      "sink": "fatal",
+      "domain": "vcpu_loop::el1_zone"
     }
   ]
 }
