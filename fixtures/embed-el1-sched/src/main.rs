@@ -49,6 +49,11 @@
 //!   often (each child `_exit`s at once). Prints each process's forks and
 //!   mismatches; any torn page or changed snapshot is a failure.
 //!
+//! - `first-touch <pages>` (EL1 increment 2): `mmap`s `<pages>` private anonymous
+//!   pages before `fork`, then parent and child concurrently touch all pages at the
+//!   same inherited virtual range: verify zero fill, write distinct role values,
+//!   rendezvous via bounded pipes, and verify role values are preserved.
+//!
 //! Every wait in the checks is bounded, so a lost wake or a lost signal is a
 //! failed line, never a hung test.
 
@@ -1081,7 +1086,11 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
                 continue;
             }
             for page in 0..8 {
-                unsafe { (scratch as *mut u8).add(page * PAGE).write_volatile(page as u8) };
+                unsafe {
+                    (scratch as *mut u8)
+                        .add(page * PAGE)
+                        .write_volatile(page as u8)
+                };
             }
             unsafe {
                 libc::mprotect(scratch, len, libc::PROT_READ);
@@ -1157,6 +1166,209 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
     ok
 }
 
+// ---------------------------------------------------------------------------
+// EL1 increment 2: anonymous memory first-touch
+
+fn poll_read_byte(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if rc <= 0 || (pfd.revents & libc::POLLIN) == 0 {
+        return false;
+    }
+    let mut byte = 0u8;
+    let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+    n == 1
+}
+
+fn write_signal_byte(fd: libc::c_int, byte: u8) -> bool {
+    let n = unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+    n == 1
+}
+
+fn first_touch_process(
+    role: &str,
+    base: usize,
+    pages: usize,
+    page_size: usize,
+    write_fd: libc::c_int,
+    read_fd: libc::c_int,
+) -> bool {
+    let words_per_page = page_size / std::mem::size_of::<u64>();
+    let mut zero_mismatches = 0u64;
+    for page_idx in 0..pages {
+        let page_ptr = (base + page_idx * page_size) as *mut u64;
+        for w in 0..words_per_page {
+            let val = unsafe { page_ptr.add(w).read_volatile() };
+            if val != 0 {
+                zero_mismatches += 1;
+            }
+        }
+    }
+
+    let role_magic: u64 = if role == "child" {
+        0x4348_494c_4400_0000 // 'CHILD'
+    } else {
+        0x5041_5245_4e54_0000 // 'PARENT'
+    };
+    for page_idx in 0..pages {
+        let page_ptr = (base + page_idx * page_size) as *mut u64;
+        let page_val = role_magic | (page_idx as u64);
+        for w in 0..words_per_page {
+            let val = page_val ^ ((w as u64) << 32);
+            unsafe { page_ptr.add(w).write_volatile(val) };
+        }
+    }
+
+    let mut immediate_mismatches = 0u64;
+    for page_idx in 0..pages {
+        let page_ptr = (base + page_idx * page_size) as *mut u64;
+        let page_val = role_magic | (page_idx as u64);
+        for w in 0..words_per_page {
+            let expected = page_val ^ ((w as u64) << 32);
+            let seen = unsafe { page_ptr.add(w).read_volatile() };
+            if seen != expected {
+                immediate_mismatches += 1;
+            }
+        }
+    }
+
+    // Rendezvous 1: signal write completion to peer and wait for peer's signal.
+    const TIMEOUT_MS: libc::c_int = 10_000;
+    if !write_signal_byte(write_fd, b'W') || !poll_read_byte(read_fd, TIMEOUT_MS) {
+        return false;
+    }
+
+    // Post-write check: preserve each process's values until both completed writes, then check again.
+    let mut post_mismatches = 0u64;
+    for page_idx in 0..pages {
+        let page_ptr = (base + page_idx * page_size) as *mut u64;
+        let page_val = role_magic | (page_idx as u64);
+        for w in 0..words_per_page {
+            let expected = page_val ^ ((w as u64) << 32);
+            let seen = unsafe { page_ptr.add(w).read_volatile() };
+            if seen != expected {
+                post_mismatches += 1;
+            }
+        }
+    }
+
+    // Rendezvous 2: signal post-check completion to peer and wait for peer's signal.
+    if !write_signal_byte(write_fd, b'D') || !poll_read_byte(read_fd, TIMEOUT_MS) {
+        return false;
+    }
+
+    zero_mismatches == 0 && immediate_mismatches == 0 && post_mismatches == 0
+}
+
+fn first_touch(pages: usize) -> i32 {
+    let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size_raw <= 0 {
+        println!("first-touch invalid page size {page_size_raw}");
+        return 1;
+    }
+    let page_size = page_size_raw as usize;
+    if pages == 0 || pages > 65_536 || !page_size.is_multiple_of(8) {
+        println!("first-touch invalid pages={pages} page_size={page_size}");
+        return 1;
+    }
+    let len = match pages.checked_mul(page_size) {
+        Some(len) if len > 0 => len,
+        _ => {
+            println!("first-touch overflowing pages={pages} page_size={page_size}");
+            return 1;
+        }
+    };
+
+    // Bound the entire fixture, including waitpid and a stuck peer. The child
+    // arms its own deadline because fork does not inherit an alarm timer.
+    unsafe { libc::alarm(60) };
+    let region = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if region == libc::MAP_FAILED {
+        println!("first-touch mmap failed");
+        return 1;
+    }
+    let base = region as usize;
+
+    let mut p2c = [0 as libc::c_int; 2];
+    let mut c2p = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe(p2c.as_mut_ptr()) } != 0 {
+        println!("first pipe failed");
+        unsafe { libc::munmap(region, len) };
+        return 1;
+    }
+    if unsafe { libc::pipe(c2p.as_mut_ptr()) } != 0 {
+        println!("second pipe failed");
+        unsafe {
+            libc::close(p2c[0]);
+            libc::close(p2c[1]);
+            libc::munmap(region, len);
+        }
+        return 1;
+    }
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        println!("fork failed");
+        unsafe {
+            libc::close(p2c[0]);
+            libc::close(p2c[1]);
+            libc::close(c2p[0]);
+            libc::close(c2p[1]);
+            libc::munmap(region, len);
+        };
+        return 1;
+    }
+
+    if pid == 0 {
+        unsafe {
+            libc::close(p2c[1]);
+            libc::close(c2p[0]);
+        }
+        unsafe { libc::alarm(60) };
+        let (write_fd, read_fd) = (c2p[1], p2c[0]);
+        let ok = first_touch_process("child", base, pages, page_size, write_fd, read_fd);
+        unsafe {
+            libc::close(write_fd);
+            libc::close(read_fd);
+            libc::munmap(region, len);
+        }
+        println!("first-touch child pages={pages} ok={ok}");
+        use std::io::Write;
+        let flushed = std::io::stdout().flush().is_ok();
+        unsafe { libc::_exit(if ok && flushed { 0 } else { 1 }) };
+    }
+
+    unsafe {
+        libc::close(p2c[0]);
+        libc::close(c2p[1]);
+    }
+    let (write_fd, read_fd) = (p2c[1], c2p[0]);
+    let parent_ok = first_touch_process("parent", base, pages, page_size, write_fd, read_fd);
+    unsafe {
+        libc::close(write_fd);
+        libc::close(read_fd);
+    }
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    let child_ok = waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    unsafe { libc::munmap(region, len) };
+    println!("first-touch parent pages={pages} child_ok={child_ok} ok={parent_ok}");
+    if parent_ok && child_ok { 0 } else { 1 }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("pingpong");
@@ -1174,12 +1386,20 @@ fn main() {
         "idle-carrier" => idle_carrier(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(500)),
         "wfi-signal" => wfi_signal(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100)),
         "pstate" => pstate_mode(),
-        "pipe-pingpong" => {
-            pipe_pingpong(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000))
-        }
+        "pipe-pingpong" => pipe_pingpong(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000)),
         "pipe-compute" => pipe_compute(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(300)),
         "two-process" => two_process(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000)),
         "mm-occupancy" => mm_occupancy(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200)),
+        "first-touch" => match args.get(2) {
+            None => first_touch(256),
+            Some(value) => match value.parse() {
+                Ok(pages) => first_touch(pages),
+                Err(_) => {
+                    println!("first-touch invalid page count {value}");
+                    2
+                }
+            },
+        },
         "exec-child" => {
             println!("exec-child ok");
             0

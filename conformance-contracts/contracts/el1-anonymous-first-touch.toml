@@ -1,0 +1,29 @@
+schema_version = 1
+id = "kernel.el1.anonymous-first-touch"
+title = "Guest EL1 anonymous memory first-touch fault resolution"
+guest_surfaces = [
+  "syscall:mmap",
+  "syscall:clone",
+  "syscall:fork",
+  "syscall:munmap",
+  "kernel:sparse_materialization",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 mmap: MAP_PRIVATE | MAP_ANONYMOUS creates a zero-filled anonymous private mapping; modifications are not visible to other processes mapping the same range",
+  "man 2 fork: the child process inherits private anonymous mappings as private copies; writes by parent or child are not observed by the other",
+  "Arm A-profile exception and translation architecture: stage-1 translation fault at EL0 is delivered to EL1 when TCR_EL1/SCTLR_EL1 configure guest stage-1 translation; EL1 resolves the fault and installs the leaf translation",
+]
+fixture = "embed:el1-sched first-touch 256|1024|4096"
+scale_points = [256, 1024, 4096]
+rationale = "EL1 increment 2, first-touch checkpoint (structural witness). Prior to this increment, anonymous memory faults on inherited private ranges exited to the host carrier via stage-2 / host translation faults and were resolved by the host VMM (resolve_mutating_fault). Under the EL1 memory model, the host grants bulk frame extents and EL1 services first-touch faults directly at EL0->EL1 data abort without exiting to the host. Two live fork-related processes touch the same inherited private anonymous range at scales 256, 1024, and 4096 pages. The structural witness verifies that incremental host exits across scales remain under 0.125 exits per added page (both processes count), rejecting even one exit per 16 KiB compound. This initial structural witness serves as an honest signed RED gate on host-side fault service while semantics pass, pending complete EL1 stage-1 fault handlers, transactional publication, permission enforcement, rollback, and elastic frame return."
+structural_budgets = []
+
+[bindings]
+embed = "carrick-embed::el1_sched (signed; el1_memory_first_touch_stays_in_guest asserts semantic completion across 256, 1024, 4096 pages per process and incremental host-exit slope < 0.125 exits/page across both processes; expected red on current host-serviced fault path; signed execution pending)"
+
+[bindings.unresolved]
+vm_free = "VM-free dispatcher tests verify memory layout and mapping semantics, but cannot execute EL0 translation faults, MMU data aborts, or ARM stage-1 page-table installation."
+docker = "The static first-touch fixture passed at 256/1024/4096 pages on native arm64 ubuntu image sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517. Raw transcripts and fixture hash are retained in target/el1-completion/first-touch; automated differential binding and permission/rollback/frame-return coverage remain open."
+embed_structural = "Incremental host-exit slope (< 0.125 exits/added page) is the structural witness; exact in-guest fault service, frame grant/return, and rollback counters will be registered with full fault migration."
+embed_timing = "Timing is not asserted for this initial structural witness; uninstrumented release comparison against Docker will be conducted at full memory milestone acceptance."

@@ -533,7 +533,7 @@ contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.e
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_sched.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy"]
+contracts = ["kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/sigframe.rs"
@@ -545,7 +545,7 @@ contracts = ["kernel.el1.guest-scheduler"]
 
 [[surfaces]]
 path = "fixtures/embed-el1-sched/src/main.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy"]
+contracts = ["kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/hvpatch/asid.rs"
