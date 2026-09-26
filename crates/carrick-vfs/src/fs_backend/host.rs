@@ -80,6 +80,26 @@ pub fn reset_test_host_stat_count() {
     TEST_HOST_STAT_COUNT.with(|c| c.set(0));
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_HOST_PARENT_FSTAT_COUNT: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn record_test_host_parent_fstat() {
+    TEST_HOST_PARENT_FSTAT_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_host_parent_fstat_count() -> u64 {
+    TEST_HOST_PARENT_FSTAT_COUNT.with(|c| c.get())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_test_host_parent_fstat_count() {
+    TEST_HOST_PARENT_FSTAT_COUNT.with(|c| c.set(0));
+}
+
 macro_rules! host_openat {
     ($($arg:expr),* $(,)?) => {{
         #[cfg(any(test, feature = "test-support"))]

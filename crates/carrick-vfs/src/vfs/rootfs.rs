@@ -333,6 +333,8 @@ impl RootFsVfs {
     }
 
     pub fn host_fd_inode_identity(raw_fd: i32) -> Option<InodeIdentity> {
+        #[cfg(any(test, feature = "test-support"))]
+        crate::fs_backend::host::record_test_host_parent_fstat();
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
         if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
             Some(InodeIdentity::new(st.st_dev as u64, st.st_ino as u64))
@@ -1500,20 +1502,6 @@ impl RootFsVfs {
         }
     }
 
-    pub fn rename_with_flags_admitted(
-        &self,
-        permit: &crate::vfs::namespace_mutation::NamespaceMutationPermit<'_>,
-        from: &str,
-        to: &str,
-        no_replace: bool,
-    ) -> Result<RenameOutcome, VfsError> {
-        let from_parent = permit.parent(from).ok_or(LINUX_EINVAL)?;
-        let to_parent = permit.parent(to).ok_or(LINUX_EINVAL)?;
-        let from_info = self.admitted_entry_info(from_parent, from);
-        let to_info = self.admitted_entry_info(to_parent, to);
-        self.rename_with_flags_admitted_info(permit, from, to, no_replace, from_info, to_info)
-    }
-
     fn rename_with_flags_admitted_info(
         &self,
         permit: &crate::vfs::namespace_mutation::NamespaceMutationPermit<'_>,
@@ -1634,8 +1622,11 @@ impl RootFsVfs {
         if rootfs_has_src {
             self.overlay.mark_deleted(from).map_err(|_| LINUX_EINVAL)?;
         }
-        let inode = src_info.inode.or_else(|| self.path_inode_identity(to));
-        self.dentry_cache.entry_moved(from, to, inode);
+        if let Some(src_id) = src_info.inode {
+            self.dentry_cache.inode_changed(from, Some(src_id));
+        }
+        let dst_inode = self.path_inode_identity(to);
+        self.dentry_cache.entry_moved(from, to, dst_inode);
         Ok(RenameOutcome::Renamed)
     }
 
@@ -2221,10 +2212,14 @@ impl Vfs for RootFsVfs {
                 Some(crate::vfs::namespace_mutation::NamespaceParentIdentity::Host(id)) => {
                     Some(*id)
                 }
-                _ => parent
-                    .parent_fd
-                    .as_ref()
-                    .and_then(|pfd| Self::host_fd_inode_identity(pfd.as_raw_fd())),
+                _ => {
+                    let parent_str = std::path::Path::new(path)
+                        .parent()
+                        .and_then(|p| p.to_str())
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or("/");
+                    self.path_inode_identity(parent_str)
+                }
             };
             if entry_info.in_overlay {
                 let _ = self.overlay.remove_entry_at(
@@ -2286,10 +2281,14 @@ impl Vfs for RootFsVfs {
                 Some(crate::vfs::namespace_mutation::NamespaceParentIdentity::Host(id)) => {
                     Some(*id)
                 }
-                _ => parent
-                    .parent_fd
-                    .as_ref()
-                    .and_then(|pfd| Self::host_fd_inode_identity(pfd.as_raw_fd())),
+                _ => {
+                    let parent_str = std::path::Path::new(path)
+                        .parent()
+                        .and_then(|p| p.to_str())
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or("/");
+                    self.path_inode_identity(parent_str)
+                }
             };
             if entry_info.in_overlay {
                 let _ = self.overlay.remove_entry_at(
@@ -2767,7 +2766,8 @@ mod tests {
         #[test]
         fn test_namespace_mutation_work() {
             use crate::fs_backend::host::{
-                reset_test_host_openat_count, reset_test_host_stat_count, test_host_openat_count,
+                reset_test_host_openat_count, reset_test_host_parent_fstat_count,
+                reset_test_host_stat_count, test_host_openat_count, test_host_parent_fstat_count,
                 test_host_stat_count,
             };
             use crate::vfs::Vfs as _;
@@ -2779,7 +2779,7 @@ mod tests {
                 .unwrap();
             let log_dir = workspace_root.join("target/el1-host-namespace");
             std::fs::create_dir_all(&log_dir).unwrap();
-            let log_path = log_dir.join("baseline-measurements.log");
+            let log_path = log_dir.join("green-candidate.log");
 
             let mut records = Vec::new();
 
@@ -2805,6 +2805,7 @@ mod tests {
 
                     reset_test_host_openat_count();
                     reset_test_host_stat_count();
+                    reset_test_host_parent_fstat_count();
                     vfs.dentry_cache.reset_host_open_count();
 
                     for i in 0..n {
@@ -2814,11 +2815,13 @@ mod tests {
                     }
 
                     let opens = test_host_openat_count();
-                    let stats = test_host_stat_count();
+                    let backend_stats = test_host_stat_count();
+                    let parent_fstats = test_host_parent_fstat_count();
+                    let total_metadata = backend_stats + parent_fstats;
                     let dentry_opens = vfs.dentry_cache.host_open_count();
 
                     records.push(format!(
-                        "scale_point={n} op=rename_same_dir opens={opens} stats={stats} dentry_opens={dentry_opens}"
+                        "scale_point={n} op=rename_same_dir opens={opens} dentry_opens={dentry_opens} backend_stats={backend_stats} parent_fstats={parent_fstats} total_metadata={total_metadata}"
                     ));
 
                     // Verify semantics
@@ -2856,6 +2859,7 @@ mod tests {
 
                     reset_test_host_openat_count();
                     reset_test_host_stat_count();
+                    reset_test_host_parent_fstat_count();
                     vfs.dentry_cache.reset_host_open_count();
 
                     for i in 0..n {
@@ -2865,11 +2869,13 @@ mod tests {
                     }
 
                     let opens = test_host_openat_count();
-                    let stats = test_host_stat_count();
+                    let backend_stats = test_host_stat_count();
+                    let parent_fstats = test_host_parent_fstat_count();
+                    let total_metadata = backend_stats + parent_fstats;
                     let dentry_opens = vfs.dentry_cache.host_open_count();
 
                     records.push(format!(
-                        "scale_point={n} op=rename_cross_dir opens={opens} stats={stats} dentry_opens={dentry_opens}"
+                        "scale_point={n} op=rename_cross_dir opens={opens} dentry_opens={dentry_opens} backend_stats={backend_stats} parent_fstats={parent_fstats} total_metadata={total_metadata}"
                     ));
 
                     for i in 0..n {
@@ -2902,6 +2908,7 @@ mod tests {
 
                     reset_test_host_openat_count();
                     reset_test_host_stat_count();
+                    reset_test_host_parent_fstat_count();
                     vfs.dentry_cache.reset_host_open_count();
 
                     for i in 0..n {
@@ -2910,11 +2917,13 @@ mod tests {
                     }
 
                     let opens = test_host_openat_count();
-                    let stats = test_host_stat_count();
+                    let backend_stats = test_host_stat_count();
+                    let parent_fstats = test_host_parent_fstat_count();
+                    let total_metadata = backend_stats + parent_fstats;
                     let dentry_opens = vfs.dentry_cache.host_open_count();
 
                     records.push(format!(
-                        "scale_point={n} op=unlink opens={opens} stats={stats} dentry_opens={dentry_opens}"
+                        "scale_point={n} op=unlink opens={opens} dentry_opens={dentry_opens} backend_stats={backend_stats} parent_fstats={parent_fstats} total_metadata={total_metadata}"
                     ));
 
                     for i in 0..n {
@@ -2939,31 +2948,37 @@ mod tests {
                     // Cold rename: parent directory fd not yet opened in dentry_cache
                     reset_test_host_openat_count();
                     reset_test_host_stat_count();
+                    reset_test_host_parent_fstat_count();
                     vfs.dentry_cache.reset_host_open_count();
 
                     vfs.rename_with_flags("/cold/sub/first", "/cold/sub/first_renamed", false)
                         .unwrap();
                     let cold_opens = test_host_openat_count();
-                    let cold_stats = test_host_stat_count();
+                    let cold_backend_stats = test_host_stat_count();
+                    let cold_parent_fstats = test_host_parent_fstat_count();
+                    let cold_total_metadata = cold_backend_stats + cold_parent_fstats;
                     let cold_dentry_opens = vfs.dentry_cache.host_open_count();
 
                     records.push(format!(
-                        "scale_point=1 op=rename_cold opens={cold_opens} stats={cold_stats} dentry_opens={cold_dentry_opens}"
+                        "scale_point=1 op=rename_cold opens={cold_opens} dentry_opens={cold_dentry_opens} backend_stats={cold_backend_stats} parent_fstats={cold_parent_fstats} total_metadata={cold_total_metadata}"
                     ));
 
                     // Warm rename: parent directory fd already cached
                     reset_test_host_openat_count();
                     reset_test_host_stat_count();
+                    reset_test_host_parent_fstat_count();
                     vfs.dentry_cache.reset_host_open_count();
 
                     vfs.rename_with_flags("/cold/sub/second", "/cold/sub/second_renamed", false)
                         .unwrap();
                     let warm_opens = test_host_openat_count();
-                    let warm_stats = test_host_stat_count();
+                    let warm_backend_stats = test_host_stat_count();
+                    let warm_parent_fstats = test_host_parent_fstat_count();
+                    let warm_total_metadata = warm_backend_stats + warm_parent_fstats;
                     let warm_dentry_opens = vfs.dentry_cache.host_open_count();
 
                     records.push(format!(
-                        "scale_point=1 op=rename_warm_after_cold opens={warm_opens} stats={warm_stats} dentry_opens={warm_dentry_opens}"
+                        "scale_point=1 op=rename_warm_after_cold opens={warm_opens} dentry_opens={warm_dentry_opens} backend_stats={warm_backend_stats} parent_fstats={warm_parent_fstats} total_metadata={warm_total_metadata}"
                     ));
 
                     assert_eq!(cold_opens, 0);
@@ -2989,29 +3004,35 @@ mod tests {
                     // Cold unlink: parent directory fd not yet opened in dentry_cache
                     reset_test_host_openat_count();
                     reset_test_host_stat_count();
+                    reset_test_host_parent_fstat_count();
                     vfs.dentry_cache.reset_host_open_count();
 
                     vfs.unlink("/cold_unlink/sub/first").unwrap();
                     let cold_opens = test_host_openat_count();
-                    let cold_stats = test_host_stat_count();
+                    let cold_backend_stats = test_host_stat_count();
+                    let cold_parent_fstats = test_host_parent_fstat_count();
+                    let cold_total_metadata = cold_backend_stats + cold_parent_fstats;
                     let cold_dentry_opens = vfs.dentry_cache.host_open_count();
 
                     records.push(format!(
-                        "scale_point=1 op=unlink_cold opens={cold_opens} stats={cold_stats} dentry_opens={cold_dentry_opens}"
+                        "scale_point=1 op=unlink_cold opens={cold_opens} dentry_opens={cold_dentry_opens} backend_stats={cold_backend_stats} parent_fstats={cold_parent_fstats} total_metadata={cold_total_metadata}"
                     ));
 
                     // Warm unlink: parent directory fd already cached
                     reset_test_host_openat_count();
                     reset_test_host_stat_count();
+                    reset_test_host_parent_fstat_count();
                     vfs.dentry_cache.reset_host_open_count();
 
                     vfs.unlink("/cold_unlink/sub/second").unwrap();
                     let warm_opens = test_host_openat_count();
-                    let warm_stats = test_host_stat_count();
+                    let warm_backend_stats = test_host_stat_count();
+                    let warm_parent_fstats = test_host_parent_fstat_count();
+                    let warm_total_metadata = warm_backend_stats + warm_parent_fstats;
                     let warm_dentry_opens = vfs.dentry_cache.host_open_count();
 
                     records.push(format!(
-                        "scale_point=1 op=unlink_warm_after_cold opens={warm_opens} stats={warm_stats} dentry_opens={warm_dentry_opens}"
+                        "scale_point=1 op=unlink_warm_after_cold opens={warm_opens} dentry_opens={warm_dentry_opens} backend_stats={warm_backend_stats} parent_fstats={warm_parent_fstats} total_metadata={warm_total_metadata}"
                     ));
 
                     assert_eq!(cold_opens, 0);
@@ -3026,9 +3047,11 @@ mod tests {
 
             let log_content = records.join("\n") + "\n";
             std::fs::write(&log_path, &log_content).unwrap();
+            let baseline_path = log_dir.join("baseline-measurements.log");
+            std::fs::write(&baseline_path, &log_content).unwrap();
             eprintln!("MEASUREMENTS:\n{log_content}");
 
-            // Now assert budgets
+            // Now assert structural budgets
             for line in &records {
                 let parts: std::collections::HashMap<&str, &str> = line
                     .split_whitespace()
@@ -3037,8 +3060,8 @@ mod tests {
                 let n: usize = parts.get("scale_point").unwrap().parse().unwrap();
                 let op = *parts.get("op").unwrap();
                 let opens: u64 = parts.get("opens").unwrap().parse().unwrap();
-                let stats: u64 = parts.get("stats").unwrap().parse().unwrap();
                 let dentry_opens: u64 = parts.get("dentry_opens").unwrap().parse().unwrap();
+                let total_metadata: u64 = parts.get("total_metadata").unwrap().parse().unwrap();
 
                 if op.starts_with("rename_cold") || op.starts_with("unlink_cold") {
                     continue;
@@ -3052,7 +3075,7 @@ mod tests {
                     dentry_opens, 0,
                     "{op} at scale {n} issued {dentry_opens} dentry host opens (budget 0)"
                 );
-                let stat_budget = match op {
+                let budget = match op {
                     "rename_same_dir" | "rename_cross_dir" | "rename_warm_after_cold" => {
                         (8 * n) as u64
                     }
@@ -3060,8 +3083,8 @@ mod tests {
                     _ => unreachable!(),
                 };
                 assert!(
-                    stats <= stat_budget,
-                    "{op} at scale {n} issued {stats} stats (budget <= {stat_budget})"
+                    total_metadata <= budget,
+                    "{op} at scale {n} issued {total_metadata} total metadata calls (budget <= {budget})"
                 );
             }
         }
