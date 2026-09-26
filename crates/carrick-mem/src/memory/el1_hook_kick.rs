@@ -1,7 +1,8 @@
 //! Contract `kernel.vcpu.kick-el0-boundary`, VM-free binding for the EL1
-//! syscall hook (Fact 9 of EL1 plan 1a), in both interrupt modes.
+//! hooks (Fact 9 of EL1 plan 1a), in both interrupt modes, and the EL0
+//! interrupt entry of EL1 plan 1c.
 //!
-//! A host kick that stops the vCPU inside the hook is owed to the EL0
+//! A host kick that stops the vCPU inside the syscall hook is owed to the EL0
 //! boundary: the engine publishes it to the slot's `pending_host_work` flag,
 //! clears `I` in the live `SPSR_EL1` when that holds the EL0 return state, and
 //! makes the owed-kick interrupt pending (`carrick_aarch64::owed_kick`). The
@@ -11,23 +12,22 @@
 //! resumes with the kick masked or consumed, and a thread that makes no
 //! further host syscall never stops for the page-table drain that kicked it.
 //!
-//! With Hypervisor.framework's in-kernel GIC ([`El1IrqMode::GicWindow`]) the
-//! owed kick is a redistributor-pending SGI that survives run returns, and the
-//! served path opens an EL1 IRQ window that can take it (or the virtual
-//! timer) in [`write_el1_irq_hook`]. Taking an IRQ at EL1 overwrites
-//! `ELR_EL1`/`SPSR_EL1`, and acknowledging the kick SGI consumes the vehicle,
-//! so the model checks both: the EL0 return state is exactly the TrapFrame's,
-//! and a consumed kick has been handed back to the host.
+//! With Hypervisor.framework's in-kernel GIC ([`El1IrqMode::Gic`]) the owed
+//! kick is a redistributor-pending SGI that survives run returns, every
+//! served return to EL0 unmasks IRQs, and an interrupt taken at EL0 enters
+//! the EL1 image through the EL0 IRQ hook, which leaves through `hvc #4` when
+//! the image forwards (the kick) and `eret`s otherwise. EL1 never unmasks
+//! IRQs itself. The model checks that the EL0 return state is exactly the
+//! TrapFrame's (with `I` clear in GIC mode) and that no kick is lost.
 //!
 //! This interprets the REAL emitted vector bytes, not a model of them, and
-//! injects the kick at every instruction boundary of the hook and of the IRQ
-//! hook when an interrupt is taken.
+//! injects the kick at every instruction boundary of the hooks.
 
 use super::*;
 use std::collections::BTreeMap;
 
 const PSTATE_I: u64 = 1 << 7;
-/// Carrick's EL0 return state: EL0t with DAIF masked.
+/// Carrick's historical EL0 return state: EL0t with DAIF masked.
 const EL0_DAIF_MASKED: u64 = 0x3c0;
 const GUEST_ELR: u64 = 0x4000_1000;
 const SLOT: u64 = 3;
@@ -35,11 +35,11 @@ const SLOT: u64 = 3;
 const CAPTURE: usize = 0x800;
 /// `CurrentTask` is 64 bytes (`lsl #6` in the hook); `pending_host_work` at 40.
 const PENDING_HOST_WORK: u64 = 40;
-const SPURIOUS: u64 = carrick_el1_abi::GIC_SPURIOUS_INTID as u64;
-const KICK: u64 = carrick_el1_abi::GIC_KICK_INTID as u64;
-const VTIMER: u64 = carrick_el1_abi::GIC_VTIMER_INTID as u64;
-/// SPSR_EL1.M for EL1h.
-const MODE_EL1H: u64 = 0b0101;
+const SERVED_WITH_WORK: u64 = 44;
+/// A syscall's syndrome (EC 0x15), stale in `ESR_EL1` when an IRQ is taken.
+const SVC_ESR: u64 = 0x15 << 26;
+/// `Action::Idle`.
+const IDLE: u64 = 3;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Exit {
@@ -47,6 +47,11 @@ enum Exit {
     Host,
     /// `eret` to EL0 with this `SPSR_EL1` and `ELR_EL1`.
     Eret { spsr: u64, elr: u64 },
+    /// `hvc #4`: the EL0-boundary kick exit, with the EL0 state the host's
+    /// decode makes the live PC and PSTATE.
+    Kick { spsr: u64, elr: u64 },
+    /// `hvc #5`: the idle exit, with SP_EL1 at this value.
+    Idle { sp: u64 },
     /// `hvc #3`: Carrick's fail-loud trap.
     Fault,
 }
@@ -54,22 +59,30 @@ enum Exit {
 /// Where the owed kick stands when the hook leaves.
 #[derive(Debug, PartialEq, Eq)]
 enum KickFate {
-    /// The syscall left through the host, which settles the kick.
+    /// The vCPU left through the host, which settles the kick.
     Host,
     /// EL0 resumes with the kick pending and I clear: it is taken at the
     /// first EL0 instruction.
     TakenAtEl0,
     /// EL0 resumes with the kick masked (the pre-fix Fact 9 hole).
     MaskedAtEl0,
-    /// The kick SGI was acknowledged at EL1 and nothing handed it back to the
-    /// host.
+    /// The kick SGI was acknowledged in EL1 and nothing handed it back to
+    /// the host.
     ConsumedAtEl1,
+}
+
+/// What the stand-in for the EL1 image (`carrick_el1_syscall`) does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Image {
+    /// Serve the syscall (or interrupt) unless host work is pending.
+    Serve,
+    /// The syscall parks its thread and the idle vCPU leaves for the host.
+    Idle,
 }
 
 /// Small independent interpreter of the vector page's instruction subset.
 /// Unknown instructions fail closed.
 struct Machine {
-    irq: El1IrqMode,
     regs: [u64; 31],
     sp: u64,
     mem: BTreeMap<u64, u64>,
@@ -77,72 +90,68 @@ struct Machine {
     spsr: u64,
     esr: u64,
     pc: usize,
-    /// PSTATE.I at EL1 (exception entry from EL0 masks it).
-    irq_masked: bool,
     equal: bool,
     bytes: Vec<u8>,
+    image: Image,
     /// Instructions retired; the kick lands before instruction `kick_at`.
     retired: usize,
     /// Where the injected kick stopped the vCPU.
     kicked_pc: Option<usize>,
     /// The owed kick is pending (the SGI in GIC mode).
     kick_pending: bool,
-    /// The virtual timer's condition holds and it is enabled.
-    vtimer_enabled: bool,
-    vtimer_pending: bool,
-    /// INTIDs acknowledged and not yet completed.
-    active: Vec<u64>,
-    /// The kick SGI was acknowledged at EL1.
+    /// The kick SGI was acknowledged in EL1.
     kick_acknowledged: bool,
+    /// The EL1 image ran with an interrupt frame (syndrome 0).
+    irq_frames: usize,
 }
 
 impl Machine {
-    fn new(irq: El1IrqMode) -> Self {
+    fn bytes(irq: El1IrqMode) -> Vec<u8> {
         let mut bytes = vec![0u8; LINUX_EL1_VECTORS_SIZE as usize];
-        if let Some(window_isb) =
-            write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, CAPTURE, irq)
-        {
-            write_el1_irq_hook(&mut bytes, EL1_IRQ_HOOK_OFFSET, window_isb);
+        write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, CAPTURE, irq);
+        if irq == El1IrqMode::Gic {
+            write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);
         }
+        bytes
+    }
+
+    /// Entering the syscall hook from the mailbox handler.
+    fn syscall(irq: El1IrqMode) -> Self {
         Self {
-            irq,
             regs: std::array::from_fn(|i| 0xAB00 + i as u64),
             sp: LINUX_SYSCALL_MAILBOX_BASE + SLOT * 256,
             mem: BTreeMap::new(),
             elr: GUEST_ELR,
             spsr: EL0_DAIF_MASKED,
-            esr: 0x15 << 26,
+            esr: SVC_ESR,
             pc: EL1_VECTOR_HOOK_OFFSET,
-            irq_masked: true,
             equal: false,
-            bytes,
+            bytes: Self::bytes(irq),
+            image: Image::Serve,
             retired: 0,
             kicked_pc: None,
             kick_pending: false,
-            vtimer_enabled: false,
-            vtimer_pending: false,
-            active: Vec::new(),
             kick_acknowledged: false,
+            irq_frames: 0,
         }
     }
 
-    /// The virtual timer fires before the hook runs.
-    fn with_vtimer_pending(mut self) -> Self {
-        self.vtimer_enabled = true;
-        self.vtimer_pending = true;
-        self
+    /// An interrupt taken at EL0 (GIC mode): the lower-EL IRQ slot, with
+    /// the EL0 return state in ELR/SPSR_EL1 and a stale syscall syndrome.
+    fn el0_irq() -> Self {
+        Self {
+            pc: AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET,
+            spsr: EL0_DAIF_MASKED & !PSTATE_I,
+            ..Self::syscall(El1IrqMode::Gic)
+        }
     }
 
     fn pending_host_work_addr() -> u64 {
         carrick_el1_abi::EL1_CURRENT_TASKS_BASE + SLOT * 64 + PENDING_HOST_WORK
     }
 
-    fn irq_taken(&self, intid: u64) -> u64 {
-        self.read(
-            carrick_el1_abi::EL1_COUNTERS_BASE
-                + core::mem::offset_of!(carrick_el1_abi::Counters, irq_taken) as u64
-                + intid * 8,
-        )
+    fn served_with_work_addr() -> u64 {
+        carrick_el1_abi::EL1_CURRENT_TASKS_BASE + SLOT * 64 + SERVED_WITH_WORK
     }
 
     fn read(&self, addr: u64) -> u64 {
@@ -173,25 +182,10 @@ impl Machine {
         }
     }
 
-    /// The highest-priority pending interrupt (the timer outranks the kick),
-    /// if one is pending and not already active.
-    fn highest_pending(&self) -> Option<u64> {
-        if self.vtimer_pending && !self.active.contains(&VTIMER) {
-            Some(VTIMER)
-        } else if self.irq == El1IrqMode::GicWindow
-            && self.kick_pending
-            && !self.active.contains(&KICK)
-        {
-            Some(KICK)
-        } else {
-            None
-        }
-    }
-
     /// What the engine does when it absorbs a kick inside Carrick's EL1 code
     /// (`OwedKick::absorb`): publish it to the slot, clear `I` in `SPSR_EL1`
-    /// when that holds the EL0 return state (not an EL1 IRQ's), and make the
-    /// owed interrupt pending.
+    /// when that holds the EL0 return state, and make the owed interrupt
+    /// pending.
     fn absorb_kick(&mut self) {
         self.mem.insert(Self::pending_host_work_addr(), 1);
         if self.spsr & 0xF == 0 {
@@ -200,17 +194,31 @@ impl Machine {
         self.kick_pending = true;
     }
 
-    /// The EL1 image (`carrick_el1_syscall`): forward at entry when host work
-    /// is pending, else serve (`Action::Served == 0`) and write the result.
+    /// The EL1 image (`carrick_el1_syscall`, `x0` = the TrapFrame). For an
+    /// interrupt frame (syndrome 0) it acknowledges the kick SGI, which
+    /// becomes pending host work, as `Sched::take_irqs` does.
     fn el1_image(&mut self) {
         let frame = self.regs[0];
-        let pending = self.read(Self::pending_host_work_addr()) != 0;
-        if pending {
-            self.regs[0] = 1;
-        } else {
-            self.mem.insert(frame, 0x5E4E);
-            self.regs[0] = 0;
+        let irq = self.read(frame + 264) == 0;
+        if irq {
+            self.irq_frames += 1;
+            if self.kick_pending {
+                self.kick_pending = false;
+                self.kick_acknowledged = true;
+                self.mem.insert(Self::pending_host_work_addr(), 1);
+            }
         }
+        let pending = self.read(Self::pending_host_work_addr()) != 0;
+        self.regs[0] = if pending {
+            1
+        } else if !irq && self.image == Image::Idle {
+            IDLE
+        } else {
+            if !irq {
+                self.mem.insert(frame, 0x5E4E);
+            }
+            0
+        };
     }
 
     fn run(&mut self, kick_at: Option<usize>) -> Exit {
@@ -218,13 +226,6 @@ impl Machine {
             if Some(self.retired) == kick_at {
                 self.kicked_pc = Some(self.pc);
                 self.absorb_kick();
-            }
-            // An unmasked pending interrupt is taken at this boundary.
-            if !self.irq_masked && self.highest_pending().is_some() {
-                self.elr = self.pc as u64;
-                self.spsr = MODE_EL1H | 0x340; // D, A, F masked; I clear
-                self.irq_masked = true;
-                self.pc = 0x280;
             }
             if self.pc == CAPTURE {
                 return Exit::Host;
@@ -236,102 +237,60 @@ impl Machine {
             let rd = (op & 31) as usize;
             let rn = ((op >> 5) & 31) as usize;
             let rm = ((op >> 16) & 31) as usize;
-            if op == 0xD69F_03E0 {
-                if self.spsr & 0xF == MODE_EL1H {
-                    // Return from an IRQ taken at EL1.
-                    self.pc = self.elr as usize;
-                    self.irq_masked = self.spsr & PSTATE_I != 0;
-                    continue;
-                }
-                return Exit::Eret {
-                    spsr: self.spsr,
-                    elr: self.elr,
-                };
-            }
-            if op == 0xD400_0062 {
-                return Exit::Fault;
-            }
-            if op == 0xD63F_0200 {
-                // blr x16: the EL1 image, then return here.
-                self.regs[30] = pc as u64 + 4;
-                self.el1_image();
-                continue;
-            }
             match op {
-                0xD503_42FF => {
-                    self.irq_masked = false; // msr daifclr, #2
-                    continue;
-                }
-                0xD503_42DF => {
-                    self.irq_masked = true; // msr daifset, #2
-                    continue;
-                }
-                0xD503_3FDF => continue, // isb
-                0xD51B_E33F => {
-                    // msr cntv_ctl_el0, xzr: the timer stops asserting.
-                    self.vtimer_enabled = false;
-                    self.vtimer_pending = false;
-                    continue;
-                }
-                _ => {}
-            }
-            // mrs/msr of ELR_EL1, SPSR_EL1, ESR_EL1, ISR_EL1, ICC_IAR1_EL1,
-            // ICC_EOIR1_EL1 with any Xt.
-            match op & !31 {
-                0xD538_4020 => self.set_xd_zr(rd, self.elr),
-                0xD538_4000 => self.set_xd_zr(rd, self.spsr),
-                0xD538_5200 => self.set_xd_zr(rd, self.esr),
-                0xD518_4020 => self.elr = self.xn_zr(rd),
-                0xD518_4000 => self.spsr = self.xn_zr(rd),
-                0xD518_5200 => self.esr = self.xn_zr(rd),
-                0xD538_C100 => {
-                    let i = if self.highest_pending().is_some() {
-                        PSTATE_I
-                    } else {
-                        0
+                0xD69F_03E0 => {
+                    return Exit::Eret {
+                        spsr: self.spsr,
+                        elr: self.elr,
                     };
-                    self.set_xd_zr(rd, i);
                 }
-                0xD538_CC00 => {
-                    let intid = self.highest_pending().unwrap_or(SPURIOUS);
-                    if intid != SPURIOUS {
-                        self.active.push(intid);
-                        match intid {
-                            KICK => {
-                                self.kick_pending = false;
-                                self.kick_acknowledged = true;
-                            }
-                            _ => self.vtimer_pending = false,
-                        }
-                    }
-                    self.set_xd_zr(rd, intid);
+                0xD400_0062 => return Exit::Fault,
+                0xD400_0082 => {
+                    // hvc #4: the host withdraws the kick and resumes at EL0.
+                    return Exit::Kick {
+                        spsr: self.spsr,
+                        elr: self.elr,
+                    };
                 }
-                0xD518_CC20 => {
-                    let intid = self.xn_zr(rd);
-                    assert!(
-                        self.active.contains(&intid),
-                        "EOI of INTID {intid} that is not active"
-                    );
-                    self.active.retain(|active| *active != intid);
-                    // A level timer still enabled asserts again.
-                    if intid == VTIMER && self.vtimer_enabled {
-                        self.vtimer_pending = true;
-                    }
+                0xD400_00A2 => return Exit::Idle { sp: self.sp },
+                0xD63F_0200 => {
+                    // blr x16: the EL1 image, then return here.
+                    self.regs[30] = pc as u64 + 4;
+                    self.el1_image();
+                    continue;
                 }
+                0xD503_3FDF | 0xD503_201F => continue, // isb, nop
                 _ => {}
             }
-            if matches!(
-                op & !31,
-                0xD538_4020
-                    | 0xD538_4000
-                    | 0xD538_5200
-                    | 0xD518_4020
-                    | 0xD518_4000
-                    | 0xD518_5200
-                    | 0xD538_C100
-                    | 0xD538_CC00
-                    | 0xD518_CC20
-            ) {
+            // mrs/msr of ELR_EL1, SPSR_EL1, ESR_EL1 with any Xt.
+            let handled = match op & !31 {
+                0xD538_4020 => {
+                    self.set_xd_zr(rd, self.elr);
+                    true
+                }
+                0xD538_4000 => {
+                    self.set_xd_zr(rd, self.spsr);
+                    true
+                }
+                0xD538_5200 => {
+                    self.set_xd_zr(rd, self.esr);
+                    true
+                }
+                0xD518_4020 => {
+                    self.elr = self.xn_zr(rd);
+                    true
+                }
+                0xD518_4000 => {
+                    self.spsr = self.xn_zr(rd);
+                    true
+                }
+                0xD518_5200 => {
+                    self.esr = self.xn_zr(rd);
+                    true
+                }
+                _ => false,
+            };
+            if handled {
                 continue;
             }
             if op & 0xFC00_0000 == 0x1400_0000 {
@@ -350,18 +309,6 @@ impl Machine {
                 if self.xn_zr(rd) & 0xFFFF_FFFF == 0 {
                     self.pc = (pc as i64 + i64::from(d) * 4) as usize;
                 }
-            } else if op & 0x7F00_0000 == 0x3600_0000 {
-                // tbz xN, #bit
-                let bit = ((op >> 19) & 31) | ((op >> 26) & 32);
-                let d = (((op >> 5) & 0x3FFF) << 18) as i32 >> 18;
-                if self.xn_zr(rd) & (1 << bit) == 0 {
-                    self.pc = (pc as i64 + i64::from(d) * 4) as usize;
-                }
-            } else if op & 0x9F00_0000 == 0x1000_0000 {
-                // adr xN
-                let imm = (((op >> 5) & 0x7FFFF) << 2) | ((op >> 29) & 3);
-                let d = ((imm << 11) as i32) >> 11;
-                self.set_xd_zr(rd, (pc as i64 + i64::from(d)) as u64);
             } else if op & 0xFFC0_0000 == 0xF900_0000 {
                 let addr = self.xn_sp(rn) + u64::from((op >> 10) & 0xFFF) * 8;
                 self.mem.insert(addr, self.xn_zr(rd));
@@ -375,11 +322,6 @@ impl Machine {
             } else if op & 0xFFFF_FC00 == 0x889F_FC00 {
                 self.mem
                     .insert(self.xn_sp(rn), self.xn_zr(rd) & 0xFFFF_FFFF);
-            } else if op & 0xFFE0_FC1F == 0xF820_001F {
-                // stadd xS, [xN]
-                let addr = self.xn_sp(rn);
-                let v = self.read(addr).wrapping_add(self.xn_zr(rm));
-                self.mem.insert(addr, v);
             } else if op & 0xFF80_0000 == 0xD280_0000 {
                 let shift = ((op >> 21) & 3) * 16;
                 self.set_xd_zr(rd, u64::from((op >> 5) & 0xFFFF) << shift);
@@ -399,6 +341,9 @@ impl Machine {
             } else if op & 0xFFE0_FC1F == 0xEB00_001F {
                 // cmp xN, xM
                 self.equal = self.xn_zr(rn) == self.xn_zr(rm);
+            } else if op & 0xFFE0_FC00 == 0x8A20_0000 {
+                // bic xd, xn, xm
+                self.set_xd_zr(rd, self.xn_zr(rn) & !self.xn_zr(rm));
             } else if op & 0xFFE0_0000 == 0x8B00_0000 {
                 let amount = (op >> 10) & 0x3F;
                 self.set_xd_zr(rd, self.xn_zr(rn) + (self.xn_zr(rm) << amount));
@@ -419,7 +364,7 @@ impl Machine {
     /// What became of an owed kick when the hook left through `exit`.
     fn kick_fate(&self, exit: &Exit) -> KickFate {
         match exit {
-            Exit::Host => KickFate::Host,
+            Exit::Host | Exit::Kick { .. } | Exit::Idle { .. } => KickFate::Host,
             Exit::Fault => panic!("the hook failed loud (hvc #3)"),
             Exit::Eret { spsr, .. } => {
                 if self.kick_pending {
@@ -428,31 +373,35 @@ impl Machine {
                     } else {
                         KickFate::MaskedAtEl0
                     }
-                } else {
+                } else if self.kick_acknowledged {
                     KickFate::ConsumedAtEl1
+                } else {
+                    // The kick landed after the image looked and was absorbed
+                    // without being taken: covered by `kick_pending`.
+                    KickFate::TakenAtEl0
                 }
             }
         }
     }
 }
 
-/// Instructions the vector page retires on the served path with no kick.
-fn served_path_len(machine: impl Fn() -> Machine) -> usize {
+/// Instructions the vector page retires with no kick.
+fn path_len(machine: impl Fn() -> Machine) -> usize {
     let mut m = machine();
-    assert!(matches!(m.run(None), Exit::Eret { .. }));
+    let _ = m.run(None);
     m.retired
 }
 
-/// Inject a kick at every instruction boundary of the served path (and of the
-/// IRQ hook, when `machine` takes an interrupt there) and collect the
-/// boundaries where the kick did not survive to the host or to EL0.
+/// Inject a kick at every instruction boundary and collect the boundaries
+/// where the kick did not survive to the host or to EL0, checking at every
+/// `eret` and kick exit that EL0 resumes with the TrapFrame's return state.
 fn lost_kicks(machine: impl Fn() -> Machine) -> Vec<String> {
-    let len = served_path_len(&machine);
+    let len = path_len(&machine);
     let mut lost = Vec::new();
     for kick_at in 0..len {
         let mut m = machine();
         let exit = m.run(Some(kick_at));
-        if let Exit::Eret { spsr, elr } = exit {
+        if let Exit::Eret { spsr, elr } | Exit::Kick { spsr, elr } = exit {
             assert_eq!(elr, GUEST_ELR, "EL0 resumed at the wrong PC");
             assert_eq!(
                 spsr | PSTATE_I,
@@ -470,16 +419,20 @@ fn lost_kicks(machine: impl Fn() -> Machine) -> Vec<String> {
 }
 
 /// No kick: the syscall is served in EL1 and EL0 resumes with its exact
-/// PSTATE and return address (the owed-kick machinery is guest-invisible).
+/// PSTATE and return address, except that GIC mode returns with IRQs
+/// unmasked (guest-invisible; see `el0_visible_pstate`).
 #[test]
 fn served_path_restores_el0_state_exactly() {
-    for irq in [El1IrqMode::Masked, El1IrqMode::GicWindow] {
-        let mut m = Machine::new(irq);
+    for (irq, spsr) in [
+        (El1IrqMode::Masked, EL0_DAIF_MASKED),
+        (El1IrqMode::Gic, EL0_DAIF_MASKED & !PSTATE_I),
+    ] {
+        let mut m = Machine::syscall(irq);
         let original = m.regs;
         assert_eq!(
             m.run(None),
             Exit::Eret {
-                spsr: EL0_DAIF_MASKED,
+                spsr,
                 elr: GUEST_ELR,
             },
             "{irq:?}"
@@ -495,69 +448,93 @@ fn served_path_restores_el0_state_exactly() {
 /// pending kick IRQ is taken at the first EL0 instruction.
 #[test]
 fn kick_absorbed_anywhere_in_served_hook_surfaces() {
-    let lost = lost_kicks(|| Machine::new(El1IrqMode::Masked));
+    let lost = lost_kicks(|| Machine::syscall(El1IrqMode::Masked));
     assert!(
         lost.is_empty(),
         "an owed kick was lost until the next host exit when absorbed at {lost:?}"
     );
 }
 
-/// The same obligation with the in-kernel GIC, where the served path opens
-/// an EL1 IRQ window: a kick absorbed at any boundary, before, inside or after
-/// the window, leaves through the host or reaches EL0 pending and unmasked,
-/// and EL0 resumes with the TrapFrame's exact return state.
+/// The same obligation with the in-kernel GIC, where the served path
+/// unmasks IRQs for EL0: a kick absorbed at any boundary leaves through the
+/// host or reaches EL0 pending and unmasked.
 #[test]
 fn gic_kick_absorbed_anywhere_in_served_hook_surfaces() {
-    let lost = lost_kicks(|| Machine::new(El1IrqMode::GicWindow));
+    let lost = lost_kicks(|| Machine::syscall(El1IrqMode::Gic));
     assert!(
         lost.is_empty(),
         "an owed kick was lost when absorbed at {lost:?}"
     );
 }
 
-/// With the virtual timer pending, the window takes it at EL1, so the kick is
-/// also injected at every boundary of the IRQ hook. The timer is taken exactly
-/// once and stopped, and the kick still surfaces.
+/// The kick SGI taken at EL0 enters the EL1 image with an interrupt frame,
+/// becomes pending host work there, and leaves through `hvc #4` with the
+/// interrupted EL0 state and every register as EL0 had it.
 #[test]
-fn gic_kick_absorbed_anywhere_while_el1_takes_the_timer_surfaces() {
-    let machine = || Machine::new(El1IrqMode::GicWindow).with_vtimer_pending();
-    let mut m = machine();
+fn gic_kick_taken_at_el0_leaves_through_the_kick_exit() {
+    let mut m = Machine::el0_irq();
+    m.kick_pending = true;
+    let original = m.regs;
+    let exit = m.run(None);
     assert_eq!(
-        m.run(None),
-        Exit::Eret {
-            spsr: EL0_DAIF_MASKED,
+        exit,
+        Exit::Kick {
+            spsr: EL0_DAIF_MASKED & !PSTATE_I,
             elr: GUEST_ELR,
         }
     );
-    assert_eq!(m.irq_taken(VTIMER), 1, "the timer was taken at EL1 once");
-    assert!(!m.vtimer_enabled && !m.vtimer_pending && m.active.is_empty());
-    assert!(
-        served_path_len(machine) > served_path_len(|| Machine::new(El1IrqMode::GicWindow)),
-        "the IRQ hook ran"
+    assert_eq!(m.irq_frames, 1, "the image saw an interrupt frame");
+    assert!(m.kick_acknowledged);
+    assert_eq!(m.regs, original, "every EL0 register as it was");
+    assert_eq!(m.sp, LINUX_SYSCALL_MAILBOX_BASE + SLOT * 256);
+    assert_eq!(
+        m.read(Machine::served_with_work_addr()),
+        0,
+        "an interrupt is not a served syscall"
     );
-    let lost = lost_kicks(machine);
+    assert_eq!(m.esr, SVC_ESR, "ESR_EL1 is left as the last syscall set it");
+}
+
+/// An interrupt the image serves (the timer, a reschedule SGI) returns to
+/// EL0 exactly; a kick absorbed at any boundary of the EL0 IRQ hook still
+/// surfaces.
+#[test]
+fn gic_el0_irq_hook_returns_exactly_and_loses_no_kick() {
+    let mut m = Machine::el0_irq();
+    let original = m.regs;
+    assert_eq!(
+        m.run(None),
+        Exit::Eret {
+            spsr: EL0_DAIF_MASKED & !PSTATE_I,
+            elr: GUEST_ELR,
+        }
+    );
+    assert_eq!(m.regs, original);
+    assert_eq!(m.irq_frames, 1);
+    let lost = lost_kicks(Machine::el0_irq);
     assert!(
         lost.is_empty(),
         "an owed kick was lost when absorbed at {lost:?}"
     );
 }
 
-/// A kick re-armed while the vCPU was inside the EL1 image (`run_to_exit`'s
-/// critical-section resume) is pending before the hook's served path with
-/// nothing published to the slot. The window takes the SGI and must hand it
-/// back to the host through pending host work.
+/// `Action::Idle`: the syscall hook leaves through `hvc #5` with SP_EL1 back
+/// on the slot's mailbox, and a resume past it fails loud.
 #[test]
-fn gic_kick_pending_before_the_window_leaves_through_the_host() {
-    let mut m = Machine::new(El1IrqMode::GicWindow);
-    m.kick_pending = true;
-    let exit = m.run(None);
-    assert_eq!(m.kick_fate(&exit), KickFate::Host, "{exit:?}");
-    assert!(m.kick_acknowledged);
-    assert_eq!(m.irq_taken(KICK), 1);
+fn idle_action_leaves_through_the_idle_exit() {
+    let mut m = Machine::syscall(El1IrqMode::Gic);
+    m.image = Image::Idle;
+    assert_eq!(
+        m.run(None),
+        Exit::Idle {
+            sp: LINUX_SYSCALL_MAILBOX_BASE + SLOT * 256
+        }
+    );
+    assert_eq!(m.run(None), Exit::Fault, "resuming past hvc #5 fails loud");
 }
 
-/// The hatch's vector bytes open no window and keep the current-EL IRQ slot a
-/// bare `eret`: an IRQ is never unmasked at EL1.
+/// The hatch's vector bytes never unmask IRQs, keep the current-EL IRQ slot
+/// a bare `eret` and the lower-EL IRQ slot the `hvc #4` kick exit.
 #[test]
 fn masked_mode_vector_page_never_unmasks_irqs() {
     let bytes = el1_vectors_bytes_mailbox_irq(true, true, true, El1IrqMode::Masked);
@@ -566,9 +543,14 @@ fn masked_mode_vector_page_never_unmasks_irqs() {
         .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
         .collect();
     assert!(!words.contains(&AARCH64_MSR_DAIFCLR_I_OPCODE));
+    assert!(!words.contains(&enc_bic_xd_xn_xm(1, 1, 2)));
     assert_eq!(
         words[AARCH64_VECTOR_CUR_EL_SPX_IRQ_OFFSET / 4],
         AARCH64_ERET_OPCODE
+    );
+    assert_eq!(
+        words[AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET / 4],
+        AARCH64_HVC_KICK_OPCODE
     );
     assert_eq!(
         bytes,
@@ -577,26 +559,43 @@ fn masked_mode_vector_page_never_unmasks_irqs() {
     );
 }
 
-/// In GIC mode the window and the IRQ hook are installed in otherwise unused
-/// vector-page space, and EL1 unmasks IRQs in exactly one place.
+/// In GIC mode the lower-EL IRQ slot enters the EL0 IRQ hook, installed in
+/// otherwise unused vector-page space; EL1 never unmasks IRQs (so the
+/// current-EL IRQ slot fails loud); and with the EL1 kernel off the page has
+/// no hook at all.
 #[test]
-fn gic_mode_vector_page_has_one_window_and_an_irq_hook() {
-    let masked = el1_vectors_bytes_mailbox_irq(true, true, true, El1IrqMode::Masked);
-    let gic = el1_vectors_bytes_mailbox_irq(true, true, true, El1IrqMode::GicWindow);
+fn gic_mode_vector_page_routes_el0_interrupts_to_el1() {
     let words = |bytes: &[u8]| -> Vec<u32> {
         bytes
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
             .collect()
     };
-    let (masked, gic) = (words(&masked), words(&gic));
+    let masked = words(&el1_vectors_bytes_mailbox_irq(
+        true,
+        true,
+        true,
+        El1IrqMode::Masked,
+    ));
+    let gic = words(&el1_vectors_bytes_mailbox_irq(
+        true,
+        true,
+        true,
+        El1IrqMode::Gic,
+    ));
+    assert!(!gic.contains(&AARCH64_MSR_DAIFCLR_I_OPCODE));
     assert_eq!(
-        gic.iter()
-            .filter(|word| **word == AARCH64_MSR_DAIFCLR_I_OPCODE)
-            .count(),
-        1
+        gic[AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET / 4],
+        enc_b(
+            AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET as u64,
+            EL0_IRQ_HOOK_OFFSET as u64
+        )
     );
-    let hook = EL1_IRQ_HOOK_OFFSET / 4;
+    assert_eq!(
+        gic[AARCH64_VECTOR_CUR_EL_SPX_IRQ_OFFSET / 4],
+        AARCH64_HVC_FAULT_OPCODE
+    );
+    let hook = EL0_IRQ_HOOK_OFFSET / 4;
     let nop = AARCH64_NOP_OPCODE;
     let hook_len = gic[hook..]
         .iter()
@@ -606,13 +605,17 @@ fn gic_mode_vector_page_has_one_window_and_an_irq_hook() {
         masked[hook..hook + hook_len]
             .iter()
             .all(|word| *word == nop),
-        "the IRQ hook overwrote live vector-page code"
+        "the EL0 IRQ hook overwrote live vector-page code"
     );
+    let off = words(&el1_vectors_bytes_mailbox_irq(
+        true,
+        true,
+        false,
+        El1IrqMode::Gic,
+    ));
     assert_eq!(
-        gic[AARCH64_VECTOR_CUR_EL_SPX_IRQ_OFFSET / 4],
-        enc_b(
-            AARCH64_VECTOR_CUR_EL_SPX_IRQ_OFFSET as u64,
-            EL1_IRQ_HOOK_OFFSET as u64
-        )
+        off[AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET / 4],
+        AARCH64_HVC_KICK_OPCODE,
+        "no EL1 kernel, no EL1 interrupt entry"
     );
 }

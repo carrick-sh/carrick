@@ -387,6 +387,7 @@ where
                 scheduler.request_residency_flush(executor);
             }
         }
+        backend.note_bound_cpu(registration.bound_cpu().map(|cpu| cpu.as_u32()));
         if let Err(error) = backend.load(&task) {
             // A load refused because the address space is retiring is not this
             // executor's failure: another thread in the group called `execve`

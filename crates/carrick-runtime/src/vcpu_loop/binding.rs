@@ -3917,7 +3917,22 @@ where
         if let Some(thread) = self.state.kernel_thread.as_ref() {
             thread.begin_guest_run();
         }
+        // Other vCPUs' EL1 may queue threads on this slot only while its
+        // vCPU is in the guest; the exit closes that before the slot is
+        // settled below.
+        let zone_slot = zone::zone_slot(engine);
+        if let Some((zone, slot)) = zone_slot {
+            // The thread may have changed its affinity since it was loaded:
+            // EL1 places the records it creates for it by this mask.
+            if let Some(thread) = self.state.kernel_thread.as_ref() {
+                zone.set_slot_affinity(slot, thread.affinity().words()[0]);
+            }
+            zone.enter_guest(slot);
+        }
         let next = engine.next_syscall();
+        if let Some((zone, slot)) = zone_slot {
+            zone.leave_guest(slot, &carrick_kernel::el1_zone::HostLockWait);
+        }
         if let Some(thread) = self.state.kernel_thread.as_ref() {
             thread.charge_user_ns(engine.take_guest_run_receipt_ns());
         }

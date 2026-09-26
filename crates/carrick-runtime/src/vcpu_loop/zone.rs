@@ -121,6 +121,25 @@ pub(super) fn zone_for(zone_mm: Option<u64>) -> Option<(&'static ZoneTables, u64
     Some((carrick_kernel::el1_zone::zone()?, zone_mm?))
 }
 
+/// The zone and the vCPU slot `engine` runs on, when the carrier schedules
+/// threads in the guest.
+pub(super) fn zone_slot<E: ThreadedEngine>(engine: &E) -> Option<(&'static ZoneTables, SlotId)> {
+    Some((
+        carrick_kernel::el1_zone::zone()?,
+        engine.mailbox_slot().and_then(SlotId::from_index)?,
+    ))
+}
+
+/// How long until the guest virtual counter reaches `deadline` (guest
+/// `CNTVCT_EL0` is the host's `mach_absolute_time` tick count).
+fn until_deadline(deadline: u64) -> std::time::Duration {
+    let ticks = deadline.saturating_sub(carrick_host::clock::monotonic_ticks());
+    let scale = carrick_host::clock::tick_scale()
+        .unwrap_or(carrick_host::clock::TickScale { numer: 1, denom: 1 });
+    let ns = u128::from(ticks) * u128::from(scale.numer) / u128::from(scale.denom.max(1));
+    std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
+}
+
 impl<E: ThreadedEngine + 'static> ProductionHvpatchLoopJob<E>
 where
     E::SiblingSpec: 'static,
@@ -133,23 +152,22 @@ where
     }
 
     /// Settle what EL1 did on this vCPU slot since the host last ran it,
-    /// before anything uses the exit. `None`: the thread this job runs is
-    /// the one that exited; handle the exit. `Some`: that thread is parked
-    /// in the zone and has settled; the exit is abandoned.
+    /// before anything uses the exit (the slot is already closed to other
+    /// vCPUs). `None`: the thread this job runs is the one that exited;
+    /// handle the exit. `Some`: that thread is parked in the zone (it waited
+    /// in EL1 while the vCPU switched to another thread or idled) and has
+    /// settled; the exit is abandoned.
     pub(super) fn reconcile_zone_exit(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         exit: ZoneExit,
     ) -> Result<Option<executor::ExecutorExit>, ProductionHvpatchPollError> {
-        let Some(zone) = carrick_kernel::el1_zone::zone() else {
-            return Ok(None);
-        };
-        let Some(slot) = engine.mailbox_slot().and_then(SlotId::from_index) else {
+        let Some((zone, slot)) = zone_slot(engine) else {
             return Ok(None);
         };
         let s = zone.slot(slot);
-        if s.current().is_none() && s.queued() == 0 {
+        if s.current().is_none() && s.queued() == 0 && s.host_record().is_none() {
             return Ok(None);
         }
         let mut woken = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
@@ -158,61 +176,90 @@ where
         for record in &discarded[..drain.discarded] {
             zone.free_record(*record);
         }
+        // This job's own record, if it was queued here, settles below as
+        // host-owned (ready); publishing it would only make the scheduler
+        // kick this very executor.
         let woken: Vec<RecordRef> = woken[..drain.woken]
             .iter()
+            .filter(|id| Some(**id) != drain.host_record)
             .map(|id| zone.record_ref(*id))
             .collect();
         publish_zone_handbacks(&self.kernel, &woken);
-        let Some(current) = drain.current else {
-            return Ok(None);
-        };
-        if drain.host_record == Some(current) {
-            // EL1 switched this job's own thread back in: it is simply
-            // running again, and its record is done.
-            zone.release_current(slot, current);
-            return Ok(None);
-        }
-        // Another thread is on the vCPU. Give it back to the host with its
-        // live state, then settle this job's thread, which EL1 parked.
-        let served_with_work =
-            carrick_kernel::el1_delegation::take_served_with_work(slot.raw().into());
-        carrick_kernel::el1_delegation::clear_pending_host_work(slot.raw().into());
-        let state = engine.snapshot_guest_state_for_publication()?;
-        let ctx = zone_ctx_from_state(
-            &state,
-            match exit {
-                ZoneExit::Syscall { .. } => ZoneExit::Syscall {
-                    completed: served_with_work,
-                },
-                ZoneExit::El0 => ZoneExit::El0,
-            },
-        )?;
-        engine.discard_terminal_syscall_continuation()?;
-        if served_with_work {
-            carrick_kernel::el1_inotify::deliver_owed_wakes();
-        }
-        // SAFETY: `current` is OnCpu on this slot and the vCPU is stopped:
-        // this executor is its only owner until the handback below.
-        unsafe { *zone.record(current).ctx_mut() = ctx };
-        let current_ref = zone.record_ref(current);
-        match zone.handback_current(slot, current) {
-            CurrentHandback::HandedBack => publish_zone_handbacks(&self.kernel, &[current_ref]),
-            CurrentHandback::Discard => zone.free_record(current),
-            CurrentHandback::Lost => {
-                return Err(RuntimeError::Configuration(format!(
-                    "EL1 zone slot {slot:?} switched-in record {current:?} was not on the slot"
-                ))
-                .into());
+        let state = match (drain.current, drain.host_record) {
+            (None, None) => return Ok(None),
+            (Some(current), Some(own)) if current == own => {
+                // EL1 switched this job's own thread back in: it is simply
+                // running again, and its record is done.
+                zone.release_current(slot, current);
+                return Ok(None);
             }
-        }
+            (Some(current), _) => {
+                // Another thread is on the vCPU. Give it back to the host
+                // with its live state; this job's thread, which EL1 parked,
+                // settles below.
+                let served_with_work =
+                    carrick_kernel::el1_delegation::take_served_with_work(slot.raw().into());
+                carrick_kernel::el1_delegation::clear_pending_host_work(slot.raw().into());
+                let state = engine.snapshot_guest_state_for_publication()?;
+                let ctx = zone_ctx_from_state(
+                    &state,
+                    match exit {
+                        ZoneExit::Syscall { .. } => ZoneExit::Syscall {
+                            completed: served_with_work,
+                        },
+                        ZoneExit::El0 => ZoneExit::El0,
+                    },
+                )?;
+                engine.discard_terminal_syscall_continuation()?;
+                if served_with_work {
+                    carrick_kernel::el1_inotify::deliver_owed_wakes();
+                }
+                // SAFETY: `current` is OnCpu on this slot and the vCPU is
+                // stopped: this executor is its only owner until the
+                // handback below.
+                unsafe { *zone.record(current).ctx_mut() = ctx };
+                let current_ref = zone.record_ref(current);
+                match zone.handback_current(slot, current) {
+                    CurrentHandback::HandedBack => {
+                        publish_zone_handbacks(&self.kernel, &[current_ref]);
+                    }
+                    CurrentHandback::Discard => zone.free_record(current),
+                    CurrentHandback::Lost => {
+                        return Err(RuntimeError::Configuration(format!(
+                            "EL1 zone slot {slot:?} switched-in record {current:?} was not on the slot"
+                        ))
+                        .into());
+                    }
+                }
+                state
+            }
+            (None, Some(_)) => {
+                // The vCPU idled in EL1 with this job's thread parked, and
+                // left for host work: no thread was on it.
+                carrick_kernel::el1_delegation::clear_pending_host_work(slot.raw().into());
+                engine.snapshot_guest_state_for_publication()?
+            }
+        };
         let own = drain.host_record.ok_or_else(|| {
             RuntimeError::Configuration(format!(
                 "EL1 zone slot {slot:?} ran another thread but never parked the loaded one"
             ))
         })?;
+        // The thread settles into a host zone wait: its record stops being
+        // this slot's home, and a deadline this slot's timer kept is the
+        // host's to keep now.
+        let affinity = self
+            .state
+            .kernel_thread
+            .as_ref()
+            .map_or(0, |thread| thread.affinity().words()[0]);
+        let (seq, timeout) = match zone.unhome(slot, own, affinity) {
+            Some((seq, deadline)) => (seq, Some(until_deadline(deadline))),
+            None => (0, None),
+        };
         let own = zone.record_ref(own);
         let request = SyscallRequest::new(98, carrick_observability::compat::SyscallArgs([0; 6]));
-        let exit = self.settle_into_zone(control, state, own, 0, None, request)?;
+        let exit = self.settle_into_zone(control, state, own, seq, timeout, request)?;
         Ok(Some(exit))
     }
 
@@ -309,6 +356,7 @@ where
                 .current_submission_key()
                 .map(|(_, generation)| generation.raw())
                 .unwrap_or(0),
+            affinity: context.thread().affinity().words()[0],
         };
         let parked = {
             let Some(guard) = zone.lock(ZoneTables::bucket_of(mm, uaddr), &HostLockWait) else {

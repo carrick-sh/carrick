@@ -9,9 +9,11 @@
 //! distributor register (the default `GICD_CTLR` already delivers SGIs and
 //! PPIs, qualified live on macOS 27.2 / M4). Carrick has no guest GIC driver,
 //! so per vCPU this module programs, on the owning thread, what a driver's
-//! CPU bring-up would: the redistributor (the kick SGI and the virtual timer
-//! PPI enabled in group 1, with priorities) and the CPU interface (priority
-//! mask, group 1 enable).
+//! CPU bring-up would: the redistributor (the kick SGI, the reschedule SGI
+//! and the virtual timer PPI enabled in group 1, with priorities) and the CPU
+//! interface (priority mask, group 1 enable). The guest's EL1 kernel sends
+//! the reschedule SGI itself (`ICC_SGI1R_EL1`), which the in-kernel GIC
+//! delivers without an exit to Carrick.
 //!
 //! Once a VM has a GIC, `hv_vcpu_set_pending_interrupt` returns
 //! `HV_UNSUPPORTED` (`hv_vcpu.h`), so the kick a vCPU owes at its next EL0
@@ -35,16 +37,26 @@ use carrick_mem::memory::{
 
 /// SGI the host makes pending for a kick owed to the EL0 boundary.
 pub(crate) const KICK_INTID: u32 = carrick_el1_abi::GIC_KICK_INTID;
+/// SGI one vCPU's EL1 sends another when it queues a thread there (EL1 plan
+/// 1c); the host never raises it.
+pub(crate) const RESCHED_INTID: u32 = carrick_el1_abi::GIC_RESCHED_INTID;
 /// Hypervisor.framework's EL1 virtual timer PPI (checked at GIC creation).
 pub(crate) const VTIMER_INTID: u32 = carrick_el1_abi::GIC_VTIMER_INTID;
 const _: () = assert!(KICK_INTID < 16, "the owed kick is an SGI");
+const _: () = assert!(
+    RESCHED_INTID < 16 && RESCHED_INTID != KICK_INTID,
+    "the reschedule interrupt is its own SGI"
+);
 const _: () = assert!(
     VTIMER_INTID >= 16 && VTIMER_INTID < 32,
     "the vtimer is a PPI"
 );
 
-/// Lower value is higher priority: the timer outranks the kick.
+/// Lower value is higher priority: the timer outranks a reschedule, which
+/// outranks the kick. EL1 acknowledges by polling with IRQs masked, so the
+/// order only decides which of several pending interrupts it sees first.
 const VTIMER_PRIORITY: u8 = 0x80;
+const RESCHED_PRIORITY: u8 = 0x90;
 const KICK_PRIORITY: u8 = 0xa0;
 /// CPU-interface priority mask: every Carrick priority passes.
 const ICC_PMR: u64 = 0xf0;
@@ -73,7 +85,7 @@ pub fn interrupt_model() -> InterruptModel {
 /// The EL1 vector page's interrupt mode for this carrier's model.
 pub fn el1_irq_mode() -> carrick_mem::memory::El1IrqMode {
     match interrupt_model() {
-        InterruptModel::Gic => carrick_mem::memory::El1IrqMode::GicWindow,
+        InterruptModel::Gic => carrick_mem::memory::El1IrqMode::Gic,
         InterruptModel::LegacyPendingLine => carrick_mem::memory::El1IrqMode::Masked,
     }
 }
@@ -333,7 +345,7 @@ pub(crate) fn configure_new_vcpu(vcpu: u64) -> Result<(), TrapError> {
             .map_err(|_| TrapError::Hypervisor(format!("GIC affinity index {index} overflows")))?
     };
     use sys::hv_gic_redistributor_reg_t as R;
-    let enabled = (1u64 << KICK_INTID) | (1u64 << VTIMER_INTID);
+    let enabled = (1u64 << KICK_INTID) | (1u64 << RESCHED_INTID) | (1u64 << VTIMER_INTID);
     // SAFETY: owning thread of a live vCPU of this VM; MPIDR is set before any
     // redistributor access, as hv_gic.h requires.
     gic_check(
@@ -353,6 +365,7 @@ pub(crate) fn configure_new_vcpu(vcpu: u64) -> Result<(), TrapError> {
     redistributor_write(vcpu, R::ICACTIVER0, ALL_PRIVATE)?;
     redistributor_write(vcpu, R::IGROUPR0, enabled)?;
     set_priority(vcpu, VTIMER_INTID, VTIMER_PRIORITY)?;
+    set_priority(vcpu, RESCHED_INTID, RESCHED_PRIORITY)?;
     set_priority(vcpu, KICK_INTID, KICK_PRIORITY)?;
     redistributor_write(vcpu, R::ISENABLER0, enabled)?;
     // SAFETY: owning thread of a live vCPU of this VM.

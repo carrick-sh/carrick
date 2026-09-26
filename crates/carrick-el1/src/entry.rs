@@ -10,11 +10,17 @@ fn main() {}
 ///
 /// Invoked with `frame` pointing to a [`carrick_el1_abi::TrapFrame`] allocated
 /// on the per-vCPU EL1 kernel stack.
+/// Also the entry of the vector's EL0 IRQ hook, which saves the same
+/// [`carrick_el1_abi::TrapFrame`] with `esr == 0`.
+///
 /// Returns [`carrick_el1_abi::Action`] encoded as `u64`:
-/// - 0 (`Action::Served`): The syscall was fully handled in-guest; restore registers
-///   and issue `eret` back to guest EL0 with `x0` set to the return value.
+/// - 0 (`Action::Served`): The syscall was fully handled in-guest (or the
+///   interrupt was); restore registers and issue `eret` back to guest EL0.
 /// - 1 (`Action::Forward`): The syscall must be forwarded to the host; restore all
-///   guest registers and branch to `mailbox_capture`.
+///   guest registers and branch to `mailbox_capture` (an interrupt: `hvc #4`).
+/// - 2 (`Action::ServedWithWork`): served, and host work is pending.
+/// - 3 (`Action::Idle`): the thread parked and the idle vCPU leaves for the
+///   host with no thread on it (`hvc #5`).
 ///
 /// # Safety
 ///
@@ -29,6 +35,11 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
     let frame_ref = unsafe { &mut *frame };
     let counters_ref =
         unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
+    // The EL0 IRQ hook saves the same frame with a zero syndrome; an SVC's
+    // syndrome is never zero.
+    if frame_ref.esr == 0 {
+        return carrick_el1::dispatch_irq(frame_ref, counters_ref) as u64;
+    }
     carrick_el1::dispatch_syscall(frame_ref, counters_ref) as u64
 }
 

@@ -412,7 +412,7 @@ where
                                 let (resume_pc, resume_pstate) =
                                     core_note_resume_pair(&registers, synchronous_fatal_owner);
                                 gregs[32] = resume_pc;
-                                gregs[33] = resume_pstate;
+                                gregs[33] = carrick_hal::el0_visible_pstate(resume_pstate);
                                 Ok(carrick_kernel::core_dump::ThreadState {
                                     tid: visible_tid,
                                     registers: carrick_kernel::core_dump::ThreadRegisters {

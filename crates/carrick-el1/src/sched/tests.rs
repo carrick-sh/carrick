@@ -40,8 +40,45 @@ fn identity(tid: u64) -> ThreadIdentity {
         mm: MM,
         file_table: 5,
         generation: 1,
+        affinity: 0,
     }
 }
+
+fn counters() -> &'static Counters {
+    Box::leak(Box::new(Counters::default()))
+}
+
+/// Serve a futex syscall on `slot` the way the dispatcher does.
+fn serve_on(
+    slot: SlotId,
+    frame: &mut TrapFrame,
+    task: &CurrentTask,
+    zone: &ZoneTables,
+    cpu: &mut FakeCpu,
+    counters: &Counters,
+) -> Option<Served> {
+    Sched {
+        zone,
+        slot,
+        task,
+        cpu,
+        user: &HardwareUserWord,
+        counters,
+    }
+    .serve_futex(frame)
+}
+
+fn serve(
+    frame: &mut TrapFrame,
+    task: &CurrentTask,
+    zone: &ZoneTables,
+    cpu: &mut FakeCpu,
+) -> Option<Served> {
+    serve_on(SLOT, frame, task, zone, cpu, counters())
+}
+
+const RETURNED: Option<Served> = Some(Served::Returned { switched: false });
+const SWITCHED: Option<Served> = Some(Served::Returned { switched: true });
 
 /// The slot's task record naming the host-loaded thread `tid`.
 fn task_for(tid: u64) -> CurrentTask {
@@ -103,13 +140,15 @@ fn live(tag: u64, uaddr: u64, op: u64, value: u64) -> (TrapFrame, FakeCpu) {
     frame.x[2] = value;
     frame.x[3] = 0;
     let cpu = FakeCpu {
-        sp_el0: ctx.sp_el0,
-        tpidr_el0: ctx.tpidr_el0,
-        tpidrro_el0: ctx.tpidrro_el0,
-        contextidr_el1: ctx.contextidr_el1,
-        v: ctx.v,
-        fpsr: ctx.fpsr,
-        fpcr: ctx.fpcr,
+        regs: FakeRegs {
+            sp_el0: ctx.sp_el0,
+            tpidr_el0: ctx.tpidr_el0,
+            tpidrro_el0: ctx.tpidrro_el0,
+            contextidr_el1: ctx.contextidr_el1,
+            v: ctx.v,
+            fpsr: ctx.fpsr,
+            fpcr: ctx.fpcr,
+        },
         ..FakeCpu::default()
     };
     (frame, cpu)
@@ -135,21 +174,14 @@ fn ping_pong(skip_fpsimd: bool) -> (TrapFrame, FakeCpu, TrapFrame, FakeCpu) {
     let (a_frame, a_cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
     let (mut frame, mut cpu) = (a_frame, a_cpu.clone());
     cpu.skip_fpsimd = skip_fpsimd;
-    let user = HardwareUserWord;
-    assert_eq!(
-        serve_futex(&mut frame, SLOT, &task, &zone, &mut cpu, &user),
-        Some(Served { switched: false })
-    );
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
     assert_eq!(frame.x[0], 1, "one waiter woken");
     assert_eq!(zone.record(b).claim(), Claim::Queued { slot: SLOT, seq: 1 });
 
     // A waits: it parks and the vCPU switches to B.
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
     let a_before_wait = (frame, cpu.clone());
-    assert_eq!(
-        serve_futex(&mut frame, SLOT, &task, &zone, &mut cpu, &user),
-        Some(Served { switched: true })
-    );
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
     assert_eq!(frame.x[0], 0, "B's wait returns 0");
     assert_eq!(frame.elr, 0xB << 12);
     assert_eq!(task.task_id.load(Ordering::Relaxed), 202);
@@ -158,20 +190,14 @@ fn ping_pong(skip_fpsimd: bool) -> (TrapFrame, FakeCpu, TrapFrame, FakeCpu) {
     assert_eq!(a, Some(b), "B is the switched-in record");
 
     // B runs and uses its FP/SIMD registers.
-    cpu.v[0] ^= 0xdead;
-    cpu.fpcr ^= 1;
+    cpu.regs.v[0] ^= 0xdead;
+    cpu.regs.fpcr ^= 1;
 
     // B wakes A and waits; A comes back.
     set_op(&mut frame, uaddr, FUTEX_WAKE_PRIVATE, 1);
-    assert_eq!(
-        serve_futex(&mut frame, SLOT, &task, &zone, &mut cpu, &user),
-        Some(Served { switched: false })
-    );
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
-    assert_eq!(
-        serve_futex(&mut frame, SLOT, &task, &zone, &mut cpu, &user),
-        Some(Served { switched: true })
-    );
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
     assert_eq!(task.task_id.load(Ordering::Relaxed), 101);
     (a_before_wait.0, a_before_wait.1, frame, cpu)
 }
@@ -182,7 +208,7 @@ fn a_futex_handoff_switches_threads_in_guest_and_preserves_state() {
     before.x[0] = 0; // the wait's return value
     assert_eq!(after, before, "A resumes with exactly its registers");
     assert_eq!(
-        after_cpu, before_cpu,
+        after_cpu.regs, before_cpu.regs,
         "and its SP_EL0, TLS, CONTEXTIDR, FP/SIMD"
     );
 }
@@ -191,24 +217,314 @@ fn a_futex_handoff_switches_threads_in_guest_and_preserves_state() {
 #[test]
 fn a_switch_without_fpsimd_save_is_detected() {
     let (_, before_cpu, _, after_cpu) = ping_pong(true);
-    assert_ne!(after_cpu.v, before_cpu.v);
-    assert_ne!(after_cpu.fpcr, before_cpu.fpcr);
+    assert_ne!(after_cpu.regs.v, before_cpu.regs.v);
+    assert_ne!(after_cpu.regs.fpcr, before_cpu.regs.fpcr);
 }
 
+/// A wait with nothing runnable parks the thread and idles the vCPU in EL1
+/// (polling, then WFI); a host kick (the kick SGI) sends the idle vCPU to the
+/// host with the thread parked in its home record.
 #[test]
-fn a_wait_with_nothing_to_switch_to_forwards() {
+fn a_wait_with_nothing_runnable_idles_until_host_work() {
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    let counters = counters();
+    let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    // The kick arrives while the vCPU is parked in WFI.
+    cpu.pending.push_back(GIC_KICK_INTID);
+    assert_eq!(
+        serve_on(SLOT, &mut frame, &task, &zone, &mut cpu, counters),
+        Some(Served::Idle)
+    );
+    assert!(task.has_pending_host_work());
+    assert_eq!(
+        counters.irq_taken[GIC_KICK_INTID as usize].load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(zone.counters.el1_idle_entries.load(Ordering::Relaxed), 1);
+    assert_eq!(zone.counters.el1_idle_exits.load(Ordering::Relaxed), 1);
+    let home = zone
+        .slot(SLOT)
+        .host_record()
+        .expect("the thread parked in its home record");
+    assert_eq!(zone.record(home).home(), Some(SLOT));
+    assert!(matches!(zone.record(home).claim(), Claim::Parked { .. }));
+    assert_eq!(zone.slot(SLOT).current(), None);
+    assert_eq!(zone.slot(SLOT).state(), carrick_el1_abi::SlotState::Running);
+    assert_eq!(zone.slot(SLOT).sgi_target(), sgi_target_of(cpu.mpidr));
+}
+
+/// With nothing to end it, an idle vCPU polls for its spin budget and then
+/// parks in WFI (the fake CPU fails the test on a WFI nothing can end, so
+/// arm a timer to observe the park).
+#[test]
+fn an_idle_vcpu_parks_in_wfi_after_its_spin() {
     let zone = zone();
     let word = AtomicU32::new(0);
     let uaddr = word.as_ptr() as u64;
     let task = task_for(101);
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_PRIVATE, 0);
-    let copy = frame;
-    assert_eq!(
-        serve_futex(&mut frame, SLOT, &task, &zone, &mut cpu, &HardwareUserWord),
-        None
+    let ts = libc_timespec(0, 5_000_000);
+    frame.x[3] = &ts as *const [u64; 2] as u64;
+    let start = cpu.now;
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
+    assert!(cpu.wfis >= 1, "the idle vCPU parked in WFI");
+    assert!(
+        cpu.now - start >= cpu.freq / 1000 * 5,
+        "it slept until the 5 ms deadline"
     );
-    assert_eq!(frame, copy, "a forward leaves the frame unchanged");
-    assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        zone.counters.el1_wfi_entries.load(Ordering::Relaxed),
+        cpu.wfis
+    );
+}
+
+fn libc_timespec(secs: u64, nanos: u64) -> [u64; 2] {
+    [secs, nanos]
+}
+
+/// A 1 ms FUTEX_WAIT_PRIVATE timeout of the host-loaded thread ends in EL1:
+/// the vCPU idles, its virtual timer ends the park, and the same thread
+/// resumes with ETIMEDOUT and exactly its registers; its home record is
+/// freed, so the host never learns of the wait.
+#[test]
+fn a_timed_wait_ends_in_guest_with_etimedout() {
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    let ts = libc_timespec(0, 1_000_000);
+    frame.x[3] = &ts as *const [u64; 2] as u64;
+    let before = (frame, cpu.regs.clone());
+    let start = cpu.now;
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
+    assert_eq!(frame.x[0] as i64, -110, "ETIMEDOUT");
+    let mut expected = before.0;
+    expected.x[0] = (-110_i64) as u64;
+    assert_eq!(frame, expected, "the thread resumes where it waited");
+    assert_eq!(cpu.regs, before.1);
+    assert!(
+        cpu.now - start >= cpu.freq / 1000,
+        "not before its deadline"
+    );
+    assert_eq!(zone.counters.el1_timeouts.load(Ordering::Relaxed), 1);
+    let home = zone
+        .slot(SLOT)
+        .host_record()
+        .expect("the loaded thread's record");
+    assert_eq!(
+        zone.slot(SLOT).current(),
+        Some(home),
+        "it runs again, as the host believes"
+    );
+    assert_eq!(cpu.timer, None, "the timer is disarmed once the park ended");
+    // Its next timed wait parks into the same record and ends the same way.
+    let ts = libc_timespec(0, 1_000_000);
+    set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    frame.x[3] = &ts as *const [u64; 2] as u64;
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
+    assert_eq!(frame.x[0] as i64, -110);
+    assert_eq!(zone.slot(SLOT).host_record(), Some(home));
+    assert_eq!(zone.counters.el1_timeouts.load(Ordering::Relaxed), 2);
+    assert_eq!(task.task_id.load(Ordering::Relaxed), 101);
+}
+
+/// A switched-in thread's timed wait is forwarded (its deadline would
+/// outlive this vCPU's hold on it); so is an invalid timespec.
+#[test]
+fn timed_waits_this_vcpu_cannot_keep_forward() {
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    let bad = libc_timespec(0, 1_000_000_000);
+    let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    frame.x[3] = &bad as *const [u64; 2] as u64;
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), None);
+    // Switch B in (A wakes B, then A waits untimed).
+    let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
+    set_op(&mut frame, uaddr, FUTEX_WAKE_PRIVATE, 1);
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
+    set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
+    assert_eq!(zone.slot(SLOT).current(), Some(b));
+    let ts = libc_timespec(0, 1_000_000);
+    set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    frame.x[3] = &ts as *const [u64; 2] as u64;
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), None);
+}
+
+/// A handoff across vCPUs: the woken thread is the other vCPU's home
+/// record, so it is queued there, with a reschedule SGI to its published
+/// routing because that vCPU parked in WFI; the other vCPU's idle loop then
+/// switches it in with its wait's result, and frees the home record.
+#[test]
+fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
+    const OTHER: SlotId = SlotId::new(4);
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let counters = counters();
+    for slot in [SLOT, OTHER] {
+        assert!(zone.reset_slot(slot));
+        zone.publish_slot(slot, MM, None, 0);
+        zone.enter_guest(slot);
+    }
+    // B, the thread the host loaded on OTHER, waits with nothing runnable:
+    // OTHER idles; a host kick is the only way this test gets it back.
+    let task_b = task_for(202);
+    let (mut frame_b, mut cpu_b) = live(0xB, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    frame_b.slot = u64::from(OTHER.raw());
+    cpu_b.mpidr = 0x8000_0104;
+    let b_before = frame_b;
+    cpu_b.pending.push_back(GIC_KICK_INTID);
+    assert_eq!(
+        serve_on(OTHER, &mut frame_b, &task_b, &zone, &mut cpu_b, counters),
+        Some(Served::Idle)
+    );
+    task_b.clear_pending_host_work();
+    // Pretend the kick never happened: OTHER is parked in WFI.
+    assert!(!zone.enter_idle(OTHER, false));
+    assert!(zone.enter_idle(OTHER, true));
+    let rb = zone.slot(OTHER).host_record().unwrap();
+
+    // A on SLOT wakes B.
+    let task_a = task_for(101);
+    let (mut frame_a, mut cpu_a) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
+    assert_eq!(
+        serve_on(SLOT, &mut frame_a, &task_a, &zone, &mut cpu_a, counters),
+        RETURNED
+    );
+    assert_eq!(frame_a.x[0], 1);
+    assert_eq!(
+        zone.record(rb).claim(),
+        Claim::Queued {
+            slot: OTHER,
+            seq: 1
+        }
+    );
+    assert_eq!(
+        cpu_a.sgis,
+        [sgi_target_of(0x8000_0104) | (u64::from(GIC_RESCHED_INTID) << 24)]
+    );
+    assert_eq!(sgi_target_of(0x8000_0104), (1 << 4) | (1 << 16));
+    assert_eq!(zone.counters.el1_cross_wakes.load(Ordering::Relaxed), 1);
+    assert_eq!(zone.slot(SLOT).queued(), 0, "nothing queued on the waker");
+
+    // OTHER's idle loop takes the SGI and runs B.
+    cpu_b.pending.push_back(GIC_RESCHED_INTID);
+    let served = Sched {
+        zone: &zone,
+        slot: OTHER,
+        task: &task_b,
+        cpu: &mut cpu_b,
+        user: &HardwareUserWord,
+        counters,
+    }
+    .idle(&mut frame_b);
+    assert_eq!(served, Served::Returned { switched: true });
+    let mut expected = b_before;
+    expected.x[0] = 0;
+    assert_eq!(frame_b, expected, "B resumes from its wait with 0");
+    assert_eq!(
+        zone.slot(OTHER).current(),
+        Some(rb),
+        "B, the loaded thread, runs again"
+    );
+    assert_eq!(
+        zone.record(rb).claim(),
+        Claim::OnCpu {
+            slot: OTHER,
+            seq: 1
+        }
+    );
+}
+
+/// Timer preemption at EL0: a thread queued behind a compute loop runs once
+/// its slice has passed, and the preempted loop later resumes with exactly
+/// its registers (no syscall result applied); neither ever left the guest.
+#[test]
+fn the_virtual_timer_preempts_a_compute_loop() {
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    let counters = counters();
+    let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
+    let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
+    assert_eq!(
+        serve_on(SLOT, &mut frame, &task, &zone, &mut cpu, counters),
+        RETURNED
+    );
+    let slice = cpu.freq / 1000 * 2;
+    assert_eq!(cpu.timer, Some(cpu.now + slice), "the slice timer is armed");
+    // A computes at EL0: its registers change, no syscall.
+    frame.x[5] = 0x5555;
+    frame.elr += 0x40;
+    let a_running = (frame, cpu.regs.clone());
+    let irq = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
+        Sched {
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu,
+            user: &HardwareUserWord,
+            counters,
+        }
+        .serve_irq(frame)
+    };
+    // Before the slice ends nothing changes (a stray reschedule SGI).
+    cpu.pending.push_back(GIC_RESCHED_INTID);
+    assert_eq!(irq(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
+    assert_eq!(frame, a_running.0);
+    // The slice ends: B runs.
+    cpu.now += slice;
+    assert_eq!(irq(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
+    assert_eq!(frame.elr, 0xB << 12, "B runs");
+    assert_eq!(frame.x[0], 0, "B's wait returns 0");
+    assert_eq!(zone.slot(SLOT).current(), Some(b));
+    assert_eq!(task.task_id.load(Ordering::Relaxed), 202);
+    // B computes; the next slice end brings A back, untouched.
+    cpu.regs.v[3] ^= 7;
+    cpu.now += slice;
+    assert_eq!(irq(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
+    assert_eq!(
+        frame, a_running.0,
+        "A resumes exactly where it was preempted"
+    );
+    assert_eq!(cpu.regs, a_running.1);
+    assert_eq!(task.task_id.load(Ordering::Relaxed), 101);
+    assert_eq!(zone.slot(SLOT).current(), zone.slot(SLOT).host_record());
+    assert_eq!(zone.counters.el1_preemptions.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        counters.irq_taken[GIC_VTIMER_INTID as usize].load(Ordering::Relaxed),
+        2
+    );
+}
+
+/// A host kick taken at EL0 sends the vCPU to the host at that boundary.
+#[test]
+fn a_kick_taken_at_el0_forwards() {
+    let zone = zone();
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, 0x1000, FUTEX_WAKE_PRIVATE, 1);
+    cpu.pending.push_back(GIC_KICK_INTID);
+    let copy = frame;
+    let action = Sched {
+        zone: &zone,
+        slot: SLOT,
+        task: &task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters: counters(),
+    }
+    .serve_irq(&mut frame);
+    assert_eq!(action, carrick_el1_abi::Action::Forward);
+    assert!(task.has_pending_host_work());
+    assert_eq!(frame, copy);
 }
 
 #[test]
@@ -219,12 +535,9 @@ fn a_wait_on_a_changed_word_returns_eagain_without_parking() {
     let task = task_for(101);
     let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
-    assert!(serve_futex(&mut frame, SLOT, &task, &zone, &mut cpu, &HardwareUserWord).is_some());
+    assert!(serve(&mut frame, &task, &zone, &mut cpu).is_some());
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 4);
-    assert_eq!(
-        serve_futex(&mut frame, SLOT, &task, &zone, &mut cpu, &HardwareUserWord),
-        Some(Served { switched: false })
-    );
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
     assert_eq!(frame.x[0] as i64, EAGAIN);
     assert_eq!(zone.record(b).claim(), Claim::Queued { slot: SLOT, seq: 1 });
     assert_eq!(zone.slot(SLOT).current(), None);
@@ -236,36 +549,31 @@ fn unserved_futex_operations_forward() {
     let word = AtomicU32::new(0);
     let uaddr = word.as_ptr() as u64;
     let task = task_for(101);
-    let user = HardwareUserWord;
     for (op, timeout, count, bitset) in [
-        (0u64, 0u64, 0u64, 0u64),             // non-private wait
-        (1, 0, 1, 0),                         // non-private wake
-        (FUTEX_WAIT_PRIVATE, 0x1000, 0, 0),   // timed wait
-        (FUTEX_WAKE_PRIVATE, 0, 0, 0),        // wake 0 (the host decides)
-        (FUTEX_WAIT_BITSET_PRIVATE, 0, 0, 0), // bitset 0 is EINVAL
-        (128 | 3, 0, 1, 0),                   // requeue
-        (128 | 4, 0, 1, 0),                   // cmp_requeue
-        (256 | FUTEX_WAIT_PRIVATE, 0, 0, 0),  // clock-realtime flag
+        (0u64, 0u64, 0u64, 0u64),                  // non-private wait
+        (1, 0, 1, 0),                              // non-private wake
+        (FUTEX_WAIT_BITSET_PRIVATE, 0x1000, 0, 1), // absolute timeout
+        (FUTEX_WAKE_PRIVATE, 0, 0, 0),             // wake 0 (the host decides)
+        (FUTEX_WAIT_BITSET_PRIVATE, 0, 0, 0),      // bitset 0 is EINVAL
+        (128 | 3, 0, 1, 0),                        // requeue
+        (128 | 4, 0, 1, 0),                        // cmp_requeue
+        (256 | FUTEX_WAIT_PRIVATE, 0, 0, 0),       // clock-realtime flag
     ] {
         let (mut frame, mut cpu) = live(0xA, uaddr, op, count);
         frame.x[3] = timeout;
         frame.x[5] = bitset;
         assert_eq!(
-            serve_futex(&mut frame, SLOT, &task, &zone, &mut cpu, &user),
+            serve(&mut frame, &task, &zone, &mut cpu),
             None,
             "op {op:#x}"
         );
     }
     let (mut frame, mut cpu) = live(0xA, uaddr + 1, FUTEX_WAKE_PRIVATE, 1);
-    assert_eq!(
-        serve_futex(&mut frame, SLOT, &task, &zone, &mut cpu, &user),
-        None,
-        "unaligned"
-    );
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), None, "unaligned");
     let off = CurrentTask::new();
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
     assert_eq!(
-        serve_futex(&mut frame, SLOT, &off, &zone, &mut cpu, &user),
+        serve(&mut frame, &off, &zone, &mut cpu),
         None,
         "zone off for the task (zone_mm 0)"
     );
@@ -280,10 +588,7 @@ fn threads_of_another_process_are_not_woken() {
     task.zone_mm.store(MM + 1, Ordering::Relaxed);
     let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
-    assert_eq!(
-        serve_futex(&mut frame, SLOT, &task, &zone, &mut cpu, &HardwareUserWord),
-        Some(Served { switched: false })
-    );
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
     assert_eq!(frame.x[0], 0);
     assert!(matches!(zone.record(b).claim(), Claim::Parked { .. }));
 }

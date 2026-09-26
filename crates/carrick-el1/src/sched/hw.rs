@@ -56,6 +56,46 @@ impl UserWord for HardwareUserWord {
         // SAFETY: tests pass the address of a live, aligned u32.
         Some(unsafe { core::ptr::read_volatile(uaddr as *const u32) })
     }
+
+    #[cfg(target_os = "none")]
+    fn read_u64(&self, task: &CurrentTask, uaddr: u64) -> Option<u64> {
+        use crate::file::MemoryValidator;
+        if crate::file::HardwareValidator.readable_bytes(uaddr, 8) < 8 {
+            return None;
+        }
+        let fixup_ptr = &task.fixup_pc as *const _ as *const u64;
+        let mut ok: u64 = 1;
+        let value: u64;
+        // SAFETY: a fault on the user word is intercepted by the EL1 fixup,
+        // which resumes at label 2.
+        unsafe {
+            core::arch::asm!(
+                "adr {tmp}, 2f",
+                "str {tmp}, [{fixup}]",
+                "ldtr {val}, [{addr}]",
+                "str xzr, [{fixup}]",
+                "b 3f",
+                "2:",
+                "str xzr, [{fixup}]",
+                "mov {ok}, #0",
+                "mov {val}, #0",
+                "3:",
+                tmp = out(reg) _,
+                fixup = in(reg) fixup_ptr,
+                addr = in(reg) uaddr,
+                val = out(reg) value,
+                ok = inout(reg) ok,
+                options(nostack)
+            );
+        }
+        (ok != 0).then_some(value)
+    }
+
+    #[cfg(not(target_os = "none"))]
+    fn read_u64(&self, _task: &CurrentTask, uaddr: u64) -> Option<u64> {
+        // SAFETY: tests pass the address of a live, aligned u64.
+        Some(unsafe { core::ptr::read_volatile(uaddr as *const u64) })
+    }
 }
 
 #[cfg(target_os = "none")]
@@ -185,5 +225,83 @@ impl ThreadCpu for HardwareCpu {
         // SAFETY: reading the virtual counter.
         unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) value, options(nostack, nomem)) };
         value
+    }
+
+    fn freq(&self) -> u64 {
+        let value: u64;
+        // SAFETY: reading the counter frequency.
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) value, options(nostack, nomem)) };
+        value
+    }
+
+    fn set_timer(&mut self, cval: Option<u64>) {
+        // SAFETY: the EL1 virtual timer of this vCPU; ENABLE with IMASK
+        // clear, or disabled.
+        unsafe {
+            match cval {
+                Some(cval) => core::arch::asm!(
+                    "msr cntv_cval_el0, {cval}",
+                    "mov {one}, #1",
+                    "msr cntv_ctl_el0, {one}",
+                    "isb",
+                    cval = in(reg) cval,
+                    one = out(reg) _,
+                    options(nostack, nomem)
+                ),
+                None => core::arch::asm!("msr cntv_ctl_el0, xzr", "isb", options(nostack, nomem)),
+            }
+        }
+    }
+
+    fn send_sgi(&mut self, sgi1r: u64) {
+        // SAFETY: ICC_SGI1R_EL1 (S3_0_C12_C11_5). The run-queue stores the
+        // target will read must be visible before it takes the interrupt.
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "msr s3_0_c12_c11_5, {v}",
+                "isb",
+                v = in(reg) sgi1r,
+                options(nostack)
+            );
+        }
+    }
+
+    fn ack_irq(&mut self) -> u32 {
+        let intid: u64;
+        // SAFETY: ICC_IAR1_EL1 (S3_0_C12_C12_0) acknowledges the highest
+        // pending group-1 interrupt (IRQs stay masked at EL1).
+        unsafe {
+            core::arch::asm!("mrs {}, s3_0_c12_c12_0", out(reg) intid, options(nostack));
+        }
+        (intid & 0xff_ffff) as u32
+    }
+
+    fn end_irq(&mut self, intid: u32) {
+        // SAFETY: ICC_EOIR1_EL1 (S3_0_C12_C12_1) completes `intid`.
+        unsafe {
+            core::arch::asm!(
+                "msr s3_0_c12_c12_1, {v}",
+                "isb",
+                v = in(reg) u64::from(intid),
+                options(nostack)
+            );
+        }
+    }
+
+    fn wait_for_interrupt(&mut self) {
+        // SAFETY: WFI with IRQs masked at EL1: a pending interrupt ends it.
+        unsafe { core::arch::asm!("dsb sy", "wfi", options(nostack)) };
+    }
+
+    fn spin(&mut self) {
+        core::hint::spin_loop();
+    }
+
+    fn own_sgi_target(&self) -> u64 {
+        let mpidr: u64;
+        // SAFETY: reading this vCPU's affinity.
+        unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nostack, nomem)) };
+        super::sgi_target_of(mpidr)
     }
 }

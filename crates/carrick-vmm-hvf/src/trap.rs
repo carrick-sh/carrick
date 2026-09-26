@@ -7664,6 +7664,14 @@ impl HvfInner {
                     spsr_el1,
                 });
             }
+            // The EL1 vector's idle exit (EL1 plan 1c): the vCPU's thread is
+            // parked in its zone record and nothing is on the vCPU. It
+            // surfaces as a halt (no syscall pending); the executor settles
+            // the parked thread before anything could resume the vCPU, and a
+            // resume past the `hvc` fails loud.
+            if carrick_hal::is_aarch64_hvc_idle(exception.syndrome) {
+                return Ok(Aarch64Exit::Halt);
+            }
             if is_aarch64_hvc_kick(exception.syndrome) {
                 crate::gic::clear_kick(vcpu)?;
                 *kick_armed = false;
