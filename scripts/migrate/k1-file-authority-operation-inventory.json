@@ -19134,7 +19134,7 @@
     },
     {
       "file": "crates/carrick-vfs/src/fs_backend/host.rs",
-      "line": 5838,
+      "line": 5858,
       "categories": [
         "mapping"
       ],

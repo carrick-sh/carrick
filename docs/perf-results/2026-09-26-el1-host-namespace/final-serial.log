@@ -1,0 +1,45 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vfs-b64f878273ffc91e)
+
+running 38 tests
+test fs_backend::tests::serial_host::dir_cache_refuses_a_symlink_that_escapes_the_sandbox ... ok
+test fs_backend::tests::serial_host::dir_cache_resolves_a_directory_once_and_reuses_it ... ok
+test fs_backend::tests::serial_host::dir_cache_survives_a_file_create_and_unlink_storm ... ok
+test fs_backend::tests::serial_host::dir_cache_survives_directory_tree_deletion ... ok
+test fs_backend::tests::serial_host::host_all_opens_are_nonblocking ... ok
+test fs_backend::tests::serial_host::host_backend_reexec_authority_preserves_sparse_upper_fast_miss ... ok
+test fs_backend::tests::serial_host::host_backend_survives_libc_fork_for_etc_hosts ... ok
+test fs_backend::tests::serial_host::host_descriptor_exhaustion_is_refused_not_unavailable ... ok
+test fs_backend::tests::serial_host::host_descriptor_exhaustion_stays_shut_after_lower_fd_released ... ok
+test fs_backend::tests::serial_host::host_may_have_fifo_nodes_tracks_durable_marker ... ok
+test fs_backend::tests::serial_host::layered_listing_reflects_every_upper_contribution_to_a_lower_directory ... ok
+test fs_backend::tests::serial_host::marker_nodes_flip_dir_overlay_interference ... ok
+test fs_backend::tests::serial_host::rename_stops_the_old_directory_path_from_resolving ... ok
+test fs_backend::tests::serial_host::sparse_upper_fast_absence_disarms_before_a_symlink_is_visible ... ok
+test fs_backend::tests::serial_host::test_decode_getattrlist_cmn_name_malformed_buffer_rejections ... ok
+test fs_backend::tests::serial_host::test_getdents64_2000_entries_host_openat_and_stat_budget ... ok
+test fs_backend::tests::serial_host::test_getdents64_marker_node_per_directory_interference_budget ... ok
+test fs_backend::tests::serial_host::test_mkdir_2000_siblings_host_openat_budget ... ok
+test fs_backend::tests::serial_host::test_mkdir_mode_fidelity_under_host_umask ... ok
+test fs_backend::tests::serial_host::test_mkdir_under_resolved_parent_zero_openat_budget ... ok
+test fs_backend::tests::serial_host::test_name_matches_on_disk_bounds_directory_entry_visits_with_siblings ... ok
+test fs_backend::tests::serial_host::test_name_matches_on_disk_hardlinks_symlinks_directories ... ok
+test fs_backend::tests::serial_host::test_open_trusted_dir_fd_reuses_cached_dir_fd ... ok
+test fs_backend::tests::serial_host::test_stat_existing_path_namei_zero_host_openat ... ok
+test fs_backend::tests::serial_host::trusted_plain_dirent_stream_does_not_repeat_marker_xattr_probe ... ok
+test fs_backend::tests::serial_host::warm_dir_cache_1000_ops_under_4_deep_tree_bounds_opens_and_eviction_visits ... ok
+test fs_backend::tests::serial_host::warm_dir_cache_bounds_path_walk_opens_per_guest_op ... ok
+test vfs::rootfs::tests::serial_host::fast_readonly_open_does_not_infer_a_miss_through_a_lower_symlink ... ok
+test vfs::rootfs::tests::serial_host::fast_readonly_open_proves_a_missing_leaf_below_a_contained_lower_directory ... ok
+test vfs::rootfs::tests::serial_host::fast_readonly_open_refuses_an_upper_shadow ... ok
+test vfs::rootfs::tests::serial_host::fast_readonly_open_uses_the_immutable_lower_when_the_sparse_upper_is_absent ... ok
+test vfs::rootfs::tests::serial_host::immutable_host_lower_merges_shadows_and_tombstones_without_mutation ... ok
+test vfs::rootfs::tests::serial_host::lower_layer_xattr_returns_enodata ... ok
+test vfs::rootfs::tests::serial_host::readonly_immutable_host_lower_open_keeps_a_real_host_file ... ok
+test vfs::rootfs::tests::serial_host::rename_between_shared_lower_upper_hardlinks_keeps_both_dentries ... ok
+test vfs::rootfs::tests::serial_host::sparse_upper_ancestor_whiteout_hides_the_immutable_lower_subtree ... ok
+test vfs::rootfs::tests::serial_host::test_namespace_mutation_work ... ok
+test vfs::rootfs::tests::serial_host::writable_host_lower_open_copies_up_to_a_fork_coherent_host_file ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 253 filtered out; finished in 1.15s
+
