@@ -1068,6 +1068,49 @@ pub fn clear_current_task_record(slot: usize) {
     current_task.clear();
 }
 
+/// The guest virtual address of `slot`'s [`TrapFrame`] on its EL1 stack: the
+/// frame the EL1 hooks save and the idle entry starts from (stack top minus
+/// 0x120, the frame rounded up to 16 bytes).
+pub const fn el1_slot_frame_va(slot: usize) -> u64 {
+    EL1_STACKS_BASE + EL1_STACK_SIZE * (slot as u64 + 1) - 0x120
+}
+
+/// Prepare `slot` for the idle entry (EL1 plan 1d): its task record names no
+/// thread and no address space (pending host work is kept: a kick owed now
+/// makes the idle vCPU leave at once), and its frame is the idle-entry frame
+/// (the slot index, syndrome and ELR 0). Returns the frame's address, for
+/// `x16` at the entry; `None` if the region is not mapped.
+pub fn prepare_idle_entry(slot: usize) -> Option<u64> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return None;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    // SAFETY: the record lives in the EL1 region; only atomics are touched.
+    let task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    task.task_id.store(0, Ordering::Relaxed);
+    task.generation.store(0, Ordering::Relaxed);
+    task.file_table.store(0, Ordering::Relaxed);
+    task.thread_serial.store(0, Ordering::Relaxed);
+    task.served_with_work.store(0, Ordering::Relaxed);
+    task.zone_mm.store(0, Ordering::Release);
+    let frame = el1_slot_frame_va(slot);
+    let frame_offset = (frame - EL1_REGION_BASE) as usize;
+    // SAFETY: the frame lies on the slot's EL1 stack in the mapped region,
+    // and the slot's vCPU is stopped (its executor calls this): nothing else
+    // reads or writes that stack now.
+    unsafe {
+        core::ptr::write(
+            (ptr + frame_offset) as *mut TrapFrame,
+            TrapFrame {
+                slot: slot as u64,
+                ..TrapFrame::default()
+            },
+        );
+    }
+    Some(frame)
+}
+
 /// Mark return-to-user work pending for the vCPU at `slot`.
 pub fn mark_pending_host_work(slot: usize) {
     let ptr = get_el1_region_host_ptr();

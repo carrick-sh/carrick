@@ -1452,6 +1452,55 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         result
     }
 
+    /// Run this vCPU in the EL1 scheduler with no thread loaded (EL1 plan
+    /// 1d, the idle entry), until it leaves for its executor. The executor's
+    /// task is detached and its registers saved elsewhere: this overwrites
+    /// PC, PSTATE, `x16` and both translation roots, which the next load
+    /// restores in full. The vCPU runs on the carrier root (ASID 0, the
+    /// kernel hole and the EL1 region only), so no process's page tables are
+    /// needed while it waits.
+    ///
+    /// Returns the exit that ended the wait: `Halt` is the idle exit (host
+    /// work, or a queued thread that needs the executor); anything else means
+    /// EL1 ran a thread here and it left at EL0, which the executor adopts.
+    pub fn run_idle_entry_on_vcpu(
+        vcpu: &mut V::Vcpu,
+        carrier_root: carrick_mem::memory::CarrierMaintenanceRoot,
+        frame_va: u64,
+    ) -> Result<Aarch64Exit, TrapError> {
+        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+        const TCR_AS: u64 = 1 << 36;
+        let root = carrier_root.raw();
+        // A vCPU that never ran a task still has its reset TCR, under which
+        // nothing translates (an EL1 fetch then faults into a vector that
+        // faults again, forever); every HVPatch task uses this one.
+        vcpu.set_sys_reg(
+            carrick_hal::SysReg::Tcr,
+            carrick_mem::arch_sysregs::TCR_EL1_BOOTSTRAP | TCR_AS,
+        )?;
+        vcpu.set_sys_reg(carrick_hal::SysReg::Ttbr0, root)?;
+        vcpu.set_sys_reg(carrick_hal::SysReg::Ttbr1, root)?;
+        vcpu.set_reg(Reg::X(16), frame_va)?;
+        vcpu.set_reg(Reg::Pc, carrick_mem::memory::el1_idle_entry_va())?;
+        vcpu.set_reg(Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)?;
+        loop {
+            match vcpu.run()? {
+                // A kick at an EL1 instruction outside the image (the vector
+                // page) surfaces here. The hook may already hold a thread
+                // EL1 switched in, so it is never abandoned: re-enter, and
+                // the hook leaves through the host on the kick's pending
+                // host work.
+                Aarch64Exit::Kicked if Self::vcpu_at_el1(vcpu) => continue,
+                exit => return Ok(exit),
+            }
+        }
+    }
+
+    fn vcpu_at_el1(vcpu: &mut V::Vcpu) -> bool {
+        vcpu.get_reg(Reg::Pstate)
+            .is_ok_and(|pstate| (pstate >> 2) & 0b11 != 0)
+    }
+
     pub fn complete_task_load_on_vcpu(vcpu: &mut V::Vcpu) -> Result<(), TrapError> {
         const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
         let saved_pc = vcpu.get_reg(Reg::Pc)?;

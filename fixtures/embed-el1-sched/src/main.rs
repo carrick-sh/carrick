@@ -29,6 +29,15 @@
 //!   idle vCPU is signalled `rounds` times; each wait must return `EINTR`.
 //! - `pstate`: the PSTATE a signal handler sees, for a signal delivered at a
 //!   syscall boundary and for one that interrupts a computing thread.
+//! - `pipe-pingpong <iters>` (EL1 plan 1d): two threads hand a byte back and
+//!   forth over two pipes, so every turn blocks one thread in a host-served
+//!   `read` and completes it from the other; prints the round-trip latency.
+//! - `pipe-compute <ms>` (EL1 plan 1d): two threads pinned to one guest CPU;
+//!   one completes the other's host-served pipe `read`, then computes: the
+//!   woken thread must still run within the window.
+//! - `two-process <iters>` (EL1 plan 1d): `fork`, then each process runs a
+//!   `pingpong` pair pinned to guest CPUs 0 and 1, so threads of the two
+//!   address spaces share those vCPUs; prints each process's round trips.
 //!
 //! Every wait in the checks is bounded, so a lost wake or a lost signal is a
 //! failed line, never a hung test.
@@ -776,6 +785,167 @@ fn pstate_mode() -> i32 {
     i32::from(sync == u64::MAX || async_ == u64::MAX)
 }
 
+// ---------------------------------------------------------------------------
+// EL1 plan 1d modes
+
+fn pipe_pair() -> (i32, i32) {
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    assert_eq!(rc, 0, "pipe");
+    (fds[0], fds[1])
+}
+
+fn read_byte(fd: i32) -> i64 {
+    let mut byte = 0u8;
+    unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) as i64 }
+}
+
+fn write_byte(fd: i32) -> i64 {
+    let byte = 1u8;
+    unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) as i64 }
+}
+
+fn pipe_pingpong(iters: usize) -> i32 {
+    const WARMUP: usize = 200;
+    let (to_b_read, to_b_write) = pipe_pair();
+    let (to_a_read, to_a_write) = pipe_pair();
+    let total = WARMUP + iters;
+    let b = std::thread::spawn(move || {
+        for _ in 0..total {
+            if read_byte(to_b_read) != 1 || write_byte(to_a_write) != 1 {
+                return false;
+            }
+        }
+        true
+    });
+    let mut samples = Vec::with_capacity(iters);
+    for i in 0..total {
+        let t0 = cntvct();
+        if write_byte(to_b_write) != 1 || read_byte(to_a_read) != 1 {
+            println!("pipe-pingpong failed at {i}");
+            return 1;
+        }
+        if i >= WARMUP {
+            samples.push(cntvct() - t0);
+        }
+    }
+    if !b.join().expect("pipe partner exits") {
+        println!("pipe-pingpong partner failed");
+        return 1;
+    }
+    let ns = ns_per_tick();
+    samples.sort_unstable();
+    println!(
+        "pipe-pingpong iters={iters} rt_p50_ns={:.0} rt_p99_ns={:.0}",
+        percentile(&samples, 0.5) as f64 * ns,
+        percentile(&samples, 0.99) as f64 * ns
+    );
+    0
+}
+
+static PC_STOP: AtomicU32 = AtomicU32::new(0);
+static PC_B: AtomicI64 = AtomicI64::new(0);
+
+/// `pipe-compute <ms>`: both threads pinned to guest CPU 0. B blocks in a
+/// host-served pipe `read`; A writes the byte that completes it, then
+/// computes without a syscall for `<ms>`. B must still run: its completed
+/// read is a thread that needs its executor, queued on the vCPU A holds, and
+/// only the in-guest scheduler's slice can give it that vCPU.
+fn pipe_compute(ms: u64) -> i32 {
+    let (read_fd, write_fd) = pipe_pair();
+    let b = std::thread::spawn(move || {
+        pin(0);
+        if read_byte(read_fd) != 1 {
+            return;
+        }
+        while PC_STOP.load(Ordering::Relaxed) == 0 {
+            PC_B.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    pin(0);
+    sleep_ms(30);
+    if write_byte(write_fd) != 1 {
+        println!("pipe-compute write failed");
+        return 1;
+    }
+    let freq = cntfrq();
+    let start = cntvct();
+    let window = freq * ms / 1000;
+    let mut a = 0u64;
+    let mut b_first = None;
+    loop {
+        a += 1;
+        let now = cntvct();
+        if b_first.is_none() && PC_B.load(Ordering::Relaxed) != 0 {
+            b_first = Some(now - start);
+        }
+        if now - start >= window {
+            break;
+        }
+    }
+    PC_STOP.store(1, Ordering::Relaxed);
+    b.join().expect("pipe-compute sibling exits");
+    let bcount = PC_B.load(Ordering::Relaxed);
+    println!(
+        "pipe-compute ms={ms} a_count={a} b_count={bcount} b_first_ms={:.3}",
+        b_first.map_or(-1.0, |t| t as f64 * ns_per_tick() / 1e6)
+    );
+    i32::from(bcount == 0)
+}
+
+/// One process's pinned futex ping-pong for `two-process`: returns the round
+/// trips it completed.
+fn pinned_pair(iters: usize) -> usize {
+    static TURN2: AtomicU32 = AtomicU32::new(0);
+    let b = std::thread::spawn(move || {
+        pin(1);
+        loop {
+            while TURN2.load(Ordering::Acquire) == 0 {
+                let _ = futex_wait(&TURN2, 0);
+            }
+            if TURN2.load(Ordering::Acquire) == 2 {
+                return;
+            }
+            TURN2.store(0, Ordering::Release);
+            let _ = futex_wake(&TURN2, 1);
+        }
+    });
+    pin(0);
+    let mut done = 0;
+    for _ in 0..iters {
+        TURN2.store(1, Ordering::Release);
+        let _ = futex_wake(&TURN2, 1);
+        while TURN2.load(Ordering::Acquire) == 1 {
+            let _ = futex_wait(&TURN2, 1);
+        }
+        done += 1;
+    }
+    TURN2.store(2, Ordering::Release);
+    let _ = futex_wake(&TURN2, 1);
+    b.join().expect("pair partner exits");
+    done
+}
+
+fn two_process(iters: usize) -> i32 {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        println!("fork failed");
+        return 1;
+    }
+    let started = Instant::now();
+    let done = pinned_pair(iters);
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+    if pid == 0 {
+        println!("two-process child round_trips={done} ms={elapsed_ms:.1}");
+        unsafe { libc::_exit(if done == iters { 0 } else { 1 }) };
+    }
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    let child_ok = waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    println!("two-process parent round_trips={done} ms={elapsed_ms:.1} child_ok={child_ok}");
+    if done == iters && child_ok { 0 } else { 1 }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("pingpong");
@@ -793,6 +963,11 @@ fn main() {
         "idle-carrier" => idle_carrier(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(500)),
         "wfi-signal" => wfi_signal(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100)),
         "pstate" => pstate_mode(),
+        "pipe-pingpong" => {
+            pipe_pingpong(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000))
+        }
+        "pipe-compute" => pipe_compute(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(300)),
+        "two-process" => two_process(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000)),
         "exec-child" => {
             println!("exec-child ok");
             0

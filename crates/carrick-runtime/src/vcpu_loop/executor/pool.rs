@@ -25,52 +25,24 @@ use carrick_kernel::kernel::{
 
 /// How many `M`s a carrier starts.
 ///
-/// An executor is an `M` in Go's G/M/P: a host thread owning one HVF vCPU
-/// lease. Each one binds to a guest CPU (`P`) round-robin at registration, so
-/// with more `M`s than `P`s several `M`s share one `P`'s run queue.
+/// An executor is an `M` in Go's G/M/P: a host thread owning one HVF vCPU.
+/// The default is ONE `M` per guest CPU (`P`) — per vCPU the guest can run
+/// threads on. Where the guest schedules its threads (EL1 plan 1d) an
+/// executor is its vCPU's driver: it runs the vCPU, serves what the vCPU
+/// forwards and loads the threads EL1 sends it, and waits in the guest when
+/// it has none; a second `M` on the same `P` would only add a host thread
+/// that competes for the same work. Measured 2026-09-24 and again for 1d
+/// (`docs/superpowers/specs/2026-09-24-el1-kernel.md`, "1d"): `go build`
+/// used 15-20% less carrier CPU with `M` = `P` than with host parallelism.
 ///
-/// The design's steady state is ONE `M` per `P`
-/// (`docs/superpowers/specs/2026-09-07-guest-cpu-scheduler-design.md`), because
-/// a carrier that runs ten host threads while telling the guest `nproc` = 4 is
-/// the over-subscription a four-worker harness turns into load coupling. That
-/// reduction is still NOT taken, but the reason recorded here in round 2 is
-/// STALE and the correction matters.
+/// GMP phase 3 (`handoffp`, a blocking inline host wait lends its `P` to a
+/// spare) is no longer the precondition it was recorded as: threads queued
+/// on a vCPU whose executor is stuck in a host wait are stolen by idle vCPUs,
+/// and completed host waits are placed on idle vCPUs, so no thread waits on
+/// one `M`. The spares and the handoff that exists stay, to keep `P` vCPUs in
+/// the guest while one executor blocks.
 ///
-/// The shapes first: the guest CPU count is the P-core rule —
-/// `host_facts::logical_cpu_count()` is
-/// `min(hw.perflevel0.logicalcpu, hw.logicalcpu)` = `min(4, 10)` = 4 on the
-/// canonical host — while `bound_workers` is `available_parallelism()` = 10.
-/// So `M` = `P` means 4 `M`s, not 10, and it is a real reduction.
-///
-/// Round 2 recorded that `M` = 4 made `go-go_types` complete its tests
-/// (`PASS` on stdout) and then WEDGE in carrier teardown, waiting in
-/// `HvpatchLoopResult::wait` for a process-job result that was never
-/// published, and concluded that phase 3's `handoffp` was the blocker.
-/// **That wedge no longer reproduces.** Measured 2026-09-08 on this branch
-/// with `CARRICK_BOUND_EXECUTORS` alternating 4 and 10 on ONE signed binary
-/// (`7307cc50`), 3 runs each: every `M` = `P` run finished with 150 `--- PASS`
-/// and `wedged=0`. The wedge was the stranded process-job publication main has
-/// since fixed, and `carrick-embed`'s `go_types_exit_publishes_every_process_job`
-/// is its regression test — it was never the phase-3 dependency.
-///
-/// What blocks the reduction now is timing, and that measurement is NOT yet
-/// conclusive, so the count stays at host parallelism. The same run gave
-/// `M` = 4 at 186 s / 95 s / 35 s against `M` = 10 at 55 s (aborted) / 35 s /
-/// 50 s, but host load fell monotonically from 30 to 15 across the sequence
-/// and the `M` = 4 arm ran FIRST in every pair, so it systematically saw the
-/// heavier load; pair 3 (35 s at load 13.85 against 50 s at 15.44) points the
-/// other way. A single-variable rerun on a quiet host decides it — that is
-/// what `CARRICK_BOUND_EXECUTORS` exists for, and it needs no rebuild.
-///
-/// Phase 3 (`handoffp`: release the `P` to a spare on entry to a blocking host
-/// wait) is still unbuilt, and it remains the mechanism that would make `M` =
-/// `P` safe under inline host waits: with one `M` per `P` there is no second
-/// `M` on that `P` to cover one that blocks. That is the term to measure if
-/// the quiet-host rerun does show `M` = `P` slower.
-///
-/// `spare_executors` are extra `M`s that hold no `P` and park; phase 3 is what
-/// will hand one the `P` of an `M` entering a blocking host call. In THIS
-/// phase nothing hands off, so they only park.
+/// `CARRICK_BOUND_EXECUTORS=<n>` is the exact bisection hatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutorPoolConfig {
     /// `M`s bound to a guest CPU, round-robin. Several may share one `P`.
@@ -113,28 +85,14 @@ impl ExecutorPoolConfig {
     }
 }
 
-/// `M`s bound to a guest CPU.
-///
-/// Host parallelism by default, with `CARRICK_BOUND_EXECUTORS=` as the exact
-/// hatch — `=<guest CPU count>` is the design's `M` = `P`, and the two are the
-/// A and B of the ablation the doc on [`ExecutorPoolConfig`] describes. It is
-/// an env read rather than a rebuild precisely because the open question is a
-/// timing comparison that needs a quiet host and many alternating runs, and a
-/// second binary would put a second variable in it.
-///
-/// The backend's vCPU ceiling is the real bound; this is only the request.
+/// `M`s bound to a guest CPU: one per guest CPU (see [`ExecutorPoolConfig`]),
+/// with `CARRICK_BOUND_EXECUTORS=<n>` as the exact bisection hatch. The
+/// backend's vCPU ceiling is the real bound; this is only the request.
 pub fn configured_bound_executors(guest_cpus: usize) -> usize {
-    let _ = guest_cpus;
-    let host_parallelism = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
+    let default = guest_cpus.max(1);
     match std::env::var("CARRICK_BOUND_EXECUTORS") {
-        Ok(raw) => raw
-            .trim()
-            .parse::<usize>()
-            .unwrap_or(host_parallelism)
-            .max(1),
-        Err(_) => host_parallelism,
+        Ok(raw) => raw.trim().parse::<usize>().unwrap_or(default).max(1),
+        Err(_) => default,
     }
 }
 
@@ -296,6 +254,9 @@ pub(crate) struct WorkerKick {
     pub(crate) binding: Mutex<Option<ExecutorBinding>>,
     pub(crate) hardware: Mutex<Option<ExactHardwareKick>>,
     pub(crate) need_resched: AtomicBool,
+    /// The executor waits for work in the guest's scheduler (EL1 plan 1d):
+    /// a scheduler wake reaches it by forcing its vCPU out.
+    guest_idle: AtomicBool,
     receipts: Arc<ReceiptLog>,
     #[cfg(test)]
     delivery_validation_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
@@ -324,6 +285,7 @@ impl WorkerKick {
             binding: Mutex::new(None),
             hardware: Mutex::new(None),
             need_resched: AtomicBool::new(false),
+            guest_idle: AtomicBool::new(false),
             receipts,
             #[cfg(test)]
             delivery_validation_gate: Mutex::new(None),
@@ -365,6 +327,13 @@ impl WorkerKick {
             ));
         }
         Ok(())
+    }
+
+    /// Publish (or end) the executor's wait in the guest. Sequentially
+    /// consistent: a waker either sees the flag and forces the vCPU out, or
+    /// published its work before the executor's re-scan that follows.
+    pub(crate) fn set_guest_idle(&self, idle: bool) {
+        self.guest_idle.store(idle, Ordering::SeqCst);
     }
 
     fn poke_control(&self) {
@@ -453,6 +422,14 @@ impl ExecutorKick for WorkerKick {
 
     fn current_binding(&self) -> Option<ExecutorBinding> {
         *self.binding.lock()
+    }
+
+    fn wake_from_guest_idle(&self) {
+        if self.guest_idle.load(Ordering::SeqCst)
+            && let Some(hardware) = self.hardware.lock().as_ref()
+        {
+            hardware.handle.kick();
+        }
     }
 
     fn debug_need_resched(&self) -> Option<bool> {

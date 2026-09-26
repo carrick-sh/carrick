@@ -466,3 +466,33 @@ mod tests {
         assert!(aggregate(&[odd]).is_err());
     }
 }
+
+/// `CARRICK_ZONE_CENSUS_EVERY_MS=<ms>`: print the in-guest scheduler's census
+/// (`ZoneTables::write_census`) to stderr every `<ms>` while the carrier
+/// runs. A wedge or livelock diagnostic that needs no debugger attached: what
+/// every vCPU slot runs and queues and who owns every parked thread.
+pub fn spawn_zone_census_reporter() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let Some(every) = std::env::var("CARRICK_ZONE_CENSUS_EVERY_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    else {
+        return;
+    };
+    if STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("carrick-zone-census".to_owned())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(every));
+                if let Some(zone) = carrick_el1_abi::zone_tables() {
+                    let mut census = String::new();
+                    let _ = zone.write_census(&mut census);
+                    eprintln!("zone census:\n{census}");
+                }
+            }
+        });
+}

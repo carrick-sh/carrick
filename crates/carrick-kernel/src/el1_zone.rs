@@ -129,41 +129,44 @@ pub fn cancel(record: RecordRef) {
     }
 }
 
+/// What a host futex wake did: how many waiters it woke, and which of them
+/// the runtime hands back to their threads (host-owned with
+/// [`Handback::Woken`]). Where the guest schedules, the others are already
+/// queued in the guest, never host-owned on the way.
+#[derive(Debug, Default)]
+pub struct ZoneWake {
+    pub count: u32,
+    pub handed: Vec<RecordRef>,
+}
+
 /// Host `FUTEX_WAKE(_BITSET)` on a zone process: wake up to `count` waiters
-/// of `(mm, uaddr)` matching `bitset`. Returns the woken records, host-owned
-/// with [`Handback::Woken`], for the runtime to hand back to their threads.
-pub fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> Vec<RecordRef> {
-    let mut woken = Vec::new();
+/// of `(mm, uaddr)` matching `bitset`.
+pub fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> ZoneWake {
+    let mut wake = ZoneWake::default();
+    let mut placements = Vec::new();
     {
         let Some(guard) = zone.lock(ZoneTables::bucket_of(mm, uaddr), &HostLockWait) else {
-            return woken;
+            return wake;
         };
-        let mut remaining = count;
-        let mut batch = [RecordId::PLACEHOLDER; 64];
-        while remaining > 0 {
-            let Ok(n) = zone.wake(
-                &guard,
-                mm,
-                uaddr,
-                bitset,
-                remaining,
-                Waker::Host,
-                &mut batch,
-            ) else {
-                break;
-            };
-            woken.extend(batch[..n as usize].iter().map(|id| zone.record_ref(*id)));
-            if (n as usize) < batch.len() {
-                break;
-            }
-            remaining -= n;
-        }
+        wake.count = zone.wake_host(
+            &guard,
+            mm,
+            uaddr,
+            bitset,
+            count,
+            schedules_in_guest(),
+            &mut |record| wake.handed.push(zone.record_ref(record)),
+            &mut |placement| placements.push(placement),
+        );
+    }
+    for placement in placements {
+        deliver_placement(Some(placement));
     }
     // A futex_waitv park is queued on other buckets too.
-    for record in &woken {
+    for record in &wake.handed {
         zone.unlink_all(record.id, &HostLockWait);
     }
-    woken
+    wake
 }
 
 /// Host `FUTEX_(CMP_)REQUEUE` on a zone process: under both bucket locks,
@@ -240,4 +243,240 @@ pub fn thread_key_of(record: RecordRef) -> Option<crate::kernel::ThreadKey> {
     let tid = i32::try_from(identity.tid).ok()?;
     let serial = std::num::NonZeroU64::new(identity.serial)?;
     crate::kernel::ThreadKey::from_zone_identity(tid, serial)
+}
+
+/// Force `slot`'s vCPU out of the guest WITHOUT host work: a host placement
+/// owes it a reschedule SGI (`ZoneTables::take_resched`), which its run loop
+/// raises before the vCPU runs on.
+pub fn resched_slot(slot: SlotId) {
+    if let Some(kicker) = SLOT_KICKER.get() {
+        kicker(slot);
+    }
+}
+
+fn deliver_placement(placed: Option<carrick_el1_abi::HostPlacement>) -> bool {
+    match placed {
+        Some(placement) => {
+            if placement.resched {
+                resched_slot(placement.slot);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+fn guest_scheduling_hatch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CARRICK_EL1_SCHED").map_or(true, |value| value.trim() != "0")
+    })
+}
+
+/// Whether this carrier schedules its threads in the guest (EL1 plan 1d):
+/// a runnable thread goes to an EL1 run queue, never to a host run queue,
+/// and an executor with no thread waits in the guest. `CARRICK_EL1_SCHED=0`
+/// (exact) is the bisection hatch: host run queues and condvar parks, with
+/// the in-guest futex zone still on.
+pub fn schedules_in_guest() -> bool {
+    guest_scheduling_hatch_enabled() && zone().is_some()
+}
+
+/// Count a runnable thread an executor took from a host run queue.
+pub fn count_host_queue_claim() {
+    if let Some(zone) = zone() {
+        zone.counters
+            .host_queue_claims
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Count an executor parking on a host run-queue condvar for work.
+pub fn count_host_executor_park() {
+    if let Some(zone) = zone() {
+        zone.counters
+            .host_executor_parks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Queue, in the guest, a thread the host made runnable at `generation`
+/// (a completed host wait, a first run, a control action): a service record
+/// ([`Handback::Service`]) that EL1 orders with the rest of a vCPU's run
+/// queue and that the vCPU's executor loads when EL1 reaches it. False: no
+/// record could be allocated; the caller keeps the thread on the host.
+pub fn place_service(
+    thread: crate::kernel::ThreadKey,
+    generation: crate::kernel::objects::ExecutionGeneration,
+    affinity: u64,
+) -> bool {
+    let Some(zone) = zone() else {
+        return false;
+    };
+    let identity = carrick_el1_abi::ThreadIdentity {
+        tid: carrick_el1_abi::El1TaskId::from_linux_tid(thread.tid.raw()).raw(),
+        serial: thread.serial.raw(),
+        mm: 0,
+        file_table: 0,
+        generation: generation.raw(),
+        affinity,
+    };
+    let Ok(record) = zone.alloc_host_runnable(identity) else {
+        return false;
+    };
+    if deliver_placement(zone.place_from_host(record)) {
+        return true;
+    }
+    zone.free_record(record);
+    false
+}
+
+/// The exact runnable generation a service record names.
+pub fn service_key(
+    record: RecordRef,
+) -> Option<(
+    crate::kernel::ThreadKey,
+    crate::kernel::objects::ExecutionGeneration,
+)> {
+    let zone = zone_tables()?;
+    let rec = zone.live(record)?;
+    let key = thread_key_of(record)?;
+    Some((
+        key,
+        crate::kernel::objects::ExecutionGeneration::from_raw(rec.identity().generation),
+    ))
+}
+
+/// How the host hands a zone thread back to its host continuation (its zone
+/// wait becomes ready and the scheduler makes it runnable). Registered by
+/// the carrier with its scheduler.
+pub type HandbackPublisher = Box<dyn Fn(RecordRef) + Send + Sync>;
+
+static HANDBACK_PUBLISHER: parking_lot::RwLock<Option<HandbackPublisher>> =
+    parking_lot::RwLock::new(None);
+
+/// Register the handback publisher of the carrier's current scheduler. Each
+/// start of the executor pool registers its own scheduler (a carrier may run
+/// several containers in turn): a publisher of a retired scheduler would drop
+/// every handback.
+pub fn register_handback_publisher(publisher: HandbackPublisher) {
+    *HANDBACK_PUBLISHER.write() = Some(publisher);
+}
+
+/// Hand host-owned zone threads back to their host continuations: each
+/// zone wait becomes ready and the scheduler makes its thread runnable.
+pub fn hand_back(records: &[RecordRef]) {
+    for record in records {
+        publish_handback(*record);
+    }
+}
+
+fn publish_handback(record: RecordRef) {
+    if let Some(zone) = zone_tables() {
+        zone.counters
+            .host_handbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(publisher) = HANDBACK_PUBLISHER.read().as_ref() {
+        publisher(record);
+    }
+}
+
+/// Before the executor of `slot` installs address space `mm` there (0: none,
+/// while it waits in the guest), move every queued thread of another address
+/// space to a slot that runs it, or else back to its host continuation.
+pub fn evict_foreign(slot: SlotId, mm: u64) {
+    let Some(zone) = zone() else {
+        return;
+    };
+    relocate(zone, slot, Some(mm));
+}
+
+fn relocate(zone: &ZoneTables, slot: SlotId, mm: Option<u64>) {
+    let mut handed = Vec::new();
+    let mut placements = Vec::new();
+    zone.relocate(
+        slot,
+        mm,
+        &mut |record, discard| handed.push((record, discard)),
+        &mut |placement| placements.push(placement),
+    );
+    for placement in placements {
+        deliver_placement(Some(placement));
+    }
+    for (record, discard) in handed {
+        if discard {
+            zone.free_record(record);
+        } else {
+            publish_handback(zone.record_ref(record));
+        }
+    }
+}
+
+/// The executor of `slot`, stopped: hand every queued thread the host asked
+/// for while EL1 held it to its host continuation (a signal, an exit or
+/// exec drain acts on it there).
+pub fn hand_back_wanted(slot: SlotId) {
+    let Some(zone) = zone() else {
+        return;
+    };
+    let mut wanted = Vec::new();
+    zone.take_host_wanted(slot, &mut |record| wanted.push(zone.record_ref(record)));
+    for record in wanted {
+        publish_handback(record);
+    }
+}
+
+/// The executor of `slot` is about to park on a host run queue (the
+/// `CARRICK_EL1_SCHED=0` hatch): nothing runs its vCPU while it waits, so
+/// every thread queued there goes to its host continuation.
+pub fn drain_to_host(slot: SlotId) {
+    let Some(zone) = zone() else {
+        return;
+    };
+    let mut handed = Vec::new();
+    zone.drain_slot(slot, &mut |record, discard| {
+        if discard {
+            zone.free_record(record);
+        } else {
+            handed.push(zone.record_ref(record));
+        }
+    });
+    for record in handed {
+        publish_handback(record);
+    }
+}
+
+/// The executor of `slot` is about to wait on the host with its vCPU stopped
+/// (a spare): nothing may be queued on it, and what is goes elsewhere.
+pub fn retire_slot(slot: SlotId) {
+    let Some(zone) = zone() else {
+        return;
+    };
+    let mut records = Vec::new();
+    let mut placements = Vec::new();
+    zone.retire_slot(slot, &mut |record| records.push(record), &mut |placement| {
+        placements.push(placement)
+    });
+    for placement in placements {
+        deliver_placement(Some(placement));
+    }
+    for record in records {
+        if zone.record(record).handback() == Some(Handback::Service) {
+            // A service record stands for its thread's held host row, which
+            // only the scheduler sees: placing it from host ownership is
+            // invisible to any claimant.
+            if !deliver_placement(zone.place_from_host(record)) {
+                // Every bound executor's slot is live and allows every CPU a
+                // thread may name, so a service thread always has a slot; one
+                // with none would strand its thread's held row.
+                carrick_fatal::carrick_fatal!(
+                    "el1_zone::retire_slot",
+                    "no vCPU slot can take service record {record:?} from retired slot {slot:?}"
+                );
+            }
+        } else {
+            publish_handback(zone.record_ref(record));
+        }
+    }
 }

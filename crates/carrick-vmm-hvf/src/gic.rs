@@ -389,6 +389,52 @@ pub(crate) fn arm_kick(vcpu: &applevisor::vcpu::Vcpu) -> Result<(), TrapError> {
     set_kick_pending(vcpu, true)
 }
 
+/// Make the reschedule SGI pending on this (the caller's own) vCPU: a host
+/// placement queued a thread on its slot and cannot send the SGI itself
+/// (EL1 plan 1d). The in-guest scheduler takes it at the next EL0
+/// instruction, or its idle loop acknowledges it.
+pub(crate) fn arm_resched(vcpu: &applevisor::vcpu::Vcpu) -> Result<(), TrapError> {
+    match interrupt_model() {
+        InterruptModel::Gic => redistributor_write(
+            vcpu.id(),
+            sys::hv_gic_redistributor_reg_t::ISPENDR0,
+            1 << carrick_el1_abi::GIC_RESCHED_INTID,
+        ),
+        InterruptModel::LegacyPendingLine => Ok(()),
+    }
+}
+
+/// Clear PSTATE.I on this (the caller's own) vCPU when it is about to resume
+/// at EL0, so an interrupt pending for the in-guest scheduler is taken at
+/// the first EL0 instruction (GIC mode only; the guest never sees the bit,
+/// `carrick_hal::el0_visible_pstate`).
+pub(crate) fn unmask_el0_irqs(vcpu: &applevisor::vcpu::Vcpu) -> Result<(), TrapError> {
+    use applevisor::prelude::Reg;
+    if interrupt_model() != InterruptModel::Gic {
+        return Ok(());
+    }
+    use applevisor::prelude::SysReg;
+    const PSTATE_I: u64 = 1 << 7;
+    let map = |error: applevisor::error::HypervisorError| TrapError::Hypervisor(error.to_string());
+    let cpsr = vcpu.get_reg(Reg::CPSR).map_err(map)?;
+    if cpsr & 0xf == 0 {
+        if cpsr & PSTATE_I != 0 {
+            vcpu.set_reg(Reg::CPSR, cpsr & !PSTATE_I).map_err(map)?;
+        }
+        return Ok(());
+    }
+    // Stopped in Carrick's EL1 code on its way back to EL0 (the mailbox
+    // return after a forwarded syscall erets with the live SPSR_EL1): the
+    // EL0 return state is there. A hook that reloads SPSR_EL1 afterwards
+    // unmasks on its served return anyway.
+    let spsr = vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(map)?;
+    if spsr & 0xf == 0 && spsr & PSTATE_I != 0 {
+        vcpu.set_sys_reg(SysReg::SPSR_EL1, spsr & !PSTATE_I)
+            .map_err(map)?;
+    }
+    Ok(())
+}
+
 /// Withdraw an owed kick that some exit surfaced.
 pub(crate) fn clear_kick(vcpu: &applevisor::vcpu::Vcpu) -> Result<(), TrapError> {
     set_kick_pending(vcpu, false)

@@ -23,10 +23,34 @@ use super::exec::ProductionHvpatchPollError;
 use super::outcome::HvpatchLoopSuspension;
 use super::*;
 use carrick_el1_abi::{
-    CurrentHandback, Handback, RecordId, RecordRef, SlotId, ThreadCtx, ThreadIdentity, ZoneTables,
+    CurrentHandback, Handback, RecordRef, SlotId, ThreadCtx, ThreadIdentity, ZoneTables,
 };
 use carrick_hal::threaded::GuestCpuState;
 use carrick_kernel::el1_zone::HostLockWait;
+
+thread_local! {
+    /// The zone thread this executor thread took off its vCPU at the last
+    /// exit (EL1 plan 1d): it claims that thread itself next, rather than
+    /// publish it to a run queue for any executor.
+    static PENDING_ADOPTION: std::cell::Cell<Option<RecordRef>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The zone thread this executor thread owes a claim, if any.
+pub(crate) fn take_pending_adoption() -> Option<RecordRef> {
+    PENDING_ADOPTION.with(std::cell::Cell::take)
+}
+
+fn owe_adoption(record: RecordRef) {
+    if let Some(previous) = PENDING_ADOPTION.with(|cell| cell.replace(Some(record))) {
+        // One exit takes at most one thread off the vCPU, and the executor
+        // claims it before its next run: a second is a protocol violation.
+        carrick_fatal::carrick_fatal!(
+            "vcpu_loop::el1_zone",
+            "executor owed two zone adoptions: {previous:?} then {record:?}"
+        );
+    }
+}
 
 /// How the vCPU left the guest, for capturing a thread's EL0 state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,22 +120,10 @@ pub(super) fn zone_ctx_from_state(
     Ok(ctx)
 }
 
-/// Make each host-owned record's thread runnable (its zone wait ready).
-pub(super) fn publish_zone_handbacks(kernel: &Kernel, records: &[RecordRef]) {
-    if records.is_empty() {
-        return;
-    }
-    use carrick_kernel::kernel::CarrierProcess as _;
-    let (Some(runtime), Some(process)) = (
-        kernel.hvpatch_runtime.as_ref(),
-        kernel.hvpatch_process.as_ref(),
-    ) else {
-        return;
-    };
-    let (scheduler, _) = runtime.continuation_services(process.kernel_graph());
-    for record in records {
-        scheduler.publish_zone_handback(*record);
-    }
+/// Hand each host-owned zone thread (a host wake no vCPU could take) back
+/// to its host continuation.
+pub(super) fn publish_zone_handbacks(_kernel: &Kernel, records: &[RecordRef]) {
+    carrick_kernel::el1_zone::hand_back(records);
 }
 
 /// The zone and this process's key, when the carrier serves its private
@@ -154,8 +166,13 @@ where
     /// before anything uses the exit (the slot is already closed to other
     /// vCPUs). `None`: the thread this job runs is the one that exited;
     /// handle the exit. `Some`: that thread is parked in the zone (it waited
-    /// in EL1 while the vCPU switched to another thread or idled) and has
-    /// settled; the exit is abandoned.
+    /// in EL1 while the vCPU switched to another thread, or was preempted
+    /// there) and has settled; the exit is abandoned.
+    ///
+    /// Threads still queued on the slot stay queued (EL1 plan 1d): EL1 runs
+    /// them when this vCPU returns to the guest, or an idle vCPU steals them.
+    /// A thread EL1 ran here that exited to the host is this executor's to
+    /// claim next ([`take_pending_adoption`]), not a run queue's.
     pub(super) fn reconcile_zone_exit(
         &mut self,
         engine: &mut E,
@@ -165,28 +182,11 @@ where
         let Some((zone, slot)) = zone_slot(engine) else {
             return Ok(None);
         };
+        zone.sweep_cancelled(slot);
+        carrick_kernel::el1_zone::hand_back_wanted(slot);
         let s = zone.slot(slot);
-        if s.current().is_none() && s.queued() == 0 && s.host_record().is_none() {
-            return Ok(None);
-        }
-        let mut handed_back: Vec<RecordId> = Vec::new();
-        let drain = zone.drain_slot(slot, &mut |record, discard| {
-            if discard {
-                zone.free_record(record);
-            } else {
-                handed_back.push(record);
-            }
-        });
-        // This job's own record, if it was queued here, settles below as
-        // host-owned (ready); publishing it would only make the scheduler
-        // kick this very executor.
-        let woken: Vec<RecordRef> = handed_back
-            .iter()
-            .filter(|id| Some(**id) != drain.host_record)
-            .map(|id| zone.record_ref(*id))
-            .collect();
-        publish_zone_handbacks(&self.kernel, &woken);
-        let state = match (drain.current, drain.host_record) {
+        let (current, own) = (s.current(), s.host_record());
+        let state = match (current, own) {
             (None, None) => return Ok(None),
             (Some(current), Some(own)) if current == own => {
                 // EL1 switched this job's own thread back in: it is simply
@@ -195,9 +195,9 @@ where
                 return Ok(None);
             }
             (Some(current), _) => {
-                // Another thread is on the vCPU. Give it back to the host
-                // with its live state; this job's thread, which EL1 parked,
-                // settles below.
+                // Another thread is on the vCPU. Take it off with its live
+                // state; this executor claims it next. This job's thread,
+                // which EL1 parked, settles below.
                 let served_with_work =
                     carrick_kernel::el1_delegation::take_served_with_work(slot.raw().into());
                 carrick_kernel::el1_delegation::clear_pending_host_work(slot.raw().into());
@@ -222,7 +222,10 @@ where
                 let current_ref = zone.record_ref(current);
                 match zone.handback_current(slot, current) {
                     CurrentHandback::HandedBack => {
-                        publish_zone_handbacks(&self.kernel, &[current_ref]);
+                        zone.counters
+                            .exit_adoptions
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        owe_adoption(current_ref);
                     }
                     CurrentHandback::Discard => zone.free_record(current),
                     CurrentHandback::Lost => {
@@ -235,13 +238,14 @@ where
                 state
             }
             (None, Some(_)) => {
-                // The vCPU idled in EL1 with this job's thread parked, and
-                // left for host work: no thread was on it.
+                // The vCPU left EL1 with no thread on it (the idle exit)
+                // with this job's thread parked or preempted: host work, or
+                // a queued thread that needs this executor.
                 carrick_kernel::el1_delegation::clear_pending_host_work(slot.raw().into());
                 engine.snapshot_guest_state_for_publication()?
             }
         };
-        let own = drain.host_record.ok_or_else(|| {
+        let own = own.ok_or_else(|| {
             RuntimeError::Configuration(format!(
                 "EL1 zone slot {slot:?} ran another thread but never parked the loaded one"
             ))

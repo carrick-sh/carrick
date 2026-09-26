@@ -1393,6 +1393,33 @@ pub fn invalidate_worker_asid(
     Aarch64EngineCore::<HvfAarch64Vmm>::invalidate_asid_on_vcpu(vcpu, asid, carrier_root)
 }
 
+/// Run the executor's own vCPU, with no task attached, in the EL1 scheduler
+/// (EL1 plan 1d): see `Aarch64EngineCore::run_idle_entry_on_vcpu`.
+pub fn run_worker_idle_entry(
+    vmm: &mut HvfAarch64Vmm,
+    vcpu: &mut HvfAarch64Vcpu,
+    frame_va: u64,
+) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
+    let live = vcpu.live()?;
+    vmm.state
+        .audit_persistent_worker_vcpu_boundary(&live.inner, &live.mailbox)?;
+    let carrier_root = vmm.state.carrier_maintenance_root()?;
+    let exit =
+        Aarch64EngineCore::<HvfAarch64Vmm>::run_idle_entry_on_vcpu(vcpu, carrier_root, frame_va);
+    // The idle entry runs EL1 on the slot's stack (SP_EL1 at the frame); an
+    // exit that abandons it mid-EL1 (a kick outside the image) leaves SP_EL1
+    // there. Every host boundary of an executor vCPU has SP_EL1 on its
+    // mailbox slot, which the syscall hook derives the slot from.
+    let live = vcpu.live()?;
+    live.inner
+        .set_sys_reg(
+            applevisor::prelude::SysReg::SP_EL1,
+            live.mailbox.slot().guest_address(),
+        )
+        .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+    exit
+}
+
 /// Service an exact-ASID generation on a loaded owner vCPU without detaching
 /// the task or reacquiring runtime page-table exclusion.
 pub fn invalidate_loaded_asid(engine: &mut HvfAarch64Engine, asid: u16) -> Result<(), TrapError> {

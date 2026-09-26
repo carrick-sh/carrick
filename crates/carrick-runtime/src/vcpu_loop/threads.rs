@@ -22,8 +22,8 @@ pub(super) fn clear_persistent_child_tid_and_wake<M: carrick_guest_mem::CurrentM
         let _ = memory.write_bytes(address, &0_i32.to_le_bytes());
         let woken = if let Some((zone, mm)) = zone {
             let woken = carrick_kernel::el1_zone::wake(zone, mm, address, u32::MAX, 1);
-            handback(&woken);
-            woken.len() as u32
+            handback(&woken.handed);
+            woken.count
         } else {
             futex.wake(address, 1)
         };
