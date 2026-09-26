@@ -53,6 +53,7 @@ impl std::ops::DerefMut for TrackedStage1Image {
 struct Stage1AuthorityInner {
     manager: TrackedStage1Image,
     arena_source: Option<Box<dyn TableArenaSource>>,
+    host_resolver: Option<Arc<dyn HostArenaResolver + Send + Sync>>,
     vfork_shares: usize,
     engines: usize,
     /// Recycle pool shared by this authority and every child authority it
@@ -207,10 +208,20 @@ impl Stage1Authority {
                     generation: std::num::NonZeroU64::new(1),
                 },
                 arena_source: None,
+                host_resolver: None,
                 vfork_shares: 0,
                 engines: 1,
                 image_pool,
             })),
+        }
+    }
+
+    /// Bind a live host arena resolver, making hardware-visible backing authoritative.
+    pub fn bind_live_backing(&self, resolver: Arc<dyn HostArenaResolver + Send + Sync>) {
+        let mut inner = self.inner.lock();
+        inner.host_resolver = Some(Arc::clone(&resolver));
+        if let Some(manager) = inner.manager.as_mut() {
+            manager.make_live(resolver);
         }
     }
 
@@ -234,8 +245,12 @@ impl Stage1Authority {
     }
 
     /// Set the inner manager directly. Used primarily for test harnesses.
-    pub fn set_manager(&self, manager: PageTableManager) {
-        *self.inner.lock().manager = Some(manager);
+    pub fn set_manager(&self, mut manager: PageTableManager) {
+        let mut inner = self.inner.lock();
+        if let Some(ref resolver) = inner.host_resolver {
+            manager.make_live(Arc::clone(resolver));
+        }
+        *inner.manager = Some(manager);
     }
 
     /// Number of active execution engines sharing this stage-1 authority.
@@ -323,24 +338,26 @@ impl Stage1Authority {
     /// Extension arenas are cloned, but the `TableArenaSource` remains exclusively
     /// owned by this `Stage1Authority`.
     pub fn snapshot_image(&self) -> Option<PageTableManager> {
-        (*self.inner.lock().manager).clone()
+        let guard = self.inner.lock();
+        let source = guard.manager.as_ref()?;
+        Some(source.snapshot_image())
     }
 
     /// Snapshot the current image into a recycled buffer when the pool holds
     /// one, cloning fresh otherwise. Returns the image and whether a fresh
     /// host allocation was needed (`true` = fresh). A recycled image is
-    /// `clone_from`-overwritten, so its contents equal [`Self::snapshot_image`].
+    /// overwritten via `snapshot_into`, so its contents equal [`Self::snapshot_image`].
     pub fn snapshot_image_recycled(&self) -> Option<(PageTableManager, bool)> {
         let guard = self.inner.lock();
         let source = guard.manager.as_ref()?;
         match guard.image_pool.take() {
             Some(mut image) => {
-                image.clone_from(source);
+                source.snapshot_into(&mut image);
                 Some((image, false))
             }
             None => {
                 guard.image_pool.record_fresh_allocation();
-                Some((source.clone(), true))
+                Some((source.snapshot_image(), true))
             }
         }
     }
@@ -429,7 +446,10 @@ impl Stage1Authority {
         let authority = self.authority_id();
         let mut inner = self.inner.try_lock_until(deadline).ok_or(on_timeout)?;
         if inner.manager.is_none() {
-            let manager = builder()?;
+            let mut manager = builder()?;
+            if let Some(ref resolver) = inner.host_resolver {
+                manager.make_live(Arc::clone(resolver));
+            }
             let had_source = inner.arena_source.is_some();
             carrick_observability::probes::stage1_arena_install(
                 4,
@@ -502,7 +522,10 @@ impl Stage1Authority {
             Ok(())
         } else {
             match eager_builder() {
-                Ok(manager) => {
+                Ok(mut manager) => {
+                    if let Some(ref resolver) = inner.host_resolver {
+                        manager.make_live(Arc::clone(resolver));
+                    }
                     carrick_observability::probes::stage1_arena_install(2, 1, 0, authority);
                     inner.arena_source = Some(source);
                     *inner.manager = Some(manager);
@@ -531,7 +554,10 @@ impl Stage1Authority {
         let authority = self.authority_id();
         let mut inner = self.inner.lock();
         if inner.manager.is_none() {
-            let manager = builder()?;
+            let mut manager = builder()?;
+            if let Some(ref resolver) = inner.host_resolver {
+                manager.make_live(Arc::clone(resolver));
+            }
             let had_source = inner.arena_source.is_some();
             carrick_observability::probes::stage1_arena_install(
                 4,
@@ -579,6 +605,9 @@ impl Stage1Authority {
             let after = before;
             carrick_observability::probes::stage1_arena_replace(site, before, after, authority);
         }
+        if let Some(ref resolver) = inner.host_resolver {
+            image.make_live(Arc::clone(resolver));
+        }
         inner.manager.replace(image)
     }
 
@@ -610,6 +639,9 @@ impl Stage1Authority {
             carrick_observability::probes::stage1_arena_replace(site, before, after, authority);
         }
         unsafe { image.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
+        if let Some(ref resolver) = inner.host_resolver {
+            image.make_live(Arc::clone(resolver));
+        }
         inner.manager.replace(image)
     }
 
@@ -710,6 +742,9 @@ impl Stage1Authority {
         if previous.is_exclusive() {
             let mut prev_guard = previous.inner.lock();
             let mut new_guard = self.inner.lock();
+            if new_guard.host_resolver.is_none() {
+                new_guard.host_resolver = prev_guard.host_resolver.clone();
+            }
             let before = u32::from(new_guard.arena_source.is_some());
             if let Some(old_source) = prev_guard.arena_source.take()
                 && new_guard.arena_source.is_none()
@@ -723,6 +758,12 @@ impl Stage1Authority {
                 } else {
                     *new_guard.manager = Some(old);
                 }
+            }
+            let resolver_opt = new_guard.host_resolver.clone();
+            if let Some(ref resolver) = resolver_opt
+                && let Some(mgr) = new_guard.manager.as_mut()
+            {
+                mgr.make_live(Arc::clone(resolver));
             }
             let after = u32::from(new_guard.arena_source.is_some());
             carrick_observability::probes::stage1_arena_replace(12, before, after, authority);
