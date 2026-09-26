@@ -1,0 +1,354 @@
+   Compiling libc v0.2.189
+   Compiling carrick-embed-interceptor-probe v0.0.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/fixtures/embed-interceptor-probe)
+    Finished `release` profile [optimized] target(s) in 0.61s
+build-embed-interceptor-probe: wrote /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/embed-fixtures/interceptor-probe-aarch64
+   Compiling carrick-embed-zone-readers v0.0.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/fixtures/embed-zone-readers)
+    Finished `release` profile [optimized] target(s) in 0.21s
+build-embed-zone-readers: wrote /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/embed-fixtures/zone-readers-aarch64
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-el1-sched: wrote /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/embed-fixtures/el1-sched-aarch64
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.186
+   Compiling cfg-if v1.0.4
+   Compiling serde v1.0.228
+   Compiling serde_core v1.0.228
+   Compiling thiserror v2.0.20
+   Compiling portable-atomic v1.13.1
+   Compiling smallvec v1.15.1
+   Compiling zmij v1.0.21
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.0
+   Compiling critical-section v1.2.0
+   Compiling serde_json v1.0.149
+   Compiling log v0.4.29
+   Compiling bitflags v2.11.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling zerocopy v0.8.48
+   Compiling pin-project-lite v0.2.17
+   Compiling version_check v0.9.5
+   Compiling generic-array v0.14.7
+   Compiling syn v2.0.117
+   Compiling syn v3.0.3
+   Compiling ucd-trie v0.1.7
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v1.3.0
+   Compiling subtle v2.6.1
+   Compiling errno v0.3.14
+   Compiling cc v1.2.62
+   Compiling pest v2.8.6
+   Compiling bytes v1.11.1
+   Compiling typenum v1.20.0
+   Compiling once_cell v1.21.4
+   Compiling carrick-fatal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-fatal)
+   Compiling futures-core v0.3.32
+   Compiling parking_lot_core v0.9.12
+   Compiling signal-hook-registry v1.4.8
+   Compiling litemap v0.8.2
+   Compiling writeable v0.6.3
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling pest_meta v2.8.6
+   Compiling tracing-core v0.1.36
+   Compiling socket2 v0.6.3
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling mio v1.2.0
+   Compiling utf8_iter v1.0.4
+   Compiling icu_properties_data v2.2.0
+   Compiling icu_normalizer_data v2.2.0
+   Compiling rustix v1.1.4
+   Compiling plain v0.2.3
+   Compiling thiserror-impl v2.0.20
+   Compiling digest v0.10.7
+   Compiling ring v0.17.14
+   Compiling parking_lot v0.12.5
+   Compiling percent-encoding v2.3.2
+   Compiling getrandom v0.3.4
+   Compiling synstructure v0.13.2
+   Compiling pest_generator v2.8.6
+   Compiling http v1.4.0
+   Compiling cpufeatures v0.2.17
+   Compiling strsim v0.11.1
+   Compiling fnv v1.0.7
+   Compiling ident_case v1.0.1
+   Compiling zeroize v1.8.2
+   Compiling usdt-impl v0.6.0
+   Compiling rustls-pki-types v1.14.1
+   Compiling darling_core v0.20.11
+   Compiling http-body v1.0.1
+   Compiling sha2 v0.10.9
+   Compiling serde_derive v1.0.228
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling zerocopy-derive v0.8.48
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.5
+   Compiling scroll_derive v0.13.1
+   Compiling tokio-macros v2.7.0
+   Compiling zerofrom v0.1.8
+   Compiling pest_derive v2.8.6
+   Compiling yoke v0.8.2
+   Compiling tracing-attributes v0.1.31
+   Compiling dtrace-parser v0.3.0
+   Compiling tokio v1.52.3
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling scroll v0.13.0
+   Compiling goblin v0.10.5
+   Compiling futures-macro v0.3.32
+   Compiling thread-id v5.1.0
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling icu_locale_core v2.2.0
+   Compiling icu_collections v2.2.0
+   Compiling tracing v0.1.44
+   Compiling getrandom v0.2.17
+   Compiling carrick-inotify-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-inotify-core)
+   Compiling mach2 v0.6.0
+   Compiling futures-task v0.3.32
+   Compiling byteorder v1.5.0
+   Compiling carrick-sched-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-sched-core)
+   Compiling slab v0.4.12
+   Compiling untrusted v0.9.0
+   Compiling fastrand v2.4.1
+   Compiling httparse v1.10.1
+   Compiling carrick-el1-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1-abi)
+   Compiling icu_provider v2.2.0
+   Compiling tempfile v3.27.0
+   Compiling icu_normalizer v2.2.0
+   Compiling icu_properties v2.2.0
+   Compiling futures-util v0.3.32
+   Compiling idna_adapter v1.2.2
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-guest-mem)
+   Compiling serde_tokenstream v0.2.3
+   Compiling darling_macro v0.20.11
+   Compiling form_urlencoded v1.2.2
+   Compiling aho-corasick v1.1.4
+   Compiling try-lock v0.2.5
+   Compiling regex-syntax v0.8.10
+   Compiling tower-service v0.3.3
+   Compiling pretty-hex v0.4.2
+   Compiling heck v0.5.0
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1-image)
+   Compiling rustls v0.23.40
+   Compiling dof v0.4.0
+   Compiling want v0.3.1
+   Compiling darling v0.20.11
+   Compiling regex-automata v0.4.14
+   Compiling idna v1.1.0
+   Compiling rustls-webpki v0.103.13
+   Compiling futures-channel v0.3.32
+   Compiling carrick-kernel-arena v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel-arena)
+   Compiling autocfg v1.5.0
+   Compiling tinyvec_macros v0.1.1
+   Compiling atomic-waker v1.1.2
+   Compiling ipnet v2.12.0
+   Compiling num-traits v0.2.19
+   Compiling hyper v1.9.0
+   Compiling tinyvec v1.11.0
+   Compiling carrick-host v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host)
+   Compiling url v2.5.8
+   Compiling derive_builder_core v0.20.2
+   Compiling usdt-attr-macro v0.6.0
+   Compiling usdt-macro v0.6.0
+   Compiling sync_wrapper v1.0.2
+   Compiling memmap2 v0.9.10
+   Compiling carrick-portable v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-portable)
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling unicode-xid v0.2.6
+   Compiling konst_macro_rules v0.2.19
+   Compiling tower-layer v0.3.3
+   Compiling base64 v0.22.1
+   Compiling tower v0.5.3
+   Compiling proc-macro-error2 v2.0.1
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-util v0.1.20
+   Compiling konst v0.2.20
+   Compiling const_format_proc_macros v0.2.34
+   Compiling usdt v0.6.0
+   Compiling carrick-timer-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-timer-core)
+   Compiling derive_builder_macro v0.20.2
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+   Compiling carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-signal-core)
+   Compiling webpki-roots v1.0.7
+   Compiling ryu v1.0.23
+   Compiling lazy_static v1.5.0
+   Compiling futures-sink v0.3.32
+   Compiling core-foundation-sys v0.8.7
+   Compiling tokio-util v0.7.18
+   Compiling iana-time-zone v0.1.65
+   Compiling serde_urlencoded v0.7.1
+   Compiling hyper-rustls v0.27.9
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-hal)
+   Compiling const_format v0.2.36
+   Compiling derive_builder v0.20.2
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-observability)
+   Compiling getset v0.1.6
+   Compiling tower-http v0.6.10
+   Compiling unicode-normalization v0.1.25
+   Compiling regex v1.12.3
+   Compiling strum_macros v0.27.2
+   Compiling http-body-util v0.1.3
+   Compiling hmac v0.12.1
+   Compiling camino v1.2.2
+   Compiling strum v0.27.2
+   Compiling base64 v0.13.1
+   Compiling jwt v0.16.0
+   Compiling reqwest v0.12.28
+   Compiling olpc-cjson v0.1.4
+   Compiling chrono v0.4.44
+   Compiling http-auth v0.1.10
+   Compiling oci-spec v0.8.4
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host-bsd)
+   Compiling getrandom v0.4.2
+   Compiling unicase v2.9.0
+   Compiling utf8parse v0.2.2
+   Compiling rand_core v0.10.1
+   Compiling crc32fast v1.5.0
+   Compiling anstyle-parse v1.0.0
+   Compiling filetime v0.2.29
+   Compiling anstyle v1.0.14
+   Compiling colorchoice v1.0.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling rustversion v1.0.22
+   Compiling anstyle-query v1.1.5
+   Compiling adler2 v2.0.1
+   Compiling simd-adler32 v0.3.9
+   Compiling miniz_oxide v0.8.9
+   Compiling anstream v1.0.0
+   Compiling oci-client v0.15.0
+   Compiling tar v0.4.45
+   Compiling chacha20 v0.10.1
+   Compiling clap_lex v1.1.0
+   Compiling carrick-el1 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1)
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-spec)
+   Compiling anyhow v1.0.102
+   Compiling clap_builder v4.6.0
+   Compiling rand v0.10.1
+   Compiling flate2 v1.1.9
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-thread)
+   Compiling clap_derive v4.6.1
+   Compiling fd-lock v4.0.4
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+   Compiling applevisor-sys v1.0.0
+   Compiling signal-hook v0.4.4
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+   Compiling equivalent v1.0.2
+   Compiling hashbrown v0.17.1
+   Compiling data-encoding v2.11.0
+   Compiling indexmap v2.14.0
+   Compiling clap v4.6.1
+   Compiling hickory-proto v0.26.1
+   Compiling applevisor v1.0.0
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vfs)
+   Compiling arc-swap v1.9.2
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-aarch64)
+   Compiling sharded-slab v0.1.7
+   Compiling matchers v0.2.0
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.9
+   Compiling toml_write v0.1.2
+   Compiling nu-ansi-term v0.50.3
+   Compiling winnow v0.7.15
+   Compiling tracing-subscriber v0.3.23
+   Compiling toml_edit v0.22.27
+   Compiling toml v0.8.23
+   Compiling carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-image)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-embed)
+    Finished `release` profile [optimized + debuginfo] target(s) in 3m 08s
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/host_wait_policy-c2a87416d37da5f9.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/host_wait_policy-c2a87416d37da5f9
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/write_seek_contract-918027bbcdc955ce.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/write_seek_contract-918027bbcdc955ce
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify-4d056326bb251066.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify-4d056326bb251066
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_gic-bd7ecd54518cd893.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_gic-bd7ecd54518cd893
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_kick_served_loop-ca7928e25b8403b9.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_kick_served_loop-ca7928e25b8403b9
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/kernel_abort-67faf2b3bbb7c5c4.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/kernel_abort-67faf2b3bbb7c5c4
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_preemption-5f35044041d74660.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_preemption-5f35044041d74660
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify09_probe-e675b15d80f515bc.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify09_probe-e675b15d80f515bc
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_vcpu_lifetime-37cb546508283ad3.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_vcpu_lifetime-37cb546508283ad3
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_transparent-fb3be4ee191c6b34.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_transparent-fb3be4ee191c6b34
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-c382c0c9c20c4432.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-c382c0c9c20c4432
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/wedge_capture_ladder-088f8e04b3db00a8.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/wedge_capture_ladder-088f8e04b3db00a8
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/perf_regression-672ff7f58fbc5fc8.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/perf_regression-672ff7f58fbc5fc8
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-234bf1d5ccbbc4d6.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-234bf1d5ccbbc4d6
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/two_process_parallelism-1812b3a7a7b1c6c5.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/two_process_parallelism-1812b3a7a7b1c6c5
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/shared_buffer_futex-addc1a67985bbe97.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/shared_buffer_futex-addc1a67985bbe97
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/inotify_hotpath_contract-ac453d09bfbcccaa.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/inotify_hotpath_contract-ac453d09bfbcccaa
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_files-aa53505e35de2895.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_files-aa53505e35de2895
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/guest_smoke-95acf906590638a0.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/guest_smoke-95acf906590638a0
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/realtime_calibration-953720e5a649dffd.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/realtime_calibration-953720e5a649dffd
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/conformance_contracts-f74754429207f38d.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/conformance_contracts-f74754429207f38d
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/discard_fork_threads-45bc1e26af33a155.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/discard_fork_threads-45bc1e26af33a155
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/carrick_embed-95f22afceb9cac79.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/carrick_embed-95f22afceb9cac79
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/fault_budget_guest-2abb49fb72b0d688.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/fault_budget_guest-2abb49fb72b0d688
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_race-264da5b2da86a8dd.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_race-264da5b2da86a8dd
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/pt_pause_drain_pressure-28b219e3af6dcaf7.tmp.61019: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/pt_pause_drain_pressure-28b219e3af6dcaf7
+test-signed: resolved exact filter el1_memory_first_touch_stays_in_guest -> el1_memory_first_touch_stays_in_guest
+test-signed: running /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-234bf1d5ccbbc4d6 el1_memory_first_touch_stays_in_guest --exact --nocapture
+
+running 1 test
+test el1_memory_first_touch_stays_in_guest ... el1-sched first-touch pages=256 exits=620 carrier_cpu_ns=39667000 wall_ms=55 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 14, wfi_entries: 7, idle_exits: 3, misplaced: 0, steals: 6, service_exits: 7, service_placements: 5, ready_placements: 0, service_adoptions: 5, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=256 ok=true
+first-touch parent pages=256 child_ok=true ok=true
+el1-sched first-touch pages=1024 exits=2148 carrier_cpu_ns=24151000 wall_ms=24 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 4, wfi_entries: 3, idle_exits: 3, misplaced: 0, steals: 0, service_exits: 1, service_placements: 4, ready_placements: 0, service_adoptions: 4, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=1024 ok=true
+first-touch parent pages=1024 child_ok=true ok=true
+el1-sched first-touch pages=4096 exits=8297 carrier_cpu_ns=87603000 wall_ms=58 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 6, wfi_entries: 5, idle_exits: 5, misplaced: 0, steals: 1, service_exits: 1, service_placements: 5, ready_placements: 0, service_adoptions: 5, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=4096 ok=true
+first-touch parent pages=4096 child_ok=true ok=true
+el1-sched first-touch slope 256->1024 pages (added=1536): exits_diff=1528 slope=0.9948 exits/page
+
+thread 'el1_memory_first_touch_stays_in_guest' (10163294) panicked at crates/carrick-embed/tests/el1_sched.rs:918:9:
+first-touch host-exit slope across scale 256 -> 1024 was 0.9948 exits/page (both processes count, added=1536); contract ceiling is <0.125 exits per added page
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    el1_memory_first_touch_stays_in_guest
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.33s
+
+test-signed: FAIL /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-234bf1d5ccbbc4d6
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-c382c0c9c20c4432.noent.61019: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-c382c0c9c20c4432.noent.61019
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+test-signed: FAILED (carrick-embed)
+remaining carrick procs (run-id el1-first-touch-red-20260926) = 0
+remaining carrick procs (run-id el1-first-touch-red-20260926-cli) = 0

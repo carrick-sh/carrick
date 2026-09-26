@@ -1,0 +1,35 @@
+2c0b989c04bb1eb3c011268b9d01ad0ec5e14048
+?? docs/perf-results/2026-09-26-el1-first-touch/
+e6782f7365676a6622b31b8d978b0a032fb43e4e61834cde91a07a668dc198d1  target/el1-completion/first-touch/el1-sched-red-frozen
+Executable=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/first-touch/el1-sched-red-frozen
+Identifier=el1_sched-234bf1d5ccbbc4d6.tmp.61019
+Format=Mach-O thin (arm64)
+CodeDirectory v=20400 size=56541 flags=0x2(adhoc) hashes=1756+7 location=embedded
+Hash type=sha256 size=32
+CandidateCDHash sha256=799b1bf2b422e1bcb0762bbe44738392c295b4f1
+CandidateCDHashFull sha256=799b1bf2b422e1bcb0762bbe44738392c295b4f1c270fd86c608603d95ff9f5c
+Hash choices=sha256
+CMSDigest=799b1bf2b422e1bcb0762bbe44738392c295b4f1c270fd86c608603d95ff9f5c
+CMSDigestType=2
+CDHash=799b1bf2b422e1bcb0762bbe44738392c295b4f1
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=0 size=12
+Total signatures=1
+Chosen signature=1
+[Dict]
+	[Key] com.apple.security.hypervisor
+	[Value]
+		[Bool] true
+  sectname __dof_carrick
+   segname __TEXT
+      addr 0x000000010103018b
+      size 0x000000000000c27c
+--
+     cmd LC_UUID
+ cmdsize 24
+    uuid 1A17D9E8-9003-36B2-98E3-A911A40B0958
+Load command 10
+671ccc3d7d401abb9914383061c023500bb559338f1c8b9998329e0087992df0  target/embed-fixtures/el1-sched-aarch64

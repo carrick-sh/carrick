@@ -1,0 +1,95 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling bitflags v2.11.1
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1-image)
+   Compiling syn v2.0.117
+   Compiling syn v3.0.3
+   Compiling thiserror-impl v2.0.20
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling scroll_derive v0.13.1
+   Compiling thiserror v2.0.20
+   Compiling scroll v0.13.0
+   Compiling zerocopy v0.8.48
+   Compiling goblin v0.10.5
+   Compiling serde v1.0.228
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-guest-mem)
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-abi)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.92s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mem-8a469d999f6cea41)
+
+running 70 tests
+test page_table::tests::compound_cow_repoint_preserves_mixed_semantic_permissions ... ok
+test page_table::tests::clone_copies_only_populated_prefix_and_preserves_capacity ... ok
+test page_table::tests::a_gib_aligned_alias_span_uses_l1_block_leaves ... ok
+test page_table::tests::an_unsatisfiable_alias_build_writes_nothing ... ok
+test page_table::tests::clone_preserves_bump_cursor_so_fork_child_does_not_realloc_live_tables ... ok
+test page_table::tests::as_bytes_into_bytes_round_trip ... ok
+test page_table::tests::clone_from_reproduces_clone_and_keeps_the_buffer ... ok
+test page_table::tests::boot_stage1_images_leave_the_gic_window_untranslated ... ok
+test page_table::tests::empty_descriptors_never_mint_an_output_address ... ok
+test page_table::tests::exhausting_spare_tables_errors ... ok
+test page_table::tests::fork_readonly_marks_the_per_mm_leaf_non_global ... ok
+test page_table::tests::fork_readonly_preserves_each_leaf_execute_permission ... ok
+test page_table::tests::indices_decompose_va ... ok
+test page_table::tests::fork_readonly_preserves_prot_none_and_later_write_keeps_non_global ... ok
+test page_table::tests::full_block_restore_coalesces_and_reclaims_table ... ok
+test page_table::tests::full_1gib_prot_none_edits_block_with_no_split ... ok
+test page_table::tests::kernel_cow_arm_and_alias_preserve_el1_only_access ... ok
+test page_table::tests::host_walk_matches_the_copying_walk ... ok
+test page_table::tests::invalid_to_valid_leaf_edit_reports_flush_not_required ... ok
+test page_table::tests::clone_with_extension_arenas_requires_child_source_for_rebase ... ok
+test page_table::tests::adopting_live_extension_state_keeps_source_and_arenas ... ok
+test page_table::tests::large_aligned_prot_none_is_coarse_not_dense ... ok
+test page_table::tests::large_vma_unmap_work_is_hierarchically_bounded_empty_and_populated_islands ... ok
+test page_table::tests::last_resort_sweep_declines_without_exclusivity ... ok
+test page_table::tests::debug_walk_host_errors_on_unresolved_arena ... ok
+test page_table::tests::last_resort_sweep_reclaims_an_emptied_subtable ... ok
+test page_table::tests::live_block_restore_keeps_table_until_break_before_make_is_available ... ok
+test page_table::tests::map_aliased_large_unaligned_len_does_not_exhaust_table_pool ... ok
+test page_table::tests::last_resort_sweep_runs_once_per_teardown ... ok
+test page_table::tests::multi_vcpu_does_not_coalesce ... ok
+test page_table::tests::multi_gib_alias_maps_with_coarse_leaves_and_a_tiny_table_budget ... ok
+test page_table::tests::private_overlay_protection_preserves_backing_and_identity_restore_repoints ... ok
+test page_table::tests::munmap_retires_leaves_so_the_reclaim_sweep_can_free_their_table ... ok
+test page_table::tests::new_rediscovers_bump_cursor_over_boot_edited_tables ... ok
+test page_table::tests::quiesced_snapshot_restore_replaces_every_live_table_byte ... ok
+test page_table::tests::hvpatch_editor_preserves_non_global_across_protect_alias_repoint_and_coalesce ... ok
+test page_table::tests::prot_none_then_rw_remaps ... ok
+test page_table::tests::rosetta_alias_vas_avoid_boot_identity_l0_slots ... ok
+test page_table::tests::rebase_moves_every_table_pointer_without_changing_leaf_translations ... ok
+test page_table::tests::partial_protection_does_not_coalesce ... ok
+test page_table::tests::retained_output_resolves_invalidated_aligned_alias_block ... ok
+test page_table::tests::readonly_does_not_coalesce_an_unaligned_physical_alias ... ok
+test page_table::tests::retained_output_resolves_invalidated_private_alias_without_revalidating_it ... ok
+test page_table::tests::spare_cursor_discovery_stops_at_the_last_used_page ... ok
+test page_table::tests::spare_cursor_discovery_preserves_holes_and_every_byte_position ... ok
+test page_table::tests::growable_stage1_arena_exhaustion_uses_extension_source ... ok
+test page_table::tests::offline_fork_copy_sweeps_where_the_inherited_marker_refused ... ok
+test page_table::tests::set_rw_on_default_rw_block_does_not_split ... ok
+test page_table::tests::sparse_arena_materializes_only_exact_private_extent ... ok
+test page_table::tests::set_prot_none_splits_block_and_invalidates_only_target ... ok
+test page_table::tests::rw_commit_into_prot_none_block_keeps_neighbors_invalid ... ok
+test page_table::tests::terminal_descriptor_permission_tracks_valid_af_ap_and_uxn ... ok
+test page_table::tests::terminal_descriptor_selects_block_page_and_invalid_leaf ... ok
+test page_table::tests::stage1_publication_refuses_outputs_in_the_gic_window ... ok
+test page_table::tests::set_readonly_then_rw_round_trips ... ok
+test page_table::tests::sub_16k_high_va_alias_does_not_perturb_neighbor_l3_entry ... ok
+test page_table::tests::translate_picks_the_live_region_for_adjacent_aliases ... ok
+test page_table::tests::sync_to_host_resolves_each_arena_once ... ok
+test page_table::tests::undo_journal_commit_keeps_the_transaction ... ok
+test page_table::tests::test_el1_stack_walk_after_rebase ... ok
+test page_table::tests::translate_resolves_aliased_va_to_ipa_with_page_offset ... ok
+test page_table::tests::reclaim_sweep_keeps_tables_whose_invalid_leaves_retain_live_outputs ... ok
+test page_table::tests::user_block_flags_match_boot_image ... ok
+test page_table::tests::rollback_undo_returns_arena_when_resolver_missing_extension ... ok
+test page_table::tests::undo_journal_reports_replaced_valid_only_for_pre_transaction_words ... ok
+test page_table::tests::stage1_arena_exhaustion_fails_without_growth ... ok
+test page_table::tests::unmap_aliased_reclaims_only_the_freed_l3_table ... ok
+test page_table::tests::stage1_heap_starts_invalid_and_preserves_neighbors ... ok
+test page_table::tests::sync_to_host_errors_on_unresolved_arena ... ok
+test page_table::tests::undo_journal_rollback_matches_a_cloned_snapshot ... ok
+
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 171 filtered out; finished in 0.12s
+
