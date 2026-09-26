@@ -166,7 +166,7 @@ contracts = [
 
 [[surfaces]]
 path = "crates/carrick-vfs/src/vfs/rootfs.rs"
-contracts = ["kernel.inotify.watch", "kernel.inotify.mark-race-hotpath"]
+contracts = ["kernel.inotify.watch", "kernel.inotify.mark-race-hotpath", "kernel.vfs.host-namespace-mutation-work"]
 
 [[surfaces]]
 path = "conformance-probes/src/bin/perf_inotify09_scale.rs"

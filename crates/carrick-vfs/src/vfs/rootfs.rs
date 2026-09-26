@@ -78,6 +78,14 @@ pub enum RenameOutcome {
     SameObject,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdmittedEntryInfo {
+    pub kind: RootFsEntryKind,
+    pub inode: Option<InodeIdentity>,
+    pub in_overlay: bool,
+    pub in_rootfs: bool,
+}
+
 /// Richer result from [`RootFsVfs::open_for_dispatch`]. Carries the
 /// rootfs-shaped types the dispatcher's existing `OpenDescription`
 /// variants consume, plus a `NotFoundCreate` variant signalling that
@@ -223,9 +231,18 @@ impl RootFsVfs {
         loop {
             let attempt = self.with_namespace_batch(paths, topology_change, |permit| {
                 let changes_topology = paths.iter().any(|path| {
-                    self.lookup_nofollow(path).is_ok_and(|metadata| {
-                        matches!(metadata.kind, EntryKind::Directory | EntryKind::Symlink)
-                    })
+                    if let Some(parent) = permit.parent(path) {
+                        self.admitted_entry_info(parent, path).is_some_and(|info| {
+                            matches!(
+                                info.kind,
+                                RootFsEntryKind::Directory | RootFsEntryKind::Symlink
+                            )
+                        })
+                    } else {
+                        self.lookup_nofollow(path).is_ok_and(|metadata| {
+                            matches!(metadata.kind, EntryKind::Directory | EntryKind::Symlink)
+                        })
+                    }
                 });
                 if changes_topology && !permit.topology_exclusive() {
                     return Ok::<_, LinuxErrno>(Attempt::Upgrade);
@@ -321,6 +338,105 @@ impl RootFsVfs {
             Some(InodeIdentity::new(st.st_dev as u64, st.st_ino as u64))
         } else {
             None
+        }
+    }
+
+    pub(crate) fn admitted_entry_info(
+        &self,
+        parent: &ResolvedParent,
+        path: &str,
+    ) -> Option<AdmittedEntryInfo> {
+        if let Some(ref pfd) = parent.parent_fd {
+            let leaf_str = parent.leaf.to_str().unwrap_or("");
+            if self.overlay.has_whiteout_in_dir(pfd.as_raw_fd(), leaf_str) {
+                return None;
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            crate::fs_backend::host::record_test_host_stat();
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            let rc = unsafe {
+                libc::fstatat(
+                    pfd.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc == 0 {
+                let mode = st.st_mode as u32;
+                let file_type = mode & (libc::S_IFMT as u32);
+                let kind = if file_type == (libc::S_IFDIR as u32) {
+                    RootFsEntryKind::Directory
+                } else if file_type == (libc::S_IFLNK as u32) {
+                    RootFsEntryKind::Symlink
+                } else if file_type == (libc::S_IFCHR as u32) {
+                    RootFsEntryKind::CharDevice
+                } else if file_type == (libc::S_IFIFO as u32) {
+                    RootFsEntryKind::Fifo
+                } else if file_type == (libc::S_IFSOCK as u32) {
+                    RootFsEntryKind::Socket
+                } else {
+                    RootFsEntryKind::File
+                };
+                let inode = Some(InodeIdentity::new(st.st_dev as u64, st.st_ino as u64));
+                return Some(AdmittedEntryInfo {
+                    kind,
+                    inode,
+                    in_overlay: true,
+                    in_rootfs: false,
+                });
+            }
+            if self
+                .dentry_cache
+                .lower_has_entry(path, self.rootfs.as_ref())
+            {
+                if let Some(md) = self
+                    .rootfs
+                    .as_ref()
+                    .and_then(|r| r.symlink_metadata(path).ok())
+                {
+                    let inode = self.path_inode_identity(path);
+                    return Some(AdmittedEntryInfo {
+                        kind: md.kind,
+                        inode,
+                        in_overlay: false,
+                        in_rootfs: true,
+                    });
+                }
+            }
+            return None;
+        }
+
+        match self.overlay.lookup_kind(path) {
+            Some(OverlayEntryKind::Deleted) => None,
+            Some(OverlayEntryKind::Dir) => Some(AdmittedEntryInfo {
+                kind: RootFsEntryKind::Directory,
+                inode: self.path_inode_identity(path),
+                in_overlay: true,
+                in_rootfs: false,
+            }),
+            Some(OverlayEntryKind::File) => Some(AdmittedEntryInfo {
+                kind: RootFsEntryKind::File,
+                inode: self.path_inode_identity(path),
+                in_overlay: true,
+                in_rootfs: false,
+            }),
+            None => {
+                if let Some(md) = self
+                    .rootfs
+                    .as_ref()
+                    .and_then(|r| r.symlink_metadata(path).ok())
+                {
+                    Some(AdmittedEntryInfo {
+                        kind: md.kind,
+                        inode: self.path_inode_identity(path),
+                        in_overlay: false,
+                        in_rootfs: true,
+                    })
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -1355,16 +1471,25 @@ impl RootFsVfs {
         let mut topology_change = false;
         loop {
             let attempt = self.with_namespace_batch(&[from, to], topology_change, |permit| {
-                let changes_topology = [from, to].into_iter().any(|path| {
-                    self.lookup_nofollow(path).is_ok_and(|metadata| {
-                        matches!(metadata.kind, EntryKind::Directory | EntryKind::Symlink)
+                let from_parent = permit.parent(from).ok_or(LINUX_EINVAL)?;
+                let to_parent = permit.parent(to).ok_or(LINUX_EINVAL)?;
+                let from_info = self.admitted_entry_info(from_parent, from);
+                let to_info = self.admitted_entry_info(to_parent, to);
+                let changes_topology = [&from_info, &to_info].into_iter().any(|info| {
+                    info.as_ref().is_some_and(|i| {
+                        matches!(
+                            i.kind,
+                            RootFsEntryKind::Directory | RootFsEntryKind::Symlink
+                        )
                     })
                 });
                 if changes_topology && !permit.topology_exclusive() {
                     return Ok::<Attempt<R>, VfsError>(Attempt::Upgrade);
                 }
                 let prepared = prepare.take().ok_or(LINUX_EINVAL)?();
-                let outcome = self.rename_with_flags_admitted(permit, from, to, no_replace)?;
+                let outcome = self.rename_with_flags_admitted_info(
+                    permit, from, to, no_replace, from_info, to_info,
+                )?;
                 let publish = publish.take().ok_or(LINUX_EINVAL)?;
                 Ok(Attempt::Complete(publish(prepared, outcome)))
             })??;
@@ -1375,46 +1500,35 @@ impl RootFsVfs {
         }
     }
 
-    fn rename_with_flags_admitted(
+    pub fn rename_with_flags_admitted(
         &self,
         permit: &crate::vfs::namespace_mutation::NamespaceMutationPermit<'_>,
         from: &str,
         to: &str,
         no_replace: bool,
     ) -> Result<RenameOutcome, VfsError> {
-        let (src_kind, src_in_overlay) = match self.overlay.lookup_kind(from) {
-            Some(OverlayEntryKind::Deleted) => return Err(LINUX_ENOENT),
-            Some(OverlayEntryKind::Dir) => (RootFsEntryKind::Directory, true),
-            Some(OverlayEntryKind::File) => (RootFsEntryKind::File, true),
-            None => match self
-                .rootfs
-                .as_ref()
-                .and_then(|r| r.symlink_metadata(from).ok())
-            {
-                Some(md) => match md.kind {
-                    // Socket never lives in the immutable rootfs (bind only
-                    // creates it in the writable overlay, handled above), but
-                    // the match must be exhaustive — treat it like a file.
-                    RootFsEntryKind::File
-                    | RootFsEntryKind::Symlink
-                    | RootFsEntryKind::CharDevice
-                    | RootFsEntryKind::Fifo
-                    | RootFsEntryKind::Socket => (RootFsEntryKind::File, false),
-                    RootFsEntryKind::Directory => (RootFsEntryKind::Directory, false),
-                },
-                None => return Err(LINUX_ENOENT),
-            },
-        };
-        let dst_kind = match self.overlay.lookup_kind(to) {
-            Some(OverlayEntryKind::Deleted) => None,
-            Some(OverlayEntryKind::Dir) => Some(RootFsEntryKind::Directory),
-            Some(OverlayEntryKind::File) => Some(RootFsEntryKind::File),
-            None => self
-                .rootfs
-                .as_ref()
-                .and_then(|r| r.symlink_metadata(to).ok())
-                .map(|metadata| metadata.kind),
-        };
+        let from_parent = permit.parent(from).ok_or(LINUX_EINVAL)?;
+        let to_parent = permit.parent(to).ok_or(LINUX_EINVAL)?;
+        let from_info = self.admitted_entry_info(from_parent, from);
+        let to_info = self.admitted_entry_info(to_parent, to);
+        self.rename_with_flags_admitted_info(permit, from, to, no_replace, from_info, to_info)
+    }
+
+    fn rename_with_flags_admitted_info(
+        &self,
+        permit: &crate::vfs::namespace_mutation::NamespaceMutationPermit<'_>,
+        from: &str,
+        to: &str,
+        no_replace: bool,
+        from_info: Option<AdmittedEntryInfo>,
+        to_info: Option<AdmittedEntryInfo>,
+    ) -> Result<RenameOutcome, VfsError> {
+        let src_info = from_info.ok_or(LINUX_ENOENT)?;
+        let src_kind = src_info.kind;
+        let src_in_overlay = src_info.in_overlay;
+        let dst_info = to_info;
+        let dst_kind = dst_info.map(|i| i.kind);
+
         if dst_kind.is_some() && no_replace {
             return Err(LINUX_EEXIST);
         }
@@ -1471,15 +1585,14 @@ impl RootFsVfs {
                 // Backend moved the entry (contents included). If the
                 // rootfs ALSO has the source path, leave a tombstone so
                 // the layered view doesn't resurrect the rootfs copy.
-                let rootfs_has_src = self
-                    .rootfs
-                    .as_ref()
-                    .map(|r| r.symlink_metadata(from).is_ok())
-                    .unwrap_or(false);
+                let rootfs_has_src = src_info.in_rootfs
+                    || self
+                        .dentry_cache
+                        .lower_has_entry(from, self.rootfs.as_ref());
                 if rootfs_has_src {
                     self.overlay.mark_deleted(from).map_err(|_| LINUX_EINVAL)?;
                 }
-                let inode = self.path_inode_identity(to);
+                let inode = src_info.inode;
                 self.dentry_cache.entry_moved(from, to, inode);
                 return Ok(RenameOutcome::Renamed);
             }
@@ -1514,15 +1627,14 @@ impl RootFsVfs {
         if src_in_overlay {
             self.overlay.remove_entry(from);
         }
-        let rootfs_has_src = self
-            .rootfs
-            .as_ref()
-            .map(|r| r.symlink_metadata(from).is_ok())
-            .unwrap_or(false);
+        let rootfs_has_src = src_info.in_rootfs
+            || self
+                .dentry_cache
+                .lower_has_entry(from, self.rootfs.as_ref());
         if rootfs_has_src {
             self.overlay.mark_deleted(from).map_err(|_| LINUX_EINVAL)?;
         }
-        let inode = self.path_inode_identity(to);
+        let inode = src_info.inode.or_else(|| self.path_inode_identity(to));
         self.dentry_cache.entry_moved(from, to, inode);
         Ok(RenameOutcome::Renamed)
     }
@@ -2099,34 +2211,22 @@ impl Vfs for RootFsVfs {
 
     fn unlink(&self, path: &str) -> Result<(), VfsError> {
         self.with_paths_topology_admission(&[path], |permit| {
-            // Layered: overlay first (a tombstone short-circuits to
-            // ENOENT). Then rootfs via symlink_metadata so symlinks are
-            // identified as such (not followed). Only the KIND is needed here:
-            // `lookup` would read the whole file back off disk just to drop it,
-            // which for an unlink of a large file is the dominant cost.
-            let (kind, in_overlay, in_rootfs) = match self.overlay.lookup_kind(path) {
-                Some(OverlayEntryKind::Deleted) => return Err(LINUX_ENOENT),
-                Some(OverlayEntryKind::Dir) => (RootFsEntryKind::Directory, true, false),
-                Some(OverlayEntryKind::File) => (RootFsEntryKind::File, true, false),
-                None => match self
-                    .rootfs
-                    .as_ref()
-                    .and_then(|r| r.symlink_metadata(path).ok())
-                {
-                    Some(md) => (md.kind, false, true),
-                    None => return Err(LINUX_ENOENT),
-                },
-            };
-            if matches!(kind, RootFsEntryKind::Directory) {
+            let parent = permit.parent(path).ok_or(LINUX_EINVAL)?;
+            let entry_info = self.admitted_entry_info(parent, path).ok_or(LINUX_ENOENT)?;
+            if matches!(entry_info.kind, RootFsEntryKind::Directory) {
                 return Err(LINUX_EISDIR);
             }
-            let inode = self.path_inode_identity(path);
-            let parent_inode = std::path::Path::new(path)
-                .parent()
-                .and_then(|p| p.to_str())
-                .and_then(|p| self.path_inode_identity(p));
-            if in_overlay {
-                let parent = permit.parent(path).ok_or(LINUX_EINVAL)?;
+            let inode = entry_info.inode;
+            let parent_inode = match permit.parent_identity(path) {
+                Some(crate::vfs::namespace_mutation::NamespaceParentIdentity::Host(id)) => {
+                    Some(*id)
+                }
+                _ => parent
+                    .parent_fd
+                    .as_ref()
+                    .and_then(|pfd| Self::host_fd_inode_identity(pfd.as_raw_fd())),
+            };
+            if entry_info.in_overlay {
                 let _ = self.overlay.remove_entry_at(
                     parent.parent_fd.as_deref(),
                     Some(&parent.leaf),
@@ -2135,15 +2235,16 @@ impl Vfs for RootFsVfs {
                 );
                 // Tombstone only if the rootfs also has this path, so a
                 // re-create still works.
-                let rootfs_has_it = self
-                    .dentry_cache
-                    .lower_has_entry(path, self.rootfs.as_ref());
+                let rootfs_has_it = entry_info.in_rootfs
+                    || self
+                        .dentry_cache
+                        .lower_has_entry(path, self.rootfs.as_ref());
                 if rootfs_has_it {
                     self.overlay
                         .mark_deleted(path)
                         .map_err(|_| carrick_abi::LINUX_EINVAL)?;
                 }
-            } else if in_rootfs {
+            } else if entry_info.in_rootfs {
                 self.overlay
                     .mark_deleted(path)
                     .map_err(|_| carrick_abi::LINUX_EINVAL)?;
@@ -2159,20 +2260,9 @@ impl Vfs for RootFsVfs {
 
     fn rmdir(&self, path: &str) -> Result<(), VfsError> {
         self.with_paths_topology_admission(&[path], |permit| {
-            let (kind, in_overlay, in_rootfs) = match self.overlay.lookup_kind(path) {
-                Some(OverlayEntryKind::Deleted) => return Err(LINUX_ENOENT),
-                Some(OverlayEntryKind::Dir) => (RootFsEntryKind::Directory, true, false),
-                Some(OverlayEntryKind::File) => (RootFsEntryKind::File, true, false),
-                None => match self
-                    .rootfs
-                    .as_ref()
-                    .and_then(|r| r.symlink_metadata(path).ok())
-                {
-                    Some(md) => (md.kind, false, true),
-                    None => return Err(LINUX_ENOENT),
-                },
-            };
-            if !matches!(kind, RootFsEntryKind::Directory) {
+            let parent = permit.parent(path).ok_or(LINUX_EINVAL)?;
+            let entry_info = self.admitted_entry_info(parent, path).ok_or(LINUX_ENOENT)?;
+            if !matches!(entry_info.kind, RootFsEntryKind::Directory) {
                 return Err(LINUX_ENOTDIR);
             }
             // Linux rmdir(2) requires the directory to be empty (ENOTEMPTY
@@ -2191,28 +2281,33 @@ impl Vfs for RootFsVfs {
             {
                 return Err(LINUX_ENOTEMPTY);
             }
-            let inode = self.path_inode_identity(path);
-            let parent_inode = std::path::Path::new(path)
-                .parent()
-                .and_then(|p| p.to_str())
-                .and_then(|p| self.path_inode_identity(p));
-            if in_overlay {
-                let parent = permit.parent(path).ok_or(LINUX_EINVAL)?;
+            let inode = entry_info.inode;
+            let parent_inode = match permit.parent_identity(path) {
+                Some(crate::vfs::namespace_mutation::NamespaceParentIdentity::Host(id)) => {
+                    Some(*id)
+                }
+                _ => parent
+                    .parent_fd
+                    .as_ref()
+                    .and_then(|pfd| Self::host_fd_inode_identity(pfd.as_raw_fd())),
+            };
+            if entry_info.in_overlay {
                 let _ = self.overlay.remove_entry_at(
                     parent.parent_fd.as_deref(),
                     Some(&parent.leaf),
                     &parent.rel,
                     true,
                 );
-                let rootfs_has_it = self
-                    .dentry_cache
-                    .lower_has_entry(path, self.rootfs.as_ref());
+                let rootfs_has_it = entry_info.in_rootfs
+                    || self
+                        .dentry_cache
+                        .lower_has_entry(path, self.rootfs.as_ref());
                 if rootfs_has_it {
                     self.overlay
                         .mark_deleted(path)
                         .map_err(|_| carrick_abi::LINUX_EINVAL)?;
                 }
-            } else if in_rootfs {
+            } else if entry_info.in_rootfs {
                 self.overlay
                     .mark_deleted(path)
                     .map_err(|_| carrick_abi::LINUX_EINVAL)?;
@@ -2666,6 +2761,309 @@ mod tests {
                 vfs.list_xattr("/usr/lib", true).unwrap(),
                 Vec::<String>::new()
             );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn test_namespace_mutation_work() {
+            use crate::fs_backend::host::{
+                reset_test_host_openat_count, reset_test_host_stat_count, test_host_openat_count,
+                test_host_stat_count,
+            };
+            use crate::vfs::Vfs as _;
+
+            let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap();
+            let log_dir = workspace_root.join("target/el1-host-namespace");
+            std::fs::create_dir_all(&log_dir).unwrap();
+            let log_path = log_dir.join("baseline-measurements.log");
+
+            let mut records = Vec::new();
+
+            for &n in &[1usize, 8, 32, 128] {
+                // 1. Warm Rename under same directory
+                {
+                    let upper = tempfile::TempDir::new().unwrap();
+                    let overlay = HostFsBackend::from_path(upper.path()).unwrap();
+                    let mut vfs = RootFsVfs::new();
+                    vfs.set_overlay(Box::new(overlay));
+
+                    vfs.mkdir("/deep", 0o755).unwrap();
+                    vfs.mkdir("/deep/nested", 0o755).unwrap();
+                    vfs.mkdir("/deep/nested/dir", 0o755).unwrap();
+
+                    for i in 0..n {
+                        vfs.create_file(&format!("/deep/nested/dir/src_{i}"))
+                            .unwrap();
+                    }
+
+                    // Warm parent resolution
+                    let _ = vfs.resolved_parent("/deep/nested/dir/dummy").unwrap();
+
+                    reset_test_host_openat_count();
+                    reset_test_host_stat_count();
+                    vfs.dentry_cache.reset_host_open_count();
+
+                    for i in 0..n {
+                        let from = format!("/deep/nested/dir/src_{i}");
+                        let to = format!("/deep/nested/dir/dst_{i}");
+                        vfs.rename_with_flags(&from, &to, false).unwrap();
+                    }
+
+                    let opens = test_host_openat_count();
+                    let stats = test_host_stat_count();
+                    let dentry_opens = vfs.dentry_cache.host_open_count();
+
+                    records.push(format!(
+                        "scale_point={n} op=rename_same_dir opens={opens} stats={stats} dentry_opens={dentry_opens}"
+                    ));
+
+                    // Verify semantics
+                    for i in 0..n {
+                        assert_eq!(
+                            vfs.lookup_nofollow(&format!("/deep/nested/dir/src_{i}")),
+                            Err(LINUX_ENOENT)
+                        );
+                        assert!(
+                            vfs.lookup_nofollow(&format!("/deep/nested/dir/dst_{i}"))
+                                .is_ok()
+                        );
+                    }
+                }
+
+                // 2. Warm Rename across directories
+                {
+                    let upper = tempfile::TempDir::new().unwrap();
+                    let overlay = HostFsBackend::from_path(upper.path()).unwrap();
+                    let mut vfs = RootFsVfs::new();
+                    vfs.set_overlay(Box::new(overlay));
+
+                    vfs.mkdir("/a", 0o755).unwrap();
+                    vfs.mkdir("/a/src_dir", 0o755).unwrap();
+                    vfs.mkdir("/b", 0o755).unwrap();
+                    vfs.mkdir("/b/dst_dir", 0o755).unwrap();
+
+                    for i in 0..n {
+                        vfs.create_file(&format!("/a/src_dir/file_{i}")).unwrap();
+                    }
+
+                    // Warm both parent directories
+                    let _ = vfs.resolved_parent("/a/src_dir/dummy").unwrap();
+                    let _ = vfs.resolved_parent("/b/dst_dir/dummy").unwrap();
+
+                    reset_test_host_openat_count();
+                    reset_test_host_stat_count();
+                    vfs.dentry_cache.reset_host_open_count();
+
+                    for i in 0..n {
+                        let from = format!("/a/src_dir/file_{i}");
+                        let to = format!("/b/dst_dir/file_{i}");
+                        vfs.rename_with_flags(&from, &to, false).unwrap();
+                    }
+
+                    let opens = test_host_openat_count();
+                    let stats = test_host_stat_count();
+                    let dentry_opens = vfs.dentry_cache.host_open_count();
+
+                    records.push(format!(
+                        "scale_point={n} op=rename_cross_dir opens={opens} stats={stats} dentry_opens={dentry_opens}"
+                    ));
+
+                    for i in 0..n {
+                        assert_eq!(
+                            vfs.lookup_nofollow(&format!("/a/src_dir/file_{i}")),
+                            Err(LINUX_ENOENT)
+                        );
+                        assert!(vfs.lookup_nofollow(&format!("/b/dst_dir/file_{i}")).is_ok());
+                    }
+                }
+
+                // 3. Warm Unlink under deep directory
+                {
+                    let upper = tempfile::TempDir::new().unwrap();
+                    let overlay = HostFsBackend::from_path(upper.path()).unwrap();
+                    let mut vfs = RootFsVfs::new();
+                    vfs.set_overlay(Box::new(overlay));
+
+                    vfs.mkdir("/deep", 0o755).unwrap();
+                    vfs.mkdir("/deep/nested", 0o755).unwrap();
+                    vfs.mkdir("/deep/nested/dir", 0o755).unwrap();
+
+                    for i in 0..n {
+                        vfs.create_file(&format!("/deep/nested/dir/file_{i}"))
+                            .unwrap();
+                    }
+
+                    // Warm parent resolution
+                    let _ = vfs.resolved_parent("/deep/nested/dir/dummy").unwrap();
+
+                    reset_test_host_openat_count();
+                    reset_test_host_stat_count();
+                    vfs.dentry_cache.reset_host_open_count();
+
+                    for i in 0..n {
+                        let path = format!("/deep/nested/dir/file_{i}");
+                        vfs.unlink(&path).unwrap();
+                    }
+
+                    let opens = test_host_openat_count();
+                    let stats = test_host_stat_count();
+                    let dentry_opens = vfs.dentry_cache.host_open_count();
+
+                    records.push(format!(
+                        "scale_point={n} op=unlink opens={opens} stats={stats} dentry_opens={dentry_opens}"
+                    ));
+
+                    for i in 0..n {
+                        assert_eq!(
+                            vfs.lookup_nofollow(&format!("/deep/nested/dir/file_{i}")),
+                            Err(LINUX_ENOENT)
+                        );
+                    }
+                }
+
+                // 4. Cold vs Warm Rename (Scale 1)
+                if n == 1 {
+                    let upper = tempfile::TempDir::new().unwrap();
+                    std::fs::create_dir_all(upper.path().join("cold/sub")).unwrap();
+                    std::fs::write(upper.path().join("cold/sub/first"), b"data").unwrap();
+                    std::fs::write(upper.path().join("cold/sub/second"), b"data").unwrap();
+
+                    let overlay = HostFsBackend::from_path(upper.path()).unwrap();
+                    let mut vfs = RootFsVfs::new();
+                    vfs.set_overlay(Box::new(overlay));
+
+                    // Cold rename: parent directory fd not yet opened in dentry_cache
+                    reset_test_host_openat_count();
+                    reset_test_host_stat_count();
+                    vfs.dentry_cache.reset_host_open_count();
+
+                    vfs.rename_with_flags("/cold/sub/first", "/cold/sub/first_renamed", false)
+                        .unwrap();
+                    let cold_opens = test_host_openat_count();
+                    let cold_stats = test_host_stat_count();
+                    let cold_dentry_opens = vfs.dentry_cache.host_open_count();
+
+                    records.push(format!(
+                        "scale_point=1 op=rename_cold opens={cold_opens} stats={cold_stats} dentry_opens={cold_dentry_opens}"
+                    ));
+
+                    // Warm rename: parent directory fd already cached
+                    reset_test_host_openat_count();
+                    reset_test_host_stat_count();
+                    vfs.dentry_cache.reset_host_open_count();
+
+                    vfs.rename_with_flags("/cold/sub/second", "/cold/sub/second_renamed", false)
+                        .unwrap();
+                    let warm_opens = test_host_openat_count();
+                    let warm_stats = test_host_stat_count();
+                    let warm_dentry_opens = vfs.dentry_cache.host_open_count();
+
+                    records.push(format!(
+                        "scale_point=1 op=rename_warm_after_cold opens={warm_opens} stats={warm_stats} dentry_opens={warm_dentry_opens}"
+                    ));
+
+                    assert_eq!(cold_opens, 0);
+                    assert_eq!(
+                        cold_dentry_opens, 2,
+                        "cold rename opens /cold and /cold/sub"
+                    );
+                    assert_eq!(warm_opens, 0);
+                    assert_eq!(warm_dentry_opens, 0, "warm rename opens 0 dir fds");
+                }
+
+                // 5. Cold vs Warm Unlink (Scale 1)
+                if n == 1 {
+                    let upper = tempfile::TempDir::new().unwrap();
+                    std::fs::create_dir_all(upper.path().join("cold_unlink/sub")).unwrap();
+                    std::fs::write(upper.path().join("cold_unlink/sub/first"), b"data").unwrap();
+                    std::fs::write(upper.path().join("cold_unlink/sub/second"), b"data").unwrap();
+
+                    let overlay = HostFsBackend::from_path(upper.path()).unwrap();
+                    let mut vfs = RootFsVfs::new();
+                    vfs.set_overlay(Box::new(overlay));
+
+                    // Cold unlink: parent directory fd not yet opened in dentry_cache
+                    reset_test_host_openat_count();
+                    reset_test_host_stat_count();
+                    vfs.dentry_cache.reset_host_open_count();
+
+                    vfs.unlink("/cold_unlink/sub/first").unwrap();
+                    let cold_opens = test_host_openat_count();
+                    let cold_stats = test_host_stat_count();
+                    let cold_dentry_opens = vfs.dentry_cache.host_open_count();
+
+                    records.push(format!(
+                        "scale_point=1 op=unlink_cold opens={cold_opens} stats={cold_stats} dentry_opens={cold_dentry_opens}"
+                    ));
+
+                    // Warm unlink: parent directory fd already cached
+                    reset_test_host_openat_count();
+                    reset_test_host_stat_count();
+                    vfs.dentry_cache.reset_host_open_count();
+
+                    vfs.unlink("/cold_unlink/sub/second").unwrap();
+                    let warm_opens = test_host_openat_count();
+                    let warm_stats = test_host_stat_count();
+                    let warm_dentry_opens = vfs.dentry_cache.host_open_count();
+
+                    records.push(format!(
+                        "scale_point=1 op=unlink_warm_after_cold opens={warm_opens} stats={warm_stats} dentry_opens={warm_dentry_opens}"
+                    ));
+
+                    assert_eq!(cold_opens, 0);
+                    assert_eq!(
+                        cold_dentry_opens, 2,
+                        "cold unlink opens /cold_unlink and /cold_unlink/sub"
+                    );
+                    assert_eq!(warm_opens, 0);
+                    assert_eq!(warm_dentry_opens, 0, "warm unlink opens 0 dir fds");
+                }
+            }
+
+            let log_content = records.join("\n") + "\n";
+            std::fs::write(&log_path, &log_content).unwrap();
+            eprintln!("MEASUREMENTS:\n{log_content}");
+
+            // Now assert budgets
+            for line in &records {
+                let parts: std::collections::HashMap<&str, &str> = line
+                    .split_whitespace()
+                    .filter_map(|pair| pair.split_once('='))
+                    .collect();
+                let n: usize = parts.get("scale_point").unwrap().parse().unwrap();
+                let op = *parts.get("op").unwrap();
+                let opens: u64 = parts.get("opens").unwrap().parse().unwrap();
+                let stats: u64 = parts.get("stats").unwrap().parse().unwrap();
+                let dentry_opens: u64 = parts.get("dentry_opens").unwrap().parse().unwrap();
+
+                if op.starts_with("rename_cold") || op.starts_with("unlink_cold") {
+                    continue;
+                }
+
+                assert_eq!(
+                    opens, 0,
+                    "{op} at scale {n} issued {opens} host openat calls (budget 0)"
+                );
+                assert_eq!(
+                    dentry_opens, 0,
+                    "{op} at scale {n} issued {dentry_opens} dentry host opens (budget 0)"
+                );
+                let stat_budget = match op {
+                    "rename_same_dir" | "rename_cross_dir" | "rename_warm_after_cold" => {
+                        (8 * n) as u64
+                    }
+                    "unlink" | "unlink_warm_after_cold" => (4 * n) as u64,
+                    _ => unreachable!(),
+                };
+                assert!(
+                    stats <= stat_budget,
+                    "{op} at scale {n} issued {stats} stats (budget <= {stat_budget})"
+                );
+            }
         }
     }
 
