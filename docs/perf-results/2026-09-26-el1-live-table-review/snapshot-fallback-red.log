@@ -1,0 +1,26 @@
+     Locking 2 packages to latest Rust 1.96.0 compatible versions
+      Adding hashbrown v0.15.5 (available: v0.17.1)
+   Compiling foldhash v0.1.5
+   Compiling hashbrown v0.15.5
+   Compiling live-review-repro v0.0.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-review-repro)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.62s
+     Running tests/snapshot.rs (target/el1-completion/live-review-repro/target/debug/deps/snapshot-cf670ed001b23def)
+
+running 1 test
+test snapshot_failure_must_not_clone_live_authority ... FAILED
+
+failures:
+
+---- snapshot_failure_must_not_clone_live_authority stdout ----
+
+thread 'snapshot_failure_must_not_clone_live_authority' (10840089) panicked at tests/snapshot.rs:18:2:
+failed snapshot silently returned shared live authority
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    snapshot_failure_must_not_clone_live_authority
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test snapshot`
