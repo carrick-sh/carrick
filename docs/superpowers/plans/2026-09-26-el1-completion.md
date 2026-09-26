@@ -124,3 +124,23 @@ bounded brief before implementation, rather than build to invented interfaces.
 Baseline: `RUSTC_WRAPPER= cargo test -p carrick-sched-core -p carrick-el1
 --lib` passed (41 scheduler-core tests and 46 EL1 tests). This is host-only
 baseline evidence; it does not qualify a signed guest artifact.
+
+2026-09-26: previous goal turn was progress (controller commit and baseline
+evidence). Added first-touch witness in `2c0b989c0`. Native arm64 Docker and
+signed Carrick both pass the three-scale two-process semantic checks; Carrick
+is structurally red at about one host exit per page. Negative entitlement
+control passes and cleanup is zero. Exact artifact and raw evidence:
+[first-touch red receipt](../../perf-results/2026-09-26-el1-first-touch/README.md).
+
+Next bounded implementation task: extract the existing stage-1 page-table
+algorithm into a neutral `no_std` core, preserving its host behavior and
+tests, and making layout constraints caller-supplied. This is a prerequisite
+inside checkpoint 2, not its acceptance. Follow it with the single live-table
+authority/mutation protocol, bulk grant integration and guest abort entry;
+the first-touch witness must become green through actual guest service.
+
+Ruling: do not adopt the audit's proposed guest-leaf/host-shadow split. Direct
+inspection found current-read translation still using `PageTableManager`,
+and `carrick-mem` depends on `carrick-abi` despite the audit's contrary claim.
+Atomic guest PTE stores alone do not repair those authorities. Cost if wrong:
+extra extraction work, but no knowingly stale host view is introduced.

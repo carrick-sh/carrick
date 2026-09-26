@@ -1,0 +1,2 @@
+first-touch child pages=1024 ok=true
+first-touch parent pages=1024 child_ok=true ok=true
