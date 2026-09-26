@@ -21,3 +21,19 @@ non-test reachability, actual module/dependency traversal, a macro policy, and
 red/green fixtures. The reviewed dependency closure must not silently stop at
 registry/git dependencies or missing paths. These checks are a known-pattern
 architecture rule; they cannot prove absence of all encoded Linux semantics.
+
+## Resolved-graph candidate review
+
+The second-round candidate also false-passes two hermetic Cargo fixtures:
+
+- `custom_lib_path`: `[lib] path = "kernel.rs"` contains `pub const RESULT: i64 = -110;`. The checker returns success with **zero scanned files**.
+- `optional_transitive`: the substrate has optional `bridge`; bridge depends on `carrick-abi`. The checker returns success with an empty shipped dependency closure.
+
+Both fixtures have local-only dependency paths and an offline-generated lockfile.
+Results and the exact candidate executable SHA-256 are in `round2-results.json`.
+The executable was copied from the worker's build directory during review; this
+is a draft-checker blackbox result, not attested source acceptance. Fixtures and
+the frozen executable remain under `target/el1-completion/boundary-review-round2`.
+The implementation also retries failed locked/offline metadata without those
+flags; acceptance requires preserving the locked graph rather than resolving
+a new graph after a failure.

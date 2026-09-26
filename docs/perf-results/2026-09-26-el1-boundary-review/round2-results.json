@@ -1,0 +1,17 @@
+{
+  "sha256": "37dd83e9cc8f2a888b60d7139084edf138d67fb48a3c787eac97b328a74f43c6",
+  "results": [
+    {
+      "case": "custom_lib_path",
+      "exit": 0,
+      "stdout": "personality boundary checked: 1 substrate crate(s) clean\n  [PASS] crate `carrick-sched-core` (shipped deps: [], dev deps: [], scanned files: 0)\n",
+      "stderr": ""
+    },
+    {
+      "case": "optional_transitive",
+      "exit": 0,
+      "stdout": "personality boundary checked: 1 substrate crate(s) clean\n  [PASS] crate `carrick-sched-core` (shipped deps: [], dev deps: [], scanned files: 1)\n",
+      "stderr": ""
+    }
+  ]
+}
