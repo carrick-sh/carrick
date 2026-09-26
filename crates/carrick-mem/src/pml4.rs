@@ -1,6 +1,6 @@
 //! x86-64 4-level (PML4) page-table codec. 4 KiB pages, 4 levels
 //! (PML4→PDPT→PD→PT), 9 index bits/level, 48-bit VA — the same granule shape
-//! as the aarch64 stage-1 tables ([`crate::page_table`]); only the descriptor
+//! as the aarch64 stage-1 tables ([`carrick_mmu_core::aarch64`]); only the descriptor
 //! bit layout differs. Descriptor bits per OSDev "Paging" / Intel SDM vol. 3
 //! (ISA references — NOT kernel source): P=bit0 (present), R/W=bit1 (needs
 //! CR0.WP for ring-0 honoring), U/S=bit2 (must be set at EVERY level of a
@@ -8,7 +8,7 @@
 //! aligned bulk mappings), NX=bit63 (needs EFER.NXE), physical address bits
 //! 51:12.
 //!
-//! Deliberately absent vs the aarch64 sibling (`page_table.rs`): block
+//! Deliberately absent vs the aarch64 sibling (`carrick-mmu-core::aarch64`): block
 //! coalesce and the multi-vCPU coalescing gate. The Phase 2 bring-up maps
 //! aligned low-VA regions with 2 MiB leaves and splits them lazily when
 //! protection edits need 4 KiB precision. Dynamic high aliases can allocate
@@ -346,7 +346,7 @@ pub fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
 }
 
 /// Runtime editor over a byte image of the PML4 tables rooted at `base` —
-/// the x86-64 sibling of [`crate::page_table::PageTableManager`], minus the
+/// the x86-64 sibling of [`carrick_mmu_core::aarch64::PageTableManager`], minus the
 /// M3-era machinery (see the module docs). Bulk mappings may start as 2 MiB
 /// leaves; edits split them to 4 KiB leaves when needed and then flip P/R\/W/NX
 /// bits in place. `set_prot_none` PRESERVES the recorded GPA in the non-present

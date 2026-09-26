@@ -3180,14 +3180,14 @@ impl HvfVmState {
 
     pub(crate) fn publish_stage1_extension_arenas(
         &mut self,
-        manager: &carrick_mem::page_table::PageTableManager,
+        manager: &carrick_mmu_core::aarch64::PageTableManager,
     ) -> Result<(), TrapError> {
         self.task.publish_stage1_extension_arenas(manager)
     }
 
     pub(crate) fn retire_stage1_extension_arenas(
         &mut self,
-        manager: &mut carrick_mem::page_table::PageTableManager,
+        manager: &mut carrick_mmu_core::aarch64::PageTableManager,
     ) -> Result<(), TrapError> {
         self.task.retire_stage1_extension_arenas(manager)
     }
@@ -3594,7 +3594,7 @@ impl HvfVmState {
                                     "deferred COW debug_walk_host failed: {e:?}"
                                 ))
                             })?;
-                        let leaf = carrick_mem::page_table::terminal_descriptor(live);
+                        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(live);
                         let translated = if must_be_valid {
                             manager.translate(page)
                         } else {
@@ -5405,7 +5405,7 @@ impl HvfTaskState {
 
     pub(crate) fn publish_stage1_extension_arenas(
         &mut self,
-        manager: &carrick_mem::page_table::PageTableManager,
+        manager: &carrick_mmu_core::aarch64::PageTableManager,
     ) -> Result<(), TrapError> {
         let root_perms = self
             .mm_root_slot
@@ -5428,7 +5428,7 @@ impl HvfTaskState {
 
     pub(crate) fn retire_stage1_extension_arenas(
         &mut self,
-        manager: &mut carrick_mem::page_table::PageTableManager,
+        manager: &mut carrick_mmu_core::aarch64::PageTableManager,
     ) -> Result<(), TrapError> {
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let custody = self.custody_arc();

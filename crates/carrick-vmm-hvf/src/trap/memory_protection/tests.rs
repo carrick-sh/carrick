@@ -255,16 +255,17 @@ mod memory_protection_tests {
     fn deferred_cow_walk_detects_interior_live_leaf_corruption() {
         let base = crate::memory::LINUX_MMAP_BASE;
         let bad_va = base + 4096;
-        let mut manager = carrick_mem::page_table::PageTableManager::new(
+        let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
         manager.set_readonly(bad_va, 4096, false, None).unwrap();
         let shadow = manager.debug_walk(bad_va);
         assert_ne!(shadow[3], 0, "fixture must contain an L3 split");
         let table = shadow[2] & 0x0000_ffff_ffff_f000;
         let slot =
-            ((table - manager.base()) / 8) as usize + carrick_mem::page_table::indices(bad_va)[3];
+            ((table - manager.base()) / 8) as usize + carrick_mmu_core::aarch64::indices(bad_va)[3];
         let pristine: Vec<u64> = manager
             .as_bytes()
             .chunks_exact(8)
@@ -293,9 +294,10 @@ mod memory_protection_tests {
     fn deferred_prot_none_accepts_retained_rw_ap_on_invalid_leaf() {
         const AP_USER_RO: u64 = 0b11 << 6;
         let va = crate::memory::LINUX_MMAP_BASE;
-        let mut page_tables = carrick_mem::page_table::PageTableManager::new(
+        let mut page_tables = carrick_mmu_core::aarch64::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
         page_tables
             .set_rw(va, 0x1000, false, None)
@@ -304,7 +306,7 @@ mod memory_protection_tests {
             .set_prot_none(va, 0x1000, None)
             .expect("invalidate leaf while retaining its output and attributes");
 
-        let leaf = carrick_mem::page_table::terminal_descriptor(page_tables.debug_walk(va));
+        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(page_tables.debug_walk(va));
         let expected_ipa = page_tables
             .translate_retained_output(va)
             .expect("invalid leaf retains exact output");
@@ -328,15 +330,16 @@ mod memory_protection_tests {
         const AP_USER_RW: u64 = 0b01 << 6;
         const UXN: u64 = 1 << 54;
         let va = crate::memory::LINUX_MMAP_BASE;
-        let mut page_tables = carrick_mem::page_table::PageTableManager::new(
+        let mut page_tables = carrick_mmu_core::aarch64::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
         page_tables
             .set_rw(va, 0x1000, false, None)
             .expect("publish writable non-executable leaf");
 
-        let leaf = carrick_mem::page_table::terminal_descriptor(page_tables.debug_walk(va));
+        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(page_tables.debug_walk(va));
         let expected_ipa = page_tables.translate(va).expect("valid leaf translates");
         assert_ne!(leaf & 1, 0, "fixture leaf is valid");
         assert_ne!(leaf & UXN, 0, "fixture leaf is execute-never");

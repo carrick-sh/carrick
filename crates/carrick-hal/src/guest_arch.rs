@@ -33,10 +33,10 @@ pub trait PageTableCodec {
     fn granule() -> PtGranule;
 
     /// The stateful page-table editor for this ISA's descriptor format
-    /// (aarch64: `carrick_mem::page_table::PageTableManager`).
+    /// (aarch64: `carrick_mmu_core::aarch64::PageTableManager`).
     type Manager;
     /// Errors the editor reports (aarch64:
-    /// `carrick_mem::page_table::PageTableError`).
+    /// `carrick_mmu_core::aarch64::PageTableError`).
     type Error;
 
     /// Build the editor over a byte snapshot of the live tables rooted at

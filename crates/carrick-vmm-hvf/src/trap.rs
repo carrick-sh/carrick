@@ -1232,7 +1232,7 @@ pub(crate) struct HvfTaskState {
     /// that whole host-VM churn on the COW path. Taken for the duration of one
     /// COW and returned on success; a rollback consumes it (it becomes the live
     /// manager) and the next COW allocates one again.
-    cow_rollback_scratch: Option<crate::page_table::PageTableManager>,
+    cow_rollback_scratch: Option<carrick_mmu_core::aarch64::PageTableManager>,
     pub(crate) registration: Option<HvpatchTaskRegistration>,
     /// The executor vCPU this task is loaded on right now. Kick handles
     /// registered for the task follow this slot, so a kick reaches the vCPU
@@ -1279,7 +1279,7 @@ pub(crate) struct HvfPageTableResolver<'a> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl<'a> carrick_mem::page_table::HostArenaResolver for HvfPageTableResolver<'a> {
+impl<'a> carrick_mmu_core::aarch64::HostArenaResolver for HvfPageTableResolver<'a> {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         self.primary_host
             .filter(|_| base == self.manager_base)
@@ -2544,9 +2544,9 @@ pub(crate) struct PendingFrameCowPublication {
 /// tables (`cpython-compile` reported fifteen bare refusals at 1 MiB anonymous
 /// maps); the child-clone and syscall edit paths already report this census.
 fn sparse_mmap_stage1_error(
-    manager: &carrick_mem::page_table::PageTableManager,
+    manager: &carrick_mmu_core::aarch64::PageTableManager,
     span: &str,
-    error: carrick_mem::page_table::PageTableError,
+    error: carrick_mmu_core::aarch64::PageTableError,
     source: bool,
 ) -> TrapError {
     let (in_use, free, capacity, arenas) = manager.pool_stats();

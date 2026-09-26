@@ -224,22 +224,23 @@ impl CurrentMmMemory for CountingMmapMemory {}
 
 pub struct Stage1MmapMemory {
     inner: CountingMmapMemory,
-    page_tables: carrick_mem::page_table::PageTableManager,
+    page_tables: carrick_mmu_core::aarch64::PageTableManager,
 }
 
 impl Stage1MmapMemory {
     pub(crate) fn new(base: u64, len: usize) -> Self {
         Self {
             inner: CountingMmapMemory::new(base, len),
-            page_tables: carrick_mem::page_table::PageTableManager::new(
+            page_tables: carrick_mmu_core::aarch64::PageTableManager::new(
                 carrick_mem::memory::stage1_hvpatch_page_tables(),
                 carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+                carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
             ),
         }
     }
 
     pub(crate) fn terminal_descriptor(&self, address: u64) -> u64 {
-        carrick_mem::page_table::terminal_descriptor(self.page_tables.debug_walk(address))
+        carrick_mmu_core::aarch64::terminal_descriptor(self.page_tables.debug_walk(address))
     }
 }
 

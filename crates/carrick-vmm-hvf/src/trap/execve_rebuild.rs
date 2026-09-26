@@ -555,9 +555,10 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
         })?;
     let mut global = plan.clone();
     let mut stage2_leases = std::collections::BTreeMap::new();
-    let mut page_tables = crate::page_table::PageTableManager::new(
+    let mut page_tables = carrick_mmu_core::aarch64::PageTableManager::new(
         global.mappings[table_index].image.as_ref().clone(),
         old_root,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     const TWO_MIB: u64 = 2 * 1024 * 1024;
     let mut order = global_frame_exec_lease_order(&global.mappings, table_index);
@@ -710,7 +711,7 @@ pub(crate) fn is_sparse_hvpatch_mmap_mapping(mapping: &GuestMapping) -> bool {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn reapply_global_exec_readonly_spans(
-    page_tables: &mut crate::page_table::PageTableManager,
+    page_tables: &mut carrick_mmu_core::aarch64::PageTableManager,
     ro_spans: &[carrick_mem::elf::RoSpan],
 ) -> Result<(), TrapError> {
     for span in ro_spans {
@@ -1425,9 +1426,10 @@ impl HvfVmState {
                     .mappings
                     .iter()
                     .find(|mapping| mapping.guest_start == crate::memory::LINUX_PAGE_TABLES_BASE)?;
-                Some(crate::page_table::PageTableManager::new(
+                Some(carrick_mmu_core::aarch64::PageTableManager::new(
                     table.image.as_ref().clone(),
                     root,
+                    carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
                 ))
             })
         };

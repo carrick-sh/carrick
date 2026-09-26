@@ -1,0 +1,18 @@
+[package]
+name = "carrick-mmu-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_mmu_core"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+hashbrown = { version = "0.15.5", default-features = false, features = ["alloc", "default-hasher"] }
+
+[dev-dependencies]
+carrick-mem = { path = "../carrick-mem" }

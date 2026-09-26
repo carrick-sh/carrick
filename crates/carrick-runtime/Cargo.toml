@@ -97,6 +97,7 @@ carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-host = { path = "../carrick-host" }
 carrick-kernel-arena = { path = "../carrick-kernel-arena" }
 carrick-mem = { path = "../carrick-mem" }
+carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-observability = { path = "../carrick-observability" }
 carrick-signal-core = { path = "../carrick-signal-core" }
 carrick-timer-core = { path = "../carrick-timer-core" }

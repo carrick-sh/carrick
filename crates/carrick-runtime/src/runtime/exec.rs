@@ -420,8 +420,8 @@ mod tests {
             carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE,
             carrick_mem::memory::LINUX_ROSETTA_VA_BASE,
         ] {
-            let leaf = carrick_mem::page_table::terminal_descriptor(
-                carrick_mem::page_table::walk_descriptors(
+            let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+                carrick_mmu_core::aarch64::walk_descriptors(
                     tables.bytes(),
                     carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
                     va,

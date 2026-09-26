@@ -45,9 +45,10 @@ fn guest_mapping_plan_shares_address_space_payload() {
 fn global_exec_readonly_spans_preserve_rebased_ipa() {
     let va = 0x20_0000;
     let ipa = 0x5000_0000;
-    let mut tables = carrick_mem::page_table::PageTableManager::new(
+    let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_identity_page_tables(),
         carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
         .map_aliased(va, ipa, 0x20_000, true, None)

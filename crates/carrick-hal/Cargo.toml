@@ -22,6 +22,7 @@ carrick-abi = { path = "../carrick-abi" }
 carrick-fatal.workspace = true
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }
+carrick-mmu-core = { path = "../carrick-mmu-core" }
 # Timer-delivery trait return/arg types (`PosixTimerSpec`, `TimerArm`) live in the
 # neutral timer-core; carrick-hal re-exports them through the `TimerDelivery`
 # trait so backends name one set of types. No cycle: timer-core depends only on

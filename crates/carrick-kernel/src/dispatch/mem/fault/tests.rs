@@ -259,9 +259,9 @@ fn dontneed_first_touch_restores_an_executable_leaf() {
         "the pending edit preserves PROT_EXEC"
     );
     assert!(
-        carrick_mem::page_table::terminal_descriptor_permits_el0(
+        carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(
             leaf,
-            carrick_mem::page_table::LeafAccess::Execute,
+            carrick_mmu_core::aarch64::LeafAccess::Execute,
         ),
         "the exact first-touch leaf must remain executable: {leaf:#x}"
     );

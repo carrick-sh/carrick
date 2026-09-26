@@ -1198,7 +1198,7 @@ impl HvfVmState {
     pub(crate) fn build_process_spec(
         &self,
         request: carrick_hal::ProcessForkRequest,
-        page_tables: &mut crate::page_table::PageTableManager,
+        page_tables: &mut carrick_mmu_core::aarch64::PageTableManager,
         cow_ranges: &[carrick_aarch64::vmm::ForkCowRange],
     ) -> Result<ProcessSpec, TrapError> {
         let cached_snapshot = self.cached_fork_alias_snapshot.lock().clone();

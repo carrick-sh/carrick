@@ -445,7 +445,7 @@ impl ProcessContext {
     pub(crate) fn table_arena_source_for_lease(
         &self,
         lease: &std::sync::Arc<stage1_mm::Stage1MmLease>,
-    ) -> Box<dyn carrick_mem::page_table::TableArenaSource> {
+    ) -> Box<dyn carrick_mmu_core::aarch64::TableArenaSource> {
         self.resources.table_arena_source_for_lease(lease)
     }
 

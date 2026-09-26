@@ -8,7 +8,7 @@ use super::*;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn invalidate_projected_fork_omissions(
-    page_tables: &mut crate::page_table::PageTableManager,
+    page_tables: &mut carrick_mmu_core::aarch64::PageTableManager,
     shares_mm: bool,
     ranges: &[carrick_hal::ForkProjectionRange],
 ) -> Result<(), TrapError> {
@@ -357,7 +357,7 @@ impl HvfTaskState {
     pub(crate) fn build_process_plan(
         &self,
         request: carrick_hal::ProcessForkRequest,
-        page_tables: &mut crate::page_table::PageTableManager,
+        page_tables: &mut carrick_mmu_core::aarch64::PageTableManager,
         cow_ranges: &[carrick_aarch64::vmm::ForkCowRange],
         mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
         syscall_transport: HvfSyscallTransport,
@@ -1259,7 +1259,7 @@ impl HvfTaskState {
                 const AP_MASK: u64 = 0b11 << 6;
                 const AP_USER_RW: u64 = 0b01 << 6;
                 const AP_USER_RO: u64 = 0b11 << 6;
-                let leaf = carrick_mem::page_table::terminal_descriptor(
+                let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
                     page_tables.debug_walk(mapping.start),
                 );
                 if leaf & VALID != 0 {
@@ -1398,7 +1398,7 @@ impl HvfTaskState {
                         "child live stage-1 debug_walk_host failed: {e:?}"
                     ))
                 })?;
-            let live_leaf = carrick_mem::page_table::terminal_descriptor(live);
+            let live_leaf = carrick_mmu_core::aarch64::terminal_descriptor(live);
             if shadow != live
                 // An unmodified CLONE_VM graph may retain an L1/L2 block: its
                 // descriptor carries the block base, while `expected_ipa`

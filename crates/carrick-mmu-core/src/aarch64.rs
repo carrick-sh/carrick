@@ -12,6 +12,10 @@
 //!
 //! 4 KiB translation granule, 40-bit IPA, AArch64 long-descriptor format.
 
+use alloc::vec;
+use alloc::vec::Vec;
+use hashbrown::HashSet;
+
 // Leaf attribute layout (must match `memory::stage1_identity_page_tables`).
 const VALID: u64 = 1 << 0;
 const TYPE_BITS: u64 = 0b11;
@@ -160,7 +164,7 @@ impl PageTableApplyOutcome {
     }
 }
 
-impl std::ops::BitOr for PageTableApplyOutcome {
+impl core::ops::BitOr for PageTableApplyOutcome {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
         Self {
@@ -170,7 +174,7 @@ impl std::ops::BitOr for PageTableApplyOutcome {
     }
 }
 
-impl std::ops::BitOrAssign for PageTableApplyOutcome {
+impl core::ops::BitOrAssign for PageTableApplyOutcome {
     fn bitor_assign(&mut self, rhs: Self) {
         self.changed |= rhs.changed;
         self.flush_required |= rhs.flush_required;
@@ -190,9 +194,9 @@ pub enum PageTableError {
     ConflictingArenaSource,
     /// Host backing pointer for the page-table arena at base IPA was unresolved.
     UnresolvedArena(u64),
-    /// An output address in the in-kernel GIC's guest-physical window
-    /// ([`crate::memory::LINUX_GIC_WINDOW_BASE`]): a stage-1 leaf there would
-    /// give the guest MMIO access to the distributor or a redistributor.
+    /// An output address in the in-kernel GIC's guest-physical window:
+    /// a stage-1 leaf there would give the guest MMIO access to the distributor
+    /// or a redistributor.
     GicWindowOutput,
 }
 
@@ -215,7 +219,7 @@ impl core::fmt::Display for PageTableError {
     }
 }
 
-impl std::error::Error for PageTableError {}
+impl core::error::Error for PageTableError {}
 
 /// Per-level table index for `va` (4 KiB granule, 40-bit IPA).
 pub fn indices(va: u64) -> [usize; 4] {
@@ -268,7 +272,7 @@ pub fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
 /// backing in place instead of a copy of it.
 ///
 /// [`walk_descriptors`] needs an owned `&[u8]` of the whole region, so a caller
-/// holding only a host pointer had to copy `LINUX_PAGE_TABLES_SIZE` (1.75 MiB)
+/// holding only a host pointer had to copy the entire page table size (1.75 MiB)
 /// to read four 8-byte descriptors. On the frame-COW fault path that copy is
 /// per fault, which made a diagnostic probe the most expensive thing in the
 /// handler. This reads the eight bytes it actually needs.
@@ -346,22 +350,6 @@ fn discover_spare_pages<'a>(
         })
 }
 
-/// Mutable editor over a copy of the page-table region bytes.
-///
-/// `Clone` is used by `fork`: the child needs its OWN manager (it gets a
-/// private copy of the page-table backing) but MUST inherit the parent's
-/// `next_free`/`free_tables` — a fresh manager would reset the bump cursor and
-/// re-hand-out table pages already live in the copied backing, corrupting it.
-///
-/// `Clone` is implemented by hand ONLY to give `clone_from` an allocation-reusing
-/// body; `clone` itself is the field-wise copy `#[derive(Clone)]` would have
-/// produced. The 1.75 MiB `LINUX_PAGE_TABLES_SIZE` image is large enough that
-/// the system allocator serves it from a fresh `mmap`, so every snapshot costs a
-/// host `mmap`, a zero-fill fault per 16 KiB page, and a `munmap`/`madvise` on
-/// drop. The frame-COW handler takes such a snapshot on EVERY fault as its
-/// rollback pre-image, so reusing one buffer removes that host-VM churn from the
-/// COW path without weakening the snapshot (it is still the complete
-/// pre-transaction image).
 /// Location of a descriptor within a possibly multi-arena page-table structure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TableLocation {
@@ -386,15 +374,48 @@ impl TableLocation {
     }
 }
 
+/// Narrow substrate guest-physical address type for stage-1 table arena boundaries.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct SubstrateGpa(pub u64);
+
+impl SubstrateGpa {
+    #[inline]
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for SubstrateGpa {
+    #[inline]
+    fn from(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+impl From<SubstrateGpa> for u64 {
+    #[inline]
+    fn from(gpa: SubstrateGpa) -> Self {
+        gpa.0
+    }
+}
+
 /// Typed identifier for a `TableArenaSource`, uniquely identified by its stage-1 root slot base.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct TableArenaSourceId(pub carrick_guest_mem::Gpa);
+pub struct TableArenaSourceId(pub SubstrateGpa);
 
 impl TableArenaSourceId {
     #[inline]
     #[must_use]
     pub const fn from_raw(raw: u64) -> Self {
-        Self(carrick_guest_mem::Gpa(raw))
+        Self(SubstrateGpa(raw))
     }
 
     #[inline]
@@ -405,15 +426,15 @@ impl TableArenaSourceId {
 }
 
 /// Provider of additional 2 MiB root slots when the primary stage-1 arena is exhausted.
-pub trait TableArenaSource: std::fmt::Debug + Send + 'static {
+pub trait TableArenaSource: core::fmt::Debug + Send + 'static {
     /// Return the typed identity of this arena source.
     fn id(&self) -> TableArenaSourceId;
 
     /// Allocate an additional 2 MiB root slot.
-    fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa>;
+    fn take_arena(&mut self) -> Option<SubstrateGpa>;
 
     /// Return an unused root slot to the allocator.
-    fn return_arena(&mut self, arena: carrick_guest_mem::Gpa);
+    fn return_arena(&mut self, arena: SubstrateGpa);
 }
 
 /// Resolves the host backing pointer for a stage-1 table arena base address.
@@ -552,8 +573,69 @@ impl Clone for TableArena {
     }
 }
 
+/// Layout constraints and reserved memory bounds required for AArch64 page-table operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageTableLayoutConfig {
+    /// Representative user VA used to detect whether initial descriptors carry nG.
+    pub user_leaf_check_va: u64,
+    /// Capacity in bytes for newly attached extension arenas.
+    pub extension_arena_capacity: usize,
+    /// Start of excluded / forbidden IPA range (e.g. GIC window).
+    pub excluded_ipa_start: u64,
+    /// Length in bytes of excluded / forbidden IPA range.
+    pub excluded_ipa_len: u64,
+}
+
+impl PageTableLayoutConfig {
+    #[must_use]
+    pub const fn new(
+        user_leaf_check_va: u64,
+        extension_arena_capacity: usize,
+        excluded_ipa_start: u64,
+        excluded_ipa_len: u64,
+    ) -> Self {
+        Self {
+            user_leaf_check_va,
+            extension_arena_capacity,
+            excluded_ipa_start,
+            excluded_ipa_len,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn ipa_overlaps_excluded(&self, ipa: u64, len: u64) -> bool {
+        if self.excluded_ipa_len == 0 || len == 0 {
+            return false;
+        }
+        let Some(a_end) = ipa.checked_add(len) else {
+            return true;
+        };
+        let Some(b_end) = self.excluded_ipa_start.checked_add(self.excluded_ipa_len) else {
+            return true;
+        };
+        !(a_end <= self.excluded_ipa_start || b_end <= ipa)
+    }
+}
+
+/// Mutable editor over a copy of the page-table region bytes.
+///
+/// `Clone` is used by `fork`: the child needs its OWN manager (it gets a
+/// private copy of the page-table backing) but MUST inherit the parent's
+/// `next_free`/`free_tables` — a fresh manager would reset the bump cursor and
+/// re-hand-out table pages already live in the copied backing, corrupting it.
+///
+/// `Clone` is implemented by hand ONLY to give `clone_from` an allocation-reusing
+/// body; `clone` itself is the field-wise copy `#[derive(Clone)]` would have
+/// produced. The table image is large enough that the system allocator serves
+/// it from a fresh `mmap`, so every snapshot costs a host `mmap`, a zero-fill
+/// fault per 16 KiB page, and a `munmap`/`madvise` on drop. The frame-COW handler
+/// takes such a snapshot on EVERY fault as its rollback pre-image, so reusing one
+/// buffer removes that host-VM churn from the COW path without weakening the
+/// snapshot (it is still the complete pre-transaction image).
 pub struct PageTableManager {
     arenas: Vec<TableArena>,
+    layout: PageTableLayoutConfig,
     /// New or rebuilt terminal descriptors must carry nG. Derived from the
     /// canonical low user leaf so a rebased/cloned HVPatch table retains its
     /// ASID-scoped construction mode without a second out-of-band authority.
@@ -620,13 +702,14 @@ struct UndoJournal {
     replaced_valid: bool,
     /// Locations already journalled by this transaction, so only the first
     /// pre-image of each word decides `replaced_valid`.
-    first_written: std::collections::HashSet<(usize, usize)>,
+    first_written: HashSet<(usize, usize)>,
 }
 
 impl Clone for PageTableManager {
     fn clone(&self) -> Self {
         Self {
             arenas: self.arenas.clone(),
+            layout: self.layout,
             asid_scoped_leaves: self.asid_scoped_leaves,
             free_tables: self.free_tables.clone(),
             multi_vcpu: self.multi_vcpu,
@@ -641,9 +724,10 @@ impl Clone for PageTableManager {
     /// Overwrite `self` with `source`, reusing `self`'s buffers. Every field is
     /// copied, so the result is indistinguishable from `clone()`; only the
     /// allocations differ. `Vec::clone_from` keeps the destination's capacity,
-    /// which is the entire point on the 1.75 MiB table image.
+    /// which is the entire point on the large table image.
     fn clone_from(&mut self, source: &Self) {
         self.arenas.clone_from(&source.arenas);
+        self.layout = source.layout;
         self.asid_scoped_leaves = source.asid_scoped_leaves;
         self.free_tables.clone_from(&source.free_tables);
         self.multi_vcpu = source.multi_vcpu;
@@ -656,14 +740,12 @@ impl Clone for PageTableManager {
 }
 
 impl PageTableManager {
-    pub fn new(mut bytes: Vec<u8>, base: u64) -> Self {
+    pub fn new(mut bytes: Vec<u8>, base: u64, layout: PageTableLayoutConfig) -> Self {
         let next_free = discover_next_free_spare(&bytes);
-        let asid_scoped_leaves = terminal_descriptor(walk_descriptors(
-            &bytes,
-            base,
-            crate::memory::LINUX_NULL_GUARD_END,
-        )) & NON_GLOBAL
-            != 0;
+        let asid_scoped_leaves =
+            terminal_descriptor(walk_descriptors(&bytes, base, layout.user_leaf_check_va))
+                & NON_GLOBAL
+                != 0;
         let capacity = bytes.len();
         let next_free = next_free.min(capacity as u64);
         bytes.truncate(next_free as usize);
@@ -674,6 +756,7 @@ impl PageTableManager {
                 next_free,
                 capacity,
             }],
+            layout,
             asid_scoped_leaves,
             free_tables: Vec::new(),
             multi_vcpu: false,
@@ -683,6 +766,13 @@ impl PageTableManager {
             dirty: Vec::new(),
             undo: None,
         }
+    }
+
+    /// Return the layout configuration for this page-table manager.
+    #[inline]
+    #[must_use]
+    pub fn layout(&self) -> PageTableLayoutConfig {
+        self.layout
     }
 
     /// Guest-physical address of the L0 table represented by this image.
@@ -765,7 +855,7 @@ impl PageTableManager {
             let Some(gpa) = source.as_mut().and_then(|source| source.take_arena()) else {
                 for &b in &new_bases[1..] {
                     if let Some(source) = source.as_mut() {
-                        source.return_arena(carrick_guest_mem::Gpa(b));
+                        source.return_arena(SubstrateGpa(b));
                     }
                 }
                 return Err(PageTableError::OutOfTables);
@@ -830,7 +920,7 @@ impl PageTableManager {
             Err(err) => {
                 for &b in &new_bases[1..] {
                     if let Some(source) = source.as_mut() {
-                        source.return_arena(carrick_guest_mem::Gpa(b));
+                        source.return_arena(SubstrateGpa(b));
                     }
                 }
                 return Err(err);
@@ -852,8 +942,6 @@ impl PageTableManager {
         Ok(())
     }
 
-    /// Tell the manager whether sibling vCPUs are live (set per-edit from the
-    /// process-wide live-vCPU count). Gates coalescing.
     /// Record whether this thread's stage-1 edits are exclusive. Gates ONLY the
     /// last-resort reclaim sweep, never the eager paths — making exclusivity
     /// enable eager coalescing took `go-net_http` from 50 s to over 200 s,
@@ -863,6 +951,8 @@ impl PageTableManager {
         self.stage1_exclusive = exclusive;
     }
 
+    /// Tell the manager whether sibling vCPUs are live (set per-edit from the
+    /// process-wide live-vCPU count). Gates coalescing.
     pub fn set_multi_vcpu(&mut self, multi: bool) {
         self.multi_vcpu = multi;
     }
@@ -877,10 +967,7 @@ impl PageTableManager {
     /// PARENT's last mapping syscall, which says nothing about this image. Left
     /// inherited it reads `false` whenever the parent's last stage-1 edit was
     /// not an exclusive one, and `alloc_table`'s last-resort sweep is then
-    /// refused while the child is publishing its own mappings: `cpython`
-    /// `concurrent_futures` reached `OutOfTables` at `in_use=438 free=0
-    /// capacity=440 exclusive=false reclaim_pending=true` — a pool with
-    /// reclaimable tables and no permission to reclaim them.
+    /// refused while the child is publishing its own mappings.
     pub fn declare_offline_private_image(&mut self) {
         self.stage1_exclusive = true;
         self.offline_private_image = true;
@@ -1078,7 +1165,7 @@ impl PageTableManager {
                 reclaim_pending: self.reclaim_pending,
                 dirty_len: self.dirty.len(),
                 replaced_valid: false,
-                first_written: std::collections::HashSet::new(),
+                first_written: HashSet::new(),
             });
         }
     }
@@ -1145,7 +1232,7 @@ impl PageTableManager {
             };
             popped.push(arena.base);
             if let Some(source) = source.as_mut() {
-                source.return_arena(carrick_guest_mem::Gpa(arena.base));
+                source.return_arena(SubstrateGpa(arena.base));
             }
         }
         popped
@@ -1162,7 +1249,7 @@ impl PageTableManager {
             if let Some(host) = resolver.host_ptr_for_base(arena.base) {
                 let prefix_len = (arena.next_free as usize).min(arena.bytes.len());
                 unsafe {
-                    std::ptr::copy_nonoverlapping(arena.bytes.as_ptr(), host, prefix_len);
+                    core::ptr::copy_nonoverlapping(arena.bytes.as_ptr(), host, prefix_len);
                 }
                 resolver.record_populated_prefix(arena.base, prefix_len);
             }
@@ -1449,7 +1536,7 @@ impl PageTableManager {
             && let Some(gpa) = source.take_arena()
         {
             let base = gpa.0;
-            let capacity = crate::memory::LINUX_PAGE_TABLES_SIZE as usize;
+            let capacity = self.layout.extension_arena_capacity;
             let mut bytes = Vec::with_capacity(capacity);
             bytes.resize(PT_PAGE as usize, 0);
             let arena = TableArena {
@@ -1792,10 +1879,7 @@ impl PageTableManager {
                 // silently repoint a private overlay back at the SHARED page).
                 // Only an EMPTY descriptor (no address recorded — see
                 // `records_output`) is rebuilt from the identity VA,
-                // preserving the historical arena behaviour. `desc != 0` is
-                // NOT that test: an invalidated-then-split empty block once
-                // left `index * stride | flags` children here, and this branch
-                // published them as VALID leaves at IPA 0x5000.
+                // preserving the historical arena behaviour.
                 let previously_valid = desc & VALID != 0;
                 let new_desc = match op {
                     PtOp::Invalidate | PtOp::Retire => {
@@ -1864,11 +1948,9 @@ impl PageTableManager {
                     | PtOp::ReadWrite { .. }
                     | PtOp::KernelReadOnly { .. } => self.desc_for(op, block_start, level),
                 };
-                // A valid leaf whose output lies in the in-kernel GIC's window
-                // would expose the distributor or a redistributor as memory,
-                // whether the output was rebuilt from the identity VA or kept.
-                if new_desc & VALID != 0
-                    && crate::memory::ipa_overlaps_gic_window(new_desc & mask, span)
+                // A valid leaf whose output lies in the excluded / forbidden window
+                // would expose distributor/redistributors as memory.
+                if new_desc & VALID != 0 && self.layout.ipa_overlaps_excluded(new_desc & mask, span)
                 {
                     return Err(PageTableError::GicWindowOutput);
                 }
@@ -1968,12 +2050,7 @@ impl PageTableManager {
     /// the leaves and KEEPS the sub-table — correct for the low-VA arena, whose
     /// pages are reused in place), a high-VA alias is torn down completely, so
     /// its dedicated per-2-MiB L3 table (one per `mmap(MAP_SHARED, fd)`, which
-    /// each takes its own 2 MiB alias block) must be freed — otherwise the
-    /// 440-entry spare pool leaks one table per alias and a churning guest
-    /// (CPython multiprocessing maps+unmaps 400+ SemLock/Pool shm files) hits
-    /// OutOfTables. Caller must hold the alias region exclusively here (this is
-    /// the munmap path, PMR-gated under multi-vCPU); reclaim is additionally
-    /// gated single-vCPU/PMR inside (see `reclaim_invalid_tables`).
+    /// each takes its own 2 MiB alias block) must be freed.
     pub fn unmap_aliased(
         &mut self,
         va: u64,
@@ -2038,16 +2115,6 @@ impl PageTableManager {
     /// `reclaim_invalid_tables`, but driven by the table graph rather than by a
     /// VA range, so a caller that has no range in hand (`alloc_table`) can still
     /// recover the pool.
-    ///
-    /// Bounded by the number of LIVE tables, not by the address space: at most
-    /// `capacity` tables, each a 512-descriptor scan. That is trivial as a
-    /// one-shot and unaffordable per edit, which is exactly why it lives here.
-    ///
-    /// EXCLUSIVITY IS REQUIRED. Freeing a table only makes it reusable, and
-    /// handing a page back out while a sibling vCPU may hold a stale cached walk
-    /// reaching it is the same break-before-make hazard that gates the eager
-    /// paths. Under `stage1_exclusive` there is no such sibling. Returns whether
-    /// anything was freed.
     fn reclaim_all_invalid_tables(&mut self) -> bool {
         if !self.stage1_exclusive || !self.reclaim_pending {
             return false;
@@ -2138,21 +2205,6 @@ impl PageTableManager {
     /// descriptors at `level` covering `[table_va, table_va + 512 * span)`,
     /// records nothing a rebuild could not reproduce — so freeing it (and
     /// zeroing the parent entry) loses no information.
-    ///
-    /// "All entries VALID-clear" is NOT that test. An invalid leaf that
-    /// retains a non-identity output is the normal shape of every
-    /// armed-but-untouched sparse-arena page, of every `PROT_NONE`/
-    /// `MADV_DONTNEED` page whose frame the mm still owns, and of every
-    /// pending materialization receipt: the next protection commit
-    /// republishes exactly that output in place. Freeing such a table and
-    /// re-splitting the emptied parent later handed those pages fabricated
-    /// outputs (`cpython-concurrent_futures`' fork child validator: "stage-1
-    /// VA 0x6008405000 resolves to IPA 0x5000, expected 0x9c19205000"; the
-    /// parent had been reading and writing IPA 0x5000 silently).
-    ///
-    /// Reclaimable entries are: empty (no output), identity (a rebuild yields
-    /// the same address), or RETIRED by `munmap` (the lease is gone; the
-    /// retained address is only a reuse signal).
     fn table_reclaimable(&self, table_loc: TableLocation, table_va: u64, level: usize) -> bool {
         let (span, mask) = Self::level_span(level);
         (0..512usize).all(|i| {
@@ -2218,20 +2270,7 @@ impl PageTableManager {
     }
 
     /// Build a fresh VA→IPA translation for `[va, va+len)` for EL0, creating
-    /// any missing L1/L2/L3 sub-tables. This is the dynamic counterpart of the
-    /// boot Rosetta alias: it maps high guest VAs (which can't be
-    /// identity-mapped — HVF's IPA is only 40 bits) down to a low IPA the caller
-    /// has `hv_vm_map`'d. Uses 2 MiB blocks when `va`/`ipa`/`len` are 2 MiB
-    /// aligned, else 4 KiB pages. The target VA range must be previously
-    /// unmapped (high space the boot tables never populate). Always Ok(true).
-    ///
-    /// `writable`: when false the leaf is built AP=RO (read-only at EL0/EL1)
-    /// while PRESERVING the IPA output address — so a guest store to a
-    /// SHM_RDONLY shmat alias raises a stage-1 permission abort (SIGSEGV),
-    /// matching Linux. The output address must stay the low IPA (NOT VA&mask),
-    /// because an alias is non-identity (VA != IPA); set_readonly/apply would
-    /// rebuild it from the VA and destroy the mapping, which is why writability
-    /// is threaded in HERE instead.
+    /// any missing L1/L2/L3 sub-tables.
     pub fn map_aliased(
         &mut self,
         va: u64,
@@ -2259,11 +2298,6 @@ impl PageTableManager {
     }
 
     /// Build a per-mm VA→IPA translation whose TLB entries are ASID-scoped.
-    ///
-    /// HVPatch uses this for private demand-materialized mmap extents. Their
-    /// output lives in a VM-global IPA arena, but the semantic translation is
-    /// owned by exactly one mm and must therefore carry nG from its first
-    /// publication. Shared aliases keep using [`Self::map_aliased`].
     pub fn map_private_aliased(
         &mut self,
         va: u64,
@@ -2286,9 +2320,7 @@ impl PageTableManager {
     }
 
     /// Repoint an EL1-only Carrick control-page range while preserving the
-    /// kernel-hole execution regime: AP=00, UXN=1, PXN=0. Using the ordinary
-    /// user alias flags here sets PXN and makes the entry trampoline/vector
-    /// page unexecutable at EL1 under FEAT_PAN3.
+    /// kernel-hole execution regime: AP=00, UXN=1, PXN=0.
     pub fn map_kernel_aliased(
         &mut self,
         va: u64,
@@ -2308,10 +2340,7 @@ impl PageTableManager {
     }
 
     /// Repoint existing 4 KiB leaves to a new linear IPA while preserving every
-    /// non-address attribute: validity, AP, AF, shareability, PXN and UXN.  Frame
-    /// COW uses this before selectively granting write to the semantic pages
-    /// which are currently writable.  That matters when one 16 KiB host
-    /// compound straddles a `brk`, `mprotect`, or partial-unmap boundary.
+    /// non-address attribute: validity, AP, AF, shareability, PXN and UXN.
     pub fn repoint_preserving_attributes(
         &mut self,
         va: u64,
@@ -2323,7 +2352,7 @@ impl PageTableManager {
         if va & (FOUR_KIB - 1) != ipa & (FOUR_KIB - 1) {
             return Err(PageTableError::BadAddress);
         }
-        if crate::memory::ipa_overlaps_gic_window(ipa, len) {
+        if self.layout.ipa_overlaps_excluded(ipa, len) {
             return Err(PageTableError::GicWindowOutput);
         }
         let pages = len.div_ceil(FOUR_KIB);
@@ -2346,9 +2375,6 @@ impl PageTableManager {
     }
 
     /// Grant EL0/EL1 write access without changing validity or execute policy.
-    /// The caller has already established that these exact semantic pages are
-    /// writable; preserving UXN/PXN avoids reintroducing execute permission on
-    /// a page whose post-fork `mprotect` state differs from its boot mapping.
     pub fn set_writable_preserving_attributes(
         &mut self,
         va: u64,
@@ -2397,24 +2423,6 @@ impl PageTableManager {
         (last - first) / gran + 1
     }
 
-    /// Build a VA→IPA alias translation using the COARSEST leaf the geometry
-    /// admits at every step: 1 GiB L1 blocks, then 2 MiB L2 blocks, then 4 KiB
-    /// L3 pages only at the edges.
-    ///
-    /// `mmap` establishes a VMA; it must not do work proportional to the
-    /// mapping's size. A block leaf maps a naturally aligned VA span onto an
-    /// equally aligned output, so it is expressible exactly when the VA and the
-    /// IPA are *congruent* modulo the block size — congruence, not either
-    /// address's own alignment, is what decides whether coarse leaves are
-    /// usable. (Masking an unaligned output into a block descriptor would
-    /// silently map the wrong bytes, so the choice is made per step and never
-    /// forced.)
-    ///
-    /// The build is also all-or-nothing. Running out of spare tables partway
-    /// used to leave a half-built mapping that the guest re-faults on forever —
-    /// an apparent hang rather than an error — so the table budget is checked
-    /// UP FRONT and an unsatisfiable build is refused whole, which the callers
-    /// lower to a guest `ENOMEM` the way Linux does.
     fn map_aliased_with_flags(
         &mut self,
         va: u64,
@@ -2430,32 +2438,21 @@ impl PageTableManager {
         if len == 0 {
             return Ok(false);
         }
-        if crate::memory::ipa_overlaps_gic_window(ipa, len) {
+        if self.layout.ipa_overlaps_excluded(ipa, len) {
             return Err(PageTableError::GicWindowOutput);
         }
         let end = va.checked_add(len).ok_or(PageTableError::BadAddress)?;
 
-        // Upper-bound the new tables this build can need, so an unsatisfiable
-        // one is refused before a single descriptor is written. Coarse leaves
-        // need no table at their own level, so only the levels ABOVE the leaf
-        // count. When VA and IPA are incongruent mod 2 MiB no block leaf is
-        // expressible anywhere and the build is page-granular throughout —
-        // which is what makes the budget check load-bearing rather than
-        // theoretical.
         let congruent = (va & (TWO_MIB - 1)) == (ipa & (TWO_MIB - 1));
         let l1_tables = Self::spans_touched(va, end, L1_SPAN);
         let l2_tables = Self::spans_touched(va, end, ONE_GIB);
         let l3_tables = if congruent {
-            // Only the two unaligned edges fall to pages.
             Self::spans_touched(va, end, TWO_MIB).min(2)
         } else {
             Self::spans_touched(va, end, TWO_MIB)
         };
         let needed = l1_tables + l2_tables + l3_tables;
         if needed > self.spare_tables_available() {
-            // The budget is checked UP FRONT (see above), so this path returns
-            // before `alloc_table` is ever called and its last-resort sweep
-            // would never run. Take the same one-shot reclaim here, then re-ask.
             self.reclaim_all_invalid_tables();
             if source.is_none() && needed > self.spare_tables_available() {
                 return Err(PageTableError::OutOfTables);
@@ -2489,10 +2486,6 @@ impl PageTableManager {
         Ok(true)
     }
 
-    /// Descend from L0 to the table at `target_level` (1, 2, or 3), allocating
-    /// any missing intermediate table from the spare pool. Returns the table's
-    /// location. Errors if an existing block sits on the path (never the case
-    /// for the high alias space).
     fn descend_creating(
         &mut self,
         va: u64,
@@ -2500,7 +2493,7 @@ impl PageTableManager {
         mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<TableLocation, PageTableError> {
         let idx = indices(va);
-        let mut table_loc = TableLocation::new(0, 0); // L0 at byte offset 0 in arena 0
+        let mut table_loc = TableLocation::new(0, 0);
         #[allow(clippy::needless_range_loop)]
         for level in 0..target_level {
             let entry_loc = table_loc.entry(idx[level]);
@@ -2512,12 +2505,6 @@ impl PageTableManager {
                 continue;
             }
             if valid {
-                // A valid BLOCK leaf covering this VA. Split it into a finer
-                // sub-table (preserving its mapping + validity) so we can
-                // descend and install a sub-range — e.g. a finer mapping inside
-                // a 2 MiB block an earlier alias mapping created (the case a
-                // forked child hits when it maps inside a block its parent's
-                // cloned tables already established). Mirrors `leaf_offset`.
                 self.split_block(entry_loc, level, source.as_deref_mut())?;
                 let desc2 = self.read_desc(entry_loc);
                 table_loc = self.pa_to_loc(desc2 & PA_MASK_TABLE)?;
@@ -2531,7 +2518,6 @@ impl PageTableManager {
     }
 
     /// True iff the leaf for `va` (block or page) is valid. Test/diagnostic.
-    #[cfg(test)]
     pub fn is_valid(&mut self, va: u64) -> bool {
         match self.leaf_offset(va, false, None) {
             Ok((loc, _)) => self.read_desc(loc) & VALID != 0,
@@ -2540,7 +2526,6 @@ impl PageTableManager {
     }
 
     /// AP[2:1] of the leaf for `va`. Test/diagnostic.
-    #[cfg(test)]
     pub fn ap_bits(&mut self, va: u64) -> u64 {
         match self.leaf_offset(va, false, None) {
             Ok((loc, _)) => self.read_desc(loc) & AP_MASK,
@@ -2549,7 +2534,6 @@ impl PageTableManager {
     }
 
     /// `unmap_aliased` returning exact traversal steps for algorithmic verification.
-    #[cfg(test)]
     pub fn unmap_aliased_counting(
         &mut self,
         va: u64,
@@ -2568,12 +2552,83 @@ impl PageTableManager {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use alloc::boxed::Box;
+    use alloc::vec;
+    use carrick_mem::memory::{
+        LINUX_ALIAS_IPA_BASE, LINUX_GIC_DISTRIBUTOR_BASE, LINUX_GIC_REDISTRIBUTOR_BASE,
+        LINUX_GIC_WINDOW_BASE, LINUX_GIC_WINDOW_SIZE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
+        LINUX_HIGH_VA_THRESHOLD, LINUX_HVPATCH_GLOBAL_FRAME_BASE, LINUX_MMAP_BASE,
+        LINUX_NULL_GUARD_END, LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE,
+        LINUX_PRIVATE_OVERLAY_BASE, LINUX_SHARED_FILE_BASE, mmap_arena_size,
+        stage1_hvpatch_page_tables, stage1_identity_page_tables,
+    };
+
+    fn test_layout() -> PageTableLayoutConfig {
+        PageTableLayoutConfig {
+            user_leaf_check_va: LINUX_NULL_GUARD_END,
+            extension_arena_capacity: LINUX_PAGE_TABLES_SIZE as usize,
+            excluded_ipa_start: LINUX_GIC_WINDOW_BASE,
+            excluded_ipa_len: LINUX_GIC_WINDOW_SIZE,
+        }
+    }
+
+    fn manager() -> PageTableManager {
+        let mut bytes = stage1_identity_page_tables();
+        bytes.resize(0x40000, 0);
+        PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE, test_layout())
+    }
+
+    fn hvpatch_manager() -> PageTableManager {
+        let mut mgr = PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            LINUX_PAGE_TABLES_BASE,
+            test_layout(),
+        );
+        mgr.set_prot_none(LINUX_MMAP_BASE, mmap_arena_size() as usize, None)
+            .expect("reserve sparse arena");
+        mgr
+    }
+
+    fn exhaust_spare_pool(mgr: &mut PageTableManager, keep_out: u64) {
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let mut block = keep_out + 64 * TWO_MIB;
+        loop {
+            let (_, free, _, _) = mgr.pool_stats();
+            let spare = mgr.spare_tables_available();
+            if spare == 0 && free == 0 {
+                break;
+            }
+            if mgr.set_rw(block + 0x1000, 0x1000, false, None).is_err() {
+                break;
+            }
+            block += TWO_MIB;
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestArenaSource {
+        id: TableArenaSourceId,
+        available: std::sync::Arc<std::sync::Mutex<Vec<SubstrateGpa>>>,
+        returned: std::sync::Arc<std::sync::Mutex<Vec<SubstrateGpa>>>,
+    }
+
+    impl TableArenaSource for TestArenaSource {
+        fn id(&self) -> TableArenaSourceId {
+            self.id
+        }
+        fn take_arena(&mut self) -> Option<SubstrateGpa> {
+            self.available.lock().unwrap().pop()
+        }
+        fn return_arena(&mut self, base: SubstrateGpa) {
+            self.returned.lock().unwrap().push(base);
+        }
+    }
+
     #[test]
     fn spare_cursor_discovery_stops_at_the_last_used_page() {
-        use std::cell::Cell;
+        use core::cell::Cell;
         let mut pages = vec![0; 440 * super::PT_PAGE as usize];
-        // A hole is not reusable merely because it is zero; an occupied final
-        // page fixes the high-water mark without inspecting earlier pages.
         *pages.last_mut().unwrap() = 0x80;
         let visited = Cell::new(0);
         let cursor = super::discover_spare_pages(
@@ -2590,7 +2645,6 @@ mod tests {
         let page = super::PT_PAGE as usize;
         let start = super::SPARE_START_OFFSET as usize;
         let mut image = vec![0; start + 4 * page + 17];
-        // An incomplete tail never constitutes an allocated table page.
         image[start + 4 * page + 16] = 1;
         assert_eq!(super::discover_next_free_spare(&image), start as u64);
         for byte in 0..page {
@@ -2607,16 +2661,14 @@ mod tests {
             super::discover_next_free_spare(&image),
             (start + 4 * page) as u64
         );
-        // The public constructor still clamps the cursor for short images.
         for len in [0, 1, start - 1, start] {
-            let manager = super::PageTableManager::new(vec![0; len], 0x10000);
+            let manager = super::PageTableManager::new(vec![0; len], 0x10000, test_layout());
             assert_eq!(manager.copied_bytes(), len as u64);
         }
     }
 
     #[test]
     fn terminal_descriptor_permission_tracks_valid_af_ap_and_uxn() {
-        use super::{LeafAccess, terminal_descriptor_permits_el0};
         let pa = 0x0000_0001_2345_6000_u64;
         let rw_nx = pa | super::USER_PAGE_FLAGS | super::UXN | super::NON_GLOBAL;
         let rw_exec = pa | super::USER_PAGE_FLAGS | super::NON_GLOBAL;
@@ -2646,27 +2698,8 @@ mod tests {
         }
     }
 
-    use super::*;
-    use crate::memory::{
-        LINUX_ALIAS_IPA_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_HIGH_VA_THRESHOLD,
-        LINUX_HVPATCH_GLOBAL_FRAME_BASE, LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE,
-        LINUX_PRIVATE_OVERLAY_BASE, LINUX_SHARED_FILE_BASE, mmap_arena_size,
-        stage1_hvpatch_page_tables, stage1_identity_page_tables,
-    };
-
-    fn manager() -> PageTableManager {
-        // Pad with spare table pages so split has room (mirrors Phase C1).
-        let mut bytes = stage1_identity_page_tables();
-        bytes.resize(0x40000, 0);
-        PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE)
-    }
-
-    /// No stage-1 leaf may output into the in-kernel GIC's guest-physical
-    /// window: EL0 or EL1 would reach the distributor or a redistributor as
-    /// memory. Every publication path that writes an output address refuses.
     #[test]
     fn stage1_publication_refuses_outputs_in_the_gic_window() {
-        use crate::memory::{LINUX_GIC_REDISTRIBUTOR_BASE, LINUX_GIC_WINDOW_BASE};
         let mut pt = manager();
         assert_eq!(
             pt.map_aliased(
@@ -2708,17 +2741,10 @@ mod tests {
         assert_eq!(pt.translate(LINUX_GIC_WINDOW_BASE), None);
     }
 
-    /// The boot stage-1 images (identity and per-mm HVPatch) give the GIC
-    /// window no translation at all, so guest EL0 cannot reach the
-    /// distributor or a redistributor through an identity VA.
     #[test]
     fn boot_stage1_images_leave_the_gic_window_untranslated() {
-        use crate::memory::{
-            LINUX_GIC_DISTRIBUTOR_BASE, LINUX_GIC_REDISTRIBUTOR_BASE, LINUX_GIC_WINDOW_BASE,
-            LINUX_GIC_WINDOW_SIZE,
-        };
         for bytes in [stage1_identity_page_tables(), stage1_hvpatch_page_tables()] {
-            let pt = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
+            let pt = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE, test_layout());
             for va in [
                 LINUX_GIC_DISTRIBUTOR_BASE,
                 LINUX_GIC_REDISTRIBUTOR_BASE,
@@ -2734,19 +2760,8 @@ mod tests {
         }
     }
 
-    /// The undo journal must roll a transaction back to EXACTLY the image a
-    /// clone-based snapshot would have restored.
-    ///
-    /// The clone is the oracle on purpose: it is the implementation this
-    /// replaced, and a rollback that is subtly incomplete corrupts guest page
-    /// tables on an error path the conformance gate may rarely reach — the
-    /// kind of bug that hides. Journalling exists because cloning copied the
-    /// whole 1.75 MiB table region on EVERY COW/mmap transaction, success path
-    /// included; under a fork storm that was ~31% of carrier CPU.
     #[test]
     fn undo_journal_rollback_matches_a_cloned_snapshot() {
-        // A mixed edit sequence: protection changes, aliasing, repointing, a
-        // fresh mapping that must split tables, and an unmap that can coalesce.
         type Edit = Box<dyn Fn(&mut PageTableManager)>;
         let edits: Vec<Edit> = vec![
             Box::new(|m: &mut PageTableManager| {
@@ -2779,13 +2794,10 @@ mod tests {
             }),
         ];
 
-        // Every prefix of the sequence is a transaction to roll back.
         for length in 1..=edits.len() {
             let mut journalled = manager();
             journalled.set_multi_vcpu(false);
             journalled.set_stage1_exclusive(true);
-            // Some pre-transaction history, so the rollback target is not the
-            // pristine image and repeated writes to one offset really occur.
             journalled
                 .set_readonly(LINUX_HEAP_BASE, 0x8000, false, None)
                 .ok();
@@ -2799,14 +2811,7 @@ mod tests {
             for edit in edits.iter().take(length) {
                 edit(&mut journalled);
             }
-            // Model the worst case for the host backing: every edit already
-            // synced. Rollback must republish enough to bring it back to the
-            // pre-image, and it republishes only the words it changed — which
-            // is the whole point, so seeding `host` with zeros would assert the
-            // opposite of the intended behaviour.
             let mut host = journalled.as_bytes().to_vec();
-            // SAFETY: `host` is a writable buffer of exactly the region length
-            // and no guest is running against this test-local manager.
             unsafe {
                 journalled.rollback_undo((journalled.base(), host.as_mut_ptr()), None);
             };
@@ -2838,19 +2843,11 @@ mod tests {
         }
     }
 
-    /// Stage-1 TLB maintenance accounting: a transaction that only turns
-    /// invalid words valid (a fresh hole mapped, then made inaccessible before
-    /// any host sync) replaced nothing a walker could have cached, while a
-    /// transaction that overwrites a live VALID word did. Only the first
-    /// pre-image of each word decides, because `sync_to_host` publishes final
-    /// shadow words, never the transient intermediate state.
     #[test]
     fn undo_journal_reports_replaced_valid_only_for_pre_transaction_words() {
         let mut fresh = manager();
         fresh.set_multi_vcpu(false);
         fresh.set_stage1_exclusive(true);
-        // Carve a page-granular hole before the transaction so the mapping
-        // below rewrites invalid leaf words rather than splitting a live block.
         fresh
             .invalidate(LINUX_MMAP_BASE, 0x4000, None)
             .expect("carve hole");
@@ -2892,7 +2889,6 @@ mod tests {
         );
     }
 
-    /// Committing must leave the edits in place and close the journal.
     #[test]
     fn undo_journal_commit_keeps_the_transaction() {
         let mut mgr = manager();
@@ -2907,7 +2903,11 @@ mod tests {
 
     #[test]
     fn hvpatch_editor_preserves_non_global_across_protect_alias_repoint_and_coalesce() {
-        let mut mgr = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let mut mgr = PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            LINUX_PAGE_TABLES_BASE,
+            test_layout(),
+        );
         mgr.declare_offline_private_image();
         let leaf = |manager: &PageTableManager, va| terminal_descriptor(manager.debug_walk(va));
         let text = 0x0040_0000_u64;
@@ -2953,9 +2953,10 @@ mod tests {
             "HVPatch ASID scope must not blanket-change compatibility editors"
         );
 
-        mgr.unmap_aliased(crate::memory::LINUX_NULL_GUARD_END, 0x1000, None)
+        mgr.unmap_aliased(carrick_mem::memory::LINUX_NULL_GUARD_END, 0x1000, None)
             .expect("remove the low detection leaf");
-        let mut reconstructed = PageTableManager::new(mgr.into_bytes(), LINUX_PAGE_TABLES_BASE);
+        let mut reconstructed =
+            PageTableManager::new(mgr.into_bytes(), LINUX_PAGE_TABLES_BASE, test_layout());
         reconstructed
             .map_aliased(shared_va, shared_ipa, 0x4000, true, None)
             .expect("publish alias after reconstructing the editor");
@@ -2966,13 +2967,6 @@ mod tests {
         );
     }
 
-    /// The in-place walk exists so the frame-COW fault path can stop copying
-    /// the whole 1.75 MiB table image to read four descriptors. It is only
-    /// worth anything if it reports EXACTLY what the copying walk reported, so
-    /// pin the two against each other over a mapped VA (a real four-level
-    /// walk), an unmapped VA (the walk stops early and leaves zeros), and a
-    /// truncated region (the length bound stops the walk instead of reading
-    /// past the mapping).
     #[test]
     fn host_walk_matches_the_copying_walk() {
         let mut mgr = manager();
@@ -2984,25 +2978,16 @@ mod tests {
 
         for probe in [va, va + 0x1000, LINUX_MMAP_BASE, LINUX_SHARED_FILE_BASE] {
             let copied = walk_descriptors(&bytes, base, probe);
-            // SAFETY: `bytes` is a live allocation of `bytes.len()` whose byte
-            // offset 0 is the PA `base`.
             let live = unsafe { walk_descriptors_host(bytes.as_ptr(), bytes.len(), base, probe) };
             assert_eq!(copied, live, "walk diverged at VA {probe:#x}");
         }
 
-        // A short region must bound both walks identically rather than reading
-        // past the caller's mapping.
         let short = 8;
         let copied = walk_descriptors(&bytes[..short], base, va);
-        // SAFETY: only the first `short` bytes are read, well inside `bytes`.
         let live = unsafe { walk_descriptors_host(bytes.as_ptr(), short, base, va) };
         assert_eq!(copied, live, "bounded walks diverged");
     }
 
-    /// `clone_from` is hand-written so the frame-COW rollback pre-image can
-    /// reuse one buffer instead of asking the allocator for 1.75 MiB per fault.
-    /// It has to stay indistinguishable from `clone`, including the allocator
-    /// cursor and free list that a fresh manager would reset.
     #[test]
     fn clone_from_reproduces_clone_and_keeps_the_buffer() {
         let mut source = manager();
@@ -3041,7 +3026,6 @@ mod tests {
         );
         assert_eq!(source.arenas[0].bytes.len(), populated as usize);
 
-        // pa_to_loc within populated range succeeds; right at next_free fails closed
         assert!(
             source
                 .pa_to_loc(source.base() + populated - PT_PAGE)
@@ -3069,7 +3053,7 @@ mod tests {
 
     #[test]
     fn indices_decompose_va() {
-        let i = indices(LINUX_MMAP_BASE); // 0x60_0000_0000
+        let i = indices(LINUX_MMAP_BASE);
         assert_eq!(i[0], 0);
         assert_eq!(i[1], (LINUX_MMAP_BASE >> 30 & 0x1ff) as usize);
     }
@@ -3088,19 +3072,12 @@ mod tests {
 
     #[test]
     fn rosetta_alias_vas_avoid_boot_identity_l0_slots() {
-        // The boot identity map covers 0..1 TiB, occupying L0 slots [0, 1].
-        // TTBR1 shares the TTBR0 root, so an aliased upper-half VA is correct
-        // only if it indexes a DISJOINT L0 slot. Every is_high_va VA (>= the
-        // 1 TiB threshold) does by construction; spot-check the VAs Rosetta
-        // actually uses — the stripped translated-ELF mmap and the 240 TiB arena.
-        assert_eq!(indices(LINUX_HIGH_VA_THRESHOLD - 1)[0], 1); // last identity slot
-        // Stripped x86-64 high-half ELF mmap (0xffff_ffff_ffff_4000 & 48-bit mask).
+        assert_eq!(indices(LINUX_HIGH_VA_THRESHOLD - 1)[0], 1);
         let elf_va = 0xffff_ffff_ffff_4000u64 & 0x0000_FFFF_FFFF_FFFF;
         assert!(
             indices(elf_va)[0] >= 2,
             "ELF alias collides with identity L0[0..1]"
         );
-        // Rosetta's ~240 TiB translation arena.
         let arena_va = 240u64 * (1 << 40);
         assert!(
             indices(arena_va)[0] >= 2,
@@ -3110,7 +3087,6 @@ mod tests {
 
     #[test]
     fn user_block_flags_match_boot_image() {
-        // Drift guard: L1B[0] (offset 0x2000) maps 512 GiB as a USER block.
         let bytes = stage1_identity_page_tables();
         let mut a = [0u8; 8];
         a.copy_from_slice(&bytes[0x2000..0x2008]);
@@ -3121,7 +3097,7 @@ mod tests {
     #[test]
     fn set_prot_none_splits_block_and_invalidates_only_target() {
         let mut mgr = manager();
-        let va = LINUX_MMAP_BASE + 0x10_0000; // inside a 1 GiB block
+        let va = LINUX_MMAP_BASE + 0x10_0000;
         assert!(mgr.is_valid(va), "arena starts mapped");
         mgr.set_prot_none(va, 0x1000, None)
             .expect("split + invalidate");
@@ -3187,7 +3163,6 @@ mod tests {
             0,
             "fork arm must not revoke execute from an executable leaf"
         );
-        // Re-arming an already-armed range is satisfied regardless of UXN.
         assert!(
             !mgr.set_fork_readonly(nx, 0x2000, None)
                 .expect("re-arm")
@@ -3220,12 +3195,12 @@ mod tests {
     #[test]
     fn kernel_cow_arm_and_alias_preserve_el1_only_access() {
         let mut mgr = manager();
-        let va = crate::memory::LINUX_SYSCALL_MAILBOX_BASE;
+        let va = carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE;
         mgr.set_kernel_readonly(va, 0x4000, false, None)
             .expect("arm kernel COW");
         assert_eq!(mgr.ap_bits(va), AP_PRIV_RO);
 
-        let private_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
+        let private_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE;
         mgr.map_kernel_aliased(va, private_ipa, 0x4000, None)
             .expect("publish kernel COW");
         assert_eq!(mgr.ap_bits(va), 0, "EL1 is writable and EL0 remains denied");
@@ -3237,7 +3212,7 @@ mod tests {
     fn compound_cow_repoint_preserves_mixed_semantic_permissions() {
         let mut mgr = manager();
         let va = LINUX_HEAP_BASE + 0x40_0000;
-        let new_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
+        let new_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE;
         mgr.set_readonly(va, 0x4000, false, None)
             .expect("arm compound read-only");
         mgr.set_prot_none(va + 0x2000, 0x1000, None)
@@ -3310,16 +3285,9 @@ mod tests {
 
     #[test]
     fn unmap_aliased_reclaims_only_the_freed_l3_table() {
-        // Two 4 KiB MAP_SHARED-style aliases 2 MiB apart in the high alias
-        // window: they share the L1+L2 but each gets its OWN L3 table (the
-        // per-2-MiB-block design — "no two file mappings share a block").
-        // munmap of one must reclaim exactly its L3 table back to the spare pool
-        // and leave the sibling intact. Without reclaim, a churning guest leaks
-        // one table per alias and exhausts the 440-entry pool (CPython
-        // multiprocessing maps+unmaps 400+ SemLock/Pool shm files -> OutOfTables).
         let mut mgr = manager();
-        let va1 = 0x100_0020_0000u64; // > 1 TiB, 2 MiB aligned, never identity-mapped
-        let va2 = va1 + (1 << 21); // next 2 MiB block — same L2 table
+        let va1 = 0x100_0020_0000u64;
+        let va2 = va1 + (1 << 21);
         mgr.map_aliased(va1, 0x80_0000, 0x1000, true, None)
             .expect("alias 1");
         mgr.map_aliased(va2, 0xA0_0000, 0x1000, true, None)
@@ -3344,20 +3312,11 @@ mod tests {
 
     #[test]
     fn map_aliased_large_unaligned_len_does_not_exhaust_table_pool() {
-        // A large file-backed alias whose length is NOT a multiple of 2 MiB (e.g.
-        // CPython's `mmap(2GB-sparse-file)` → 2 GiB + 16 KiB) must map its
-        // 2 MiB-aligned bulk as BLOCKS (L2 leaves, no L3 table per 2 MiB) and only
-        // the sub-2 MiB tail as 4 KiB pages. The old code fell to a fully
-        // page-granular loop for the WHOLE region, allocating one L3 table per
-        // 2 MiB — ~1024 tables for 2 GiB — which exhausts the spare pool, returns
-        // OutOfTables, and (in the runtime) leaves a half-built mapping the guest
-        // re-faults on forever. 128 MiB + 16 KiB needs ~66 L3 tables page-granular
-        // (> the 56-page test pool) but only ~3 tables block+tail.
         let mut mgr = manager();
-        let va = LINUX_HIGH_VA_THRESHOLD; // 1 TiB, 2 MiB-aligned (alias VA base)
-        let ipa = LINUX_ALIAS_IPA_BASE; // 96 GiB, 2 MiB-aligned
-        let bulk = 128 * (1u64 << 20); // 128 MiB (64 blocks)
-        let len = bulk + 0x4000; // + 16 KiB tail → not 2 MiB-aligned
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        let ipa = LINUX_ALIAS_IPA_BASE;
+        let bulk = 128 * (1u64 << 20);
+        let len = bulk + 0x4000;
         let ok = mgr
             .map_aliased(va, ipa, len, true, None)
             .expect("large unaligned alias must not exhaust the table pool");
@@ -3381,28 +3340,21 @@ mod tests {
     #[test]
     fn translate_resolves_aliased_va_to_ipa_with_page_offset() {
         let mut mgr = manager();
-        let va = LINUX_HIGH_VA_THRESHOLD; // 1 TiB, 2 MiB-aligned
-        let ipa = LINUX_ALIAS_IPA_BASE; // 96 GiB, 2 MiB-aligned
-        let len = 0x1_0000; // 64 KiB (16 pages)
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        let ipa = LINUX_ALIAS_IPA_BASE;
+        let len = 0x1_0000;
         mgr.map_aliased(va, ipa, len, true, None).expect("map");
-        // Base, mid-page offset, and a later page all keep the VA→IPA delta.
         assert_eq!(mgr.translate(va), Some(ipa));
         assert_eq!(mgr.translate(va + 0xabc), Some(ipa + 0xabc));
         assert_eq!(mgr.translate(va + 0x3000 + 0x10), Some(ipa + 0x3000 + 0x10));
-        // One page past the mapping is unmapped.
         assert_eq!(mgr.translate(va + len), None);
     }
 
     #[test]
     fn readonly_does_not_coalesce_an_unaligned_physical_alias() {
-        // The merged Go tool image begins at VA 0x10000 and its HVPatch frame
-        // may begin at IPA ...014000. The mapping has a constant +0x4000
-        // VA-to-IPA delta, so a uniform 2 MiB run of read-only L3 leaves is not
-        // representable as an aligned L2 block. Coalescing it masks off that
-        // delta and makes Go read unrelated bytes from .gopclntab.
         let mut mgr = manager();
         let va = 0x1_0000;
-        let ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x1_4000;
+        let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x1_4000;
         let len = 0xc1_0000;
         let probe = 0x80_e280;
 
@@ -3440,9 +3392,6 @@ mod tests {
         let (before, _, capacity, _) = mgr.pool_stats();
         let va = LINUX_HIGH_VA_THRESHOLD;
         let ipa = LINUX_ALIAS_IPA_BASE;
-        // CPython mmaps a 2 GiB sparse file, so the alias length rounds to
-        // 2 GiB + 16 KiB. A page-granular build needs ~1024 L3 tables — far
-        // more than the spare pool — while coarse leaves need a handful.
         let len = 2 * ONE_GIB + 4 * 0x1000;
         mgr.map_aliased(va, ipa, len, true, None)
             .expect("a 2 GiB + 16 KiB alias must map");
@@ -3485,10 +3434,6 @@ mod tests {
         const FOUR_KIB: u64 = 1 << 12;
         const ONE_GIB: u64 = 1 << 30;
         let mut mgr = manager();
-        // VA and IPA incongruent mod 2 MiB: no block leaf can express this
-        // translation, so the build is page-granular and cannot fit the spare
-        // pool. It must be refused WHOLE rather than half-built — a partial
-        // mapping is one the guest re-faults on forever.
         let va = LINUX_HIGH_VA_THRESHOLD;
         let ipa = LINUX_ALIAS_IPA_BASE + FOUR_KIB;
         let before = mgr.pool_stats();
@@ -3575,27 +3520,18 @@ mod tests {
 
     #[test]
     fn translate_picks_the_live_region_for_adjacent_aliases() {
-        // Mirrors the amd64 `cat -n` bug: region A is mapped, then the adjacent
-        // region B. In the runtime, A's 16 KiB-rounded HOST size made A's
-        // `HvfMappedRegion.end` over-claim into B's VA span, so the newest-first
-        // VA-range scan mis-picked A for a buffer that actually lives in B —
-        // sending a `read()` write to A's backing while the guest read B's
-        // (→ zeros). `translate` walks the REAL stage-1, so an address inside B
-        // resolves to B's IPA; the runtime then selects B by IPA, not A.
         let mut mgr = manager();
         let a_va = LINUX_HIGH_VA_THRESHOLD;
         let a_ipa = LINUX_ALIAS_IPA_BASE;
-        let a_len = 0xa2000; // page-aligned but NOT 16 KiB-aligned at the top
+        let a_len = 0xa2000;
         let b_va = a_va + a_len;
-        let b_ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000; // a distinct 2 MiB IPA block
+        let b_ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
         let b_len = 0x2_2000;
         mgr.map_aliased(a_va, a_ipa, a_len, true, None)
             .expect("map A");
         mgr.map_aliased(b_va, b_ipa, b_len, true, None)
             .expect("map B");
-        // The first page of B resolves to B's IPA (the bug resolved it via A).
         assert_eq!(mgr.translate(b_va + 0x1000), Some(b_ipa + 0x1000));
-        // The last page of A still resolves to A.
         assert_eq!(
             mgr.translate(a_va + a_len - 0x1000),
             Some(a_ipa + a_len - 0x1000)
@@ -3604,9 +3540,6 @@ mod tests {
 
     #[test]
     fn sub_16k_high_va_alias_does_not_perturb_neighbor_l3_entry() {
-        // HVF needs the host mapping length rounded up to 16 KiB, but stage-1
-        // must map only the guest-requested length. If the rounded length leaks
-        // into stage-1, a 12 KiB alias clobbers the adjacent page's L3 entry.
         let mut mgr = manager();
         let a_va = LINUX_HIGH_VA_THRESHOLD;
         let a_ipa = LINUX_ALIAS_IPA_BASE;
@@ -3636,14 +3569,7 @@ mod tests {
 
     #[test]
     fn clone_preserves_bump_cursor_so_fork_child_does_not_realloc_live_tables() {
-        // Regression for the cross-test TestUserArenaNew SIGSEGV: fork rebuilt
-        // the child (and, before the fix, the PARENT) with a FRESH manager,
-        // resetting `next_free` to the first spare while the copied backing
-        // already had that page live as an L2 table. The next split then
-        // re-handed-out the in-use page and wrote L3 entries over the live L2
-        // table. fork must CLONE the manager (preserving the cursor), not reset.
         let mut parent = manager();
-        // Split two distinct 1 GiB regions → two live spare sub-tables.
         parent
             .set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000, None)
             .unwrap();
@@ -3653,32 +3579,24 @@ mod tests {
         let (parent_in_use, _, _, _) = parent.pool_stats();
         assert!(parent_in_use >= 2, "two splits allocated >=2 tables");
 
-        // The child inherits a CLONE — cursor and live tables intact.
         let mut child = parent.clone();
         assert_eq!(child.pool_stats(), parent.pool_stats(), "cursor preserved");
-        // The parent's splits are visible (and correct) in the child.
         assert!(!child.is_valid(LINUX_MMAP_BASE + 0x10_0000));
         assert!(child.is_valid(LINUX_MMAP_BASE + 0x10_0000 + 0x1000));
 
-        // A NEW split in the child must allocate a FRESH page (in_use grows),
-        // never re-use a live table — and must not disturb the parent's edits.
         child
             .set_prot_none(LINUX_MMAP_BASE + 0x8080_0000, 0x1000, None)
             .unwrap();
         let (child_in_use, _, _, _) = child.pool_stats();
         assert!(child_in_use > parent_in_use, "fresh table, no re-handout");
-        // The first split's neighborhood is still a correctly-mapped page (the
-        // bug clobbered exactly this L2 table with an L3 page descriptor).
         assert!(child.is_valid(LINUX_MMAP_BASE + 0x10_0000 + 0x1000));
     }
 
     #[test]
     fn exhausting_spare_tables_errors() {
-        // Truncate to exactly the six boot tables (no spare pool), so the very
-        // first block split has nowhere to allocate and surfaces OutOfTables.
         let mut bytes = stage1_identity_page_tables();
         bytes.truncate(6 * 0x1000);
-        let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
+        let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE, test_layout());
         assert_eq!(
             mgr.set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000, None),
             Err(PageTableError::OutOfTables),
@@ -3687,14 +3605,9 @@ mod tests {
 
     #[test]
     fn set_rw_on_default_rw_block_does_not_split() {
-        // No spare pages: setting RW-non-exec on the already-RW-non-exec arena
-        // must skip (no split) and succeed, rather than exhaust the pool. The
-        // arena's boot blocks default UXN=1 (NX), so a non-exec mmap matches the
-        // existing leaf — the common case must stay a no-op (no dense split).
         let mut bytes = stage1_identity_page_tables();
         bytes.truncate(6 * 0x1000);
-        let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
-        // Already RW + non-exec → no change, no split, no allocation.
+        let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE, test_layout());
         assert_eq!(
             mgr.set_rw(LINUX_MMAP_BASE + 0x10_0000, 0x4000, false, None),
             Ok(PageTableApplyOutcome::default())
@@ -3703,19 +3616,15 @@ mod tests {
 
     #[test]
     fn full_block_restore_coalesces_and_reclaims_table() {
-        // Split a 2 MiB block (set one page PROT_NONE), then restore the WHOLE
-        // 2 MiB to RW: the sub-table becomes uniform and is reclaimed, so the
-        // spare cursor/free-list returns to its pre-split capacity.
         let mut mgr = manager();
         mgr.declare_offline_private_image();
-        let block = LINUX_MMAP_BASE + 0x20_0000; // 2 MiB-aligned arena block
+        let block = LINUX_MMAP_BASE + 0x20_0000;
         mgr.set_prot_none(block, 0x1000, None).expect("split");
         let after_split = mgr.arenas[0].next_free;
         assert!(
             after_split > SPARE_START_OFFSET,
             "split consumed spare pages"
         );
-        // Restore the entire 2 MiB block to RW -> uniform -> coalesce.
         mgr.set_rw(block, 1 << 21, true, None).expect("restore");
         assert!(mgr.is_valid(block));
         assert!(
@@ -3726,12 +3635,6 @@ mod tests {
 
     #[test]
     fn live_block_restore_keeps_table_until_break_before_make_is_available() {
-        // A live table-to-block replacement is an ARM break-before-make
-        // transition. Carrick's live editor currently publishes one descriptor
-        // batch followed by one TLBI, so it cannot safely perform the required
-        // invalidate -> TLBI -> make -> TLBI sequence. Keeping the L3 table is
-        // semantically exact and avoids a stale leaf continuing to receive
-        // writes after the software model has installed the coarse block.
         let mut mgr = manager();
         let block = LINUX_MMAP_BASE + 0x40_0000;
         mgr.set_prot_none(block, 0x1000, None).expect("split");
@@ -3752,9 +3655,6 @@ mod tests {
 
     #[test]
     fn large_aligned_prot_none_is_coarse_not_dense() {
-        // A 512 MiB PROT_NONE on the (1 GiB-aligned) arena base must cost ONE
-        // L1->L2 split (then 256 in-place L2-block edits), NOT 256 L3 tables.
-        // This is the Go page-summary-reservation regression fix.
         let mut mgr = manager();
         assert_eq!(
             LINUX_MMAP_BASE % (1 << 30),
@@ -3771,23 +3671,17 @@ mod tests {
         );
         assert!(!mgr.is_valid(LINUX_MMAP_BASE));
         assert!(!mgr.is_valid(LINUX_MMAP_BASE + (512 << 20) - 0x1000));
-        // Just past the range stays valid.
         assert!(mgr.is_valid(LINUX_MMAP_BASE + (512 << 20)));
     }
 
     #[test]
     fn rw_commit_into_prot_none_block_keeps_neighbors_invalid() {
-        // Go's page allocator shape: reserve a region PROT_NONE (coarse,
-        // invalid block), then RW-commit a single page inside it (MAP_FIXED).
-        // The committed page must become RW; the rest of the (split) block must
-        // STAY invalid — splitting an invalid block must not revalidate it.
         let mut mgr = manager();
-        let block = LINUX_MMAP_BASE; // 2 MiB-aligned
+        let block = LINUX_MMAP_BASE;
         mgr.set_prot_none(block, 1 << 21, None)
             .expect("reserve PROT_NONE");
         assert!(!mgr.is_valid(block));
         assert!(!mgr.is_valid(block + 0x1000));
-        // Commit one page RW (splits the invalid 2 MiB block to L3).
         mgr.set_rw(block + 0x10000, 0x1000, true, None)
             .expect("RW commit");
         assert!(mgr.is_valid(block + 0x10000), "committed page is RW");
@@ -3805,11 +3699,9 @@ mod tests {
 
     #[test]
     fn full_1gib_prot_none_edits_block_with_no_split() {
-        // A whole 1 GiB-aligned 1 GiB PROT_NONE flips the L1 block in place — 0
-        // splits — so it works even with no spare pages.
         let mut bytes = stage1_identity_page_tables();
         bytes.truncate(6 * 0x1000);
-        let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
+        let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE, test_layout());
         assert_eq!(
             mgr.set_prot_none(LINUX_MMAP_BASE, 1 << 30, None),
             Ok(PageTableApplyOutcome {
@@ -3821,19 +3713,12 @@ mod tests {
         assert!(!mgr.is_valid(LINUX_MMAP_BASE + (1 << 30) - 0x1000));
     }
 
-    /// The last-resort sweep is what keeps a churning guest off `OutOfTables`
-    /// once eager reclaim is (correctly) declined for a multi-vCPU guest: a
-    /// sub-table left ALL-INVALID by a teardown is taken back and its parent
-    /// entry cleared.
     #[test]
     fn last_resort_sweep_reclaims_an_emptied_subtable() {
         let mut mgr = manager();
-        mgr.set_multi_vcpu(true); // eager reclaim declined, as in a busy guest
+        mgr.set_multi_vcpu(true);
         mgr.set_stage1_exclusive(true);
         let block = LINUX_MMAP_BASE + 0x60_0000;
-        // Split the 2 MiB block, then tear the WHOLE block down so the L3 that
-        // the split created is left with 512 invalid descriptors. Invalidating
-        // one page only would leave 511 valid and nothing to reclaim.
         mgr.set_prot_none(block, 0x1000, None).expect("split");
         mgr.set_prot_none(block, 1 << 21, None)
             .expect("tear the block down");
@@ -3845,8 +3730,6 @@ mod tests {
         assert!(!mgr.free_tables.is_empty(), "the emptied table came back");
     }
 
-    /// Freeing a table only makes it REUSABLE, so without exclusivity a sibling
-    /// could still hold a stale cached walk reaching it. The sweep must decline.
     #[test]
     fn last_resort_sweep_declines_without_exclusivity() {
         let mut mgr = manager();
@@ -3860,9 +3743,6 @@ mod tests {
         assert!(mgr.free_tables.is_empty(), "nothing may be reclaimed");
     }
 
-    /// The sweep walks the table graph, which is far too expensive to repeat per
-    /// allocation — doing so starved the vCPU badly enough to trip the sibling
-    /// materialization start gate. It may run only once per teardown epoch.
     #[test]
     fn last_resort_sweep_runs_once_per_teardown() {
         let mut mgr = manager();
@@ -3880,7 +3760,6 @@ mod tests {
             !mgr.reclaim_all_invalid_tables(),
             "a second sweep with no new teardown must decline"
         );
-        // A fresh teardown re-arms it.
         let other = LINUX_MMAP_BASE + 0x80_0000;
         mgr.set_prot_none(other, 0x1000, None).expect("split");
         mgr.set_prot_none(other, 1 << 21, None)
@@ -3888,28 +3767,12 @@ mod tests {
         assert!(mgr.reclaim_all_invalid_tables(), "new teardown re-arms");
     }
 
-    /// A fork copy inherits `stage1_exclusive` verbatim, but the field
-    /// describes the EDITOR and an offline copy has none — the inherited value
-    /// is the PARENT's last mapping syscall. When that syscall was not an
-    /// exclusive edit, the copy carries `false`, `alloc_table`'s last-resort
-    /// sweep is refused, and the child's own mapping publication dies
-    /// `OutOfTables` with reclaimable tables still in the graph. Observed live
-    /// as `cpython-concurrent_futures` failing
-    /// `map hvpatch child VA 0x2d00020000 ... OutOfTables (in_use=438 free=0
-    /// capacity=440 multi_vcpu=true exclusive=false reclaim_pending=true)`.
     #[test]
     fn offline_fork_copy_sweeps_where_the_inherited_marker_refused() {
         let mut parent = manager();
-        // A busy guest: eager coalescing correctly declined...
         parent.set_multi_vcpu(true);
-        // ...and the parent's last stage-1 edit was not an exclusive one.
         parent.set_stage1_exclusive(false);
 
-        // Churn the pool the way CPython's SemLock/Pool map+unmap cycles do:
-        // split each 2 MiB block to 4 KiB granularity, then tear the whole
-        // block down so its L3 is left ALL-INVALID. Nothing is reclaimed, so
-        // the bump cursor walks to the end of the pool. Every block stays
-        // inside the first 1 GiB, so only one L1->L2 split happens.
         let mut block = LINUX_MMAP_BASE;
         let mut exhausted = false;
         for _ in 0..1024 {
@@ -3936,8 +3799,6 @@ mod tests {
             "and it is refused with a teardown still pending"
         );
 
-        // `alloc_table` failed before writing anything, so both copies below
-        // start from the same intact graph.
         let mut inherited = parent.clone();
         assert_eq!(
             inherited.set_prot_none(block, 0x1000, None),
@@ -3964,9 +3825,6 @@ mod tests {
 
     #[test]
     fn multi_vcpu_does_not_coalesce() {
-        // With sibling vCPUs live, a full-block restore must NOT coalesce
-        // (coalesce is a break-before-make change unsafe without an all-vCPU
-        // flush). The structure stays split; no table is reclaimed.
         let mut mgr = manager();
         mgr.declare_offline_private_image();
         mgr.set_multi_vcpu(true);
@@ -3978,7 +3836,6 @@ mod tests {
             mgr.free_tables.is_empty(),
             "multi-vCPU must NOT coalesce/reclaim"
         );
-        // Back to single-vCPU, a subsequent full-block restore coalesces again.
         mgr.set_multi_vcpu(false);
         mgr.set_prot_none(block, 0x1000, None).expect("split");
         mgr.set_rw(block, 1 << 21, true, None).expect("restore");
@@ -3990,14 +3847,11 @@ mod tests {
 
     #[test]
     fn partial_protection_does_not_coalesce() {
-        // One page RO, the rest RW: NOT uniform -> must keep the sub-table.
         let mut mgr = manager();
         let block = LINUX_MMAP_BASE + 0x40_0000;
         mgr.set_readonly(block, 0x1000, true, None)
             .expect("ro one page");
         mgr.set_rw(block, 1 << 21, true, None).expect("rw the rest");
-        // The RO page was overwritten to RW by the full-block set_rw, so it WILL
-        // coalesce; instead verify a genuinely-mixed state is preserved:
         let mut mgr2 = manager();
         mgr2.set_readonly(block, 0x1000, true, None)
             .expect("ro one page");
@@ -4014,7 +3868,7 @@ mod tests {
         let va = LINUX_MMAP_BASE + 0x40_0000;
         mgr.set_prot_none(va, 0x1000, None).unwrap();
         let bytes = mgr.into_bytes();
-        let mut mgr2 = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
+        let mut mgr2 = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE, test_layout());
         assert!(!mgr2.is_valid(va), "edit survived round-trip through bytes");
     }
 
@@ -4072,27 +3926,20 @@ mod tests {
 
     #[test]
     fn new_rediscovers_bump_cursor_over_boot_edited_tables() {
-        // The boot ELF read-only-span pass edits the pristine image (splitting
-        // blocks -> allocating spare tables) BEFORE the runtime manager is
-        // lazily rebuilt from the live backing. The rebuilt manager must
-        // re-discover the bump cursor instead of resetting it — a reset would
-        // re-hand-out the live sub-tables and corrupt the walk.
         let mut boot = manager();
-        boot.set_multi_vcpu(true); // the boot pass suppresses coalescing
-        let ro_va = 0x40_0000; // image-shaped low VA inside a 2 MiB boot block
+        boot.set_multi_vcpu(true);
+        let ro_va = 0x40_0000;
         boot.set_readonly(ro_va, 0x2000, true, None)
             .expect("boot RO span");
         let (used, _, _, _) = boot.pool_stats();
         assert!(used >= 1, "boot edit allocated spare table(s)");
 
-        let mut rebuilt = PageTableManager::new(boot.into_bytes(), LINUX_PAGE_TABLES_BASE);
+        let mut rebuilt =
+            PageTableManager::new(boot.into_bytes(), LINUX_PAGE_TABLES_BASE, test_layout());
         let (rebuilt_used, _, _, _) = rebuilt.pool_stats();
         assert_eq!(rebuilt_used, used, "cursor re-discovered, not reset");
-        // The boot edit is visible and intact through the rebuilt manager.
         assert_eq!(rebuilt.ap_bits(ro_va), AP_RO);
         assert_eq!(rebuilt.ap_bits(ro_va + 0x2000), AP_RW, "past the span");
-        // A new split allocates a FRESH page (cursor really advanced past the
-        // boot-allocated tables) and must not clobber the boot edit.
         rebuilt
             .set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000, None)
             .expect("fresh split");
@@ -4110,7 +3957,6 @@ mod tests {
             let walk_leaf =
                 |va| terminal_descriptor(walk_descriptors(&bytes, LINUX_PAGE_TABLES_BASE, va));
 
-            // Heap base must start invalid.
             let heap_base_leaf = walk_leaf(LINUX_HEAP_BASE);
             assert_eq!(
                 heap_base_leaf & VALID,
@@ -4119,7 +3965,6 @@ mod tests {
                 LINUX_HEAP_BASE
             );
 
-            // Last page of the 128 MiB heap reservation must start invalid.
             let last_heap_page = LINUX_HEAP_BASE + LINUX_HEAP_SIZE - 0x1000;
             let last_heap_leaf = walk_leaf(last_heap_page);
             assert_eq!(
@@ -4129,7 +3974,6 @@ mod tests {
                 last_heap_page
             );
 
-            // First address past heap reservation must retain validity.
             let past_heap = LINUX_HEAP_BASE + LINUX_HEAP_SIZE;
             let past_heap_leaf = walk_leaf(past_heap);
             assert_ne!(
@@ -4147,7 +3991,6 @@ mod tests {
                 );
             }
 
-            // Neighboring/non-heap mappings retain prior validity and ASID scoping.
             for (name, va) in [
                 ("user text", 0x0040_0000),
                 ("mmap", LINUX_MMAP_BASE),
@@ -4175,12 +4018,10 @@ mod tests {
             }
         }
 
-        // HVPatch live heap transition in multi-vCPU mode:
         let hvpatch_bytes = stage1_hvpatch_page_tables();
-        let mut mgr = PageTableManager::new(hvpatch_bytes, LINUX_PAGE_TABLES_BASE);
+        let mut mgr = PageTableManager::new(hvpatch_bytes, LINUX_PAGE_TABLES_BASE, test_layout());
         mgr.set_multi_vcpu(true);
 
-        // 1. Grow: make first heap page (0x1000) RW.
         mgr.set_rw(LINUX_HEAP_BASE, 0x1000, false, None)
             .expect("grow heap page to RW");
         let bytes_after_grow = mgr.into_bytes();
@@ -4212,8 +4053,8 @@ mod tests {
             "next heap page must remain invalid"
         );
 
-        // 2. Shrink: make first heap page PROT_NONE again.
-        let mut mgr2 = PageTableManager::new(bytes_after_grow, LINUX_PAGE_TABLES_BASE);
+        let mut mgr2 =
+            PageTableManager::new(bytes_after_grow, LINUX_PAGE_TABLES_BASE, test_layout());
         mgr2.set_multi_vcpu(true);
         mgr2.set_prot_none(LINUX_HEAP_BASE, 0x1000, None)
             .expect("shrink heap page to PROT_NONE");
@@ -4234,53 +4075,14 @@ mod tests {
         );
     }
 
-    /// The HVPatch tables as the runtime leaves them at boot: ASID-scoped, with
-    /// the sparse mmap arena reserved `PROT_NONE` (identity-invalid blocks).
-    fn hvpatch_manager() -> PageTableManager {
-        let mut mgr = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
-        mgr.set_prot_none(LINUX_MMAP_BASE, mmap_arena_size() as usize, None)
-            .expect("reserve sparse arena");
-        mgr
-    }
-
-    /// Fill the spare pool so the next allocation must run the last-resort
-    /// reclaim sweep: burn every remaining table on 4 KiB splits of untouched
-    /// arena blocks well away from `keep_out`.
-    fn exhaust_spare_pool(mgr: &mut PageTableManager, keep_out: u64) {
-        const TWO_MIB: u64 = 2 * 1024 * 1024;
-        let mut block = keep_out + 64 * TWO_MIB;
-        loop {
-            let (_, free, _, _) = mgr.pool_stats();
-            let spare = mgr.spare_tables_available();
-            if spare == 0 && free == 0 {
-                break;
-            }
-            // A one-page RW edit inside a 2 MiB block bisects it: one L3 table
-            // (plus an L2 the first time a fresh 1 GiB is entered).
-            if mgr.set_rw(block + 0x1000, 0x1000, false, None).is_err() {
-                break;
-            }
-            block += TWO_MIB;
-        }
-    }
-
     #[test]
     fn reclaim_sweep_keeps_tables_whose_invalid_leaves_retain_live_outputs() {
-        // The sparse HVPatch arena publishes every armed-but-untouched page as
-        // an INVALID leaf that retains its semantic IPA (`materialize` +
-        // `set_prot_none`), and `MADV_DONTNEED`/`PROT_NONE` put touched pages
-        // back into that state while their frames stay owned. A whole 2 MiB of
-        // such leaves is therefore the NORMAL shape of a fresh thread stack.
-        // The pool-exhaustion sweep must not mistake it for an empty table:
-        // freeing it loses every retained output, and the next protection
-        // commit then revalidates whatever the re-split parent minted.
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let mut mgr = hvpatch_manager();
         mgr.declare_offline_private_image();
         let va = LINUX_MMAP_BASE + 8 * TWO_MIB;
         let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x1234_5000;
         let probe = va + 0x5000;
-        // 4 KiB granules force an L3 table; the leaves then go invalid-retained.
         mgr.map_private_aliased(va, ipa, TWO_MIB - 0x1000, true, None)
             .expect("publish sparse extent");
         mgr.set_prot_none(va, (TWO_MIB - 0x1000) as usize, None)
@@ -4295,8 +4097,6 @@ mod tests {
             "sweep (freed={reclaimed}) must keep a table whose invalid leaves still \
              retain live outputs"
         );
-        // And the protection commit that follows a touch must publish the
-        // retained frame, never a minted address.
         mgr.set_rw(probe, 0x1000, false, None)
             .expect("commit resident page");
         assert_eq!(mgr.translate(probe), Some(ipa + 0x5000));
@@ -4304,9 +4104,6 @@ mod tests {
 
     #[test]
     fn munmap_retires_leaves_so_the_reclaim_sweep_can_free_their_table() {
-        // `munmap` (`invalidate`) retires the frame lease, so its retained
-        // output is a reuse SIGNAL, not a live claim: a table holding only
-        // retired/empty leaves is the one the sweep exists to recover.
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let mut mgr = hvpatch_manager();
         mgr.declare_offline_private_image();
@@ -4327,14 +4124,9 @@ mod tests {
             "the retired table is reclaimable"
         );
         let (in_use_after, _, _, _) = mgr.pool_stats();
-        // The retired L3 goes, and so does the L2 above it: its other entries
-        // are identity-invalid reservation blocks, which a rebuild reproduces.
         assert_eq!(in_use_after, in_use_before - 2);
         assert_eq!(mgr.translate_retained_output(va + 0x5000), None);
 
-        // The freed table left an EMPTY L2 entry. Bisecting it (a one-page
-        // PROT_NONE at the next reuse) must not manufacture `index * 4 KiB`
-        // outputs that the next protection commit publishes as real IPAs.
         mgr.set_prot_none(va + 0x1000, 0x1000, None)
             .expect("bisect empty entry");
         assert_eq!(mgr.translate_retained_output(va + 0x5000), None);
@@ -4345,16 +4137,10 @@ mod tests {
 
     #[test]
     fn empty_descriptors_never_mint_an_output_address() {
-        // Invalidating a never-populated block and then bisecting it must not
-        // manufacture `index * stride` output addresses that a later in-place
-        // revalidation publishes as a VALID leaf at IPA 0x5000 (the fork-child
-        // validator's `resolves to IPA 0x5000, expected 0x9c...` signature).
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let mut mgr = hvpatch_manager();
         let block = LINUX_MMAP_BASE + 40 * TWO_MIB;
         let probe = block + 0x5000;
-        // One published page carves a fresh L3 table whose 511 neighbours are
-        // EMPTY descriptors. Invalidating the block must leave them empty.
         mgr.map_private_aliased(
             block,
             LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x7000,
@@ -4391,13 +4177,11 @@ mod tests {
         let page0 = block;
         let page1 = block + 0x1000;
 
-        // Ensure page0 and page1 are invalid leaves.
         mgr.set_prot_none(block, 2 * 1024 * 1024, None)
             .expect("set block to prot_none");
         assert!(!mgr.is_valid(page0));
         assert!(!mgr.is_valid(page1));
 
-        // 1. Validating an invalid leaf reports flush_required=false
         let outcome_validating = mgr
             .set_rw(page0, 0x1000, false, None)
             .expect("validate invalid leaf to rw");
@@ -4408,7 +4192,6 @@ mod tests {
         );
         assert!(mgr.is_valid(page0));
 
-        // 2. Changing a valid leaf's AP reports flush_required=true
         let outcome_perm_change = mgr
             .set_readonly(page0, 0x1000, false, None)
             .expect("change valid leaf AP to ro");
@@ -4418,9 +4201,6 @@ mod tests {
             "changing a valid leaf's AP must report flush_required=true"
         );
 
-        // 3. An edit touching both reports flush_required=true:
-        // page0 is currently valid (RO), page1 is invalid (PROT_NONE).
-        // Editing [page0, page0 + 0x2000) touches both.
         let outcome_both = mgr
             .set_rw(page0, 0x2000, false, None)
             .expect("edit touching both invalid and valid leaves");
@@ -4443,35 +4223,13 @@ mod tests {
         assert_eq!(err, PageTableError::OutOfTables);
     }
 
-    #[derive(Debug)]
-    struct TestArenaSource {
-        id: TableArenaSourceId,
-        available: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
-        returned: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
-    }
-
-    impl TableArenaSource for TestArenaSource {
-        fn id(&self) -> TableArenaSourceId {
-            self.id
-        }
-        fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
-            self.available.lock().unwrap().pop()
-        }
-        fn return_arena(&mut self, base: carrick_guest_mem::Gpa) {
-            self.returned.lock().unwrap().push(base);
-        }
-    }
-
-    /// A rollback that restores a pre-transaction image must not strip the
-    /// arena source or orphan arenas the live manager acquired meanwhile.
     #[test]
     fn adopting_live_extension_state_keeps_source_and_arenas() {
-        use carrick_guest_mem::Gpa;
         use std::sync::{Arc, Mutex};
 
         let mut live = hvpatch_manager();
         exhaust_spare_pool(&mut live, LINUX_MMAP_BASE);
-        let ext_base = Gpa(0xb0_0000_0000);
+        let ext_base = SubstrateGpa(0xb0_0000_0000);
         let mut source = TestArenaSource {
             id: TableArenaSourceId(ext_base),
             available: Arc::new(Mutex::new(vec![ext_base])),
@@ -4498,7 +4256,6 @@ mod tests {
             None,
             "pre-image tree does not see the live edit"
         );
-        // The restored manager can keep growing from the adopted arena.
         restored
             .set_rw(va, 0x1000, false, Some(&mut source))
             .expect("restored manager allocates");
@@ -4507,8 +4264,6 @@ mod tests {
 
     #[test]
     fn growable_stage1_arena_exhaustion_uses_extension_source() {
-        use crate::memory::LINUX_PAGE_TABLES_SIZE;
-        use carrick_guest_mem::Gpa;
         use std::sync::{Arc, Mutex};
 
         let mut mgr = hvpatch_manager();
@@ -4521,7 +4276,7 @@ mod tests {
             PageTableError::OutOfTables
         );
 
-        let ext_base = Gpa(0xb0_0000_0000);
+        let ext_base = SubstrateGpa(0xb0_0000_0000);
         let available = Arc::new(Mutex::new(vec![ext_base]));
         let returned = Arc::new(Mutex::new(Vec::new()));
         let mut source = TestArenaSource {
@@ -4530,7 +4285,6 @@ mod tests {
             returned: Arc::clone(&returned),
         };
 
-        // Start an undo transaction to verify rollback returns the arena.
         mgr.begin_undo();
         mgr.set_rw(va, 0x1000, false, Some(&mut source))
             .expect("mapping succeeds by allocating extension arena");
@@ -4548,7 +4302,6 @@ mod tests {
             (mgr.base(), host_arena0.as_mut_ptr()),
             (ext_base.0, host_arena1.as_mut_ptr()),
         ];
-        // Rollback transaction: extension arena should be returned to source.
         unsafe { mgr.rollback_undo(&resolver[..], Some(&mut source)) };
         assert_eq!(mgr.pool_stats().3, 1, "pool reports 1 arena after rollback");
         assert_eq!(
@@ -4557,7 +4310,6 @@ mod tests {
             "rolled back arena returned to source"
         );
 
-        // Put the arena back into available for the real mapping.
         available.lock().unwrap().push(ext_base);
         mgr.set_rw(va, 0x1000, false, Some(&mut source))
             .expect("mapping succeeds with extension arena");
@@ -4583,8 +4335,7 @@ mod tests {
 
     #[test]
     fn sync_to_host_resolves_each_arena_once() {
-        use crate::memory::LINUX_PAGE_TABLES_SIZE;
-        use std::cell::Cell;
+        use core::cell::Cell;
 
         let mut mgr = hvpatch_manager();
         mgr.set_rw(LINUX_MMAP_BASE + 0x1000, 64 * 0x1000, true, None)
@@ -4625,8 +4376,6 @@ mod tests {
 
     #[test]
     fn sync_to_host_errors_on_unresolved_arena() {
-        use crate::memory::LINUX_PAGE_TABLES_SIZE;
-        use carrick_guest_mem::Gpa;
         use std::sync::{Arc, Mutex};
 
         let mut mgr = hvpatch_manager();
@@ -4635,7 +4384,7 @@ mod tests {
         let next_block = LINUX_MMAP_BASE + 600 * TWO_MIB;
         let va = next_block + 0x1000;
 
-        let ext_base = Gpa(0xb0_0000_0000);
+        let ext_base = SubstrateGpa(0xb0_0000_0000);
         let available = Arc::new(Mutex::new(vec![ext_base]));
         let returned = Arc::new(Mutex::new(Vec::new()));
         let mut source = TestArenaSource {
@@ -4649,7 +4398,6 @@ mod tests {
         assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas");
 
         let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
-        // Only provide host mapping for root arena, omitting ext_base!
         let resolver = [(mgr.base(), host_arena0.as_mut_ptr())];
         let dirty_len = mgr.dirty.len();
         let res = unsafe { mgr.sync_to_host(&resolver[..]) };
@@ -4674,8 +4422,6 @@ mod tests {
 
     #[test]
     fn rollback_undo_returns_arena_when_resolver_missing_extension() {
-        use crate::memory::LINUX_PAGE_TABLES_SIZE;
-        use carrick_guest_mem::Gpa;
         use std::sync::{Arc, Mutex};
 
         let mut mgr = hvpatch_manager();
@@ -4684,7 +4430,7 @@ mod tests {
         let next_block = LINUX_MMAP_BASE + 600 * TWO_MIB;
         let va = next_block + 0x1000;
 
-        let ext_base = Gpa(0xb0_0000_0000);
+        let ext_base = SubstrateGpa(0xb0_0000_0000);
         let available = Arc::new(Mutex::new(vec![ext_base]));
         let returned = Arc::new(Mutex::new(Vec::new()));
         let mut source = TestArenaSource {
@@ -4699,18 +4445,14 @@ mod tests {
         assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas");
 
         let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
-        // Missing ext_base in resolver
         let resolver = [(mgr.base(), host_arena0.as_mut_ptr())];
         unsafe { mgr.rollback_undo(&resolver[..], Some(&mut source)) };
-        // Confirm arena was still returned despite host error
         assert_eq!(returned.lock().unwrap().as_slice(), &[ext_base]);
         assert_eq!(mgr.pool_stats().3, 1, "pool reports 1 arena after rollback");
     }
 
     #[test]
     fn debug_walk_host_errors_on_unresolved_arena() {
-        use crate::memory::LINUX_PAGE_TABLES_SIZE;
-        use carrick_guest_mem::Gpa;
         use std::sync::{Arc, Mutex};
 
         let mut mgr = hvpatch_manager();
@@ -4719,7 +4461,7 @@ mod tests {
         let next_block = LINUX_MMAP_BASE + 600 * TWO_MIB;
         let va = next_block + 0x1000;
 
-        let ext_base = Gpa(0xb0_0000_0000);
+        let ext_base = SubstrateGpa(0xb0_0000_0000);
         let available = Arc::new(Mutex::new(vec![ext_base]));
         let returned = Arc::new(Mutex::new(Vec::new()));
         let mut source = TestArenaSource {
@@ -4741,20 +4483,17 @@ mod tests {
             mgr.restore_quiesced_snapshot_to_host(&full_resolver[..]);
         };
 
-        // Const resolver missing ext_base:
-        let partial_resolver =
-            crate::page_table::const_resolver(|base: u64| -> Option<*const u8> {
-                if base == mgr.base() {
-                    Some(host_arena0.as_ptr())
-                } else {
-                    None
-                }
-            });
+        let partial_resolver = crate::aarch64::const_resolver(|base: u64| -> Option<*const u8> {
+            if base == mgr.base() {
+                Some(host_arena0.as_ptr())
+            } else {
+                None
+            }
+        });
         let res = unsafe { mgr.debug_walk_host(partial_resolver, va) };
         assert_eq!(res, Err(PageTableError::UnresolvedArena(ext_base.0)));
 
-        // Const resolver with ext_base succeeds:
-        let good_resolver = crate::page_table::const_resolver(|base: u64| -> Option<*const u8> {
+        let good_resolver = crate::aarch64::const_resolver(|base: u64| -> Option<*const u8> {
             if base == mgr.base() {
                 Some(host_arena0.as_ptr())
             } else if base == ext_base.0 {
@@ -4769,15 +4508,13 @@ mod tests {
 
     #[test]
     fn clone_with_extension_arenas_requires_child_source_for_rebase() {
-        use crate::memory::LINUX_PAGE_TABLES_SIZE;
-        use carrick_guest_mem::Gpa;
         use std::sync::{Arc, Mutex};
 
         let mut parent = hvpatch_manager();
         exhaust_spare_pool(&mut parent, LINUX_MMAP_BASE);
         const TWO_MIB: u64 = 2 * 1024 * 1024;
-        let ext1_base = Gpa(0xb0_0000_0000);
-        let ext2_base = Gpa(0xc0_0000_0000);
+        let ext1_base = SubstrateGpa(0xb0_0000_0000);
+        let ext2_base = SubstrateGpa(0xc0_0000_0000);
 
         let parent_available = Arc::new(Mutex::new(vec![ext2_base, ext1_base]));
         let parent_returned = Arc::new(Mutex::new(Vec::new()));
@@ -4787,14 +4524,12 @@ mod tests {
             returned: Arc::clone(&parent_returned),
         };
 
-        // Grow parent to 2 arenas (1 extension arena)
         let va1 = LINUX_MMAP_BASE + 600 * TWO_MIB + 0x1000;
         parent
             .set_rw(va1, 0x1000, false, Some(&mut parent_source))
             .expect("allocates first extension arena");
         assert_eq!(parent.pool_stats().3, 2, "parent has 2 arenas");
 
-        // First check with 2 arenas (1 extension arena)
         let mut child2 = parent.clone();
         let child_root = 0x50_0000_0000;
         assert_eq!(
@@ -4803,7 +4538,6 @@ mod tests {
             "rebase without source fails with MissingArenaSource"
         );
 
-        // Add a second extension arena to parent so parent has 3 arenas (2 extension arenas)
         parent.arenas.push(TableArena {
             base: ext2_base.0,
             bytes: vec![0u8; SPARE_START_OFFSET as usize],
@@ -4812,19 +4546,16 @@ mod tests {
         });
         assert_eq!(parent.pool_stats().3, 3, "parent has 3 arenas");
 
-        // Clone parent with two extension arenas
         let mut child = parent.clone();
 
-        // Rebasing child without a source returns MissingArenaSource
         assert_eq!(
             child.rebase(child_root, None).unwrap_err(),
             PageTableError::MissingArenaSource,
             "rebasing 3-arena manager without source returns MissingArenaSource"
         );
 
-        // Prepare a child source with 2 fresh slots
-        let child_ext1 = Gpa(0xd0_0000_0000);
-        let child_ext2 = Gpa(0xe0_0000_0000);
+        let child_ext1 = SubstrateGpa(0xd0_0000_0000);
+        let child_ext2 = SubstrateGpa(0xe0_0000_0000);
         let child_available = Arc::new(Mutex::new(vec![child_ext2, child_ext1]));
         let child_returned = Arc::new(Mutex::new(Vec::new()));
         let mut child_source = TestArenaSource {
@@ -4835,18 +4566,15 @@ mod tests {
 
         let parent_avail_count_before = parent_available.lock().unwrap().len();
 
-        // Rebase child
         child
             .rebase(child_root, Some(&mut child_source))
             .expect("rebase succeeds with child source");
 
-        // Verify child took two fresh slots from child source
         assert_eq!(
             child_available.lock().unwrap().len(),
             0,
             "child took two fresh slots from child source"
         );
-        // Verify parent source was untouched
         assert_eq!(
             parent_available.lock().unwrap().len(),
             parent_avail_count_before,
@@ -4862,10 +4590,8 @@ mod tests {
     fn large_vma_unmap_work_is_hierarchically_bounded_empty_and_populated_islands() {
         let mut mgr = hvpatch_manager();
         let size_16t = 16u64 << 40;
-        let base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let base = LINUX_HIGH_VA_THRESHOLD;
 
-        // 1. Unmapping a completely empty 16 TiB reservation traverses only the top-level
-        // descriptors (32 L0 slots covering 512 GiB each).
         let (outcome, steps_empty) = mgr
             .unmap_aliased_counting(base, size_16t as usize, None)
             .expect("unmap empty 16 TiB");
@@ -4875,7 +4601,6 @@ mod tests {
             "empty 16 TiB traverses exactly 32 L0 slots"
         );
 
-        // 2. Populate three isolated 2-MiB islands: first, middle, last.
         let island_offsets = [
             0,
             (size_16t / 2 / (2 * 1024 * 1024)) * (2 * 1024 * 1024),
@@ -4890,7 +4615,6 @@ mod tests {
             assert!(mgr.is_valid(va), "island at {va:#x} must be valid");
         }
 
-        // 3. Unmap the entire 16 TiB range with populated islands.
         let (outcome_populated, steps_populated) = mgr
             .unmap_aliased_counting(base, size_16t as usize, None)
             .expect("unmap populated 16 TiB");
@@ -4904,10 +4628,6 @@ mod tests {
             assert!(!mgr.is_valid(va), "island at {va:#x} must be invalidated");
         }
 
-        // Without hierarchical skipping (the old 2 MiB linear sweep), steps would be
-        // 16 TiB / 2 MiB = 8,388,608.
-        // With hierarchical skipping, unpopulated L0 (512 GiB) and L1 (1 GiB) ranges are
-        // skipped in O(1) steps, keeping total steps bounded below 5,000.
         assert!(
             steps_populated < 5000,
             "16 TiB reclaim steps must be hierarchically bounded: {steps_populated} < 5000 (old linear sweep = 8,388,608)"
@@ -4917,7 +4637,7 @@ mod tests {
     #[test]
     fn test_el1_stack_walk_after_rebase() {
         let bytes = stage1_hvpatch_page_tables();
-        let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
+        let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE, test_layout());
         let stack_va = 0x2d04213ee0;
         let leaf_before = terminal_descriptor(mgr.debug_walk(stack_va));
 

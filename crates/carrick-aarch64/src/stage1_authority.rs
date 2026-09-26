@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 
 use carrick_hal::TrapError;
-use carrick_mem::page_table::{
-    HostArenaResolver, PageTableApplyOutcome, PageTableError, PageTableManager, TableArenaSource,
+use carrick_mmu_core::aarch64::{
+    HostArenaResolver, PageTableApplyOutcome, PageTableError, PageTableManager, PtOp,
+    TableArenaSource,
 };
 
 /// Explicit sharing lifecycle for stage-1 page tables across process fork/execve boundaries.
@@ -399,10 +400,7 @@ impl Stage1Authority {
     /// # Safety
     ///
     /// `resolver` must return valid host pointers for all touched page table arenas.
-    pub unsafe fn rollback_undo(
-        &self,
-        resolver: impl carrick_mem::page_table::HostArenaResolver,
-    ) -> Vec<u64> {
+    pub unsafe fn rollback_undo(&self, resolver: impl HostArenaResolver) -> Vec<u64> {
         let mut inner = self.inner.lock();
         let inner = &mut *inner;
         if let Some(manager) = inner.manager.as_mut() {
@@ -840,7 +838,7 @@ impl<'a> Stage1Editor<'a> {
         &mut self,
         base: u64,
         size: usize,
-        op: carrick_mem::page_table::PtOp,
+        op: PtOp,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
         self.manager
             .apply(base, size, op, self.arena_source.as_deref_mut())
@@ -994,10 +992,7 @@ impl<'a> Stage1Editor<'a> {
     /// # Safety
     ///
     /// `resolver` must return valid host pointers for all page table arenas.
-    pub unsafe fn rollback_undo(
-        &mut self,
-        resolver: impl carrick_mem::page_table::HostArenaResolver,
-    ) -> Vec<u64> {
+    pub unsafe fn rollback_undo(&mut self, resolver: impl HostArenaResolver) -> Vec<u64> {
         unsafe {
             self.manager
                 .rollback_undo(resolver, self.arena_source.as_deref_mut())
@@ -1014,14 +1009,14 @@ impl<'a> Stage1Editor<'a> {
     /// retire every supplied arena's backing before returning success.
     pub unsafe fn rollback_undo_retiring<E>(
         &mut self,
-        resolver: impl carrick_mem::page_table::HostArenaResolver,
+        resolver: impl HostArenaResolver,
         retire: impl FnOnce(&[u64]) -> Result<(), E>,
     ) -> Result<Vec<u64>, E> {
         let popped = unsafe { self.manager.rollback_undo(resolver, None) };
         retire(&popped)?;
         if let Some(source) = self.arena_source.as_deref_mut() {
             for &base in &popped {
-                source.return_arena(carrick_guest_mem::Gpa(base));
+                source.return_arena(carrick_mmu_core::aarch64::SubstrateGpa(base));
             }
         }
         Ok(popped)
@@ -1043,9 +1038,10 @@ mod tests {
     use super::*;
     use carrick_guest_mem::Gpa;
     use carrick_mem::memory::{
-        LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE, stage1_hvpatch_page_tables,
+        AARCH64_LINUX_PAGE_TABLE_LAYOUT, LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE,
+        LINUX_PAGE_TABLES_SIZE, stage1_hvpatch_page_tables,
     };
-    use carrick_mem::page_table::{TableArenaSource, TableArenaSourceId};
+    use carrick_mmu_core::aarch64::{SubstrateGpa, TableArenaSource, TableArenaSourceId};
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug)]
@@ -1060,13 +1056,33 @@ mod tests {
             self.id
         }
 
-        fn take_arena(&mut self) -> Option<Gpa> {
-            self.available.lock().unwrap().pop()
+        fn take_arena(&mut self) -> Option<SubstrateGpa> {
+            self.available
+                .lock()
+                .unwrap()
+                .pop()
+                .map(|gpa| SubstrateGpa(gpa.0))
         }
 
-        fn return_arena(&mut self, gpa: Gpa) {
-            self.returned.lock().unwrap().push(gpa);
+        fn return_arena(&mut self, gpa: SubstrateGpa) {
+            self.returned.lock().unwrap().push(Gpa(gpa.0));
         }
+    }
+
+    fn test_manager() -> PageTableManager {
+        PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            LINUX_PAGE_TABLES_BASE,
+            AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        )
+    }
+
+    fn test_manager_at(base: u64) -> PageTableManager {
+        PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            base,
+            AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        )
     }
 
     fn observed_generation(authority: &Stage1Authority) -> Option<std::num::NonZeroU64> {
@@ -1082,8 +1098,7 @@ mod tests {
 
     #[test]
     fn image_generation_invalidates_edits_errors_restore_and_replacement() {
-        let manager =
-            || PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let manager = || test_manager();
         let mut authority = Stage1Authority::new_with_manager(Some(manager()));
         let original = observed_generation(&authority);
         authority.with_manager(|m| m.debug_walk(0x40_0000));
@@ -1150,10 +1165,7 @@ mod tests {
 
     #[test]
     fn image_generation_exhaustion_never_reenables_reuse() {
-        let authority = Stage1Authority::new_with_manager(Some(PageTableManager::new(
-            stage1_hvpatch_page_tables(),
-            LINUX_PAGE_TABLES_BASE,
-        )));
+        let authority = Stage1Authority::new_with_manager(Some(test_manager()));
         authority.inner.lock().manager.generation = std::num::NonZeroU64::new(u64::MAX);
         for _ in 0..2 {
             authority
@@ -1168,10 +1180,7 @@ mod tests {
         // `kernel.fork.stage1-image`: the parent forks, the child owns a
         // private image, the child exits. The image must come back to the
         // parent's pool so the next fork clones into it instead of allocating.
-        let parent = Stage1Authority::new_with_manager(Some(PageTableManager::new(
-            stage1_hvpatch_page_tables(),
-            LINUX_PAGE_TABLES_BASE,
-        )));
+        let parent = Stage1Authority::new_with_manager(Some(test_manager()));
         let pool = parent.image_pool();
         assert_eq!(pool.retained(), 0);
 
@@ -1203,29 +1212,15 @@ mod tests {
     fn image_pool_is_bounded_and_exec_recycles_the_retired_image() {
         let pool = Stage1ImagePool::new(2);
         for _ in 0..3 {
-            pool.recycle(PageTableManager::new(
-                stage1_hvpatch_page_tables(),
-                LINUX_PAGE_TABLES_BASE,
-            ));
+            pool.recycle(test_manager());
         }
         assert_eq!(pool.retained(), 2, "images beyond capacity are dropped");
         assert_eq!(pool.recycled_images(), 2);
 
-        let mut authority = Stage1Authority::new_with_manager(Some(PageTableManager::new(
-            stage1_hvpatch_page_tables(),
-            LINUX_PAGE_TABLES_BASE,
-        )));
+        let mut authority = Stage1Authority::new_with_manager(Some(test_manager()));
         let pool = authority.image_pool();
         authority
-            .replace_for_exec(
-                || {
-                    Ok::<_, PageTableError>(Some(PageTableManager::new(
-                        stage1_hvpatch_page_tables(),
-                        LINUX_PAGE_TABLES_BASE,
-                    )))
-                },
-                |_| Ok(()),
-            )
+            .replace_for_exec(|| Ok::<_, PageTableError>(Some(test_manager())), |_| Ok(()))
             .expect("exec replacement");
         assert_eq!(
             pool.retained(),
@@ -1242,30 +1237,22 @@ mod tests {
         // `ConflictingArenaSource` and the exec dies past its point of no
         // return (busybox `sh -c /bin/true` under the first landing).
         let old = CountingArenaSource {
-            id: TableArenaSourceId(Gpa(LINUX_PAGE_TABLES_BASE)),
+            id: TableArenaSourceId(SubstrateGpa(LINUX_PAGE_TABLES_BASE)),
             available: Arc::new(Mutex::new(Vec::new())),
             returned: Arc::new(Mutex::new(Vec::new())),
         };
         let replacement = CountingArenaSource {
-            id: TableArenaSourceId(Gpa(0x9a_0020_0000)),
+            id: TableArenaSourceId(SubstrateGpa(0x9a_0020_0000)),
             available: Arc::new(Mutex::new(Vec::new())),
             returned: Arc::new(Mutex::new(Vec::new())),
         };
-        let manager = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let manager = test_manager();
         let mut authority = Stage1Authority::new_with_manager(Some(manager));
         authority
             .install_source(Box::new(old))
             .expect("install the pre-exec source");
         let retired = authority
-            .replace_for_exec(
-                || {
-                    Ok::<_, PageTableError>(Some(PageTableManager::new(
-                        stage1_hvpatch_page_tables(),
-                        LINUX_PAGE_TABLES_BASE,
-                    )))
-                },
-                |_| Ok(()),
-            )
+            .replace_for_exec(|| Ok::<_, PageTableError>(Some(test_manager())), |_| Ok(()))
             .expect("exclusive exec replacement");
         assert!(retired.shares_exact_authority(&authority));
         assert!(
@@ -1300,13 +1287,12 @@ mod tests {
         let returned = Arc::new(Mutex::new(Vec::new()));
 
         let source = CountingArenaSource {
-            id: TableArenaSourceId(root),
+            id: TableArenaSourceId(SubstrateGpa(root.0)),
             available: Arc::clone(&available),
             returned: Arc::clone(&returned),
         };
 
-        let mut manager =
-            PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let mut manager = test_manager();
         manager.set_multi_vcpu(false);
         manager.set_stage1_exclusive(true);
         manager
@@ -1422,12 +1408,12 @@ mod tests {
         let available = Arc::new(Mutex::new(Vec::new()));
         let returned = Arc::new(Mutex::new(Vec::new()));
         let source = CountingArenaSource {
-            id: TableArenaSourceId(root),
+            id: TableArenaSourceId(SubstrateGpa(root.0)),
             available,
             returned,
         };
 
-        let manager = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let manager = test_manager();
         let parent = Stage1Authority::new_with_manager(Some(manager));
         parent
             .install_source(Box::new(source))
@@ -1451,12 +1437,7 @@ mod tests {
         let mut retired1 = false;
         let new_child1 = child1
             .replace_for_exec(
-                || {
-                    Ok::<_, ()>(Some(PageTableManager::new(
-                        stage1_hvpatch_page_tables(),
-                        0x9a_0020_0000,
-                    )))
-                },
+                || Ok::<_, ()>(Some(test_manager_at(0x9a_0020_0000))),
                 |_| {
                     retired1 = true;
                     Ok(())
@@ -1482,12 +1463,7 @@ mod tests {
         let mut retired2 = false;
         let new_child2 = child2
             .replace_for_exec(
-                || {
-                    Ok::<_, ()>(Some(PageTableManager::new(
-                        stage1_hvpatch_page_tables(),
-                        0x9a_0040_0000,
-                    )))
-                },
+                || Ok::<_, ()>(Some(test_manager_at(0x9a_0040_0000))),
                 |_| {
                     retired2 = true;
                     Ok(())
@@ -1514,12 +1490,7 @@ mod tests {
         let mut parent_exec = parent.clone();
         let exec_parent = parent_exec
             .replace_for_exec(
-                || {
-                    Ok::<_, ()>(Some(PageTableManager::new(
-                        stage1_hvpatch_page_tables(),
-                        0x9a_0060_0000,
-                    )))
-                },
+                || Ok::<_, ()>(Some(test_manager_at(0x9a_0060_0000))),
                 |_| {
                     retired_parent = true;
                     Ok(())
@@ -1545,12 +1516,12 @@ mod tests {
         let available = Arc::new(Mutex::new(Vec::new()));
         let returned = Arc::new(Mutex::new(Vec::new()));
         let source = CountingArenaSource {
-            id: TableArenaSourceId(root),
+            id: TableArenaSourceId(SubstrateGpa(root.0)),
             available,
             returned,
         };
 
-        let manager = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let manager = test_manager();
         let parent = Stage1Authority::new_with_manager(Some(manager));
         parent
             .install_source(Box::new(source))
@@ -1566,12 +1537,7 @@ mod tests {
         // Child execs: the internal decision sees vfork_shares > 0
         let (new_child, was_shared) = child
             .replace_for_exec_internal(
-                || {
-                    Ok::<_, ()>(Some(PageTableManager::new(
-                        stage1_hvpatch_page_tables(),
-                        0x9a_0020_0000,
-                    )))
-                },
+                || Ok::<_, ()>(Some(test_manager_at(0x9a_0020_0000))),
                 |_| {
                     retired = true;
                     Ok(())
@@ -1593,7 +1559,7 @@ mod tests {
 
     #[test]
     fn stage1_authority_undo_journal_commit_and_rollback() {
-        let manager = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let manager = test_manager();
         let authority = Stage1Authority::new_with_manager(Some(manager));
 
         let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];

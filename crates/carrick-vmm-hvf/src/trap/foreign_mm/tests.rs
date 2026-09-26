@@ -668,9 +668,10 @@ fn install_mm_sparse(
         0,
         "fixture owner must contain whole host compounds",
     );
-    let mut tables = carrick_mem::page_table::PageTableManager::new(
+    let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables.rebase(root, None).expect("rebase foreign test root");
     tables
@@ -1188,8 +1189,8 @@ fn ptrace_text_cow_accepts_unarmed_rx_mapping_and_preserves_peer_and_stage1_ap()
     const AP_MASK: u64 = 0b11 << 6;
     let (before_ap, before_ipa) = page_tables
         .with_manager(|tables| {
-            let ap =
-                carrick_mem::page_table::terminal_descriptor(tables.debug_walk(TEST_VA)) & AP_MASK;
+            let ap = carrick_mmu_core::aarch64::terminal_descriptor(tables.debug_walk(TEST_VA))
+                & AP_MASK;
             let ipa = tables
                 .translate_retained_output(TEST_VA)
                 .expect("RX source translation");
@@ -1220,7 +1221,7 @@ fn ptrace_text_cow_accepts_unarmed_rx_mapping_and_preserves_peer_and_stage1_ap()
         )
         .expect("RX ptrace text must break COW without writable-fault arming");
     let after_ap = page_tables
-        .with_manager(|mgr| carrick_mem::page_table::terminal_descriptor(mgr.debug_walk(TEST_VA)))
+        .with_manager(|mgr| carrick_mmu_core::aarch64::terminal_descriptor(mgr.debug_walk(TEST_VA)))
         .expect("post-COW RX page tables")
         & AP_MASK;
     assert_eq!(
@@ -3116,9 +3117,10 @@ fn copied_fork_child_activation_publishes_exact_foreign_mm_binding() {
         child_token_verifier,
     };
     let runtime_page_tables = carrick_aarch64::Stage1Authority::new_with_manager(Some(
-        crate::page_table::PageTableManager::new(
+        carrick_mmu_core::aarch64::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             stage1_root.raw(),
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         ),
     ));
     let runtime = registration
@@ -3185,20 +3187,27 @@ fn copied_fork_child_activation_publishes_exact_foreign_mm_binding() {
 
 #[derive(Debug)]
 struct TestArenaSource {
-    id: carrick_mem::page_table::TableArenaSourceId,
+    id: carrick_mmu_core::aarch64::TableArenaSourceId,
     available: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
     returned: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
 }
 
-impl carrick_mem::page_table::TableArenaSource for TestArenaSource {
-    fn id(&self) -> carrick_mem::page_table::TableArenaSourceId {
+impl carrick_mmu_core::aarch64::TableArenaSource for TestArenaSource {
+    fn id(&self) -> carrick_mmu_core::aarch64::TableArenaSourceId {
         self.id
     }
-    fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
-        self.available.lock().unwrap().pop()
+    fn take_arena(&mut self) -> Option<carrick_mmu_core::aarch64::SubstrateGpa> {
+        self.available
+            .lock()
+            .unwrap()
+            .pop()
+            .map(|gpa| carrick_mmu_core::aarch64::SubstrateGpa(gpa.0))
     }
-    fn return_arena(&mut self, base: carrick_guest_mem::Gpa) {
-        self.returned.lock().unwrap().push(base);
+    fn return_arena(&mut self, base: carrick_mmu_core::aarch64::SubstrateGpa) {
+        self.returned
+            .lock()
+            .unwrap()
+            .push(carrick_guest_mem::Gpa(base.0));
     }
 }
 
@@ -3290,9 +3299,10 @@ fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() 
         child_token_verifier,
     };
 
-    let mut manager = crate::page_table::PageTableManager::new(
+    let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     manager
         .set_prot_none(
@@ -3308,7 +3318,9 @@ fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() 
     let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
     let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let source = TestArenaSource {
-        id: carrick_mem::page_table::TableArenaSourceId(stage1_root),
+        id: carrick_mmu_core::aarch64::TableArenaSourceId(carrick_mmu_core::aarch64::SubstrateGpa(
+            stage1_root.0,
+        )),
         available: std::sync::Arc::clone(&available),
         returned: std::sync::Arc::clone(&returned),
     };
@@ -3439,9 +3451,10 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
         child_token_verifier,
     };
 
-    let mut manager = crate::page_table::PageTableManager::new(
+    let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     manager
         .set_prot_none(
@@ -3457,7 +3470,9 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
     let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
     let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let source = TestArenaSource {
-        id: carrick_mem::page_table::TableArenaSourceId(stage1_root),
+        id: carrick_mmu_core::aarch64::TableArenaSourceId(carrick_mmu_core::aarch64::SubstrateGpa(
+            stage1_root.0,
+        )),
         available: std::sync::Arc::clone(&available),
         returned: std::sync::Arc::clone(&returned),
     };
@@ -3625,9 +3640,10 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
         child_token_verifier,
     };
 
-    let mut parent_manager = crate::page_table::PageTableManager::new(
+    let mut parent_manager = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     parent_manager
         .set_prot_none(
@@ -3643,7 +3659,9 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
     let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let source = TestArenaSource {
-        id: carrick_mem::page_table::TableArenaSourceId(stage1_root),
+        id: carrick_mmu_core::aarch64::TableArenaSourceId(carrick_mmu_core::aarch64::SubstrateGpa(
+            stage1_root.0,
+        )),
         available: std::sync::Arc::clone(&available),
         returned: std::sync::Arc::clone(&returned),
     };
@@ -3705,7 +3723,9 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     let child_available = std::sync::Arc::new(std::sync::Mutex::new(vec![child_ext_base]));
     let child_returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut child_source = TestArenaSource {
-        id: carrick_mem::page_table::TableArenaSourceId(Gpa(child_root_base)),
+        id: carrick_mmu_core::aarch64::TableArenaSourceId(carrick_mmu_core::aarch64::SubstrateGpa(
+            child_root_base,
+        )),
         available: child_available,
         returned: child_returned,
     };
@@ -3766,7 +3786,10 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     for va in mapped_vas {
         let walk = unsafe {
             child_page_tables
-                .debug_walk_host(carrick_mem::page_table::const_resolver(child_resolver), va)
+                .debug_walk_host(
+                    carrick_mmu_core::aarch64::const_resolver(child_resolver),
+                    va,
+                )
                 .expect("debug_walk_host succeeds on child host memory")
         };
         assert_eq!(
@@ -4330,9 +4353,10 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         table_arena_source: None,
     };
     let make_child_page_tables = |translated_ipa| {
-        let mut child_page_tables = crate::page_table::PageTableManager::new(
+        let mut child_page_tables = carrick_mmu_core::aarch64::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
         child_page_tables
             .map_aliased(vvar_ipa, translated_ipa, vvar_len, false, None)
@@ -5881,9 +5905,10 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     //    (c) Shared Executable / RX (Code)
     //    (d) Shared Writable User (Data)
     //    (e) Private / COW User (Data)
-    let _parent_pt = crate::page_table::PageTableManager::new(
+    let _parent_pt = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
 
     let parent_pt_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -6294,9 +6319,10 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         table_arena_source: None,
     };
 
-    let mut child_pt = crate::page_table::PageTableManager::new(
+    let mut child_pt = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     child_pt
         .map_aliased(0x0040_0000, parent_rx_ipa, 0x4000, false, None)
@@ -7099,9 +7125,10 @@ fn semantic_lookup_rejects_foreign_va_alias_at_same_live_ipa() {
         ..own
     };
     alias_registry().lock().extend([own, foreign]);
-    let mut tables = crate::page_table::PageTableManager::new(
+    let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
         .map_aliased(va, key.0, key.1, false, None)
@@ -7195,9 +7222,10 @@ fn shared_extent_repoint_subpage_resolves_covering_owner_and_repoints_leaf() {
     };
     task.mappings.insert(region);
 
-    let mut tables = crate::page_table::PageTableManager::new(
+    let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
         .map_aliased(va, extent_base, size as u64, false, None)
@@ -7331,18 +7359,20 @@ fn semantic_lookup_isolates_same_va_in_different_mm() {
     };
     alias_registry().lock().extend([alias_a, alias_b]);
 
-    let mut tables_a = crate::page_table::PageTableManager::new(
+    let mut tables_a = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables_a
         .map_aliased(va, key_a.0, key_a.1, false, None)
         .expect("stage-1 mapping a");
     task_a.page_tables_authority().set_manager(tables_a);
 
-    let mut tables_b = crate::page_table::PageTableManager::new(
+    let mut tables_b = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables_b
         .map_aliased(va, key_b.0, key_b.1, false, None)
@@ -7414,9 +7444,10 @@ fn semantic_lookup_rejects_overlapping_row_with_wrong_va_to_ipa_offset() {
     };
     alias_registry().lock().extend([alias]);
 
-    let mut tables = crate::page_table::PageTableManager::new(
+    let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
         .map_aliased(
@@ -7475,9 +7506,10 @@ fn semantic_lookup_rejects_stale_owner_generation_and_accepts_current() {
     };
     alias_registry().lock().extend([stale_alias]);
 
-    let mut tables = crate::page_table::PageTableManager::new(
+    let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
         .map_aliased(va, key.0, key.1, false, None)
@@ -7544,9 +7576,10 @@ fn semantic_lookup_enforces_exact_boundary_length_and_overflow_protection() {
     };
     alias_registry().lock().extend([alias]);
 
-    let mut tables = crate::page_table::PageTableManager::new(
+    let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
         .map_aliased(va, key.0, key.1, false, None)
@@ -7709,9 +7742,10 @@ fn invalid_leaf_lookup_selects_the_newest_projection_over_a_shadowed_row() {
     });
     // First-touch re-arm after a discard: the leaf is invalid but keeps its
     // output, so the ordinary translation misses and the VA path decides.
-    let mut tables = crate::page_table::PageTableManager::new(
+    let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
         .map_aliased(edge_va, stale.ipa, edge_len as u64, false, None)
@@ -7736,9 +7770,10 @@ fn invalid_leaf_lookup_selects_the_newest_projection_over_a_shadowed_row() {
     // the newer projection and repointed the (now invalid) leaves to it.
     let replacement = projection(new_key, new_host, new_generation);
     alias_registry().lock().push(replacement);
-    let mut tables = crate::page_table::PageTableManager::new(
+    let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
         .map_aliased(edge_va, replacement.ipa, edge_len as u64, false, None)
@@ -7855,9 +7890,10 @@ fn semantic_lookup_preserves_map_shared_and_maintenance_fallback() {
     assert_eq!(selected.start, va);
     assert_eq!(selected.sharing, GuestMappingSharing::GlobalShared);
 
-    let mut tables = crate::page_table::PageTableManager::new(
+    let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     tables
         .map_aliased(va, key.0, key.1, false, None)
@@ -7884,9 +7920,10 @@ fn cow_source_falls_back_to_offset_logical_inventory_with_current_physical_owner
     let semantic_va = 0x6001_020000_u64;
     let (mut task, custody, key, generation) =
         inventoried_cow_source_fixture(CowSourceInventoryFixture::CurrentOffsetLogicalKey);
-    let mut page_tables = crate::page_table::PageTableManager::new(
+    let mut page_tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     page_tables
         .map_aliased(semantic_va, key.0, key.1, false, None)

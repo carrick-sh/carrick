@@ -3148,7 +3148,7 @@ pub(crate) mod tests {
 
         fn install_stage1_table_arena_source(
             &mut self,
-            _source: Box<dyn carrick_mem::page_table::TableArenaSource>,
+            _source: Box<dyn carrick_mmu_core::aarch64::TableArenaSource>,
         ) -> Result<(), TrapError> {
             self.installed_table_arena_sources += 1;
             Ok(())

@@ -877,6 +877,15 @@ pub const fn ipa_overlaps_gic_window(ipa: u64, len: u64) -> bool {
     len != 0 && !ranges_do_not_overlap(ipa, len, LINUX_GIC_WINDOW_BASE, LINUX_GIC_WINDOW_SIZE)
 }
 
+/// AArch64 Linux page-table layout constraints for `carrick_mmu_core::aarch64::PageTableManager`.
+pub const AARCH64_LINUX_PAGE_TABLE_LAYOUT: carrick_mmu_core::aarch64::PageTableLayoutConfig =
+    carrick_mmu_core::aarch64::PageTableLayoutConfig {
+        user_leaf_check_va: LINUX_NULL_GUARD_END,
+        extension_arena_capacity: LINUX_PAGE_TABLES_SIZE as usize,
+        excluded_ipa_start: LINUX_GIC_WINDOW_BASE,
+        excluded_ipa_len: LINUX_GIC_WINDOW_SIZE,
+    };
+
 const _: () = assert!(
     ranges_do_not_overlap(
         LINUX_EL1_KERNEL_BASE,
@@ -2411,8 +2420,11 @@ impl AddressSpace {
         let bytes = if self.ro_spans.is_empty() {
             initial_tables
         } else {
-            let mut mgr =
-                crate::page_table::PageTableManager::new(initial_tables, LINUX_PAGE_TABLES_BASE);
+            let mut mgr = carrick_mmu_core::aarch64::PageTableManager::new(
+                initial_tables,
+                LINUX_PAGE_TABLES_BASE,
+                AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+            );
             mgr.set_multi_vcpu(true); // no coalesce: keep spare allocation sequential
             for span in &self.ro_spans {
                 // Clamp below the null guard (never mapped; nothing to protect).
@@ -3473,7 +3485,11 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     let rosetta_block = (LINUX_ROSETTA_IPA_BASE & PA_MASK_2MIB) | USER_BLOCK_FLAGS;
     bytes[0x7000..0x7008].copy_from_slice(&rosetta_block.to_le_bytes());
 
-    let mut mgr = crate::page_table::PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
+    let mut mgr = carrick_mmu_core::aarch64::PageTableManager::new(
+        bytes,
+        LINUX_PAGE_TABLES_BASE,
+        AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+    );
     mgr.set_multi_vcpu(true);
     let heap_size = usize::try_from(LINUX_HEAP_SIZE).unwrap_or_else(|_| {
         carrick_fatal!(
@@ -6351,9 +6367,10 @@ mod loader_tests {
             .iter()
             .find(|r| r.start == LINUX_PAGE_TABLES_BASE)
             .expect("stage-1 page-table region");
-        let mut mgr = crate::page_table::PageTableManager::new(
+        let mut mgr = carrick_mmu_core::aarch64::PageTableManager::new(
             pt_region.bytes().to_vec(),
             LINUX_PAGE_TABLES_BASE,
+            AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
         const AP_RO: u64 = 0b11 << 6; // AP[2:1]=11: RO at EL0+EL1
         const AP_RW: u64 = 0b01 << 6; // AP[2:1]=01: RW at EL0+EL1
@@ -6919,11 +6936,9 @@ mod stage1_tests {
             ("syscall mailbox", LINUX_SYSCALL_MAILBOX_BASE),
             ("Rosetta alias", LINUX_ROSETTA_VA_BASE),
         ] {
-            let leaf = crate::page_table::terminal_descriptor(crate::page_table::walk_descriptors(
-                &bytes,
-                LINUX_PAGE_TABLES_BASE,
-                va,
-            ));
+            let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+                carrick_mmu_core::aarch64::walk_descriptors(&bytes, LINUX_PAGE_TABLES_BASE, va),
+            );
             assert_ne!(leaf & 0b11, 0, "{name} leaf at {va:#x} is not mapped");
             assert_ne!(
                 leaf & NON_GLOBAL,
@@ -6933,12 +6948,13 @@ mod stage1_tests {
         }
 
         let compatibility = stage1_identity_page_tables();
-        let compatibility_text =
-            crate::page_table::terminal_descriptor(crate::page_table::walk_descriptors(
+        let compatibility_text = carrick_mmu_core::aarch64::terminal_descriptor(
+            carrick_mmu_core::aarch64::walk_descriptors(
                 &compatibility,
                 LINUX_PAGE_TABLES_BASE,
                 0x0040_0000,
-            ));
+            ),
+        );
         assert_eq!(
             compatibility_text & NON_GLOBAL,
             0,
@@ -7003,11 +7019,13 @@ mod stage1_tests {
             ("syscall mailbox", LINUX_SYSCALL_MAILBOX_BASE),
             ("fd ceiling control", LINUX_FD_CEILING_CONTROL_BASE),
         ] {
-            let leaf = crate::page_table::terminal_descriptor(crate::page_table::walk_descriptors(
-                &bytes,
-                LINUX_CARRIER_MAINT_ROOT_BASE,
-                va,
-            ));
+            let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+                carrick_mmu_core::aarch64::walk_descriptors(
+                    &bytes,
+                    LINUX_CARRIER_MAINT_ROOT_BASE,
+                    va,
+                ),
+            );
             assert_ne!(
                 leaf & 0b11,
                 0,
@@ -7024,11 +7042,13 @@ mod stage1_tests {
             ("stack", LINUX_STACK_TOP - 0x4000),
             ("Rosetta alias", LINUX_ROSETTA_VA_BASE),
         ] {
-            let leaf = crate::page_table::terminal_descriptor(crate::page_table::walk_descriptors(
-                &bytes,
-                LINUX_CARRIER_MAINT_ROOT_BASE,
-                va,
-            ));
+            let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+                carrick_mmu_core::aarch64::walk_descriptors(
+                    &bytes,
+                    LINUX_CARRIER_MAINT_ROOT_BASE,
+                    va,
+                ),
+            );
             assert_eq!(
                 leaf & 0b11,
                 0,

@@ -1478,8 +1478,12 @@ fn exec_replacement_keeps_every_representative_leaf_asid_scoped() {
         ),
         ("Rosetta alias", carrick_mem::memory::LINUX_ROSETTA_VA_BASE),
     ] {
-        let leaf = carrick_mem::page_table::terminal_descriptor(
-            carrick_mem::page_table::walk_descriptors(tables.image.as_ref(), tables.ipa_start, va),
+        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+            carrick_mmu_core::aarch64::walk_descriptors(
+                tables.image.as_ref(),
+                tables.ipa_start,
+                va,
+            ),
         );
         if name != "mmap" {
             assert_ne!(leaf & 0b11, 0, "{name} leaf at {va:#x} is not mapped");
@@ -1761,9 +1765,10 @@ fn root_exec_rebuilds_tables_with_sparse_and_hvpatch_reservations() {
         .iter()
         .find(|mapping| mapping.guest_start == crate::memory::LINUX_PAGE_TABLES_BASE)
         .unwrap();
-    let mut manager = crate::page_table::PageTableManager::new(
+    let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
         table.image.as_ref().clone(),
         rebuilt.stage1_page_tables_base.unwrap(),
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     assert_eq!(
         manager.translate(0x20_0000),
@@ -5248,9 +5253,10 @@ fn foreign_mm_binding_stage1_tables_preserves_the_exact_shared_mm_access_arc() {
 fn bind_page_tables_authority_migrates_live_manager_when_new_authority_empty() {
     let owner = HvfTaskState::neutral();
     let bytes = carrick_mem::memory::stage1_identity_page_tables();
-    let manager = crate::page_table::PageTableManager::new(
+    let manager = carrick_mmu_core::aarch64::PageTableManager::new(
         bytes,
         carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     let old_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
     owner
@@ -5269,28 +5275,30 @@ fn bind_page_tables_authority_migrates_live_manager_when_new_authority_empty() {
     );
 }
 #[derive(Debug)]
-struct BindTestArenaSource(carrick_mem::page_table::TableArenaSourceId);
+struct BindTestArenaSource(carrick_mmu_core::aarch64::TableArenaSourceId);
 
-impl carrick_mem::page_table::TableArenaSource for BindTestArenaSource {
-    fn id(&self) -> carrick_mem::page_table::TableArenaSourceId {
+impl carrick_mmu_core::aarch64::TableArenaSource for BindTestArenaSource {
+    fn id(&self) -> carrick_mmu_core::aarch64::TableArenaSourceId {
         self.0
     }
-    fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
+    fn take_arena(&mut self) -> Option<carrick_mmu_core::aarch64::SubstrateGpa> {
         None
     }
-    fn return_arena(&mut self, _base: carrick_guest_mem::Gpa) {}
+    fn return_arena(&mut self, _base: carrick_mmu_core::aarch64::SubstrateGpa) {}
 }
 
 #[test]
 fn bind_page_tables_authority_adopts_extension_state_when_both_present() {
     let owner = HvfTaskState::neutral();
     let bytes = carrick_mem::memory::stage1_identity_page_tables();
-    let old_mgr = crate::page_table::PageTableManager::new(
+    let old_mgr = carrick_mmu_core::aarch64::PageTableManager::new(
         bytes.clone(),
         carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
-    let stage1_root = carrick_guest_mem::Gpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
-    let source = BindTestArenaSource(carrick_mem::page_table::TableArenaSourceId(stage1_root));
+    let stage1_root =
+        carrick_mmu_core::aarch64::SubstrateGpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+    let source = BindTestArenaSource(carrick_mmu_core::aarch64::TableArenaSourceId(stage1_root));
     let old_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(old_mgr));
     old_authority.install_source(Box::new(source)).unwrap();
     assert!(old_authority.has_source());
@@ -5300,9 +5308,10 @@ fn bind_page_tables_authority_adopts_extension_state_when_both_present() {
         .bind_page_tables_authority(old_authority.clone());
     drop(old_authority);
 
-    let new_mgr = crate::page_table::PageTableManager::new(
+    let new_mgr = carrick_mmu_core::aarch64::PageTableManager::new(
         bytes,
         carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     let new_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(new_mgr));
     assert!(!new_authority.has_source());
@@ -5321,12 +5330,14 @@ fn bind_page_tables_authority_adopts_extension_state_when_both_present() {
 fn bind_page_tables_authority_preserves_shared_previous_authority() {
     let owner = HvfTaskState::neutral();
     let bytes = carrick_mem::memory::stage1_identity_page_tables();
-    let old_mgr = crate::page_table::PageTableManager::new(
+    let old_mgr = carrick_mmu_core::aarch64::PageTableManager::new(
         bytes.clone(),
         carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
-    let stage1_root = carrick_guest_mem::Gpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
-    let source = BindTestArenaSource(carrick_mem::page_table::TableArenaSourceId(stage1_root));
+    let stage1_root =
+        carrick_mmu_core::aarch64::SubstrateGpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+    let source = BindTestArenaSource(carrick_mmu_core::aarch64::TableArenaSourceId(stage1_root));
     let shared_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(old_mgr));
     shared_authority.install_source(Box::new(source)).unwrap();
     shared_authority.share_with_vfork_child();
@@ -5800,9 +5811,10 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
         "fork-only leaf policies must not punch holes in a shared mm",
     );
 
-    let mut copied_tables = crate::page_table::PageTableManager::new(
+    let mut copied_tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     copied_tables
         .map_aliased(coarse.start, coarse.ipa, coarse.size as u64, true, None)
@@ -5821,9 +5833,10 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
         "the wiped neighbour remains mapped for its independent-zero plan",
     );
 
-    let mut shared_tables = crate::page_table::PageTableManager::new(
+    let mut shared_tables = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     shared_tables
         .map_aliased(coarse.start, coarse.ipa, coarse.size as u64, true, None)

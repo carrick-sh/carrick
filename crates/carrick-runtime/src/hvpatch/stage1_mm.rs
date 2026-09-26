@@ -306,7 +306,7 @@ impl Stage1MmLease {
     pub(crate) fn table_arena_source(
         self: &Arc<Self>,
         pool: Stage1MmPool,
-    ) -> Box<dyn carrick_mem::page_table::TableArenaSource> {
+    ) -> Box<dyn carrick_mmu_core::aarch64::TableArenaSource> {
         Box::new(Stage1MmTableArenaSource {
             pool,
             lease: Arc::clone(self),
@@ -511,19 +511,21 @@ impl carrick_hal::stage1_mm::ForeignMmInstaller for Stage1MmLease {
     type InstallPermit = super::ForeignMmInstallPermit;
 }
 
-impl carrick_mem::page_table::TableArenaSource for Stage1MmTableArenaSource {
-    fn id(&self) -> carrick_mem::page_table::TableArenaSourceId {
-        carrick_mem::page_table::TableArenaSourceId(self.lease.root_slot_base())
+impl carrick_mmu_core::aarch64::TableArenaSource for Stage1MmTableArenaSource {
+    fn id(&self) -> carrick_mmu_core::aarch64::TableArenaSourceId {
+        carrick_mmu_core::aarch64::TableArenaSourceId(carrick_mmu_core::aarch64::SubstrateGpa(
+            self.lease.root_slot_base().0,
+        ))
     }
 
-    fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
+    fn take_arena(&mut self) -> Option<carrick_mmu_core::aarch64::SubstrateGpa> {
         let mut inner = self.pool.inner.lock();
         let slot = inner.free_root_slots.pop_first()?;
         self.lease.extension_slots.lock().push(slot);
-        Some(carrick_guest_mem::Gpa(slot.base()))
+        Some(carrick_mmu_core::aarch64::SubstrateGpa(slot.base()))
     }
 
-    fn return_arena(&mut self, base: carrick_guest_mem::Gpa) {
+    fn return_arena(&mut self, base: carrick_mmu_core::aarch64::SubstrateGpa) {
         let slot = {
             let mut ext = self.lease.extension_slots.lock();
             ext.iter()
@@ -902,7 +904,9 @@ impl PreparedStage1Mm {
         self.lease.root_slot()
     }
 
-    pub(crate) fn table_arena_source(&self) -> Box<dyn carrick_mem::page_table::TableArenaSource> {
+    pub(crate) fn table_arena_source(
+        &self,
+    ) -> Box<dyn carrick_mmu_core::aarch64::TableArenaSource> {
         self.lease.table_arena_source(self.pool.clone())
     }
 
