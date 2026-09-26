@@ -728,7 +728,6 @@ impl HvpatchRuntimeDirectory {
         })?;
         *pool = Some(started);
         crate::el1_census::init_from_env();
-        crate::el1_census::spawn_zone_census_reporter();
         Ok(true)
     }
 
