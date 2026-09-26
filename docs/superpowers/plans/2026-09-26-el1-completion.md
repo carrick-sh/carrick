@@ -169,3 +169,32 @@ returned zero on the committed source; its host-authority census explicitly
 reports Linux, FreeBSD and NetBSD profiles pending. Logs are retained beside
 the red witness. These results do not confer signed or cross-platform acceptance.
 The source-to-contract registry now names the live reader and its buffer tests.
+
+### Extraction and boundary review (2026-09-26)
+
+The previous turn was progress: live-read runtime correction `28a096160` and
+verification receipts `e41965f3c`. The next turn revalidated the clean integration
+tree and live `mmu-core` worker handle, then started the independent
+`personality-boundary` worker in its own managed worktree at `e41965f3c`.
+That task injects the scheduler timeout result and adds the first mechanical
+substrate dependency/literal gate. It does not claim the signal/timer or EL1
+personality split is finished; the MMU crate must be added to the gate on
+integration.
+
+Preliminary extraction review found all 70 existing page-table test names and
+the same assertion counts, but acceptance remains withheld pending full tests
+and diff review. Required corrections: preserve removed invariant/regression
+comments; retain the original test-only visibility of three helper methods;
+check whether hashbrown's sysroot-oriented `alloc` feature is unnecessary.
+Do not integrate the in-flight tree or run signed acceptance against it.
+
+Memory sequencing remains driven by the live-authority result. The relocated
+`TableArena` still owns a `Vec` image; `read_desc`, clone/fork snapshots and undo
+all depend on it. Updating one host reader does not authorize an EL1 leaf writer
+beside this model. The next memory implementation must give mutation/snapshot
+paths the same live authority, preserve exclusive structural allocation and
+rollback, then wire fault entry and bulk grants. The existing ABI frame has no
+saved FAR and the EL0 sync hook currently selects SVC only; fault entry must
+preserve fault address and ELR/SPSR before nested EL1 work. Existing sparse
+materialization and fixed pre-mapped frame pooling are host venue mechanisms,
+not proof of the required EL1 allocator or elastic extent return.
