@@ -2579,7 +2579,7 @@ impl ZoneTables {
     /// The executor of `slot`, stopped, moves the threads queued there ready
     /// at EL0 to other slots in the guest: every such thread (`mm: None`), or
     /// those of another address space than `mm`. Each goes straight from this
-    /// run queue to another ([`Self::place_in_guest`]); one no slot may run
+    /// run queue to another (`place_in_guest`); one no slot may run
     /// now becomes host-owned and goes to `handed` (`true`: its thread was
     /// retired, free it). Threads that need the executor stay. Returns the
     /// placements, for the caller to deliver their reschedules.
@@ -2653,7 +2653,7 @@ impl ZoneTables {
     /// A host futex wake of up to `count` waiters of `(mm, uaddr)` matching
     /// `bitset`, under the bucket lock. With `place`, each woken thread that
     /// waits on this one futex is queued in the guest where a vCPU of its
-    /// address space runs it ([`Self::place_in_guest`]) and its reschedule
+    /// address space runs it (`place_in_guest`) and its reschedule
     /// goes to `placed`; every other woken thread becomes [`Claim::Host`]
     /// with [`Handback::Woken`] and goes to `handed`, for the caller to hand
     /// back (and unlink from its other buckets). Returns the number woken.
