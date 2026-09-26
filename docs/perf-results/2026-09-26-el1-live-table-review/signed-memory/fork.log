@@ -1,0 +1,104 @@
+    Finished `release` profile [optimized] target(s) in 0.08s
+build-embed-interceptor-probe: wrote /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/embed-fixtures/interceptor-probe-aarch64
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-zone-readers: wrote /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/embed-fixtures/zone-readers-aarch64
+    Finished `release` profile [optimized] target(s) in 0.07s
+build-embed-el1-sched: wrote /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/embed-fixtures/el1-sched-aarch64
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mmu-core)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-embed)
+    Finished `release` profile [optimized + debuginfo] target(s) in 3m 25s
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-84e096fe2d3bc607.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-84e096fe2d3bc607
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_gic-f6a1a10a7aceeda4.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_gic-f6a1a10a7aceeda4
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/pt_pause_drain_pressure-0140d5297f9db090.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/pt_pause_drain_pressure-0140d5297f9db090
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/conformance_contracts-38fb068f15bda479.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/conformance_contracts-38fb068f15bda479
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/wedge_capture_ladder-08fe33c3d7527d4e.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/wedge_capture_ladder-08fe33c3d7527d4e
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_preemption-7a6bc774c3c232eb.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_preemption-7a6bc774c3c232eb
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/realtime_calibration-cf1f052aaa0a7052.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/realtime_calibration-cf1f052aaa0a7052
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-b08df73a8257f391.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-b08df73a8257f391
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/shared_buffer_futex-20655fce89a524fa.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/shared_buffer_futex-20655fce89a524fa
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/host_wait_policy-99c8de450616809f.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/host_wait_policy-99c8de450616809f
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_vcpu_lifetime-ab0c357e5ab259fa.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_vcpu_lifetime-ab0c357e5ab259fa
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify09_probe-c3bca8c0541fae2f.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify09_probe-c3bca8c0541fae2f
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/kernel_abort-ebef9ff2bf9cfbe0.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/kernel_abort-ebef9ff2bf9cfbe0
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/perf_regression-47c4a3be336ce4fb.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/perf_regression-47c4a3be336ce4fb
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/fault_budget_guest-f464af5180fb1183.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/fault_budget_guest-f464af5180fb1183
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/inotify_hotpath_contract-cde02f2a8696af10.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/inotify_hotpath_contract-cde02f2a8696af10
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_race-f721fd3d341a70a0.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_race-f721fd3d341a70a0
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_kick_served_loop-09ee2a7d0983560a.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_kick_served_loop-09ee2a7d0983560a
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_transparent-8a6b3008d94cf032.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_transparent-8a6b3008d94cf032
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify-4ec7db388db7187c.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify-4ec7db388db7187c
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/discard_fork_threads-28a7fde0e7a49f1e.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/discard_fork_threads-28a7fde0e7a49f1e
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_files-83f1127830a9aa63.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_files-83f1127830a9aa63
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/write_seek_contract-03f23dea1a1441f8.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/write_seek_contract-03f23dea1a1441f8
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/guest_smoke-bab9863ec56b813b.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/guest_smoke-bab9863ec56b813b
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/two_process_parallelism-30aa67597d94d700.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/two_process_parallelism-30aa67597d94d700
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/carrick_embed-ca95ccacb7b9962e.tmp.98326: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/carrick_embed-ca95ccacb7b9962e
+test-signed: running /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/conformance_contracts-38fb068f15bda479 fork_stage1_image_structural_contract --nocapture
+
+running 3 tests
+test fork_stage1_image_structural_contract ... fork.stage1-image scale=1 task_admissions=Some(1) page_table_image_allocations=Some(1) host_mapping_allocations=Some(1) fork_projection_rows_visited=Some(20) completeness=Complete
+fork.stage1-image scale=8 task_admissions=Some(8) page_table_image_allocations=Some(1) host_mapping_allocations=Some(8) fork_projection_rows_visited=Some(174) completeness=Complete
+fork.stage1-image scale=32 task_admissions=Some(32) page_table_image_allocations=Some(2) host_mapping_allocations=Some(32) fork_projection_rows_visited=Some(702) completeness=Complete
+fork.stage1-image scale=128 task_admissions=Some(128) page_table_image_allocations=Some(2) host_mapping_allocations=Some(128) fork_projection_rows_visited=Some(3070) completeness=Complete
+ok
+test fork_stage1_image_structural_contract_dirty_parent ... fork.stage1-image(dirty) scale=1 task_admissions=Some(1) page_table_image_allocations=Some(1) host_mapping_allocations=Some(1) fork_projection_rows_visited=Some(20) completeness=Complete
+fork.stage1-image(dirty) scale=8 task_admissions=Some(8) page_table_image_allocations=Some(1) host_mapping_allocations=Some(8) fork_projection_rows_visited=Some(174) completeness=Complete
+fork.stage1-image(dirty) scale=32 task_admissions=Some(32) page_table_image_allocations=Some(1) host_mapping_allocations=Some(32) fork_projection_rows_visited=Some(702) completeness=Complete
+fork.stage1-image(dirty) scale=128 task_admissions=Some(128) page_table_image_allocations=Some(2) host_mapping_allocations=Some(128) fork_projection_rows_visited=Some(3070) completeness=Complete
+ok
+test fork_stage1_image_structural_contract_via_shell ... fork.stage1-image(shell) scale=1 task_admissions=Some(1) page_table_image_allocations=Some(0) host_mapping_allocations=Some(1) fork_projection_rows_visited=Some(20) completeness=Complete
+fork.stage1-image(shell) scale=8 task_admissions=Some(8) page_table_image_allocations=Some(1) host_mapping_allocations=Some(8) fork_projection_rows_visited=Some(174) completeness=Complete
+fork.stage1-image(shell) scale=32 task_admissions=Some(32) page_table_image_allocations=Some(1) host_mapping_allocations=Some(32) fork_projection_rows_visited=Some(702) completeness=Complete
+fork.stage1-image(shell) scale=128 task_admissions=Some(128) page_table_image_allocations=Some(1) host_mapping_allocations=Some(128) fork_projection_rows_visited=Some(3070) completeness=Complete
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.54s
+
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-84e096fe2d3bc607.noent.98326: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-84e096fe2d3bc607.noent.98326
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+remaining carrick procs (run-id el1-live-fork-20260926-b6ce9ab26) = 0
+remaining carrick procs (run-id el1-live-fork-20260926-b6ce9ab26-cli) = 0
+test-signed: receipt target/test-results/carrick-embed-signed-artifacts.jsonl
+test-signed: OK (carrick-embed: 1 invoked signed executable(s) passed, 26 signed, negative control passed)

@@ -1,0 +1,108 @@
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-interceptor-probe: wrote /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/embed-fixtures/interceptor-probe-aarch64
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-zone-readers: wrote /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/embed-fixtures/zone-readers-aarch64
+    Finished `release` profile [optimized] target(s) in 0.07s
+build-embed-el1-sched: wrote /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/embed-fixtures/el1-sched-aarch64
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.33s
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/carrick_embed-ca95ccacb7b9962e.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/carrick_embed-ca95ccacb7b9962e.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/carrick_embed-ca95ccacb7b9962e
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_files-83f1127830a9aa63.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_files-83f1127830a9aa63.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_files-83f1127830a9aa63
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_kick_served_loop-09ee2a7d0983560a.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_kick_served_loop-09ee2a7d0983560a.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_kick_served_loop-09ee2a7d0983560a
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/write_seek_contract-03f23dea1a1441f8.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/write_seek_contract-03f23dea1a1441f8.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/write_seek_contract-03f23dea1a1441f8
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/kernel_abort-ebef9ff2bf9cfbe0.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/kernel_abort-ebef9ff2bf9cfbe0.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/kernel_abort-ebef9ff2bf9cfbe0
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_gic-f6a1a10a7aceeda4.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_gic-f6a1a10a7aceeda4.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_gic-f6a1a10a7aceeda4
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/inotify_hotpath_contract-cde02f2a8696af10.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/inotify_hotpath_contract-cde02f2a8696af10.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/inotify_hotpath_contract-cde02f2a8696af10
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/conformance_contracts-38fb068f15bda479.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/conformance_contracts-38fb068f15bda479.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/conformance_contracts-38fb068f15bda479
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_vcpu_lifetime-ab0c357e5ab259fa.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_vcpu_lifetime-ab0c357e5ab259fa.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_vcpu_lifetime-ab0c357e5ab259fa
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/perf_regression-47c4a3be336ce4fb.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/perf_regression-47c4a3be336ce4fb.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/perf_regression-47c4a3be336ce4fb
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/pt_pause_drain_pressure-0140d5297f9db090.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/pt_pause_drain_pressure-0140d5297f9db090.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/pt_pause_drain_pressure-0140d5297f9db090
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/wedge_capture_ladder-08fe33c3d7527d4e.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/wedge_capture_ladder-08fe33c3d7527d4e.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/wedge_capture_ladder-08fe33c3d7527d4e
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/discard_fork_threads-28a7fde0e7a49f1e.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/discard_fork_threads-28a7fde0e7a49f1e.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/discard_fork_threads-28a7fde0e7a49f1e
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify09_probe-c3bca8c0541fae2f.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify09_probe-c3bca8c0541fae2f.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify09_probe-c3bca8c0541fae2f
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/shared_buffer_futex-20655fce89a524fa.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/shared_buffer_futex-20655fce89a524fa.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/shared_buffer_futex-20655fce89a524fa
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-b08df73a8257f391.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-b08df73a8257f391.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-b08df73a8257f391
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/host_wait_policy-99c8de450616809f.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/host_wait_policy-99c8de450616809f.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/host_wait_policy-99c8de450616809f
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/realtime_calibration-cf1f052aaa0a7052.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/realtime_calibration-cf1f052aaa0a7052.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/realtime_calibration-cf1f052aaa0a7052
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/guest_smoke-bab9863ec56b813b.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/guest_smoke-bab9863ec56b813b.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/guest_smoke-bab9863ec56b813b
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/fault_budget_guest-f464af5180fb1183.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/fault_budget_guest-f464af5180fb1183.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/fault_budget_guest-f464af5180fb1183
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_race-f721fd3d341a70a0.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_race-f721fd3d341a70a0.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_race-f721fd3d341a70a0
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify-4ec7db388db7187c.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify-4ec7db388db7187c.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify-4ec7db388db7187c
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/two_process_parallelism-30aa67597d94d700.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/two_process_parallelism-30aa67597d94d700.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/two_process_parallelism-30aa67597d94d700
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_transparent-8a6b3008d94cf032.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_transparent-8a6b3008d94cf032.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_transparent-8a6b3008d94cf032
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_preemption-7a6bc774c3c232eb.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_preemption-7a6bc774c3c232eb.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/scheduler_preemption-7a6bc774c3c232eb
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-84e096fe2d3bc607.tmp.1734
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-84e096fe2d3bc607.tmp.1734: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-84e096fe2d3bc607
+test-signed: resolved exact filter el1_sched_mm_occupancy_two_processes -> el1_sched_mm_occupancy_two_processes
+test-signed: running /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-b08df73a8257f391 el1_sched_mm_occupancy_two_processes --exact --nocapture
+
+running 1 test
+test el1_sched_mm_occupancy_two_processes ... el1-sched mm-occupancy exits=131577 carrier_cpu_ns=2246249000 wall_ms=961 zone=ZoneCounts { el1_parks: 6351, el1_switches: 3470, host_parks: 1189, signal_claims: 0, control_claims: 0, cross_wakes: 11, sgis: 11, preemptions: 153, migrations: 0, timeouts: 0, idle_entries: 2481, wfi_entries: 312, idle_exits: 308, misplaced: 0, steals: 4739, service_exits: 4949, service_placements: 8081, ready_placements: 163, service_adoptions: 8081, exit_adoptions: 3467, host_handbacks: 595, host_queue_claims: 0, host_executor_parks: 0 } mm-occupancy parent writers=8 forks=150 edits=1064 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=941 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 1.03s
+
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-84e096fe2d3bc607.noent.1734: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-84e096fe2d3bc607.noent.1734
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+remaining carrick procs (run-id el1-live-occupancy-20260926-5c1116d55) = 0
+remaining carrick procs (run-id el1-live-occupancy-20260926-5c1116d55-cli) = 0
+test-signed: receipt target/test-results/carrick-embed-signed-artifacts.jsonl
+test-signed: OK (carrick-embed: 1 invoked signed executable(s) passed, 26 signed, negative control passed)
