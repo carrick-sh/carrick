@@ -684,9 +684,29 @@ pub struct TableArena {
     pub storage: TableArenaStorage,
     pub next_free: u64,
     pub capacity: usize,
+    // Empty allocation retained solely for a later owned snapshot. Live reads
+    // never consult it; its length is zero whenever storage is Live.
+    snapshot_scratch: Vec<u8>,
 }
 
 impl TableArena {
+    fn make_live_storage(&mut self) {
+        if let TableArenaStorage::Owned(mut bytes) =
+            core::mem::replace(&mut self.storage, TableArenaStorage::Live)
+        {
+            bytes.clear();
+            if bytes.capacity() >= self.snapshot_scratch.capacity() {
+                self.snapshot_scratch = bytes;
+            }
+        }
+    }
+
+    fn prepare_owned_storage(&mut self) {
+        if self.is_live() {
+            self.storage = TableArenaStorage::Owned(core::mem::take(&mut self.snapshot_scratch));
+        }
+    }
+
     #[inline]
     #[must_use]
     pub fn is_live(&self) -> bool {
@@ -724,6 +744,7 @@ impl Clone for TableArena {
             TableArenaStorage::Live => TableArenaStorage::Live,
         };
         Self {
+            snapshot_scratch: Vec::new(),
             base: self.base,
             storage,
             next_free: self.next_free,
@@ -735,6 +756,11 @@ impl Clone for TableArena {
         self.base = source.base;
         self.next_free = source.next_free;
         self.capacity = source.capacity;
+        if matches!(source.storage, TableArenaStorage::Live) {
+            self.make_live_storage();
+        } else {
+            self.prepare_owned_storage();
+        }
         match (&mut self.storage, &source.storage) {
             (TableArenaStorage::Owned(my_bytes), TableArenaStorage::Owned(src_bytes)) => {
                 my_bytes.clear();
@@ -874,6 +900,7 @@ impl PageTableManager {
         bytes.truncate(next_free as usize);
         Self {
             arenas: vec![TableArena {
+                snapshot_scratch: Vec::new(),
                 base,
                 storage: TableArenaStorage::Owned(bytes),
                 next_free,
@@ -912,6 +939,7 @@ impl PageTableManager {
         let asid_scoped_leaves = terminal_descriptor(walk) & NON_GLOBAL != 0;
         Ok(Self {
             arenas: vec![TableArena {
+                snapshot_scratch: Vec::new(),
                 base,
                 storage: TableArenaStorage::Live,
                 next_free: SPARE_START_OFFSET,
@@ -941,14 +969,15 @@ impl PageTableManager {
         self.resolver.as_ref()
     }
 
-    /// Convert this manager to live backing authority, discarding any software shadow buffers.
+    /// Convert this manager to live backing authority. Discard descriptor contents
+    /// while retaining empty allocation capacity for owned snapshot recycling.
     ///
     /// # Safety
     /// `resolver` must return valid, resident, 8-byte aligned host backing pointers.
     pub unsafe fn make_live(&mut self, resolver: Arc<dyn HostArenaResolver + Send + Sync>) {
         self.resolver = Some(resolver);
         for arena in &mut self.arenas {
-            arena.storage = TableArenaStorage::Live;
+            arena.make_live_storage();
         }
         self.staged.clear();
         self.dirty.clear();
@@ -992,6 +1021,7 @@ impl PageTableManager {
             let mut bytes = Vec::with_capacity(src.capacity);
             bytes.resize(src.next_free as usize, 0);
             target.arenas.push(TableArena {
+                snapshot_scratch: Vec::new(),
                 base: src.base,
                 storage: TableArenaStorage::Owned(bytes),
                 next_free: src.next_free,
@@ -1001,6 +1031,7 @@ impl PageTableManager {
 
         for (i, src_arena) in self.arenas.iter().enumerate() {
             let target_arena = &mut target.arenas[i];
+            target_arena.prepare_owned_storage();
             target_arena.base = src_arena.base;
             target_arena.next_free = src_arena.next_free;
             target_arena.capacity = src_arena.capacity;
@@ -1797,6 +1828,7 @@ impl PageTableManager {
                 TableArenaStorage::Live => TableArenaStorage::Live,
             };
             self.arenas.push(TableArena {
+                snapshot_scratch: Vec::new(),
                 base: arena.base,
                 storage,
                 next_free: PT_PAGE,
@@ -2044,6 +2076,7 @@ impl PageTableManager {
                 TableArenaStorage::Live => TableArenaStorage::Live,
             };
             let arena = TableArena {
+                snapshot_scratch: Vec::new(),
                 base,
                 storage,
                 next_free: PT_PAGE,
@@ -3237,6 +3270,79 @@ mod tests {
             assert!(!manager.undo_is_open());
             assert_eq!(backing.words[0].load(Ordering::SeqCst), 0);
             assert_eq!(backing.words[1].load(Ordering::SeqCst), 0);
+        }
+    }
+
+    mod snapshot_allocations {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+        std::thread_local! { pub(super) static LARGE: Cell<Option<u64>> = const { Cell::new(None) }; }
+        struct CountingAllocator;
+        #[global_allocator]
+        static ALLOCATOR: CountingAllocator = CountingAllocator;
+        fn allocated(size: usize) {
+            if size >= super::LINUX_PAGE_TABLES_SIZE as usize {
+                let _ = LARGE.try_with(|count| {
+                    if let Some(n) = count.get() {
+                        count.set(Some(n.checked_add(1).unwrap()));
+                    }
+                });
+            }
+        }
+        // SAFETY: forwards each allocation unchanged; const TLS does not allocate.
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                allocated(layout.size());
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                allocated(layout.size());
+                unsafe { System.alloc_zeroed(layout) }
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                allocated(size);
+                unsafe { System.realloc(ptr, layout, size) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+    }
+
+    #[test]
+    fn recycled_live_images_do_not_reallocate_snapshot_buffers() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+        let mut source = hvpatch_manager();
+        unsafe {
+            source
+                .restore_quiesced_snapshot_to_host(&*resolver)
+                .unwrap();
+            source.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        }
+        let mut recycled = source.snapshot_image().unwrap();
+        let mut results = Vec::new();
+        for scale in [1, 8, 32, 128] {
+            snapshot_allocations::LARGE.with(|n| n.set(Some(0)));
+            for _ in 0..scale {
+                unsafe {
+                    recycled.make_live(
+                        Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>
+                    );
+                }
+                source.snapshot_into(&mut recycled).unwrap();
+            }
+            let allocations = snapshot_allocations::LARGE
+                .with(|n| n.replace(None))
+                .unwrap();
+            std::eprintln!("scale={scale} large_snapshot_allocations={allocations}");
+            results.push((scale, allocations));
+        }
+        for (scale, allocations) in results {
+            assert_eq!(
+                allocations, 0,
+                "warmed live image reuse allocated arena buffers at scale {scale}"
+            );
         }
     }
 
@@ -5282,6 +5388,7 @@ mod tests {
         );
 
         parent.arenas.push(TableArena {
+            snapshot_scratch: Vec::new(),
             base: ext2_base.0,
             storage: TableArenaStorage::Owned(vec![0u8; SPARE_START_OFFSET as usize]),
             next_free: SPARE_START_OFFSET,

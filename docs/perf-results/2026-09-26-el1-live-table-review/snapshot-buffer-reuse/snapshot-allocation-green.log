@@ -1,0 +1,14 @@
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.33s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-1d1f88d6a1eb2090)
+
+running 1 test
+scale=1 large_snapshot_allocations=0
+scale=8 large_snapshot_allocations=0
+scale=32 large_snapshot_allocations=0
+scale=128 large_snapshot_allocations=0
+test aarch64::tests::recycled_live_images_do_not_reallocate_snapshot_buffers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 82 filtered out; finished in 0.05s
+
