@@ -365,6 +365,7 @@ fn begin_pt_pause(
     let election_deadline = election_start + budget.election;
     loop {
         if barrier.try_become_coordinator() {
+            barrier.await_parked_entrants();
             break;
         }
         // Give up only from the LOSER side, and only before taking anything:
