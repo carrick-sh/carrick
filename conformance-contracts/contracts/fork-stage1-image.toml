@@ -9,10 +9,10 @@ semantic_authority = [
 ]
 fixture = "probe:forkserial"
 scale_points = [1, 8, 32, 128]
-rationale = "Every forked child owns private stage-1 page-table state for its lifetime. Fork and rollback snapshots must reflect the live descriptors, including edits published independently of a host software image. A serial fork/exit/wait storm must recycle retired images through the process tree's bounded pool: fresh image allocations are bounded by the number of concurrently live child images, never by the fork count. The kernel-example VM-free lane proves semantics and one task admission per fork; the runtime live-backing control proves snapshot fidelity after leaf publication. The image budget is proven under signed execution."
+rationale = "Every forked child owns private stage-1 page-table state for its lifetime. Fork and rollback snapshots must reflect the live descriptors, including edits published independently of a host software image. A serial fork/exit/wait storm must recycle retired images through the process tree's bounded pool: fresh image allocations are bounded by the number of concurrently live child images, never by the fork count. The kernel-example VM-free lane proves semantics and one task admission per fork; the runtime live-backing control proves snapshot fidelity after leaf publication. Rollback resolution failure retains the complete undo journal, including after a partial restore, until all original descriptors can be restored. The image budget is proven under signed execution."
 
 [bindings]
-vm_free = "carrick-kernel-example::fork_stage1_image_contract; carrick-runtime::vcpu_loop::memory::tests::native_buffers::stage1_snapshot_observes_live_leaf_after_guest_publication"
+vm_free = "carrick-mmu-core::aarch64::tests::rollback_revocation; carrick-kernel-example::fork_stage1_image_contract; carrick-runtime::vcpu_loop::memory::tests::native_buffers::stage1_snapshot_observes_live_leaf_after_guest_publication"
 embed = "carrick-embed::fork_stage1_image_contract"
 docker = "probe:forkserial"
 ecosystem = ["ltp:fork14", "ltp:fork09"]
