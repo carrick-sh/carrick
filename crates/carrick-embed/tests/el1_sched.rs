@@ -842,21 +842,422 @@ fn el1_sched_mm_occupancy_two_processes() {
         stdout.trim()
     );
     assert!(measured.result.success(), "{}", describe(&measured));
-    for role in ["parent", "child"] {
-        let line = stdout
-            .lines()
-            .find(|line| line.starts_with(&format!("mm-occupancy {role} ")))
-            .unwrap_or_else(|| panic!("no {role} line: {stdout:?}"));
-        assert!(
-            line.contains(&format!("forks={FORKS} "))
-                && line.contains(" torn=0 ")
-                && line.contains(" snapshot_changes=0 ")
-                && line.contains(" child_failures=0 ")
-                && line.ends_with("ok=true"),
-            "{role}: {line}"
-        );
+    let report = validate_mm_occupancy_stdout(&stdout, FORKS).expect("valid mm-occupancy report");
+    assert!(report.child_ok, "child process failed: {report:?}");
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmOccupancyRoleReport {
+    pub role: String,
+    pub writers: usize,
+    pub forks: u64,
+    pub edits: u64,
+    pub edit_failures: u64,
+    pub torn: u64,
+    pub snapshot_changes: u64,
+    pub child_failures: u64,
+    pub join_failures: u64,
+    pub ok: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmOccupancyReport {
+    pub parent: MmOccupancyRoleReport,
+    pub child: MmOccupancyRoleReport,
+    pub child_ok: bool,
+}
+
+fn parse_role_line(
+    line: &str,
+    expected_role: &str,
+    expected_forks: u64,
+) -> Result<MmOccupancyRoleReport, String> {
+    let mut tokens = line.split_whitespace();
+    let prefix = tokens.next().ok_or_else(|| "empty line".to_string())?;
+    if prefix != "mm-occupancy" {
+        return Err(format!("expected 'mm-occupancy' prefix, got '{prefix}'"));
     }
-    assert!(stdout.contains("mm-occupancy child_ok=true"), "{stdout:?}");
+    let role = tokens
+        .next()
+        .ok_or_else(|| "missing role token".to_string())?;
+    if role != expected_role {
+        return Err(format!("expected role '{expected_role}', got '{role}'"));
+    }
+
+    let mut writers = None;
+    let mut forks = None;
+    let mut edits = None;
+    let mut edit_failures = None;
+    let mut torn = None;
+    let mut snapshot_changes = None;
+    let mut child_failures = None;
+    let mut join_failures = None;
+    let mut ok = None;
+
+    for token in tokens {
+        let (key, value) = token
+            .split_once('=')
+            .ok_or_else(|| format!("invalid key-value token: '{token}'"))?;
+        match key {
+            "writers" => {
+                let v = value
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid writers '{value}': {e}"))?;
+                if writers.is_some() {
+                    return Err("duplicate writers key".to_string());
+                }
+                writers = Some(v);
+            }
+            "forks" => {
+                let v = value
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid forks '{value}': {e}"))?;
+                if forks.is_some() {
+                    return Err("duplicate forks key".to_string());
+                }
+                forks = Some(v);
+            }
+            "edits" => {
+                let v = value
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid edits '{value}': {e}"))?;
+                if edits.is_some() {
+                    return Err("duplicate edits key".to_string());
+                }
+                edits = Some(v);
+            }
+            "edit_failures" => {
+                let v = value
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid edit_failures '{value}': {e}"))?;
+                if edit_failures.is_some() {
+                    return Err("duplicate edit_failures key".to_string());
+                }
+                edit_failures = Some(v);
+            }
+            "torn" => {
+                let v = value
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid torn '{value}': {e}"))?;
+                if torn.is_some() {
+                    return Err("duplicate torn key".to_string());
+                }
+                torn = Some(v);
+            }
+            "snapshot_changes" => {
+                let v = value
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid snapshot_changes '{value}': {e}"))?;
+                if snapshot_changes.is_some() {
+                    return Err("duplicate snapshot_changes key".to_string());
+                }
+                snapshot_changes = Some(v);
+            }
+            "child_failures" => {
+                let v = value
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid child_failures '{value}': {e}"))?;
+                if child_failures.is_some() {
+                    return Err("duplicate child_failures key".to_string());
+                }
+                child_failures = Some(v);
+            }
+            "join_failures" => {
+                let v = value
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid join_failures '{value}': {e}"))?;
+                if join_failures.is_some() {
+                    return Err("duplicate join_failures key".to_string());
+                }
+                join_failures = Some(v);
+            }
+            "ok" => {
+                let v = value
+                    .parse::<bool>()
+                    .map_err(|e| format!("invalid ok '{value}': {e}"))?;
+                if ok.is_some() {
+                    return Err("duplicate ok key".to_string());
+                }
+                ok = Some(v);
+            }
+            other => {
+                return Err(format!("unexpected key '{other}' in line: '{line}'"));
+            }
+        }
+    }
+
+    let writers = writers.ok_or_else(|| "missing writers counter".to_string())?;
+    let forks = forks.ok_or_else(|| "missing forks counter".to_string())?;
+    let edits = edits.ok_or_else(|| "missing edits counter".to_string())?;
+    let edit_failures = edit_failures.ok_or_else(|| "missing edit_failures counter".to_string())?;
+    let torn = torn.ok_or_else(|| "missing torn counter".to_string())?;
+    let snapshot_changes =
+        snapshot_changes.ok_or_else(|| "missing snapshot_changes counter".to_string())?;
+    let child_failures =
+        child_failures.ok_or_else(|| "missing child_failures counter".to_string())?;
+    let join_failures = join_failures.ok_or_else(|| "missing join_failures counter".to_string())?;
+    let ok = ok.ok_or_else(|| "missing ok flag".to_string())?;
+
+    if writers == 0 {
+        return Err("writers must be non-zero".to_string());
+    }
+    if forks != expected_forks {
+        return Err(format!(
+            "expected forks={expected_forks}, saw forks={forks}"
+        ));
+    }
+    if edits == 0 {
+        return Err("edits must be non-zero".to_string());
+    }
+    if edit_failures != 0 {
+        return Err(format!("edit_failures must be 0, saw {edit_failures}"));
+    }
+    if torn != 0 {
+        return Err(format!("torn must be 0, saw {torn}"));
+    }
+    if snapshot_changes != 0 {
+        return Err(format!(
+            "snapshot_changes must be 0, saw {snapshot_changes}"
+        ));
+    }
+    if child_failures != 0 {
+        return Err(format!("child_failures must be 0, saw {child_failures}"));
+    }
+    if join_failures != 0 {
+        return Err(format!("join_failures must be 0, saw {join_failures}"));
+    }
+    if !ok {
+        return Err("role report ok must be true".to_string());
+    }
+
+    Ok(MmOccupancyRoleReport {
+        role: expected_role.to_string(),
+        writers,
+        forks,
+        edits,
+        edit_failures,
+        torn,
+        snapshot_changes,
+        child_failures,
+        join_failures,
+        ok,
+    })
+}
+
+pub fn validate_mm_occupancy_stdout(
+    stdout: &str,
+    expected_forks: u64,
+) -> Result<MmOccupancyReport, String> {
+    let parent_line = stdout
+        .lines()
+        .find(|line| line.starts_with("mm-occupancy parent "))
+        .ok_or_else(|| "missing parent report line".to_string())?;
+    let parent = parse_role_line(parent_line, "parent", expected_forks)?;
+
+    let child_line = stdout
+        .lines()
+        .find(|line| line.starts_with("mm-occupancy child "))
+        .ok_or_else(|| "missing child report line".to_string())?;
+    let child = parse_role_line(child_line, "child", expected_forks)?;
+
+    let child_ok_line = stdout
+        .lines()
+        .find(|line| line.starts_with("mm-occupancy child_ok="))
+        .ok_or_else(|| "missing child_ok line".to_string())?;
+    let child_ok = match child_ok_line.strip_prefix("mm-occupancy child_ok=") {
+        Some("true") => true,
+        Some("false") => false,
+        _ => return Err(format!("invalid child_ok line: '{child_ok_line}'")),
+    };
+    if !child_ok {
+        return Err("child_ok must be true".to_string());
+    }
+
+    Ok(MmOccupancyReport {
+        parent,
+        child,
+        child_ok,
+    })
+}
+
+#[test]
+fn occupancy_report_accepts_valid_tight_report() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=42 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    let report = validate_mm_occupancy_stdout(stdout, 150).expect("valid report must parse");
+    assert_eq!(report.parent.edits, 42);
+    assert_eq!(report.child.edits, 45);
+    assert!(report.child_ok);
+}
+
+#[test]
+fn occupancy_report_rejects_zero_edits() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=0 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "zero parent edits must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_legacy_missing_counters_transcript() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=0 torn=0 snapshot_changes=0 child_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=0 torn=0 snapshot_changes=0 child_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "legacy unmetered transcript with missing counters must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_edit_failures() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=42 edit_failures=2 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "edit failures must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_join_failures() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=42 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=1 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "worker join failures must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_torn_writes() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=42 edit_failures=0 torn=1 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "torn writes must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_snapshot_changes() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=42 edit_failures=0 torn=0 snapshot_changes=1 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "snapshot changes must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_child_failures() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=42 edit_failures=0 torn=0 snapshot_changes=0 child_failures=1 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "child failures must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_fork_count_mismatch() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=100 edits=42 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "fork count mismatch must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_failed_child_ok() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=42 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=false
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "child_ok=false must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_missing_child_ok() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=42 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "missing child_ok line must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_missing_role_line() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=42 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "missing child role line must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_malformed_counter_values() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=invalid edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "malformed counter values must be rejected"
+    );
+}
+
+#[test]
+fn occupancy_report_rejects_spurious_ok_substring() {
+    let stdout = "\
+mm-occupancy parent writers=8 forks=150 edits=42 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=false fake=ok=true
+mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy child_ok=true
+";
+    assert!(
+        validate_mm_occupancy_stdout(stdout, 150).is_err(),
+        "spurious ok substring with ok=false must be rejected"
+    );
 }
 
 /// Contract `kernel.el1.anonymous-first-touch` (EL1 increment 2, first-touch checkpoint):

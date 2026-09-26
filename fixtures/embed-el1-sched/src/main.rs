@@ -43,11 +43,13 @@
 //!   processes runs twice as many writer threads as guest CPUs (pairs handing
 //!   a turn off through private futexes, each writing and reading back its own
 //!   page), an editor thread churning `mmap`/`mprotect`/`munmap`/`madvise` on
-//!   a scratch region (stage-1 pauses of the MM), and a forker thread that
-//!   forks `<forks>` times while the writers run (each child checks that the
-//!   writer pages it inherited do not change after the fork) and `vfork`s as
-//!   often (each child `_exit`s at once). Prints each process's forks and
-//!   mismatches; any torn page or changed snapshot is a failure.
+//!   a scratch region (stage-1 pauses of the MM; verified non-zero completed
+//!   edits and zero edit failures), and a forker thread that forks `<forks>`
+//!   times while the writers run (each allocation-free child checks that all
+//!   allocated writer pages stay stable after fork) and `vfork`s as often
+//!   (each child `_exit`s at once, with waitpid status and reap verification).
+//!   Prints each process's counters; any torn page, changed snapshot, edit
+//!   failure, unmap failure, worker join panic, or child failure is a failure.
 //!
 //! - `first-touch <pages>` (EL1 increment 2): `mmap`s `<pages>` private anonymous
 //!   pages before `fork`, then parent and child concurrently touch all pages at the
@@ -1012,11 +1014,13 @@ fn mm_occupancy(forks: usize) -> i32 {
 
 fn mm_occupancy_process(role: &str, forks: usize) -> bool {
     let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as usize;
-    let writers = (2 * cpus).max(4) & !1;
+    const MAX_WRITERS: usize = 128;
+    let writers = ((2 * cpus).max(4) & !1).min(MAX_WRITERS);
+    let region_len = writers * PAGE;
     let region = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            writers * PAGE,
+            region_len,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
@@ -1070,6 +1074,7 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
     let editor_stop = stop.clone();
     let editor = std::thread::spawn(move || {
         let mut edits = 0u64;
+        let mut edit_failures = 0u64;
         while editor_stop.load(Ordering::Acquire) == 0 {
             let len = 8 * PAGE;
             let scratch = unsafe {
@@ -1083,6 +1088,7 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
                 )
             };
             if scratch == libc::MAP_FAILED {
+                edit_failures += 1;
                 continue;
             }
             for page in 0..8 {
@@ -1092,15 +1098,17 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
                         .write_volatile(page as u8)
                 };
             }
-            unsafe {
-                libc::mprotect(scratch, len, libc::PROT_READ);
-                libc::mprotect(scratch, len, libc::PROT_READ | libc::PROT_WRITE);
-                libc::madvise(scratch, len, libc::MADV_DONTNEED);
-                libc::munmap(scratch, len);
+            let rc_ro = unsafe { libc::mprotect(scratch, len, libc::PROT_READ) };
+            let rc_rw = unsafe { libc::mprotect(scratch, len, libc::PROT_READ | libc::PROT_WRITE) };
+            let rc_madv = unsafe { libc::madvise(scratch, len, libc::MADV_DONTNEED) };
+            let rc_unmap = unsafe { libc::munmap(scratch, len) };
+            if rc_ro != 0 || rc_rw != 0 || rc_madv != 0 || rc_unmap != 0 {
+                edit_failures += 1;
+            } else {
+                edits += 1;
             }
-            edits += 1;
         }
-        edits
+        (edits, edit_failures)
     });
     let mut forked = 0;
     let mut snapshot_changes = 0;
@@ -1110,17 +1118,22 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
         if child == 0 {
             // A fork child's memory is a copy as of the fork: the parent's
             // writers keep writing, and none of it may show up here.
-            let mut before = [0u64; 8];
-            for (index, slot) in before.iter_mut().enumerate() {
-                *slot = unsafe { ((base + index * PAGE) as *const u64).read_volatile() };
+            let mut before = [0u64; MAX_WRITERS];
+            for id in 0..writers {
+                before[id] = unsafe { ((base + id * PAGE) as *const u64).read_volatile() };
             }
             let spin = Instant::now();
             while spin.elapsed() < Duration::from_micros(500) {
                 std::hint::spin_loop();
             }
-            let changed = before.iter().enumerate().any(|(index, value)| {
-                (unsafe { ((base + index * PAGE) as *const u64).read_volatile() }) != *value
-            });
+            let mut changed = false;
+            for id in 0..writers {
+                let after = unsafe { ((base + id * PAGE) as *const u64).read_volatile() };
+                if after != before[id] {
+                    changed = true;
+                    break;
+                }
+            }
             unsafe { libc::_exit(if changed { 3 } else { 0 }) };
         }
         if child < 0 {
@@ -1128,8 +1141,10 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
             continue;
         }
         let mut status = 0;
-        unsafe { libc::waitpid(child, &mut status, 0) };
-        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 3 {
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        if waited != child {
+            child_failures += 1;
+        } else if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 3 {
             snapshot_changes += 1;
         } else if !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0) {
             child_failures += 1;
@@ -1143,8 +1158,8 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
         }
         if vchild > 0 {
             let mut status = 0;
-            unsafe { libc::waitpid(vchild, &mut status, 0) };
-            if !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0) {
+            let waited = unsafe { libc::waitpid(vchild, &mut status, 0) };
+            if waited != vchild || !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0) {
                 child_failures += 1;
             }
         } else {
@@ -1153,15 +1168,36 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
         forked += 1;
     }
     stop.store(1, Ordering::Release);
+    let mut join_failures = 0usize;
     for thread in threads {
-        let _ = thread.join();
+        if thread.join().is_err() {
+            join_failures += 1;
+        }
     }
-    let edits = editor.join().unwrap_or(0);
+    let (edits, edit_failures) = match editor.join() {
+        Ok((e, ef)) => (e, ef),
+        Err(_) => {
+            join_failures += 1;
+            (0, 1)
+        }
+    };
     let torn = mismatches.load(Ordering::Relaxed);
-    let ok = forked == forks && torn == 0 && snapshot_changes == 0 && child_failures == 0;
+    let unmap_rc = unsafe { libc::munmap(region, region_len) };
+    let unmap_ok = unmap_rc == 0;
+    if !unmap_ok {
+        println!("mm-occupancy {role} munmap failed rc={unmap_rc}");
+    }
+    let ok = forked == forks
+        && edits > 0
+        && edit_failures == 0
+        && torn == 0
+        && snapshot_changes == 0
+        && child_failures == 0
+        && join_failures == 0
+        && unmap_ok;
     println!(
-        "mm-occupancy {role} writers={writers} forks={forked} edits={edits} torn={torn} \
-         snapshot_changes={snapshot_changes} child_failures={child_failures} ok={ok}"
+        "mm-occupancy {role} writers={writers} forks={forked} edits={edits} edit_failures={edit_failures} torn={torn} \
+         snapshot_changes={snapshot_changes} child_failures={child_failures} join_failures={join_failures} ok={ok}"
     );
     ok
 }
