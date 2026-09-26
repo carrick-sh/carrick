@@ -55,7 +55,7 @@ ALLOWED_NUMERIC_METHOD_SUFFIX = "_for_probe"
 
 CRASH_MUTATION_OWNERS = frozenset(
     {
-        "crates/carrick-kernel/src/kernel/guest_execution.rs",
+        "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
         "crates/carrick-kernel/src/kernel/objects.rs",
     }
 )

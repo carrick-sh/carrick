@@ -922,7 +922,7 @@ fn host_wait_control_pokes_and_residency_flush_requests() {
     scheduler.unregister_executor(&m1_reg).expect("unreg m1");
 }
 
-/// Compose the public dispatcher, actual host-operation injection, MM census,
+/// Compose the public dispatcher, actual host-operation injection, MM admission,
 /// and scheduler. The replacement needs a sole-MM mutation while sync waits.
 #[test]
 fn injected_host_sync_allows_replacement_mm_mutation() {

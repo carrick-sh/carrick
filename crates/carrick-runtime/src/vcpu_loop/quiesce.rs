@@ -744,9 +744,12 @@ where
         // membership, so a lease-less sibling woken mid-transaction parks at
         // the barrier instead of resuming into it.
         // Kernel thread membership is durable across block/preempt/queue
-        // boundaries. The executor census is deliberately transient and can be
-        // zero while a same-task sibling is wakeable, so it cannot authorize
-        // skipping the COW barrier.
+        // boundaries. Address-space occupancy is deliberately transient and
+        // can be empty while a same-task sibling is wakeable, so it cannot
+        // authorize skipping the COW barrier. (Which vCPUs run the parent MM
+        // right now is the COW pause's question below: it drains every vCPU
+        // running it, including one whose executor loaded another process's
+        // thread.)
         let fork_participants = match parent_context
             .task()
             .fork_barrier_participants(parent_context.thread().key())
@@ -1081,7 +1084,7 @@ where
         //
         // Sole exact-MM authority is the cheap arm, but it is only ever
         // instantaneous: the process fork barrier parks siblings by DURABLE
-        // task membership, while the executor census is transient, so a
+        // task membership, while slot occupancy is transient, so a
         // sibling that withdrew its vCPU lease into a lease-releasing host
         // wait, or is between wake and park, still counts. A multithreaded
         // parent (every Go program) therefore lost sole authority on a
@@ -1593,7 +1596,6 @@ where
             kernel: Arc::clone(child_context.kernel()),
             mm: child_mm_id,
             owner_inventory: ops.frame_cow_owner_inventory(&task_backend),
-            guest_executors: child_kernel.dispatcher.mm_executor_census(),
             tid: child_tid,
             identity: cow_identity,
             pt_quiesce: child_kernel.dispatcher.pt_quiesce(),
@@ -1965,15 +1967,57 @@ mod pt_pause_tests {
         ));
     }
 
+    /// A test MM: its id and fence. Occupants go on host-only slots.
+    struct TestMm {
+        mm: carrick_kernel::kernel::MmId,
+        barrier: Arc<crate::fork_quiesce::PtQuiesce>,
+    }
+
+    /// A test executor occupying a host-only slot with a [`TestMm`].
+    struct TestOccupant {
+        _occupancy: carrick_kernel::kernel::MmOccupancy,
+        _slot: carrick_kernel::kernel::HostExecutionSlot,
+    }
+
+    impl TestMm {
+        fn new(barrier: &Arc<crate::fork_quiesce::PtQuiesce>, raw: u64) -> Self {
+            Self {
+                mm: carrick_kernel::kernel::MmId::from_raw_u64(raw).expect("test MM"),
+                barrier: Arc::clone(barrier),
+            }
+        }
+
+        fn enter_with_pause_endpoint(
+            &self,
+            thread: Option<carrick_kernel::kernel::ThreadRef>,
+            registry: Arc<dyn VcpuRegistry>,
+            tid: ThreadId,
+        ) -> Result<TestOccupant, carrick_kernel::kernel::MmOccupancyError> {
+            let slot = carrick_kernel::kernel::HostExecutionSlot::allocate()?;
+            let occupancy = carrick_kernel::kernel::MmOccupancy::install_registered_for_test(
+                slot.slot(),
+                self.mm,
+                &self.barrier,
+                thread,
+                registry,
+                tid,
+            )?;
+            Ok(TestOccupant {
+                _occupancy: occupancy,
+                _slot: slot,
+            })
+        }
+    }
+
     fn enter_for_test(
-        census: &Arc<carrick_kernel::kernel::GuestExecutorCensus>,
+        census: &TestMm,
         registry: &Arc<GenericVcpuRegistry>,
         tid: ThreadId,
-    ) -> carrick_kernel::kernel::GuestExecutorParticipation {
+    ) -> TestOccupant {
         let endpoint: Arc<dyn VcpuRegistry> = registry.clone();
         census
             .enter_with_pause_endpoint(None, endpoint, tid)
-            .expect("test exact-MM participation")
+            .expect("test exact-MM occupancy")
     }
 
     #[test]
@@ -1982,7 +2026,7 @@ mod pt_pause_tests {
         let barrier = Arc::clone(pt_barrier());
         assert!(!barrier.is_quiescing());
         let registry = Arc::new(GenericVcpuRegistry::new());
-        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
+        let census = TestMm::new(&barrier, 1_703);
         let active_tid = tid(1_701);
         let caller_tid = tid(1_702);
         let active_flag = carrick_hal::InGuestFlag::for_guest_thread();
@@ -2011,7 +2055,6 @@ mod pt_pause_tests {
         let authority = carrick_kernel::dispatch::mm_mutation::ForeignMmMutationAuthority::new(
             mm,
             coordinator,
-            Arc::clone(&census),
             Arc::clone(&stage1) as Arc<dyn Stage1MmProjection>,
             Arc::clone(&barrier),
         );
@@ -2076,7 +2119,6 @@ mod pt_pause_tests {
         assert_eq!(scheduler.budget(), 1);
         assert!(!scheduler.has_spare_capacity(), "the only vCPU is occupied");
 
-        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
         let (_pool, stage1) = crate::hvpatch::Stage1MmPool::new_root_for_tests(0x8000, 1)
             .expect("one-slot target stage-1 pool");
         let caller_tid = tid(1_711);
@@ -2095,7 +2137,6 @@ mod pt_pause_tests {
         let authority = carrick_kernel::dispatch::mm_mutation::ForeignMmMutationAuthority::new(
             mm,
             coordinator,
-            census,
             Arc::clone(&stage1) as Arc<dyn Stage1MmProjection>,
             Arc::clone(pt_barrier()),
         );
@@ -2132,16 +2173,15 @@ mod pt_pause_tests {
     fn mm_mutation_alias_waiter_cannot_enter_inner_before_real_pt_pause() {
         let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let registry = Arc::new(GenericVcpuRegistry::new());
-        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
-        let mut first_executor = enter_for_test(&census, &registry, tid(1591));
-        let mut second_executor = enter_for_test(&census, &registry, tid(1592));
+        let census = TestMm::new(&barrier, 9003);
+        let _first_executor = enter_for_test(&census, &registry, tid(1591));
+        let _second_executor = enter_for_test(&census, &registry, tid(1592));
         let mm = carrick_kernel::kernel::MmId::from_raw_u64(91).expect("test MM");
         let coordinator =
             Arc::new(carrick_kernel::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
 
         let mut outer = acquire_mutation_pause_for_test(
             &barrier,
-            &mut first_executor,
             tid(1591),
             mm,
             Arc::clone(&coordinator),
@@ -2162,7 +2202,6 @@ mod pt_pause_tests {
             attempted_tx.send(()).expect("announce outer acquisition");
             let mut outer = acquire_mutation_pause_for_test(
                 &worker_barrier,
-                &mut second_executor,
                 tid(1592),
                 mm,
                 Arc::clone(&worker_coordinator),
@@ -2793,9 +2832,9 @@ mod pt_pause_tests {
         for siblings in [1_usize, 8, 32] {
             let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
             let registry = Arc::new(GenericVcpuRegistry::new());
-            let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
+            let census = TestMm::new(&barrier, 9004);
             let coordinator = tid(1601);
-            let mut coordinator_participation = enter_for_test(&census, &registry, coordinator);
+            let _coordinator_participation = enter_for_test(&census, &registry, coordinator);
             let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
             register_for_test(&registry, coordinator, &coordinator_in_guest);
             let mut participations = Vec::new();
@@ -2825,12 +2864,7 @@ mod pt_pause_tests {
 
             let wall = Instant::now();
             let cpu = thread_cpu_time();
-            let result = acquire_pt_pause(
-                &barrier,
-                &mut coordinator_participation,
-                coordinator,
-                PtPauseBudget::DEFAULT,
-            );
+            let result = acquire_pt_pause(&barrier, census.mm, coordinator, PtPauseBudget::DEFAULT);
             let waited_cpu = thread_cpu_time().saturating_sub(cpu);
             let waited_wall = wall.elapsed();
             let observed_left = left.load(Ordering::SeqCst);
@@ -2934,7 +2968,7 @@ mod pt_pause_tests {
     fn pt_pause_drain_wakes_for_a_sibling_registered_mid_drain() {
         let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let inner = Arc::new(GenericVcpuRegistry::new());
-        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
+        let census = TestMm::new(&barrier, 9005);
         let coordinator = tid(1651);
         let sibling = tid(1652);
         let flag = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
@@ -2944,7 +2978,7 @@ mod pt_pause_tests {
             flag: Arc::clone(&flag),
             armed: AtomicBool::new(true),
         });
-        let mut coordinator_participation = enter_for_test(&census, &inner, coordinator);
+        let coordinator_participation = enter_for_test(&census, &inner, coordinator);
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         register_for_test(&inner, coordinator, &coordinator_in_guest);
         // Admitted, but with no vCPU registration yet.
@@ -2957,7 +2991,7 @@ mod pt_pause_tests {
         let pause_worker = std::thread::spawn(move || {
             let guard = acquire_pt_pause(
                 &pause_barrier,
-                &mut coordinator_participation,
+                census.mm,
                 coordinator,
                 PtPauseBudget::DEFAULT,
             )
@@ -2973,9 +3007,8 @@ mod pt_pause_tests {
         );
         flag.leave_guest();
         if paused_rx.recv_timeout(Duration::from_secs(5)).is_err() {
-            // The stranded coordinator still holds the exact-MM census lock;
-            // dropping the sibling's participation would block this thread on
-            // it forever instead of failing.
+            // The stranded coordinator still holds the MM's fence; keep the
+            // sibling's occupancy rather than vacate it under a live drain.
             std::mem::forget(sibling_participation);
             panic!("the mid-drain sibling's leave did not wake the drain");
         }
@@ -2995,9 +3028,9 @@ mod pt_pause_tests {
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
-        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
+        let census = TestMm::new(&barrier, 9006);
         let waiter = tid(1521);
-        let mut waiter_participation = enter_for_test(&census, &registry, waiter);
+        let _waiter_participation = enter_for_test(&census, &registry, waiter);
         let waiter_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         register_for_test(&registry, waiter, &waiter_in_guest);
 
@@ -3007,7 +3040,7 @@ mod pt_pause_tests {
 
         let result = acquire_pt_pause(
             &barrier,
-            &mut waiter_participation,
+            census.mm,
             waiter,
             PtPauseBudget {
                 election: Duration::from_millis(50),
@@ -3039,10 +3072,10 @@ mod pt_pause_tests {
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
-        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
+        let census = TestMm::new(&barrier, 9007);
         let coordinator = tid(1511);
         let sibling = tid(1512);
-        let mut coordinator_participation = enter_for_test(&census, &registry, coordinator);
+        let _coordinator_participation = enter_for_test(&census, &registry, coordinator);
         let _sibling_participation = enter_for_test(&census, &registry, sibling);
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         let sibling_in_guest = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
@@ -3061,7 +3094,7 @@ mod pt_pause_tests {
         assert!(!current_thread_holds_pt_pause());
         let guard = acquire_pt_pause(
             &barrier,
-            &mut coordinator_participation,
+            census.mm,
             coordinator,
             PtPauseBudget {
                 election: Duration::from_secs(30),
@@ -3085,16 +3118,14 @@ mod pt_pause_tests {
     fn nested_frame_cow_borrows_exact_mm_lease_and_extends_real_pause() {
         let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let registry = Arc::new(GenericVcpuRegistry::new());
-        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
+        let census = TestMm::new(&barrier, 9008);
         let coordinator = tid(1513);
-        let mut participation = enter_for_test(&census, &registry, coordinator);
-        let mm = carrick_kernel::kernel::MmId::from_registry_allocation(
-            std::num::NonZeroU64::new(coordinator.raw() as u64).unwrap(),
-        );
+        let _participation = enter_for_test(&census, &registry, coordinator);
+        let mm = census.mm;
 
         let outer = acquire_pt_pause(
             &barrier,
-            &mut participation,
+            census.mm,
             coordinator,
             PtPauseBudget {
                 election: Duration::from_secs(1),
@@ -3104,7 +3135,6 @@ mod pt_pause_tests {
         let nested = acquire_frame_cow_quiesce(
             &barrier,
             mm,
-            &census,
             coordinator,
             PtPauseBudget {
                 election: Duration::from_millis(10),
@@ -3122,9 +3152,9 @@ mod pt_pause_tests {
     }
 
     #[test]
-    fn exact_mm_pause_drains_distinct_dispatcher_registries_and_blocks_admission() {
+    fn exact_mm_pause_drains_distinct_dispatcher_registries_and_fences_new_occupants() {
         let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
-        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
+        let census = TestMm::new(&barrier, 9009);
         let coordinator_registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
         let child_registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
         let coordinator_tid = tid(1521);
@@ -3133,7 +3163,7 @@ mod pt_pause_tests {
         let child_flag = carrick_hal::InGuestFlag::for_guest_thread();
         let kicks = Arc::new(AtomicUsize::new(0));
 
-        let mut coordinator = census
+        let coordinator = census
             .enter_with_pause_endpoint(None, Arc::clone(&coordinator_registry), coordinator_tid)
             .expect("coordinator participation");
         let child = census
@@ -3162,10 +3192,11 @@ mod pt_pause_tests {
         let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let pause_barrier = Arc::clone(&barrier);
+        let pause_mm = census.mm;
         let pause_worker = std::thread::spawn(move || {
             let guard = acquire_pt_pause(
                 &pause_barrier,
-                &mut coordinator,
+                pause_mm,
                 coordinator_tid,
                 PtPauseBudget {
                     election: Duration::from_secs(1),
@@ -3196,36 +3227,29 @@ mod pt_pause_tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("pause completes only after child leaves guest");
 
-        let admission_census = Arc::clone(&census);
+        // A vCPU may install the MM during the pause, but it reads the raised
+        // fence before it can enter the guest.
         let admission_registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
-        let (admitted_tx, admitted_rx) = std::sync::mpsc::sync_channel(1);
-        let admission = std::thread::spawn(move || {
-            let participant = admission_census
-                .enter_with_pause_endpoint(None, admission_registry, tid(1523))
-                .expect("post-pause participant");
-            admitted_tx.send(()).expect("announce admission");
-            participant
-        });
-        assert_eq!(
-            admitted_rx.recv_timeout(Duration::from_millis(25)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
-            "a new exact-MM executor entered during the pause"
+        let participant = census
+            .enter_with_pause_endpoint(None, admission_registry, tid(1523))
+            .expect("an executor may occupy its vCPU during the pause");
+        assert!(
+            barrier.is_quiescing(),
+            "a new exact-MM executor could enter the guest during the pause"
         );
 
         release_tx.send(()).expect("release pause worker");
         let coordinator = pause_worker.join().expect("pause worker");
-        admitted_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("admission resumes after pause");
-        drop(admission.join().expect("admission worker"));
+        assert!(!barrier.is_quiescing());
+        drop(participant);
         drop(coordinator);
         drop(child);
     }
 
     #[test]
-    fn standalone_frame_cow_sole_witness_blocks_exact_mm_admission() {
+    fn standalone_frame_cow_sole_witness_fences_exact_mm_entry() {
         let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
-        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
+        let census = TestMm::new(&barrier, 1531);
         let registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
         let _existing = census
             .enter_with_pause_endpoint(None, registry, tid(1531))
@@ -3233,37 +3257,32 @@ mod pt_pause_tests {
 
         let guard = acquire_frame_cow_quiesce(
             &barrier,
-            carrick_kernel::kernel::MmId::from_registry_allocation(
-                std::num::NonZeroU64::new(1531).unwrap(),
-            ),
-            &census,
+            census.mm,
             tid(1531),
             PtPauseBudget {
                 election: Duration::from_secs(1),
             },
         )
         .expect("standalone COW sole witness");
+        assert!(
+            matches!(
+                guard,
+                carrick_kernel::dispatch::mm_quiesce::FrameCowExactMmGuard::Sole { .. }
+            ),
+            "an occupant stopped at an exit needs no drain"
+        );
 
-        let admission_census = Arc::clone(&census);
         let admission_registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
-        let (admitted_tx, admitted_rx) = std::sync::mpsc::sync_channel(1);
-        let admission = std::thread::spawn(move || {
-            let participant = admission_census
-                .enter_with_pause_endpoint(None, admission_registry, tid(1532))
-                .expect("frame-COW peer admission");
-            admitted_tx.send(()).expect("announce frame-COW peer");
-            participant
-        });
-        assert_eq!(
-            admitted_rx.recv_timeout(Duration::from_millis(25)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
-            "frame-COW sole authority released exact-MM admission"
+        let peer = census
+            .enter_with_pause_endpoint(None, admission_registry, tid(1532))
+            .expect("frame-COW peer may occupy its vCPU");
+        assert!(
+            barrier.is_quiescing(),
+            "frame-COW sole authority let a peer enter the guest"
         );
         drop(guard);
-        admitted_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("frame-COW peer enters after sole witness releases");
-        drop(admission.join().expect("frame-COW admission worker"));
+        assert!(!barrier.is_quiescing());
+        drop(peer);
     }
 
     #[test]
@@ -3332,10 +3351,10 @@ mod pt_pause_tests {
     fn pt_pause_drain_sees_a_sibling_that_reregistered_after_a_block() {
         let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let registry = Arc::new(GenericVcpuRegistry::new());
-        let census = Arc::new(carrick_kernel::kernel::GuestExecutorCensus::default());
+        let census = TestMm::new(&barrier, 9011);
         let coordinator = tid(1531);
         let sibling = tid(1532);
-        let mut coordinator_participation = enter_for_test(&census, &registry, coordinator);
+        let coordinator_participation = enter_for_test(&census, &registry, coordinator);
         let _sibling_participation = enter_for_test(&census, &registry, sibling);
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         // The sibling's ONE lifetime flag, as `ThreadRuntimeState` holds it.
@@ -3356,7 +3375,7 @@ mod pt_pause_tests {
         let pause_worker = std::thread::spawn(move || {
             let guard = acquire_pt_pause(
                 &pause_barrier,
-                &mut coordinator_participation,
+                census.mm,
                 coordinator,
                 PtPauseBudget::DEFAULT,
             )

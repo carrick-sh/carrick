@@ -2291,10 +2291,7 @@ impl<'a> IpcView<'a> {
                 super::mm_quiesce::PtPauseBudget::DEFAULT,
             ) {
                 Ok(authority) => authority,
-                Err(
-                    super::mm_quiesce::PtPauseError::TimedOut
-                    | super::mm_quiesce::PtPauseError::UnkickableExecutor,
-                ) => return Ok(DispatchOutcome::errno(linux_errno::ENOMEM)),
+                Err(super::mm_quiesce::PtPauseError::TimedOut) => return Ok(DispatchOutcome::errno(linux_errno::ENOMEM)),
             };
             let mutation = match &mut authority {
                 super::mm_quiesce::MmStage1Authority::Sole(sole) => {

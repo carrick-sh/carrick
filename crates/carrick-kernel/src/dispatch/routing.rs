@@ -192,7 +192,7 @@ impl SyscallDispatcher {
     }
 
     /// Focused unit-test boundary for mutation handlers. Production callers
-    /// receive their guard from the exact-MM executor census; tests use the
+    /// receive their guard from an exact-MM stage-1 pause; tests use the
     /// real page-table-pause issuer rather than falling back to the ordinary
     /// route (which intentionally cannot resolve mutation syscalls).
     #[cfg(test)]

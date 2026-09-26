@@ -787,14 +787,6 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-kernel/src/kernel/guest_execution.rs",
-      "symbol": "tests::duplicate_admission_preserves_live_pause_endpoint::CARRICK_ADMISSION_RECEIPT_DIR",
-      "fingerprint": "aa41d8c77a73c3f559a81a08b4e432cc8472d02d1031d38d457e6af1f2a5d1e5",
-      "classification": "test_only",
-      "rationale": "Test-only output directory CARRICK_ADMISSION_RECEIPT_DIR: when set, the test writes its receipt there; it never influences guest or carrier behaviour."
-    },
-    {
-      "kind": "env_var_os",
       "file": "crates/carrick-kernel/src/kernel/operations/signal.rs",
       "symbol": "post_signal_to_authorized_target_inner::CARRICK_SIG_DEBUG",
       "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
@@ -3424,6 +3416,38 @@
       "fingerprint": "177e888108131b293f8547b9a19fd5342add7f305f239d3db5035946b7cf7726",
       "classification": "carrier_infra",
       "rationale": "Per-executor-thread record in crates/carrick-runtime/src/vcpu_loop/executor/backend.rs of the EL1 zone slot the executor drives now (EL1 plan 1d): a slot follows its vCPU's mailbox lease, which a task can carry, so an executor that moves to another slot leaves the one it drove; it names only this host thread's own vCPU and selects no container state."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "PORTS",
+      "fingerprint": "f55653b286f94e0f93d81d3b76eb4639336defd7c3fa4aaefaacca7936e0ad91",
+      "classification": "carrier_infra",
+      "rationale": "Per-vCPU-execution-slot port table of the address-space occupancy authority in crates/carrick-kernel/src/kernel/mm_occupancy.rs: the pause endpoint and fence of the MM each slot runs, written under its slot lock by the executor that occupies the slot; carrier VM scope like the mailbox slots it is indexed by, and scoped per kernel graph by the MM's fence object."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "TABLE",
+      "fingerprint": "4bd89dd6b51df01dd91a32225334bcb045c5792718a970d1a2af1b0d4bd95380",
+      "classification": "carrier_infra",
+      "rationale": "The address-space occupancy table (carrick_sched_core::Occupancy) in crates/carrick-kernel/src/kernel/mm_occupancy.rs: which address space each vCPU execution slot runs, the one authority every pause, sole check, crash snapshot and ASID retirement reads; carrier VM scope like the mailbox slots it is indexed by (one HVF VM per process)."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "THREAD_HOST_SLOT",
+      "fingerprint": "6ef2a8d6b2ee33d06a93c59140912d1194df7ef60869e145e644aa4bbdec5e53",
+      "classification": "carrier_infra",
+      "rationale": "The host-only execution slot of an executor thread whose vCPU has no mailbox lease, in crates/carrick-kernel/src/kernel/mm_occupancy.rs; a vCPU is bound to the thread that runs it, so the slot lives as long as the thread and is freed at its exit when vacant."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "test_execution_slot::SLOTS",
+      "fingerprint": "246b5ffc039f22f07d217116ff90095a959f7c55465974f6ec7017a3dead0b3f",
+      "classification": "test_only",
+      "rationale": "Test-only per-thread list of host-only execution slots handed to test admissions in crates/carrick-runtime/src/vcpu_loop/mod.rs, freed at the test thread's exit; never compiled outside cfg(test)."
     }
   ]
 }

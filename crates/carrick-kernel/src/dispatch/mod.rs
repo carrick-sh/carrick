@@ -1260,56 +1260,96 @@ impl SyscallDispatcher {
         mm_mutation::ForeignMmMutationAuthority::new(
             authority.mm_id,
             Arc::clone(&authority.mutation_coordinator),
-            Arc::clone(&authority.guest_executors),
             stage1,
             Arc::clone(&authority.pt_quiesce),
         )
     }
 
-    pub fn mm_executor_census(&self) -> Arc<crate::kernel::GuestExecutorCensus> {
-        Arc::clone(&self.mm_authority().guest_executors)
+    /// Occupied vCPU slots of the current dispatch MM.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mm_occupant_count_for_probe(&self) -> i32 {
+        self.mm_authority().occupant_count_for_probe()
     }
 
-    /// Enter the executor census owned by the exact current dispatch MM.
-    ///
-    /// A CLONE_VM dispatcher shares this census even though its dispatcher
-    /// binding object is distinct. If exec promotion changes the selected MM
-    /// during admission, the stale participation is dropped and selection is
-    /// retried.
+    /// The vCPUs running the current dispatch MM, as a pause would see them.
+    #[cfg(test)]
+    pub(crate) fn mm_residents_for_test(&self) -> crate::kernel::mm_occupancy::MmResidents {
+        let authority = self.mm_binding.current.load_full();
+        crate::kernel::mm_occupancy::residents(authority.mm_id, &authority.pt_quiesce, None)
+    }
+
+    /// A probe of how many vCPU slots the current dispatch MM occupies.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mm_occupancy_probe(&self) -> Arc<dyn Fn() -> i32 + Send + Sync> {
+        let authority = self.mm_binding.current.load_full();
+        Arc::new(move || authority.occupant_count_for_probe())
+    }
+
+    /// Pause every vCPU running the current dispatch MM except `own` (the
+    /// caller's occupied slot), for a host reader that needs the MM's memory
+    /// and registers to hold still: crash capture. No vCPU can start running
+    /// the MM until the guard drops.
+    pub fn pause_current_mm_for_capture(
+        &self,
+        own: Option<crate::kernel::ExecutionSlot>,
+        tid: carrick_hal::ThreadId,
+        budget: mm_quiesce::PtPauseBudget,
+    ) -> Result<mm_quiesce::PtPauseGuard<'static>, mm_quiesce::PtPauseError> {
+        let authority = self.mm_binding.current.load_full();
+        mm_quiesce::pause_exact_mm(&authority.pt_quiesce, authority.mm_id, own, tid, budget)
+    }
+
+    /// Admit an editor of the exact current dispatch MM: host-side work with
+    /// no guest execution of its own, so it occupies no vCPU slot.
     pub fn enter_mm_executor(
         &self,
-    ) -> Result<MmExecutorParticipation, crate::kernel::GuestExecutorCensusError> {
+    ) -> Result<MmExecutorParticipation, crate::kernel::MmOccupancyError> {
         self.enter_mm_executor_inner(None, None)
     }
 
+    /// Admit a thread executor of the exact current dispatch MM on the vCPU
+    /// execution slot `slot`, whose vCPU is registered in `registry` under
+    /// `tid`: the slot is occupied by the MM until the participation drops
+    /// or is released for a host wait.
+    ///
+    /// A CLONE_VM dispatcher shares the MM even though its dispatcher binding
+    /// object is distinct. If exec promotion changes the selected MM during
+    /// admission, the stale admission is dropped and selection is retried.
     pub fn enter_mm_executor_for_thread(
         &self,
         thread: Option<crate::kernel::ThreadRef>,
         registry: Arc<dyn carrick_hal::VcpuRegistry>,
         tid: carrick_hal::ThreadId,
-    ) -> Result<MmExecutorParticipation, crate::kernel::GuestExecutorCensusError> {
-        self.enter_mm_executor_inner(thread, Some((registry, tid)))
+        slot: crate::kernel::ExecutionSlot,
+    ) -> Result<MmExecutorParticipation, crate::kernel::MmOccupancyError> {
+        self.enter_mm_executor_inner(thread, Some((registry, tid, slot)))
     }
 
     fn enter_mm_executor_inner(
         &self,
         thread: Option<crate::kernel::ThreadRef>,
-        pause_endpoint: Option<(Arc<dyn carrick_hal::VcpuRegistry>, carrick_hal::ThreadId)>,
-    ) -> Result<MmExecutorParticipation, crate::kernel::GuestExecutorCensusError> {
+        pause_endpoint: Option<(
+            Arc<dyn carrick_hal::VcpuRegistry>,
+            carrick_hal::ThreadId,
+            crate::kernel::ExecutionSlot,
+        )>,
+    ) -> Result<MmExecutorParticipation, crate::kernel::MmOccupancyError> {
         loop {
             let authority = self.mm_binding.current.load_full();
             let admission = match (&thread, &pause_endpoint) {
                 (None, None) => MmExecutorAdmissionRecipe::Anonymous,
-                (None, Some((registry, tid))) => {
+                (None, Some((registry, tid, slot))) => {
                     MmExecutorAdmissionRecipe::AnonymousWithPauseEndpoint {
                         registry: Arc::clone(registry),
                         tid: *tid,
+                        slot: *slot,
                     }
                 }
-                (Some(thread), Some((registry, tid))) => MmExecutorAdmissionRecipe::Thread {
+                (Some(thread), Some((registry, tid, slot))) => MmExecutorAdmissionRecipe::Thread {
                     thread: thread.clone(),
                     registry: Arc::clone(registry),
                     tid: *tid,
+                    slot: *slot,
                 },
                 _ => {
                     tracing::error!(
@@ -1321,12 +1361,12 @@ impl SyscallDispatcher {
                     )
                 }
             };
-            let participation = admission.enter(&authority)?;
+            let occupancy = admission.enter(&authority)?;
             if Arc::ptr_eq(&self.mm_binding.current.load_full(), &authority) {
                 return Ok(MmExecutorParticipation {
                     authority,
                     admission,
-                    participation: Some(participation),
+                    occupancy,
                 });
             }
         }
@@ -1377,7 +1417,7 @@ impl SyscallDispatcher {
     /// the caller is synchronously performing that pause. The dispatcher/MM,
     /// exact thread identity, and running execution lease are authenticated on
     /// both sides. Re-entry failure is fatal because returning to guest code
-    /// without census membership would make a later page-table pause unsound.
+    /// without slot occupancy would make a later page-table pause unsound.
     pub(crate) fn with_current_mm_executor_released_parts<T>(
         &self,
         kernel: &crate::kernel::KernelContext,
@@ -1393,10 +1433,13 @@ impl SyscallDispatcher {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
         if let Err(error) = executor.reenter_exact() {
-            tracing::error!(?error, "failed to re-enter exact caller-MM executor census");
+            tracing::error!(
+                ?error,
+                "failed to re-occupy the exact caller-MM execution slot"
+            );
             carrick_fatal!(
                 "dispatch::mm_executor_reentry",
-                "failed to re-enter exact caller-MM executor census"
+                "failed to re-occupy the exact caller-MM execution slot"
             );
         }
 
@@ -1649,9 +1692,9 @@ impl SyscallDispatcher {
     }
 
     /// Publish the loaded boot image as one VMA generation before the first
-    /// guest executor starts. The non-threaded outer boundary admits the exact
-    /// MM into its executor census, mints real sole-stage-1 authority, and only
-    /// then permits the host-alias/VMA transaction.
+    /// guest executor starts. The non-threaded outer boundary admits an editor
+    /// of the exact MM, mints real sole-stage-1 authority, and only then
+    /// permits the host-alias/VMA transaction.
     pub fn publish_initial_image_state(
         &mut self,
         regions: Vec<ProcMapsEntry>,

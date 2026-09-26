@@ -6855,7 +6855,12 @@ fn run_production_exec_failure_pool_case(boundary: InjectedExecFailureBoundary, 
     state.guest_execution = Some(
         kernel
             .dispatcher
-            .enter_mm_executor_for_thread(Some(Arc::clone(context.thread())), kicker, this_tid)
+            .enter_mm_executor_for_thread(
+                Some(Arc::clone(context.thread())),
+                kicker,
+                this_tid,
+                crate::vcpu_loop::test_execution_slot(),
+            )
             .expect("context-boundary MM participation"),
     );
 

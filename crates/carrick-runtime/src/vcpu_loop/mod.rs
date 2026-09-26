@@ -1646,14 +1646,13 @@ where
         // `current_thread_holds_pt_pause()` — so the only new cost is a pause
         // on a `MADV_DONTNEED` whose backing needed no COW. The advice check
         // keeps it off every other advice, which never reaches `zero_backing`.
-        // The population this decision needs is active or admitted guest
-        // execution, NOT current vCPU lease publication — see
-        // `KernelState::has_peer_guest_executor`. Registration can be
-        // transiently absent while an admitted loop acquires or rebinds its
-        // lease, so census participation is published first. A sibling
-        // suspended in `epoll_wait` has dropped participation and is absent
-        // from this page-table RAISE population; fork/crash use durable task
-        // membership for their distinct barriers.
+        // The population this decision needs is the vCPUs running the MM
+        // (address-space occupancy), NOT current vCPU lease publication.
+        // Registration can be transiently absent while an admitted loop
+        // acquires or rebinds its lease, so slot occupancy is published
+        // first. A sibling suspended in `epoll_wait` has vacated its slot and
+        // is absent from this page-table RAISE population; fork/crash use
+        // durable task membership for their distinct barriers.
         // Claim stage-1 exclusivity for the whole dispatch of any syscall that
         // edits stage-1 descriptors. Both arms below are exclusive, for
         // different reasons, and the backend page-table manager needs to know
@@ -1673,10 +1672,7 @@ where
                 mm_quiesce::PtPauseBudget::DEFAULT,
             ) {
                 Ok(authority) => SyscallMmPhase::Mutation(authority),
-                Err(
-                    mm_quiesce::PtPauseError::TimedOut
-                    | mm_quiesce::PtPauseError::UnkickableExecutor,
-                ) => {
+                Err(mm_quiesce::PtPauseError::TimedOut) => {
                     // No dispatcher/backend mapping call has started yet. Return
                     // a clean Linux allocation failure after pt_pause rolled the
                     // request back and resumed already-parked siblings. This is
@@ -3454,4 +3450,30 @@ thread_local! {
     /// Set while the host syscall service runs, so the EL1 census counts the
     /// first dispatch as part of the service rather than as a resumption.
     static CENSUS_IN_SERVICE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A fresh host-only execution slot for a test admission, freed when the
+/// test's thread ends if nothing still occupies it (a test may hold several
+/// admissions at once, and the production poll path uses the thread's own
+/// host slot). One still occupied then is leaked, not freed.
+#[cfg(test)]
+pub(crate) fn test_execution_slot() -> carrick_kernel::kernel::ExecutionSlot {
+    struct Slots(Vec<carrick_kernel::kernel::HostExecutionSlot>);
+    impl Drop for Slots {
+        fn drop(&mut self) {
+            for slot in self.0.drain(..) {
+                if let Err(occupied) = slot.try_release() {
+                    std::mem::forget(occupied);
+                }
+            }
+        }
+    }
+    thread_local! {
+        static SLOTS: std::cell::RefCell<Slots> = const { std::cell::RefCell::new(Slots(Vec::new())) };
+    }
+    let slot = carrick_kernel::kernel::HostExecutionSlot::allocate()
+        .unwrap_or_else(|error| panic!("test execution slot: {error}"));
+    let id = slot.slot();
+    SLOTS.with(|slots| slots.borrow_mut().0.push(slot));
+    id
 }

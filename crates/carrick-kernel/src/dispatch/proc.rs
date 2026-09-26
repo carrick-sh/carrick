@@ -5503,7 +5503,7 @@ mod kernel_process_dispatch_tests {
         let mut initial = vec![b'_'; 0x4000];
         initial[..4].copy_from_slice(b"same");
         let target = crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_097, initial);
-        target.observe_caller_executor_census(dispatcher.mm_executor_census());
+        target.observe_caller_occupancy(dispatcher.mm_occupancy_probe());
         let root = refreshed(&root);
         let target_pid = target.target().task().key().id.raw();
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
@@ -6182,7 +6182,7 @@ mod kernel_process_dispatch_tests {
         let mut initial = vec![b'_'; 0x4000];
         initial[..8].copy_from_slice(b"sameword");
         let target = crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_123, initial);
-        target.observe_caller_executor_census(dispatcher.mm_executor_census());
+        target.observe_caller_occupancy(dispatcher.mm_occupancy_probe());
         arm_ptrace_memory_access(&root, target.target());
         let root = refreshed(&root);
         let target_pid = target.target().task().key().id.raw();
@@ -6231,7 +6231,7 @@ mod kernel_process_dispatch_tests {
             executable: true,
             kernel_visible: true,
         });
-        target.observe_caller_executor_census(dispatcher.mm_executor_census());
+        target.observe_caller_occupancy(dispatcher.mm_occupancy_probe());
         arm_ptrace_memory_access(&root, target.target());
         let root = refreshed(&root);
         let target_pid = target.target().task().key().id.raw();
@@ -6325,7 +6325,7 @@ mod kernel_process_dispatch_tests {
                 vec![0; 0x4000],
             );
             target.set_vma_access_for_test(access);
-            target.observe_caller_executor_census(dispatcher.mm_executor_census());
+            target.observe_caller_occupancy(dispatcher.mm_occupancy_probe());
             arm_ptrace_memory_access(&root, target.target());
             let refreshed_root = refreshed(&root);
             assert_eq!(
@@ -6453,7 +6453,7 @@ mod kernel_process_dispatch_tests {
         let mut initial = vec![b'_'; 0x4000];
         initial[..8].copy_from_slice(b"initword");
         let target = crate::kernel::consumer_cow_fixture(root.kernel(), &root, 61_129, initial);
-        target.observe_caller_executor_census(dispatcher.mm_executor_census());
+        target.observe_caller_occupancy(dispatcher.mm_occupancy_probe());
         arm_ptrace_memory_access(&root, target.target());
         let root = refreshed(&root);
         let target_pid = target.target().task().key().id.raw();

@@ -1,0 +1,21 @@
+base 3c52608b8, test appended to crates/carrick-kernel/src/kernel/guest_execution.rs
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-519a4989768d60d2)
+
+running 1 test
+test kernel::guest_execution::occupancy_red::a_pause_of_z_drains_a_vcpu_switched_from_y_to_z ... FAILED
+
+failures:
+
+---- kernel::guest_execution::occupancy_red::a_pause_of_z_drains_a_vcpu_switched_from_y_to_z stdout ----
+
+thread 'kernel::guest_execution::occupancy_red::a_pause_of_z_drains_a_vcpu_switched_from_y_to_z' (8410244) panicked at crates/carrick-kernel/src/kernel/guest_execution.rs:825:9:
+a pause of Z was granted while a vCPU running Z was in guest: the exact-MM census counts the thread its executor loaded (Y), not the address space the vCPU runs
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    kernel::guest_execution::occupancy_red::a_pause_of_z_drains_a_vcpu_switched_from_y_to_z
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2235 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-kernel --lib`

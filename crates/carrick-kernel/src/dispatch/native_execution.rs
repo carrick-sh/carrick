@@ -22,8 +22,9 @@ use std::{
 const EXTERNAL_STOP: u8 = 1;
 const MEMORY_PAUSE: u8 = 2;
 
-/// The census owns this exact state directly. Registry replacement/removal can
-/// neither conceal its running flag nor redirect a page-table drain's request.
+/// The occupancy port owns this exact state directly. Registry
+/// replacement/removal can neither conceal its running flag nor redirect a
+/// page-table drain's request.
 pub(crate) struct NativeExecutorState {
     tid: ThreadId,
     running: InGuestFlag,
@@ -89,14 +90,17 @@ impl LeaseIdentity {
 }
 
 /// One exact task/executor quantum, reusable across synchronous native entries.
-/// Setup allocates its census endpoint once. Entry/exit takes no census lock and
+/// Setup occupies a host-only execution slot once (native execution has no
+/// vCPU). Entry/exit takes no occupancy lock and
 /// holds no MM mutation authority. Drop this admission before scheduler handoff;
 /// a successor lease must receive a fresh admission and control endpoint.
 ///
 /// This is only the execution facet. It neither registers an HVF vCPU nor
 /// services carrier COW invalidation tickets or delivers Linux signal handlers.
 pub struct NativeExecutor {
+    // Vacates the slot before `_slot` frees it.
     participant: MmExecutorParticipation,
+    _slot: crate::kernel::HostExecutionSlot,
     state: Arc<NativeExecutorState>,
     lease: LeaseIdentity,
     _thread: PhantomData<Rc<()>>,
@@ -163,7 +167,7 @@ impl NativeExecution<'_> {
     }
 
     /// Authenticate the mutation authority that originally prepared a data pin
-    /// against this scope's actual pause/census/coordinator objects, not MM IDs.
+    /// against this scope's actual pause/coordinator objects, not MM IDs.
     pub(crate) fn data_context(
         &self,
         mutation: &super::mm_mutation::ForeignMmMutationAuthority,
@@ -210,7 +214,7 @@ pub enum NativeExecutionError {
     #[error(transparent)]
     Dispatch(#[from] DispatchError),
     #[error(transparent)]
-    Admission(#[from] crate::kernel::GuestExecutorCensusError),
+    Admission(#[from] crate::kernel::MmOccupancyError),
     #[error("native admission belongs to another execution lease")]
     ChangedExecutionLease,
     #[error("native admission lost its exact running endpoint")]
@@ -223,7 +227,7 @@ pub enum NativeExecutionError {
 
 impl SyscallDispatcher {
     /// Test-only adapter to the production carrier fixture's exact authority.
-    /// The normal authentication and census admission path remains unchanged.
+    /// The normal authentication and occupancy admission path remains unchanged.
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_native_mm_for_test(authority: Arc<super::DispatchMmAuthority>) -> Self {
         let dispatcher = Self::new();
@@ -239,15 +243,17 @@ impl SyscallDispatcher {
         context.validate_current_execution_mm(execution)?;
         let authority = self.mm_binding.current.load_full();
         let state = Arc::new(NativeExecutorState::new(context.thread().registry_id()));
+        let slot = crate::kernel::HostExecutionSlot::allocate()?;
         let admission = MmExecutorAdmissionRecipe::NativeThread {
             thread: context.thread().clone(),
             state: Arc::clone(&state),
+            slot: slot.slot(),
         };
-        let participation = admission.enter(&authority)?;
+        let occupancy = admission.enter(&authority)?;
         let participant = MmExecutorParticipation {
             authority,
             admission,
-            participation: Some(participation),
+            occupancy,
         };
         // Admission can wait behind a mutator. Re-authenticate after joining,
         // then fail closed on exec/MM drift; never carry a stale owner forward.
@@ -255,6 +261,7 @@ impl SyscallDispatcher {
         context.validate_current_execution_mm(execution)?;
         Ok(NativeExecutor {
             participant,
+            _slot: slot,
             state,
             lease: LeaseIdentity::of(execution),
             _thread: PhantomData,
@@ -280,7 +287,7 @@ impl SyscallDispatcher {
         }
         self.validate_current_mm_executor(&executor.participant, context, execution)?;
         context.validate_current_execution_mm(execution)?;
-        if executor.participant.participation.is_none() {
+        if executor.participant.is_released() {
             return Err(DispatchError::MmExecutorParticipationUnavailable.into());
         }
         Ok(())
@@ -328,7 +335,7 @@ impl SyscallDispatcher {
         self.validate_native_executor(executor, context, execution)?;
         // SeqCst publish-before-check is the existing page-table entry
         // handshake: either we see the barrier or the drain sees us. Nothing
-        // here holds the census lock, so simultaneous readers remain possible.
+        // here holds an occupancy lock, so simultaneous readers remain possible.
         executor.state.running.enter_guest();
         let scope = NativeExecution {
             executor,

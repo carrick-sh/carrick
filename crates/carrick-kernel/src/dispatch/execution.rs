@@ -32,7 +32,7 @@ use super::watch_addr;
 impl SyscallDispatcher {
     /// Single-threaded dispatch (legacy + unit tests + the fork-based runtime
     /// path). Tid-aware handlers see `thread: None`. The exact current MM's
-    /// executor census, not `&mut self`, proves mutation exclusivity.
+    /// fenced stage-1 pause, not `&mut self`, proves mutation exclusivity.
     pub fn dispatch(
         &mut self,
         kernel: &crate::kernel::KernelContext,
@@ -120,7 +120,7 @@ impl SyscallDispatcher {
         }
     }
 
-    /// Run a non-threaded completion under a fresh exact-MM census admission.
+    /// Run a non-threaded completion under a fresh exact-MM editor admission.
     pub fn with_mm_executor_mutation<T>(
         &mut self,
         run: impl FnOnce(&mut Self, &mut mm_mutation::MmMutationGuard<'_>) -> T,
@@ -220,9 +220,9 @@ impl SyscallDispatcher {
     }
 
     /// Shared-dispatch semantics under an exact-MM executor participation.
-    /// Mutation is admitted only while that participation can lock a real
-    /// sole-executor census election. Production multi-vCPU dispatch uses the
-    /// same participation and takes a real page-table pause when a peer exists.
+    /// Mutation is admitted only as a sole stage-1 proof (a fenced pause that
+    /// found no other vCPU running the MM). Production multi-vCPU dispatch
+    /// uses the same participation and drains the vCPUs when a peer exists.
     pub fn dispatch_threaded_with_mm_executor(
         &self,
         executor: &mut MmExecutorParticipation,

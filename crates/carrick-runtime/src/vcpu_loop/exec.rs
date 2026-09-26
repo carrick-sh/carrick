@@ -2206,7 +2206,6 @@ where
                     kernel: std::sync::Arc::clone(committed_context.kernel()),
                     mm: committed_mm,
                     owner_inventory,
-                    guest_executors: kernel.dispatcher.mm_executor_census(),
                     tid: self.this_tid,
                     identity: carrick_hal::FrameCowIdentity {
                         linux_pid: process.pid(),
@@ -2698,6 +2697,7 @@ pub(crate) mod tests {
                     Some(Arc::clone(context.thread())),
                     Arc::clone(&state.kicker),
                     state.this_tid,
+                    crate::vcpu_loop::test_execution_slot(),
                 )
                 .expect("MM executor admission"),
         );
@@ -2916,6 +2916,7 @@ pub(crate) mod tests {
                     Some(Arc::clone(root.thread())),
                     Arc::clone(&state.kicker),
                     this_tid,
+                    crate::vcpu_loop::test_execution_slot(),
                 )
                 .unwrap(),
         );
@@ -3174,7 +3175,12 @@ pub(crate) mod tests {
             .set_lease(root_running.take_lease());
         let mm_executor = kernel
             .dispatcher
-            .enter_mm_executor_for_thread(Some(Arc::clone(root.thread())), kicker, this_tid)
+            .enter_mm_executor_for_thread(
+                Some(Arc::clone(root.thread())),
+                kicker,
+                this_tid,
+                crate::vcpu_loop::test_execution_slot(),
+            )
             .expect("parent MM executor participation");
         state.guest_execution = Some(mm_executor);
         let frame = carrick_hal::RawSyscall {
@@ -3426,7 +3432,12 @@ pub(crate) mod tests {
         state.guest_execution = Some(
             kernel
                 .dispatcher
-                .enter_mm_executor_for_thread(Some(Arc::clone(root.thread())), kicker, this_tid)
+                .enter_mm_executor_for_thread(
+                    Some(Arc::clone(root.thread())),
+                    kicker,
+                    this_tid,
+                    crate::vcpu_loop::test_execution_slot(),
+                )
                 .expect("parent MM executor participation"),
         );
         let flags = (carrick_abi::LinuxCloneFlags::THREAD
@@ -3698,7 +3709,12 @@ pub(crate) mod tests {
             state.guest_execution = Some(
                 kernel
                     .dispatcher
-                    .enter_mm_executor_for_thread(Some(Arc::clone(root.thread())), kicker, this_tid)
+                    .enter_mm_executor_for_thread(
+                        Some(Arc::clone(root.thread())),
+                        kicker,
+                        this_tid,
+                        crate::vcpu_loop::test_execution_slot(),
+                    )
                     .expect("root MM executor participation"),
             );
             let request_address = 0x20_000;
@@ -3951,7 +3967,12 @@ pub(crate) mod tests {
             state.guest_execution = Some(
                 kernel
                     .dispatcher
-                    .enter_mm_executor_for_thread(Some(Arc::clone(root.thread())), kicker, this_tid)
+                    .enter_mm_executor_for_thread(
+                        Some(Arc::clone(root.thread())),
+                        kicker,
+                        this_tid,
+                        crate::vcpu_loop::test_execution_slot(),
+                    )
                     .expect("root MM executor participation"),
             );
             let request_address = 0x21_000;
@@ -4194,7 +4215,12 @@ pub(crate) mod tests {
         state.guest_execution = Some(
             kernel
                 .dispatcher
-                .enter_mm_executor_for_thread(Some(Arc::clone(root.thread())), kicker, this_tid)
+                .enter_mm_executor_for_thread(
+                    Some(Arc::clone(root.thread())),
+                    kicker,
+                    this_tid,
+                    crate::vcpu_loop::test_execution_slot(),
+                )
                 .expect("root MM executor participation"),
         );
         let frame = carrick_hal::RawSyscall {
@@ -4760,6 +4786,7 @@ pub(crate) mod tests {
                     state.kernel_thread.as_ref().map(Arc::clone),
                     Arc::clone(&state.kicker),
                     state.this_tid,
+                    crate::vcpu_loop::test_execution_slot(),
                 )
                 .expect("immediate production exec MM participation"),
         );
@@ -4848,7 +4875,12 @@ pub(crate) mod tests {
         state.guest_execution = Some(
             kernel
                 .dispatcher
-                .enter_mm_executor_for_thread(Some(Arc::clone(context.thread())), kicker, this_tid)
+                .enter_mm_executor_for_thread(
+                    Some(Arc::clone(context.thread())),
+                    kicker,
+                    this_tid,
+                    crate::vcpu_loop::test_execution_slot(),
+                )
                 .expect("context-boundary MM participation"),
         );
         if let Some(failpoint) = failpoint {
@@ -4931,6 +4963,7 @@ pub(crate) mod tests {
                     state.kernel_thread.as_ref().map(Arc::clone),
                     Arc::clone(&state.kicker),
                     state.this_tid,
+                    crate::vcpu_loop::test_execution_slot(),
                 )
                 .expect("pending exec MM participation"),
         );
@@ -5053,10 +5086,13 @@ pub(crate) mod tests {
                     case.job.state.kernel_thread.as_ref().map(Arc::clone),
                     Arc::clone(&case.job.state.kicker),
                     case.job.state.this_tid,
+                    crate::vcpu_loop::test_execution_slot(),
                 )
                 .expect("occupy the exact MM/thread admission");
+            // The thread's first admission holds its crash safe-point
+            // participation, so a second one is refused.
             let expected = format!(
-                "thread {:?} is already admitted as a guest executor",
+                "thread {:?} already owns crash safe-point participation",
                 case.context.thread().key()
             );
             let scheduler = case
@@ -5741,6 +5777,7 @@ pub(crate) mod tests {
                         case.job.state.kernel_thread.as_ref().map(Arc::clone),
                         Arc::clone(&case.job.state.kicker),
                         case.job.state.this_tid,
+                        crate::vcpu_loop::test_execution_slot(),
                     )
                     .expect("second exec MM participation"),
             );
@@ -6085,6 +6122,7 @@ pub(crate) mod tests {
                     state.kernel_thread.as_ref().map(Arc::clone),
                     Arc::clone(&state.kicker),
                     state.this_tid,
+                    crate::vcpu_loop::test_execution_slot(),
                 )
                 .expect("delayed guest exec MM participation"),
         );
@@ -6179,6 +6217,7 @@ pub(crate) mod tests {
                     state.kernel_thread.as_ref().map(Arc::clone),
                     Arc::clone(&state.kicker),
                     state.this_tid,
+                    crate::vcpu_loop::test_execution_slot(),
                 )
                 .expect("delayed internal exec MM participation"),
         );
@@ -6439,6 +6478,7 @@ pub(crate) mod tests {
                     state.kernel_thread.as_ref().map(Arc::clone),
                     Arc::clone(&state.kicker),
                     state.this_tid,
+                    crate::vcpu_loop::test_execution_slot(),
                 )
                 .expect("delayed exec MM participation"),
         );
@@ -6931,6 +6971,7 @@ pub(crate) mod tests {
                     Some(Arc::clone(context.thread())),
                     Arc::clone(&state.kicker),
                     state.this_tid,
+                    crate::vcpu_loop::test_execution_slot(),
                 )
                 .expect("MM executor admission"),
         );

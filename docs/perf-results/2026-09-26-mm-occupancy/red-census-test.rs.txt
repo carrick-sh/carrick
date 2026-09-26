@@ -1,0 +1,49 @@
+mod occupancy_red {
+    use super::*;
+    use carrick_hal::{InGuestFlag, ThreadId, VcpuRegistrationEnrollment, VcpuRegistry};
+
+    /// Red-first for `kernel.mm.address-space-occupancy`: a vCPU whose
+    /// executor loaded a thread of MM Y but which runs MM Z (as an EL1
+    /// address-space switch would leave it) must be drained by a pause of Z.
+    #[test]
+    fn a_pause_of_z_drains_a_vcpu_switched_from_y_to_z() {
+        let census_y = Arc::new(GuestExecutorCensus::default());
+        let census_z = Arc::new(GuestExecutorCensus::default());
+        let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let tid = ThreadId::synthetic_for_tests(31_001);
+        let flag = InGuestFlag::for_guest_thread();
+        #[derive(Clone)]
+        struct Noop;
+        impl carrick_hal::VcpuKick for Noop {
+            fn kick(&self) {}
+        }
+        assert!(matches!(
+            registry.subscribe_register(tid, Box::new(Noop), &flag, Arc::new(|| {})),
+            VcpuRegistrationEnrollment::Registered
+        ));
+        let _loaded_y = census_y
+            .enter_with_pause_endpoint(None, registry.clone(), tid)
+            .unwrap();
+        // The vCPU runs Z now (switched in the guest) and is in guest.
+        flag.enter_guest();
+        let editor_tid = ThreadId::synthetic_for_tests(31_002);
+        let mut editor = census_z
+            .enter_with_pause_endpoint(None, registry.clone(), editor_tid)
+            .unwrap();
+        let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
+        let pause = crate::dispatch::mm_quiesce::try_acquire_pt_pause_for_test(
+            &barrier,
+            &mut editor,
+            editor_tid,
+            crate::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
+        );
+        let granted_while_z_runs = pause.is_ok() && flag.is_in_guest();
+        drop(pause);
+        flag.leave_guest();
+        registry.unregister(tid);
+        assert!(
+            !granted_while_z_runs,
+            "a pause of Z was granted while a vCPU running Z was in guest: the exact-MM census counts the thread its executor loaded (Y), not the address space the vCPU runs"
+        );
+    }
+}

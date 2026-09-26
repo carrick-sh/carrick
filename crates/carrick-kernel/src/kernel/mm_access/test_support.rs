@@ -340,8 +340,18 @@ pub struct MockCowCounters {
     pub(crate) break_calls: Arc<AtomicUsize>,
     pub(crate) prepare_calls: Arc<AtomicUsize>,
     pub(crate) commit_calls: Arc<AtomicUsize>,
-    caller_census_probe: Arc<parking_lot::Mutex<Option<Arc<crate::kernel::GuestExecutorCensus>>>>,
+    caller_occupancy_probe: Arc<parking_lot::Mutex<Option<OccupancyProbe>>>,
     break_observed_caller_executor: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// How many vCPU slots the caller's MM occupies, read by a mock transport.
+#[derive(Clone)]
+pub(crate) struct OccupancyProbe(Arc<dyn Fn() -> i32 + Send + Sync>);
+
+impl std::fmt::Debug for OccupancyProbe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OccupancyProbe")
+    }
 }
 
 #[derive(Debug)]
@@ -518,10 +528,10 @@ impl ForeignMmReadLease for MockCowLease {
         self.counters.break_calls.fetch_add(1, Ordering::SeqCst);
         if self
             .counters
-            .caller_census_probe
+            .caller_occupancy_probe
             .lock()
             .as_ref()
-            .is_some_and(|census| census.participant_count_for_probe() != 0)
+            .is_some_and(|occupants| (occupants.0)() != 0)
         {
             self.counters
                 .break_observed_caller_executor
@@ -982,7 +992,6 @@ pub fn cow_fixture(
             crate::dispatch::mm_mutation::ForeignMmMutationAuthority::new(
                 mm,
                 Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm)),
-                Arc::new(crate::kernel::GuestExecutorCensus::default()),
                 stage1,
                 Arc::clone(child.shared().mm().pt_quiesce()),
             ),
@@ -1029,11 +1038,8 @@ impl ConsumerCowFixture {
         self.counters.commit_calls.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn observe_caller_executor_census(
-        &self,
-        census: Arc<crate::kernel::GuestExecutorCensus>,
-    ) {
-        *self.counters.caller_census_probe.lock() = Some(census);
+    pub(crate) fn observe_caller_occupancy(&self, occupants: Arc<dyn Fn() -> i32 + Send + Sync>) {
+        *self.counters.caller_occupancy_probe.lock() = Some(OccupancyProbe(occupants));
     }
 
     pub(crate) fn break_observed_caller_executor(&self) -> bool {

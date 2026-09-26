@@ -629,6 +629,7 @@ dependencies = [
  "carrick-mem",
  "carrick-observability",
  "carrick-portable",
+ "carrick-sched-core",
  "carrick-signal-core",
  "carrick-spec",
  "carrick-test-support",

@@ -1,24 +1,32 @@
 //! Exact-mm stage-1 quiesce: the authority a page-table edit holds while it
 //! runs, and how dispatch and the carrier obtain it.
 //!
-//! Every stage-1 mutation of one Linux process's address space runs under
-//! exactly one of three proofs that no other executor can observe the tables
-//! mid-edit:
+//! Every stage-1 mutation of one Linux process's address space runs under a
+//! Pause-Modify-Resume over the MM's [`crate::fork_quiesce::PtQuiesce`]
+//! barrier (its fence): the editor wins the barrier's election, raises the
+//! fence, then snapshots which vCPUs run the MM from the address-space
+//! occupancy authority ([`crate::kernel::mm_occupancy`]) and kicks and drains
+//! every one of them in guest. The proof comes in three shapes:
 //!
-//! - [`SoleMmStage1`]: the exact-MM census counted one executor and the
-//!   election stays locked until drop, so nothing can enter behind the proof;
-//! - [`PtPauseGuard`]: a Pause-Modify-Resume over the process-wide
-//!   [`crate::fork_quiesce::PtQuiesce`] barrier that kicked and drained every
-//!   peer out of guest;
+//! - [`SoleMmStage1`]: the snapshot held no vCPU but the caller's own, so
+//!   nothing was kicked;
+//! - [`PtPauseGuard`]: the drain kicked and waited for every other vCPU
+//!   running the MM;
 //! - [`FrameCowExactMmGuard`]: the frame-COW variant, which may instead
 //!   borrow the pause this host thread already holds (the `EXACT_MM_STAGE1`
 //!   thread-local is only that lookup; authority is the upgraded lease).
 //!
+//! Every shape holds the raised fence until drop, so no vCPU can start
+//! running the MM behind the proof: an executor marks itself in guest and
+//! then reads the fence before every entry, and the occupancy snapshot is
+//! taken after the raise (the ordering argument is in
+//! [`crate::kernel::mm_occupancy`]).
+//!
 //! `dispatch::mm_mutation` seals each proof into an `MmMutationGuard`; the
 //! carrier takes [`acquire_mm_stage1_authority`] before a fork/exec install.
-//! The protocol names the kernel census, the dispatch coordinator and the
-//! `carrick_thread` barrier only; no VMM type appears here, which is what
-//! lets the dispatcher unit tests take the sole-executor arm with no carrier.
+//! The protocol names the occupancy authority, the dispatch coordinator and
+//! the `carrick_thread` barrier only; no VMM type appears here, which is what
+//! lets the dispatcher unit tests take the sole arm with no carrier.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,14 +38,15 @@ use carrick_hal::stage1_mm::Stage1MmProjection;
 thread_local! {
     /// Exact live stage-1 leases on this vCPU service thread. The weak entry is
     /// only a lookup path for synchronous backend re-entry; authority is the
-    /// upgraded, exact-MM `Rc<ExactMmStage1Lease>`, which owns the real census
+    /// upgraded, exact-MM `Rc<ExactMmStage1Lease>`, which owns the real fenced
     /// election or pause and therefore remains valid even if the outer wrapper
     /// is dropped first. A boolean/thread-local observation is never accepted.
     static EXACT_MM_STAGE1: std::cell::RefCell<Vec<(crate::kernel::MmId, std::rc::Weak<ExactMmStage1Lease>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Enter sole-executor stage-1 authority only from an exact-MM census token.
+/// Enter sole stage-1 authority for an admitted executor: `None` when
+/// another vCPU runs the MM (the caller must take a real pause instead).
 /// Normalized handlers receive no such token.
 pub(crate) fn with_sole_mm_stage1<T>(
     participation: &mut crate::dispatch::MmExecutorParticipation,
@@ -48,33 +57,38 @@ pub(crate) fn with_sole_mm_stage1<T>(
 }
 
 /// Holds this thread's stage-1 exclusivity claim for a mapping syscall's whole
-/// dispatch. Separate from [`PtPauseGuard`] because exclusivity has two
-/// sources: the pause (which raises the same marker, so the two nest harmlessly
-/// when both apply) and simply having no peer that can execute guest code.
+/// dispatch. The pause raises the same marker, so the two nest harmlessly.
 pub struct Stage1Exclusive {
     _private: (),
-}
-
-enum ExactMmStage1LeaseKind {
-    Sole {
-        // Drop the engine-visible marker before releasing census admission.
-        _stage1: Stage1Exclusive,
-        _census: crate::kernel::ExactMmCensusGuard,
-    },
-    Paused {
-        // Drop the marker before the barrier guard resumes peer vCPUs.
-        _stage1: Stage1Exclusive,
-        _inner: crate::fork_quiesce::PtPauseGuard,
-        _census: crate::kernel::ExactMmCensusGuard,
-    },
 }
 
 /// Shareable only within the current host service thread. A nested frame-COW
 /// borrow clones this exact lease rather than trusting ambient thread state.
 pub struct ExactMmStage1Lease {
     mm: crate::kernel::MmId,
-    _kind: ExactMmStage1LeaseKind,
+    // Drop the engine-visible marker before the barrier guard resumes the
+    // MM's vCPUs.
+    _stage1: Stage1Exclusive,
+    inner: crate::fork_quiesce::PtPauseGuard,
+    /// The vCPUs the drain waited for (empty for a sole proof).
+    residents: crate::kernel::mm_occupancy::MmResidents,
     _not_send_or_sync: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl ExactMmStage1Lease {
+    fn new(
+        mm: crate::kernel::MmId,
+        inner: crate::fork_quiesce::PtPauseGuard,
+        residents: crate::kernel::mm_occupancy::MmResidents,
+    ) -> std::rc::Rc<Self> {
+        std::rc::Rc::new(Self {
+            mm,
+            _stage1: Stage1Exclusive::claim(),
+            inner,
+            residents,
+            _not_send_or_sync: std::marker::PhantomData,
+        })
+    }
 }
 
 struct ExactMmStage1Scope {
@@ -149,10 +163,10 @@ impl Drop for Stage1Exclusive {
     }
 }
 
-/// Stage-1 authority for one executor proven sole in the exact MM census.
+/// Stage-1 authority for an executor that is the only vCPU running its MM.
 ///
-/// The census election stays locked until drop, preventing a CLONE_VM peer
-/// dispatcher from entering after the proof is minted.
+/// The fence stays raised until drop, so no other vCPU can start running the
+/// MM after the proof is minted.
 pub struct SoleMmStage1<'participant> {
     // Scope drops first, removing the lookup before this wrapper releases its
     // lease. Nested borrowers own their own `Rc` and keep exclusion alive.
@@ -169,18 +183,17 @@ impl<'participant> SoleMmStage1<'participant> {
     ) -> Option<Self> {
         let mm = participation.mm_id();
         let coordinator = participation.mutation_coordinator();
-        let census = participation.participation_mut().lock_exact_mm();
-        if census.participant_count() != 1 {
+        let barrier = Arc::clone(participation.pt_quiesce());
+        let own = participation.occupied_slot();
+        // An election timeout here is a peer editor that never finished: the
+        // caller reports it like any other peer (it cannot wait either way).
+        begin_pt_pause(&barrier, ThreadId::NONE, PtPauseBudget::DEFAULT).ok()?;
+        let residents = crate::kernel::mm_occupancy::residents(mm, &barrier, own);
+        if !residents.is_empty() {
+            barrier.end();
             return None;
         }
-        let lease = std::rc::Rc::new(ExactMmStage1Lease {
-            mm,
-            _kind: ExactMmStage1LeaseKind::Sole {
-                _stage1: Stage1Exclusive::claim(),
-                _census: census,
-            },
-            _not_send_or_sync: std::marker::PhantomData,
-        });
+        let lease = ExactMmStage1Lease::new(mm, barrier.pause_guard(ThreadId::NONE), residents);
         Some(Self {
             _scope: ExactMmStage1Scope::enter(&lease),
             _lease: lease,
@@ -211,16 +224,12 @@ pub fn acquire_mm_stage1_authority<'participant>(
 ) -> Result<MmStage1Authority<'participant>, PtPauseError> {
     let mm = participation.mm_id();
     let coordinator = participation.mutation_coordinator();
-    let census = participation.participation_mut().lock_exact_mm();
-    if census.participant_count() == 1 {
-        let lease = std::rc::Rc::new(ExactMmStage1Lease {
-            mm,
-            _kind: ExactMmStage1LeaseKind::Sole {
-                _stage1: Stage1Exclusive::claim(),
-                _census: census,
-            },
-            _not_send_or_sync: std::marker::PhantomData,
-        });
+    let barrier = Arc::clone(participation.pt_quiesce());
+    let own = participation.occupied_slot();
+    begin_pt_pause(&barrier, tid, budget)?;
+    let residents = crate::kernel::mm_occupancy::residents(mm, &barrier, own);
+    if residents.is_empty() {
+        let lease = ExactMmStage1Lease::new(mm, barrier.pause_guard(tid), residents);
         return Ok(MmStage1Authority::Sole(SoleMmStage1 {
             _scope: ExactMmStage1Scope::enter(&lease),
             _lease: lease,
@@ -229,11 +238,13 @@ pub fn acquire_mm_stage1_authority<'participant>(
             coordinator,
         }));
     }
-    drop(census);
-    let pt_quiesce = Arc::clone(participation.pt_quiesce());
-    begin_pt_pause(&pt_quiesce, tid, budget)?;
-    let census = participation.participation_mut().lock_exact_mm();
-    drain_exact_mm(&pt_quiesce, mm, Some(coordinator), census, tid).map(MmStage1Authority::Paused)
+    Ok(MmStage1Authority::Paused(drain_exact_mm(
+        &barrier,
+        mm,
+        Some(coordinator),
+        residents,
+        tid,
+    )))
 }
 
 pub struct PtPauseGuard<'mm> {
@@ -247,18 +258,10 @@ impl<'mm> PtPauseGuard<'mm> {
     fn new(
         mm: crate::kernel::MmId,
         mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
-        census: crate::kernel::ExactMmCensusGuard,
+        residents: crate::kernel::mm_occupancy::MmResidents,
         inner: crate::fork_quiesce::PtPauseGuard,
     ) -> Self {
-        let lease = std::rc::Rc::new(ExactMmStage1Lease {
-            mm,
-            _kind: ExactMmStage1LeaseKind::Paused {
-                _stage1: Stage1Exclusive::claim(),
-                _inner: inner,
-                _census: census,
-            },
-            _not_send_or_sync: std::marker::PhantomData,
-        });
+        let lease = ExactMmStage1Lease::new(mm, inner, residents);
         Self {
             _scope: ExactMmStage1Scope::enter(&lease),
             _lease: lease,
@@ -277,6 +280,12 @@ impl<'mm> PtPauseGuard<'mm> {
             .as_ref()
             .map(|coordinator| (Arc::clone(coordinator), self._lease.mm))
     }
+
+    /// The vCPUs this pause drained.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn drained_count(&self) -> usize {
+        self._lease.residents.len()
+    }
 }
 
 /// Process-wide page-table-edit Pause-Modify-Resume barrier.
@@ -290,7 +299,6 @@ pub enum PtPauseError {
     /// The coordinator election exceeded [`PtPauseBudget::election`]. The drain
     /// itself never times out; it waits for acknowledgement.
     TimedOut,
-    UnkickableExecutor,
 }
 
 /// The bound on a page-table pause: the election only.
@@ -404,49 +412,45 @@ pub fn raise_pt_pause_for_test(
     begin_pt_pause(barrier, tid, budget)
 }
 
-/// Kick every sibling of the exact MM out of guest and wait for each one's
-/// acknowledgement, then mint the guard.
+/// Kick every other vCPU running the exact MM out of guest and wait for each
+/// one's acknowledgement, then mint the guard.
 ///
-/// The census lock is held throughout, so no new executor can be admitted, and
-/// `quiescing` is raised, so an admitted one that has not entered parks at its
-/// guest-entry re-check instead. Each round reads the wake generation, then
-/// re-takes a watch on every endpoint (an admitted executor may register its
-/// vCPU mid-drain, onto a cell the previous round could not watch), then reads
-/// the predicate, so no leave or registration can fall between the check and
-/// the sleep.
+/// `residents` was taken after the fence was raised, so a vCPU that installs
+/// the MM later sees the fence before it can enter the guest and is not
+/// waited for (`crate::kernel::mm_occupancy`). Each round reads the wake
+/// generation, then re-takes a watch on every resident (an executor may
+/// register its vCPU mid-drain, onto a cell the previous round could not
+/// watch), then reads the predicate, so no leave or registration can fall
+/// between the check and the sleep.
 fn drain_exact_mm<'mm>(
     barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     mm: crate::kernel::MmId,
     mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
-    census: crate::kernel::ExactMmCensusGuard,
+    residents: crate::kernel::mm_occupancy::MmResidents,
     tid: ThreadId,
-) -> Result<PtPauseGuard<'mm>, PtPauseError> {
-    if !census.all_have_pause_endpoints() {
-        barrier.end();
-        return Err(PtPauseError::UnkickableExecutor);
-    }
+) -> PtPauseGuard<'mm> {
     crate::probes::pt_pause_begin(
         tid.raw(),
-        i32::from(census.any_in_guest()),
-        census.first_in_guest_tid().map_or(0, ThreadId::raw),
-        i32::try_from(census.participant_count()).unwrap_or(i32::MAX),
+        i32::from(residents.any_in_guest()),
+        residents.first_in_guest_tid().map_or(0, ThreadId::raw),
+        i32::try_from(residents.len()).unwrap_or(i32::MAX),
     );
 
     let start = Instant::now();
     let wake = carrick_hal::GuestLeaveWake::new();
-    census.kick_all_in_guest();
+    residents.kick_all_in_guest();
     let mut rounds: i32 = 0;
     loop {
         // Generation first, then fresh watches, then the predicate: any
         // leave, registration or removal after `seen` bumps the generation,
         // and anything before it is visible to the watches or the read.
         let seen = wake.generation();
-        let _watches = census.watch_leaves(&wake);
-        if !census.any_in_guest() {
+        let _watches = residents.watch_leaves(&wake);
+        if !residents.any_in_guest() {
             break;
         }
         if rounds == 0 {
-            for sibling in census.in_guest_tids() {
+            for sibling in residents.in_guest_tids() {
                 crate::probes::pt_pause_drain_wait(
                     tid.raw(),
                     sibling.raw(),
@@ -458,12 +462,12 @@ fn drain_exact_mm<'mm>(
         wake.wait_past(seen);
     }
     crate::probes::pt_pause_ready(tid.raw(), rounds, start.elapsed().as_micros() as i64);
-    Ok(PtPauseGuard::new(
+    PtPauseGuard::new(
         mm,
         mutation_coordinator,
-        census,
+        residents,
         barrier.pause_guard(tid),
-    ))
+    )
 }
 
 /// A non-blocking drain for single-thread test fixtures whose only "sibling"
@@ -482,62 +486,62 @@ fn try_drain_exact_mm<'mm>(
     barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     mm: crate::kernel::MmId,
     mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
-    census: crate::kernel::ExactMmCensusGuard,
+    residents: crate::kernel::mm_occupancy::MmResidents,
     tid: ThreadId,
 ) -> Result<PtPauseGuard<'mm>, PtPauseTryError> {
-    if !census.all_have_pause_endpoints() {
-        barrier.end();
-        return Err(PtPauseTryError::Pause(PtPauseError::UnkickableExecutor));
-    }
-    census.kick_all_in_guest();
-    if census.any_in_guest() {
+    residents.kick_all_in_guest();
+    if residents.any_in_guest() {
         barrier.end();
         return Err(PtPauseTryError::SiblingInGuest);
     }
     Ok(PtPauseGuard::new(
         mm,
         mutation_coordinator,
-        census,
+        residents,
         barrier.pause_guard(tid),
     ))
 }
 
-// Test fixture reachable through `test-support`, so `cfg(test)` is not set
-// for it and clippy's `allow-{unwrap,expect}-in-tests` does not apply.
-#[cfg(any(test, feature = "test-support"))]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
-pub fn acquire_pt_pause<'participant>(
+/// A real pause of `mm` under `barrier`: every vCPU running it but `own`
+/// is kicked and drained, and none can start running it until the guard
+/// drops. For host readers that need the MM still (crash capture) as well
+/// as editors.
+pub(crate) fn pause_exact_mm<'mm>(
     barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
-    participation: &'participant mut crate::kernel::GuestExecutorParticipation,
+    mm: crate::kernel::MmId,
+    own: Option<crate::kernel::ExecutionSlot>,
     tid: ThreadId,
     budget: PtPauseBudget,
-) -> Result<PtPauseGuard<'participant>, PtPauseError> {
+) -> Result<PtPauseGuard<'mm>, PtPauseError> {
     begin_pt_pause(barrier, tid, budget)?;
-    let mm = crate::kernel::MmId::from_registry_allocation(
-        std::num::NonZeroU64::new(tid.raw() as u64)
-            .unwrap_or_else(|| std::num::NonZeroU64::new(1).unwrap()),
-    );
-    let census = participation.lock_exact_mm();
-    drain_exact_mm(barrier, mm, None, census, tid)
+    let residents = crate::kernel::mm_occupancy::residents(mm, barrier, own);
+    Ok(drain_exact_mm(barrier, mm, None, residents, tid))
+}
+
+/// A real pause of `mm` under `barrier`, by an editor that occupies no slot
+/// (every occupant is drained).
+#[cfg(any(test, feature = "test-support"))]
+pub fn acquire_pt_pause<'mm>(
+    barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
+    mm: crate::kernel::MmId,
+    tid: ThreadId,
+    budget: PtPauseBudget,
+) -> Result<PtPauseGuard<'mm>, PtPauseError> {
+    pause_exact_mm(barrier, mm, None, tid, budget)
 }
 
 /// [`acquire_pt_pause`] for a fixture whose in-guest sibling is driven by the
 /// calling thread itself: fail instead of waiting.
 #[cfg(any(test, feature = "test-support"))]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
-pub fn try_acquire_pt_pause_for_test<'participant>(
+pub fn try_acquire_pt_pause_for_test<'mm>(
     barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
-    participation: &'participant mut crate::kernel::GuestExecutorParticipation,
+    mm: crate::kernel::MmId,
     tid: ThreadId,
     budget: PtPauseBudget,
-) -> Result<PtPauseGuard<'participant>, PtPauseTryError> {
+) -> Result<PtPauseGuard<'mm>, PtPauseTryError> {
     begin_pt_pause(barrier, tid, budget).map_err(PtPauseTryError::Pause)?;
-    let mm = crate::kernel::MmId::from_registry_allocation(
-        std::num::NonZeroU64::new(tid.raw() as u64)
-            .unwrap_or_else(|| std::num::NonZeroU64::new(1).unwrap()),
-    );
-    let census = participation.lock_exact_mm();
-    try_drain_exact_mm(barrier, mm, None, census, tid)
+    let residents = crate::kernel::mm_occupancy::residents(mm, barrier, None);
+    try_drain_exact_mm(barrier, mm, None, residents, tid)
 }
 
 // Test fixture reachable through `test-support`, so `cfg(test)` is not set
@@ -549,36 +553,31 @@ pub fn with_real_pt_pause_for_test<T>(
     run: impl FnOnce(&mut PtPauseGuard<'_>) -> T,
 ) -> T {
     let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
-    let registry: Arc<dyn carrick_hal::VcpuRegistry> =
-        Arc::new(carrick_hal::GenericVcpuRegistry::new());
-    let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
     let tid = ThreadId::synthetic_for_tests(20_900);
-    let mut participation = census
-        .enter_with_pause_endpoint(None, registry, tid)
-        .expect("test exact-MM participation");
     begin_pt_pause(&barrier, tid, PtPauseBudget::DEFAULT)
         .expect("test must elect a real page-table pause");
     let mm = coordinator.mm();
-    let census = participation.lock_exact_mm();
-    let mut authority = drain_exact_mm(&barrier, mm, Some(coordinator), census, tid)
-        .expect("test must acquire a real page-table pause");
+    let residents = crate::kernel::mm_occupancy::residents(mm, &barrier, None);
+    let mut authority = drain_exact_mm(&barrier, mm, Some(coordinator), residents, tid);
     run(&mut authority)
 }
 
 #[allow(dead_code)] // Foreign variants are consumed by the canonical Task 8 syscall path.
 pub enum FrameCowExactMmGuard {
+    /// This host thread already holds a pause of the MM.
     Nested {
         _lease: std::rc::Rc<ExactMmStage1Lease>,
         mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
         foreign_stage1: Option<Arc<dyn Stage1MmProjection>>,
     },
+    /// A pause of the MM that drained nothing: no other vCPU was in guest
+    /// running it (for a foreign target: none ran it at all).
     Sole {
-        _stage1: Stage1Exclusive,
-        _census: crate::kernel::ExactMmCensusGuard,
-        mm: crate::kernel::MmId,
+        _guard: PtPauseGuard<'static>,
         mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
         foreign_stage1: Option<Arc<dyn Stage1MmProjection>>,
     },
+    /// A pause that kicked and drained the vCPUs running the MM.
     Paused {
         _guard: PtPauseGuard<'static>,
         foreign_stage1: Option<Arc<dyn Stage1MmProjection>>,
@@ -589,8 +588,7 @@ impl FrameCowExactMmGuard {
     fn exact_mm(&self) -> crate::kernel::MmId {
         match self {
             Self::Nested { _lease, .. } => _lease.mm,
-            Self::Sole { mm, .. } => *mm,
-            Self::Paused { _guard, .. } => _guard._lease.mm,
+            Self::Sole { _guard, .. } | Self::Paused { _guard, .. } => _guard._lease.mm,
         }
     }
 
@@ -610,12 +608,12 @@ impl FrameCowExactMmGuard {
                 .as_ref()
                 .map(|coordinator| (Arc::clone(coordinator), _lease.mm)),
             Self::Sole {
-                mm,
+                _guard,
                 mutation_coordinator,
                 ..
             } => mutation_coordinator
                 .as_ref()
-                .map(|coordinator| (Arc::clone(coordinator), *mm)),
+                .map(|coordinator| (Arc::clone(coordinator), _guard._lease.mm)),
             Self::Paused { _guard, .. } => _guard.mutation_identity(),
         }
     }
@@ -646,19 +644,14 @@ impl FrameCowExactMmGuard {
         let Self::Paused { _guard, .. } = self else {
             return Ok(());
         };
-        let (inner, expected) = match &_guard._lease._kind {
-            ExactMmStage1LeaseKind::Paused {
-                _inner, _census, ..
-            } => (_inner, _census.hardware_invalidation_tids()),
-            ExactMmStage1LeaseKind::Sole { .. } => {
-                return Err(ForeignCowInvalidationError::MissingPause);
-            }
-        };
-        let phase = inner
-            .publish_exact_invalidation(identity, expected)
+        let lease = &_guard._lease;
+        let phase = lease
+            .inner
+            .publish_exact_invalidation(identity, lease.residents.hardware_invalidation_tids())
             .map_err(ForeignCowInvalidationError::Pause)?;
-        let result = inner.wait_invalidation(&phase, deadline);
-        inner
+        let result = lease.inner.wait_invalidation(&phase, deadline);
+        lease
+            .inner
             .finish_invalidation(&phase)
             .map_err(ForeignCowInvalidationError::Pause)?;
         result.map_err(ForeignCowInvalidationError::Pause)
@@ -677,21 +670,45 @@ pub enum ForeignCowInvalidationError {
     Pause(#[from] crate::fork_quiesce::PtInvalidationError),
 }
 
+/// Stage-1 authority for a frame-COW edit of `mm`: the pause this thread
+/// already holds, or a new one. A vCPU of the MM stopped at an exit need not
+/// be drained (the raised fence keeps it out of the guest), so the pause is
+/// `Sole` when none is in guest.
 pub fn acquire_frame_cow_quiesce(
     barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     mm: crate::kernel::MmId,
-    census: &crate::kernel::GuestExecutorCensus,
     tid: ThreadId,
     budget: PtPauseBudget,
 ) -> Result<FrameCowExactMmGuard, PtPauseError> {
-    acquire_frame_cow_quiesce_inner(barrier, mm, census, None, tid, budget)
+    if let Some(lease) = borrow_current_exact_mm_stage1(mm) {
+        return Ok(FrameCowExactMmGuard::Nested {
+            _lease: lease,
+            mutation_coordinator: None,
+            foreign_stage1: None,
+        });
+    }
+    begin_pt_pause(barrier, tid, budget)?;
+    let residents = crate::kernel::mm_occupancy::residents(mm, barrier, None);
+    if !residents.any_in_guest() {
+        return Ok(FrameCowExactMmGuard::Sole {
+            _guard: PtPauseGuard::new(mm, None, residents, barrier.pause_guard(tid)),
+            mutation_coordinator: None,
+            foreign_stage1: None,
+        });
+    }
+    Ok(FrameCowExactMmGuard::Paused {
+        _guard: drain_exact_mm(barrier, mm, None, residents, tid),
+        foreign_stage1: None,
+    })
 }
 
+/// Stage-1 authority for a foreign-MM edit (the caller runs another MM).
+/// `Sole` only when no vCPU runs the target at all: a resident target vCPU
+/// must acknowledge the exact-ASID invalidation phase.
 #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
 pub(crate) fn acquire_foreign_mm_mutation_quiesce(
     barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     mm: crate::kernel::MmId,
-    census: &crate::kernel::GuestExecutorCensus,
     coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
     stage1: Arc<dyn Stage1MmProjection>,
     tid: ThreadId,
@@ -704,89 +721,51 @@ pub(crate) fn acquire_foreign_mm_mutation_quiesce(
             foreign_stage1: Some(stage1),
         });
     }
-    let sole = census.lock_for_frame_cow();
-    if sole.participant_count() == 0 {
+    begin_pt_pause(barrier, tid, budget)?;
+    let residents = crate::kernel::mm_occupancy::residents(mm, barrier, None);
+    if residents.is_empty() {
         return Ok(FrameCowExactMmGuard::Sole {
-            _stage1: Stage1Exclusive::claim(),
-            _census: sole,
-            mm,
+            _guard: PtPauseGuard::new(mm, None, residents, barrier.pause_guard(tid)),
             mutation_coordinator: Some(coordinator),
             foreign_stage1: Some(stage1),
         });
     }
-    drop(sole);
-    begin_pt_pause(barrier, tid, budget)?;
-    let census = census.lock_for_frame_cow();
-    drain_exact_mm(barrier, mm, Some(coordinator), census, tid).map(|guard| {
-        FrameCowExactMmGuard::Paused {
-            _guard: guard,
-            foreign_stage1: Some(stage1),
-        }
-    })
-}
-
-fn acquire_frame_cow_quiesce_inner(
-    barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
-    mm: crate::kernel::MmId,
-    census: &crate::kernel::GuestExecutorCensus,
-    mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
-    tid: ThreadId,
-    budget: PtPauseBudget,
-) -> Result<FrameCowExactMmGuard, PtPauseError> {
-    if let Some(lease) = borrow_current_exact_mm_stage1(mm) {
-        return Ok(FrameCowExactMmGuard::Nested {
-            _lease: lease,
-            mutation_coordinator,
-            foreign_stage1: None,
-        });
-    }
-    let sole = census.lock_for_frame_cow();
-    if sole.participant_count() <= 1 && !sole.any_in_guest() {
-        return Ok(FrameCowExactMmGuard::Sole {
-            _stage1: Stage1Exclusive::claim(),
-            _census: sole,
-            mm,
-            mutation_coordinator,
-            foreign_stage1: None,
-        });
-    }
-    drop(sole);
-    begin_pt_pause(barrier, tid, budget)?;
-    let census = census.lock_for_frame_cow();
-    drain_exact_mm(barrier, mm, mutation_coordinator, census, tid).map(|guard| {
-        FrameCowExactMmGuard::Paused {
-            _guard: guard,
-            foreign_stage1: None,
-        }
+    Ok(FrameCowExactMmGuard::Paused {
+        _guard: drain_exact_mm(barrier, mm, Some(coordinator), residents, tid),
+        foreign_stage1: Some(stage1),
     })
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn acquire_mutation_pause_for_test<'participant>(
+pub fn acquire_mutation_pause_for_test<'mm>(
     barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
-    participation: &'participant mut crate::kernel::GuestExecutorParticipation,
     tid: ThreadId,
     mm: crate::kernel::MmId,
     coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
     budget: PtPauseBudget,
-) -> Result<PtPauseGuard<'participant>, PtPauseError> {
+) -> Result<PtPauseGuard<'mm>, PtPauseError> {
     begin_pt_pause(barrier, tid, budget)?;
-    let census = participation.lock_exact_mm();
-    drain_exact_mm(barrier, mm, Some(coordinator), census, tid)
+    let residents = crate::kernel::mm_occupancy::residents(mm, barrier, None);
+    Ok(drain_exact_mm(
+        barrier,
+        mm,
+        Some(coordinator),
+        residents,
+        tid,
+    ))
 }
 
 /// [`acquire_mutation_pause_for_test`] for a fixture whose in-guest sibling is
 /// driven by the calling thread itself: fail instead of waiting.
 #[cfg(any(test, feature = "test-support"))]
-pub fn try_acquire_mutation_pause_for_test<'participant>(
+pub fn try_acquire_mutation_pause_for_test<'mm>(
     barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
-    participation: &'participant mut crate::kernel::GuestExecutorParticipation,
     tid: ThreadId,
     mm: crate::kernel::MmId,
     coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
     budget: PtPauseBudget,
-) -> Result<PtPauseGuard<'participant>, PtPauseTryError> {
+) -> Result<PtPauseGuard<'mm>, PtPauseTryError> {
     begin_pt_pause(barrier, tid, budget).map_err(PtPauseTryError::Pause)?;
-    let census = participation.lock_exact_mm();
-    try_drain_exact_mm(barrier, mm, Some(coordinator), census, tid)
+    let residents = crate::kernel::mm_occupancy::residents(mm, barrier, None);
+    try_drain_exact_mm(barrier, mm, Some(coordinator), residents, tid)
 }

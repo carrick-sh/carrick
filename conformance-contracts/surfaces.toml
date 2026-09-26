@@ -401,11 +401,19 @@ contracts = ["kernel.mm.backing-maintenance-lookup"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mm_quiesce.rs"
-contracts = ["kernel.mm.pt-pause-drain-acknowledgement"]
+contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.mm.address-space-occupancy"]
 
 [[surfaces]]
-path = "crates/carrick-kernel/src/kernel/guest_execution.rs"
-contracts = ["kernel.mm.pt-pause-drain-acknowledgement"]
+path = "crates/carrick-kernel/src/kernel/mm_occupancy.rs"
+contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.mm.address-space-occupancy", "kernel.mm.executor-admission"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/mm_occupancy/tests.rs"
+contracts = ["kernel.mm.address-space-occupancy", "kernel.mm.executor-admission"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/occupancy.rs"
+contracts = ["kernel.mm.address-space-occupancy"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/threaded.rs"
