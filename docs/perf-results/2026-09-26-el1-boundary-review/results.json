@@ -1,0 +1,48 @@
+{
+  "binary_sha256": "bea0f191bf26c46d736759f79d6c8358383cd13d3ee6e721ae4228aef40aa9bf",
+  "scope": "frozen worker draft binary, no final source or integration acceptance",
+  "cases": [
+    {
+      "case": "positive",
+      "exit": 0,
+      "expected": "pass",
+      "stdout": "personality boundary checked: 1 substrate crate(s) clean\n  [PASS] crate `carrick-sched-core` (shipped deps: [], dev deps: [], scanned files: 1)\n",
+      "stderr": ""
+    },
+    {
+      "case": "direct_forbidden",
+      "exit": 1,
+      "expected": "reject",
+      "stdout": "",
+      "stderr": "substrate boundary violations detected (1 violation(s)):\n  [DEP] crate `carrick-sched-core` reaches forbidden personality crate `carrick-abi` via normal edge: carrick-sched-core -> carrick-abi\n"
+    },
+    {
+      "case": "not_test",
+      "exit": 0,
+      "expected": "reject",
+      "stdout": "personality boundary checked: 1 substrate crate(s) clean\n  [PASS] crate `carrick-sched-core` (shipped deps: [], dev deps: [], scanned files: 1)\n",
+      "stderr": ""
+    },
+    {
+      "case": "production_test_filename",
+      "exit": 0,
+      "expected": "reject",
+      "stdout": "personality boundary checked: 1 substrate crate(s) clean\n  [PASS] crate `carrick-sched-core` (shipped deps: [], dev deps: [], scanned files: 2)\n",
+      "stderr": ""
+    },
+    {
+      "case": "macro",
+      "exit": 0,
+      "expected": "reject",
+      "stdout": "personality boundary checked: 1 substrate crate(s) clean\n  [PASS] crate `carrick-sched-core` (shipped deps: [], dev deps: [], scanned files: 1)\n",
+      "stderr": ""
+    },
+    {
+      "case": "missing_path",
+      "exit": 0,
+      "expected": "reject",
+      "stdout": "personality boundary checked: 1 substrate crate(s) clean\n  [PASS] crate `carrick-sched-core` (shipped deps: [\"helper\"], dev deps: [], scanned files: 1)\n",
+      "stderr": ""
+    }
+  ]
+}
