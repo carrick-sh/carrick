@@ -96,6 +96,8 @@ pub enum BoundaryError {
         "cargo metadata not provided; please provide --metadata-file <path> or generate <root>/target/cargo-metadata.json with 'cargo metadata --locked --offline --all-features --format-version 1'"
     )]
     MissingMetadata,
+    #[error("Cargo metadata does not belong to workspace {}", root.display())]
+    MetadataWorkspaceMismatch { root: PathBuf },
     #[error("cannot parse cargo metadata JSON: {source}")]
     MetadataJson {
         #[source]
@@ -320,6 +322,20 @@ pub fn check_substrate_boundary(
         }
     };
 
+    let canonical_root = fs::canonicalize(root).map_err(|source| BoundaryError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let metadata_root = metadata
+        .workspace_root
+        .as_deref()
+        .and_then(|path| fs::canonicalize(path).ok());
+    if metadata_root.as_ref() != Some(&canonical_root) {
+        return Err(BoundaryError::MetadataWorkspaceMismatch {
+            root: root.to_path_buf(),
+        });
+    }
+
     let forbidden_crates: BTreeSet<String> = config
         .forbidden_personality_crates
         .iter()
@@ -409,7 +425,14 @@ fn audit_crate_dependencies_metadata<'a>(
     let substrate_pkg = metadata
         .packages
         .iter()
-        .find(|p| p.name == substrate_crate)
+        .find(|p| {
+            let expected = root.join("crates").join(substrate_crate).join("Cargo.toml");
+            p.name == substrate_crate
+                && fs::canonicalize(&p.manifest_path)
+                    .ok()
+                    .zip(fs::canonicalize(expected).ok())
+                    .is_some_and(|(actual, expected)| actual == expected)
+        })
         .ok_or_else(|| {
             let crate_dir = root.join("crates").join(substrate_crate);
             BoundaryError::MissingCrate {
@@ -725,10 +748,19 @@ fn audit_crate_source(
 
     // 1. Identify production target source files from Cargo metadata
     for target in &substrate_pkg.targets {
-        let is_prod = target
-            .kind
-            .iter()
-            .any(|k| k == "lib" || k == "bin" || k == "custom-build" || k == "proc-macro");
+        let is_prod = target.kind.iter().any(|k| {
+            matches!(
+                k.as_str(),
+                "lib"
+                    | "rlib"
+                    | "dylib"
+                    | "cdylib"
+                    | "staticlib"
+                    | "bin"
+                    | "custom-build"
+                    | "proc-macro"
+            )
+        });
         if is_prod {
             let p = PathBuf::from(&target.src_path);
             let resolved_p = if p.is_absolute() {
@@ -736,24 +768,16 @@ fn audit_crate_source(
             } else {
                 crate_dir.join(p)
             };
-            if resolved_p.exists() && !prod_root_files.contains(&resolved_p) {
+            if !prod_root_files.contains(&resolved_p) {
                 prod_root_files.push(resolved_p);
             }
         }
     }
 
-    // Fallback if metadata targets list was empty
     if prod_root_files.is_empty() {
-        let src_dir = crate_dir.join("src");
-        if src_dir.join("lib.rs").exists() {
-            prod_root_files.push(src_dir.join("lib.rs"));
-        }
-        if src_dir.join("main.rs").exists() {
-            prod_root_files.push(src_dir.join("main.rs"));
-        }
-        if crate_dir.join("build.rs").exists() {
-            prod_root_files.push(crate_dir.join("build.rs"));
-        }
+        return Err(BoundaryError::NoScannedSourceFiles {
+            crate_name: substrate_crate.to_string(),
+        });
     }
 
     let mut visited_files = BTreeSet::new();
@@ -1203,267 +1227,190 @@ impl<'ast, 'a> Visit<'ast> for SourceCheckerVisitor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
 
-    #[test]
-    fn test_positive_real_repository_substrate_passes() {
-        let root = Path::new("../../");
-        let meta_file = root.join("target").join("cargo-metadata.json");
-        let config = if meta_file.exists() {
-            BoundaryConfig {
-                metadata_file: Some(meta_file),
-                ..Default::default()
-            }
-        } else {
-            let backup_meta =
-                root.join("target/el1-completion/boundary-review-round2/resolved-workspace.json");
-            if backup_meta.exists() {
-                BoundaryConfig {
-                    metadata_file: Some(backup_meta),
+    struct Fixture {
+        root: tempfile::TempDir,
+        metadata: Value,
+    }
+    impl Fixture {
+        fn new(path: &str, code: &str) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("crates/carrick-sched-core");
+            let source = dir.join(path);
+            fs::create_dir_all(source.parent().unwrap()).unwrap();
+            fs::write(&source, code).unwrap();
+            fs::write(
+                dir.join("Cargo.toml"),
+                "[package]\nname='carrick-sched-core'\nversion='0.1.0'\n",
+            )
+            .unwrap();
+            let metadata = json!({
+                "workspace_root": root.path(),
+                "packages": [{"id":"core", "name":"carrick-sched-core", "version":"0.1.0",
+                    "manifest_path":dir.join("Cargo.toml"),
+                    "targets":[{"kind":["lib"],"src_path":source}],"dependencies":[]}],
+                "resolve":{"nodes":[{"id":"core","deps":[]}]}
+            });
+            Self { root, metadata }
+        }
+        fn check(&self) -> Result<Vec<CrateAuditReport>, BoundaryError> {
+            check_substrate_boundary(
+                self.root.path(),
+                &BoundaryConfig {
+                    metadata_json: Some(self.metadata.to_string()),
                     ..Default::default()
-                }
-            } else {
-                BoundaryConfig::default()
-            }
-        };
-        let reports = check_substrate_boundary(root, &config).expect("real substrate must pass");
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].crate_name, "carrick-sched-core");
-        assert!(reports[0].is_clean());
-        assert!(!reports[0].scanned_source_files.is_empty());
+                },
+            )
+        }
+        fn package(&mut self, id: &str, name: &str) {
+            self.metadata["packages"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "id":id,"name":name,"version":"0.1.0","dependencies":[],"targets":[]
+                }));
+            self.metadata["resolve"]["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"id":id,"deps":[]}));
+        }
+        fn edge(
+            &mut self,
+            from: usize,
+            to: &str,
+            alias: &str,
+            kind: Option<&str>,
+            target: Option<&str>,
+        ) {
+            self.metadata["resolve"]["nodes"][from]["deps"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "name":alias,"pkg":to,"dep_kinds":[{"kind":kind,"target":target}]
+                }));
+        }
     }
 
+    #[test]
+    fn test_positive_fixture_substrate_passes() {
+        let f = Fixture::new("src/lib.rs", "pub fn value(x:u64)->u64 { x }");
+        let r = f.check().unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].scanned_source_files.len(), 1);
+    }
     #[test]
     fn test_negative_custom_lib_path_rejected() {
-        let root = Path::new("../../target/el1-completion/boundary-review-round2/custom_lib_path");
-        if !root.exists() {
-            return;
-        }
-        let mock_metadata = r#"{
-            "packages": [{
-                "id": "carrick-sched-core 0.1.0 (path+file:///crates/carrick-sched-core)",
-                "name": "carrick-sched-core",
-                "version": "0.1.0",
-                "manifest_path": "../../target/el1-completion/boundary-review-round2/custom_lib_path/crates/carrick-sched-core/Cargo.toml",
-                "targets": [{
-                    "kind": ["lib"],
-                    "name": "carrick-sched-core",
-                    "src_path": "../../target/el1-completion/boundary-review-round2/custom_lib_path/crates/carrick-sched-core/kernel.rs"
-                }],
-                "dependencies": []
-            }],
-            "resolve": {
-                "nodes": [{
-                    "id": "carrick-sched-core 0.1.0 (path+file:///crates/carrick-sched-core)",
-                    "dependencies": [],
-                    "deps": []
-                }]
-            }
-        }"#;
-
-        let config = BoundaryConfig {
-            metadata_json: Some(mock_metadata.to_string()),
-            ..Default::default()
-        };
-
-        let result = check_substrate_boundary(root, &config);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("-110"),
-            "custom lib path with -110 must be rejected: {err_msg}"
-        );
+        let f = Fixture::new("kernel.rs", "pub const RESULT:i64=-110;");
+        assert!(matches!(f.check(), Err(BoundaryError::Violations { .. })));
     }
-
     #[test]
     fn test_negative_optional_transitive_dependency_rejected() {
-        let root =
-            Path::new("../../target/el1-completion/boundary-review-round2/optional_transitive");
-        if !root.exists() {
-            return;
-        }
-        let mock_metadata = r#"{
-            "packages": [
-                {
-                    "id": "carrick-sched-core 0.1.0",
-                    "name": "carrick-sched-core",
-                    "version": "0.1.0",
-                    "manifest_path": "../../target/el1-completion/boundary-review-round2/optional_transitive/crates/carrick-sched-core/Cargo.toml",
-                    "targets": [{
-                        "kind": ["lib"],
-                        "name": "carrick-sched-core",
-                        "src_path": "../../target/el1-completion/boundary-review-round2/optional_transitive/crates/carrick-sched-core/src/lib.rs"
-                    }],
-                    "dependencies": [
-                        { "name": "bridge", "optional": true, "kind": null }
-                    ]
-                },
-                {
-                    "id": "bridge 0.1.0",
-                    "name": "bridge",
-                    "version": "0.1.0",
-                    "manifest_path": "../../target/el1-completion/boundary-review-round2/optional_transitive/crates/bridge/Cargo.toml",
-                    "targets": [{
-                        "kind": ["lib"],
-                        "name": "bridge",
-                        "src_path": "../../target/el1-completion/boundary-review-round2/optional_transitive/crates/bridge/src/lib.rs"
-                    }],
-                    "dependencies": [
-                        { "name": "carrick-abi", "optional": false, "kind": null }
-                    ]
-                },
-                {
-                    "id": "carrick-abi 0.1.0",
-                    "name": "carrick-abi",
-                    "version": "0.1.0",
-                    "manifest_path": "../../target/el1-completion/boundary-review-round2/optional_transitive/crates/carrick-abi/Cargo.toml",
-                    "targets": [{
-                        "kind": ["lib"],
-                        "name": "carrick-abi",
-                        "src_path": "../../target/el1-completion/boundary-review-round2/optional_transitive/crates/carrick-abi/src/lib.rs"
-                    }],
-                    "dependencies": []
-                }
-            ],
-            "resolve": {
-                "nodes": [
-                    {
-                        "id": "carrick-sched-core 0.1.0",
-                        "dependencies": ["bridge 0.1.0"],
-                        "deps": [{ "name": "bridge", "pkg": "bridge 0.1.0", "dep_kinds": [{ "kind": null }] }]
-                    },
-                    {
-                        "id": "bridge 0.1.0",
-                        "dependencies": ["carrick-abi 0.1.0"],
-                        "deps": [{ "name": "carrick-abi", "pkg": "carrick-abi 0.1.0", "dep_kinds": [{ "kind": null }] }]
-                    },
-                    {
-                        "id": "carrick-abi 0.1.0",
-                        "dependencies": [],
-                        "deps": []
-                    }
-                ]
-            }
-        }"#;
-
-        let config = BoundaryConfig {
-            metadata_json: Some(mock_metadata.to_string()),
-            ..Default::default()
-        };
-
-        let result = check_substrate_boundary(root, &config);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("reaches forbidden personality crate `carrick-abi`"),
-            "optional transitive dependency must be rejected: {err_msg}"
-        );
+        let mut f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        f.package("bridge", "bridge");
+        f.package("abi", "carrick-abi");
+        f.metadata["packages"][0]["dependencies"] = json!([{"name":"bridge","optional":true}]);
+        f.edge(0, "bridge", "bridge", None, None);
+        f.edge(1, "abi", "carrick_abi", None, None);
+        assert!(matches!(f.check(), Err(BoundaryError::Violations { .. })));
     }
-
     #[test]
     fn test_negative_unresolved_registry_dependency_rejected() {
-        let root =
-            Path::new("../../target/el1-completion/boundary-review-round2/unresolved_registry");
-        if !root.exists() {
-            return;
-        }
-        let mock_metadata = r#"{
-            "packages": [
-                {
-                    "id": "carrick-sched-core 0.1.0",
-                    "name": "carrick-sched-core",
-                    "version": "0.1.0",
-                    "manifest_path": "../../target/el1-completion/boundary-review-round2/unresolved_registry/crates/carrick-sched-core/Cargo.toml",
-                    "targets": [{
-                        "kind": ["lib"],
-                        "name": "carrick-sched-core",
-                        "src_path": "../../target/el1-completion/boundary-review-round2/unresolved_registry/crates/carrick-sched-core/src/lib.rs"
-                    }],
-                    "dependencies": [
-                        { "name": "unknown_bridge", "req": "=999.0.0", "optional": false, "kind": null }
-                    ]
-                }
-            ],
-            "resolve": {
-                "nodes": [
-                    {
-                        "id": "carrick-sched-core 0.1.0",
-                        "dependencies": [],
-                        "deps": []
-                    }
-                ]
-            }
-        }"#;
-
-        let config = BoundaryConfig {
-            metadata_json: Some(mock_metadata.to_string()),
-            ..Default::default()
-        };
-
-        let result = check_substrate_boundary(root, &config);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("unresolved cargo dependency graph"),
-            "unresolved registry dependency must fail closed: {err_msg}"
-        );
+        let mut f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        f.metadata["packages"][0]["dependencies"] =
+            json!([{"name":"unknown_bridge","optional":false}]);
+        assert!(matches!(
+            f.check(),
+            Err(BoundaryError::UnresolvedDependencyGraph { .. })
+        ));
     }
-
     #[test]
     fn test_negative_missing_allowlisted_crate_rejected() {
-        let root = Path::new("../../");
-        let mock_metadata = r#"{
-            "packages": [],
-            "resolve": { "nodes": [] }
-        }"#;
-        let config = BoundaryConfig {
-            substrate_allowlist: vec!["carrick-nonexistent-substrate".to_string()],
-            metadata_json: Some(mock_metadata.to_string()),
-            ..Default::default()
-        };
-        let result = check_substrate_boundary(root, &config);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            BoundaryError::MissingCrate { crate_name, .. } => {
-                assert_eq!(crate_name, "carrick-nonexistent-substrate");
-            }
-            other => panic!("expected MissingCrate error, got {other:?}"),
-        }
+        let mut f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        f.metadata["packages"] = json!([]);
+        assert!(matches!(f.check(), Err(BoundaryError::MissingCrate { .. })));
     }
-
     #[test]
     fn test_negative_no_scanned_source_files_rejected() {
-        let root = Path::new("../../");
-        let mock_metadata = r#"{
-            "packages": [{
-                "id": "carrick-sched-core 0.1.0",
-                "name": "carrick-sched-core",
-                "version": "0.1.0",
-                "manifest_path": "/nonexistent/path/Cargo.toml",
-                "targets": [],
-                "dependencies": []
-            }],
-            "resolve": {
-                "nodes": [{
-                    "id": "carrick-sched-core 0.1.0",
-                    "dependencies": [],
-                    "deps": []
-                }]
-            }
-        }"#;
-        let config = BoundaryConfig {
-            metadata_json: Some(mock_metadata.to_string()),
-            ..Default::default()
-        };
-        let result = check_substrate_boundary(root, &config);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            BoundaryError::NoScannedSourceFiles { crate_name } => {
-                assert_eq!(crate_name, "carrick-sched-core");
-            }
-            other => panic!("expected NoScannedSourceFiles error, got {other:?}"),
-        }
+        let f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        fs::remove_dir_all(f.root.path().join("crates/carrick-sched-core")).unwrap();
+        assert!(f.check().is_err());
     }
-
+    #[test]
+    fn test_metadata_from_another_workspace_rejected() {
+        let mut f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        f.metadata["workspace_root"] = json!(f.root.path().join("another-checkout"));
+        assert!(
+            f.check().is_err(),
+            "metadata must belong to the selected workspace"
+        );
+    }
+    #[test]
+    fn test_negative_missing_target_cannot_fall_back_to_other_source() {
+        let mut f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        f.metadata["packages"][0]["targets"][0]["src_path"] =
+            json!(f.root.path().join("missing.rs"));
+        assert!(
+            f.check().is_err(),
+            "a missing production target must not be replaced by src/lib.rs"
+        );
+    }
+    #[test]
+    fn test_negative_direct_dependency_rejected() {
+        let mut f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        f.package("abi", "carrick-abi");
+        f.edge(0, "abi", "carrick_abi", None, None);
+        assert!(matches!(f.check(), Err(BoundaryError::Violations { .. })));
+    }
+    #[test]
+    fn test_negative_renamed_alias_dependency_rejected() {
+        let mut f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        f.package("abi", "carrick-abi");
+        f.edge(0, "abi", "renamed", None, None);
+        assert!(matches!(f.check(), Err(BoundaryError::Violations { .. })));
+    }
+    #[test]
+    fn test_negative_target_conditioned_build_dependency_rejected() {
+        let mut f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        f.package("abi", "carrick-abi");
+        f.edge(
+            0,
+            "abi",
+            "carrick_abi",
+            Some("build"),
+            Some("cfg(target_os = \"linux\")"),
+        );
+        assert!(matches!(f.check(), Err(BoundaryError::Violations { .. })));
+    }
+    #[test]
+    fn test_positive_dev_only_dependency_allowed() {
+        let mut f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        f.package("abi", "carrick-abi");
+        f.edge(0, "abi", "carrick_abi", Some("dev"), None);
+        let r = f.check().unwrap();
+        assert!(r[0].shipped_dependency_closure.is_empty());
+        assert_eq!(r[0].dev_dependencies_scope, vec!["carrick-abi"]);
+    }
+    #[test]
+    fn test_negative_missing_transitive_node_rejected() {
+        let mut f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        f.package("bridge", "bridge");
+        f.edge(0, "bridge", "bridge", None, None);
+        f.metadata["resolve"]["nodes"].as_array_mut().unwrap().pop();
+        assert!(matches!(
+            f.check(),
+            Err(BoundaryError::UnresolvedDependencyGraph { .. })
+        ));
+    }
+    #[test]
+    fn test_inherited_test_module_and_production_filename() {
+        let f = Fixture::new("src/lib.rs", "#[cfg(test)] mod checks;");
+        let d = f.root.path().join("crates/carrick-sched-core/src");
+        fs::write(d.join("checks.rs"), "pub const RESULT:i64=-110;").unwrap();
+        assert!(f.check().is_ok());
+        fs::write(d.join("lib.rs"), "mod checks;").unwrap();
+        assert!(matches!(f.check(), Err(BoundaryError::Violations { .. })));
+    }
     #[test]
     fn test_negative_cfg_not_test_rejected() {
         let code = r#"
@@ -1637,164 +1584,6 @@ mod tests {
         let parsed = syn::parse_file(code).unwrap();
         visitor.visit_file(&parsed);
         assert_eq!(visitor.violations.len(), 0);
-    }
-
-    #[test]
-    fn test_negative_direct_dependency_rejected() {
-        let root = Path::new("../../");
-        let mock_metadata = r#"{
-            "packages": [
-                {
-                    "id": "carrick-sched-core 0.1.0",
-                    "name": "carrick-sched-core",
-                    "version": "0.1.0",
-                    "manifest_path": "../../crates/carrick-sched-core/Cargo.toml",
-                    "targets": [{
-                        "kind": ["lib"],
-                        "name": "carrick-sched-core",
-                        "src_path": "../../crates/carrick-sched-core/src/lib.rs"
-                    }],
-                    "dependencies": [
-                        { "name": "carrick-abi", "optional": false, "kind": null }
-                    ]
-                },
-                {
-                    "id": "carrick-abi 0.1.0",
-                    "name": "carrick-abi",
-                    "version": "0.1.0",
-                    "manifest_path": "../../crates/carrick-abi/Cargo.toml",
-                    "targets": [],
-                    "dependencies": []
-                }
-            ],
-            "resolve": {
-                "nodes": [
-                    {
-                        "id": "carrick-sched-core 0.1.0",
-                        "dependencies": ["carrick-abi 0.1.0"],
-                        "deps": [{ "name": "carrick-abi", "pkg": "carrick-abi 0.1.0", "dep_kinds": [{ "kind": null }] }]
-                    },
-                    {
-                        "id": "carrick-abi 0.1.0",
-                        "dependencies": [],
-                        "deps": []
-                    }
-                ]
-            }
-        }"#;
-        let config = BoundaryConfig {
-            metadata_json: Some(mock_metadata.to_string()),
-            ..Default::default()
-        };
-        let result = check_substrate_boundary(root, &config);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("reaches forbidden personality crate `carrick-abi`"));
-    }
-
-    #[test]
-    fn test_negative_renamed_alias_dependency_rejected() {
-        let root = Path::new("../../");
-        let mock_metadata = r#"{
-            "packages": [
-                {
-                    "id": "carrick-sched-core 0.1.0",
-                    "name": "carrick-sched-core",
-                    "version": "0.1.0",
-                    "manifest_path": "../../crates/carrick-sched-core/Cargo.toml",
-                    "targets": [{
-                        "kind": ["lib"],
-                        "name": "carrick-sched-core",
-                        "src_path": "../../crates/carrick-sched-core/src/lib.rs"
-                    }],
-                    "dependencies": [
-                        { "name": "carrick-abi", "rename": "compat", "optional": false, "kind": null }
-                    ]
-                },
-                {
-                    "id": "carrick-abi 0.1.0",
-                    "name": "carrick-abi",
-                    "version": "0.1.0",
-                    "manifest_path": "../../crates/carrick-abi/Cargo.toml",
-                    "targets": [],
-                    "dependencies": []
-                }
-            ],
-            "resolve": {
-                "nodes": [
-                    {
-                        "id": "carrick-sched-core 0.1.0",
-                        "dependencies": ["carrick-abi 0.1.0"],
-                        "deps": [{ "name": "compat", "pkg": "carrick-abi 0.1.0", "dep_kinds": [{ "kind": null }] }]
-                    },
-                    {
-                        "id": "carrick-abi 0.1.0",
-                        "dependencies": [],
-                        "deps": []
-                    }
-                ]
-            }
-        }"#;
-        let config = BoundaryConfig {
-            metadata_json: Some(mock_metadata.to_string()),
-            ..Default::default()
-        };
-        let result = check_substrate_boundary(root, &config);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("compat(renamed:carrick-abi)"));
-    }
-
-    #[test]
-    fn test_positive_dev_only_dependency_allowed() {
-        let root = Path::new("../../");
-        let mock_metadata = r#"{
-            "packages": [
-                {
-                    "id": "carrick-sched-core 0.1.0",
-                    "name": "carrick-sched-core",
-                    "version": "0.1.0",
-                    "manifest_path": "../../crates/carrick-sched-core/Cargo.toml",
-                    "targets": [{
-                        "kind": ["lib"],
-                        "name": "carrick-sched-core",
-                        "src_path": "../../crates/carrick-sched-core/src/lib.rs"
-                    }],
-                    "dependencies": [
-                        { "name": "test-helper", "optional": false, "kind": "dev" }
-                    ]
-                },
-                {
-                    "id": "test-helper 0.1.0",
-                    "name": "test-helper",
-                    "version": "0.1.0",
-                    "manifest_path": "/fake/test-helper/Cargo.toml",
-                    "targets": [],
-                    "dependencies": []
-                }
-            ],
-            "resolve": {
-                "nodes": [
-                    {
-                        "id": "carrick-sched-core 0.1.0",
-                        "dependencies": ["test-helper 0.1.0"],
-                        "deps": [{ "name": "test-helper", "pkg": "test-helper 0.1.0", "dep_kinds": [{ "kind": "dev" }] }]
-                    },
-                    {
-                        "id": "test-helper 0.1.0",
-                        "dependencies": [],
-                        "deps": []
-                    }
-                ]
-            }
-        }"#;
-        let config = BoundaryConfig {
-            metadata_json: Some(mock_metadata.to_string()),
-            ..Default::default()
-        };
-        let reports = check_substrate_boundary(root, &config).expect("dev only dep should pass");
-        assert_eq!(reports[0].shipped_dependency_closure.len(), 0);
-        assert_eq!(reports[0].dev_dependencies_scope, vec!["test-helper"]);
     }
 
     fn make_test_visitor<'a>(code: &'a str) -> SourceCheckerVisitor<'a> {

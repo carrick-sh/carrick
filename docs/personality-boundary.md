@@ -106,3 +106,13 @@ expand across subsystems:
    distinct Linux personality mappings.
 3. **Increment 4 (VFS & Descriptors):** Separate EL1 file descriptor tables and
    dentry caches into substrate storage and Linux syscall bindings.
+
+### Verification constraints
+
+The checker binds metadata to the selected workspace and the actual substrate
+manifest. Every declared production target must exist; a missing target cannot
+fall back to a different source file. The unit fixtures are temporary,
+self-contained workspaces with resolved graph inputs, so missing scratch files
+cannot silently skip regression coverage. The public recipe regenerates locked,
+offline, all-feature metadata immediately before checking. Standalone use must
+likewise provide freshly generated metadata.
