@@ -1,0 +1,6 @@
+serial_forks=128
+dirty_parent=true
+fork_succeeded=true
+children_exited_zero=true
+reaped_each_child=true
+child_pids_distinct=true

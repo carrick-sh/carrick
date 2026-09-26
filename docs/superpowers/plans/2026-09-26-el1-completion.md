@@ -395,3 +395,24 @@ status is superseded by this integration, not by a claim of guest execution.
 After those gates, the critical path is EL1 metadata allocation, abort entry,
 elastic frame grant/return, and real guest first-touch service. Keep all later
 checkpoints and the per-workload native-Docker objective in scope.
+
+### Snapshot allocation correction and matching-image fork oracle
+
+Integrated `12246bbd5` as `54f3167a7`. The allocator witness observes zero
+large snapshot-buffer allocations after warmup at all four scales, replacing
+the old live-conversion behavior that allocated once per fork. Live descriptors
+remain authoritative; retained buffers contain no readable snapshot contents.
+
+The preceding full CI on `899873310` exited zero (6,179 passing tests across
+101 result groups; 12 existing ignores). Its transcript remains at
+`target/el1-completion/live-integrated/ci.log`, SHA-256
+`73d09acfd5ac0012fa7493f15021e1a0acb54bd447927721f09b75b5755d6d03`.
+That result does not cover the allocation correction. Full CI for `54f3167a7`
+is in progress at `target/el1-completion/live-integrated/ci-54f3167a7.log`.
+
+Fresh image inspection found different Ubuntu image versions behind Docker's
+and Carrick's cached tags. The native fork runner now pins Carrick's exact
+manifest and verifies equal root filesystem layer digests. All 12 native rows
+pass with cleanup proved. Receipts:
+[matching-image fork authority](../../perf-results/2026-09-26-el1-live-table-review/native-fork-54f3167a7/README.md).
+Signed validation and every remaining migration checkpoint remain open.

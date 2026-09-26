@@ -1,0 +1,500 @@
+{
+  "head": "54f3167a7d1929e962788e79b552a63cec03cf04",
+  "image": "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+  "binary_sha256": "1239c755486ab7d1c53cfb0675d22499810457ff0b8067db16945fb9960ced62",
+  "carrick_image": {
+    "image": "docker.io/library/ubuntu:24.04",
+    "digest": "sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+    "image_dir": "/Users/tjfontaine/.carrick/images/docker.io/library/ubuntu/24.04",
+    "config_size": 2069,
+    "layers": [
+      {
+        "digest": "sha256:818154cda96df8bbb276b4f4339124da55756620a1037af15570bc95312850fa",
+        "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "size": 28875785,
+        "path": "/Users/tjfontaine/.carrick/blobs/sha256/818154cda96df8bbb276b4f4339124da55756620a1037af15570bc95312850fa"
+      }
+    ]
+  },
+  "docker_image": {
+    "Id": "sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+    "RepoTags": [
+      "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05"
+    ],
+    "RepoDigests": [
+      "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05"
+    ],
+    "Created": "2026-04-10T06:56:54.752442228Z",
+    "Config": {
+      "Env": [
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      ],
+      "Cmd": [
+        "/bin/bash"
+      ],
+      "Labels": {
+        "org.opencontainers.image.version": "24.04"
+      }
+    },
+    "Architecture": "arm64",
+    "Variant": "v8",
+    "Os": "linux",
+    "Size": 139236806,
+    "RootFS": {
+      "Type": "layers",
+      "Layers": [
+        "sha256:d9a56420aee7ff835e0c05fc666d1237d40f0da5fe338738e651b01db4672a5d"
+      ]
+    },
+    "Metadata": {
+      "LastTagTime": "2026-09-26T23:43:39.999925011Z"
+    },
+    "Descriptor": {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+      "size": 424
+    },
+    "Identity": {
+      "Pull": [
+        {
+          "Repository": "docker.io/library/ubuntu"
+        }
+      ]
+    }
+  },
+  "cache_file_sha256": {
+    "config.json": "3c220491de2e7cd3946456f3e8b2a2d2e0f52383235f5cab93ead70cca9ee9ed",
+    "manifest.json": "0fcdcec41d9aabc43001a4f200bb7ece2bcf0f6a576cc6e85267d5cecf81fb59",
+    "carrick-image.json": "a0ec0fd4ab76a1de2bcb6c4de4f7338a3ad8f5a4c783c2d94da3e8ebbe1889c0"
+  },
+  "rows": [
+    {
+      "mode": "direct",
+      "scale": 1,
+      "name": "el1-live-native-fork-direct-1",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--name",
+        "el1-live-native-fork-direct-1",
+        "--mount",
+        "type=bind,source=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkserial,target=/p/forkserial,readonly",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/usr/bin/timeout",
+        "45",
+        "/p/forkserial",
+        "1"
+      ],
+      "exit_code": 0,
+      "observed": {
+        "serial_forks": "1",
+        "dirty_parent": "false",
+        "fork_succeeded": "true",
+        "children_exited_zero": "true",
+        "reaped_each_child": "true",
+        "child_pids_distinct": "true"
+      },
+      "remaining": "",
+      "passed": true
+    },
+    {
+      "mode": "direct",
+      "scale": 8,
+      "name": "el1-live-native-fork-direct-8",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--name",
+        "el1-live-native-fork-direct-8",
+        "--mount",
+        "type=bind,source=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkserial,target=/p/forkserial,readonly",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/usr/bin/timeout",
+        "45",
+        "/p/forkserial",
+        "8"
+      ],
+      "exit_code": 0,
+      "observed": {
+        "serial_forks": "8",
+        "dirty_parent": "false",
+        "fork_succeeded": "true",
+        "children_exited_zero": "true",
+        "reaped_each_child": "true",
+        "child_pids_distinct": "true"
+      },
+      "remaining": "",
+      "passed": true
+    },
+    {
+      "mode": "direct",
+      "scale": 32,
+      "name": "el1-live-native-fork-direct-32",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--name",
+        "el1-live-native-fork-direct-32",
+        "--mount",
+        "type=bind,source=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkserial,target=/p/forkserial,readonly",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/usr/bin/timeout",
+        "45",
+        "/p/forkserial",
+        "32"
+      ],
+      "exit_code": 0,
+      "observed": {
+        "serial_forks": "32",
+        "dirty_parent": "false",
+        "fork_succeeded": "true",
+        "children_exited_zero": "true",
+        "reaped_each_child": "true",
+        "child_pids_distinct": "true"
+      },
+      "remaining": "",
+      "passed": true
+    },
+    {
+      "mode": "direct",
+      "scale": 128,
+      "name": "el1-live-native-fork-direct-128",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--name",
+        "el1-live-native-fork-direct-128",
+        "--mount",
+        "type=bind,source=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkserial,target=/p/forkserial,readonly",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/usr/bin/timeout",
+        "45",
+        "/p/forkserial",
+        "128"
+      ],
+      "exit_code": 0,
+      "observed": {
+        "serial_forks": "128",
+        "dirty_parent": "false",
+        "fork_succeeded": "true",
+        "children_exited_zero": "true",
+        "reaped_each_child": "true",
+        "child_pids_distinct": "true"
+      },
+      "remaining": "",
+      "passed": true
+    },
+    {
+      "mode": "dirty",
+      "scale": 1,
+      "name": "el1-live-native-fork-dirty-1",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--name",
+        "el1-live-native-fork-dirty-1",
+        "--mount",
+        "type=bind,source=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkserial,target=/p/forkserial,readonly",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/usr/bin/timeout",
+        "45",
+        "/p/forkserial",
+        "1",
+        "dirty"
+      ],
+      "exit_code": 0,
+      "observed": {
+        "serial_forks": "1",
+        "dirty_parent": "true",
+        "fork_succeeded": "true",
+        "children_exited_zero": "true",
+        "reaped_each_child": "true",
+        "child_pids_distinct": "true"
+      },
+      "remaining": "",
+      "passed": true
+    },
+    {
+      "mode": "dirty",
+      "scale": 8,
+      "name": "el1-live-native-fork-dirty-8",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--name",
+        "el1-live-native-fork-dirty-8",
+        "--mount",
+        "type=bind,source=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkserial,target=/p/forkserial,readonly",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/usr/bin/timeout",
+        "45",
+        "/p/forkserial",
+        "8",
+        "dirty"
+      ],
+      "exit_code": 0,
+      "observed": {
+        "serial_forks": "8",
+        "dirty_parent": "true",
+        "fork_succeeded": "true",
+        "children_exited_zero": "true",
+        "reaped_each_child": "true",
+        "child_pids_distinct": "true"
+      },
+      "remaining": "",
+      "passed": true
+    },
+    {
+      "mode": "dirty",
+      "scale": 32,
+      "name": "el1-live-native-fork-dirty-32",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--name",
+        "el1-live-native-fork-dirty-32",
+        "--mount",
+        "type=bind,source=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkserial,target=/p/forkserial,readonly",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/usr/bin/timeout",
+        "45",
+        "/p/forkserial",
+        "32",
+        "dirty"
+      ],
+      "exit_code": 0,
+      "observed": {
+        "serial_forks": "32",
+        "dirty_parent": "true",
+        "fork_succeeded": "true",
+        "children_exited_zero": "true",
+        "reaped_each_child": "true",
+        "child_pids_distinct": "true"
+      },
+      "remaining": "",
+      "passed": true
+    },
+    {
+      "mode": "dirty",
+      "scale": 128,
+      "name": "el1-live-native-fork-dirty-128",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--name",
+        "el1-live-native-fork-dirty-128",
+        "--mount",
+        "type=bind,source=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkserial,target=/p/forkserial,readonly",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/usr/bin/timeout",
+        "45",
+        "/p/forkserial",
+        "128",
+        "dirty"
+      ],
+      "exit_code": 0,
+      "observed": {
+        "serial_forks": "128",
+        "dirty_parent": "true",
+        "fork_succeeded": "true",
+        "children_exited_zero": "true",
+        "reaped_each_child": "true",
+        "child_pids_distinct": "true"
+      },
+      "remaining": "",
+      "passed": true
+    },
+    {
+      "mode": "shell",
+      "scale": 1,
+      "name": "el1-live-native-fork-shell-1",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--name",
+        "el1-live-native-fork-shell-1",
+        "--mount",
+        "type=bind,source=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkserial,target=/p/forkserial,readonly",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/usr/bin/timeout",
+        "45",
+        "/bin/sh",
+        "-c",
+        "exec /p/forkserial 1"
+      ],
+      "exit_code": 0,
+      "observed": {
+        "serial_forks": "1",
+        "dirty_parent": "false",
+        "fork_succeeded": "true",
+        "children_exited_zero": "true",
+        "reaped_each_child": "true",
+        "child_pids_distinct": "true"
+      },
+      "remaining": "",
+      "passed": true
+    },
+    {
+      "mode": "shell",
+      "scale": 8,
+      "name": "el1-live-native-fork-shell-8",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--name",
+        "el1-live-native-fork-shell-8",
+        "--mount",
+        "type=bind,source=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkserial,target=/p/forkserial,readonly",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/usr/bin/timeout",
+        "45",
+        "/bin/sh",
+        "-c",
+        "exec /p/forkserial 8"
+      ],
+      "exit_code": 0,
+      "observed": {
+        "serial_forks": "8",
+        "dirty_parent": "false",
+        "fork_succeeded": "true",
+        "children_exited_zero": "true",
+        "reaped_each_child": "true",
+        "child_pids_distinct": "true"
+      },
+      "remaining": "",
+      "passed": true
+    },
+    {
+      "mode": "shell",
+      "scale": 32,
+      "name": "el1-live-native-fork-shell-32",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--name",
+        "el1-live-native-fork-shell-32",
+        "--mount",
+        "type=bind,source=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkserial,target=/p/forkserial,readonly",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/usr/bin/timeout",
+        "45",
+        "/bin/sh",
+        "-c",
+        "exec /p/forkserial 32"
+      ],
+      "exit_code": 0,
+      "observed": {
+        "serial_forks": "32",
+        "dirty_parent": "false",
+        "fork_succeeded": "true",
+        "children_exited_zero": "true",
+        "reaped_each_child": "true",
+        "child_pids_distinct": "true"
+      },
+      "remaining": "",
+      "passed": true
+    },
+    {
+      "mode": "shell",
+      "scale": 128,
+      "name": "el1-live-native-fork-shell-128",
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--name",
+        "el1-live-native-fork-shell-128",
+        "--mount",
+        "type=bind,source=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkserial,target=/p/forkserial,readonly",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/usr/bin/timeout",
+        "45",
+        "/bin/sh",
+        "-c",
+        "exec /p/forkserial 128"
+      ],
+      "exit_code": 0,
+      "observed": {
+        "serial_forks": "128",
+        "dirty_parent": "false",
+        "fork_succeeded": "true",
+        "children_exited_zero": "true",
+        "reaped_each_child": "true",
+        "child_pids_distinct": "true"
+      },
+      "remaining": "",
+      "passed": true
+    }
+  ]
+}
