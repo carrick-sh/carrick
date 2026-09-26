@@ -243,3 +243,18 @@ worktree, preserving the failing snapshot witness. Personality review round 2
 requires resolved Cargo graph traversal: a path-only manifest walk cannot prove
 registry or Git transitive closure. Both are implementation work in progress;
 neither grants EL1 memory acceptance.
+
+### Full host gate on the extraction
+
+`RUSTC_WRAPPER= just ci` started at `2e5cce585`; only boundary-review evidence
+documents changed during execution (`6214798f2`), not product/test source. It
+exited 101 in `just test` at the intentional live-snapshot witness: 618 runtime
+tests passed, one failed, and eight existing diagnostics were ignored. The
+failure still reports a physical translation after revoking the live leaf.
+Formatting, workspace Clippy, domain checks (with the documented partial
+cross-platform census), dependency policy, matrix/check and warning-free docs
+completed before that failure. Earlier host test groups also passed.
+Later test groups and integration tests were not reached; this is not CI green.
+The complete transcript is `docs/perf-results/2026-09-26-el1-first-touch/mmu-integrated-ci.log`.
+The red remains unchanged while the isolated live-table worker implements the
+shared storage authority.
