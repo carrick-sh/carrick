@@ -204,6 +204,10 @@ impl HostWaitToken<'_> {
             drop(state);
             if let Some(owner) = owner {
                 self.executors.deliver_kick_to(owner);
+                // The borrower may be waiting for work in the guest (EL1
+                // plan 1d), holding the slot with no thread to settle: force
+                // its vCPU out so it rescans and releases the slot here.
+                self.executors.wake_guest_idle_executor(owner);
             }
             self.queue.cpus[self.cpu.as_usize()].nudge();
             state = self.queue.state.lock();

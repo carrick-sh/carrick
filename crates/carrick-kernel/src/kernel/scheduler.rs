@@ -7582,6 +7582,112 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// A kick that counts the scheduler's attempts to force an executor out
+    /// of its wait in the guest (EL1 plan 1d).
+    #[derive(Debug, Default)]
+    struct GuestIdleKick {
+        inner: RecordingKick,
+        idle_wakes: AtomicUsize,
+    }
+
+    impl ExecutorKick for GuestIdleKick {
+        fn try_bind(&self, binding: super::ExecutorBinding) -> bool {
+            self.inner.try_bind(binding)
+        }
+
+        fn unbind(&self, binding: super::ExecutorBinding) {
+            self.inner.unbind(binding);
+        }
+
+        fn rebind_exact_with(
+            &self,
+            predecessor: super::ExecutorBinding,
+            successor: super::ExecutorBinding,
+            publish: &mut dyn FnMut() -> bool,
+        ) -> bool {
+            self.inner
+                .rebind_exact_with(predecessor, successor, publish)
+        }
+
+        fn deliver_exact(&self, token: ExecutorKickToken) -> bool {
+            self.inner.deliver_exact(token)
+        }
+
+        fn current_binding(&self) -> Option<super::ExecutorBinding> {
+            self.inner.current_binding()
+        }
+
+        fn wake_from_guest_idle(&self) {
+            self.idle_wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// kernel.scheduler.host-wait-handoff under guest scheduling: a spare
+    /// that borrowed a host-waiting executor's CPU and found no thread waits
+    /// in the guest holding it, and nothing but a guest-idle wake reaches it
+    /// there. The returning owner must force it out so it releases the CPU;
+    /// without that `go build` wedged with its stdout writer parked in
+    /// `HostWaitToken::resume` for good.
+    #[test]
+    fn a_returning_host_waiter_wakes_the_guest_idle_borrower_of_its_cpu() {
+        let (kernel, context) = bootstrap(12_406);
+        publish(&context, 49);
+        let scheduler = scheduler_with_cpus(kernel, 1);
+        let owner = scheduler
+            .register_executor_bound(
+                Arc::new(RecordingKick::default()),
+                Some(GuestCpuId::new(0)),
+                false,
+            )
+            .unwrap();
+        let borrower_kick = Arc::new(GuestIdleKick::default());
+        let borrower = scheduler
+            .register_executor_bound(borrower_kick.clone(), None, true)
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let running = scheduler.take(&owner).unwrap();
+        let token = scheduler.begin_host_wait(&running, &owner).unwrap();
+        // The spare takes the lent CPU, finds nothing, and would wait in the
+        // guest.
+        assert!(scheduler.try_take(&borrower).unwrap().is_none());
+        assert!(
+            borrower.bound_cpu().is_some(),
+            "the spare holds the lent CPU"
+        );
+
+        // The borrower waits "in the guest" until something wakes it, then
+        // rescans: it gives the CPU back and parks as a spare (closing the
+        // queue ends that park). A red run times out the wait and rescans
+        // anyway, so the owner below is never left blocked.
+        let borrower_side = {
+            let scheduler = Arc::clone(&scheduler);
+            let borrower_kick = Arc::clone(&borrower_kick);
+            thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while borrower_kick.idle_wakes.load(Ordering::SeqCst) == 0
+                    && std::time::Instant::now() < deadline
+                {
+                    thread::yield_now();
+                }
+                let woken = borrower_kick.idle_wakes.load(Ordering::SeqCst);
+                (
+                    woken,
+                    scheduler.try_take(&borrower).map(|taken| taken.is_some()),
+                )
+            })
+        };
+        // The owner returns from its host wait: it waits for its CPU back.
+        drop(token);
+        scheduler.settle_exited(running).unwrap();
+        scheduler.close();
+        let (woken, rescan) = borrower_side.join().unwrap();
+        assert!(matches!(rescan, Err(RunQueueError::Closed)), "{rescan:?}");
+        assert!(
+            woken > 0,
+            "the returning owner never woke the guest-idle borrower"
+        );
+    }
+
     #[test]
     fn close_drains_with_spare_executors_parked() {
         let (kernel, root) = bootstrap(12_407);
