@@ -120,15 +120,21 @@ where
     ) else {
         return Action::Forward;
     };
-    sched::Sched {
+    let mut sched = sched::Sched {
         zone: zone.tables,
         slot,
         task,
         cpu: zone.cpu,
         user: zone.user,
         counters,
+    };
+    // The idle entry: the host started this vCPU in the scheduler with no
+    // thread (a frame with no EL0 return address, which an interrupt taken
+    // at EL0 never has).
+    if frame.elr == 0 {
+        return sched.serve_idle_entry(frame);
     }
-    .serve_irq(frame)
+    sched.serve_irq(frame)
 }
 
 /// The in-guest scheduler's tables and the CPU and user-memory access an
@@ -172,47 +178,41 @@ where
         return Action::Forward;
     }
 
-    // Threads EL1 woke onto this vCPU wait for the running one to block in
-    // a served futex wait; any other syscall goes to the host, which takes
-    // them at that exit rather than let them wait behind this thread.
-    if let (Some(zone), Some(task), Some(zslot)) = (zone, cur_task, SlotId::from_index(slot)) {
-        let queued = zone.tables.slot(zslot).queued() != 0;
-        if sched::is_served_futex_op(frame) {
-            let orig_x0 = frame.x[0];
-            let mut sched = sched::Sched {
-                zone: zone.tables,
-                slot: zslot,
-                task,
-                cpu: zone.cpu,
-                user: zone.user,
-                counters,
-            };
-            match sched.serve_futex(frame) {
-                Some(sched::Served::Returned { switched }) => {
-                    counters.served[sched::SYS_FUTEX].fetch_add(1, Ordering::Relaxed);
-                    // After a switch the frame is the switched-in thread's,
-                    // whose own futex argument the switch recorded.
-                    if !switched {
-                        task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    }
-                    if task.has_pending_host_work() {
-                        task.served_with_work.store(1, Ordering::Release);
-                        return Action::ServedWithWork;
-                    }
-                    return Action::Served;
+    // Threads queued on this vCPU wait for the running one to block in a
+    // served futex wait or for its slice to end (EL1 plan 1d: other
+    // syscalls are served or forwarded as usual; 1b forwarded them all so
+    // the host could run the queued threads).
+    if let (Some(zone), Some(task), Some(zslot)) = (zone, cur_task, SlotId::from_index(slot))
+        && sched::is_served_futex_op(frame)
+    {
+        let orig_x0 = frame.x[0];
+        let mut sched = sched::Sched {
+            zone: zone.tables,
+            slot: zslot,
+            task,
+            cpu: zone.cpu,
+            user: zone.user,
+            counters,
+        };
+        match sched.serve_futex(frame) {
+            Some(sched::Served::Returned { switched }) => {
+                counters.served[sched::SYS_FUTEX].fetch_add(1, Ordering::Relaxed);
+                // After a switch the frame is the switched-in thread's,
+                // whose own futex argument the switch recorded.
+                if !switched {
+                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
                 }
-                Some(sched::Served::Idle) => {
-                    counters.served[sched::SYS_FUTEX].fetch_add(1, Ordering::Relaxed);
-                    return Action::Idle;
+                if task.has_pending_host_work() {
+                    task.served_with_work.store(1, Ordering::Release);
+                    return Action::ServedWithWork;
                 }
-                None => {}
+                return Action::Served;
             }
-        } else if queued {
-            let nr = frame.x[8] as usize;
-            if nr < 512 {
-                counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
+            Some(sched::Served::Idle) => {
+                counters.served[sched::SYS_FUTEX].fetch_add(1, Ordering::Relaxed);
+                return Action::Idle;
             }
-            return Action::Forward;
+            None => {}
         }
     }
 

@@ -54,6 +54,26 @@
 //! Timed waits of a slot's loaded thread end on that slot's virtual timer,
 //! which also bounds how long a queued thread waits behind a running one
 //! ([`PREEMPT_SLICE_NS`]).
+//!
+//! # EL1 as the scheduler (EL1 plan 1d)
+//!
+//! A slot's run queue is a FIFO linked through the records, with no capacity
+//! but the records themselves. It holds two kinds of runnable thread:
+//!
+//! - threads ready to run at EL0 (woken, timed out, preempted), whose
+//!   context is in the record, and
+//! - threads runnable on the host's side ([`Handback::Service`]): a completed
+//!   host wait, a first run, a control action. The host queues them
+//!   ([`ZoneTables::place_from_host`]); EL1 orders them with the rest but
+//!   never runs one at EL0: when one reaches the head of a switch, the vCPU
+//!   leaves for its executor, which loads the thread and serves it.
+//!
+//! An idle vCPU takes a queued thread it may run from another slot
+//! ([`ZoneTables::steal`], never a home record), so a queue whose vCPU is
+//! stopped at a long host exit does not strand its threads. The host cannot
+//! send an SGI: a placement that needs one sets the slot's reschedule flag
+//! and forces the vCPU out, and its run loop raises the SGI
+//! ([`ZoneTables::take_resched`]).
 
 #![no_std]
 
@@ -72,8 +92,8 @@ pub const ZONE_ENTRIES: usize = 8192;
 pub const ZONE_BUCKETS: usize = 1024;
 /// vCPU slots (one per syscall-mailbox slot).
 pub const ZONE_SLOTS: usize = 256;
-/// Threads one vCPU slot may hold woken and waiting to run.
-pub const ZONE_RUNQ_CAPACITY: usize = 8;
+/// Words of a per-slot bitmap.
+pub const ZONE_SLOT_WORDS: usize = ZONE_SLOTS / 64;
 
 /// How long a thread queued behind a running one waits before the virtual
 /// timer preempts the running thread (the bound the 1b run-queue guard gave
@@ -267,6 +287,12 @@ pub enum Handback {
     Control = 5,
     /// Its host continuation was cancelled; the thread will not run again.
     Cancelled = 6,
+    /// Runnable on the host's side (EL1 plan 1d): its registers are not in
+    /// the record, and resuming it needs host service (a completed host wait,
+    /// a first run, a control action). EL1 schedules it like any queued
+    /// thread but never runs it at EL0: switching to it makes the vCPU leave
+    /// for its executor, which loads the thread and serves it there.
+    Service = 7,
 }
 
 impl Handback {
@@ -278,6 +304,7 @@ impl Handback {
             4 => Some(Self::Signal),
             5 => Some(Self::Control),
             6 => Some(Self::Cancelled),
+            7 => Some(Self::Service),
             _ => None,
         }
     }
@@ -378,6 +405,9 @@ pub struct ZoneRecord {
     home: AtomicU32,
     /// `slot + 1` of the slot it last ran on (0: never ran in-guest).
     last_slot: AtomicU32,
+    /// The next record on the run queue it is queued on (0: the tail).
+    /// Written only under that slot's run-queue lock.
+    next: AtomicU32,
     /// CNTVCT deadline of the current park (0: untimed).
     deadline: AtomicU64,
     affinity: AtomicU64,
@@ -432,6 +462,12 @@ impl ZoneRecord {
 
     pub fn handback(&self) -> Option<Handback> {
         Handback::from_raw(self.handback.load(Ordering::Acquire))
+    }
+
+    /// Whether resuming it needs its executor ([`Handback::Service`]): EL1
+    /// never runs such a thread at EL0.
+    pub fn needs_host(&self) -> bool {
+        self.handback() == Some(Handback::Service)
     }
 
     pub fn entry_count(&self) -> u32 {
@@ -525,7 +561,11 @@ pub struct ZoneBucket {
 pub struct ZoneSlot {
     /// The record EL1 switched in (0: the thread the host loaded is running).
     current: AtomicU32,
+    /// Threads on the run queue: a FIFO linked through [`ZoneRecord`]'s
+    /// `next`, unbounded (the records are the only capacity).
     len: AtomicU32,
+    head: AtomicU32,
+    tail: AtomicU32,
     /// The record EL1 allocated when it parked the thread the host loaded on
     /// this slot (0: it has not parked since the host loaded it).
     host_record: AtomicU32,
@@ -534,7 +574,6 @@ pub struct ZoneSlot {
     /// CNTVCT when the run queue last became non-empty, or when the running
     /// thread last got the CPU while threads waited (the slice start).
     queued_since: AtomicU64,
-    runq: [AtomicU32; ZONE_RUNQ_CAPACITY],
     /// A [`SlotState`].
     state: AtomicU32,
     /// `guest CPU + 1` the executor holding the slot is bound to (0: any).
@@ -552,6 +591,12 @@ pub struct ZoneSlot {
     affinity: AtomicU64,
     /// The `CNTV_CVAL_EL0` EL1 armed on this slot's vCPU (0: disarmed).
     timer_cval: AtomicU64,
+    /// The host queued a thread here and forced the vCPU out: its run loop
+    /// owes it a reschedule SGI before the vCPU runs on ([`ZoneTables::take_resched`]).
+    resched_owed: AtomicU32,
+    /// An executor drives this slot's vCPU (set when the host first loads or
+    /// enters it): the host may queue a thread that needs its executor here.
+    live: AtomicU32,
 }
 
 impl ZoneSlot {
@@ -677,6 +722,22 @@ pub struct ZoneCounters {
     /// Woken threads EL1 could not place where they belong, queued on the
     /// waker's slot, which then exits so the host places them.
     pub el1_misplaced: AtomicU64,
+    /// Queued threads an idle vCPU took from another slot's run queue.
+    pub el1_steals: AtomicU64,
+    /// Vcpus that left the guest to serve a queued thread that needs its
+    /// executor ([`Handback::Service`]).
+    pub el1_service_exits: AtomicU64,
+    /// Threads the host queued in the guest: runnable on the host's side
+    /// ([`Handback::Service`]), and woken zone threads ready to run at EL0.
+    pub host_service_placements: AtomicU64,
+    pub host_ready_placements: AtomicU64,
+    /// Host placements that forced the target vCPU out to deliver a
+    /// reschedule SGI.
+    pub host_resched_kicks: AtomicU64,
+    /// Threads an executor took from its own slot to serve (a service
+    /// adoption), and threads it adopted from its vCPU at an exit.
+    pub service_adoptions: AtomicU64,
+    pub exit_adoptions: AtomicU64,
 }
 
 /// The zone: every table, as one `repr(C)` object in the shared EL1 region.
@@ -690,6 +751,9 @@ pub struct ZoneTables {
     /// One bit per slot that is idle in EL1 (a hint; the slot's lock and
     /// state decide).
     idle_map: [AtomicU64; ZONE_SLOTS / 64],
+    /// One bit per slot whose run queue is not empty (a hint for stealing;
+    /// the slot's lock decides).
+    queued_map: [AtomicU64; ZONE_SLOTS / 64],
     pub counters: ZoneCounters,
     entries: [ZoneEntry; ZONE_ENTRIES],
     records: [ZoneRecord; ZONE_RECORDS],
@@ -737,22 +801,19 @@ impl BucketGuard<'_> {
 pub enum WakeRefusal {
     /// A matching waiter parks on several futexes (`futex_waitv`).
     MultiEntry,
-    /// More waiters would wake than the slot's run queue can hold.
-    RunQueueFull,
     /// A waiter may run only where EL1 cannot queue it now: its home slot is
     /// stopped at a host exit, or no slot its affinity allows is available.
     Unplaceable,
 }
 
-/// What an EL1 wake did besides claiming its waiters: the reschedule SGIs
-/// the waker must send once it released its locks, and whether it had to
+/// What an EL1 wake did besides claiming its waiters: the slots owed a
+/// reschedule SGI once the waker released its locks, and whether it had to
 /// queue a waiter on its own slot although the waiter belongs elsewhere (the
 /// waker then leaves through the host, whose exit hands that thread over).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WakeEffects {
-    /// `ICC_SGI1R_EL1` values to write, first `sgis` valid.
-    pub sgi: [u64; ZONE_RUNQ_CAPACITY],
-    pub sgis: usize,
+    /// One bit per slot to send a reschedule SGI to ([`ZoneSlot::sgi_target`]).
+    pub sgi: [u64; ZONE_SLOT_WORDS],
     /// A woken thread was queued on the waker's own slot where it may not
     /// run; the waker must exit to the host.
     pub misplaced: bool,
@@ -761,11 +822,23 @@ pub struct WakeEffects {
 }
 
 impl WakeEffects {
-    fn push_sgi(&mut self, target: u64) {
-        if target != 0 && self.sgis < self.sgi.len() && !self.sgi[..self.sgis].contains(&target) {
-            self.sgi[self.sgis] = target;
-            self.sgis += 1;
-        }
+    fn push_sgi(&mut self, slot: SlotId) {
+        self.sgi[slot.index() / 64] |= 1 << (slot.index() % 64);
+    }
+
+    /// The slots owed a reschedule SGI.
+    pub fn sgi_slots(&self) -> impl Iterator<Item = SlotId> + '_ {
+        self.sgi.iter().enumerate().flat_map(|(word, bits)| {
+            let mut bits = *bits;
+            core::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                SlotId::from_index(word * 64 + bit)
+            })
+        })
     }
 }
 
@@ -818,6 +891,14 @@ pub struct SlotDrain {
     pub current: Option<RecordId>,
     /// The record of the host-loaded thread, if EL1 parked it.
     pub host_record: Option<RecordId>,
+}
+
+/// Where [`ZoneTables::place_from_host`] queued a thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostPlacement {
+    pub slot: SlotId,
+    /// The slot's vCPU must be forced out to take a reschedule SGI.
+    pub resched: bool,
 }
 
 /// The outcome of [`ZoneTables::handback_current`].
@@ -953,6 +1034,7 @@ impl ZoneTables {
         record.cancelled.store(0, Ordering::Relaxed);
         record.home.store(0, Ordering::Relaxed);
         record.last_slot.store(0, Ordering::Relaxed);
+        record.next.store(NIL, Ordering::Relaxed);
         record.deadline.store(0, Ordering::Relaxed);
         record.claim.store(Claim::Free.encode(), Ordering::Release);
         Ok(id)
@@ -1074,14 +1156,14 @@ impl ZoneTables {
 
     /// Wake up to `count` waiters on `(mm, uaddr)` whose bitset intersects
     /// `bitset`, in queue order, under the lock `guard` holds. Returns the
-    /// number woken and writes the woken records to `woken`.
+    /// number woken and writes the woken records to `woken` (as many as fit).
     ///
     /// An EL1 waker is refused as a whole (nothing changes) if a waiter it
-    /// would wake parks on several futexes, if its own run queue could not
-    /// take them all, or if a waiter can only run where EL1 cannot queue it
-    /// now; it then forwards the syscall. A host waker wakes a `futex_waitv`
-    /// park too: it must call [`Self::unlink_all`] for each woken record
-    /// after releasing `guard`.
+    /// would wake parks on several futexes, or if a waiter can only run where
+    /// EL1 cannot queue it now; it then forwards the syscall. A host waker
+    /// wakes at most `woken.len()` (the caller loops) and wakes a
+    /// `futex_waitv` park too: it must call [`Self::unlink_all`] for each
+    /// woken record after releasing `guard`.
     #[allow(clippy::too_many_arguments)]
     pub fn wake(
         &self,
@@ -1103,9 +1185,8 @@ impl ZoneTables {
     /// its home slot, any other on the slot it last ran on if that slot is
     /// idle, else on another idle slot, else on the waker's own slot. It
     /// claims a thread for another slot under that slot's lock, only while
-    /// the slot is in the guest, and falls back to its own run queue (always
-    /// able to take every waiter: that is the capacity condition) when the
-    /// slot it planned changed meanwhile.
+    /// the slot is in the guest, and falls back to its own run queue (which
+    /// is unbounded) when the slot it planned changed meanwhile.
     #[allow(clippy::too_many_arguments)]
     pub fn wake_placed(
         &self,
@@ -1118,44 +1199,39 @@ impl ZoneTables {
         woken: &mut [RecordId],
         effects: &mut WakeEffects,
     ) -> Result<u32, WakeRefusal> {
+        let bucket = &self.buckets[guard.bucket];
         // An EL1 wake is all or nothing: it must wake every eligible waiter
         // up to `count` or refuse (the host then serves it), never return a
-        // short count because its run queue or `woken` is smaller. A host
-        // wake takes a batch of at most `woken.len()` and the caller loops.
+        // short count. A host wake takes a batch and the caller loops.
         let limit = match waker {
-            Waker::El1 { .. } => (count as usize).min(woken.len() + 1),
+            Waker::El1 { slot } => {
+                // First pass: decide without changing anything.
+                let mut planned = 0usize;
+                let mut cursor = bucket.head.load(Ordering::Relaxed);
+                while cursor != NIL && planned < count as usize {
+                    let entry = self.entry(cursor);
+                    let next = entry.next.load(Ordering::Relaxed);
+                    if let Some(record) = self.eligible(entry, mm, uaddr, bitset) {
+                        if self.record(record).entry_count() != 1 {
+                            return Err(WakeRefusal::MultiEntry);
+                        }
+                        if self.placement(record, slot).is_none() {
+                            return Err(WakeRefusal::Unplaceable);
+                        }
+                        planned += 1;
+                    }
+                    cursor = next;
+                }
+                planned
+            }
             Waker::Host => (count as usize).min(woken.len()),
         };
-        let bucket = &self.buckets[guard.bucket];
-        // First pass: decide without changing anything.
-        let mut planned = 0usize;
-        let mut cursor = bucket.head.load(Ordering::Relaxed);
-        while cursor != NIL && planned < limit {
-            let entry = self.entry(cursor);
-            let next = entry.next.load(Ordering::Relaxed);
-            if let Some(record) = self.eligible(entry, mm, uaddr, bitset) {
-                if let Waker::El1 { slot } = waker {
-                    if self.record(record).entry_count() != 1 {
-                        return Err(WakeRefusal::MultiEntry);
-                    }
-                    if self.placement(record, slot).is_none() {
-                        return Err(WakeRefusal::Unplaceable);
-                    }
-                }
-                planned += 1;
-            }
-            cursor = next;
-        }
-        if let Waker::El1 { slot } = waker
-            && (planned > woken.len() || self.slot(slot).queued() + planned > ZONE_RUNQ_CAPACITY)
-        {
-            return Err(WakeRefusal::RunQueueFull);
-        }
         // Second pass: claim. A record the host claimed meanwhile (a signal
-        // or a timeout needs no bucket lock) is skipped, not counted.
+        // or a timeout needs no bucket lock) is skipped, not counted; nothing
+        // can become eligible, since parking needs the bucket lock.
         let mut done = 0usize;
         let mut cursor = bucket.head.load(Ordering::Relaxed);
-        while cursor != NIL && done < planned {
+        while cursor != NIL && done < limit {
             let entry = self.entry(cursor);
             let next = entry.next.load(Ordering::Relaxed);
             if let Some(record) = self.eligible(entry, mm, uaddr, bitset) {
@@ -1178,7 +1254,9 @@ impl ZoneTables {
                 if claimed {
                     self.unlink(guard, cursor);
                     self.drop_entry(self.record(record), cursor);
-                    woken[done] = record;
+                    if let Some(slot) = woken.get_mut(done) {
+                        *slot = record;
+                    }
                     done += 1;
                 }
             }
@@ -1204,25 +1282,37 @@ impl ZoneTables {
         if let Some(idle) = self.find_idle(rec, waker) {
             return Some(idle);
         }
-        rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed))
-            .then_some(waker)
+        (self.runs_mm_of(waker, rec)
+            && rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed)))
+        .then_some(waker)
+    }
+
+    /// Whether `slot` may run `rec` at EL0 by the address space installed on
+    /// it: a thread that needs its executor runs through the host on any
+    /// slot; any other only on a slot running its address space.
+    fn runs_mm_of(&self, slot: SlotId, rec: &ZoneRecord) -> bool {
+        rec.needs_host() || self.slot(slot).mm() == rec.mm.load(Ordering::Relaxed)
     }
 
     /// Whether slot `slot` may take `rec` now: in the guest (idle, unless
-    /// `home`), room on its run queue, the same address space, and a CPU
-    /// the thread's affinity allows.
+    /// `home`), able to run it ([`Self::runs_mm_of`]), and on a CPU the
+    /// thread's affinity allows.
     fn accepts(&self, slot: SlotId, rec: &ZoneRecord, home: bool) -> bool {
         let s = self.slot(slot);
         let state = s.state();
         state.in_guest()
             && (home || state.is_idle())
-            && s.queued() < ZONE_RUNQ_CAPACITY
-            && (home || s.mm() == rec.mm.load(Ordering::Relaxed))
+            && (home || self.runs_mm_of(slot, rec))
             && (home || rec.allows_cpu(s.cpu.load(Ordering::Relaxed)))
     }
 
     /// An idle slot other than `waker` that may take `rec`.
     fn find_idle(&self, rec: &ZoneRecord, waker: SlotId) -> Option<SlotId> {
+        self.find_idle_except(rec, Some(waker))
+    }
+
+    /// An idle slot other than `except` that may take `rec`.
+    fn find_idle_except(&self, rec: &ZoneRecord, except: Option<SlotId>) -> Option<SlotId> {
         for (word_index, word) in self.idle_map.iter().enumerate() {
             let mut bits = word.load(Ordering::Acquire);
             while bits != 0 {
@@ -1231,7 +1321,7 @@ impl ZoneTables {
                 let Some(slot) = SlotId::from_index(word_index * 64 + bit) else {
                     continue;
                 };
-                if slot != waker && self.accepts(slot, rec, false) {
+                if Some(slot) != except && self.accepts(slot, rec, false) {
                     return Some(slot);
                 }
             }
@@ -1259,7 +1349,6 @@ impl ZoneTables {
             let is_home = home == Some(target);
             let takes = if is_home {
                 self.slot(target).state().in_guest()
-                    && self.slot(target).queued() < ZONE_RUNQ_CAPACITY
             } else {
                 self.accepts(target, rec, false)
             };
@@ -1272,7 +1361,7 @@ impl ZoneTables {
                 self.push_locked(&slot_guard, record, None);
                 drop(slot_guard);
                 if matches!(state, SlotState::Running | SlotState::IdleWfi) {
-                    effects.push_sgi(self.slot(target).sgi_target());
+                    effects.push_sgi(target);
                 }
                 self.counters.el1_wakes.fetch_add(1, Ordering::Relaxed);
                 self.counters
@@ -1294,6 +1383,7 @@ impl ZoneTables {
         drop(slot_guard);
         effects.queued_own = true;
         if (home.is_some() && home != Some(waker))
+            || !self.runs_mm_of(waker, rec)
             || !rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed))
         {
             effects.misplaced = true;
@@ -1418,21 +1508,59 @@ impl ZoneTables {
         }
     }
 
-    /// Append `record` to the run queue `guard` holds (room was checked). The
-    /// first thread queued on an empty queue starts the slice clock at `now`
-    /// (`None`: the caller restarts it itself).
+    /// Append `record` to the run queue `guard` holds. The first thread
+    /// queued on an empty queue starts the slice clock at `now` (`None`: the
+    /// caller restarts it itself).
     fn push_locked(&self, guard: &SlotGuard<'_>, record: RecordId, now: Option<u64>) {
         let s = self.slot(guard.slot);
-        let len = s.len.load(Ordering::Relaxed) as usize;
-        if len < ZONE_RUNQ_CAPACITY {
-            s.runq[len].store(record.raw(), Ordering::Relaxed);
-            if len == 0 {
-                // A thread queued from another vCPU carries no time of its
-                // own; the slot's EL1 restarts the slice when it sees it.
-                s.queued_since.store(now.unwrap_or(0), Ordering::Release);
-            }
-            s.len.store(len as u32 + 1, Ordering::Release);
+        self.record(record).next.store(NIL, Ordering::Relaxed);
+        let tail = s.tail.load(Ordering::Relaxed);
+        if tail == NIL {
+            s.head.store(record.raw(), Ordering::Release);
+            // A thread queued from another vCPU carries no time of its own;
+            // the slot's EL1 restarts the slice when it sees it.
+            s.queued_since.store(now.unwrap_or(0), Ordering::Release);
+        } else {
+            self.records[tail as usize]
+                .next
+                .store(record.raw(), Ordering::Release);
         }
+        s.tail.store(record.raw(), Ordering::Release);
+        s.len.fetch_add(1, Ordering::AcqRel);
+        self.queued_map[guard.slot.index() / 64]
+            .fetch_or(1 << (guard.slot.index() % 64), Ordering::AcqRel);
+    }
+
+    /// Unlink `record` from the run queue `guard` holds, wherever it is.
+    /// Returns false if it is not on that queue.
+    fn remove_locked(&self, guard: &SlotGuard<'_>, record: RecordId) -> bool {
+        let s = self.slot(guard.slot);
+        let mut prev = NIL;
+        let mut cursor = s.head.load(Ordering::Relaxed);
+        while cursor != NIL {
+            let next = self.records[cursor as usize].next.load(Ordering::Relaxed);
+            if cursor == record.raw() {
+                if prev == NIL {
+                    s.head.store(next, Ordering::Release);
+                } else {
+                    self.records[prev as usize]
+                        .next
+                        .store(next, Ordering::Release);
+                }
+                if s.tail.load(Ordering::Relaxed) == cursor {
+                    s.tail.store(prev, Ordering::Release);
+                }
+                self.record(record).next.store(NIL, Ordering::Relaxed);
+                if s.len.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    self.queued_map[guard.slot.index() / 64]
+                        .fetch_and(!(1 << (guard.slot.index() % 64)), Ordering::AcqRel);
+                }
+                return true;
+            }
+            prev = cursor;
+            cursor = next;
+        }
+        false
     }
 
     /// Record the CNTVCT at which `slot`'s run queue became non-empty (EL1
@@ -1443,35 +1571,32 @@ impl ZoneTables {
             .store(cntvct, Ordering::Release);
     }
 
-    /// The oldest woken record on `slot`'s run queue, if it is still queued
-    /// there (only that slot removes it, so it stays switchable until the
-    /// slot's next [`Self::switch_in`]).
+    /// The oldest record on `slot`'s run queue, if it is still queued there
+    /// and not cancelled (only that slot removes its head, so it stays
+    /// switchable until the slot's next [`Self::switch_in`]; a thief takes
+    /// only other entries or under the lock).
     pub fn runnable_head(&self, slot: SlotId) -> Option<RecordId> {
         let s = self.slot(slot);
-        if s.len.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        let record = RecordId::from_raw(s.runq[0].load(Ordering::Relaxed))?;
+        let record = RecordId::from_raw(s.head.load(Ordering::Acquire))?;
         let rec = self.record(record);
         (matches!(rec.claim(), Claim::Queued { slot: owner, .. } if owner == slot)
             && !rec.is_cancelled())
         .then_some(record)
     }
 
+    /// Whether the thread at the head of `slot`'s run queue needs its
+    /// executor ([`Handback::Service`]): EL1 then leaves the vCPU for the
+    /// host instead of switching to it.
+    pub fn head_needs_host(&self, slot: SlotId) -> bool {
+        self.runnable_head(slot)
+            .is_some_and(|record| self.record(record).needs_host())
+    }
+
     /// Remove and return the head of `slot`'s run queue.
     fn pop_head(&self, slot: SlotId) -> Option<RecordId> {
-        let _guard = self.slot_lock(slot, &SpinForever)?;
-        let s = self.slot(slot);
-        let len = s.len.load(Ordering::Relaxed) as usize;
-        if len == 0 {
-            return None;
-        }
-        let first = s.runq[0].load(Ordering::Relaxed);
-        for i in 1..len {
-            s.runq[i - 1].store(s.runq[i].load(Ordering::Relaxed), Ordering::Relaxed);
-        }
-        s.len.store(len as u32 - 1, Ordering::Release);
-        RecordId::from_raw(first)
+        let guard = self.slot_lock(slot, &SpinForever)?;
+        let record = RecordId::from_raw(self.slot(slot).head.load(Ordering::Relaxed))?;
+        self.remove_locked(&guard, record).then_some(record)
     }
 
     /// EL1: take the oldest thread off `slot`'s run queue and make it the
@@ -1485,6 +1610,10 @@ impl ZoneTables {
     /// [`Self::switch_in`] with what the caller must apply.
     pub fn switch_in_full(&self, slot: SlotId) -> Option<SwitchedIn> {
         let head = self.runnable_head(slot)?;
+        if self.record(head).needs_host() {
+            // EL1 never runs it at EL0: the caller leaves for the host.
+            return None;
+        }
         let record = self.pop_head(slot)?;
         if record != head {
             return None;
@@ -1629,7 +1758,7 @@ impl ZoneTables {
                 self.push_locked(&guard, record, None);
                 drop(guard);
                 if state == SlotState::IdleWfi {
-                    effects.push_sgi(self.slot(target).sgi_target());
+                    effects.push_sgi(target);
                 }
                 true
             });
@@ -1695,9 +1824,6 @@ impl ZoneTables {
         let Some(slot_guard) = self.slot_lock(slot, &SpinForever) else {
             return Err(());
         };
-        if s.queued() >= ZONE_RUNQ_CAPACITY {
-            return Err(());
-        }
         if self.entry(entry_id).bucket.load(Ordering::Relaxed) as usize != guard.bucket
             || !rec.cas(Claim::Parked { seq }, Claim::Queued { slot, seq })
         {
@@ -1750,9 +1876,9 @@ impl ZoneTables {
     /// The executor is about to run `slot`'s vCPU: other vCPUs may queue on
     /// it again.
     pub fn enter_guest(&self, slot: SlotId) {
-        self.slot(slot)
-            .state
-            .store(SlotState::Running as u32, Ordering::Release);
+        let s = self.slot(slot);
+        s.live.store(1, Ordering::Relaxed);
+        s.state.store(SlotState::Running as u32, Ordering::Release);
     }
 
     /// The executor holds `slot`'s stopped vCPU: under the slot's lock, stop
@@ -1767,34 +1893,30 @@ impl ZoneTables {
         drop(guard);
     }
 
-    /// The executor of `slot`, at an exit (vCPU stopped): take everything EL1
-    /// did on the slot since it last ran it. Every record still queued
-    /// becomes host-owned: a woken one with [`Handback::Woken`], a preempted
-    /// one with [`Handback::Resumed`] (both written to `woken`), or, if the
-    /// host retired its thread meanwhile, [`Handback::Cancelled`] (written to
-    /// `discarded`, for the caller to free). The switched-in record, if any,
-    /// is left for the caller, which captures its live state and calls
-    /// [`Self::handback_current`], or, if it is the thread the executor
-    /// loaded, [`Self::release_current`].
-    pub fn drain_slot(
-        &self,
-        slot: SlotId,
-        woken: &mut [RecordId],
-        discarded: &mut [RecordId],
-    ) -> SlotDrain {
+    /// The executor of `slot`, at an exit (vCPU stopped): take every record
+    /// still queued on the slot. Each becomes host-owned: a woken one with
+    /// [`Handback::Woken`], a preempted one with [`Handback::Resumed`], a
+    /// host-runnable one keeps [`Handback::Service`] (all passed to `take`
+    /// with `false`), or, if the host retired its thread meanwhile,
+    /// [`Handback::Cancelled`] (passed with `true`, for the caller to free).
+    /// The switched-in record, if any, is left for the caller.
+    pub fn drain_slot(&self, slot: SlotId, take: &mut impl FnMut(RecordId, bool)) -> SlotDrain {
         let guard = self.slot_lock(slot, &SpinForever);
         let s = self.slot(slot);
-        let len = (s.len.load(Ordering::Acquire) as usize).min(ZONE_RUNQ_CAPACITY);
         let mut drain = SlotDrain {
             woken: 0,
             discarded: 0,
             current: s.current(),
             host_record: s.host_record(),
         };
-        for i in 0..len {
-            let Some(record) = RecordId::from_raw(s.runq[i].load(Ordering::Relaxed)) else {
-                continue;
-            };
+        let mut cursor = s.head.load(Ordering::Acquire);
+        while cursor != NIL {
+            let next = self.records[cursor as usize].next.load(Ordering::Relaxed);
+            self.records[cursor as usize]
+                .next
+                .store(NIL, Ordering::Relaxed);
+            let record = RecordId(cursor);
+            cursor = next;
             let rec = self.record(record);
             let Claim::Queued { slot: owner, seq } = rec.claim() else {
                 continue;
@@ -1805,25 +1927,24 @@ impl ZoneTables {
             if rec.is_cancelled() {
                 rec.handback
                     .store(Handback::Cancelled as u32, Ordering::Release);
-                if drain.discarded < discarded.len() {
-                    discarded[drain.discarded] = record;
-                    drain.discarded += 1;
-                }
+                drain.discarded += 1;
+                take(record, true);
                 continue;
             }
-            if rec.handback() != Some(Handback::Resumed) {
+            if !matches!(rec.handback(), Some(Handback::Resumed | Handback::Service)) {
                 rec.handback
                     .store(Handback::Woken as u32, Ordering::Release);
             }
             self.counters
                 .reconcile_woken
                 .fetch_add(1, Ordering::Relaxed);
-            if drain.woken < woken.len() {
-                woken[drain.woken] = record;
-                drain.woken += 1;
-            }
+            drain.woken += 1;
+            take(record, false);
         }
+        s.head.store(NIL, Ordering::Release);
+        s.tail.store(NIL, Ordering::Release);
         s.len.store(0, Ordering::Release);
+        self.queued_map[slot.index() / 64].fetch_and(!(1 << (slot.index() % 64)), Ordering::AcqRel);
         drop(guard);
         drain
     }
@@ -1891,15 +2012,15 @@ impl ZoneTables {
         timer
     }
 
-    /// Reset `slot` when the host loads a thread on it (nothing switched in,
-    /// nothing queued), publishing the address space, bound guest CPU and
-    /// affinity EL1 places threads by. Anything left is a protocol violation
-    /// the caller reports.
+    /// Reset `slot` when the host loads a thread on it (nothing switched in);
+    /// the run queue stays as it is. A switched-in record left over is a
+    /// protocol violation the caller reports.
     pub fn reset_slot(&self, slot: SlotId) -> bool {
         let s = self.slot(slot);
-        let clean = s.current.load(Ordering::Acquire) == NIL && s.len.load(Ordering::Acquire) == 0;
+        // The run queue is not the loaded thread's: what EL1 queued here
+        // stays queued, and EL1 runs it after this thread or steals it.
+        let clean = s.current.load(Ordering::Acquire) == NIL;
         s.current.store(NIL, Ordering::Release);
-        s.len.store(0, Ordering::Release);
         s.host_record.store(NIL, Ordering::Release);
         s.timer_record.store(NIL, Ordering::Release);
         // The slot may name another vCPU now (a new mailbox lease): what EL1
@@ -1913,12 +2034,205 @@ impl ZoneTables {
     /// (`None`: any) and the loaded thread's affinity mask (0: any).
     pub fn publish_slot(&self, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
         let s = self.slot(slot);
+        s.live.store(1, Ordering::Relaxed);
         s.mm.store(mm, Ordering::Release);
         s.cpu.store(
             cpu.map_or(0, |cpu| cpu.saturating_add(1)),
             Ordering::Release,
         );
         s.affinity.store(affinity, Ordering::Release);
+    }
+
+    /// EL1 on idle `thief`: take a queued thread it may run from another
+    /// slot's run queue (never a home record, which must run on its home) and
+    /// switch it in. Takes the victim's lock only (never two slot locks).
+    pub fn steal(&self, thief: SlotId) -> Option<SwitchedIn> {
+        for (word_index, word) in self.queued_map.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let Some(victim) = SlotId::from_index(word_index * 64 + bit) else {
+                    continue;
+                };
+                if victim == thief {
+                    continue;
+                }
+                if let Some(switched) = self.steal_from(thief, victim) {
+                    return Some(switched);
+                }
+            }
+        }
+        None
+    }
+
+    fn steal_from(&self, thief: SlotId, victim: SlotId) -> Option<SwitchedIn> {
+        let guard = self.slot_lock(victim, &BoundedSpin(EL1_SLOT_LOCK_SPINS))?;
+        let s = self.slot(victim);
+        let cpu = self.slot(thief).cpu.load(Ordering::Relaxed);
+        let mut cursor = s.head.load(Ordering::Acquire);
+        while cursor != NIL {
+            let record = RecordId(cursor);
+            let rec = self.record(record);
+            cursor = rec.next.load(Ordering::Relaxed);
+            let Claim::Queued { slot: owner, seq } = rec.claim() else {
+                continue;
+            };
+            if owner != victim
+                || rec.home().is_some()
+                || rec.is_cancelled()
+                || !self.runs_mm_of(thief, rec)
+                || !rec.allows_cpu(cpu)
+            {
+                continue;
+            }
+            // Only `victim` (under this lock) and its executor move a
+            // queued record, so the claim cannot change under us.
+            if !rec.cas(
+                Claim::Queued { slot: victim, seq },
+                Claim::Queued { slot: thief, seq },
+            ) {
+                continue;
+            }
+            self.remove_locked(&guard, record);
+            drop(guard);
+            self.counters.el1_steals.fetch_add(1, Ordering::Relaxed);
+            // It needs its executor: queue it on the thief, whose idle loop
+            // then leaves for the host with it at its head.
+            if rec.needs_host() {
+                if let Some(own) = self.slot_lock(thief, &SpinForever) {
+                    self.push_locked(&own, record, None);
+                }
+                return None;
+            }
+            if !rec.cas(
+                Claim::Queued { slot: thief, seq },
+                Claim::OnCpu { slot: thief, seq },
+            ) {
+                return None;
+            }
+            let t = self.slot(thief);
+            t.current.store(record.raw(), Ordering::Release);
+            rec.last_slot.store(thief.plus_one(), Ordering::Relaxed);
+            self.counters.el1_switches.fetch_add(1, Ordering::Relaxed);
+            let result = match rec.handback() {
+                Some(Handback::Resumed) => None,
+                _ => Some(rec.result()),
+            };
+            return Some(SwitchedIn {
+                record,
+                result,
+                home: false,
+            });
+        }
+        None
+    }
+
+    /// The host queues `record`, which it owns ([`Claim::Host`]), in the
+    /// guest: a thread ready to run at EL0 (woken, preempted) goes to a slot
+    /// running its address space, preferring an idle one; a thread that needs
+    /// its executor ([`Handback::Service`]) goes to an idle slot, else to the
+    /// least loaded slot its affinity allows, in the guest or not (a stopped
+    /// slot's executor serves it before it runs the vCPU again). `None`: an
+    /// EL0-ready thread no slot can run now; the caller hands it to its
+    /// thread's host continuation instead.
+    ///
+    /// A slot running a thread, or parked in WFI, owes a reschedule SGI the
+    /// host cannot send: [`HostPlacement::resched`] tells the caller to force
+    /// that vCPU out, and its run loop delivers the SGI
+    /// ([`Self::take_resched`]).
+    pub fn place_from_host(&self, record: RecordId) -> Option<HostPlacement> {
+        let rec = self.record(record);
+        let Claim::Host { seq } = rec.claim() else {
+            return None;
+        };
+        let service = rec.needs_host();
+        let candidates = [
+            rec.last_slot()
+                .filter(|slot| self.accepts(*slot, rec, false)),
+            self.find_idle_except(rec, None),
+            self.least_loaded(rec, true),
+            if service {
+                self.least_loaded(rec, false)
+            } else {
+                None
+            },
+        ];
+        for slot in candidates.into_iter().flatten() {
+            let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+                continue;
+            };
+            let state = self.slot(slot).state();
+            let fits = if service {
+                rec.allows_cpu(self.slot(slot).cpu.load(Ordering::Relaxed))
+            } else {
+                state.in_guest() && self.accepts_running(slot, rec)
+            };
+            if !fits {
+                continue;
+            }
+            if !rec.cas(Claim::Host { seq }, Claim::Queued { slot, seq }) {
+                return None;
+            }
+            self.push_locked(&guard, record, None);
+            drop(guard);
+            let resched = matches!(state, SlotState::Running | SlotState::IdleWfi);
+            if resched {
+                self.slot(slot).resched_owed.store(1, Ordering::Release);
+                self.counters
+                    .host_resched_kicks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if service {
+                self.counters
+                    .host_service_placements
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.counters
+                    .host_ready_placements
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return Some(HostPlacement { slot, resched });
+        }
+        None
+    }
+
+    /// Whether a slot in the guest may run `rec` (idle or not).
+    fn accepts_running(&self, slot: SlotId, rec: &ZoneRecord) -> bool {
+        self.runs_mm_of(slot, rec) && rec.allows_cpu(self.slot(slot).cpu.load(Ordering::Relaxed))
+    }
+
+    /// The slot with the shortest run queue that may run `rec`: among slots
+    /// in the guest (`in_guest`), or among all slots an executor drives,
+    /// for a thread that needs its executor.
+    fn least_loaded(&self, rec: &ZoneRecord, in_guest: bool) -> Option<SlotId> {
+        let mut best: Option<(SlotId, u32)> = None;
+        for index in 0..ZONE_SLOTS {
+            let Some(slot) = SlotId::from_index(index) else {
+                continue;
+            };
+            let s = self.slot(slot);
+            if s.live.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            if in_guest && !s.state().in_guest() {
+                continue;
+            }
+            if !self.accepts_running(slot, rec) {
+                continue;
+            }
+            let len = s.len.load(Ordering::Relaxed);
+            if best.is_none_or(|(_, shortest)| len < shortest) {
+                best = Some((slot, len));
+            }
+        }
+        best.map(|(slot, _)| slot)
+    }
+
+    /// The run loop of `slot`'s vCPU takes the reschedule SGI a host
+    /// placement owes it.
+    pub fn take_resched(&self, slot: SlotId) -> bool {
+        self.slot(slot).resched_owed.swap(0, Ordering::AcqRel) != 0
     }
 
     /// The host takes `r` for `kind` (a signal, a timeout, a control wake or

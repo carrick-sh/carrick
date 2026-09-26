@@ -67,12 +67,33 @@ fn wake(
     count: u32,
     waker: Waker,
 ) -> Result<Vec<RecordId>, WakeRefusal> {
+    // An EL1 waker runs a thread of the process: its slot has the address
+    // space installed.
+    if let Waker::El1 { slot } = waker
+        && zone.slot(slot).mm() == 0
+    {
+        zone.publish_slot(slot, MM, None, 0);
+    }
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, uaddr), &HostWait)
         .unwrap();
-    let mut woken = [RecordId::PLACEHOLDER; 16];
+    let mut woken = [RecordId::PLACEHOLDER; 64];
     let n = zone.wake(&guard, MM, uaddr, u32::MAX, count, waker, &mut woken)?;
     Ok(woken[..n as usize].to_vec())
+}
+
+/// Drain `slot` as its executor does at an exit: (handed back, discarded).
+fn drain(zone: &ZoneTables, slot: SlotId) -> (Vec<RecordId>, Vec<RecordId>, SlotDrain) {
+    let mut woken = Vec::new();
+    let mut discarded = Vec::new();
+    let drain = zone.drain_slot(slot, &mut |record, discard| {
+        if discard {
+            discarded.push(record);
+        } else {
+            woken.push(record);
+        }
+    });
+    (woken, discarded, drain)
 }
 
 #[test]
@@ -147,7 +168,7 @@ fn el1_wake_queues_on_the_slot_and_switch_in_takes_it() {
 }
 
 #[test]
-fn el1_refuses_multi_entry_waiters_and_a_full_run_queue() {
+fn el1_refuses_multi_entry_waiters() {
     let zone = zone();
     // A waitv-style park on two futexes.
     let record = zone.alloc_record(identity(1)).unwrap();
@@ -172,66 +193,41 @@ fn el1_refuses_multi_entry_waiters_and_a_full_run_queue() {
     zone.unlink_all(record, &HostWait);
     assert_eq!(zone.record(record).entry_count(), 0);
     assert!(wake(&zone, 0x10, 1, Waker::Host).unwrap().is_empty());
-
-    let parked: Vec<_> = (0..ZONE_RUNQ_CAPACITY as u64 + 1)
-        .map(|tid| park(&zone, 100 + tid, 0x3000))
-        .collect();
-    assert_eq!(
-        wake(&zone, 0x3000, u32::MAX, Waker::El1 { slot: SLOT }),
-        Err(WakeRefusal::RunQueueFull)
-    );
-    assert!(
-        parked
-            .iter()
-            .all(|r| matches!(zone.record(*r).claim(), Claim::Parked { .. }))
-    );
 }
 
-/// futexforkwakegroups / LTP futex_wake02: `FUTEX_WAKE(9)` with nine or more
-/// waiters must wake nine. EL1's buffer is the run queue's capacity (8), so
-/// it must refuse rather than return a short count (it returned 8, leaving a
-/// waiter asleep until a later wake).
+/// futexforkwakegroups / LTP futex_wake02: `FUTEX_WAKE(9)` with more
+/// waiters must wake exactly nine. The run queue is unbounded (EL1 plan 1d),
+/// so EL1 serves any count itself; 1b-1c refused beyond eight.
 #[test]
-fn el1_wake_beyond_run_queue_capacity_refuses_instead_of_waking_fewer() {
+fn el1_wakes_any_count_and_exactly_that_many() {
     let zone = zone();
-    let parked: Vec<_> = (0..ZONE_RUNQ_CAPACITY as u64 + 2)
-        .map(|tid| park(&zone, 200 + tid, 0x5000))
-        .collect();
+    let parked: Vec<_> = (0..20).map(|tid| park(&zone, 200 + tid, 0x5000)).collect();
+    zone.publish_slot(SLOT, MM, None, 0);
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, 0x5000), &HostWait)
         .unwrap();
-    let mut woken = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-    let count = ZONE_RUNQ_CAPACITY as u32 + 1;
     assert_eq!(
         zone.wake(
             &guard,
             MM,
             0x5000,
             u32::MAX,
-            count,
+            9,
             Waker::El1 { slot: SLOT },
-            &mut woken
+            &mut []
         ),
-        Err(WakeRefusal::RunQueueFull)
+        Ok(9)
     );
-    assert!(
-        parked
-            .iter()
-            .all(|r| matches!(zone.record(*r).claim(), Claim::Parked { .. }))
-    );
-    // Exactly the capacity is still served in-guest.
-    assert_eq!(
-        zone.wake(
-            &guard,
-            MM,
-            0x5000,
-            u32::MAX,
-            ZONE_RUNQ_CAPACITY as u32,
-            Waker::El1 { slot: SLOT },
-            &mut woken
-        ),
-        Ok(ZONE_RUNQ_CAPACITY as u32)
-    );
+    let queued = parked
+        .iter()
+        .filter(|r| matches!(zone.record(**r).claim(), Claim::Queued { .. }))
+        .count();
+    assert_eq!(queued, 9);
+    assert_eq!(zone.slot(SLOT).queued(), 9);
+    // FIFO: the first nine parked are queued, in order.
+    for (index, record) in parked.iter().take(9).enumerate() {
+        assert_eq!(zone.switch_in(SLOT), Some(*record), "position {index}");
+    }
     // The host takes batches of its buffer and its caller loops.
     let mut small = [RecordId::PLACEHOLDER; 1];
     assert_eq!(
@@ -302,10 +298,9 @@ fn drain_slot_hands_back_queued_and_reports_the_switched_in_record() {
     let b = park(&zone, 2, 0x1000);
     let _ = wake(&zone, 0x1000, 2, Waker::El1 { slot: SLOT }).unwrap();
     assert_eq!(zone.switch_in(SLOT), Some(a));
-    let mut woken = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-    let mut discarded = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-    let drain = zone.drain_slot(SLOT, &mut woken, &mut discarded);
-    assert_eq!(&woken[..drain.woken], [b]);
+    let (woken, discarded, drain) = drain(&zone, SLOT);
+    assert_eq!(woken, [b]);
+    assert!(discarded.is_empty());
     assert_eq!(drain.discarded, 0);
     assert_eq!(zone.record(b).claim(), Claim::Host { seq: 1 });
     assert_eq!(zone.record(b).handback(), Some(Handback::Woken));
@@ -411,9 +406,7 @@ fn concurrent_el1_wakes_and_host_claims_give_each_record_one_owner() {
         assert_eq!(host, host_claimed, "round {round}");
         assert_eq!(queued + host, records.len(), "round {round}");
         // Clean up for the next round.
-        let mut drained = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-        let mut discarded = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-        let _ = zone.drain_slot(SLOT, &mut drained, &mut discarded);
+        let _ = drain(&zone, SLOT);
         for record in &records {
             zone.unlink_all(*record, &HostWait);
             zone.free_record(*record);
@@ -441,11 +434,9 @@ fn a_cancelled_record_is_discarded_not_run() {
         None,
         "the cancelled head is not run"
     );
-    let mut woken = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-    let mut discarded = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-    let drain = zone.drain_slot(SLOT, &mut woken, &mut discarded);
-    assert_eq!(&discarded[..drain.discarded], [a]);
-    assert_eq!(&woken[..drain.woken], [b]);
+    let (woken, discarded, _) = drain(&zone, SLOT);
+    assert_eq!(discarded, [a]);
+    assert_eq!(woken, [b]);
     assert_eq!(zone.record(a).handback(), Some(Handback::Cancelled));
 }
 
@@ -537,7 +528,11 @@ fn el1_wake_places_a_floating_thread_on_an_idle_slot() {
     );
     assert_eq!(zone.slot(OTHER).queued(), 1);
     assert_eq!(zone.slot(SLOT).queued(), 0);
-    assert_eq!(effects.sgis, 0, "a polling slot needs no SGI");
+    assert_eq!(
+        effects.sgi_slots().count(),
+        0,
+        "a polling slot needs no SGI"
+    );
     assert!(!effects.queued_own && !effects.misplaced);
     assert_eq!(zone.counters.el1_cross_wakes.load(Ordering::Relaxed), 1);
     // The idle slot runs it.
@@ -554,8 +549,7 @@ fn el1_wake_places_a_floating_thread_on_an_idle_slot() {
     assert!(zone.enter_idle(OTHER, true));
     let (woken, effects) = wake_effects(&zone, 0x2000, 1, SLOT);
     assert_eq!(woken.unwrap(), [b]);
-    assert_eq!(effects.sgis, 1);
-    assert_eq!(effects.sgi[0], 0x5_0001);
+    assert_eq!(effects.sgi_slots().collect::<Vec<_>>(), [OTHER]);
 }
 
 /// A slot does not park in WFI while its queue holds a thread: the check
@@ -600,7 +594,7 @@ fn a_home_record_runs_only_on_its_home_slot() {
             seq: 1
         }
     );
-    assert_eq!(&effects.sgi[..effects.sgis], [0x77]);
+    assert_eq!(effects.sgi_slots().collect::<Vec<_>>(), [OTHER]);
     let switched = zone.switch_in_full(OTHER).unwrap();
     assert!(switched.home);
     assert_eq!(
@@ -724,10 +718,8 @@ fn a_preempted_thread_resumes_without_a_result() {
     assert_eq!(zone.counters.el1_preemptions.load(Ordering::Relaxed), 2);
     // An exit now hands B back as preempted.
     zone.leave_guest(SLOT, &HostWait);
-    let mut woken = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-    let mut discarded = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-    let drain = zone.drain_slot(SLOT, &mut woken, &mut discarded);
-    assert_eq!(&woken[..drain.woken], [b]);
+    let (woken, _, _) = drain(&zone, SLOT);
+    assert_eq!(woken, [b]);
     assert_eq!(zone.record(b).handback(), Some(Handback::Resumed));
 }
 
@@ -755,7 +747,7 @@ fn a_tick_migrates_queued_threads_to_idle_slots() {
             seq: 1
         }
     );
-    assert_eq!(&effects.sgi[..effects.sgis], [0x42]);
+    assert_eq!(effects.sgi_slots().collect::<Vec<_>>(), [OTHER]);
 }
 
 /// The executor's exit transition and cross-slot queueing are serialized by
@@ -793,10 +785,7 @@ fn cross_slot_wakes_never_strand_a_thread_on_a_stopped_slot() {
             std::thread::spawn(move || {
                 while !go.load(Ordering::Acquire) {}
                 zone.leave_guest(OTHER, &HostWait);
-                let mut woken = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-                let mut discarded = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-                let drain = zone.drain_slot(OTHER, &mut woken, &mut discarded);
-                drain.woken
+                drain(&zone, OTHER).2.woken
             })
         };
         go.store(true, Ordering::Release);
@@ -815,13 +804,196 @@ fn cross_slot_wakes_never_strand_a_thread_on_a_stopped_slot() {
         }
         assert_eq!(zone.slot(OTHER).queued(), 0, "round {round}");
         assert_eq!(own + drained, woken, "round {round}");
-        let mut drained_own = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
-        let mut discarded = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
         zone.leave_guest(SLOT, &HostWait);
-        let _ = zone.drain_slot(SLOT, &mut drained_own, &mut discarded);
+        let _ = drain(&zone, SLOT);
         for record in &records {
             zone.unlink_all(*record, &HostWait);
             zone.free_record(*record);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// EL1 plan 1d: host-runnable threads in the guest's run queues, stealing and
+// host placement.
+
+const THIRD: SlotId = SlotId::new(9);
+
+/// A thread the host made runnable (its record host-owned, handback
+/// `Service`), as the host venue creates one for a completed host wait.
+fn service_record(zone: &ZoneTables, tid: u64) -> RecordId {
+    let record = zone.alloc_record(identity(tid)).unwrap();
+    let seq = zone.next_seq(record);
+    zone.publish_park(record, seq);
+    assert_eq!(
+        zone.claim_for_host(zone.record_ref(record), None, Handback::Service, &HostWait),
+        HostClaim::Claimed
+    );
+    assert!(zone.record(record).needs_host());
+    record
+}
+
+/// The run queue is a FIFO of any length, and a record can leave from the
+/// middle (a thief) without breaking the order of the rest.
+#[test]
+fn run_queue_is_unbounded_fifo_and_survives_removal_from_the_middle() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let parked: Vec<_> = (0..40).map(|tid| park(&zone, 300 + tid, 0x6000)).collect();
+    assert_eq!(
+        wake(&zone, 0x6000, 40, Waker::El1 { slot: SLOT })
+            .unwrap()
+            .len(),
+        40
+    );
+    assert_eq!(zone.slot(SLOT).queued(), 40);
+    // An idle thief of the same address space takes the head (the oldest).
+    enter(&zone, OTHER, 1);
+    assert!(!zone.enter_idle(OTHER, false));
+    let stolen = zone.steal(OTHER).unwrap();
+    assert_eq!(stolen.record, parked[0]);
+    assert_eq!(zone.slot(SLOT).queued(), 39);
+    for record in &parked[1..] {
+        assert_eq!(zone.switch_in(SLOT), Some(*record));
+    }
+    assert_eq!(zone.slot(SLOT).queued(), 0);
+    assert_eq!(zone.switch_in(SLOT), None);
+}
+
+/// A thread that needs its executor is never switched in at EL0: the slot
+/// sees it at its head and leaves for the host instead.
+#[test]
+fn a_service_record_is_never_switched_in() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let service = service_record(&zone, 1);
+    let placed = zone.place_from_host(service).unwrap();
+    assert_eq!(placed.slot, SLOT);
+    assert!(zone.head_needs_host(SLOT));
+    assert_eq!(zone.switch_in_full(SLOT), None);
+    assert_eq!(zone.slot(SLOT).queued(), 1);
+    // Its executor takes it at the exit, still a service record.
+    zone.leave_guest(SLOT, &HostWait);
+    let (woken, _, _) = drain(&zone, SLOT);
+    assert_eq!(woken, [service]);
+    assert_eq!(zone.record(service).handback(), Some(Handback::Service));
+}
+
+/// Host placement: a service thread goes to an idle slot of any address
+/// space; a thread ready at EL0 only to a slot running its address space,
+/// else nowhere (the host serves it). A running or WFI target owes a
+/// reschedule SGI, which its run loop takes once.
+#[test]
+fn host_placement_respects_address_spaces_and_owes_resched_sgis() {
+    let zone = zone();
+    // SLOT runs MM; OTHER idles with no address space (an executor waiting
+    // in the guest); THIRD runs another process.
+    enter(&zone, SLOT, 0);
+    assert!(zone.reset_slot(OTHER));
+    zone.publish_slot(OTHER, 0, Some(1), 0);
+    zone.enter_guest(OTHER);
+    assert!(!zone.enter_idle(OTHER, false));
+    assert!(zone.enter_idle(OTHER, true));
+    assert!(zone.reset_slot(THIRD));
+    zone.publish_slot(THIRD, MM + 1, Some(2), 0);
+    zone.enter_guest(THIRD);
+
+    let service = service_record(&zone, 1);
+    let placed = zone.place_from_host(service).unwrap();
+    assert_eq!(placed.slot, OTHER, "the idle slot takes a service thread");
+    assert!(placed.resched, "a WFI slot needs its SGI");
+    assert!(zone.take_resched(OTHER));
+    assert!(!zone.take_resched(OTHER), "taken once");
+
+    // A woken thread of MM: OTHER (no address space) cannot run it at EL0;
+    // SLOT (running MM) can.
+    let ready = park(&zone, 2, 0x7000);
+    assert_eq!(wake(&zone, 0x7000, 1, Waker::Host).unwrap(), [ready]);
+    let placed = zone.place_from_host(ready).unwrap();
+    assert_eq!(placed.slot, SLOT);
+    assert!(
+        placed.resched,
+        "a running slot needs its SGI to start a slice"
+    );
+    assert_eq!(
+        zone.record(ready).claim(),
+        Claim::Queued { slot: SLOT, seq: 1 }
+    );
+
+    // With SLOT stopped at an exit, nothing runs MM: the host keeps it.
+    zone.leave_guest(SLOT, &HostWait);
+    let stranded = park(&zone, 3, 0x7004);
+    assert_eq!(wake(&zone, 0x7004, 1, Waker::Host).unwrap(), [stranded]);
+    assert_eq!(zone.place_from_host(stranded), None);
+    assert_eq!(zone.record(stranded).claim(), Claim::Host { seq: 1 });
+
+    // A service thread with every slot stopped still goes to a slot: its
+    // executor serves it before it runs the vCPU again.
+    zone.leave_guest(OTHER, &HostWait);
+    zone.leave_guest(THIRD, &HostWait);
+    let late = service_record(&zone, 4);
+    let placed = zone.place_from_host(late).unwrap();
+    assert!(!placed.resched, "a stopped slot needs no SGI");
+    assert_eq!(
+        zone.counters
+            .host_service_placements
+            .load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        zone.counters.host_ready_placements.load(Ordering::Relaxed),
+        1
+    );
+}
+
+/// Stealing never takes a home record (its thread must run where the host
+/// loaded it) and never a thread the thief's address space cannot run; a
+/// service thread moves to the thief's queue for it to serve.
+#[test]
+fn stealing_takes_only_what_the_thief_may_run() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    // A home record of OTHER, woken by SLOT: queued on OTHER.
+    let home = el1_park(&zone, OTHER, 9, 0x8000, 0);
+    let (woken, _) = wake_effects(&zone, 0x8000, 1, SLOT);
+    assert_eq!(woken.unwrap(), [home]);
+    assert!(zone.reset_slot(THIRD));
+    zone.publish_slot(THIRD, MM, Some(2), 0);
+    zone.enter_guest(THIRD);
+    assert!(!zone.enter_idle(THIRD, false));
+    assert_eq!(zone.steal(THIRD), None, "a home record is not stolen");
+    // A service thread on OTHER moves to the idle thief's queue.
+    let service = service_record(&zone, 5);
+    zone.leave_guest(OTHER, &HostWait);
+    let placed = zone.place_from_host(service).unwrap();
+    assert_eq!(placed.slot, THIRD, "the idle slot is chosen first");
+    assert!(zone.head_needs_host(THIRD));
+    // An idle slot of another address space takes neither EL0 thread.
+    let foreign = SlotId::new(11);
+    assert!(zone.reset_slot(foreign));
+    zone.publish_slot(foreign, MM + 7, Some(3), 0);
+    zone.enter_guest(foreign);
+    assert!(!zone.enter_idle(foreign, false));
+    let ready = park(&zone, 6, 0x8004);
+    let (woken, _) = wake_effects(&zone, 0x8004, 1, SLOT);
+    assert_eq!(woken.unwrap(), [ready]);
+    let ready_slot = match zone.record(ready).claim() {
+        Claim::Queued { slot, .. } => slot,
+        other => panic!("{other:?}"),
+    };
+    // It takes the service thread (any vCPU may serve one) onto its own
+    // queue, but not the EL0 thread of MM.
+    assert_eq!(zone.steal(foreign), None);
+    assert!(zone.head_needs_host(foreign));
+    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 1);
+    assert_eq!(zone.steal(foreign), None);
+    assert_eq!(
+        zone.record(ready).claim(),
+        Claim::Queued {
+            slot: ready_slot,
+            seq: 1
+        }
+    );
+    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 1);
 }

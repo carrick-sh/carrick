@@ -30,11 +30,9 @@
 
 use carrick_el1_abi::{
     Counters, CurrentTask, GIC_KICK_INTID, GIC_RESCHED_INTID, GIC_SPURIOUS_INTID, GIC_VTIMER_INTID,
-    RecordId, SlotId, ThreadCtx, ThreadIdentity, TrapFrame, Waker, ZoneTables,
+    SlotId, ThreadCtx, ThreadIdentity, TrapFrame, Waker, ZoneTables,
 };
-use carrick_sched_core::{
-    BoundedSpin, IDLE_SPIN_NS, PREEMPT_SLICE_NS, SwitchedIn, WakeEffects, ZONE_RUNQ_CAPACITY,
-};
+use carrick_sched_core::{BoundedSpin, IDLE_SPIN_NS, PREEMPT_SLICE_NS, SwitchedIn, WakeEffects};
 use core::sync::atomic::Ordering;
 
 pub const SYS_FUTEX: usize = 98;
@@ -196,7 +194,6 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             ZoneTables::bucket_of(mm, uaddr),
             &BoundedSpin(EL1_ZONE_LOCK_SPINS),
         )?;
-        let mut woken = [RecordId::PLACEHOLDER; ZONE_RUNQ_CAPACITY];
         let mut effects = WakeEffects::default();
         let n = zone
             .wake_placed(
@@ -206,7 +203,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 bitset,
                 count,
                 Waker::El1 { slot },
-                &mut woken,
+                &mut [],
                 &mut effects,
             )
             .ok()?;
@@ -308,13 +305,27 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         Some(self.run_next(frame))
     }
 
-    /// The running thread parked: run the next runnable thread, or idle.
+    /// The running thread parked: run the next runnable thread, or leave
+    /// for the host when that thread needs its executor, or idle.
     fn run_next(&mut self, frame: &mut TrapFrame) -> Served {
         if let Some(switched) = self.zone.switch_in_full(self.slot) {
             self.load(frame, switched);
             return Served::Returned { switched: true };
         }
+        if self.zone.head_needs_host(self.slot) {
+            return self.service_exit();
+        }
         self.idle(frame)
+    }
+
+    /// The next thread on this vCPU needs its executor: leave for the host
+    /// with no thread on the vCPU; the executor takes it from the run queue.
+    fn service_exit(&mut self) -> Served {
+        self.zone
+            .counters
+            .el1_service_exits
+            .fetch_add(1, Ordering::Relaxed);
+        Served::Idle
     }
 
     /// Make the switched-in thread the running one.
@@ -355,10 +366,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             }
             let now = self.cpu.now();
             let _ = zone.expire_timer(slot, now);
-            if let Some(switched) = zone.switch_in_full(slot) {
+            if let Some(switched) = zone.switch_in_full(slot).or_else(|| zone.steal(slot)) {
                 zone.leave_idle(slot);
                 self.load(frame, switched);
                 return Served::Returned { switched: true };
+            }
+            if zone.head_needs_host(slot) {
+                zone.leave_idle(slot);
+                return self.service_exit();
             }
             if now < spin_until {
                 self.cpu.spin();
@@ -429,7 +444,15 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 let mut effects = WakeEffects::default();
                 zone.migrate_queued(slot, &mut effects);
                 self.send_sgis(&effects);
-                if zone.slot(slot).queued() != 0 {
+                if zone.head_needs_host(slot) {
+                    // The next thread needs its executor: the running one
+                    // goes to the tail of the run queue with its registers,
+                    // and the vCPU leaves for the host with no thread on it.
+                    if self.park_preempted(frame) {
+                        self.service_exit();
+                        return carrick_el1_abi::Action::Idle;
+                    }
+                } else if zone.slot(slot).queued() != 0 {
                     self.preempt(frame);
                 } else {
                     zone.slot(slot).restart_slice(now);
@@ -438,6 +461,37 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         }
         self.program_timer(true);
         carrick_el1_abi::Action::Served
+    }
+
+    /// The idle entry (EL1 plan 1d): the executor of this vCPU has no thread
+    /// to load and started the vCPU in the scheduler. Run a queued thread
+    /// (`Served`: the frame is now that thread's), or leave for the host
+    /// (`Idle`): host work arrived, or the next thread needs its executor.
+    pub fn serve_idle_entry(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action {
+        self.take_irqs();
+        if self.task.has_pending_host_work() {
+            return carrick_el1_abi::Action::Idle;
+        }
+        match self.idle(frame) {
+            Served::Returned { .. } => carrick_el1_abi::Action::Served,
+            Served::Idle => carrick_el1_abi::Action::Idle,
+        }
+    }
+
+    /// Preempt the running thread into its record at the tail of this
+    /// vCPU's run queue, with nothing switched in (the next thread needs its
+    /// executor). False if it could not be parked; it keeps running.
+    fn park_preempted(&mut self, frame: &TrapFrame) -> bool {
+        let (zone, slot) = (self.zone, self.slot);
+        let affinity = zone.slot(slot).affinity();
+        let Ok(prev) = zone.current_or_new(slot, identity_of(self.task, affinity)) else {
+            return false;
+        };
+        // SAFETY: `prev` holds the running thread (a fresh home record, or
+        // the switched-in OnCpu one): this vCPU is its only owner.
+        self.cpu.save(frame, unsafe { zone.record(prev).ctx_mut() });
+        zone.requeue_preempted(slot, prev);
+        true
     }
 
     /// Preempt the running thread: it goes to the tail of this vCPU's run
@@ -508,9 +562,13 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     }
 
     fn send_sgis(&mut self, effects: &WakeEffects) {
-        for target in &effects.sgi[..effects.sgis] {
+        for slot in effects.sgi_slots() {
+            let target = self.zone.slot(slot).sgi_target();
+            if target == 0 {
+                continue;
+            }
             self.cpu
-                .send_sgi(*target | (u64::from(GIC_RESCHED_INTID) << 24));
+                .send_sgi(target | (u64::from(GIC_RESCHED_INTID) << 24));
             self.zone.counters.el1_sgis.fetch_add(1, Ordering::Relaxed);
         }
     }

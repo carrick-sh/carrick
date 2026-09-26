@@ -308,11 +308,14 @@ fn el1_sched_exit_group_with_parked_threads() {
             measured.zone
         );
         // Part (e) of `kernel.el1.guest-scheduler`: the siblings parked with
-        // nothing to switch to idled their vCPUs in WFI, and exit_group's
-        // kicks forced those vCPUs out.
+        // nothing to switch to idled their vCPUs in EL1, and exit_group's
+        // kicks forced those vCPUs out. Whether an idle vCPU reached WFI or
+        // was still polling (or stealing the handing-off pair's threads,
+        // EL1 plan 1d) when the kick came is timing; the WFI path itself is
+        // `el1_sched_signal_reaches_a_wfi_parked_vcpu`.
         assert!(
-            measured.zone.wfi_entries > 0 && measured.zone.idle_exits > 0,
-            "exit_group did not reach threads on vCPUs parked in WFI: {:?}",
+            measured.zone.idle_entries > 0 && measured.zone.idle_exits > 0,
+            "exit_group did not reach threads on idle vCPUs: {:?}",
             measured.zone
         );
     }

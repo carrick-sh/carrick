@@ -4515,7 +4515,7 @@ fn write_el1_vector_hook(
     mailbox_capture: usize,
     irq: El1IrqMode,
 ) {
-    write_el1_hook(bytes, hook_offset, mailbox_capture, irq, HookEntry::Syscall);
+    let _ = write_el1_hook(bytes, hook_offset, mailbox_capture, irq, HookEntry::Syscall);
 }
 
 fn write_el1_hook(
@@ -4524,7 +4524,7 @@ fn write_el1_hook(
     mailbox_capture: usize,
     irq: El1IrqMode,
     entry: HookEntry,
-) {
+) -> usize {
     let put = |bytes: &mut [u8], off: usize, op: u32| {
         bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
     };
@@ -4626,7 +4626,11 @@ fn write_el1_hook(
         HookEntry::Irq => emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264)),
     }
 
-    // 6. Switch SP to TrapFrame and prepare x0 as frame argument
+    // 6. Switch SP to TrapFrame and prepare x0 as frame argument. The idle
+    //    entry (EL1 plan 1d) starts HERE in the EL0 IRQ hook, with x16 at a
+    //    frame the host prepared: an executor with no thread enters its
+    //    vCPU in the EL1 scheduler.
+    let frame_entry = cursor;
     emit(bytes, &mut cursor, 0x9100_021F); // mov sp, x16
     emit(bytes, &mut cursor, 0x9100_03E0); // mov x0, sp
 
@@ -4652,14 +4656,14 @@ fn write_el1_hook(
     emit(bytes, &mut cursor, 0x8B11_0210); // add x16, x16, x17
     emit(bytes, &mut cursor, 0xD63F_0200); // blr x16
 
-    // 8. Check return value: Action::Idle == 3 (a syscall hook's idle exit),
-    //    Action::Served == 0, anything else forwards.
-    let idle_branch = (entry == HookEntry::Syscall).then(|| {
+    // 8. Check return value: Action::Idle == 3 (the idle exit: no thread is
+    //    left on the vCPU), Action::Served == 0, anything else forwards.
+    let idle_branch = {
         emit(bytes, &mut cursor, enc_cmp_xn_imm(0, 3)); // cmp x0, #3
         let at = cursor;
         emit(bytes, &mut cursor, 0); // b.eq idle_exit (placeholder)
-        at
-    });
+        Some(at)
+    };
     emit(bytes, &mut cursor, 0xF100_001F); // cmp x0, #0
     let forward_branch = cursor;
     emit(bytes, &mut cursor, 0); // b.ne forward_label (placeholder)
@@ -4834,12 +4838,14 @@ fn write_el1_hook(
         }
     }
 
-    // ===== IDLE EXIT (a syscall hook, x0 == Action::Idle) =====
+    // ===== IDLE EXIT (x0 == Action::Idle) =====
     //
-    // The syscall's thread is parked in its zone record and nothing else ran:
-    // restore SP_EL1 to the mailbox slot (the executor's invariant at every
-    // host boundary) and leave with `hvc #5`. There is no EL0 state to return
-    // to; a resume past the `hvc` is Carrick corruption and fails loud.
+    // No thread is on the vCPU: the syscall's (or the interrupted) thread is
+    // in its zone record, and nothing else runs here, or the next thread
+    // needs its executor. Restore SP_EL1 to the mailbox slot (the executor's
+    // invariant at every host boundary) and leave with `hvc #5`. There is no
+    // EL0 state to return to; a resume past the `hvc` is Carrick corruption
+    // and fails loud.
     if let Some(idle_branch) = idle_branch {
         let idle_exit = cursor;
         put(
@@ -4874,6 +4880,7 @@ fn write_el1_hook(
         cursor <= hook_offset + 0x1000,
         "EL1 hook overruns its 4 KiB of the vector page"
     );
+    frame_entry
 }
 
 /// Install the EL0 IRQ hook ([`El1IrqMode::Gic`]): the lower-EL IRQ slot
@@ -4881,16 +4888,40 @@ fn write_el1_hook(
 /// branches to an EL1 hook that saves the EL0 frame, marks it an interrupt
 /// (syndrome 0) and calls the EL1 image; and the current-EL IRQ slot fails
 /// loud, because EL1 never unmasks IRQs.
-fn write_el0_irq_hook(bytes: &mut [u8], hook_offset: usize) {
+fn write_el0_irq_hook(bytes: &mut [u8], hook_offset: usize) -> usize {
     let put = |bytes: &mut [u8], off: usize, op: u32| {
         bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
     };
-    write_el1_hook(bytes, hook_offset, 0, El1IrqMode::Gic, HookEntry::Irq);
+    let frame_entry = write_el1_hook(bytes, hook_offset, 0, El1IrqMode::Gic, HookEntry::Irq);
     let slot = AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET;
     put(bytes, slot, enc_b(slot as u64, hook_offset as u64));
     put(bytes, slot + 4, AARCH64_NOP_OPCODE);
     let slot = AARCH64_VECTOR_CUR_EL_SPX_IRQ_OFFSET;
     put(bytes, slot, AARCH64_HVC_FAULT_OPCODE);
+    frame_entry
+}
+
+/// The idle entry (EL1 plan 1d): where an executor with no thread starts its
+/// vCPU so the EL1 scheduler runs there. It is the EL0 IRQ hook's call into
+/// the EL1 image, entered with EL1h, IRQs masked, `x16` at the slot's
+/// [`carrick_el1_abi::TrapFrame`] (prepared by the host: `slot` set, `elr` 0
+/// marking the idle entry) and TTBR0 on the carrier's EL1 root. The image
+/// leaves by `eret` into a thread it switched in, or by the `hvc #5` idle
+/// exit. Only in [`El1IrqMode::Gic`] vector pages.
+pub fn el1_idle_entry_va() -> u64 {
+    static OFFSET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let offset = *OFFSET.get_or_init(|| {
+        let mut scratch = vec![0u8; LINUX_EL1_VECTORS_SIZE as usize];
+        write_el0_irq_hook(&mut scratch, EL0_IRQ_HOOK_OFFSET)
+    });
+    LINUX_EL1_VECTORS_BASE + offset as u64
+}
+
+/// The byte offset, within its slot's EL1 stack, of the
+/// [`carrick_el1_abi::TrapFrame`] the EL1 hooks save (and the idle entry
+/// starts from): the stack top minus 0x120.
+pub fn el1_slot_frame_va(slot: usize) -> u64 {
+    carrick_el1_abi::EL1_STACKS_BASE + carrick_el1_abi::EL1_STACK_SIZE * (slot as u64 + 1) - 0x120
 }
 
 fn el1_vectors_bytes_mailbox_inner(identity_fast_path: bool, fd_ceiling: bool) -> Vec<u8> {
@@ -5399,7 +5430,7 @@ pub fn el1_vectors_bytes_mailbox_irq(
     if el1_enabled {
         write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, mailbox_capture, irq);
         if irq == El1IrqMode::Gic {
-            write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);
+            let _ = write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);
         }
     }
     bytes
