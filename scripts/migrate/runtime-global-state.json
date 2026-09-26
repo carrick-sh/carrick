@@ -3428,10 +3428,34 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
-      "symbol": "TABLE",
-      "fingerprint": "4bd89dd6b51df01dd91a32225334bcb045c5792718a970d1a2af1b0d4bd95380",
+      "symbol": "HOST_TABLE",
+      "fingerprint": "6bc2e6e1746fce0d6af84c46de81fc57d846465e85c2b7a64451025c12593f5f",
       "classification": "carrier_infra",
-      "rationale": "The address-space occupancy table (carrick_sched_core::Occupancy) in crates/carrick-kernel/src/kernel/mm_occupancy.rs: which address space each vCPU execution slot runs, the one authority every pause, sole check, crash snapshot and ASID retirement reads; carrier VM scope like the mailbox slots it is indexed by (one HVF VM per process)."
+      "rationale": "The host-memory half of the address-space occupancy authority (carrick_sched_core::Occupancy) in crates/carrick-kernel/src/kernel/mm_occupancy.rs: the words of host-only execution slots, and of every slot while the carrier does not schedule in the guest (zone slots otherwise live in the shared EL1 region); carrier VM scope like the mailbox slots it is indexed by (one HVF VM per process)."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "switching_enabled::CARRICK_EL1_MM_SWITCH",
+      "fingerprint": "ef331b74c9689eaec22956f8528cd60e9b7f80f542b29271da5268bdf11fc92e",
+      "classification": "config_debug",
+      "rationale": "Exact =0 bisection hatch CARRICK_EL1_MM_SWITCH in crates/carrick-kernel/src/kernel/mm_occupancy.rs that stops publishing address spaces for guest EL1 to install itself (EL1 increment 2, step 2: threads of another process reach a vCPU through its executor again), read once per carrier process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "switching_enabled::ENABLED",
+      "fingerprint": "810e6edc6ac71f37c4eb86f28b68168eb8d1faac13e5facea0127a51501d3002",
+      "classification": "config_debug",
+      "rationale": "Cached value of the CARRICK_EL1_MM_SWITCH bisection hatch in crates/carrick-kernel/src/kernel/mm_occupancy.rs; read once, immutable for the carrier's life."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "SPACES_LOCK",
+      "fingerprint": "ce764b981fd018aae03602b1b3e13f434f71b1a4272909814bb1680953f17f51",
+      "classification": "carrier_infra",
+      "rationale": "Serializes publication and freeing of address-space entries in the shared EL1 region (carrick_sched_core::AddressSpaces, the only host mutations of that table) in crates/carrick-kernel/src/kernel/mm_occupancy.rs; carrier VM scope like the zone tables it guards."
     },
     {
       "kind": "thread_local",
