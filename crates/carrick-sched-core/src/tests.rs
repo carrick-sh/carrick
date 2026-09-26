@@ -1132,3 +1132,16 @@ fn relocation_moves_queued_threads_between_run_queues_without_host_ownership() {
     assert_eq!(zone.record(a).handback(), Some(Handback::Woken));
     assert_eq!(zone.record(b).handback(), Some(Handback::Cancelled));
 }
+
+/// A thread the host loads on a slot starts a fresh slice: the slot's slice
+/// start from what it ran before would preempt it at the first tick (EL1
+/// restarts the slice at its next look when the start is 0).
+#[test]
+fn a_host_load_starts_a_fresh_slice() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    zone.slot(SLOT).restart_slice(1_000);
+    zone.leave_guest(SLOT, &HostWait);
+    assert!(zone.reset_slot(SLOT));
+    assert_eq!(zone.slot(SLOT).queued_since(), 0);
+}

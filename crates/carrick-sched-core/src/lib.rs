@@ -2220,6 +2220,11 @@ impl ZoneTables {
         // The slot may name another vCPU now (a new mailbox lease): what EL1
         // armed on the old one says nothing about this one's timer.
         s.timer_cval.store(0, Ordering::Relaxed);
+        // The loaded thread starts a fresh slice (EL1 restarts it at its next
+        // look): a slice left over from what the slot ran before would
+        // preempt it at the first tick, and a slot whose threads all need
+        // their executor would then turn over without progress.
+        s.queued_since.store(0, Ordering::Release);
         clean
     }
 
