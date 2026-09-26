@@ -1336,21 +1336,23 @@ impl SyscallDispatcher {
     ) -> Result<MmExecutorParticipation, crate::kernel::MmOccupancyError> {
         loop {
             let authority = self.mm_binding.current.load_full();
-            let admission = match (&thread, &pause_endpoint) {
-                (None, None) => MmExecutorAdmissionRecipe::Anonymous,
-                (None, Some((registry, tid, slot))) => {
+            let (admission, slot) = match (&thread, &pause_endpoint) {
+                (None, None) => (MmExecutorAdmissionRecipe::Anonymous, None),
+                (None, Some((registry, tid, slot))) => (
                     MmExecutorAdmissionRecipe::AnonymousWithPauseEndpoint {
                         registry: Arc::clone(registry),
                         tid: *tid,
-                        slot: *slot,
-                    }
-                }
-                (Some(thread), Some((registry, tid, slot))) => MmExecutorAdmissionRecipe::Thread {
-                    thread: thread.clone(),
-                    registry: Arc::clone(registry),
-                    tid: *tid,
-                    slot: *slot,
-                },
+                    },
+                    Some(*slot),
+                ),
+                (Some(thread), Some((registry, tid, slot))) => (
+                    MmExecutorAdmissionRecipe::Thread {
+                        thread: thread.clone(),
+                        registry: Arc::clone(registry),
+                        tid: *tid,
+                    },
+                    Some(*slot),
+                ),
                 _ => {
                     tracing::error!(
                         "MM executor admission must be anonymous or carry an exact thread pause endpoint"
@@ -1361,7 +1363,7 @@ impl SyscallDispatcher {
                     )
                 }
             };
-            let occupancy = admission.enter(&authority)?;
+            let occupancy = admission.enter(&authority, slot)?;
             if Arc::ptr_eq(&self.mm_binding.current.load_full(), &authority) {
                 return Ok(MmExecutorParticipation {
                     authority,

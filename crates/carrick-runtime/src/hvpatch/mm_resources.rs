@@ -307,11 +307,8 @@ impl ExecMmReservation {
         self.active().0.root_slot()
     }
 
-    pub(crate) fn begin_replacement_asid_load(
-        &self,
-        executor: carrick_kernel::kernel::objects::ExecutorId,
-    ) -> Result<AsidLoad, AsidResidencyError> {
-        self.active().0.begin_asid_load(executor)
+    pub(crate) fn begin_replacement_asid_load(&self) -> Result<AsidLoad, AsidResidencyError> {
+        self.active().0.begin_asid_load()
     }
 
     pub(crate) fn abort(mut self) -> Result<ExecMmAbortReceipt, MmResourcesError> {
@@ -1471,13 +1468,6 @@ mod tests {
         }
     }
 
-    fn executor(raw: i32) -> carrick_kernel::kernel::objects::ExecutorId {
-        carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(
-            crate::thread::ThreadId::synthetic_for_tests(raw),
-        )
-        .unwrap()
-    }
-
     fn resources(root: TaskKey, asid_limit: u16) -> (MmResources, Arc<Stage1MmBackend>) {
         let (resources, backend) = MmResources::new_for_tests(0x4000, asid_limit).unwrap();
         resources.publish_root(root).unwrap();
@@ -2020,7 +2010,7 @@ mod tests {
             "final-owner exec reservation closed predecessor loads before commit"
         );
         let load = predecessor
-            .begin_asid_load(executor(13_501))
+            .begin_asid_load()
             .expect("exec owner reloads its own address space during sibling drain");
         drop(load);
 
@@ -2031,7 +2021,7 @@ mod tests {
         };
         assert!(predecessor.is_retiring());
         assert!(matches!(
-            predecessor.begin_asid_load(executor(13_502)),
+            predecessor.begin_asid_load(),
             Err(AsidResidencyError::Retiring)
         ));
         retirement.complete_for_test().unwrap();
@@ -2044,12 +2034,12 @@ mod tests {
         let resources = Arc::new(resources);
         let predecessor = resources.lease(owner).unwrap();
         let reservation = resources.reserve_exec(owner).unwrap();
-        let load = predecessor.begin_asid_load(executor(13_601)).unwrap();
+        let load = predecessor.begin_asid_load().unwrap();
         let receipt = reservation.abort().unwrap();
         assert!(matches!(receipt, ExecMmAbortReceipt::RestoredFinal { .. }));
         drop(load);
         assert!(!predecessor.is_retiring());
-        predecessor.begin_asid_load(executor(13_601)).unwrap();
+        predecessor.begin_asid_load().unwrap();
     }
 
     #[test]
@@ -2148,7 +2138,6 @@ mod tests {
     fn explicit_exec_abort_returns_dirty_replacement_quarantine_for_both_dispositions() {
         let retained_parent = task(140, 1);
         let retained_child = task(141, 2);
-        let retained_executor = executor(14_001);
         let (retained_resources, _) = resources(retained_parent, 2);
         let retained_resources = Arc::new(retained_resources);
         retained_resources
@@ -2156,9 +2145,7 @@ mod tests {
             .unwrap();
         let retained_predecessor = retained_resources.lease(retained_child).unwrap();
         let retained_reservation = retained_resources.reserve_exec(retained_child).unwrap();
-        let mut retained_load = retained_reservation
-            .begin_replacement_asid_load(retained_executor)
-            .unwrap();
+        let mut retained_load = retained_reservation.begin_replacement_asid_load().unwrap();
         retained_load.arm_hardware_dirty().unwrap();
         retained_load.mark_resident().unwrap();
         let retained_abort = retained_reservation.abort().unwrap();
@@ -2175,8 +2162,7 @@ mod tests {
             other => panic!("dirty retained abort was not quarantined: {other:?}"),
         };
         retained_retirement
-            .acknowledge(super::super::asid::InvalidationAck::new(
-                retained_executor,
+            .acknowledge(super::super::asid::BroadcastInvalidation::completed(
                 retained_retirement.asid_generation(),
             ))
             .unwrap();
@@ -2184,14 +2170,11 @@ mod tests {
         drop(retained_resources.reserve_exec(retained_child).unwrap());
 
         let final_task = task(142, 3);
-        let final_executor = executor(14_002);
         let (final_resources, _) = resources(final_task, 2);
         let final_resources = Arc::new(final_resources);
         let final_predecessor = final_resources.lease(final_task).unwrap();
         let final_reservation = final_resources.reserve_exec(final_task).unwrap();
-        let mut final_load = final_reservation
-            .begin_replacement_asid_load(final_executor)
-            .unwrap();
+        let mut final_load = final_reservation.begin_replacement_asid_load().unwrap();
         final_load.arm_hardware_dirty().unwrap();
         final_load.mark_resident().unwrap();
         let final_abort = final_reservation.abort().unwrap();
@@ -2207,10 +2190,9 @@ mod tests {
             }
             other => panic!("dirty final abort was not quarantined: {other:?}"),
         };
-        assert!(final_predecessor.begin_asid_load(executor(14_003)).is_ok());
+        assert!(final_predecessor.begin_asid_load().is_ok());
         final_retirement
-            .acknowledge(super::super::asid::InvalidationAck::new(
-                final_executor,
+            .acknowledge(super::super::asid::BroadcastInvalidation::completed(
                 final_retirement.asid_generation(),
             ))
             .unwrap();
@@ -2281,7 +2263,7 @@ mod tests {
             ))
         ));
         assert!(Arc::ptr_eq(&resources.lease(root).unwrap(), &predecessor));
-        assert!(predecessor.begin_asid_load(executor(16_001)).is_ok());
+        assert!(predecessor.begin_asid_load().is_ok());
         drop(resources.reserve_exec(root).unwrap());
     }
 
@@ -2315,7 +2297,7 @@ mod tests {
             ]
         );
         assert!(Arc::ptr_eq(&resources.lease(root).unwrap(), &predecessor));
-        assert!(predecessor.begin_asid_load(executor(16_002)).is_ok());
+        assert!(predecessor.begin_asid_load().is_ok());
         let retry = resources.reserve_exec(root).unwrap();
         assert_eq!(retry.replacement_asid_generation().asid(), expected_asid);
         assert_eq!(retry.replacement_root_slot(), expected_root);
@@ -2664,7 +2646,6 @@ mod tests {
     fn explicit_dirty_final_abort_orders_replacement_predecessor_marker_settlement() {
         let root = task(199, 1);
         let alias = task(200, 2);
-        let dirty_executor = executor(19_901);
         let (resources, _) = resources(root, 2);
         let resources = Arc::new(resources);
         let predecessor = resources.lease(root).unwrap();
@@ -2672,9 +2653,7 @@ mod tests {
         let reservation = resources
             .reserve_exec_with_settlement_trace_for_tests(root, trace.clone())
             .unwrap();
-        let mut load = reservation
-            .begin_replacement_asid_load(dirty_executor)
-            .unwrap();
+        let mut load = reservation.begin_replacement_asid_load().unwrap();
         load.arm_hardware_dirty().unwrap();
         load.mark_resident().unwrap();
 
@@ -2700,7 +2679,6 @@ mod tests {
     fn dropping_dirty_final_reservation_restores_predecessor_and_quarantines_replacement() {
         let root = task(201, 1);
         let alias = task(202, 2);
-        let dirty_executor = executor(20_101);
         let (resources, _) = resources(root, 2);
         let resources = Arc::new(resources);
         let predecessor = resources.lease(root).unwrap();
@@ -2708,9 +2686,7 @@ mod tests {
         let reservation = resources
             .reserve_exec_with_settlement_trace_for_tests(root, trace.clone())
             .unwrap();
-        let mut load = reservation
-            .begin_replacement_asid_load(dirty_executor)
-            .unwrap();
+        let mut load = reservation.begin_replacement_asid_load().unwrap();
         load.arm_hardware_dirty().unwrap();
         load.mark_resident().unwrap();
         drop(reservation);
@@ -2723,7 +2699,7 @@ mod tests {
             ]
         );
         assert!(Arc::ptr_eq(&resources.lease(root).unwrap(), &predecessor));
-        assert!(predecessor.begin_asid_load(executor(20_102)).is_ok());
+        assert!(predecessor.begin_asid_load().is_ok());
         resources.publish_shared_child(root, alias).unwrap();
         assert!(matches!(
             resources.prepare_child(),
@@ -2736,7 +2712,6 @@ mod tests {
         let root = task(203, 1);
         let exec_child = task(204, 2);
         let post_drop_alias = task(205, 3);
-        let dirty_executor = executor(20_301);
         let (resources, _) = resources(root, 2);
         let resources = Arc::new(resources);
         resources.publish_shared_child(root, exec_child).unwrap();
@@ -2746,9 +2721,7 @@ mod tests {
             .reserve_exec_with_settlement_trace_for_tests(exec_child, trace.clone())
             .unwrap();
         assert!(reservation.disposition() == ExecMmDispositionKind::RetainOldMm);
-        let mut load = reservation
-            .begin_replacement_asid_load(dirty_executor)
-            .unwrap();
+        let mut load = reservation.begin_replacement_asid_load().unwrap();
         load.arm_hardware_dirty().unwrap();
         load.mark_resident().unwrap();
         drop(reservation);

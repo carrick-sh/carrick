@@ -69,9 +69,9 @@ pub struct ExactMmStage1Lease {
     // Drop the engine-visible marker before the barrier guard resumes the
     // MM's vCPUs.
     _stage1: Stage1Exclusive,
-    inner: crate::fork_quiesce::PtPauseGuard,
+    _inner: crate::fork_quiesce::PtPauseGuard,
     /// The vCPUs the drain waited for (empty for a sole proof).
-    residents: crate::kernel::mm_occupancy::MmResidents,
+    _residents: crate::kernel::mm_occupancy::MmResidents,
     _not_send_or_sync: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -84,8 +84,8 @@ impl ExactMmStage1Lease {
         std::rc::Rc::new(Self {
             mm,
             _stage1: Stage1Exclusive::claim(),
-            inner,
-            residents,
+            _inner: inner,
+            _residents: residents,
             _not_send_or_sync: std::marker::PhantomData,
         })
     }
@@ -284,7 +284,7 @@ impl<'mm> PtPauseGuard<'mm> {
     /// The vCPUs this pause drained.
     #[cfg(any(test, feature = "test-support"))]
     pub fn drained_count(&self) -> usize {
-        self._lease.residents.len()
+        self._lease._residents.len()
     }
 }
 
@@ -436,6 +436,9 @@ fn drain_exact_mm<'mm>(
         i32::try_from(residents.len()).unwrap_or(i32::MAX),
     );
 
+    if !residents.is_empty() {
+        barrier.set_draining();
+    }
     let start = Instant::now();
     let wake = carrick_hal::GuestLeaveWake::new();
     residents.kick_all_in_guest();
@@ -585,13 +588,6 @@ pub enum FrameCowExactMmGuard {
 }
 
 impl FrameCowExactMmGuard {
-    fn exact_mm(&self) -> crate::kernel::MmId {
-        match self {
-            Self::Nested { _lease, .. } => _lease.mm,
-            Self::Sole { _guard, .. } | Self::Paused { _guard, .. } => _guard._lease.mm,
-        }
-    }
-
     #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
     pub(crate) fn mutation_identity(
         &self,
@@ -618,12 +614,16 @@ impl FrameCowExactMmGuard {
         }
     }
 
+    /// Publish that the target MM's translations changed under a foreign
+    /// COW. Every guard shape holds the MM's fence (or the caller's own
+    /// pause of it), so no vCPU runs the MM now; each vCPU that runs it
+    /// next first runs one broadcast `TLBI ASIDE1IS` unless another already
+    /// covered this publication, which removes the stale translations from
+    /// every PE, wherever the MM ran before.
     pub(crate) fn publish_foreign_cow_invalidation(
         &mut self,
         expected_binding: carrick_hal::ForeignMmBinding,
-        deadline: Instant,
     ) -> Result<(), ForeignCowInvalidationError> {
-        let exact_mm = self.exact_mm();
         let stage1 = match self {
             Self::Nested { foreign_stage1, .. }
             | Self::Sole { foreign_stage1, .. }
@@ -634,27 +634,8 @@ impl FrameCowExactMmGuard {
         if stage1.foreign_mm_binding() != expected_binding {
             return Err(ForeignCowInvalidationError::BindingMismatch);
         }
-        let generation = stage1.publish_foreign_cow_invalidation();
-        let identity = carrick_hal::ForeignCowInvalidationIdentity::new(
-            stage1.foreign_stage1_identity(carrick_hal::ForeignMmId::from_kernel_allocation(
-                exact_mm.nonzero(),
-            )),
-            generation,
-        );
-        let Self::Paused { _guard, .. } = self else {
-            return Ok(());
-        };
-        let lease = &_guard._lease;
-        let phase = lease
-            .inner
-            .publish_exact_invalidation(identity, lease.residents.hardware_invalidation_tids())
-            .map_err(ForeignCowInvalidationError::Pause)?;
-        let result = lease.inner.wait_invalidation(&phase, deadline);
-        lease
-            .inner
-            .finish_invalidation(&phase)
-            .map_err(ForeignCowInvalidationError::Pause)?;
-        result.map_err(ForeignCowInvalidationError::Pause)
+        stage1.publish_foreign_cow_invalidation();
+        Ok(())
     }
 }
 
@@ -662,12 +643,8 @@ impl FrameCowExactMmGuard {
 pub enum ForeignCowInvalidationError {
     #[error("foreign COW mutation has no exact stage-1 lease")]
     MissingStage1Lease,
-    #[error("foreign COW mutation with active target executors has no pause")]
-    MissingPause,
     #[error("foreign COW invalidation binding does not match the exact stage-1 lease")]
     BindingMismatch,
-    #[error("foreign COW exact-ASID invalidation failed: {0}")]
-    Pause(#[from] crate::fork_quiesce::PtInvalidationError),
 }
 
 /// Stage-1 authority for a frame-COW edit of `mm`: the pause this thread

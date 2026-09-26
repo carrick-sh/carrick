@@ -40,7 +40,7 @@
 // guard. `lock()`/`wait()` only return `Err` on poisoning — a thread panicking
 // while holding the guard — which cannot occur in this no-panic codebase.
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
@@ -106,9 +106,11 @@ pub fn current_mm_fork_quiesce() -> Option<Arc<ForkQuiesce>> {
     CURRENT_MM_QUIESCE.with(|cell| cell.borrow().as_ref().map(|s| Arc::clone(&s.fork)))
 }
 
-/// Returns true if the current thread's MM is currently quiescing for a stage-1 edit.
+/// Returns true if a stage-1 edit of the current thread's MM is draining
+/// vCPUs out of the guest. A pause that found no other vCPU running the MM
+/// (a sole editor) still fences guest entry but asks no host wait to bail.
 pub fn is_current_mm_quiescing() -> bool {
-    CURRENT_MM_QUIESCE.with(|cell| cell.borrow().as_ref().is_some_and(|s| s.pt.is_quiescing()))
+    CURRENT_MM_QUIESCE.with(|cell| cell.borrow().as_ref().is_some_and(|s| s.pt.is_draining()))
 }
 
 /// Returns true if the current thread's MM is currently quiescing for a fork.
@@ -833,77 +835,13 @@ pub fn pt_barrier() -> &'static Arc<PtQuiesce> {
 #[derive(Debug)]
 pub struct PtQuiesce {
     coordinator: AtomicBool,
+    /// The MM's fence: no vCPU may enter the guest for the MM while set.
     quiescing: AtomicBool,
-    lock: Mutex<PtQuiesceState>,
+    /// The pause is kicking and draining other vCPUs of the MM.
+    draining: AtomicBool,
+    lock: Mutex<()>,
     cv: Condvar,
 }
-
-#[derive(Debug, Default)]
-struct PtQuiesceState {
-    next_invalidation: u64,
-    invalidation: Option<PtInvalidationState>,
-}
-
-#[derive(Debug)]
-struct PtInvalidationState {
-    phase: PtInvalidationPhase,
-    request: PtInvalidationRequest,
-    expected: BTreeSet<PtInvalidationParticipant>,
-    acknowledged: BTreeSet<PtInvalidationParticipant>,
-    failed: BTreeSet<PtInvalidationParticipant>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct PtInvalidationParticipant {
-    stage1: carrick_hal::ForeignStage1Identity,
-    tid: carrick_hal::ThreadId,
-}
-
-/// Data-only exact-ASID request published after a quiesced stage-1 edit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PtInvalidationRequest {
-    identity: carrick_hal::ForeignCowInvalidationIdentity,
-}
-
-impl PtInvalidationRequest {
-    pub const fn identity(self) -> carrick_hal::ForeignCowInvalidationIdentity {
-        self.identity
-    }
-}
-
-/// Opaque identity of one invalidation phase within a held pause.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PtInvalidationPhase(u64);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PtInvalidationError {
-    PauseNotActive,
-    AlreadyPublished,
-    StalePhase,
-    ServiceFailed(carrick_hal::ThreadId),
-    TimedOut(carrick_hal::ThreadId),
-}
-
-impl std::fmt::Display for PtInvalidationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PauseNotActive => formatter.write_str("page-table pause is not active"),
-            Self::AlreadyPublished => {
-                formatter.write_str("another exact-ASID invalidation phase is already active")
-            }
-            Self::StalePhase => formatter.write_str("exact-ASID invalidation phase is stale"),
-            Self::ServiceFailed(tid) => {
-                write!(formatter, "executor {tid:?} failed exact-ASID invalidation")
-            }
-            Self::TimedOut(tid) => write!(
-                formatter,
-                "timed out waiting for executor {tid:?} to invalidate the exact ASID"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PtInvalidationError {}
 
 impl Default for PtQuiesce {
     fn default() -> Self {
@@ -916,7 +854,8 @@ impl PtQuiesce {
         Self {
             coordinator: AtomicBool::new(false),
             quiescing: AtomicBool::new(false),
-            lock: Mutex::new(PtQuiesceState::default()),
+            draining: AtomicBool::new(false),
+            lock: Mutex::new(()),
             cv: Condvar::new(),
         }
     }
@@ -936,61 +875,22 @@ impl PtQuiesce {
         self.quiescing.store(true, Ordering::SeqCst);
     }
 
+    /// The coordinator must drain other vCPUs of the MM: host waits of the
+    /// MM's threads may bail to their run-loop top ([`is_quiescing`]).
+    pub fn set_draining(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
     /// OTHER thread (or a coordinator-CAS loser) parks here until the pause
     /// ends, keeping its vCPU. Called at the lock-safe run-loop top.
     pub fn park(&self) {
         #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut g = self.lock.lock().unwrap();
         while self.quiescing.load(Ordering::SeqCst) {
-            #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-            let next = self.cv.wait(g).unwrap();
-            g = next;
-        }
-    }
-
-    /// Park an out-of-guest owner vCPU, servicing at most the exact phase that
-    /// names this logical executor. The callback runs without the barrier lock
-    /// and the executor remains parked after acknowledgement until the pause
-    /// guard drops.
-    pub fn park_servicing_exact_invalidation(
-        &self,
-        stage1: carrick_hal::ForeignStage1Identity,
-        tid: carrick_hal::ThreadId,
-        mut service: impl FnMut(PtInvalidationRequest) -> Result<(), ()>,
-    ) {
-        let participant = PtInvalidationParticipant { stage1, tid };
-        let mut serviced_phase = 0;
-        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-        let mut g = self.lock.lock().unwrap();
-        while self.quiescing.load(Ordering::SeqCst) {
-            let work = g.invalidation.as_ref().and_then(|state| {
-                (state.phase.0 > serviced_phase && state.expected.contains(&participant))
-                    .then_some((state.phase, state.request))
-            });
-            if let Some((phase, request)) = work {
-                drop(g);
-                let result = service(request);
-                #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-                let acquired = self.lock.lock().unwrap();
-                g = acquired;
-                serviced_phase = phase.0;
-                if let Some(state) = g
-                    .invalidation
-                    .as_mut()
-                    .filter(|state| state.phase == phase && state.expected.contains(&participant))
-                {
-                    match result {
-                        Ok(()) => {
-                            state.acknowledged.insert(participant);
-                        }
-                        Err(()) => {
-                            state.failed.insert(participant);
-                        }
-                    }
-                    self.cv.notify_all();
-                }
-                continue;
-            }
             #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
             let next = self.cv.wait(g).unwrap();
             g = next;
@@ -1029,8 +929,8 @@ impl PtQuiesce {
     /// Coordinator: end the pause, wake parked threads, drop coordinator.
     pub fn end(&self) {
         #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-        let mut g = self.lock.lock().unwrap();
-        g.invalidation = None;
+        let _held = self.lock.lock().unwrap();
+        self.draining.store(false, Ordering::SeqCst);
         self.quiescing.store(false, Ordering::SeqCst);
         self.coordinator.store(false, Ordering::SeqCst);
         self.cv.notify_all();
@@ -1063,98 +963,6 @@ impl Drop for PtPauseGuard {
     }
 }
 
-impl PtPauseGuard {
-    pub fn publish_exact_invalidation(
-        &self,
-        identity: carrick_hal::ForeignCowInvalidationIdentity,
-        expected: impl IntoIterator<Item = carrick_hal::ThreadId>,
-    ) -> Result<PtInvalidationPhase, PtInvalidationError> {
-        if !self.barrier.quiescing.load(Ordering::SeqCst) {
-            return Err(PtInvalidationError::PauseNotActive);
-        }
-        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-        let mut state = self.barrier.lock.lock().unwrap();
-        if state.invalidation.is_some() {
-            return Err(PtInvalidationError::AlreadyPublished);
-        }
-        state.next_invalidation = state.next_invalidation.checked_add(1).unwrap_or_else(|| {
-            carrick_fatal!(
-                "thread::fork_quiesce",
-                "page table next invalidation phase overflow"
-            );
-        });
-        let phase = PtInvalidationPhase(state.next_invalidation);
-        state.invalidation = Some(PtInvalidationState {
-            phase,
-            request: PtInvalidationRequest { identity },
-            expected: expected
-                .into_iter()
-                .map(|tid| PtInvalidationParticipant {
-                    stage1: identity.stage1(),
-                    tid,
-                })
-                .collect(),
-            acknowledged: BTreeSet::new(),
-            failed: BTreeSet::new(),
-        });
-        self.barrier.cv.notify_all();
-        Ok(phase)
-    }
-
-    pub fn wait_invalidation(
-        &self,
-        phase: &PtInvalidationPhase,
-        deadline: Instant,
-    ) -> Result<(), PtInvalidationError> {
-        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-        let mut guard = self.barrier.lock.lock().unwrap();
-        loop {
-            let state = guard
-                .invalidation
-                .as_ref()
-                .filter(|state| state.phase == *phase)
-                .ok_or(PtInvalidationError::StalePhase)?;
-            if let Some(participant) = state.failed.iter().next().copied() {
-                return Err(PtInvalidationError::ServiceFailed(participant.tid));
-            }
-            if state.acknowledged == state.expected {
-                return Ok(());
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                let missing = state
-                    .expected
-                    .difference(&state.acknowledged)
-                    .next()
-                    .copied()
-                    .ok_or(PtInvalidationError::StalePhase)?;
-                return Err(PtInvalidationError::TimedOut(missing.tid));
-            };
-            #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-            let (next, _) = self.barrier.cv.wait_timeout(guard, remaining).unwrap();
-            guard = next;
-        }
-    }
-
-    /// Retire one completed or failed phase while keeping the admission
-    /// barrier raised. This permits rollback to publish a second exact-ASID
-    /// generation to the same parked owners before the pause guard releases.
-    pub fn finish_invalidation(
-        &self,
-        phase: &PtInvalidationPhase,
-    ) -> Result<(), PtInvalidationError> {
-        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-        let mut guard = self.barrier.lock.lock().unwrap();
-        match guard.invalidation.as_ref() {
-            Some(state) if state.phase == *phase => {
-                guard.invalidation = None;
-                self.barrier.cv.notify_all();
-                Ok(())
-            }
-            _ => Err(PtInvalidationError::StalePhase),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -1163,35 +971,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
-
-    fn invalidation_identity(
-        mm: u64,
-        asid: u16,
-        asid_generation: u64,
-        root: u64,
-        cow_generation: u64,
-    ) -> carrick_hal::ForeignCowInvalidationIdentity {
-        use std::num::{NonZeroU16, NonZeroU64};
-
-        let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(mm).unwrap());
-        let asid = carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(asid).unwrap());
-        let binding = carrick_hal::ForeignMmBinding::for_aarch64_root_raw(asid, root);
-        let stage1 = carrick_hal::ForeignStage1Identity::new(
-            mm,
-            binding,
-            carrick_hal::ForeignAsidGeneration::from_runtime_binding(
-                asid,
-                NonZeroU64::new(asid_generation).unwrap(),
-            ),
-        )
-        .unwrap();
-        carrick_hal::ForeignCowInvalidationIdentity::new(
-            stage1,
-            carrick_hal::ForeignCowInvalidationGeneration::from_runtime_publication(
-                NonZeroU64::new(cow_generation).unwrap(),
-            ),
-        )
-    }
 
     #[test]
     fn quiesce_waits_for_all_others_then_releases() {
@@ -1526,174 +1305,6 @@ mod tests {
             "the claim is reusable after end_exec_replacement"
         );
         end_exec_replacement();
-    }
-
-    #[test]
-    fn pt_pause_publishes_exact_invalidation_and_waits_for_owner_ack() {
-        let barrier = Arc::new(PtQuiesce::new());
-        let tid = carrick_hal::ThreadId::synthetic_for_tests(801);
-        assert!(barrier.try_become_coordinator());
-        barrier.set_quiescing();
-        let guard = barrier.pause_guard(carrick_hal::ThreadId::synthetic_for_tests(800));
-        let serviced = Arc::new(AtomicBool::new(false));
-        let worker_serviced = Arc::clone(&serviced);
-        let identity = invalidation_identity(13, 17, 23, 0x8000, 29);
-        let worker_barrier = Arc::clone(&barrier);
-        let worker = std::thread::spawn(move || {
-            worker_barrier.park_servicing_exact_invalidation(identity.stage1(), tid, |request| {
-                assert_eq!(request.identity(), identity);
-                worker_serviced.store(true, Ordering::SeqCst);
-                Ok(())
-            })
-        });
-
-        let phase = guard
-            .publish_exact_invalidation(identity, [tid])
-            .expect("publish exact-ASID invalidation phase");
-        guard
-            .wait_invalidation(&phase, Instant::now() + Duration::from_secs(1))
-            .expect("owner vCPU acknowledgement");
-        assert!(serviced.load(Ordering::SeqCst));
-        assert!(
-            !worker.is_finished(),
-            "owner remains excluded through commit"
-        );
-        drop(guard);
-        worker.join().expect("parked owner resumes");
-    }
-
-    #[test]
-    fn pt_pause_invalidation_fails_closed_on_owner_failure_or_timeout() {
-        let failed_barrier = Arc::new(PtQuiesce::new());
-        let failed_tid = carrick_hal::ThreadId::synthetic_for_tests(811);
-        assert!(failed_barrier.try_become_coordinator());
-        failed_barrier.set_quiescing();
-        let failed_guard =
-            failed_barrier.pause_guard(carrick_hal::ThreadId::synthetic_for_tests(810));
-        let service_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let worker_calls = Arc::clone(&service_calls);
-        let failed_identity = invalidation_identity(15, 19, 29, 0xa000, 31);
-        let worker_barrier = Arc::clone(&failed_barrier);
-        let worker = std::thread::spawn(move || {
-            worker_barrier.park_servicing_exact_invalidation(
-                failed_identity.stage1(),
-                failed_tid,
-                |_| {
-                    (worker_calls.fetch_add(1, Ordering::SeqCst) != 0)
-                        .then_some(())
-                        .ok_or(())
-                },
-            )
-        });
-        let phase = failed_guard
-            .publish_exact_invalidation(failed_identity, [failed_tid])
-            .expect("publish failure phase");
-        assert_eq!(
-            failed_guard.wait_invalidation(&phase, Instant::now() + Duration::from_secs(1)),
-            Err(PtInvalidationError::ServiceFailed(failed_tid))
-        );
-        failed_guard
-            .finish_invalidation(&phase)
-            .expect("retire failed publication while pause remains held");
-        let rollback_identity = invalidation_identity(15, 19, 29, 0xa000, 32);
-        let rollback = failed_guard
-            .publish_exact_invalidation(rollback_identity, [failed_tid])
-            .expect("publish rollback invalidation");
-        failed_guard
-            .wait_invalidation(&rollback, Instant::now() + Duration::from_secs(1))
-            .expect("parked owner services rollback generation");
-        failed_guard
-            .finish_invalidation(&rollback)
-            .expect("retire rollback publication");
-        assert_eq!(service_calls.load(Ordering::SeqCst), 2);
-        drop(failed_guard);
-        worker.join().expect("failed worker resumes after rollback");
-
-        let timeout_barrier = Arc::new(PtQuiesce::new());
-        let missing_tid = carrick_hal::ThreadId::synthetic_for_tests(821);
-        assert!(timeout_barrier.try_become_coordinator());
-        timeout_barrier.set_quiescing();
-        let timeout_guard =
-            timeout_barrier.pause_guard(carrick_hal::ThreadId::synthetic_for_tests(820));
-        let timeout_identity = invalidation_identity(17, 31, 37, 0xc000, 41);
-        let phase = timeout_guard
-            .publish_exact_invalidation(timeout_identity, [missing_tid])
-            .expect("publish timeout phase");
-        assert_eq!(
-            timeout_guard.wait_invalidation(&phase, Instant::now() + Duration::from_millis(10)),
-            Err(PtInvalidationError::TimedOut(missing_tid))
-        );
-        drop(timeout_guard);
-    }
-
-    #[test]
-    fn pt_pause_exact_identity_does_not_accept_recycled_asid_with_new_root() {
-        use std::num::{NonZeroU16, NonZeroU64};
-
-        let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(91).unwrap());
-        let asid = carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(17).unwrap());
-        let old_binding = carrick_hal::ForeignMmBinding::for_aarch64_root_raw(asid, 0x8000);
-        let new_binding = carrick_hal::ForeignMmBinding::for_aarch64_root_raw(asid, 0x9000);
-        let old_stage1 = carrick_hal::ForeignStage1Identity::new(
-            mm,
-            old_binding,
-            carrick_hal::ForeignAsidGeneration::from_runtime_binding(
-                asid,
-                NonZeroU64::new(23).unwrap(),
-            ),
-        )
-        .unwrap();
-        let recycled_stage1 = carrick_hal::ForeignStage1Identity::new(
-            mm,
-            new_binding,
-            carrick_hal::ForeignAsidGeneration::from_runtime_binding(
-                asid,
-                NonZeroU64::new(24).unwrap(),
-            ),
-        )
-        .unwrap();
-        let request = carrick_hal::ForeignCowInvalidationIdentity::new(
-            old_stage1,
-            carrick_hal::ForeignCowInvalidationGeneration::from_runtime_publication(
-                NonZeroU64::new(29).unwrap(),
-            ),
-        );
-        let barrier = Arc::new(PtQuiesce::new());
-        let tid = carrick_hal::ThreadId::synthetic_for_tests(831);
-        assert!(barrier.try_become_coordinator());
-        barrier.set_quiescing();
-        let guard = barrier.pause_guard(carrick_hal::ThreadId::synthetic_for_tests(830));
-        let wrong_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let wrong_worker_calls = Arc::clone(&wrong_calls);
-        let worker_barrier1 = Arc::clone(&barrier);
-        let wrong_worker = std::thread::spawn(move || {
-            worker_barrier1.park_servicing_exact_invalidation(recycled_stage1, tid, |_| {
-                wrong_worker_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            })
-        });
-        let right_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let right_worker_calls = Arc::clone(&right_calls);
-        let worker_barrier2 = Arc::clone(&barrier);
-        let right_worker = std::thread::spawn(move || {
-            worker_barrier2.park_servicing_exact_invalidation(old_stage1, tid, |observed| {
-                assert_eq!(observed.identity(), request);
-                right_worker_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            })
-        });
-
-        let phase = guard
-            .publish_exact_invalidation(request, [tid])
-            .expect("publish typed exact-stage1 invalidation");
-        guard
-            .wait_invalidation(&phase, Instant::now() + Duration::from_secs(1))
-            .expect("only exact old identity acknowledges");
-        assert_eq!(right_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(wrong_calls.load(Ordering::SeqCst), 0);
-        drop(guard);
-        right_worker.join().unwrap();
-        wrong_worker.join().unwrap();
     }
 
     /// The forkexecstorm wedge (2026-09-12, core `probe-wedge-16307`): a

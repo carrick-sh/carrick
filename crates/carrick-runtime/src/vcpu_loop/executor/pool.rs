@@ -336,13 +336,6 @@ impl WorkerKick {
         self.guest_idle.store(idle, Ordering::SeqCst);
     }
 
-    fn poke_control(&self) {
-        self.need_resched.store(true, Ordering::Release);
-        if let Some(hardware) = self.hardware.lock().as_ref() {
-            hardware.handle.kick();
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn install_delivery_validation_gate(&self, gate: Arc<std::sync::Barrier>) {
         *self.delivery_validation_gate.lock() = Some(gate);
@@ -458,10 +451,6 @@ impl ExecutorKick for WorkerKick {
 pub(crate) enum WorkerCommand {
     Initialize,
     Run,
-    InvalidateAsid {
-        generation: crate::hvpatch::AsidGeneration,
-        response: mpsc::SyncSender<Result<crate::hvpatch::InvalidationAck, String>>,
-    },
     Stop,
 }
 
@@ -506,8 +495,6 @@ pub(crate) struct WorkerRuntime<'a> {
 pub(crate) struct PoolControl {
     usable_workers: std::sync::atomic::AtomicUsize,
     pub(crate) wait_service: carrick_kernel::kernel::continuation::CarrierWaitService,
-    scheduler: Arc<Scheduler>,
-    workers: Mutex<std::collections::BTreeMap<ExecutorId, WorkerControlHandle>>,
     /// Set once pool shutdown (or startup rollback) begins. A worker that
     /// faulted after its startup keeps its idle vCPU until then: every vCPU
     /// lives for its VM's life (EL1 plan 1a D2).
@@ -515,36 +502,11 @@ pub(crate) struct PoolControl {
     shutdown_changed: parking_lot::Condvar,
 }
 
-#[derive(Clone, Debug)]
-struct WorkerControlHandle {
-    command: mpsc::Sender<WorkerCommand>,
-    kick: Arc<WorkerKick>,
-}
-
-type PendingAsidInvalidation = (
-    ExecutorId,
-    mpsc::Receiver<Result<crate::hvpatch::InvalidationAck, String>>,
-);
-type PendingAsidInvalidations = Vec<PendingAsidInvalidation>;
-
-struct InvalidationServicingContext<'a, E> {
-    retirement: &'a crate::hvpatch::Stage1MmRetirement,
-    current: ExecutorId,
-    backend: &'a mut E,
-    boundary: &'a WorkerBoundaryAudit,
-    receipts: &'a ReceiptLog,
-    commands: &'a mpsc::Receiver<WorkerCommand>,
-}
-
 impl PoolControl {
     fn new(workers: usize, scheduler: Arc<Scheduler>) -> Self {
         Self {
             usable_workers: std::sync::atomic::AtomicUsize::new(workers),
-            wait_service: carrick_kernel::kernel::continuation::CarrierWaitService::new(
-                Arc::clone(&scheduler),
-            ),
-            scheduler,
-            workers: Mutex::new(std::collections::BTreeMap::new()),
+            wait_service: carrick_kernel::kernel::continuation::CarrierWaitService::new(scheduler),
             shutdown_begun: Mutex::new(false),
             shutdown_changed: parking_lot::Condvar::new(),
         }
@@ -563,216 +525,16 @@ impl PoolControl {
         }
     }
 
-    fn register_worker(
-        &self,
-        executor: ExecutorId,
-        command: mpsc::Sender<WorkerCommand>,
-        kick: Arc<WorkerKick>,
-    ) {
-        if self
-            .workers
-            .lock()
-            .insert(executor, WorkerControlHandle { command, kick })
-            .is_some()
-        {
-            carrick_fatal!(
-                "vcpu_loop::executor_control",
-                "duplicate worker registration in PoolControl: executor={:?}",
-                executor
-            );
-        }
-    }
-
     pub(crate) fn retire_failed_worker(&self) -> bool {
         self.usable_workers.fetch_sub(1, Ordering::AcqRel) == 1
     }
 
-    fn dispatch_invalidation_commands(
-        &self,
-        generation: crate::hvpatch::AsidGeneration,
-        targets: impl IntoIterator<Item = ExecutorId>,
-    ) -> Result<PendingAsidInvalidations, String> {
-        let workers = self.workers.lock();
-        let mut pending = Vec::new();
-        for target in targets {
-            let worker = workers
-                .get(&target)
-                .ok_or_else(|| format!("ASID retirement resident executor {target:?} is absent"))?;
-            let (response_tx, response_rx) = mpsc::sync_channel(1);
-            worker
-                .command
-                .send(WorkerCommand::InvalidateAsid {
-                    generation,
-                    response: response_tx,
-                })
-                .map_err(|_| {
-                    format!("ASID retirement executor {target:?} command channel closed")
-                })?;
-            worker.kick.poke_control();
-            pending.push((target, response_rx));
-        }
-        drop(workers);
-        // `WorkerKick::poke_control` reaches only a RUNNING quantum (it sets
-        // need_resched and kicks live vCPU hardware). An executor IDLE in
-        // `Scheduler::take` holds no hardware and checks need_resched only
-        // inside a quantum, so its InvalidateAsid command sat unserviced until
-        // it next happened to receive work — for a quiet carrier, never. The
-        // exec-from-thread survivor in a forked process (which retires an
-        // ASID; the root process's exec does not) then waited forever for
-        // that idle peer's ack: execfromthread's container wedge, sampled
-        // live as one executor parked in `invalidate_after_exec`'s
-        // recv_timeout and another in `Scheduler::take`'s condvar. Poke the
-        // queue control once when a peer command actually exists so every idle
-        // target bounces out with ControlPoked, services its command channel at
-        // loop-top, and acks. A current-executor-only retirement has no peer
-        // command and must not wake the whole carrier pool.
-        if !pending.is_empty() {
-            self.scheduler.poke_executor_control();
-        }
-        Ok(pending)
-    }
-
-    /// Wait for peer invalidation acks WHILE SERVICING this executor's own
-    /// `InvalidateAsid` commands. A blocking wait deadlocked whole carriers:
-    /// with ten executors each inside a process terminal, every one waited in
-    /// `consume_invalidation_acks` for peers that were themselves waiting —
-    /// commands are otherwise only serviced between quanta — and the frozen
-    /// guests showed all ten executors in `invalidate` with hundreds of
-    /// claimable Runnable threads starving (futexforkrequeue). Mutual
-    /// servicing breaks the cycle. A `Stop` consumed here is REMEMBERED and
-    /// returned so the caller can honor shutdown after the terminal settles —
-    /// it must not be lost (shutdown stalls) or treated as an error (it is
-    /// routine at pool shutdown).
-    fn consume_invalidation_acks_servicing<E: PersistentExecutor>(
-        &self,
-        pending: Vec<(
-            ExecutorId,
-            mpsc::Receiver<Result<crate::hvpatch::InvalidationAck, String>>,
-        )>,
-        ctx: InvalidationServicingContext<'_, E>,
-    ) -> Result<bool, String> {
-        let InvalidationServicingContext {
-            retirement,
-            current,
-            backend,
-            boundary,
-            receipts,
-            commands,
-        } = ctx;
-        let mut stop_seen = false;
-        // Re-poke cadence: the dispatch-side queue poke can race an executor
-        // that is between its epoch check and its condvar enroll, or one that
-        // re-enters `Scheduler::take` after servicing an unrelated poke.
-        // Waiting here is fail-open without a periodic re-poke — the peer
-        // never re-checks its command channel and the ack never comes.
-        let mut ticks_since_poke = 0u32;
-        for (target, response) in pending {
-            let ack = loop {
-                match response.recv_timeout(std::time::Duration::from_millis(1)) {
-                    Ok(ack) => break ack?,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(format!(
-                            "ASID retirement executor {target:?} lost acknowledgement"
-                        ));
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        ticks_since_poke += 1;
-                        if ticks_since_poke >= 20 {
-                            ticks_since_poke = 0;
-                            self.scheduler.poke_executor_control();
-                        }
-                        loop {
-                            match commands.try_recv() {
-                                Ok(WorkerCommand::InvalidateAsid {
-                                    generation,
-                                    response: peer_response,
-                                }) => {
-                                    if let Err(error) = boundary.audit_runtime(backend) {
-                                        let message = format!(
-                                            "executor {current:?} failed boundary audit before ASID invalidation: {error}"
-                                        );
-                                        let _ = peer_response.send(Err(message.clone()));
-                                        return Err(message);
-                                    }
-                                    if let Err(error) = backend.invalidate_asid(generation) {
-                                        let message = format!(
-                                            "executor {current:?} failed ASID generation {} invalidation: {error}",
-                                            generation.generation()
-                                        );
-                                        let _ = peer_response.send(Err(message.clone()));
-                                        return Err(message);
-                                    }
-                                    receipts.record(
-                                        current,
-                                        ExecutorPoolEvent::InvalidatedAsid {
-                                            generation: generation.generation(),
-                                        },
-                                    );
-                                    probe_executor_lifecycle(
-                                    current,
-                                    crate::probes::HvpatchExecutorLifecyclePhase::InvalidateAsid,
-                                    None,
-                                    None,
-                                    generation.generation(),
-                                );
-                                    let _ = peer_response.send(Ok(
-                                        crate::hvpatch::InvalidationAck::new(current, generation),
-                                    ));
-                                }
-                                Ok(WorkerCommand::Stop) => stop_seen = true,
-                                Ok(WorkerCommand::Initialize | WorkerCommand::Run) => {
-                                    return Err(
-                                    "executor received an invalid owner-thread command during                                      ASID acknowledgement wait"
-                                        .to_owned(),
-                                );
-                                }
-                                Err(mpsc::TryRecvError::Empty) => break,
-                                Err(mpsc::TryRecvError::Disconnected) => {
-                                    stop_seen = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-            retirement
-                .acknowledge(ack)
-                .map_err(|error| format!("ASID retirement acknowledgement rejected: {error}"))?;
-        }
-        Ok(stop_seen)
-    }
-
-    /// Test-only external invalidation: the caller is OUTSIDE the executor
-    /// pool (no command queue of its own to service), so a plain blocking
-    /// ack wait cannot deadlock the mutual-servicing way an executor's does.
-    #[cfg(test)]
-    pub(crate) fn invalidate_external(
-        &self,
-        retirement: &crate::hvpatch::Stage1MmRetirement,
-    ) -> Result<(), String> {
-        self.invalidate_external_timeout(retirement, std::time::Duration::from_secs(5))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn invalidate_external_timeout(
-        &self,
-        retirement: &crate::hvpatch::Stage1MmRetirement,
-        timeout: std::time::Duration,
-    ) -> Result<(), String> {
-        let pending = self
-            .dispatch_invalidation_commands(retirement.asid_generation(), retirement.pending())?;
-        for (target, response) in pending {
-            let ack = response.recv_timeout(timeout).map_err(|error| {
-                format!("ASID retirement executor {target:?} acknowledgement timed out: {error}")
-            })??;
-            retirement
-                .acknowledge(ack)
-                .map_err(|error| format!("ASID retirement acknowledgement rejected: {error}"))?;
-        }
-        Ok(())
-    }
-
+    /// Retire an address space's ASID generation: one broadcast `TLBI
+    /// ASIDE1IS` on this executor's own idle vCPU reaches every PE of the
+    /// VM, whichever vCPUs ever ran the address space. By retirement no task
+    /// of it is left, so no vCPU occupies it or can load it again (the
+    /// generation refuses loads); vCPUs that last ran it switch TTBR0 before
+    /// they run anything. A generation no load ever installed needs none.
     pub(crate) fn invalidate_after_exec<E: PersistentExecutor>(
         &self,
         retirement: &crate::hvpatch::Stage1MmRetirement,
@@ -780,42 +542,33 @@ impl PoolControl {
         backend: &mut E,
         boundary: &WorkerBoundaryAudit,
         receipts: &ReceiptLog,
-        commands: &mpsc::Receiver<WorkerCommand>,
-    ) -> Result<bool, String> {
-        let generation = retirement.asid_generation();
-        let targets = retirement.pending();
-        let pending = self.dispatch_invalidation_commands(
-            generation,
-            targets.iter().copied().filter(|target| *target != current),
-        )?;
-        if targets.contains(&current) {
-            boundary
-                .audit_runtime(backend)
-                .map_err(|error| error.to_string())?;
-            backend
-                .invalidate_asid(generation)
-                .map_err(|error| error.to_string())?;
-            receipts.record(
-                current,
-                ExecutorPoolEvent::InvalidatedAsid {
-                    generation: generation.generation(),
-                },
-            );
-            retirement
-                .acknowledge(crate::hvpatch::InvalidationAck::new(current, generation))
-                .map_err(|error| error.to_string())?;
+    ) -> Result<(), String> {
+        if !retirement.needs_invalidation() {
+            return Ok(());
         }
-        self.consume_invalidation_acks_servicing(
-            pending,
-            InvalidationServicingContext {
-                retirement,
-                current,
-                backend,
-                boundary,
-                receipts,
-                commands,
+        let generation = retirement.asid_generation();
+        boundary
+            .audit_runtime(backend)
+            .map_err(|error| error.to_string())?;
+        backend
+            .invalidate_asid(generation)
+            .map_err(|error| error.to_string())?;
+        receipts.record(
+            current,
+            ExecutorPoolEvent::InvalidatedAsid {
+                generation: generation.generation(),
             },
-        )
+        );
+        probe_executor_lifecycle(
+            current,
+            crate::probes::HvpatchExecutorLifecyclePhase::InvalidateAsid,
+            None,
+            None,
+            generation.generation(),
+        );
+        retirement
+            .acknowledge(crate::hvpatch::BroadcastInvalidation::completed(generation))
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1278,27 +1031,6 @@ where
                         startup_failure = Some(format!(
                             "worker {index} omitted exact executor/kick startup identity"
                         ));
-                    } else {
-                        control.register_worker(
-                            handle.executor.unwrap_or_else(|| {
-                                carrick_fatal!(
-                                    "vcpu_loop::executor_pool",
-                                    "worker handle missing assigned ExecutorId during pool initialization: worker_index={index}"
-                                );
-                            }),
-                            handle.command.clone(),
-                            Arc::clone(
-                                handle
-                                    .kick
-                                    .as_ref()
-                                    .unwrap_or_else(|| {
-                                        carrick_fatal!(
-                                            "vcpu_loop::executor_pool",
-                                            "worker handle missing kick synchronization handle during pool initialization: worker_index={index}"
-                                        );
-                                    }),
-                            ),
-                        );
                     }
                 }
                 Ok(status) => {
@@ -1363,32 +1095,6 @@ where
             debug_aux_registration,
             control,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn executor_ids(&self) -> Vec<ExecutorId> {
-        self.handles
-            .iter()
-            .map(|handle| handle.executor.unwrap_or_else(|| std::process::abort()))
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn invalidate_asid_retirement(
-        &self,
-        retirement: &crate::hvpatch::Stage1MmRetirement,
-    ) -> Result<(), String> {
-        self.control.invalidate_external(retirement)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn invalidate_asid_retirement_timeout(
-        &self,
-        retirement: &crate::hvpatch::Stage1MmRetirement,
-        timeout: std::time::Duration,
-    ) -> Result<(), String> {
-        self.control
-            .invalidate_external_timeout(retirement, timeout)
     }
 
     pub fn shutdown(mut self) -> Result<ExecutorPoolReport, ExecutorPoolShutdownError> {
@@ -1574,28 +1280,6 @@ mod tests {
             scheduler.settle_exited(running).unwrap();
             scheduler.unregister_executor(&registration).unwrap();
         }
-    }
-
-    #[test]
-    fn empty_asid_invalidation_fanout_does_not_poke_idle_executors() {
-        let input = carrick_kernel::kernel::RootBootstrap::for_reference_model(
-            13_990,
-            carrick_hal::ThreadId::synthetic_for_tests(13_990),
-            "empty invalidation fanout".to_owned(),
-        )
-        .expect("bootstrap input");
-        let (kernel, _) = carrick_kernel::kernel::Kernel::bootstrap_root(input).expect("kernel");
-        let scheduler = Arc::new(Scheduler::new(kernel));
-        let control = PoolControl::new(0, Arc::clone(&scheduler));
-        let before = scheduler.scheduler_summary().control_epoch;
-        let generation = crate::hvpatch::AsidGeneration::for_tests(1, 1);
-
-        let pending = control
-            .dispatch_invalidation_commands(generation, std::iter::empty())
-            .expect("empty invalidation fanout");
-
-        assert!(pending.is_empty());
-        assert_eq!(scheduler.scheduler_summary().control_epoch, before);
     }
 }
 

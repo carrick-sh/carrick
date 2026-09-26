@@ -378,17 +378,6 @@
       "domain": "thread::fork_quiesce"
     },
     {
-      "file": "crates/carrick-thread/src/fork_quiesce.rs",
-      "function": "PtPauseGuard::publish_exact_invalidation",
-      "ordinal_in_function": 1,
-      "fingerprint": "ca9c8c7cb9ea9c0ce794c2fd6c451484056df4ba98bae6f57c7c432444548435",
-      "verdict": "carrier_fault",
-      "failure_domain": "thread::fork_quiesce",
-      "rationale": "Active page table pause guard dropped while invalidation state was missing or mismatched.",
-      "sink": "fatal",
-      "domain": "thread::fork_quiesce"
-    },
-    {
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "RamInner::remove_shared_backings",
       "ordinal_in_function": 1,

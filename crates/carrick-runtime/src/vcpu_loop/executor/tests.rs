@@ -3131,7 +3131,7 @@ fn saved_replacement_returns_host_wait_slot_before_terminal_retirement() {
     process
         .stage1_mm_lease()
         .unwrap()
-        .begin_asid_load(pool.executor_ids()[1])
+        .begin_asid_load()
         .unwrap()
         .mark_resident()
         .unwrap();
@@ -4808,83 +4808,6 @@ fn invalid_migration_authority_and_invalidation_failure_never_load_or_run_backen
             binding.require_continuation_sequence(7);
         },
     );
-}
-
-#[test]
-fn retirement_command_invalidates_on_exact_resident_owner_worker_only() {
-    let (process, context) = crate::hvpatch::process_context_for_tests(14_254);
-    let scheduler = Arc::new(Scheduler::new(Arc::clone(context.kernel())));
-    let factory = Arc::new(FakeFactory::default());
-    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
-    let executor = pool.executor_ids()[0];
-    let lease = process.stage1_mm_lease().expect("exact MM lease");
-    lease
-        .begin_asid_load(executor)
-        .expect("load admission")
-        .mark_resident()
-        .expect("resident executor");
-    let retired = process
-        .mm_resources()
-        .retire(process.task_key())
-        .expect("retire process MM");
-    let retirement = retired
-        .retirement()
-        .expect("last MM owner retirement authority");
-
-    pool.invalidate_asid_retirement_timeout(retirement, Duration::from_secs(5))
-        .expect("owner-thread invalidation and exact ack");
-
-    assert!(retirement.pending().is_empty());
-    let invalidations = factory
-        .events
-        .lock()
-        .iter()
-        .filter(|event| event.kind == BackendEventKind::Invalidate)
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(invalidations.len(), 1);
-    assert_eq!(invalidations[0].executor, executor);
-    assert_ne!(invalidations[0].host_thread, thread::current().id());
-    retired
-        .complete_for_test()
-        .expect("release exact ASID/root only after all acks");
-    pool.shutdown().expect("pool shutdown");
-}
-
-#[test]
-fn failed_owner_thread_invalidation_retires_worker_and_quarantines_generation() {
-    let (process, context) = crate::hvpatch::process_context_for_tests(14_256);
-    let scheduler = Arc::new(Scheduler::new(Arc::clone(context.kernel())));
-    let factory = Arc::new(FakeFactory::default());
-    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
-    let executor = pool.executor_ids()[0];
-    let lease = process.stage1_mm_lease().expect("exact MM lease");
-    lease
-        .begin_asid_load(executor)
-        .expect("load admission")
-        .mark_resident()
-        .expect("resident executor");
-    factory
-        .fail_invalidation_generation
-        .store(lease.asid_generation().generation(), Ordering::SeqCst);
-    let retired = process
-        .mm_resources()
-        .retire(process.task_key())
-        .expect("retire process MM");
-    let retirement = retired
-        .retirement()
-        .expect("last MM owner retirement authority");
-
-    assert!(pool.invalidate_asid_retirement(retirement).is_err());
-    assert_eq!(retirement.pending(), vec![executor]);
-    assert!(
-        retired
-            .complete_for_test()
-            .unwrap_err()
-            .to_string()
-            .contains("awaits executor invalidation")
-    );
-    assert!(pool.shutdown().is_err());
 }
 
 #[test]

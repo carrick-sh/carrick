@@ -753,7 +753,6 @@ mod tests {
         execution_lease, fixture_backend, foreign_mm, fork_with_backend, publish_cow_mapping,
         with_foreign_mutation,
     };
-    use carrick_kernel::kernel::objects::ExecutorId;
     use carrick_kernel::kernel::{
         ClonePlan, Kernel, KernelContext, LinuxWaitStatus, MmAccessError, MmBackend, MmId,
         MmRelation, SnapshotError, VmaAccess,
@@ -1674,12 +1673,11 @@ mod tests {
                 .zip(&leases)
                 .map(|(c, e)| dispatcher.admit_native_executor(c, e).unwrap())
                 .collect();
-            // Model a previous hardware quantum on the current executor. Native
-            // execution must neither load this ASID nor consume its ticket.
-            let resident = leases[0].executor();
+            // Model a previous hardware quantum of this MM. Native execution
+            // must neither load this ASID nor consume its invalidation.
             fixture
                 .stage1
-                .begin_asid_load(resident)
+                .begin_asid_load()
                 .unwrap()
                 .mark_resident()
                 .unwrap();
@@ -1708,7 +1706,7 @@ mod tests {
             );
             let mut prepared = result.unwrap();
             drop(current);
-            assert!(fixture.stage1.pending_cow_invalidation(resident).is_some());
+            assert!(fixture.stage1.cow_invalidation_pending());
             for ((executor, context), lease) in executors.iter_mut().zip(&contexts).zip(&mut leases)
             {
                 let scope = dispatcher
@@ -1724,7 +1722,7 @@ mod tests {
                     }
                 }
                 drop(scope);
-                assert!(fixture.stage1.pending_cow_invalidation(resident).is_some());
+                assert!(fixture.stage1.cow_invalidation_pending());
             }
             assert_eq!(original.prefix(), *b"same");
             for ((context, executor), lease) in contexts.iter().zip(executors).zip(leases) {
@@ -2981,11 +2979,9 @@ mod tests {
             caller_tid,
         );
         let mm = fixture.child.shared().mm().id();
-        let caller_executor = ExecutorId::for_transitional_thread(caller_tid)
-            .expect("production caller executor identity");
         fixture
             .stage1
-            .begin_asid_load(caller_executor)
+            .begin_asid_load()
             .expect("publish caller target-MM load")
             .mark_resident()
             .expect("publish caller target-MM residency");
@@ -2994,7 +2990,7 @@ mod tests {
             mm,
         )
         .expect("construct caller foreign-COW task binding");
-        let observer = binding.cow_invalidation_observer(caller_executor);
+        let observer = binding.cow_invalidation_observer();
         carrick_hal::vcpu_sched::install_for_budget(1);
         let scheduler = carrick_hal::vcpu_sched::global();
         let occupied = scheduler.acquire(caller_tid.raw() as u64);
@@ -3011,11 +3007,8 @@ mod tests {
                 .expect("full-occupancy carrier COW must not acquire a maintenance vCPU");
         });
         assert!(
-            fixture
-                .stage1
-                .pending_cow_invalidation(caller_executor)
-                .is_some(),
-            "foreign caller resident must not be awaited as its own command"
+            fixture.stage1.cow_invalidation_pending(),
+            "the publication is owed to the next vCPU that runs the MM, not awaited"
         );
         assert!(
             !scheduler.has_waiters(),
@@ -3028,8 +3021,6 @@ mod tests {
             crate::vcpu_loop::quiesce::enter_hvpatch_guest_or_service_invalidation_for_test(
                 &in_guest,
                 fixture.dispatch_mm.pt_quiesce().as_ref(),
-                caller_tid,
-                caller_executor,
                 &binding,
                 &observer,
                 |_| {
@@ -3044,17 +3035,12 @@ mod tests {
         );
         in_guest.leave_guest();
         assert_eq!(hardware_calls.load(Ordering::SeqCst), 1);
-        assert!(
-            fixture
-                .stage1
-                .pending_cow_invalidation(caller_executor)
-                .is_none()
-        );
+        assert!(!fixture.stage1.cow_invalidation_pending());
         scheduler.release(occupied, carrick_hal::vcpu_sched::Yield::Exited);
     }
 
     #[test]
-    fn production_carrier_active_target_services_publication_on_owner_entry_path() {
+    fn production_carrier_active_target_services_publication_at_its_next_entry() {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
 
         let _handshake = crate::vcpu_loop::quiesce::foreign_cow_handshake_test_lock();
@@ -3081,11 +3067,9 @@ mod tests {
             .unwrap();
         let mm = fixture.child.shared().mm().id();
         let active_tid = ThreadId::synthetic_for_tests(31_116);
-        let active_executor = ExecutorId::for_transitional_thread(active_tid)
-            .expect("production active executor identity");
         fixture
             .stage1
-            .begin_asid_load(active_executor)
+            .begin_asid_load()
             .expect("publish active target-MM load")
             .mark_resident()
             .expect("publish active target-MM residency");
@@ -3094,7 +3078,7 @@ mod tests {
             mm,
         )
         .expect("construct active foreign-COW task binding");
-        let observer = binding.cow_invalidation_observer(active_executor);
+        let observer = binding.cow_invalidation_observer();
         let registry = Arc::new(carrick_hal::GenericVcpuRegistry::new());
         let in_guest = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
         assert!(matches!(
@@ -3113,7 +3097,11 @@ mod tests {
         let worker_calls = Arc::clone(&hardware_calls);
         let target_quiesce = Arc::clone(fixture.dispatch_mm.pt_quiesce());
         let worker_quiesce = Arc::clone(&target_quiesce);
+        let worker_binding = Arc::clone(&binding);
+        let worker_observer = observer.clone();
+        let worker_in_guest = Arc::clone(&in_guest);
         let worker = std::thread::spawn(move || {
+            let (binding, observer, in_guest) = (worker_binding, worker_observer, worker_in_guest);
             let slot = carrick_kernel::kernel::HostExecutionSlot::allocate()
                 .expect("active target host slot");
             let _participation = target_mm
@@ -3133,8 +3121,6 @@ mod tests {
                 crate::vcpu_loop::quiesce::enter_hvpatch_guest_or_service_invalidation_for_test(
                     &in_guest,
                     &worker_quiesce,
-                    active_tid,
-                    active_executor,
                     &binding,
                     &observer,
                     |_| {
@@ -3165,13 +3151,26 @@ mod tests {
             result.is_ok(),
             "active target carrier COW failed: {result:?}"
         );
+        // The paused target parked without invalidating; its next entry
+        // services the publication before it runs the MM.
+        assert_eq!(hardware_calls.load(Ordering::SeqCst), 0);
+        assert!(fixture.stage1.cow_invalidation_pending());
+        let entered =
+            crate::vcpu_loop::quiesce::enter_hvpatch_guest_or_service_invalidation_for_test(
+                &in_guest,
+                &target_quiesce,
+                &binding,
+                &observer,
+                |_| {
+                    hardware_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .expect("active target next entry");
+        assert!(entered);
+        in_guest.leave_guest();
         assert_eq!(hardware_calls.load(Ordering::SeqCst), 1);
-        assert!(
-            fixture
-                .stage1
-                .pending_cow_invalidation(active_executor)
-                .is_none()
-        );
+        assert!(!fixture.stage1.cow_invalidation_pending());
         registry.unregister(active_tid);
         drop(native_executor);
         fixture

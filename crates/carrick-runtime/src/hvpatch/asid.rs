@@ -9,7 +9,6 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use carrick_kernel::kernel::Asid;
-use carrick_kernel::kernel::objects::ExecutorId;
 
 const FIRST_GUEST_ASID: u16 = 1;
 const LAST_GUEST_ASID: u16 = u16::MAX;
@@ -64,18 +63,19 @@ impl AsidGeneration {
     }
 }
 
+/// Proof that one broadcast `TLBI ASIDE1IS` for an ASID generation completed
+/// on a vCPU of the VM, and therefore on every PE of the Inner Shareable
+/// domain, whichever vCPUs ever ran the address space. Minted only by the
+/// caller that ran that invalidation to completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct InvalidationAck {
-    executor: ExecutorId,
+pub(crate) struct BroadcastInvalidation {
     generation: AsidGeneration,
 }
 
-impl InvalidationAck {
-    pub(crate) const fn new(executor: ExecutorId, generation: AsidGeneration) -> Self {
-        Self {
-            executor,
-            generation,
-        }
+impl BroadcastInvalidation {
+    /// `generation`'s broadcast invalidation returned successfully.
+    pub(crate) const fn completed(generation: AsidGeneration) -> Self {
+        Self { generation }
     }
 }
 
@@ -85,15 +85,13 @@ pub(crate) enum AsidResidencyError {
     Retiring,
     #[error("ASID generation retirement already began")]
     AlreadyRetiring,
-    #[error("executor already has an in-flight load for this ASID generation")]
-    AlreadyLoading,
-    #[error("executor cannot acknowledge this ASID while its load is still in flight")]
+    #[error("an executor load of this ASID generation is still in flight")]
     ExecutorStillLoading,
     #[error("ASID load hardware-dirty boundary was already armed")]
     HardwareAlreadyDirty,
-    #[error("executor was not pending for this ASID generation")]
-    UnexpectedExecutor,
-    #[error("stale ASID generation acknowledgement")]
+    #[error("ASID load already completed")]
+    UnexpectedLoad,
+    #[error("stale ASID generation invalidation")]
     StaleGeneration,
 }
 
@@ -105,13 +103,21 @@ enum ResidencyLifecycle {
     Retired,
 }
 
+/// Whether an ASID generation may have translations cached anywhere. Which
+/// vCPUs run the address space NOW is the occupancy authority's question
+/// (`carrick_kernel::kernel::mm_occupancy`); this records only whether any
+/// ever installed it, since one broadcast invalidation reaches them all.
 #[derive(Debug, Default)]
 struct ResidencyState {
     lifecycle: ResidencyLifecycle,
-    loading: BTreeSet<ExecutorId>,
-    residents: BTreeSet<ExecutorId>,
-    pending: BTreeSet<ExecutorId>,
+    /// Loads admitted and not yet completed or cancelled.
+    loading: usize,
+    /// A load armed its hardware boundary: a vCPU may hold translations.
     hardware_dirty: bool,
+    /// A load completed its install.
+    installed: bool,
+    /// The broadcast invalidation after retirement completed.
+    invalidated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -128,16 +134,13 @@ impl AsidResidency {
         }
     }
 
-    pub(crate) fn begin_load(&self, executor: ExecutorId) -> Result<AsidLoad, AsidResidencyError> {
+    pub(crate) fn begin_load(&self) -> Result<AsidLoad, AsidResidencyError> {
         let mut state = self.state.lock();
         if state.lifecycle != ResidencyLifecycle::Live {
             return Err(AsidResidencyError::Retiring);
         }
-        if !state.loading.insert(executor) {
-            return Err(AsidResidencyError::AlreadyLoading);
-        }
+        state.loading += 1;
         Ok(AsidLoad {
-            executor,
             state: Arc::clone(&self.state),
             active: true,
             hardware_dirty: false,
@@ -154,8 +157,10 @@ impl AsidResidency {
         self.state.lock().lifecycle != ResidencyLifecycle::Live
     }
 
-    pub(crate) fn residents(&self) -> Vec<ExecutorId> {
-        self.state.lock().residents.iter().copied().collect()
+    /// Whether any vCPU may hold translations of this generation.
+    pub(crate) fn was_installed(&self) -> bool {
+        let state = self.state.lock();
+        state.installed || state.hardware_dirty
     }
 
     pub(crate) fn prepare_retirement(
@@ -166,7 +171,6 @@ impl AsidResidency {
             return Err(AsidResidencyError::AlreadyRetiring);
         }
         state.lifecycle = ResidencyLifecycle::RetirementPrepared;
-        state.pending = state.residents.union(&state.loading).copied().collect();
         Ok(PreparedAsidResidencyRetirement {
             residency: self.clone(),
             active: true,
@@ -178,13 +182,12 @@ impl AsidResidency {
     }
 }
 
-/// Non-cloneable proof that this executor won admission before retirement
-/// closed the ASID generation. Dropping it before task installation cancels
-/// the load; committing it records residency only after the TTBR install and
+/// Non-cloneable proof that a load won admission before retirement closed
+/// the ASID generation. Dropping it before task installation cancels the
+/// load; committing it records the install only after the TTBR install and
 /// required barriers completed.
 #[derive(Debug)]
 pub(crate) struct AsidLoad {
-    executor: ExecutorId,
     state: Arc<Mutex<ResidencyState>>,
     active: bool,
     hardware_dirty: bool,
@@ -195,21 +198,21 @@ impl AsidLoad {
         if self.hardware_dirty {
             return Err(AsidResidencyError::HardwareAlreadyDirty);
         }
-        let mut state = self.state.lock();
-        if !state.loading.contains(&self.executor) {
-            return Err(AsidResidencyError::UnexpectedExecutor);
+        if !self.active {
+            return Err(AsidResidencyError::UnexpectedLoad);
         }
-        state.hardware_dirty = true;
+        self.state.lock().hardware_dirty = true;
         self.hardware_dirty = true;
         Ok(())
     }
 
     pub(crate) fn mark_resident(mut self) -> Result<(), AsidResidencyError> {
         let mut state = self.state.lock();
-        if !state.loading.remove(&self.executor) {
-            return Err(AsidResidencyError::UnexpectedExecutor);
-        }
-        state.residents.insert(self.executor);
+        state.loading = state
+            .loading
+            .checked_sub(1)
+            .ok_or(AsidResidencyError::UnexpectedLoad)?;
+        state.installed = true;
         self.active = false;
         Ok(())
     }
@@ -220,21 +223,15 @@ impl Drop for AsidLoad {
         if !self.active {
             return;
         }
+        // An armed load stays recorded as `hardware_dirty` (fail closed): its
+        // vCPU may hold translations even though the install did not finish.
         let mut state = self.state.lock();
-        state.loading.remove(&self.executor);
-        if self.hardware_dirty {
-            state.residents.insert(self.executor);
-        } else if state.lifecycle != ResidencyLifecycle::Live
-            && !state.residents.contains(&self.executor)
-        {
-            state.pending.remove(&self.executor);
-        }
+        state.loading = state.loading.saturating_sub(1);
     }
 }
 
-/// Reversible closure of one ASID generation's executor-load admission.
-/// Dropping this token restores the live state without changing real resident
-/// or still-loading executors; committing consumes it into the exact
+/// Reversible closure of one ASID generation's load admission. Dropping this
+/// token restores the live state; committing consumes it into the
 /// invalidation authority.
 #[derive(Debug)]
 pub(crate) struct PreparedAsidResidencyRetirement {
@@ -243,19 +240,16 @@ pub(crate) struct PreparedAsidResidencyRetirement {
 }
 
 impl PreparedAsidResidencyRetirement {
-    pub(crate) fn pending(&self) -> Vec<ExecutorId> {
-        self.residency
-            .state
-            .lock()
-            .pending
-            .iter()
-            .copied()
-            .collect()
+    /// Whether committing now would owe a broadcast invalidation.
+    #[cfg(test)]
+    pub(crate) fn needs_invalidation(&self) -> bool {
+        let state = self.residency.state.lock();
+        state.installed || state.hardware_dirty || state.loading != 0
     }
 
     pub(crate) fn requires_quarantine(&self) -> bool {
         let state = self.residency.state.lock();
-        state.hardware_dirty || !state.loading.is_empty()
+        state.hardware_dirty || state.loading != 0
     }
 
     pub(crate) fn commit(mut self) -> AsidRetirement {
@@ -287,11 +281,11 @@ impl Drop for PreparedAsidResidencyRetirement {
             ResidencyLifecycle::RetirementPrepared,
             "prepared ASID residency retirement lost its lifecycle reservation"
         );
-        state.pending.clear();
         state.lifecycle = ResidencyLifecycle::Live;
     }
 }
 
+/// A retired ASID generation waiting for its one broadcast invalidation.
 #[derive(Debug)]
 pub(crate) struct AsidRetirement {
     generation: AsidGeneration,
@@ -303,27 +297,35 @@ impl AsidRetirement {
         self.generation
     }
 
-    pub(crate) fn pending(&self) -> Vec<ExecutorId> {
-        self.state.lock().pending.iter().copied().collect()
+    /// Whether a broadcast invalidation is still owed: some vCPU may hold
+    /// translations of this generation. A generation no load ever armed
+    /// needs none.
+    pub(crate) fn needs_invalidation(&self) -> bool {
+        let state = self.state.lock();
+        (state.installed || state.hardware_dirty || state.loading != 0) && !state.invalidated
     }
 
-    pub(crate) fn acknowledge(&self, ack: InvalidationAck) -> Result<(), AsidResidencyError> {
-        if ack.generation != self.generation {
+    /// Record the broadcast invalidation. Refused while a load admitted
+    /// before retirement is still in flight: it could cache translations
+    /// after the invalidation.
+    pub(crate) fn acknowledge(
+        &self,
+        invalidation: BroadcastInvalidation,
+    ) -> Result<(), AsidResidencyError> {
+        if invalidation.generation != self.generation {
             return Err(AsidResidencyError::StaleGeneration);
         }
         let mut state = self.state.lock();
-        if state.loading.contains(&ack.executor) {
+        if state.loading != 0 {
             return Err(AsidResidencyError::ExecutorStillLoading);
         }
-        if !state.pending.remove(&ack.executor) {
-            return Err(AsidResidencyError::UnexpectedExecutor);
-        }
-        state.residents.remove(&ack.executor);
+        state.invalidated = true;
         Ok(())
     }
 
     pub(crate) fn is_complete(&self) -> bool {
-        self.state.lock().pending.is_empty()
+        let state = self.state.lock();
+        state.invalidated || (!state.installed && !state.hardware_dirty && state.loading == 0)
     }
 }
 
@@ -514,14 +516,7 @@ impl Drop for PreparedAsidAllocatorRetirement {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsidAllocator, AsidError, AsidResidency, InvalidationAck};
-    use crate::thread::ThreadId;
-    use carrick_kernel::kernel::objects::ExecutorId;
-
-    fn executor(raw: i32) -> ExecutorId {
-        ExecutorId::for_transitional_thread(ThreadId::synthetic_for_tests(raw))
-            .expect("test executor id")
-    }
+    use super::{AsidAllocator, AsidError, AsidResidency, BroadcastInvalidation};
 
     #[test]
     fn allocates_distinct_nonzero_asids_until_exhausted() {
@@ -632,78 +627,49 @@ mod tests {
     }
 
     #[test]
-    fn retirement_requires_every_resident_executor_exact_ack() {
-        let first = executor(1);
-        let second = executor(2);
+    fn retirement_needs_one_broadcast_invalidation_of_its_exact_generation() {
         let allocator = AsidAllocator::with_limit_for_tests(1);
         let generation = allocator.allocate().expect("ASID generation");
         let residency = AsidResidency::new(generation);
-        residency
-            .begin_load(first)
-            .expect("first load")
-            .mark_resident()
-            .expect("first residence");
-        residency
-            .begin_load(second)
-            .expect("second load")
-            .mark_resident()
-            .expect("second residence");
+        for _ in 0..2 {
+            let mut load = residency.begin_load().expect("load");
+            load.arm_hardware_dirty().expect("armed");
+            load.mark_resident().expect("installed");
+        }
         let retirement = residency.begin_retirement().expect("retirement");
 
-        assert!(residency.begin_load(first).is_err());
-        assert_eq!(retirement.pending(), vec![first, second]);
-        retirement
-            .acknowledge(InvalidationAck::new(first, generation))
-            .expect("first exact ack");
+        assert!(residency.begin_load().is_err());
+        assert!(retirement.needs_invalidation());
         assert!(!retirement.is_complete());
-        assert!(
-            retirement
-                .acknowledge(InvalidationAck::new(first, generation))
-                .is_err()
-        );
         let stale = generation.successor_for_tests();
-        assert!(
-            retirement
-                .acknowledge(InvalidationAck::new(second, stale))
-                .is_err()
+        assert_eq!(
+            retirement.acknowledge(BroadcastInvalidation::completed(stale)),
+            Err(super::AsidResidencyError::StaleGeneration)
         );
         retirement
-            .acknowledge(InvalidationAck::new(second, generation))
-            .expect("second exact ack");
+            .acknowledge(BroadcastInvalidation::completed(generation))
+            .expect("one broadcast invalidation");
         assert!(retirement.is_complete());
-        assert!(residency.residents().is_empty());
+        assert!(!retirement.needs_invalidation());
     }
 
     #[test]
-    fn retirement_closes_new_loads_and_waits_for_loading_and_resident_executors() {
-        let loading_executor = executor(3);
-        let resident_executor = executor(4);
-        let rejected_executor = executor(5);
+    fn retirement_closes_new_loads_and_waits_for_an_in_flight_load() {
         let allocator = AsidAllocator::with_limit_for_tests(1);
         let generation = allocator.allocate().expect("ASID generation");
         let residency = AsidResidency::new(generation);
-        let loading = residency
-            .begin_load(loading_executor)
-            .expect("loading executor admitted");
-        residency
-            .begin_load(resident_executor)
-            .expect("resident executor admitted")
-            .mark_resident()
-            .expect("resident executor committed");
+        let mut loading = residency.begin_load().expect("loading executor admitted");
+        loading.arm_hardware_dirty().expect("armed");
 
         let retirement = residency.begin_retirement().expect("retirement");
 
         assert_eq!(
-            residency.begin_load(rejected_executor).unwrap_err(),
+            residency.begin_load().unwrap_err(),
             super::AsidResidencyError::Retiring
         );
         assert_eq!(
-            retirement.pending(),
-            vec![loading_executor, resident_executor]
-        );
-        assert_eq!(
             retirement
-                .acknowledge(InvalidationAck::new(loading_executor, generation))
+                .acknowledge(BroadcastInvalidation::completed(generation))
                 .unwrap_err(),
             super::AsidResidencyError::ExecutorStillLoading
         );
@@ -711,37 +677,32 @@ mod tests {
             .mark_resident()
             .expect("winning pre-retirement load becomes resident");
         retirement
-            .acknowledge(InvalidationAck::new(loading_executor, generation))
-            .expect("loading executor exact ack");
-        retirement
-            .acknowledge(InvalidationAck::new(resident_executor, generation))
-            .expect("resident executor exact ack");
+            .acknowledge(BroadcastInvalidation::completed(generation))
+            .expect("broadcast after the load settled");
         assert!(retirement.is_complete());
     }
 
     #[test]
-    fn cancelled_preinstall_load_does_not_require_an_invalidation_ack() {
-        let executor = executor(6);
+    fn cancelled_preinstall_load_does_not_require_an_invalidation() {
         let allocator = AsidAllocator::with_limit_for_tests(1);
         let generation = allocator.allocate().expect("ASID generation");
         let residency = AsidResidency::new(generation);
-        let load = residency.begin_load(executor).expect("load admitted");
+        let load = residency.begin_load().expect("load admitted");
         let retirement = residency.begin_retirement().expect("retirement");
-        assert_eq!(retirement.pending(), vec![executor]);
+        assert!(!retirement.is_complete());
 
         drop(load);
 
         assert!(retirement.is_complete());
-        assert!(retirement.pending().is_empty());
+        assert!(!retirement.needs_invalidation());
     }
 
     #[test]
-    fn hardware_dirty_partial_load_survives_concurrent_retirement_until_exact_ack() {
-        let executor = executor(7);
+    fn hardware_dirty_partial_load_survives_concurrent_retirement_until_invalidated() {
         let allocator = AsidAllocator::with_limit_for_tests(1);
         let generation = allocator.allocate().expect("ASID generation");
         let residency = AsidResidency::new(generation);
-        let mut load = residency.begin_load(executor).expect("load admitted");
+        let mut load = residency.begin_load().expect("load admitted");
         load.arm_hardware_dirty().expect("hardware mutation armed");
 
         let residency_for_retire = residency.clone();
@@ -754,10 +715,10 @@ mod tests {
         .unwrap();
         drop(load);
 
-        assert_eq!(retirement.pending(), vec![executor]);
+        assert!(retirement.needs_invalidation());
         retirement
-            .acknowledge(InvalidationAck::new(executor, generation))
-            .expect("dirty partial load requires exact TLBI ack");
+            .acknowledge(BroadcastInvalidation::completed(generation))
+            .expect("dirty partial load requires the broadcast");
         assert!(retirement.is_complete());
     }
 }

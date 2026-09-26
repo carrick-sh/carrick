@@ -9,7 +9,7 @@ use parking_lot::{Mutex, RwLock};
 
 use super::asid::{
     AsidAllocator, AsidError, AsidGeneration, AsidLoad, AsidResidency, AsidResidencyError,
-    AsidRetirement, InvalidationAck, PreparedAsidAllocatorRetirement,
+    AsidRetirement, BroadcastInvalidation, PreparedAsidAllocatorRetirement,
     PreparedAsidResidencyRetirement, RetiredAsid,
 };
 use carrick_kernel::kernel::{
@@ -127,34 +127,29 @@ pub(crate) struct Stage1MmLease {
     root_slot: Option<Stage1RootSlot>,
     extension_slots: Mutex<Vec<Stage1RootSlot>>,
     lifecycle: Mutex<Stage1MmLeaseLifecycle>,
+    /// The last foreign-COW invalidation generation published for this MM.
     cow_invalidation_published: Arc<AtomicU64>,
-    cow_invalidation: Mutex<CowInvalidationState>,
+    /// The last generation a broadcast invalidation covered (on any vCPU).
+    cow_invalidation_serviced: Arc<AtomicU64>,
+    cow_invalidation: Mutex<u64>,
     #[cfg(test)]
     cow_invalidation_slow_paths: AtomicU64,
 }
 
-#[derive(Debug, Default)]
-struct CowInvalidationState {
-    generation: u64,
-    pending: BTreeSet<carrick_kernel::kernel::objects::ExecutorId>,
-    observed:
-        std::collections::BTreeMap<carrick_kernel::kernel::objects::ExecutorId, Arc<AtomicU64>>,
-}
-
-/// Per-resident fast-path observation retained by the loaded owner executor.
-/// Two atomic loads answer the no-work case; the lease mutex is entered only
-/// after a published generation differs.
+/// The MM's foreign-COW invalidation state as seen by a vCPU about to run
+/// it. Two atomic loads answer the no-work case. One broadcast `TLBI
+/// ASIDE1IS` reaches every PE, so the first vCPU that enters the MM after a
+/// publication services it for all of them, wherever they ran it before.
 #[derive(Clone, Debug)]
 pub(crate) struct CowInvalidationObserver {
-    executor: carrick_kernel::kernel::objects::ExecutorId,
     asid: AsidGeneration,
     published: Arc<AtomicU64>,
-    observed: Arc<AtomicU64>,
+    serviced: Arc<AtomicU64>,
 }
 
 impl CowInvalidationObserver {
     fn needs_service(&self) -> bool {
-        self.observed.load(Ordering::Acquire) != self.published.load(Ordering::Acquire)
+        self.serviced.load(Ordering::Acquire) < self.published.load(Ordering::Acquire)
     }
 }
 
@@ -167,7 +162,6 @@ pub(crate) struct CowInvalidationTicket {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CowInvalidationPublication {
     ticket: CowInvalidationTicket,
-    pending: Vec<carrick_kernel::kernel::objects::ExecutorId>,
 }
 
 impl CowInvalidationPublication {
@@ -176,32 +170,15 @@ impl CowInvalidationPublication {
         self.ticket.asid
     }
 
-    #[cfg(test)]
-    pub(crate) fn pending(&self) -> Vec<carrick_kernel::kernel::objects::ExecutorId> {
-        self.pending.clone()
-    }
-
     pub(crate) const fn ticket(&self) -> CowInvalidationTicket {
         self.ticket
     }
 }
 
 impl CowInvalidationTicket {
-    pub(crate) const fn asid_generation(self) -> AsidGeneration {
-        self.asid
-    }
-
     pub(crate) const fn generation(self) -> carrick_hal::ForeignCowInvalidationGeneration {
         self.generation
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum CowInvalidationError {
-    #[error("stale COW ASID invalidation generation")]
-    StaleGeneration,
-    #[error("executor was not pending for COW ASID invalidation")]
-    UnexpectedExecutor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -244,7 +221,8 @@ impl Stage1MmLease {
             extension_slots: Mutex::new(Vec::new()),
             lifecycle: Mutex::new(Stage1MmLeaseLifecycle::Live),
             cow_invalidation_published: Arc::new(AtomicU64::new(0)),
-            cow_invalidation: Mutex::new(CowInvalidationState::default()),
+            cow_invalidation_serviced: Arc::new(AtomicU64::new(0)),
+            cow_invalidation: Mutex::new(0),
             #[cfg(test)]
             cow_invalidation_slow_paths: AtomicU64::new(0),
         }
@@ -293,107 +271,53 @@ impl Stage1MmLease {
         *self.lifecycle.lock() != Stage1MmLeaseLifecycle::Live || self.residency.is_retiring()
     }
 
-    pub(crate) fn begin_asid_load(
-        &self,
-        executor: carrick_kernel::kernel::objects::ExecutorId,
-    ) -> Result<AsidLoad, AsidResidencyError> {
+    pub(crate) fn begin_asid_load(&self) -> Result<AsidLoad, AsidResidencyError> {
         let lifecycle = self.lifecycle.lock();
         if *lifecycle != Stage1MmLeaseLifecycle::Live {
             return Err(AsidResidencyError::Retiring);
         }
-        let load = self.residency.begin_load(executor)?;
-        let mut state = self.cow_invalidation.lock();
-        let initial = if state.pending.contains(&executor) {
-            0
-        } else {
-            state.generation
-        };
-        state
-            .observed
-            .entry(executor)
-            .or_insert_with(|| Arc::new(AtomicU64::new(initial)));
-        Ok(load)
+        self.residency.begin_load()
     }
 
-    pub(crate) fn cow_invalidation_observer(
-        &self,
-        executor: carrick_kernel::kernel::objects::ExecutorId,
-    ) -> CowInvalidationObserver {
-        let observed = self
-            .cow_invalidation
-            .lock()
-            .observed
-            .get(&executor)
-            .cloned()
-            .unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::stage1_mm",
-                    "missing observed atomic in cow_invalidation_observer"
-                );
-            });
+    pub(crate) fn cow_invalidation_observer(&self) -> CowInvalidationObserver {
         CowInvalidationObserver {
-            executor,
             asid: self.asid,
             published: Arc::clone(&self.cow_invalidation_published),
-            observed,
+            serviced: Arc::clone(&self.cow_invalidation_serviced),
         }
     }
 
+    /// Publish that this MM's translations changed under a foreign COW: no
+    /// vCPU may run it again before a broadcast invalidation covers this
+    /// generation ([`Self::service_pending_cow_invalidation`]).
     pub(crate) fn publish_cow_invalidation(&self) -> CowInvalidationPublication {
-        let pending = self.residency.residents();
-        let mut state = self.cow_invalidation.lock();
-        state.generation = state.generation.checked_add(1).unwrap_or_else(|| {
+        let mut generation = self.cow_invalidation.lock();
+        *generation = generation.checked_add(1).unwrap_or_else(|| {
             carrick_fatal!(
                 "hvpatch::stage1_mm",
                 "cow invalidation generation overflow in publish_cow_invalidation"
             );
         });
-        let generation = carrick_hal::ForeignCowInvalidationGeneration::from_runtime_publication(
-            std::num::NonZeroU64::new(state.generation).unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::stage1_mm",
-                    "zero cow invalidation generation in publish_cow_invalidation"
-                );
-            }),
-        );
-        for executor in &pending {
-            state
-                .observed
-                .entry(*executor)
-                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
-        }
-        state.pending = pending.iter().copied().collect();
-        let publication = CowInvalidationPublication {
-            ticket: CowInvalidationTicket {
-                asid: self.asid,
-                generation,
-            },
-            pending,
+        let ticket = CowInvalidationTicket {
+            asid: self.asid,
+            generation: carrick_hal::ForeignCowInvalidationGeneration::from_runtime_publication(
+                std::num::NonZeroU64::new(*generation).unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::stage1_mm",
+                        "zero cow invalidation generation in publish_cow_invalidation"
+                    );
+                }),
+            ),
         };
         self.cow_invalidation_published
-            .store(state.generation, Ordering::Release);
-        publication
+            .store(*generation, Ordering::Release);
+        CowInvalidationPublication { ticket }
     }
 
-    pub(crate) fn pending_cow_invalidation(
-        &self,
-        executor: carrick_kernel::kernel::objects::ExecutorId,
-    ) -> Option<CowInvalidationTicket> {
-        let state = self.cow_invalidation.lock();
-        state
-            .pending
-            .contains(&executor)
-            .then_some(CowInvalidationTicket {
-                asid: self.asid,
-                generation: carrick_hal::ForeignCowInvalidationGeneration::from_runtime_publication(
-                    std::num::NonZeroU64::new(state.generation).unwrap_or_else(|| {
-                        carrick_fatal!(
-                            "hvpatch::stage1_mm",
-                            "zero cow invalidation generation in pending_cow_invalidation"
-                        );
-                    }),
-                ),
-            })
+    /// Whether a published invalidation is not yet covered by a broadcast.
+    #[cfg(test)]
+    pub(crate) fn cow_invalidation_pending(&self) -> bool {
+        self.cow_invalidation_observer().needs_service()
     }
 
     #[cfg(test)]
@@ -401,34 +325,13 @@ impl Stage1MmLease {
         self.cow_invalidation_slow_paths.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn acknowledge_cow_invalidation(
-        &self,
-        executor: carrick_kernel::kernel::objects::ExecutorId,
-        ticket: CowInvalidationTicket,
-    ) -> Result<(), CowInvalidationError> {
-        let mut state = self.cow_invalidation.lock();
-        if ticket.asid != self.asid || ticket.generation.raw_for_probe() != state.generation {
-            return Err(CowInvalidationError::StaleGeneration);
-        }
-        if !state.pending.remove(&executor) {
-            return Err(CowInvalidationError::UnexpectedExecutor);
-        }
-        state
-            .observed
-            .get(&executor)
-            .unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::stage1_mm",
-                    "missing observed atomic in acknowledge_cow_invalidation"
-                );
-            })
-            .store(state.generation, Ordering::Release);
-        Ok(())
-    }
-
-    /// Mandatory exact-binding pre-entry service. A failed hardware operation
-    /// leaves the ticket pending, so this executor cannot silently cross into
-    /// guest with stale translations.
+    /// Mandatory pre-entry service on a vCPU about to run this MM (at task
+    /// load and at every guest entry). When a publication is not yet covered,
+    /// run the broadcast invalidation here and record the generation it
+    /// covers: the generation is read BEFORE the invalidation, so one
+    /// published during it stays owed. A failed hardware operation records
+    /// nothing, so this vCPU cannot silently cross into guest with stale
+    /// translations.
     pub(crate) fn service_pending_cow_invalidation<E>(
         &self,
         observer: &CowInvalidationObserver,
@@ -436,6 +339,7 @@ impl Stage1MmLease {
     ) -> Result<(), E> {
         if observer.asid != self.asid
             || !Arc::ptr_eq(&observer.published, &self.cow_invalidation_published)
+            || !Arc::ptr_eq(&observer.serviced, &self.cow_invalidation_serviced)
         {
             carrick_fatal!(
                 "hvpatch::stage1_mm",
@@ -448,20 +352,9 @@ impl Stage1MmLease {
         #[cfg(test)]
         self.cow_invalidation_slow_paths
             .fetch_add(1, Ordering::Relaxed);
-        let Some(ticket) = self.pending_cow_invalidation(observer.executor) else {
-            carrick_fatal!(
-                "hvpatch::stage1_mm",
-                "missing pending cow invalidation ticket"
-            );
-        };
-        invalidate(ticket.asid_generation())?;
-        self.acknowledge_cow_invalidation(observer.executor, ticket)
-            .unwrap_or_else(|_| {
-                carrick_fatal!(
-                    "hvpatch::stage1_mm",
-                    "acknowledge_cow_invalidation failed in service_pending_cow_invalidation"
-                );
-            });
+        let covered = observer.published.load(Ordering::Acquire);
+        invalidate(self.asid)?;
+        observer.serviced.fetch_max(covered, Ordering::AcqRel);
         Ok(())
     }
 
@@ -785,15 +678,12 @@ impl PreparedStage1MmRetirement {
         self.rollback_hook = Some(hook);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn pending(&self) -> Vec<carrick_kernel::kernel::objects::ExecutorId> {
-        let Some(residency) = self.residency.as_ref() else {
-            carrick_fatal!(
-                "hvpatch::stage1_retirement",
-                "missing residency in PreparedStage1MmRetirement::pending"
-            );
-        };
-        residency.pending()
+    /// Whether retiring now would owe a broadcast invalidation.
+    #[cfg(test)]
+    pub(crate) fn needs_invalidation(&self) -> bool {
+        self.residency
+            .as_ref()
+            .is_some_and(PreparedAsidResidencyRetirement::needs_invalidation)
     }
 
     fn requires_quarantine(&self) -> bool {
@@ -954,11 +844,8 @@ impl PreparedStage1Mm {
         self.lease.asid_generation()
     }
 
-    pub(crate) fn begin_asid_load(
-        &self,
-        executor: carrick_kernel::kernel::objects::ExecutorId,
-    ) -> Result<AsidLoad, AsidResidencyError> {
-        self.lease.begin_asid_load(executor)
+    pub(crate) fn begin_asid_load(&self) -> Result<AsidLoad, AsidResidencyError> {
+        self.lease.begin_asid_load()
     }
 
     pub(crate) fn commit(mut self) -> Arc<Stage1MmLease> {
@@ -1037,12 +924,16 @@ impl Stage1MmRetirement {
         self.residency.generation()
     }
 
-    pub(crate) fn pending(&self) -> Vec<carrick_kernel::kernel::objects::ExecutorId> {
-        self.residency.pending()
+    /// Whether a broadcast invalidation of the retired ASID is still owed.
+    pub(crate) fn needs_invalidation(&self) -> bool {
+        self.residency.needs_invalidation()
     }
 
-    pub(crate) fn acknowledge(&self, ack: InvalidationAck) -> Result<(), AsidResidencyError> {
-        self.residency.acknowledge(ack)
+    pub(crate) fn acknowledge(
+        &self,
+        invalidation: BroadcastInvalidation,
+    ) -> Result<(), AsidResidencyError> {
+        self.residency.acknowledge(invalidation)
     }
 
     pub(crate) fn take_root_retirement_ticket(
@@ -1116,7 +1007,7 @@ pub(crate) enum Stage1MmError {
     RootSlotExhausted,
     #[error("hvpatch stage-1 mm is already retired")]
     Retired,
-    #[error("hvpatch stage-1 mm retirement still awaits executor invalidation")]
+    #[error("hvpatch stage-1 mm retirement still awaits its broadcast ASID invalidation")]
     RetirementIncomplete,
     #[error("hvpatch stage-1 root retirement ticket was already issued")]
     RootRetirementTicketAlreadyIssued,
@@ -1467,13 +1358,6 @@ mod tests {
         }
     }
 
-    fn executor(raw: i32) -> carrick_kernel::kernel::objects::ExecutorId {
-        carrick_kernel::kernel::objects::ExecutorId::for_transitional_thread(
-            crate::thread::ThreadId::synthetic_for_tests(raw),
-        )
-        .expect("test executor id")
-    }
-
     #[test]
     fn old_observer_keeps_its_binding_after_exec_and_retirement() {
         let task = root_key();
@@ -1554,21 +1438,20 @@ mod tests {
         let root_slot = prepared.root_slot();
         let lease = prepared.commit();
         lease
-            .begin_asid_load(executor(20))
+            .begin_asid_load()
             .expect("executor load")
             .mark_resident()
             .expect("executor resident");
         let retirement = pool.retire(&lease).expect("retire live mm");
 
-        assert_eq!(retirement.pending(), vec![executor(20)]);
+        assert!(retirement.needs_invalidation());
         assert_eq!(
             pool.prepare_child().unwrap_err(),
             Stage1MmError::AsidExhausted,
             "numeric ASID and root slot stay quarantined"
         );
         retirement
-            .acknowledge(super::super::asid::InvalidationAck::new(
-                executor(20),
+            .acknowledge(super::super::asid::BroadcastInvalidation::completed(
                 retirement.asid_generation(),
             ))
             .expect("owner-thread invalidation ack");
@@ -1592,9 +1475,8 @@ mod tests {
         let first_generation = first.asid_generation();
         let first_root = first.root_slot().expect("first root slot");
         let first = first.commit();
-        let resident = executor(47);
         first
-            .begin_asid_load(resident)
+            .begin_asid_load()
             .expect("resident load")
             .mark_resident()
             .expect("resident commit");
@@ -1609,7 +1491,7 @@ mod tests {
         );
 
         retirement
-            .acknowledge(InvalidationAck::new(resident, first_generation))
+            .acknowledge(BroadcastInvalidation::completed(first_generation))
             .expect("exact first invalidation acknowledgement");
         retirement
             .complete_for_test()
@@ -1626,32 +1508,30 @@ mod tests {
         let lease = pool.prepare_child().expect("child preparation").commit();
         let binding = lease.binding();
         let generation = lease.asid_generation();
-        let first = executor(30);
-        let second = executor(31);
         lease
-            .begin_asid_load(first)
+            .begin_asid_load()
             .expect("first load")
             .mark_resident()
             .expect("first resident");
 
         let prepared = pool.prepare_retirement(&lease).expect("prepare retirement");
         assert_eq!(
-            lease.begin_asid_load(second).unwrap_err(),
+            lease.begin_asid_load().unwrap_err(),
             AsidResidencyError::Retiring
         );
-        assert_eq!(prepared.pending(), vec![first]);
+        assert!(prepared.needs_invalidation());
 
         drop(prepared);
 
         assert_eq!(lease.binding(), binding);
         assert_eq!(lease.asid_generation(), generation);
-        assert_eq!(lease.residency.residents(), vec![first]);
+        assert!(lease.residency.was_installed());
         lease
-            .begin_asid_load(second)
+            .begin_asid_load()
             .expect("rollback reopens exact predecessor")
             .mark_resident()
             .expect("second resident");
-        assert_eq!(lease.residency.residents(), vec![first, second]);
+        assert!(lease.residency.was_installed());
     }
 
     #[test]
@@ -1660,9 +1540,8 @@ mod tests {
         let lease = pool.prepare_child().expect("child preparation").commit();
         let binding = lease.binding();
         let generation = lease.asid_generation();
-        let resident = executor(32);
         lease
-            .begin_asid_load(resident)
+            .begin_asid_load()
             .expect("resident load")
             .mark_resident()
             .expect("resident commit");
@@ -1675,9 +1554,9 @@ mod tests {
 
         assert_eq!(lease.binding(), binding);
         assert_eq!(lease.asid_generation(), generation);
-        assert_eq!(lease.residency.residents(), vec![resident]);
+        assert!(lease.residency.was_installed());
         let retry = pool.prepare_retirement(&lease).expect("exact retry");
-        assert_eq!(retry.pending(), vec![resident]);
+        assert!(retry.needs_invalidation());
     }
 
     #[test]
@@ -1686,10 +1565,8 @@ mod tests {
         let lease = pool.prepare_child().expect("child preparation").commit();
         let binding = lease.binding();
         let generation = lease.asid_generation();
-        let resident = executor(33);
-        let retry_executor = executor(34);
         lease
-            .begin_asid_load(resident)
+            .begin_asid_load()
             .expect("resident load")
             .mark_resident()
             .expect("resident commit");
@@ -1702,12 +1579,12 @@ mod tests {
 
         assert_eq!(lease.binding(), binding);
         assert_eq!(lease.asid_generation(), generation);
-        assert_eq!(lease.residency.residents(), vec![resident]);
+        assert!(lease.residency.was_installed());
         let retry_load = lease
-            .begin_asid_load(retry_executor)
+            .begin_asid_load()
             .expect("lease and residency admission both reopen");
         let retry = pool.prepare_retirement(&lease).expect("exact retry");
-        assert_eq!(retry.pending(), vec![resident, retry_executor]);
+        assert!(retry.needs_invalidation());
         drop(retry);
         drop(retry_load);
     }
@@ -1719,9 +1596,8 @@ mod tests {
         let binding = lease.binding();
         let generation = lease.asid_generation();
         let root_slot = lease.root_slot();
-        let resident = executor(35);
         lease
-            .begin_asid_load(resident)
+            .begin_asid_load()
             .expect("resident load")
             .mark_resident()
             .expect("resident commit");
@@ -1734,19 +1610,19 @@ mod tests {
 
         assert_eq!(lease.binding(), binding);
         assert_eq!(lease.asid_generation(), generation);
-        assert_eq!(lease.residency.residents(), vec![resident]);
+        assert!(lease.residency.was_installed());
         let retirement = pool
             .prepare_retirement(&lease)
             .expect("exact retry after every layer rollback")
             .commit();
-        assert_eq!(retirement.pending(), vec![resident]);
+        assert!(retirement.needs_invalidation());
         assert_eq!(
             pool.prepare_child().unwrap_err(),
             Stage1MmError::AsidExhausted,
             "prepared generation commits into TLB quarantine"
         );
         retirement
-            .acknowledge(InvalidationAck::new(resident, generation))
+            .acknowledge(BroadcastInvalidation::completed(generation))
             .expect("exact invalidation acknowledgement");
         retirement
             .complete_for_test()
@@ -1782,7 +1658,7 @@ mod tests {
         let load_lease = Arc::clone(&lease);
         let load = std::thread::spawn(move || {
             load_started_tx.send(()).unwrap();
-            let result = load_lease.begin_asid_load(executor(46)).map(drop);
+            let result = load_lease.begin_asid_load().map(drop);
             load_done_tx.send(result).unwrap();
         });
         let (publish_started_tx, publish_started_rx) = std::sync::mpsc::channel();
@@ -1824,21 +1700,19 @@ mod tests {
     fn clean_inflight_load_cancellation_stays_cancelled_across_retirement_rollback() {
         let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
         let lease = pool.prepare_child().expect("child preparation").commit();
-        let loading = executor(36);
-        let later = executor(37);
-        let load = lease.begin_asid_load(loading).expect("in-flight load");
+        let load = lease.begin_asid_load().expect("in-flight load");
         let prepared = pool
             .prepare_retirement(&lease)
             .expect("prepare around in-flight load");
-        assert_eq!(prepared.pending(), vec![loading]);
+        assert!(prepared.needs_invalidation());
 
         drop(load);
-        assert!(prepared.pending().is_empty());
+        assert!(!prepared.needs_invalidation());
         drop(prepared);
 
-        assert!(lease.residency.residents().is_empty());
+        assert!(!lease.residency.was_installed());
         lease
-            .begin_asid_load(later)
+            .begin_asid_load()
             .expect("rollback reopens admission after clean cancellation");
     }
 
@@ -1846,21 +1720,20 @@ mod tests {
     fn dirty_inflight_load_cancellation_survives_retirement_rollback_as_resident() {
         let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
         let lease = pool.prepare_child().expect("child preparation").commit();
-        let executor = executor(38);
-        let mut load = lease.begin_asid_load(executor).expect("in-flight load");
+        let mut load = lease.begin_asid_load().expect("in-flight load");
         load.arm_hardware_dirty().expect("real dirty boundary");
         let prepared = pool
             .prepare_retirement(&lease)
             .expect("prepare around dirty in-flight load");
-        assert_eq!(prepared.pending(), vec![executor]);
+        assert!(prepared.needs_invalidation());
 
         drop(load);
-        assert_eq!(prepared.pending(), vec![executor]);
+        assert!(prepared.needs_invalidation());
         drop(prepared);
 
-        assert_eq!(lease.residency.residents(), vec![executor]);
+        assert!(lease.residency.was_installed());
         let retry = pool.prepare_retirement(&lease).expect("exact retry");
-        assert_eq!(retry.pending(), vec![executor]);
+        assert!(retry.needs_invalidation());
     }
 
     #[test]
@@ -1869,9 +1742,7 @@ mod tests {
         let prepared = pool.prepare_child().expect("replacement preparation");
         let binding = prepared.binding();
         let root_slot = prepared.root_slot();
-        let clean_load = prepared
-            .begin_asid_load(executor(39))
-            .expect("clean replacement load");
+        let clean_load = prepared.begin_asid_load().expect("clean replacement load");
         drop(clean_load);
 
         let settlement = prepared.abort().expect("settle clean abort");
@@ -1900,10 +1771,7 @@ mod tests {
         let binding = prepared.binding();
         let generation = prepared.asid_generation();
         let root_slot = prepared.root_slot();
-        let dirty_executor = executor(40);
-        let mut load = prepared
-            .begin_asid_load(dirty_executor)
-            .expect("replacement load");
+        let mut load = prepared.begin_asid_load().expect("replacement load");
         load.arm_hardware_dirty().expect("real dirty boundary");
         drop(load);
 
@@ -1912,14 +1780,14 @@ mod tests {
             panic!("hardware-dirty replacement must enter retirement quarantine");
         };
         assert_eq!(retirement.asid_generation(), generation);
-        assert_eq!(retirement.pending(), vec![dirty_executor]);
+        assert!(retirement.needs_invalidation());
         assert_eq!(
             pool.prepare_child().unwrap_err(),
             Stage1MmError::AsidExhausted,
             "dirty ASID/root stay unavailable before exact acknowledgement"
         );
         retirement
-            .acknowledge(InvalidationAck::new(dirty_executor, generation))
+            .acknowledge(BroadcastInvalidation::completed(generation))
             .expect("exact dirty invalidation acknowledgement");
         retirement
             .complete_for_test()
@@ -1936,10 +1804,7 @@ mod tests {
         let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
         let mut prepared = pool.prepare_child().expect("replacement preparation");
         let generation = prepared.asid_generation();
-        let dirty_executor = executor(44);
-        let mut load = prepared
-            .begin_asid_load(dirty_executor)
-            .expect("replacement load");
+        let mut load = prepared.begin_asid_load().expect("replacement load");
         let reached_classification = Arc::new(std::sync::Barrier::new(2));
         let resume_classification = Arc::new(std::sync::Barrier::new(2));
         prepared.install_abort_classification_hook_for_tests(AbortClassificationHook {
@@ -1958,9 +1823,9 @@ mod tests {
         let PreparedStage1MmAbort::Retirement(retirement) = settlement else {
             panic!("atomic classification must quarantine the raced dirty load");
         };
-        assert_eq!(retirement.pending(), vec![dirty_executor]);
+        assert!(retirement.needs_invalidation());
         retirement
-            .acknowledge(InvalidationAck::new(dirty_executor, generation))
+            .acknowledge(BroadcastInvalidation::completed(generation))
             .expect("exact raced invalidation acknowledgement");
         retirement
             .complete_for_test()
@@ -1973,20 +1838,19 @@ mod tests {
         let prepared = pool.prepare_child().expect("replacement preparation");
         let binding = prepared.binding();
         let root_slot = prepared.root_slot();
-        let loading_executor = executor(41);
         let load = prepared
-            .begin_asid_load(loading_executor)
+            .begin_asid_load()
             .expect("clean in-flight replacement load");
 
         let settlement = prepared.abort().expect("settle in-flight abort");
         let PreparedStage1MmAbort::Retirement(retirement) = settlement else {
             panic!("an in-flight load must be quarantined until it settles");
         };
-        assert_eq!(retirement.pending(), vec![loading_executor]);
+        assert!(retirement.needs_invalidation());
 
         drop(load);
 
-        assert!(retirement.pending().is_empty());
+        assert!(!retirement.needs_invalidation());
         retirement
             .complete_for_test()
             .expect("clean cancellation discharges retirement");
@@ -2000,10 +1864,7 @@ mod tests {
         let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
         let prepared = pool.prepare_child().expect("replacement preparation");
         let generation = prepared.asid_generation();
-        let resident_executor = executor(42);
-        let mut load = prepared
-            .begin_asid_load(resident_executor)
-            .expect("replacement load");
+        let mut load = prepared.begin_asid_load().expect("replacement load");
         load.arm_hardware_dirty().expect("real dirty boundary");
         load.mark_resident().expect("dirty load becomes resident");
 
@@ -2011,13 +1872,13 @@ mod tests {
         let PreparedStage1MmAbort::Retirement(retirement) = settlement else {
             panic!("resident hardware-dirty replacement must enter quarantine");
         };
-        assert_eq!(retirement.pending(), vec![resident_executor]);
+        assert!(retirement.needs_invalidation());
         assert_eq!(
             pool.prepare_child().unwrap_err(),
             Stage1MmError::AsidExhausted
         );
         retirement
-            .acknowledge(InvalidationAck::new(resident_executor, generation))
+            .acknowledge(BroadcastInvalidation::completed(generation))
             .expect("exact resident invalidation acknowledgement");
         retirement
             .complete_for_test()
@@ -2029,10 +1890,7 @@ mod tests {
     fn dropping_dirty_replacement_without_settlement_quarantines_permanently() {
         let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
         let prepared = pool.prepare_child().expect("replacement preparation");
-        let dirty_executor = executor(43);
-        let mut load = prepared
-            .begin_asid_load(dirty_executor)
-            .expect("replacement load");
+        let mut load = prepared.begin_asid_load().expect("replacement load");
         load.arm_hardware_dirty().expect("real dirty boundary");
         drop(load);
 
@@ -2049,10 +1907,7 @@ mod tests {
     fn implicit_drop_classifies_hardware_exposure_atomically() {
         let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
         let mut prepared = pool.prepare_child().expect("replacement preparation");
-        let dirty_executor = executor(45);
-        let mut load = prepared
-            .begin_asid_load(dirty_executor)
-            .expect("replacement load");
+        let mut load = prepared.begin_asid_load().expect("replacement load");
         let reached_classification = Arc::new(std::sync::Barrier::new(2));
         let resume_classification = Arc::new(std::sync::Barrier::new(2));
         prepared.install_abort_classification_hook_for_tests(AbortClassificationHook {
@@ -2108,108 +1963,86 @@ mod tests {
         )
         .expect("binding owns exact stage-1 lease");
         binding
-            .begin_asid_load(executor(21))
+            .begin_asid_load()
             .expect("binding load authority")
             .mark_resident()
             .expect("binding resident");
 
         let retirement = pool.retire(&lease).expect("retirement");
-        assert_eq!(retirement.pending(), vec![executor(21)]);
+        assert!(retirement.needs_invalidation());
         assert_eq!(retirement.asid_generation(), generation);
     }
 
+    /// One broadcast invalidation reaches every PE, so the first vCPU that
+    /// runs the MM after a publication services it for all of them: a
+    /// second vCPU (which may have run the MM before) enters without another.
     #[test]
-    fn cow_invalidation_tracks_exact_generation_and_defers_inactive_residents() {
+    fn one_service_on_any_vcpu_covers_a_publication_for_every_vcpu() {
         let (_pool, lease) = Stage1MmPool::new_root_for_tests(0x8000, 4).expect("root pool");
-        let active = executor(31);
-        let inactive = executor(32);
-        lease
-            .begin_asid_load(active)
-            .expect("active load")
-            .mark_resident()
-            .expect("active resident");
-        lease
-            .begin_asid_load(inactive)
-            .expect("inactive load")
-            .mark_resident()
-            .expect("inactive resident");
-
+        let first_vcpu = lease.cow_invalidation_observer();
+        let second_vcpu = lease.cow_invalidation_observer();
         let publication = lease.publish_cow_invalidation();
         assert_eq!(publication.asid_generation(), lease.asid_generation());
-        assert_eq!(publication.pending(), vec![active, inactive]);
-        let active_ticket = lease
-            .pending_cow_invalidation(active)
-            .expect("active pending ticket");
-        lease
-            .acknowledge_cow_invalidation(active, active_ticket)
-            .expect("active acknowledgement");
-        assert!(lease.pending_cow_invalidation(active).is_none());
-        assert_eq!(
-            lease.pending_cow_invalidation(inactive),
-            Some(publication.ticket())
-        );
+        assert!(lease.cow_invalidation_pending());
+        let calls = std::cell::Cell::new(0_u32);
+        for observer in [&first_vcpu, &second_vcpu] {
+            lease
+                .service_pending_cow_invalidation(observer, |asid| {
+                    assert_eq!(asid, lease.asid_generation());
+                    calls.set(calls.get() + 1);
+                    Ok::<(), ()>(())
+                })
+                .expect("pre-entry service");
+        }
+        assert_eq!(calls.get(), 1, "one broadcast covers every vCPU");
+        assert!(!lease.cow_invalidation_pending());
     }
 
+    /// The covered generation is read before the invalidation runs, so a
+    /// publication made while it runs is still owed afterwards.
     #[test]
-    fn cow_invalidation_rejects_stale_or_wrong_executor_acknowledgement() {
+    fn a_publication_during_a_service_stays_owed() {
         let (_pool, lease) = Stage1MmPool::new_root_for_tests(0x8000, 4).expect("root pool");
-        let resident = executor(41);
+        let observer = lease.cow_invalidation_observer();
+        lease.publish_cow_invalidation();
         lease
-            .begin_asid_load(resident)
-            .expect("load")
-            .mark_resident()
-            .expect("resident");
-        let first = lease.publish_cow_invalidation();
-        let second = lease.publish_cow_invalidation();
-        assert_eq!(
-            lease.acknowledge_cow_invalidation(resident, first.ticket()),
-            Err(CowInvalidationError::StaleGeneration)
-        );
-        assert_eq!(
-            lease.acknowledge_cow_invalidation(executor(42), second.ticket()),
-            Err(CowInvalidationError::UnexpectedExecutor)
-        );
-    }
-
-    #[test]
-    fn pre_entry_service_is_exact_and_acknowledges_only_after_hardware_success() {
-        let (_pool, lease) = Stage1MmPool::new_root_for_tests(0x8000, 4).expect("root pool");
-        let resident = executor(51);
-        lease
-            .begin_asid_load(resident)
-            .expect("load")
-            .mark_resident()
-            .expect("resident");
-        let observer = lease.cow_invalidation_observer(resident);
-        let publication = lease.publish_cow_invalidation();
-        let mut invalidated = Vec::new();
-        lease
-            .service_pending_cow_invalidation(&observer, |asid| {
-                invalidated.push(asid);
-                Ok::<(), &'static str>(())
+            .service_pending_cow_invalidation(&observer, |_| {
+                lease.publish_cow_invalidation();
+                Ok::<(), ()>(())
             })
-            .expect("pre-entry service");
-        assert_eq!(invalidated, vec![publication.asid_generation()]);
-        assert!(lease.pending_cow_invalidation(resident).is_none());
+            .expect("first service");
+        assert!(lease.cow_invalidation_pending());
+        let calls = std::cell::Cell::new(0_u32);
+        lease
+            .service_pending_cow_invalidation(&observer, |_| {
+                calls.set(calls.get() + 1);
+                Ok::<(), ()>(())
+            })
+            .expect("second service");
+        assert_eq!(calls.get(), 1);
+        assert!(!lease.cow_invalidation_pending());
+    }
 
+    #[test]
+    fn pre_entry_service_records_coverage_only_after_hardware_success() {
+        let (_pool, lease) = Stage1MmPool::new_root_for_tests(0x8000, 4).expect("root pool");
+        let observer = lease.cow_invalidation_observer();
         lease.publish_cow_invalidation();
         assert_eq!(
             lease.service_pending_cow_invalidation(&observer, |_| Err("hardware failed")),
             Err("hardware failed")
         );
-        assert!(lease.pending_cow_invalidation(resident).is_some());
+        assert!(lease.cow_invalidation_pending());
+        lease
+            .service_pending_cow_invalidation(&observer, |_| Ok::<(), &'static str>(()))
+            .expect("retry succeeds");
+        assert!(!lease.cow_invalidation_pending());
     }
 
     #[test]
     fn no_work_current_mm_reentry_never_enters_cow_invalidation_slow_path() {
         let (_pool, lease) = Stage1MmPool::new_root_for_tests(0x8000, 4).expect("root pool");
-        let resident = executor(52);
-        lease
-            .begin_asid_load(resident)
-            .expect("load")
-            .mark_resident()
-            .expect("resident");
-        let observer = lease.cow_invalidation_observer(resident);
+        let observer = lease.cow_invalidation_observer();
         let hardware_calls = std::cell::Cell::new(0_u64);
 
         lease
@@ -2223,7 +2056,7 @@ mod tests {
         assert_eq!(
             lease.cow_invalidation_slow_paths_for_tests(),
             0,
-            "no-work re-entry must not lock or perform a resident lookup"
+            "no-work re-entry must not take a lock"
         );
     }
 

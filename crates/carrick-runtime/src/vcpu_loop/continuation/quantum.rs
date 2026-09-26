@@ -9,7 +9,6 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use carrick_fatal::carrick_fatal;
-use carrick_hal::stage1_mm::Stage1MmProjection;
 use parking_lot::{Condvar, Mutex};
 
 use carrick_kernel::kernel::Scheduler;
@@ -53,6 +52,11 @@ pub(crate) trait PersistentQuantumJob: Send + 'static {
     ) -> crate::vcpu_loop::executor::ExecutorExit;
 
     fn after_terminal_settlement(&mut self) {}
+
+    /// The executor unloaded this task from its vCPU (the task may stay
+    /// admitted: an executor can preempt it at a syscall boundary). The job
+    /// vacates the vCPU's address-space occupancy.
+    fn end_residency(&mut self) {}
 
     /// See `ProductionHvpatchLoopPoll::after_reaped_settlement`.
     /// The default is the terminal publication: a job with no separate reaped
@@ -116,6 +120,10 @@ impl HvpatchTaskQuantum {
         control: &mut crate::vcpu_loop::executor::HvpatchQuantumControl<'_, '_>,
     ) -> crate::vcpu_loop::executor::ExecutorExit {
         self.job.lock().poll_quantum_with_engine(engine, control)
+    }
+
+    pub(crate) fn end_residency(&self) {
+        self.job.lock().end_residency();
     }
 
     pub(crate) fn after_terminal_settlement(&self) {
@@ -303,7 +311,6 @@ impl HvpatchTaskBinding {
 
     pub(crate) fn begin_asid_load(
         &self,
-        executor: carrick_kernel::kernel::objects::ExecutorId,
     ) -> Result<crate::hvpatch::AsidLoad, crate::trap::TrapError> {
         let stage1_mm = self.stage1_mm.as_ref().ok_or_else(|| {
             crate::trap::TrapError::Hypervisor(
@@ -315,7 +322,7 @@ impl HvpatchTaskBinding {
                 "HVPatch task binding strong ASID generation drifted".to_owned(),
             ));
         }
-        stage1_mm.begin_asid_load(executor).map_err(|error| {
+        stage1_mm.begin_asid_load().map_err(|error| {
             crate::trap::TrapError::Hypervisor(format!("HVPatch ASID load rejected: {error}"))
         })
     }
@@ -337,54 +344,17 @@ impl HvpatchTaskBinding {
             .service_pending_cow_invalidation(observer, invalidate)
     }
 
-    pub(crate) fn cow_invalidation_observer(
-        &self,
-        executor: carrick_kernel::kernel::objects::ExecutorId,
-    ) -> crate::hvpatch::CowInvalidationObserver {
+    pub(crate) fn cow_invalidation_observer(&self) -> crate::hvpatch::CowInvalidationObserver {
         self.stage1_mm
             .as_ref()
             .unwrap_or_else(|| {
                 carrick_fatal!(
                     "hvpatch::mm_authority",
-                    "HvpatchTaskBinding missing stage-1 MM lease when obtaining COW invalidation observer: mm={:?}, executor={:?}",
-                    self.identity.mm,
-                    executor
-                );
-            })
-            .cow_invalidation_observer(executor)
-    }
-
-    pub(crate) fn foreign_stage1_identity(&self) -> carrick_hal::ForeignStage1Identity {
-        self.stage1_mm
-            .as_ref()
-            .unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::mm_authority",
-                    "HvpatchTaskBinding missing stage-1 MM lease when extracting foreign stage-1 identity: mm={:?}",
+                    "HvpatchTaskBinding missing stage-1 MM lease when obtaining COW invalidation observer: mm={:?}",
                     self.identity.mm
                 );
             })
-            .foreign_stage1_identity(carrick_hal::ForeignMmId::from_kernel_allocation(
-                self.identity.mm.nonzero(),
-            ))
-    }
-
-    pub(crate) fn pending_cow_invalidation(
-        &self,
-        executor: carrick_kernel::kernel::objects::ExecutorId,
-    ) -> Option<crate::hvpatch::CowInvalidationTicket> {
-        self.stage1_mm.as_ref()?.pending_cow_invalidation(executor)
-    }
-
-    pub(crate) fn acknowledge_cow_invalidation(
-        &self,
-        executor: carrick_kernel::kernel::objects::ExecutorId,
-        ticket: crate::hvpatch::CowInvalidationTicket,
-    ) -> Result<(), crate::hvpatch::CowInvalidationError> {
-        self.stage1_mm
-            .as_ref()
-            .ok_or(crate::hvpatch::CowInvalidationError::StaleGeneration)?
-            .acknowledge_cow_invalidation(executor, ticket)
+            .cow_invalidation_observer()
     }
 
     pub(crate) fn validate_state(

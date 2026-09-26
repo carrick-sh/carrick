@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use crate::trap::TrapError;
 use carrick_kernel::dispatch::SyscallDispatcher;
 use carrick_kernel::kernel::objects::{
-    BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
+    BlockedReason, ExecutionFailure, ExecutionGeneration, MigratableTaskState,
     ThreadExecutionLease, ThreadExecutionState, ThreadKey,
 };
 use carrick_kernel::kernel::{ExecutorKick as _, ExecutorRegistration, RunnableThread, Scheduler};
@@ -443,56 +443,16 @@ pub(crate) fn thread_settlement_event_code(state: ThreadExecutionState) -> i32 {
     }
 }
 
-pub(crate) fn service_owner_thread_commands<E: PersistentExecutor>(
-    backend: &mut E,
-    executor: ExecutorId,
+/// Service the executor's owner-thread command channel at its loop top:
+/// whether a `Stop` arrived.
+pub(crate) fn service_owner_thread_commands(
     commands: &mpsc::Receiver<WorkerCommand>,
-    boundary: &WorkerBoundaryAudit,
-    receipts: &ReceiptLog,
 ) -> Result<bool, String> {
-    loop {
-        match commands.try_recv() {
-            Ok(WorkerCommand::InvalidateAsid {
-                generation,
-                response,
-            }) => {
-                if let Err(error) = boundary.audit_runtime(backend) {
-                    let message = format!(
-                        "executor {executor:?} failed boundary audit before ASID invalidation: {error}"
-                    );
-                    let _ = response.send(Err(message.clone()));
-                    return Err(message);
-                }
-                if let Err(error) = backend.invalidate_asid(generation) {
-                    let message = format!(
-                        "executor {executor:?} failed ASID generation {} invalidation: {error}",
-                        generation.generation()
-                    );
-                    let _ = response.send(Err(message.clone()));
-                    return Err(message);
-                }
-                receipts.record(
-                    executor,
-                    ExecutorPoolEvent::InvalidatedAsid {
-                        generation: generation.generation(),
-                    },
-                );
-                probe_executor_lifecycle(
-                    executor,
-                    crate::probes::HvpatchExecutorLifecyclePhase::InvalidateAsid,
-                    None,
-                    None,
-                    generation.generation(),
-                );
-                let _ = response.send(Ok(crate::hvpatch::InvalidationAck::new(
-                    executor, generation,
-                )));
-            }
-            Ok(WorkerCommand::Stop) | Err(mpsc::TryRecvError::Disconnected) => return Ok(true),
-            Err(mpsc::TryRecvError::Empty) => return Ok(false),
-            Ok(WorkerCommand::Initialize | WorkerCommand::Run) => {
-                return Err("executor received an invalid owner-thread command".to_owned());
-            }
+    match commands.try_recv() {
+        Ok(WorkerCommand::Stop) | Err(mpsc::TryRecvError::Disconnected) => Ok(true),
+        Err(mpsc::TryRecvError::Empty) => Ok(false),
+        Ok(WorkerCommand::Initialize | WorkerCommand::Run) => {
+            Err("executor received an invalid owner-thread command".to_owned())
         }
     }
 }

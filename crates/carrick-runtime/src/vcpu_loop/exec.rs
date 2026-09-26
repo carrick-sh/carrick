@@ -544,7 +544,6 @@ impl RuntimePreparedExec {
     fn prepare_hvpatch_address_space<E: ThreadedEngine>(
         &self,
         engine: &mut E,
-        executor: carrick_kernel::kernel::objects::ExecutorId,
     ) -> Result<Option<crate::hvpatch::AsidLoad>, String> {
         let Self::Hvpatch(prepared) = self else {
             return Ok(None);
@@ -553,7 +552,7 @@ impl RuntimePreparedExec {
             .replacement_root_slot()
             .ok_or_else(|| "HVPatch exec replacement has no root slot".to_owned())?;
         let generation = prepared.replacement_asid_generation();
-        let mut load = prepared.begin_replacement_load(executor)?;
+        let mut load = prepared.begin_replacement_load()?;
         load.arm_hardware_dirty()
             .map_err(|error| error.to_string())?;
         engine
@@ -1871,18 +1870,18 @@ where
                     "exec replacement lost worker-authenticated execution lease".to_owned(),
                 )
             })?;
-        let replacement_asid_load =
-            match prepared_kernel_exec.prepare_hvpatch_address_space(engine, worker_executor) {
-                Ok(load) => load,
-                Err(error) => {
-                    return Self::exec_failed_past_no_return(
-                        kernel,
-                        engine,
-                        &format!("bind fresh HVPatch exec MM/ASID lease: {error}"),
-                    )
-                    .map(Some);
-                }
-            };
+        let replacement_asid_load = match prepared_kernel_exec.prepare_hvpatch_address_space(engine)
+        {
+            Ok(load) => load,
+            Err(error) => {
+                return Self::exec_failed_past_no_return(
+                    kernel,
+                    engine,
+                    &format!("bind fresh HVPatch exec MM/ASID lease: {error}"),
+                )
+                .map(Some);
+            }
+        };
         let old_files = prepared_kernel_exec.old_file_table();
         let armed_kernel_exec = match (kernel.hvpatch_process.as_ref(), prepared_kernel_exec) {
             (Some(process), RuntimePreparedExec::Hvpatch(prepared)) => {
@@ -2934,12 +2933,8 @@ pub(crate) mod tests {
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         // Publish the same executor/ASID observation metadata as task load.
         // No hardware is dirtied by this scripted engine.
-        binding
-            .begin_asid_load(registration.id())
-            .unwrap()
-            .mark_resident()
-            .unwrap();
-        let observer = binding.cow_invalidation_observer(registration.id());
+        binding.begin_asid_load().unwrap().mark_resident().unwrap();
+        let observer = binding.cow_invalidation_observer();
         let mut submission = executor::ExecutorSubmissionContext {
             registration: None,
             scheduler: &scheduler,
@@ -2951,7 +2946,6 @@ pub(crate) mod tests {
         let mut control = executor::HvpatchQuantumControl {
             need_resched: &need_resched,
             submission: &mut submission,
-            executor_id: Some(registration.id()),
             binding: Some(&binding),
             cow_invalidation_observer: Some(&observer),
         };

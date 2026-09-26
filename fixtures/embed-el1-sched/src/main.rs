@@ -39,6 +39,16 @@
 //!   `pingpong` pair pinned to guest CPUs 0 and 1, so threads of the two
 //!   address spaces share those vCPUs; prints each process's round trips.
 //!
+//! - `mm-occupancy <forks>` (EL1 increment 2): `fork`, then each of the two
+//!   processes runs twice as many writer threads as guest CPUs (pairs handing
+//!   a turn off through private futexes, each writing and reading back its own
+//!   page), an editor thread churning `mmap`/`mprotect`/`munmap`/`madvise` on
+//!   a scratch region (stage-1 pauses of the MM), and a forker thread that
+//!   forks `<forks>` times while the writers run (each child checks that the
+//!   writer pages it inherited do not change after the fork) and `vfork`s as
+//!   often (each child `_exit`s at once). Prints each process's forks and
+//!   mismatches; any torn page or changed snapshot is a failure.
+//!
 //! Every wait in the checks is bounded, so a lost wake or a lost signal is a
 //! failed line, never a hung test.
 
@@ -967,6 +977,181 @@ fn two_process(iters: usize) -> i32 {
     if done == iters && child_ok { 0 } else { 1 }
 }
 
+const PAGE: usize = 16384;
+const WORDS: usize = 64;
+
+/// Two processes, each with more threads than guest CPUs, under stage-1
+/// pauses (the editor), fork COW arming (the forker) and vfork (shared MM).
+fn mm_occupancy(forks: usize) -> i32 {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        println!("fork failed");
+        return 1;
+    }
+    let role = if pid == 0 { "child" } else { "parent" };
+    let ok = mm_occupancy_process(role, forks);
+    if pid == 0 {
+        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+    }
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    let child_ok = waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    println!("mm-occupancy child_ok={child_ok}");
+    if ok && child_ok { 0 } else { 1 }
+}
+
+fn mm_occupancy_process(role: &str, forks: usize) -> bool {
+    let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as usize;
+    let writers = (2 * cpus).max(4) & !1;
+    let region = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            writers * PAGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if region == libc::MAP_FAILED {
+        println!("mm-occupancy {role} mmap failed");
+        return false;
+    }
+    let base = region as usize;
+    let stop = std::sync::Arc::new(AtomicU32::new(0));
+    let mismatches = std::sync::Arc::new(AtomicU32::new(0));
+    let turns: std::sync::Arc<Vec<AtomicU32>> =
+        std::sync::Arc::new((0..writers / 2).map(|_| AtomicU32::new(0)).collect());
+    let mut threads = Vec::new();
+    for id in 0..writers {
+        let (stop, mismatches, turns) = (stop.clone(), mismatches.clone(), turns.clone());
+        threads.push(std::thread::spawn(move || {
+            let page = (base + id * PAGE) as *mut u64;
+            let turn = &turns[id / 2];
+            let mine = (id % 2) as u32;
+            let mut round = 0u64;
+            while stop.load(Ordering::Acquire) == 0 {
+                round += 1;
+                let value = ((id as u64) << 40) | round;
+                for word in 0..WORDS {
+                    unsafe { page.add(word).write_volatile(value) };
+                }
+                for word in 0..WORDS {
+                    if unsafe { page.add(word).read_volatile() } != value {
+                        mismatches.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                // Hand the pair's turn over and wait for it back (bounded).
+                if turn.load(Ordering::Acquire) % 2 == mine {
+                    turn.fetch_add(1, Ordering::AcqRel);
+                    futex_wake(turn, 1);
+                } else {
+                    let seen = turn.load(Ordering::Acquire);
+                    if seen % 2 != mine {
+                        futex_wait_timeout(turn, seen, Duration::from_millis(2));
+                    }
+                }
+            }
+            // Release a partner parked on the turn.
+            turn.fetch_add(1, Ordering::AcqRel);
+            futex_wake(turn, 1);
+        }));
+    }
+    let editor_stop = stop.clone();
+    let editor = std::thread::spawn(move || {
+        let mut edits = 0u64;
+        while editor_stop.load(Ordering::Acquire) == 0 {
+            let len = 8 * PAGE;
+            let scratch = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if scratch == libc::MAP_FAILED {
+                continue;
+            }
+            for page in 0..8 {
+                unsafe { (scratch as *mut u8).add(page * PAGE).write_volatile(page as u8) };
+            }
+            unsafe {
+                libc::mprotect(scratch, len, libc::PROT_READ);
+                libc::mprotect(scratch, len, libc::PROT_READ | libc::PROT_WRITE);
+                libc::madvise(scratch, len, libc::MADV_DONTNEED);
+                libc::munmap(scratch, len);
+            }
+            edits += 1;
+        }
+        edits
+    });
+    let mut forked = 0;
+    let mut snapshot_changes = 0;
+    let mut child_failures = 0;
+    for _ in 0..forks {
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            // A fork child's memory is a copy as of the fork: the parent's
+            // writers keep writing, and none of it may show up here.
+            let mut before = [0u64; 8];
+            for (index, slot) in before.iter_mut().enumerate() {
+                *slot = unsafe { ((base + index * PAGE) as *const u64).read_volatile() };
+            }
+            let spin = Instant::now();
+            while spin.elapsed() < Duration::from_micros(500) {
+                std::hint::spin_loop();
+            }
+            let changed = before.iter().enumerate().any(|(index, value)| {
+                (unsafe { ((base + index * PAGE) as *const u64).read_volatile() }) != *value
+            });
+            unsafe { libc::_exit(if changed { 3 } else { 0 }) };
+        }
+        if child < 0 {
+            child_failures += 1;
+            continue;
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 3 {
+            snapshot_changes += 1;
+        } else if !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0) {
+            child_failures += 1;
+        }
+        // The vfork child only `_exit`s: it shares this stack and MM until
+        // then, which is the shape (posix_spawn, Go os/exec) under test.
+        #[allow(deprecated)]
+        let vchild = unsafe { libc::vfork() };
+        if vchild == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        if vchild > 0 {
+            let mut status = 0;
+            unsafe { libc::waitpid(vchild, &mut status, 0) };
+            if !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0) {
+                child_failures += 1;
+            }
+        } else {
+            child_failures += 1;
+        }
+        forked += 1;
+    }
+    stop.store(1, Ordering::Release);
+    for thread in threads {
+        let _ = thread.join();
+    }
+    let edits = editor.join().unwrap_or(0);
+    let torn = mismatches.load(Ordering::Relaxed);
+    let ok = forked == forks && torn == 0 && snapshot_changes == 0 && child_failures == 0;
+    println!(
+        "mm-occupancy {role} writers={writers} forks={forked} edits={edits} torn={torn} \
+         snapshot_changes={snapshot_changes} child_failures={child_failures} ok={ok}"
+    );
+    ok
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("pingpong");
@@ -989,6 +1174,7 @@ fn main() {
         }
         "pipe-compute" => pipe_compute(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(300)),
         "two-process" => two_process(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000)),
+        "mm-occupancy" => mm_occupancy(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200)),
         "exec-child" => {
             println!("exec-child ok");
             0
