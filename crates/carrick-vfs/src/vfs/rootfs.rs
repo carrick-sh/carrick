@@ -215,11 +215,12 @@ impl RootFsVfs {
         self.namespace_mutations.with_archive(operation)
     }
 
-    pub fn with_paths_topology_admission<R, E>(
+    pub(crate) fn with_paths_topology_and_entry_admission<R, E>(
         &self,
         paths: &[&str],
         operation: impl FnOnce(
             &crate::vfs::namespace_mutation::NamespaceMutationPermit<'_>,
+            &[Option<AdmittedEntryInfo>],
         ) -> Result<R, E>,
     ) -> Result<Result<R, E>, LinuxErrno> {
         enum Attempt<R, E> {
@@ -230,31 +231,50 @@ impl RootFsVfs {
         let mut topology_change = false;
         loop {
             let attempt = self.with_namespace_batch(paths, topology_change, |permit| {
-                let changes_topology = paths.iter().any(|path| {
-                    if let Some(parent) = permit.parent(path) {
-                        self.admitted_entry_info(parent, path).is_some_and(|info| {
-                            matches!(
-                                info.kind,
-                                RootFsEntryKind::Directory | RootFsEntryKind::Symlink
-                            )
-                        })
+                let mut entry_infos = Vec::with_capacity(paths.len());
+                for path in paths {
+                    let info = if let Some(parent) = permit.parent(path) {
+                        self.admitted_entry_info(parent, path)
                     } else {
-                        self.lookup_nofollow(path).is_ok_and(|metadata| {
+                        None
+                    };
+                    entry_infos.push(info);
+                }
+                let changes_topology = entry_infos.iter().enumerate().any(|(i, info)| {
+                    if let Some(info) = info {
+                        matches!(
+                            info.kind,
+                            RootFsEntryKind::Directory | RootFsEntryKind::Symlink
+                        )
+                    } else if permit.parent(paths[i]).is_none() {
+                        self.lookup_nofollow(paths[i]).is_ok_and(|metadata| {
                             matches!(metadata.kind, EntryKind::Directory | EntryKind::Symlink)
                         })
+                    } else {
+                        false
                     }
                 });
                 if changes_topology && !permit.topology_exclusive() {
                     return Ok::<_, LinuxErrno>(Attempt::Upgrade);
                 }
                 let operation = operation.take().ok_or(LINUX_EINVAL)?;
-                Ok(Attempt::Complete(operation(permit)))
+                Ok(Attempt::Complete(operation(permit, &entry_infos)))
             })??;
             match attempt {
                 Attempt::Upgrade => topology_change = true,
                 Attempt::Complete(result) => return Ok(result),
             }
         }
+    }
+
+    pub fn with_paths_topology_admission<R, E>(
+        &self,
+        paths: &[&str],
+        operation: impl FnOnce(
+            &crate::vfs::namespace_mutation::NamespaceMutationPermit<'_>,
+        ) -> Result<R, E>,
+    ) -> Result<Result<R, E>, LinuxErrno> {
+        self.with_paths_topology_and_entry_admission(paths, |permit, _entries| operation(permit))
     }
 
     pub fn new() -> Self {
@@ -2201,9 +2221,12 @@ impl Vfs for RootFsVfs {
     }
 
     fn unlink(&self, path: &str) -> Result<(), VfsError> {
-        self.with_paths_topology_admission(&[path], |permit| {
+        self.with_paths_topology_and_entry_admission(&[path], |permit, entries| {
             let parent = permit.parent(path).ok_or(LINUX_EINVAL)?;
-            let entry_info = self.admitted_entry_info(parent, path).ok_or(LINUX_ENOENT)?;
+            let entry_info = entries
+                .first()
+                .and_then(|e| e.as_ref())
+                .ok_or(LINUX_ENOENT)?;
             if matches!(entry_info.kind, RootFsEntryKind::Directory) {
                 return Err(LINUX_EISDIR);
             }
@@ -2254,9 +2277,12 @@ impl Vfs for RootFsVfs {
     }
 
     fn rmdir(&self, path: &str) -> Result<(), VfsError> {
-        self.with_paths_topology_admission(&[path], |permit| {
+        self.with_paths_topology_and_entry_admission(&[path], |permit, entries| {
             let parent = permit.parent(path).ok_or(LINUX_EINVAL)?;
-            let entry_info = self.admitted_entry_info(parent, path).ok_or(LINUX_ENOENT)?;
+            let entry_info = entries
+                .first()
+                .and_then(|e| e.as_ref())
+                .ok_or(LINUX_ENOENT)?;
             if !matches!(entry_info.kind, RootFsEntryKind::Directory) {
                 return Err(LINUX_ENOTDIR);
             }
@@ -2772,6 +2798,16 @@ mod tests {
             };
             use crate::vfs::Vfs as _;
 
+            struct MeasurementRecord {
+                scale_point: usize,
+                op: &'static str,
+                opens: u64,
+                dentry_opens: u64,
+                backend_stats: u64,
+                parent_fstats: u64,
+                total_metadata: u64,
+            }
+
             let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .unwrap()
@@ -2820,9 +2856,15 @@ mod tests {
                     let total_metadata = backend_stats + parent_fstats;
                     let dentry_opens = vfs.dentry_cache.host_open_count();
 
-                    records.push(format!(
-                        "scale_point={n} op=rename_same_dir opens={opens} dentry_opens={dentry_opens} backend_stats={backend_stats} parent_fstats={parent_fstats} total_metadata={total_metadata}"
-                    ));
+                    records.push(MeasurementRecord {
+                        scale_point: n,
+                        op: "rename_same_dir",
+                        opens,
+                        dentry_opens,
+                        backend_stats,
+                        parent_fstats,
+                        total_metadata,
+                    });
 
                     // Verify semantics
                     for i in 0..n {
@@ -2874,9 +2916,15 @@ mod tests {
                     let total_metadata = backend_stats + parent_fstats;
                     let dentry_opens = vfs.dentry_cache.host_open_count();
 
-                    records.push(format!(
-                        "scale_point={n} op=rename_cross_dir opens={opens} dentry_opens={dentry_opens} backend_stats={backend_stats} parent_fstats={parent_fstats} total_metadata={total_metadata}"
-                    ));
+                    records.push(MeasurementRecord {
+                        scale_point: n,
+                        op: "rename_cross_dir",
+                        opens,
+                        dentry_opens,
+                        backend_stats,
+                        parent_fstats,
+                        total_metadata,
+                    });
 
                     for i in 0..n {
                         assert_eq!(
@@ -2922,9 +2970,15 @@ mod tests {
                     let total_metadata = backend_stats + parent_fstats;
                     let dentry_opens = vfs.dentry_cache.host_open_count();
 
-                    records.push(format!(
-                        "scale_point={n} op=unlink opens={opens} dentry_opens={dentry_opens} backend_stats={backend_stats} parent_fstats={parent_fstats} total_metadata={total_metadata}"
-                    ));
+                    records.push(MeasurementRecord {
+                        scale_point: n,
+                        op: "unlink",
+                        opens,
+                        dentry_opens,
+                        backend_stats,
+                        parent_fstats,
+                        total_metadata,
+                    });
 
                     for i in 0..n {
                         assert_eq!(
@@ -2959,9 +3013,15 @@ mod tests {
                     let cold_total_metadata = cold_backend_stats + cold_parent_fstats;
                     let cold_dentry_opens = vfs.dentry_cache.host_open_count();
 
-                    records.push(format!(
-                        "scale_point=1 op=rename_cold opens={cold_opens} dentry_opens={cold_dentry_opens} backend_stats={cold_backend_stats} parent_fstats={cold_parent_fstats} total_metadata={cold_total_metadata}"
-                    ));
+                    records.push(MeasurementRecord {
+                        scale_point: 1,
+                        op: "rename_cold",
+                        opens: cold_opens,
+                        dentry_opens: cold_dentry_opens,
+                        backend_stats: cold_backend_stats,
+                        parent_fstats: cold_parent_fstats,
+                        total_metadata: cold_total_metadata,
+                    });
 
                     // Warm rename: parent directory fd already cached
                     reset_test_host_openat_count();
@@ -2977,17 +3037,15 @@ mod tests {
                     let warm_total_metadata = warm_backend_stats + warm_parent_fstats;
                     let warm_dentry_opens = vfs.dentry_cache.host_open_count();
 
-                    records.push(format!(
-                        "scale_point=1 op=rename_warm_after_cold opens={warm_opens} dentry_opens={warm_dentry_opens} backend_stats={warm_backend_stats} parent_fstats={warm_parent_fstats} total_metadata={warm_total_metadata}"
-                    ));
-
-                    assert_eq!(cold_opens, 0);
-                    assert_eq!(
-                        cold_dentry_opens, 2,
-                        "cold rename opens /cold and /cold/sub"
-                    );
-                    assert_eq!(warm_opens, 0);
-                    assert_eq!(warm_dentry_opens, 0, "warm rename opens 0 dir fds");
+                    records.push(MeasurementRecord {
+                        scale_point: 1,
+                        op: "rename_warm_after_cold",
+                        opens: warm_opens,
+                        dentry_opens: warm_dentry_opens,
+                        backend_stats: warm_backend_stats,
+                        parent_fstats: warm_parent_fstats,
+                        total_metadata: warm_total_metadata,
+                    });
                 }
 
                 // 5. Cold vs Warm Unlink (Scale 1)
@@ -3014,9 +3072,15 @@ mod tests {
                     let cold_total_metadata = cold_backend_stats + cold_parent_fstats;
                     let cold_dentry_opens = vfs.dentry_cache.host_open_count();
 
-                    records.push(format!(
-                        "scale_point=1 op=unlink_cold opens={cold_opens} dentry_opens={cold_dentry_opens} backend_stats={cold_backend_stats} parent_fstats={cold_parent_fstats} total_metadata={cold_total_metadata}"
-                    ));
+                    records.push(MeasurementRecord {
+                        scale_point: 1,
+                        op: "unlink_cold",
+                        opens: cold_opens,
+                        dentry_opens: cold_dentry_opens,
+                        backend_stats: cold_backend_stats,
+                        parent_fstats: cold_parent_fstats,
+                        total_metadata: cold_total_metadata,
+                    });
 
                     // Warm unlink: parent directory fd already cached
                     reset_test_host_openat_count();
@@ -3031,61 +3095,74 @@ mod tests {
                     let warm_total_metadata = warm_backend_stats + warm_parent_fstats;
                     let warm_dentry_opens = vfs.dentry_cache.host_open_count();
 
-                    records.push(format!(
-                        "scale_point=1 op=unlink_warm_after_cold opens={warm_opens} dentry_opens={warm_dentry_opens} backend_stats={warm_backend_stats} parent_fstats={warm_parent_fstats} total_metadata={warm_total_metadata}"
-                    ));
-
-                    assert_eq!(cold_opens, 0);
-                    assert_eq!(
-                        cold_dentry_opens, 2,
-                        "cold unlink opens /cold_unlink and /cold_unlink/sub"
-                    );
-                    assert_eq!(warm_opens, 0);
-                    assert_eq!(warm_dentry_opens, 0, "warm unlink opens 0 dir fds");
+                    records.push(MeasurementRecord {
+                        scale_point: 1,
+                        op: "unlink_warm_after_cold",
+                        opens: warm_opens,
+                        dentry_opens: warm_dentry_opens,
+                        backend_stats: warm_backend_stats,
+                        parent_fstats: warm_parent_fstats,
+                        total_metadata: warm_total_metadata,
+                    });
                 }
             }
 
-            let log_content = records.join("\n") + "\n";
+            let log_content = records
+                .iter()
+                .map(|r| {
+                    format!(
+                        "scale_point={} op={} opens={} dentry_opens={} backend_stats={} parent_fstats={} total_metadata={}",
+                        r.scale_point, r.op, r.opens, r.dentry_opens, r.backend_stats, r.parent_fstats, r.total_metadata
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
             std::fs::write(&log_path, &log_content).unwrap();
             let baseline_path = log_dir.join("baseline-measurements.log");
             std::fs::write(&baseline_path, &log_content).unwrap();
             eprintln!("MEASUREMENTS:\n{log_content}");
 
-            // Now assert structural budgets
-            for line in &records {
-                let parts: std::collections::HashMap<&str, &str> = line
-                    .split_whitespace()
-                    .filter_map(|pair| pair.split_once('='))
-                    .collect();
-                let n: usize = parts.get("scale_point").unwrap().parse().unwrap();
-                let op = *parts.get("op").unwrap();
-                let opens: u64 = parts.get("opens").unwrap().parse().unwrap();
-                let dentry_opens: u64 = parts.get("dentry_opens").unwrap().parse().unwrap();
-                let total_metadata: u64 = parts.get("total_metadata").unwrap().parse().unwrap();
-
-                if op.starts_with("rename_cold") || op.starts_with("unlink_cold") {
-                    continue;
+            // Now assert structural budgets on every record
+            for r in &records {
+                if r.op == "rename_cold" {
+                    assert_eq!(r.opens, 0);
+                    assert_eq!(r.dentry_opens, 2, "cold rename opens /cold and /cold/sub");
+                    assert!(r.total_metadata <= 8);
+                } else if r.op == "unlink_cold" {
+                    assert_eq!(r.opens, 0);
+                    assert_eq!(
+                        r.dentry_opens, 2,
+                        "cold unlink opens /cold_unlink and /cold_unlink/sub"
+                    );
+                    assert!(r.total_metadata <= 4);
+                } else {
+                    assert_eq!(
+                        r.opens, 0,
+                        "{} at scale {} issued {} host openat calls (budget 0)",
+                        r.op, r.scale_point, r.opens
+                    );
+                    assert_eq!(
+                        r.dentry_opens, 0,
+                        "{} at scale {} issued {} dentry host opens (budget 0)",
+                        r.op, r.scale_point, r.dentry_opens
+                    );
+                    let budget = match r.op {
+                        "rename_same_dir" | "rename_cross_dir" | "rename_warm_after_cold" => {
+                            (8 * r.scale_point) as u64
+                        }
+                        "unlink" | "unlink_warm_after_cold" => (3 * r.scale_point) as u64,
+                        _ => unreachable!(),
+                    };
+                    assert!(
+                        r.total_metadata <= budget,
+                        "{} at scale {} issued {} total metadata calls (budget <= {})",
+                        r.op,
+                        r.scale_point,
+                        r.total_metadata,
+                        budget
+                    );
                 }
-
-                assert_eq!(
-                    opens, 0,
-                    "{op} at scale {n} issued {opens} host openat calls (budget 0)"
-                );
-                assert_eq!(
-                    dentry_opens, 0,
-                    "{op} at scale {n} issued {dentry_opens} dentry host opens (budget 0)"
-                );
-                let budget = match op {
-                    "rename_same_dir" | "rename_cross_dir" | "rename_warm_after_cold" => {
-                        (8 * n) as u64
-                    }
-                    "unlink" | "unlink_warm_after_cold" => (4 * n) as u64,
-                    _ => unreachable!(),
-                };
-                assert!(
-                    total_metadata <= budget,
-                    "{op} at scale {n} issued {total_metadata} total metadata calls (budget <= {budget})"
-                );
             }
         }
     }
