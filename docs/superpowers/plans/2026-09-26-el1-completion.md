@@ -214,3 +214,20 @@ private stage-1 state rather than requiring an authoritative software shadow;
 its runtime binding adds the live-snapshot control. This new red is intentional
 and remains open alongside signed first-touch. The earlier 622-test green
 receipt still belongs only to `28a096160`.
+
+### Integrated MMU extraction (2026-09-26)
+
+The extraction and bounded review corrections are now integrated as `41370ac96`
+and `600e5c859`. The director stopped an off-scope worker revision, retained
+its rejected patch, and preserved original invariant comments, test-only APIs,
+and checked-overflow behavior. The normal no_std closure is hashbrown/foldhash.
+All 70 MMU and 171 memory tests passed on the integrated tree, alongside the
+bare-metal check, CLI/embed test compilation, warning-free MMU/memory docs,
+contract registry validation and all five current-read runtime controls. Logs
+remain in `target/el1-completion/mmu-integrated-*.log`. Earlier independent
+extraction checks also covered 17 stage1-authority tests and targeted Clippy.
+
+This is portability groundwork only. The live snapshot witness and signed
+first-touch witness remain red. Live backing authority is the next bounded
+implementation; full CI, signed promotion, paired workloads and the remaining
+end-to-end stages are still open.
