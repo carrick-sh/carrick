@@ -1,0 +1,126 @@
+# EL1 migration: end-to-end execution controller
+
+Status: active. Owner authorized this goal on 2026-09-26. Starting revision:
+`d7393f6163adccbe001868b9056f2832813e10d2`.
+
+Authority: [accepted EL1 design](../specs/2026-09-24-el1-kernel.md),
+`AGENTS.md`, and [conformance contracts](../../conformance-contracts.md).
+This controller tracks the whole goal; it does not replace the design or
+turn proposed interfaces into accepted implementation facts.
+
+## Goal
+
+Complete the accepted EL1 migration through the x86 ring-0 venue. Carry each
+increment through implementation, removal of superseded implementations,
+conformance, measurements, and recorded acceptance. Preserve elastic memory,
+host-scheduled CPUs, host-native I/O, and the substrate/personality boundary.
+Prove Linux semantics and bounded operational cost, and measure the per-row
+2x native-arm64 Docker objective without hiding host-platform I/O costs.
+Neither a foundation nor a focused green test completes an increment.
+
+## Checkpoints
+
+| Checkpoint | Required outcome | Status at start |
+|---|---|---|
+| 0: existing scheduler and address-space switch | Preserve the implemented scheduler, futex handoff, GIC/timer, occupancy, and EL1 address-space switch; retain their contracts | Implemented on starting HEAD; acceptance receipts inherited from the design, not rerun by this campaign |
+| 2: memory | EL1 owns anonymous mappings, first-touch/permission faults, brk/mmap/munmap/mprotect, elastic frame allocation/return, fork COW, and stage-1 publication; remove the host page-table pause once no host writer needs it | Next |
+| 2a: host file operations | Reduce measured namespace-operation overhead while retaining containment, namespace transactions, and native macOS controls | Pending; finish before checkpoint 4 |
+| 3: descriptors, IPC, signals | EL1 owns fd tables/descriptions, pipes, AF_UNIX, eventfd/timerfd, readiness waits and signals; preserve credentials, lifecycle and continuation semantics | Pending |
+| 4: names and page cache | EL1 owns name resolution, dentry/stat cache and host-file page cache; host mutations/writers remain coherent; replace the existing file zone | Pending |
+| 5: process lifecycle | EL1 drives fork/exec, image loading and process lifecycle; host supplies validated file bytes and process-boundary services | Pending |
+| 6: x86 venue | Run the same neutral cores in guest ring 0 through the shared x86 engine, with real backend execution evidence | Pending |
+| Final acceptance | Full declared conformance/workload population, exact-artifact provenance, performance accounting, dead-path removal, docs and unresolved-item closure | Pending |
+
+The end-state ownership table is part of the denominator: credentials,
+rlimits, process groups/sessions, in-zone loopback, ptrace/core capture, clocks,
+and terminal boundaries must be assigned and verified during these checkpoints,
+not omitted because they do not appear in a checkpoint's short title.
+
+## First memory increment: goal brief
+
+Outcome: execute anonymous first-touch and permission handling in EL1 using
+one authoritative mapping/publication model shared with the host venue.
+Start by resolving the interfaces below and recording semantic/structural red
+evidence. An independent EL1 cache of host mapping decisions is not the result.
+
+Current interfaces confirmed on the starting source:
+
+- `carrick-runtime/src/vcpu_loop/signal.rs::resolve_mutating_fault` owns the
+  host first-touch/protection commit sequence.
+- `carrick-kernel/src/dispatch/mem/fault.rs::FirstTouchArming` stores pending
+  first-touch permissions and supports bounded range lookup/splitting.
+- `carrick-vmm-hvf/src/trap/sparse_materialization.rs` prepares backing under
+  rollback ownership; `cow_engine.rs::materialize_sparse_mmap_extent_inner`
+  authenticates exact owners and publishes the backing.
+- `carrick-sched-core/src/spaces.rs::AddressSpaces` publishes roots and a
+  pause/retirement gate; the occupancy protocol must still cover every vCPU
+  executing the address space after an EL1 switch.
+- `carrick-el1/src/entry.rs` currently dispatches SVC and IRQ entry; a data
+  abort needs its own correctly preserved fault entry and continuation.
+
+Constraints: distinguish semantic VA, stage-1 IPA, frame identity and owner
+generation; do not expose a valid leaf before stage-2 and inventory commit;
+roll back failed publication; no fixed RAM pool as the end state; zero recycled
+anonymous frames; preserve host-backed shared aliases, foreign copyout, fork,
+exec, mincore, mprotect and discard semantics. IRQ handling must not acquire a
+page-table lock already held by interrupted EL1 code. Kernel exceptions remain
+distinguishable from recoverable user faults.
+
+Acceptance witnesses must include two live processes using overlapping virtual
+addresses, concurrent first touches, denied accesses, mapping replacement and
+retirement, foreign reads/writes, allocation refusal and rollback, and repeated
+allocate/free cycles proving frame return. Structural evidence must distinguish
+bulk grants from per-page host exits and use at least three scale points.
+Choose and register the precise contract/bindings before implementation; do not
+claim existing host-only fault tests prove guest page-table execution.
+
+## Acceptance protocol
+
+For each checkpoint, record source, fixture and oracle identities, observed
+red/green results, and all outstanding gates. Run the cheapest capable semantic
+and deterministic-work tests first; use signed embed for actual guest execution.
+Run `just ci`, `just el1-gate`, and applicable probe/smoke/full promotion gates
+on their exact recorded artifacts. Keep Carrick and Docker phases serialized.
+Preserve SHA-256, CDHash, LC_UUID, entitlement, DOF, and run-scoped cleanup.
+
+Compare uninstrumented release workloads with the previous accepted checkpoint
+on Go build, cpython-threading and cpython-subprocess, and broaden to the full
+declared ecosystem population for final acceptance. Keep Linux ratios and native
+macOS controls separate. Document temporary migration regressions; do not turn
+them into final acceptance, widen budgets, retry until green, or reduce concurrency.
+
+Use one implementation in neutral cores with venue adapters. Retain host-venue
+adapters needed by other backends until checkpoint 6; remove duplicate semantic
+implementations as replacements land. Mechanically enforce the personality
+boundary at its first split.
+
+## Open obligations carried from the design
+
+- Parked-EL1-thread registers are absent from crash snapshots.
+- Entrant refusal bound is measured rather than derived.
+- Personality boundary has no mechanical gate yet.
+- SPI delivery / `hv_vcpus_exit` anomalies and wedged-vCPU recovery under GIC
+  require evidence before dependent behavior is accepted.
+- Durable paired carrier-CPU profiling across Go/Python/Node remains an entry
+  criterion where migration ordering depends on those measurements.
+- Idle-entry thread execution is not enabled because of the documented host
+  control-claim race; change it only if measurements justify it and its contract
+  proves the race resolved.
+- Real x86 backend hardware and a native x86 oracle must be verified before
+  checkpoint 6; translated amd64 Docker is not an oracle.
+
+## Campaign record
+
+2026-09-26: created isolated `el1-completion` worktree at the starting revision.
+Read the accepted design and current memory publication paths. Started the
+host-only scheduler/EL1 core baseline and a read-only Antigravity interface
+audit. No implementation or signed acceptance is claimed yet.
+
+Ruling: follow the accepted design's goal-brief format, rather than expand the
+entire migration into speculative code-level steps. The first memory increment
+will fix its interfaces from source and red evidence. Cost if wrong: revise a
+bounded brief before implementation, rather than build to invented interfaces.
+
+Baseline: `RUSTC_WRAPPER= cargo test -p carrick-sched-core -p carrick-el1
+--lib` passed (41 scheduler-core tests and 46 EL1 tests). This is host-only
+baseline evidence; it does not qualify a signed guest artifact.
