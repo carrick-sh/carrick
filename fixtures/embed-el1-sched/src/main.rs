@@ -927,9 +927,30 @@ fn pinned_pair(iters: usize) -> usize {
 }
 
 fn two_process(iters: usize) -> i32 {
+    // Both processes start their ping-pong together (a two-pipe rendezvous
+    // after the fork), so their threads share the two pinned vCPUs rather
+    // than running one after the other.
+    let mut ready = [0 as libc::c_int; 2];
+    let mut go = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe(ready.as_mut_ptr()) } != 0 || unsafe { libc::pipe(go.as_mut_ptr()) } != 0
+    {
+        println!("pipe failed");
+        return 1;
+    }
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         println!("fork failed");
+        return 1;
+    }
+    let mut byte = 0u8;
+    let byte_ptr = std::ptr::addr_of_mut!(byte).cast::<libc::c_void>();
+    let rendezvous = if pid == 0 {
+        unsafe { libc::write(ready[1], byte_ptr, 1) == 1 && libc::read(go[0], byte_ptr, 1) == 1 }
+    } else {
+        unsafe { libc::read(ready[0], byte_ptr, 1) == 1 && libc::write(go[1], byte_ptr, 1) == 1 }
+    };
+    if !rendezvous {
+        println!("two-process rendezvous failed");
         return 1;
     }
     let started = Instant::now();
