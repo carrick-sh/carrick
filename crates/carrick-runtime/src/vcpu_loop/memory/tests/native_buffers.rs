@@ -924,6 +924,62 @@ fn current_read_window_observes_changed_bytes_and_rejects_other_ranges_and_lease
     fixture.child.thread().yield_from_executor(next).unwrap();
 }
 
+/// An EL1 writer changes the hardware-visible leaf, not a host Vec shadow.
+/// Both a warmed window and new preparation must observe that revocation.
+/// Keeping the shadow as the read authority would disclose the old bytes.
+#[test]
+fn current_read_window_uses_live_leaf_after_guest_publication() {
+    let (kernel, root) = bootstrap(39_610);
+    let tid = ThreadId::synthetic_for_tests(39_611);
+    let fixture = real_production_cow_fixture(
+        &kernel,
+        &root,
+        39_611,
+        0x9a06_0000_0000,
+        0x9b06_0000_0000,
+        tid,
+    );
+    let execution = execution_lease(&fixture.child, 39_611);
+    fixture
+        .child
+        .copy_current_from(&execution, GuestVa(TEST_VA), b"live")
+        .unwrap();
+    let window = fixture
+        .child
+        .prepare_current_read_window(&execution, GuestVa(TEST_VA), 256)
+        .unwrap();
+    let current = fixture.child.current_mm(&execution).unwrap();
+    carrick_kernel::kernel::MmAccessAuthority::new()
+        .with_current_mutation(&current, tid, |_| {
+            fixture
+                .carrier
+                .invalidate_live_leaf_without_shadow_for_test(TEST_VA)
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+    let mut bytes = [0; 4];
+    let cached = window.copy_into(&fixture.child, &execution, GuestVa(TEST_VA), &mut bytes);
+    let prepared = fixture
+        .child
+        .prepare_current_read_window(&execution, GuestVa(TEST_VA), 256);
+    drop(current);
+    fixture
+        .child
+        .thread()
+        .yield_from_executor(execution)
+        .unwrap();
+    assert!(
+        cached.is_err(),
+        "cached read used a revoked live leaf: {cached:?}; bytes={bytes:?}"
+    );
+    assert_eq!(bytes, [0; 4], "revoked input must not be copied");
+    assert!(
+        prepared.is_err(),
+        "new read preparation used the host shadow"
+    );
+}
+
 #[test]
 fn current_read_window_rejects_vma_revocation_and_cow_replacement() {
     let (kernel, root) = bootstrap(39_500);

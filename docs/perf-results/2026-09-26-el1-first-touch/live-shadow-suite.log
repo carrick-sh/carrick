@@ -1,0 +1,25 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 26.18s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-08f8030d0cc24dc5)
+
+running 13 tests
+test vcpu_loop::memory::tests::native_buffers::carrier_buffer_elf_control ... ignored, requires CARRICK_NATIVE_BUFFER_ELF and a bounded research ELF
+test vcpu_loop::memory::tests::native_buffers::current_buffer_invalid_fd_cost_contract ... ok
+test vcpu_loop::memory::tests::native_buffers::current_copies_cross_compounds_and_preserve_source ... ok
+test vcpu_loop::memory::tests::native_buffers::current_copies_honor_vma_read_write_and_executable_permissions ... ok
+test vcpu_loop::memory::tests::native_buffers::current_copies_reject_wrong_lease_and_invalid_ranges ... ok
+test vcpu_loop::memory::tests::native_buffers::current_copyout_rechecks_live_leaf_and_protection_tracker ... ok
+test vcpu_loop::memory::tests::native_buffers::current_read_reuse_cost_contract ... ok
+test vcpu_loop::memory::tests::native_buffers::current_read_window_observes_changed_bytes_and_rejects_other_ranges_and_leases ... ok
+test vcpu_loop::memory::tests::native_buffers::current_read_window_rechecks_live_carrier_authorities ... ok
+test vcpu_loop::memory::tests::native_buffers::current_read_window_rejects_vma_revocation_and_cow_replacement ... ok
+test vcpu_loop::memory::tests::native_buffers::current_read_window_uses_live_leaf_after_guest_publication ... ok
+test vcpu_loop::memory::tests::native_buffers::repeated_copyout_crosses_private_guest_pages ... ok
+test vcpu_loop::memory::tests::native_buffers::syscall_copyout_updates_carrier_not_private_elf_data ... ok
+
+test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured; 617 filtered out; finished in 0.48s
+

@@ -31,15 +31,109 @@ impl std::fmt::Debug for ReadWindow {
     }
 }
 
-fn translation(tables: &crate::page_table::PageTableManager, va: GuestVa) -> Result<u64, Error> {
-    let leaf = carrick_mem::page_table::terminal_descriptor(tables.debug_walk(va.raw()));
-    // AP[1] grants EL0 access for both RW (01) and read-only (11) leaves.
-    if leaf & 1 == 0 || leaf & (1 << 6) == 0 {
-        return Err(Error::Translation(va));
+/// Walk hardware-visible descriptors. The caller holds the MM mutation and
+/// page-table read guards through validation/copy. Each descriptor is resolved
+/// against this MM's live inventory and exact backing generation; neither a
+/// software descriptor shadow nor a retained pointer is translation authority.
+fn translation(
+    state: &MmAccessState,
+    custody: &CarrierVmCustody,
+    root: carrick_guest_mem::Gpa,
+    va: GuestVa,
+    deadline: Instant,
+) -> Result<u64, Error> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
+    let mut table = root.raw();
+    for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
+        let ipa = table
+            .checked_add(((va.raw() >> shift) & 0x1ff) * 8)
+            .ok_or(Error::Translation(va))?;
+        let inventory = state
+            .frame_inventory
+            .ledger
+            .try_lock_until(deadline)
+            .ok_or(Error::TimedOut)?;
+        let (&logical, extent) = inventory
+            .extents
+            .range(..=(ipa, u64::MAX))
+            .next_back()
+            .filter(|(key, _)| {
+                ipa.checked_add(8)
+                    .is_some_and(|end| key.0.checked_add(key.1).is_some_and(|limit| end <= limit))
+            })
+            .ok_or(Error::OwnerStale)?;
+        let key = (extent.stage2_base, extent.stage2_length);
+        let expected = extent.stage2_owner;
+        if logical.0 < key.0
+            || logical
+                .0
+                .checked_add(logical.1)
+                .is_none_or(|end| key.0.checked_add(key.1).is_none_or(|limit| end > limit))
+        {
+            return Err(Error::OwnerStale);
+        }
+        let offset = ipa
+            .checked_sub(key.0)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or(Error::OwnerStale)?;
+        let owners = custody
+            .global_frame_host_owners
+            .try_lock_until(deadline)
+            .ok_or(Error::TimedOut)?;
+        let structural = state
+            .structural_owners
+            .try_read_until(deadline)
+            .ok_or(Error::TimedOut)?;
+        let ptr = if let Some(owner) = owners
+            .get(&key)
+            .and_then(GlobalFrameOwnerEntry::live_owner)
+            .filter(|owner| {
+                owner.generation() != 0
+                    && owner.generation() == expected.generation
+                    && owner.host_addr() == expected.host_addr
+                    && owner.length() == key.1
+            }) {
+            owner.ptr()
+        } else {
+            let size = usize::try_from(key.1).map_err(|_| Error::OwnerStale)?;
+            structural
+                .get(&(key.0, size))
+                .filter(|owner| {
+                    owner.epoch.raw() != 0
+                        && owner.epoch.raw() == expected.generation
+                        && owner.ptr() as usize == expected.host_addr
+                        && owner.len() == size
+                })
+                .ok_or(Error::OwnerStale)?
+                .ptr()
+        };
+        if offset.checked_add(8).is_none_or(|end| end as u64 > key.1)
+            || (ptr as usize)
+                .checked_add(offset)
+                .is_none_or(|addr| addr % 8 != 0)
+        {
+            return Err(Error::OwnerStale);
+        }
+        // SAFETY: exact live owner and full aligned descriptor extent checked
+        // above. Registry guards retain its storage across the atomic load.
+        let descriptor = unsafe { (*ptr.add(offset).cast::<AtomicU64>()).load(Ordering::Acquire) };
+        if descriptor & 1 == 0 {
+            return Err(Error::Translation(va));
+        }
+        if level < 3 && descriptor & 2 != 0 {
+            table = descriptor & ADDRESS_MASK;
+            continue;
+        }
+        // L0 blocks and an L3 table-bit-clear descriptor are reserved. AP[1]
+        // must grant EL0 access for either a read-only or read-write leaf.
+        if level == 0 || (level == 3 && descriptor & 2 == 0) || descriptor & (1 << 6) == 0 {
+            return Err(Error::Translation(va));
+        }
+        let mask = (1_u64 << shift) - 1;
+        return Ok((descriptor & ADDRESS_MASK & !mask) | (va.raw() & mask));
     }
-    tables
-        .translate_retained_output(va.raw())
-        .ok_or(Error::Translation(va))
+    Err(Error::Translation(va))
 }
 
 pub(super) fn prepare(
@@ -84,7 +178,15 @@ pub(super) fn prepare(
         deadline,
         Error::TimedOut,
         Error::AuthorityUnavailable,
-        |tables| translation(tables, start),
+        |_| {
+            translation(
+                &lease.state,
+                &lease.custody,
+                snapshot.binding().stage1_root(),
+                start,
+                deadline,
+            )
+        },
     )?;
     let inventory = lease
         .state
@@ -144,6 +246,7 @@ pub(super) fn prepare(
     if !authority.matches_authenticated_snapshot(snapshot, deadline)? {
         return Err(Error::LeaseStale);
     }
+    drop(page_tables);
     Ok(Box::new(ReadWindow {
         custody: Arc::clone(&lease.custody),
         state: Arc::clone(&lease.state),
@@ -250,14 +353,21 @@ impl ForeignMmReadWindow for ReadWindow {
             deadline,
             Error::TimedOut,
             Error::AuthorityUnavailable,
-            |tables| {
-                if translation(tables, va)? != physical {
+            |_| {
+                if translation(
+                    &self.state,
+                    &self.custody,
+                    self.snapshot.binding().stage1_root(),
+                    va,
+                    deadline,
+                )? != physical
+                {
                     return Err(Error::Translation(va));
                 }
                 // SAFETY: preparation checked the entire single-leaf range against
-                // this exact pinned owner. Live ledger, owner, permissions and leaf
-                // were revalidated above. The page-table read lock spans the copy;
-                // only bytes are copied, and no guest-memory reference escapes.
+                // this exact pinned owner. Live ledger, owner, permissions and hardware
+                // leaf were revalidated above. The mutation/page-table guards span the
+                // copy; only bytes are copied and no guest-memory reference escapes.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         owner.ptr().add(offset),

@@ -144,3 +144,20 @@ inspection found current-read translation still using `PageTableManager`,
 and `carrick-mem` depends on `carrick-abi` despite the audit's contrary claim.
 Atomic guest PTE stores alone do not repair those authorities. Cost if wrong:
 extra extraction work, but no knowingly stale host view is introduced.
+
+### Live host-read authority prerequisite (2026-09-26)
+
+A VM-free red test invalidated the hardware-visible leaf while preserving the
+software image. The cached input window incorrectly copied the old bytes.
+The reader now walks live descriptors from the authenticated root, resolving
+at most four descriptor addresses through the MM inventory and exact live
+owner generations. It retains the existing mutation/page-table guards through
+copy, adds no allocation or owner pin on reuse, and rejects revoked leaves
+before copying. Existing host-mutation fixtures now publish their edits to
+hardware backing instead of changing only the shadow.
+
+The 12 active native-buffer tests pass with `conformance-metrics`, including
+all four cost scales; the existing research-ELF control remains ignored by its
+pre-existing external-fixture requirement. This is VM-free prerequisite proof
+only. Other shadow consumers, shared host/EL1 mutation exclusion, guest fault
+service, full CI, signed promotion and paired workload timing remain open.

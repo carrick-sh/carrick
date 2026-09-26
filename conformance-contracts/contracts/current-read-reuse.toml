@@ -8,7 +8,7 @@ scale_points = [1, 8, 32, 128]
 rationale = "Sixteen warmed reads of one fixed 256-byte resident range must not enumerate or retain the whole address space as unrelated COW backing compounds grow. A reusable window must authenticate the current execution lease and live revisions, leaf validity, permissions and exact owner on every copy. No raw pointer escapes and no execution scope is held across dispatch. Cold preparation and unsupported-range fallback remain separately attributed."
 
 [bindings]
-vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_buffers::current_read_reuse_cost_contract (conformance-metrics), plus read-window revocation controls"
+vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_buffers::current_read_reuse_cost_contract (conformance-metrics), plus read-window revocation controls including current_read_window_uses_live_leaf_after_guest_publication"
 
 [bindings.unresolved]
 embed_structural = "Bounded ELF carrier-buffer controls use private research text and mock stage-2; signed native execution remains unbound."
