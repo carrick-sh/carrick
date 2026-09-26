@@ -3384,6 +3384,38 @@
       "fingerprint": "049e4652fa654904786636503a4192196dd78ebed87344d5550539b0583e88f3",
       "classification": "carrier_infra",
       "rationale": "Per-EL1-mailbox-slot vCPU id table in crates/carrick-vmm-hvf/src/vcpu_kick.rs, written by the executor that loads a task on the slot, so a zone kick reaches the vCPU running that slot; carrier VM scope like the mailbox slots."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "symbol": "guest_scheduling_hatch_enabled::ENABLED",
+      "fingerprint": "d3bce58c23c5a39148597c742d4efc3d23c0c671f159649ee582aae719dda689",
+      "classification": "config_debug",
+      "rationale": "Cached value of the CARRICK_EL1_SCHED bisection hatch in crates/carrick-kernel/src/el1_zone.rs; read once, immutable for the carrier's life."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "symbol": "guest_scheduling_hatch_enabled::CARRICK_EL1_SCHED",
+      "fingerprint": "cb3b9c148759403b19dc9014874e8a5b750ffa331d6a0ef63638cf3bb4bc54d9",
+      "classification": "config_debug",
+      "rationale": "Exact =0 bisection hatch CARRICK_EL1_SCHED in crates/carrick-kernel/src/el1_zone.rs that turns off guest scheduling (EL1 plan 1d: host run queues and condvar parks again, the futex zone still on), read once per carrier process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "symbol": "HANDBACK_PUBLISHER",
+      "fingerprint": "05fc3bd6e0dfa2579b35ad4d020da4f829fbd9f72bee178fae545baa236e10d5",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide hook in crates/carrick-kernel/src/el1_zone.rs through which the kernel hands a zone thread back to its host continuation; each start of the persistent executor pool registers its own scheduler's publisher (a carrier may run several containers in turn), and the zone tables it serves are per carrier VM."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
+      "symbol": "PENDING_ADOPTION",
+      "fingerprint": "59a1aeac5323936cf6068660fe5ec9df9d56c8865c8f60d77947254f0ff8facb",
+      "classification": "carrier_infra",
+      "rationale": "Per-executor-thread slot in crates/carrick-runtime/src/vcpu_loop/zone.rs holding the one zone thread EL1 ran on this executor's vCPU that exited to the host (EL1 plan 1d); the executor claims it before its next run, so it never outlives one exit and belongs to exactly one executor thread."
     }
   ]
 }
