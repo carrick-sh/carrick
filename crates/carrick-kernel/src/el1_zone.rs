@@ -235,6 +235,37 @@ pub fn requeue<E>(
     Ok((woken, moved))
 }
 
+/// Whether the zone thread `record` is running or runnable in the guest
+/// (`Some(true)`: queued, on a vCPU, or claimed by the host to run) or parked
+/// there (`Some(false)`); `None` if the record is gone.
+pub fn record_runs(record: RecordRef) -> Option<bool> {
+    let rec = zone_tables()?.live(record)?;
+    match rec.claim() {
+        carrick_el1_abi::Claim::Parked { .. } => Some(false),
+        carrick_el1_abi::Claim::Queued { .. }
+        | carrick_el1_abi::Claim::OnCpu { .. }
+        | carrick_el1_abi::Claim::Host { .. } => Some(true),
+        _ => None,
+    }
+}
+
+/// Whether the thread `key`, which the host loaded on a vCPU, is parked in
+/// EL1 there: its slot's home record is `Parked` (its vCPU runs another thread
+/// or idles, and the host learns it at the next exit).
+pub fn home_record_parked(key: crate::kernel::ThreadKey) -> bool {
+    let Some(zone) = zone_tables() else {
+        return false;
+    };
+    (0..carrick_el1_abi::ZONE_SLOTS)
+        .filter_map(SlotId::from_index)
+        .filter_map(|slot| zone.slot(slot).host_record())
+        .any(|record| {
+            let rec = zone.record(record);
+            matches!(rec.claim(), carrick_el1_abi::Claim::Parked { .. })
+                && thread_key_of(zone.record_ref(record)) == Some(key)
+        })
+}
+
 /// The kernel thread a record names.
 pub fn thread_key_of(record: RecordRef) -> Option<crate::kernel::ThreadKey> {
     let zone = zone_tables()?;
