@@ -14,8 +14,9 @@
 //!   and a pair is handing off.
 //! - `exec`: `execve` from a non-leader thread while siblings are parked.
 //! - `exec-child`: the image `exec` runs.
-//! - `pinned-pingpong <iters>`: `pingpong` with the two threads pinned to
-//!   different guest CPUs, so every handoff crosses vCPUs (EL1 plan 1c).
+//! - `pinned-pingpong <iters> <work_us>`: `pingpong` with the two threads
+//!   pinned to different guest CPUs, each computing `work_us` with the turn,
+//!   so every handoff wakes a thread parked on the other vCPU (EL1 plan 1c).
 //! - `timed-wait <iters>`: `FUTEX_WAIT_PRIVATE` with a 1 ms relative timeout
 //!   and no waker, `iters` times: every result must be `ETIMEDOUT`; prints the
 //!   lateness past the deadline.
@@ -392,11 +393,25 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 static PTURN: AtomicU32 = AtomicU32::new(0); // 0: A acts, 1: B acts, 2: stop
 static PREADY: AtomicU32 = AtomicU32::new(0);
 
-/// `pingpong` between threads pinned to guest CPUs 0 and 1.
-fn pinned_pingpong(iters: usize) -> i32 {
-    const WARMUP: usize = 2000;
+/// Spin for `ticks` of the virtual counter (no syscall).
+fn busy(ticks: u64) {
+    let start = cntvct();
+    while cntvct() - start < ticks {
+        std::hint::spin_loop();
+    }
+}
+
+/// `pingpong` between threads pinned to guest CPUs 0 and 1, each computing
+/// for `work_us` once it has the turn and before it hands it back: the
+/// partner is parked by then, so every handoff wakes a thread parked on the
+/// other vCPU. Below the idle vCPU's spin budget the partner's vCPU is still
+/// polling; above it, it is parked in WFI. Prints the round trip and the
+/// handoff latency (half the round trip less one side's work).
+fn pinned_pingpong(iters: usize, work_us: u64) -> i32 {
+    const WARMUP: usize = 200;
+    let work = cntfrq() * work_us / 1_000_000;
     let pin_a = pin(0);
-    let b = std::thread::spawn(|| {
+    let b = std::thread::spawn(move || {
         let rc = pin(1);
         PREADY.store(if rc == 0 { 1 } else { 2 }, Ordering::Release);
         let _ = futex_wake(&PREADY, 1);
@@ -407,6 +422,7 @@ fn pinned_pingpong(iters: usize) -> i32 {
             if PTURN.load(Ordering::Acquire) == 2 {
                 return;
             }
+            busy(work);
             PTURN.store(0, Ordering::Release);
             let _ = futex_wake(&PTURN, 1);
         }
@@ -422,8 +438,16 @@ fn pinned_pingpong(iters: usize) -> i32 {
         );
         return 1;
     }
-    let mut samples = Vec::with_capacity(iters);
+    // Written before the loop: its first-touch page faults are host memory
+    // work (each one quiesces the process's other vCPUs), which is not what
+    // this mode measures.
+    let mut samples = vec![0u64; iters];
+    for sample in samples.iter_mut() {
+        // SAFETY: an element of the live vector.
+        unsafe { std::ptr::write_volatile(sample, 1) };
+    }
     for i in 0..WARMUP + iters {
+        busy(work);
         let t0 = cntvct();
         PTURN.store(1, Ordering::Release);
         let _ = futex_wake(&PTURN, 1);
@@ -431,7 +455,7 @@ fn pinned_pingpong(iters: usize) -> i32 {
             let _ = futex_wait(&PTURN, 1);
         }
         if i >= WARMUP {
-            samples.push(cntvct() - t0);
+            samples[i - WARMUP] = cntvct() - t0;
         }
     }
     PTURN.store(2, Ordering::Release);
@@ -439,10 +463,13 @@ fn pinned_pingpong(iters: usize) -> i32 {
     b.join().expect("pinned-pingpong partner exits");
     samples.sort_unstable();
     let ns = ns_per_tick();
+    let handoff = |rt: u64| (rt.saturating_sub(work)) as f64 * ns / 2.0;
     println!(
-        "pinned-pingpong iters={iters} p50_ns={:.0} p99_ns={:.0} max_ns={:.0}",
+        "pinned-pingpong iters={iters} work_us={work_us} rt_p50_ns={:.0} handoff_p50_ns={:.0} \
+         handoff_p99_ns={:.0} rt_max_ns={:.0}",
         percentile(&samples, 0.5) as f64 * ns,
-        percentile(&samples, 0.99) as f64 * ns,
+        handoff(percentile(&samples, 0.5)),
+        handoff(percentile(&samples, 0.99)),
         *samples.last().unwrap_or(&0) as f64 * ns
     );
     0
@@ -757,9 +784,10 @@ fn main() {
         "signal" => signal_mode(),
         "exit-group" => exit_group_mode(),
         "exec" => exec_mode(&args[0]),
-        "pinned-pingpong" => {
-            pinned_pingpong(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000))
-        }
+        "pinned-pingpong" => pinned_pingpong(
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000),
+            args.get(3).and_then(|n| n.parse().ok()).unwrap_or(5),
+        ),
         "timed-wait" => timed_wait(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200)),
         "compute-pair" => compute_pair(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(300)),
         "idle-carrier" => idle_carrier(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(500)),
