@@ -113,9 +113,6 @@ pub const PREEMPT_SLICE_NS: u64 = 2_000_000;
 /// so a vCPU whose next thread is imminent (a handoff partner) keeps running.
 pub const IDLE_SPIN_NS: u64 = 20_000;
 
-/// The syscall result of a timed wait whose deadline passed (`-ETIMEDOUT`).
-pub const ETIMEDOUT_RESULT: u64 = (-110_i64) as u64;
-
 const NIL: u32 = 0;
 
 /// A record index in `1..ZONE_RECORDS`.
@@ -734,7 +731,7 @@ pub struct ZoneCounters {
     pub el1_preemptions: AtomicU64,
     /// Queued threads EL1 moved to an idle vCPU slot at a tick.
     pub el1_migrations: AtomicU64,
-    /// Timed waits EL1 ended at their deadline (ETIMEDOUT).
+    /// Timed waits EL1 ended at their deadline.
     pub el1_timeouts: AtomicU64,
     /// Times a vCPU slot went idle in EL1 (nothing runnable).
     pub el1_idle_entries: AtomicU64,
@@ -2206,11 +2203,11 @@ impl ZoneTables {
     }
 
     /// EL1 at `now`: end `slot`'s timed park if its deadline passed. The
-    /// thread is claimed onto the slot's run queue with `ETIMEDOUT`, unless a
+    /// thread is claimed onto the slot's run queue with `result`, unless a
     /// waker won it first. `Err(())`: a bucket lock was busy or the run queue
     /// full; the caller retries at its next timer check.
     #[allow(clippy::result_unit_err)]
-    pub fn expire_timer(&self, slot: SlotId, now: u64) -> Result<bool, ()> {
+    pub fn expire_timer(&self, slot: SlotId, now: u64, result: u64) -> Result<bool, ()> {
         let s = self.slot(slot);
         let Some(deadline) = self.timer_deadline(slot) else {
             return Ok(false);
@@ -2239,7 +2236,7 @@ impl ZoneTables {
             s.timer_record.store(NIL, Ordering::Release);
             return Ok(false);
         }
-        self.mark_woken(rec, ETIMEDOUT_RESULT);
+        self.mark_woken(rec, result);
         self.unlink(&guard, entry_id);
         self.drop_entry(rec, entry_id);
         self.push_locked(&slot_guard, record, None);

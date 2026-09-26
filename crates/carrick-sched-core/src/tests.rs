@@ -677,22 +677,23 @@ fn el1_honours_affinity_for_floating_threads() {
     );
 }
 
-/// The slot's timer ends its home thread's timed park with ETIMEDOUT, once;
-/// a waker that wins the record first leaves the timer nothing to claim.
+/// The slot's timer ends its home thread's timed park with the caller-supplied
+/// result, once; a waker that wins the record first leaves the timer nothing to
+/// claim.
 #[test]
 fn the_slot_timer_ends_a_timed_park_once() {
     let zone = zone();
     enter(&zone, SLOT, 0);
     let a = el1_park(&zone, SLOT, 1, 0x1000, 500);
     assert_eq!(zone.timer_deadline(SLOT), Some(500));
-    assert_eq!(zone.expire_timer(SLOT, 499), Ok(false));
-    assert_eq!(zone.expire_timer(SLOT, 500), Ok(true));
+    assert_eq!(zone.expire_timer(SLOT, 499, 0xdead_beef), Ok(false));
+    assert_eq!(zone.expire_timer(SLOT, 500, 0xdead_beef), Ok(true));
     assert_eq!(zone.record(a).claim(), Claim::Queued { slot: SLOT, seq: 1 });
     assert_eq!(zone.record(a).entry_count(), 0);
     assert_eq!(zone.timer_deadline(SLOT), None);
-    assert_eq!(zone.expire_timer(SLOT, 900), Ok(false));
+    assert_eq!(zone.expire_timer(SLOT, 900, 0xdead_beef), Ok(false));
     let switched = zone.switch_in_full(SLOT).unwrap();
-    assert_eq!(switched.result, Some(ETIMEDOUT_RESULT));
+    assert_eq!(switched.result, Some(0xdead_beef));
     assert!(switched.home);
     // Woken before the deadline: the timer finds the park over.
     let b = el1_park(&zone, SLOT, 1, 0x1000, 500);
@@ -708,8 +709,23 @@ fn the_slot_timer_ends_a_timed_park_once() {
     );
     drop(guard);
     assert!(matches!(zone.record(b).claim(), Claim::Host { .. }));
-    assert_eq!(zone.expire_timer(SLOT, 900), Ok(false));
+    assert_eq!(zone.expire_timer(SLOT, 900, 0xdead_beef), Ok(false));
     assert_eq!(zone.counters.el1_timeouts.load(Ordering::Relaxed), 1);
+}
+
+/// Arbitrary non-Linux caller results propagate through expire_timer without
+/// assuming Linux errno values.
+#[test]
+fn arbitrary_non_linux_caller_result_propagates_on_timer_expiration() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let arbitrary_result: u64 = 0xCAFE_BABE_DEAD_BEEF;
+    let a = el1_park(&zone, SLOT, 1, 0x2000, 1000);
+    assert_eq!(zone.timer_deadline(SLOT), Some(1000));
+    assert_eq!(zone.expire_timer(SLOT, 1000, arbitrary_result), Ok(true));
+    assert_eq!(zone.record(a).claim(), Claim::Queued { slot: SLOT, seq: 1 });
+    let switched = zone.switch_in_full(SLOT).expect("switched in");
+    assert_eq!(switched.result, Some(arbitrary_result));
 }
 
 /// Preemption: the running thread (the host-loaded one, so a fresh home
