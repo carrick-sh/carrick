@@ -356,3 +356,20 @@ higher checkpoint gates remain pending. The previous occupancy worker commits
 are preserved on `el1-occupancy-witness-accepted`; their accepted changes were
 already integrated. No memory/host-namespace source files are shared between
 these two active worker tasks.
+
+### Namespace integration and director rollback correction
+
+Integrated the reviewed namespace candidate through `0d8bf00cd`. Its complete
+VFS split passes (253 parallel, 38 serial), as do Clippy, registry, and the
+post-integration work-budget witness. The original unlink cost is preserved;
+rename eliminates repeated backend directory opens. Exact receipts are under
+`docs/perf-results/2026-09-26-el1-host-namespace/`. Stage 2a remains open.
+
+On separate `el1-memory-corrections`, based on unaccepted candidate
+`22323a343`, director correction `878d3a69e` retains the undo journal through
+failed/partial host restore. Two real-crate controls failed before the fix;
+82 MMU, 171 memory, and 20 authority tests pass afterward, as does MMU Clippy.
+This candidate remains unintegrated pending live-owner access/retirement
+exclusion and snapshot recovery. No fourth worker review is authorized;
+remaining corrections belong to the director. The original goal scope,
+first-touch structural red, signed gates, and workload objective remain open.

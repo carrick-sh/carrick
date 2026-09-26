@@ -1,0 +1,60 @@
+{
+  "head": "b3a6ea73f2c7c30353ae7c2b20a3c1fa3ff894e3",
+  "results": [
+    {
+      "name": "parallel",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-vfs",
+        "--lib",
+        "--",
+        "--skip",
+        "serial_host"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "serial",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "carrick-vfs",
+        "--lib",
+        "serial_host"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "carrick-vfs",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "contracts",
+      "command": [
+        "cargo",
+        "run",
+        "-p",
+        "carrick-conformance-contract",
+        "--bin",
+        "check-contracts",
+        "--",
+        "--root",
+        "."
+      ],
+      "exit_code": 0
+    }
+  ]
+}
