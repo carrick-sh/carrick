@@ -247,7 +247,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/mod.rs::E::close_open_file_and_free_pty::pty_table#1",
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2177,
+      "line": 2222,
       "item": "E::close_open_file_and_free_pty",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -256,7 +256,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/mod.rs::E::register_controlling_pty::pty_table#1",
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2392,
+      "line": 2437,
       "item": "E::register_controlling_pty",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -265,7 +265,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/mod.rs::E::initialize_controlling_tty_for::pty_table#1",
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2397,
+      "line": 2442,
       "item": "E::initialize_controlling_tty_for",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -274,7 +274,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/mod.rs::SyntheticProcContext::synthetic_proc_context_observed::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2927,
+      "line": 2972,
       "item": "SyntheticProcContext::synthetic_proc_context_observed",
       "category": "proc",
       "expression": ".proc.lock()",
