@@ -1,0 +1,18 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running tests/snapshot.rs (target/el1-completion/live-review-round2/target/debug/deps/snapshot-cf670ed001b23def)
+
+running 1 test
+
+thread 'snapshot_failure_must_not_clone_live_authority' (11086968) panicked at src/aarch64.rs:865:17:
+cannot clone live PageTableManager when backing is unavailable: unresolved stage-1 arena host backing at IPA 0x100000
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test snapshot_failure_must_not_clone_live_authority ... FAILED
+
+failures:
+
+failures:
+    snapshot_failure_must_not_clone_live_authority
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test snapshot`

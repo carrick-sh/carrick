@@ -1,0 +1,15 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "--manifest-path",
+    "target/el1-completion/live-review-round2/Cargo.toml",
+    "--test",
+    "snapshot",
+    "--",
+    "--nocapture"
+  ],
+  "exit_code": 101,
+  "scope": "Frozen in-flight round-2 source; not final committed candidate"
+}
