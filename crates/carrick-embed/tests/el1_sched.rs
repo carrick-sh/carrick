@@ -710,6 +710,77 @@ fn el1_sched_host_blocked_read_resumes_by_guest_scheduling() {
     }
 }
 
+/// Contract `kernel.el1.guest-run-queue`, two live processes sharing vCPUs:
+/// each of a parent and its forked child runs a futex ping-pong between two
+/// threads pinned to guest CPUs 0 and 1, so both processes' threads hand off
+/// on the same two vCPUs at once. Both processes must complete every round
+/// trip (the child's exit status reaches the parent's `waitpid`), and every
+/// handoff is an in-guest wake. The host exits per round trip over the
+/// difference of a long and a short run are reported: EL1 does not switch
+/// address spaces (plan 1d leaves that open), so a vCPU that turns from one
+/// process's thread to the other's goes through its executor, and this
+/// number is the baseline an in-guest address-space switch must remove. It
+/// is bounded so a regression to host scheduling fails.
+#[test]
+fn el1_sched_two_processes_share_vcpus() {
+    const SHORT: u64 = 500;
+    const LONG: u64 = 3_000;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+    for iters in [SHORT, LONG, SHORT, LONG] {
+        let measured = run_fixture(
+            &carrier,
+            &["two-process", &iters.to_string()],
+            Duration::from_secs(120),
+        );
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched two-process iters={iters} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+            measured.exits,
+            measured.cpu_ns,
+            measured.wall.as_millis(),
+            measured.zone,
+            stdout.trim()
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            stdout.contains(&format!("two-process child round_trips={iters} "))
+                && stdout.contains(&format!("two-process parent round_trips={iters} "))
+                && stdout.contains("child_ok=true"),
+            "both processes must complete every round trip: {stdout:?}"
+        );
+        runs.push((iters, measured.exits, measured.zone, measured.cpu_ns));
+    }
+    let span = 2.0 * (LONG - SHORT) as f64;
+    for pair in runs.chunks(2) {
+        let (short, long) = (&pair[0], &pair[1]);
+        let exits = (long.1 as f64 - short.1 as f64) / span;
+        let per = |f: fn(&ZoneCounts) -> u64| (f(&long.2) as f64 - f(&short.2) as f64) / span;
+        let cross = per(|z| z.cross_wakes);
+        let services = per(|z| z.service_exits);
+        let claims = per(|z| z.host_queue_claims);
+        let cpu = (long.3 as f64 - short.3 as f64) / span;
+        println!(
+            "el1-sched two-process exits_per_rt={exits:.3} cross_wakes_per_rt={cross:.3} \
+             service_exits_per_rt={services:.3} host_queue_claims_per_rt={claims:.4} \
+             carrier_cpu_ns_per_rt={cpu:.0}"
+        );
+        assert!(
+            claims < 0.01,
+            "two processes' handoffs went through host run queues: {claims:.3} per round trip"
+        );
+        // Measured 7.5 per round trip at 1d (each turn of a vCPU between
+        // the two address spaces goes through its executor); bounded well
+        // above that so only a structural regression fails here.
+        assert!(
+            exits < 20.0,
+            "two processes sharing vCPUs cost {exits:.3} host exits per round trip"
+        );
+    }
+}
+
 /// Part (a) continued: a thread whose host-served `read` completes, queued
 /// on a vCPU that runs a thread computing without syscalls (both pinned to
 /// one guest CPU), gets that vCPU within the in-guest scheduler's slice. The
