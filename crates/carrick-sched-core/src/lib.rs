@@ -755,6 +755,9 @@ pub struct ZoneCounters {
     pub host_handbacks: AtomicU64,
     pub lost_adoptions: AtomicU64,
     pub stale_services: AtomicU64,
+    /// Threads ready at EL0 in another address space than their slot's,
+    /// which that slot's executor took off its run queue to load.
+    pub foreign_adoptions: AtomicU64,
     /// Queued (not running) threads a host claimant took off a run queue.
     pub host_queue_takes: AtomicU64,
     /// Host executor handoffs: runnable threads an executor took from a host
@@ -1090,7 +1093,8 @@ impl ZoneTables {
     }
 
     /// The executor of `slot`, stopped at an exit, takes the thread that
-    /// needs it from the head of its run queue (host-owned from here).
+    /// needs it from the head of its run queue (host-owned from here): a
+    /// service thread, or a thread ready at EL0 in another address space.
     pub fn take_service_head(&self, slot: SlotId) -> Option<RecordId> {
         let guard = self.slot_lock(slot, &SpinForever)?;
         let s = self.slot(slot);
@@ -1099,7 +1103,7 @@ impl ZoneTables {
         let Claim::Queued { slot: owner, seq } = rec.claim() else {
             return None;
         };
-        if owner != slot || !rec.needs_host() {
+        if owner != slot || !self.needs_executor(slot, rec) {
             return None;
         }
         if !rec.cas(Claim::Queued { slot, seq }, Claim::Host { seq }) {
@@ -1107,9 +1111,15 @@ impl ZoneTables {
         }
         self.remove_locked(&guard, record);
         drop(guard);
-        self.counters
-            .service_adoptions
-            .fetch_add(1, Ordering::Relaxed);
+        if rec.handback() == Some(Handback::Service) {
+            self.counters
+                .service_adoptions
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.counters
+                .foreign_adoptions
+                .fetch_add(1, Ordering::Relaxed);
+        }
         Some(record)
     }
 
@@ -1775,7 +1785,15 @@ impl ZoneTables {
     /// host instead of switching to it.
     pub fn head_needs_host(&self, slot: SlotId) -> bool {
         self.runnable_head(slot)
-            .is_some_and(|record| self.record(record).needs_host())
+            .is_some_and(|record| self.needs_executor(slot, self.record(record)))
+    }
+
+    /// Whether `slot` can run `rec` only through its executor: it needs host
+    /// service, or it is ready at EL0 in an address space other than the one
+    /// installed on the slot (EL1 does not switch address spaces), which its
+    /// executor loads.
+    fn needs_executor(&self, slot: SlotId, rec: &ZoneRecord) -> bool {
+        rec.needs_host() || self.slot(slot).mm() != rec.mm.load(Ordering::Relaxed)
     }
 
     /// Remove and return the head of `slot`'s run queue.
@@ -2281,7 +2299,6 @@ impl ZoneTables {
                 || rec.home().is_some()
                 || rec.is_cancelled()
                 || rec.host_wanted()
-                || !self.runs_mm_of(thief, rec)
                 || !rec.allows_cpu(cpu)
             {
                 continue;
@@ -2303,9 +2320,10 @@ impl ZoneTables {
             self.remove_locked(&guard, record);
             drop(guard);
             self.counters.el1_steals.fetch_add(1, Ordering::Relaxed);
-            // It needs its executor: queue it on the thief, whose idle loop
-            // then leaves for the host with it at its head.
-            if rec.needs_host() {
+            // It needs its executor (host service, or another address space
+            // than the thief's): queue it on the thief, whose idle loop then
+            // leaves for the host with it at its head.
+            if self.needs_executor(thief, rec) {
                 if let Some(own) = self.slot_lock(thief, &SpinForever) {
                     self.push_locked(&own, record, None);
                 }
@@ -2816,7 +2834,7 @@ impl ZoneTables {
         let c = &self.counters;
         writeln!(
             out,
-            "zone counters: el1_wakes={} host_wakes={} el1_parks={} host_parks={} switches={} steals={} service_exits={} host_service_placements={} host_ready_placements={} resched_kicks={} service_adoptions={} exit_adoptions={} host_handbacks={} lost_adoptions={} stale_services={} held_refusals={} host_queue_claims={} host_executor_parks={} host_queue_takes={}",
+            "zone counters: el1_wakes={} host_wakes={} el1_parks={} host_parks={} switches={} steals={} service_exits={} host_service_placements={} host_ready_placements={} resched_kicks={} service_adoptions={} exit_adoptions={} host_handbacks={} lost_adoptions={} stale_services={} held_refusals={} host_queue_claims={} host_executor_parks={} host_queue_takes={} foreign_adoptions={}",
             c.el1_wakes.load(Ordering::Relaxed),
             c.host_wakes.load(Ordering::Relaxed),
             c.el1_parks.load(Ordering::Relaxed),
@@ -2836,6 +2854,7 @@ impl ZoneTables {
             c.host_queue_claims.load(Ordering::Relaxed),
             c.host_executor_parks.load(Ordering::Relaxed),
             c.host_queue_takes.load(Ordering::Relaxed),
+            c.foreign_adoptions.load(Ordering::Relaxed),
         )?;
         for (index, record) in self.records.iter().enumerate().skip(1) {
             let claim = record.claim();
