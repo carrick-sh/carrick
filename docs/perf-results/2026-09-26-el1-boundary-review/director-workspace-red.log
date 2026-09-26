@@ -1,0 +1,22 @@
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-personality-boundary/carrick/crates/carrick-conformance-contract)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.76s
+     Running unittests src/lib.rs (target/debug/deps/carrick_conformance_contract-a87a7a364c0059ca)
+
+running 1 test
+test personality_boundary::tests::test_metadata_from_another_workspace_rejected ... FAILED
+
+failures:
+
+---- personality_boundary::tests::test_metadata_from_another_workspace_rejected stdout ----
+
+thread 'personality_boundary::tests::test_metadata_from_another_workspace_rejected' (10702242) panicked at crates/carrick-conformance-contract/src/personality_boundary.rs:1285:9:
+metadata must belong to the selected workspace
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    personality_boundary::tests::test_metadata_from_another_workspace_rejected
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-conformance-contract --lib`

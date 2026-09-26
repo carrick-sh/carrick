@@ -1,0 +1,35 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling syn v2.0.117
+   Compiling syn v3.0.3
+   Compiling thiserror-impl v2.0.20
+   Compiling thiserror v2.0.20
+   Compiling pest_generator v2.8.6
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling scroll_derive v0.13.1
+   Compiling pest_derive v2.8.6
+   Compiling dtrace-parser v0.3.0
+   Compiling scroll v0.13.0
+   Compiling goblin v0.10.5
+   Compiling zerocopy v0.8.48
+   Compiling serde v1.0.228
+   Compiling serde_tokenstream v0.2.3
+   Compiling usdt-impl v0.6.0
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling toml_edit v0.22.27
+   Compiling usdt-attr-macro v0.6.0
+   Compiling usdt-macro v0.6.0
+   Compiling dof v0.4.0
+   Compiling carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-guest-mem)
+   Compiling toml v0.8.23
+   Compiling usdt v0.6.0
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-observability)
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-conformance-contract)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.75s
+     Running `target/debug/check-personality-boundary --root . --metadata-file target/cargo-metadata.json`
+personality boundary checked: 2 substrate crate(s) clean
+  [PASS] crate `carrick-sched-core` (shipped deps: [], dev deps: [], scanned files: 4)
+  [PASS] crate `carrick-mmu-core` (shipped deps: ["foldhash", "hashbrown"], dev deps: ["carrick-mem"], scanned files: 2)
