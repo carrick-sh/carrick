@@ -161,3 +161,11 @@ all four cost scales; the existing research-ELF control remains ignored by its
 pre-existing external-fixture requirement. This is VM-free prerequisite proof
 only. Other shadow consumers, shared host/EL1 mutation exclusion, guest fault
 service, full CI, signed promotion and paired workload timing remain open.
+
+Verification of `28a096160`: the serial runtime library suite with
+`conformance-metrics` passed 622 tests; eight existing manual/research diagnostics
+were ignored. Targeted runtime/HVF all-target Clippy passed. `just lint-domains`
+returned zero on the committed source; its host-authority census explicitly
+reports Linux, FreeBSD and NetBSD profiles pending. Logs are retained beside
+the red witness. These results do not confer signed or cross-platform acceptance.
+The source-to-contract registry now names the live reader and its buffer tests.
