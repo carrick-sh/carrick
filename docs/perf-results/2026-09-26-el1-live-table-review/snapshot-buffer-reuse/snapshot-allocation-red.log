@@ -1,0 +1,26 @@
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.26s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-1d1f88d6a1eb2090)
+
+running 1 test
+scale=1 large_snapshot_allocations=1
+scale=8 large_snapshot_allocations=8
+scale=32 large_snapshot_allocations=32
+scale=128 large_snapshot_allocations=128
+
+thread 'aarch64::tests::recycled_live_images_do_not_reallocate_snapshot_buffers' (11800658) panicked at crates/carrick-mmu-core/src/aarch64.rs:3294:13:
+assertion `left == right` failed: warmed live image reuse allocated arena buffers at scale 1
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test aarch64::tests::recycled_live_images_do_not_reallocate_snapshot_buffers ... FAILED
+
+failures:
+
+failures:
+    aarch64::tests::recycled_live_images_do_not_reallocate_snapshot_buffers
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 82 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `-p carrick-mmu-core --lib`
