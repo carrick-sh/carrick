@@ -101,7 +101,7 @@ path = "crates/carrick-aarch64/src/engine.rs"
 contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime"]
 
 [[surfaces]]
-path = "crates/carrick-mem/src/page_table.rs"
+path = "crates/carrick-mmu-core/src/aarch64.rs"
 contracts = ["kernel.fork.stage1-image", "kernel.el1.gic"]
 
 [[surfaces]]

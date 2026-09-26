@@ -46,7 +46,7 @@
 //! and flips `SCTLR_EL1.M=1`; the per-page AP/PXN/UXN bits are shaped to dodge
 //! Apple Silicon's FEAT_PAN3 fault (full detail in that function's doc).
 //! Because the host edits the table bytes out-of-band (here at boot, and via
-//! [`crate::page_table`] at runtime) while the guest's stage-1 TLB is stale, the
+//! [`carrick_mmu_core::aarch64`] at runtime) while the guest's stage-1 TLB is stale, the
 //! EL1 maintenance trampoline ([`el1_maintenance_bytes`]) must run a
 //! `tlbi vmalle1is` before the guest can observe an edit.
 //!
@@ -253,7 +253,7 @@ pub const LINUX_EL1_VECTORS_SIZE: u64 = 0x4000;
 pub const LINUX_PAGE_TABLES_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x20000;
 // 1.75 MiB: six boot tables (L0, L1A, L1B, L2A, L2B, L3A in the first six 4 KiB
 // pages) plus a 442-page spare pool the runtime page-table manager
-// (`crate::page_table`) carves sub-tables from when it splits a coarse block to
+// (`carrick_mmu_core::aarch64`) carves sub-tables from when it splits a coarse block to
 // finer granularity for guest mprotect/PROT_NONE/munmap. The spare tail is
 // zero-filled (invalid descriptors). Sized up from 0x40000 (58 spare): each
 // distinct 2 MiB region that gets any 4 KiB-granular mapping holds one live L3
@@ -3290,7 +3290,7 @@ fn region_from_load_segments(
 ///   PAN check never fires on them.
 ///
 /// Buffer layout — eight 4 KiB tables in the first eight pages of the region,
-/// followed by the spare pool [`crate::page_table`] carves runtime sub-tables
+/// followed by the spare pool [`carrick_mmu_core::aarch64`] carves runtime sub-tables
 /// from (see [`LINUX_PAGE_TABLES_SIZE`]). All translation is identity (`IPA ==
 /// VA`) except the Rosetta high-VA alias:
 ///
