@@ -1,0 +1,17 @@
+    Checking smallvec v1.15.1
+    Checking serde_core v1.0.228
+    Checking bitflags v2.11.1
+    Checking log v0.4.29
+    Checking zerocopy v0.8.48
+    Checking thiserror v2.0.20
+    Checking scroll v0.13.0
+ Documenting carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mmu-core)
+    Checking parking_lot_core v0.9.12
+    Checking goblin v0.10.5
+    Checking parking_lot v0.12.5
+    Checking serde v1.0.228
+    Checking carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-guest-mem)
+    Checking carrick-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-abi)
+ Documenting carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-mem)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.14s
+   Generated /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/doc/carrick_mem/index.html and 1 other file
