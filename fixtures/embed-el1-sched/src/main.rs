@@ -1014,9 +1014,14 @@ fn mm_occupancy(forks: usize) -> i32 {
 
 fn mm_occupancy_process(role: &str, forks: usize) -> bool {
     let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as usize;
-    const MAX_WRITERS: usize = 128;
-    let writers = ((2 * cpus).max(4) & !1).min(MAX_WRITERS);
-    let region_len = writers * PAGE;
+    let writers = (2 * cpus).max(4) & !1;
+    let region_len = match writers.checked_mul(PAGE) {
+        Some(len) if len > 0 => len,
+        _ => {
+            println!("mm-occupancy {role} invalid writers {writers}");
+            return false;
+        }
+    };
     let region = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -1113,23 +1118,24 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
     let mut forked = 0;
     let mut snapshot_changes = 0;
     let mut child_failures = 0;
+    let mut snapshot_buf = vec![0u64; writers];
     for _ in 0..forks {
         let child = unsafe { libc::fork() };
         if child == 0 {
             // A fork child's memory is a copy as of the fork: the parent's
             // writers keep writing, and none of it may show up here.
-            let mut before = [0u64; MAX_WRITERS];
-            for id in 0..writers {
-                before[id] = unsafe { ((base + id * PAGE) as *const u64).read_volatile() };
+            let before = snapshot_buf.as_mut_slice();
+            for (id, slot) in before.iter_mut().enumerate() {
+                *slot = unsafe { ((base + id * PAGE) as *const u64).read_volatile() };
             }
             let spin = Instant::now();
             while spin.elapsed() < Duration::from_micros(500) {
                 std::hint::spin_loop();
             }
             let mut changed = false;
-            for id in 0..writers {
+            for (id, slot) in before.iter().enumerate() {
                 let after = unsafe { ((base + id * PAGE) as *const u64).read_volatile() };
-                if after != before[id] {
+                if after != *slot {
                     changed = true;
                     break;
                 }
