@@ -1,0 +1,74 @@
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-image)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-kernel)
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/experiments/native-syscall-slice)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 27.91s
+     Running unittests src/lib.rs (target/debug/deps/carrick_runtime-2411b783b91b973b)
+
+running 1 test
+test vcpu_loop::signal::first_touch_access_tests::frame_grant_claim_requires_the_exact_mm_fault_and_access ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 629 filtered out; finished in 0.00s
+
+     Running tests/integration/main.rs (target/debug/deps/integration-55210b3a9af6f52e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.00s
+
+     Running tests/interactive_tty.rs (target/debug/deps/interactive_tty-6aaabf2daa5cb692)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/live_bhyve_x86.rs (target/debug/deps/live_bhyve_x86-72793c4e5380ac21)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_nvmm_x86.rs (target/debug/deps/live_nvmm_x86-11f0ceb76bf39425)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/minherit_probe.rs (target/debug/deps/minherit_probe-fc67c02b37bf09b2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/runtime_loop.rs (target/debug/deps/runtime_loop-b5dec6fb7da984a3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/syscall_process.rs (target/debug/deps/syscall_process-4adab5d39a534918)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/thread_stress_harness.rs (target/debug/deps/thread_stress_harness-b5fe0913106d597c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/trap_hvf.rs (target/debug/deps/trap_hvf-12319bcb1d263c07)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+

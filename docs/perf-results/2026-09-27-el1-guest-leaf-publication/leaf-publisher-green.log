@@ -1,0 +1,11 @@
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-image)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.21s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-438fb741d9d260b3)
+
+running 1 test
+test aarch64::tests::guest_leaf_publication_validates_the_whole_span_before_exposing_it ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 94 filtered out; finished in 0.00s
+

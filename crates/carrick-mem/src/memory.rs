@@ -250,7 +250,7 @@ pub const LINUX_EL1_VECTORS_SIZE: u64 = 0x4000;
 // Shareable WB cacheable" memory (MAIR index 0). This is what
 // `ldaxr`/`stlxr` need to work — without it ARMv8 treats every data
 // access as Device-nGnRnE and exclusive ops are prohibited.
-pub const LINUX_PAGE_TABLES_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x20000;
+pub const LINUX_PAGE_TABLES_BASE: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE;
 // 1.75 MiB: six boot tables (L0, L1A, L1B, L2A, L2B, L3A in the first six 4 KiB
 // pages) plus a 442-page spare pool the runtime page-table manager
 // (`carrick_mmu_core::aarch64`) carves sub-tables from when it splits a coarse block to
@@ -264,7 +264,7 @@ pub const LINUX_PAGE_TABLES_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x20000;
 // Whole region stays inside the kernel hole's first 2 MiB block alongside the
 // maintenance trampoline (0x20000 + 0x1C0000 + maint 0x4000 = 0x1E4000 <
 // 0x200000), so it remains kernel-only.
-pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x1C0000;
+pub const LINUX_PAGE_TABLES_SIZE: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE;
 // Carrick-owned EL1 stage-1 maintenance trampoline. After the host edits page
 // descriptors (host backing of the table region), the stage-1 TLB is stale; the
 // guest can't observe the edit until a `tlbi`. arm64 public HVF has no stage-2
@@ -6983,10 +6983,19 @@ mod stage1_tests {
             l2b_base_pa & 0x0000_FFFF_FFE0_0000
         );
         assert_eq!(l2b_base_pa, LINUX_KERNEL_REGION_BASE);
+        let el1_first = ((LINUX_EL1_KERNEL_BASE - LINUX_KERNEL_REGION_BASE) >> 21) as usize;
+        let el1_end = el1_first + (LINUX_EL1_KERNEL_SIZE >> 21) as usize;
+        let dynamic_first = ((carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+            - LINUX_KERNEL_REGION_BASE)
+            >> 21) as usize;
+        let dynamic_end =
+            dynamic_first + (carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE >> 21) as usize;
         for index in 1..512usize {
             let d = read_u64_le(&bytes, 0x4000 + index * 8);
             assert!(valid_block(d), "L2_B[{}] must be a block", index);
-            if (32..64).contains(&index) {
+            if (el1_first..el1_end).contains(&index)
+                || (dynamic_first..dynamic_end).contains(&index)
+            {
                 assert_eq!(ap(d), 0b00, "L2_B[{}] EL1 block must use AP=00", index);
                 assert_eq!(pxn(d), 0, "L2_B[{}] PXN must be 0", index);
                 assert_eq!(uxn(d), 1, "L2_B[{}] UXN must be 1", index);

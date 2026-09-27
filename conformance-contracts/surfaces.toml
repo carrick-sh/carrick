@@ -6,7 +6,7 @@ contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.
 
 [[surfaces]]
 path = "crates/carrick-mem/src/memory.rs"
-contracts = ["hvpatch.syscall.portal", "kernel.el1.transparent", "kernel.vcpu.kick-el0-boundary", "kernel.el1.gic", "kernel.el1.guest-scheduler", "kernel.el1.fault-entry"]
+contracts = ["hvpatch.syscall.portal", "kernel.el1.transparent", "kernel.vcpu.kick-el0-boundary", "kernel.el1.gic", "kernel.el1.guest-scheduler", "kernel.el1.fault-entry", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_transparent.rs"

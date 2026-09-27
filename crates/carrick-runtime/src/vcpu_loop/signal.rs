@@ -300,6 +300,7 @@ fn apply_first_touch(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameGrantClaim {
     None,
+    ResponsePending,
     Refused,
     Accepted(carrick_el1_abi::FrameGrantRequest),
 }
@@ -319,6 +320,13 @@ fn claim_frame_grant_request(
     fault_va: u64,
     access: Option<carrick_mmu_core::aarch64::LeafAccess>,
 ) -> FrameGrantClaim {
+    if frame_grant_access(access).is_some_and(|actual| {
+        mailbox
+            .response_for_fault(mm_key, fault_va, actual)
+            .is_some()
+    }) {
+        return FrameGrantClaim::ResponsePending;
+    }
     let Some(request) = mailbox.claim_request() else {
         return FrameGrantClaim::None;
     };
@@ -397,6 +405,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         let mm_key = mutation.host_alias_permit().mm().raw();
         match claim_frame_grant_request(mailbox, mm_key, address, access) {
             FrameGrantClaim::None => {}
+            FrameGrantClaim::ResponsePending => return Ok(true),
             FrameGrantClaim::Refused => return Ok(true),
             FrameGrantClaim::Accepted(request) => {
                 let permit = mutation.host_alias_permit();
@@ -1424,6 +1433,15 @@ mod first_touch_access_tests {
         };
         assert_eq!(claimed, request);
         assert!(mailbox.publish_refusal(carrick_el1_abi::FRAME_GRANT_ERR_DENIED));
+        assert!(matches!(
+            claim_frame_grant_request(
+                &mailbox,
+                request.mm_key,
+                request.fault_va,
+                Some(LeafAccess::Write)
+            ),
+            FrameGrantClaim::ResponsePending
+        ));
         let response = mailbox
             .claim_response(request.mm_key, request.request_generation)
             .expect("claimed response");
