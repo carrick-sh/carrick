@@ -722,3 +722,11 @@ return wiring and an embed fixture, not host-only allocation. Worker runs host
 checks and compilation only; director retains signed execution and acceptance.
 This task has zero review rounds used; metadata-refusal is terminal after
 three rounds and director correction, not reopened.
+
+2026-09-26: full integrated CI on clean `b8a3ccea7` exits zero: 6,201
+passing tests, zero failures, 12 existing ignores across 101 Rust result
+groups. Complete hashed evidence is under metadata-refusal-director/
+integrated-ci/green/. This closes the host gate only; signed guest validation,
+first-touch structural acceptance and every later checkpoint remain open.
+The separate elastic metadata worker is active on its first turn; its exact
+dispatch brief is preserved under el1-elastic-metadata-director/dispatch.md.
