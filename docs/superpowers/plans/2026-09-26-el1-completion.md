@@ -792,3 +792,19 @@ weaken semantics, work budgets, concurrency, provenance or final acceptance.
 No additional cleanup or architecture extraction is admitted unless a
 reproduced blocker directly prevents guest allocation or first-touch service.
 Report milestones in guest behavior and host-exit slope, not commit/test count.
+
+2026-09-26: elastic metadata worker is terminal after initial implementation
+plus two review rounds (three turns); the broad delegation loop is now closed
+per the delivery ruling. No third review is dispatched. Its uncommitted final
+changes are preserved in worker checkpoint83972685e, explicitly unaccepted.
+Director takes over the same now-idle correction checkout. Fixed the actual
+Linux fixture to execute exactly one requested basic/growth/denial phase in
+2d3b55cc9; the prior fixture ignored the phase argument and ran all three.
+The static fixture cross-build passes. Started the focused signed witness via
+`CARRICK_RUN_ID=el1-allocator-director-red-20260926 RUSTC_WRAPPER= just test-embed
+el1_metadata_allocator_grows_and_returns_extents --nocapture` on that source.
+Log is in correction checkout target/el1-completion/allocator-director-red/.
+Do not edit its product source or relink while the run is active. No signed
+allocator result, integration acceptance or first-touch improvement is claimed.
+Remaining review includes coherent shared host backing and carrier-owned
+lifetime; use the actual focused failure to order direct corrections.
