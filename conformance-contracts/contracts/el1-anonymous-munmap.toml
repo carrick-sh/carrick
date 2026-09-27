@@ -12,16 +12,12 @@ semantic_authority = [
   "man 2 munmap: the address must be page aligned, the length must be nonzero, and pages intersecting the requested range are unmapped",
   "Hypervisor.framework hv_vm_unmap: retired stage-2 backing is removed before its IPA is returned for reuse",
 ]
-fixture = "embed:el1-sched resident-anonymous-munmap pages=256|1024|4096 rounds=4"
+fixture = "embed:el1-sched mapping-retirement pages=256|1024|4096 rounds=4"
 scale_points = [256, 1024, 4096]
 rationale = "EL1 increment 2 resident-anonymous munmap checkpoint. EL1 must validate the complete range under the exact-MM editor, retire each tagged live terminal descriptor, issue one ASID-scoped invalidation, and complete through one host boundary that authenticates the original syscall and returns all physical backing in bulk. The static fixture process has one additional eligible runtime cleanup served by EL1 and one fixed untagged runtime cleanup on the host fallback; both are asserted separately from the requested rounds. Untagged, shared, file-backed, partial-coarse-block, malformed and nonresident ranges remain on the existing host path. The descriptor walk and host exits must be bounded by terminal mappings and rounds, never Linux pages times rounds."
 structural_budgets = []
 
 [bindings]
 vm_free = "carrick-mmu-core::aarch64::tests::{allocation_free_guest_retirement_retires_complete_l2_and_l3_terminals,allocation_free_guest_retirement_refuses_partial_or_untagged_ranges}; carrick-el1::memory::tests::{resident_anonymous_munmap_retires_under_exact_mm_guard,malformed_or_ineligible_munmap_preserves_linux_fallback}"
-
-[bindings.unresolved]
-embed = "Signed resident-anonymous munmap ownership witness has not run yet."
-docker = "Same-source native arm64 munmap differential has not run yet."
-embed_structural = "Register exact EL1 retirement attempts, terminal edits, host completion boundaries, returned bytes and incremental exit slopes in the signed fixture."
-production = "The guest retirement editor and authenticated host completion are intentionally red at contract registration."
+embed = "carrick-embed::el1_sched::el1_anonymous_mapping_retirement_returns_and_reuses_frames (signed at implementation commit 73dfedec1; 256/1024/4096 pages, four rounds, 5 EL1-served munmaps plus one fixed host fallback at each scale, exact frame/byte return, physical reuse, incremental exit slopes 0.0039/0.0020 < 0.125, unentitled negative control and zero scoped cleanup; docs/perf-results/2026-09-27-el1-anonymous-munmap)"
+docker = "Exact static fixture on native arm64 ubuntu image sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517 at 256/1024/4096 pages; every row reports zero=true writes=true unmaps=true with empty stderr and zero scoped containers; docs/perf-results/2026-09-27-el1-anonymous-munmap"

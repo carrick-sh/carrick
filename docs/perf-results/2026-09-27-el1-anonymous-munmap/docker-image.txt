@@ -1,0 +1,8 @@
+server_version=29.8.0
+server_os=linux
+server_arch=arm64
+image=ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+image_id=sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+image_os=linux
+image_arch=arm64
+remaining_scoped_containers=0

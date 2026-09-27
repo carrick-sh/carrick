@@ -1,0 +1,10 @@
+
+running 1 test
+test el1_anonymous_mapping_retirement_returns_and_reuses_frames ... el1-sched mapping-retirement pages=256 rounds=4 exits=44 served_munmap=5 forwarded_munmap=1 grants=6 returns=6 reused=3 bytes_granted=4308992 bytes_returned=4308992 mapping-retirement pages=256 rounds=4 base=0x6000005000 zero=true writes=true unmaps=true
+el1-sched mapping-retirement pages=1024 rounds=4 exits=56 served_munmap=5 forwarded_munmap=1 grants=14 returns=14 reused=9 bytes_granted=16891904 bytes_returned=16891904 mapping-retirement pages=1024 rounds=4 base=0x6000005000 zero=true writes=true unmaps=true
+el1-sched mapping-retirement pages=4096 rounds=4 exits=80 served_munmap=5 forwarded_munmap=1 grants=38 returns=38 reused=27 bytes_granted=67223552 bytes_returned=67223552 mapping-retirement pages=4096 rounds=4 base=0x6000005000 zero=true writes=true unmaps=true
+el1-sched mapping-retirement slope 256->1024 pages rounds=4: exits_diff=12 slope=0.0039 exits/page/round
+el1-sched mapping-retirement slope 1024->4096 pages rounds=4: exits_diff=24 slope=0.0020 exits/page/round
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.32s
