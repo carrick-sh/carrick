@@ -11,6 +11,7 @@ Every stage-1 MMU edit transaction (`begin_undo` .. `sync_to_host` / `commit_und
 - **Zero-Allocation Rollback:** `rollback_undo` operates entirely within pre-admitted storage. It restores descriptors, truncates arena sizes, clears staged mutations, and pops extension arenas returning them to their source without performing a single heap allocation (`host_heap_allocations = 0`, `host_heap_bytes = 0`).
 - **Exact-Once Grant Lifecycles:** When `alloc_table` requests an extension arena from a `TableArenaSource`, any metadata allocation failure (such as failure to admit into `arenas` or `returned_bases`) returns the newly granted arena to the source immediately and exactly once.
 - **Authoritative Recovery & Subsequent Success:** After an allocation failure and rollback, existing descriptor pre-images, live translation walks, and owner identities are byte-for-byte preserved. Subsequent valid transactions succeed deterministically on the same manager and authority instances.
+- **Nonallocating Typed Error Lowering:** `PageTableError::MetadataAllocation` lowers to `MemoryError::MetadataAllocation` and `TrapError::MetadataAllocation` across production publication, rollback, and trap adapters without allocating error strings or heap memory.
 
 ## Coalescing and Reclamation Refusal Ordering Proofs
 
@@ -19,6 +20,7 @@ Coalescing (`try_coalesce`) and table reclamation (`reclaim_invalid_tables`, `re
    - If descriptor journaling or staged allocation fails during parent invalidation/update, the child table is never zeroed, never unlinked, and never pushed to `free_tables`.
    - The original child table and all leaf translations remain intact.
    - The operation returns `Err(PageTableError::MetadataAllocation)` and `coalesced = false`.
+   - Durable evidence: `docs/perf-results/2026-09-26-mmu-metadata-refusal-director/review-1/coalesce-witness.diff` and `coalesce-witness.log`.
 2. **Free-Bookkeeping Failure Ordering (`free_tables` Refusal):**
    - Before any descriptor write or table unlinking is performed, `free_tables.try_reserve(1)` is pre-admitted.
    - If `free_tables` capacity cannot be grown, the parent descriptor write is never attempted and the child table remains linked and untouched.
@@ -28,18 +30,24 @@ Coalescing (`try_coalesce`) and table reclamation (`reclaim_invalid_tables`, `re
 
 Empirical measurements from `test_metadata_refusal_witness_rollback_allocations` across scale points [1, 8, 32, 128]:
 
-| Extension Scale | Admission Allocations | Admission Bytes | Justified Max Allocs / Bytes | Rollback Allocations | Rollback Bytes | Popped Arenas |
+| Extension Scale | Admission Allocations | Admission Bytes | Derived Max Allocs / Bytes | Rollback Allocations | Rollback Bytes | Popped Arenas |
 |---|---|---|---|---|---|---|
-| **1** | 22 | 88,300 (~86 KiB) | 30 / 128 KiB | **0** | **0** | 1 |
-| **8** | 38 | 706,564 (~690 KiB) | 60 / 1 MiB | **0** | **0** | 8 |
-| **32** | 70 | 2,827,412 (~2.7 MiB) | 120 / 4 MiB | **0** | **0** | 32 |
-| **128** | 175 | 23,893,668 (~22.8 MiB) | 250 / 32 MiB | **0** | **0** | 128 |
+| **1** | 22 | 88,300 (~86 KiB) | 31 / 268 KiB | **0** | **0** | 1 |
+| **8** | 38 | 706,564 (~690 KiB) | 83 / 1.7 MiB | **0** | **0** | 8 |
+| **32** | 70 | 2,827,412 (~2.7 MiB) | 137 / 6.6 MiB | **0** | **0** | 32 |
+| **128** | 175 | 23,893,668 (~22.8 MiB) | 263 / 26.2 MiB | **0** | **0** | 128 |
 
-### Data Structure Growth Rationale
-- `journal.words` and `journal.first_written` grow via geometric amortized reallocation ($O(\log K)$ allocations across scale $K$).
-- `journal.returned_bases` and `arenas` use geometric `try_reserve` ($O(\log K)$ capacity reallocations), preventing linear exact-reallocation thrash.
-- Attached arena buffers contribute $K \times \text{PT\_PAGE}$ byte backing plus amortized metadata overhead.
-- Rollback performs strictly **0** allocations and **0** heap bytes across all scale points.
+### Derived Admission Budget Rationale
+- **Per-Arena Backing:** Each attached extension arena allocates its `PT_PAGE = 4096` byte backing buffer (where `extension_arena_capacity = PT_PAGE = 4096`).
+- **Amortized Geometric Growth:** Seven dynamic collections (`arenas`, `free_tables`, `staged`, `dirty`, `journal.words`, `journal.first_written`, `journal.returned_bases`) expand via geometric capacity doubling. Over a run attaching $K$ arenas, each container experiences at most $\lceil \log_2(K) \rceil + 2$ reallocations.
+- **Common Derived Allocation Bound:**
+  $$\text{max\_allocations}(K) = 15 + K + 15 \times (\lfloor \log_2(K) \rfloor + 1)$$
+  (Scale 1: 31, Scale 8: 83, Scale 32: 137, Scale 128: 263).
+- **Common Derived Byte Bound:**
+  $$\text{max\_bytes}(K) = 64\text{ KiB} + K \times (\text{PT\_PAGE} + 200\text{ KiB})$$
+  (Scale 1: 268 KiB, Scale 8: 1.7 MiB, Scale 32: 6.6 MiB, Scale 128: 26.2 MiB).
+- **Negative Control Verification:** `test_metadata_refusal_negative_control_detects_exact_reallocation_regression` demonstrates that linear exact reallocation (e.g. `try_reserve_exact(needed_capacity)` while `len == 0`) incurs 128 reallocations for a single container at $K=128$, violating the derived $O(\log K)$ logarithmic growth budget.
+- **Rollback Invariant:** Rollback performs strictly **0** allocations and **0** heap bytes across all scale points.
 
 ## Infallible Allocation Operations and Remaining Denominator
 

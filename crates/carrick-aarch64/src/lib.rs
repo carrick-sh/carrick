@@ -35,7 +35,8 @@ pub mod vmm;
 
 pub use engine::{
     Aarch64EngineCore, Aarch64ResidentTaskMetadata, Aarch64TaskEngineState,
-    Aarch64TaskRuntimeProjection,
+    Aarch64TaskRuntimeProjection, memory_error_to_trap_error, page_table_error_to_memory_error,
+    page_table_rollback_error_to_memory_error, page_table_sync_error_to_memory_error,
 };
 pub use stage1_authority::{ShareState, Stage1Authority, Stage1Editor, Stage1ImagePool};
 pub use vmm::{
