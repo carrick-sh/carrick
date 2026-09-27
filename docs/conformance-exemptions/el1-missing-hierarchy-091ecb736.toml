@@ -1,0 +1,22 @@
+schema = "carrick.conformance-exemption.v1"
+base = "023182c250156d3fc30115456f723b5044510b52"
+head = "091ecb736e84b5f359481edb547752be485b4353"
+contracts = [
+  "hvpatch.syscall.portal",
+  "kernel.el1.fault-entry",
+  "kernel.el1.gic",
+  "kernel.el1.guest-run-queue",
+  "kernel.el1.guest-scheduler",
+  "kernel.el1.metadata-allocation",
+  "kernel.el1.transparent",
+  "kernel.fork.stage1-image",
+  "kernel.mm.metadata-refusal",
+  "kernel.vcpu.kick-el0-boundary",
+]
+paths = [
+  "crates/carrick-el1-abi/src/lib.rs",
+  "crates/carrick-el1/src/fault.rs",
+  "crates/carrick-mem/src/memory.rs",
+  "crates/carrick-mmu-core/src/aarch64.rs",
+]
+rationale = "The exact product diff implements the registered kernel.el1.stage1-publication missing-hierarchy transaction. Shared ABI constants move the existing null-guard and GIC-window literal values to the ABI without changing their values or layouts; memory continues to consume those same values. Fault routing and mailbox layout are unchanged. The shared manager now publishes terminal descriptors before table pointers and descendant pointers before ancestors, strengthening live visibility without changing fork snapshots, GIC exclusion, metadata-refusal rollback or existing protection semantics. The complete 97-test MMU suite and 174-test memory suite pass, including fork image, GIC exclusion, metadata refusal, rollback, live synchronization and EL1 vector controls; targeted warning-denied Clippy and the bare-metal EL1 release build also pass."
