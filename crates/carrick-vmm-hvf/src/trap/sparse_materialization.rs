@@ -1070,6 +1070,9 @@ pub(super) fn publish_replacing(
                             "sparse HVPatch mmap sync_to_host failed: {other:?}"
                         )),
                     })?;
+                    carrick_observability::probes::hvpatch_sparse_boundary_with(end, || unsafe {
+                        editor.debug_walk_host(&page_table_resolver, end).ok()
+                    });
                     replaced_valid_descriptor = editor.manager.undo_replaced_valid_descriptor();
                     #[cfg(test)]
                     if STAGE2_AUDIT_STATE.with(|state| state.borrow().fail_sparse_publication_after_sync) {

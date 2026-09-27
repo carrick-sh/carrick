@@ -716,6 +716,76 @@ fn lazy_anonymous_mmap_arms_first_touch_without_accessible_backing() {
 }
 
 #[test]
+fn lazy_fixed_anonymous_replacement_rearms_first_touch_after_retirement() {
+    const SYS_MMAP: u64 = 222;
+    const LENGTH: u64 = 1024 * 1024;
+
+    let dispatcher = SyscallDispatcher::new();
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1001));
+    let reporter = CompatReporter::default();
+    let mut memory =
+        CountingMmapMemory::new(LINUX_MMAP_BASE, LENGTH as usize).with_defer_anon(true);
+    let prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
+
+    let initial = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                0,
+                LENGTH,
+                prot,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ]),
+        ),
+    );
+    let address = returned(initial) as u64;
+    assert_eq!(address, LINUX_MMAP_BASE);
+    memory.protect_log.borrow_mut().clear();
+
+    let replacement = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                address,
+                LENGTH,
+                prot,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                u64::MAX,
+                0,
+            ]),
+        ),
+    );
+
+    assert_eq!(returned(replacement), address as i64);
+    assert_eq!(
+        memory.unmap_calls.get(),
+        1,
+        "replacement must retire old backing"
+    );
+    assert_eq!(
+        *memory.protect_log.borrow(),
+        vec![(address, LENGTH as usize, 0)],
+        "a lazy fixed replacement must remain inaccessible until first touch"
+    );
+    assert_eq!(
+        dispatcher.with_resident_fault_plan_for_test(address, |plan| plan.prot()),
+        Some(prot),
+        "the replacement must arm the same bulk first-touch route as a fresh mmap"
+    );
+}
+
+#[test]
 fn native16k_rejects_shared_write_exec_mmap() {
     const SYS_MMAP: u64 = 222;
     const PAGE_SIZE: u64 = 16 * 1024;

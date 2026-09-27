@@ -1,0 +1,28 @@
+schema_version = 1
+id = "kernel.el1.anonymous-retirement"
+title = "Guest EL1 anonymous mappings retire and reuse bulk frames"
+guest_surfaces = [
+  "syscall:mmap",
+  "syscall:munmap",
+  "fault:first-touch",
+  "kernel:stage1-mmu",
+  "kernel:frame-inventory",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 mmap: a fresh MAP_PRIVATE | MAP_ANONYMOUS mapping is zero-filled even when it reuses a previously unmapped virtual range",
+  "man 2 munmap: references to pages in the unmapped range are invalid and the mapping may be replaced by a later mmap",
+  "Hypervisor.framework hv_vm_unmap: retired stage-2 backing is removed before its IPA is returned for reuse",
+]
+fixture = "embed:el1-sched mapping-retirement 256|1024|4096"
+scale_points = [256, 1024, 4096]
+rationale = "EL1 increment 2 mapping-retirement checkpoint. Each run repeatedly maps one private anonymous range at the same virtual address, verifies complete zero fill, writes every Linux page, unmaps the range, and maps it again. Host diagnostics bind every successfully published EL1 frame-grant lease to its eventual exact allocator return and report whether a later grant reused a returned IPA. The signed three-scale witness requires all grant bytes to return, at least one physical lease to be reused, and incremental host exits below 0.125 per added page per round. This proves semantic replacement, physical return, zeroed reuse and bulk rather than page-granular host work; it does not by itself migrate the munmap syscall into EL1."
+structural_budgets = []
+
+[bindings]
+embed = "carrick-embed::el1_sched::el1_anonymous_mapping_retirement_returns_and_reuses_frames"
+
+[bindings.unresolved]
+vm_free = "Inventory and allocator unit contracts cover exact retirement transactions, but cannot execute the EL1 fault path or prove that signed guest munmap returns its frame-grant leases."
+docker = "Run the same mapping-retirement fixture on native arm64 Linux and bind the transcript before checkpoint-2 acceptance."
+production = "Signed guest execution, exact frame-grant return counters, repeated physical IPA reuse, permission-denial coverage and EL1 syscall ownership remain open until the bound witness and later permission migration pass."

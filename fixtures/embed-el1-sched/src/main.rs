@@ -56,6 +56,10 @@
 //!   same inherited virtual range: verify zero fill, write distinct role values,
 //!   rendezvous via bounded pipes, and verify role values are preserved.
 //!
+//! - `mapping-retirement <pages> <rounds>` (EL1 increment 2): repeatedly maps
+//!   one private anonymous range at the same VA, verifies every byte is zero,
+//!   writes every Linux page, verifies the writes, and unmaps the whole range.
+//!
 //! - `fault-entry`: triggers a stage-1 permission fault on a PROT_READ mapping,
 //!   catches SIGSEGV with SA_SIGINFO, verifies si_addr, mprotects PROT_READ|PROT_WRITE,
 //!   retries store, and verifies store success and register preservation.
@@ -1415,6 +1419,110 @@ fn first_touch(pages: usize) -> i32 {
     if parent_ok && child_ok { 0 } else { 1 }
 }
 
+fn mapping_retirement(pages: usize, rounds: usize) -> i32 {
+    let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size_raw <= 0 {
+        println!("mapping-retirement invalid page size {page_size_raw}");
+        return 1;
+    }
+    let page_size = page_size_raw as usize;
+    if pages == 0 || pages > 65_536 || rounds < 2 || rounds > 32 {
+        println!(
+            "mapping-retirement invalid pages={pages} rounds={rounds} page_size={page_size}"
+        );
+        return 1;
+    }
+    let Some(len) = pages.checked_mul(page_size).filter(|len| *len > 0) else {
+        println!("mapping-retirement overflowing pages={pages} page_size={page_size}");
+        return 1;
+    };
+    unsafe { libc::alarm(90) };
+
+    let mut fixed_base = 0usize;
+    for round in 0..rounds {
+        let requested = if round == 0 {
+            std::ptr::null_mut()
+        } else {
+            fixed_base as *mut libc::c_void
+        };
+        let flags = libc::MAP_PRIVATE
+            | libc::MAP_ANONYMOUS
+            | if round == 0 { 0 } else { libc::MAP_FIXED };
+        let region = unsafe {
+            libc::mmap(
+                requested,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags,
+                -1,
+                0,
+            )
+        };
+        if region == libc::MAP_FAILED {
+            println!("mapping-retirement mmap failed round={round}");
+            return 1;
+        }
+        if round == 0 {
+            fixed_base = region as usize;
+        } else if region as usize != fixed_base {
+            println!(
+                "mapping-retirement wrong VA round={round} actual={:#x} expected={fixed_base:#x}",
+                region as usize
+            );
+            unsafe { libc::munmap(region, len) };
+            return 1;
+        }
+
+        let words = len / core::mem::size_of::<u64>();
+        for word in 0..words {
+            let value = unsafe { std::ptr::read_volatile((region as *const u64).add(word)) };
+            if value != 0 {
+                println!(
+                    "mapping-retirement stale byte round={round} word={word} value={value:#x}"
+                );
+                unsafe { libc::munmap(region, len) };
+                return 1;
+            }
+        }
+        for page in 0..pages {
+            let value = 0xC411_0000_0000_0000u64
+                ^ ((round as u64) << 32)
+                ^ page as u64;
+            unsafe {
+                std::ptr::write_volatile(
+                    (region as *mut u8).add(page * page_size).cast::<u64>(),
+                    value,
+                );
+            }
+        }
+        for page in 0..pages {
+            let expected = 0xC411_0000_0000_0000u64
+                ^ ((round as u64) << 32)
+                ^ page as u64;
+            let actual = unsafe {
+                std::ptr::read_volatile(
+                    (region as *const u8).add(page * page_size).cast::<u64>(),
+                )
+            };
+            if actual != expected {
+                println!(
+                    "mapping-retirement write mismatch round={round} page={page} actual={actual:#x} expected={expected:#x}"
+                );
+                unsafe { libc::munmap(region, len) };
+                return 1;
+            }
+        }
+        if unsafe { libc::munmap(region, len) } != 0 {
+            println!("mapping-retirement munmap failed round={round}");
+            return 1;
+        }
+    }
+    println!(
+        "mapping-retirement pages={pages} rounds={rounds} base={fixed_base:#x} zero=true writes=true unmaps=true"
+    );
+    0
+}
+
 static FAULT_COUNT: AtomicU32 = AtomicU32::new(0);
 static FAULT_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static FAULT_MMAP_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2054,6 +2162,10 @@ fn main() {
                 }
             },
         },
+        "mapping-retirement" => mapping_retirement(
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
+            args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
+        ),
         "fault-entry" => fault_entry_mode(),
         "metadata-allocator" => {
             metadata_allocator_mode(args.get(2).map(String::as_str).unwrap_or(""))

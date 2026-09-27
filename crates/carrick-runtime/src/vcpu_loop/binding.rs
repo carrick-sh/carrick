@@ -4111,6 +4111,13 @@ where
                 // descriptor reads, and it was running on EVERY data abort to
                 // feed two probes that are a no-op with no D script attached.
                 crate::probes::pt_fault_with(far, || engine.diagnostic_fault_page_tables(far));
+                if let Some(next_page) = (far & !0xfff_u64).checked_add(4096) {
+                    crate::probes::pt_fault_next_with(next_page, || {
+                        engine
+                            .diagnostic_fault_page_tables(next_page)
+                            .map(|(_, descriptors)| descriptors)
+                    });
+                }
                 if let Some(process) = self.kernel.hvpatch_process.as_ref() {
                     process.trace_fault(syndrome, elr, far, self.state.this_tid);
                 }

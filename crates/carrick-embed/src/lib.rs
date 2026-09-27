@@ -145,7 +145,10 @@ pub use carrick_kernel::observe::{
 };
 pub use carrick_kernel::run_result::{RunResult, RuntimeError, TerminalReason};
 pub use carrick_runtime::compat::CompatReport;
-pub use carrick_runtime::{read_el1_counters, reset_el1_counters, vcpu_run_exits_total};
+pub use carrick_runtime::{
+    El1FrameGrantStats, el1_frame_grant_stats, read_el1_counters, reset_el1_counters,
+    vcpu_run_exits_total,
+};
 pub use carrick_spec::{
     Mount, MountSpec, NetworkSpec, Platform, ProcessSpec, ResourceSpec, RunSpec, SecuritySpec,
     StdioMode,

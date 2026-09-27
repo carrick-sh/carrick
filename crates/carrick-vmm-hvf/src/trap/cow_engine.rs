@@ -1043,8 +1043,22 @@ impl HvfVmState {
         }
         register_shared_alias(published.alias);
         drop(registry);
+        let physical_grant = (
+            published.alias.physical_ipa,
+            published.alias.physical_size as u64,
+        );
         self.mappings.insert(published.region);
         transition.commit();
+        mark_el1_frame_grant_in(self.custody(), physical_grant.0, physical_grant.1).unwrap_or_else(
+            |error| {
+            carrick_fatal!(
+                "hvpatch::el1_frame_grant",
+                "published EL1 frame grant could not bind allocator diagnostics: ipa=0x{:x} len=0x{:x} error={error}",
+                physical_grant.0,
+                physical_grant.1,
+            );
+            },
+        );
         Ok(Some(published.ready))
     }
 
