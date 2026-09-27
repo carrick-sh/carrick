@@ -1897,29 +1897,34 @@ fn fault_entry_mode() -> i32 {
     0
 }
 
-fn metadata_allocator_mode() -> i32 {
-    // 1. Basic allocation, alignment (16, 32, 64, 128, 4096), memory writes, verification, and free
-    let res1 = unsafe { raw6(carrick_el1_abi::SYS_CARRICK_EL1_CONTROL, 1, 1, 0, 0, 0, 0) };
-    if res1 != 0 {
-        println!("metadata-allocator basic test failed: rc={res1}");
+fn metadata_allocator_mode(phase: &str) -> i32 {
+    // Each invocation executes one phase so the host can arm grant refusal
+    // only after ordinary growth/return has completed in this carrier.
+    let subtest = match phase {
+        "basic" => 1,
+        "growth" => 2,
+        "denial" => 3,
+        _ => {
+            eprintln!("metadata-allocator requires basic, growth, or denial");
+            return 2;
+        }
+    };
+    let result = unsafe {
+        raw6(
+            carrick_el1_abi::SYS_CARRICK_EL1_CONTROL,
+            1,
+            subtest,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    if result != 0 {
+        println!("metadata-allocator {phase} failed: rc={result}");
         return 1;
     }
-
-    // 2. Force growth beyond 9 MiB bootstrap capacity (allocating 10 MiB) into dynamic extents, write, verify, and return
-    let res2 = unsafe { raw6(carrick_el1_abi::SYS_CARRICK_EL1_CONTROL, 1, 2, 0, 0, 0, 0) };
-    if res2 != 0 {
-        println!("metadata-allocator dynamic growth and return test failed: rc={res2}");
-        return 1;
-    }
-
-    // 3. Exercise denied host grant failpoint followed by recovery and retry
-    let res3 = unsafe { raw6(carrick_el1_abi::SYS_CARRICK_EL1_CONTROL, 1, 3, 0, 0, 0, 0) };
-    if res3 != 0 {
-        println!("metadata-allocator denied grant and recovery test failed: rc={res3}");
-        return 1;
-    }
-
-    println!("metadata-allocator ok");
+    println!("metadata-allocator {phase} ok");
     0
 }
 
@@ -1955,7 +1960,9 @@ fn main() {
             },
         },
         "fault-entry" => fault_entry_mode(),
-        "metadata-allocator" => metadata_allocator_mode(),
+        "metadata-allocator" => {
+            metadata_allocator_mode(args.get(2).map(String::as_str).unwrap_or(""))
+        }
         "exec-child" => {
             println!("exec-child ok");
             0
