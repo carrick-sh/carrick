@@ -9,6 +9,27 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_FRAME_GRANT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static LAST_FRAME_GRANT_PUBLICATION_ERROR: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(target_os = "none", test))]
+fn publication_error_code(error: carrick_mmu_core::aarch64::GuestLeafPublicationError) -> u64 {
+    use carrick_mmu_core::aarch64::GuestLeafPublicationError;
+
+    match error {
+        GuestLeafPublicationError::BadRange => 1,
+        GuestLeafPublicationError::TableOutsidePrimary => 2,
+        GuestLeafPublicationError::MissingTable => 3,
+        GuestLeafPublicationError::InvalidLeafShape => 4,
+        GuestLeafPublicationError::AlreadyValid => 5,
+        GuestLeafPublicationError::RetiredLeaf => 6,
+    }
+}
+
+/// Return the last guest leaf-publication refusal for the EL1 panic bridge.
+/// Zero means the panic did not follow that publication boundary.
+pub fn panic_publication_detail() -> u64 {
+    LAST_FRAME_GRANT_PUBLICATION_ERROR.load(Ordering::Relaxed)
+}
 
 fn next_frame_grant_generation() -> u64 {
     loop {
@@ -44,6 +65,7 @@ struct HardwareFrameGrantLeafPublisher;
 impl FrameGrantLeafPublisher for HardwareFrameGrantLeafPublisher {
     fn publish_and_invalidate(&mut self, ttbr0: u64, ready: FrameGrantReady) -> bool {
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+        LAST_FRAME_GRANT_PUBLICATION_ERROR.store(0, Ordering::Relaxed);
         let result = unsafe {
             carrick_mmu_core::aarch64::publish_existing_invalid_private_pages(
                 carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE
@@ -59,7 +81,9 @@ impl FrameGrantLeafPublisher for HardwareFrameGrantLeafPublisher {
                 },
             )
         };
-        if result.is_err() {
+        if let Err(error) = result {
+            LAST_FRAME_GRANT_PUBLICATION_ERROR
+                .store(publication_error_code(error), Ordering::Relaxed);
             return false;
         }
         let mut cpu = crate::sched::HardwareCpu;
@@ -174,6 +198,36 @@ mod tests {
         EL1_FRAME_GRANT_TARGET_SIZE, FRAME_GRANT_ERR_DENIED, FrameGrantMailbox, FrameGrantReady,
     };
     use carrick_sched_core::AddressSpaces;
+
+    #[test]
+    fn guest_leaf_publication_errors_have_stable_panic_detail_codes() {
+        use carrick_mmu_core::aarch64::GuestLeafPublicationError;
+
+        assert_eq!(
+            publication_error_code(GuestLeafPublicationError::BadRange),
+            1
+        );
+        assert_eq!(
+            publication_error_code(GuestLeafPublicationError::TableOutsidePrimary),
+            2
+        );
+        assert_eq!(
+            publication_error_code(GuestLeafPublicationError::MissingTable),
+            3
+        );
+        assert_eq!(
+            publication_error_code(GuestLeafPublicationError::InvalidLeafShape),
+            4
+        );
+        assert_eq!(
+            publication_error_code(GuestLeafPublicationError::AlreadyValid),
+            5
+        );
+        assert_eq!(
+            publication_error_code(GuestLeafPublicationError::RetiredLeaf),
+            6
+        );
+    }
 
     #[derive(Default)]
     struct RecordingPublisher {

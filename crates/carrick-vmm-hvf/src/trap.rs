@@ -7688,9 +7688,14 @@ impl HvfInner {
                 let spsr_el1 = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
                 let x0 = vcpu.get_reg(Reg::X0).unwrap_or(0);
                 if x0 == carrick_el1_abi::PANIC_SENTINEL {
+                    let source_line = vcpu.get_reg(Reg::X1).unwrap_or(0);
+                    let source_column = vcpu.get_reg(Reg::X2).unwrap_or(0);
+                    let publication_detail = vcpu.get_reg(Reg::X3).unwrap_or(0);
                     carrick_fatal!(
                         "el1",
-                        "EL1 panic handler invoked: panic sentinel {x0:#x} at elr_el1={elr_el1:#x}"
+                        "EL1 panic handler invoked: panic sentinel {x0:#x} at elr_el1={elr_el1:#x}; \
+                         source_line={source_line} source_column={source_column} \
+                         frame_grant_publication_detail={publication_detail}"
                     );
                 }
                 if is_stage1_cow_write_fault(esr_el1) {
