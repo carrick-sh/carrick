@@ -821,6 +821,73 @@ impl MmAccessState {
         Ok(())
     }
 
+    /// Retire every stage-1 extension arena this mm published: each owner in
+    /// the root-slot arena other than the mm's own root slot. The runtime's
+    /// slot allocator returns the mm's extension slots at retirement
+    /// completion; before this, their structural owners outlived the process
+    /// (terminal retirement forgets rows it did not retire), the pooled slot
+    /// stayed checked out, and the next address space the runtime handed the
+    /// same slot failed to publish it ("still held by the root-slot pool").
+    /// Returns the retired physical extents.
+    pub(crate) fn retire_stage1_extension_owners_in(
+        &self,
+        custody: &CarrierVmCustody,
+        root_slot: Option<(u64, u64)>,
+    ) -> Result<Vec<(u64, usize)>, TrapError> {
+        self.retire_stage1_extension_owners_in_using(
+            custody,
+            root_slot,
+            &mut unmap_global_frame_stage2_record,
+        )
+    }
+
+    pub(crate) fn retire_stage1_extension_owners_in_using(
+        &self,
+        custody: &CarrierVmCustody,
+        root_slot: Option<(u64, u64)>,
+        unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    ) -> Result<Vec<(u64, usize)>, TrapError> {
+        const ARENA_START: u64 = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
+        const ARENA_END: u64 = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE
+            + carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE;
+        let in_root_slot =
+            |ipa: u64| root_slot.is_some_and(|(base, size)| ipa >= base && ipa - base < size);
+        let page_tables = self.page_tables.read();
+        page_tables.with_retirement_exclusion(|_| {
+            let extensions: Vec<_> = self
+                .structural_owners
+                .read()
+                .iter()
+                .filter(|((ipa, _), _)| {
+                    (ARENA_START..ARENA_END).contains(ipa) && !in_root_slot(*ipa)
+                })
+                .map(|(&key, owner)| (key, std::sync::Arc::clone(owner)))
+                .collect();
+            let mut retired = Vec::with_capacity(extensions.len());
+            for ((ipa, size), owner) in extensions {
+                let identity = owner.record_identity();
+                owner
+                    .retained
+                    .owner_retired
+                    .store(true, std::sync::atomic::Ordering::Release);
+                retry_structural_backing_identities_in_using(
+                    custody,
+                    &[identity],
+                    unmap,
+                    &mut release_retired_stage2_ipa,
+                )?;
+                if let Some(snapshot) = custody.stage2_record_snapshot(identity.record_id) {
+                    return Err(TrapError::Hypervisor(format!(
+                        "stage-1 extension arena 0x{ipa:x} structural record remained nonterminal: {snapshot:?}"
+                    )));
+                }
+                self.release_structural_owner_at(ipa, size);
+                retired.push((ipa, size));
+            }
+            Ok(retired)
+        })
+    }
+
     pub(crate) fn retire_mm_root_stage2_in(
         &self,
         custody: &CarrierVmCustody,
@@ -873,10 +940,19 @@ impl MmAccessState {
                 ));
             }
 
-            let copied_bytes = manager.map_or(0, |m| m.copied_bytes());
+            // The host manager's cursor covers only its own table pages;
+            // guest EL1 allocates at the top of the same primary arena. The
+            // next occupant of a pooled slot reads it as zero beyond its
+            // image, so the zeroing prefix is measured from the slot itself.
+            let copied_bytes = manager.map_or(0, |m| m.copied_bytes()) as usize;
+            // SAFETY: the owner keeps its `len()`-byte slot backing mapped, and
+            // retirement exclusion keeps every stage-1 editor out of it.
+            let occupied = carrick_mmu_core::aarch64::table_image_populated_prefix(unsafe {
+                std::slice::from_raw_parts(authority.owner.ptr().cast_const(), authority.owner.len())
+            });
             authority
                 .owner
-                .record_populated_prefix(copied_bytes as usize);
+                .record_populated_prefix(copied_bytes.max(occupied));
 
             authority
                 .owner
