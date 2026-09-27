@@ -1,0 +1,9 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.05s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-d63dbca9ffee398f)
+
+running 1 test
+test trap::frame_inventory::tests::shared_process_exec_splits_inventory_without_retiring_parent_ledger ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.02s
+

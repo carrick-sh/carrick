@@ -1390,6 +1390,25 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
 fn shared_process_exec_splits_inventory_without_retiring_parent_ledger() {
     let mut task = hvpatch_task_state_test_fixture(8, 0x8000, 8);
     task.shared_process_mm = true;
+    let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
+        carrick_mem::memory::stage1_hvpatch_page_tables(),
+        crate::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+    );
+    let parent_va = 0x6000_2000_0000;
+    let parent_ipa = 0x9b00_7700_0000;
+    tables
+        .map_aliased(parent_va, parent_ipa, 0x4000, true, None)
+        .unwrap();
+    let parent_tables = carrick_aarch64::Stage1Authority::new_with_manager(Some(tables));
+    task.mm_access
+        .bind_page_tables_authority(parent_tables.clone());
+    assert_eq!(
+        parent_tables
+            .with_manager(|m| m.translate(parent_va))
+            .flatten(),
+        Some(parent_ipa)
+    );
     let parent_ledger = task.frame_inventory.shared_ledger();
     parent_ledger.lock().initialized = true;
     let (_unused, replacement) = inventory_pair(11);
@@ -1397,6 +1416,13 @@ fn shared_process_exec_splits_inventory_without_retiring_parent_ledger() {
     task.begin_exec_inventory(None, replacement)
         .expect("arm shared-process exec inventory");
 
+    assert_eq!(
+        parent_tables
+            .with_manager(|m| m.translate(parent_va))
+            .flatten(),
+        Some(parent_ipa),
+        "preparing a vfork child exec must preserve the live parent's table authority",
+    );
     let replacement_ledger = task.frame_inventory.shared_ledger();
     assert!(!std::sync::Arc::ptr_eq(&parent_ledger, &replacement_ledger));
     assert!(parent_ledger.lock().initialized);

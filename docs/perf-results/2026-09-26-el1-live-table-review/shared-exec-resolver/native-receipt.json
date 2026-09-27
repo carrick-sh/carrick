@@ -1,0 +1,59 @@
+{
+  "image": "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+  "rootfs": {
+    "Type": "layers",
+    "Layers": [
+      "sha256:d9a56420aee7ff835e0c05fc666d1237d40f0da5fe338738e651b01db4672a5d"
+    ]
+  },
+  "rows": [
+    {
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--name",
+        "el1-forkexecstorm-native-musl-20260926",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "-v",
+        "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/forkexecstorm:/probe:ro",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/bin/sh",
+        "-c",
+        "/probe"
+      ],
+      "exit_code": 0,
+      "match": true,
+      "leftover": "",
+      "sha256": "9c60c719df749ec890cf45326c0b9ba1490a19ecd00a086bfeda6f0f87d8ba73"
+    },
+    {
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--name",
+        "el1-forkexecstorm-native-gnu-20260926",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "-v",
+        "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-gnu/release/forkexecstorm:/probe:ro",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/bin/sh",
+        "-c",
+        "/probe"
+      ],
+      "exit_code": 0,
+      "match": true,
+      "leftover": "",
+      "sha256": "43d5935b4b6e3f085c9eadf5003209bc44233892368e63be4b7c6dd35d6f9978"
+    }
+  ]
+}
