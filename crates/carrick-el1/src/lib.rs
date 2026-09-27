@@ -219,6 +219,31 @@ where
         }
     }
 
+    #[cfg(target_os = "none")]
+    if nr == 215
+        && let Some(zone) = zone.as_ref()
+    {
+        let orig_x0 = frame.x[0];
+        let mut editor = memory::HardwareAnonymousRetirementEditor;
+        match memory::try_serve_munmap(frame, current_tasks, &zone.tables.spaces, &mut editor) {
+            memory::MunmapDisposition::Forward => {}
+            memory::MunmapDisposition::Return(result) => {
+                frame.x[0] = result as u64;
+                counters.served[nr].fetch_add(1, Ordering::Relaxed);
+                return Action::Served;
+            }
+            memory::MunmapDisposition::Retired => {
+                frame.x[0] = 0;
+                counters.served[nr].fetch_add(1, Ordering::Relaxed);
+                if let Some(task) = cur_task {
+                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                    task.served_with_work.store(1, Ordering::Release);
+                    return Action::ServedWithWork;
+                }
+            }
+        }
+    }
+
     // Threads queued on this vCPU wait for the running one to block in a
     // served futex wait or for its slice to end (EL1 plan 1d: other
     // syscalls are served or forwarded as usual; 1b forwarded them all so

@@ -1367,6 +1367,12 @@ fn el1_anonymous_mapping_retirement_returns_and_reuses_frames() {
 
     for pages in SCALES {
         let before = carrick_embed::el1_frame_grant_stats();
+        let counters_before = read_el1_counters().map_or((0, 0), |counters| {
+            (
+                counters.served[215].load(std::sync::atomic::Ordering::Relaxed),
+                counters.forwarded[215].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
         let measured = run_fixture(
             &carrier,
             &[
@@ -1377,6 +1383,14 @@ fn el1_anonymous_mapping_retirement_returns_and_reuses_frames() {
             Duration::from_secs(120),
         );
         let after = carrick_embed::el1_frame_grant_stats();
+        let counters_after = read_el1_counters().map_or((0, 0), |counters| {
+            (
+                counters.served[215].load(std::sync::atomic::Ordering::Relaxed),
+                counters.forwarded[215].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
+        let served_munmap = counters_after.0 - counters_before.0;
+        let forwarded_munmap = counters_after.1 - counters_before.1;
         let grants = after.grants_succeeded - before.grants_succeeded;
         let returns = after.returns_completed - before.returns_completed;
         let reused = after.reused_grants - before.reused_grants;
@@ -1384,7 +1398,7 @@ fn el1_anonymous_mapping_retirement_returns_and_reuses_frames() {
         let bytes_returned = after.bytes_returned - before.bytes_returned;
         let stdout = measured.result.stdout_utf8();
         println!(
-            "el1-sched mapping-retirement pages={pages} rounds={ROUNDS} exits={} grants={grants} returns={returns} reused={reused} bytes_granted={bytes_granted} bytes_returned={bytes_returned} {}",
+            "el1-sched mapping-retirement pages={pages} rounds={ROUNDS} exits={} served_munmap={served_munmap} forwarded_munmap={forwarded_munmap} grants={grants} returns={returns} reused={reused} bytes_granted={bytes_granted} bytes_returned={bytes_returned} {}",
             measured.exits,
             stdout.trim(),
         );
@@ -1401,6 +1415,15 @@ fn el1_anonymous_mapping_retirement_returns_and_reuses_frames() {
             "every granted physical byte must return"
         );
         assert!(reused > 0, "repeated mapping never reused a returned IPA");
+        assert_eq!(
+            served_munmap,
+            ROUNDS + 1,
+            "EL1 must retire every target munmap plus the fixed eligible runtime cleanup"
+        );
+        assert_eq!(
+            forwarded_munmap, 1,
+            "only the fixed untagged runtime cleanup may stay on the host fallback"
+        );
         runs.push((pages, measured.exits));
     }
 

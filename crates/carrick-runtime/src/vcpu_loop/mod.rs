@@ -1495,13 +1495,24 @@ where
                 original_args,
                 request,
             };
-            let val = frame.args[0] as i64;
-            let outcome = if let Some(errno) = LinuxErrno::from_guest_retval(val) {
-                DispatchOutcome::Errno { errno }
+            // EL1 has already made the resident private-anonymous munmap
+            // guest-visible by retiring its exact live terminals. The syscall
+            // still crosses this one typed boundary so the ordinary
+            // exact-context mutation route authenticates the original request,
+            // retires stage-2/frame-inventory backing in bulk, and commits VMA
+            // metadata. Reapplying retirement there is idempotent and remains
+            // temporary until mmap-family policy itself moves into EL1.
+            if request.number.raw() == 215 {
+                (syscall, None)
             } else {
-                DispatchOutcome::Returned { value: val }
-            };
-            (syscall, Some(outcome))
+                let val = frame.args[0] as i64;
+                let outcome = if let Some(errno) = LinuxErrno::from_guest_retval(val) {
+                    DispatchOutcome::Errno { errno }
+                } else {
+                    DispatchOutcome::Returned { value: val }
+                };
+                (syscall, Some(outcome))
+            }
         } else {
             match kernel
                 .dispatcher
