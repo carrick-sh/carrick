@@ -1612,6 +1612,37 @@ impl HostFdRef {
         }))
     }
 
+    /// Adopt a freshly opened host descriptor and read its device/inode ONCE.
+    ///
+    /// The identity is returned for the description's base and cached in the
+    /// owner, so every later consumer of this descriptor (EL1 registration,
+    /// record locks, identity checks) is served without another `fstat` of the
+    /// same fd. `None` when the host refuses the `fstat`; nothing is cached
+    /// then, exactly as [`Self::inode_identity`] behaves.
+    pub(crate) fn adopt_with_identity(
+        fd: i32,
+        private_file_source: carrick_guest_mem::PrivateFileSource,
+    ) -> (Self, Option<carrick_vfs::vfs::InodeIdentity>) {
+        Self::adopt_with_known_identity(fd, private_file_source, None)
+    }
+
+    /// [`Self::adopt_with_identity`] when the creator already read `fd`'s
+    /// identity from this same descriptor (not from a path, which could name
+    /// a different inode by now). `known` is cached as-is; `None` falls back
+    /// to one `fstat`.
+    pub(crate) fn adopt_with_known_identity(
+        fd: i32,
+        private_file_source: carrick_guest_mem::PrivateFileSource,
+        known: Option<carrick_vfs::vfs::InodeIdentity>,
+    ) -> (Self, Option<carrick_vfs::vfs::InodeIdentity>) {
+        let owner = Self::with_private_file_source(fd, private_file_source);
+        if let Some(identity) = known {
+            let _ = owner.0.inode_identity.set(identity);
+        }
+        let identity = owner.inode_identity();
+        (owner, identity)
+    }
+
     pub(super) fn private_file_source(&self) -> carrick_guest_mem::PrivateFileSource {
         self.0.private_file_source
     }
