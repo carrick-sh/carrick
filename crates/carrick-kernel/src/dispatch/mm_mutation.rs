@@ -347,7 +347,9 @@ pub struct HostAliasPermit<'guard> {
 }
 
 impl HostAliasPermit<'_> {
-    #[cfg(any(test, feature = "test-support"))]
+    /// Return the exact MM identity already carried by this borrow-bound
+    /// permit. This exposes no additional mutation authority: consumers must
+    /// still present the permit to every host-alias operation.
     pub const fn mm(&self) -> MmId {
         self.mm
     }
