@@ -479,3 +479,17 @@ when exec creates its independent authority. See the
 [shared exec receipt](../../perf-results/2026-09-26-el1-live-table-review/shared-exec-resolver/README.md).
 Full CI and public probe promotion on this correction remain pending, followed
 by smoke/full and real EL1 first-touch service. No scope or budget is reduced.
+
+### Qualified public probe result after both exec corrections
+
+`just --no-deps conformance-probes` exits zero on clean `863e81757`: 912 unique
+generic arm64 executions, dedicated signed cases and the CLI boundary pass.
+Retained musl passes 33/33; GNU passes 31/33 with two report-only discrepancies:
+`ppollwaitset` wake latency bucket (`lt100` versus `lt1`) and `sigprofvdso`
+timer text sampling (`1` versus `0`). Preserve both findings for controlled
+attribution; the zero exit status is not strict closure. The CLI remains byte
+identical and frozen, and final scoped cleanup is empty. Separate signed-stage
+receipts are preserved, with the generic artifact re-signing limitation stated
+in the [public probe receipt](../../perf-results/2026-09-26-el1-live-table-review/public-probes-863e81757/README.md).
+Full CI on this revision is running. Smoke/full, strict probe acceptance and
+actual EL1 first-touch remain open with the full goal scope intact.
