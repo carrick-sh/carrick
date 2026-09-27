@@ -3,11 +3,28 @@
 version = 4
 
 [[package]]
+name = "carrick-el1-abi"
+version = "0.1.0"
+dependencies = [
+ "carrick-inotify-core",
+ "carrick-sched-core",
+]
+
+[[package]]
 name = "carrick-embed-el1-sched"
 version = "0.0.0"
 dependencies = [
+ "carrick-el1-abi",
  "libc",
 ]
+
+[[package]]
+name = "carrick-inotify-core"
+version = "0.1.0"
+
+[[package]]
+name = "carrick-sched-core"
+version = "0.1.0"
 
 [[package]]
 name = "libc"

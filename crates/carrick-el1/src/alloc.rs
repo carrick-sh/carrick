@@ -1,45 +1,38 @@
-//! EL1 in-guest kernel metadata allocator.
+//! Bounded segregated-fit metadata allocator for Carrick EL1 kernel.
 //!
-//! Provides a bounded segregated-fit allocator supporting:
-//! - Bounded O(1) allocation and deallocation across 28 size bins with bitmap indexing
-//! - O(1) bidirectional coalescing via physical boundary tag offsets
-//! - Dynamic host extent grants via HVC #6 (`METADATA_GRANT_OP_ALLOC`)
-//! - Exact-once return of unused dynamic extents via HVC #6 (`METADATA_GRANT_OP_FREE`)
-//! - Safe spinlock acquisition preserving DAIF IRQ state, dropping locks before host hypercalls
-//! - GlobalAlloc implementation installed as `#[global_allocator]`
+//! Provides $O(1)$ allocation, deallocation, bidirectional coalescing, and
+//! dynamic extent expansion/return via host hypercall `HVC #6`.
 
 use crate::lock::SpinLock;
 use core::alloc::Layout;
 
-pub const NUM_BINS: usize = 28;
-pub const MAX_EXTENTS: usize = 128;
 pub const MIN_BLOCK_SIZE: usize = 32;
 pub const HEADER_SIZE: usize = 32;
+pub const NUM_BINS: usize = 28;
+pub const MAX_EXTENTS: usize = 128;
 pub const BLOCK_MAGIC: u16 = 0xCA77;
-pub const NO_PREV_BLOCK: u32 = u32::MAX;
+pub const NO_PREV_BLOCK: u32 = 0xFFFF_FFFF;
 
-/// Physical and logical header preceding every memory block in an admitted extent.
+/// Boundary tag block header preceding every allocated and free payload.
 #[repr(C, align(16))]
 pub struct BlockHeader {
-    /// Intrusive pointer to previous free block in segregated free bin.
-    pub prev_free: *mut BlockHeader,
-    /// Intrusive pointer to next free block in segregated free bin.
-    pub next_free: *mut BlockHeader,
-    /// Total size of this block in bytes, including this 32-byte header.
-    pub size: usize,
-    /// Byte offset from the containing extent's base to the physically preceding block,
-    /// or `NO_PREV_BLOCK` if this block is at the start of the extent.
-    pub prev_phys_offset: u32,
-    /// Index into the allocator's `extents` table.
-    pub extent_idx: u8,
-    /// Allocation status flag (true = allocated, false = free).
-    pub is_allocated: bool,
-    /// Header validation magic (`BLOCK_MAGIC = 0xCA77`).
+    /// Integrity magic (`0xCA77`).
     pub magic: u16,
+    /// Containing extent index in the allocator's extent table.
+    pub extent_idx: u8,
+    /// Allocation flag (`true` when in active use, `false` when free).
+    pub is_allocated: bool,
+    /// Relative offset to preceding physical block within the extent, or `NO_PREV_BLOCK`.
+    pub prev_phys_offset: u32,
+    /// Total block size in bytes (including this 32-byte header).
+    pub size: usize,
+    /// Intrusive free-list pointer to previous free block in the bin.
+    pub prev_free: *mut BlockHeader,
+    /// Intrusive free-list pointer to next free block in the bin.
+    pub next_free: *mut BlockHeader,
 }
 
-// Ensure BlockHeader is strictly 32 bytes and 16-byte aligned.
-const _: () = assert!(core::mem::size_of::<BlockHeader>() == 32);
+const _: () = assert!(core::mem::size_of::<BlockHeader>() == HEADER_SIZE);
 const _: () = assert!(core::mem::align_of::<BlockHeader>() == 16);
 
 /// Descriptor for an admitted contiguous memory extent.
@@ -78,12 +71,22 @@ pub enum ExtentKind {
 pub enum ExtentState {
     Unused,
     Active,
+    PendingReturn,
     Returned,
 }
 
 /// Dynamic extent to be returned to the host hypervisor after complete deallocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtentToReturn {
+    pub base_va: u64,
+    pub size: usize,
+    pub token: u64,
+    pub slot_idx: usize,
+}
+
+/// Receipt for a granted host extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtentGrantReceipt {
     pub base_va: u64,
     pub size: usize,
     pub token: u64,
@@ -115,19 +118,12 @@ pub struct DeallocMetrics {
 
 /// Bounded segregated-fit allocator core.
 pub struct MetadataAllocatorCore {
-    /// Segregated free list heads for each size class.
     bins: [*mut BlockHeader; NUM_BINS],
-    /// Bitmap of non-empty size bins for O(1) search.
     active_bins: u32,
-    /// Bounded table of admitted extents.
     extents: [ExtentDescriptor; MAX_EXTENTS],
-    /// Total extents ever admitted.
     extents_admitted_count: usize,
-    /// Currently active extents.
     active_extents_count: usize,
-    /// Total capacity in bytes across all active extents.
     total_capacity_bytes: usize,
-    /// Total allocated payload + header bytes in active use.
     allocated_bytes: usize,
 }
 
@@ -306,7 +302,7 @@ impl MetadataAllocatorCore {
 
         // Authenticate non-overlap with any currently active extents
         for ext in &self.extents {
-            if ext.state == ExtentState::Active {
+            if ext.state == ExtentState::Active || ext.state == ExtentState::PendingReturn {
                 let ext_end = ext.base_va.saturating_add(ext.size as u64);
                 if base_va < ext_end && end_va > ext.base_va {
                     return Err(ExtentAdmissionError::OverlapWithExisting);
@@ -361,120 +357,118 @@ impl MetadataAllocatorCore {
         let target_bin = Self::bin_for_size(max_needed);
 
         let mut metrics = AllocMetrics::default();
-        let mut candidate_block: *mut BlockHeader = core::ptr::null_mut();
+        let mut chosen_block: *mut BlockHeader = core::ptr::null_mut();
 
-        // 1. Check head of target_bin
-        metrics.bins_checked += 1;
+        // 1. Try head of target bin
         if (self.active_bins & (1u32 << target_bin)) != 0 {
+            metrics.bins_checked += 1;
             let head = self.bins[target_bin];
             if !head.is_null() {
                 metrics.blocks_inspected += 1;
                 if self.can_fit(head, aligned_size, align) {
-                    candidate_block = head;
+                    chosen_block = head;
                 }
             }
         }
 
-        // 2. If head of target_bin did not fit, check head of next non-empty higher bin
-        if candidate_block.is_null() {
-            let higher_mask = self.active_bins & !((1u32 << (target_bin + 1)) - 1);
-            if higher_mask != 0 {
+        // 2. If target bin head didn't fit, check head of next non-empty bin
+        if chosen_block.is_null() && target_bin + 1 < NUM_BINS {
+            let mask = !((1u32 << (target_bin + 1)) - 1);
+            let next_bins = self.active_bins & mask;
+            if next_bins != 0 {
                 metrics.bins_checked += 1;
-                let next_bin = higher_mask.trailing_zeros() as usize;
-                let head = self.bins[next_bin];
+                let bin = next_bins.trailing_zeros() as usize;
+                let head = self.bins[bin];
                 if !head.is_null() {
                     metrics.blocks_inspected += 1;
                     if self.can_fit(head, aligned_size, align) {
-                        candidate_block = head;
+                        chosen_block = head;
                     }
                 }
             }
         }
 
-        let Some(block) = (if !candidate_block.is_null() {
-            Some(candidate_block)
-        } else {
-            None
-        }) else {
+        if chosen_block.is_null() {
             return (None, metrics);
-        };
+        }
+
+        self.unlink_free_block(chosen_block);
 
         unsafe {
-            self.unlink_free_block(block);
-            let block_addr = block as usize;
-            let orig_size = (*block).size;
-            let extent_idx = (*block).extent_idx as usize;
+            let block_addr = chosen_block as usize;
+            let orig_block_size = (*chosen_block).size;
+            let extent_idx = (*chosen_block).extent_idx as usize;
+            let orig_prev_phys = (*chosen_block).prev_phys_offset;
             let extent_base = self.extents[extent_idx].base_va as usize;
-            let extent_size = self.extents[extent_idx].size;
-            let prev_phys = (*block).prev_phys_offset;
 
-            // Compute payload address satisfying alignment
             let min_p = block_addr + HEADER_SIZE;
             let mut p = (min_p + (align - 1)) & !(align - 1);
-            let mut prefix = (p - HEADER_SIZE) - block_addr;
-            if prefix > 0 && prefix < MIN_BLOCK_SIZE {
+            let mut prefix_size = (p - HEADER_SIZE) - block_addr;
+            if prefix_size > 0 && prefix_size < MIN_BLOCK_SIZE {
                 p += align;
-                prefix = (p - HEADER_SIZE) - block_addr;
+                prefix_size = (p - HEADER_SIZE) - block_addr;
             }
 
-            let allocated_block_addr = p - HEADER_SIZE;
-            let allocated_block = allocated_block_addr as *mut BlockHeader;
+            let mut cur_block_addr = block_addr;
+            let mut cur_prev_phys = orig_prev_phys;
 
-            // If prefix > 0, split off preceding free block
-            if prefix > 0 {
+            // Prefix split
+            if prefix_size >= MIN_BLOCK_SIZE {
                 metrics.splits_performed += 1;
-                let pref_block = block_addr as *mut BlockHeader;
-                (*pref_block).size = prefix;
-                (*pref_block).prev_phys_offset = prev_phys;
-                (*pref_block).extent_idx = extent_idx as u8;
-                (*pref_block).is_allocated = false;
-                (*pref_block).magic = BLOCK_MAGIC;
-                self.insert_free_block(pref_block);
+                let prefix_block = block_addr as *mut BlockHeader;
+                (*prefix_block).size = prefix_size;
+                (*prefix_block).extent_idx = extent_idx as u8;
+                (*prefix_block).prev_phys_offset = orig_prev_phys;
+                (*prefix_block).is_allocated = false;
+                (*prefix_block).magic = BLOCK_MAGIC;
+                self.insert_free_block(prefix_block);
 
-                (*allocated_block).prev_phys_offset = (block_addr - extent_base) as u32;
-            } else {
-                (*allocated_block).prev_phys_offset = prev_phys;
+                cur_block_addr = block_addr + prefix_size;
+                cur_prev_phys = (block_addr - extent_base) as u32;
             }
 
-            let allocated_size = HEADER_SIZE + aligned_size;
-            let remaining_size = orig_size - (prefix + allocated_size);
+            let allocated_block = cur_block_addr as *mut BlockHeader;
+            let remaining_from_cur = orig_block_size - prefix_size;
+            let needed_for_alloc = HEADER_SIZE + aligned_size;
+            let suffix_size = remaining_from_cur.saturating_sub(needed_for_alloc);
 
-            if remaining_size >= MIN_BLOCK_SIZE {
+            // Suffix split
+            if suffix_size >= MIN_BLOCK_SIZE {
                 metrics.splits_performed += 1;
-                (*allocated_block).size = allocated_size;
-                let suffix_addr = allocated_block_addr + allocated_size;
+                let actual_alloc_size = remaining_from_cur - suffix_size;
+                (*allocated_block).size = actual_alloc_size;
+
+                let suffix_addr = cur_block_addr + actual_alloc_size;
                 let suffix_block = suffix_addr as *mut BlockHeader;
-                (*suffix_block).size = remaining_size;
-                (*suffix_block).prev_phys_offset = (allocated_block_addr - extent_base) as u32;
+                (*suffix_block).size = suffix_size;
                 (*suffix_block).extent_idx = extent_idx as u8;
+                (*suffix_block).prev_phys_offset = (cur_block_addr - extent_base) as u32;
                 (*suffix_block).is_allocated = false;
                 (*suffix_block).magic = BLOCK_MAGIC;
 
-                let next_phys_offset = (suffix_addr + remaining_size) - extent_base;
-                if next_phys_offset < extent_size {
-                    let next_phys = (extent_base + next_phys_offset) as *mut BlockHeader;
-                    (*next_phys).prev_phys_offset = (suffix_addr - extent_base) as u32;
+                let after_suffix_offset = (suffix_addr + suffix_size) - extent_base;
+                if after_suffix_offset < self.extents[extent_idx].size {
+                    let after_suffix = (extent_base + after_suffix_offset) as *mut BlockHeader;
+                    (*after_suffix).prev_phys_offset = (suffix_addr - extent_base) as u32;
                 }
 
                 self.insert_free_block(suffix_block);
             } else {
-                (*allocated_block).size = orig_size - prefix;
-                let next_phys_offset =
-                    (allocated_block_addr + (*allocated_block).size) - extent_base;
-                if next_phys_offset < extent_size {
-                    let next_phys = (extent_base + next_phys_offset) as *mut BlockHeader;
-                    (*next_phys).prev_phys_offset = (allocated_block_addr - extent_base) as u32;
-                }
+                (*allocated_block).size = remaining_from_cur;
             }
 
             (*allocated_block).extent_idx = extent_idx as u8;
+            (*allocated_block).prev_phys_offset = cur_prev_phys;
             (*allocated_block).is_allocated = true;
             (*allocated_block).magic = BLOCK_MAGIC;
+            (*allocated_block).prev_free = core::ptr::null_mut();
+            (*allocated_block).next_free = core::ptr::null_mut();
 
             self.extents[extent_idx].live_allocations += 1;
             self.allocated_bytes += (*allocated_block).size;
 
-            (Some(p as *mut u8), metrics)
+            let payload_ptr = (cur_block_addr + HEADER_SIZE) as *mut u8;
+            (Some(payload_ptr), metrics)
         }
     }
 
@@ -484,17 +478,17 @@ impl MetadataAllocatorCore {
         ptr
     }
 
-    /// Deallocate a previously allocated block, recording merge work metrics.
+    /// Deallocate a previously allocated block, recording structural work metrics.
     pub fn deallocate_with_metrics(
         &mut self,
         ptr: *mut u8,
         _align: usize,
     ) -> (Option<ExtentToReturn>, DeallocMetrics) {
-        let mut metrics = DeallocMetrics::default();
-        if ptr.is_null() {
-            return (None, metrics);
+        if ptr.is_null() || (ptr as usize) < HEADER_SIZE {
+            return (None, DeallocMetrics::default());
         }
 
+        let mut metrics = DeallocMetrics::default();
         let mut block = (ptr as usize - HEADER_SIZE) as *mut BlockHeader;
 
         unsafe {
@@ -556,15 +550,14 @@ impl MetadataAllocatorCore {
                 && self.extents[extent_idx].live_allocations == 0
                 && (*block).size == extent_size
             {
-                self.extents[extent_idx].state = ExtentState::Returned;
-                self.active_extents_count = self.active_extents_count.saturating_sub(1);
-                self.total_capacity_bytes = self.total_capacity_bytes.saturating_sub(extent_size);
+                self.extents[extent_idx].state = ExtentState::PendingReturn;
 
                 return (
                     Some(ExtentToReturn {
                         base_va: self.extents[extent_idx].base_va,
                         size: extent_size,
                         token,
+                        slot_idx: extent_idx,
                     }),
                     metrics,
                 );
@@ -575,10 +568,45 @@ impl MetadataAllocatorCore {
         }
     }
 
-    /// Deallocate a previously allocated block.
-    pub fn deallocate(&mut self, ptr: *mut u8, align: usize) -> Option<ExtentToReturn> {
+    /// Prepare to deallocate a block, returning dynamic extent to return if ready.
+    pub fn prepare_deallocate_extent(
+        &mut self,
+        ptr: *mut u8,
+        align: usize,
+    ) -> Option<ExtentToReturn> {
         let (to_return, _) = self.deallocate_with_metrics(ptr, align);
         to_return
+    }
+
+    /// Complete dynamic extent return after host hypercall confirmation.
+    pub fn complete_extent_return(&mut self, slot_idx: usize) {
+        if slot_idx < MAX_EXTENTS && self.extents[slot_idx].state == ExtentState::PendingReturn {
+            let size = self.extents[slot_idx].size;
+            self.extents[slot_idx].state = ExtentState::Returned;
+            self.active_extents_count = self.active_extents_count.saturating_sub(1);
+            self.total_capacity_bytes = self.total_capacity_bytes.saturating_sub(size);
+        }
+    }
+
+    /// Cancel dynamic extent return if host hypercall was refused or failed.
+    pub fn cancel_extent_return(&mut self, slot_idx: usize) {
+        if slot_idx < MAX_EXTENTS && self.extents[slot_idx].state == ExtentState::PendingReturn {
+            self.extents[slot_idx].state = ExtentState::Active;
+            unsafe {
+                let initial_block = self.extents[slot_idx].base_va as *mut BlockHeader;
+                (*initial_block).size = self.extents[slot_idx].size;
+                (*initial_block).prev_phys_offset = NO_PREV_BLOCK;
+                (*initial_block).extent_idx = slot_idx as u8;
+                (*initial_block).is_allocated = false;
+                (*initial_block).magic = BLOCK_MAGIC;
+                self.insert_free_block(initial_block);
+            }
+        }
+    }
+
+    /// Deallocate a previously allocated block.
+    pub fn deallocate(&mut self, ptr: *mut u8, align: usize) -> Option<ExtentToReturn> {
+        self.prepare_deallocate_extent(ptr, align)
     }
 
     /// Read diagnostics snapshot.
@@ -605,12 +633,13 @@ pub struct AllocatorDiagnostics {
 
 /// Dynamic extent allocation helper invoking host hypercall HVC #6.
 #[inline(never)]
-pub fn request_host_extent_grant(requested_size: usize) -> Option<(u64, usize)> {
+pub fn request_host_extent_grant(requested_size: usize) -> Option<ExtentGrantReceipt> {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status: u64;
         let mut granted_base: u64;
         let mut granted_size: u64;
+        let mut token: u64;
 
         unsafe {
             core::arch::asm!(
@@ -618,6 +647,7 @@ pub fn request_host_extent_grant(requested_size: usize) -> Option<(u64, usize)> 
                 inout("x0") carrick_el1_abi::METADATA_GRANT_OP_ALLOC => status,
                 inout("x1") requested_size as u64 => granted_base,
                 inout("x2") 0u64 => granted_size,
+                inout("x3") 0u64 => token,
                 options(nostack)
             );
         }
@@ -625,8 +655,13 @@ pub fn request_host_extent_grant(requested_size: usize) -> Option<(u64, usize)> 
         if status == carrick_el1_abi::METADATA_GRANT_SUCCESS
             && granted_base != 0
             && granted_size > 0
+            && token != 0
         {
-            Some((granted_base, granted_size as usize))
+            Some(ExtentGrantReceipt {
+                base_va: granted_base,
+                size: granted_size as usize,
+                token,
+            })
         } else {
             None
         }
@@ -640,12 +675,16 @@ pub fn request_host_extent_grant(requested_size: usize) -> Option<(u64, usize)> 
 
 /// Dynamic extent return helper invoking host hypercall HVC #6.
 #[inline(never)]
-pub fn return_host_extent(base_va: u64, size: usize) -> bool {
+pub fn return_host_extent(base_va: u64, size: usize, token: u64) -> bool {
+    if token == 0 {
+        return false;
+    }
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status: u64;
         let mut _out1: u64;
         let mut _out2: u64;
+        let mut _out3: u64;
 
         unsafe {
             core::arch::asm!(
@@ -653,6 +692,7 @@ pub fn return_host_extent(base_va: u64, size: usize) -> bool {
                 inout("x0") carrick_el1_abi::METADATA_GRANT_OP_FREE => status,
                 inout("x1") base_va => _out1,
                 inout("x2") size as u64 => _out2,
+                inout("x3") token => _out3,
                 options(nostack)
             );
         }
@@ -661,7 +701,7 @@ pub fn return_host_extent(base_va: u64, size: usize) -> bool {
     }
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
     {
-        let _ = (base_va, size);
+        let _ = (base_va, size, token);
         true
     }
 }
@@ -725,6 +765,20 @@ impl MetadataStorage {
         }
     }
 
+    pub fn ensure_bootstrap_admitted(&self) {
+        let guard = disable_irq_save();
+        let mut core = self.lock.lock();
+        if core.active_extents_count == 0 {
+            let _ = core.admit_extent(
+                carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE,
+                carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE as usize,
+                ExtentKind::Bootstrap,
+            );
+        }
+        core::mem::drop(core);
+        restore_irq(guard);
+    }
+
     pub fn admit_bootstrap_region(
         &self,
         base_va: u64,
@@ -747,6 +801,14 @@ impl MetadataStorage {
         // 1. Try allocating from existing extents under lock
         let guard = disable_irq_save();
         let mut core = self.lock.lock();
+        #[cfg(target_os = "none")]
+        if core.active_extents_count == 0 {
+            let _ = core.admit_extent(
+                carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE,
+                carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE as usize,
+                ExtentKind::Bootstrap,
+            );
+        }
         let p = core.allocate(size, align);
         if p.is_some() {
             core::mem::drop(core);
@@ -759,24 +821,24 @@ impl MetadataStorage {
         restore_irq(guard);
 
         // 2. Request host grant with lock DROPPED and IRQs restored
-        let (granted_base, granted_size) = request_host_extent_grant(needed_size)?;
+        let granted = request_host_extent_grant(needed_size)?;
 
         // 3. Re-acquire lock, admit extent, and fulfill allocation
         let guard = disable_irq_save();
         let mut core = self.lock.lock();
         if core
             .admit_extent(
-                granted_base,
-                granted_size,
+                granted.base_va,
+                granted.size,
                 ExtentKind::Dynamic {
-                    token: granted_base,
+                    token: granted.token,
                 },
             )
             .is_err()
         {
             core::mem::drop(core);
             restore_irq(guard);
-            return_host_extent(granted_base, granted_size);
+            return_host_extent(granted.base_va, granted.size, granted.token);
             return None;
         }
 
@@ -790,13 +852,25 @@ impl MetadataStorage {
         let align = layout.align().max(16);
         let guard = disable_irq_save();
         let mut core = self.lock.lock();
-        let extent_to_return = core.deallocate(ptr, align);
+        let extent_to_return = core.prepare_deallocate_extent(ptr, align);
         core::mem::drop(core);
         restore_irq(guard);
 
         // Return extent to host hypervisor with lock DROPPED
         if let Some(to_return) = extent_to_return {
-            return_host_extent(to_return.base_va, to_return.size);
+            if return_host_extent(to_return.base_va, to_return.size, to_return.token) {
+                let guard = disable_irq_save();
+                let mut core = self.lock.lock();
+                core.complete_extent_return(to_return.slot_idx);
+                core::mem::drop(core);
+                restore_irq(guard);
+            } else {
+                let guard = disable_irq_save();
+                let mut core = self.lock.lock();
+                core.cancel_extent_return(to_return.slot_idx);
+                core::mem::drop(core);
+                restore_irq(guard);
+            }
         }
     }
 
@@ -824,6 +898,14 @@ unsafe impl core::alloc::GlobalAlloc for MetadataStorage {
 /// Global EL1 kernel metadata allocator instance.
 #[cfg_attr(target_os = "none", global_allocator)]
 pub static GLOBAL_ALLOCATOR: MetadataStorage = MetadataStorage::new();
+
+/// Ensure the global metadata allocator has admitted the bootstrap region.
+pub fn ensure_bootstrap_initialized() {
+    #[cfg(target_os = "none")]
+    {
+        GLOBAL_ALLOCATOR.ensure_bootstrap_admitted();
+    }
+}
 
 /// Initialize the EL1 metadata allocator with the bootstrap region.
 pub fn init_bootstrap_allocator(bootstrap_base: u64, bootstrap_size: usize) {
@@ -920,66 +1002,84 @@ pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
         }
         3 => {
             // Test 3: Denial failpoint recovery
-            // Fill bootstrap and dynamic memory with 10 MiB
+            // Fill bootstrap with 8 x 1 MiB chunks
             let chunk_size = 1024 * 1024;
             let chunk_layout = match Layout::from_size_align(chunk_size, 64) {
                 Ok(l) => l,
                 Err(_) => return 300,
             };
-            let mut ptrs = [core::ptr::null_mut(); 10];
-            let mut count = 0;
+            let mut ptrs = [core::ptr::null_mut(); 8];
             for (i, slot) in ptrs.iter_mut().enumerate() {
-                if let Some(p) = GLOBAL_ALLOCATOR.allocate(chunk_layout) {
-                    unsafe {
-                        core::ptr::write_bytes(p, (0x50 + i) as u8, chunk_size);
-                    }
-                    *slot = p;
-                    count += 1;
-                } else {
-                    break;
+                let p = match GLOBAL_ALLOCATOR.allocate(chunk_layout) {
+                    Some(p) => p,
+                    None => return 301,
+                };
+                unsafe {
+                    core::ptr::write_bytes(p, (0x50 + i) as u8, chunk_size);
                 }
-            }
-            if count < 10 {
-                for &p in ptrs.iter().take(count) {
-                    GLOBAL_ALLOCATOR.deallocate(p, chunk_layout);
-                }
-                return 301;
+                *slot = p;
             }
 
-            // Verify all existing 10 MiB
-            for (i, &p) in ptrs.iter().take(count).enumerate() {
+            // Attempt 9th allocation (2 MiB chunk) which exceeds bootstrap and triggers host grant.
+            // Host failpoint is armed, so this request MUST be denied (returning None).
+            let big_layout = match Layout::from_size_align(2 * 1024 * 1024, 64) {
+                Ok(l) => l,
+                Err(_) => return 302,
+            };
+            let denied_p = GLOBAL_ALLOCATOR.allocate(big_layout);
+            if denied_p.is_some() {
+                // Should have been denied by failpoint
+                if let Some(p) = denied_p {
+                    GLOBAL_ALLOCATOR.deallocate(p, big_layout);
+                }
+                for &p in ptrs.iter() {
+                    GLOBAL_ALLOCATOR.deallocate(p, chunk_layout);
+                }
+                return 303;
+            }
+
+            // Verify all existing 8 MiB allocations are intact
+            for (i, &p) in ptrs.iter().enumerate() {
                 unsafe {
                     for j in (0..chunk_size).step_by(4096) {
                         if *p.add(j) != (0x50 + i) as u8 {
-                            for &to_free in ptrs.iter().take(count) {
+                            for &to_free in ptrs.iter() {
                                 GLOBAL_ALLOCATOR.deallocate(to_free, chunk_layout);
                             }
-                            return 302;
+                            return 304;
                         }
                     }
                 }
             }
 
-            // Free 1 block to test reuse
-            GLOBAL_ALLOCATOR.deallocate(ptrs[0], chunk_layout);
-            ptrs[0] = core::ptr::null_mut();
-
-            // Reallocate into freed space: must succeed
-            let realloc_p = match GLOBAL_ALLOCATOR.allocate(chunk_layout) {
+            // Retry the 2 MiB allocation: failpoint is now consumed, so host grant succeeds!
+            let retry_p = match GLOBAL_ALLOCATOR.allocate(big_layout) {
                 Some(p) => p,
                 None => {
-                    for &p in ptrs.iter().skip(1) {
+                    for &p in ptrs.iter() {
                         GLOBAL_ALLOCATOR.deallocate(p, chunk_layout);
                     }
-                    return 303;
+                    return 305;
                 }
             };
             unsafe {
-                core::ptr::write_bytes(realloc_p, 0x99, chunk_size);
+                core::ptr::write_bytes(retry_p, 0x88, 2 * 1024 * 1024);
+                for j in (0..2 * 1024 * 1024).step_by(4096) {
+                    if *retry_p.add(j) != 0x88 {
+                        GLOBAL_ALLOCATOR.deallocate(retry_p, big_layout);
+                        for &to_free in ptrs.iter() {
+                            GLOBAL_ALLOCATOR.deallocate(to_free, chunk_layout);
+                        }
+                        return 306;
+                    }
+                }
             }
-            GLOBAL_ALLOCATOR.deallocate(realloc_p, chunk_layout);
 
-            for &p in ptrs.iter().skip(1) {
+            // Deallocate the 2 MiB dynamic chunk (triggering extent return)
+            GLOBAL_ALLOCATOR.deallocate(retry_p, big_layout);
+
+            // Deallocate all 8 bootstrap chunks
+            for &p in ptrs.iter() {
                 GLOBAL_ALLOCATOR.deallocate(p, chunk_layout);
             }
 
@@ -1134,8 +1234,10 @@ mod tests {
                 base_va: dyn_base,
                 size: dynamic_backing.len(),
                 token: 42,
+                slot_idx: 1,
             })
         );
+        alloc.complete_extent_return(1);
 
         let diag = alloc.diagnostics();
         assert_eq!(diag.allocated_bytes, 0);
@@ -1190,6 +1292,36 @@ mod tests {
             .expect("p2");
         alloc.deallocate(p1, small_layout.align());
         alloc.deallocate(p2, large_layout.align());
+    }
+
+    #[test]
+    fn test_extent_return_cancellation_preserves_reusable_memory() {
+        let mut dynamic_backing = vec![0u8; 16 * 1024];
+        let dyn_base = dynamic_backing.as_mut_ptr() as u64;
+        let mut alloc = MetadataAllocatorCore::new();
+        alloc
+            .admit_extent(
+                dyn_base,
+                dynamic_backing.len(),
+                ExtentKind::Dynamic { token: 88 },
+            )
+            .expect("admit dyn");
+
+        let layout = Layout::from_size_align(8192, 64).unwrap();
+        let p = alloc.allocate(layout.size(), layout.align()).expect("p");
+        let to_return = alloc
+            .prepare_deallocate_extent(p, layout.align())
+            .expect("to_return");
+
+        // Simulate host refusal: cancel return
+        alloc.cancel_extent_return(to_return.slot_idx);
+        let diag = alloc.diagnostics();
+        assert_eq!(diag.active_extents, 1);
+
+        // Reallocate into canceled extent must succeed
+        let p2 = alloc.allocate(layout.size(), layout.align()).expect("p2");
+        assert_eq!(p2, p);
+        alloc.deallocate(p2, layout.align());
     }
 
     #[test]

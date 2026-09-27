@@ -27,6 +27,7 @@ struct GrantedSlotRecord {
     host_ptr: *mut u8,
     layout: std::alloc::Layout,
     size: usize,
+    num_slots: usize,
     token: u64,
     #[allow(dead_code)]
     generation: u64,
@@ -48,45 +49,55 @@ impl HostApertureState {
         }
     }
 
-    fn find_free_slot(&self) -> Option<usize> {
-        if self.occupied_bitmap[0] != u64::MAX {
-            let bit = self.occupied_bitmap[0].trailing_ones() as usize;
-            if bit < 64 {
-                return Some(bit);
-            }
-        }
-        if self.occupied_bitmap[1] != u64::MAX {
-            let bit = self.occupied_bitmap[1].trailing_ones() as usize;
-            if bit < 64 {
-                return Some(64 + bit);
-            }
-        }
-        None
-    }
-
-    fn set_slot_occupied(&mut self, slot: usize) {
-        if slot < 64 {
-            self.occupied_bitmap[0] |= 1u64 << slot;
-        } else if slot < 128 {
-            self.occupied_bitmap[1] |= 1u64 << (slot - 64);
-        }
-    }
-
-    fn clear_slot_occupied(&mut self, slot: usize) {
-        if slot < 64 {
-            self.occupied_bitmap[0] &= !(1u64 << slot);
-        } else if slot < 128 {
-            self.occupied_bitmap[1] &= !(1u64 << (slot - 64));
-        }
-    }
-
     fn is_slot_occupied(&self, slot: usize) -> bool {
         if slot < 64 {
             (self.occupied_bitmap[0] & (1u64 << slot)) != 0
         } else if slot < 128 {
             (self.occupied_bitmap[1] & (1u64 << (slot - 64))) != 0
         } else {
-            false
+            true
+        }
+    }
+
+    /// Atomically find and reserve `num_slots` contiguous unoccupied slots.
+    fn find_and_reserve_slots(&mut self, num_slots: usize) -> Option<usize> {
+        if num_slots == 0 || num_slots > MAX_DYNAMIC_EXTENT_SLOTS {
+            return None;
+        }
+        let max_start = MAX_DYNAMIC_EXTENT_SLOTS - num_slots;
+        for start in 0..=max_start {
+            let mut all_free = true;
+            for s in start..start + num_slots {
+                if self.is_slot_occupied(s) {
+                    all_free = false;
+                    break;
+                }
+            }
+            if all_free {
+                self.reserve_slots(start, num_slots);
+                return Some(start);
+            }
+        }
+        None
+    }
+
+    fn reserve_slots(&mut self, start: usize, num_slots: usize) {
+        for s in start..start + num_slots {
+            if s < 64 {
+                self.occupied_bitmap[0] |= 1u64 << s;
+            } else if s < 128 {
+                self.occupied_bitmap[1] |= 1u64 << (s - 64);
+            }
+        }
+    }
+
+    fn unreserve_slots(&mut self, start: usize, num_slots: usize) {
+        for s in start..start + num_slots {
+            if s < 64 {
+                self.occupied_bitmap[0] &= !(1u64 << s);
+            } else if s < 128 {
+                self.occupied_bitmap[1] &= !(1u64 << (s - 64));
+            }
         }
     }
 }
@@ -130,8 +141,6 @@ pub fn reset_metadata_grant_state() {
     BYTES_GRANTED.store(0, Ordering::Relaxed);
     BYTES_RETURNED.store(0, Ordering::Relaxed);
     FAILPOINT_DENY_NEXT.store(false, Ordering::SeqCst);
-    NEXT_TOKEN.store(1, Ordering::Relaxed);
-    GLOBAL_GENERATION.store(1, Ordering::Relaxed);
 
     let mut state = HOST_APERTURE.lock();
     for (i, slot_opt) in state.slots.iter_mut().enumerate() {
@@ -140,12 +149,14 @@ pub fn reset_metadata_grant_state() {
                 EL1_DYNAMIC_METADATA_BASE + (i as u64) * (EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64);
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             unsafe {
-                let _ = crate::trap::inventory_hv_vm_unmap(ipa, record.size);
-                std::alloc::dealloc(record.host_ptr, record.layout);
+                let rc = crate::trap::inventory_hv_vm_unmap(ipa, record.size);
+                if rc == 0 {
+                    std::alloc::dealloc(record.host_ptr, record.layout);
+                }
             }
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            {
-                let _ = (ipa, record);
+            unsafe {
+                std::alloc::dealloc(record.host_ptr, record.layout);
             }
         }
     }
@@ -187,12 +198,14 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
         }
 
         let requested_size = arg1 as usize;
-        let extent_size = (requested_size.max(EL1_DYNAMIC_METADATA_EXTENT_SIZE) + 0xFFFF) & !0xFFFF;
+        let extent_quantum = EL1_DYNAMIC_METADATA_EXTENT_SIZE;
+        let num_slots = requested_size.max(1).div_ceil(extent_quantum);
+        let extent_size = num_slots * extent_quantum;
 
-        // 2. Find a free aperture slot
+        // 2. Find and atomically reserve contiguous aperture slots
         let slot_idx = {
-            let state = HOST_APERTURE.lock();
-            state.find_free_slot()
+            let mut state = HOST_APERTURE.lock();
+            state.find_and_reserve_slots(num_slots)
         };
 
         let Some(slot_idx) = slot_idx else {
@@ -209,6 +222,10 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
         if ipa.saturating_add(extent_size as u64)
             > EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE
         {
+            {
+                let mut state = HOST_APERTURE.lock();
+                state.unreserve_slots(slot_idx, num_slots);
+            }
             GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
@@ -221,6 +238,10 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
         let layout = match std::alloc::Layout::from_size_align(extent_size, 4096) {
             Ok(l) => l,
             Err(_) => {
+                {
+                    let mut state = HOST_APERTURE.lock();
+                    state.unreserve_slots(slot_idx, num_slots);
+                }
                 GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
                 vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
                     .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
@@ -232,6 +253,10 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
 
         let host_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if host_ptr.is_null() {
+            {
+                let mut state = HOST_APERTURE.lock();
+                state.unreserve_slots(slot_idx, num_slots);
+            }
             GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
@@ -249,6 +274,10 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             unsafe {
                 std::alloc::dealloc(host_ptr, layout);
             }
+            {
+                let mut state = HOST_APERTURE.lock();
+                state.unreserve_slots(slot_idx, num_slots);
+            }
             GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
@@ -262,11 +291,11 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
         let generation = GLOBAL_GENERATION.fetch_add(1, Ordering::Relaxed);
         {
             let mut state = HOST_APERTURE.lock();
-            state.set_slot_occupied(slot_idx);
             state.slots[slot_idx] = Some(GrantedSlotRecord {
                 host_ptr,
                 layout,
                 size: extent_size,
+                num_slots,
                 token,
                 generation,
             });
@@ -291,10 +320,11 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
         let size = arg2 as usize;
         let token = arg3;
 
-        // Validate IPA bounds and alignment
+        // Validate IPA bounds, alignment, and non-zero token
         if !(EL1_DYNAMIC_METADATA_BASE..EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE)
             .contains(&ipa)
             || !ipa.is_multiple_of(EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64)
+            || token == 0
         {
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_ALIGNMENT)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
@@ -330,8 +360,8 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             return Ok(());
         };
 
-        if record.size != size || (token != 0 && record.token != token) {
-            // Restore slot record on parameter mismatch
+        if record.size != size || record.token != token {
+            // Restore slot record on parameter/token mismatch
             let mut state = HOST_APERTURE.lock();
             state.slots[slot_idx] = Some(record);
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_INVALID)
@@ -344,7 +374,7 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
         // Unmap from stage-2
         let rc = unsafe { crate::trap::inventory_hv_vm_unmap(ipa, record.size) };
         if rc != 0 {
-            // Failed unmap: do NOT deallocate host memory to avoid UAF
+            // Failed unmap: do NOT deallocate host memory to avoid UAF, restore record
             let mut state = HOST_APERTURE.lock();
             state.slots[slot_idx] = Some(record);
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
@@ -354,13 +384,13 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             return Ok(());
         }
 
-        // Deallocate host memory and clear bitmap slot
+        // Deallocate host memory and clear bitmap reservation across all covered slots
         unsafe {
             std::alloc::dealloc(record.host_ptr, record.layout);
         }
         {
             let mut state = HOST_APERTURE.lock();
-            state.clear_slot_occupied(slot_idx);
+            state.unreserve_slots(slot_idx, record.num_slots);
         }
 
         RETURNS_COMPLETED.fetch_add(1, Ordering::Relaxed);
@@ -377,5 +407,43 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
         vcpu.set_reg(Reg::PC, pc + 4)
             .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_host_aperture_multi_slot_reservation_and_overlap_rejection() {
+        let mut state = HostApertureState::new();
+
+        // 1. Request 3 slots (1,114,112 bytes rounded to 3x 512 KiB = 1.5 MiB)
+        let s0 = state.find_and_reserve_slots(3).expect("reserve 3 slots");
+        assert_eq!(s0, 0);
+        assert!(state.is_slot_occupied(0));
+        assert!(state.is_slot_occupied(1));
+        assert!(state.is_slot_occupied(2));
+        assert!(!state.is_slot_occupied(3));
+
+        // 2. Next request for 1 slot must return slot 3 (no overlap with slots 0..2)
+        let s1 = state.find_and_reserve_slots(1).expect("reserve 1 slot");
+        assert_eq!(s1, 3);
+        assert!(state.is_slot_occupied(3));
+
+        // 3. Unreserve slot 0..2 (freeing 3 slots)
+        state.unreserve_slots(0, 3);
+        assert!(!state.is_slot_occupied(0));
+        assert!(!state.is_slot_occupied(1));
+        assert!(!state.is_slot_occupied(2));
+        assert!(state.is_slot_occupied(3)); // slot 3 remains occupied
+
+        // 4. Allocate 2 slots: reuses freed slots 0..1
+        let s2 = state.find_and_reserve_slots(2).expect("reuse 2 slots");
+        assert_eq!(s2, 0);
+        assert!(state.is_slot_occupied(0));
+        assert!(state.is_slot_occupied(1));
+        assert!(!state.is_slot_occupied(2));
+        assert!(state.is_slot_occupied(3));
     }
 }
