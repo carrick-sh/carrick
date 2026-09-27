@@ -30,6 +30,9 @@ Evidence retained here:
 - `clippy-green.log`: warning-denied Clippy passes for the four changed crates
   on the active platform;
 - `contract-green.log`: 62 contracts, 15 claims and 142 surfaces validate;
+- `contract-change-green.log`: the exact `cc3647b4a..3b1a110d4` product diff
+  has stage-1-publication evidence, with a revision-bound exemption for the
+  unchanged contracts that share the ABI, HAL and runtime source files;
 - `inventory-drift-green.log`: the generated syscall inventory remains current.
 
 `clippy-all-features-invalid.log` preserves one rejected invocation that
