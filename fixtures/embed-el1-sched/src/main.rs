@@ -1897,7 +1897,48 @@ fn fault_entry_mode() -> i32 {
     0
 }
 
+/// Four guest threads grow/free the shared EL1 heap while a fifth thread
+/// completes host-served uname calls. The embed watchdog bounds every join.
+fn metadata_allocator_concurrent() -> i32 {
+    const ROUNDS: usize = 16;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut failures = 0;
+            for _ in 0..ROUNDS {
+                barrier.wait();
+                let rc = unsafe {
+                    raw6(carrick_el1_abi::SYS_CARRICK_EL1_CONTROL, 1, 2, 0, 0, 0, 0)
+                };
+                failures += usize::from(rc != 0);
+                barrier.wait();
+            }
+            failures
+        }));
+    }
+    let mut host_calls = 0;
+    let mut host_failures = 0;
+    for _ in 0..ROUNDS {
+        barrier.wait();
+        for _ in 0..64 {
+            let mut name = [0u8; 390];
+            let rc = unsafe { raw6(160, name.as_mut_ptr() as u64, 0, 0, 0, 0, 0) };
+            host_calls += 1;
+            host_failures += usize::from(rc != 0 || &name[..5] != b"Linux");
+        }
+        barrier.wait();
+    }
+    let failures: usize = workers.into_iter().map(|w| w.join().expect("allocator worker")).sum();
+    println!("metadata-allocator concurrent workers=4 rounds={ROUNDS} failures={failures} host_calls={host_calls} host_failures={host_failures}");
+    i32::from(failures != 0 || host_failures != 0)
+}
+
 fn metadata_allocator_mode(phase: &str) -> i32 {
+    if phase == "concurrent" {
+        return metadata_allocator_concurrent();
+    }
     // Each invocation executes one phase so the host can arm grant refusal
     // only after ordinary growth/return has completed in this carrier.
     let subtest = match phase {
