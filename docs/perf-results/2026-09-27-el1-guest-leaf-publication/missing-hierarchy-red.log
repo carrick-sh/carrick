@@ -1,0 +1,23 @@
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-image)
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+error[E0599]: no method named `publish_live_private_pages_transaction` found for struct `aarch64::PageTableManager` in the current scope
+    --> crates/carrick-mmu-core/src/aarch64.rs:7250:18
+     |
+ 942 | pub struct PageTableManager {
+     | --------------------------- method `publish_live_private_pages_transaction` not found for this struct
+...
+7250 |             live.publish_live_private_pages_transaction(GuestLeafPublication {
+     |             -----^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `aarch64::PageTableManager`
+
+error[E0599]: no method named `publish_live_private_pages_transaction` found for struct `aarch64::PageTableManager` in the current scope
+    --> crates/carrick-mmu-core/src/aarch64.rs:7289:18
+     |
+ 942 | pub struct PageTableManager {
+     | --------------------------- method `publish_live_private_pages_transaction` not found for this struct
+...
+7289 |             live.publish_live_private_pages_transaction(occupied),
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `aarch64::PageTableManager`
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `carrick-mmu-core` (lib test) due to 2 previous errors

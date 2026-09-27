@@ -5,6 +5,9 @@
 
 #![cfg_attr(target_os = "none", no_std)]
 
+#[cfg(target_os = "none")]
+extern crate alloc as rust_alloc;
+
 pub mod alloc;
 pub mod fault;
 pub mod file;

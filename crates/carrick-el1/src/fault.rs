@@ -22,6 +22,28 @@ fn publication_error_code(error: carrick_mmu_core::aarch64::GuestLeafPublication
         GuestLeafPublicationError::InvalidLeafShape => 4,
         GuestLeafPublicationError::AlreadyValid => 5,
         GuestLeafPublicationError::RetiredLeaf => 6,
+        GuestLeafPublicationError::Manager(
+            carrick_mmu_core::aarch64::PageTableError::OutOfTables,
+        ) => 7,
+        GuestLeafPublicationError::Manager(
+            carrick_mmu_core::aarch64::PageTableError::BadAddress,
+        ) => 8,
+        GuestLeafPublicationError::Manager(
+            carrick_mmu_core::aarch64::PageTableError::MissingArenaSource,
+        ) => 9,
+        GuestLeafPublicationError::Manager(
+            carrick_mmu_core::aarch64::PageTableError::ConflictingArenaSource,
+        ) => 10,
+        GuestLeafPublicationError::Manager(
+            carrick_mmu_core::aarch64::PageTableError::UnresolvedArena(_),
+        ) => 11,
+        GuestLeafPublicationError::Manager(
+            carrick_mmu_core::aarch64::PageTableError::GicWindowOutput,
+        ) => 12,
+        GuestLeafPublicationError::Manager(
+            carrick_mmu_core::aarch64::PageTableError::MetadataAllocation,
+        ) => 13,
+        GuestLeafPublicationError::RollbackFailed => 14,
     }
 }
 
@@ -62,25 +84,68 @@ pub trait FrameGrantLeafPublisher {
 struct HardwareFrameGrantLeafPublisher;
 
 #[cfg(target_os = "none")]
+#[derive(Debug)]
+struct GuestPrimaryArenaResolver {
+    physical_base: u64,
+    host_base: usize,
+    byte_len: usize,
+}
+
+#[cfg(target_os = "none")]
+unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for GuestPrimaryArenaResolver {
+    fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
+        (base == self.physical_base && len <= self.byte_len).then_some(self.host_base as *mut u8)
+    }
+}
+
+#[cfg(target_os = "none")]
 impl FrameGrantLeafPublisher for HardwareFrameGrantLeafPublisher {
     fn publish_and_invalidate(&mut self, ttbr0: u64, ready: FrameGrantReady) -> bool {
+        use crate::rust_alloc::sync::Arc;
+        use carrick_mmu_core::aarch64::{
+            GuestLeafPublication, GuestLeafPublicationError, HostArenaResolver,
+            PageTableLayoutConfig, PageTableManager,
+        };
+
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         LAST_FRAME_GRANT_PUBLICATION_ERROR.store(0, Ordering::Relaxed);
-        let result = unsafe {
-            carrick_mmu_core::aarch64::publish_existing_invalid_private_pages(
-                carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE
-                    as *mut core::sync::atomic::AtomicU64,
-                ttbr0 & TTBR_BADDR_MASK,
-                carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
-                carrick_mmu_core::aarch64::GuestLeafPublication {
-                    va: ready.semantic_base,
-                    ipa: ready.physical_ipa,
-                    len: ready.len,
-                    writable: ready.permissions & 2 != 0,
-                    executable: ready.permissions & 4 != 0,
-                },
+        let physical_base = ttbr0 & TTBR_BADDR_MASK;
+        let byte_len = carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize;
+        let resolver: Arc<dyn HostArenaResolver + Send + Sync> =
+            Arc::new(GuestPrimaryArenaResolver {
+                physical_base,
+                host_base: carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as usize,
+                byte_len,
+            });
+        let mut manager = match unsafe {
+            PageTableManager::new_live(
+                physical_base,
+                PageTableLayoutConfig::new(
+                    carrick_el1_abi::AARCH64_USER_LEAF_CHECK_VA,
+                    byte_len,
+                    carrick_el1_abi::AARCH64_GIC_WINDOW_BASE,
+                    carrick_el1_abi::AARCH64_GIC_WINDOW_SIZE,
+                ),
+                byte_len,
+                resolver,
             )
+        } {
+            Ok(manager) => manager,
+            Err(error) => {
+                LAST_FRAME_GRANT_PUBLICATION_ERROR.store(
+                    publication_error_code(GuestLeafPublicationError::Manager(error)),
+                    Ordering::Relaxed,
+                );
+                return false;
+            }
         };
+        let result = manager.publish_live_private_pages_transaction(GuestLeafPublication {
+            va: ready.semantic_base,
+            ipa: ready.physical_ipa,
+            len: ready.len,
+            writable: ready.permissions & 2 != 0,
+            executable: ready.permissions & 4 != 0,
+        });
         if let Err(error) = result {
             LAST_FRAME_GRANT_PUBLICATION_ERROR
                 .store(publication_error_code(error), Ordering::Relaxed);
@@ -226,6 +291,22 @@ mod tests {
         assert_eq!(
             publication_error_code(GuestLeafPublicationError::RetiredLeaf),
             6
+        );
+        assert_eq!(
+            publication_error_code(GuestLeafPublicationError::Manager(
+                carrick_mmu_core::aarch64::PageTableError::OutOfTables
+            )),
+            7
+        );
+        assert_eq!(
+            publication_error_code(GuestLeafPublicationError::Manager(
+                carrick_mmu_core::aarch64::PageTableError::UnresolvedArena(0x1234)
+            )),
+            11
+        );
+        assert_eq!(
+            publication_error_code(GuestLeafPublicationError::RollbackFailed),
+            14
         );
     }
 

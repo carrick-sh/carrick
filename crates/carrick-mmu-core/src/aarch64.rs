@@ -190,6 +190,8 @@ pub enum GuestLeafPublicationError {
     InvalidLeafShape,
     AlreadyValid,
     RetiredLeaf,
+    Manager(PageTableError),
+    RollbackFailed,
 }
 
 /// One exact semantic-to-physical leaf span and its Linux permissions.
@@ -1816,27 +1818,49 @@ impl PageTableManager {
             }
         }
         let dirty = core::mem::take(&mut self.dirty);
-        for (loc, is_ptr) in dirty {
+        let publish = |loc: TableLocation, is_ptr: bool| -> Result<(), PageTableError> {
             let arena = &self.arenas[loc.arena];
-            let v = if let Some(&(staged_desc, _)) = self.staged.get(&loc) {
-                staged_desc
-            } else {
-                match arena.storage {
-                    TableArenaStorage::Owned(ref bytes) => {
-                        let mut a = [0u8; 8];
-                        a.copy_from_slice(&bytes[loc.offset..loc.offset + 8]);
-                        u64::from_le_bytes(a)
-                    }
-                    TableArenaStorage::Live => self.read_desc(loc)?,
-                }
-            };
-            if is_ptr {
+            let (v, final_is_ptr) =
+                if let Some(&(staged_desc, staged_is_ptr)) = self.staged.get(&loc) {
+                    (staged_desc, staged_is_ptr)
+                } else {
+                    let value = match arena.storage {
+                        TableArenaStorage::Owned(ref bytes) => {
+                            let mut a = [0u8; 8];
+                            a.copy_from_slice(&bytes[loc.offset..loc.offset + 8]);
+                            u64::from_le_bytes(a)
+                        }
+                        TableArenaStorage::Live => self.read_desc(loc)?,
+                    };
+                    (value, is_ptr)
+                };
+            if final_is_ptr != is_ptr {
+                return Ok(());
+            }
+            if final_is_ptr {
                 fence(Ordering::SeqCst);
             }
             let host = hosts[loc.arena].ok_or(PageTableError::UnresolvedArena(arena.base))?;
             unsafe {
                 let slot = host.add(loc.offset) as *mut AtomicU64;
                 (*slot).store(v, Ordering::SeqCst);
+            }
+            Ok(())
+        };
+        // Publish terminal descriptors first. Newly created table pointers are
+        // then replayed in reverse creation order, so an L3 table becomes
+        // reachable before its L2 parent and that L2 table before its L1
+        // parent. A sibling hardware walker can therefore observe either the
+        // old invalid path or a completely initialized descendant path, never
+        // a parent pointing at not-yet-published child contents.
+        for &(loc, is_ptr) in &dirty {
+            if !is_ptr {
+                publish(loc, false)?;
+            }
+        }
+        for &(loc, is_ptr) in dirty.iter().rev() {
+            if is_ptr {
+                publish(loc, true)?;
             }
         }
         fence(Ordering::SeqCst);
@@ -1850,6 +1874,128 @@ impl PageTableManager {
             }
         }
         Ok(())
+    }
+
+    fn preflight_live_private_publication(
+        &self,
+        publication: GuestLeafPublication,
+    ) -> Result<usize, GuestLeafPublicationError> {
+        if !publication.va.is_multiple_of(PT_PAGE)
+            || !publication.ipa.is_multiple_of(PT_PAGE)
+            || publication.len == 0
+            || !publication.len.is_multiple_of(PT_PAGE)
+            || publication.va.checked_add(publication.len).is_none()
+            || publication.ipa.checked_add(publication.len).is_none()
+        {
+            return Err(GuestLeafPublicationError::BadRange);
+        }
+        if self
+            .layout
+            .ipa_overlaps_excluded(publication.ipa, publication.len)
+        {
+            return Err(GuestLeafPublicationError::Manager(
+                PageTableError::GicWindowOutput,
+            ));
+        }
+        let pages = usize::try_from(publication.len / PT_PAGE)
+            .map_err(|_| GuestLeafPublicationError::BadRange)?;
+        for page in 0..pages {
+            let va = publication.va + page as u64 * PT_PAGE;
+            let indexes = indices(va);
+            let mut table = TableLocation::new(0, 0);
+            #[allow(clippy::needless_range_loop)]
+            for level in 0..4 {
+                let entry = table.entry(indexes[level]);
+                if entry.offset + core::mem::size_of::<u64>()
+                    > self.arenas[entry.arena].allocated_span() as usize
+                {
+                    return Err(GuestLeafPublicationError::Manager(
+                        PageTableError::BadAddress,
+                    ));
+                }
+                let descriptor = self
+                    .read_desc(entry)
+                    .map_err(GuestLeafPublicationError::Manager)?;
+                if descriptor & VALID == 0 {
+                    if descriptor & SW_RETIRED != 0 {
+                        return Err(GuestLeafPublicationError::RetiredLeaf);
+                    }
+                    break;
+                }
+                if level == 3 {
+                    return if descriptor & TYPE_BITS == TYPE_TABLE_OR_PAGE {
+                        Err(GuestLeafPublicationError::AlreadyValid)
+                    } else {
+                        Err(GuestLeafPublicationError::InvalidLeafShape)
+                    };
+                }
+                if descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+                    return if level == 0 {
+                        Err(GuestLeafPublicationError::InvalidLeafShape)
+                    } else {
+                        Err(GuestLeafPublicationError::AlreadyValid)
+                    };
+                }
+                table = self
+                    .pa_to_loc(descriptor & PA_MASK_TABLE)
+                    .map_err(GuestLeafPublicationError::Manager)?;
+            }
+        }
+        Ok(pages)
+    }
+
+    /// Transactionally publish an authenticated private frame grant into this
+    /// live stage-1 image, allocating a missing hierarchy from the manager's
+    /// current table pool. The complete target range is checked before the
+    /// first edit. Descriptor publication is child-before-parent, and every
+    /// failed edit restores the journal to hardware-visible memory.
+    ///
+    /// This entry point deliberately has no extension-arena source: a guest
+    /// cannot make a new arena walker-visible until its stage-2 backing is
+    /// separately granted. Exhausting the current live pool therefore refuses
+    /// the transaction whole with `Manager(OutOfTables)`.
+    pub fn publish_live_private_pages_transaction(
+        &mut self,
+        publication: GuestLeafPublication,
+    ) -> Result<usize, GuestLeafPublicationError> {
+        if !self.is_live() {
+            return Err(GuestLeafPublicationError::Manager(
+                PageTableError::UnresolvedArena(self.base()),
+            ));
+        }
+        let pages = self.preflight_live_private_publication(publication)?;
+        let resolver =
+            self.resolver
+                .as_ref()
+                .cloned()
+                .ok_or(GuestLeafPublicationError::Manager(
+                    PageTableError::UnresolvedArena(self.base()),
+                ))?;
+        self.begin_undo()
+            .map_err(GuestLeafPublicationError::Manager)?;
+
+        let edit = self.map_private_aliased_with_permissions(
+            publication.va,
+            publication.ipa,
+            publication.len,
+            publication.writable,
+            publication.executable,
+            None,
+        );
+        if let Err(error) = edit {
+            if unsafe { self.rollback_undo(&resolver, None) }.is_err() {
+                return Err(GuestLeafPublicationError::RollbackFailed);
+            }
+            return Err(GuestLeafPublicationError::Manager(error));
+        }
+        if let Err(error) = unsafe { self.sync_to_host(&resolver) } {
+            if unsafe { self.rollback_undo(&resolver, None) }.is_err() {
+                return Err(GuestLeafPublicationError::RollbackFailed);
+            }
+            return Err(GuestLeafPublicationError::Manager(error));
+        }
+        self.commit_undo();
+        Ok(pages)
     }
 
     /// Open an undo journal covering every descriptor edit from here until
@@ -3205,16 +3351,35 @@ impl PageTableManager {
         writable: bool,
         source: Option<&mut dyn TableArenaSource>,
     ) -> Result<bool, PageTableError> {
+        self.map_private_aliased_with_permissions(va, ipa, len, writable, true, source)
+    }
+
+    /// Build a per-mm private VA→IPA translation with explicit Linux write and
+    /// execute permissions. New leaves are always ASID-scoped (`nG`).
+    pub fn map_private_aliased_with_permissions(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        writable: bool,
+        executable: bool,
+        source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<bool, PageTableError> {
         let block_flags = if writable {
             USER_BLOCK_FLAGS | NON_GLOBAL
         } else {
             (USER_BLOCK_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL
         };
-        let page_flags = if writable {
+        let mut block_flags = block_flags;
+        let mut page_flags = if writable {
             USER_PAGE_FLAGS | NON_GLOBAL
         } else {
             (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL
         };
+        if !executable {
+            block_flags |= UXN;
+            page_flags |= UXN;
+        }
         self.map_aliased_with_flags(va, ipa, len, block_flags, page_flags, source)
     }
 
@@ -7211,5 +7376,150 @@ mod tests {
             ));
             assert_ne!(descriptor & NON_GLOBAL, 0);
         }
+    }
+
+    #[test]
+    fn live_guest_publication_builds_missing_hierarchy_transactionally() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let offline = hvpatch_manager();
+        let va = LINUX_MMAP_BASE + 0x4080_0000;
+        let ipa = 0x9000_0000;
+        assert_eq!(
+            terminal_descriptor(offline.debug_walk(va)) & VALID,
+            0,
+            "the red fixture must begin without an accessible translation"
+        );
+        assert_eq!(
+            offline.debug_walk(va)[3],
+            0,
+            "the red fixture must exercise missing hierarchy rather than an existing L3 leaf"
+        );
+        unsafe {
+            offline
+                .restore_quiesced_snapshot_to_host(&*resolver)
+                .expect("publish fixture");
+        }
+
+        let mut live = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                LINUX_PAGE_TABLES_SIZE as usize,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .expect("adopt live fixture")
+        };
+        assert_eq!(
+            live.publish_live_private_pages_transaction(GuestLeafPublication {
+                va,
+                ipa,
+                len: 3 * PT_PAGE,
+                writable: true,
+                executable: false,
+            }),
+            Ok(3)
+        );
+
+        for page in 0..3 {
+            let page_va = va + page * PT_PAGE;
+            assert_eq!(live.translate(page_va), Some(ipa + page * PT_PAGE));
+            let descriptor = terminal_descriptor(live.debug_walk(page_va));
+            assert!(terminal_descriptor_permits_el0(
+                descriptor,
+                LeafAccess::Read
+            ));
+            assert!(terminal_descriptor_permits_el0(
+                descriptor,
+                LeafAccess::Write
+            ));
+            assert!(!terminal_descriptor_permits_el0(
+                descriptor,
+                LeafAccess::Execute
+            ));
+            assert_ne!(descriptor & NON_GLOBAL, 0);
+        }
+        assert_eq!(live.translate(va - PT_PAGE), None);
+        assert_eq!(live.translate(va + 3 * PT_PAGE), None);
+
+        let occupied = GuestLeafPublication {
+            va: va + 2 * PT_PAGE,
+            ipa: ipa + 0x20_0000,
+            len: 2 * PT_PAGE,
+            writable: true,
+            executable: false,
+        };
+        assert_eq!(
+            live.publish_live_private_pages_transaction(occupied),
+            Err(GuestLeafPublicationError::AlreadyValid)
+        );
+        assert_eq!(
+            live.translate(va + 3 * PT_PAGE),
+            None,
+            "whole-range preflight must reject before exposing a later page"
+        );
+    }
+
+    #[test]
+    fn live_guest_publication_refuses_table_exhaustion_without_partial_mapping() {
+        let full = MockLiveResolver::new();
+        full.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+        let offline = hvpatch_manager();
+        let capacity = offline.copied_bytes() as usize;
+        let va = LINUX_MMAP_BASE + 0x4080_0000;
+        unsafe {
+            offline
+                .restore_quiesced_snapshot_to_host(&*full)
+                .expect("publish fixture");
+        }
+
+        let constrained = MockLiveResolver::new();
+        let bytes = full
+            .arenas
+            .lock()
+            .unwrap()
+            .get(&LINUX_PAGE_TABLES_BASE)
+            .unwrap()[..capacity]
+            .to_vec();
+        constrained
+            .arenas
+            .lock()
+            .unwrap()
+            .insert(LINUX_PAGE_TABLES_BASE, bytes.clone());
+        let mut live = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                capacity,
+                Arc::clone(&constrained) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .expect("adopt constrained fixture")
+        };
+        assert_eq!(live.spare_tables_available(), 0);
+        assert_eq!(
+            live.publish_live_private_pages_transaction(GuestLeafPublication {
+                va,
+                ipa: 0x9000_0000,
+                len: 3 * PT_PAGE,
+                writable: true,
+                executable: false,
+            }),
+            Err(GuestLeafPublicationError::Manager(
+                PageTableError::OutOfTables
+            ))
+        );
+        assert_eq!(live.translate(va), None);
+        assert_eq!(
+            constrained
+                .arenas
+                .lock()
+                .unwrap()
+                .get(&LINUX_PAGE_TABLES_BASE)
+                .unwrap()
+                .as_slice(),
+            bytes.as_slice(),
+            "capacity refusal must leave every hardware-visible byte unchanged"
+        );
     }
 }

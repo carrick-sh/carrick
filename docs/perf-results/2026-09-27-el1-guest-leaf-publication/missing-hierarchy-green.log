@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-438fb741d9d260b3)
+
+running 2 tests
+test aarch64::tests::live_guest_publication_builds_missing_hierarchy_transactionally ... ok
+test aarch64::tests::live_guest_publication_refuses_table_exhaustion_without_partial_mapping ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 95 filtered out; finished in 0.01s
+

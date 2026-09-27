@@ -228,7 +228,7 @@ pub const LINUX_KERNEL_REGION_SIZE: u64 = 0x20_0000;
 // whose host-side syscall-buffer gate is a flat window that DOES back GPA 0
 // (KVM's low identity window) must consult this so a NULL syscall buffer
 // EFAULTs like the guest's own access would (LTP pipe05: pipe(NULL) → EFAULT).
-pub const LINUX_NULL_GUARD_END: u64 = 0x10000;
+pub const LINUX_NULL_GUARD_END: u64 = carrick_el1_abi::AARCH64_USER_LEAF_CHECK_VA;
 pub const LINUX_EL0_TRAMPOLINE_BASE: u64 = LINUX_KERNEL_REGION_BASE;
 // Trampoline region size. Must be at least one HVF page (16 KiB) so the
 // stage-2 mapping is aligned. The first 4 bytes carry the `eret` opcode;
@@ -825,8 +825,8 @@ const fn ranges_do_not_overlap(a_base: u64, a_size: u64, b_base: u64, b_size: u6
 /// boundary and stage-1 publication both refuse it. It sits between the
 /// vvar/vDSO/clock-stub pages (0x2E_0000_0000) and the sigreturn trampoline
 /// (0x30_0000_0000), below 2^40.
-pub const LINUX_GIC_WINDOW_BASE: u64 = 0x2F_0000_0000;
-pub const LINUX_GIC_WINDOW_SIZE: u64 = 0x1000_0000; // 256 MiB
+pub const LINUX_GIC_WINDOW_BASE: u64 = carrick_el1_abi::AARCH64_GIC_WINDOW_BASE;
+pub const LINUX_GIC_WINDOW_SIZE: u64 = carrick_el1_abi::AARCH64_GIC_WINDOW_SIZE; // 256 MiB
 pub const LINUX_GIC_DISTRIBUTOR_BASE: u64 = LINUX_GIC_WINDOW_BASE;
 /// Room for the distributor frame (Hypervisor.framework reports 64 KiB).
 pub const LINUX_GIC_DISTRIBUTOR_MAX: u64 = 0x100_0000; // 16 MiB
