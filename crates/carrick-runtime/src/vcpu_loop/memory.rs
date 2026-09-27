@@ -11,27 +11,8 @@ use carrick_kernel::kernel::KernelForeignCowProof;
 use carrick_kernel::run_result::RuntimeError;
 use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 
-/// Whether this syscall must take the process-wide page-table pause BEFORE the
-/// dispatcher runs — see the call site in `service_threaded_syscall` for the
-/// lock-order argument. `arg2` is the third syscall argument (madvise's
-/// `advice`); it is ignored for every other number.
-pub(crate) fn syscall_takes_pre_dispatch_pt_pause(
-    number: u64,
-    arg2: u64,
-    multi_vcpu: bool,
-) -> bool {
-    if !multi_vcpu {
-        return false;
-    }
-    syscall_edits_stage1(number, arg2)
-}
-
 /// Whether this syscall edits stage-1 descriptors at all, independent of how
-/// many threads exist. Split out from the pause predicate because the two
-/// answers are used for different things: a peer executor decides whether a
-/// PAUSE is needed, while editing stage-1 at all decides whether this thread
-/// should claim stage-1 EXCLUSIVITY for the dispatch — which it holds either
-/// way, since with no peer executor there is nobody to be exclusive against.
+/// many threads exist.
 pub(crate) fn syscall_edits_stage1(number: u64, arg2: u64) -> bool {
     carrick_kernel::dispatch::syscall_requires_mm_mutation(
         number,
@@ -755,55 +736,24 @@ mod tests {
                 syscall_edits_stage1(editor, 0),
                 "{editor} edits stage-1 whether or not a peer exists"
             );
-            assert_eq!(
-                syscall_takes_pre_dispatch_pt_pause(editor, 0, true),
-                syscall_edits_stage1(editor, 0)
-            );
         }
         assert!(!syscall_edits_stage1(63, 0), "read edits no descriptors");
     }
 
-    /// The pre-dispatch page-table pause exists to keep ONE global lock order
-    /// (pause, then the dispatcher's host-alias phase). `MADV_DONTNEED` is in
-    /// the set because it is the one host-alias-taking syscall that reaches the
-    /// backend's self-quiescing `zero_backing` path; without it the two orders
-    /// crossed and deadlocked a whole guest at ~0% CPU.
     #[test]
-    fn pre_dispatch_pt_pause_covers_madvise_dontneed() {
-        for &editor in carrick_kernel::dispatch::MM_MUTATION_SYSCALLS {
-            assert!(syscall_takes_pre_dispatch_pt_pause(editor, 0, true));
-            assert!(
-                !syscall_takes_pre_dispatch_pt_pause(editor, 0, false),
-                "a single-vCPU process has no sibling to pause"
-            );
-        }
-        assert!(!syscall_takes_pre_dispatch_pt_pause(63, 0, true));
-    }
-
-    #[test]
-    fn remap_file_pages_does_not_pause_stage1() {
+    fn remap_file_pages_does_not_edit_stage1() {
         assert!(
             !syscall_edits_stage1(carrick_abi::syscall::nr::REMAP_FILE_PAGES.raw(), 0),
             "remap_file_pages only updates attachment metadata or copies bytes"
         );
-        assert!(!syscall_takes_pre_dispatch_pt_pause(
-            carrick_abi::syscall::nr::REMAP_FILE_PAGES.raw(),
-            0,
-            true,
-        ));
     }
 
     #[test]
-    fn shmdt_validates_before_pausing_stage1() {
+    fn shmdt_validates_before_editing_stage1() {
         assert!(
             !syscall_edits_stage1(carrick_abi::syscall::nr::SHMDT.raw(), 0),
             "shmdt must reject invalid or remapped attachments before acquiring mutation authority"
         );
-        assert!(!syscall_takes_pre_dispatch_pt_pause(
-            carrick_abi::syscall::nr::SHMDT.raw(),
-            0,
-            true,
-        ));
     }
 
     // ------------------------------------------------------------------

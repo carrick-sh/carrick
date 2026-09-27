@@ -6,9 +6,8 @@
 
 use super::*;
 use carrick_fatal::carrick_fatal;
-use carrick_kernel::dispatch::mm_quiesce::{
-    MmStage1Authority, PtPauseBudget, acquire_mm_stage1_authority,
-};
+#[cfg(test)]
+use carrick_kernel::dispatch::mm_quiesce::PtPauseBudget;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 enum PreparedHvpatchProcessMm {
@@ -1060,34 +1059,8 @@ where
                     })?,
                 ),
             };
-        let coordinator = kernel.dispatcher.mm_mutation_coordinator();
         let parent_mm_id = parent_context.shared().mm().id();
-        let install_authority =
-            acquire_mm_stage1_authority(mm_executor, self.this_tid, PtPauseBudget::DEFAULT);
-        let mut parent_authority = match install_authority {
-            Ok(authority) => authority,
-            Err(install_failure) => {
-                tracing::warn!(
-                    ?install_failure,
-                    "dispatcher fork install could not pause the parent MM; fork(2) = EAGAIN"
-                );
-                return Ok(PreparedInProcessFork::Complete(Some(
-                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
-                )));
-            }
-        };
-        let parent_mutation = match &mut parent_authority {
-            MmStage1Authority::Sole(sole) => {
-                carrick_kernel::dispatch::mm_mutation::from_sole_executor(
-                    sole,
-                    coordinator,
-                    parent_mm_id,
-                )
-            }
-            MmStage1Authority::Paused(pause) => {
-                carrick_kernel::dispatch::mm_mutation::from_pt_pause(pause)
-            }
-        };
+        let parent_mutation = carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor);
         let mut inventory_transaction = None;
         let mut inventory_reserve =
             |frame_candidates: usize,
@@ -1431,7 +1404,6 @@ where
         }
         drop(topology);
         drop(parent_mutation);
-        drop(parent_authority);
 
         fork_stage_started = Instant::now();
         let published = match prepared_fork.commit() {
@@ -2379,13 +2351,13 @@ mod pt_pause_tests {
             "prepare_in_process_fork body missing from quiesce.rs",
         );
 
-        assert!(prepare.contains("acquire_mm_stage1_authority(mm_executor"));
+        assert!(prepare.contains("mm_mutation::from_executor(mm_executor)"));
         // Lock order P -> topology: the stage-1 authority is taken before the
         // frame-inventory reservation and the backend topology lock, matching
         // the mmap/munmap editors, so a paused editor can never wait on a
         // topology lock the forker holds while the forker waits for P.
         let authority_at = prepare
-            .find("acquire_mm_stage1_authority(mm_executor")
+            .find("mm_mutation::from_executor(mm_executor)")
             .expect("fork install acquires stage-1 authority");
         let reserve_at = prepare
             .find(".reserve_frame_inventory(")
@@ -2401,8 +2373,6 @@ mod pt_pause_tests {
             authority_at < topology_at,
             "authority must precede the mm transaction"
         );
-        assert!(prepare.contains("MmStage1Authority::Paused(pause)"));
-        assert!(prepare.contains("mm_mutation::from_pt_pause(pause)"));
         assert!(!prepare.contains("with_sole_mm_stage1"));
         assert!(!prepare.contains("lost sole exact-MM authority"));
         assert!(!prepare.contains("try_acquire_topology_lock("));
@@ -2430,7 +2400,7 @@ mod pt_pause_tests {
             .find(".hold_owner_set_edit(parent_task)")
             .expect("shared fork admits against the parent's MM generation");
         let authority_at = prepare
-            .find("acquire_mm_stage1_authority(mm_executor")
+            .find("mm_mutation::from_executor(mm_executor)")
             .expect("fork install acquires stage-1 authority");
         let publish_at = prepare
             .find(".publish_shared_child(parent_task")

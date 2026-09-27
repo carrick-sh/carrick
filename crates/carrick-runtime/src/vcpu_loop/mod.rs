@@ -49,7 +49,6 @@ use crate::linux_abi::LinuxErrno;
 use crate::memory::AddressSpace;
 use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
 use crate::trap::{SyscallTrap, TrapError};
-use carrick_kernel::dispatch::mm_quiesce;
 use carrick_kernel::dispatch::routing::{MutationDispatchRoute, OrdinaryDispatchRoute};
 use carrick_kernel::dispatch::{
     CurrentMmMemory, DispatchError, DispatchOutcome, PreparedDispatch, PreparedSyscall,
@@ -70,7 +69,7 @@ pub(crate) mod native_probe;
 pub(crate) use memory::{
     KernelFrameCowAuthority, RefuseAliasInstallSpec, apply_alias_frame_inventory,
     apply_exec_image_proc_state, apply_image_proc_state, refuse_alias_install,
-    requires_no_unwind_host_exit, stamp_ns_visible_guest_tid, syscall_takes_pre_dispatch_pt_pause,
+    requires_no_unwind_host_exit, stamp_ns_visible_guest_tid, syscall_edits_stage1,
 };
 #[cfg(test)]
 pub(crate) use memory::{
@@ -1339,34 +1338,11 @@ where
 
     fn with_mm_mutation_authority_for_executor<T>(
         &mut self,
-        kernel: &Kernel,
+        _kernel: &Kernel,
         executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
         run: impl FnOnce(&mut carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
     ) -> Result<T, RuntimeError> {
-        let context = kernel
-            .dispatcher
-            .capture_kernel_context(self.linux_tid)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let coordinator = kernel.dispatcher.mm_mutation_coordinator();
-        let mm = context.shared().mm().id();
-        let mut authority = mm_quiesce::acquire_mm_stage1_authority(
-            executor,
-            self.this_tid,
-            mm_quiesce::PtPauseBudget::DEFAULT,
-        )
-        .map_err(|error| {
-            RuntimeError::Configuration(format!(
-                "fault page-table pause failed before mutation: {error:?}"
-            ))
-        })?;
-        let mut mutation = match &mut authority {
-            mm_quiesce::MmStage1Authority::Sole(sole) => {
-                carrick_kernel::dispatch::mm_mutation::from_sole_executor(sole, coordinator, mm)
-            }
-            mm_quiesce::MmStage1Authority::Paused(pause) => {
-                carrick_kernel::dispatch::mm_mutation::from_pt_pause(pause)
-            }
-        };
+        let mut mutation = carrick_kernel::dispatch::mm_mutation::from_executor(executor);
         Ok(run(&mut mutation))
     }
 
@@ -1671,27 +1647,13 @@ where
         // (`carrick_hal::stage1_exclusive` documents what leaks when it cannot).
         enum SyscallMmPhase<'executor> {
             Ordinary(&'executor mut carrick_kernel::dispatch::MmExecutorParticipation),
-            Mutation(mm_quiesce::MmStage1Authority<'executor>),
+            Mutation(carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'executor>),
         }
 
-        let edits_stage1 =
-            syscall_takes_pre_dispatch_pt_pause(request.number.raw(), request.args.0[2], true);
+        let edits_stage1 = syscall_edits_stage1(request.number.raw(), request.args.0[2]);
         let mut mm_phase = if edits_stage1 {
-            match mm_quiesce::acquire_mm_stage1_authority(
-                mm_executor,
-                self.this_tid,
-                mm_quiesce::PtPauseBudget::DEFAULT,
-            ) {
-                Ok(authority) => SyscallMmPhase::Mutation(authority),
-                Err(mm_quiesce::PtPauseError::TimedOut) => {
-                    // No dispatcher/backend mapping call has started yet. Return
-                    // a clean Linux allocation failure after pt_pause rolled the
-                    // request back and resumed already-parked siblings. This is
-                    // still a completed syscall boundary, so retain the exact
-                    // context required by errno completion and signal service.
-                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOMEM));
-                }
-            }
+            let guard = carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor);
+            SyscallMmPhase::Mutation(guard)
         } else {
             SyscallMmPhase::Ordinary(mm_executor)
         };
@@ -1729,9 +1691,8 @@ where
                         request.number.raw(),
                         request.args,
                     ) {
-                        let coordinator = kernel.dispatcher.mm_mutation_coordinator();
-                        let stage1_authority = match &mut mm_phase {
-                            SyscallMmPhase::Mutation(authority) => authority,
+                        let mutation = match &mut mm_phase {
+                            SyscallMmPhase::Mutation(guard) => guard,
                             SyscallMmPhase::Ordinary(_) => {
                                 tracing::error!("mutation dispatch lacks outer stage-1 authority");
                                 carrick_fatal!(
@@ -1740,46 +1701,19 @@ where
                                 )
                             }
                         };
-                        match stage1_authority {
-                            mm_quiesce::MmStage1Authority::Sole(authority) => {
-                                let mut mutation =
-                                    carrick_kernel::dispatch::mm_mutation::from_sole_executor(
-                                        authority,
-                                        coordinator,
-                                        kernel_context.shared().mm().id(),
-                                    );
-                                kernel
-                                    .dispatcher
-                                    .dispatch_threaded_prepared_mutation_with_lease(
-                                        &kernel_context,
-                                        syscall,
-                                        engine,
-                                        &kernel.reporter,
-                                        make_thread_ctx(),
-                                        MutationDispatchRoute {
-                                            guard: &mut mutation,
-                                            lease,
-                                        },
-                                    )
-                            }
-                            mm_quiesce::MmStage1Authority::Paused(authority) => {
-                                let mut mutation =
-                                    carrick_kernel::dispatch::mm_mutation::from_pt_pause(authority);
-                                kernel
-                                    .dispatcher
-                                    .dispatch_threaded_prepared_mutation_with_lease(
-                                        &kernel_context,
-                                        syscall,
-                                        engine,
-                                        &kernel.reporter,
-                                        make_thread_ctx(),
-                                        MutationDispatchRoute {
-                                            guard: &mut mutation,
-                                            lease,
-                                        },
-                                    )
-                            }
-                        }
+                        kernel
+                            .dispatcher
+                            .dispatch_threaded_prepared_mutation_with_lease(
+                                &kernel_context,
+                                syscall,
+                                engine,
+                                &kernel.reporter,
+                                make_thread_ctx(),
+                                MutationDispatchRoute {
+                                    guard: mutation,
+                                    lease,
+                                },
+                            )
                     } else {
                         let mm_executor = match &mut mm_phase {
                             SyscallMmPhase::Ordinary(executor) => &mut **executor,
@@ -1845,7 +1779,6 @@ where
                     prot_none,
                 } if kernel.hvpatch_process.is_some() => {
                     let shared = backing.is_shared();
-                    let coordinator = kernel.dispatcher.mm_mutation_coordinator();
                     let install_alias =
                         |permit: &carrick_kernel::dispatch::mm_mutation::HostAliasPermit<'_>| {
                             let Some(install) = transaction.claim(permit) else {
@@ -2034,8 +1967,8 @@ where
                                 value: success_retval,
                             })
                         };
-                    let stage1_authority = match &mut mm_phase {
-                        SyscallMmPhase::Mutation(authority) => authority,
+                    let mutation = match &mut mm_phase {
+                        SyscallMmPhase::Mutation(guard) => guard,
                         SyscallMmPhase::Ordinary(_) => {
                             tracing::error!("host-alias install lacks outer stage-1 authority");
                             carrick_fatal!(
@@ -2044,24 +1977,8 @@ where
                             )
                         }
                     };
-                    let installed = match stage1_authority {
-                        mm_quiesce::MmStage1Authority::Sole(authority) => {
-                            let mutation =
-                                carrick_kernel::dispatch::mm_mutation::from_sole_executor(
-                                    authority,
-                                    coordinator,
-                                    kernel_context.shared().mm().id(),
-                                );
-                            let permit = mutation.host_alias_permit();
-                            install_alias(&permit)
-                        }
-                        mm_quiesce::MmStage1Authority::Paused(authority) => {
-                            let mutation =
-                                carrick_kernel::dispatch::mm_mutation::from_pt_pause(authority);
-                            let permit = mutation.host_alias_permit();
-                            install_alias(&permit)
-                        }
-                    };
+                    let permit = mutation.host_alias_permit();
+                    let installed = install_alias(&permit);
                     break 'service installed;
                 }
                 other => break 'service Ok(other),

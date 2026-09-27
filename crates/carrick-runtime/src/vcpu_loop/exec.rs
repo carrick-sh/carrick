@@ -1784,7 +1784,7 @@ where
         // Task 4: replaced acquire_topology_lock with mutation.begin_transaction().
         let topology_lock_started = std::time::Instant::now();
         let mut admitted_mm_executor = None;
-        let mut mm_authority = if kernel.hvpatch_process.is_some() {
+        let mutation = if kernel.hvpatch_process.is_some() {
             let mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation = match self
                 .guest_execution
                 .as_mut()
@@ -1803,46 +1803,14 @@ where
                     }
                 },
             };
-            let coordinator = kernel.dispatcher.mm_mutation_coordinator();
-            let authority = match carrick_kernel::dispatch::mm_quiesce::acquire_mm_stage1_authority(
-                mm_executor,
-                self.this_tid,
-                carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
-            ) {
-                Ok(auth) => auth,
-                Err(error) => {
-                    return Self::exec_failed_past_no_return(
-                        kernel,
-                        engine,
-                        &format!("acquire exact-MM exec authority: {error:?}"),
-                    )
-                    .map(Some);
-                }
-            };
-            Some((authority, coordinator, old_mm_id))
+            let mutation = carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor)
+                .with_operation(
+                    carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
+                );
+            Some(mutation)
         } else {
             None
         };
-        let mutation =
-            mm_authority
-                .as_mut()
-                .map(|(authority, coordinator, mm_id)| match authority {
-                    carrick_kernel::dispatch::mm_quiesce::MmStage1Authority::Sole(sole) => {
-                        carrick_kernel::dispatch::mm_mutation::from_sole_executor(
-                            sole,
-                            std::sync::Arc::clone(coordinator),
-                            *mm_id,
-                        )
-                        .with_operation(
-                            carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
-                        )
-                    }
-                    carrick_kernel::dispatch::mm_quiesce::MmStage1Authority::Paused(pause) => {
-                        carrick_kernel::dispatch::mm_mutation::from_pt_pause(pause).with_operation(
-                            carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
-                        )
-                    }
-                });
         let mut _hvpatch_topology = mutation.as_ref().map(|m| m.begin_transaction());
         if let Some(guard) = _hvpatch_topology.as_mut() {
             if let Some(process) = kernel.hvpatch_process.as_ref() {
@@ -1992,7 +1960,6 @@ where
         // frame-inventory authority lock.
         drop(_hvpatch_topology);
         drop(mutation);
-        drop(mm_authority);
         drop(admitted_mm_executor);
         if let Some(process) = kernel.hvpatch_process.as_ref() {
             let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
