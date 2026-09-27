@@ -1,0 +1,88 @@
+(lldb) target create "target/el1-completion/allocator-maintenance-fix/test-frozen/el1_sched-ba795739d7a1a0f3"
+Current executable set to '/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-maintenance-fix/test-frozen/el1_sched-ba795739d7a1a0f3' (arm64).
+(lldb) settings set -- target.run-args  "el1_metadata_allocator_grows_and_returns_extents" "--nocapture"
+(lldb) breakpoint set --file metadata_grant.rs --line 273
+Breakpoint 1: where = el1_sched-ba795739d7a1a0f3`carrick_vmm_hvf::metadata_grant::handle_metadata_grant_trap::hab5b403d7197999b + 1280 at metadata_grant.rs:273:12, address = 0x0000000100473190
+(lldb) run
+
+running 1 test
+test el1_metadata_allocator_grows_and_returns_extents ... warning: el1_sched-ba795739d7a1a0f3 was compiled with optimization - stepping may behave oddly; variables may not be available.
+Process 30500 launched: '/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-maintenance-fix/test-frozen/el1_sched-ba795739d7a1a0f3' (arm64)
+Process 30500 stopped
+* thread #8, name = 'carrick-executor-0', stop reason = breakpoint 1.1
+       frame #0: 0x0000000100473190 el1_sched-ba795739d7a1a0f3`carrick_vmm_hvf::metadata_grant::handle_metadata_grant_trap::hab5b403d7197999b(vcpu=0x0000000170ee39d8) at metadata_grant.rs:273:12 [opt]
+   270 	        let rc = unsafe {
+   271 	            crate::trap::inventory_hv_vm_map(host_ptr.cast(), ipa, extent_size, permissions)
+   272 	        };
+-> 273 	        if rc != 0 {
+    	           ^
+   274 	            unsafe {
+   275 	                std::alloc::dealloc(host_ptr, layout);
+   276 	            }
+Target 0: (el1_sched-ba795739d7a1a0f3) stopped.
+(lldb) frame variable rc host_ptr ipa extent_size requested_size
+(int) rc = 0
+(unsigned char *) host_ptr = 0x00000001301b8000 ""
+(unsigned long) ipa = 193407746048
+(unsigned long) extent_size = 1572864
+(unsigned long) requested_size = <variable not available>
+
+(lldb) thread backtrace
+* thread #8, name = 'carrick-executor-0', stop reason = breakpoint 1.1
+   * frame #0: 0x0000000100473190 el1_sched-ba795739d7a1a0f3`carrick_vmm_hvf::metadata_grant::handle_metadata_grant_trap::hab5b403d7197999b(vcpu=0x0000000170ee39d8) at metadata_grant.rs:273:12 [opt]
+     frame #1: 0x00000001003e3c90 el1_sched-ba795739d7a1a0f3`carrick_vmm_hvf::trap::HvfInner::run_to_exit_inner::h7c97e573f3280c8e(vcpu=<unavailable>, mailbox=<unavailable>, kick_armed=<unavailable>) at trap.rs:7738:17 [opt]
+     frame #2: 0x00000001003e37e8 el1_sched-ba795739d7a1a0f3`carrick_vmm_hvf::trap::HvfInner::run_to_exit::h7f1a3952404f978b(vcpu=<unavailable>, mailbox=<unavailable>) at trap.rs:7452:20 [opt]
+     frame #3: 0x000000010046fc6c el1_sched-ba795739d7a1a0f3`_$LT$carrick_vmm_hvf..hvf_aarch64_engine..HvfAarch64Vcpu$u20$as$u20$carrick_aarch64..vmm..Aarch64Vcpu$GT$::run::hb51a24fd9eb1504d(self=0x0000000170ee39d8) at hvf_aarch64_engine.rs:581:20 [opt]
+     frame #4: 0x00000001002f6a64 el1_sched-ba795739d7a1a0f3`_$LT$carrick_aarch64..engine..Aarch64EngineCore$LT$V$GT$$u20$as$u20$carrick_hal..trap..SyscallTrap$GT$::next_syscall::_$u7b$$u7b$closure$u7d$$u7d$::h24ef4fb91f186003 at engine.rs:2601:71 [opt] [inlined]
+     frame #5: 0x00000001002f6a58 el1_sched-ba795739d7a1a0f3`carrick_host::guest_cpu::timed_run_with_clock::heaf6ea1c79da128e(now_ns={closure_env#0}<core::result::Result<carrick_aarch64::vmm::Aarch64Exit, carrick_hal::trap::TrapError>, carrick_aarch64::engine::{impl#10}::next_syscall::{closure_env#0}<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vmm>> @ sp, run={closure_env#0}<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vmm> @ x22) at guest_cpu.rs:183:17 [opt]
+     frame #6: 0x00000001002f6a44 el1_sched-ba795739d7a1a0f3`carrick_host::guest_cpu::timed_run::hb87c297060ff0e5a(run=<unavailable>) at guest_cpu.rs:191:5 [opt]
+     frame #7: 0x00000001002d4bc0 el1_sched-ba795739d7a1a0f3`_$LT$carrick_aarch64..engine..Aarch64EngineCore$LT$V$GT$$u20$as$u20$carrick_hal..trap..SyscallTrap$GT$::next_syscall::h137e2ac29543dc92(self=<unavailable>) at engine.rs:2601:23 [opt]
+     frame #8: 0x00000001002b3854 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob$LT$E$GT$::poll_with_engine::hef62b3d9c240fd05(self=0x0000000123023800, engine=0x0000000170ee33d8, control=0x0000000170ee0bb0) at binding.rs:3952:27 [opt]
+     frame #9: 0x00000001002a6a58 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob$LT$E$GT$::poll_with_engine_typed::h822fe704e6bb224f(self=0x0000000123023800, engine=0x0000000170ee33d8, control=0x0000000170ee0bb0) at binding.rs:4286:27 [opt]
+     frame #10: 0x00000001002a6a18 el1_sched-ba795739d7a1a0f3`_$LT$carrick_runtime..vcpu_loop..binding..ProductionHvpatchLoopJob$LT$E$GT$$u20$as$u20$carrick_runtime..vcpu_loop..binding..ProductionHvpatchLoopPoll$GT$::poll::hbf1de19ab62dc606(self=0x0000000123023800, engine=&mut dyn core::any::Any @ 0x00000076497790f0, control=0x0000000170ee0bb0) at binding.rs:4357:20 [opt]
+     frame #11: 0x00000001002aa180 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::binding::HvpatchLoopJob$LT$E$GT$::poll_production::he4461f55eabc7c70(job=0x0000000122e11d40, engine=0x0000000170ee33d8, control=0x0000000170ee0bb0) at binding.rs:4737:31 [opt]
+     frame #12: 0x00000001002a4d34 el1_sched-ba795739d7a1a0f3`_$LT$carrick_runtime..vcpu_loop..binding..HvpatchLoopJob$LT$E$GT$$u20$as$u20$carrick_runtime..vcpu_loop..continuation..quantum..PersistentQuantumJob$GT$::poll_quantum_with_engine::h6e5a5193ff7f9d3c(self=0x0000000122e11d40, engine=&mut dyn core::any::Any @ 0x0000007649778c60, control=0x0000000170ee0bb0) at binding.rs:4775:9 [opt]
+     frame #13: 0x000000010032b0a8 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::continuation::quantum::HvpatchTaskQuantum::poll_quantum_with_engine::h5803505e86f326a1(self=0x0000000122e11d80, engine=<unavailable>, control=0x0000000170ee0bb0) at quantum.rs:122:25 [opt] [inlined]
+     frame #14: 0x000000010032b0a0 el1_sched-ba795739d7a1a0f3`_$LT$carrick_runtime..vcpu_loop..executor..backend..HvpatchPersistentExecutor$u20$as$u20$carrick_runtime..vcpu_loop..executor..backend..PersistentExecutor$GT$::run_until_boundary::haf134e6037eadfdd(self=0x0000000170ee22e0, need_resched=<unavailable>, submission=<unavailable>) at backend.rs:815:20 [opt]
+     frame #15: 0x0000000100265d40 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::executor::run_executor_loop::_$u7b$$u7b$closure$u7d$$u7d$::h6973dfc24225d76d at executor.rs:483:25 [opt] [inlined]
+     frame #16: 0x0000000100265d20 el1_sched-ba795739d7a1a0f3`core::ops::function::FnOnce::call_once::h83d144b9196b3ded((null)={closure_env#4}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutor, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory> @ 0x00000076214229c0, (null)=<unavailable>) at function.rs:250:5 [opt] [inlined]
+     frame #17: 0x0000000100265d20 el1_sched-ba795739d7a1a0f3`_$LT$core..panic..unwind_safe..AssertUnwindSafe$LT$F$GT$$u20$as$u20$core..ops..function..FnOnce$LT$$LP$$RP$$GT$$GT$::call_once::h311480b42cbdf9e8(self=AssertUnwindSafe<carrick_runtime::vcpu_loop::executor::run_executor_loop::{closure_env#4}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutor, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory>> @ 0x00000076214229a0, (null)=<unavailable>) at unwind_safe.rs:275:9 [opt] [inlined]
+     frame #18: 0x0000000100265d20 el1_sched-ba795739d7a1a0f3`std::panicking::catch_unwind::do_call::h69519a8bcff0a328(data=<unavailable>) at panicking.rs:581:40 [opt]
+     frame #19: 0x0000000100265d20 el1_sched-ba795739d7a1a0f3`std::panicking::catch_unwind::h026e91f621a640bd(f=AssertUnwindSafe<carrick_runtime::vcpu_loop::executor::run_executor_loop::{closure_env#4}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutor, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory>> @ 0x0000007621422a00) at panicking.rs:544:19 [opt]
+     frame #20: 0x0000000100265d20 el1_sched-ba795739d7a1a0f3`std::panic::catch_unwind::h8544ddee97224f72(f=AssertUnwindSafe<carrick_runtime::vcpu_loop::executor::run_executor_loop::{closure_env#4}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutor, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory>> @ 0x0000007621422a20) at panic.rs:359:14 [opt] [inlined]
+     frame #21: 0x0000000100265d20 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::executor::run_executor_loop::h16559fca504fb64c(scheduler=<unavailable>, resolver=0x0000000170ee2268, backend=<unavailable>, runtime=<unavailable>, commands=<unavailable>) at executor.rs:482:29 [opt]
+     frame #22: 0x0000000100263dd0 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::executor::executor_worker::_$u7b$$u7b$closure$u7d$$u7d$::h9caefef6dadcaa07 at executor.rs:155:39 [opt]
+     frame #23: 0x0000000100263cb8 el1_sched-ba795739d7a1a0f3`core::ops::function::FnOnce::call_once::h8a1267a422c367e1((null)={closure_env#1}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory> @ 0x000000764bca4c60, (null)=<unavailable>) at function.rs:250:5 [opt] [inlined]
+     frame #24: 0x0000000100263cb8 el1_sched-ba795739d7a1a0f3`_$LT$core..panic..unwind_safe..AssertUnwindSafe$LT$F$GT$$u20$as$u20$core..ops..function..FnOnce$LT$$LP$$RP$$GT$$GT$::call_once::h5f3fe5d9958d86ad(self=AssertUnwindSafe<carrick_runtime::vcpu_loop::executor::executor_worker::{closure_env#1}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory>> @ 0x000000764bca4f60, (null)=<unavailable>) at unwind_safe.rs:275:9 [opt] [inlined]
+     frame #25: 0x0000000100263cb8 el1_sched-ba795739d7a1a0f3`std::panicking::catch_unwind::do_call::h29ce9e822a642d98(data=<unavailable>) at panicking.rs:581:40 [opt]
+     frame #26: 0x0000000100263cb8 el1_sched-ba795739d7a1a0f3`std::panicking::catch_unwind::h1a41084116cdd5ec(f=AssertUnwindSafe<carrick_runtime::vcpu_loop::executor::executor_worker::{closure_env#1}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory>> @ 0x000000764bca4fc0) at panicking.rs:544:19 [opt]
+     frame #27: 0x0000000100263cb8 el1_sched-ba795739d7a1a0f3`std::panic::catch_unwind::h9e6697967e43cc34(f=AssertUnwindSafe<carrick_runtime::vcpu_loop::executor::executor_worker::{closure_env#1}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory>> @ 0x000000764bca4f00) at panic.rs:359:14 [opt] [inlined]
+     frame #28: 0x0000000100263cb8 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::executor::executor_worker::h6659650ec665c127(slot=<unavailable>, scheduler=Arc<carrick_kernel::kernel::scheduler::Scheduler, alloc::alloc::Global> @ 0x0000000170ee2258, factory=Arc<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, alloc::alloc::Global> @ 0x0000000170ee2260, resolver=Arc<carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory, alloc::alloc::Global> @ 0x0000000170ee2268, receipts=Arc<carrick_runtime::vcpu_loop::executor::pool::ReceiptLog, alloc::alloc::Global> @ 0x0000000170ee2270, control=Arc<carrick_runtime::vcpu_loop::executor::pool::PoolControl, alloc::alloc::Global> @ 0x0000000170ee2278, channels=<unavailable>) at executor.rs:125:21 [opt]
+     frame #29: 0x00000001002412c0 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::executor::pool::ExecutorPool$LT$F$C$R$GT$::start::_$u7b$$u7b$closure$u7d$$u7d$::hb743ce58afda6e7c at pool.rs:987:21 [opt] [inlined]
+     frame #30: 0x0000000100241294 el1_sched-ba795739d7a1a0f3`std::sys::backtrace::__rust_begin_short_backtrace::hf904e9adac42143e(f=<unavailable>) at backtrace.rs:166:18 [opt]
+     frame #31: 0x000000010031d734 el1_sched-ba795739d7a1a0f3`std::thread::lifecycle::spawn_unchecked::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::h6f97fec13f2b11b2 at lifecycle.rs:91:13 [opt] [inlined]
+     frame #32: 0x000000010031d6f8 el1_sched-ba795739d7a1a0f3`_$LT$core..panic..unwind_safe..AssertUnwindSafe$LT$F$GT$$u20$as$u20$core..ops..function..FnOnce$LT$$LP$$RP$$GT$$GT$::call_once::h6ca9278a66b3246b(self=AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<carrick_runtime::vcpu_loop::executor::pool::{impl#15}::start::{closure_env#4}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory>, carrick_runtime::vcpu_loop::executor::pool::WorkerOutcome>> @ 0x0000007644e87880, (null)=<unavailable>) at unwind_safe.rs:275:9 [opt] [inlined]
+     frame #33: 0x000000010031d6ec el1_sched-ba795739d7a1a0f3`std::panicking::catch_unwind::do_call::h26fe3308ed829988(data=<unavailable>) at panicking.rs:581:40 [opt]
+     frame #34: 0x000000010031d6ec el1_sched-ba795739d7a1a0f3`std::panicking::catch_unwind::h685e6787e1d99c3d(f=AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<carrick_runtime::vcpu_loop::executor::pool::{impl#15}::start::{closure_env#4}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory>, carrick_runtime::vcpu_loop::executor::pool::WorkerOutcome>> @ 0x0000007644e87780) at panicking.rs:544:19 [opt]
+     frame #35: 0x000000010031d6ec el1_sched-ba795739d7a1a0f3`std::panic::catch_unwind::h8edd4e8e12c9ad12(f=AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<carrick_runtime::vcpu_loop::executor::pool::{impl#15}::start::{closure_env#4}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory>, carrick_runtime::vcpu_loop::executor::pool::WorkerOutcome>> @ 0x0000007644e87800) at panic.rs:359:14 [opt] [inlined]
+     frame #36: 0x000000010031d6ec el1_sched-ba795739d7a1a0f3`std::thread::lifecycle::spawn_unchecked::_$u7b$$u7b$closure$u7d$$u7d$::ha34d47043a5b9232 at lifecycle.rs:89:26 [opt] [inlined]
+     frame #37: 0x000000010031d6b8 el1_sched-ba795739d7a1a0f3`core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::hdb2a01d778d5ac22((null)=<unavailable>, (null)=<unavailable>) at function.rs:250:5 [opt]
+     frame #38: 0x0000000100db43d4 el1_sched-ba795739d7a1a0f3`<alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once at boxed.rs:2249:9 [opt] [inlined]
+     frame #39: 0x0000000100db43c8 el1_sched-ba795739d7a1a0f3`<std::sys::thread::unix::Thread>::new::thread_start at unix.rs:118:17 [opt]
+     frame #40: 0x000000018a8ffd00 libsystem_pthread.dylib`_pthread_start + 136
+(lldb) continue
+
+thread 'el1_metadata_allocator_grows_and_returns_extents' (14766689) panicked at crates/carrick-embed/tests/el1_sched.rs:1439:5:
+exit 1 signal None stdout "metadata-allocator growth failed: rc=201\n" stderr ""
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    el1_metadata_allocator_grows_and_returns_extents
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.37s
+
+Process 30500 resuming
+Process 30500 exited with status = 101 (0x00000065)

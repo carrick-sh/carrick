@@ -1,0 +1,40 @@
+(lldb) target create "target/el1-completion/allocator-maintenance-fix/test-frozen/el1_sched-ba795739d7a1a0f3"
+Current executable set to '/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-maintenance-fix/test-frozen/el1_sched-ba795739d7a1a0f3' (arm64).
+(lldb) settings set -- target.run-args  "el1_metadata_allocator_grows_and_returns_extents" "--nocapture"
+(lldb) breakpoint set --file metadata_grant.rs --line 273
+Breakpoint 1: where = el1_sched-ba795739d7a1a0f3`carrick_vmm_hvf::metadata_grant::handle_metadata_grant_trap::hab5b403d7197999b + 1280 at metadata_grant.rs:273:12, address = 0x0000000100473190
+(lldb) run
+
+running 1 test
+test el1_metadata_allocator_grows_and_returns_extents ... warning: el1_sched-ba795739d7a1a0f3 was compiled with optimization - stepping may behave oddly; variables may not be available.
+Process 30586 launched: '/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-maintenance-fix/test-frozen/el1_sched-ba795739d7a1a0f3' (arm64)
+Process 30586 stopped
+* thread #8, name = 'carrick-executor-0', stop reason = breakpoint 1.1
+       frame #0: 0x0000000100473190 el1_sched-ba795739d7a1a0f3`carrick_vmm_hvf::metadata_grant::handle_metadata_grant_trap::hab5b403d7197999b(vcpu=0x0000000170ee39d8) at metadata_grant.rs:273:12 [opt]
+   270 	        let rc = unsafe {
+   271 	            crate::trap::inventory_hv_vm_map(host_ptr.cast(), ipa, extent_size, permissions)
+   272 	        };
+-> 273 	        if rc != 0 {
+    	           ^
+   274 	            unsafe {
+   275 	                std::alloc::dealloc(host_ptr, layout);
+   276 	            }
+Target 0: (el1_sched-ba795739d7a1a0f3) stopped.
+(lldb) frame variable pc
+(unsigned long) pc = 193340645316
+(lldb) continue
+
+thread 'el1_metadata_allocator_grows_and_returns_extents' (14767442) panicked at crates/carrick-embed/tests/el1_sched.rs:1439:5:
+exit 1 signal None stdout "metadata-allocator growth failed: rc=201\n" stderr ""
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    el1_metadata_allocator_grows_and_returns_extents
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.21s
+
+Process 30586 resuming
+Process 30586 exited with status = 101 (0x00000065)
