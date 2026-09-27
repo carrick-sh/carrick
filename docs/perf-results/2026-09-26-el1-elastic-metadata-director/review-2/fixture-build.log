@@ -1,0 +1,27 @@
+   Compiling carrick-embed-el1-sched v0.0.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/fixtures/embed-el1-sched)
+error[E0433]: cannot find module or crate `carrick_el1_abi` in this scope
+    --> src/main.rs:1902:30
+     |
+1902 |     let res1 = unsafe { raw6(carrick_el1_abi::SYS_CARRICK_EL1_CONTROL, 1, 1, 0, 0, 0, 0) };
+     |                              ^^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_el1_abi`
+     |
+     = help: if you wanted to use a crate named `carrick_el1_abi`, use `cargo add carrick_el1_abi` to add it to your `Cargo.toml`
+
+error[E0433]: cannot find module or crate `carrick_el1_abi` in this scope
+    --> src/main.rs:1909:30
+     |
+1909 |     let res2 = unsafe { raw6(carrick_el1_abi::SYS_CARRICK_EL1_CONTROL, 1, 2, 0, 0, 0, 0) };
+     |                              ^^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_el1_abi`
+     |
+     = help: if you wanted to use a crate named `carrick_el1_abi`, use `cargo add carrick_el1_abi` to add it to your `Cargo.toml`
+
+error[E0433]: cannot find module or crate `carrick_el1_abi` in this scope
+    --> src/main.rs:1916:30
+     |
+1916 |     let res3 = unsafe { raw6(carrick_el1_abi::SYS_CARRICK_EL1_CONTROL, 1, 3, 0, 0, 0, 0) };
+     |                              ^^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `carrick_el1_abi`
+     |
+     = help: if you wanted to use a crate named `carrick_el1_abi`, use `cargo add carrick_el1_abi` to add it to your `Cargo.toml`
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `carrick-embed-el1-sched` (bin "el1-sched") due to 3 previous errors

@@ -1,0 +1,603 @@
+mod carrick_el1_abi { pub const EL1_DYNAMIC_METADATA_EXTENT_SIZE: usize = 512 * 1024; }
+pub const NUM_BINS: usize = 28;
+pub const MAX_EXTENTS: usize = 128;
+pub const MIN_BLOCK_SIZE: usize = 32;
+pub const HEADER_SIZE: usize = 32;
+pub const BLOCK_MAGIC: u16 = 0xCA77;
+pub const NO_PREV_BLOCK: u32 = u32::MAX;
+
+/// Physical and logical header preceding every memory block in an admitted extent.
+#[repr(C, align(16))]
+pub struct BlockHeader {
+    /// Intrusive pointer to previous free block in segregated free bin.
+    pub prev_free: *mut BlockHeader,
+    /// Intrusive pointer to next free block in segregated free bin.
+    pub next_free: *mut BlockHeader,
+    /// Total size of this block in bytes, including this 32-byte header.
+    pub size: usize,
+    /// Byte offset from the containing extent's base to the physically preceding block,
+    /// or `NO_PREV_BLOCK` if this block is at the start of the extent.
+    pub prev_phys_offset: u32,
+    /// Index into the allocator's `extents` table.
+    pub extent_idx: u8,
+    /// Allocation status flag (true = allocated, false = free).
+    pub is_allocated: bool,
+    /// Header validation magic (`BLOCK_MAGIC = 0xCA77`).
+    pub magic: u16,
+}
+
+// Ensure BlockHeader is strictly 32 bytes and 16-byte aligned.
+const _: () = assert!(core::mem::size_of::<BlockHeader>() == 32);
+const _: () = assert!(core::mem::align_of::<BlockHeader>() == 16);
+
+/// Descriptor for an admitted contiguous memory extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtentDescriptor {
+    pub base_va: u64,
+    pub size: usize,
+    pub kind: ExtentKind,
+    pub state: ExtentState,
+    pub live_allocations: usize,
+}
+
+impl ExtentDescriptor {
+    pub const fn unused() -> Self {
+        Self {
+            base_va: 0,
+            size: 0,
+            kind: ExtentKind::Bootstrap,
+            state: ExtentState::Unused,
+            live_allocations: 0,
+        }
+    }
+}
+
+/// Provenance of an extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtentKind {
+    /// Pre-mapped bootstrap arena in the EL1 region (e.g. 9 MiB bootstrap).
+    Bootstrap,
+    /// Dynamically granted extent from the host hypervisor.
+    Dynamic { token: u64 },
+}
+
+/// State of an extent descriptor slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtentState {
+    Unused,
+    Active,
+    Returned,
+}
+
+/// Dynamic extent to be returned to the host hypervisor after complete deallocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtentToReturn {
+    pub base_va: u64,
+    pub size: usize,
+    pub token: u64,
+}
+
+/// Errors occurring during extent admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtentAdmissionError {
+    TableFull,
+    InvalidSize,
+    InvalidAlignment,
+    OverlapWithExisting,
+    BufferTooSmall,
+}
+
+/// Operation metrics recorded during allocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AllocMetrics {
+    pub bins_checked: usize,
+    pub blocks_inspected: usize,
+    pub splits_performed: usize,
+}
+
+/// Operation metrics recorded during deallocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeallocMetrics {
+    pub merges_performed: usize,
+}
+
+/// Bounded segregated-fit allocator core.
+pub struct MetadataAllocatorCore {
+    /// Segregated free list heads for each size class.
+    bins: [*mut BlockHeader; NUM_BINS],
+    /// Bitmap of non-empty size bins for O(1) search.
+    active_bins: u32,
+    /// Bounded table of admitted extents.
+    extents: [ExtentDescriptor; MAX_EXTENTS],
+    /// Total extents ever admitted.
+    extents_admitted_count: usize,
+    /// Currently active extents.
+    active_extents_count: usize,
+    /// Total capacity in bytes across all active extents.
+    total_capacity_bytes: usize,
+    /// Total allocated payload + header bytes in active use.
+    allocated_bytes: usize,
+}
+
+// SAFETY: All raw pointers point into admitted memory buffers protected by external synchronization.
+unsafe impl Send for MetadataAllocatorCore {}
+
+impl Default for MetadataAllocatorCore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MetadataAllocatorCore {
+    /// Create a new empty allocator state.
+    pub const fn new() -> Self {
+        Self {
+            bins: [core::ptr::null_mut(); NUM_BINS],
+            active_bins: 0,
+            extents: [ExtentDescriptor::unused(); MAX_EXTENTS],
+            extents_admitted_count: 0,
+            active_extents_count: 0,
+            total_capacity_bytes: 0,
+            allocated_bytes: 0,
+        }
+    }
+
+    /// Calculate bin index for a given required block size.
+    #[inline]
+    pub fn bin_for_size(size: usize) -> usize {
+        if size <= 64 {
+            return 0;
+        }
+        let fls = (usize::BITS - 1 - size.leading_zeros()) as usize;
+        if fls <= 6 {
+            0
+        } else if fls >= 23 {
+            NUM_BINS - 1
+        } else {
+            let base_bin = (fls - 6) * 2;
+            let half = 1usize << (fls - 1);
+            if (size & half) != 0 && base_bin + 1 < NUM_BINS {
+                base_bin + 1
+            } else {
+                base_bin.min(NUM_BINS - 1)
+            }
+        }
+    }
+
+    /// Minimum size for a given bin index.
+    #[inline]
+    pub fn min_size_for_bin(bin: usize) -> usize {
+        match bin {
+            0 => 32,
+            1 => 48,
+            2 => 64,
+            3 => 96,
+            4 => 128,
+            5 => 192,
+            6 => 256,
+            7 => 384,
+            8 => 512,
+            9 => 768,
+            10 => 1024,
+            11 => 1536,
+            12 => 2048,
+            13 => 3072,
+            14 => 4096,
+            15 => 6144,
+            16 => 8192,
+            17 => 12288,
+            18 => 16384,
+            19 => 24576,
+            20 => 32768,
+            21 => 49152,
+            22 => 65536,
+            23 => 131072,
+            24 => 262144,
+            25 => 524288,
+            26 => 1048576,
+            27 => 2097152,
+            _ => 2097152,
+        }
+    }
+
+    #[inline]
+    fn insert_free_block(&mut self, block: *mut BlockHeader) {
+        unsafe {
+            let size = (*block).size;
+            let bin = Self::bin_for_size(size);
+            let head = self.bins[bin];
+
+            (*block).prev_free = core::ptr::null_mut();
+            (*block).next_free = head;
+            (*block).is_allocated = false;
+            (*block).magic = BLOCK_MAGIC;
+
+            if !head.is_null() {
+                (*head).prev_free = block;
+            }
+            self.bins[bin] = block;
+            self.active_bins |= 1u32 << bin;
+        }
+    }
+
+    #[inline]
+    fn unlink_free_block(&mut self, block: *mut BlockHeader) {
+        unsafe {
+            let bin = Self::bin_for_size((*block).size);
+            let prev = (*block).prev_free;
+            let next = (*block).next_free;
+
+            if !prev.is_null() {
+                (*prev).next_free = next;
+            } else {
+                self.bins[bin] = next;
+                if next.is_null() {
+                    self.active_bins &= !(1u32 << bin);
+                }
+            }
+
+            if !next.is_null() {
+                (*next).prev_free = prev;
+            }
+
+            (*block).prev_free = core::ptr::null_mut();
+            (*block).next_free = core::ptr::null_mut();
+        }
+    }
+
+    /// Check if a free block can satisfy a requested payload size and alignment.
+    #[inline]
+    fn can_fit(&self, block: *mut BlockHeader, size: usize, align: usize) -> bool {
+        unsafe {
+            let block_addr = block as usize;
+            let block_size = (*block).size;
+            let min_p = block_addr + HEADER_SIZE;
+            let mut p = (min_p + (align - 1)) & !(align - 1);
+            let mut prefix = (p - HEADER_SIZE) - block_addr;
+            if prefix > 0 && prefix < MIN_BLOCK_SIZE {
+                p += align;
+                prefix = (p - HEADER_SIZE) - block_addr;
+            }
+            let total_needed = prefix + HEADER_SIZE + size;
+            total_needed <= block_size
+        }
+    }
+
+    /// Calculate required host grant size to satisfy layout requirements.
+    pub fn needed_grant_size(&self, size: usize, align: usize) -> usize {
+        let max_block_req = size
+            .saturating_add(HEADER_SIZE)
+            .saturating_add(align)
+            .saturating_add(MIN_BLOCK_SIZE);
+        let min_quantum = carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE;
+        let needed = max_block_req.max(min_quantum);
+        (needed + 0x0FFF) & !0x0FFF
+    }
+
+    /// Admit an extent into the allocator.
+    pub fn admit_extent(
+        &mut self,
+        base_va: u64,
+        size: usize,
+        kind: ExtentKind,
+    ) -> Result<usize, ExtentAdmissionError> {
+        if size < MIN_BLOCK_SIZE || !size.is_multiple_of(16) {
+            return Err(ExtentAdmissionError::InvalidSize);
+        }
+        if base_va == 0 || !(base_va as usize).is_multiple_of(16) {
+            return Err(ExtentAdmissionError::InvalidAlignment);
+        }
+
+        let end_va = base_va
+            .checked_add(size as u64)
+            .ok_or(ExtentAdmissionError::InvalidSize)?;
+
+        // Authenticate non-overlap with any currently active extents
+        for ext in &self.extents {
+            if ext.state == ExtentState::Active {
+                let ext_end = ext.base_va.saturating_add(ext.size as u64);
+                if base_va < ext_end && end_va > ext.base_va {
+                    return Err(ExtentAdmissionError::OverlapWithExisting);
+                }
+            }
+        }
+
+        // Find a free descriptor slot
+        let slot_idx = self
+            .extents
+            .iter()
+            .position(|e| e.state == ExtentState::Unused || e.state == ExtentState::Returned)
+            .ok_or(ExtentAdmissionError::TableFull)?;
+
+        self.extents[slot_idx] = ExtentDescriptor {
+            base_va,
+            size,
+            kind,
+            state: ExtentState::Active,
+            live_allocations: 0,
+        };
+        self.extents_admitted_count += 1;
+        self.active_extents_count += 1;
+        self.total_capacity_bytes += size;
+
+        // Initialize extent as one single free block
+        unsafe {
+            let initial_block = base_va as *mut BlockHeader;
+            (*initial_block).size = size;
+            (*initial_block).prev_phys_offset = NO_PREV_BLOCK;
+            (*initial_block).extent_idx = slot_idx as u8;
+            (*initial_block).is_allocated = false;
+            (*initial_block).magic = BLOCK_MAGIC;
+            self.insert_free_block(initial_block);
+        }
+
+        Ok(slot_idx)
+    }
+
+    /// Allocate a block satisfying layout requirements, recording structural work metrics.
+    pub fn allocate_with_metrics(
+        &mut self,
+        size: usize,
+        align: usize,
+    ) -> (Option<*mut u8>, AllocMetrics) {
+        let align = align.max(16);
+        let aligned_size = (size.max(1) + 15) & !15;
+        let max_needed = aligned_size
+            .saturating_add(HEADER_SIZE)
+            .saturating_add(align)
+            .saturating_add(MIN_BLOCK_SIZE);
+        let target_bin = Self::bin_for_size(max_needed);
+
+        let mut metrics = AllocMetrics::default();
+        let mut candidate_block: *mut BlockHeader = core::ptr::null_mut();
+
+        // 1. Check head of target_bin
+        metrics.bins_checked += 1;
+        if (self.active_bins & (1u32 << target_bin)) != 0 {
+            let head = self.bins[target_bin];
+            if !head.is_null() {
+                metrics.blocks_inspected += 1;
+                if self.can_fit(head, aligned_size, align) {
+                    candidate_block = head;
+                }
+            }
+        }
+
+        // 2. If head of target_bin did not fit, check head of next non-empty higher bin
+        if candidate_block.is_null() {
+            let higher_mask = self.active_bins & !((1u32 << (target_bin + 1)) - 1);
+            if higher_mask != 0 {
+                metrics.bins_checked += 1;
+                let next_bin = higher_mask.trailing_zeros() as usize;
+                let head = self.bins[next_bin];
+                if !head.is_null() {
+                    metrics.blocks_inspected += 1;
+                    if self.can_fit(head, aligned_size, align) {
+                        candidate_block = head;
+                    }
+                }
+            }
+        }
+
+        let Some(block) = (if !candidate_block.is_null() {
+            Some(candidate_block)
+        } else {
+            None
+        }) else {
+            return (None, metrics);
+        };
+
+        unsafe {
+            self.unlink_free_block(block);
+            let block_addr = block as usize;
+            let orig_size = (*block).size;
+            let extent_idx = (*block).extent_idx as usize;
+            let extent_base = self.extents[extent_idx].base_va as usize;
+            let extent_size = self.extents[extent_idx].size;
+            let prev_phys = (*block).prev_phys_offset;
+
+            // Compute payload address satisfying alignment
+            let min_p = block_addr + HEADER_SIZE;
+            let mut p = (min_p + (align - 1)) & !(align - 1);
+            let mut prefix = (p - HEADER_SIZE) - block_addr;
+            if prefix > 0 && prefix < MIN_BLOCK_SIZE {
+                p += align;
+                prefix = (p - HEADER_SIZE) - block_addr;
+            }
+
+            let allocated_block_addr = p - HEADER_SIZE;
+            let allocated_block = allocated_block_addr as *mut BlockHeader;
+
+            // If prefix > 0, split off preceding free block
+            if prefix > 0 {
+                metrics.splits_performed += 1;
+                let pref_block = block_addr as *mut BlockHeader;
+                (*pref_block).size = prefix;
+                (*pref_block).prev_phys_offset = prev_phys;
+                (*pref_block).extent_idx = extent_idx as u8;
+                (*pref_block).is_allocated = false;
+                (*pref_block).magic = BLOCK_MAGIC;
+                self.insert_free_block(pref_block);
+
+                (*allocated_block).prev_phys_offset = (block_addr - extent_base) as u32;
+            } else {
+                (*allocated_block).prev_phys_offset = prev_phys;
+            }
+
+            let allocated_size = HEADER_SIZE + aligned_size;
+            let remaining_size = orig_size - (prefix + allocated_size);
+
+            if remaining_size >= MIN_BLOCK_SIZE {
+                metrics.splits_performed += 1;
+                (*allocated_block).size = allocated_size;
+                let suffix_addr = allocated_block_addr + allocated_size;
+                let suffix_block = suffix_addr as *mut BlockHeader;
+                (*suffix_block).size = remaining_size;
+                (*suffix_block).prev_phys_offset = (allocated_block_addr - extent_base) as u32;
+                (*suffix_block).extent_idx = extent_idx as u8;
+                (*suffix_block).is_allocated = false;
+                (*suffix_block).magic = BLOCK_MAGIC;
+
+                let next_phys_offset = (suffix_addr + remaining_size) - extent_base;
+                if next_phys_offset < extent_size {
+                    let next_phys = (extent_base + next_phys_offset) as *mut BlockHeader;
+                    (*next_phys).prev_phys_offset = (suffix_addr - extent_base) as u32;
+                }
+
+                self.insert_free_block(suffix_block);
+            } else {
+                (*allocated_block).size = orig_size - prefix;
+                let next_phys_offset =
+                    (allocated_block_addr + (*allocated_block).size) - extent_base;
+                if next_phys_offset < extent_size {
+                    let next_phys = (extent_base + next_phys_offset) as *mut BlockHeader;
+                    (*next_phys).prev_phys_offset = (allocated_block_addr - extent_base) as u32;
+                }
+            }
+
+            (*allocated_block).extent_idx = extent_idx as u8;
+            (*allocated_block).is_allocated = true;
+            (*allocated_block).magic = BLOCK_MAGIC;
+
+            self.extents[extent_idx].live_allocations += 1;
+            self.allocated_bytes += (*allocated_block).size;
+
+            (Some(p as *mut u8), metrics)
+        }
+    }
+
+    /// Allocate a block satisfying layout requirements.
+    pub fn allocate(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        let (ptr, _) = self.allocate_with_metrics(size, align);
+        ptr
+    }
+
+    /// Deallocate a previously allocated block, recording merge work metrics.
+    pub fn deallocate_with_metrics(
+        &mut self,
+        ptr: *mut u8,
+        _align: usize,
+    ) -> (Option<ExtentToReturn>, DeallocMetrics) {
+        let mut metrics = DeallocMetrics::default();
+        if ptr.is_null() {
+            return (None, metrics);
+        }
+
+        let mut block = (ptr as usize - HEADER_SIZE) as *mut BlockHeader;
+
+        unsafe {
+            if (*block).magic != BLOCK_MAGIC || !(*block).is_allocated {
+                return (None, metrics);
+            }
+
+            let extent_idx = (*block).extent_idx as usize;
+            if extent_idx >= MAX_EXTENTS || self.extents[extent_idx].state != ExtentState::Active {
+                return (None, metrics);
+            }
+
+            (*block).is_allocated = false;
+            self.extents[extent_idx].live_allocations =
+                self.extents[extent_idx].live_allocations.saturating_sub(1);
+            self.allocated_bytes = self.allocated_bytes.saturating_sub((*block).size);
+
+            let extent_base = self.extents[extent_idx].base_va as usize;
+            let extent_size = self.extents[extent_idx].size;
+
+            // 1. Coalesce with physically subsequent block if free
+            let next_offset = (block as usize + (*block).size) - extent_base;
+            if next_offset < extent_size {
+                let next_phys = (extent_base + next_offset) as *mut BlockHeader;
+                if (*next_phys).magic == BLOCK_MAGIC && !(*next_phys).is_allocated {
+                    metrics.merges_performed += 1;
+                    self.unlink_free_block(next_phys);
+                    (*block).size += (*next_phys).size;
+
+                    let after_next_offset = (block as usize + (*block).size) - extent_base;
+                    if after_next_offset < extent_size {
+                        let after_next = (extent_base + after_next_offset) as *mut BlockHeader;
+                        (*after_next).prev_phys_offset = (block as usize - extent_base) as u32;
+                    }
+                }
+            }
+
+            // 2. Coalesce with physically preceding block if free
+            if (*block).prev_phys_offset != NO_PREV_BLOCK {
+                let prev_phys =
+                    (extent_base + (*block).prev_phys_offset as usize) as *mut BlockHeader;
+                if (*prev_phys).magic == BLOCK_MAGIC && !(*prev_phys).is_allocated {
+                    metrics.merges_performed += 1;
+                    self.unlink_free_block(prev_phys);
+                    (*prev_phys).size += (*block).size;
+
+                    let after_offset = (prev_phys as usize + (*prev_phys).size) - extent_base;
+                    if after_offset < extent_size {
+                        let after = (extent_base + after_offset) as *mut BlockHeader;
+                        (*after).prev_phys_offset = (prev_phys as usize - extent_base) as u32;
+                    }
+
+                    block = prev_phys;
+                }
+            }
+
+            // 3. Dynamic extent reclamation check
+            if let ExtentKind::Dynamic { token } = self.extents[extent_idx].kind
+                && self.extents[extent_idx].live_allocations == 0
+                && (*block).size == extent_size
+            {
+                self.extents[extent_idx].state = ExtentState::Returned;
+                self.active_extents_count = self.active_extents_count.saturating_sub(1);
+                self.total_capacity_bytes = self.total_capacity_bytes.saturating_sub(extent_size);
+
+                return (
+                    Some(ExtentToReturn {
+                        base_va: self.extents[extent_idx].base_va,
+                        size: extent_size,
+                        token,
+                    }),
+                    metrics,
+                );
+            }
+
+            self.insert_free_block(block);
+            (None, metrics)
+        }
+    }
+
+    /// Deallocate a previously allocated block.
+    pub fn deallocate(&mut self, ptr: *mut u8, align: usize) -> Option<ExtentToReturn> {
+        let (to_return, _) = self.deallocate_with_metrics(ptr, align);
+        to_return
+    }
+
+    /// Read diagnostics snapshot.
+    pub fn diagnostics(&self) -> AllocatorDiagnostics {
+        AllocatorDiagnostics {
+            extents_admitted: self.extents_admitted_count,
+            active_extents: self.active_extents_count,
+            total_capacity_bytes: self.total_capacity_bytes,
+            allocated_bytes: self.allocated_bytes,
+            active_bins_mask: self.active_bins,
+        }
+    }
+}
+
+/// Snapshot of allocator operational diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocatorDiagnostics {
+    pub extents_admitted: usize,
+    pub active_extents: usize,
+    pub total_capacity_bytes: usize,
+    pub allocated_bytes: usize,
+    pub active_bins_mask: u32,
+}
+
+
+#[repr(align(4096))] struct Arena([u8; 2097152]);
+fn main() {
+ let mut backing=Box::new(Arena([0;2097152]));
+ let mut core=MetadataAllocatorCore::new();
+ core.admit_extent(backing.0.as_mut_ptr() as u64,2097152,ExtentKind::Bootstrap).unwrap();
+ let p=core.allocate(64,64).unwrap();
+ assert_eq!(p as usize%64,0);println!("alignment64: passed");
+ let grant=core.needed_grant_size(65536,16);assert!(grant>65536);println!("grant includes overhead: {grant}");
+}

@@ -1,0 +1,6 @@
+{
+  "source": "bc5500391a333f9f78daf63a0224b04ec98bba8c",
+  "command": "RUSTC_WRAPPER= just ci",
+  "exit_code": 1,
+  "log_sha256": "dc798b0e13779d9f290bdc9256835bed2eeed2cd387b82a6b68ed86e7f82c35a"
+}

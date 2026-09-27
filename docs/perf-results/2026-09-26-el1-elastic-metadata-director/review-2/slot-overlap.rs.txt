@@ -1,0 +1,93 @@
+pub const MAX_DYNAMIC_EXTENT_SLOTS: usize = 128;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetadataGrantStats {
+    pub grants_requested: u64,
+    pub grants_succeeded: u64,
+    pub grants_denied: u64,
+    pub returns_completed: u64,
+    pub bytes_granted: u64,
+    pub bytes_returned: u64,
+}
+
+#[derive(Copy, Clone)]
+struct GrantedSlotRecord {
+    host_ptr: *mut u8,
+    layout: std::alloc::Layout,
+    size: usize,
+    token: u64,
+    #[allow(dead_code)]
+    generation: u64,
+}
+
+unsafe impl Send for GrantedSlotRecord {}
+unsafe impl Sync for GrantedSlotRecord {}
+
+struct HostApertureState {
+    occupied_bitmap: [u64; 2],
+    slots: [Option<GrantedSlotRecord>; MAX_DYNAMIC_EXTENT_SLOTS],
+}
+
+impl HostApertureState {
+    const fn new() -> Self {
+        Self {
+            occupied_bitmap: [0; 2],
+            slots: [None; MAX_DYNAMIC_EXTENT_SLOTS],
+        }
+    }
+
+    fn find_free_slot(&self) -> Option<usize> {
+        if self.occupied_bitmap[0] != u64::MAX {
+            let bit = self.occupied_bitmap[0].trailing_ones() as usize;
+            if bit < 64 {
+                return Some(bit);
+            }
+        }
+        if self.occupied_bitmap[1] != u64::MAX {
+            let bit = self.occupied_bitmap[1].trailing_ones() as usize;
+            if bit < 64 {
+                return Some(64 + bit);
+            }
+        }
+        None
+    }
+
+    fn set_slot_occupied(&mut self, slot: usize) {
+        if slot < 64 {
+            self.occupied_bitmap[0] |= 1u64 << slot;
+        } else if slot < 128 {
+            self.occupied_bitmap[1] |= 1u64 << (slot - 64);
+        }
+    }
+
+    fn clear_slot_occupied(&mut self, slot: usize) {
+        if slot < 64 {
+            self.occupied_bitmap[0] &= !(1u64 << slot);
+        } else if slot < 128 {
+            self.occupied_bitmap[1] &= !(1u64 << (slot - 64));
+        }
+    }
+
+    fn is_slot_occupied(&self, slot: usize) -> bool {
+        if slot < 64 {
+            (self.occupied_bitmap[0] & (1u64 << slot)) != 0
+        } else if slot < 128 {
+            (self.occupied_bitmap[1] & (1u64 << (slot - 64))) != 0
+        } else {
+            false
+        }
+    }
+}
+
+
+fn main() {
+ let mut state=HostApertureState::new();
+ let quantum=512*1024usize;
+ let requested=1024*1024usize + 128;
+ let extent_size=(requested.max(quantum)+0xffff)&!0xffff;
+ let first=state.find_free_slot().unwrap();
+ state.set_slot_occupied(first);
+ let next=state.find_free_slot().unwrap();
+ println!("first_slot={first} granted_bytes={extent_size} next_slot={next} next_offset={}",next*quantum);
+ assert!(next*quantum >= first*quantum+extent_size,"production slot policy proposes an overlapping second extent");
+}
