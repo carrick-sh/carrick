@@ -1411,37 +1411,86 @@ fn el1_metadata_allocator_grows_and_returns_extents() {
         "reset_el1_counters must clear any stale snapshot before carrier execution"
     );
 
-    // Arm failpoint so sub-command 3 in the fixture triggers a denied grant on its first attempt
-    carrick_runtime::arm_deny_next_metadata_grant();
-
     let carrier = carrier_or_fail();
-    let measured = run_fixture(&carrier, &["metadata-allocator"], Duration::from_secs(30));
-    assert!(measured.result.success(), "{}", describe(&measured));
-    let stdout = measured.result.stdout_utf8();
+
+    // Phase 1: Basic allocations, arbitrary alignments (16..4096), payload pattern verification
+    let measured_basic = run_fixture(
+        &carrier,
+        &["metadata-allocator", "basic"],
+        Duration::from_secs(30),
+    );
     assert!(
-        stdout.contains("metadata-allocator ok"),
-        "fixture metadata-allocator must succeed: {stdout:?}"
+        measured_basic.result.success(),
+        "{}",
+        describe(&measured_basic)
+    );
+    let stdout_basic = measured_basic.result.stdout_utf8();
+    assert!(
+        stdout_basic.contains("metadata-allocator basic ok"),
+        "fixture metadata-allocator basic must succeed: {stdout_basic:?}"
     );
 
-    let stats = carrick_runtime::metadata_grant_stats();
-    println!("metadata_grant_stats: {stats:?}");
+    // Phase 2: Force dynamic growth crossing 9 MiB bootstrap into dynamic extents (allocating 10 MiB)
+    let measured_growth = run_fixture(
+        &carrier,
+        &["metadata-allocator", "growth"],
+        Duration::from_secs(30),
+    );
     assert!(
-        stats.grants_succeeded >= 1,
+        measured_growth.result.success(),
+        "{}",
+        describe(&measured_growth)
+    );
+    let stdout_growth = measured_growth.result.stdout_utf8();
+    assert!(
+        stdout_growth.contains("metadata-allocator growth ok"),
+        "fixture metadata-allocator growth must succeed: {stdout_growth:?}"
+    );
+
+    let stats_growth = carrick_runtime::metadata_grant_stats();
+    println!("metadata_grant_stats after growth: {stats_growth:?}");
+    assert!(
+        stats_growth.grants_succeeded >= 1,
         "expected at least 1 dynamic extent granted by host, got {}",
-        stats.grants_succeeded
+        stats_growth.grants_succeeded
     );
     assert!(
-        stats.returns_completed >= 1,
+        stats_growth.returns_completed >= 1,
         "expected at least 1 dynamic extent returned to host, got {}",
-        stats.returns_completed
-    );
-    assert!(
-        stats.grants_denied >= 1,
-        "expected at least 1 grant denial from armed failpoint, got {}",
-        stats.grants_denied
+        stats_growth.returns_completed
     );
     assert_eq!(
-        stats.bytes_granted, stats.bytes_returned,
+        stats_growth.bytes_granted, stats_growth.bytes_returned,
         "all granted dynamic bytes must be completely returned to host upon deallocation"
+    );
+
+    // Phase 3: Arm host grant denial failpoint, verify data preservation, and recovery retry
+    carrick_runtime::arm_deny_next_metadata_grant();
+    let measured_denial = run_fixture(
+        &carrier,
+        &["metadata-allocator", "denial"],
+        Duration::from_secs(30),
+    );
+    assert!(
+        measured_denial.result.success(),
+        "{}",
+        describe(&measured_denial)
+    );
+    let stdout_denial = measured_denial.result.stdout_utf8();
+    assert!(
+        stdout_denial.contains("metadata-allocator denial ok"),
+        "fixture metadata-allocator denial must succeed: {stdout_denial:?}"
+    );
+
+    let stats_total = carrick_runtime::metadata_grant_stats();
+    println!("metadata_grant_stats final: {stats_total:?}");
+    assert!(
+        stats_total.grants_denied >= 1,
+        "expected at least 1 grant denial from armed failpoint, got {}",
+        stats_total.grants_denied
+    );
+    assert_eq!(
+        stats_total.bytes_granted, stats_total.bytes_returned,
+        "all granted dynamic bytes across all phases must be completely returned to host"
     );
 }

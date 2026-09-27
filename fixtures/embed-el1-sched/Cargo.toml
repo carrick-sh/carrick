@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+carrick-el1-abi = { path = "../../crates/carrick-el1-abi" }
 
 [profile.release]
 opt-level = 2

@@ -3469,6 +3469,10 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
         let pa = l2_b_base_pa + (index << 21);
         let flags = if pa == kernel_block_pa
             || (LINUX_EL1_KERNEL_BASE..LINUX_EL1_KERNEL_BASE + LINUX_EL1_KERNEL_SIZE).contains(&pa)
+            || (carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                ..carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                    + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE)
+                .contains(&pa)
         {
             KERNEL_BLOCK_FLAGS
         } else {
@@ -8361,6 +8365,41 @@ mod el1_shim_tests {
             1,
             "EL1 region must be UXN=1 (EL0 execute denied)"
         );
+
+        // Verify dynamic metadata aperture is kernel-only (AP=00, UXN=1) across all its blocks
+        let dyn_first_block = (carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE >> 21) & 0x1ff;
+        let dyn_block_count = carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE >> 21;
+        for i in 0..dyn_block_count {
+            let entry = read_u64_le(&pt_bytes, 0x4000 + ((dyn_first_block + i) as usize) * 8);
+            assert!(valid_block(entry));
+            assert_eq!(
+                ap(entry),
+                0b00,
+                "Dynamic metadata block {i} must be AP=00 (EL0 denied)"
+            );
+            assert_eq!(
+                uxn(entry),
+                1,
+                "Dynamic metadata block {i} must be UXN=1 (EL0 execute denied)"
+            );
+        }
+
+        // Also verify in hvpatch scoped tables
+        let hvpatch_pt_bytes = stage1_hvpatch_page_tables();
+        for i in 0..dyn_block_count {
+            let entry = read_u64_le(
+                &hvpatch_pt_bytes,
+                0x4000 + ((dyn_first_block + i) as usize) * 8,
+            );
+            assert!(valid_block(entry));
+            assert_eq!(ap(entry), 0b00, "hvpatch dynamic metadata block {i} AP=00");
+            assert_eq!(uxn(entry), 1, "hvpatch dynamic metadata block {i} UXN=1");
+            assert_ne!(
+                entry & (1 << 11),
+                0,
+                "hvpatch dynamic metadata block {i} nG=1"
+            );
+        }
     }
 
     #[test]
