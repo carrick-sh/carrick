@@ -1470,7 +1470,7 @@ unsafe fn execute_fault_sequence(ctx: &mut FaultTestContext) {
     unsafe {
         std::arch::asm!(
         // Save callee-saved registers x19-x30 and frame context
-        "sub sp, sp, #112",
+        "sub sp, sp, #128",
         "stp x19, x20, [sp, #0]",
         "stp x21, x22, [sp, #16]",
         "stp x23, x24, [sp, #32]",
@@ -1637,17 +1637,15 @@ unsafe fn execute_fault_sequence(ctx: &mut FaultTestContext) {
         "str x2, [x1]",
 
         // Capture post-retry state:
-        // Immediately record post-fault SP
-        "mov x16, sp",
-        // Save post-fault x0 to scratch slot [sp, #104]
-        "str x0, [sp, #104]",
+        // Save post-fault x0 and x1 to stack scratch slots [sp, #104] and [sp, #112]
+        "stp x0, x1, [sp, #104]",
         // Reload ctx pointer from [sp, #96] into x0
         "ldr x0, [sp, #96]",
-        // Store post-fault SP into ctx.captured_sp_post (offset 32)
-        "str x16, [x0, #32]",
+        // Record post-fault SP using x1 as scratch
+        "mov x1, sp",
+        "str x1, [x0, #32]",
 
-        // Store captured registers x1..x30 into ctx.captured_regs (offset 40 + r*8)
-        "str x1, [x0, #48]",
+        // Store captured registers x2..x30 into ctx.captured_regs (offset 40 + r*8)
         "str x2, [x0, #56]",
         "str x3, [x0, #64]",
         "str x4, [x0, #72]",
@@ -1678,9 +1676,11 @@ unsafe fn execute_fault_sequence(ctx: &mut FaultTestContext) {
         "str x29, [x0, #272]",
         "str x30, [x0, #280]",
 
-        // Save post-fault x0 into ctx.captured_regs[0] (offset 40)
-        "ldr x1, [sp, #104]",
+        // Retrieve post-fault x0 and x1 from stack scratch slots into x1 and x2
+        "ldp x1, x2, [sp, #104]",
+        // Store post-fault x0 and x1 into ctx.captured_regs[0] and ctx.captured_regs[1]
         "str x1, [x0, #40]",
+        "str x2, [x0, #48]",
 
         // Read back written value from target_addr
         "ldr x1, [x0, #0]",
@@ -1694,7 +1694,7 @@ unsafe fn execute_fault_sequence(ctx: &mut FaultTestContext) {
         "ldp x25, x26, [sp, #48]",
         "ldp x27, x28, [sp, #64]",
         "ldp x29, x30, [sp, #80]",
-        "add sp, sp, #112",
+        "add sp, sp, #128",
         inout("x0") ctx as *mut FaultTestContext => _,
         out("x1") _,
         out("x2") _,
