@@ -226,12 +226,17 @@ The first signed acceptance execution after the slot-local correction reports:
 | Pages per process | Total pages | Carrick host exits | Semantics |
 |---:|---:|---:|---|
 | 256 | 512 | 99 | parent and child pass |
-| 1,024 | 2,048 | 102 | parent and child pass |
-| 4,096 | 8,192 | 119 | parent and child pass |
+| 1,024 | 2,048 | 107 | parent and child pass |
+| 4,096 | 8,192 | 113 | parent and child pass |
 
-The incremental slopes are `(102 - 99) / 1536 = 0.0020` and
-`(119 - 102) / 6144 = 0.0028` host exits per added page. Both are far below the
-strict `<0.125` contract. The unentitled negative control passes and scoped
+The incremental slopes are `(107 - 99) / 1536 = 0.0052` and
+`(113 - 107) / 6144 = 0.0010` host exits per added page. Both are far below the
+strict `<0.125` contract. This authoritative rerun names source
+`a44e510db6cf757c3a956e24bbd1b9e3d37a17b2` and signed test executable SHA-256
+`8604f89ef01daab89b9d9aad1cf461765463feef2064ad8dd893c7e30abf891f`, CDHash
+`5bb716f49f1ee11442d4ecba31905acb0105d411`, and LC_UUID
+`10BFE99A-AECB-353C-BB90-9B44A4671DD6`; the hypervisor entitlement and
+`__dof_carrick` are present. The unentitled negative control passes and scoped
 cleanup reports zero remaining processes. The first-touch semantic and
 structural boundary is accepted; checkpoint 2 remains open for permission and
 retirement paths, elastic frame return, fork COW ownership, migration of the
