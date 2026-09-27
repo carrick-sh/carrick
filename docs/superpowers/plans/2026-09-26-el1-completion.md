@@ -535,3 +535,14 @@ The dedicated public-probe executables were frozen and hash-verified (four
 executables, 32 passing execution rows). The earlier generic-stage artifacts
 remain unavailable in their original signed form; a stale-receipt capture
 was rejected before copying. Fault-entry worker turn 1 remains active.
+
+2026-09-26: fault-entry worker produced `99610317a`, but director review
+round 1 rejected acceptance. The 239 host tests pass independently; the real
+guest fixture fails cross-compilation (invalid assembly output constraints
+and siginfo accessor). Review also requires sound register capture, deliberate
+stage-1 fault construction, bounded handler failure, EL1-off control, precise
+EC classification and truthful red-first/provenance evidence. The same worker
+is active on turn 2. Details are in
+`docs/perf-results/2026-09-26-el1-fault-entry-director/`. No implementation
+was integrated and no signed acceptance was attempted. The initial reset
+concern was withdrawn after inspecting its pointer/snapshot lifecycle.
