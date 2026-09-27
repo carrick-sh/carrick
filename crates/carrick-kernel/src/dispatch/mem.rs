@@ -546,6 +546,27 @@ impl MemState {
     }
 }
 
+/// Cached `CARRICK_FORK_DEBUG_VA=<hex guest VA>`, parsed once.
+///
+/// The allocator audits below consult it on every `mmap`/`munmap`. Reading
+/// the environment there took the process-wide environment lock and
+/// allocated a `String` per call on the guest's hottest mapping path.
+pub(super) fn fork_debug_va() -> Option<u64> {
+    static DEBUG_VA: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *DEBUG_VA.get_or_init(|| {
+        std::env::var("CARRICK_FORK_DEBUG_VA")
+            .ok()
+            .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+    })
+}
+
+/// Cached `CARRICK_MMAP_GRANT_DEBUG` presence, read once (see
+/// [`fork_debug_va`] for why not per call).
+fn mmap_grant_debug() -> bool {
+    static GRANT_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GRANT_DEBUG.get_or_init(|| std::env::var_os("CARRICK_MMAP_GRANT_DEBUG").is_some())
+}
+
 /// Debug: log any `mmap_next` LOWERING that crosses `CARRICK_FORK_DEBUG_VA`.
 /// The bump allocator's invariant is "everything at/above `mmap_next` is
 /// unallocated"; a lowering that crosses a LIVE mapping breaks it and the next
@@ -553,9 +574,7 @@ impl MemState {
 /// forkserver zeroed-granule corruption. `new` may come from the free-region
 /// merge loop, so call this AFTER the final value is computed.
 pub(super) fn debug_mmap_next_lowering(old: u64, new: u64) {
-    if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
-        .ok()
-        .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+    if let Some(debug_va) = fork_debug_va()
         && new <= debug_va
         && debug_va < old
     {
@@ -595,27 +614,30 @@ pub(super) fn lower_mmap_next(
     let lowered_from = *mmap_next;
     *mmap_next = new_next;
     // Absorb anything contiguous BELOW the new cursor, repeatedly: each
-    // absorbed region can expose another one below it.
-    while let Some(pos) = free_regions
-        .iter()
-        .position(|&(s, l)| s.checked_add(l) == Some(*mmap_next))
-    {
-        let (s, _l) = free_regions.remove(pos);
-        *mmap_next = s;
+    // absorbed region can expose another one below it. The list is sorted
+    // and disjoint, so the one region that can end exactly at the cursor is
+    // found by binary search rather than a scan per absorbed region.
+    loop {
+        let cursor = *mmap_next;
+        let index = free_regions.partition_point(|&(s, l)| s.saturating_add(l) < cursor);
+        match free_regions.get(index) {
+            Some(&(s, l)) if s.checked_add(l) == Some(cursor) => {
+                free_regions.remove(index);
+                *mmap_next = s;
+            }
+            _ => break,
+        }
     }
     let cursor = *mmap_next;
-    free_regions.retain_mut(|(start, len)| {
-        let end = start.saturating_add(*len);
-        if *start >= cursor {
-            false
-        } else if end > cursor {
-            // Straddles the cursor: keep only the part that is still below it.
-            *len = cursor - *start;
-            true
-        } else {
-            true
-        }
-    });
+    // Everything starting at/above the cursor is dropped; the last survivor
+    // may straddle it and keeps only the part still below it.
+    let keep = free_regions.partition_point(|&(start, _)| start < cursor);
+    free_regions.truncate(keep);
+    if let Some((start, len)) = free_regions.last_mut()
+        && start.saturating_add(*len) > cursor
+    {
+        *len = cursor - *start;
+    }
     debug_assert!(
         free_regions
             .iter()
@@ -678,34 +700,27 @@ impl MmapGrantCongruence {
 }
 
 pub(super) fn free_regions_remove_range(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
-    let end = addr.saturating_add(len);
-    let mut out: Vec<(u64, u64)> = Vec::with_capacity(regions.len() + 1);
-    for &(s, l) in regions.iter() {
-        let e = s.saturating_add(l);
-        if e <= addr || s >= end {
-            out.push((s, l));
-            continue;
-        }
-        if s < addr {
-            out.push((s, addr - s));
-        }
-        if e > end {
-            out.push((end, e - end));
-        }
-    }
-    *regions = out;
+    cut_sorted_disjoint(
+        regions,
+        addr,
+        addr.saturating_add(len),
+        |&(start, len)| (start, start.saturating_add(len)),
+        |_, start, end| Some((start, end - start)),
+    );
 }
 
 /// Insert `[addr, addr+len)` into `regions` (sorted by start), coalescing any
 /// adjacent or overlapping ranges. `len` must be > 0.
+///
+/// Splices only the run of entries the new range touches: a churning
+/// allocator holds thousands of holes, and rebuilding and re-sorting the whole
+/// list per `munmap` made every call pay for every other hole.
 pub(super) fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
     // Free-list audit: CARRICK_FORK_DEBUG_VA=<hex> logs any insert covering
     // that VA, with the caller — the final provenance hook in the forkserver
     // zeroed-granule chain (an insert overlapping a live mapping is the seed
     // corruption every later grant faithfully amplifies).
-    if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
-        .ok()
-        .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+    if let Some(debug_va) = fork_debug_va()
         && addr <= debug_va
         && debug_va < addr.saturating_add(len)
     {
@@ -717,28 +732,62 @@ pub(super) fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len:
     }
     let mut new_start = addr;
     let mut new_end = addr.saturating_add(len);
-    let mut out: Vec<(u64, u64)> = Vec::with_capacity(regions.len() + 1);
-    let mut inserted = false;
-    for &(s, l) in regions.iter() {
-        let e = s.saturating_add(l);
-        if e < new_start || s > new_end {
-            // Disjoint from the (growing) merged range. Emit in sorted order.
-            if !inserted && s > new_end {
-                out.push((new_start, new_end - new_start));
-                inserted = true;
-            }
-            out.push((s, l));
-        } else {
-            // Overlapping or adjacent — absorb into the merged range.
-            new_start = new_start.min(s);
-            new_end = new_end.max(e);
+    // Overlapping or ADJACENT entries are absorbed into the new range.
+    let first = regions.partition_point(|&(s, l)| s.saturating_add(l) < new_start);
+    let mut last = first;
+    while let Some(&(s, l)) = regions.get(last) {
+        if s > new_end {
+            break;
         }
+        new_start = new_start.min(s);
+        new_end = new_end.max(s.saturating_add(l));
+        last += 1;
     }
-    if !inserted {
-        out.push((new_start, new_end - new_start));
+    regions.splice(first..last, [(new_start, new_end - new_start)]);
+}
+
+/// Cut `[start, end)` out of `items`, which must be sorted by start and
+/// pairwise disjoint (so their ends are sorted too). An entry straddling a
+/// cut edge keeps the part outside the cut, rebuilt by `clip(entry, s, e)`.
+///
+/// Work is O(log n + entries touched) and allocates nothing beyond the (at
+/// most two) clipped remainders. The whole-vector rebuilds this replaces
+/// allocated and moved every entry of the process on every `munmap`, so a
+/// mapping syscall's cost grew with the number of OTHER mappings.
+pub(super) fn cut_sorted_disjoint<T>(
+    items: &mut Vec<T>,
+    start: u64,
+    end: u64,
+    bounds: impl Fn(&T) -> (u64, u64),
+    clip: impl Fn(&T, u64, u64) -> Option<T>,
+) {
+    if start >= end {
+        return;
     }
-    out.sort_by_key(|&(s, _)| s);
-    *regions = out;
+    debug_assert!(
+        items
+            .windows(2)
+            .all(|pair| bounds(&pair[0]).1 <= bounds(&pair[1]).0),
+        "cut_sorted_disjoint requires a sorted, disjoint collection"
+    );
+    let first = items.partition_point(|item| bounds(item).1 <= start);
+    let last = first + items[first..].partition_point(|item| bounds(item).0 < end);
+    if first >= last {
+        return;
+    }
+    let (head_start, _) = bounds(&items[first]);
+    let (_, tail_end) = bounds(&items[last - 1]);
+    let left = if head_start < start {
+        clip(&items[first], head_start, start)
+    } else {
+        None
+    };
+    let right = if tail_end > end {
+        clip(&items[last - 1], end, tail_end)
+    } else {
+        None
+    };
+    items.splice(first..last, left.into_iter().chain(right));
 }
 
 pub(super) fn page_floor(value: u64, page_size: u64) -> u64 {
@@ -820,7 +869,29 @@ pub(super) fn locked_ranges_remove(
     ranges: &mut Vec<carrick_vfs::GuestMemoryRange>,
     remove: carrick_vfs::GuestMemoryRange,
 ) {
-    let mut out = Vec::with_capacity(ranges.len());
+    cut_sorted_disjoint(
+        ranges,
+        remove.start().raw(),
+        remove.end().raw(),
+        |range| (range.start().raw(), range.end().raw()),
+        |_, start, end| carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)),
+    );
+}
+
+/// [`locked_ranges_remove`] for a range list kept in insertion order (the
+/// secretmem registry): no sortedness is assumed, and nothing is rebuilt when
+/// nothing overlaps.
+pub(super) fn unsorted_ranges_remove(
+    ranges: &mut Vec<carrick_vfs::GuestMemoryRange>,
+    remove: carrick_vfs::GuestMemoryRange,
+) {
+    if !ranges
+        .iter()
+        .any(|range| remove.start() < range.end() && range.start() < remove.end())
+    {
+        return;
+    }
+    let mut out = Vec::with_capacity(ranges.len() + 1);
     for range in ranges.drain(..) {
         if remove.end() <= range.start() || remove.start() >= range.end() {
             out.push(range);
@@ -1394,7 +1465,7 @@ impl<'a> MemView<'a> {
         // zeros (the forkserver SIGSEGV cluster); this names the guilty path in
         // one run instead of a day of ledger archaeology.
         if flags & LINUX_MAP_FIXED == 0
-            && std::env::var_os("CARRICK_MMAP_GRANT_DEBUG").is_some()
+            && mmap_grant_debug()
             && let Some((address, _)) = granted
         {
             let mem_authority_9 = self.mem();
@@ -1418,9 +1489,7 @@ impl<'a> MemView<'a> {
             // Even without a ledger overlap, a grant covering the debug VA is
             // the event under investigation — dump the ledger's view of the
             // neighbourhood so a MISSING dynamic_maps entry is visible too.
-            if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
-                .ok()
-                .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+            if let Some(debug_va) = fork_debug_va()
                 && address <= debug_va
                 && debug_va < address.saturating_add(length)
             {
@@ -2382,6 +2451,10 @@ pub(super) fn mmap_request_uses_alias(
 #[cfg(test)]
 #[path = "mem/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "mem/metadata_budget_tests.rs"]
+mod metadata_budget_tests;
 
 #[cfg(test)]
 mod routing_characterization_tests {
