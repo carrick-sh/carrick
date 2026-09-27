@@ -156,7 +156,26 @@ all 98 MMU tests, warning-denied MMU Clippy and the existing warmed recycled
 snapshot allocation witness pass in `live-snapshot-cursor-green.log`,
 `live-snapshot-mmu-tests.log` and `live-snapshot-clippy.log`.
 
+The exact signed `0a1c70a47` artifact is recorded in
+`live-snapshot-artifact-identity.txt`, with its build in
+`live-snapshot-signed-build.log`. The run
+`el1-live-snapshot-first-touch-20260927` reproduced the same pre-touch fork
+mismatch, so the snapshot correction fixed a real stale-image defect but did
+not move this signed acceptance boundary. The fixture forks before either side
+touches the anonymous range. `live-snapshot-forkdiag.log` proves the mapping
+and alias inventory already name IPA `0x9b40001000`, while the parent stage-1
+leaf is intentionally invalid and retains the old identity output
+`0x6000001000`.
+
+`fork-invalid-alias-red.log` is the compile-red for the absent projection
+correction. `a6b32fe6b` repoints only an inherited dynamic private alias whose
+leaf is invalid and retains a superseded output. It preserves validity and all
+permission attributes, so fork does not make an untouched page accessible.
+The focused control, warning-denied HVF Clippy, formatting, and the prescribed
+serial HVF library suite pass; the suite reports 573 passed, three ignored and
+one already documented GIC source-shape assertion filtered.
+
 The next decisive action remains the same 256-page signed witness on one exact
-artifact containing `9d521e6be`. If it passes, run 1,024 and 4,096 pages and
+artifact containing `a6b32fe6b`. If it passes, run 1,024 and 4,096 pages and
 measure the `<0.125` host-exit slope. Checkpoint 2 and any performance impact
 remain open until those signed results exist.

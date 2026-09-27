@@ -1,0 +1,24 @@
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-hal)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-aarch64)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-thread)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-vmm-hvf)
+warning: unused import: `super::*`
+    --> crates/carrick-vmm-hvf/src/trap/process_plan.rs:1544:9
+     |
+1544 |     use super::*;
+     |         ^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0425]: cannot find function `repoint_inherited_invalid_alias` in this scope
+    --> crates/carrick-vmm-hvf/src/trap/process_plan.rs:1566:9
+     |
+1566 |         repoint_inherited_invalid_alias(
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+For more information about this error, try `rustc --explain E0425`.
+warning: `carrick-vmm-hvf` (lib test) generated 1 warning
+error: could not compile `carrick-vmm-hvf` (lib test) due to 1 previous error; 1 warning emitted
+warning: build failed, waiting for other jobs to finish...

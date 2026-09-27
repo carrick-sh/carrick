@@ -1067,3 +1067,26 @@ Build and sign one exact artifact containing this commit, then rerun the
 4,096 pages for the `<0.125` exits-per-added-page decision. Do not open a new
 allocator or fork campaign unless that signed witness names a new direct
 boundary; checkpoint 2 and measured impact remain open.
+
+### Untouched private alias across fork (2026-09-27)
+
+The exact signed `0a1c70a47` rerun did not move: it reproduced the same child
+projection mismatch before either side touched the anonymous range. The
+environment-gated fork diagnostic corrected the attribution. The registry and
+mapping row already named global IPA `0x9b40001000`; the parent leaf was
+intentionally invalid for first touch and retained the old identity output
+`0x6000001000`. The live-snapshot correction remains valid for guest-linked
+hierarchy beyond an older cursor, but that hierarchy was not the active cause
+in this fixture.
+
+`a6b32fe6b` is the direct correction. Fork projection repoints only an inherited
+dynamic private alias with an invalid leaf and a stale retained output. The
+operation preserves validity and every permission attribute, so it does not
+materialize or expose an untouched mapping. Its red-first focused test,
+warning-denied HVF Clippy, formatting and the prescribed serial HVF library
+suite pass (573 passed, three ignored, one unchanged GIC assertion filtered).
+
+Build and sign one exact artifact containing this commit, then rerun the same
+256-page witness. Only a green result promotes the frozen artifact to 1,024 and
+4,096 pages. If it remains red, use the next exact signed boundary; do not turn
+this into a general fork rewrite.
