@@ -1,0 +1,302 @@
+(lldb) target create "target/el1-completion/allocator-director-red/test-frozen/el1_sched-ba795739d7a1a0f3"
+Current executable set to '/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-director-red/test-frozen/el1_sched-ba795739d7a1a0f3' (arm64).
+(lldb) settings set -- target.run-args  "el1_metadata_allocator_grows_and_returns_extents" "--nocapture"
+(lldb) breakpoint set --file executor.rs --line 231
+Breakpoint 1: where = el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::executor::executor_worker::h6659650ec665c127 + 6016 at executor.rs:231:17, address = 0x0000000100264658
+(lldb) run
+
+running 1 test
+test el1_metadata_allocator_grows_and_returns_extents ... warning: el1_sched-ba795739d7a1a0f3 was compiled with optimization - stepping may behave oddly; variables may not be available.
+Process 27500 launched: '/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-director-red/test-frozen/el1_sched-ba795739d7a1a0f3' (arm64)
+Process 27500 stopped
+* thread #10, name = 'carrick-executor-0', stop reason = breakpoint 1.1
+       frame #0: 0x0000000100264658 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::executor::executor_worker::h6659650ec665c127(slot=<unavailable>, scheduler=Arc<carrick_kernel::kernel::scheduler::Scheduler, alloc::alloc::Global> @ 0x0000000170ee2258, factory=Arc<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, alloc::alloc::Global> @ 0x0000000170ee2260, resolver=Arc<carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory, alloc::alloc::Global> @ 0x0000000170ee2268, receipts=Arc<carrick_runtime::vcpu_loop::executor::pool::ReceiptLog, alloc::alloc::Global> @ 0x0000000170ee2270, control=Arc<carrick_runtime::vcpu_loop::executor::pool::PoolControl, alloc::alloc::Global> @ 0x0000000170ee2278, channels=<unavailable>) at executor.rs:231:17 [opt]
+   228 	                existing.push_str(&message);
+   229 	            }
+   230 	        }
+-> 231 	        control.wait_for_shutdown();
+    	                ^
+   232 	    }
+   233 	    if let Some(destroy_error) = destroy_and_unregister(
+   234 	        backend,
+Target 0: (el1_sched-ba795739d7a1a0f3) stopped.
+(lldb) frame variable
+(carrick_runtime::vcpu_loop::executor::pool::WorkerSlot) slot = <variable not available>
+
+(alloc::sync::Arc<carrick_kernel::kernel::scheduler::Scheduler, alloc::alloc::Global>) scheduler = {
+  ptr = {
+    pointer = 0x000000012800bcc0
+  }
+  phantom = {}
+  alloc = {}
+}
+(alloc::sync::Arc<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, alloc::alloc::Global>) factory = {
+  ptr = {
+    pointer = 0x00000001280164e0
+  }
+  phantom = {}
+  alloc = {}
+}
+(alloc::sync::Arc<carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory, alloc::alloc::Global>) resolver = {
+  ptr = {
+    pointer = 0x000000012801f1c0
+  }
+  phantom = {}
+  alloc = {}
+}
+(alloc::sync::Arc<carrick_runtime::vcpu_loop::executor::pool::ReceiptLog, alloc::alloc::Global>) receipts = {
+  ptr = {
+    pointer = 0x000000012800c7d0
+  }
+  phantom = {}
+  alloc = {}
+}
+(alloc::sync::Arc<carrick_runtime::vcpu_loop::executor::pool::PoolControl, alloc::alloc::Global>) control = {
+  ptr = {
+    pointer = 0x000000012800ca60
+  }
+  phantom = {}
+  alloc = {}
+}
+(carrick_runtime::vcpu_loop::executor::pool::WorkerChannels) channels = <could not evaluate DW_OP_entry_value: no call edge for retn-pc = 0x1002412c0 in parent frame std::sys::backtrace::__rust_begin_short_backtrace::hf904e9adac42143e>
+
+(unsigned long) index = 0
+(bool) is_spare = <no location, value may have been optimized out>
+
+(std::sync::mpsc::Receiver<carrick_runtime::vcpu_loop::executor::pool::WorkerCommand>) commands = {
+  inner = {
+    flavor = {
+      $variants$ = {
+        $variant$0 = {
+          $discr$ = 1
+          value = {...}
+        }
+        $variant$1 = {
+          $discr$ = 1
+          value = {...}
+        }
+        $variant$2 = {
+          $discr$ = 1
+          value = {...}
+        }
+      }
+    }
+  }
+}
+(std::sync::mpsc::Sender<carrick_runtime::vcpu_loop::executor::pool::StartupStatus>) startup = {
+  inner = {
+    flavor = {
+      $variants$ = {
+        $variant$0 = {
+          $discr$ = 1
+          value = {...}
+        }
+        $variant$1 = {
+          $discr$ = 1
+          value = {...}
+        }
+        $variant$2 = {
+          $discr$ = 1
+          value = {...}
+        }
+      }
+    }
+  }
+}
+(alloc::sync::Arc<carrick_runtime::vcpu_loop::executor::pool::WorkerKick, alloc::alloc::Global>) kick = {
+  ptr = {
+    pointer = 0x000000012760a320
+  }
+  phantom = {}
+  alloc = {}
+}
+(carrick_kernel::kernel::scheduler::ExecutorRegistration) registration = {
+  id = (__0 = 1)
+  placement = {
+    ptr = {
+      pointer = 0x000000012760a400
+    }
+    phantom = {}
+    alloc = {}
+  }
+  close_observation_epoch = {
+    ptr = {
+      pointer = 0x000000012760a3a0
+    }
+    phantom = {}
+    alloc = {}
+  }
+  control_observation_epoch = {
+    ptr = {
+      pointer = 0x000000012760a3c0
+    }
+    phantom = {}
+    alloc = {}
+  }
+  flush_requested = {
+    ptr = {
+      pointer = 0x000000012760a3e0
+    }
+    phantom = {}
+    alloc = {}
+  }
+}
+(carrick_kernel::kernel::objects::thread::ExecutorId) executor_id = (__0 = 1)
+(carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutor) backend = {
+  executor_id = (__0 = 1)
+  lifecycle = {
+    $variants$ = {
+      $variant$2 = ($discr$ = 0, value = core::option::Option<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vmm>::None<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vmm>:64 @ 0x0000000170ee2e10)
+      $variant$ = {
+        value = {
+          __0 = {...}
+        }
+      }
+    }
+  }
+  vcpu = {
+    $variants$ = {
+      $variant$3 = ($discr$ = 'p', value = core::option::Option<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vcpu>::None<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vcpu>:8 @ 0x0000000170ee2d80)
+      $variant$ = {
+        value = {
+          __0 = {...}
+        }
+      }
+    }
+  }
+  current = {
+    $variants$ = {
+      $variant$2 = ($discr$ = 0, value = core::option::Option<carrick_aarch64::engine::Aarch64EngineCore<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vmm>>::None<carrick_aarch64::engine::Aarch64EngineCore<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vmm> >:64 @ 0x0000000170ee33d8)
+      $variant$ = {
+        value = {
+          __0 = {...}
+        }
+      }
+    }
+  }
+  binding = {
+    $variants$ = {
+      $variant$0 = ($discr$ = 4966146880, value = core::option::Option<alloc::sync::Arc<carrick_runtime::vcpu_loop::continuation::quantum::HvpatchTaskBinding, alloc::alloc::Global>>::None<alloc::sync::Arc<carrick_runtime::vcpu_loop::continuation::quantum::HvpatchTaskBinding, alloc::alloc::Global> >:64 @ 0x0000000170ee3ab0)
+      $variant$ = {
+        value = {
+          __0 = {...}
+        }
+      }
+    }
+  }
+  cow_invalidation_observer = {
+    $variants$ = {
+      $variant$0 = ($discr$ = 0, value = core::option::Option<carrick_runtime::hvpatch::stage1_mm::CowInvalidationObserver>::None<carrick_runtime::hvpatch::stage1_mm::CowInvalidationObserver>:64 @ 0x0000000170ee2de0)
+      $variant$ = {
+        value = {
+          __0 = {...}
+        }
+      }
+    }
+  }
+  loaded_task_only = {
+    $variants$ = {
+      $variant$3 = ($discr$ = 3, value = core::option::Option<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState>::None<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState>:64 @ 0x0000000170ee23f0)
+      $variant$ = {
+        value = {
+          __0 = {...}
+        }
+      }
+    }
+  }
+  receipt = (user_ns = 0, system_ns = 0)
+  raw_vcpu_id = 0
+  owner_thread_port = 8963
+  residency_generation = (__0 = 1)
+  resident_task = {
+    $variants$ = {
+      $variant$2 = ($discr$ = 2, value = core::option::Option<carrick_runtime::vcpu_loop::executor::backend::HvpatchResidentTaskRecord>::None<carrick_runtime::vcpu_loop::executor::backend::HvpatchResidentTaskRecord>:64 @ 0x0000000170ee22e0)
+      $variant$ = {
+        value = {
+          __0 = {...}
+        }
+      }
+    }
+  }
+  bound_cpu = {
+    $variants$ = {
+      $variant$0 = ($discr$ = 1, value = core::option::Option<u32>::None<unsigned int>:32 @ 0x0000000170ee3aa0)
+      $variant$1 = {
+        $discr$ = 1
+        value = (__0 = 0)
+      }
+    }
+  }
+}
+(bool) startup_sent = <variable not available>
+
+(core::result::Result<core::result::Result<(), alloc::string::String>, alloc::boxed::Box<(dyn core::any::Any + core::marker::Send), alloc::alloc::Global>>) lifecycle = {
+  $variants$ = {
+    $variant$ = {
+      value = {
+        __0 = {
+          $variants$ = {...}
+        }
+      }
+    }
+    $variant$1 = {
+      $discr$ = 110
+      value = {
+        __0 = {
+          pointer = 0x000000011785f8e0 {...}
+          vtable = 0x000000000000006a {...}
+        }
+      }
+    }
+  }
+}
+(bool) retired = <variable not available>
+
+(core::option::Option<alloc::string::String>) failure = {
+  $variants$ = {
+    $variant$0 = ($discr$ = 110, value = core::option::Option<alloc::string::String>::None<alloc::string::String>:64 @ 0x0000000170ee52e0)
+    $variant$ = {
+      value = {
+        __0 = {
+          vec = {...}
+        }
+      }
+    }
+  }
+}
+(alloc::string::String) drain_error = <variable not available>
+
+(bool) faulted_after_startup = <variable not available>
+
+*** Some of the displayed variables have a greater depth of members than the debugger will show by default. To increase the limit, use the --depth option to frame variable, or raise the limit by changing the target.max-children-depth setting.
+(lldb) thread backtrace
+* thread #10, name = 'carrick-executor-0', stop reason = breakpoint 1.1
+   * frame #0: 0x0000000100264658 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::executor::executor_worker::h6659650ec665c127(slot=<unavailable>, scheduler=Arc<carrick_kernel::kernel::scheduler::Scheduler, alloc::alloc::Global> @ 0x0000000170ee2258, factory=Arc<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, alloc::alloc::Global> @ 0x0000000170ee2260, resolver=Arc<carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory, alloc::alloc::Global> @ 0x0000000170ee2268, receipts=Arc<carrick_runtime::vcpu_loop::executor::pool::ReceiptLog, alloc::alloc::Global> @ 0x0000000170ee2270, control=Arc<carrick_runtime::vcpu_loop::executor::pool::PoolControl, alloc::alloc::Global> @ 0x0000000170ee2278, channels=<unavailable>) at executor.rs:231:17 [opt]
+     frame #1: 0x00000001002412c0 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::executor::pool::ExecutorPool$LT$F$C$R$GT$::start::_$u7b$$u7b$closure$u7d$$u7d$::hb743ce58afda6e7c at pool.rs:987:21 [opt] [inlined]
+     frame #2: 0x0000000100241294 el1_sched-ba795739d7a1a0f3`std::sys::backtrace::__rust_begin_short_backtrace::hf904e9adac42143e(f=<unavailable>) at backtrace.rs:166:18 [opt]
+     frame #3: 0x000000010031d734 el1_sched-ba795739d7a1a0f3`std::thread::lifecycle::spawn_unchecked::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::h6f97fec13f2b11b2 at lifecycle.rs:91:13 [opt] [inlined]
+     frame #4: 0x000000010031d6f8 el1_sched-ba795739d7a1a0f3`_$LT$core..panic..unwind_safe..AssertUnwindSafe$LT$F$GT$$u20$as$u20$core..ops..function..FnOnce$LT$$LP$$RP$$GT$$GT$::call_once::h6ca9278a66b3246b(self=AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<carrick_runtime::vcpu_loop::executor::pool::{impl#15}::start::{closure_env#4}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory>, carrick_runtime::vcpu_loop::executor::pool::WorkerOutcome>> @ 0x0000007587c29300, (null)=<unavailable>) at unwind_safe.rs:275:9 [opt] [inlined]
+     frame #5: 0x000000010031d6ec el1_sched-ba795739d7a1a0f3`std::panicking::catch_unwind::do_call::h26fe3308ed829988(data=<unavailable>) at panicking.rs:581:40 [opt]
+     frame #6: 0x000000010031d6ec el1_sched-ba795739d7a1a0f3`std::panicking::catch_unwind::h685e6787e1d99c3d(f=AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<carrick_runtime::vcpu_loop::executor::pool::{impl#15}::start::{closure_env#4}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory>, carrick_runtime::vcpu_loop::executor::pool::WorkerOutcome>> @ 0x0000007587c29300) at panicking.rs:544:19 [opt]
+     frame #7: 0x000000010031d6ec el1_sched-ba795739d7a1a0f3`std::panic::catch_unwind::h8edd4e8e12c9ad12(f=AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<carrick_runtime::vcpu_loop::executor::pool::{impl#15}::start::{closure_env#4}<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory>, carrick_runtime::vcpu_loop::executor::pool::WorkerOutcome>> @ 0x0000007587c29300) at panic.rs:359:14 [opt] [inlined]
+     frame #8: 0x000000010031d6ec el1_sched-ba795739d7a1a0f3`std::thread::lifecycle::spawn_unchecked::_$u7b$$u7b$closure$u7d$$u7d$::ha34d47043a5b9232 at lifecycle.rs:89:26 [opt] [inlined]
+     frame #9: 0x000000010031d6b8 el1_sched-ba795739d7a1a0f3`core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::hdb2a01d778d5ac22((null)=<unavailable>, (null)=<unavailable>) at function.rs:250:5 [opt]
+     frame #10: 0x0000000100db4354 el1_sched-ba795739d7a1a0f3`<alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once at boxed.rs:2249:9 [opt] [inlined]
+     frame #11: 0x0000000100db4348 el1_sched-ba795739d7a1a0f3`<std::sys::thread::unix::Thread>::new::thread_start at unix.rs:118:17 [opt]
+     frame #12: 0x000000018a8ffd00 libsystem_pthread.dylib`_pthread_start + 136
+(lldb) continue
+
+thread 'el1_metadata_allocator_grows_and_returns_extents' (14752490) panicked at crates/carrick-embed/tests/common/mod.rs:112:21:
+container run failed: runtime failure: filesystem backend error: failed to run ELF from dispatcher: carrier failed: logical HVPatch job 1 published before its executor binding retired
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    el1_metadata_allocator_grows_and_returns_extents
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 32 filtered out; finished in 5.21s
+
+Process 27500 resuming
+Process 27500 exited with status = 101 (0x00000065)
