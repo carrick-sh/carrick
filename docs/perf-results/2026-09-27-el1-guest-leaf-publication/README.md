@@ -175,7 +175,25 @@ The focused control, warning-denied HVF Clippy, formatting, and the prescribed
 serial HVF library suite pass; the suite reports 573 passed, three ignored and
 one already documented GIC source-shape assertion filtered.
 
-The next decisive action remains the same 256-page signed witness on one exact
-artifact containing `a6b32fe6b`. If it passes, run 1,024 and 4,096 pages and
-measure the `<0.125` host-exit slope. Checkpoint 2 and any performance impact
-remain open until those signed results exist.
+The frozen `58c76fdfd` artifact and exact in-process signed test executable are
+attested in `fork-invalid-alias-artifact-identity.txt`; the build and run are
+in `fork-invalid-alias-signed-build.log` and
+`fork-invalid-alias-signed-first-touch.log`. The signed fixture now completes
+both parent and child semantics at every scale:
+
+| Pages per process | Total pages | Carrick host exits | Semantics |
+|---:|---:|---:|---|
+| 256 | 512 | 612 | parent and child pass |
+| 1,024 | 2,048 | 2,148 | parent and child pass |
+| 4,096 | 8,192 | 8,292 | parent and child pass |
+
+The fork projection correction therefore closes the signed semantic blocker.
+It does not yet deliver the structural impact: `(2148 - 612) / 1536` and
+`(8292 - 2148) / 6144` are both exactly `1.0000` host exit per added page,
+against the `<0.125` contract. The entitlement negative control passes and
+scoped cleanup reports zero remaining processes for both run IDs.
+
+The next bounded task is an exit-class census on this exact fixture. One host
+exit still scales with every touched page; classify it as grant/first-touch,
+stage-1 frame COW, stage-2 replay or another exact boundary before changing
+code. Checkpoint 2 and measured performance acceptance remain open.

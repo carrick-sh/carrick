@@ -1,0 +1,90 @@
+source_head:
+58c76fdfd52f122b6da7e9874bb177d7104ec486
+cli_sha256:
+44bd235905e9cd0101d590a4d334a74fde718e3aa56ebd9cb314f955e8579a99  target/release/carrick
+cli_codesign:
+Executable=/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/carrick
+Identifier=carrick.tmp.28374
+Format=Mach-O thin (arm64)
+CodeDirectory v=20400 size=70282 flags=0x2(adhoc) hashes=2186+7 location=embedded
+VersionPlatform=1
+VersionMin=720896
+VersionSDK=786432
+Hash type=sha256 size=32
+CandidateCDHash sha256=5d15695ebc0bb035b28355b8f38eb8e7669e7e52
+CandidateCDHashFull sha256=5d15695ebc0bb035b28355b8f38eb8e7669e7e52bf682e485654245d38feb8a3
+Hash choices=sha256
+CMSDigest=5d15695ebc0bb035b28355b8f38eb8e7669e7e52bf682e485654245d38feb8a3
+CMSDigestType=2
+Executable Segment base=0
+Executable Segment limit=24772608
+Executable Segment flags=0x1
+Page size=16384
+CDHash=5d15695ebc0bb035b28355b8f38eb8e7669e7e52
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=0 size=12
+Total signatures=1
+Chosen signature=1
+cli_entitlements:
+Executable=/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/carrick
+warning: Specifying ':' in the path is deprecated and will not work in a future release
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>
+cli_lc_uuid:
+     cmd LC_UUID
+ cmdsize 24
+    uuid 1E59C6C4-42BA-377D-9629-3A237877E199
+cli_dof:
+  sectname __dof_carrick
+   segname __TEXT
+      addr 0x000000010147f963
+      size 0x000000000000c7f4
+    offset 21494115
+     align 2^0 (1)
+test_executable:
+target/release/deps/el1_sched-ba447c5401356583
+test_sha256:
+44deb663e9682cf3c9c994076e7cc5819298a4e57fa02410d83392c8069dcf71  target/release/deps/el1_sched-ba447c5401356583
+test_codesign:
+Executable=/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_sched-ba447c5401356583
+Identifier=el1_sched-ba447c5401356583.tmp.28518
+Format=Mach-O thin (arm64)
+CodeDirectory v=20400 size=56989 flags=0x2(adhoc) hashes=1770+7 location=embedded
+VersionPlatform=1
+VersionMin=720896
+VersionSDK=786432
+Hash type=sha256 size=32
+CandidateCDHash sha256=846fb1bbe457b74ca13099464c4b69219cebedd6
+CandidateCDHashFull sha256=846fb1bbe457b74ca13099464c4b69219cebedd608c278f2a5dafd120a4e1705
+Hash choices=sha256
+CMSDigest=846fb1bbe457b74ca13099464c4b69219cebedd608c278f2a5dafd120a4e1705
+CMSDigestType=2
+Executable Segment base=0
+Executable Segment limit=19808256
+Executable Segment flags=0x1
+Page size=16384
+CDHash=846fb1bbe457b74ca13099464c4b69219cebedd6
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=0 size=12
+Total signatures=1
+Chosen signature=1
+test_entitlements:
+Executable=/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_sched-ba447c5401356583
+warning: Specifying ':' in the path is deprecated and will not work in a future release
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>
+test_lc_uuid:
+     cmd LC_UUID
+ cmdsize 24
+    uuid 833AB959-8695-3677-AFA6-2388F9CCC1D7
+test_dof:
+  sectname __dof_carrick
+   segname __TEXT
+      addr 0x0000000101054953
+      size 0x000000000000c27c
+    offset 17123667
+     align 2^0 (1)
