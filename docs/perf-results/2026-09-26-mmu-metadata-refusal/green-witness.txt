@@ -1,0 +1,15 @@
+# Green Witness: MMU Metadata Refusal, Recovery, and Zero-Allocation Rollback
+
+- **Source HEAD:** `f27a3f644e92fd1de2d4cdf9a52c07be45daa9a5` (plus Review Round 3 corrections)
+- **Verification Command:**
+  ```bash
+  RUSTC_WRAPPER= cargo test -p carrick-mmu-core --lib test_metadata_refusal_witness_rollback_allocations -- --nocapture
+  ```
+- **Exit Status:** `0` (PASSED)
+- **Raw Unedited Log:** `docs/perf-results/2026-09-26-mmu-metadata-refusal/raw-green.log` (SHA-256: `d1b42179b4c7751d7ee19c8000eb82f956228acd71f0e7667ead077b450b145b`)
+
+### Verification Summary
+- Scale 1: admission_allocations = 22, admission_bytes = 88,300, rollback_allocations = 0, rollback_bytes = 0
+- Scale 8: admission_allocations = 38, admission_bytes = 706,564, rollback_allocations = 0, rollback_bytes = 0
+- Scale 32: admission_allocations = 70, admission_bytes = 2,827,412, rollback_allocations = 0, rollback_bytes = 0
+- Scale 128: admission_allocations = 175, admission_bytes = 23,893,668, rollback_allocations = 0, rollback_bytes = 0

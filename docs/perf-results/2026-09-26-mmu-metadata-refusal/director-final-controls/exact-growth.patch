@@ -1,0 +1,11 @@
+--- a/crates/carrick-mmu-core/src/aarch64.rs
++++ b/crates/carrick-mmu-core/src/aarch64.rs
+@@ -2213,7 +2213,7 @@
+             if let Some(journal) = self.undo.as_mut() {
+                 let needed_capacity = self.arenas.len().saturating_sub(journal.arenas_len) + 1;
+                 if journal.returned_bases.capacity() < needed_capacity
+-                    && journal.returned_bases.try_reserve(needed_capacity).is_err()
++                    && journal.returned_bases.try_reserve_exact(needed_capacity).is_err()
+                 {
+                     source.return_arena(gpa);
+                     return Err(PageTableError::MetadataAllocation);
