@@ -1129,18 +1129,29 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                         page_table_sync_error_to_memory_error(error)
                     })?;
                 }
-                match edit(editor) {
-                    Ok(res) => {
+                // Journal this edit unless an enclosing transaction already
+                // owns one. Every failure below happens before `sync_to_host`
+                // stores a word, so it is abandoned in the shadow alone: a
+                // failed extension-arena publication used to leave `dirty`
+                // non-empty, and every later adoption refused the manager.
+                let own_journal = !editor.undo_is_open();
+                if own_journal {
+                    editor
+                        .begin_undo()
+                        .map_err(page_table_sync_error_to_memory_error)?;
+                }
+                let result = match edit(editor) {
+                    Ok(res) => 'publish: {
                         outcome = res;
                         if outcome.changed {
-                            self.vm
-                                .publish_stage1_extension_arenas(editor.manager)
-                                .map_err(|error| {
-                                    eprintln!("EL1DBG EXT-FAIL base=0x{:x} arenas={} next_free=0x{:x} cap=0x{:x} region={:?} bytes_span=0x{:x} pool={:?}", editor.manager.arenas[0].base, editor.manager.arenas.len(), editor.manager.arenas[0].next_free, editor.manager.arenas[0].capacity, editor.manager.table_region_for_debug(), editor.manager.arenas[0].allocated_span(), editor.manager.pool_stats());
-                                    MemoryError::HostMap(format!(
-                                        "publish stage-1 extension arenas failed: {error:?}"
-                                    ))
-                                })?;
+                            if let Err(error) =
+                                self.vm.publish_stage1_extension_arenas(editor.manager)
+                            {
+                                eprintln!("EL1DBG EXT-FAIL base=0x{:x} arenas={} next_free=0x{:x} cap=0x{:x} region={:?} bytes_span=0x{:x} pool={:?}", editor.manager.arenas[0].base, editor.manager.arenas.len(), editor.manager.arenas[0].next_free, editor.manager.arenas[0].capacity, editor.manager.table_region_for_debug(), editor.manager.arenas[0].allocated_span(), editor.manager.pool_stats());
+                                break 'publish Err(MemoryError::HostMap(format!(
+                                    "publish stage-1 extension arenas failed: {error:?}"
+                                )));
+                            }
                             // SAFETY: `host` backs the live page-table region for the whole process
                             // lifetime; the manager writes only 8-byte-aligned descriptor slots
                             // within `[host, host + size)`.
@@ -1150,10 +1161,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                                 host,
                                 size,
                             };
-                            unsafe {
-                                editor.sync_to_host(resolver)
+                            if let Err(error) = unsafe { editor.sync_to_host(resolver) } {
+                                break 'publish Err(page_table_sync_error_to_memory_error(error));
                             }
-                            .map_err(page_table_sync_error_to_memory_error)?;
                             editor.manager.record_populated_prefixes(|base, prefix| {
                                 self.vm.record_stage1_populated_prefix(base, prefix);
                             });
@@ -1196,7 +1206,17 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     Err(PageTableError::MetadataAllocation) => {
                         Err(MemoryError::MetadataAllocation)
                     }
+                };
+                if own_journal {
+                    if result.is_ok() {
+                        // An edit that joined the journal (fork-COW arming)
+                        // keeps it for its own commit or rollback.
+                        editor.manager.commit_undo_unless_retained();
+                    } else {
+                        editor.manager.abandon_unpublished_undo();
+                    }
                 }
+                result
             },
         );
         edit_res?;
@@ -3839,7 +3859,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // its user mappings must retain the same writable frames rather than
         // entering the ordinary fork-COW protocol.
         let private_ranges = self.vm.fork_cow_ranges();
-        eprintln!("EL1DBG FORK ranges={:x?}", private_ranges.iter().map(|r| (r.va, r.len, r.kernel_only)).collect::<Vec<_>>());
+        eprintln!(
+            "EL1DBG FORK ranges={:x?}",
+            private_ranges
+                .iter()
+                .map(|r| (r.va, r.len, r.kernel_only))
+                .collect::<Vec<_>>()
+        );
         // Guest EL1 publishes, protects and retires private-anonymous leaves
         // directly in the live tables, while this host manager edits an owned
         // copy. Adopt the live descriptors for every private range before the
