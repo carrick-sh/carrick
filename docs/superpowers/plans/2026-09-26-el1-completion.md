@@ -954,3 +954,36 @@ claim the request at the existing forwarded-fault boundary, reuse sparse
 stage-2 preparation, apply and authenticate the inventory receipt, retain the
 alias/backing, and publish Ready last. Then implement guest leaf publication
 and rerun the signed three-scale witness before broadening checkpoint 2.
+
+### Authenticated frame-grant host service (2026-09-27)
+
+`a90315d59` completes the host half of the direct production join. The existing
+forwarded-fault boundary now claims only the current MM's exact request, clips
+it through the same-protection 2 MiB planner, and calls a neutral VMM service.
+HVF quiesces and reauthenticates that MM, creates real zeroed stage-2 backing,
+stages the backend inventory row, applies and authenticates the kernel receipt
+and owner generation, retains the alias, and returns the leaf IPA. The runtime
+publishes mailbox `Ready` last and commits the whole semantic resident span.
+Backend refusal stays in the mailbox until guest consumption before the
+ordinary host fallback can resume.
+
+Red-first request-claim, backend-validation and Linux permission controls are
+green. Focused ABI/runtime/HVF/AArch64 tests, targeted warning-denied Clippy,
+formatting, the 62-contract registry, syscall inventory and exact product-diff
+gate pass. A serial HVF library run passes 571 tests with three existing ignores
+and one unchanged GIC source-shape assertion filtered out. That assertion also
+fails on the checkpoint base because it expects the old `run_to_exit_inner`
+signature; the two inventory failures from an invalid concurrent run disappear
+under serial isolation. Exact evidence is under
+`docs/perf-results/2026-09-27-el1-frame-grant-host-service/`.
+
+This does not improve the signed first-touch slope: the guest still never
+publishes or consumes the request, so the new host service is dormant. The next
+bounded task is the impact-bearing guest transaction. On a recoverable EL0 data
+abort, publish one exact request and forward; on retry, claim the exact response,
+handle refusal without reissuing it, acquire and reauthenticate the live MM
+editor, install the existing invalid leaf span with the returned IPA and current
+permissions, perform required TLB maintenance, and acknowledge success. Preserve
+rollback for every path that does not publish a leaf. Re-run the signed
+three-scale witness immediately after that path is live; do not return to
+allocator work unless this transaction exposes a specific allocator regression.
