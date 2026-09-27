@@ -342,6 +342,35 @@ authority, and remove the host page-table writer and pause only after no path
 needs them. The permission trace is closed; do not keep instrumenting it absent
 a new failing contract.
 
+### Accepted resident anonymous munmap boundary (2026-09-27)
+
+The resident private-anonymous `munmap` vertical landed in `73dfedec1`. Guest
+EL1 validates every tagged terminal before mutation, refuses partial L1/L2
+blocks and untagged mapping shapes, retires complete L1/L2 blocks and L3 leaves
+under the exact-MM editor, and invalidates the ASID before crossing one host
+boundary. The ordinary exact-context host mutation route authenticates the
+original syscall, returns stage-2/frame-inventory backing in bulk and commits
+VMA metadata. Its repeated retirement edit is idempotent and remains only until
+the rest of checkpoint 2 permits deletion of the host page-table writer.
+
+The exact signed 256/1,024/4,096-page witness is green. Every scale serves the
+four target unmaps plus one eligible runtime cleanup in EL1, leaves only one
+fixed untagged runtime cleanup on the host fallback, returns every grant and
+byte, and physically reuses returned extents. The retained exit counts are
+44/56/80, with slopes 0.0039 and 0.0020 exits per added page per round against
+the 0.125 gate. The full signed harness also passed its unentitled negative
+control and zero-process cleanup. The exact same static fixture passes all
+three scales on pinned native arm64 Docker. Receipts are in
+[the munmap acceptance](../../perf-results/2026-09-27-el1-anonymous-munmap/README.md).
+
+Checkpoint 2 remains open. The next bounded task is anonymous `mmap` and `brk`
+ownership: move the semantic range allocator and lazy reservation bookkeeping
+under the same EL1 address-space authority while retaining bulk host frame
+grants. After that, establish fork-COW ownership and delete the host stage-1
+writer/page-table pause only when the remaining paths no longer require them.
+The accepted permission and munmap traces are closed unless a new contract
+fails.
+
 ### Scheduler personality split and mechanical gate
 
 The reviewed scheduler split and checker are integrated as `26f104341` and
