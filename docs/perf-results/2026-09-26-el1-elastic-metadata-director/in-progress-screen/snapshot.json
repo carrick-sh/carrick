@@ -1,0 +1,5 @@
+{
+  "source": "worker in-progress snapshot; not terminal candidate",
+  "sha256": "58383eeb7e3608924adb791af52a6f8748980a50a4f5b114554f339ea7203559",
+  "extraction": "unchanged core from use core::alloc::Layout to before request_host_extent_grant"
+}

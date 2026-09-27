@@ -730,3 +730,13 @@ integrated-ci/green/. This closes the host gate only; signed guest validation,
 first-touch structural acceptance and every later checkpoint remain open.
 The separate elastic metadata worker is active on its first turn; its exact
 dispatch brief is preserved under el1-elastic-metadata-director/dispatch.md.
+
+2026-09-26: the preceding user status turn was no implementation progress.
+Resumed the same live elastic metadata worker, with no replacement or review
+round consumed. A read-only in-progress core screen reproduces two behavioral
+failures: 64-byte alignment returns remainder 32, and payload-only grant sizing
+cannot fit its header. Raw source and red output are preserved under
+el1-elastic-metadata-director/in-progress-screen/. Recheck against the terminal
+candidate before review; no worker source was modified. Signed release build
+on a6ac6935c completed and its exact CLI artifact is frozen. The integrated EL1
+gate is running; no result or first-touch acceptance is claimed yet.
