@@ -11,9 +11,10 @@ pub use container::ContainerId;
 pub mod aarch64;
 pub use aarch64::{
     AARCH64_EL0_VISIBLE_DAIF, AARCH64_HVC_EXCEPTION_CLASS, AARCH64_HVC_IDLE_IMM,
-    AARCH64_HVC_KICK_IMM, AARCH64_SVC_EXCEPTION_CLASS, ExecLevel, aarch64_exception_class,
-    el0_visible_pstate, is_aarch64_hvc_exception, is_aarch64_hvc_idle, is_aarch64_hvc_kick,
-    is_aarch64_hvc_maintenance, is_aarch64_svc_exception, is_aarch64_syscall_exception,
+    AARCH64_HVC_KICK_IMM, AARCH64_HVC_METADATA_GRANT_IMM, AARCH64_SVC_EXCEPTION_CLASS, ExecLevel,
+    aarch64_exception_class, el0_visible_pstate, is_aarch64_hvc_exception, is_aarch64_hvc_idle,
+    is_aarch64_hvc_kick, is_aarch64_hvc_maintenance, is_aarch64_hvc_metadata_grant,
+    is_aarch64_svc_exception, is_aarch64_syscall_exception,
 };
 pub mod error;
 pub use error::{MemPerms, OsError, Reg, SysReg};

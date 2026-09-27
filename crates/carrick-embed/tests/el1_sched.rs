@@ -1395,3 +1395,49 @@ fn el1_memory_fault_entry_preserves_context() {
         );
     }
 }
+
+/// EL1 elastic metadata allocator verification: executes the real in-guest
+/// allocator and actual host extent grant/return hypercall transport (`HVC #6`),
+/// forces dynamic growth beyond the bootstrap arena, verifies memory integrity
+/// and reuse, checks host grant and return counters, and exercises simulated
+/// host grant refusal followed by successful retry recovery.
+#[test]
+fn el1_metadata_allocator_grows_and_returns_extents() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    carrick_runtime::reset_metadata_grant_state();
+    assert!(
+        read_el1_counters().is_none(),
+        "reset_el1_counters must clear any stale snapshot before carrier execution"
+    );
+
+    // Arm failpoint so sub-command 3 in the fixture triggers a denied grant on its first attempt
+    carrick_runtime::arm_deny_next_metadata_grant();
+
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(&carrier, &["metadata-allocator"], Duration::from_secs(30));
+    assert!(measured.result.success(), "{}", describe(&measured));
+    let stdout = measured.result.stdout_utf8();
+    assert!(
+        stdout.contains("metadata-allocator ok"),
+        "fixture metadata-allocator must succeed: {stdout:?}"
+    );
+
+    let stats = carrick_runtime::metadata_grant_stats();
+    println!("metadata_grant_stats: {stats:?}");
+    assert!(
+        stats.extents_granted >= 1,
+        "expected at least 1 dynamic extent granted by host, got {}",
+        stats.extents_granted
+    );
+    assert!(
+        stats.extents_returned >= 1,
+        "expected at least 1 dynamic extent returned to host, got {}",
+        stats.extents_returned
+    );
+    assert!(
+        stats.grant_failures >= 1,
+        "expected at least 1 grant failure from simulated refusal, got {}",
+        stats.grant_failures
+    );
+}

@@ -7734,6 +7734,10 @@ impl HvfInner {
                 crate::probes::vcpu_irq_kick(elr);
                 return Ok(Aarch64Exit::Kicked);
             }
+            if carrick_hal::is_aarch64_hvc_metadata_grant(exception.syndrome) {
+                crate::metadata_grant::handle_metadata_grant_trap(vcpu)?;
+                continue;
+            }
             if !is_aarch64_syscall_exception(exception.syndrome) {
                 return Err(TrapError::UnexpectedException {
                     syndrome: exception.syndrome,

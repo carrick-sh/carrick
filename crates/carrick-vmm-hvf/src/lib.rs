@@ -58,6 +58,7 @@ pub mod posix_timer;
 // (shared by KVM/bhyve, which used to get a `lookup → None` stub). Re-exported as
 // `crate::syscall` so HVF's compat reporter + the probes provider are unchanged.
 pub use carrick_abi::syscall;
+pub mod metadata_grant;
 pub mod signal_arrival;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod staged_cpu;
@@ -67,6 +68,10 @@ pub mod threaded_impl;
 pub mod timer_delivery;
 pub mod trap;
 pub mod vcpu_kick;
+pub use metadata_grant::{
+    MetadataGrantStats, arm_deny_next_metadata_grant, metadata_grant_stats,
+    reset_metadata_grant_state,
+};
 // The HVF aarch64 backend on the shared `carrick-aarch64` scaffold (F7 step 4/5):
 // the thin `Aarch64Vmm`/`Aarch64Vcpu` trait pair the generic `Aarch64EngineCore`
 // is parameterized over. `crate::trap::HvfTrapEngine` aliases the specialization.
