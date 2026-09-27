@@ -2957,6 +2957,7 @@
       "contracts": [
         "kernel.el1.address-space-switch",
         "kernel.el1.anonymous-first-touch",
+        "kernel.el1.anonymous-munmap",
         "kernel.el1.anonymous-permissions",
         "kernel.el1.anonymous-retirement",
         "kernel.el1.zone-entry-at-open",

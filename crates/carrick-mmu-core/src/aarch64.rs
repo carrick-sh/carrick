@@ -242,6 +242,15 @@ pub enum GuestPermissionEditError {
     RollbackFailed,
 }
 
+/// Why EL1 could not retire a requested resident private-anonymous range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestRetirementError {
+    BadRange,
+    TableOutsidePrimary,
+    MissingTable,
+    NotPrivateAnonymous,
+}
+
 unsafe fn live_primary_descriptor(
     words: *mut core::sync::atomic::AtomicU64,
     physical_base: u64,
@@ -519,6 +528,84 @@ pub unsafe fn protect_existing_el1_private_pages(
         };
         let updated = (descriptor & !AP_MASK & !UXN) | ap | uxn | VALID;
         unsafe { (*terminal.word).store(updated, Ordering::Release) };
+        current = terminal.semantic_base + terminal.span;
+    }
+    Ok(pages)
+}
+
+/// Retire existing L1/L2 blocks or L3 leaves carrying EL1's
+/// private-anonymous authority. The complete range and every terminal are
+/// checked before the first store. A partial coarse block is refused rather
+/// than allocating a split table on the syscall path.
+///
+/// The output address and permission ceiling remain in each invalid retired
+/// descriptor so the host's authenticated bulk-return path can reconcile its
+/// frame inventory before the descriptor storage is reused. The caller owns
+/// the exact-MM editor and performs the architectural TLB invalidation after
+/// success.
+///
+/// # Safety
+///
+/// The safety and exclusion requirements are identical to
+/// [`publish_existing_invalid_private_pages`].
+pub unsafe fn retire_existing_el1_private_pages(
+    words: *mut core::sync::atomic::AtomicU64,
+    physical_base: u64,
+    byte_len: usize,
+    va: u64,
+    len: u64,
+) -> Result<usize, GuestRetirementError> {
+    use core::sync::atomic::Ordering;
+
+    if words.is_null()
+        || !(words as usize).is_multiple_of(core::mem::align_of::<core::sync::atomic::AtomicU64>())
+        || !physical_base.is_multiple_of(PT_PAGE)
+        || !va.is_multiple_of(PT_PAGE)
+        || len == 0
+        || !len.is_multiple_of(PT_PAGE)
+        || va.checked_add(len).is_none()
+    {
+        return Err(GuestRetirementError::BadRange);
+    }
+    let pages = usize::try_from(len / PT_PAGE).map_err(|_| GuestRetirementError::BadRange)?;
+    let terminal_for = |address| unsafe {
+        existing_terminal_descriptor(words, physical_base, byte_len, address).map_err(|error| {
+            match error {
+                GuestLeafPublicationError::TableOutsidePrimary => {
+                    GuestRetirementError::TableOutsidePrimary
+                }
+                GuestLeafPublicationError::MissingTable => GuestRetirementError::MissingTable,
+                _ => GuestRetirementError::NotPrivateAnonymous,
+            }
+        })
+    };
+
+    let end = va + len;
+    let mut current = va;
+    while current < end {
+        let terminal = terminal_for(current)?;
+        let terminal_end = terminal
+            .semantic_base
+            .checked_add(terminal.span)
+            .ok_or(GuestRetirementError::BadRange)?;
+        if terminal.semantic_base < va || terminal_end > end {
+            return Err(GuestRetirementError::NotPrivateAnonymous);
+        }
+        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
+        if descriptor & VALID == 0
+            || descriptor & SW_RETIRED != 0
+            || descriptor & SW_EL1_PRIVATE == 0
+        {
+            return Err(GuestRetirementError::NotPrivateAnonymous);
+        }
+        current = terminal_end;
+    }
+
+    current = va;
+    while current < end {
+        let terminal = terminal_for(current)?;
+        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
+        unsafe { (*terminal.word).store((descriptor & !VALID) | SW_RETIRED, Ordering::Release) };
         current = terminal.semantic_base + terminal.span;
     }
     Ok(pages)
@@ -8277,6 +8364,126 @@ mod tests {
             Err(GuestPermissionEditError::NotPrivateAnonymous)
         );
         assert_eq!(words[l2].load(Ordering::Acquire), before);
+    }
+
+    #[test]
+    fn allocation_free_guest_retirement_retires_complete_l2_and_l3_terminals() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        let root = 0x8800_0000_0000;
+        let va = 0x4000_0000;
+        let ipa = 0x009b_4000_0000;
+        let mut words: Vec<AtomicU64> = (0..(4 * 512)).map(|_| AtomicU64::new(0)).collect();
+        let indexes = indices(va);
+        words[indexes[0]].store((root + 0x1000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[512 + indexes[1]].store((root + 0x2000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        let l2 = 1024 + indexes[2];
+        let block = (ipa & PA_MASK_2MIB)
+            | USER_BLOCK_FLAGS
+            | NON_GLOBAL
+            | UXN
+            | SW_EL1_PRIVATE
+            | SW_EL1_MAY_WRITE;
+        words[l2].store(block, Ordering::Relaxed);
+
+        assert_eq!(
+            unsafe {
+                retire_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    words.len() * core::mem::size_of::<AtomicU64>(),
+                    va,
+                    1 << 21,
+                )
+            },
+            Ok(512)
+        );
+        let retired_block = words[l2].load(Ordering::Acquire);
+        assert_eq!(retired_block & VALID, 0);
+        assert_ne!(retired_block & SW_RETIRED, 0);
+        assert_eq!(retired_block & PA_MASK_2MIB, ipa & PA_MASK_2MIB);
+
+        let leaf_va = va + (1 << 21);
+        let leaf_ipa = ipa + (1 << 21);
+        let leaf_indexes = indices(leaf_va);
+        words[l2 + 1].store((root + 0x3000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        let l3 = 1536 + leaf_indexes[3];
+        words[l3].store(
+            (leaf_ipa & PA_MASK_4KIB)
+                | USER_PAGE_FLAGS
+                | NON_GLOBAL
+                | UXN
+                | SW_EL1_PRIVATE
+                | SW_EL1_MAY_WRITE,
+            Ordering::Relaxed,
+        );
+        assert_eq!(
+            unsafe {
+                retire_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    words.len() * core::mem::size_of::<AtomicU64>(),
+                    leaf_va,
+                    PT_PAGE,
+                )
+            },
+            Ok(1)
+        );
+        let retired_leaf = words[l3].load(Ordering::Acquire);
+        assert_eq!(retired_leaf & VALID, 0);
+        assert_ne!(retired_leaf & SW_RETIRED, 0);
+        assert_eq!(retired_leaf & PA_MASK_4KIB, leaf_ipa);
+    }
+
+    #[test]
+    fn allocation_free_guest_retirement_refuses_partial_or_untagged_ranges() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        let root = 0x8800_0000_0000;
+        let va = 0x4000_0000;
+        let ipa = 0x009b_4000_0000;
+        let mut words: Vec<AtomicU64> = (0..(3 * 512)).map(|_| AtomicU64::new(0)).collect();
+        let indexes = indices(va);
+        words[indexes[0]].store((root + 0x1000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[512 + indexes[1]].store((root + 0x2000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        let l2 = 1024 + indexes[2];
+        let tagged = (ipa & PA_MASK_2MIB)
+            | USER_BLOCK_FLAGS
+            | NON_GLOBAL
+            | UXN
+            | SW_EL1_PRIVATE
+            | SW_EL1_MAY_WRITE;
+        words[l2].store(tagged, Ordering::Relaxed);
+
+        assert_eq!(
+            unsafe {
+                retire_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    words.len() * core::mem::size_of::<AtomicU64>(),
+                    va + PT_PAGE,
+                    PT_PAGE,
+                )
+            },
+            Err(GuestRetirementError::NotPrivateAnonymous)
+        );
+        assert_eq!(words[l2].load(Ordering::Acquire), tagged);
+
+        let untagged = tagged & !SW_EL1_PRIVATE;
+        words[l2].store(untagged, Ordering::Release);
+        assert_eq!(
+            unsafe {
+                retire_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    words.len() * core::mem::size_of::<AtomicU64>(),
+                    va,
+                    1 << 21,
+                )
+            },
+            Err(GuestRetirementError::NotPrivateAnonymous)
+        );
+        assert_eq!(words[l2].load(Ordering::Acquire), untagged);
     }
 
     #[test]
