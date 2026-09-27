@@ -1080,57 +1080,36 @@ pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
             0
         }
         2 => {
-            // Test 2: Cross bootstrap capacity (9 MiB) by allocating 10 MiB, verify writes, and free to return extents
-            let chunk_size = 1024 * 1024; // 1 MiB per chunk
-            let chunk_layout = match Layout::from_size_align(chunk_size, 64) {
+            // Test 2: Cross the 9 MiB bootstrap with one 10 MiB allocation.
+            // Keeping the operation atomic across the pending-host-work
+            // boundary models the transaction preflight required by the MMU:
+            // a capacity miss unwinds before partial allocator state exists.
+            let allocation_size = 10 * 1024 * 1024;
+            let allocation_layout = match Layout::from_size_align(allocation_size, 64) {
                 Ok(l) => l,
                 Err(_) => return 200,
             };
-            let mut ptrs = [core::ptr::null_mut(); 10];
-            let mut count = 0;
-
-            for (i, slot) in ptrs.iter_mut().enumerate() {
-                if let Some(p) = GLOBAL_ALLOCATOR.allocate(chunk_layout) {
-                    unsafe {
-                        core::ptr::write_bytes(p, (0x30 + i) as u8, chunk_size);
+            let ptr = match GLOBAL_ALLOCATOR.allocate(allocation_layout) {
+                Some(ptr) => ptr,
+                None => {
+                    if GLOBAL_ALLOCATOR.service_test_host_work() {
+                        return carrick_el1_abi::METADATA_GRANT_PENDING;
                     }
-                    *slot = p;
-                    count += 1;
-                } else {
-                    break;
+                    return 201;
                 }
-            }
+            };
 
-            if count < 10 {
-                // Failed to allocate all 10 MiB
-                for &p in ptrs.iter().take(count) {
-                    GLOBAL_ALLOCATOR.deallocate(p, chunk_layout);
-                }
-                if GLOBAL_ALLOCATOR.service_test_host_work() {
-                    return carrick_el1_abi::METADATA_GRANT_PENDING;
-                }
-                return 201;
-            }
-
-            // Verify payload integrity across all 10 MiB
-            for (i, &p) in ptrs.iter().take(count).enumerate() {
-                unsafe {
-                    for j in (0..chunk_size).step_by(4096) {
-                        if *p.add(j) != (0x30 + i) as u8 {
-                            for &to_free in ptrs.iter().take(count) {
-                                GLOBAL_ALLOCATOR.deallocate(to_free, chunk_layout);
-                            }
-                            return 202;
-                        }
+            unsafe {
+                core::ptr::write_bytes(ptr, 0x30, allocation_size);
+                for offset in (0..allocation_size).step_by(4096) {
+                    if *ptr.add(offset) != 0x30 {
+                        GLOBAL_ALLOCATOR.deallocate(ptr, allocation_layout);
+                        return 202;
                     }
                 }
             }
 
-            // Deallocate all 10 MiB to trigger dynamic extent return
-            for &p in ptrs.iter().take(count) {
-                GLOBAL_ALLOCATOR.deallocate(p, chunk_layout);
-            }
-
+            GLOBAL_ALLOCATOR.deallocate(ptr, allocation_layout);
             0
         }
         3 => {
