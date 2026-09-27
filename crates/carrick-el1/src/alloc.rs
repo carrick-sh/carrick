@@ -1523,4 +1523,18 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn oversized_layout_fails_without_panic_or_state_change() {
+        let mut alloc = MetadataAllocatorCore::new();
+        let before = alloc.diagnostics();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            alloc.allocate_with_metrics(usize::MAX, 4096)
+        }));
+        assert!(result.is_ok(), "oversized layout arithmetic panicked");
+        let (ptr, metrics) = result.expect("checked allocation result");
+        assert!(ptr.is_none());
+        assert_eq!(metrics, AllocMetrics::default());
+        assert_eq!(alloc.diagnostics(), before);
+    }
 }

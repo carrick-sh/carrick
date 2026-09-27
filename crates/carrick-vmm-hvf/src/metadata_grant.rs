@@ -693,4 +693,32 @@ mod tests {
         assert!(!state.is_slot_occupied(2));
         assert!(state.is_slot_occupied(3));
     }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn oversized_metadata_request_is_invalid_without_reserving_aperture() {
+        let custody = crate::trap::CarrierVmCustody::new();
+        let generation = custody.begin_create().expect("create");
+        custody.commit_create(generation).expect("live");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            service_metadata_operation(
+                &custody,
+                Some(generation),
+                METADATA_GRANT_OP_ALLOC,
+                u64::MAX,
+                0,
+                0,
+            )
+        }));
+        assert!(result.is_ok(), "oversized grant arithmetic panicked");
+        assert_eq!(
+            result
+                .expect("checked grant result")
+                .expect("typed outcome"),
+            [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
+        );
+        let aperture = metadata_aperture(&custody).lock();
+        assert!(aperture.slots.iter().all(Option::is_none));
+        assert!(aperture.occupied_bitmap.iter().all(|word| *word == 0));
+    }
 }
