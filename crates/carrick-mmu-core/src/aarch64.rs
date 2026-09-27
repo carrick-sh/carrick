@@ -875,6 +875,19 @@ impl TableArena {
         }
     }
 
+    /// Bytes that may contain a descriptor reached through a hardware-visible
+    /// table pointer. A second exact-MM editor can grow a live primary arena
+    /// after this manager cached its allocator cursor; the pointer is the
+    /// authority for reading that table, while owned snapshots remain bounded
+    /// by their populated prefix.
+    #[inline]
+    fn descriptor_span(&self) -> u64 {
+        match self.storage {
+            TableArenaStorage::Owned(_) => self.allocated_span(),
+            TableArenaStorage::Live => self.capacity as u64,
+        }
+    }
+
     #[inline]
     #[must_use]
     pub fn current_pages(&self) -> usize {
@@ -1898,6 +1911,32 @@ impl PageTableManager {
         resolver: impl HostArenaResolver,
     ) -> Result<(), PageTableError> {
         use core::sync::atomic::{AtomicU64, Ordering, fence};
+        // An EL1 editor may have linked a table page after this live manager
+        // cached its bump cursor. A host edit that reached and dirtied that page
+        // has now authenticated it through the live table graph. Adopt the
+        // complete table page before resolving/publishing the dirty words so
+        // later snapshots and allocations cannot truncate or reissue it.
+        for &(loc, _) in &self.dirty {
+            let arena = self
+                .arenas
+                .get_mut(loc.arena)
+                .ok_or(PageTableError::BadAddress)?;
+            let touched = loc
+                .offset
+                .checked_add(core::mem::size_of::<u64>())
+                .ok_or(PageTableError::BadAddress)?;
+            if touched > arena.capacity {
+                return Err(PageTableError::BadAddress);
+            }
+            if arena.is_live() {
+                let table_end = touched
+                    .checked_add(PT_PAGE as usize - 1)
+                    .ok_or(PageTableError::BadAddress)?
+                    / PT_PAGE as usize
+                    * PT_PAGE as usize;
+                arena.next_free = arena.next_free.max(table_end as u64);
+            }
+        }
         let mut inline_hosts = [None; 8];
         let mut overflow_hosts;
         let hosts = if self.arenas.len() <= inline_hosts.len() {
@@ -2011,7 +2050,7 @@ impl PageTableManager {
             for level in 0..4 {
                 let entry = table.entry(indexes[level]);
                 if entry.offset + core::mem::size_of::<u64>()
-                    > self.arenas[entry.arena].allocated_span() as usize
+                    > self.arenas[entry.arena].descriptor_span() as usize
                 {
                     return Err(GuestLeafPublicationError::Manager(
                         PageTableError::BadAddress,
@@ -2021,9 +2060,11 @@ impl PageTableManager {
                     .read_desc(entry)
                     .map_err(GuestLeafPublicationError::Manager)?;
                 if descriptor & VALID == 0 {
-                    if descriptor & SW_RETIRED != 0 {
-                        return Err(GuestLeafPublicationError::RetiredLeaf);
-                    }
+                    // This transaction carries a newly authenticated frame
+                    // grant for the exact MM and semantic span. A retired
+                    // descriptor records only the predecessor lease; the new
+                    // mapping replaces that output and clears SW_RETIRED.
+                    // Valid leaves remain an overwrite refusal below.
                     break;
                 }
                 if level == 3 {
@@ -2288,7 +2329,7 @@ impl PageTableManager {
     /// Location of a PA known to live inside one of the page-table arenas.
     fn pa_to_loc(&self, pa: u64) -> Result<TableLocation, PageTableError> {
         for (i, arena) in self.arenas.iter().enumerate() {
-            let end = arena.base + arena.allocated_span();
+            let end = arena.base + arena.descriptor_span();
             if pa >= arena.base && pa < end {
                 return Ok(TableLocation::new(i, (pa - arena.base) as usize));
             }
@@ -2381,7 +2422,7 @@ impl PageTableManager {
         #[allow(clippy::needless_range_loop)]
         for level in 0..4usize {
             let entry_loc = table_loc.entry(idx[level]);
-            if entry_loc.offset + 8 > self.arenas[entry_loc.arena].allocated_span() as usize {
+            if entry_loc.offset + 8 > self.arenas[entry_loc.arena].descriptor_span() as usize {
                 break;
             }
             let desc = self.read_desc(entry_loc)?;
@@ -2507,7 +2548,7 @@ impl PageTableManager {
         #[allow(clippy::needless_range_loop)]
         for level in 0..4usize {
             let entry_loc = table_loc.entry(idx[level]);
-            if entry_loc.offset + 8 > self.arenas[entry_loc.arena].allocated_span() as usize {
+            if entry_loc.offset + 8 > self.arenas[entry_loc.arena].descriptor_span() as usize {
                 return Ok(None);
             }
             let desc = self.read_desc(entry_loc)?;
@@ -2558,6 +2599,37 @@ impl PageTableManager {
     ) -> Result<u64, PageTableError> {
         if let Some(pa) = self.free_tables.pop() {
             return Ok(pa);
+        }
+        // A guest editor can grow the same live primary arena between host
+        // edits. Usually the cached cursor still points at a pristine zero
+        // page, so the fixed one-page check is the whole cost. If that exact
+        // candidate is occupied, reconstruct the high-water mark once from the
+        // authoritative live image before bump allocation; never hand a
+        // guest-linked table page out again.
+        if self.arenas[0].is_live()
+            && self.arenas[0].next_free + PT_PAGE <= self.arenas[0].capacity as u64
+        {
+            let arena = &self.arenas[0];
+            let resolver = self
+                .resolver
+                .as_ref()
+                .ok_or(PageTableError::UnresolvedArena(arena.base))?;
+            let candidate_end = (arena.next_free + PT_PAGE) as usize;
+            let host = resolver
+                .host_const_ptr_for_range(arena.base, candidate_end)
+                .ok_or(PageTableError::UnresolvedArena(arena.base))?;
+            let candidate = unsafe {
+                core::slice::from_raw_parts(host.add(arena.next_free as usize), PT_PAGE as usize)
+            };
+            const ZERO_PAGE: [u8; PT_PAGE as usize] = [0; PT_PAGE as usize];
+            if candidate != ZERO_PAGE {
+                let host = resolver
+                    .host_const_ptr_for_range(arena.base, arena.capacity)
+                    .ok_or(PageTableError::UnresolvedArena(arena.base))?;
+                let image = unsafe { core::slice::from_raw_parts(host, arena.capacity) };
+                let discovered = discover_next_free_spare(image);
+                self.arenas[0].next_free = self.arenas[0].next_free.max(discovered);
+            }
         }
         if self.arenas[0].next_free + PT_PAGE <= self.arenas[0].capacity as u64 {
             let off = self.arenas[0].next_free;
@@ -7566,6 +7638,64 @@ mod tests {
     }
 
     #[test]
+    fn live_guest_publication_replaces_a_retired_leaf_with_the_new_grant() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let mut offline = hvpatch_manager();
+        let va = LINUX_MMAP_BASE + 0x4080_0000;
+        let stale_ipa = va;
+        let granted_ipa = 0x009b_4000_1000;
+        offline
+            .set_rw(va, PT_PAGE as usize, false, None)
+            .expect("publish predecessor");
+        offline
+            .invalidate(va, PT_PAGE as usize, None)
+            .expect("retire predecessor");
+        let retired = terminal_descriptor(offline.debug_walk(va));
+        assert_eq!(retired & VALID, 0);
+        assert_ne!(retired & SW_RETIRED, 0);
+        assert_eq!(retired & PA_MASK_4KIB, stale_ipa);
+        unsafe {
+            offline
+                .restore_quiesced_snapshot_to_host(&*resolver)
+                .expect("publish retired fixture");
+        }
+
+        let mut live = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                LINUX_PAGE_TABLES_SIZE as usize,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .expect("adopt live retired fixture")
+        };
+        assert_eq!(
+            live.publish_live_private_pages_transaction(GuestLeafPublication {
+                va,
+                ipa: granted_ipa,
+                len: PT_PAGE,
+                writable: true,
+                executable: false,
+            }),
+            Ok(1)
+        );
+
+        let published = terminal_descriptor(live.debug_walk(va));
+        assert_eq!(published & SW_RETIRED, 0);
+        assert_eq!(published & PA_MASK_4KIB, granted_ipa);
+        assert!(terminal_descriptor_permits_el0(
+            published,
+            LeafAccess::Write
+        ));
+        assert!(!terminal_descriptor_permits_el0(
+            published,
+            LeafAccess::Execute
+        ));
+    }
+
+    #[test]
     fn live_snapshot_includes_hierarchy_allocated_by_guest_editor() {
         let resolver = MockLiveResolver::new();
         resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
@@ -7613,6 +7743,106 @@ mod tests {
         assert!(
             snapshot.copied_bytes() >= guest.copied_bytes(),
             "snapshot prefix must cover the guest-published hierarchy"
+        );
+    }
+
+    #[test]
+    fn live_host_edit_adopts_hierarchy_allocated_by_guest_editor() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let mut host = hvpatch_manager();
+        unsafe {
+            host.restore_quiesced_snapshot_to_host(&*resolver)
+                .expect("publish fixture");
+            host.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        }
+        let host_prefix_before = host.copied_bytes();
+
+        let mut guest = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                LINUX_PAGE_TABLES_SIZE as usize,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .expect("adopt live fixture in guest editor")
+        };
+        let va = LINUX_MMAP_BASE + 5 * PT_PAGE;
+        let len = 16 * 1024 * 1024;
+        let ipa = 0x009b_4000_0000;
+        assert_eq!(
+            guest.publish_live_private_pages_transaction(GuestLeafPublication {
+                va,
+                ipa,
+                len,
+                writable: true,
+                executable: false,
+            }),
+            Ok((len / PT_PAGE) as usize)
+        );
+        assert!(
+            guest.copied_bytes() > host_prefix_before,
+            "guest publication must grow the hierarchy beyond the host's cached prefix"
+        );
+
+        host.unmap_aliased(va, len as usize, None)
+            .expect("host edit must adopt guest-grown live tables");
+        unsafe {
+            host.sync_to_host(&*resolver)
+                .expect("publish host invalidation");
+        }
+        assert_eq!(host.translate(va), None);
+        assert_eq!(host.translate(va + len - PT_PAGE), None);
+        assert!(
+            host.copied_bytes() >= guest.copied_bytes(),
+            "host allocator high-water mark must cover every guest-grown table"
+        );
+    }
+
+    #[test]
+    fn live_host_allocator_never_reissues_guest_grown_table_pages() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let mut host = hvpatch_manager();
+        unsafe {
+            host.restore_quiesced_snapshot_to_host(&*resolver)
+                .expect("publish fixture");
+            host.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        }
+        assert!(host.free_tables.is_empty());
+        let host_prefix_before = host.copied_bytes();
+
+        let mut guest = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                LINUX_PAGE_TABLES_SIZE as usize,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .expect("adopt live fixture in guest editor")
+        };
+        let va = LINUX_MMAP_BASE + 0x4080_0000;
+        assert_eq!(
+            guest.publish_live_private_pages_transaction(GuestLeafPublication {
+                va,
+                ipa: 0x009b_4000_1000,
+                len: PT_PAGE,
+                writable: true,
+                executable: false,
+            }),
+            Ok(1)
+        );
+        let guest_prefix = guest.copied_bytes();
+        assert!(guest_prefix > host_prefix_before);
+
+        let allocated = host
+            .alloc_table_for_test()
+            .expect("host allocator must advance beyond guest-grown tables");
+        assert!(
+            allocated >= LINUX_PAGE_TABLES_BASE + guest_prefix,
+            "host reissued a guest-grown table page: allocated=0x{allocated:x} guest_prefix=0x{guest_prefix:x}"
         );
     }
 

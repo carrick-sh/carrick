@@ -1,0 +1,15 @@
+   Compiling carrick-el1-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-abi)
+error[E0433]: cannot find type `FrameGrantMailboxes` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2989:25
+     |
+2989 |         let mailboxes = FrameGrantMailboxes::new();
+     |                         ^^^^^^^^^^^^^^^^^^^ use of undeclared type `FrameGrantMailboxes`
+     |
+help: a struct with a similar name exists
+     |
+2989 -         let mailboxes = FrameGrantMailboxes::new();
+2989 +         let mailboxes = FrameGrantMailbox::new();
+     |
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `carrick-el1-abi` (lib test) due to 1 previous error

@@ -1,0 +1,21 @@
+
+running 1 test
+el1-sched first-touch pages=256 exits=176 carrier_cpu_ns=30720000 wall_ms=37 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 16, wfi_entries: 7, idle_exits: 3, misplaced: 0, steals: 8, service_exits: 9, service_placements: 4, ready_placements: 0, service_adoptions: 4, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=256 ok=true
+first-touch parent pages=256 child_ok=true ok=true
+el1-sched first-touch pages=1024 exits=395 carrier_cpu_ns=18510000 wall_ms=21 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 7, wfi_entries: 6, idle_exits: 6, misplaced: 0, steals: 1, service_exits: 1, service_placements: 6, ready_placements: 0, service_adoptions: 6, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=1024 ok=true
+first-touch parent pages=1024 child_ok=true ok=true
+el1-sched first-touch pages=4096 exits=1419 carrier_cpu_ns=52185000 wall_ms=34 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 6, wfi_entries: 6, idle_exits: 6, misplaced: 0, steals: 0, service_exits: 0, service_placements: 6, ready_placements: 0, service_adoptions: 6, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=4096 ok=true
+first-touch parent pages=4096 child_ok=true ok=true
+el1-sched first-touch slope 256->1024 pages (added=1536): exits_diff=219 slope=0.1426 exits/page
+
+thread 'dtrace_el1_memory_first_touch_with_unique_run_id' (15448882) panicked at crates/carrick-embed/tests/el1_sched.rs:1347:9:
+first-touch host-exit slope across scale 256 -> 1024 was 0.1426 exits/page (both processes count, added=1536); contract ceiling is <0.125 exits per added page
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test dtrace_el1_memory_first_touch_with_unique_run_id ... FAILED
+
+failures:
+
+failures:
+    dtrace_el1_memory_first_touch_with_unique_run_id
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 35 filtered out; finished in 0.33s

@@ -70,10 +70,10 @@ pub const METADATA_MAILBOX_HOST_WORKING: u32 = 3;
 pub const METADATA_MAILBOX_RESPONSE: u32 = 4;
 pub const METADATA_MAILBOX_GUEST_CONSUMING: u32 = 5;
 
-/// Shared single-flight anonymous-frame grant mailbox. EL1 publishes a fault
-/// request here and leaves through the ordinary host boundary. The host may
-/// publish a successful response only after the named stage-2 owner and frame
-/// inventory mapping are live and authenticated.
+/// Per-vCPU single-flight anonymous-frame grant mailboxes. EL1 publishes a
+/// fault request in the current slot and leaves through the ordinary host
+/// boundary. The host may publish a successful response only after the named
+/// stage-2 owner and frame inventory mapping are live and authenticated.
 pub const EL1_FRAME_GRANT_MAILBOX_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x20_000;
 pub const EL1_FRAME_GRANT_MAILBOX_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_MAILBOX_OFFSET;
 
@@ -322,6 +322,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::align_of::<MetadataGrantMailbox>() as u64,
         core::mem::size_of::<FrameGrantMailbox>() as u64,
         core::mem::align_of::<FrameGrantMailbox>() as u64,
+        core::mem::size_of::<FrameGrantMailboxes>() as u64,
+        core::mem::align_of::<FrameGrantMailboxes>() as u64,
         core::mem::offset_of!(FrameGrantMailbox, state) as u64,
         core::mem::offset_of!(FrameGrantMailbox, status) as u64,
         core::mem::offset_of!(FrameGrantMailbox, mm_key) as u64,
@@ -774,7 +776,7 @@ pub struct FrameGrantResponse {
     pub ready: Option<FrameGrantReady>,
 }
 
-/// One carrier-wide anonymous-frame request. The request generation and MM key
+/// One slot-local anonymous-frame request. The request generation and MM key
 /// prevent a response from crossing address-space or request incarnations. A
 /// successful response carries identities rather than authority: EL1 may use
 /// them only to authenticate the exact host-published grant before installing
@@ -926,6 +928,62 @@ impl FrameGrantMailbox {
         Some(self.load_request())
     }
 
+    /// Claim only the request produced by this exact forwarded fault.
+    ///
+    /// The mailbox is carrier-wide, so another vCPU may reach a host boundary
+    /// while this request is pending. That boundary must leave the request for
+    /// its owner instead of converting ordinary concurrency into a refusal.
+    pub fn claim_request_for_fault(
+        &self,
+        mm_key: u64,
+        fault_va: u64,
+        access: u64,
+    ) -> Option<FrameGrantRequest> {
+        let matches = |request: FrameGrantRequest| {
+            request.mm_key == mm_key && request.fault_va == fault_va && request.access == access
+        };
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_REQUESTED {
+            return None;
+        }
+        let preview = self.load_request();
+        if !matches(preview) {
+            return None;
+        }
+        self.state
+            .compare_exchange(
+                FRAME_GRANT_MAILBOX_REQUESTED,
+                FRAME_GRANT_MAILBOX_HOST_WORKING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        let claimed = self.load_request();
+        if matches(claimed) {
+            return Some(claimed);
+        }
+
+        // The mailbox completed one request and accepted another between the
+        // preview and CAS. We own HOST_WORKING now, so return the new request
+        // unchanged to REQUESTED for its exact host boundary.
+        self.state
+            .store(FRAME_GRANT_MAILBOX_REQUESTED, Ordering::Release);
+        None
+    }
+
+    /// Release the exact request when the host resolved the fault through an
+    /// existing path and therefore has no frame-grant response for EL1.
+    pub fn cancel_request_for_fault(&self, mm_key: u64, fault_va: u64, access: u64) -> bool {
+        if self
+            .claim_request_for_fault(mm_key, fault_va, access)
+            .is_none()
+        {
+            return false;
+        }
+        self.state
+            .store(FRAME_GRANT_MAILBOX_IDLE, Ordering::Release);
+        true
+    }
+
     pub fn publish_ready(&self, ready: FrameGrantReady) -> bool {
         if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING {
             return false;
@@ -1068,6 +1126,36 @@ impl FrameGrantMailbox {
 }
 
 impl Default for FrameGrantMailbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One independent frame-grant transaction for every persistent vCPU slot.
+///
+/// A carrier-wide single-flight mailbox makes an unrelated runnable slot fall
+/// back to page-granular host service while the owner of the outstanding
+/// response is waiting to run. Slot-local mailboxes preserve the exact request
+/// authentication while allowing independent address spaces to make progress.
+#[repr(C, align(64))]
+#[derive(Debug)]
+pub struct FrameGrantMailboxes {
+    slots: [FrameGrantMailbox; EL1_STACK_SLOTS as usize],
+}
+
+impl FrameGrantMailboxes {
+    pub const fn new() -> Self {
+        Self {
+            slots: [const { FrameGrantMailbox::new() }; EL1_STACK_SLOTS as usize],
+        }
+    }
+
+    pub fn slot(&self, slot: usize) -> Option<&FrameGrantMailbox> {
+        self.slots.get(slot)
+    }
+}
+
+impl Default for FrameGrantMailboxes {
     fn default() -> Self {
         Self::new()
     }
@@ -1677,10 +1765,10 @@ const _: () = assert!(
 );
 const _: () = assert!(
     EL1_FRAME_GRANT_MAILBOX_OFFSET
-        .is_multiple_of(core::mem::align_of::<FrameGrantMailbox>() as u64)
+        .is_multiple_of(core::mem::align_of::<FrameGrantMailboxes>() as u64)
 );
 const _: () = assert!(
-    EL1_FRAME_GRANT_MAILBOX_OFFSET + core::mem::size_of::<FrameGrantMailbox>() as u64
+    EL1_FRAME_GRANT_MAILBOX_OFFSET + core::mem::size_of::<FrameGrantMailboxes>() as u64
         <= EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE
 );
 const _: () =
@@ -1719,16 +1807,20 @@ pub fn metadata_mailbox_host() -> Option<&'static MetadataGrantMailbox> {
     Some(unsafe { &*((ptr + EL1_METADATA_MAILBOX_OFFSET as usize) as *const MetadataGrantMailbox) })
 }
 
-/// Host view of the shared anonymous-frame mailbox, if an EL1 region is
-/// installed.
-pub fn frame_grant_mailbox_host() -> Option<&'static FrameGrantMailbox> {
+/// Host view of one slot's anonymous-frame mailbox, if an EL1 region is
+/// installed and `slot` names a persistent vCPU slot.
+pub fn frame_grant_mailbox_host_for_slot(slot: usize) -> Option<&'static FrameGrantMailbox> {
     let ptr = get_el1_region_host_ptr();
     if ptr == 0 {
         return None;
     }
     // SAFETY: the EL1 region owner keeps this shared mapping alive until it
-    // first clears EL1_REGION_HOST_PTR; the mailbox contains only atomics.
-    Some(unsafe { &*((ptr + EL1_FRAME_GRANT_MAILBOX_OFFSET as usize) as *const FrameGrantMailbox) })
+    // first clears EL1_REGION_HOST_PTR; the arena and its mailboxes contain
+    // only atomics and the ABI offset preserves the declared alignment.
+    let mailboxes = unsafe {
+        &*((ptr + EL1_FRAME_GRANT_MAILBOX_OFFSET as usize) as *const FrameGrantMailboxes)
+    };
+    mailboxes.slot(slot)
 }
 
 /// Guest view of the shared metadata mailbox. Call only while executing in
@@ -1740,13 +1832,14 @@ pub fn metadata_mailbox_guest() -> &'static MetadataGrantMailbox {
     unsafe { &*(EL1_METADATA_MAILBOX_BASE as *const MetadataGrantMailbox) }
 }
 
-/// Guest view of the shared anonymous-frame mailbox. Call only while executing
+/// Guest view of one slot's anonymous-frame mailbox. Call only while executing
 /// in the installed Carrick EL1 image.
 #[cfg(target_os = "none")]
-pub fn frame_grant_mailbox_guest() -> &'static FrameGrantMailbox {
+pub fn frame_grant_mailbox_guest_for_slot(slot: usize) -> Option<&'static FrameGrantMailbox> {
     // SAFETY: EL1_FRAME_GRANT_MAILBOX_BASE is part of the mapped kernel-only
-    // EL1 ABI region and the object layout is included in EL1_ABI_LAYOUT_HASH.
-    unsafe { &*(EL1_FRAME_GRANT_MAILBOX_BASE as *const FrameGrantMailbox) }
+    // EL1 ABI region and the arena layout is included in EL1_ABI_LAYOUT_HASH.
+    let mailboxes = unsafe { &*(EL1_FRAME_GRANT_MAILBOX_BASE as *const FrameGrantMailboxes) };
+    mailboxes.slot(slot)
 }
 
 /// Guest view of one current-task record.
@@ -2926,6 +3019,78 @@ mod tests {
         assert!(!mailbox.finish_response(41, 8));
         assert!(mailbox.finish_response(41, 7));
         assert!(mailbox.try_publish_request(request));
+    }
+
+    #[test]
+    fn frame_grant_mailboxes_are_single_flight_per_vcpu_slot() {
+        let mailboxes = FrameGrantMailboxes::new();
+        let first = FrameGrantRequest {
+            mm_key: 61,
+            request_generation: 17,
+            fault_va: 0x6100_1000,
+            requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+            access: 2,
+        };
+        let second = FrameGrantRequest {
+            mm_key: 62,
+            request_generation: 18,
+            fault_va: 0x6200_1000,
+            requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+            access: 2,
+        };
+
+        assert!(mailboxes.slot(3).unwrap().try_publish_request(first));
+        assert!(
+            mailboxes.slot(7).unwrap().try_publish_request(second),
+            "an unrelated vCPU slot must not fall back while another slot has an in-flight grant",
+        );
+        assert!(!mailboxes.slot(3).unwrap().try_publish_request(second));
+        assert_eq!(mailboxes.slot(3).unwrap().claim_request(), Some(first));
+        assert_eq!(mailboxes.slot(7).unwrap().claim_request(), Some(second));
+        assert!(mailboxes.slot(EL1_STACK_SLOTS as usize).is_none());
+    }
+
+    #[test]
+    fn frame_grant_host_claim_leaves_another_faults_request_pending() {
+        let mailbox = FrameGrantMailbox::new();
+        let request = FrameGrantRequest {
+            mm_key: 41,
+            request_generation: 8,
+            fault_va: 0x4000_3000,
+            requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+            access: 2,
+        };
+        assert!(mailbox.try_publish_request(request));
+
+        assert_eq!(
+            mailbox.claim_request_for_fault(
+                request.mm_key,
+                request.fault_va + 4096,
+                request.access,
+            ),
+            None,
+            "an unrelated carrier fault must not consume the single-flight request",
+        );
+        assert_eq!(
+            mailbox.claim_request_for_fault(request.mm_key, request.fault_va, request.access),
+            Some(request),
+            "the host boundary for the requesting fault must still be able to claim it",
+        );
+
+        let mailbox = FrameGrantMailbox::new();
+        assert!(mailbox.try_publish_request(request));
+        assert!(!mailbox.cancel_request_for_fault(
+            request.mm_key,
+            request.fault_va + 4096,
+            request.access,
+        ));
+        assert!(
+            mailbox.cancel_request_for_fault(request.mm_key, request.fault_va, request.access,)
+        );
+        assert!(
+            mailbox.try_publish_request(request),
+            "a host-resolved fault must release its exact unused request",
+        );
     }
 
     #[test]

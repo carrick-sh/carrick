@@ -301,7 +301,6 @@ fn apply_first_touch(
 enum FrameGrantClaim {
     None,
     ResponsePending,
-    Refused,
     Accepted(carrick_el1_abi::FrameGrantRequest),
 }
 
@@ -327,32 +326,12 @@ fn claim_frame_grant_request(
     }) {
         return FrameGrantClaim::ResponsePending;
     }
-    let Some(request) = mailbox.claim_request() else {
+    let Some(actual) = frame_grant_access(access) else {
         return FrameGrantClaim::None;
     };
-    let status = if request.mm_key != mm_key {
-        Some(carrick_el1_abi::FRAME_GRANT_ERR_STALE)
-    } else if request.fault_va != fault_va
-        || frame_grant_access(access).is_none_or(|actual| request.access != actual)
-    {
-        Some(carrick_el1_abi::FRAME_GRANT_ERR_INVALID)
-    } else {
-        None
-    };
-    if let Some(status) = status {
-        if !mailbox.publish_refusal(status) {
-            carrick_fatal::carrick_fatal!(
-                "hvpatch::el1_frame_grant",
-                "claimed frame-grant request could not publish refusal: mm={} generation={} status={}",
-                request.mm_key,
-                request.request_generation,
-                status
-            );
-        }
-        FrameGrantClaim::Refused
-    } else {
-        FrameGrantClaim::Accepted(request)
-    }
+    mailbox
+        .claim_request_for_fault(mm_key, fault_va, actual)
+        .map_or(FrameGrantClaim::None, FrameGrantClaim::Accepted)
 }
 
 fn publish_frame_grant_refusal(
@@ -368,6 +347,24 @@ fn publish_frame_grant_refusal(
             request.request_generation,
             status
         );
+    }
+}
+
+/// Drop an exact EL1 request when the host resolved or delivered the fault
+/// without producing a frame grant. Requests are hints; leaving one pending
+/// would make the carrier-wide mailbox one fault behind every later exit.
+pub(super) fn cancel_frame_grant_request(
+    mailbox_slot: Option<usize>,
+    mm_key: u64,
+    address: u64,
+    access: Option<carrick_mmu_core::aarch64::LeafAccess>,
+) {
+    let Some(actual) = frame_grant_access(access) else {
+        return;
+    };
+    if let Some(mailbox) = mailbox_slot.and_then(carrick_el1_abi::frame_grant_mailbox_host_for_slot)
+    {
+        let _ = mailbox.cancel_request_for_fault(mm_key, address, actual);
     }
 }
 
@@ -401,12 +398,14 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
             );
         }
     };
-    if let Some(mailbox) = carrick_el1_abi::frame_grant_mailbox_host() {
+    if let Some(mailbox) = engine
+        .mailbox_slot()
+        .and_then(carrick_el1_abi::frame_grant_mailbox_host_for_slot)
+    {
         let mm_key = mutation.host_alias_permit().mm().raw();
         match claim_frame_grant_request(mailbox, mm_key, address, access) {
             FrameGrantClaim::None => {}
             FrameGrantClaim::ResponsePending => return Ok(true),
-            FrameGrantClaim::Refused => return Ok(true),
             FrameGrantClaim::Accepted(request) => {
                 let permit = mutation.host_alias_permit();
                 let Some(plan) =
@@ -1448,41 +1447,39 @@ mod first_touch_access_tests {
         assert_eq!(response.status, carrick_el1_abi::FRAME_GRANT_ERR_DENIED);
         assert!(mailbox.finish_response(request.mm_key, request.request_generation));
 
-        for (mm, fault, access, expected_status) in [
+        for (mm, fault, access) in [
             (
                 request.mm_key + 1,
                 request.fault_va,
                 Some(LeafAccess::Write),
-                carrick_el1_abi::FRAME_GRANT_ERR_STALE,
             ),
             (
                 request.mm_key,
                 request.fault_va + 4096,
                 Some(LeafAccess::Write),
-                carrick_el1_abi::FRAME_GRANT_ERR_INVALID,
             ),
-            (
-                request.mm_key,
-                request.fault_va,
-                Some(LeafAccess::Read),
-                carrick_el1_abi::FRAME_GRANT_ERR_INVALID,
-            ),
-            (
-                request.mm_key,
-                request.fault_va,
-                None,
-                carrick_el1_abi::FRAME_GRANT_ERR_INVALID,
-            ),
+            (request.mm_key, request.fault_va, Some(LeafAccess::Read)),
+            (request.mm_key, request.fault_va, None),
         ] {
             assert!(mailbox.try_publish_request(request));
             assert!(matches!(
                 claim_frame_grant_request(&mailbox, mm, fault, access),
-                FrameGrantClaim::Refused
+                FrameGrantClaim::None
             ));
+            let FrameGrantClaim::Accepted(claimed) = claim_frame_grant_request(
+                &mailbox,
+                request.mm_key,
+                request.fault_va,
+                Some(LeafAccess::Write),
+            ) else {
+                panic!("an unrelated host fault must leave the request claimable");
+            };
+            assert_eq!(claimed, request);
+            assert!(mailbox.publish_refusal(carrick_el1_abi::FRAME_GRANT_ERR_DENIED));
             let response = mailbox
                 .claim_response(request.mm_key, request.request_generation)
                 .expect("refusal response");
-            assert_eq!(response.status, expected_status);
+            assert_eq!(response.status, carrick_el1_abi::FRAME_GRANT_ERR_DENIED);
             assert!(mailbox.finish_response(request.mm_key, request.request_generation));
         }
         assert!(matches!(

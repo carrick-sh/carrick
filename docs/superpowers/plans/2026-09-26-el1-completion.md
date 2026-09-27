@@ -1104,3 +1104,37 @@ artifact before changing code. The result must name whether the remaining
 per-page exit is grant/first-touch, stage-1 frame COW, stage-2 replay or another
 typed boundary. Fix that boundary against the existing slope gate; do not
 broaden into general MM or fork redesign without evidence from the census.
+
+### Accepted anonymous first-touch boundary (2026-09-27)
+
+The bounded census named two direct defects in the existing transaction. First,
+an older host live manager refused guest-linked hierarchy beyond its cached
+allocation prefix during later `munmap`; the target syscall returned `ENOMEM`
+although the table pointer was hardware-visible and valid. Red-first MMU
+contracts now require host edits to follow and adopt authenticated live tables
+through physical capacity and prevent the host allocator from reissuing a
+guest-owned table page. All 101 MMU tests pass.
+
+Second, one carrier-wide frame-grant mailbox serialized unrelated vCPU slots.
+While one process waited to consume Ready, the other process could not publish
+and accumulated 1,291 page-granular host commits in the three-scale diagnostic
+run. The red-first ABI contract now requires independent single-flight state per
+persistent vCPU slot. EL1 selects the mailbox from the trap-frame slot and the
+host selects it from the active engine slot; all existing exact-MM, generation,
+fault, access and inventory authentication remains intact.
+
+The signed three-scale witness is green. Both parent and child pass zero-fill,
+private write and post-rendezvous checks at 256, 1,024 and 4,096 pages. Host
+exits are 99, 102 and 119, yielding 0.0020 and 0.0028 exits per added page
+against the strict `<0.125` gate. The entitlement negative control passes and
+scoped cleanup is zero. This is the first measured impact closure inside
+checkpoint 2: the earlier 612/2,148/8,292 semantic-green result has become
+nearly scale-flat guest service.
+
+Checkpoint 2 is not complete. The next bounded memory work is permission and
+mapping-retirement behavior on this accepted publication path, including
+denied access, mprotect/munmap replacement, elastic frame return and repeated
+reuse, followed by fork-COW ownership and migration of brk/mmap/munmap/mprotect.
+Remove the host page-table writer and pause only after those paths no longer
+need them. Keep the remaining checkpoints and per-workload 2x native-Docker
+objective in scope.

@@ -1,0 +1,120 @@
+disk: 305 GiB free
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-image)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-engine)
+   Compiling carrick-cli v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-cli)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1m 22s
+target/release/carrick.tmp.46617: replacing existing signature
+built + signed: target/release/carrick (from target/release/carrick, entitlements=scripts/entitlements.plist)
+./scripts/test-signed.sh carrick-embed el1_memory_first_touch_stays_in_guest --nocapture
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-interceptor-probe: wrote /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/embed-fixtures/interceptor-probe-aarch64
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-zone-readers: wrote /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/embed-fixtures/zone-readers-aarch64
+    Finished `release` profile [optimized] target(s) in 0.06s
+build-embed-el1-sched: wrote /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/embed-fixtures/el1-sched-aarch64
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-image)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-vfs)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-embed)
+    Finished `release` profile [optimized + debuginfo] target(s) in 2m 23s
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/host_wait_policy-f55a835076db5824.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/host_wait_policy-f55a835076db5824
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/conformance_contracts-f43cd086d856a651.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/conformance_contracts-f43cd086d856a651
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_gic-b63719d5f57862f7.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_gic-b63719d5f57862f7
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_inotify09_probe-cbedaa8c704cd39b.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_inotify09_probe-cbedaa8c704cd39b
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/realtime_calibration-da2ff4ca9a060e1f.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/realtime_calibration-da2ff4ca9a060e1f
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/perf_regression-ddf8c61809e1e613.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/perf_regression-ddf8c61809e1e613
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/discard_fork_threads-149fadc0cbe3526d.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/discard_fork_threads-149fadc0cbe3526d
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_sched-ba447c5401356583.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_sched-ba447c5401356583
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/scheduler_race-c672984d0939b46e.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/scheduler_race-c672984d0939b46e
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/scheduler_preemption-9403940c2ec22f83.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/scheduler_preemption-9403940c2ec22f83
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/write_seek_contract-fd0c4fb19359b363.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/write_seek_contract-fd0c4fb19359b363
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/inotify_hotpath_contract-a7b45715c16a1060.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/inotify_hotpath_contract-a7b45715c16a1060
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_transparent-e0bb19798985f020.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_transparent-e0bb19798985f020
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_inotify-7b990ac0cfe7b05f.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_inotify-7b990ac0cfe7b05f
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/wedge_capture_ladder-3ca4e9c1d41767cd.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/wedge_capture_ladder-3ca4e9c1d41767cd
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/pt_pause_drain_pressure-7670078550ebbed3.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/pt_pause_drain_pressure-7670078550ebbed3
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_kick_served_loop-1a0a6be70f923e21.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_kick_served_loop-1a0a6be70f923e21
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/fault_budget_guest-7cb8a5d9b0a4de56.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/fault_budget_guest-7cb8a5d9b0a4de56
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/shared_buffer_futex-6cd159738baf28e2.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/shared_buffer_futex-6cd159738baf28e2
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/kernel_abort-aae775cbb72b5a9a.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/kernel_abort-aae775cbb72b5a9a
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_files-dc947c7b82ae464c.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_files-dc947c7b82ae464c
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/carrick_embed-dad4dd38b2b18955.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/carrick_embed-dad4dd38b2b18955
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/entitlement_negative-0fc8e53e9f74bda5.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/entitlement_negative-0fc8e53e9f74bda5
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_vcpu_lifetime-33f7cd0ce57806bb.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_vcpu_lifetime-33f7cd0ce57806bb
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/guest_smoke-a91de390f3927996.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/guest_smoke-a91de390f3927996
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/two_process_parallelism-5c032ea7cce3cc4a.tmp.46745: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/two_process_parallelism-5c032ea7cce3cc4a
+test-signed: running /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_sched-ba447c5401356583 el1_memory_first_touch_stays_in_guest --nocapture
+
+running 1 test
+test el1_memory_first_touch_stays_in_guest ... el1-sched first-touch pages=256 exits=193 carrier_cpu_ns=39011000 wall_ms=57 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 10, wfi_entries: 7, idle_exits: 3, misplaced: 0, steals: 2, service_exits: 3, service_placements: 4, ready_placements: 0, service_adoptions: 4, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch child pages=256 ok=true
+first-touch parent pages=256 child_ok=true ok=true
+el1-sched first-touch pages=1024 exits=455 carrier_cpu_ns=27754000 wall_ms=34 zone=ZoneCounts { el1_parks: 0, el1_switches: 0, host_parks: 0, signal_claims: 0, control_claims: 0, cross_wakes: 0, sgis: 0, preemptions: 0, migrations: 0, timeouts: 0, idle_entries: 7, wfi_entries: 6, idle_exits: 6, misplaced: 0, steals: 1, service_exits: 1, service_placements: 6, ready_placements: 0, service_adoptions: 6, exit_adoptions: 0, host_handbacks: 0, host_queue_claims: 0, host_executor_parks: 0 } first-touch parent pages=1024 child_ok=false ok=true
+
+thread 'el1_memory_first_touch_stays_in_guest' (15406212) panicked at crates/carrick-embed/tests/el1_sched.rs:1326:9:
+exit 1 signal None stdout "first-touch parent pages=1024 child_ok=false ok=true\n" stderr "memory allocation of 1024 bytes failed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    el1_memory_first_touch_stays_in_guest
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.22s
+
+test-signed: FAIL /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/el1_sched-ba447c5401356583
+/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/entitlement_negative-0fc8e53e9f74bda5.noent.46745: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/release/deps/entitlement_negative-0fc8e53e9f74bda5.noent.46745
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+test-signed: FAILED (carrick-embed)
+remaining carrick procs (run-id el1-frame-grant-fresh-retired-leaf-20260927) = 0
+remaining carrick procs (run-id el1-frame-grant-fresh-retired-leaf-20260927-cli) = 0
+error: recipe `test-embed` failed on line 700 with exit code 1

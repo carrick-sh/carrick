@@ -1,0 +1,34 @@
+   Compiling carrick-el1-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-abi)
+error[E0599]: no method named `claim_request_for_fault` found for struct `FrameGrantMailbox` in the current scope
+    --> crates/carrick-el1-abi/src/lib.rs:2944:21
+     |
+ 784 | pub struct FrameGrantMailbox {
+     | ---------------------------- method `claim_request_for_fault` not found for this struct
+...
+2944 |             mailbox.claim_request_for_fault(
+     |             --------^^^^^^^^^^^^^^^^^^^^^^^
+     |
+help: there is a method `claim_request` with a similar name, but with different arguments
+    --> crates/carrick-el1-abi/src/lib.rs:917:5
+     |
+ 917 |     pub fn claim_request(&self) -> Option<FrameGrantRequest> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no method named `claim_request_for_fault` found for struct `FrameGrantMailbox` in the current scope
+    --> crates/carrick-el1-abi/src/lib.rs:2953:21
+     |
+ 784 | pub struct FrameGrantMailbox {
+     | ---------------------------- method `claim_request_for_fault` not found for this struct
+...
+2953 |             mailbox.claim_request_for_fault(request.mm_key, request.fault_va, request.access),
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^
+     |
+help: there is a method `claim_request` with a similar name, but with different arguments
+    --> crates/carrick-el1-abi/src/lib.rs:917:5
+     |
+ 917 |     pub fn claim_request(&self) -> Option<FrameGrantRequest> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `carrick-el1-abi` (lib test) due to 2 previous errors
+EXIT_CODE:101

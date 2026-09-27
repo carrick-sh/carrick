@@ -1,0 +1,21 @@
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-image)
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.58s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-438fb741d9d260b3)
+
+running 1 test
+
+thread 'aarch64::tests::live_host_edit_adopts_hierarchy_allocated_by_guest_editor' (15433635) panicked at crates/carrick-mmu-core/src/aarch64.rs:7720:14:
+host edit must adopt guest-grown live tables: BadAddress
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test aarch64::tests::live_host_edit_adopts_hierarchy_allocated_by_guest_editor ... FAILED
+
+failures:
+
+failures:
+    aarch64::tests::live_host_edit_adopts_hierarchy_allocated_by_guest_editor
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p carrick-mmu-core --lib`

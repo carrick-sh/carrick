@@ -197,3 +197,43 @@ The next bounded task is an exit-class census on this exact fixture. One host
 exit still scales with every touched page; classify it as grant/first-touch,
 stage-1 frame COW, stage-2 replay or another exact boundary before changing
 code. Checkpoint 2 and measured performance acceptance remain open.
+
+## Accepted first-touch structural boundary
+
+The bounded census found that the bulk grant path was active but a
+carrier-wide single-flight mailbox forced the other concurrently faulting vCPU
+slot through page-granular fallback. The post-coherence capture recorded 207
+matching grant-service function entries alongside 1,291
+`commit_resident_fault` entries. This explained the residual scale-dependent
+exit count without reopening general MM or fork design.
+
+The red-first ABI contract `frame_grant_mailboxes_are_single_flight_per_vcpu_slot`
+required two slots to publish and claim independently. The checked ABI now
+contains one exact single-flight mailbox per persistent vCPU slot. EL1 selects
+it from the trap-frame slot; the host selects the same mailbox from the active
+engine's mailbox slot. MM key, request generation, fault address, access class,
+frame/mapping identity and owner generation authentication are unchanged.
+
+The preceding signed run also exposed one live-table coherence defect: a host
+manager created before guest hierarchy growth rejected the guest-linked table
+as outside its cached allocated prefix. Red-first MMU contracts now require a
+host edit to follow and adopt that live hierarchy and require its allocator not
+to reissue a guest-owned table page. All 101 MMU tests pass with that
+correction.
+
+The first signed acceptance execution after the slot-local correction reports:
+
+| Pages per process | Total pages | Carrick host exits | Semantics |
+|---:|---:|---:|---|
+| 256 | 512 | 99 | parent and child pass |
+| 1,024 | 2,048 | 102 | parent and child pass |
+| 4,096 | 8,192 | 119 | parent and child pass |
+
+The incremental slopes are `(102 - 99) / 1536 = 0.0020` and
+`(119 - 102) / 6144 = 0.0028` host exits per added page. Both are far below the
+strict `<0.125` contract. The unentitled negative control passes and scoped
+cleanup reports zero remaining processes. The first-touch semantic and
+structural boundary is accepted; checkpoint 2 remains open for permission and
+retirement paths, elastic frame return, fork COW ownership, migration of the
+memory syscalls, removal of the superseded host writer/pause, and paired
+workload timing.
