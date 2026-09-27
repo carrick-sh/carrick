@@ -99,6 +99,7 @@ struct Machine {
     spsr: u64,
     esr: u64,
     far: u64,
+    tpidr: u64,
     pc: usize,
     equal: bool,
     bytes: Vec<u8>,
@@ -142,9 +143,33 @@ impl Machine {
             spsr: EL0_DAIF_MASKED,
             esr: SVC_ESR,
             far: 0x4000_1000,
+            tpidr: 0,
             pc: EL1_VECTOR_HOOK_OFFSET,
             equal: false,
             bytes: Self::bytes(irq),
+            image: Image::Serve,
+            retired: 0,
+            kicked_pc: None,
+            kick_pending: false,
+            kick_acknowledged: false,
+            irq_frames: 0,
+        }
+    }
+
+    /// The full production vector page starting from `pc = MAILBOX_HANDLER_OFFSET`.
+    fn full_vector_page(irq: El1IrqMode) -> Self {
+        Self {
+            regs: std::array::from_fn(|i| 0xAB00 + i as u64),
+            sp: LINUX_SYSCALL_MAILBOX_BASE + SLOT * 256,
+            mem: BTreeMap::new(),
+            elr: GUEST_ELR,
+            spsr: EL0_DAIF_MASKED,
+            esr: SVC_ESR,
+            far: 0x4000_1000,
+            tpidr: 0,
+            pc: MAILBOX_HANDLER_OFFSET,
+            equal: false,
+            bytes: el1_vectors_bytes_mailbox_irq(true, false, true, irq),
             image: Image::Serve,
             retired: 0,
             kicked_pc: None,
@@ -219,7 +244,7 @@ impl Machine {
         let frame = self.regs[0];
         let esr = self.read(frame + 264);
         let irq = esr == 0;
-        let is_fault = (esr >> 26) == 0x24;
+        let is_fault = ((esr >> 26) & 0x3F) == 0x24;
         if irq {
             self.irq_frames += 1;
             if self.kick_pending {
@@ -271,6 +296,7 @@ impl Machine {
                         elr: self.elr,
                     };
                 }
+                0xD400_0002 | 0xD400_0042 => return Exit::Host, // hvc #0 / hvc #2: host syscall / legacy trap
                 0xD400_0062 => return Exit::Fault,
                 0xD400_0082 => {
                     // hvc #4: the host withdraws the kick and resumes at EL0.
@@ -289,7 +315,7 @@ impl Machine {
                 0xD503_3FDF | 0xD503_201F => continue, // isb, nop
                 _ => {}
             }
-            // mrs/msr of ELR_EL1, SPSR_EL1, ESR_EL1, FAR_EL1 with any Xt.
+            // mrs/msr of ELR_EL1, SPSR_EL1, ESR_EL1, FAR_EL1, TPIDR_EL1 with any Xt.
             let handled = match op & !31 {
                 0xD538_4020 => {
                     self.set_xd_zr(rd, self.elr);
@@ -307,6 +333,10 @@ impl Machine {
                     self.set_xd_zr(rd, self.far);
                     true
                 }
+                0xD538_D080 => {
+                    self.set_xd_zr(rd, self.tpidr);
+                    true
+                }
                 0xD518_4020 => {
                     self.elr = self.xn_zr(rd);
                     true
@@ -321,6 +351,10 @@ impl Machine {
                 }
                 0xD518_6000 => {
                     self.far = self.xn_zr(rd);
+                    true
+                }
+                0xD518_D080 => {
+                    self.tpidr = self.xn_zr(rd);
                     true
                 }
                 _ => false,
@@ -385,10 +419,21 @@ impl Machine {
             } else if op & 0xFFE0_0000 == 0xCB00_0000 {
                 let amount = (op >> 10) & 0x3F;
                 self.set_xd_zr(rd, self.xn_zr(rn) - (self.xn_zr(rm) << amount));
-            } else if op & 0xFFC0_FC00 == 0xD340_FC00 {
-                // lsr xd, xn, #immr
-                let amount = (op >> 16) & 0x3F;
-                self.set_xd_zr(rd, self.xn_zr(rn) >> amount);
+            } else if op & 0xFFC0_0000 == 0xD340_0000 {
+                // ubfm xd, xn, #immr, #imms (handles both lsr and ubfx)
+                let immr = (op >> 16) & 0x3F;
+                let imms = (op >> 10) & 0x3F;
+                let width = if imms >= immr {
+                    imms - immr + 1
+                } else {
+                    panic!("unsupported ubfm rotation {op:08x} at {pc:#x}");
+                };
+                let mask = if width == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << width) - 1
+                };
+                self.set_xd_zr(rd, (self.xn_zr(rn) >> immr) & mask);
             } else {
                 panic!("unsupported vector-page opcode {op:08x} at {pc:#x}");
             }
@@ -723,12 +768,13 @@ fn the_idle_entry_runs_a_switched_in_thread_or_leaves_idle() {
 
 #[test]
 fn fault_hook_forward_restores_complete_architectural_context() {
+    let raw_esr = (0xABCD_EF01_u64 << 32) | (0x24 << 26) | (1 << 25) | 0x47;
     let mut m = Machine {
         pc: EL0_FAULT_HOOK_OFFSET,
         regs: std::array::from_fn(|i| 0xCAFE_0000 + i as u64),
         elr: 0x4000_2000,
         spsr: EL0_DAIF_MASKED,
-        esr: (0x24 << 26) | 0x47,
+        esr: raw_esr,
         far: 0x1000_5000,
         image: Image::Serve, // image returns Action::Forward for faults
         ..Machine::syscall(El1IrqMode::Masked)
@@ -745,9 +791,8 @@ fn fault_hook_forward_restores_complete_architectural_context() {
         "SPSR_EL1 must be preserved on fault forward"
     );
     assert_eq!(
-        m.esr,
-        (0x24 << 26) | 0x47,
-        "ESR_EL1 must be preserved on fault forward"
+        m.esr, raw_esr,
+        "ESR_EL1 (including high syndrome bits) must be preserved on fault forward"
     );
     assert_eq!(
         m.far, 0x1000_5000,
@@ -756,4 +801,24 @@ fn fault_hook_forward_restores_complete_architectural_context() {
     for (i, (&actual, &expected)) in m.regs.iter().zip(original_regs.iter()).enumerate() {
         assert_eq!(actual, expected, "x{i} must be preserved on fault forward");
     }
+}
+
+#[test]
+fn non_data_abort_sync_exception_bypasses_fault_hook_to_host() {
+    // Instruction Abort (EC = 0x20) from lower EL with nonzero high ESR bits
+    let esr_inst_abort = (0xDEAD_BEEF_u64 << 32) | (0x20 << 26) | 0x12;
+    let mut m = Machine {
+        regs: std::array::from_fn(|i| 0xBAAD_0000 + i as u64),
+        elr: 0x5000_1000,
+        spsr: EL0_DAIF_MASKED,
+        esr: esr_inst_abort,
+        far: 0,
+        ..Machine::full_vector_page(El1IrqMode::Masked)
+    };
+    let exit = m.run(None);
+    assert_eq!(
+        exit,
+        Exit::Host,
+        "non-data-abort exception must bypass EL1 hooks and exit to host via legacy HVC"
+    );
 }

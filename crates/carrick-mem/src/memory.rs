@@ -560,6 +560,7 @@ const AARCH64_MRS_TPIDR_EL1_X16_OPCODE: u32 = 0xd538_d090;
 // before dispatching on stale x8.
 const AARCH64_MRS_ESR_EL1_X16_OPCODE: u32 = 0xd538_5210;
 const AARCH64_LSR_X16_X16_26_OPCODE: u32 = 0xd35a_fe10;
+const AARCH64_UBFX_X16_X16_26_6_OPCODE: u32 = 0xd35a_7e10;
 const AARCH64_CMP_X16_SVC64_OPCODE: u32 = 0xf100_561f;
 const AARCH64_CMP_X16_DATA_ABORT_OPCODE: u32 = 0xf100_921f;
 const AARCH64_MRS_FAR_EL1_X17_OPCODE: u32 = 0xd538_6011;
@@ -4678,7 +4679,7 @@ fn write_el1_hook(
         HookEntry::Syscall | HookEntry::Fault => {
             emit(bytes, &mut cursor, 0xD538_5211); // mrs x17, esr_el1
             emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 264)); // esr at offset 264
-            emit(bytes, &mut cursor, 0xD538_6011); // mrs x17, far_el1
+            emit(bytes, &mut cursor, AARCH64_MRS_FAR_EL1_X17_OPCODE); // mrs x17, far_el1
             emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 280)); // far at offset 280
         }
         // An interrupt frame: syndrome 0 (an SVC's never is).
@@ -4873,7 +4874,7 @@ fn write_el1_hook(
         emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 264)); // esr
         emit(bytes, &mut cursor, 0xD518_5211); // msr esr_el1, x17
         emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 280)); // far
-        emit(bytes, &mut cursor, 0xD518_6011); // msr far_el1, x17
+        emit(bytes, &mut cursor, AARCH64_MSR_FAR_EL1_X17_OPCODE); // msr far_el1, x17
     }
     // Restore x0..x15, x18..x30
     for r in 0..=15 {
@@ -5054,7 +5055,7 @@ pub fn el1_vectors_bytes_mailbox_irq(
 
     emit(&mut bytes, &mut cursor, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
     emit(&mut bytes, &mut cursor, AARCH64_MRS_ESR_EL1_X16_OPCODE);
-    emit(&mut bytes, &mut cursor, AARCH64_LSR_X16_X16_26_OPCODE);
+    emit(&mut bytes, &mut cursor, AARCH64_UBFX_X16_X16_26_6_OPCODE);
     emit(&mut bytes, &mut cursor, AARCH64_CMP_X16_SVC64_OPCODE);
     emit(&mut bytes, &mut cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
     let not_svc_branch = cursor;
@@ -5395,7 +5396,7 @@ pub fn el1_vectors_bytes_mailbox_irq(
     let not_svc = cursor;
     emit(&mut bytes, &mut cursor, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
     emit(&mut bytes, &mut cursor, AARCH64_MRS_ESR_EL1_X16_OPCODE);
-    emit(&mut bytes, &mut cursor, AARCH64_LSR_X16_X16_26_OPCODE);
+    emit(&mut bytes, &mut cursor, AARCH64_UBFX_X16_X16_26_6_OPCODE);
     emit(&mut bytes, &mut cursor, AARCH64_CMP_X16_DATA_ABORT_OPCODE);
     let not_data_abort_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
@@ -7363,7 +7364,10 @@ mod syscall_mailbox_tests {
         assert_eq!(handler, MAILBOX_HANDLER_OFFSET);
         assert_eq!(rd_u32(&bytes, handler), AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
         assert_eq!(rd_u32(&bytes, handler + 4), AARCH64_MRS_ESR_EL1_X16_OPCODE);
-        assert_eq!(rd_u32(&bytes, handler + 8), AARCH64_LSR_X16_X16_26_OPCODE);
+        assert_eq!(
+            rd_u32(&bytes, handler + 8),
+            AARCH64_UBFX_X16_X16_26_6_OPCODE
+        );
         assert_eq!(rd_u32(&bytes, handler + 12), AARCH64_CMP_X16_SVC64_OPCODE);
         assert_eq!(
             rd_u32(&bytes, handler + 16),
@@ -8393,13 +8397,20 @@ mod el1_shim_tests {
         let enabled = el1_vectors_bytes_mailbox_configured(true, false, true);
         let disabled = el1_vectors_bytes_mailbox_configured(true, false, false);
 
-        // Verify Data Abort opcode is emitted
+        // Verify Data Abort opcode and UBFX EC extraction opcode are emitted
         assert!(
             enabled
                 .chunks_exact(4)
                 .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
                 .any(|op| op == AARCH64_CMP_X16_DATA_ABORT_OPCODE),
             "vectors must contain cmp x16, #0x24"
+        );
+        assert!(
+            enabled
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                .any(|op| op == AARCH64_UBFX_X16_X16_26_6_OPCODE),
+            "vectors must contain ubfx x16, x16, #26, #6 for EC extraction"
         );
 
         // Fault hook is installed at EL0_FAULT_HOOK_OFFSET (0x3000) in enabled vectors

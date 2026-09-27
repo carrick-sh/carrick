@@ -1839,6 +1839,30 @@ mod tests {
     }
 
     #[test]
+    fn test_counters_snapshot_and_initialization() {
+        let counters = Counters::new();
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.served[0].load(Ordering::Relaxed), 0);
+        assert_eq!(counters.forwarded[0].load(Ordering::Relaxed), 0);
+        assert_eq!(counters.irq_taken[0].load(Ordering::Relaxed), 0);
+
+        counters.fault_taken.store(5, Ordering::Relaxed);
+        counters.served[10].store(20, Ordering::Relaxed);
+        counters.forwarded[30].store(40, Ordering::Relaxed);
+        counters.irq_taken[2].store(8, Ordering::Relaxed);
+
+        let snap = counters.copy_snapshot();
+        assert_eq!(snap.fault_taken.load(Ordering::Relaxed), 5);
+        assert_eq!(snap.served[10].load(Ordering::Relaxed), 20);
+        assert_eq!(snap.forwarded[30].load(Ordering::Relaxed), 40);
+        assert_eq!(snap.irq_taken[2].load(Ordering::Relaxed), 8);
+
+        // Modifying original doesn't affect snapshot
+        counters.fault_taken.store(100, Ordering::Relaxed);
+        assert_eq!(snap.fault_taken.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
     fn test_image_header_layout() {
         assert_eq!(core::mem::size_of::<ImageHeader>(), 32);
         assert_eq!(core::mem::offset_of!(ImageHeader, abi_hash_offset), 24);
