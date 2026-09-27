@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-6528256f6740d9d0)
+
+running 1 test
+
+thread 'trap::stage2_backend::tests::el1_stage1_table_backing_is_stage2_writable_but_not_guest_writable' (15216921) panicked at crates/carrick-vmm-hvf/src/trap/stage2_backend.rs:1203:9:
+assertion `left == right` failed: EL1 must be able to publish new table descriptors through its fixed alias
+  left: Read
+ right: ReadWriteExec
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test trap::stage2_backend::tests::el1_stage1_table_backing_is_stage2_writable_but_not_guest_writable ... FAILED
+
+failures:
+
+failures:
+    trap::stage2_backend::tests::el1_stage1_table_backing_is_stage2_writable_but_not_guest_writable
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 575 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`

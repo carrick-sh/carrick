@@ -109,3 +109,24 @@ This source has not yet run as one frozen signed artifact. The next gate is the
 256-page signed witness; only after it passes run the 1,024- and 4,096-page
 scales. Checkpoint 2, extension growth, full CI and full EL1 migration
 completion remain open.
+
+The first committed missing-hierarchy artifact is recorded in
+`missing-hierarchy-artifact-identity.txt`; its exact signed build is in
+`missing-hierarchy-signed-build.log`. The 256-page witness in
+`missing-hierarchy-signed-first-touch.log` crossed the old `MissingTable`
+invariant and reached the first write to the newly allocated table page. It
+then exited at `FAR=0x2d0002c008`, the fixed primary-table alias plus `0xc008`,
+with a write abort. The backing root extent and alias already cover that page;
+the root cause was that the allocator-backed root mapping inherited the
+semantic region's read-only permission at stage 2. EL0 remained excluded by
+stage-1 AP bits, but EL1 could read and not update its own table image.
+
+`stage2-write-red.log` captures the production-shaped contract observing
+`Read` stage-2 permission. The correction upgrades only the physical table
+backing to `ReadWriteExec` (the existing HVF writable-map policy) and leaves
+the mapping's `guest_writable` flag false. `stage2-write-green.log` and
+`stage2-write-clippy.log` preserve the focused green test and warning-denied
+Clippy. The prescribed host test gate reached the unchanged GIC source-shape
+assertion already documented by the host-service checkpoint; the new test and
+the affected production crate otherwise pass. A new exact signed artifact and
+256-page rerun remain the next acceptance step.

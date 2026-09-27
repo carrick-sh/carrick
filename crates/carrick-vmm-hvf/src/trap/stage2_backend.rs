@@ -575,7 +575,7 @@ pub(crate) fn prepare_exec_region_raw_in_sized(
         host_addr: host,
         size,
         physical_size: size,
-        perms: hvf_perms(mapping.perms),
+        perms: exec_mapping_stage2_perms(mapping),
         memory: None,
         host_mapping: Some(host_mapping),
         structural_owner: None,
@@ -678,7 +678,7 @@ pub(crate) fn prepare_pooled_exec_root_region_in(
         host_addr: host,
         size,
         physical_size: handle.len(),
-        perms: hvf_perms(mapping.perms),
+        perms: exec_mapping_stage2_perms(mapping),
         memory: None,
         host_mapping: None,
         structural_owner: None,
@@ -767,7 +767,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
             ),
         );
     }
-    let perms = hvf_perms(mapping.perms);
+    let perms = exec_mapping_stage2_perms(mapping);
     let perms_raw: u64 = u64::from(perms);
     // Map at the IPA (identity for all but the Rosetta alias); the guest's
     // stage-1 page tables translate the VIRTUAL `guest_start` to this IPA.
@@ -1024,6 +1024,22 @@ pub(crate) fn hvf_perms(perms: SegmentPerms) -> applevisor::memory::MemPerms {
     }
 }
 
+/// Stage-2 permissions for an exec mapping.
+///
+/// The stage-1 table image is EL0-inaccessible through its stage-1 AP bits and
+/// stays non-writable to the host syscall-copy view. EL1 now grows that image
+/// in place, however, so its physical backing must admit guest writes. Keep the
+/// permission upgrade at the stage-2 boundary rather than marking the semantic
+/// mapping writable to Linux userspace.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn exec_mapping_stage2_perms(mapping: &GuestMapping) -> applevisor::memory::MemPerms {
+    let mut perms = mapping.perms;
+    if mapping.guest_start == carrick_mem::memory::LINUX_PAGE_TABLES_BASE {
+        perms.write = true;
+    }
+    hvf_perms(perms)
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn hvf_error(error: applevisor::error::HypervisorError) -> TrapError {
     TrapError::Hypervisor(error.to_string())
@@ -1180,6 +1196,36 @@ pub(crate) fn hvf_set_sys_reg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn el1_stage1_table_backing_is_stage2_writable_but_not_guest_writable() {
+        let mapping = GuestMapping {
+            guest_start: carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            ipa_start: 0x8800_0000_0000,
+            mapped_size: 0x4000,
+            offset_in_mapping: 0,
+            payload_size: 0x4000,
+            perms: SegmentPerms {
+                read: true,
+                write: false,
+                execute: false,
+            },
+            shared: false,
+            image: std::sync::Arc::new(vec![0_u8; 0x4000]),
+            private_file_backing: None,
+        };
+
+        let region = prepare_exec_region_raw(&mapping).expect("prepare stage-1 table region");
+        assert_eq!(
+            region.perms,
+            applevisor::memory::MemPerms::ReadWriteExec,
+            "EL1 must be able to publish new table descriptors through its fixed alias"
+        );
+        assert!(
+            !region.guest_writable,
+            "stage-2 write permission must not make the EL0/syscall view writable"
+        );
+    }
 
     #[test]
     fn test_stage2_abort_classifier() {
