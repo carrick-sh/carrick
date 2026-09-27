@@ -1,0 +1,9 @@
+positions updated: 3
+rationale site references rebound: 3
+inventory rows: 588; capture rows: 588
+host-authority positions: 3 rebound
+runtime-aborts fingerprints: 0 rebound
+dispatch-lock-authority lines: 0 rebound
+k1 operation inventory: 0 rebound
+k1 callsite taxonomy: 0 rebound
+inventories reconciled; review `git diff` (positions only) and commit

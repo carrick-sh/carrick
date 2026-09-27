@@ -600,3 +600,17 @@ entitlement and scoped zero-process cleanup evidence preserved under
 This closes focused fault-entry acceptance, not first-touch service or full
 promotion. Integrated CI is the next check; the broad EL1 gate still includes
 the deliberately red anonymous-first-touch contract.
+
+2026-09-26: fault-entry integrated CI exposed test-only Clippy errors, fixed
+in `a3fe1bd12`, then three position-only authority inventory shifts. Capture
+reconciliation retains all 588 reviewed rows. Raw failed runs and correction
+evidence are preserved in the director integrated-ci directory. Full CI is
+rerun after reconciliation; no full integration acceptance is claimed yet.
+
+The next bounded task is the MMU metadata-refusal plan. Antigravity worker
+`metadata-refusal` (cid `8b754593-3510-4caf-995f-76732c475fdd`) runs in the clean
+reused el1-memory-corrections checkout at plan base `cb2a854bf`. This is a new
+task with zero review rounds used; the completed fault-entry worker remains
+terminal at its three-round cap. The task requires real allocator refusal,
+zero-allocation rollback and complete edit/publication recovery. It permits
+host tests only, with director-owned integration and signed execution.
