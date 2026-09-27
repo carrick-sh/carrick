@@ -972,14 +972,6 @@ pub unsafe fn walk_descriptors_host(host: *const u8, len: usize, base: u64, va: 
     out
 }
 
-/// Reconstruct the spare-pool bump cursor from an existing table image: one
-/// past the LAST non-zero spare page. The pristine boot image has an all-zero
-/// spare tail (cursor = `SPARE_START_OFFSET`, the historical constant), but the
-/// boot-time ELF read-only-span pass now allocates spare sub-tables BEFORE the
-/// runtime manager is (lazily) built from the live backing — resetting the
-/// cursor over those live tables would re-hand them out and corrupt the walk.
-/// Taking one-past-the-LAST non-zero page (not the first all-zero page) also
-/// treats any zeroed hole as used — safe (wasted at worst), never re-issued.
 /// The part of the primary arena a manager allocates table pages from.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TableRegion {
@@ -1001,6 +993,14 @@ fn guest_table_start(capacity: usize) -> u64 {
     ((capacity - capacity / 8) & !(PT_PAGE - 1)).max(SPARE_START_OFFSET)
 }
 
+/// Reconstruct the spare-pool bump cursor from an existing table image: one
+/// past the LAST non-zero spare page. The pristine boot image has an all-zero
+/// spare tail (cursor = `SPARE_START_OFFSET`, the historical constant), but the
+/// boot-time ELF read-only-span pass now allocates spare sub-tables BEFORE the
+/// runtime manager is (lazily) built from the live backing — resetting the
+/// cursor over those live tables would re-hand them out and corrupt the walk.
+/// Taking one-past-the-LAST non-zero page (not the first all-zero page) also
+/// treats any zeroed hole as used — safe (wasted at worst), never re-issued.
 fn discover_next_free_spare(bytes: &[u8]) -> u64 {
     let spare = bytes.get(SPARE_START_OFFSET as usize..).unwrap_or_default();
     discover_spare_pages(spare.chunks_exact(PT_PAGE as usize))
@@ -1020,6 +1020,16 @@ fn discover_spare_pages<'a>(
         .map_or(SPARE_START_OFFSET, |(index, _)| {
             SPARE_START_OFFSET + (index as u64 + 1) * PT_PAGE
         })
+}
+
+/// Bytes of a primary table image that a later occupant must see zeroed:
+/// one past the last non-zero table page. Two editors allocate in one primary
+/// arena (the host below [`guest_table_start`], guest EL1 above it), and
+/// neither allocator cursor covers the other's pages, so a recycled table
+/// slot's populated prefix is measured from the image itself. The scan runs
+/// from the top and stops at the first occupied page.
+pub fn table_image_populated_prefix(image: &[u8]) -> usize {
+    (discover_next_free_spare(image) as usize).min(image.len())
 }
 
 /// Location of a descriptor within a possibly multi-arena page-table structure.
@@ -1476,6 +1486,10 @@ struct UndoJournal {
     /// REVERSE so repeated writes to one location unwind to the oldest value.
     words: Vec<(TableLocation, u64)>,
     arena_next_frees: Vec<u64>,
+    /// Owned image length of each arena when the journal opened. A host copy
+    /// holds guest EL1 table pages above its own cursor; restoring the length
+    /// (not truncating to the cursor) keeps them.
+    arena_owned_lens: Vec<usize>,
     arenas_len: usize,
     free_tables: Vec<u64>,
     reclaim_pending: bool,
@@ -1497,6 +1511,10 @@ struct UndoJournal {
     /// Pre-admitted storage for extension arena bases popped during rollback,
     /// ensuring rollback_undo performs zero heap allocations.
     returned_bases: Vec<u64>,
+    /// Set when [`PageTableManager::begin_undo`] is called again while this
+    /// journal is open: an inner transaction joined it and owns its end, so
+    /// [`PageTableManager::commit_undo_unless_retained`] leaves it open.
+    retained: bool,
 }
 
 impl PageTableManager {
@@ -1634,6 +1652,12 @@ impl PageTableManager {
     /// Mark this manager as the host's copy beside a guest EL1 editor: its
     /// table pages come from below the guest region of the primary arena, and its
     /// cursor ignores pages EL1 allocated there. Idempotent.
+    ///
+    /// The cursor is rediscovered from the host region's own content, owned or
+    /// live. A cursor inherited from a whole-arena discovery already points
+    /// past EL1's pages; clamping it to the region end instead declared the
+    /// host region full, so the first host table of a fresh process spilled
+    /// into an extension arena.
     pub fn use_host_table_region(&mut self) {
         if self.table_region == TableRegion::Host {
             return;
@@ -1644,9 +1668,43 @@ impl PageTableManager {
             TableArenaStorage::Owned(ref bytes) => {
                 discover_next_free_spare(&bytes[..(start as usize).min(bytes.len())])
             }
-            TableArenaStorage::Live => self.arenas[0].next_free.min(start),
+            TableArenaStorage::Live => {
+                let arena = &self.arenas[0];
+                match self.resolver.as_ref().and_then(|resolver| {
+                    resolver.host_const_ptr_for_range(arena.base, start as usize)
+                }) {
+                    // SAFETY: the resolver maps `start` readable bytes of the
+                    // live primary arena for the duration of this call.
+                    Some(host) => discover_next_free_spare(unsafe {
+                        core::slice::from_raw_parts(host, start as usize)
+                    }),
+                    // Without the live image the only safe cursor is one that
+                    // reissues nothing.
+                    None => arena.next_free.min(start),
+                }
+            }
         };
         self.arenas[0].next_free = lower;
+    }
+
+    /// End of the primary-arena span this manager bump-allocates from.
+    fn primary_alloc_limit(&self) -> u64 {
+        match self.table_region {
+            TableRegion::Whole | TableRegion::Guest => self.arenas[0].capacity as u64,
+            TableRegion::Host => guest_table_start(self.arenas[0].capacity),
+        }
+    }
+
+    /// Advance an arena's bump cursor past a table page that the live graph
+    /// proved occupied, unless the page lies in the other editor's region of
+    /// the primary arena: the host copy reads EL1's tables but never
+    /// allocates among them, so they must not move its cursor.
+    fn note_occupied_table_end(&mut self, arena: usize, table_end: u64) {
+        if arena == 0 && table_end > self.primary_alloc_limit() {
+            return;
+        }
+        let arena = &mut self.arenas[arena];
+        arena.next_free = arena.next_free.max(table_end);
     }
 
     /// True if this manager is bound to live hardware-visible memory.
@@ -1696,8 +1754,7 @@ impl PageTableManager {
         if !self.arenas[0].is_live() {
             // The occupied prefix, not the allocation cursor: a host copy
             // can hold guest EL1 table pages it adopted above its cursor.
-            return Ok(self
-                .arenas[0]
+            return Ok(self.arenas[0]
                 .allocated_span()
                 .min(self.arenas[0].capacity as u64));
         }
@@ -2461,10 +2518,11 @@ impl PageTableManager {
         // has now authenticated it through the live table graph. Adopt the
         // complete table page before resolving/publishing the dirty words so
         // later snapshots and allocations cannot truncate or reissue it.
-        for &(loc, _) in &self.dirty {
+        for index in 0..self.dirty.len() {
+            let loc = self.dirty[index].0;
             let arena = self
                 .arenas
-                .get_mut(loc.arena)
+                .get(loc.arena)
                 .ok_or(PageTableError::BadAddress)?;
             let touched = loc
                 .offset
@@ -2479,7 +2537,7 @@ impl PageTableManager {
                     .ok_or(PageTableError::BadAddress)?
                     / PT_PAGE as usize
                     * PT_PAGE as usize;
-                arena.next_free = arena.next_free.max(table_end as u64);
+                self.note_occupied_table_end(loc.arena, table_end as u64);
             }
         }
         let mut inline_hosts = [None; 8];
@@ -2862,6 +2920,15 @@ impl PageTableManager {
                 .map_err(|_| PageTableError::MetadataAllocation)?;
             arena_next_frees.extend(self.arenas.iter().map(|a| a.next_free));
 
+            let mut arena_owned_lens = Vec::new();
+            arena_owned_lens
+                .try_reserve_exact(self.arenas.len())
+                .map_err(|_| PageTableError::MetadataAllocation)?;
+            arena_owned_lens.extend(self.arenas.iter().map(|a| match a.storage {
+                TableArenaStorage::Owned(ref bytes) => bytes.len(),
+                TableArenaStorage::Live => 0,
+            }));
+
             let mut free_tables = Vec::new();
             free_tables
                 .try_reserve_exact(self.free_tables.len())
@@ -2871,6 +2938,7 @@ impl PageTableManager {
             self.undo = Some(UndoJournal {
                 words: Vec::new(),
                 arena_next_frees,
+                arena_owned_lens,
                 arenas_len: self.arenas.len(),
                 free_tables,
                 reclaim_pending: self.reclaim_pending,
@@ -2878,9 +2946,21 @@ impl PageTableManager {
                 replaced_valid: false,
                 first_written: hashbrown::HashSet::new(),
                 returned_bases: Vec::new(),
+                retained: false,
             });
+        } else if let Some(journal) = self.undo.as_mut() {
+            journal.retained = true;
         }
         Ok(())
+    }
+
+    /// Close a journal opened around one edit, unless code inside the edit
+    /// joined it with [`Self::begin_undo`] to keep the transaction open past
+    /// the edit (its later commit or rollback owns the journal then).
+    pub fn commit_undo_unless_retained(&mut self) {
+        if self.undo.as_ref().is_some_and(|journal| !journal.retained) {
+            self.undo = None;
+        }
     }
 
     /// Whether the open undo transaction has overwritten a walker-visible
@@ -2960,14 +3040,7 @@ impl PageTableManager {
         for &(loc, _) in &journal.words {
             self.staged.remove(&loc);
         }
-        for (i, &next_free) in journal.arena_next_frees.iter().enumerate() {
-            if i < self.arenas.len() {
-                self.arenas[i].next_free = next_free;
-                if let TableArenaStorage::Owned(ref mut bytes) = self.arenas[i].storage {
-                    bytes.truncate(next_free as usize);
-                }
-            }
-        }
+        Self::restore_journal_cursors(&mut self.arenas, &journal);
         self.free_tables = journal.free_tables;
         self.reclaim_pending = journal.reclaim_pending;
         self.dirty.truncate(journal.dirty_len);
@@ -2983,6 +3056,69 @@ impl PageTableManager {
             }
         }
         Ok(popped)
+    }
+
+    fn restore_journal_cursors(arenas: &mut [TableArena], journal: &UndoJournal) {
+        for (i, &next_free) in journal.arena_next_frees.iter().enumerate() {
+            let Some(arena) = arenas.get_mut(i) else {
+                continue;
+            };
+            arena.next_free = next_free;
+            if let TableArenaStorage::Owned(ref mut bytes) = arena.storage {
+                let len = journal
+                    .arena_owned_lens
+                    .get(i)
+                    .copied()
+                    .unwrap_or(next_free as usize);
+                bytes.truncate(len.max(next_free as usize));
+            }
+        }
+    }
+
+    /// Abandon the open transaction whose edits never reached hardware-visible
+    /// memory ([`Self::sync_to_host`] was not reached, or refused before its
+    /// first store). Restores the shadow image, cursors, free list, dirty and
+    /// staged sets to their state at [`Self::begin_undo`] without writing the
+    /// live backing: a pre-image written back there would overwrite guest EL1
+    /// publications this shadow never adopted.
+    ///
+    /// Extension arenas attached by the transaction stay attached, emptied
+    /// (as [`Self::adopt_live_extension_state`] does for a restored image):
+    /// the caller may already have published their stage-2 backing, and a
+    /// slot handed back to the source while still backed would be reissued to
+    /// another address space. Returns false when no journal was open.
+    pub fn abandon_unpublished_undo(&mut self) -> bool {
+        let Some(journal) = self.undo.take() else {
+            return false;
+        };
+        for &(loc, previous) in journal.words.iter().rev() {
+            if loc.arena >= journal.arenas_len {
+                continue;
+            }
+            if let Some(TableArena {
+                storage: TableArenaStorage::Owned(bytes),
+                ..
+            }) = self.arenas.get_mut(loc.arena)
+                && loc.offset + 8 <= bytes.len()
+            {
+                bytes[loc.offset..loc.offset + 8].copy_from_slice(&previous.to_le_bytes());
+            }
+        }
+        for &(loc, _) in &journal.words {
+            self.staged.remove(&loc);
+        }
+        Self::restore_journal_cursors(&mut self.arenas, &journal);
+        for arena in self.arenas.iter_mut().skip(journal.arenas_len) {
+            arena.next_free = PT_PAGE;
+            if let TableArenaStorage::Owned(ref mut bytes) = arena.storage {
+                bytes.clear();
+                bytes.resize(PT_PAGE as usize, 0);
+            }
+        }
+        self.free_tables = journal.free_tables;
+        self.reclaim_pending = journal.reclaim_pending;
+        self.dirty.truncate(journal.dirty_len);
+        true
     }
 
     /// Replace the live host backing with this manager's complete image across all arenas.
@@ -3258,7 +3394,7 @@ impl PageTableManager {
                         let descriptor = unsafe { (*slot).load(Ordering::Acquire) };
                         bytes[offset..offset + 8].copy_from_slice(&descriptor.to_le_bytes());
                     }
-                    arena.next_free = arena.next_free.max(table_end as u64);
+                    self.note_occupied_table_end(table.arena, table_end as u64);
                     let table_pa = base + table.offset as u64;
                     self.free_tables.retain(|pa| *pa != table_pa);
                     copied.push(table);
@@ -3481,18 +3617,18 @@ impl PageTableManager {
             };
             const ZERO_PAGE: [u8; PT_PAGE as usize] = [0; PT_PAGE as usize];
             if candidate != ZERO_PAGE {
+                // Rediscover only this manager's own region: a host copy
+                // must not jump past guest EL1's pages at the top.
+                let span = (self.primary_alloc_limit() as usize).min(arena.capacity);
                 let host = resolver
-                    .host_const_ptr_for_range(arena.base, arena.capacity)
+                    .host_const_ptr_for_range(arena.base, span)
                     .ok_or(PageTableError::UnresolvedArena(arena.base))?;
-                let image = unsafe { core::slice::from_raw_parts(host, arena.capacity) };
+                let image = unsafe { core::slice::from_raw_parts(host, span) };
                 let discovered = discover_next_free_spare(image);
                 self.arenas[0].next_free = self.arenas[0].next_free.max(discovered);
             }
         }
-        let primary_limit = match self.table_region {
-            TableRegion::Whole | TableRegion::Guest => self.arenas[0].capacity as u64,
-            TableRegion::Host => guest_table_start(self.arenas[0].capacity),
-        };
+        let primary_limit = self.primary_alloc_limit();
         if self.arenas[0].next_free + PT_PAGE <= primary_limit {
             let off = self.arenas[0].next_free;
             let needed = (off + PT_PAGE) as usize;
@@ -8415,6 +8551,250 @@ mod tests {
             LINUX_PAGE_TABLES_BASE + expected_next,
             "the first allocation follows the last occupied live spare page"
         );
+    }
+
+    /// A host stage-1 copy beside guest EL1, sharing one live primary arena:
+    /// the host mapped `host_va` (its tables sit below the guest region), and
+    /// guest EL1 then allocated an L3 table at the start of the guest region
+    /// for `el1_va`, the next 2 MiB span under the same L2 table, and
+    /// published one leaf in it. The host's owned shadow predates EL1's edit.
+    struct HostBesideEl1 {
+        host: PageTableManager,
+        live: Arc<MockLiveResolver>,
+        el1_va: u64,
+        guest_start: u64,
+    }
+
+    fn host_beside_el1() -> HostBesideEl1 {
+        let mut host = manager();
+        host.use_host_table_region();
+        let host_va = 0x4000_0000_u64;
+        host.map_private_aliased(host_va, 0x9000_0000, PT_PAGE, true, None)
+            .expect("host maps a page below the guest table region");
+        let capacity = host.arenas[0].capacity;
+        let guest_start = guest_table_start(capacity);
+        let live = MockLiveResolver::new();
+        live.register_arena(LINUX_PAGE_TABLES_BASE, capacity);
+        let TableArenaStorage::Owned(ref bytes) = host.arenas[0].storage else {
+            panic!("host copy is owned");
+        };
+        for (index, word) in bytes.chunks_exact(8).enumerate() {
+            let mut raw = [0_u8; 8];
+            raw.copy_from_slice(word);
+            live.write_word(LINUX_PAGE_TABLES_BASE, index * 8, u64::from_le_bytes(raw));
+        }
+        // The copied image is what the host published.
+        host.dirty.clear();
+        host.staged.clear();
+        assert!(host.arenas[0].next_free < guest_start);
+
+        let el1_va = host_va + (2 << 20);
+        let l2_table = host.try_debug_walk(host_va).expect("host walk")[1] & PA_MASK_TABLE;
+        let l2_offset = (l2_table - LINUX_PAGE_TABLES_BASE) as usize;
+        let el1_table = LINUX_PAGE_TABLES_BASE + guest_start;
+        live.write_word(
+            LINUX_PAGE_TABLES_BASE,
+            l2_offset + indices(el1_va)[2] * 8,
+            el1_table | TYPE_TABLE_OR_PAGE,
+        );
+        live.write_word(
+            LINUX_PAGE_TABLES_BASE,
+            guest_start as usize + indices(el1_va)[3] * 8,
+            0x9020_0000 | USER_PAGE_FLAGS | NON_GLOBAL,
+        );
+        HostBesideEl1 {
+            host,
+            live,
+            el1_va,
+            guest_start,
+        }
+    }
+
+    fn assert_host_allocates_below_guest_region(host: &mut PageTableManager, guest_start: u64) {
+        assert!(
+            host.arenas[0].next_free <= guest_start,
+            "host cursor 0x{:x} moved into the guest EL1 table region at 0x{guest_start:x}",
+            host.arenas[0].next_free
+        );
+        let table = host
+            .alloc_table(None)
+            .expect("the host region still has room: no extension arena is needed");
+        assert!(table < LINUX_PAGE_TABLES_BASE + guest_start);
+    }
+
+    #[test]
+    fn adopting_a_guest_el1_table_keeps_the_host_cursor_in_its_region() {
+        let HostBesideEl1 {
+            mut host,
+            live,
+            el1_va,
+            guest_start,
+        } = host_beside_el1();
+        unsafe { host.adopt_live_tables_for_range(&*live, el1_va, PT_PAGE as usize) }
+            .expect("adopt EL1's table for a host edit of its span");
+        assert_eq!(
+            host.try_debug_walk(el1_va).expect("walk adopted span")[3],
+            0x9020_0000 | USER_PAGE_FLAGS | NON_GLOBAL,
+            "the shadow reads the leaf EL1 published"
+        );
+        assert_host_allocates_below_guest_region(&mut host, guest_start);
+    }
+
+    #[test]
+    fn live_host_region_cursor_is_rediscovered_below_guest_tables() {
+        let HostBesideEl1 {
+            host,
+            live,
+            guest_start,
+            ..
+        } = host_beside_el1();
+        let host_high_water = host.arenas[0].next_free;
+        let mut live_host = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                host.arenas[0].capacity,
+                Arc::clone(&live) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+        }
+        .expect("bind live host manager");
+        live_host.use_host_table_region();
+        assert_eq!(live_host.arenas[0].next_free, host_high_water);
+        assert_host_allocates_below_guest_region(&mut live_host, guest_start);
+    }
+
+    #[test]
+    fn live_host_edit_of_a_guest_table_keeps_its_cursor_in_region() {
+        let HostBesideEl1 {
+            host,
+            live,
+            el1_va,
+            guest_start,
+        } = host_beside_el1();
+        let mut live_host = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                host.arenas[0].capacity,
+                Arc::clone(&live) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+        }
+        .expect("bind live host manager");
+        live_host.use_host_table_region();
+        live_host
+            .set_readonly(el1_va, PT_PAGE as usize, false, None)
+            .expect("host protects a page EL1 mapped");
+        unsafe { live_host.sync_to_host(&*live) }.expect("publish the host edit");
+        assert_host_allocates_below_guest_region(&mut live_host, guest_start);
+    }
+
+    #[test]
+    fn populated_prefix_covers_guest_el1_tables_above_the_host_cursor() {
+        let HostBesideEl1 {
+            host,
+            live,
+            guest_start,
+            ..
+        } = host_beside_el1();
+        let capacity = host.arenas[0].capacity;
+        let image = live
+            .host_const_ptr_for_range(LINUX_PAGE_TABLES_BASE, capacity)
+            .expect("live image");
+        let image = unsafe { core::slice::from_raw_parts(image, capacity) };
+        assert_eq!(
+            table_image_populated_prefix(image) as u64,
+            guest_start + PT_PAGE,
+            "slot reuse must zero EL1's table page, not stop at the host cursor"
+        );
+        assert!(host.copied_bytes() < guest_start);
+    }
+
+    #[test]
+    fn abandoned_unpublished_edit_restores_the_shadow_and_keeps_new_arenas() {
+        let HostBesideEl1 {
+            mut host,
+            live,
+            el1_va,
+            guest_start,
+        } = host_beside_el1();
+        let before = host.snapshot_image().expect("pre-edit image");
+        let available =
+            std::sync::Arc::new(std::sync::Mutex::new(vec![SubstrateGpa(0x9a00_0020_0000)]));
+        let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut source = TestArenaSource {
+            id: TableArenaSourceId::from_raw(0x9a00_0000_0000),
+            available: std::sync::Arc::clone(&available),
+            returned: std::sync::Arc::clone(&returned),
+        };
+        // Fill the host region so the edit needs an extension arena too.
+        host.arenas[0].next_free = guest_start;
+        let full_region = host.arenas[0].next_free;
+        host.begin_undo().expect("open the edit's journal");
+        host.map_private_aliased(
+            0x80_0000_0000,
+            0x9100_0000,
+            PT_PAGE,
+            true,
+            Some(&mut source),
+        )
+        .expect("edit builds new tables");
+        assert_eq!(host.arenas.len(), 2, "the edit attached an extension arena");
+        assert!(!host.dirty.is_empty());
+        // Publication of the extension arena failed: the edit never reached
+        // hardware. Without recovery every later adoption is refused.
+        assert_eq!(
+            unsafe { host.adopt_live_tables_for_range(&*live, el1_va, PT_PAGE as usize) },
+            Err(PageTableError::BadAddress)
+        );
+
+        assert!(host.abandon_unpublished_undo());
+        assert!(host.dirty.is_empty() && host.staged.is_empty() && !host.undo_is_open());
+        assert_eq!(host.arenas[0].next_free, full_region);
+        assert_eq!(host.free_tables, before.free_tables);
+        let (TableArenaStorage::Owned(now), TableArenaStorage::Owned(then)) =
+            (&host.arenas[0].storage, &before.arenas[0].storage)
+        else {
+            panic!("owned host copy");
+        };
+        assert_eq!(now, then, "the shadow image is back to its pre-edit bytes");
+        assert_eq!(host.try_debug_walk(0x80_0000_0000).unwrap()[3], 0);
+        assert_eq!(
+            host.arenas.len(),
+            2,
+            "a possibly published arena stays owned"
+        );
+        assert_eq!(host.arenas[1].next_free, PT_PAGE);
+        assert!(returned.lock().unwrap().is_empty());
+        assert_eq!(
+            live.read_word(
+                LINUX_PAGE_TABLES_BASE,
+                guest_start as usize + indices(el1_va)[3] * 8
+            ),
+            0x9020_0000 | USER_PAGE_FLAGS | NON_GLOBAL,
+            "abandonment never writes the live backing"
+        );
+        host.arenas[0].next_free = before.arenas[0].next_free;
+        unsafe { host.adopt_live_tables_for_range(&*live, el1_va, PT_PAGE as usize) }
+            .expect("a later host edit can adopt live tables again");
+    }
+
+    #[test]
+    fn edit_journal_joined_from_inside_the_edit_outlives_the_edit() {
+        let mut mgr = manager();
+        mgr.begin_undo().expect("edit journal");
+        mgr.commit_undo_unless_retained();
+        assert!(!mgr.undo_is_open(), "an unjoined edit journal closes");
+
+        mgr.begin_undo().expect("edit journal");
+        mgr.begin_undo()
+            .expect("the edit joins it (fork-COW arming)");
+        mgr.commit_undo_unless_retained();
+        assert!(
+            mgr.undo_is_open(),
+            "the joined journal stays open for the later fork commit or rollback"
+        );
+        mgr.commit_undo();
+        assert!(!mgr.undo_is_open());
     }
 
     #[test]
