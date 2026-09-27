@@ -614,3 +614,10 @@ task with zero review rounds used; the completed fault-entry worker remains
 terminal at its three-round cap. The task requires real allocator refusal,
 zero-allocation rollback and complete edit/publication recovery. It permits
 host tests only, with director-owned integration and signed execution.
+
+2026-09-26: integrated fault-entry full CI passed on `084c9a272`: 6,188
+passed, zero failed, 12 ignored across 101 Rust result groups. Complete log
+and hashed receipt are preserved under the fault-entry director
+`ci-reconciled/` evidence directory. The six non-macOS authority profiles
+remain explicitly pending. Signed promotion and actual guest first-touch
+service are still open; the independent metadata-refusal worker is active.
