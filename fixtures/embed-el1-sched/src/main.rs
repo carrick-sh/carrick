@@ -1951,14 +1951,16 @@ fn metadata_allocator_concurrent() -> i32 {
     for _ in 0..4 {
         let barrier = barrier.clone();
         workers.push(std::thread::spawn(move || {
-            let mut failures = 0;
+            let mut failure_codes = Vec::new();
             for _ in 0..ROUNDS {
                 barrier.wait();
                 let rc = metadata_allocator_phase(2, false);
-                failures += usize::from(rc != 0);
+                if rc != 0 {
+                    failure_codes.push(rc);
+                }
                 barrier.wait();
             }
-            failures
+            failure_codes
         }));
     }
     let mut host_calls = 0;
@@ -1973,9 +1975,17 @@ fn metadata_allocator_concurrent() -> i32 {
         }
         barrier.wait();
     }
-    let mut failures: usize = workers.into_iter().map(|w| w.join().expect("allocator worker")).sum();
-    failures += usize::from(metadata_allocator_drain() != 0);
-    println!("metadata-allocator concurrent workers=4 rounds={ROUNDS} failures={failures} host_calls={host_calls} host_failures={host_failures}");
+    let mut failure_codes: Vec<i64> = workers
+        .into_iter()
+        .flat_map(|worker| worker.join().expect("allocator worker"))
+        .collect();
+    let drain = metadata_allocator_drain();
+    if drain != 0 {
+        failure_codes.push(drain);
+    }
+    failure_codes.sort_unstable();
+    let failures = failure_codes.len();
+    println!("metadata-allocator concurrent workers=4 rounds={ROUNDS} failures={failures} host_calls={host_calls} host_failures={host_failures} failure_codes={failure_codes:?}");
     i32::from(failures != 0 || host_failures != 0)
 }
 
