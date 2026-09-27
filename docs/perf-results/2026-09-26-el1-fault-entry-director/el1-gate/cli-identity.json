@@ -1,0 +1,10 @@
+{
+  "source_head": "3667731b2d65347a3f8a5bf4166f397e18098ff7",
+  "sha256": "e36d452942619460b34c5dc92fead500490c8f9fc82f2bf8e0c34f42e72ce526",
+  "cdhash": "c3c432c79f200055cdebb9a687889429d570effd",
+  "lc_uuid": "728ED042-8EBA-30EC-B1E7-BF271B2300FA",
+  "hypervisor_entitlement": true,
+  "dof_present": true,
+  "binary": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/carrick",
+  "frozen_binary": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/fault-entry-final/cli-frozen/carrick"
+}

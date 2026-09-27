@@ -1,0 +1,28 @@
+diff --git a/crates/carrick-mmu-core/src/aarch64.rs b/crates/carrick-mmu-core/src/aarch64.rs
+index 6d9a654f7..3e287cd9c 100644
+--- a/crates/carrick-mmu-core/src/aarch64.rs
++++ b/crates/carrick-mmu-core/src/aarch64.rs
+@@ -3898,6 +3898,23 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn director_coalesce_refusal_preserves_linked_table() {
++        let mut mgr = manager();
++        let block = LINUX_MMAP_BASE + 0x20_0000;
++        mgr.set_prot_none(block, 0x1000, None).unwrap();
++        mgr.set_rw(block, 1 << 21, true, None).unwrap();
++        let original = mgr.translate(block);
++        assert!(original.is_some());
++        mgr.declare_offline_private_image();
++        mgr.dirty = Vec::new();
++        mgr.free_tables.reserve(2);
++        snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(0)));
++        let coalesced = mgr.try_coalesce(block);
++        snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
++        assert_eq!(mgr.translate(block), original, "failed parent write must not free its still-linked child; coalesced={coalesced}");
++    }
++
+     fn test_layout() -> PageTableLayoutConfig {
+         PageTableLayoutConfig {
+             user_leaf_check_va: LINUX_NULL_GUARD_END,
