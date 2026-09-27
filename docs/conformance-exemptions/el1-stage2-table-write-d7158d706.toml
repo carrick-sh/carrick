@@ -1,0 +1,10 @@
+schema = "carrick.conformance-exemption.v1"
+base = "3a10e6b2ccbe7d23598482761eb7b99cf94f4c8b"
+head = "d7158d70606b2aedc34ae2a137c872b1bf41e1c7"
+contracts = [
+  "kernel.el1.gic",
+]
+paths = [
+  "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
+]
+rationale = "The exact product diff changes only exec mapping permissions for the stage-1 table image and adds its production-shaped control. The page-table physical backing becomes writable for EL1 descriptor publication while the semantic mapping remains non-writable to EL0 and syscall-copy paths. GIC stage-2 exclusion and the raw mapping rejection boundary are unchanged; the focused stage2_map_refuses_the_gic_window negative control passes. The new EL1 table-backing contract, warning-denied carrick-vmm-hvf Clippy, formatting and the 62-contract registry also pass."
