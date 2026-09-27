@@ -1494,3 +1494,40 @@ fn el1_metadata_allocator_grows_and_returns_extents() {
         "all granted dynamic bytes across all phases must be completely returned to host"
     );
 }
+
+/// Concurrent users of the actual guest allocator must complete with unrelated
+/// host service work, return every dynamic byte, and stay within the watchdog.
+#[test]
+fn el1_metadata_allocator_concurrent_growth() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    carrick_runtime::reset_metadata_grant_state();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["metadata-allocator", "concurrent"],
+        Duration::from_secs(30),
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert!(
+        measured
+            .result
+            .stdout_utf8()
+            .contains("workers=4 rounds=16 failures=0 host_calls=1024 host_failures=0"),
+        "{}",
+        describe(&measured)
+    );
+    let stats = carrick_runtime::metadata_grant_stats();
+    assert!(stats.grants_succeeded > 0, "no dynamic growth: {stats:?}");
+    assert_eq!(
+        stats.grants_denied, 0,
+        "unexpected capacity refusal: {stats:?}"
+    );
+    assert_eq!(stats.grants_succeeded, stats.returns_completed, "{stats:?}");
+    assert_eq!(stats.bytes_granted, stats.bytes_returned, "{stats:?}");
+    let counters = read_el1_counters().expect("EL1 counters after guest");
+    assert!(
+        counters.forwarded[160].load(std::sync::atomic::Ordering::Relaxed) >= 1024,
+        "uname must execute through host service, not just a guest fast path"
+    );
+}
