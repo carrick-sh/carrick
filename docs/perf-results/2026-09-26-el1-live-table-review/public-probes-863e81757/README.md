@@ -46,3 +46,25 @@ Full CI on this revision is running separately at
 `target/el1-completion/live-integrated/ci-863e81757.log`. Smoke/full promotion,
 strict retained-probe closure, real EL1 first-touch service, and all later
 migration checkpoints remain open. No workload speedup or 2x acceptance is claimed.
+
+## Executable preservation follow-up
+
+The four dedicated-stage executables remain byte-identical to their recorded
+SHA-256 values and are now copied to
+`target/el1-completion/live-integrated/dedicated-frozen-863e81757/`.
+`dedicated-frozen-artifacts.json` records their exact paths and identities;
+their existing receipt covers 32 passing test executions.
+
+`freeze-signed-receipt.py RECEIPT DESTINATION` preserves completed signed
+artifacts before another stage can re-sign them. It checks the full source
+population before copying, verifies each copy and rechecks its source, then
+saves the original receipt and capture manifest. Running it on the dedicated
+receipt succeeded (four executables, 32 executions). Running it on the older
+generic receipt failed with a source-artifact hash mismatch before creating
+the destination. This confirms that the generic-stage artifact gap remains
+open; later binaries cannot repair that evidence. On the next promotion, run
+the capture after each signed stage and before starting the next signer.
+
+The unentitled negative control is temporary and removed by the runner; this
+capture preserves the entitled executables and the negative-control receipt,
+not the removed negative executable. It adds no new guest execution claims.

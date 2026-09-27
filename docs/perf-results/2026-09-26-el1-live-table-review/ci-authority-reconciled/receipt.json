@@ -1,0 +1,12 @@
+{
+  "source_head": "d35c880010f2188f6398ed3042953d4e48edff5e",
+  "command": "RUSTC_WRAPPER= just ci",
+  "terminal_session": 37223,
+  "exit_code": 0,
+  "log_sha256": "27e698f13beda122f45595f52a755b8edaacb2aea142508c35a0e0a446e6b19b",
+  "result_groups": 101,
+  "passed": 6180,
+  "failed": 0,
+  "ignored": 12,
+  "scope": "host CI; not signed guest or workload performance acceptance"
+}
