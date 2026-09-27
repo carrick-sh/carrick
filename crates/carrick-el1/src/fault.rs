@@ -194,6 +194,7 @@ impl FrameGrantLeafPublisher for HardwareFrameGrantLeafPublisher {
                 return false;
             }
         };
+        manager.forbid_table_allocation();
         let result = manager.publish_live_private_pages_transaction(GuestLeafPublication {
             va: ready.semantic_base,
             ipa: ready.physical_ipa,
@@ -357,10 +358,12 @@ pub fn dispatch_fault_with_regions<P: FrameGrantLeafPublisher, C: CowResolver>(
         let ready = response
             .ready
             .expect("successful frame-grant response carries Ready authority");
-        assert!(
-            publisher.publish_and_invalidate(grant.ttbr0, ready),
-            "authenticated frame-grant leaf publication failed after editor admission"
-        );
+        if !publisher.publish_and_invalidate(grant.ttbr0, ready) {
+            // The range needs a table page EL1 may not allocate: the host
+            // publishes this grant when it takes the forwarded fault.
+            assert!(source.fail_response(mm_key, generation));
+            return Action::Forward;
+        }
         assert!(source.finish_response(mm_key, generation));
         return Action::Served;
     }

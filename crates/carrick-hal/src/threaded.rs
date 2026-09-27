@@ -2852,6 +2852,18 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         Ok(None)
     }
 
+    /// Publish the stage-1 leaves of a prepared EL1 frame grant that guest
+    /// EL1 handed back unpublished. `Ok(false)`: unsupported backend.
+    fn publish_el1_frame_grant_on_host(
+        &mut self,
+        _va: u64,
+        _ipa: u64,
+        _len: u64,
+        _permissions: u64,
+    ) -> Result<bool, TrapError> {
+        Ok(false)
+    }
+
     /// Refresh fork-private backend state after the child frame inventory and
     /// exact MM/COW authority are live, but before the child enters guest code.
     fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {

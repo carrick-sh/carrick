@@ -1421,6 +1421,11 @@ pub struct PageTableManager {
     /// Pre-images of every descriptor word written since [`Self::begin_undo`],
     /// in write order, with the scalar state to restore alongside them.
     undo: Option<UndoJournal>,
+    /// Guest EL1's editor never allocates table pages: the host's owned copy
+    /// cannot see EL1's allocations, and a fresh table can be all zero, so a
+    /// content-discovered cursor would hand one page to both. EL1 publishes
+    /// only into existing tables and hands the rest back to the host.
+    table_allocation_forbidden: bool,
 }
 
 impl core::fmt::Debug for PageTableManager {
@@ -1506,6 +1511,7 @@ impl PageTableManager {
             staged: hashbrown::HashMap::new(),
             resolver: None,
             undo: None,
+            table_allocation_forbidden: false,
         }
     }
 
@@ -1552,7 +1558,13 @@ impl PageTableManager {
             staged: hashbrown::HashMap::new(),
             resolver: Some(resolver),
             undo: None,
+            table_allocation_forbidden: false,
         })
+    }
+
+    /// Refuse every table-page allocation (see `table_allocation_forbidden`).
+    pub fn forbid_table_allocation(&mut self) {
+        self.table_allocation_forbidden = true;
     }
 
     /// True if this manager is bound to live hardware-visible memory.
@@ -1824,6 +1836,7 @@ impl PageTableManager {
             staged: hashbrown::HashMap::new(),
             resolver: None,
             undo: None,
+            table_allocation_forbidden: false,
         };
         self.snapshot_into(&mut target)?;
         Ok(target)
@@ -2582,6 +2595,26 @@ impl PageTableManager {
         Ok(pages)
     }
 
+    /// Host fallback for a guest EL1 frame grant the guest could not publish
+    /// (the range needs a table page, which only the host allocates): map the
+    /// granted pages exactly as EL1 would, including the EL1 ownership tags.
+    pub fn publish_private_pages(
+        &mut self,
+        publication: GuestLeafPublication,
+        source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<(), GuestLeafPublicationError> {
+        self.map_private_aliased_with_permissions(
+            publication.va,
+            publication.ipa,
+            publication.len,
+            publication.writable,
+            publication.executable,
+            source,
+        )
+        .map_err(GuestLeafPublicationError::Manager)?;
+        self.mark_guest_private_publication(publication)
+    }
+
     fn mark_guest_private_publication(
         &mut self,
         publication: GuestLeafPublication,
@@ -3311,6 +3344,9 @@ impl PageTableManager {
         &mut self,
         mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<u64, PageTableError> {
+        if self.table_allocation_forbidden {
+            return Err(PageTableError::OutOfTables);
+        }
         if let Some(&pa) = self.free_tables.last() {
             // A guest EL1 editor can write the shared live backing after the
             // host cached this unlinked page as free. Re-establish the allocator

@@ -4158,6 +4158,19 @@ where
                 );
                 let interrupted_pc = from_el0_direct.then_some(elr);
                 let faulting_tid = self.state.linux_tid;
+                if let Some(mm_key) = self.state.zone_mm
+                    && signal::any_handed_back_frame_grant()
+                {
+                    let published = self
+                        .state
+                        .with_mm_mutation_authority(&self.kernel, |_guard| {
+                            signal::publish_handed_back_frame_grant(engine, mm_key, si_addr)
+                        })?
+                        .map_err(RuntimeError::Trap)?;
+                    if published {
+                        return Ok(executor::ExecutorExit::Syscall);
+                    }
+                }
                 if self.kernel.dispatcher.fault_requires_mm_mutation(si_addr)
                     && self
                         .state
