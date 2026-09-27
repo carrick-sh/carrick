@@ -62,6 +62,10 @@ pub struct SpaceEntry {
     /// The exact guest EL1 page-table editor, or zero. A host pause raises
     /// `gate` and waits for this word to clear before mutating the same tables.
     active_editor: AtomicU64,
+    /// Monotonic bump cursor for anonymous private mmap allocations in the mmap arena.
+    pub mmap_next: AtomicU64,
+    /// Current program break for heap allocations.
+    pub brk_current: AtomicU64,
 }
 
 /// The table, in the shared EL1 region inside the zone.
@@ -110,6 +114,24 @@ pub struct SpaceEditor<'a> {
     owner: NonZeroU64,
 }
 
+impl<'a> SpaceEditor<'a> {
+    pub fn mmap_next(&self) -> u64 {
+        self.entry.mmap_next.load(Ordering::Acquire)
+    }
+
+    pub fn set_mmap_next(&self, val: u64) {
+        self.entry.mmap_next.store(val, Ordering::Release);
+    }
+
+    pub fn brk_current(&self) -> u64 {
+        self.entry.brk_current.load(Ordering::Acquire)
+    }
+
+    pub fn set_brk_current(&self, val: u64) {
+        self.entry.brk_current.store(val, Ordering::Release);
+    }
+}
+
 impl Drop for SpaceEditor<'_> {
     fn drop(&mut self) {
         let released = self.entry.active_editor.compare_exchange(
@@ -141,6 +163,8 @@ impl AddressSpaces {
                     cow_published: AtomicU64::new(0),
                     cow_covered: AtomicU64::new(0),
                     active_editor: AtomicU64::new(0),
+                    mmap_next: AtomicU64::new(0),
+                    brk_current: AtomicU64::new(0),
                 }
             }; ADDRESS_SPACES],
         }
@@ -188,6 +212,18 @@ impl AddressSpaces {
     /// Host, serialized: a closed entry for `key` with its roots, or `None`
     /// when the table is full. The caller has checked `key` is not published.
     pub fn publish_closed(&self, key: u64, ttbr0: u64, ttbr1: u64) -> Option<SpaceIndex> {
+        self.publish_closed_with_layout(key, ttbr0, ttbr1, 0, 0)
+    }
+
+    /// Host, serialized: a closed entry for `key` with its roots and layout hints.
+    pub fn publish_closed_with_layout(
+        &self,
+        key: u64,
+        ttbr0: u64,
+        ttbr1: u64,
+        brk_current: u64,
+        mmap_next: u64,
+    ) -> Option<SpaceIndex> {
         if key == 0 || key == FREED {
             return None;
         }
@@ -205,6 +241,8 @@ impl AddressSpaces {
             entry.cow_published.store(0, Ordering::Relaxed);
             entry.cow_covered.store(0, Ordering::Relaxed);
             entry.active_editor.store(0, Ordering::Relaxed);
+            entry.mmap_next.store(mmap_next, Ordering::Relaxed);
+            entry.brk_current.store(brk_current, Ordering::Relaxed);
             // The key last: a reader that finds it sees the rest.
             entry.key.store(key, Ordering::SeqCst);
             return SpaceIndex::from_index(index);
@@ -275,6 +313,24 @@ impl AddressSpaces {
         entry.key.store(FREED, Ordering::SeqCst);
         entry.ttbr0.store(0, Ordering::Relaxed);
         entry.ttbr1.store(0, Ordering::Relaxed);
+        entry.mmap_next.store(0, Ordering::Relaxed);
+        entry.brk_current.store(0, Ordering::Relaxed);
+    }
+
+    pub fn mmap_next(&self, index: SpaceIndex) -> u64 {
+        self.entry(index).mmap_next.load(Ordering::Acquire)
+    }
+
+    pub fn set_mmap_next(&self, index: SpaceIndex, val: u64) {
+        self.entry(index).mmap_next.store(val, Ordering::Release);
+    }
+
+    pub fn brk_current(&self, index: SpaceIndex) -> u64 {
+        self.entry(index).brk_current.load(Ordering::Acquire)
+    }
+
+    pub fn set_brk_current(&self, index: SpaceIndex, val: u64) {
+        self.entry(index).brk_current.store(val, Ordering::Release);
     }
 
     /// Host, under a pause of the space: its translations changed under a

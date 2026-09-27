@@ -608,11 +608,24 @@ pub fn publish_address_space(
     ttbr0: u64,
     ttbr1: u64,
 ) -> Option<AddressSpacePublication> {
+    publish_address_space_with_layout(mm, fence, ttbr0, ttbr1, 0, 0)
+}
+
+/// Publish `mm`, whose translation roots are `ttbr0`/`ttbr1`, with initial
+/// `brk_current` and `mmap_next` layout anchors for guest EL1 to install.
+pub fn publish_address_space_with_layout(
+    mm: MmId,
+    fence: &MmFence,
+    ttbr0: u64,
+    ttbr1: u64,
+    brk_current: u64,
+    mmap_next: u64,
+) -> Option<AddressSpacePublication> {
     if !switching_enabled() {
         return None;
     }
     let zone = crate::el1_zone::zone()?;
-    publish_in(
+    publish_in_with_layout(
         SpaceTables {
             spaces: &zone.spaces,
             occupancy: &zone.occupancy,
@@ -622,9 +635,12 @@ pub fn publish_address_space(
         fence,
         ttbr0,
         ttbr1,
+        brk_current,
+        mmap_next,
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn publish_in(
     tables: SpaceTables,
     mm: MmId,
@@ -632,12 +648,25 @@ fn publish_in(
     ttbr0: u64,
     ttbr1: u64,
 ) -> Option<AddressSpacePublication> {
+    publish_in_with_layout(tables, mm, fence, ttbr0, ttbr1, 0, 0)
+}
+
+fn publish_in_with_layout(
+    tables: SpaceTables,
+    mm: MmId,
+    fence: &MmFence,
+    ttbr0: u64,
+    ttbr1: u64,
+    brk_current: u64,
+    mmap_next: u64,
+) -> Option<AddressSpacePublication> {
     let spaces = tables.spaces;
     let _serial = SPACES_LOCK.lock();
     if spaces.find(mm.raw()).is_some() {
         return None;
     }
-    let index = spaces.publish_closed(mm.raw(), ttbr0, ttbr1)?;
+    let index =
+        spaces.publish_closed_with_layout(mm.raw(), ttbr0, ttbr1, brk_current, mmap_next)?;
     // Bound while closed: a pause in force now raises the gate before it
     // opens, and every later pause raises it before its occupancy scan.
     if !fence.bind_mirror(Arc::new(SpaceGate { tables, index })) {

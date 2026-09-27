@@ -8,15 +8,44 @@ use carrick_sched_core::AddressSpaces;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
-const SYS_MPROTECT: u64 = 226;
+const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
+const SYS_MMAP: u64 = 222;
+const SYS_MPROTECT: u64 = 226;
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
 const PROT_EXEC: u64 = 4;
+const MAP_SHARED: u64 = 0x01;
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_FIXED: u64 = 0x10;
+const MAP_ANONYMOUS: u64 = 0x20;
+const MAP_GROWSDOWN: u64 = 0x0100;
+const MAP_STACK: u64 = 0x20000;
+const MAP_HUGETLB: u64 = 0x40000;
+
+const LINUX_HEAP_BASE: u64 = 0x40_0000_0000;
+const LINUX_HEAP_SIZE: u64 = 128 * 1024 * 1024;
+const LINUX_MMAP_BASE: u64 = 0x60_0000_0000;
+const LINUX_MMAP_SIZE_MAX: u64 = 160 * 1024 * 1024 * 1024;
+
 const EACCES: i64 = 13;
 const EINVAL: i64 = 22;
 const ENOMEM: i64 = 12;
 const PAGE_SIZE: u64 = 4096;
+
+/// Result of attempting the bounded EL1 `brk` vertical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrkDisposition {
+    Forward,
+    Return(u64),
+}
+
+/// Result of attempting the bounded EL1 `mmap` vertical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmapDisposition {
+    Forward,
+    Return(i64),
+}
 
 /// Result of attempting the bounded EL1 `mprotect` vertical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +194,162 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
             | GuestRetirementError::MissingTable
             | GuestRetirementError::NotPrivateAnonymous,
         ) => MunmapDisposition::Forward,
+    }
+}
+
+/// Try to serve `brk(2)` for the heap in EL1.
+pub fn try_serve_brk<E: AnonymousRetirementEditor>(
+    frame: &TrapFrame,
+    current_tasks: &[CurrentTask],
+    spaces: &AddressSpaces,
+    editor: &mut E,
+) -> BrkDisposition {
+    if frame.x[8] != SYS_BRK {
+        return BrkDisposition::Forward;
+    }
+    let requested = frame.x[0];
+    let Some(task) = current_tasks.get(frame.slot as usize) else {
+        return BrkDisposition::Forward;
+    };
+    let mm_key = task.zone_mm.load(Ordering::Acquire);
+    let Some(index) = spaces.find(mm_key) else {
+        return BrkDisposition::Forward;
+    };
+    let Some(grant) = spaces.grant(index, mm_key) else {
+        return BrkDisposition::Forward;
+    };
+    let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
+        return BrkDisposition::Forward;
+    };
+    let Some(editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
+        return BrkDisposition::Forward;
+    };
+    let mut current = editor_guard.brk_current();
+    if current == 0 {
+        current = LINUX_HEAP_BASE;
+        editor_guard.set_brk_current(current);
+    }
+    if requested == 0 {
+        return BrkDisposition::Return(current);
+    }
+    if requested < LINUX_HEAP_BASE || requested > LINUX_HEAP_BASE + LINUX_HEAP_SIZE {
+        return BrkDisposition::Return(current);
+    }
+    let Some(old_page_end) = current
+        .checked_add(PAGE_SIZE - 1)
+        .map(|v| v & !(PAGE_SIZE - 1))
+    else {
+        return BrkDisposition::Return(current);
+    };
+    let Some(new_page_end) = requested
+        .checked_add(PAGE_SIZE - 1)
+        .map(|v| v & !(PAGE_SIZE - 1))
+    else {
+        return BrkDisposition::Return(current);
+    };
+
+    if new_page_end < old_page_end {
+        let shrink_len = old_page_end - new_page_end;
+        if editor
+            .retire_and_invalidate(grant.ttbr0, new_page_end, shrink_len)
+            .is_err()
+        {
+            return BrkDisposition::Forward;
+        }
+    }
+    editor_guard.set_brk_current(requested);
+    BrkDisposition::Return(requested)
+}
+
+/// Try to serve private-anonymous `mmap(2)` in EL1.
+pub fn try_serve_mmap<E: AnonymousRetirementEditor>(
+    frame: &TrapFrame,
+    current_tasks: &[CurrentTask],
+    spaces: &AddressSpaces,
+    editor: &mut E,
+) -> MmapDisposition {
+    if frame.x[8] != SYS_MMAP {
+        return MmapDisposition::Forward;
+    }
+    let requested_addr = frame.x[0];
+    let requested_len = frame.x[1];
+    let prot = frame.x[2];
+    let flags = frame.x[3];
+
+    if flags & MAP_ANONYMOUS == 0 || flags & MAP_PRIVATE == 0 || flags & MAP_SHARED != 0 {
+        return MmapDisposition::Forward;
+    }
+    if flags & (MAP_GROWSDOWN | MAP_STACK | MAP_HUGETLB) != 0 {
+        return MmapDisposition::Forward;
+    }
+    if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return MmapDisposition::Return(-EINVAL);
+    }
+    if requested_len == 0 {
+        return MmapDisposition::Return(-EINVAL);
+    }
+    let Some(len) = requested_len
+        .checked_add(PAGE_SIZE - 1)
+        .map(|v| v & !(PAGE_SIZE - 1))
+    else {
+        return MmapDisposition::Return(-ENOMEM);
+    };
+
+    let Some(task) = current_tasks.get(frame.slot as usize) else {
+        return MmapDisposition::Forward;
+    };
+    let mm_key = task.zone_mm.load(Ordering::Acquire);
+    let Some(index) = spaces.find(mm_key) else {
+        return MmapDisposition::Forward;
+    };
+    let Some(grant) = spaces.grant(index, mm_key) else {
+        return MmapDisposition::Forward;
+    };
+    let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
+        return MmapDisposition::Forward;
+    };
+    let Some(editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
+        return MmapDisposition::Forward;
+    };
+
+    let fixed = flags & MAP_FIXED != 0;
+    if !fixed {
+        let mut mmap_next = editor_guard.mmap_next();
+        if mmap_next == 0 {
+            mmap_next = LINUX_MMAP_BASE;
+        }
+        let alloc_addr = if requested_addr != 0
+            && requested_addr.is_multiple_of(PAGE_SIZE)
+            && requested_addr >= mmap_next
+            && requested_addr
+                .checked_add(len)
+                .is_some_and(|end| end <= LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX)
+        {
+            editor_guard.set_mmap_next(requested_addr + len);
+            requested_addr
+        } else {
+            let Some(new_next) = mmap_next.checked_add(len) else {
+                return MmapDisposition::Return(-ENOMEM);
+            };
+            if new_next > LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX {
+                return MmapDisposition::Return(-ENOMEM);
+            }
+            editor_guard.set_mmap_next(new_next);
+            mmap_next
+        };
+        MmapDisposition::Return(alloc_addr as i64)
+    } else {
+        if requested_addr == 0 || !requested_addr.is_multiple_of(PAGE_SIZE) {
+            return MmapDisposition::Return(-EINVAL);
+        }
+        let Some(end) = requested_addr.checked_add(len) else {
+            return MmapDisposition::Return(-ENOMEM);
+        };
+        if requested_addr < LINUX_MMAP_BASE || end > LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX {
+            return MmapDisposition::Forward;
+        }
+        let _ = editor.retire_and_invalidate(grant.ttbr0, requested_addr, len);
+        MmapDisposition::Return(requested_addr as i64)
     }
 }
 
@@ -375,6 +560,97 @@ mod tests {
         assert_eq!(
             try_serve_munmap(&frame, &tasks, &spaces, &mut editor),
             MunmapDisposition::Return(-EINVAL)
+        );
+    }
+
+    #[test]
+    fn resident_anonymous_brk_manages_heap_break() {
+        let (mut frame, tasks, spaces, ttbr0) = fixture(PROT_READ | PROT_WRITE);
+        frame.x[8] = SYS_BRK;
+        frame.x[0] = 0; // query
+        let mut editor = RecordingRetirementEditor::default();
+        assert_eq!(
+            try_serve_brk(&frame, &tasks, &spaces, &mut editor),
+            BrkDisposition::Return(LINUX_HEAP_BASE)
+        );
+        assert!(editor.calls.is_empty());
+
+        // Grow by 2 pages
+        frame.x[0] = LINUX_HEAP_BASE + 0x2000;
+        assert_eq!(
+            try_serve_brk(&frame, &tasks, &spaces, &mut editor),
+            BrkDisposition::Return(LINUX_HEAP_BASE + 0x2000)
+        );
+        assert!(editor.calls.is_empty());
+
+        // Shrink by 1 page: must retire the released page in stage 1
+        frame.x[0] = LINUX_HEAP_BASE + 0x1000;
+        assert_eq!(
+            try_serve_brk(&frame, &tasks, &spaces, &mut editor),
+            BrkDisposition::Return(LINUX_HEAP_BASE + 0x1000)
+        );
+        assert_eq!(
+            editor.calls,
+            vec![(ttbr0, LINUX_HEAP_BASE + 0x1000, 0x1000)]
+        );
+
+        // Out of bounds requested break returns unchanged current break
+        frame.x[0] = LINUX_HEAP_BASE + LINUX_HEAP_SIZE + 0x1000;
+        assert_eq!(
+            try_serve_brk(&frame, &tasks, &spaces, &mut editor),
+            BrkDisposition::Return(LINUX_HEAP_BASE + 0x1000)
+        );
+    }
+
+    #[test]
+    fn resident_anonymous_mmap_allocates_and_replaces() {
+        let (mut frame, tasks, spaces, ttbr0) = fixture(PROT_READ | PROT_WRITE);
+        frame.x[8] = SYS_MMAP;
+        frame.x[0] = 0; // addr = 0
+        frame.x[1] = 0x3000; // len
+        frame.x[2] = PROT_READ | PROT_WRITE;
+        frame.x[3] = MAP_PRIVATE | MAP_ANONYMOUS;
+        frame.x[4] = u64::MAX; // fd = -1
+        frame.x[5] = 0;
+        let mut editor = RecordingRetirementEditor::default();
+
+        // First bump allocation
+        assert_eq!(
+            try_serve_mmap(&frame, &tasks, &spaces, &mut editor),
+            MmapDisposition::Return(LINUX_MMAP_BASE as i64)
+        );
+        assert!(editor.calls.is_empty());
+
+        // Second bump allocation
+        frame.x[1] = 0x2000;
+        assert_eq!(
+            try_serve_mmap(&frame, &tasks, &spaces, &mut editor),
+            MmapDisposition::Return((LINUX_MMAP_BASE + 0x3000) as i64)
+        );
+
+        // Fixed replacement over first allocation
+        frame.x[0] = LINUX_MMAP_BASE;
+        frame.x[1] = 0x2000;
+        frame.x[3] = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+        assert_eq!(
+            try_serve_mmap(&frame, &tasks, &spaces, &mut editor),
+            MmapDisposition::Return(LINUX_MMAP_BASE as i64)
+        );
+        assert_eq!(editor.calls, vec![(ttbr0, LINUX_MMAP_BASE, 0x2000)]);
+
+        // Non-anonymous mmap must forward to host
+        frame.x[3] = MAP_SHARED | MAP_ANONYMOUS;
+        assert_eq!(
+            try_serve_mmap(&frame, &tasks, &spaces, &mut editor),
+            MmapDisposition::Forward
+        );
+
+        // Zero length returns EINVAL
+        frame.x[1] = 0;
+        frame.x[3] = MAP_PRIVATE | MAP_ANONYMOUS;
+        assert_eq!(
+            try_serve_mmap(&frame, &tasks, &spaces, &mut editor),
+            MmapDisposition::Return(-EINVAL)
         );
     }
 }
