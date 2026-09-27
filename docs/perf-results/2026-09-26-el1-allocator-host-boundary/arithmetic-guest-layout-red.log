@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1-5dacaf448aea3bd0)
+
+running 1 test
+
+thread 'alloc::tests::oversized_layout_fails_without_panic_or_state_change' (14969242) panicked at crates/carrick-el1/src/alloc.rs:367:28:
+attempt to add with overflow
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'alloc::tests::oversized_layout_fails_without_panic_or_state_change' (14969242) panicked at crates/carrick-el1/src/alloc.rs:1534:9:
+oversized layout arithmetic panicked
+test alloc::tests::oversized_layout_fails_without_panic_or_state_change ... FAILED
+
+failures:
+
+failures:
+    alloc::tests::oversized_layout_fails_without_panic_or_state_change
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-el1 --lib`

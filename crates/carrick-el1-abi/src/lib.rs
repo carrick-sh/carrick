@@ -579,6 +579,9 @@ impl MetadataGrantMailbox {
     }
 
     pub fn try_publish_request(&self, request: MetadataGrantRequest) -> bool {
+        let Ok(op) = u32::try_from(request.op) else {
+            return false;
+        };
         if self
             .state
             .compare_exchange(
@@ -591,7 +594,7 @@ impl MetadataGrantMailbox {
         {
             return false;
         }
-        self.op.store(request.op as u32, Ordering::Relaxed);
+        self.op.store(op, Ordering::Relaxed);
         self.status
             .store(METADATA_GRANT_ERR_INVALID, Ordering::Relaxed);
         self.arg1.store(request.arg1, Ordering::Relaxed);
