@@ -669,3 +669,24 @@ authorized. Evidence is in metadata-refusal-director/review-3/. Candidate
 integration and guest acceptance remain withheld. Previous turn was a
 verified wait on the same live worker; this turn completed independent
 verification and dispatched bounded corrections.
+
+2026-09-26: integrated metadata-refusal through director correction
+`1f6b71619` as `0687248fb`. The final worker `68bb6dc79` passes host checks
+but its claimed derived budgets were absent; director correction installs
+actual structure-derived bounds and authentic production-mutation controls.
+Exact growth fails at scale 32 (112 > 99 allocations); new rollback storage
+fails at scale 1 (one > zero). Restored source passes all four scales with
+zero rollback allocations/bytes; all five prescribed commands pass. The
+unused test-only public converter is removed. No fourth worker round occurred.
+Full integration CI and signed promotion remain open. First-touch remains red.
+
+The next bounded allocator/grant outcome is documented in
+2026-09-26-el1-elastic-metadata.md, committed as `b5df14f93`; it requires
+actual guest allocation, dynamic growth and return rather than host-only
+proof. All later checkpoints and original performance objectives remain open.
+
+Post-merge inventory reconciliation updated four existing abort fingerprints
+without changing verdicts or rationale, but host-authority compiler capture
+produced no candidate. Inspect the direct capture diagnostics before accepting
+inventory or CI closure; this is a verification failure, not a reason to bless
+an old capture. Implementation source is otherwise integrated.
