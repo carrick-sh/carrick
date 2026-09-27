@@ -1111,10 +1111,13 @@ pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
             let ptr = match GLOBAL_ALLOCATOR.allocate(allocation_layout) {
                 Some(ptr) => ptr,
                 None => {
-                    if GLOBAL_ALLOCATOR.service_test_host_work() {
-                        return carrick_el1_abi::METADATA_GRANT_PENDING;
-                    }
-                    return 201;
+                    // Another allocator user may complete the shared mailbox
+                    // between this miss losing publication and this check.
+                    // Either way the transaction must retry from its bounded
+                    // userspace loop; only exhaustion of that bound is a
+                    // terminal progress failure.
+                    let _ = GLOBAL_ALLOCATOR.service_test_host_work();
+                    return carrick_el1_abi::METADATA_GRANT_PENDING;
                 }
             };
 
