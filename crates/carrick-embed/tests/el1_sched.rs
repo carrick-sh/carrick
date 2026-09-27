@@ -1816,3 +1816,39 @@ fn el1_metadata_allocator_host_wait_requires_unmasked_irq() {
             .contains("metadata-allocator irq ok")
     );
 }
+
+/// Fork COW resolution verification: forks 100 times with private anonymous
+/// pages armed read-only for COW. 4 guest threads concurrently write to the
+/// pages, taking write permission faults. EL1 serves the faults in-guest by
+/// upgrading descriptors to AP_RW and invalidating ASIDs without host exits.
+/// Parent and child verify memory isolation and integrity.
+#[test]
+fn el1_fork_cow_resolves_in_guest() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["fork-cow", "100", "16"],
+        Duration::from_secs(60),
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    let stdout = measured.result.stdout_utf8();
+    assert!(
+        stdout.contains("fork-cow forks=100 pages=16 ok=true"),
+        "fixture fork-cow must succeed and verify isolation: {stdout:?}"
+    );
+
+    let el1_active = std::env::var("CARRICK_EL1").as_deref() != Ok("0");
+    if el1_active {
+        let counters =
+            read_el1_counters().expect("EL1 counters must be populated when EL1 is enabled");
+        let faults = counters
+            .fault_taken
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            faults >= 100,
+            "expected at least 100 EL1 fault entries for 100 fork-COW rounds, got {faults}"
+        );
+    }
+}

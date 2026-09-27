@@ -611,6 +611,145 @@ pub unsafe fn retire_existing_el1_private_pages(
     Ok(pages)
 }
 
+/// The outcome of attempting to resolve a COW fault in EL1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestCowResolution {
+    /// Leaf was already writable (stale TLB entry on this PE).
+    AlreadyWritable,
+    /// Leaf was armed read-only for COW and upgraded to writable.
+    Upgraded,
+}
+
+/// Why a guest EL1 COW fault could not be resolved in the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestCowError {
+    BadAddress,
+    NotMapped,
+    TableOutsidePrimary,
+    MissingTable,
+    NotPrivateAnonymous,
+    PermissionDenied,
+}
+
+/// Resolve one COW fault on an existing L3 leaf or block carrying EL1's
+/// private-anonymous authority.
+///
+/// If the descriptor is already writable (`AP_RW`), reports `AlreadyWritable`
+/// so caller can invalidate the ASID for this PE.
+/// If the descriptor is valid, read-only (`AP_RO`), carries `SW_EL1_PRIVATE`,
+/// and carries `SW_EL1_MAY_WRITE`, upgrades it to `AP_RW` with release ordering
+/// and reports `Upgraded`.
+/// If the descriptor does not carry `SW_EL1_MAY_WRITE` or `SW_EL1_PRIVATE`,
+/// returns `PermissionDenied` so the fault can be forwarded for signal delivery.
+///
+/// # Safety
+///
+/// The safety and exclusion requirements are identical to
+/// [`publish_existing_invalid_private_pages`].
+pub unsafe fn resolve_existing_el1_cow_page(
+    words: *mut core::sync::atomic::AtomicU64,
+    physical_base: u64,
+    byte_len: usize,
+    va: u64,
+) -> Result<GuestCowResolution, GuestCowError> {
+    use core::sync::atomic::Ordering;
+
+    if words.is_null()
+        || !(words as usize).is_multiple_of(core::mem::align_of::<core::sync::atomic::AtomicU64>())
+        || !physical_base.is_multiple_of(PT_PAGE)
+        || !va.is_multiple_of(PT_PAGE)
+    {
+        return Err(GuestCowError::BadAddress);
+    }
+    let terminal = unsafe {
+        existing_terminal_descriptor(words, physical_base, byte_len, va).map_err(|error| {
+            match error {
+                GuestLeafPublicationError::TableOutsidePrimary => {
+                    GuestCowError::TableOutsidePrimary
+                }
+                GuestLeafPublicationError::MissingTable => GuestCowError::MissingTable,
+                _ => GuestCowError::NotPrivateAnonymous,
+            }
+        })?
+    };
+    let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
+    if descriptor & VALID == 0 || descriptor & SW_RETIRED != 0 {
+        return Err(GuestCowError::NotMapped);
+    }
+    if descriptor & SW_EL1_PRIVATE == 0 {
+        return Err(GuestCowError::NotPrivateAnonymous);
+    }
+    if descriptor & AP_MASK == AP_RW {
+        return Ok(GuestCowResolution::AlreadyWritable);
+    }
+    if descriptor & SW_EL1_MAY_WRITE == 0 {
+        return Err(GuestCowError::PermissionDenied);
+    }
+    let uxn = descriptor & UXN;
+    let updated = (descriptor & !AP_MASK & !UXN) | AP_RW | uxn | VALID;
+    unsafe { (*terminal.word).store(updated, Ordering::Release) };
+    Ok(GuestCowResolution::Upgraded)
+}
+
+/// Arm an existing resident private-anonymous range read-only for fork COW under EL1 authority.
+///
+/// # Safety
+///
+/// The safety and exclusion requirements are identical to
+/// [`publish_existing_invalid_private_pages`].
+pub unsafe fn arm_existing_el1_fork_pages(
+    words: *mut core::sync::atomic::AtomicU64,
+    physical_base: u64,
+    byte_len: usize,
+    va: u64,
+    len: u64,
+) -> Result<usize, GuestCowError> {
+    use core::sync::atomic::Ordering;
+
+    if words.is_null()
+        || !(words as usize).is_multiple_of(core::mem::align_of::<core::sync::atomic::AtomicU64>())
+        || !physical_base.is_multiple_of(PT_PAGE)
+        || !va.is_multiple_of(PT_PAGE)
+        || len == 0
+        || !len.is_multiple_of(PT_PAGE)
+        || va.checked_add(len).is_none()
+    {
+        return Err(GuestCowError::BadAddress);
+    }
+    let pages = usize::try_from(len / PT_PAGE).map_err(|_| GuestCowError::BadAddress)?;
+    let terminal_for = |address| unsafe {
+        existing_terminal_descriptor(words, physical_base, byte_len, address).map_err(|error| {
+            match error {
+                GuestLeafPublicationError::TableOutsidePrimary => {
+                    GuestCowError::TableOutsidePrimary
+                }
+                GuestLeafPublicationError::MissingTable => GuestCowError::MissingTable,
+                _ => GuestCowError::NotPrivateAnonymous,
+            }
+        })
+    };
+
+    let end = va + len;
+    let mut current = va;
+    while current < end {
+        let terminal = terminal_for(current)?;
+        let terminal_end = terminal
+            .semantic_base
+            .checked_add(terminal.span)
+            .ok_or(GuestCowError::BadAddress)?;
+        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
+        if descriptor & VALID != 0
+            && descriptor & SW_RETIRED == 0
+            && descriptor & SW_EL1_PRIVATE != 0
+        {
+            let updated = (descriptor & !AP_MASK) | AP_RO | NON_GLOBAL;
+            unsafe { (*terminal.word).store(updated, Ordering::Release) };
+        }
+        current = terminal_end;
+    }
+    Ok(pages)
+}
+
 // User leaf flags (must match memory.rs USER_BLOCK_FLAGS / USER_PAGE_FLAGS).
 const USER_BLOCK_FLAGS: u64 = (1u64 << 53) | (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01;
 const USER_PAGE_FLAGS: u64 = USER_BLOCK_FLAGS | 0b10;
@@ -9074,5 +9213,83 @@ mod tests {
             bytes.as_slice(),
             "capacity refusal must leave every hardware-visible byte unchanged"
         );
+    }
+
+    #[test]
+    fn allocation_free_guest_cow_resolution_upgrades_armed_leaf_and_detects_stale_tlb() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        let root = 0x8800_0000_0000;
+        let va = 0x4000_0000;
+        let ipa = 0x009b_4000_0000;
+        let mut words: Vec<AtomicU64> = (0..(4 * 512)).map(|_| AtomicU64::new(0)).collect();
+        let indexes = indices(va);
+        words[indexes[0]].store((root + 0x1000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[512 + indexes[1]].store((root + 0x2000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[1024 + indexes[2]].store((root + 0x3000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        let l3 = 1536 + indexes[3];
+
+        // 1. Armed COW leaf: RO, non-global, private, may write.
+        let armed = (ipa & PA_MASK_4KIB)
+            | (USER_PAGE_FLAGS & !AP_MASK)
+            | AP_RO
+            | NON_GLOBAL
+            | UXN
+            | SW_EL1_PRIVATE
+            | SW_EL1_MAY_WRITE;
+        words[l3].store(armed, Ordering::Relaxed);
+
+        let byte_len = words.len() * core::mem::size_of::<AtomicU64>();
+        let res = unsafe { resolve_existing_el1_cow_page(words.as_mut_ptr(), root, byte_len, va) };
+        assert_eq!(res, Ok(GuestCowResolution::Upgraded));
+        let upgraded = words[l3].load(Ordering::Acquire);
+        assert_eq!(upgraded & AP_MASK, AP_RW);
+        assert_ne!(upgraded & SW_EL1_PRIVATE, 0);
+        assert_ne!(upgraded & SW_EL1_MAY_WRITE, 0);
+
+        // 2. Already writable: stale TLB detection.
+        let res2 = unsafe { resolve_existing_el1_cow_page(words.as_mut_ptr(), root, byte_len, va) };
+        assert_eq!(res2, Ok(GuestCowResolution::AlreadyWritable));
+
+        // 3. Permission denied: private page without SW_EL1_MAY_WRITE.
+        let readonly_private = (ipa & PA_MASK_4KIB)
+            | (USER_PAGE_FLAGS & !AP_MASK)
+            | AP_RO
+            | NON_GLOBAL
+            | UXN
+            | SW_EL1_PRIVATE;
+        words[l3].store(readonly_private, Ordering::Relaxed);
+        let res3 = unsafe { resolve_existing_el1_cow_page(words.as_mut_ptr(), root, byte_len, va) };
+        assert_eq!(res3, Err(GuestCowError::PermissionDenied));
+    }
+
+    #[test]
+    fn allocation_free_guest_fork_arming_sets_readonly_and_non_global() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        let root = 0x8800_0000_0000;
+        let va = 0x4000_0000;
+        let ipa = 0x009b_4000_0000;
+        let mut words: Vec<AtomicU64> = (0..(4 * 512)).map(|_| AtomicU64::new(0)).collect();
+        let indexes = indices(va);
+        words[indexes[0]].store((root + 0x1000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[512 + indexes[1]].store((root + 0x2000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[1024 + indexes[2]].store((root + 0x3000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        let l3 = 1536 + indexes[3];
+
+        // Active RW private leaf.
+        let active =
+            (ipa & PA_MASK_4KIB) | USER_PAGE_FLAGS | UXN | SW_EL1_PRIVATE | SW_EL1_MAY_WRITE;
+        words[l3].store(active, Ordering::Relaxed);
+
+        let byte_len = words.len() * core::mem::size_of::<AtomicU64>();
+        let armed_pages =
+            unsafe { arm_existing_el1_fork_pages(words.as_mut_ptr(), root, byte_len, va, PT_PAGE) };
+        assert_eq!(armed_pages, Ok(1));
+        let armed = words[l3].load(Ordering::Acquire);
+        assert_eq!(armed & AP_MASK, AP_RO);
+        assert_ne!(armed & NON_GLOBAL, 0);
+        assert_ne!(armed & SW_EL1_PRIVATE, 0);
+        assert_ne!(armed & SW_EL1_MAY_WRITE, 0);
     }
 }
