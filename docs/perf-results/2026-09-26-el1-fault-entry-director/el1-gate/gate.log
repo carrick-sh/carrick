@@ -1,0 +1,48 @@
+head 3667731b2
+sha256 e36d452942619460b34c5dc92fead500490c8f9fc82f2bf8e0c34f42e72ce526
+CDHash=c3c432c79f200055cdebb9a687889429d570effd
+    uuid 728ED042-8EBA-30EC-B1E7-BF271B2300FA
+com.apple.security.hypervisor
+dof present
+el1-gate: step el1-embed failed; tail of target/el1-gate/3667731b2/el1-embed.log:
+test el1_files_exit_group_stress ... ok
+test el1_files_inode_exclusivity_two_processes ... ok
+test el1_files_kick_delivery_spin_loop ... ok
+test el1_files_kick_delivery_spin_loop_signal ... ok
+test el1_files_memfd_never_delegated_and_seals_hold ... ok
+test el1_files_path_mutation_contract ... ok
+test el1_files_recall_on_teardown ... ok
+test el1_files_shared_inode_contract ... ok
+test el1_files_signal_stress ... ok
+test el1_zone_entry_at_open_contract ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.02s
+
+test-signed: running /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_transparent-1951afcd6ee3ca07 el1_
+
+running 2 tests
+test el1_transparent_fork_exec_shared_backing ... ok
+test el1_transparent_smoke ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+test-signed: running /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_kick_served_loop-1c85754bdf9a8aed el1_
+
+running 2 tests
+test el1_served_burst_surfaces_kicks_under_oversubscription ... ok
+test el1_served_loop_surfaces_kicks ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 112.03s
+
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-2b17a9dc788a7ac7.noent.26562: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-2b17a9dc788a7ac7.noent.26562
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+test-signed: FAILED (carrick-embed)
+remaining carrick procs (run-id el1-integrated-gate-20260926-3667731b2) = 0
+remaining carrick procs (run-id el1-integrated-gate-20260926-3667731b2-cli) = 0
+error: recipe `el1-gate` failed with exit code 1

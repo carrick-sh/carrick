@@ -621,3 +621,19 @@ and hashed receipt are preserved under the fault-entry director
 `ci-reconciled/` evidence directory. The six non-macOS authority profiles
 remain explicitly pending. Signed promotion and actual guest first-touch
 service are still open; the independent metadata-refusal worker is active.
+
+2026-09-26: signed integrated EL1 gate on `3667731b2` exits 1 solely on
+anonymous first-touch work: 614/2148/8293 host exits at 512/2048/8192 total
+pages, slope 0.9987 versus <0.125. Forty-one other EL1 tests and the negative
+control pass; cleanup is zero. All eight executed artifacts are frozen and
+CLI identity is unchanged. Public probes/LTP/inotify recipe steps did not
+run. Exact failure evidence is under fault-entry-director/el1-gate/.
+
+Metadata-refusal worker `32b0ad50f` passes the five prescribed commands but
+fails independent semantic review: under actual allocation refusal,
+coalescing drops a valid translation by freeing a still-linked child after
+ignoring the failed parent write. The retained director reproducer exits 101.
+Review round 1 also requires real live/adapter bindings, nonallocating error
+propagation and complete provenance/work evidence. The same worker is active
+on turn 2; implementation remains unintegrated. Evidence lives under
+`docs/perf-results/2026-09-26-mmu-metadata-refusal-director/review-1/`.

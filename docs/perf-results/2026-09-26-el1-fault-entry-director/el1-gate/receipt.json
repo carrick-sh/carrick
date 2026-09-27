@@ -1,0 +1,95 @@
+{
+  "source_head": "3667731b2d65347a3f8a5bf4166f397e18098ff7",
+  "command": "CARRICK_RUN_ID=el1-integrated-gate-20260926-3667731b2 RUSTC_WRAPPER= just --no-deps el1-gate",
+  "exit_code": 1,
+  "executables": [
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify09_probe-9605a37148f75c20",
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/fault-entry-final/el1-gate-frozen/a83a359f372f410ca661e4ccef5123c2c70cf49c55ef85addcc05de99a1f4c27-el1_inotify09_probe-9605a37148f75c20",
+      "sha256": "a83a359f372f410ca661e4ccef5123c2c70cf49c55ef85addcc05de99a1f4c27",
+      "cdhash": "eaac11b979e85b2dd7924448797ef4b9a7ad89c0",
+      "lc_uuid": "1E61AD2B-A83A-3281-ADFE-1C5C38F8CC78",
+      "hypervisor_entitlement": true,
+      "dof_present": true
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-ba795739d7a1a0f3",
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/fault-entry-final/el1-gate-frozen/46835e745de14045da8e934f15e45fa1201da040fd1068a8dde6def8f036e6c2-el1_sched-ba795739d7a1a0f3",
+      "sha256": "46835e745de14045da8e934f15e45fa1201da040fd1068a8dde6def8f036e6c2",
+      "cdhash": "6c112aa9a0823fa293e3af5b5c3ae9ffd03d7e92",
+      "lc_uuid": "FA6A2FE5-21D2-3CAC-9B12-09F94649A4D5",
+      "hypervisor_entitlement": true,
+      "dof_present": true
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify-2fab4762834f2e91",
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/fault-entry-final/el1-gate-frozen/389371f9d86ed592376aab684f88f032ed7affcd2afb8806661611e8d14ca28e-el1_inotify-2fab4762834f2e91",
+      "sha256": "389371f9d86ed592376aab684f88f032ed7affcd2afb8806661611e8d14ca28e",
+      "cdhash": "5c50818d755b2593e5c2eb85549c82cf57d95e1f",
+      "lc_uuid": "74188FCE-D381-300C-8D21-69DC89A2BC17",
+      "hypervisor_entitlement": true,
+      "dof_present": true
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_vcpu_lifetime-721cf0b5e1096e04",
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/fault-entry-final/el1-gate-frozen/060aa2fa6e4613306459210e3594f2947d9583cfbe20953d97af27d47145df3e-el1_vcpu_lifetime-721cf0b5e1096e04",
+      "sha256": "060aa2fa6e4613306459210e3594f2947d9583cfbe20953d97af27d47145df3e",
+      "cdhash": "7b70e9f324330d95d0c7301407e43b03fce611f0",
+      "lc_uuid": "A14F83ED-9C66-307A-948E-092931EA2613",
+      "hypervisor_entitlement": true,
+      "dof_present": true
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_gic-2e52deb07bcbc0e1",
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/fault-entry-final/el1-gate-frozen/6c79e9f3d63a6af9ce78ed73e1dbdc341ae82f3ba75f46cf8c5d91ca2bedf1de-el1_gic-2e52deb07bcbc0e1",
+      "sha256": "6c79e9f3d63a6af9ce78ed73e1dbdc341ae82f3ba75f46cf8c5d91ca2bedf1de",
+      "cdhash": "3d547145ea5bb53376fa2d9ad35cf64e1a500c01",
+      "lc_uuid": "8603DB26-522B-3F63-9857-48D17E101188",
+      "hypervisor_entitlement": true,
+      "dof_present": true
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_files-b5fe0e13fbafa92a",
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/fault-entry-final/el1-gate-frozen/c6e8729463da05d67b95190b6cc978f96386298b70c0dfea4a9a22771a850754-el1_files-b5fe0e13fbafa92a",
+      "sha256": "c6e8729463da05d67b95190b6cc978f96386298b70c0dfea4a9a22771a850754",
+      "cdhash": "75443f2f8f7ad40acda484fc1482066488a8c7f4",
+      "lc_uuid": "6A4F5C51-B2C1-37B6-8404-2D4691988841",
+      "hypervisor_entitlement": true,
+      "dof_present": true
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_transparent-1951afcd6ee3ca07",
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/fault-entry-final/el1-gate-frozen/38f7454efe1fa86aea45259ac6d9adf9246bde207e4644645e9238f6c22bdad5-el1_transparent-1951afcd6ee3ca07",
+      "sha256": "38f7454efe1fa86aea45259ac6d9adf9246bde207e4644645e9238f6c22bdad5",
+      "cdhash": "5e9420d8d48b02b0919aa32a3b18a9ff8288fe0f",
+      "lc_uuid": "848A303A-C308-365E-BEE7-724E40E5B574",
+      "hypervisor_entitlement": true,
+      "dof_present": true
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_kick_served_loop-1c85754bdf9a8aed",
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/fault-entry-final/el1-gate-frozen/5ff6a027594624dda3db8055229f76819c4b3a0f83b8c840570b224acc047916-el1_kick_served_loop-1c85754bdf9a8aed",
+      "sha256": "5ff6a027594624dda3db8055229f76819c4b3a0f83b8c840570b224acc047916",
+      "cdhash": "da2243b7e77358fa5744c08e3b7249eeab72fe86",
+      "lc_uuid": "AEF977C3-AF99-30CE-A1F4-6B8782EA0687",
+      "hypervisor_entitlement": true,
+      "dof_present": true
+    }
+  ],
+  "passed_including_negative_control": 42,
+  "failed": 1,
+  "failed_test": "el1_memory_first_touch_stays_in_guest",
+  "first_touch_total_pages": [
+    512,
+    2048,
+    8192
+  ],
+  "first_touch_host_exits": [
+    614,
+    2148,
+    8293
+  ],
+  "cleanup_remaining_processes": 0,
+  "later_gate_steps_executed": false,
+  "cli_unchanged": true
+}
