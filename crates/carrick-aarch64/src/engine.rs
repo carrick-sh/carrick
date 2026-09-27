@@ -68,6 +68,59 @@ pub fn reserve_hvpatch_process_apertures(
     )
 }
 
+/// Lower a [`PageTableError`] from page table operations into [`MemoryError`],
+/// preserving [`PageTableError::MetadataAllocation`] without allocating error strings.
+pub fn page_table_error_to_memory_error(error: PageTableError) -> MemoryError {
+    match error {
+        PageTableError::MetadataAllocation => MemoryError::MetadataAllocation,
+        PageTableError::OutOfTables => {
+            MemoryError::HostMap("stage-1 page-table pool exhausted".to_owned())
+        }
+        PageTableError::BadAddress | PageTableError::GicWindowOutput => MemoryError::OutOfBounds {
+            address: 0,
+            length: 0,
+        },
+        PageTableError::MissingArenaSource => {
+            MemoryError::HostMap("stage-1 page-table manager has no arena source".to_owned())
+        }
+        PageTableError::ConflictingArenaSource => {
+            MemoryError::HostMap("stage-1 page-table manager conflicting arena source".to_owned())
+        }
+        PageTableError::UnresolvedArena(base) => MemoryError::HostMap(format!(
+            "stage-1 page-table manager unresolved arena 0x{base:x}"
+        )),
+    }
+}
+
+/// Lower a [`PageTableError`] from `sync_to_host` into [`MemoryError`], preserving
+/// [`PageTableError::MetadataAllocation`] without allocating error strings.
+pub fn page_table_sync_error_to_memory_error(error: PageTableError) -> MemoryError {
+    match error {
+        PageTableError::MetadataAllocation => MemoryError::MetadataAllocation,
+        other => MemoryError::HostMap(format!(
+            "sync stage-1 page tables to host failed: {other:?}"
+        )),
+    }
+}
+
+/// Lower a [`PageTableError`] from `rollback_undo` into [`MemoryError`], preserving
+/// [`PageTableError::MetadataAllocation`] without allocating error strings.
+pub fn page_table_rollback_error_to_memory_error(error: PageTableError) -> MemoryError {
+    match error {
+        PageTableError::MetadataAllocation => MemoryError::MetadataAllocation,
+        other => MemoryError::HostMap(format!("stage-1 rollback failed: {other:?}")),
+    }
+}
+
+/// Lower a [`MemoryError`] into [`TrapError`], preserving [`MemoryError::MetadataAllocation`]
+/// as typed [`TrapError::MetadataAllocation`] without allocating strings.
+pub fn memory_error_to_trap_error(error: MemoryError, context: &str) -> TrapError {
+    match error {
+        MemoryError::MetadataAllocation => TrapError::MetadataAllocation,
+        other => TrapError::Hypervisor(format!("{context}: {other}")),
+    }
+}
+
 struct EngineHostResolver<'a, V> {
     vm: &'a V,
     pt_base: u64,
@@ -1081,11 +1134,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                             unsafe {
                                 editor.sync_to_host(resolver)
                             }
-                            .map_err(|error| {
-                                MemoryError::HostMap(format!(
-                                    "sync stage-1 page tables to host failed: {error:?}"
-                                ))
-                            })?;
+                            .map_err(page_table_sync_error_to_memory_error)?;
                             editor.manager.record_populated_prefixes(|base, prefix| {
                                 self.vm.record_stage1_populated_prefix(base, prefix);
                             });
@@ -1198,10 +1247,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         unsafe {
             self.page_tables
                 .rollback_undo(resolver)
-                .map_err(|e| match e {
-                    PageTableError::MetadataAllocation => MemoryError::MetadataAllocation,
-                    other => MemoryError::HostMap(format!("stage-1 rollback failed: {other}")),
-                })?;
+                .map_err(page_table_rollback_error_to_memory_error)?;
         }
         self.run_stage1_maintenance()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
@@ -2875,7 +2921,10 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                     cleanup_len
                 );
             }
-            return Err(TrapError::Hypervisor(error.to_string()));
+            return Err(memory_error_to_trap_error(
+                error,
+                "stage-1 alias page table mapping failed",
+            ));
         }
         Ok(())
     }
@@ -3464,20 +3513,17 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                         carrick_mem::memory::mmap_arena_size() as usize,
                     )
                 })
-                .map_err(|error| match error {
-                    MemoryError::MetadataAllocation => TrapError::MetadataAllocation,
-                    other => TrapError::Hypervisor(format!(
-                        "reserve sparse HVPatch root mmap arena: {other}"
-                    )),
+                .map_err(|error| {
+                    memory_error_to_trap_error(error, "reserve sparse HVPatch root mmap arena")
                 })?;
                 self.vm.retire_initial_mmap_arena()?;
             }
             self.pt_edit_and_flush(|editor| editor.reserve_hvpatch_process_apertures())
-                .map_err(|error| match error {
-                    MemoryError::MetadataAllocation => TrapError::MetadataAllocation,
-                    other => TrapError::Hypervisor(format!(
-                        "reserve hvpatch root-slot/global-frame apertures: {other}"
-                    )),
+                .map_err(|error| {
+                    memory_error_to_trap_error(
+                        error,
+                        "reserve hvpatch root-slot/global-frame apertures",
+                    )
                 })?;
         }
         self.set_unmapped(
@@ -3810,11 +3856,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                         }
                         Ok(outcome)
                     })
-                    .map_err(|error| match error {
-                        MemoryError::MetadataAllocation => TrapError::MetadataAllocation,
-                        other => TrapError::Hypervisor(format!(
-                            "arm hvpatch parent private fork leaves read-only: {other}"
-                        )),
+                    .map_err(|error| {
+                        memory_error_to_trap_error(
+                            error,
+                            "arm hvpatch parent private fork leaves read-only",
+                        )
                     })?;
 
                     // Durable pre-write structural receipt: one live-backing walk
@@ -5477,16 +5523,19 @@ mod tests {
     #[test]
     fn test_metadata_allocation_error_propagation_is_nonallocating() {
         let pt_err = PageTableError::MetadataAllocation;
-        let mem_err = match pt_err {
-            PageTableError::MetadataAllocation => MemoryError::MetadataAllocation,
-            other => MemoryError::HostMap(format!("{other:?}")),
-        };
+        let mem_err = page_table_sync_error_to_memory_error(pt_err);
         assert_eq!(mem_err, MemoryError::MetadataAllocation);
-
-        let trap_err = match mem_err {
-            MemoryError::MetadataAllocation => TrapError::MetadataAllocation,
-            other => TrapError::Hypervisor(format!("{other:?}")),
-        };
+        let trap_err = memory_error_to_trap_error(mem_err, "test context");
         assert!(matches!(trap_err, TrapError::MetadataAllocation));
+
+        let rollback_mem_err = page_table_rollback_error_to_memory_error(pt_err);
+        assert_eq!(rollback_mem_err, MemoryError::MetadataAllocation);
+        let rollback_trap_err = memory_error_to_trap_error(rollback_mem_err, "test rollback");
+        assert!(matches!(rollback_trap_err, TrapError::MetadataAllocation));
+
+        let general_mem_err = page_table_error_to_memory_error(pt_err);
+        assert_eq!(general_mem_err, MemoryError::MetadataAllocation);
+        let general_trap_err = memory_error_to_trap_error(general_mem_err, "test general");
+        assert!(matches!(general_trap_err, TrapError::MetadataAllocation));
     }
 }

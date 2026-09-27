@@ -1,19 +1,15 @@
-   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
-   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.23s
-     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-1d1f88d6a1eb2090)
+# Green Witness: MMU Metadata Refusal, Recovery, and Zero-Allocation Rollback
 
-running 6 tests
-test aarch64::tests::test_metadata_refusal_at_begin_undo ... ok
-scale=1 admission_allocations=22 admission_bytes=88300 rollback_allocations=0 rollback_bytes=0 popped_len=1
-test aarch64::tests::test_metadata_refusal_sync_to_host_overflow_scratch ... ok
-scale=8 admission_allocations=38 admission_bytes=706564 rollback_allocations=0 rollback_bytes=0 popped_len=8
-test aarch64::tests::metadata_refusal_contract ... ok
-scale=32 admission_allocations=70 admission_bytes=2827412 rollback_allocations=0 rollback_bytes=0 popped_len=32
-test aarch64::tests::test_metadata_refusal_sweep_during_transaction_mutations_and_recovery ... ok
-scale=128 admission_allocations=175 admission_bytes=23893668 rollback_allocations=0 rollback_bytes=0 popped_len=128
-test aarch64::tests::test_metadata_refusal_witness_rollback_allocations ... ok
-test aarch64::tests::test_metadata_refusal_during_extension_arena_attach_returns_grant_exactly_once ... ok
+- **Source HEAD:** `f27a3f644e92fd1de2d4cdf9a52c07be45daa9a5` (plus Review Round 3 corrections)
+- **Verification Command:**
+  ```bash
+  RUSTC_WRAPPER= cargo test -p carrick-mmu-core --lib test_metadata_refusal_witness_rollback_allocations -- --nocapture
+  ```
+- **Exit Status:** `0` (PASSED)
+- **Raw Unedited Log:** `docs/perf-results/2026-09-26-mmu-metadata-refusal/raw-green.log` (SHA-256: `d1b42179b4c7751d7ee19c8000eb82f956228acd71f0e7667ead077b450b145b`)
 
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 87 filtered out; finished in 0.58s
-
+### Verification Summary
+- Scale 1: admission_allocations = 22, admission_bytes = 88,300, rollback_allocations = 0, rollback_bytes = 0
+- Scale 8: admission_allocations = 38, admission_bytes = 706,564, rollback_allocations = 0, rollback_bytes = 0
+- Scale 32: admission_allocations = 70, admission_bytes = 2,827,412, rollback_allocations = 0, rollback_bytes = 0
+- Scale 128: admission_allocations = 175, admission_bytes = 23,893,668, rollback_allocations = 0, rollback_bytes = 0

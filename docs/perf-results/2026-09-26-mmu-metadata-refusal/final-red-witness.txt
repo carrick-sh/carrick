@@ -2,7 +2,17 @@
 
 ## 1. Zero-Allocation Rollback Structural Red Witness (Final Fixture Shape)
 
-### Source Diff (Reverting Pre-Admitted Returned Bases Production Code)
+- **Source HEAD:** `f27a3f644e92fd1de2d4cdf9a52c07be45daa9a5`
+- **Applied Production Diff File:** `docs/perf-results/2026-09-26-mmu-metadata-refusal/revert-returned-bases.patch`
+- **Patch SHA-256:** `722484d1eefaea646a61ecd4e8e9e792970ee603e7f3361b65c588eed54f12fb`
+- **Verification Command:**
+  ```bash
+  RUSTC_WRAPPER= cargo test -p carrick-mmu-core --lib test_metadata_refusal_witness_rollback_allocations -- --nocapture
+  ```
+- **Exit Status:** `101` (FAILED)
+- **Raw Unedited Log:** `docs/perf-results/2026-09-26-mmu-metadata-refusal/raw-final-red.log` (SHA-256: `a9996f4c05c7b6b968323d1e828d0fb241a80116d58601b55c399c772ab20bc2`)
+
+### Applied Source Diff
 ```diff
 --- a/crates/carrick-mmu-core/src/aarch64.rs
 +++ b/crates/carrick-mmu-core/src/aarch64.rs
@@ -12,43 +22,14 @@
 +        let mut popped = Vec::new();
 ```
 
-### Verification Command
-```bash
-RUSTC_WRAPPER= cargo test -p carrick-mmu-core --lib test_metadata_refusal_witness_rollback_allocations -- --nocapture
-```
-
-### Verbatim Raw Failure Output
-```
-    Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
-    Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
-     Finished `test` profile [unoptimized + debuginfo] target(s) in 1.06s
-      Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-1d1f88d6a1eb2090)
-
-running 1 test
-scale=1 admission_allocations=22 admission_bytes=88300 rollback_allocations=1 rollback_bytes=32 popped_len=1
-
-thread 'aarch64::tests::test_metadata_refusal_witness_rollback_allocations' (13696349) panicked at crates/carrick-mmu-core/src/aarch64.rs:3699:13:
-assertion `left == right` failed: scale=1: rollback allocated heap memory (1 allocs)
-  left: 1
- right: 0
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-test aarch64::tests::test_metadata_refusal_witness_rollback_allocations ... FAILED
-
-failures:
-
-failures:
-    aarch64::tests::test_metadata_refusal_witness_rollback_allocations
-
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 92 filtered out; finished in 0.03s
-
-error: test failed, to rerun pass `-p carrick-mmu-core --lib`
-```
-
 ## 2. Coalescing and Reclaim Refusal Ordering Witness Citation
 
-- **Authentic Review Round 1 Coalescing Failure:** Tested via director witness `/tmp/el1-metadata-review1/coalesce-witness.diff` and log `/tmp/el1-metadata-review1/coalesce-witness.log`.
-- **Finding:** In unpatched source, `try_coalesce` and reclaim helpers ignored errors from `write_desc` and `free_table`. Allocator refusal during parent descriptor write resulted in freeing the child table and returning `coalesced = true`, leaving `translation None` instead of original `Some(...)`.
-- **Durable Regressions Tested:**
+- **Durable Director Coalesce Proof:** Committed under `docs/perf-results/2026-09-26-mmu-metadata-refusal-director/review-1/coalesce-witness.diff` (SHA-256 `d4ded7cf0ea00b56431ba8db9ba6fbaa95f94555246dd6e00b18533054a97c02`) and `coalesce-witness.log` (SHA-256 `913833feb939ea63f5e6ad93018673d8aa334264fe93584cc83dcd3f490259c4`).
+- **Defect Demonstrated:** In unpatched source, `try_coalesce` and reclaim helpers ignored errors from `write_desc` and `free_table`. Allocator refusal during parent descriptor write resulted in zeroing/freeing the child table and returning `coalesced = true`, corrupting translation (`None` vs `Some(412318957568)`).
+- **Durable Regressions Enforced in Test Suite:**
   - `director_coalesce_refusal_preserves_linked_table` (write-failure ordering: parent write refusal keeps child table linked and preserved).
   - `test_coalesce_free_tables_refusal_preserves_state` (free-bookkeeping ordering: `free_tables` reservation refusal aborts before mutating parent descriptor).
   - `test_reclaim_refusal_preserves_linked_tables` (reclamation sweep refusal preserves `reclaim_pending` and linked child tables).
+
+## 3. Historical Artifacts
+- `red-witness.txt`: Preserved historical evidence from initial pre-admission harness shape (three allocations at scale 1 before journal pre-reservation).
