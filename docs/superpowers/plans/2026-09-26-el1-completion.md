@@ -445,3 +445,19 @@ promotion and the first-touch structural red remain open. Next implementation
 work must establish EL1 metadata allocation/reclamation, fault entry and elastic
 frame grant/return, then service first-touch in the guest; all later checkpoints
 and inherited acceptance obligations remain in scope.
+
+### Public probe regression: exec successor resolver
+
+Public probe promotion on `33b590cd8` aborted at the first case of every shard
+in brk heap expansion. LLDB established that the replacement exec tables were
+being read through the predecessor MM resolver. The initially displayed
+zero-length ledger key was an optimized-debugger artifact; real register bounds
+were valid. Do not weaken bounds or generation authentication.
+
+Binding the replacement resolver in `execve_rebuild_inner` turns the existing
+`accessx` signed probe green for musl and GNU. Fresh matching-image native
+Docker output also matches both committed oracles, negative entitlement passes,
+and cleanup is empty. Exact red/green artifacts and the correction are in the
+[exec resolver receipt](../../perf-results/2026-09-26-el1-live-table-review/exec-resolver/README.md).
+Full probe promotion and CI still need rerunning; smoke/full and actual EL1
+first-touch service remain open. The complete migration scope is unchanged.

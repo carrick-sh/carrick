@@ -1,0 +1,81 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-kernel)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+   Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-engine)
+   Compiling carrick-embed v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-embed)
+   Compiling carrick-conformance-next v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-conformance-next)
+    Finished `release` profile [optimized + debuginfo] target(s) in 2m 06s
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/futex_contract-62a2fe7d9ca68235.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/futex_contract-62a2fe7d9ca68235
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/dedicated_service_groups-647a6c4834f8eb83.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/dedicated_service_groups-647a6c4834f8eb83
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/signal_lease_gap-365d1f091e5130ef.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/signal_lease_gap-365d1f091e5130ef
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/ptrace_poketext_signed-49ae785254ed02fd.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/ptrace_poketext_signed-49ae785254ed02fd
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/private_file_cow_lanes-6c4a057643b21880.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/private_file_cow_lanes-6c4a057643b21880
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/immutable_private_file-2cc8267c470830e1.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/immutable_private_file-2cc8267c470830e1
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/workload_cases-f3ae325e0ca8615e.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/workload_cases-f3ae325e0ca8615e
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/dedicated_container_topologies-33b9e74d6b58675d.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/dedicated_container_topologies-33b9e74d6b58675d
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/deferred_anonymous-9fcc517660531c21.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/deferred_anonymous-9fcc517660531c21
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_2-19749884b4f574cf.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_2-19749884b4f574cf
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/core_mount-c4d897b66eef633e.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/core_mount-c4d897b66eef633e
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/dedicated_bridge_single-0ebfab20df9ad78e.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/dedicated_bridge_single-0ebfab20df9ad78e
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/ecosystem_reducers-0a8c14d3ad4dd098.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/ecosystem_reducers-0a8c14d3ad4dd098
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/carrick_conformance_next-c958bfcf6cdb579f.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/carrick_conformance_next-c958bfcf6cdb579f
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/inotify_lifecycle-2dc6a6241a89085f.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/inotify_lifecycle-2dc6a6241a89085f
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/write_seek_lease-bfb1f7871184c2cd.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/write_seek_lease-bfb1f7871184c2cd
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/syscall_write_destinations-94325811b17b8933.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/syscall_write_destinations-94325811b17b8933
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_1-bc0e839cf293d362.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_1-bc0e839cf293d362
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-3f2703bc80d07645.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-3f2703bc80d07645
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_0-6f17ebf33364690d.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_0-6f17ebf33364690d
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/conformance_cases-0afeefc56eb25036.tmp.7795: replacing existing signature
+test-signed: signed /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/conformance_cases-0afeefc56eb25036
+test-signed: running /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_2-19749884b4f574cf generic_probe_shard_ --nocapture
+
+running 1 test
+test generic_probe_shard_2 ... RUN generic probe shard 2 aarch64-unknown-linux-musl:accessx
+carrick fatal [dispatch::brk]: protect_range failed during brk heap expansion
+./scripts/test-signed.sh: line 371:  9681 Abort trap: 6           env RUST_TEST_THREADS=1 "$exe" "$@"
+test-signed: FAIL /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_2-19749884b4f574cf
+test-signed: running /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_1-bc0e839cf293d362 generic_probe_shard_ --nocapture
+
+running 1 test
+test generic_probe_shard_1 ... RUN generic probe shard 1 aarch64-unknown-linux-musl:acceptsock
+carrick fatal [dispatch::brk]: protect_range failed during brk heap expansion
+./scripts/test-signed.sh: line 371:  9706 Abort trap: 6           env RUST_TEST_THREADS=1 "$exe" "$@"
+test-signed: FAIL /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_1-bc0e839cf293d362
+test-signed: running /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_0-6f17ebf33364690d generic_probe_shard_ --nocapture
+
+running 1 test
+test generic_probe_shard_0 ... RUN generic probe shard 0 aarch64-unknown-linux-musl:abortdeath
+carrick fatal [dispatch::brk]: protect_range failed during brk heap expansion
+./scripts/test-signed.sh: line 371:  9731 Abort trap: 6           env RUST_TEST_THREADS=1 "$exe" "$@"
+test-signed: FAIL /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_0-6f17ebf33364690d
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-3f2703bc80d07645.noent.7795: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-3f2703bc80d07645.noent.7795
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.05s
+
+test-signed: FAILED (carrick-conformance-next)
+remaining carrick procs (run-id el1-public-probes-20260926-33b590cd8) = 0
+remaining carrick procs (run-id el1-public-probes-20260926-33b590cd8-cli) = 0
+error: recipe `conformance-probes` failed with exit code 1
