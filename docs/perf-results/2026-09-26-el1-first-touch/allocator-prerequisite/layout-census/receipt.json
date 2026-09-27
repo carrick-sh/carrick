@@ -1,0 +1,10 @@
+{
+  "source_head": "7f7b4ba13d67d233338633736a9261aa50a7c575",
+  "abi_sha256": "8b694b74e0399657b46d83ab23ba8f7073fe2f8b417c6caac2aa76296c595207",
+  "witness_sha256": "191ca9695a40c4f5eef03353862be20c135e2cb7b366821028e4d803e9dbd61f",
+  "command": "RUSTC_WRAPPER= cargo run --manifest-path target/el1-completion/allocator-prerequisite/Cargo.toml --example layout",
+  "exit_code": 0,
+  "nominal_heap_bytes": 50331648,
+  "unassigned_bytes_in_nominal_heap": 1835008,
+  "unassigned_bytes_in_region": 11272192
+}

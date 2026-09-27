@@ -1,0 +1,20 @@
+   Compiling carrick-el1-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1-abi)
+   Compiling carrick-el1 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-el1)
+   Compiling el1-allocator-prerequisite v0.0.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/allocator-prerequisite)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.33s
+     Running `target/el1-completion/allocator-prerequisite/target/debug/examples/layout`
+reserved image offset=0x0 end=0x100000 bytes=1048576
+reserved counters offset=0x100000 end=0x200000 bytes=1048576
+reserved stacks offset=0x200000 end=0x600000 bytes=4194304
+reserved current_tasks offset=0x600000 end=0x700000 bytes=1048576
+unassigned offset=0x700000 end=0x1000000 bytes=9437184
+reserved objects offset=0x1000000 end=0x1010000 bytes=65536
+reserved fd_map offset=0x1010000 end=0x1020000 bytes=65536
+reserved open_files offset=0x1020000 end=0x1030000 bytes=65536
+unassigned offset=0x1030000 end=0x1100000 bytes=851968
+reserved file_cache offset=0x1100000 end=0x3100000 bytes=33554432
+reserved inotify offset=0x3100000 end=0x3400000 bytes=3145728
+reserved name_cache offset=0x3400000 end=0x3410000 bytes=65536
+unassigned offset=0x3410000 end=0x3500000 bytes=983040
+reserved scheduler_zone offset=0x3500000 end=0x4000000 bytes=11534336
+region_base=0x2d04000000 region_size=67108864 unassigned_total=11272192 nominal_heap_size=50331648 unassigned_in_nominal_heap=1835008

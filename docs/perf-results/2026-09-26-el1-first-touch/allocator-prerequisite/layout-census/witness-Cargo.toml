@@ -1,0 +1,8 @@
+[package]
+name="el1-allocator-prerequisite"
+version="0.0.0"
+edition="2024"
+[workspace]
+[dependencies]
+carrick-el1={path="../../../crates/carrick-el1"}
+carrick-el1-abi={path="../../../crates/carrick-el1-abi"}

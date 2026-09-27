@@ -637,3 +637,11 @@ Review round 1 also requires real live/adapter bindings, nonallocating error
 propagation and complete provenance/work evidence. The same worker is active
 on turn 2; implementation remains unintegrated. Evidence lives under
 `docs/perf-results/2026-09-26-mmu-metadata-refusal-director/review-1/`.
+
+2026-09-26: compiled ABI layout census confirms the nominal 48 MiB heap
+contains only 1.75 MiB outside named reservations; 9 MiB more is unassigned
+before it. Evidence and exact source/ABI hashes live in first-touch/
+allocator-prerequisite/layout-census/. These are possible bootstrap intervals,
+not an elastic allocator or guest execution proof. Keep extent growth/return,
+pointer-domain identity and IRQ/lock ordering in the allocator prerequisite;
+do not fix the dormant bump allocator by moving it into another reserved table.
