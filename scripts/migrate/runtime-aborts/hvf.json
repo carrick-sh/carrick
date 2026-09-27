@@ -1734,7 +1734,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
       "ordinal_in_function": 1,
-      "fingerprint": "f96b34923482d8dc96aba09e6e329858df0a6406af04b35d198cbf12161c84fa",
+      "fingerprint": "f5507e259087c123f39d8b67c43696b635d97bf2c8d7008b6050a12aacfb4fa7",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::sparse_materialization_rollback",
       "rationale": "Sparse page-table publication failed and restoring its descriptor journal or retiring extension arenas also failed; continuing would retain a partial stage-1 mapping or recycle live structural backing.",
