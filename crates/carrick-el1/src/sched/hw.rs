@@ -355,12 +355,6 @@ pub fn read_current_sp() -> u64 {
     sp
 }
 
-#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-#[inline(always)]
-pub fn read_current_sp() -> u64 {
-    0
-}
-
 /// Guard structure capturing saved DAIF interrupt flags.
 pub struct IrqGuard {
     #[allow(dead_code)]

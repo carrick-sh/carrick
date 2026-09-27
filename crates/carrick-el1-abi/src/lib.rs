@@ -1068,6 +1068,39 @@ impl FrameGrantMailbox {
         Some(self.load_response(request))
     }
 
+    /// Observe, without consuming, a response for this MM whose granted
+    /// range covers `fault_va`, or a refusal for the same page. The EL1
+    /// scheduler migrates threads between vCPUs, so a retried fault can land
+    /// on a vCPU other than the one whose mailbox holds its response; left
+    /// unclaimed, that response would also wedge the original mailbox.
+    pub fn response_covering_fault(
+        &self,
+        mm_key: u64,
+        fault_va: u64,
+        access: u64,
+    ) -> Option<FrameGrantResponse> {
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_RESPONSE {
+            return None;
+        }
+        let request = self.load_request();
+        if request.mm_key != mm_key {
+            return None;
+        }
+        let response = self.load_response(request);
+        let covers = match response.ready {
+            Some(ready) => {
+                ready.semantic_base <= fault_va
+                    && ready
+                        .semantic_base
+                        .checked_add(ready.len)
+                        .is_some_and(|end| fault_va < end)
+                    && Self::permissions_allow_access(ready.permissions, access)
+            }
+            None => request.fault_va / Self::PAGE_SIZE == fault_va / Self::PAGE_SIZE,
+        };
+        covers.then_some(response)
+    }
+
     pub fn claim_response(
         &self,
         mm_key: u64,
@@ -1154,6 +1187,10 @@ impl FrameGrantMailboxes {
 
     pub fn slot(&self, slot: usize) -> Option<&FrameGrantMailbox> {
         self.slots.get(slot)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &FrameGrantMailbox> {
+        self.slots.iter()
     }
 }
 
@@ -1832,6 +1869,14 @@ pub fn metadata_mailbox_guest() -> &'static MetadataGrantMailbox {
     // SAFETY: EL1_METADATA_MAILBOX_BASE is part of the mapped kernel-only EL1
     // ABI region and the object layout is included in EL1_ABI_LAYOUT_HASH.
     unsafe { &*(EL1_METADATA_MAILBOX_BASE as *const MetadataGrantMailbox) }
+}
+
+/// Guest view of every slot's anonymous-frame mailbox. Call only while
+/// executing in the installed Carrick EL1 image.
+#[cfg(target_os = "none")]
+pub fn frame_grant_mailboxes_guest() -> &'static FrameGrantMailboxes {
+    // SAFETY: identical to `frame_grant_mailbox_guest_for_slot`.
+    unsafe { &*(EL1_FRAME_GRANT_MAILBOX_BASE as *const FrameGrantMailboxes) }
 }
 
 /// Guest view of one slot's anonymous-frame mailbox. Call only while executing

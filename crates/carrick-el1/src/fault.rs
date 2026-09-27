@@ -2,7 +2,7 @@
 
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, EL1_FRAME_GRANT_TARGET_SIZE, FRAME_GRANT_SUCCESS,
-    FrameGrantMailbox, FrameGrantReady, FrameGrantRequest, TrapFrame,
+    FrameGrantMailbox, FrameGrantMailboxes, FrameGrantReady, FrameGrantRequest, TrapFrame,
 };
 use carrick_sched_core::AddressSpaces;
 use core::num::NonZeroU64;
@@ -118,8 +118,7 @@ impl CowResolver for HardwareCowResolver {
             )
         };
         match outcome {
-            Ok(carrick_mmu_core::aarch64::GuestCowResolution::AlreadyWritable)
-            | Ok(carrick_mmu_core::aarch64::GuestCowResolution::Upgraded) => {
+            Ok(carrick_mmu_core::aarch64::GuestCowResolution::AlreadyWritable) => {
                 let mut cpu = crate::sched::HardwareCpu;
                 crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
                 true
@@ -238,7 +237,10 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
             counters,
             current_tasks,
             &zone.spaces,
-            mailbox,
+            GrantMailboxes {
+                own: mailbox,
+                peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
+            },
             &mut HardwareFrameGrantLeafPublisher,
             &mut HardwareCowResolver,
         )
@@ -251,6 +253,21 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
     }
 }
 
+/// The faulting vCPU's frame-grant mailbox, plus every vCPU's mailbox so a
+/// retry migrated by the EL1 scheduler can consume the grant its first fault
+/// was answered with elsewhere.
+#[derive(Clone, Copy)]
+pub struct GrantMailboxes<'a> {
+    pub own: &'a FrameGrantMailbox,
+    pub peers: Option<&'a FrameGrantMailboxes>,
+}
+
+impl<'a> GrantMailboxes<'a> {
+    pub fn own(own: &'a FrameGrantMailbox) -> Self {
+        Self { own, peers: None }
+    }
+}
+
 /// Fault dispatch with explicitly supplied shared regions, leaf publisher, and COW resolver.
 /// A refusal or any inability to authenticate/edit the exact MM consumes the
 /// response and forwards once through the existing host fault path.
@@ -259,10 +276,14 @@ pub fn dispatch_fault_with_regions<P: FrameGrantLeafPublisher, C: CowResolver>(
     counters: &Counters,
     current_tasks: &[CurrentTask],
     spaces: &AddressSpaces,
-    mailbox: &FrameGrantMailbox,
+    mailboxes: GrantMailboxes<'_>,
     publisher: &mut P,
     cow_resolver: &mut C,
 ) -> Action {
+    let GrantMailboxes {
+        own: mailbox,
+        peers,
+    } = mailboxes;
     counters.fault_taken.fetch_add(1, Ordering::Relaxed);
     if is_write_permission_fault(frame.esr) {
         let Some(task) = current_tasks.get(frame.slot as usize) else {
@@ -301,12 +322,21 @@ pub fn dispatch_fault_with_regions<P: FrameGrantLeafPublisher, C: CowResolver>(
         return Action::Forward;
     }
 
-    if let Some(response) = mailbox.response_for_fault(mm_key, frame.far, access) {
+    let found = mailbox
+        .response_for_fault(mm_key, frame.far, access)
+        .map(|response| (mailbox, response))
+        .or_else(|| {
+            peers?.iter().find_map(|peer| {
+                peer.response_covering_fault(mm_key, frame.far, access)
+                    .map(|response| (peer, response))
+            })
+        });
+    if let Some((source, response)) = found {
+        let generation = response.request.request_generation;
         if response.status != FRAME_GRANT_SUCCESS {
-            let Some(response) = mailbox.claim_response_for_fault(mm_key, frame.far, access) else {
-                return Action::Forward;
-            };
-            assert!(mailbox.finish_response(mm_key, response.request.request_generation));
+            if source.claim_response(mm_key, generation).is_some() {
+                assert!(source.finish_response(mm_key, generation));
+            }
             return Action::Forward;
         }
         let Some(index) = spaces.find(mm_key) else {
@@ -321,7 +351,7 @@ pub fn dispatch_fault_with_regions<P: FrameGrantLeafPublisher, C: CowResolver>(
         let Some(_editor) = spaces.try_begin_edit(index, mm_key, owner) else {
             return Action::Forward;
         };
-        let Some(response) = mailbox.claim_response_for_fault(mm_key, frame.far, access) else {
+        let Some(response) = source.claim_response(mm_key, generation) else {
             return Action::Forward;
         };
         let ready = response
@@ -331,7 +361,7 @@ pub fn dispatch_fault_with_regions<P: FrameGrantLeafPublisher, C: CowResolver>(
             publisher.publish_and_invalidate(grant.ttbr0, ready),
             "authenticated frame-grant leaf publication failed after editor admission"
         );
-        assert!(mailbox.finish_response(mm_key, response.request.request_generation));
+        assert!(source.finish_response(mm_key, generation));
         return Action::Served;
     }
 
@@ -475,7 +505,7 @@ mod tests {
                 &counters,
                 &tasks,
                 &spaces,
-                &mailbox,
+                GrantMailboxes::own(&mailbox),
                 &mut publisher,
                 &mut cow_resolver,
             ),
@@ -507,7 +537,7 @@ mod tests {
                 &counters,
                 &tasks,
                 &spaces,
-                &mailbox,
+                GrantMailboxes::own(&mailbox),
                 &mut publisher,
                 &mut cow_resolver,
             ),
@@ -516,6 +546,84 @@ mod tests {
         assert_eq!(publisher.calls, vec![(ttbr0, ready)]);
         assert!(!mailbox.has_guest_work());
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 2);
+    }
+
+    /// A thread whose grant request was answered in vCPU 0's mailbox can be
+    /// migrated by the EL1 scheduler before it retries. The retry on vCPU 1
+    /// must consume that covering response instead of republishing: the
+    /// host has already committed the plan, so a new request is refused and
+    /// the fault becomes SIGSEGV, and the orphaned response wedges vCPU 0.
+    #[test]
+    fn migrated_retry_consumes_the_covering_grant_from_another_vcpu() {
+        let mm = 9;
+        let ttbr0 = (33_u64 << 48) | 0x8a00_0000_0000;
+        let first = CurrentTask::new();
+        first.zone_mm.store(mm, Ordering::Release);
+        let second = CurrentTask::new();
+        second.zone_mm.store(mm, Ordering::Release);
+        let tasks = [first, second];
+        let spaces = published_space(mm, ttbr0);
+        let mailboxes = FrameGrantMailboxes::new();
+        let origin = mailboxes.slot(0).unwrap();
+        let current = mailboxes.slot(1).unwrap();
+        let counters = Counters::default();
+        let mut publisher = RecordingPublisher {
+            succeeds: true,
+            ..RecordingPublisher::default()
+        };
+        let mut cow_resolver = NoopCowResolver;
+
+        let mut on_origin = write_translation_fault(0, 0x4000_2123);
+        assert_eq!(
+            dispatch_fault_with_regions(
+                &mut on_origin,
+                &counters,
+                &tasks,
+                &spaces,
+                GrantMailboxes {
+                    own: origin,
+                    peers: Some(&mailboxes),
+                },
+                &mut publisher,
+                &mut cow_resolver,
+            ),
+            Action::Forward
+        );
+        let request = origin.claim_request().expect("origin request");
+        let ready = FrameGrantReady {
+            mm_key: mm,
+            request_generation: request.request_generation,
+            semantic_base: 0x4000_0000,
+            physical_ipa: 0x9000_0000,
+            len: 0x20_0000,
+            permissions: 3,
+            frame_id: 51,
+            mapping_id: 52,
+            owner_generation: 53,
+            inventory_revision: 54,
+        };
+        assert!(origin.publish_ready(ready));
+
+        // Retried on another vCPU, at another page inside the grant.
+        let mut migrated = write_translation_fault(1, 0x4000_5008);
+        assert_eq!(
+            dispatch_fault_with_regions(
+                &mut migrated,
+                &counters,
+                &tasks,
+                &spaces,
+                GrantMailboxes {
+                    own: current,
+                    peers: Some(&mailboxes),
+                },
+                &mut publisher,
+                &mut cow_resolver,
+            ),
+            Action::Served
+        );
+        assert_eq!(publisher.calls, vec![(ttbr0, ready)]);
+        assert!(!origin.has_guest_work(), "origin mailbox must be released");
+        assert!(!current.has_guest_work(), "no duplicate request published");
     }
 
     #[test]
@@ -537,7 +645,7 @@ mod tests {
                 &counters,
                 &tasks,
                 &spaces,
-                &mailbox,
+                GrantMailboxes::own(&mailbox),
                 &mut publisher,
                 &mut cow_resolver,
             ),
@@ -551,7 +659,7 @@ mod tests {
                 &counters,
                 &tasks,
                 &spaces,
-                &mailbox,
+                GrantMailboxes::own(&mailbox),
                 &mut publisher,
                 &mut cow_resolver,
             ),
@@ -581,7 +689,7 @@ mod tests {
                 &counters,
                 &tasks,
                 &spaces,
-                &mailbox,
+                GrantMailboxes::own(&mailbox),
                 &mut publisher,
                 &mut cow_resolver,
             ),
@@ -619,7 +727,7 @@ mod tests {
                 &counters,
                 &tasks,
                 &spaces,
-                &mailbox,
+                GrantMailboxes::own(&mailbox),
                 &mut publisher,
                 &mut cow_resolver,
             ),
@@ -647,7 +755,7 @@ mod tests {
                 &counters,
                 &tasks,
                 &spaces,
-                &mailbox,
+                GrantMailboxes::own(&mailbox),
                 &mut publisher,
                 &mut cow_resolver,
             ),
@@ -663,7 +771,7 @@ mod tests {
                 &counters,
                 &tasks,
                 &spaces,
-                &mailbox,
+                GrantMailboxes::own(&mailbox),
                 &mut publisher,
                 &mut cow_resolver,
             ),
@@ -692,7 +800,7 @@ mod tests {
                 &counters,
                 &tasks,
                 &spaces,
-                &mailbox,
+                GrantMailboxes::own(&mailbox),
                 &mut publisher,
                 &mut cow_resolver,
             ),
@@ -726,7 +834,7 @@ mod tests {
                 &counters,
                 &tasks,
                 &spaces,
-                &mailbox,
+                GrantMailboxes::own(&mailbox),
                 &mut publisher,
                 &mut cow_resolver,
             ),
@@ -762,7 +870,7 @@ mod tests {
                 &counters,
                 &tasks,
                 &spaces,
-                &mailbox,
+                GrantMailboxes::own(&mailbox),
                 &mut publisher,
                 &mut cow_resolver,
             ),

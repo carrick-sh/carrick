@@ -155,10 +155,12 @@ impl El1FrameGrantLedger {
             )));
         }
         let key = (base, length);
+        // This ledger only feeds allocator statistics. Some host return paths
+        // (process teardown, host-side munmap of an EL1 grant) release the
+        // extent without `mark_return`; a re-grant of the same extent is then
+        // counted as reuse rather than aborting the carrier.
         if !self.active.insert(key) {
-            return Err(TrapError::Hypervisor(format!(
-                "EL1 frame grant extent was tagged twice: base=0x{base:x} length=0x{length:x}"
-            )));
+            self.returned.insert(key);
         }
         self.stats.grants_succeeded = self.stats.grants_succeeded.saturating_add(1);
         self.stats.bytes_granted = self.stats.bytes_granted.saturating_add(length);

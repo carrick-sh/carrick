@@ -114,6 +114,9 @@ pub struct MmMutationGuard<'authority> {
     mm: MmId,
     operation: carrick_observability::probes::HvpatchTopologyOperation,
     foreign_authority: Option<&'authority mut super::mm_quiesce::FrameCowExactMmGuard>,
+    /// Held for the guard's lifetime: no guest EL1 stage-1 edit of `mm`
+    /// runs concurrently with a host edit.
+    _el1_editor: Option<crate::kernel::mm_occupancy::El1EditorExclusion>,
     _authority: PhantomData<&'authority mut ()>,
 }
 
@@ -291,6 +294,7 @@ pub fn from_pt_pause<'authority>(
         mm,
         operation: carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
         foreign_authority: None,
+        _el1_editor: crate::kernel::mm_occupancy::exclude_el1_editor(mm),
         _authority: PhantomData,
     }
 }
@@ -309,6 +313,7 @@ pub fn from_sole_executor<'authority>(
         mm,
         operation: carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
         foreign_authority: None,
+        _el1_editor: crate::kernel::mm_occupancy::exclude_el1_editor(mm),
         _authority: PhantomData,
     }
 }
@@ -323,6 +328,7 @@ pub fn from_executor<'authority>(
         mm,
         operation: carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
         foreign_authority: None,
+        _el1_editor: crate::kernel::mm_occupancy::exclude_el1_editor(mm),
         _authority: PhantomData,
     }
 }
@@ -342,6 +348,7 @@ pub(crate) fn from_frame_cow<'authority>(
         mm,
         operation: carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
         foreign_authority: Some(authority),
+        _el1_editor: crate::kernel::mm_occupancy::exclude_el1_editor(mm),
         _authority: PhantomData,
     }
 }
