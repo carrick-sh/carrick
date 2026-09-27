@@ -1,0 +1,26 @@
+{
+  "worker_revision": "eb2d4f6a37fd977ede5c17cb80b05fde4020d156",
+  "review_round": 2,
+  "accepted": false,
+  "director_checks": [
+    {
+      "command": "RUSTC_WRAPPER= scripts/build-embed-el1-sched.sh",
+      "exit_code": 0
+    },
+    {
+      "command": "RUSTC_WRAPPER= cargo test -p carrick-el1-abi -p carrick-el1 -p carrick-mem --lib",
+      "exit_code": 0,
+      "passed": 244
+    },
+    {
+      "native_receipt": "review-2-native.json",
+      "exit_code": 0
+    }
+  ],
+  "remaining": [
+    "wire actual entry through tested dispatch helper",
+    "assert SP before/after rather than only capturing it",
+    "preserve reproducible raw semantic red evidence"
+  ],
+  "signed_execution": "pending"
+}
