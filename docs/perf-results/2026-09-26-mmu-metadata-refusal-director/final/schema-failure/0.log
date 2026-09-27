@@ -1,0 +1,100 @@
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-hal)
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-aarch64)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.74s
+     Running unittests src/lib.rs (target/debug/deps/carrick_aarch64-b5a822a9efc4ee6f)
+
+running 76 tests
+test anonymous_discard::tests::invalid_ranges_do_not_reach_backend ... ok
+test engine::tests::core_resume_pair_uses_live_el0_state_outside_a_syscall_trap ... ok
+test engine::tests::asid_retirement_maintenance_is_exactly_scoped_and_ordered ... ok
+test anonymous_discard::tests::interior_failure_preserves_classification_without_edge_work ... ok
+test engine::tests::absent_sparse_editor_preserves_live_vcpu_bootstrap ... ok
+test engine::tests::a_hardware_readback_of_the_bootstrap_sctlr_is_still_neutral ... ok
+test engine::tests::core_resume_pair_uses_saved_el0_state_during_a_syscall_trap ... ok
+test anonymous_discard::tests::edge_failure_after_retirement_is_indeterminate ... ok
+test engine::tests::core_resume_pair_uses_saved_el0_state_when_fatal_capture_runs_in_el1 ... ok
+test engine::tests::el1_signal_ignores_stale_caller_pc ... ok
+test engine::tests::core_register_capture_rejects_disabled_fpsimd_authority ... ok
+test engine::tests::el1_signal_recovers_backend_mailbox_return_only_when_caller_has_none ... ok
+test engine::tests::existing_sparse_editor_skips_parked_vcpu_bootstrap ... ok
+test engine::tests::live_el0_signal_preserves_supplied_pc_without_reread ... ok
+test engine::tests::fresh_root_engine_and_exec_heap_lifecycle ... ok
+test engine::tests::live_el0_signal_without_caller_hint_uses_live_pc ... ok
+test engine::tests::migratable_snapshot_rejects_disabled_fpsimd_authority ... ok
+test engine::tests::private_repoint_tlbi_failure_is_indeterminate ... ok
+test anonymous_discard::tests::refusal_and_empty_interior_do_not_mutate ... ok
+test engine::tests::frame_cow_binding_preserves_strong_asid_generation_distinct_from_mm ... ok
+test engine::tests::seed_applies_thread_entry_deltas ... ok
+test engine::tests::snapshot_roundtrip_preserves_complete_task_state_and_destination_local_state ... ok
+test engine::tests::stage1_authority_conflicting_lease_rejection ... ok
+test engine::tests::snapshot_typed_state_roundtrips_every_task_field ... ok
+test engine::tests::live_hvpatch_stage1_edits_are_asid_scoped ... ok
+test engine::tests::replace_page_tables_authority_retires_old_when_unshared ... ok
+test engine::tests::replace_page_tables_authority_preserves_parent_manager_and_source_when_shared ... ok
+test engine::tests::shared_futex_high_alias_uses_live_stage1_backing_ipa ... ok
+test engine::tests::hvpatch_process_aperture_reservation_removes_both_identity_ranges ... ok
+test engine::tests::execve_sharing_governed_solely_by_authority_even_on_disagreement ... ok
+test engine::tests::task_only_terminal_cleanup_never_flushes_all_asids_or_destroys_worker_vcpu ... ok
+test engine::tests::wait_diagnostics_decode_hvpatch_island_back_to_original_svc ... ok
+test engine::tests::test_metadata_allocation_error_propagation_is_nonallocating ... ok
+test engine::tests::wait_diagnostics_prefer_post_syscall_guest_resume_pc ... ok
+test esr::tests::hw_breakpoint_and_watchpoint_map_to_sigtrap_hwbkpt ... ok
+test esr::tests::brk_aarch64_maps_to_sigtrap_brkpt ... ok
+test esr::tests::non_debug_faults_are_not_debug_signals ... ok
+test esr::tests::software_step_maps_to_sigtrap_trace ... ok
+test mailbox::tests::mailbox_layout_is_fixed ... ok
+test mailbox::tests::mailbox_ownership_transition_is_linear ... ok
+test mailbox::tests::generation_rollover_never_publishes_zero ... ok
+test mailbox::tests::mailbox_wire_values_are_unique_and_stable ... ok
+test mailbox::tests::portal_scalar_allowlist_is_exact ... ok
+test mailbox::tests::portal_wire_layout_and_transitions_are_closed ... ok
+test mailbox::tests::request_metadata_rejects_stale_and_duplicate_publications ... ok
+test mailbox::tests::response_cannot_publish_before_request_ownership ... ok
+test mailbox::tests::unpublished_payload_and_wrong_trap_kind_fail_closed ... ok
+test owed_kick::tests::absorbed_kick_is_published_to_the_el1_hook ... ok
+test owed_kick::tests::gic_pending_kick_survives_run_returns_and_is_withdrawn_when_served ... ok
+test owed_kick::tests::owed_kick_survives_internal_el1_exits_before_eret ... ok
+test owed_kick::tests::kick_absorbed_in_el1_vector_surfaces_at_the_el0_boundary ... ok
+test owed_kick::tests::surfaced_el1_exit_settles_the_owed_kick_in_spsr ... ok
+test engine::tests::replace_page_tables_authority_preserves_parent_under_concurrent_vfork_children ... ok
+test engine::tests::stage1_authority_deferred_install_on_one_clone_then_build_on_another ... ok
+test engine::tests::stage1_authority_sibling_lazy_build_sees_source ... ok
+test engine::tests::stage1_authority_source_survives_exec_while_shared ... ok
+test engine::tests::stage1_authority_source_survives_rollback ... ok
+test engine::tests::stage1_authority_source_survives_snapshot_image ... ok
+test anonymous_discard::tests::unaligned_discard_bounds_scrub_and_preserves_neighbors ... FAILED
+test stage1_authority::tests::image_generation_exhaustion_never_reenables_reuse ... ok
+test engine::tests::stage1_protection_edit_fork_cow_downgrade_preserves_requested_exec_not_stale_arm ... ok
+test stage1_authority::tests::retiring_child_authority_returns_its_image_to_the_shared_pool ... ok
+test stage1_authority::tests::exec_replacement_drops_the_retired_source_so_the_replacement_lease_installs ... ok
+test stage1_authority::tests::stage1_authority_live_restore_and_rollback_updates_hardware_backing ... ok
+test stage1_authority::tests::stage1_authority_restore_and_rollback_fail_and_preserve_on_unresolved_arena ... ok
+test stage1_authority::tests::stage1_authority_undo_journal_commit_and_rollback ... ok
+test vmm::completion_tests::default_complete_syscall_return_preserves_register_transport ... ok
+test stage1_authority::tests::stage1_authority_snapshot_fails_on_unresolved_live_backing ... ok
+test stage1_authority::tests::concurrent_vfork_children_share_authority_and_detach_independently ... ok
+test stage1_authority::tests::stage1_authority_metadata_refusal_propagation ... ok
+test stage1_authority::tests::vfork_shares_prevents_exclusive_path_even_if_called_as_first_or_only_child ... ok
+test stage1_authority::tests::image_pool_is_bounded_and_exec_recycles_the_retired_image ... ok
+test stage1_authority::tests::rollback_retirement_failure_quarantines_arena_address ... ok
+test stage1_authority::tests::rollback_retires_backing_before_returning_arena_to_source ... ok
+test stage1_authority::tests::image_generation_invalidates_edits_errors_restore_and_replacement ... ok
+test stage1_authority::tests::rollback_returns_allocated_extension_arena_to_source ... ok
+
+failures:
+
+---- anonymous_discard::tests::unaligned_discard_bounds_scrub_and_preserves_neighbors stdout ----
+
+thread 'anonymous_discard::tests::unaligned_discard_bounds_scrub_and_preserves_neighbors' (13923708) panicked at crates/carrick-aarch64/src/anonymous_discard.rs:125:53:
+called `Result::unwrap()` on an `Err` value: Toml { path: "/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/conformance-contracts/contracts/mmu-metadata-refusal.toml", source: TomlError { message: "unknown variant `host_heap_bytes`, expected one of `kernel_dispatches`, `kernel_redispatches`, `continuation_enrollments`, `continuation_parks`, `wake_publications`, `continuation_resumes`, `guest_memory_read_bytes`, `guest_memory_write_bytes`, `guest_memory_copy_bytes`, `guest_memory_zero_bytes`, `backing_materialized_bytes`, `vfs_backend_operations`, `directory_entries_visited`, `host_backend_calls`, `host_write_position_queries`, `page_table_edits`, `page_table_invalidations`, `page_table_image_allocations`, `host_mapping_allocations`, `fork_projection_rows_visited`, `inotify_queue_visits`, `backing_allocations`, `task_admissions`, `vcpu_admissions`, `vcpu_releases`, `vcpu_migrations`, `futex_queue_visits`, `futex_waiters_woken`, `hvf_syscall_exits`, `portal_requests`, `portal_completions`, `portal_fallbacks`, `portal_stale_rejects`, `host_heap_allocations`, `native_activation_leaf_checks`, `native_data_activations`, `native_code_words`, `native_code_invalidation_pages`, `mm_snapshot_collections`, `foreign_owner_pins`, `alias_rows_visited`, `task_mapping_rows_visited`, `frame_extents_visited`", raw: Some("schema_version = 1\nid = \"kernel.mm.metadata-refusal\"\ntitle = \"MMU metadata allocation admission, refusal recovery, and zero-allocation rollback\"\nguest_surfaces = [\n  \"kernel:stage1_mmu\",\n  \"kernel:undo_journal\",\n  \"syscall:mmap\",\n  \"syscall:mprotect\",\n  \"syscall:munmap\",\n]\nsemantic_authority = [\n  \"man 2 mmap: MAP_PRIVATE | MAP_ANONYMOUS creates a private mapping whose pages and protections are preserved upon transaction failure\",\n  \"Linux mm semantics: Carrick kernel preserves internal page table consistency and stage-1 descriptor authority on failed memory management transactions, avoiding corrupted state or descriptor authority leakage (distinguished from an unproven blanket guarantee that all failed mprotect calls are atomic across partial range splits)\",\n  \"Arm Architecture Reference Manual Armv8-A D5: stage-1 translation preserves existing descriptor authority when a table update transaction is rolled back or aborted\",\n]\nfixture = \"mmu:metadata-refusal 1|8|32|128\"\nscale_points = [1, 8, 32, 128]\nrationale = \"Neutral MMU edit, publication, and rollback transactions must recover deterministically from metadata allocation refusal without aborting, leaking grants, or corrupting live descriptor authority. All collection capacities (descriptor undo pre-images, staged writes, dirty locations, owned table expansion, arena tracking, and free-table reclamation lists) must be admitted through fallible reservations before corresponding recoverable mutations. Rollback consumes pre-admitted storage and performs zero heap allocations, including extension-arena return bookkeeping. Capacity failure when requesting a stage-1 extension arena returns any unused grant exactly once. Transactions must preserve authoritative descriptors, translation outcomes, owner generations, and subsequent mutation capability under repeated failure and retry cycles at scales 1, 8, 32, and 128.\"\n\n[bindings]\nvm_free = \"carrick-mmu-core::aarch64::tests::metadata_refusal_contract; carrick-mmu-core::aarch64::tests::test_metadata_refusal_witness_rollback_allocations; carrick-aarch64::stage1_authority::tests::stage1_authority_metadata_refusal_propagation\"\n\n[bindings.unresolved]\nembed = \"Signed guest execution pending in-guest EL1 MMU service bring-up; host VM-free tests prove transactional admission, zero-allocation rollback, and genuine allocator refusal.\"\ndocker = \"Docker oracle differential comparison is maintained for user-visible syscall boundaries; metadata transaction failure recovery operates at the internal kernel MMU substrate.\"\nembed_structural = \"Structural budgets for zero-allocation rollback and bounded admission are verified via VM-free allocator witnesses across 1, 8, 32, and 128 extension scales.\"\nembed_timing = \"Timing ratio is not asserted for internal kernel MMU metadata refusal.\"\n\n[[structural_budgets]]\nkind = \"exact\"\nmetric = \"host_heap_allocations\"\nvalue = 0\nrationale = \"Rollback must consume pre-admitted capacity and never allocate heap memory, even when returning extension arenas.\"\n\n[[structural_budgets]]\nkind = \"exact\"\nmetric = \"host_heap_bytes\"\nvalue = 0\nrationale = \"Rollback requests zero heap bytes; admission is separately bounded by fixture write population, Vec geometric growth, hashbrown bucket growth and exact extent bytes in test_metadata_refusal_witness_rollback_allocations.\"\n"), keys: ["structural_budgets", "metric"], span: Some(3070..3087) } }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    anonymous_discard::tests::unaligned_discard_bounds_scrub_and_preserves_neighbors
+
+test result: FAILED. 75 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p carrick-aarch64 --lib`

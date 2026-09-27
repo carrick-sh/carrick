@@ -1,0 +1,12 @@
+--- a/crates/carrick-mmu-core/src/aarch64.rs
++++ b/crates/carrick-mmu-core/src/aarch64.rs
+@@ -1816,8 +1816,7 @@
+         self.free_tables = journal.free_tables;
+         self.reclaim_pending = journal.reclaim_pending;
+         self.dirty.truncate(journal.dirty_len);
+-        let mut popped = journal.returned_bases;
+-        popped.clear();
++        let mut popped = Vec::new();
+         while self.arenas.len() > journal.arenas_len {
+             let Some(arena) = self.arenas.pop() else {
+                 break;

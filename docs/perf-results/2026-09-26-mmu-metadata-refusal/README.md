@@ -26,28 +26,39 @@ Coalescing (`try_coalesce`) and table reclamation (`reclaim_invalid_tables`, `re
    - If `free_tables` capacity cannot be grown, the parent descriptor write is never attempted and the child table remains linked and untouched.
    - `reclaim_pending` is retained across failed sweeps so subsequent retries can complete table reclamation.
 
-## Measured Allocation and Admission Work
+## Measured allocation and admission work
 
-Empirical measurements from `test_metadata_refusal_witness_rollback_allocations` across scale points [1, 8, 32, 128]:
+Director correction supersedes the worker's claimed derived-budget result:
+`68bb6dc79` still contained the old scale-specific caps and no named negative
+control test. The final fixture publishes setup before counting, so historical
+dirty entries from pool exhaustion do not inflate the transaction population.
 
-| Extension Scale | Admission Allocations | Admission Bytes | Derived Max Allocs / Bytes | Rollback Allocations | Rollback Bytes | Popped Arenas |
-|---|---|---|---|---|---|---|
-| **1** | 22 | 88,300 (~86 KiB) | 31 / 268 KiB | **0** | **0** | 1 |
-| **8** | 38 | 706,564 (~690 KiB) | 83 / 1.7 MiB | **0** | **0** | 8 |
-| **32** | 70 | 2,827,412 (~2.7 MiB) | 137 / 6.6 MiB | **0** | **0** | 32 |
-| **128** | 175 | 23,893,668 (~22.8 MiB) | 263 / 26.2 MiB | **0** | **0** | 128 |
+| Extents | Allocations / bound | Requested bytes / bound | Rollback allocations / bytes |
+|---|---|---|---|
+| 1 | 31 / 46 | 137356 / 139141 | 0 / 0 |
+| 8 | 50 / 65 | 1099684 / 1103978 | 0 / 0 |
+| 32 | 84 / 99 | 4400180 / 4414104 | 0 / 0 |
+| 128 | 190 / 205 | 17602116 / 17654470 | 0 / 0 |
 
-### Derived Admission Budget Rationale
-- **Per-Arena Backing:** Each attached extension arena allocates its `PT_PAGE = 4096` byte backing buffer (where `extension_arena_capacity = PT_PAGE = 4096`).
-- **Amortized Geometric Growth:** Seven dynamic collections (`arenas`, `free_tables`, `staged`, `dirty`, `journal.words`, `journal.first_written`, `journal.returned_bases`) expand via geometric capacity doubling. Over a run attaching $K$ arenas, each container experiences at most $\lceil \log_2(K) \rceil + 2$ reallocations.
-- **Common Derived Allocation Bound:**
-  $$\text{max\_allocations}(K) = 15 + K + 15 \times (\lfloor \log_2(K) \rfloor + 1)$$
-  (Scale 1: 31, Scale 8: 83, Scale 32: 137, Scale 128: 263).
-- **Common Derived Byte Bound:**
-  $$\text{max\_bytes}(K) = 64\text{ KiB} + K \times (\text{PT\_PAGE} + 200\text{ KiB})$$
-  (Scale 1: 268 KiB, Scale 8: 1.7 MiB, Scale 32: 6.6 MiB, Scale 128: 26.2 MiB).
-- **Negative Control Verification:** `test_metadata_refusal_negative_control_detects_exact_reallocation_regression` demonstrates that linear exact reallocation (e.g. `try_reserve_exact(needed_capacity)` while `len == 0`) incurs 128 reallocations for a single container at $K=128$, violating the derived $O(\log K)$ logarithmic growth budget.
-- **Rollback Invariant:** Rollback performs strictly **0** allocations and **0** heap bytes across all scale points.
+The fixture admits at most 514 descriptor writes per added 4 KiB L3 table:
+512 initial leaves, one parent link, and the selected leaf rewrite. It checks
+this population directly. Each of four Vecs contributes a geometric growth
+bound derived from its required element count and element size; the first-write
+HashSet contributes power-of-two buckets at 7/8 occupancy, control bytes and
+alignment padding. Exact extent buffers and the initial journal snapshots are
+accounted separately. There are no scale-specific fitted constants. This
+Owned-storage arm has no staged HashMap allocations; separate live/refusal
+fixtures cover that path. These are requested bytes across allocations, not
+resident-memory or end-to-end timing claims.
+
+`director-final-controls/` contains unedited output, actual source diffs and
+SHA-256 identities for the exact final fixture. Changing only returned-base
+admission to `try_reserve_exact` fails at scale 32 (112 allocations > 99).
+Changing only rollback to allocate a new Vec fails at scale 1 (one allocation
+instead of zero). Restoring the identical fixture/source passes all scales.
+These are controlled production mutations of the existing witness, not a
+separate claimed negative-control test. Older raw worker logs remain historical
+and do not attest the revised fixture.
 
 ## Infallible Allocation Operations and Remaining Denominator
 

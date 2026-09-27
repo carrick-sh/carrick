@@ -1,0 +1,22 @@
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.19s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-1d1f88d6a1eb2090)
+
+running 1 test
+scale=1 admission_allocations=31 admission_bytes=137332 max_allocs=46 max_bytes=139141 rollback_allocations=0 rollback_bytes=0 popped_len=1
+scale=8 admission_allocations=56 admission_bytes=1099876 max_allocs=65 max_bytes=1103978 rollback_allocations=0 rollback_bytes=0 popped_len=8
+
+thread 'aarch64::tests::test_metadata_refusal_witness_rollback_allocations' (13915342) panicked at crates/carrick-mmu-core/src/aarch64.rs:3690:13:
+scale=32: admission allocations 112 exceeded justified bound 99
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test aarch64::tests::test_metadata_refusal_witness_rollback_allocations ... FAILED
+
+failures:
+
+failures:
+    aarch64::tests::test_metadata_refusal_witness_rollback_allocations
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 92 filtered out; finished in 0.12s
+
+error: test failed, to rerun pass `-p carrick-mmu-core --lib`

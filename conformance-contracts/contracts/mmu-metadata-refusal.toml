@@ -18,7 +18,7 @@ scale_points = [1, 8, 32, 128]
 rationale = "Neutral MMU edit, publication, and rollback transactions must recover deterministically from metadata allocation refusal without aborting, leaking grants, or corrupting live descriptor authority. All collection capacities (descriptor undo pre-images, staged writes, dirty locations, owned table expansion, arena tracking, and free-table reclamation lists) must be admitted through fallible reservations before corresponding recoverable mutations. Rollback consumes pre-admitted storage and performs zero heap allocations, including extension-arena return bookkeeping. Capacity failure when requesting a stage-1 extension arena returns any unused grant exactly once. Transactions must preserve authoritative descriptors, translation outcomes, owner generations, and subsequent mutation capability under repeated failure and retry cycles at scales 1, 8, 32, and 128."
 
 [bindings]
-vm_free = "carrick-mmu-core::aarch64::tests::metadata_refusal_contract; carrick-aarch64::stage1_authority::tests::stage1_authority_metadata_refusal_propagation"
+vm_free = "carrick-mmu-core::aarch64::tests::metadata_refusal_contract; carrick-mmu-core::aarch64::tests::test_metadata_refusal_witness_rollback_allocations; carrick-aarch64::stage1_authority::tests::stage1_authority_metadata_refusal_propagation"
 
 [bindings.unresolved]
 embed = "Signed guest execution pending in-guest EL1 MMU service bring-up; host VM-free tests prove transactional admission, zero-allocation rollback, and genuine allocator refusal."
@@ -30,4 +30,4 @@ embed_timing = "Timing ratio is not asserted for internal kernel MMU metadata re
 kind = "exact"
 metric = "host_heap_allocations"
 value = 0
-rationale = "Rollback must consume pre-admitted capacity and never allocate heap memory, even when returning extension arenas."
+rationale = "Rollback must consume pre-admitted capacity and never allocate heap memory, even when returning extension arenas. The bound VM-free witness additionally asserts zero rollback requested bytes and derives admission allocation/byte bounds from descriptor population and geometric container growth."

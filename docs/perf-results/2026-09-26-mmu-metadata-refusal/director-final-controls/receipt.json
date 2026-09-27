@@ -1,0 +1,35 @@
+{
+  "source_head": "68bb6dc790bb484e8c1c3c7c2324f7ff7872f438",
+  "fixture_source_sha256": "cb99b039e987f03f936e3a35f4c608a7a270b174bf085543ce1bc23f4e45cc66",
+  "command": [
+    "cargo",
+    "test",
+    "-p",
+    "carrick-mmu-core",
+    "--lib",
+    "test_metadata_refusal_witness_rollback_allocations",
+    "--",
+    "--nocapture"
+  ],
+  "controls": [
+    {
+      "name": "exact-growth",
+      "exit_code": 101,
+      "mutated_source_sha256": "0aa4204b28636b3b0e4de7b79739f55744deb6c500fab4184690babf81854aa0"
+    },
+    {
+      "name": "rollback-allocation",
+      "exit_code": 101,
+      "mutated_source_sha256": "687d80ff217c1b79d4133a83542ea61c171f64101263d2eaad9669875e76a941"
+    }
+  ],
+  "green_exit_code": 0,
+  "files": {
+    "exact-growth.log": "01d1d0f7c17732ff07544ab67e1477cdb226a34828359baeea898dc6fa47a2dd",
+    "exact-growth.patch": "2b976ad1301819710f3b465ba02a7949bcabe78ec89124426d39c70f74b133fc",
+    "fixture-source.diff": "2721d7e840544b693903c6b14efdae80a1924a40b7e54ef5c631f045828a7adb",
+    "green.log": "6a9868858671172a02dace4fdf3ce66e8edf41ba106530b8674031f1042f1656",
+    "rollback-allocation.log": "a70ac888d7d3f83a485b8c42c8adfe9b2f20449b3b3dc64a3ea2f155a217c5a3",
+    "rollback-allocation.patch": "04718ecded6ab3624fee65476ed96a673cbb8a4d76dd4392404a548f8840d7ad"
+  }
+}

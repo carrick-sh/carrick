@@ -2058,7 +2058,7 @@ mod tests {
         test_allocator::ALLOC_BYTES.with(|c| c.set(Some(0)));
         test_allocator::FAIL_AFTER.with(|c| c.set(Some(0)));
         let pt_err = edit_res.unwrap_err();
-        let mem_err = crate::engine::page_table_error_to_memory_error(pt_err);
+        let mem_err = crate::engine::page_table_rollback_error_to_memory_error(pt_err);
         assert_eq!(mem_err, carrick_guest_mem::MemoryError::MetadataAllocation);
         let trap_err = crate::engine::memory_error_to_trap_error(mem_err, "stage1 authority edit");
         assert!(matches!(

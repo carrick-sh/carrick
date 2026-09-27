@@ -1,0 +1,76 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/carrick_conformance_contract-a87a7a364c0059ca)
+
+running 26 tests
+test personality_boundary::tests::test_negative_macro_rules_definition_containing_literal_rejected ... ok
+test personality_boundary::tests::test_negative_cfg_not_test_rejected ... ok
+test personality_boundary::tests::test_negative_macro_rules_definition_containing_symbol_rejected ... ok
+test personality_boundary::tests::test_negative_macro_invocation_containing_literal_rejected ... ok
+test personality_boundary::tests::test_negative_cfg_feature_containing_test_word_rejected ... ok
+test personality_boundary::tests::test_negative_cfg_any_test_and_prod_feature_rejected ... ok
+test personality_boundary::tests::test_metadata_from_another_workspace_rejected ... ok
+test personality_boundary::tests::test_negative_custom_lib_path_rejected ... ok
+test personality_boundary::tests::test_negative_unannotated_mod_tests_filename_rejected ... ok
+test personality_boundary::tests::test_negative_missing_allowlisted_crate_rejected ... ok
+test personality_boundary::tests::test_negative_missing_transitive_node_rejected ... ok
+test personality_boundary::tests::test_negative_no_scanned_source_files_rejected ... ok
+test personality_boundary::tests::test_negative_direct_dependency_rejected ... ok
+test personality_boundary::tests::test_negative_missing_target_cannot_fall_back_to_other_source ... ok
+test personality_boundary::tests::test_positive_annotated_mod_arbitrary_name_allowed ... ok
+test personality_boundary::tests::test_positive_cfg_all_test_and_foo_allowed ... ok
+test personality_boundary::tests::test_positive_prose_comments_allowed ... ok
+test personality_boundary::tests::test_positive_typed_caller_values_allowed ... ok
+test personality_boundary::tests::test_negative_unresolved_registry_dependency_rejected ... ok
+test personality_boundary::tests::test_positive_test_only_oracle_assertions_allowed ... ok
+test personality_boundary::tests::test_inherited_test_module_and_production_filename ... ok
+test personality_boundary::tests::test_positive_fixture_substrate_passes ... ok
+test personality_boundary::tests::test_negative_renamed_alias_dependency_rejected ... ok
+test personality_boundary::tests::test_negative_target_conditioned_build_dependency_rejected ... ok
+test personality_boundary::tests::test_negative_optional_transitive_dependency_rejected ... ok
+test personality_boundary::tests::test_positive_dev_only_dependency_allowed ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/bin/check-contracts.rs (target/debug/deps/check_contracts-a07a3282bcf7acb8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/check-personality-boundary.rs (target/debug/deps/check_personality_boundary-6b2c2853d0118524)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/generate-inventory.rs (target/debug/deps/generate_inventory-173da34c40a0ff15)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/claims.rs (target/debug/deps/claims-39cd1f3f25b5944f)
+
+running 6 tests
+test claim_id_rejects_invalid_format ... ok
+test claim_id_accepts_valid_format ... ok
+test violation_demonstrated_requires_known_bad_revision ... ok
+test claim_serialization_round_trip ... ok
+test registry_loads_claims_successfully ... ok
+test live_registry_loads_all_claims ... FAILED
+
+failures:
+
+---- live_registry_loads_all_claims stdout ----
+
+thread 'live_registry_loads_all_claims' (13924764) panicked at crates/carrick-conformance-contract/tests/claims.rs:145:10:
+live registry should load: Toml { path: "/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/conformance-contracts/contracts/mmu-metadata-refusal.toml", source: TomlError { message: "unknown variant `host_heap_bytes`, expected one of `kernel_dispatches`, `kernel_redispatches`, `continuation_enrollments`, `continuation_parks`, `wake_publications`, `continuation_resumes`, `guest_memory_read_bytes`, `guest_memory_write_bytes`, `guest_memory_copy_bytes`, `guest_memory_zero_bytes`, `backing_materialized_bytes`, `vfs_backend_operations`, `directory_entries_visited`, `host_backend_calls`, `host_write_position_queries`, `page_table_edits`, `page_table_invalidations`, `page_table_image_allocations`, `host_mapping_allocations`, `fork_projection_rows_visited`, `inotify_queue_visits`, `backing_allocations`, `task_admissions`, `vcpu_admissions`, `vcpu_releases`, `vcpu_migrations`, `futex_queue_visits`, `futex_waiters_woken`, `hvf_syscall_exits`, `portal_requests`, `portal_completions`, `portal_fallbacks`, `portal_stale_rejects`, `host_heap_allocations`, `native_activation_leaf_checks`, `native_data_activations`, `native_code_words`, `native_code_invalidation_pages`, `mm_snapshot_collections`, `foreign_owner_pins`, `alias_rows_visited`, `task_mapping_rows_visited`, `frame_extents_visited`", raw: Some("schema_version = 1\nid = \"kernel.mm.metadata-refusal\"\ntitle = \"MMU metadata allocation admission, refusal recovery, and zero-allocation rollback\"\nguest_surfaces = [\n  \"kernel:stage1_mmu\",\n  \"kernel:undo_journal\",\n  \"syscall:mmap\",\n  \"syscall:mprotect\",\n  \"syscall:munmap\",\n]\nsemantic_authority = [\n  \"man 2 mmap: MAP_PRIVATE | MAP_ANONYMOUS creates a private mapping whose pages and protections are preserved upon transaction failure\",\n  \"Linux mm semantics: Carrick kernel preserves internal page table consistency and stage-1 descriptor authority on failed memory management transactions, avoiding corrupted state or descriptor authority leakage (distinguished from an unproven blanket guarantee that all failed mprotect calls are atomic across partial range splits)\",\n  \"Arm Architecture Reference Manual Armv8-A D5: stage-1 translation preserves existing descriptor authority when a table update transaction is rolled back or aborted\",\n]\nfixture = \"mmu:metadata-refusal 1|8|32|128\"\nscale_points = [1, 8, 32, 128]\nrationale = \"Neutral MMU edit, publication, and rollback transactions must recover deterministically from metadata allocation refusal without aborting, leaking grants, or corrupting live descriptor authority. All collection capacities (descriptor undo pre-images, staged writes, dirty locations, owned table expansion, arena tracking, and free-table reclamation lists) must be admitted through fallible reservations before corresponding recoverable mutations. Rollback consumes pre-admitted storage and performs zero heap allocations, including extension-arena return bookkeeping. Capacity failure when requesting a stage-1 extension arena returns any unused grant exactly once. Transactions must preserve authoritative descriptors, translation outcomes, owner generations, and subsequent mutation capability under repeated failure and retry cycles at scales 1, 8, 32, and 128.\"\n\n[bindings]\nvm_free = \"carrick-mmu-core::aarch64::tests::metadata_refusal_contract; carrick-mmu-core::aarch64::tests::test_metadata_refusal_witness_rollback_allocations; carrick-aarch64::stage1_authority::tests::stage1_authority_metadata_refusal_propagation\"\n\n[bindings.unresolved]\nembed = \"Signed guest execution pending in-guest EL1 MMU service bring-up; host VM-free tests prove transactional admission, zero-allocation rollback, and genuine allocator refusal.\"\ndocker = \"Docker oracle differential comparison is maintained for user-visible syscall boundaries; metadata transaction failure recovery operates at the internal kernel MMU substrate.\"\nembed_structural = \"Structural budgets for zero-allocation rollback and bounded admission are verified via VM-free allocator witnesses across 1, 8, 32, and 128 extension scales.\"\nembed_timing = \"Timing ratio is not asserted for internal kernel MMU metadata refusal.\"\n\n[[structural_budgets]]\nkind = \"exact\"\nmetric = \"host_heap_allocations\"\nvalue = 0\nrationale = \"Rollback must consume pre-admitted capacity and never allocate heap memory, even when returning extension arenas.\"\n\n[[structural_budgets]]\nkind = \"exact\"\nmetric = \"host_heap_bytes\"\nvalue = 0\nrationale = \"Rollback requests zero heap bytes; admission is separately bounded by fixture write population, Vec geometric growth, hashbrown bucket growth and exact extent bytes in test_metadata_refusal_witness_rollback_allocations.\"\n"), keys: ["structural_budgets", "metric"], span: Some(3070..3087) } }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    live_registry_loads_all_claims
+
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-conformance-contract --test claims`
