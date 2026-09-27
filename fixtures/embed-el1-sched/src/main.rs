@@ -1897,25 +1897,23 @@ fn fault_entry_mode() -> i32 {
     0
 }
 
-const SYS_EL1_METADATA_TEST: u64 = 448;
-
 fn metadata_allocator_mode() -> i32 {
-    // 1. Basic allocation, alignment, memory writes, verification, and free
-    let res1 = unsafe { raw6(SYS_EL1_METADATA_TEST, 1, 0, 0, 0, 0, 0) };
+    // 1. Basic allocation, alignment (16, 32, 64, 128, 4096), memory writes, verification, and free
+    let res1 = unsafe { raw6(carrick_el1_abi::SYS_CARRICK_EL1_CONTROL, 1, 1, 0, 0, 0, 0) };
     if res1 != 0 {
         println!("metadata-allocator basic test failed: rc={res1}");
         return 1;
     }
 
-    // 2. Force growth beyond bootstrap capacity into dynamic extents, write, verify, and return
-    let res2 = unsafe { raw6(SYS_EL1_METADATA_TEST, 2, 0, 0, 0, 0, 0) };
+    // 2. Force growth beyond 9 MiB bootstrap capacity (allocating 10 MiB) into dynamic extents, write, verify, and return
+    let res2 = unsafe { raw6(carrick_el1_abi::SYS_CARRICK_EL1_CONTROL, 1, 2, 0, 0, 0, 0) };
     if res2 != 0 {
         println!("metadata-allocator dynamic growth and return test failed: rc={res2}");
         return 1;
     }
 
     // 3. Exercise denied host grant failpoint followed by recovery and retry
-    let res3 = unsafe { raw6(SYS_EL1_METADATA_TEST, 3, 0, 0, 0, 0, 0) };
+    let res3 = unsafe { raw6(carrick_el1_abi::SYS_CARRICK_EL1_CONTROL, 1, 3, 0, 0, 0, 0) };
     if res3 != 0 {
         println!("metadata-allocator denied grant and recovery test failed: rc={res3}");
         return 1;

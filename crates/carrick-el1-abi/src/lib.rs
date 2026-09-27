@@ -71,6 +71,9 @@ pub const EL1_DYNAMIC_METADATA_BASE: u64 = 0x2D_0800_0000;
 /// Total size of the dynamic metadata grant aperture (64 MiB).
 pub const EL1_DYNAMIC_METADATA_SIZE: u64 = 0x0400_0000;
 
+/// Standard quantum size of a dynamic metadata extent granted by the host (512 KiB).
+pub const EL1_DYNAMIC_METADATA_EXTENT_SIZE: usize = 512 * 1024;
+
 /// Operation code for requesting an extent grant from the host (HVC #6).
 pub const METADATA_GRANT_OP_ALLOC: u64 = 1;
 
@@ -94,6 +97,9 @@ pub const METADATA_GRANT_ERR_OVERLAP: u64 = 4;
 
 /// Metadata grant hypercall outcome: extent alignment violation.
 pub const METADATA_GRANT_ERR_ALIGNMENT: u64 = 5;
+
+/// Unaliased Carrick-private test and diagnostic control syscall number (outside Linux 0..500 space).
+pub const SYS_CARRICK_EL1_CONTROL: u64 = 0xCA88_0001;
 
 /// Byte offset of the EL1 kernel heap within the region.
 pub const EL1_HEAP_OFFSET: u64 = 0x100_0000;
@@ -220,6 +226,11 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_CURRENT_TASKS_OFFSET,
         EL1_BOOTSTRAP_METADATA_OFFSET,
         EL1_BOOTSTRAP_METADATA_SIZE,
+        EL1_DYNAMIC_METADATA_BASE,
+        EL1_DYNAMIC_METADATA_SIZE,
+        METADATA_GRANT_OP_ALLOC,
+        METADATA_GRANT_OP_FREE,
+        SYS_CARRICK_EL1_CONTROL,
         EL1_OBJECT_TABLE_OFFSET,
         EL1_FD_MAP_OFFSET,
         EL1_OPEN_FILE_TABLE_OFFSET,

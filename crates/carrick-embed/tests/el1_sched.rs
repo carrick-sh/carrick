@@ -1426,18 +1426,22 @@ fn el1_metadata_allocator_grows_and_returns_extents() {
     let stats = carrick_runtime::metadata_grant_stats();
     println!("metadata_grant_stats: {stats:?}");
     assert!(
-        stats.extents_granted >= 1,
+        stats.grants_succeeded >= 1,
         "expected at least 1 dynamic extent granted by host, got {}",
-        stats.extents_granted
+        stats.grants_succeeded
     );
     assert!(
-        stats.extents_returned >= 1,
+        stats.returns_completed >= 1,
         "expected at least 1 dynamic extent returned to host, got {}",
-        stats.extents_returned
+        stats.returns_completed
     );
     assert!(
-        stats.grant_failures >= 1,
-        "expected at least 1 grant failure from simulated refusal, got {}",
-        stats.grant_failures
+        stats.grants_denied >= 1,
+        "expected at least 1 grant denial from armed failpoint, got {}",
+        stats.grants_denied
+    );
+    assert_eq!(
+        stats.bytes_granted, stats.bytes_returned,
+        "all granted dynamic bytes must be completely returned to host upon deallocation"
     );
 }
