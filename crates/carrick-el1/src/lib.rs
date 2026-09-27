@@ -353,6 +353,7 @@ where
                 return Action::Served;
             }
         }
+        #[cfg(feature = "allocator-test-control")]
         _ if (nr as u64) == carrick_el1_abi::SYS_CARRICK_EL1_CONTROL => {
             let res = match frame.x[0] {
                 1 => alloc::run_guest_allocator_test(frame.x[1], frame.x[2]),
@@ -583,6 +584,33 @@ pub unsafe fn serve_locked_file_op(
 mod tests {
     use super::*;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn allocator_control_requires_test_feature() {
+        let mut frame = TrapFrame::default();
+        frame.x[8] = carrick_el1_abi::SYS_CARRICK_EL1_CONTROL;
+        let counters = Counters::default();
+        let action = dispatch_syscall_with_regions(
+            &mut frame,
+            &counters,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &InotifyNameCache::new(),
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(
+            action,
+            if cfg!(feature = "allocator-test-control") {
+                Action::Served
+            } else {
+                Action::Forward
+            }
+        );
+    }
 
     #[test]
     fn test_dispatch_forwards_all_and_counts() {

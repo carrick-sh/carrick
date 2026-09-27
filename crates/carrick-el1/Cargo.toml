@@ -13,6 +13,7 @@ carrick-sched-core = { path = "../carrick-sched-core" }
 [features]
 default = []
 host-test = []
+allocator-test-control = []
 
 [[bin]]
 name = "carrick-el1"

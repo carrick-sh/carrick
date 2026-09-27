@@ -7,3 +7,8 @@ repository.workspace = true
 
 [dependencies]
 carrick-el1-abi = { path = "../carrick-el1-abi" }
+
+[features]
+default = []
+# Only signed embed verification builds expose the private allocator control.
+allocator-test-control = []
