@@ -368,48 +368,6 @@ pub(super) fn cancel_frame_grant_request(
     }
 }
 
-/// Whether any vCPU mailbox holds a grant guest EL1 handed back (cheap,
-/// unlocked; the fault path takes the MM guard only when this is true).
-pub(super) fn any_handed_back_frame_grant() -> bool {
-    (0..carrick_el1_abi::EL1_STACK_SLOTS as usize).any(|slot| {
-        carrick_el1_abi::frame_grant_mailbox_host_for_slot(slot)
-            .is_some_and(carrick_el1_abi::FrameGrantMailbox::has_failed_publication)
-    })
-}
-
-/// Publish a grant guest EL1 claimed but could not publish itself (it needs
-/// a table page, and only the host allocates tables), possibly from another
-/// vCPU's mailbox. The caller holds the MM mutation guard. `Ok(true)`:
-/// published, retry the faulting instruction.
-pub(super) fn publish_handed_back_frame_grant<E: ThreadedEngine>(
-    engine: &mut E,
-    mm_key: u64,
-    address: u64,
-) -> Result<bool, TrapError> {
-    for slot in 0..carrick_el1_abi::EL1_STACK_SLOTS as usize {
-        let Some(ready) = carrick_el1_abi::frame_grant_mailbox_host_for_slot(slot)
-            .and_then(|mailbox| mailbox.take_failed_publication(mm_key, address))
-        else {
-            continue;
-        };
-        if !engine.publish_el1_frame_grant_on_host(
-            ready.semantic_base,
-            ready.physical_ipa,
-            ready.len,
-            ready.permissions,
-        )? {
-            carrick_fatal::carrick_fatal!(
-                "hvpatch::el1_frame_grant",
-                "backend cannot publish a handed-back EL1 frame grant: base={:#x} len={:#x}",
-                ready.semantic_base,
-                ready.len
-            );
-        }
-        return Ok(true);
-    }
-    Ok(false)
-}
-
 /// Guest EL1 bulk frame grants for first touch. `CARRICK_EL1_FRAME_GRANT=0`
 /// ignores EL1's requests (the fault path cancels them) so every first touch
 /// takes the host path.
@@ -513,28 +471,36 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     );
                     return Ok(true);
                 };
-                if !mailbox.publish_ready(carrick_el1_abi::FrameGrantReady {
-                    mm_key: request.mm_key,
-                    request_generation: request.request_generation,
-                    semantic_base: service.semantic_base,
-                    physical_ipa: ready.physical_ipa,
-                    len: service.len,
-                    permissions: service.permissions,
-                    frame_id: ready.frame_id,
-                    mapping_id: ready.mapping_id,
-                    owner_generation: ready.owner_generation,
-                    inventory_revision: ready.inventory_revision,
-                }) {
-                    carrick_fatal::carrick_fatal!(
-                        "hvpatch::el1_frame_grant",
-                        "authenticated frame grant could not publish Ready: mm={} generation={} semantic_base={:#x} len={:#x}",
-                        request.mm_key,
-                        request.request_generation,
-                        service.semantic_base,
-                        service.len
+                let completed = mailbox.complete_grant(
+                    carrick_el1_abi::FrameGrantReady {
+                        mm_key: request.mm_key,
+                        request_generation: request.request_generation,
+                        semantic_base: service.semantic_base,
+                        physical_ipa: ready.physical_ipa,
+                        len: service.len,
+                        permissions: service.permissions,
+                        frame_id: ready.frame_id,
+                        mapping_id: ready.mapping_id,
+                        owner_generation: ready.owner_generation,
+                        inventory_revision: ready.inventory_revision,
+                    },
+                    |grant| {
+                        engine.publish_el1_frame_grant_on_host(
+                            grant.semantic_base,
+                            grant.physical_ipa,
+                            grant.len,
+                            grant.permissions,
+                        )
+                    },
+                    || dispatcher.commit_resident_frame_grant(plan),
+                )?;
+                if !completed {
+                    publish_frame_grant_refusal(
+                        mailbox,
+                        request,
+                        carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
                     );
                 }
-                dispatcher.commit_resident_frame_grant(plan);
                 return Ok(true);
             }
         }
