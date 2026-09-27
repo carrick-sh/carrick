@@ -93,10 +93,20 @@ pub enum WorkMetric {
     /// Frame-inventory extents one containment lookup visited in an mm's
     /// extent ledger.
     FrameExtentsVisited,
+    /// Segregated allocator size classes checked for one allocation.
+    AllocatorBinsChecked,
+    /// Free blocks inspected while selecting storage for one allocation.
+    AllocatorBlocksInspected,
+    /// Free-block splits performed for one allocation.
+    AllocatorSplitsPerformed,
+    /// Adjacent free-block merges performed for one deallocation.
+    AllocatorMergesPerformed,
+    /// Bytes of allocator capacity admitted by the observed fixture.
+    AllocatorCapacityBytes,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 43;
+    pub const COUNT: usize = 48;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -141,6 +151,11 @@ impl WorkMetric {
         Self::AliasRowsVisited,
         Self::TaskMappingRowsVisited,
         Self::FrameExtentsVisited,
+        Self::AllocatorBinsChecked,
+        Self::AllocatorBlocksInspected,
+        Self::AllocatorSplitsPerformed,
+        Self::AllocatorMergesPerformed,
+        Self::AllocatorCapacityBytes,
     ];
 }
 

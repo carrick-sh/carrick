@@ -2961,6 +2961,7 @@
         "kernel.mm.address-space-occupancy",
         "kernel.mm.backing-maintenance-lookup",
         "kernel.mm.current-read-reuse",
+        "kernel.mm.metadata-refusal",
         "kernel.mm.native-data-activation",
         "kernel.mm.pt-pause-drain-acknowledgement",
         "kernel.mm.retained-fragment-query"
@@ -3083,6 +3084,7 @@
         "kernel.fork.mappings",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.backing-maintenance-lookup",
+        "kernel.mm.metadata-refusal",
         "kernel.mm.pt-pause-drain-acknowledgement",
         "kernel.mm.retained-fragment-query",
         "kernel.mm.scrub-remap-query"
@@ -3142,6 +3144,7 @@
         "kernel.el1.fault-entry",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.current-read-reuse",
+        "kernel.mm.metadata-refusal",
         "kernel.mm.native-data-activation",
         "kernel.mm.pt-pause-drain-acknowledgement"
       ],

@@ -287,14 +287,14 @@ impl MetadataAllocatorCore {
     }
 
     /// Calculate required host grant size to satisfy layout requirements.
-    pub fn needed_grant_size(&self, size: usize, align: usize) -> usize {
+    pub fn needed_grant_size(&self, size: usize, align: usize) -> Option<usize> {
         let max_block_req = size
-            .saturating_add(HEADER_SIZE)
-            .saturating_add(align)
-            .saturating_add(MIN_BLOCK_SIZE);
+            .checked_add(HEADER_SIZE)?
+            .checked_add(align)?
+            .checked_add(MIN_BLOCK_SIZE)?;
         let min_quantum = carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE;
         let needed = max_block_req.max(min_quantum);
-        (needed + 0x0FFF) & !0x0FFF
+        Some(needed.checked_add(0x0FFF)? & !0x0FFF)
     }
 
     /// Admit an extent into the allocator.
@@ -363,15 +363,24 @@ impl MetadataAllocatorCore {
         size: usize,
         align: usize,
     ) -> (Option<*mut u8>, AllocMetrics) {
+        let metrics = AllocMetrics::default();
+        if align == 0 || !align.is_power_of_two() {
+            return (None, metrics);
+        }
         let align = align.max(16);
-        let aligned_size = (size.max(1) + 15) & !15;
-        let max_needed = aligned_size
-            .saturating_add(HEADER_SIZE)
-            .saturating_add(align)
-            .saturating_add(MIN_BLOCK_SIZE);
+        let Some(aligned_size) = size.max(1).checked_add(15).map(|value| value & !15) else {
+            return (None, metrics);
+        };
+        let Some(max_needed) = aligned_size
+            .checked_add(HEADER_SIZE)
+            .and_then(|value| value.checked_add(align))
+            .and_then(|value| value.checked_add(MIN_BLOCK_SIZE))
+        else {
+            return (None, metrics);
+        };
         let target_bin = Self::bin_for_size(max_needed);
 
-        let mut metrics = AllocMetrics::default();
+        let mut metrics = metrics;
         let mut chosen_block: *mut BlockHeader = core::ptr::null_mut();
 
         // 1. Try head of target bin
@@ -965,7 +974,7 @@ impl MetadataStorage {
                 return None;
             }
             let needed_size = core.needed_grant_size(size, align);
-            if let Some(slot) = current_el1_slot() {
+            if let (Some(slot), Some(needed_size)) = (current_el1_slot(), needed_size) {
                 Self::publish_request(
                     slot,
                     carrick_el1_abi::MetadataGrantRequest {

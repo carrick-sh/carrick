@@ -159,6 +159,18 @@ static INLINE_HVC_TRAPS: AtomicU64 = AtomicU64::new(0);
 static FAILPOINT_DENY_NEXT: AtomicBool = AtomicBool::new(false);
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+fn reserve_metadata_token(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+            if token == 0 || token == u64::MAX {
+                None
+            } else {
+                Some(token + 1)
+            }
+        })
+        .ok()
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn metadata_aperture(custody: &crate::trap::CarrierVmCustody) -> &Mutex<HostApertureState> {
     &custody.metadata_aperture
@@ -256,10 +268,17 @@ fn service_metadata_operation(
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         }
 
-        let requested_size = arg1 as usize;
+        let Ok(requested_size) = usize::try_from(arg1) else {
+            return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+        };
+        if requested_size == 0 || requested_size > EL1_DYNAMIC_METADATA_SIZE as usize {
+            return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+        }
         let extent_quantum = EL1_DYNAMIC_METADATA_EXTENT_SIZE;
-        let num_slots = requested_size.max(1).div_ceil(extent_quantum);
-        let extent_size = num_slots * extent_quantum;
+        let num_slots = requested_size.div_ceil(extent_quantum);
+        let Some(extent_size) = num_slots.checked_mul(extent_quantum) else {
+            return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+        };
 
         // 2. Find and atomically reserve contiguous aperture slots
         let slot_idx = {
@@ -272,15 +291,23 @@ fn service_metadata_operation(
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         };
 
-        let ipa = EL1_DYNAMIC_METADATA_BASE
-            + (slot_idx as u64) * (EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64);
-        if ipa.saturating_add(extent_size as u64)
-            > EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE
-        {
+        let Some(ipa) = (slot_idx as u64)
+            .checked_mul(EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64)
+            .and_then(|offset| EL1_DYNAMIC_METADATA_BASE.checked_add(offset))
+        else {
             {
                 let mut state = aperture.lock();
                 state.unreserve_slots(slot_idx, num_slots);
             }
+            GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        };
+        let Some(extent_end) = ipa.checked_add(extent_size as u64) else {
+            aperture.lock().unreserve_slots(slot_idx, num_slots);
+            return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+        };
+        if extent_end > EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE {
+            aperture.lock().unreserve_slots(slot_idx, num_slots);
             GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         }
@@ -298,7 +325,11 @@ fn service_metadata_operation(
 
         // 4. Map into stage-2 with Read/Write permissions (strictly non-executable)
         let permissions = 0b011; // HV_MEMORY_READ | HV_MEMORY_WRITE
-        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        let Some(token) = reserve_metadata_token(&NEXT_TOKEN) else {
+            aperture.lock().unreserve_slots(slot_idx, num_slots);
+            GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        };
         let spec = crate::trap::CarrierStage2RecordSpec {
             vm_generation: crate::trap::CarrierVmGeneration(generation),
             ipa,
@@ -339,7 +370,9 @@ fn service_metadata_operation(
         Ok([METADATA_GRANT_SUCCESS, ipa, extent_size as u64, token])
     } else if op == METADATA_GRANT_OP_FREE {
         let ipa = arg1;
-        let size = arg2 as usize;
+        let Ok(size) = usize::try_from(arg2) else {
+            return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+        };
         let token = arg3;
 
         // Validate IPA bounds, alignment, and non-zero token
@@ -720,5 +753,18 @@ mod tests {
         let aperture = metadata_aperture(&custody).lock();
         assert!(aperture.slots.iter().all(Option::is_none));
         assert!(aperture.occupied_bitmap.iter().all(|word| *word == 0));
+    }
+
+    #[test]
+    fn metadata_tokens_never_wrap_or_issue_zero() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(reserve_metadata_token(&counter), Some(u64::MAX - 1));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(reserve_metadata_token(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+
+        let invalid = AtomicU64::new(0);
+        assert_eq!(reserve_metadata_token(&invalid), None);
+        assert_eq!(invalid.load(Ordering::Relaxed), 0);
     }
 }

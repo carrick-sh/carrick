@@ -66,6 +66,25 @@ The green source marks every allocator participant that observes unfinished
 carrier-wide work as pending host work. The host services at most the one
 single-flight request after the allocator stack and lock have unwound.
 
+## Checked arithmetic red
+
+Source `548aa42382ac0aca8e2c737f984d772d07503b43` added two behavioral
+controls before changing the allocator. An oversized guest layout panicked in
+alignment arithmetic, and an oversized host request panicked while deriving
+its extent size. The failing transcripts are
+[`arithmetic-guest-layout-red.log`](arithmetic-guest-layout-red.log) and
+[`arithmetic-host-grant-red.log`](arithmetic-host-grant-red.log); their source
+identity is retained in
+[`arithmetic-red-source-head.txt`](arithmetic-red-source-head.txt).
+
+The corrected path rejects unrepresentable guest layouts without changing
+allocator state, rejects invalid host sizes before reserving the aperture, and
+exhausts metadata tokens without issuing zero or wrapping. The VM-free work
+contract now records the allocator's existing constant bounds at scales 1, 8,
+32, and 128: at most two bin checks, block inspections, splits, and merges,
+with exactly 64 KiB of admitted capacity per scale unit. These controls do not
+replace the final signed rerun required for the changed source.
+
 This is allocator acceptance evidence. It does not claim shared MMU
 publication, anonymous first-touch closure, a better host-exit slope, memory
 checkpoint acceptance, or the end-to-end 2x workload target.
