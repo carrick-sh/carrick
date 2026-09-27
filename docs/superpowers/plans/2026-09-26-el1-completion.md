@@ -707,3 +707,18 @@ identities and rationale bodies. The four earlier abort fingerprints remain
 reviewed. Full integrated CI starts after committing these inventory updates;
 no full CI or signed acceptance is yet claimed. Non-macOS profiles remain
 pending as before.
+
+2026-09-26: full CI on `bc5500391` stopped at generated contract inventory
+validation after workspace Clippy and earlier domain checks passed. Regenerated
+inventory adds only the metadata-refusal claim to mmap/munmap/mprotect; full
+CI reruns after commit. Failure evidence is under metadata-refusal-director/
+integrated-ci/. No full CI acceptance is claimed.
+
+Dispatched the next distinct implementation, `el1-elastic-metadata`, through
+Antigravity (cid `bce3369a-a045-4632-a3f0-736bab05eae1`) in the clean reused
+el1-memory-corrections checkout at `bc5500391`. Its director-written brief is
+2026-09-26-el1-elastic-metadata.md. It requires real guest allocator/grant/
+return wiring and an embed fixture, not host-only allocation. Worker runs host
+checks and compilation only; director retains signed execution and acceptance.
+This task has zero review rounds used; metadata-refusal is terminal after
+three rounds and director correction, not reopened.
