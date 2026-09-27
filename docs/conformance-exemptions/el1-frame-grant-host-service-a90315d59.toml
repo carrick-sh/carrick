@@ -1,0 +1,28 @@
+schema = "carrick.conformance-exemption.v1"
+base = "ce1c23b4e267ce2399fa978b04ab5db6a3dac2b0"
+head = "a90315d597a367e9ecbffd2ae2f828b1e7c5ade1"
+paths = [
+  "crates/carrick-aarch64/src/engine.rs",
+  "crates/carrick-aarch64/src/vmm.rs",
+  "crates/carrick-el1-abi/src/lib.rs",
+  "crates/carrick-hal/src/threaded.rs",
+  "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
+  "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+]
+contracts = [
+  "kernel.mm.syscall-code-write",
+  "kernel.fork.mappings",
+  "kernel.fork.stage1-image",
+  "kernel.time.realtime-calibration",
+  "kernel.mm.backing-maintenance-lookup",
+  "kernel.el1.gic",
+  "kernel.mm.metadata-refusal",
+  "kernel.mm.pt-pause-drain-acknowledgement",
+  "kernel.el1.guest-run-queue",
+  "kernel.el1.fault-entry",
+  "kernel.el1.metadata-allocation",
+  "kernel.transport.exit-overhead",
+  "kernel.vcpu.kick-el0-boundary",
+  "kernel.vcpu.vm-lifetime",
+]
+rationale = "The exact product diff adds the EL1 frame-grant host service and the neutral backend seam. It does not change syscall writes, fork mapping or stage-1 snapshot behavior, realtime calibration, backing lookup, GIC, metadata refusal/allocation, page-table drain, guest run queue, fault entry, transport overhead, kick delivery, or VM lifetime behavior registered to these shared adapter files; kernel.el1.stage1-publication carries the changed semantics and red-first evidence."

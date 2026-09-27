@@ -27,6 +27,9 @@ Evidence retained here:
 - `clippy.log`: warning-denied Clippy passes across the changed product crates;
 - `contract-green.log`: 62 contracts, 15 claims and 143 registered surfaces
   validate after adding the production host-service paths;
+- `contract-change-green.log`: the exact `ce1c23b4e..a90315d59` product diff
+  has stage-1-publication evidence, with a revision-bound exemption for older
+  contracts sharing the ABI, HAL, AArch64 and HVF adapter files;
 - `inventory-drift-green.log`: the generated 338-syscall inventory remains
   current;
 - `hvf-lib-first-run-red.log`: an invalid parallel validation run produced two
