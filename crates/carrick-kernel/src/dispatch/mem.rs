@@ -335,6 +335,11 @@ pub struct MemState {
     pub brk_current: u64,
     /// Bump cursor for the anonymous mmap arena.
     pub mmap_next: u64,
+    /// Cursor of guest EL1's anonymous-mmap window
+    /// ([`MemoryLayout::el1_anon_window`]): past every mapping the host has
+    /// seen there. Seeds the EL1 allocator when the address space is
+    /// published, including a forked child's copy.
+    pub el1_anon_next: u64,
     /// MONOTONIC high-water of the arena: the highest address the guest could
     /// EVER have stored a non-zero byte into. `munmap` NEVER lowers it (unlike
     /// `mmap_next`).
@@ -499,6 +504,7 @@ impl MemState {
             semantic_vmas: VmaMap::new(),
             brk_current: layout.heap_base,
             mmap_next: layout.mmap_base,
+            el1_anon_next: layout.el1_anon_window().0,
             mmap_writable_high: layout.mmap_base,
             shared: crate::shared_aperture::SharedAperture::new(),
             overlay: crate::shared_aperture::SharedAperture::with_window(
@@ -1493,7 +1499,12 @@ impl<'a> MemView<'a> {
                 // zero. See `lower_mmap_next` for the full mechanism and the
                 // one-second reducer.
                 free_regions_remove_range(&mut mem.free_regions, requested, length);
-                if end > mem.mmap_next {
+                let (window_start, window_end) = layout.el1_anon_window();
+                if requested < window_end && end > window_start {
+                    // EL1's window keeps its own cursor; the host bump cursor
+                    // must never climb into it.
+                    mem.el1_anon_next = mem.el1_anon_next.max(end.min(window_end));
+                } else if end > mem.mmap_next {
                     // Skipping ahead would strand `[mmap_next, requested)`
                     // forever, so hand it to the free list rather than lose it.
                     let gap_start = mem.mmap_next;
@@ -1512,8 +1523,14 @@ impl<'a> MemView<'a> {
 
         if requested != 0 {
             let aligned_hint = requested.is_multiple_of(page_size);
-            let arena_hint =
-                aligned_hint && range_within(requested, length, layout.mmap_base, layout.mmap_size);
+            let (window_start, _) = layout.el1_anon_window();
+            let arena_hint = aligned_hint
+                && range_within(
+                    requested,
+                    length,
+                    layout.mmap_base,
+                    window_start - layout.mmap_base,
+                );
             if arena_hint {
                 let mem_authority_11 = self.mem();
                 let mut mem = mem_authority_11.lock();
@@ -1575,7 +1592,12 @@ impl<'a> MemView<'a> {
             }
             if let Some(cursor) = align_up_u64(mem.mmap_next, page_size)
                 && let Some(address) = congruence.first_at_or_after(cursor)
-                && range_within(address, length, layout.mmap_base, layout.mmap_size)
+                && range_within(
+                    address,
+                    length,
+                    layout.mmap_base,
+                    layout.el1_anon_window().0 - layout.mmap_base,
+                )
                 && let Some(end) = address.checked_add(length)
             {
                 // A congruent bump skipped `[cursor, address)`; park it for reuse

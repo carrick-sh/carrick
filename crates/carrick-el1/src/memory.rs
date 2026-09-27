@@ -19,14 +19,12 @@ const MAP_SHARED: u64 = 0x01;
 const MAP_PRIVATE: u64 = 0x02;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
-const MAP_GROWSDOWN: u64 = 0x0100;
-const MAP_STACK: u64 = 0x20000;
-const MAP_HUGETLB: u64 = 0x40000;
+const MAP_NORESERVE: u64 = 0x4000;
 
 const LINUX_HEAP_BASE: u64 = 0x40_0000_0000;
 const LINUX_HEAP_SIZE: u64 = 128 * 1024 * 1024;
+#[cfg(test)]
 const LINUX_MMAP_BASE: u64 = 0x60_0000_0000;
-const LINUX_MMAP_SIZE_MAX: u64 = 160 * 1024 * 1024 * 1024;
 
 const EACCES: i64 = 13;
 const EINVAL: i64 = 22;
@@ -279,7 +277,7 @@ pub fn try_serve_mmap<E: AnonymousRetirementEditor>(
     if flags & MAP_ANONYMOUS == 0 || flags & MAP_PRIVATE == 0 || flags & MAP_SHARED != 0 {
         return MmapDisposition::Forward;
     }
-    if flags & (MAP_GROWSDOWN | MAP_STACK | MAP_HUGETLB) != 0 {
+    if flags & !(MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE) != 0 {
         return MmapDisposition::Forward;
     }
     if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
@@ -312,45 +310,33 @@ pub fn try_serve_mmap<E: AnonymousRetirementEditor>(
         return MmapDisposition::Forward;
     };
 
-    let fixed = flags & MAP_FIXED != 0;
-    if !fixed {
-        let mut mmap_next = editor_guard.mmap_next();
-        if mmap_next == 0 {
-            mmap_next = LINUX_MMAP_BASE;
-        }
-        let alloc_addr = if requested_addr != 0
-            && requested_addr.is_multiple_of(PAGE_SIZE)
-            && requested_addr >= mmap_next
-            && requested_addr
-                .checked_add(len)
-                .is_some_and(|end| end <= LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX)
-        {
-            editor_guard.set_mmap_next(requested_addr + len);
-            requested_addr
-        } else {
-            let Some(new_next) = mmap_next.checked_add(len) else {
-                return MmapDisposition::Return(-ENOMEM);
-            };
-            if new_next > LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX {
-                return MmapDisposition::Return(-ENOMEM);
-            }
-            editor_guard.set_mmap_next(new_next);
-            mmap_next
-        };
-        MmapDisposition::Return(alloc_addr as i64)
-    } else {
-        if requested_addr == 0 || !requested_addr.is_multiple_of(PAGE_SIZE) {
-            return MmapDisposition::Return(-EINVAL);
-        }
-        let Some(end) = requested_addr.checked_add(len) else {
-            return MmapDisposition::Return(-ENOMEM);
-        };
-        if requested_addr < LINUX_MMAP_BASE || end > LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX {
-            return MmapDisposition::Forward;
-        }
-        let _ = editor.retire_and_invalidate(grant.ttbr0, requested_addr, len);
-        MmapDisposition::Return(requested_addr as i64)
+    // Only a hint-free, non-fixed reservation is EL1's: it comes from the
+    // window the host placer never uses, so the two allocators cannot
+    // collide. The host replays `[mmap_drained, mmap_next)` as one
+    // MAP_FIXED mapping at its next boundary for this MM (see
+    // `AddressSpaces::take_pending`), so a pending run must share one
+    // protection; a differing one forwards and the host drains first.
+    if flags & MAP_FIXED != 0 || requested_addr != 0 {
+        return MmapDisposition::Forward;
     }
+    let window_end = editor_guard.mmap_window_end();
+    let cursor = editor_guard.mmap_next();
+    if window_end == 0 || cursor == 0 {
+        return MmapDisposition::Forward;
+    }
+    let pending = editor_guard.mmap_drained() != cursor;
+    if pending && editor_guard.mmap_pending_prot() != prot {
+        return MmapDisposition::Forward;
+    }
+    let Some(end) = cursor.checked_add(len).filter(|end| *end <= window_end) else {
+        return MmapDisposition::Forward;
+    };
+    let _ = (grant, editor);
+    if !pending {
+        editor_guard.set_mmap_pending_prot(prot);
+    }
+    editor_guard.set_mmap_next(end);
+    MmapDisposition::Return(cursor as i64)
 }
 
 /// Try to serve canonical AArch64 `mprotect(2)` for a fully resident
@@ -603,49 +589,76 @@ mod tests {
     }
 
     #[test]
-    fn resident_anonymous_mmap_allocates_and_replaces() {
-        let (mut frame, tasks, spaces, ttbr0) = fixture(PROT_READ | PROT_WRITE);
+    fn anonymous_mmap_reserves_from_the_window_and_logs_one_pending_run() {
+        let mm = 17;
+        let ttbr0 = (9_u64 << 48) | 0x8800_0000_0000;
+        let task = CurrentTask::new();
+        task.zone_mm.store(mm, Ordering::Release);
+        let tasks = [task];
+        let spaces = AddressSpaces::new();
+        let window = LINUX_MMAP_BASE + 0x1_0000_0000;
+        let index = spaces
+            .publish_closed_with_layout(mm, ttbr0, ttbr0, 0, window, window + 0x6000)
+            .unwrap();
+        spaces.open(index);
+        let mut frame = TrapFrame::default();
         frame.x[8] = SYS_MMAP;
-        frame.x[0] = 0; // addr = 0
-        frame.x[1] = 0x3000; // len
+        frame.x[1] = 0x3000;
         frame.x[2] = PROT_READ | PROT_WRITE;
         frame.x[3] = MAP_PRIVATE | MAP_ANONYMOUS;
-        frame.x[4] = u64::MAX; // fd = -1
-        frame.x[5] = 0;
+        frame.x[4] = u64::MAX;
         let mut editor = RecordingRetirementEditor::default();
+        assert!(!spaces.has_pending(index));
 
-        // First bump allocation
         assert_eq!(
             try_serve_mmap(&frame, &tasks, &spaces, &mut editor),
-            MmapDisposition::Return(LINUX_MMAP_BASE as i64)
+            MmapDisposition::Return(window as i64)
         );
-        assert!(editor.calls.is_empty());
-
-        // Second bump allocation
-        frame.x[1] = 0x2000;
+        frame.x[1] = 0x1000;
         assert_eq!(
             try_serve_mmap(&frame, &tasks, &spaces, &mut editor),
-            MmapDisposition::Return((LINUX_MMAP_BASE + 0x3000) as i64)
+            MmapDisposition::Return((window + 0x3000) as i64)
         );
-
-        // Fixed replacement over first allocation
-        frame.x[0] = LINUX_MMAP_BASE;
-        frame.x[1] = 0x2000;
-        frame.x[3] = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
-        assert_eq!(
-            try_serve_mmap(&frame, &tasks, &spaces, &mut editor),
-            MmapDisposition::Return(LINUX_MMAP_BASE as i64)
-        );
-        assert_eq!(editor.calls, vec![(ttbr0, LINUX_MMAP_BASE, 0x2000)]);
-
-        // Non-anonymous mmap must forward to host
-        frame.x[3] = MAP_SHARED | MAP_ANONYMOUS;
+        // A different protection cannot join the pending run.
+        frame.x[2] = PROT_READ;
         assert_eq!(
             try_serve_mmap(&frame, &tasks, &spaces, &mut editor),
             MmapDisposition::Forward
         );
-
-        // Zero length returns EINVAL
+        assert!(spaces.has_pending(index));
+        assert_eq!(
+            spaces.take_pending(index).mmap,
+            Some((window, 0x4000, PROT_READ | PROT_WRITE))
+        );
+        assert!(!spaces.has_pending(index));
+        // After the host replayed the run, a new protection starts a new one.
+        assert_eq!(
+            try_serve_mmap(&frame, &tasks, &spaces, &mut editor),
+            MmapDisposition::Return((window + 0x4000) as i64)
+        );
+        // Window exhausted: the host serves it.
+        frame.x[1] = 0x2000;
+        assert_eq!(
+            try_serve_mmap(&frame, &tasks, &spaces, &mut editor),
+            MmapDisposition::Forward
+        );
+        // Fixed, hinted, shared and populate mappings stay on the host.
+        frame.x[1] = 0x1000;
+        for (addr, flags) in [
+            (window, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED),
+            (window + 0x8000, MAP_PRIVATE | MAP_ANONYMOUS),
+            (0, MAP_SHARED | MAP_ANONYMOUS),
+            (0, MAP_PRIVATE | MAP_ANONYMOUS | 0x8000),
+        ] {
+            frame.x[0] = addr;
+            frame.x[3] = flags;
+            assert_eq!(
+                try_serve_mmap(&frame, &tasks, &spaces, &mut editor),
+                MmapDisposition::Forward
+            );
+        }
+        assert!(editor.calls.is_empty());
+        frame.x[0] = 0;
         frame.x[1] = 0;
         frame.x[3] = MAP_PRIVATE | MAP_ANONYMOUS;
         assert_eq!(

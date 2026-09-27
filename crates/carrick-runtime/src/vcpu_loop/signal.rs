@@ -368,6 +368,47 @@ pub(super) fn cancel_frame_grant_request(
     }
 }
 
+/// Publish a frame grant guest EL1 claimed but could not publish itself
+/// (no table room it can reach), possibly in another vCPU's mailbox after a
+/// migration. `Ok(true)`: published, retry the faulting instruction.
+pub(super) fn any_handed_back_frame_grant() -> bool {
+    (0..carrick_el1_abi::EL1_STACK_SLOTS as usize).any(|slot| {
+        carrick_el1_abi::frame_grant_mailbox_host_for_slot(slot)
+            .is_some_and(carrick_el1_abi::FrameGrantMailbox::has_failed_publication)
+    })
+}
+
+/// Publish a handed-back grant covering `address` (see
+/// [`any_handed_back_frame_grant`]); the caller holds the MM mutation guard.
+pub(super) fn publish_handed_back_frame_grant<E: ThreadedEngine>(
+    engine: &mut E,
+    mm_key: u64,
+    address: u64,
+) -> Result<bool, TrapError> {
+    for slot in 0..carrick_el1_abi::EL1_STACK_SLOTS as usize {
+        let Some(ready) = carrick_el1_abi::frame_grant_mailbox_host_for_slot(slot)
+            .and_then(|mailbox| mailbox.take_failed_publication(mm_key, address))
+        else {
+            continue;
+        };
+        if !engine.publish_el1_frame_grant_on_host(
+            ready.semantic_base,
+            ready.physical_ipa,
+            ready.len,
+            ready.permissions,
+        )? {
+            carrick_fatal::carrick_fatal!(
+                "hvpatch::el1_frame_grant",
+                "backend cannot publish a handed-back EL1 frame grant: base={:#x} len={:#x}",
+                ready.semantic_base,
+                ready.len
+            );
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Resolve a fault whose read-only outer classification placed it inside a
 /// first-touch or grow-down extent. This entry point cannot be called without
 /// structural mutation authority and is kept separate from ordinary signal
@@ -411,6 +452,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                 let Some(plan) =
                     dispatcher.resident_frame_grant_plan(&permit, address, request.requested_len)
                 else {
+                    eprintln!("EL1DBG DENY no-plan addr=0x{:x}", address);
                     publish_frame_grant_refusal(
                         mailbox,
                         request,
@@ -419,6 +461,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     return Ok(true);
                 };
                 let prot = plan.prot();
+                eprintln!("EL1DBG ACCEPT addr=0x{:x} mm={} plan=0x{:x}+0x{:x} prot={}", address, request.mm_key, plan.start(), plan.len(), prot);
                 crate::probes::hvpatch_el1_frame_grant_plan(
                     request.fault_va,
                     plan.start(),
@@ -528,6 +571,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         return Ok(false);
     };
     let retried = engine.resolve_stale_stage1_fault(address, access)?;
+    eprintln!("EL1DBG STALE addr=0x{:x} retried={}", address, retried);
     if retried {
         crate::probes::hvpatch_stale_stage1_retry(address, access as u32, tid.raw());
     } else {

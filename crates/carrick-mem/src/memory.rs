@@ -688,6 +688,21 @@ impl MemoryLayout {
             mmap_size: mmap_arena_size(),
         }
     }
+
+    /// The top quarter of the private mmap arena, reserved for guest EL1's
+    /// anonymous-mmap bump allocator. Host placement never hands out a
+    /// non-fixed address here, so EL1 reservations cannot collide with host
+    /// mappings; the host replays EL1's reservations as MAP_FIXED.
+    pub fn el1_anon_window(&self) -> (u64, u64) {
+        const ALIGN: u64 = 2 * 1024 * 1024;
+        let end = self.mmap_base.saturating_add(self.mmap_size);
+        let start = self
+            .mmap_base
+            .saturating_add(self.mmap_size - self.mmap_size / 4)
+            .div_ceil(ALIGN)
+            .saturating_mul(ALIGN);
+        (start.min(end), end)
+    }
 }
 // Stable shared aperture for guest MAP_SHARED mmaps. The whole window is
 // hv_vm_map'd ONCE at boot (host MAP_ANON|MAP_SHARED|MAP_NORESERVE; see

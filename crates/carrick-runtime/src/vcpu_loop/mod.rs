@@ -618,6 +618,7 @@ impl KernelState {
     }
 
     fn record_fatal_signal(&self, record: FatalSignalRecord) {
+        eprintln!("EL1DBG FATAL tid={:?} signo={} code={} addr=0x{:x}", record.tid, record.signo, record.code, record.addr);
         let _ = self.fatal_signal.record(record);
     }
 
@@ -1346,6 +1347,106 @@ where
         Ok(run(&mut mutation))
     }
 
+    /// Replay the anonymous mmap/brk reservations guest EL1 served for this
+    /// thread's MM into the host VMA state, before any host path consults
+    /// it: a forwarded syscall, a first-touch fault, fork or exec. EL1 only
+    /// advanced its window cursor and program break; the host commits them
+    /// as MAP_FIXED/brk through the ordinary mutation route, so first-touch
+    /// plans, fork COW ranges and /proc maps stay authoritative.
+    /// `Ok(true)`: reservations were replayed, so a fault taken before the
+    /// replay may now be stale and must be retried rather than classified.
+    pub(super) fn replay_el1_reservations(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+    ) -> Result<bool, RuntimeError> {
+        let Some(mm) = self.zone_mm else {
+            return Ok(false);
+        };
+        if !carrick_kernel::kernel::mm_occupancy::el1_reservations_pending(mm) {
+            return Ok(false);
+        }
+        let mut executor = self.guest_execution.take().ok_or_else(|| {
+            RuntimeError::Configuration("EL1 reservation replay lacks executor".to_owned())
+        })?;
+        let result = self.replay_el1_reservations_for_executor(kernel, engine, &mut executor);
+        self.guest_execution = Some(executor);
+        result.map(|()| true)
+    }
+
+    fn replay_el1_reservations_for_executor(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+        mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
+    ) -> Result<(), RuntimeError> {
+        let Some(mm) = self.zone_mm else {
+            return Ok(());
+        };
+        if !carrick_kernel::kernel::mm_occupancy::el1_reservations_pending(mm) {
+            return Ok(());
+        }
+        let kernel_context = kernel
+            .dispatcher
+            .capture_kernel_context(self.linux_tid)
+            .map_err(|error| {
+                RuntimeError::Configuration(format!("EL1 reservation replay context: {error}"))
+            })?;
+        // The guard raises the MM's EL1 editor gate: no reservation can be
+        // added while this one is taken and replayed.
+        let mut guard = carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor);
+        let pending = carrick_kernel::kernel::mm_occupancy::take_el1_reservations(mm);
+        let mut replays: [Option<(u64, [u64; 6])>; 2] = [None, None];
+        if let Some((start, len, prot)) = pending.mmap {
+            const MAP_PRIVATE_ANONYMOUS_FIXED: u64 = 0x02 | 0x20 | 0x10;
+            replays[0] = Some((
+                222,
+                [start, len, prot, MAP_PRIVATE_ANONYMOUS_FIXED, u64::MAX, 0],
+            ));
+        }
+        if let Some(brk) = pending.brk {
+            replays[1] = Some((214, [brk, 0, 0, 0, 0, 0]));
+        }
+        for (number, args) in replays.into_iter().flatten() {
+            eprintln!("EL1DBG REPLAY mm={mm} nr={number} args={args:x?}");
+            let request = SyscallRequest::new(
+                number,
+                crate::compat::SyscallArgs(args),
+            );
+            let syscall = PreparedSyscall {
+                original_args: request.args,
+                request,
+            };
+            let ctx = ThreadCtx::new(self.this_tid, &self.registry, &self.futex)
+                .with_zone(zone::zone_for(self.zone_mm));
+            let outcome = kernel
+                .dispatcher
+                .dispatch_threaded_prepared_mutation_with_lease(
+                    &kernel_context,
+                    syscall,
+                    engine,
+                    &kernel.reporter,
+                    ctx,
+                    MutationDispatchRoute {
+                        guard: &mut guard,
+                        lease: None,
+                    },
+                )
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!("EL1 reservation replay: {error:?}"))
+                })?;
+            let expected = args[0];
+            match outcome {
+                DispatchOutcome::Returned { value } if value as u64 == expected => {}
+                other => carrick_fatal::carrick_fatal!(
+                    "vcpu_loop::el1_reservation_replay",
+                    "EL1 reservation replay nr={number} args={args:x?} returned {other:?}"
+                ),
+            }
+        }
+        Ok(())
+    }
+
     fn service_threaded_syscall(
         &mut self,
         kernel: &Kernel,
@@ -1415,6 +1516,7 @@ where
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
         self.service_kernel_context = None;
+        self.replay_el1_reservations_for_executor(kernel, engine, mm_executor)?;
         if !self.syscall_completion.is_idle() {
             return Err(RuntimeError::Configuration(
                 "new syscall trapped while a completion token is still live".to_owned(),

@@ -108,7 +108,13 @@ unsafe impl<V: Aarch64Vmm> carrick_mmu_core::aarch64::HostArenaResolver
     for EngineHostResolver<'_, V>
 {
     fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
-        let needed = len.max(self.size);
+        // The primary arena is resolved whole; an extension arena is smaller
+        // than the primary, so asking for the primary's size fails its lookup.
+        let needed = if base == self.pt_base {
+            len.max(self.size)
+        } else {
+            len
+        };
         self.vm
             .host_ptr(base, needed)
             .or_else(|| (base == self.pt_base && len <= self.size).then_some(self.host))
@@ -1095,6 +1101,17 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 }
                 editor.set_multi_vcpu(unsafe_to_coalesce);
                 editor.set_stage1_exclusive(stage1_exclusive);
+                // Guest EL1 allocates table pages from the top eighth of the
+                // primary arena; this copy allocates only below it, and reads
+                // that half as EL1 last published it.
+                editor.manager.use_host_table_region();
+                // SAFETY: `host` maps the live primary arena for `size` bytes,
+                // and host edits hold the guard that excludes the EL1 editor.
+                unsafe {
+                    editor
+                        .manager
+                        .refresh_guest_table_region(host.cast_const(), size)
+                };
                 if let Some((address, len)) = live_range {
                     let resolver = EngineHostResolver {
                         vm: &self.vm,
@@ -1107,7 +1124,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                             .manager
                             .adopt_live_tables_for_range(&resolver, address, len)
                     }
-                    .map_err(page_table_sync_error_to_memory_error)?;
+                    .map_err(|error| {
+                        eprintln!("EL1DBG ADOPT-FAIL va=0x{address:x} len=0x{len:x} error={error:?}");
+                        page_table_sync_error_to_memory_error(error)
+                    })?;
                 }
                 match edit(editor) {
                     Ok(res) => {
@@ -1116,6 +1136,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                             self.vm
                                 .publish_stage1_extension_arenas(editor.manager)
                                 .map_err(|error| {
+                                    eprintln!("EL1DBG EXT-FAIL base=0x{:x} arenas={} next_free=0x{:x} cap=0x{:x} region={:?} bytes_span=0x{:x} pool={:?}", editor.manager.arenas[0].base, editor.manager.arenas.len(), editor.manager.arenas[0].next_free, editor.manager.arenas[0].capacity, editor.manager.table_region_for_debug(), editor.manager.arenas[0].allocated_span(), editor.manager.pool_stats());
                                     MemoryError::HostMap(format!(
                                         "publish stage-1 extension arenas failed: {error:?}"
                                     ))
@@ -3379,6 +3400,41 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.prepare_el1_frame_grant(request)
     }
 
+    fn publish_el1_frame_grant_on_host(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        permissions: u64,
+    ) -> Result<bool, TrapError> {
+        let size = usize::try_from(len).map_err(|_| TrapError::MappingTooLarge(len))?;
+        self.pt_edit_and_flush_after_adopting(va, size, |editor| {
+            let source = editor.arena_source.as_deref_mut();
+            editor
+                .manager
+                .publish_private_pages(
+                    carrick_mmu_core::aarch64::GuestLeafPublication {
+                        va,
+                        ipa,
+                        len,
+                        writable: permissions & 2 != 0,
+                        executable: permissions & 4 != 0,
+                    },
+                    source,
+                )
+                .map_err(|error| match error {
+                    carrick_mmu_core::aarch64::GuestLeafPublicationError::Manager(error) => error,
+                    _ => PageTableError::BadAddress,
+                })?;
+            Ok(PageTableApplyOutcome {
+                changed: true,
+                flush_required: true,
+            })
+        })
+        .map_err(|error| memory_error_to_trap_error(error, "publish EL1 frame grant on host"))?;
+        Ok(true)
+    }
+
     fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
@@ -3783,6 +3839,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // its user mappings must retain the same writable frames rather than
         // entering the ordinary fork-COW protocol.
         let private_ranges = self.vm.fork_cow_ranges();
+        eprintln!("EL1DBG FORK ranges={:x?}", private_ranges.iter().map(|r| (r.va, r.len, r.kernel_only)).collect::<Vec<_>>());
         // Guest EL1 publishes, protects and retires private-anonymous leaves
         // directly in the live tables, while this host manager edits an owned
         // copy. Adopt the live descriptors for every private range before the

@@ -66,6 +66,25 @@ pub struct SpaceEntry {
     pub mmap_next: AtomicU64,
     /// Current program break for heap allocations.
     pub brk_current: AtomicU64,
+    /// End of the anonymous-mmap window EL1 allocates from (`mmap_next` is
+    /// its cursor); 0 keeps every mmap on the host.
+    mmap_window_end: AtomicU64,
+    /// Host-replayed prefix of the window: `[mmap_drained, mmap_next)` is
+    /// reserved by EL1 but not yet a host VMA.
+    mmap_drained: AtomicU64,
+    /// Linux protection of the whole pending `[mmap_drained, mmap_next)`.
+    mmap_pending_prot: AtomicU64,
+    /// Program break the host last replayed.
+    brk_drained: AtomicU64,
+}
+
+/// EL1 reservations the host must replay into its VMA state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PendingReservations {
+    /// `(start, len, prot)` of one contiguous private-anonymous mapping.
+    pub mmap: Option<(u64, u64, u64)>,
+    /// The program break EL1 moved to.
+    pub brk: Option<u64>,
 }
 
 /// The table, in the shared EL1 region inside the zone.
@@ -130,6 +149,22 @@ impl<'a> SpaceEditor<'a> {
     pub fn set_brk_current(&self, val: u64) {
         self.entry.brk_current.store(val, Ordering::Release);
     }
+
+    pub fn mmap_window_end(&self) -> u64 {
+        self.entry.mmap_window_end.load(Ordering::Acquire)
+    }
+
+    pub fn mmap_drained(&self) -> u64 {
+        self.entry.mmap_drained.load(Ordering::Acquire)
+    }
+
+    pub fn mmap_pending_prot(&self) -> u64 {
+        self.entry.mmap_pending_prot.load(Ordering::Acquire)
+    }
+
+    pub fn set_mmap_pending_prot(&self, prot: u64) {
+        self.entry.mmap_pending_prot.store(prot, Ordering::Release);
+    }
 }
 
 impl Drop for SpaceEditor<'_> {
@@ -165,6 +200,10 @@ impl AddressSpaces {
                     active_editor: AtomicU64::new(0),
                     mmap_next: AtomicU64::new(0),
                     brk_current: AtomicU64::new(0),
+                    mmap_window_end: AtomicU64::new(0),
+                    mmap_drained: AtomicU64::new(0),
+                    mmap_pending_prot: AtomicU64::new(0),
+                    brk_drained: AtomicU64::new(0),
                 }
             }; ADDRESS_SPACES],
         }
@@ -212,7 +251,7 @@ impl AddressSpaces {
     /// Host, serialized: a closed entry for `key` with its roots, or `None`
     /// when the table is full. The caller has checked `key` is not published.
     pub fn publish_closed(&self, key: u64, ttbr0: u64, ttbr1: u64) -> Option<SpaceIndex> {
-        self.publish_closed_with_layout(key, ttbr0, ttbr1, 0, 0)
+        self.publish_closed_with_layout(key, ttbr0, ttbr1, 0, 0, 0)
     }
 
     /// Host, serialized: a closed entry for `key` with its roots and layout hints.
@@ -223,6 +262,7 @@ impl AddressSpaces {
         ttbr1: u64,
         brk_current: u64,
         mmap_next: u64,
+        mmap_window_end: u64,
     ) -> Option<SpaceIndex> {
         if key == 0 || key == FREED {
             return None;
@@ -243,6 +283,17 @@ impl AddressSpaces {
             entry.active_editor.store(0, Ordering::Relaxed);
             entry.mmap_next.store(mmap_next, Ordering::Relaxed);
             entry.brk_current.store(brk_current, Ordering::Relaxed);
+            entry.mmap_window_end.store(
+                if mmap_next != 0 && mmap_next < mmap_window_end {
+                    mmap_window_end
+                } else {
+                    0
+                },
+                Ordering::Relaxed,
+            );
+            entry.mmap_drained.store(mmap_next, Ordering::Relaxed);
+            entry.mmap_pending_prot.store(0, Ordering::Relaxed);
+            entry.brk_drained.store(brk_current, Ordering::Relaxed);
             // The key last: a reader that finds it sees the rest.
             entry.key.store(key, Ordering::SeqCst);
             return SpaceIndex::from_index(index);
@@ -399,6 +450,36 @@ impl AddressSpaces {
             return None;
         }
         Some(SpaceEditor { entry, owner })
+    }
+
+    /// Host: whether EL1 served an mmap or brk the host has not replayed.
+    /// A cheap unlocked check; [`Self::take_pending`] is authoritative.
+    pub fn has_pending(&self, index: SpaceIndex) -> bool {
+        let entry = self.entry(index);
+        entry.mmap_drained.load(Ordering::Acquire) != entry.mmap_next.load(Ordering::Acquire)
+            || entry.brk_drained.load(Ordering::Acquire)
+                != entry.brk_current.load(Ordering::Acquire)
+    }
+
+    /// Host, with EL1's editor excluded (gate raised and drained): take the
+    /// reservations EL1 made since the last call and mark them replayed.
+    pub fn take_pending(&self, index: SpaceIndex) -> PendingReservations {
+        let entry = self.entry(index);
+        let mut pending = PendingReservations::default();
+        let next = entry.mmap_next.load(Ordering::Acquire);
+        let drained = entry.mmap_drained.swap(next, Ordering::AcqRel);
+        if next > drained {
+            pending.mmap = Some((
+                drained,
+                next - drained,
+                entry.mmap_pending_prot.load(Ordering::Acquire),
+            ));
+        }
+        let brk = entry.brk_current.load(Ordering::Acquire);
+        if entry.brk_drained.swap(brk, Ordering::AcqRel) != brk {
+            pending.brk = Some(brk);
+        }
+        pending
     }
 
     /// Exact active guest editor (tests and diagnostics).
