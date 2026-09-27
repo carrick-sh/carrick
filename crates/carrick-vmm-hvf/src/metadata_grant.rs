@@ -1,5 +1,6 @@
 //! Host engine for servicing in-guest EL1 metadata extent grant (`HVC #6`) requests.
 
+use crate::host_mapping::{HostMappingKind, OwnedHostMapping};
 use carrick_el1_abi::{
     EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_EXTENT_SIZE, EL1_DYNAMIC_METADATA_SIZE,
     METADATA_GRANT_ERR_ALIGNMENT, METADATA_GRANT_ERR_DENIED, METADATA_GRANT_ERR_INVALID,
@@ -22,10 +23,8 @@ pub struct MetadataGrantStats {
     pub bytes_returned: u64,
 }
 
-#[derive(Copy, Clone)]
 struct GrantedSlotRecord {
-    host_ptr: *mut u8,
-    layout: std::alloc::Layout,
+    backing: OwnedHostMapping,
     size: usize,
     num_slots: usize,
     token: u64,
@@ -33,8 +32,9 @@ struct GrantedSlotRecord {
     generation: u64,
 }
 
+// Backing ownership moves only under HOST_APERTURE; access is synchronized by
+// the guest allocator and the record is retained until stage-2 unmap succeeds.
 unsafe impl Send for GrantedSlotRecord {}
-unsafe impl Sync for GrantedSlotRecord {}
 
 struct HostApertureState {
     occupied_bitmap: [u64; 2],
@@ -45,7 +45,23 @@ impl HostApertureState {
     const fn new() -> Self {
         Self {
             occupied_bitmap: [0; 2],
-            slots: [None; MAX_DYNAMIC_EXTENT_SLOTS],
+            slots: [const { None }; MAX_DYNAMIC_EXTENT_SLOTS],
+        }
+    }
+
+    fn reset_using(&mut self, mut unmap: impl FnMut(u64, &GrantedSlotRecord) -> bool) {
+        for i in 0..self.slots.len() {
+            let Some(record) = self.slots[i].as_ref() else {
+                continue;
+            };
+            let ipa =
+                EL1_DYNAMIC_METADATA_BASE + (i as u64) * EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64;
+            if unmap(ipa, record) {
+                let num_slots = record.num_slots;
+                // Drop host backing only after the stage-2 mapping is gone.
+                self.slots[i] = None;
+                self.unreserve_slots(i, num_slots);
+            }
         }
     }
 
@@ -115,6 +131,10 @@ static GLOBAL_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 static HOST_APERTURE: Mutex<HostApertureState> = Mutex::new(HostApertureState::new());
 
+fn allocate_metadata_backing(size: usize) -> Result<OwnedHostMapping, std::io::Error> {
+    OwnedHostMapping::map_shared_anon(size, HostMappingKind::SharedAnon)
+}
+
 /// Return a snapshot of metadata grant counters.
 pub fn metadata_grant_stats() -> MetadataGrantStats {
     MetadataGrantStats {
@@ -132,7 +152,8 @@ pub fn arm_deny_next_metadata_grant() {
     FAILPOINT_DENY_NEXT.store(true, Ordering::SeqCst);
 }
 
-/// Reset all metadata grant statistics, failpoints, and active grant records.
+/// Reset statistics/failpoints and release active grants whose unmap succeeds.
+/// Failed unmaps retain their exact backing and aperture reservation for retry.
 pub fn reset_metadata_grant_state() {
     GRANTS_REQUESTED.store(0, Ordering::Relaxed);
     GRANTS_SUCCEEDED.store(0, Ordering::Relaxed);
@@ -142,25 +163,17 @@ pub fn reset_metadata_grant_state() {
     BYTES_RETURNED.store(0, Ordering::Relaxed);
     FAILPOINT_DENY_NEXT.store(false, Ordering::SeqCst);
 
-    let mut state = HOST_APERTURE.lock();
-    for (i, slot_opt) in state.slots.iter_mut().enumerate() {
-        if let Some(record) = slot_opt.take() {
-            let ipa =
-                EL1_DYNAMIC_METADATA_BASE + (i as u64) * (EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64);
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            unsafe {
-                let rc = crate::trap::inventory_hv_vm_unmap(ipa, record.size);
-                if rc == 0 {
-                    std::alloc::dealloc(record.host_ptr, record.layout);
-                }
-            }
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            unsafe {
-                std::alloc::dealloc(record.host_ptr, record.layout);
-            }
+    HOST_APERTURE.lock().reset_using(|ipa, record| {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            unsafe { crate::trap::inventory_hv_vm_unmap(ipa, record.size) == 0 }
         }
-    }
-    state.occupied_bitmap = [0; 2];
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (ipa, record);
+            true
+        }
+    });
 }
 
 /// Handle a trapped metadata grant hypercall (`HVC #6`) from EL1.
@@ -227,14 +240,12 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             return Ok(());
         }
 
-        // 3. Allocate anonymous host backing (4 KiB aligned)
-        let layout = match std::alloc::Layout::from_size_align(extent_size, 4096) {
-            Ok(l) => l,
+        // 3. Use host-page-aligned MAP_SHARED backing so HVF and the host
+        // always observe the same VM object; guest privacy is stage-1 owned.
+        let backing = match allocate_metadata_backing(extent_size) {
+            Ok(backing) => backing,
             Err(_) => {
-                {
-                    let mut state = HOST_APERTURE.lock();
-                    state.unreserve_slots(slot_idx, num_slots);
-                }
+                HOST_APERTURE.lock().unreserve_slots(slot_idx, num_slots);
                 GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
                 vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
                     .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
@@ -242,27 +253,12 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             }
         };
 
-        let host_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if host_ptr.is_null() {
-            {
-                let mut state = HOST_APERTURE.lock();
-                state.unreserve_slots(slot_idx, num_slots);
-            }
-            GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
-            vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
-                .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            return Ok(());
-        }
-
         // 4. Map into stage-2 with Read/Write permissions (strictly non-executable)
         let permissions = 0b011; // HV_MEMORY_READ | HV_MEMORY_WRITE
         let rc = unsafe {
-            crate::trap::inventory_hv_vm_map(host_ptr.cast(), ipa, extent_size, permissions)
+            crate::trap::inventory_hv_vm_map(backing.as_ptr().cast(), ipa, extent_size, permissions)
         };
         if rc != 0 {
-            unsafe {
-                std::alloc::dealloc(host_ptr, layout);
-            }
             {
                 let mut state = HOST_APERTURE.lock();
                 state.unreserve_slots(slot_idx, num_slots);
@@ -279,8 +275,7 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
         {
             let mut state = HOST_APERTURE.lock();
             state.slots[slot_idx] = Some(GrantedSlotRecord {
-                host_ptr,
-                layout,
+                backing,
                 size: extent_size,
                 num_slots,
                 token,
@@ -360,9 +355,7 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
         }
 
         // Deallocate host memory and clear bitmap reservation across all covered slots
-        unsafe {
-            std::alloc::dealloc(record.host_ptr, record.layout);
-        }
+        drop(record.backing);
         {
             let mut state = HOST_APERTURE.lock();
             state.unreserve_slots(slot_idx, record.num_slots);
@@ -384,6 +377,47 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_reset_keeps_backing_and_aperture_reserved() {
+        let mut state = HostApertureState::new();
+        let slot = state.find_and_reserve_slots(2).expect("reserve");
+        let backing =
+            allocate_metadata_backing(2 * EL1_DYNAMIC_METADATA_EXTENT_SIZE).expect("backing");
+        assert!(backing.shares_across_host_fork());
+        let host_ptr = backing.as_ptr();
+        unsafe { host_ptr.write(0xa5) };
+        state.slots[slot] = Some(GrantedSlotRecord {
+            size: backing.len(),
+            backing,
+            num_slots: 2,
+            token: 7,
+            generation: 1,
+        });
+        state.reset_using(|_, _| false);
+        let retained = state.slots[slot]
+            .as_ref()
+            .expect("failed unmap lost backing");
+        assert_eq!(retained.backing.as_ptr(), host_ptr);
+        assert_eq!(unsafe { host_ptr.read() }, 0xa5);
+        assert!(state.is_slot_occupied(slot) && state.is_slot_occupied(slot + 1));
+        assert_eq!(state.find_and_reserve_slots(1), Some(2));
+        let mut attempts = 0;
+        state.reset_using(|ipa, record| {
+            assert_eq!(ipa, EL1_DYNAMIC_METADATA_BASE);
+            assert_eq!(record.token, 7);
+            attempts += 1;
+            true
+        });
+        assert_eq!(attempts, 1);
+        assert!(state.slots[slot].is_none());
+        assert_eq!(state.find_and_reserve_slots(2), Some(0));
+        assert!(
+            state.is_slot_occupied(2),
+            "unpublished reservation must survive reset"
+        );
+        state.reset_using(|_, _| panic!("already returned backing must not unmap twice"));
+    }
 
     #[test]
     fn test_host_aperture_multi_slot_reservation_and_overlap_rejection() {
