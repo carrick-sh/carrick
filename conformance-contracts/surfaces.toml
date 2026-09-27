@@ -134,7 +134,7 @@ contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.vm-lifetime", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
+contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.vm-lifetime", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/dispatcher.rs"
@@ -517,7 +517,7 @@ contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue", "kernel.el1.fault-e
 
 [[surfaces]]
 path = "crates/carrick-el1/src/entry.rs"
-contracts = ["kernel.el1.fault-entry"]
+contracts = ["kernel.el1.fault-entry", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/fault.rs"

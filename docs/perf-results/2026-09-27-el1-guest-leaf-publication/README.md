@@ -5,7 +5,8 @@ to the production EL1 data-abort path. It is source and VM-free validation for
 the impact-bearing path; signed first-touch acceptance is deliberately not
 claimed here.
 
-Product commit: `dae6f092c3a8eed2f574f93231d320edd6cc96b8`.
+Guest-transaction commit: `dae6f092c3a8eed2f574f93231d320edd6cc96b8`.
+Release-service fix: `afdf580392fd8244253b4a19c219e1f96d48885a`.
 
 On the first recoverable translation or permission fault, EL1 publishes one
 carrier-wide request bound to the loaded task's exact MM, FAR, access class and
@@ -66,10 +67,28 @@ gate was run separately and passes.
 
 ## Open acceptance
 
-The previous signed three-scale witness remains red at about 0.9954 host exits
-per page versus the `<0.125` contract. The next step is to commit this exact
-source, build and sign one release artifact, and run
-`el1_memory_first_touch_stays_in_guest` at 256, 1,024 and 4,096 pages per
-process. Until that run proves semantic success and the slope, this checkpoint
-does not claim guest execution, performance impact, checkpoint-2 completion,
-full CI or full EL1 migration completion.
+`afdf58039` fixes the release-only host service build by exposing the exact MM
+identity through the existing borrow-bound permit in shipped configurations.
+The exact release CLI build passes; `artifact-identity.txt` records source HEAD,
+SHA-256, CDHash, LC_UUID, entitlement and DOF identity for that signed binary.
+The release check, focused Clippy, contract registry and exact product-diff
+receipts are retained beside it.
+
+The first exact signed execution reaches the EL1 publication invariant and
+aborts. The durable panic bridge then preserved the source location and stable
+publication detail across HVC. `signed-first-touch-panic-code.log` reports
+`frame_grant_publication_detail=3`, which is `MissingTable`: request publication,
+the authenticated host grant, Ready delivery and exact guest-editor admission
+all completed, but the anonymous range had no existing L3 table for the
+existing-invalid-leaf publisher to edit. The negative entitlement control and
+scoped cleanup passed.
+
+The diagnostic reruns contain uncommitted panic instrumentation and therefore
+are discovery evidence, not acceptance receipts for `afdf58039`. The previous
+signed three-scale witness remains red at about 0.9954 host exits per page
+versus the `<0.125` contract, so no performance improvement is claimed. The
+next bounded task is transactional creation of the missing hierarchy under the
+same guest editor, with whole-range preflight, RW/UXN/nG preservation, rollback
+and explicit capacity refusal. Run the 256-page signed witness immediately;
+only after it passes run the 1,024- and 4,096-page scales. Checkpoint 2, full CI
+and full EL1 migration completion remain open.

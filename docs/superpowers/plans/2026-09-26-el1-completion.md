@@ -987,3 +987,29 @@ permissions, perform required TLB maintenance, and acknowledge success. Preserve
 rollback for every path that does not publish a leaf. Re-run the signed
 three-scale witness immediately after that path is live; do not return to
 allocator work unless this transaction exposes a specific allocator regression.
+
+### Signed guest-leaf diagnosis (2026-09-27)
+
+`dae6f092c` connects the exact EL1 request/response/editor transaction, and
+`afdf58039` repairs its release-only host-service build without widening the
+permit's authority. The exact signed release CLI build passes and its SHA-256,
+CDHash, LC_UUID, entitlement and DOF identity are retained under
+`docs/perf-results/2026-09-27-el1-guest-leaf-publication/`.
+
+The first signed first-touch execution reaches the guest publication invariant
+and aborts before the first scale can complete. A durable panic bridge preserves
+source coordinates and a stable publication error across HVC; the diagnostic
+rerun reports detail 3, `MissingTable`. This proves the request, authenticated
+host backing, Ready response and exact guest-editor admission are live, while
+falsifying the plan's assumption that the anonymous range already contains an
+invalid L3 leaf span. The dirty diagnostic artifact is discovery evidence only,
+not signed acceptance, and the impact measurement remains the earlier roughly
+0.9954 host exits per page against the `<0.125` gate.
+
+Keep the correction bounded: add a red-first live-manager contract for a range
+with a missing L3 table, transactionally allocate and publish the missing
+hierarchy under the admitted editor, preserve RW/UXN/nG permissions, synchronize
+child-before-parent, and roll back or refuse cleanly on exhaustion. Run the
+256-page signed witness immediately. Broaden to the other two scales only after
+that passes; do not reopen general allocator design unless the focused witness
+proves the existing elastic table source cannot satisfy this transaction.

@@ -51,7 +51,7 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
 /// mistaking a panic for an unresponsive hang.
 #[cfg(target_os = "none")]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
     let counters =
         unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
     counters.served[carrick_el1_abi::PANIC_SENTINEL_SYSCALL_NR].store(
@@ -62,11 +62,17 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
         carrick_el1_abi::PANIC_SENTINEL,
         core::sync::atomic::Ordering::Relaxed,
     );
+    let (line, column) = info.location().map_or((0, 0), |location| {
+        (u64::from(location.line()), u64::from(location.column()))
+    });
+    let detail = carrick_el1::fault::panic_publication_detail();
     unsafe {
         core::arch::asm!(
-            "mov x0, {code}",
             "hvc #3",
-            code = in(reg) carrick_el1_abi::PANIC_SENTINEL,
+            in("x0") carrick_el1_abi::PANIC_SENTINEL,
+            in("x1") line,
+            in("x2") column,
+            in("x3") detail,
         );
     }
     loop {

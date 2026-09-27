@@ -1,0 +1,8 @@
+source_head=afdf580392fd8244253b4a19c219e1f96d48885a
+sha256=f38ca2437eb0da57633af8b8015092691fa7b990c4aca43692395814540dfc85
+cdhash=374250bda4ac80c68286d88115cb6896691fd3ff
+lc_uuid=989178C7-9B4F-3328-BBE5-B7F5D2586970
+identifier=carrick.tmp.1106
+signature=adhoc
+entitlement.com.apple.security.hypervisor=true
+dof_section=__TEXT,__dof_carrick
