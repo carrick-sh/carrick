@@ -196,6 +196,13 @@ pub fn terminal_descriptor_has_el1_private_authority(descriptor: u64) -> bool {
     descriptor & SW_EL1_PRIVATE != 0
 }
 
+/// Whether a terminal descriptor carries EL1's private-anonymous write permission
+/// intent, even if the leaf is temporarily armed read-only for fork COW.
+#[inline]
+pub fn terminal_descriptor_may_write(descriptor: u64) -> bool {
+    descriptor & SW_EL1_MAY_WRITE != 0
+}
+
 /// Why a guest EL1 frame grant could not replace an already-provisioned span
 /// of invalid L3 leaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -616,8 +623,6 @@ pub unsafe fn retire_existing_el1_private_pages(
 pub enum GuestCowResolution {
     /// Leaf was already writable (stale TLB entry on this PE).
     AlreadyWritable,
-    /// Leaf was armed read-only for COW and upgraded to writable.
-    Upgraded,
 }
 
 /// Why a guest EL1 COW fault could not be resolved in the guest.
@@ -635,12 +640,9 @@ pub enum GuestCowError {
 /// private-anonymous authority.
 ///
 /// If the descriptor is already writable (`AP_RW`), reports `AlreadyWritable`
-/// so caller can invalidate the ASID for this PE.
-/// If the descriptor is valid, read-only (`AP_RO`), carries `SW_EL1_PRIVATE`,
-/// and carries `SW_EL1_MAY_WRITE`, upgrades it to `AP_RW` with release ordering
-/// and reports `Upgraded`.
-/// If the descriptor does not carry `SW_EL1_MAY_WRITE` or `SW_EL1_PRIVATE`,
-/// returns `PermissionDenied` so the fault can be forwarded for signal delivery.
+/// so caller can invalidate the ASID for this PE. Every read-only leaf returns
+/// `PermissionDenied` and is forwarded: fork COW needs a frame copy the host
+/// owns, and a protection-denied write must deliver SIGSEGV.
 ///
 /// # Safety
 ///
@@ -682,13 +684,11 @@ pub unsafe fn resolve_existing_el1_cow_page(
     if descriptor & AP_MASK == AP_RW {
         return Ok(GuestCowResolution::AlreadyWritable);
     }
-    if descriptor & SW_EL1_MAY_WRITE == 0 {
-        return Err(GuestCowError::PermissionDenied);
-    }
-    let uxn = descriptor & UXN;
-    let updated = (descriptor & !AP_MASK & !UXN) | AP_RW | uxn | VALID;
-    unsafe { (*terminal.word).store(updated, Ordering::Release) };
-    Ok(GuestCowResolution::Upgraded)
+    // A read-only private leaf is either fork-COW armed (its frame is still
+    // shared with another MM and must be copied by the host frame-COW path)
+    // or mprotect(PROT_READ) (the write must fault). Neither may be upgraded
+    // in place: doing so leaked parent writes into a forked child's frames.
+    Err(GuestCowError::PermissionDenied)
 }
 
 /// Arm an existing resident private-anonymous range read-only for fork COW under EL1 authority.
@@ -9216,7 +9216,7 @@ mod tests {
     }
 
     #[test]
-    fn allocation_free_guest_cow_resolution_upgrades_armed_leaf_and_detects_stale_tlb() {
+    fn allocation_free_guest_cow_resolution_never_upgrades_shared_leaf_and_detects_stale_tlb() {
         use core::sync::atomic::{AtomicU64, Ordering};
 
         let root = 0x8800_0000_0000;
@@ -9241,13 +9241,15 @@ mod tests {
 
         let byte_len = words.len() * core::mem::size_of::<AtomicU64>();
         let res = unsafe { resolve_existing_el1_cow_page(words.as_mut_ptr(), root, byte_len, va) };
-        assert_eq!(res, Ok(GuestCowResolution::Upgraded));
-        let upgraded = words[l3].load(Ordering::Acquire);
-        assert_eq!(upgraded & AP_MASK, AP_RW);
-        assert_ne!(upgraded & SW_EL1_PRIVATE, 0);
-        assert_ne!(upgraded & SW_EL1_MAY_WRITE, 0);
+        assert_eq!(res, Err(GuestCowError::PermissionDenied));
+        assert_eq!(
+            words[l3].load(Ordering::Acquire),
+            armed,
+            "an armed COW leaf still shares its frame and must not be upgraded in place"
+        );
 
         // 2. Already writable: stale TLB detection.
+        words[l3].store((armed & !AP_MASK) | AP_RW, Ordering::Relaxed);
         let res2 = unsafe { resolve_existing_el1_cow_page(words.as_mut_ptr(), root, byte_len, va) };
         assert_eq!(res2, Ok(GuestCowResolution::AlreadyWritable));
 

@@ -847,7 +847,9 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\n    }\n").next())
             .expect("run_to_exit");
-        assert!(outer.contains("Self::run_to_exit_inner(vcpu, mailbox, &mut kick_armed)"));
+        assert!(outer.contains(
+            "Self::run_to_exit_inner(vcpu, mailbox, custody, vm_generation, &mut kick_armed)"
+        ));
         assert!(outer.contains("crate::gic::clear_kick(vcpu)"));
         let inner = trap
             .split(concat!("fn run_to_exit_", "inner("))

@@ -196,50 +196,11 @@ where
         return Action::Forward;
     }
 
-    #[cfg(target_os = "none")]
-    if nr == 214
-        && let Some(zone) = zone.as_ref()
-    {
-        let orig_x0 = frame.x[0];
-        let mut editor = memory::HardwareAnonymousRetirementEditor;
-        match memory::try_serve_brk(frame, current_tasks, &zone.tables.spaces, &mut editor) {
-            memory::BrkDisposition::Forward => {}
-            memory::BrkDisposition::Return(result) => {
-                frame.x[0] = result;
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                if let Some(task) = cur_task {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    if task.has_pending_host_work() {
-                        task.served_with_work.store(1, Ordering::Release);
-                        return Action::ServedWithWork;
-                    }
-                }
-                return Action::Served;
-            }
-        }
-    }
-
-    #[cfg(target_os = "none")]
-    if nr == 222
-        && let Some(zone) = zone.as_ref()
-    {
-        let orig_x0 = frame.x[0];
-        let mut editor = memory::HardwareAnonymousRetirementEditor;
-        match memory::try_serve_mmap(frame, current_tasks, &zone.tables.spaces, &mut editor) {
-            memory::MmapDisposition::Forward => {}
-            memory::MmapDisposition::Return(result) => {
-                frame.x[0] = result as u64;
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                if let Some(task) = cur_task {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    if task.has_pending_host_work() {
-                        task.served_with_work.store(1, Ordering::Release);
-                        return Action::ServedWithWork;
-                    }
-                }
-                return Action::Served;
-            }
-        }
+    // Anonymous brk (214) and mmap (222) stay host-served until EL1
+    // reservations are published to the host's first-touch plan; an EL1-only
+    // reservation has no plan and its first touch is refused as SIGSEGV.
+    if nr == 214 || nr == 222 {
+        return Action::Forward;
     }
 
     #[cfg(target_os = "none")]

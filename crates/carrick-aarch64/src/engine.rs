@@ -1743,8 +1743,21 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             return true;
         };
         let descriptor = carrick_mmu_core::aarch64::terminal_descriptor(walk);
-        !carrick_mmu_core::aarch64::terminal_descriptor_has_el1_private_authority(descriptor)
-            || carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(descriptor, access)
+        if !carrick_mmu_core::aarch64::terminal_descriptor_has_el1_private_authority(descriptor) {
+            return true;
+        }
+        // A fork-COW armed leaf is read-only only because its frame is still
+        // shared; the host copyout path privatizes it before writing. Known
+        // gap: a leaf made read-only by an EL1-served mprotect also carries
+        // MAY_WRITE and is accepted here, because the host protection table
+        // does not see EL1 mprotect and a forked child's engine has no
+        // armed-range set to tell the two apart.
+        if access == carrick_mmu_core::aarch64::LeafAccess::Write
+            && carrick_mmu_core::aarch64::terminal_descriptor_may_write(descriptor)
+        {
+            return true;
+        }
+        carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(descriptor, access)
     }
 
     fn el1_private_range_permits(
@@ -3769,10 +3782,25 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // gives the child a private stage-1 root and per-process EL1 state, but
         // its user mappings must retain the same writable frames rather than
         // entering the ordinary fork-COW protocol.
+        let private_ranges = self.vm.fork_cow_ranges();
+        // Guest EL1 publishes, protects and retires private-anonymous leaves
+        // directly in the live tables, while this host manager edits an owned
+        // copy. Adopt the live descriptors for every private range before the
+        // child image is cloned and the parent is armed; otherwise both the
+        // child snapshot and the parent's re-armed leaves resurrect the
+        // pre-EL1 invalid descriptors and the next touch is a SIGSEGV.
+        for range in private_ranges.iter().filter(|range| !range.kernel_only) {
+            self.pt_edit_locked_after_adopting(Some((range.va, range.len)), |_| {
+                Ok(PageTableApplyOutcome::default())
+            })
+            .map_err(|error| {
+                memory_error_to_trap_error(error, "adopt live stage-1 tables before fork")
+            })?;
+        }
         let cow_ranges = if request.shares_mm() {
             Vec::new()
         } else {
-            self.vm.fork_cow_ranges()
+            private_ranges
         };
 
         let stage_started = std::time::Instant::now();

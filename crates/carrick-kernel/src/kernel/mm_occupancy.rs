@@ -571,6 +571,54 @@ impl carrick_thread::fork_quiesce::FenceMirror for SpaceGate {
     }
 }
 
+/// Host stage-1 edit exclusion against guest EL1's editor of one MM. Guest
+/// EL1 publishes, protects and retires leaves in the live tables under the
+/// entry's editor token; a host edit racing it replays a stale descriptor
+/// over the guest's store (a fork re-armed a freshly granted leaf back to
+/// its retired shape). Raising the gate refuses new EL1 editors and waits for
+/// an admitted one; EL1 then forwards the fault or syscall to the host.
+pub struct El1EditorExclusion {
+    tables: SpaceTables,
+    index: SpaceIndex,
+    key: u64,
+}
+
+impl std::fmt::Debug for El1EditorExclusion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("El1EditorExclusion")
+            .field("key", &self.key)
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
+/// Exclude the guest EL1 editor of `mm` for the lifetime of the returned
+/// guard. `None` when `mm` has no published address space (EL1 never edits
+/// it).
+pub fn exclude_el1_editor(mm: MmId) -> Option<El1EditorExclusion> {
+    let zone = crate::el1_zone::zone()?;
+    let tables = SpaceTables {
+        spaces: &zone.spaces,
+        occupancy: &zone.occupancy,
+        zone: true,
+    };
+    let key = mm.raw();
+    let index = tables.spaces.find(key)?;
+    tables
+        .spaces
+        .raise_and_wait_for_editor(index, core::hint::spin_loop);
+    Some(El1EditorExclusion { tables, index, key })
+}
+
+impl Drop for El1EditorExclusion {
+    fn drop(&mut self) {
+        if self.tables.live() {
+            self.tables.spaces.lower(self.index);
+        }
+    }
+}
+
 /// An address space guest EL1 may install on a vCPU itself (EL1 increment
 /// 2, step 2), for as long as this lives and is not closed. Its gate in the
 /// shared region follows the MM's fence ([`carrick_thread::fork_quiesce::PtQuiesce::bind_mirror`]),
