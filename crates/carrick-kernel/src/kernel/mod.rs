@@ -96,7 +96,8 @@ pub use ids::{
 };
 pub use mm_occupancy::{
     AddressSpacePublication, ExecutionSlot, HostExecutionSlot, MmOccupancy, MmOccupancyError,
-    execution_slot_for_current_thread, note_foreign_cow, publish_address_space, publish_idle_root,
+    execution_slot_for_current_thread, note_foreign_cow, publish_address_space,
+    publish_address_space_with_layout, publish_idle_root,
 };
 pub use netns::{NetNs, UtsNs};
 pub use objects::{

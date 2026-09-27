@@ -452,7 +452,18 @@ impl MmExecutorParticipation {
         ttbr0: u64,
         ttbr1: u64,
     ) -> Option<crate::kernel::AddressSpacePublication> {
-        crate::kernel::publish_address_space(self.mm_id(), self.pt_quiesce(), ttbr0, ttbr1)
+        let (brk_current, mmap_next) = {
+            let state = self.authority.mem.lock();
+            (state.brk_current, state.mmap_next)
+        };
+        crate::kernel::publish_address_space_with_layout(
+            self.mm_id(),
+            self.pt_quiesce(),
+            ttbr0,
+            ttbr1,
+            brk_current,
+            mmap_next,
+        )
     }
 
     pub(crate) fn mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {

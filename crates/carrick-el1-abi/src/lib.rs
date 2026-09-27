@@ -361,6 +361,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::size_of::<carrick_sched_core::Occupancy>() as u64,
         core::mem::size_of::<carrick_sched_core::AddressSpaces>() as u64,
         core::mem::size_of::<carrick_sched_core::spaces::SpaceEntry>() as u64,
+        core::mem::offset_of!(carrick_sched_core::spaces::SpaceEntry, mmap_next) as u64,
+        core::mem::offset_of!(carrick_sched_core::spaces::SpaceEntry, brk_current) as u64,
         carrick_sched_core::ADDRESS_SPACES as u64,
         carrick_sched_core::EXECUTION_SLOTS as u64,
         carrick_sched_core::GATE_CLOSED,
