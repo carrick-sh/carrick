@@ -35,16 +35,7 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
     let frame_ref = unsafe { &mut *frame };
     let counters_ref =
         unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
-    // The EL0 IRQ hook saves the same frame with a zero syndrome; an SVC or fault
-    // syndrome is never zero.
-    if frame_ref.esr == 0 {
-        return carrick_el1::dispatch_irq(frame_ref, counters_ref) as u64;
-    }
-    // Lower-EL data abort (EC = 0x24, bits 31:26):
-    if ((frame_ref.esr >> 26) & 0x3F) == 0x24 {
-        return carrick_el1::dispatch_fault(frame_ref, counters_ref) as u64;
-    }
-    carrick_el1::dispatch_syscall(frame_ref, counters_ref) as u64
+    carrick_el1::dispatch_entry(frame_ref, counters_ref) as u64
 }
 
 /// Observable bare-metal panic handler.

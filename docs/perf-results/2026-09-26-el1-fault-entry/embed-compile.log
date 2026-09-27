@@ -10,5 +10,5 @@
    Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-runtime)
    Compiling carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-engine)
    Compiling carrick-embed v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-embed)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.67s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.74s
   Executable tests/el1_sched.rs (target/debug/deps/el1_sched-96c9546955befcb8)

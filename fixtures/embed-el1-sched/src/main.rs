@@ -1460,7 +1460,8 @@ struct FaultTestContext {
     target_addr: u64,
     store_val: u64,
     captured_val: u64,
-    captured_sp: u64,
+    captured_sp_pre: u64,
+    captured_sp_post: u64,
     captured_regs: [u64; 31],
 }
 
@@ -1636,46 +1637,50 @@ unsafe fn execute_fault_sequence(ctx: &mut FaultTestContext) {
         "str x2, [x1]",
 
         // Capture post-retry state:
+        // Immediately record post-fault SP
+        "mov x16, sp",
         // Save post-fault x0 to scratch slot [sp, #104]
         "str x0, [sp, #104]",
         // Reload ctx pointer from [sp, #96] into x0
         "ldr x0, [sp, #96]",
+        // Store post-fault SP into ctx.captured_sp_post (offset 32)
+        "str x16, [x0, #32]",
 
-        // Store captured registers x1..x30 into ctx.captured_regs (offset 32 + r*8)
-        "str x1, [x0, #40]",
-        "str x2, [x0, #48]",
-        "str x3, [x0, #56]",
-        "str x4, [x0, #64]",
-        "str x5, [x0, #72]",
-        "str x6, [x0, #80]",
-        "str x7, [x0, #88]",
-        "str x8, [x0, #96]",
-        "str x9, [x0, #104]",
-        "str x10, [x0, #112]",
-        "str x11, [x0, #120]",
-        "str x12, [x0, #128]",
-        "str x13, [x0, #136]",
-        "str x14, [x0, #144]",
-        "str x15, [x0, #152]",
-        "str x16, [x0, #160]",
-        "str x17, [x0, #168]",
-        "str x18, [x0, #176]",
-        "str x19, [x0, #184]",
-        "str x20, [x0, #192]",
-        "str x21, [x0, #200]",
-        "str x22, [x0, #208]",
-        "str x23, [x0, #216]",
-        "str x24, [x0, #224]",
-        "str x25, [x0, #232]",
-        "str x26, [x0, #240]",
-        "str x27, [x0, #248]",
-        "str x28, [x0, #256]",
-        "str x29, [x0, #264]",
-        "str x30, [x0, #272]",
+        // Store captured registers x1..x30 into ctx.captured_regs (offset 40 + r*8)
+        "str x1, [x0, #48]",
+        "str x2, [x0, #56]",
+        "str x3, [x0, #64]",
+        "str x4, [x0, #72]",
+        "str x5, [x0, #80]",
+        "str x6, [x0, #88]",
+        "str x7, [x0, #96]",
+        "str x8, [x0, #104]",
+        "str x9, [x0, #112]",
+        "str x10, [x0, #120]",
+        "str x11, [x0, #128]",
+        "str x12, [x0, #136]",
+        "str x13, [x0, #144]",
+        "str x14, [x0, #152]",
+        "str x15, [x0, #160]",
+        "str x16, [x0, #168]",
+        "str x17, [x0, #176]",
+        "str x18, [x0, #184]",
+        "str x19, [x0, #192]",
+        "str x20, [x0, #200]",
+        "str x21, [x0, #208]",
+        "str x22, [x0, #216]",
+        "str x23, [x0, #224]",
+        "str x24, [x0, #232]",
+        "str x25, [x0, #240]",
+        "str x26, [x0, #248]",
+        "str x27, [x0, #256]",
+        "str x28, [x0, #264]",
+        "str x29, [x0, #272]",
+        "str x30, [x0, #280]",
 
-        // Save post-fault x0 into ctx.captured_regs[0]
+        // Save post-fault x0 into ctx.captured_regs[0] (offset 40)
         "ldr x1, [sp, #104]",
-        "str x1, [x0, #32]",
+        "str x1, [x0, #40]",
 
         // Read back written value from target_addr
         "ldr x1, [x0, #0]",
@@ -1763,7 +1768,8 @@ fn fault_entry_mode() -> i32 {
         target_addr,
         store_val,
         captured_val: 0,
-        captured_sp: 0,
+        captured_sp_pre: 0,
+        captured_sp_post: 0,
         captured_regs: [0; 31],
     };
 
@@ -1789,6 +1795,21 @@ fn fault_entry_mode() -> i32 {
         println!(
             "fault-entry store failed captured_val={:#x} expected={:#x}",
             ctx.captured_val, store_val
+        );
+        return 1;
+    }
+    if ctx.captured_sp_pre == 0 || ctx.captured_sp_post == 0 {
+        println!("fault-entry SP not captured");
+        return 1;
+    }
+    if (ctx.captured_sp_pre & 0xF) != 0 {
+        println!("fault-entry SP unaligned pre={:#x}", ctx.captured_sp_pre);
+        return 1;
+    }
+    if ctx.captured_sp_pre != ctx.captured_sp_post {
+        println!(
+            "fault-entry SP mismatch pre={:#x} post={:#x}",
+            ctx.captured_sp_pre, ctx.captured_sp_post
         );
         return 1;
     }

@@ -1365,4 +1365,25 @@ mod tests {
         assert_eq!(action, Action::Forward);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
     }
+
+    #[test]
+    fn test_dispatch_entry_routes_syscall() {
+        let counters = Counters::default();
+        let mut frame = TrapFrame {
+            esr: (0xCAFE_0000_u64 << 32) | (0x15 << 26) | (1 << 25), // SVC64
+            far: 0,
+            x: {
+                let mut x = [0u64; 31];
+                x[8] = 172; // SYS_getpid
+                x
+            },
+            ..TrapFrame::default()
+        };
+
+        let action = dispatch_entry(&mut frame, &counters);
+        assert_eq!(action, Action::Forward);
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.served[172].load(Ordering::Relaxed), 0);
+    }
 }
