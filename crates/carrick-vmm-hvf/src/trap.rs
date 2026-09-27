@@ -7738,7 +7738,11 @@ impl HvfInner {
                 crate::metadata_grant::handle_metadata_grant_trap(vcpu)?;
                 continue;
             }
-            if !is_aarch64_syscall_exception(exception.syndrome) {
+            // Maintenance completion is a control exit, not a syscall. It
+            // still reaches the HVC decoder below during executor load.
+            if !is_aarch64_syscall_exception(exception.syndrome)
+                && !is_aarch64_hvc_maintenance(exception.syndrome)
+            {
                 return Err(TrapError::UnexpectedException {
                     syndrome: exception.syndrome,
                     virtual_address: exception.virtual_address,

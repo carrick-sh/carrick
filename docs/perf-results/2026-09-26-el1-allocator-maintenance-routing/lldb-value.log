@@ -1,0 +1,90 @@
+(lldb) target create "target/el1-completion/allocator-director-red/test-frozen/el1_sched-ba795739d7a1a0f3"
+Current executable set to '/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-director-red/test-frozen/el1_sched-ba795739d7a1a0f3' (arm64).
+(lldb) settings set -- target.run-args  "el1_metadata_allocator_grows_and_returns_extents" "--nocapture"
+(lldb) breakpoint set --file executor.rs --line 231
+Breakpoint 1: where = el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::executor::executor_worker::h6659650ec665c127 + 6016 at executor.rs:231:17, address = 0x0000000100264658
+(lldb) run
+
+running 1 test
+test el1_metadata_allocator_grows_and_returns_extents ... warning: el1_sched-ba795739d7a1a0f3 was compiled with optimization - stepping may behave oddly; variables may not be available.
+Process 27591 launched: '/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-director-red/test-frozen/el1_sched-ba795739d7a1a0f3' (arm64)
+Process 27591 stopped
+* thread #11, name = 'carrick-executor-1', stop reason = breakpoint 1.1
+       frame #0: 0x0000000100264658 el1_sched-ba795739d7a1a0f3`carrick_runtime::vcpu_loop::executor::executor_worker::h6659650ec665c127(slot=<unavailable>, scheduler=Arc<carrick_kernel::kernel::scheduler::Scheduler, alloc::alloc::Global> @ 0x00000001710ee258, factory=Arc<carrick_runtime::vcpu_loop::executor::backend::HvpatchPersistentExecutorFactory, alloc::alloc::Global> @ 0x00000001710ee260, resolver=Arc<carrick_runtime::vcpu_loop::executor::binding::HvpatchTaskBindingDirectory, alloc::alloc::Global> @ 0x00000001710ee268, receipts=Arc<carrick_runtime::vcpu_loop::executor::pool::ReceiptLog, alloc::alloc::Global> @ 0x00000001710ee270, control=Arc<carrick_runtime::vcpu_loop::executor::pool::PoolControl, alloc::alloc::Global> @ 0x00000001710ee278, channels=<unavailable>) at executor.rs:231:17 [opt]
+   228 	                existing.push_str(&message);
+   229 	            }
+   230 	        }
+-> 231 	        control.wait_for_shutdown();
+    	                ^
+   232 	    }
+   233 	    if let Some(destroy_error) = destroy_and_unregister(
+   234 	        backend,
+Target 0: (el1_sched-ba795739d7a1a0f3) stopped.
+(lldb) frame variable --depth 12 failure
+(core::option::Option<alloc::string::String>) failure = {
+  $variants$ = {
+    $variant$0 = ($discr$ = 110, value = core::option::Option<alloc::string::String>::None<alloc::string::String>:64 @ 0x00000001710f12e0)
+    $variant$ = {
+      value = {
+        __0 = {
+          vec = {
+            buf = {
+              inner = {
+                ptr = {
+                  pointer = (pointer = "guest exception is not an AArch64 SVC trap: syndrome=0x5a000001, virtual_address=0x0, physical_address=0x0")
+                  _marker = {}
+                }
+                cap = (__0 = 110)
+                alloc = {}
+              }
+              _marker = {}
+            }
+            len = 106
+          }
+        }
+      }
+    }
+  }
+}
+(lldb) script v=lldb.frame.FindVariable("failure"); print(v)
+(core::option::Option<alloc::string::String>) failure = {
+  $variants$ = {
+    $variant$0 = ($discr$ = 110, value = core::option::Option<alloc::string::String>::None<alloc::string::String>:64 @ 0x00000001710f12e0)
+    $variant$ = {
+      value = {
+        __0 = {
+          vec = {
+            buf = {
+              inner = {
+                ptr = {
+                  pointer = (pointer = "guest exception is not an AArch64 SVC trap: syndrome=0x5a000001, virtual_address=0x0, physical_address=0x0")
+                  _marker = {}
+                }
+                cap = (__0 = 110)
+                alloc = {}
+              }
+              _marker = {}
+            }
+            len = 106
+          }
+        }
+      }
+    }
+  }
+}
+(lldb) continue
+
+thread 'el1_metadata_allocator_grows_and_returns_extents' (14753295) panicked at crates/carrick-embed/tests/common/mod.rs:112:21:
+container run failed: runtime failure: filesystem backend error: failed to run ELF from dispatcher: carrier failed: logical HVPatch job 1 published before its executor binding retired
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    el1_metadata_allocator_grows_and_returns_extents
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 32 filtered out; finished in 5.10s
+
+Process 27591 resuming
+Process 27591 exited with status = 101 (0x00000065)
