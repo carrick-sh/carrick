@@ -560,7 +560,7 @@ impl carrick_thread::fork_quiesce::FenceMirror for SpaceGate {
         if self.tables.live() {
             self.tables
                 .spaces
-                .raise_and_wait_for_editor(self.index, std::thread::yield_now);
+                .raise_and_wait_for_editor(self.index, core::hint::spin_loop);
         }
     }
 
@@ -688,7 +688,7 @@ impl AddressSpacePublication {
         if self.tables.live() {
             self.tables
                 .spaces
-                .close_and_wait_for_editor(self.index, std::thread::yield_now);
+                .close_and_wait_for_editor(self.index, core::hint::spin_loop);
         }
     }
 
@@ -727,7 +727,7 @@ impl Drop for AddressSpacePublication {
         }
         self.tables
             .spaces
-            .close_and_wait_for_editor(self.index, std::thread::yield_now);
+            .close_and_wait_for_editor(self.index, core::hint::spin_loop);
         drain_space(self.tables.occupancy, self.mm);
         let _serial = SPACES_LOCK.lock();
         self.tables.spaces.free(self.index);
