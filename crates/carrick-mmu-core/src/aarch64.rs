@@ -123,6 +123,13 @@ const UXN: u64 = 1 << 54;
 // and freeing its table loses the outputs the next protection commit
 // republishes. Cleared whenever the leaf is revalidated or rewritten.
 const SW_RETIRED: u64 = 1 << 55;
+/// Leaf belongs to a resident private-anonymous span published by Carrick EL1.
+/// Bits 58:55 are software-defined in an AArch64 stage-1 descriptor.
+const SW_EL1_PRIVATE: u64 = 1 << 56;
+/// The originating Linux VMA permits a later `mprotect(PROT_WRITE)`.
+const SW_EL1_MAY_WRITE: u64 = 1 << 57;
+/// The originating Linux VMA permits a later `mprotect(PROT_EXEC)`.
+const SW_EL1_MAY_EXEC: u64 = 1 << 58;
 
 // PA field masks per level (identical to memory.rs).
 const PA_MASK_1GIB: u64 = 0x0000_FFFF_C000_0000;
@@ -180,6 +187,15 @@ pub fn terminal_descriptor_permits_el0(descriptor: u64, access: LeafAccess) -> b
     }
 }
 
+/// Whether a terminal descriptor carries EL1's private-anonymous permission
+/// authority. Host syscall-buffer paths use this bit to enforce permission
+/// transitions served entirely in guest EL1 without consulting stale host VMA
+/// mirrors.
+#[inline]
+pub fn terminal_descriptor_has_el1_private_authority(descriptor: u64) -> bool {
+    descriptor & SW_EL1_PRIVATE != 0
+}
+
 /// Why a guest EL1 frame grant could not replace an already-provisioned span
 /// of invalid L3 leaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +218,28 @@ pub struct GuestLeafPublication {
     pub len: u64,
     pub writable: bool,
     pub executable: bool,
+}
+
+/// One resident private-anonymous permission transition owned by guest EL1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestPermissionEdit {
+    pub va: u64,
+    pub len: u64,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+/// Why EL1 could not own a requested resident-anonymous protection edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestPermissionEditError {
+    BadRange,
+    TableOutsidePrimary,
+    MissingTable,
+    NotPrivateAnonymous,
+    PermissionWidening,
+    Manager(PageTableError),
+    RollbackFailed,
 }
 
 unsafe fn live_primary_descriptor(
@@ -256,6 +294,69 @@ unsafe fn existing_l3_descriptor(
         .ok_or(GuestLeafPublicationError::TableOutsidePrimary)?;
     // SAFETY: forwarded from publish_existing_invalid_private_pages.
     unsafe { live_primary_descriptor(words, physical_base, byte_len, leaf_pa) }
+}
+
+#[derive(Clone, Copy)]
+struct ExistingTerminalDescriptor {
+    word: *mut core::sync::atomic::AtomicU64,
+    semantic_base: u64,
+    span: u64,
+}
+
+unsafe fn existing_terminal_descriptor(
+    words: *mut core::sync::atomic::AtomicU64,
+    physical_base: u64,
+    byte_len: usize,
+    va: u64,
+) -> Result<ExistingTerminalDescriptor, GuestLeafPublicationError> {
+    use core::sync::atomic::Ordering;
+
+    let indexes = indices(va);
+    let mut table = physical_base;
+    for (level, &index) in indexes.iter().enumerate() {
+        let descriptor_pa = table
+            .checked_add((index * core::mem::size_of::<u64>()) as u64)
+            .ok_or(GuestLeafPublicationError::TableOutsidePrimary)?;
+        // SAFETY: forwarded from protect_existing_el1_private_pages.
+        let word =
+            unsafe { live_primary_descriptor(words, physical_base, byte_len, descriptor_pa)? };
+        let descriptor = unsafe { (*word).load(Ordering::Acquire) };
+        if descriptor & VALID == 0 {
+            return Err(GuestLeafPublicationError::MissingTable);
+        }
+        let descriptor_type = descriptor & TYPE_BITS;
+        match level {
+            0 if descriptor_type == TYPE_TABLE_OR_PAGE => {
+                table = descriptor & PA_MASK_TABLE;
+            }
+            1 | 2 if descriptor_type == TYPE_TABLE_OR_PAGE => {
+                table = descriptor & PA_MASK_TABLE;
+            }
+            1 if descriptor_type == TYPE_BLOCK => {
+                return Ok(ExistingTerminalDescriptor {
+                    word,
+                    semantic_base: va & PA_MASK_1GIB,
+                    span: 1 << 30,
+                });
+            }
+            2 if descriptor_type == TYPE_BLOCK => {
+                return Ok(ExistingTerminalDescriptor {
+                    word,
+                    semantic_base: va & PA_MASK_2MIB,
+                    span: 1 << 21,
+                });
+            }
+            3 if descriptor_type == TYPE_TABLE_OR_PAGE => {
+                return Ok(ExistingTerminalDescriptor {
+                    word,
+                    semantic_base: va & PA_MASK_4KIB,
+                    span: PT_PAGE,
+                });
+            }
+            _ => return Err(GuestLeafPublicationError::MissingTable),
+        }
+    }
+    Err(GuestLeafPublicationError::MissingTable)
 }
 
 /// Publish one exact linear IPA span into L3 leaves whose table hierarchy
@@ -316,6 +417,13 @@ pub unsafe fn publish_existing_invalid_private_pages(
     } else {
         (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL
     };
+    flags |= SW_EL1_PRIVATE;
+    if publication.writable {
+        flags |= SW_EL1_MAY_WRITE;
+    }
+    if publication.executable {
+        flags |= SW_EL1_MAY_EXEC;
+    }
     if !publication.executable {
         flags |= UXN;
     }
@@ -326,6 +434,92 @@ pub unsafe fn publish_existing_invalid_private_pages(
         // pass while the caller's exact-MM editor remained held.
         let leaf = unsafe { existing_l3_descriptor(words, physical_base, byte_len, page_va)? };
         unsafe { (*leaf).store((page_ipa & PA_MASK_4KIB) | flags, Ordering::Release) };
+    }
+    Ok(pages)
+}
+
+/// Apply one permission transition to existing L1/L2 blocks or L3 leaves
+/// carrying EL1's private-anonymous authority. The complete range, terminal
+/// coverage, and permission ceiling are checked before the first store; no
+/// metadata or table allocation occurs. A partially covered block is rejected
+/// so its split can remain an explicit host-owned fallback.
+///
+/// # Safety
+///
+/// The safety and exclusion requirements are identical to
+/// [`publish_existing_invalid_private_pages`].
+pub unsafe fn protect_existing_el1_private_pages(
+    words: *mut core::sync::atomic::AtomicU64,
+    physical_base: u64,
+    byte_len: usize,
+    edit: GuestPermissionEdit,
+) -> Result<usize, GuestPermissionEditError> {
+    use core::sync::atomic::Ordering;
+
+    if words.is_null()
+        || !(words as usize).is_multiple_of(core::mem::align_of::<core::sync::atomic::AtomicU64>())
+        || !physical_base.is_multiple_of(PT_PAGE)
+        || !edit.va.is_multiple_of(PT_PAGE)
+        || edit.len == 0
+        || !edit.len.is_multiple_of(PT_PAGE)
+        || edit.va.checked_add(edit.len).is_none()
+    {
+        return Err(GuestPermissionEditError::BadRange);
+    }
+    let pages =
+        usize::try_from(edit.len / PT_PAGE).map_err(|_| GuestPermissionEditError::BadRange)?;
+    let terminal_for = |va| unsafe {
+        existing_terminal_descriptor(words, physical_base, byte_len, va).map_err(
+            |error| match error {
+                GuestLeafPublicationError::TableOutsidePrimary => {
+                    GuestPermissionEditError::TableOutsidePrimary
+                }
+                GuestLeafPublicationError::MissingTable => GuestPermissionEditError::MissingTable,
+                _ => GuestPermissionEditError::NotPrivateAnonymous,
+            },
+        )
+    };
+
+    let end = edit.va + edit.len;
+    let mut current = edit.va;
+    while current < end {
+        let terminal = terminal_for(current)?;
+        let terminal_end = terminal
+            .semantic_base
+            .checked_add(terminal.span)
+            .ok_or(GuestPermissionEditError::BadRange)?;
+        if terminal.semantic_base < edit.va || terminal_end > end {
+            return Err(GuestPermissionEditError::NotPrivateAnonymous);
+        }
+        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
+        if descriptor & VALID == 0
+            || descriptor & SW_RETIRED != 0
+            || descriptor & SW_EL1_PRIVATE == 0
+        {
+            return Err(GuestPermissionEditError::NotPrivateAnonymous);
+        }
+        if (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
+            || (edit.executable && descriptor & SW_EL1_MAY_EXEC == 0)
+        {
+            return Err(GuestPermissionEditError::PermissionWidening);
+        }
+        current = terminal_end;
+    }
+
+    current = edit.va;
+    while current < end {
+        let terminal = terminal_for(current)?;
+        let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
+        let (ap, uxn) = if !(edit.readable || edit.writable || edit.executable) {
+            (AP_PRIV_RO, UXN)
+        } else if edit.writable {
+            (AP_RW, if edit.executable { 0 } else { UXN })
+        } else {
+            (AP_RO, if edit.executable { 0 } else { UXN })
+        };
+        let updated = (descriptor & !AP_MASK & !UXN) | ap | uxn | VALID;
+        unsafe { (*terminal.word).store(updated, Ordering::Release) };
+        current = terminal.semantic_base + terminal.span;
     }
     Ok(pages)
 }
@@ -2146,6 +2340,12 @@ impl PageTableManager {
             }
             return Err(GuestLeafPublicationError::Manager(error));
         }
+        if let Err(error) = self.mark_guest_private_publication(publication) {
+            if unsafe { self.rollback_undo(&resolver, None) }.is_err() {
+                return Err(GuestLeafPublicationError::RollbackFailed);
+            }
+            return Err(error);
+        }
         if let Err(error) = unsafe { self.sync_to_host(&resolver) } {
             if unsafe { self.rollback_undo(&resolver, None) }.is_err() {
                 return Err(GuestLeafPublicationError::RollbackFailed);
@@ -2154,6 +2354,143 @@ impl PageTableManager {
         }
         self.commit_undo();
         Ok(pages)
+    }
+
+    fn mark_guest_private_publication(
+        &mut self,
+        publication: GuestLeafPublication,
+    ) -> Result<(), GuestLeafPublicationError> {
+        let end = publication
+            .va
+            .checked_add(publication.len)
+            .ok_or(GuestLeafPublicationError::BadRange)?;
+        let mut current = publication.va;
+        while current < end {
+            let (location, level) = self
+                .leaf_offset(current, false, None)
+                .map_err(GuestLeafPublicationError::Manager)?;
+            let descriptor = self
+                .read_desc(location)
+                .map_err(GuestLeafPublicationError::Manager)?;
+            let (span, mask) = Self::level_span(level);
+            let semantic_base = current & mask;
+            let semantic_end = semantic_base
+                .checked_add(span)
+                .ok_or(GuestLeafPublicationError::BadRange)?;
+            if descriptor & VALID == 0 || semantic_base < publication.va || semantic_end > end {
+                return Err(GuestLeafPublicationError::InvalidLeafShape);
+            }
+            let expected_output = publication
+                .ipa
+                .checked_add(semantic_base - publication.va)
+                .ok_or(GuestLeafPublicationError::BadRange)?;
+            if descriptor & mask != expected_output & mask {
+                return Err(GuestLeafPublicationError::InvalidLeafShape);
+            }
+            let mut tagged = descriptor | SW_EL1_PRIVATE;
+            if publication.writable {
+                tagged |= SW_EL1_MAY_WRITE;
+            }
+            if publication.executable {
+                tagged |= SW_EL1_MAY_EXEC;
+            }
+            self.write_desc(location, tagged)
+                .map_err(GuestLeafPublicationError::Manager)?;
+            current = semantic_end;
+        }
+        Ok(())
+    }
+
+    fn preflight_live_private_permission(
+        &mut self,
+        edit: GuestPermissionEdit,
+    ) -> Result<PtOp, GuestPermissionEditError> {
+        if !edit.va.is_multiple_of(PT_PAGE)
+            || edit.len == 0
+            || !edit.len.is_multiple_of(PT_PAGE)
+            || edit.va.checked_add(edit.len).is_none()
+        {
+            return Err(GuestPermissionEditError::BadRange);
+        }
+        let end = edit.va + edit.len;
+        let mut current = edit.va;
+        while current < end {
+            let (location, level) = self
+                .leaf_offset(current, false, None)
+                .map_err(GuestPermissionEditError::Manager)?;
+            let descriptor = self
+                .read_desc(location)
+                .map_err(GuestPermissionEditError::Manager)?;
+            if descriptor & VALID == 0
+                || descriptor & SW_RETIRED != 0
+                || descriptor & SW_EL1_PRIVATE == 0
+            {
+                return Err(GuestPermissionEditError::NotPrivateAnonymous);
+            }
+            if (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
+                || (edit.executable && descriptor & SW_EL1_MAY_EXEC == 0)
+            {
+                return Err(GuestPermissionEditError::PermissionWidening);
+            }
+            let (span, mask) = Self::level_span(level);
+            let next = (current & mask)
+                .checked_add(span)
+                .ok_or(GuestPermissionEditError::BadRange)?;
+            current = next.min(end);
+        }
+        Ok(if !(edit.readable || edit.writable || edit.executable) {
+            PtOp::KernelReadOnly { exec: false }
+        } else if edit.writable {
+            PtOp::ReadWrite {
+                exec: edit.executable,
+            }
+        } else {
+            PtOp::ReadOnly {
+                exec: edit.executable,
+            }
+        })
+    }
+
+    /// Transactionally change permissions on a completely resident
+    /// private-anonymous span previously published by guest EL1. The leaf's
+    /// output address and software ownership ceiling remain unchanged.
+    pub fn protect_live_private_pages_transaction(
+        &mut self,
+        edit: GuestPermissionEdit,
+    ) -> Result<PageTableApplyOutcome, GuestPermissionEditError> {
+        if !self.is_live() {
+            return Err(GuestPermissionEditError::Manager(
+                PageTableError::UnresolvedArena(self.base()),
+            ));
+        }
+        let op = self.preflight_live_private_permission(edit)?;
+        let resolver = self
+            .resolver
+            .as_ref()
+            .cloned()
+            .ok_or(GuestPermissionEditError::Manager(
+                PageTableError::UnresolvedArena(self.base()),
+            ))?;
+        self.begin_undo()
+            .map_err(GuestPermissionEditError::Manager)?;
+        let len = usize::try_from(edit.len).map_err(|_| GuestPermissionEditError::BadRange)?;
+        let outcome = match self.apply(edit.va, len, op, None) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if unsafe { self.rollback_undo(&resolver, None) }.is_err() {
+                    return Err(GuestPermissionEditError::RollbackFailed);
+                }
+                return Err(GuestPermissionEditError::Manager(error));
+            }
+        };
+        if let Err(error) = unsafe { self.sync_to_host(&resolver) } {
+            if unsafe { self.rollback_undo(&resolver, None) }.is_err() {
+                return Err(GuestPermissionEditError::RollbackFailed);
+            }
+            return Err(GuestPermissionEditError::Manager(error));
+        }
+        self.commit_undo();
+        Ok(outcome)
     }
 
     /// Open an undo journal covering every descriptor edit from here until
@@ -2465,6 +2802,138 @@ impl PageTableManager {
         self.try_debug_walk(va).unwrap_or([0u64; 4])
     }
 
+    /// Refresh the owned shadow table pages that a host edit of `[va, va+len)`
+    /// can reach from the hardware-visible root.
+    ///
+    /// During the EL1 migration, guest code can allocate and populate a table
+    /// below a host manager whose owned image predates that hierarchy. A host
+    /// `munmap` must adopt the complete reached table pages before editing: a
+    /// range-only leaf copy would lose live neighboring mappings when the
+    /// owned image is published back to hardware. Work is bounded by the table
+    /// pages covering the range, rather than by its Linux-page count.
+    ///
+    /// Live managers already read the hardware-visible backing directly and
+    /// need no adoption.
+    ///
+    /// # Safety
+    ///
+    /// The caller must exclude every other stage-1 editor for this MM, and
+    /// `resolver` must return readable backing for each reachable table arena.
+    pub unsafe fn adopt_live_tables_for_range(
+        &mut self,
+        resolver: &impl HostArenaResolver,
+        va: u64,
+        len: usize,
+    ) -> Result<(), PageTableError> {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        if self.arenas.first().is_some_and(TableArena::is_live) || len == 0 {
+            return Ok(());
+        }
+        if !va.is_multiple_of(PT_PAGE)
+            || !self.dirty.is_empty()
+            || !self.staged.is_empty()
+            || self.undo.is_some()
+        {
+            return Err(PageTableError::BadAddress);
+        }
+        let rounded_len = (len as u64)
+            .checked_add(PT_PAGE - 1)
+            .map(|value| value & !(PT_PAGE - 1))
+            .ok_or(PageTableError::BadAddress)?;
+        let end = va
+            .checked_add(rounded_len)
+            .ok_or(PageTableError::BadAddress)?;
+        let mut copied = Vec::<TableLocation>::new();
+        copied
+            .try_reserve(4)
+            .map_err(|_| PageTableError::MetadataAllocation)?;
+
+        let mut current = va;
+        while current < end {
+            let indexes = indices(current);
+            let mut table = TableLocation::new(0, 0);
+            let mut next = end;
+            for (level, index) in indexes.into_iter().enumerate() {
+                if !copied.contains(&table) {
+                    if copied.len() == copied.capacity() {
+                        copied
+                            .try_reserve(1)
+                            .map_err(|_| PageTableError::MetadataAllocation)?;
+                    }
+                    let (base, table_end) = {
+                        let arena = self
+                            .arenas
+                            .get(table.arena)
+                            .ok_or(PageTableError::BadAddress)?;
+                        let table_end = table
+                            .offset
+                            .checked_add(PT_PAGE as usize)
+                            .ok_or(PageTableError::BadAddress)?;
+                        if !table.offset.is_multiple_of(PT_PAGE as usize)
+                            || table_end > arena.capacity
+                        {
+                            return Err(PageTableError::BadAddress);
+                        }
+                        (arena.base, table_end)
+                    };
+                    let host = resolver
+                        .host_const_ptr_for_range(base, table_end)
+                        .ok_or(PageTableError::UnresolvedArena(base))?;
+                    let arena = &mut self.arenas[table.arena];
+                    let TableArenaStorage::Owned(ref mut bytes) = arena.storage else {
+                        return Err(PageTableError::BadAddress);
+                    };
+                    if bytes.len() < table_end {
+                        bytes
+                            .try_reserve(table_end - bytes.len())
+                            .map_err(|_| PageTableError::MetadataAllocation)?;
+                        bytes.resize(table_end, 0);
+                    }
+                    for offset in (table.offset..table_end).step_by(8) {
+                        let slot = unsafe { host.add(offset).cast::<AtomicU64>() };
+                        let descriptor = unsafe { (*slot).load(Ordering::Acquire) };
+                        bytes[offset..offset + 8].copy_from_slice(&descriptor.to_le_bytes());
+                    }
+                    arena.next_free = arena.next_free.max(table_end as u64);
+                    let table_pa = base + table.offset as u64;
+                    self.free_tables.retain(|pa| *pa != table_pa);
+                    copied.push(table);
+                }
+
+                let entry = table.entry(index);
+                let descriptor = self.read_desc(entry)?;
+                if level == 3 {
+                    next = (current & !((1_u64 << 21) - 1))
+                        .checked_add(1_u64 << 21)
+                        .ok_or(PageTableError::BadAddress)?;
+                    break;
+                }
+                if descriptor & VALID == 0 || descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+                    let (span, mask) = Self::level_span(level);
+                    next = (current & mask)
+                        .checked_add(span)
+                        .ok_or(PageTableError::BadAddress)?;
+                    break;
+                }
+                let child_pa = descriptor & PA_MASK_TABLE;
+                table = self
+                    .arenas
+                    .iter()
+                    .enumerate()
+                    .find_map(|(arena_index, arena)| {
+                        let offset = child_pa.checked_sub(arena.base)?;
+                        let child_end = offset.checked_add(PT_PAGE)?;
+                        (offset.is_multiple_of(PT_PAGE) && child_end <= arena.capacity as u64)
+                            .then_some(TableLocation::new(arena_index, offset as usize))
+                    })
+                    .ok_or(PageTableError::BadAddress)?;
+            }
+            current = next.min(end);
+        }
+        Ok(())
+    }
+
     /// Read-only descriptor walk over the LIVE host backing that the hardware
     /// MMU walks, rather than this manager's shadow bytes. Descriptor loads are
     /// atomic acquire operations, matching [`Self::sync_to_host`]'s atomic
@@ -2505,12 +2974,18 @@ impl PageTableManager {
                 break;
             }
             let child_pa = desc & PA_MASK_TABLE;
-            match self.pa_to_loc(child_pa) {
-                Ok(loc) => {
+            let live_child = self.arenas.iter().enumerate().find_map(|(arena, entry)| {
+                let offset = child_pa.checked_sub(entry.base)?;
+                let end = offset.checked_add(PT_PAGE)?;
+                (offset.is_multiple_of(PT_PAGE) && end <= entry.capacity as u64)
+                    .then_some(TableLocation::new(arena, offset as usize))
+            });
+            match live_child {
+                Some(loc) => {
                     current_base = self.arenas[loc.arena].base;
                     table_off = loc.offset;
                 }
-                Err(_) => break,
+                None => break,
             }
         }
         Ok(out)
@@ -7646,6 +8121,165 @@ mod tests {
     }
 
     #[test]
+    fn allocation_free_guest_permission_edit_cycles_existing_l3_leaves() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        let root = 0x8800_0000_0000;
+        let va = 0x4000_0000;
+        let ipa = 0x009b_4000_0000;
+        let mut words: Vec<AtomicU64> = (0..(4 * 512)).map(|_| AtomicU64::new(0)).collect();
+        let indexes = indices(va);
+        words[indexes[0]].store((root + 0x1000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[512 + indexes[1]].store((root + 0x2000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[1024 + indexes[2]].store((root + 0x3000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        let l3 = 1536 + indexes[3];
+        unsafe {
+            publish_existing_invalid_private_pages(
+                words.as_mut_ptr(),
+                root,
+                words.len() * core::mem::size_of::<AtomicU64>(),
+                GuestLeafPublication {
+                    va,
+                    ipa,
+                    len: 2 * PT_PAGE,
+                    writable: true,
+                    executable: false,
+                },
+            )
+        }
+        .expect("publish tagged leaves");
+
+        for (readable, writable) in [(true, false), (false, false), (true, true)] {
+            unsafe {
+                protect_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    words.len() * core::mem::size_of::<AtomicU64>(),
+                    GuestPermissionEdit {
+                        va,
+                        len: 2 * PT_PAGE,
+                        readable,
+                        writable,
+                        executable: false,
+                    },
+                )
+            }
+            .expect("permission transition");
+            for page in 0..2 {
+                let descriptor = words[l3 + page].load(Ordering::Acquire);
+                assert_eq!(descriptor & PA_MASK_4KIB, ipa + page as u64 * PT_PAGE);
+                assert_eq!(
+                    terminal_descriptor_permits_el0(descriptor, LeafAccess::Read),
+                    readable || writable
+                );
+                assert_eq!(
+                    terminal_descriptor_permits_el0(descriptor, LeafAccess::Write),
+                    writable
+                );
+                assert!(!terminal_descriptor_permits_el0(
+                    descriptor,
+                    LeafAccess::Execute
+                ));
+            }
+        }
+
+        let before = words[l3].load(Ordering::Acquire);
+        assert_eq!(
+            unsafe {
+                protect_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    words.len() * core::mem::size_of::<AtomicU64>(),
+                    GuestPermissionEdit {
+                        va,
+                        len: 2 * PT_PAGE,
+                        readable: true,
+                        writable: true,
+                        executable: true,
+                    },
+                )
+            },
+            Err(GuestPermissionEditError::PermissionWidening)
+        );
+        assert_eq!(words[l3].load(Ordering::Acquire), before);
+    }
+
+    #[test]
+    fn allocation_free_guest_permission_edit_updates_complete_l2_block() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        let root = 0x8800_0000_0000;
+        let va = 0x4000_0000;
+        let ipa = 0x009b_4000_0000;
+        let mut words: Vec<AtomicU64> = (0..(3 * 512)).map(|_| AtomicU64::new(0)).collect();
+        let indexes = indices(va);
+        words[indexes[0]].store((root + 0x1000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[512 + indexes[1]].store((root + 0x2000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        let l2 = 1024 + indexes[2];
+        let block = (ipa & PA_MASK_2MIB)
+            | USER_BLOCK_FLAGS
+            | NON_GLOBAL
+            | UXN
+            | SW_EL1_PRIVATE
+            | SW_EL1_MAY_WRITE;
+        let adjacent = ((ipa + (1 << 21)) & PA_MASK_2MIB)
+            | USER_BLOCK_FLAGS
+            | NON_GLOBAL
+            | UXN
+            | SW_EL1_PRIVATE
+            | SW_EL1_MAY_WRITE;
+        words[l2].store(block, Ordering::Relaxed);
+        words[l2 + 1].store(adjacent, Ordering::Relaxed);
+
+        assert_eq!(
+            unsafe {
+                protect_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    words.len() * core::mem::size_of::<AtomicU64>(),
+                    GuestPermissionEdit {
+                        va,
+                        len: 1 << 21,
+                        readable: true,
+                        writable: false,
+                        executable: false,
+                    },
+                )
+            },
+            Ok(512)
+        );
+        let protected = words[l2].load(Ordering::Acquire);
+        assert_eq!(protected & PA_MASK_2MIB, ipa & PA_MASK_2MIB);
+        assert_eq!(protected & TYPE_BITS, TYPE_BLOCK);
+        assert!(terminal_descriptor_permits_el0(protected, LeafAccess::Read));
+        assert!(!terminal_descriptor_permits_el0(
+            protected,
+            LeafAccess::Write
+        ));
+        assert_eq!(words[l2 + 1].load(Ordering::Acquire), adjacent);
+
+        let before = words[l2].load(Ordering::Acquire);
+        assert_eq!(
+            unsafe {
+                protect_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    words.len() * core::mem::size_of::<AtomicU64>(),
+                    GuestPermissionEdit {
+                        va: va + PT_PAGE,
+                        len: PT_PAGE,
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                    },
+                )
+            },
+            Err(GuestPermissionEditError::NotPrivateAnonymous)
+        );
+        assert_eq!(words[l2].load(Ordering::Acquire), before);
+    }
+
+    #[test]
     fn live_guest_publication_builds_missing_hierarchy_transactionally() {
         let resolver = MockLiveResolver::new();
         resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
@@ -7725,6 +8359,129 @@ mod tests {
             live.translate(va + 3 * PT_PAGE),
             None,
             "whole-range preflight must reject before exposing a later page"
+        );
+    }
+
+    #[test]
+    fn live_guest_permission_transaction_preserves_frames_and_refuses_widening() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let offline = hvpatch_manager();
+        let va = LINUX_MMAP_BASE + 0x4080_0000;
+        let ipa = 0x009b_4000_0000;
+        unsafe {
+            offline
+                .restore_quiesced_snapshot_to_host(&*resolver)
+                .expect("publish fixture");
+        }
+
+        let mut live = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                LINUX_PAGE_TABLES_SIZE as usize,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .expect("adopt live fixture")
+        };
+        live.publish_live_private_pages_transaction(GuestLeafPublication {
+            va,
+            ipa,
+            len: 3 * PT_PAGE,
+            writable: true,
+            executable: false,
+        })
+        .expect("publish resident anonymous span");
+
+        let outputs = (0..3)
+            .map(|page| {
+                live.translate(va + page * PT_PAGE)
+                    .expect("resident output")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            outputs
+                .iter()
+                .copied()
+                .eq((0..3).map(|page| ipa + page * PT_PAGE))
+        );
+
+        live.protect_live_private_pages_transaction(GuestPermissionEdit {
+            va,
+            len: 3 * PT_PAGE,
+            readable: true,
+            writable: false,
+            executable: false,
+        })
+        .expect("RW to RO");
+        for page in 0..3 {
+            let descriptor = terminal_descriptor(live.debug_walk(va + page * PT_PAGE));
+            assert!(terminal_descriptor_permits_el0(
+                descriptor,
+                LeafAccess::Read
+            ));
+            assert!(!terminal_descriptor_permits_el0(
+                descriptor,
+                LeafAccess::Write
+            ));
+            assert!(!terminal_descriptor_permits_el0(
+                descriptor,
+                LeafAccess::Execute
+            ));
+            assert_eq!(descriptor & PA_MASK_4KIB, outputs[page as usize]);
+        }
+
+        live.protect_live_private_pages_transaction(GuestPermissionEdit {
+            va,
+            len: 3 * PT_PAGE,
+            readable: false,
+            writable: false,
+            executable: false,
+        })
+        .expect("RO to PROT_NONE");
+        for page in 0..3 {
+            let descriptor = terminal_descriptor(live.debug_walk(va + page * PT_PAGE));
+            assert_ne!(descriptor & VALID, 0, "PROT_NONE retains the live VMA leaf");
+            for access in [LeafAccess::Read, LeafAccess::Write, LeafAccess::Execute] {
+                assert!(!terminal_descriptor_permits_el0(descriptor, access));
+            }
+            assert_eq!(descriptor & PA_MASK_4KIB, outputs[page as usize]);
+        }
+
+        live.protect_live_private_pages_transaction(GuestPermissionEdit {
+            va,
+            len: 3 * PT_PAGE,
+            readable: true,
+            writable: true,
+            executable: false,
+        })
+        .expect("PROT_NONE to RW");
+        assert!(
+            outputs.iter().enumerate().all(|(page, output)| {
+                live.translate(va + page as u64 * PT_PAGE) == Some(*output)
+            })
+        );
+
+        let before = live
+            .snapshot_image()
+            .expect("snapshot before refused widening");
+        assert_eq!(
+            live.protect_live_private_pages_transaction(GuestPermissionEdit {
+                va,
+                len: 3 * PT_PAGE,
+                readable: true,
+                writable: true,
+                executable: true,
+            }),
+            Err(GuestPermissionEditError::PermissionWidening)
+        );
+        assert_eq!(
+            live.snapshot_image()
+                .expect("snapshot after refused widening")
+                .as_bytes(),
+            before.as_bytes(),
+            "a refused widening must not publish a partial edit"
         );
     }
 
@@ -7838,6 +8595,49 @@ mod tests {
     }
 
     #[test]
+    fn host_debug_walk_reaches_guest_grown_primary_tables_beyond_owned_prefix() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let host = hvpatch_manager();
+        unsafe {
+            host.restore_quiesced_snapshot_to_host(&*resolver)
+                .expect("publish fixture");
+        }
+        let host_prefix_before = host.copied_bytes();
+
+        let mut guest = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                LINUX_PAGE_TABLES_SIZE as usize,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .expect("adopt live fixture in guest editor")
+        };
+        let va = LINUX_MMAP_BASE + 0x4080_0000;
+        let ipa = 0x009b_4000_1000;
+        guest
+            .publish_live_private_pages_transaction(GuestLeafPublication {
+                va,
+                ipa,
+                len: PT_PAGE,
+                writable: true,
+                executable: false,
+            })
+            .expect("publish guest-grown hierarchy");
+        assert!(guest.copied_bytes() > host_prefix_before);
+
+        let walk = unsafe {
+            host.debug_walk_host(&*resolver, va)
+                .expect("walk hardware-visible guest hierarchy")
+        };
+        let leaf = terminal_descriptor(walk);
+        assert_eq!(leaf & PA_MASK_4KIB, ipa);
+        assert!(terminal_descriptor_has_el1_private_authority(leaf));
+    }
+
+    #[test]
     fn live_host_edit_adopts_hierarchy_allocated_by_guest_editor() {
         let resolver = MockLiveResolver::new();
         resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
@@ -7888,6 +8688,76 @@ mod tests {
         assert!(
             host.copied_bytes() >= guest.copied_bytes(),
             "host allocator high-water mark must cover every guest-grown table"
+        );
+    }
+
+    #[test]
+    fn live_host_unmap_preserves_adjacent_guest_private_leaf() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let mut host = hvpatch_manager();
+        unsafe {
+            host.restore_quiesced_snapshot_to_host(&*resolver)
+                .expect("publish fixture");
+            host.sync_to_host(&*resolver)
+                .expect("finish the host's bootstrap publication");
+        }
+
+        let mut guest = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                LINUX_PAGE_TABLES_SIZE as usize,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .expect("adopt live fixture in guest editor")
+        };
+        let va = LINUX_MMAP_BASE + 5 * PT_PAGE;
+        let target_len = 256 * PT_PAGE;
+        let adjacent_va = va + target_len;
+        let ipa = 0x009b_4000_0000;
+        assert_eq!(
+            guest.publish_live_private_pages_transaction(GuestLeafPublication {
+                va,
+                ipa,
+                len: target_len + PT_PAGE,
+                writable: true,
+                executable: false,
+            }),
+            Ok(257)
+        );
+        assert_eq!(guest.translate(adjacent_va), Some(ipa + target_len));
+
+        for (readable, writable) in [(true, false), (true, true), (false, false), (true, true)] {
+            guest
+                .protect_live_private_pages_transaction(GuestPermissionEdit {
+                    va,
+                    len: target_len,
+                    readable,
+                    writable,
+                    executable: false,
+                })
+                .expect("permission edit must stay inside the target range");
+        }
+        assert_eq!(guest.translate(adjacent_va), Some(ipa + target_len));
+
+        unsafe {
+            host.adopt_live_tables_for_range(&*resolver, va, target_len as usize)
+                .expect("host shadow must adopt the guest-grown hierarchy before editing");
+        }
+        host.unmap_aliased(va, target_len as usize, None)
+            .expect("host unmap must preserve the adjacent guest leaf");
+        unsafe {
+            host.sync_to_host(&*resolver)
+                .expect("publish host invalidation");
+        }
+
+        assert_eq!(host.translate(va), None);
+        assert_eq!(
+            host.translate(adjacent_va),
+            Some(ipa + target_len),
+            "unmapping a guest-grown range must not reclaim its neighbor's live table"
         );
     }
 

@@ -6201,6 +6201,46 @@ fn concurrent_cow_loser_retries_only_an_exact_live_writable_winner() {
 }
 
 #[test]
+fn el1_owned_live_leaf_overrides_stale_host_shadow_without_weakening_untagged_parity() {
+    const VALID_PAGE: u64 = 0b11;
+    const NON_GLOBAL: u64 = 1 << 11;
+    const AP_USER_RW: u64 = 0b01 << 6;
+    const AP_USER_RO: u64 = 0b11 << 6;
+    const SW_EL1_PRIVATE: u64 = 1 << 56;
+    let ipa = 0x009b_4000_0000;
+    let stale_shadow = [0x1003, 0x0060_0060_0000_0f40, 0, 0];
+    let live_prefix = [0x1003, 0x2b003, 0x2c003];
+    let live_ro = [
+        live_prefix[0],
+        live_prefix[1],
+        live_prefix[2],
+        ipa | VALID_PAGE | NON_GLOBAL | AP_USER_RO | SW_EL1_PRIVATE,
+    ];
+
+    assert_eq!(
+        winner_pte_writable_private(stale_shadow, live_ro, ipa),
+        Ok(false),
+        "an EL1-owned read-only leaf is a real permission denial, not shadow corruption"
+    );
+
+    let mut live_rw = live_ro;
+    live_rw[3] = (live_rw[3] & !(0b11 << 6)) | AP_USER_RW;
+    assert_eq!(
+        winner_pte_writable_private(stale_shadow, live_rw, ipa),
+        Ok(true),
+        "an exact EL1-owned writable leaf can prove a concurrent COW winner"
+    );
+
+    let mut untagged = live_rw;
+    untagged[3] &= !SW_EL1_PRIVATE;
+    assert_eq!(
+        winner_pte_writable_private(stale_shadow, untagged, ipa),
+        Err(WinnerPteError::ShadowLiveMismatch),
+        "ordinary host-owned leaves retain the fail-closed parity check"
+    );
+}
+
+#[test]
 fn retired_invalid_output_materializes_before_a_stale_cow_arm() {
     use carrick_aarch64::vmm::FrameCowWriteIntent;
 

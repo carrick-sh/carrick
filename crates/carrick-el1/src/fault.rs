@@ -62,12 +62,14 @@ fn next_frame_grant_generation() -> u64 {
     }
 }
 
+/// Decode an EL0 translation fault that can be satisfied by publishing fresh
+/// anonymous backing. Permission faults name an already-mapped page and must
+/// follow the protection/COW path; requesting another frame for them adds a
+/// host round trip and can never authorize the denied access.
 fn frame_grant_access(esr: u64) -> Option<u64> {
     let ec = (esr >> 26) & 0x3f;
     let dfsc = esr & 0x3f;
-    if !matches!(ec, 0x24 | 0x25)
-        || !((0x04..=0x07).contains(&dfsc) || (0x0c..=0x0f).contains(&dfsc))
-    {
+    if !matches!(ec, 0x24 | 0x25) || !(0x04..=0x07).contains(&dfsc) {
         return None;
     }
     Some(if esr & (1 << 6) != 0 { 2 } else { 1 })
@@ -337,6 +339,15 @@ mod tests {
         }
     }
 
+    fn write_permission_fault(slot: u64, address: u64) -> TrapFrame {
+        TrapFrame {
+            esr: (0x24 << 26) | (1 << 6) | 0x0f,
+            far: address,
+            slot,
+            ..TrapFrame::default()
+        }
+    }
+
     fn published_space(mm: u64, ttbr0: u64) -> AddressSpaces {
         let spaces = AddressSpaces::new();
         let index = spaces.publish_closed(mm, ttbr0, ttbr0).unwrap();
@@ -447,6 +458,37 @@ mod tests {
         assert!(!mailbox.has_guest_work());
         assert!(publisher.calls.is_empty());
         assert_ne!(request.request_generation, 0);
+    }
+
+    #[test]
+    fn permission_fault_never_requests_a_first_touch_frame_grant() {
+        let mm = 82;
+        let task = CurrentTask::new();
+        task.zone_mm.store(mm, Ordering::Release);
+        let tasks = [task];
+        let spaces = published_space(mm, (35_u64 << 48) | 0x8c00_0000_0000);
+        let mailbox = FrameGrantMailbox::new();
+        let counters = Counters::default();
+        let mut publisher = RecordingPublisher::default();
+        let mut frame = write_permission_fault(0, 0x5300_1000);
+
+        assert_eq!(
+            dispatch_fault_with_regions(
+                &mut frame,
+                &counters,
+                &tasks,
+                &spaces,
+                &mailbox,
+                &mut publisher,
+            ),
+            Action::Forward
+        );
+        assert!(
+            !mailbox.has_guest_work(),
+            "a mapped-page permission denial must not request new physical backing"
+        );
+        assert!(publisher.calls.is_empty());
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
     }
 
     #[test]

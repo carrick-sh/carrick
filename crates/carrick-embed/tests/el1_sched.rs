@@ -1420,6 +1420,161 @@ fn el1_anonymous_mapping_retirement_returns_and_reuses_frames() {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PermissionRun {
+    pages: u64,
+    rounds: u64,
+    exits: u64,
+    served_mprotect: u64,
+    forwarded_mprotect: u64,
+    faults: u64,
+    grants: u64,
+    returns: u64,
+    bytes_granted: u64,
+    bytes_returned: u64,
+}
+
+fn permission_counter_snapshot() -> (u64, u64, u64) {
+    read_el1_counters().map_or((0, 0, 0), |counters| {
+        (
+            counters.served[226].load(std::sync::atomic::Ordering::Relaxed),
+            counters.forwarded[226].load(std::sync::atomic::Ordering::Relaxed),
+            counters
+                .fault_taken
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    })
+}
+
+/// Contract `kernel.el1.anonymous-permissions` (EL1 increment 2): resident
+/// anonymous `mprotect` transitions are served by EL1, preserve contents, and
+/// deny disallowed reads/writes with Linux `SEGV_ACCERR`. Pure permission edits
+/// neither churn frame grants nor grow host exits with the number of pages.
+#[test]
+fn el1_anonymous_permission_transitions_stay_in_guest() {
+    const SCALE_ROUNDS: u64 = 4;
+    const SCALES: [u64; 3] = [256, 1024, 4096];
+    const ROUND_PAIR: [u64; 2] = [2, 18];
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+
+    for (pages, rounds) in SCALES
+        .into_iter()
+        .map(|pages| (pages, SCALE_ROUNDS))
+        .chain(ROUND_PAIR.into_iter().map(|rounds| (256, rounds)))
+    {
+        let counters_before = permission_counter_snapshot();
+        let grants_before = carrick_embed::el1_frame_grant_stats();
+        let measured = run_fixture(
+            &carrier,
+            &[
+                "permission-transitions",
+                &pages.to_string(),
+                &rounds.to_string(),
+            ],
+            Duration::from_secs(120),
+        );
+        let grants_after = carrick_embed::el1_frame_grant_stats();
+        let counters_after = permission_counter_snapshot();
+        let stdout = measured.result.stdout_utf8();
+        let run = PermissionRun {
+            pages,
+            rounds,
+            exits: measured.exits,
+            served_mprotect: counters_after.0 - counters_before.0,
+            forwarded_mprotect: counters_after.1 - counters_before.1,
+            faults: counters_after.2 - counters_before.2,
+            grants: grants_after.grants_succeeded - grants_before.grants_succeeded,
+            returns: grants_after.returns_completed - grants_before.returns_completed,
+            bytes_granted: grants_after.bytes_granted - grants_before.bytes_granted,
+            bytes_returned: grants_after.bytes_returned - grants_before.bytes_returned,
+        };
+        println!(
+            "el1-sched permission-transitions pages={pages} rounds={rounds} exits={} served_mprotect={} forwarded_mprotect={} faults={} grants={} returns={} bytes_granted={} bytes_returned={} {}",
+            run.exits,
+            run.served_mprotect,
+            run.forwarded_mprotect,
+            run.faults,
+            run.grants,
+            run.returns,
+            run.bytes_granted,
+            run.bytes_returned,
+            stdout.trim(),
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            stdout.contains(&format!(
+                "permission-transitions pages={pages} rounds={rounds}"
+            )) && stdout.contains(&format!(
+                "write_faults={rounds} read_faults={rounds} signal_errors=0 transition_failures=0 byte_failures=0 preserved=true segv_accerr=true unmap=true"
+            )),
+            "permission transition semantics were not complete: {stdout:?}"
+        );
+        assert_eq!(run.returns, run.grants, "every initial grant must return");
+        assert_eq!(
+            run.bytes_returned, run.bytes_granted,
+            "every initially granted byte must return"
+        );
+        runs.push(run);
+    }
+
+    for run in &runs {
+        assert_eq!(
+            run.served_mprotect,
+            4 * run.rounds,
+            "EL1 must serve every protection transition: {run:?}"
+        );
+        assert_eq!(
+            run.forwarded_mprotect, 1,
+            "only the process signal-stack guard may cross the host boundary: {run:?}"
+        );
+        assert!(
+            run.faults >= 2 * run.rounds,
+            "both denied accesses must enter EL1: {run:?}"
+        );
+    }
+
+    for pair in runs[..SCALES.len()].windows(2) {
+        let added_pages = SCALE_ROUNDS as f64 * (pair[1].pages - pair[0].pages) as f64;
+        let slope = (pair[1].exits as f64 - pair[0].exits as f64) / added_pages;
+        println!(
+            "el1-sched permission-transitions page-slope {}->{} rounds={SCALE_ROUNDS}: exits_diff={} slope={slope:.4} exits/page/round",
+            pair[0].pages,
+            pair[1].pages,
+            pair[1].exits as i64 - pair[0].exits as i64,
+        );
+        assert!(
+            slope < 0.125,
+            "permission-transition host-exit slope {slope:.4} exceeds <0.125 exits per added page per round"
+        );
+    }
+
+    let short = runs[SCALES.len()];
+    let long = runs[SCALES.len() + 1];
+    let exit_slope = (long.exits as f64 - short.exits as f64) / (long.rounds - short.rounds) as f64;
+    println!(
+        "el1-sched permission-transitions round-slope pages={} {}->{}: exits_diff={} slope={exit_slope:.4} exits/round",
+        short.pages,
+        short.rounds,
+        long.rounds,
+        long.exits as i64 - short.exits as i64,
+    );
+    assert!(
+        exit_slope < 4.5,
+        "permission-transition host-exit slope {exit_slope:.4} exceeds the two denied-signal cycles plus noise per round"
+    );
+    assert_eq!(
+        long.grants, short.grants,
+        "additional pure permission rounds must not allocate frame grants"
+    );
+    assert_eq!(
+        long.bytes_granted, short.bytes_granted,
+        "additional pure permission rounds must not allocate frame bytes"
+    );
+}
+
 /// EL1 data-abort entry verification: a stage-1 permission fault in guest user code
 /// enters the EL1 vector image, increments EL1 fault_taken counter, restores complete
 /// architectural context and forwards through host fault handling to guest SIGSEGV.

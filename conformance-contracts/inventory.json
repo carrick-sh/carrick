@@ -2957,6 +2957,7 @@
       "contracts": [
         "kernel.el1.address-space-switch",
         "kernel.el1.anonymous-first-touch",
+        "kernel.el1.anonymous-permissions",
         "kernel.el1.anonymous-retirement",
         "kernel.el1.zone-entry-at-open",
         "kernel.mm.address-space-occupancy",
@@ -3080,6 +3081,7 @@
       "contracts": [
         "kernel.el1.address-space-switch",
         "kernel.el1.anonymous-first-touch",
+        "kernel.el1.anonymous-permissions",
         "kernel.el1.anonymous-retirement",
         "kernel.el1.fault-entry",
         "kernel.el1.zone-entry-at-open",
@@ -3143,6 +3145,7 @@
       "authority": "hybrid",
       "contracts": [
         "kernel.el1.address-space-switch",
+        "kernel.el1.anonymous-permissions",
         "kernel.el1.fault-entry",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.current-read-reuse",

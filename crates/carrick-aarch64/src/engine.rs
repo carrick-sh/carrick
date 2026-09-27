@@ -1054,6 +1054,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         &mut self,
         edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<PageTableApplyOutcome, MemoryError> {
+        self.pt_edit_locked_after_adopting(None, edit)
+    }
+
+    fn pt_edit_locked_after_adopting(
+        &mut self,
+        live_range: Option<(u64, usize)>,
+        edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
+    ) -> Result<PageTableApplyOutcome, MemoryError> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let pt_base = self
             .vcpu
@@ -1087,6 +1095,20 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 }
                 editor.set_multi_vcpu(unsafe_to_coalesce);
                 editor.set_stage1_exclusive(stage1_exclusive);
+                if let Some((address, len)) = live_range {
+                    let resolver = EngineHostResolver {
+                        vm: &self.vm,
+                        pt_base,
+                        host,
+                        size,
+                    };
+                    unsafe {
+                        editor
+                            .manager
+                            .adopt_live_tables_for_range(&resolver, address, len)
+                    }
+                    .map_err(page_table_sync_error_to_memory_error)?;
+                }
                 match edit(editor) {
                     Ok(res) => {
                         outcome = res;
@@ -1194,6 +1216,20 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             // Nothing changed that requires a TLB flush: no previously-valid leaf
             // was modified, split, or coalesced, so there is no stale TLB entry
             // to invalidate.
+            return Ok(());
+        }
+        self.run_stage1_maintenance()
+            .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
+    }
+
+    fn pt_edit_and_flush_after_adopting(
+        &mut self,
+        address: u64,
+        len: usize,
+        edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
+    ) -> Result<(), MemoryError> {
+        let outcome = self.pt_edit_locked_after_adopting(Some((address, len)), edit)?;
+        if !outcome.flush_required {
             return Ok(());
         }
         self.run_stage1_maintenance()
@@ -1694,6 +1730,48 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .map(Gpa)
     }
 
+    /// Enforce permission transitions served by guest EL1 on host-side syscall
+    /// buffers. Only leaves carrying EL1's private-anonymous software authority
+    /// participate; every other mapping keeps the existing protection registry
+    /// and backend checks.
+    fn el1_private_leaf_permits(
+        &self,
+        va: u64,
+        access: carrick_mmu_core::aarch64::LeafAccess,
+    ) -> bool {
+        let Some((_ttbr, walk)) = self.diagnostic_fault_page_tables(va) else {
+            return true;
+        };
+        let descriptor = carrick_mmu_core::aarch64::terminal_descriptor(walk);
+        !carrick_mmu_core::aarch64::terminal_descriptor_has_el1_private_authority(descriptor)
+            || carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(descriptor, access)
+    }
+
+    fn el1_private_range_permits(
+        &self,
+        address: u64,
+        length: usize,
+        access: carrick_mmu_core::aarch64::LeafAccess,
+    ) -> bool {
+        if length == 0 {
+            return true;
+        }
+        let Some(end) = address.checked_add(length as u64) else {
+            return false;
+        };
+        let mut page = address & !0xfff;
+        while page < end {
+            if !self.el1_private_leaf_permits(page, access) {
+                return false;
+            }
+            let Some(next) = page.checked_add(0x1000) else {
+                return false;
+            };
+            page = next;
+        }
+        true
+    }
+
     /// One page-bounded VA→IPA segment of a syscall buffer. Page bounding is
     /// mandatory: a private prefix/middle/suffix overlay can make numerically
     /// adjacent guest VAs resolve to unrelated physical pages.
@@ -1824,6 +1902,13 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        if !self.el1_private_range_permits(
+            address,
+            length,
+            carrick_mmu_core::aarch64::LeafAccess::Read,
+        ) {
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
         // PROT_NONE was gated on the guest VA in the default `read_bytes`. Walk
         // every page independently so a buffer spanning shared identity and a
         // private overlay never assumes one physically-contiguous base IPA.
@@ -1864,6 +1949,13 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // No-alloc fixed-size read (`read_u32`/`read_u64`/struct headers), still
         // page-segmented for fragmented overlays.
         let length = dst.len();
+        if !self.el1_private_range_permits(
+            address,
+            length,
+            carrick_mmu_core::aarch64::LeafAccess::Read,
+        ) {
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
         let mut copied = 0usize;
         while copied < length {
             let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
@@ -1901,10 +1993,15 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // syscall write observes the change. The backend's `translated_write` may
         // additionally enforce per-mapping write intent (HVF's boot/file mappings).
         if !bytes.is_empty()
-            && self
+            && (self
                 .vm
                 .protections()
                 .is_some_and(|p| p.range_write_denied(address, bytes.len()))
+                || !self.el1_private_range_permits(
+                    address,
+                    bytes.len(),
+                    carrick_mmu_core::aarch64::LeafAccess::Write,
+                ))
         {
             return Err(MemoryError::OutOfBounds {
                 address,
@@ -1971,14 +2068,35 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             );
             return false;
         }
+        if !self.el1_private_range_permits(
+            address,
+            length,
+            carrick_mmu_core::aarch64::LeafAccess::Write,
+        ) {
+            return false;
+        }
         true
     }
 
     fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
+        if !self.el1_private_range_permits(
+            address,
+            len,
+            carrick_mmu_core::aarch64::LeafAccess::Read,
+        ) {
+            return None;
+        }
         self.vm.host_ptr_for_read(address, len)
     }
 
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
+        if !self.el1_private_range_permits(
+            address,
+            len,
+            carrick_mmu_core::aarch64::LeafAccess::Write,
+        ) {
+            return None;
+        }
         self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::GuestVisible)
             .ok()?;
         self.vm.host_ptr_for_write(address, len)
@@ -2292,7 +2410,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // pt_edit_AND_FLUSH: a guest can `mprotect` an ALREADY-TOUCHED page (e.g.
         // RELRO RW→RO), so the stale stage-1 TLB entry must be invalidated for the
         // new protection to take effect.
-        self.pt_edit_and_flush(|editor| {
+        self.pt_edit_and_flush_after_adopting(address, len, |editor| {
             editor.apply_protection_edit(address, len, prot, &armed_cow)
         })?;
         self.vm
@@ -2308,12 +2426,12 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// the guest's own access faults (vs the host-side `no_access` check). The
     /// unmapped range is typically ALREADY-TOUCHED, so flush the stale TLB entry.
     fn restore_shared_identity(&mut self, va: u64, len: usize) -> Result<(), MemoryError> {
-        let len = u64::try_from(len).map_err(|_| MemoryError::OutOfBounds {
+        let len_u64 = u64::try_from(len).map_err(|_| MemoryError::OutOfBounds {
             address: va,
             length: len,
         })?;
-        self.pt_edit_and_flush(|mgr| {
-            mgr.map_aliased(va, va, len, true)
+        self.pt_edit_and_flush_after_adopting(va, len, |mgr| {
+            mgr.map_aliased(va, va, len_u64, true)
                 .map(|changed| PageTableApplyOutcome::new(changed, changed))
         })
     }
@@ -2331,9 +2449,13 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 }))
                 || carrick_mem::memory::is_high_va(address))
         {
-            self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))?;
+            self.pt_edit_and_flush_after_adopting(address, len, |mgr| {
+                mgr.unmap_aliased(address, len)
+            })?;
         } else {
-            self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))?;
+            self.pt_edit_and_flush_after_adopting(address, len, |mgr| {
+                mgr.invalidate(address, len)
+            })?;
         }
         self.vm.on_unmap(address, len).map_err(|error| {
             MemoryError::HostMap(format!("retire backend mapping after munmap: {error}"))
@@ -2349,7 +2471,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // Reclaim the alias leaves/table and complete TLBI before unregistering
         // backend lookup metadata. An Err therefore leaves the alias registry
         // intact and consistent with the still-owned host/stage-2 backing.
-        self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))?;
+        self.pt_edit_and_flush_after_adopting(address, len, |mgr| mgr.unmap_aliased(address, len))?;
         self.vm.on_unmap(address, len).map_err(|error| {
             MemoryError::HostMap(format!("retire backend alias after munmap: {error}"))
         })?;

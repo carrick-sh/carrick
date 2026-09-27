@@ -2070,11 +2070,6 @@ impl HvfTaskState {
         fault_va: u64,
         mapping: MappingView,
     ) -> Result<bool, TrapError> {
-        const VALID_PAGE: u64 = 0b11;
-        const NON_GLOBAL: u64 = 1 << 11;
-        const AP_MASK: u64 = 0b11 << 6;
-        const AP_USER_RW: u64 = 0b01 << 6;
-        const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
         const PAGE_SIZE: u64 = 4 * 1024;
 
         let page_va = align_down(fault_va, PAGE_SIZE);
@@ -2106,16 +2101,11 @@ impl HvfTaskState {
                             "HVPatch winner PTE debug_walk_host failed: {e:?}"
                         ))
                     })?;
-                if shadow != live {
-                    return Err(TrapError::Hypervisor(format!(
-                        "HVPatch winner PTE shadow/live mismatch at VA 0x{page_va:x}: shadow={shadow:x?} live={live:x?}"
-                    )));
-                }
-                let leaf = live[3];
-                Ok(leaf & VALID_PAGE == VALID_PAGE
-                    && leaf & NON_GLOBAL != 0
-                    && leaf & AP_MASK == AP_USER_RW
-                    && leaf & PA_MASK_4KIB == expected_ipa & PA_MASK_4KIB)
+                winner_pte_writable_private(shadow, live, expected_ipa).map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "HVPatch winner PTE {error:?} at VA 0x{page_va:x}: shadow={shadow:x?} live={live:x?}"
+                    ))
+                })
             })
             .ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch winner PTE manager is absent".to_owned())
@@ -6244,6 +6234,36 @@ pub(crate) enum UnarmedPermissionFaultRoute {
     NotCow,
     RetryCommittedWinner,
     MissingArm,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WinnerPteError {
+    ShadowLiveMismatch,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn winner_pte_writable_private(
+    shadow: [u64; 4],
+    live: [u64; 4],
+    expected_ipa: u64,
+) -> Result<bool, WinnerPteError> {
+    const VALID_PAGE: u64 = 0b11;
+    const NON_GLOBAL: u64 = 1 << 11;
+    const AP_MASK: u64 = 0b11 << 6;
+    const AP_USER_RW: u64 = 0b01 << 6;
+    const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+
+    let leaf = live[3];
+    if shadow != live
+        && !carrick_mmu_core::aarch64::terminal_descriptor_has_el1_private_authority(leaf)
+    {
+        return Err(WinnerPteError::ShadowLiveMismatch);
+    }
+    Ok(leaf & VALID_PAGE == VALID_PAGE
+        && leaf & NON_GLOBAL != 0
+        && leaf & AP_MASK == AP_USER_RW
+        && leaf & PA_MASK_4KIB == expected_ipa & PA_MASK_4KIB)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

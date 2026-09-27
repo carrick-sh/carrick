@@ -60,6 +60,11 @@
 //!   one private anonymous range at the same VA, verifies every byte is zero,
 //!   writes every Linux page, verifies the writes, and unmaps the whole range.
 //!
+//! - `permission-transitions <pages> <rounds>` (EL1 increment 2): initializes
+//!   private anonymous pages, repeatedly applies read-only and `PROT_NONE` to
+//!   the complete range, proves write/read denial through `SEGV_ACCERR`, restores
+//!   RW from the signal handler, and verifies every byte remains intact.
+//!
 //! - `fault-entry`: triggers a stage-1 permission fault on a PROT_READ mapping,
 //!   catches SIGSEGV with SA_SIGINFO, verifies si_addr, mprotects PROT_READ|PROT_WRITE,
 //!   retries store, and verifies store success and register preservation.
@@ -1523,6 +1528,199 @@ fn mapping_retirement(pages: usize, rounds: usize) -> i32 {
     0
 }
 
+static PERMISSION_BASE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static PERMISSION_LEN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static PERMISSION_EXPECTED_ADDR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static PERMISSION_PHASE: AtomicU32 = AtomicU32::new(0);
+static PERMISSION_WRITE_FAULTS: AtomicU32 = AtomicU32::new(0);
+static PERMISSION_READ_FAULTS: AtomicU32 = AtomicU32::new(0);
+static PERMISSION_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn on_permission_segv(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _ucontext: *mut libc::c_void,
+) {
+    if sig != libc::SIGSEGV || info.is_null() {
+        unsafe { libc::_exit(51) };
+    }
+    let phase = PERMISSION_PHASE.swap(0, Ordering::SeqCst);
+    let fault_addr = unsafe { (*info).si_addr() as usize };
+    let expected_addr = PERMISSION_EXPECTED_ADDR.load(Ordering::SeqCst);
+    let si_code = unsafe { (*info).si_code };
+    if phase == 0 || fault_addr != expected_addr || si_code != 2 {
+        PERMISSION_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
+    match phase {
+        1 => {
+            PERMISSION_WRITE_FAULTS.fetch_add(1, Ordering::SeqCst);
+        }
+        2 => {
+            PERMISSION_READ_FAULTS.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    }
+
+    let base = PERMISSION_BASE.load(Ordering::SeqCst);
+    let len = PERMISSION_LEN.load(Ordering::SeqCst);
+    if base == 0
+        || len == 0
+        || unsafe {
+            libc::mprotect(
+                base as *mut libc::c_void,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+            )
+        } != 0
+    {
+        unsafe { libc::_exit(52) };
+    }
+}
+
+fn permission_transitions(pages: usize, rounds: usize) -> i32 {
+    let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size_raw <= 0 {
+        println!("permission-transitions invalid page size {page_size_raw}");
+        return 1;
+    }
+    let page_size = page_size_raw as usize;
+    if pages == 0 || pages > 65_536 || rounds == 0 || rounds > 64 {
+        println!(
+            "permission-transitions invalid pages={pages} rounds={rounds} page_size={page_size}"
+        );
+        return 1;
+    }
+    let Some(len) = pages.checked_mul(page_size).filter(|len| *len > 0) else {
+        println!("permission-transitions overflowing pages={pages} page_size={page_size}");
+        return 1;
+    };
+    unsafe { libc::alarm(90) };
+
+    let region = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if region == libc::MAP_FAILED {
+        println!("permission-transitions mmap failed");
+        return 1;
+    }
+    let base = region as usize;
+    PERMISSION_BASE.store(base, Ordering::SeqCst);
+    PERMISSION_LEN.store(len, Ordering::SeqCst);
+    PERMISSION_PHASE.store(0, Ordering::SeqCst);
+    PERMISSION_WRITE_FAULTS.store(0, Ordering::SeqCst);
+    PERMISSION_READ_FAULTS.store(0, Ordering::SeqCst);
+    PERMISSION_ERRORS.store(0, Ordering::SeqCst);
+
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = on_permission_segv as *const () as usize;
+    action.sa_flags = libc::SA_SIGINFO;
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    if unsafe { libc::sigaction(libc::SIGSEGV, &action, std::ptr::null_mut()) } != 0 {
+        println!("permission-transitions sigaction failed");
+        unsafe { libc::munmap(region, len) };
+        return 1;
+    }
+
+    let mut expected = Vec::with_capacity(pages);
+    for page in 0..pages {
+        let value = 0xC411_5045_524D_0000u64 ^ page as u64;
+        expected.push(value);
+        unsafe {
+            std::ptr::write_volatile(
+                (region as *mut u8).add(page * page_size).cast::<u64>(),
+                value,
+            );
+        }
+    }
+
+    let mut transition_failures = 0u64;
+    let mut byte_failures = 0u64;
+    for round in 0..rounds {
+        if unsafe { libc::mprotect(region, len, libc::PROT_READ) } != 0 {
+            transition_failures += 1;
+            break;
+        }
+        for page in 0..pages {
+            let actual = unsafe {
+                std::ptr::read_volatile(
+                    (region as *const u8).add(page * page_size).cast::<u64>(),
+                )
+            };
+            if actual != expected[page] {
+                byte_failures += 1;
+            }
+        }
+
+        let write_page = round % pages;
+        let write_ptr = unsafe { (region as *mut u8).add(write_page * page_size).cast::<u64>() };
+        let write_value = 0xC411_5752_4954_0000u64 ^ round as u64;
+        expected[write_page] = write_value;
+        PERMISSION_EXPECTED_ADDR.store(write_ptr as usize, Ordering::SeqCst);
+        PERMISSION_PHASE.store(1, Ordering::SeqCst);
+        unsafe { std::ptr::write_volatile(write_ptr, write_value) };
+        if PERMISSION_PHASE.load(Ordering::SeqCst) != 0 {
+            transition_failures += 1;
+        }
+
+        if unsafe { libc::mprotect(region, len, libc::PROT_NONE) } != 0 {
+            transition_failures += 1;
+            break;
+        }
+        let read_page = (round.wrapping_mul(17).wrapping_add(1)) % pages;
+        let read_ptr = unsafe { (region as *const u8).add(read_page * page_size).cast::<u64>() };
+        PERMISSION_EXPECTED_ADDR.store(read_ptr as usize, Ordering::SeqCst);
+        PERMISSION_PHASE.store(2, Ordering::SeqCst);
+        let actual = unsafe { std::ptr::read_volatile(read_ptr) };
+        if PERMISSION_PHASE.load(Ordering::SeqCst) != 0 {
+            transition_failures += 1;
+        }
+        if actual != expected[read_page] {
+            byte_failures += 1;
+        }
+
+        for page in 0..pages {
+            let actual = unsafe {
+                std::ptr::read_volatile(
+                    (region as *const u8).add(page * page_size).cast::<u64>(),
+                )
+            };
+            if actual != expected[page] {
+                byte_failures += 1;
+            }
+        }
+    }
+
+    let write_faults = PERMISSION_WRITE_FAULTS.load(Ordering::SeqCst);
+    let read_faults = PERMISSION_READ_FAULTS.load(Ordering::SeqCst);
+    let signal_errors = PERMISSION_ERRORS.load(Ordering::SeqCst);
+    PERMISSION_PHASE.store(0, Ordering::SeqCst);
+    PERMISSION_BASE.store(0, Ordering::SeqCst);
+    PERMISSION_LEN.store(0, Ordering::SeqCst);
+    let unmap_ok = unsafe { libc::munmap(region, len) } == 0;
+    let ok = transition_failures == 0
+        && byte_failures == 0
+        && signal_errors == 0
+        && write_faults == rounds as u32
+        && read_faults == rounds as u32
+        && unmap_ok;
+    println!(
+        "permission-transitions pages={pages} rounds={rounds} write_faults={write_faults} read_faults={read_faults} signal_errors={signal_errors} transition_failures={transition_failures} byte_failures={byte_failures} preserved={} segv_accerr={} unmap={unmap_ok}",
+        byte_failures == 0,
+        signal_errors == 0,
+    );
+    i32::from(!ok)
+}
+
 static FAULT_COUNT: AtomicU32 = AtomicU32::new(0);
 static FAULT_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static FAULT_MMAP_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2163,6 +2361,10 @@ fn main() {
             },
         },
         "mapping-retirement" => mapping_retirement(
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
+            args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
+        ),
+        "permission-transitions" => permission_transitions(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
         ),
