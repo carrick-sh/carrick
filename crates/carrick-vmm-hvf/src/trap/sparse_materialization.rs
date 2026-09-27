@@ -19,6 +19,39 @@ pub(super) struct PreparedSparseBacking {
     pub(super) owner_rollback: GlobalFrameOwnerRollback,
 }
 
+pub(super) struct PublishedFrameGrant {
+    pub(super) region: HvfMappedRegion,
+    pub(super) ready: carrick_hal::El1FrameGrantReady,
+}
+
+pub(super) fn frame_grant_request_is_valid(
+    identity: carrick_hal::FrameCowIdentity,
+    request: carrick_hal::El1FrameGrantRequest,
+) -> bool {
+    let Some(end) = request.semantic_base.checked_add(request.len) else {
+        return false;
+    };
+    let access_allowed = match request.access {
+        1 => request.permissions != 0,
+        2 => request.permissions & 2 != 0,
+        4 => request.permissions & 4 != 0,
+        _ => false,
+    };
+    identity.mm != 0
+        && identity.asid != 0
+        && request.mm_key == identity.mm
+        && request.request_generation != 0
+        && request.semantic_base.is_multiple_of(4096)
+        && request.len != 0
+        && request.len <= carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
+        && request.len.is_multiple_of(4096)
+        && request.semantic_base <= request.fault_va
+        && request.fault_va < end
+        && request.permissions != 0
+        && request.permissions & !7 == 0
+        && access_allowed
+}
+
 pub(super) fn prepare(
     custody: std::sync::Arc<CarrierVmCustody>,
     start: u64,
@@ -223,6 +256,190 @@ pub(super) fn prepare(
     })
 }
 
+/// Prepare and authenticate one EL1-owned stage-1 grant without editing a
+/// host stage-1 descriptor. Every fallible operation precedes alias
+/// publication; failed inventory application rolls back the backend ledger,
+/// while the prepared owner's RAII guard retires stage-2 custody.
+pub(super) fn publish_frame_grant(
+    context: &PublicationContext<'_>,
+    request: carrick_hal::El1FrameGrantRequest,
+    _registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
+) -> Result<PublishedFrameGrant, TrapError> {
+    let end = request
+        .semantic_base
+        .checked_add(request.len)
+        .ok_or_else(|| TrapError::Hypervisor("EL1 frame-grant range overflow".to_owned()))?;
+    let semantic_len =
+        usize::try_from(request.len).map_err(|_| TrapError::MappingTooLarge(request.len))?;
+    let mut reservation = context.authority.reserve(1, 1, 2).map_err(|error| {
+        TrapError::Hypervisor(format!("reserve EL1 frame-grant inventory: {error}"))
+    })?;
+    let PreparedSparseBacking {
+        physical_host,
+        semantic_host,
+        physical_ipa,
+        semantic_ipa,
+        physical_len,
+        physical_size,
+        stage2_perms,
+        inventory_backing,
+        page_granular_arm,
+        owner_generation,
+        owner_rollback,
+    } = prepare(
+        std::sync::Arc::clone(&context.custody),
+        request.semantic_base,
+        end,
+        SparseExtentBacking::Anon,
+    )?;
+    if page_granular_arm {
+        carrick_fatal!(
+            "hvpatch::el1_frame_grant",
+            "anonymous EL1 frame grant unexpectedly requires page-granular COW arming"
+        );
+    }
+    let inventory_mapping = {
+        let mut inventory = context.state.frame_inventory.ledger.lock();
+        HvfVmState::stage_mapping_in(
+            &context.custody,
+            &mut inventory,
+            &mut reservation,
+            InventoryMappingStage {
+                gpa: physical_ipa,
+                length: physical_len,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: true,
+                },
+                backing: inventory_backing,
+                inherited_frame: None,
+                stage2_lease: Some((physical_ipa, physical_len)),
+                stage2_owner: InventoryStage2OwnerIdentity {
+                    host_addr: physical_host as usize,
+                    generation: owner_generation,
+                },
+            },
+        )?
+    };
+    let inventory_entry = ((physical_ipa, physical_len), inventory_mapping);
+    let commit = reservation.commit(());
+    let challenge = commit.receipt_challenge();
+    let physical_length = carrick_hal::FrameLength::from_mapping_extent(
+        std::num::NonZeroU64::new(physical_len).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::el1_frame_grant",
+                "prepared EL1 frame grant has zero physical length"
+            );
+        }),
+    );
+    let applied = context.authority.apply_frame_grant(
+        commit,
+        inventory_mapping.mapping,
+        inventory_mapping.frame,
+        carrick_guest_mem::Gpa(physical_ipa),
+        physical_length,
+    );
+    let (receipt, authenticated_owner_generation) = match applied {
+        Ok(applied) => applied,
+        Err(error) => {
+            if let Err(rollback) = HvfVmState::rollback_unpublished_mappings(
+                &mut context.state.frame_inventory.ledger.lock(),
+                &[inventory_entry],
+            ) {
+                carrick_fatal!(
+                    "hvpatch::el1_frame_grant",
+                    "backend frame-grant rollback failed after kernel refusal: {rollback}"
+                );
+            }
+            return Err(TrapError::Hypervisor(format!(
+                "apply EL1 frame-grant inventory: {error}"
+            )));
+        }
+    };
+    let expected_mm = std::num::NonZeroU64::new(request.mm_key).unwrap_or_else(|| {
+        carrick_fatal!(
+            "hvpatch::el1_frame_grant",
+            "EL1 frame-grant request reached inventory with zero MM identity"
+        );
+    });
+    if !challenge.authenticate_apply(&receipt, expected_mm)
+        || !receipt.authorizes(inventory_mapping.mapping, inventory_mapping.frame)
+        || authenticated_owner_generation.raw_for_probe() != owner_generation
+    {
+        if let Err(error) = context.authority.rollback_frame_grant(&receipt) {
+            carrick_fatal!(
+                "hvpatch::el1_frame_grant",
+                "kernel frame-grant rollback failed after receipt mismatch: {error}"
+            );
+        }
+        if let Err(error) = HvfVmState::rollback_unpublished_mappings(
+            &mut context.state.frame_inventory.ledger.lock(),
+            &[inventory_entry],
+        ) {
+            carrick_fatal!(
+                "hvpatch::el1_frame_grant",
+                "backend frame-grant rollback failed after receipt mismatch: {error}"
+            );
+        }
+        return Err(TrapError::Hypervisor(
+            "EL1 frame-grant receipt or owner generation failed authentication".to_owned(),
+        ));
+    }
+
+    let sharing = GuestMappingSharing::Private;
+    register_shared_alias(AliasBacking {
+        start: request.semantic_base,
+        ipa: semantic_ipa,
+        host_addr: semantic_host as usize,
+        size: semantic_len,
+        physical_ipa,
+        physical_host_addr: physical_host as usize,
+        physical_size,
+        perms: u64::from(stage2_perms),
+        guest_writable: true,
+        sharing,
+        ownership_scope: alias_ownership_scope(
+            sharing,
+            context.mm_root_slot,
+            context.container_root,
+        ),
+        inventory_backing,
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation,
+    });
+    let region = HvfMappedRegion {
+        start: request.semantic_base,
+        ipa: semantic_ipa,
+        physical_ipa,
+        end,
+        host_addr: semantic_host,
+        size: semantic_len,
+        physical_size,
+        perms: stage2_perms,
+        memory: None,
+        host_mapping: None,
+        structural_owner: None,
+        stage2_lease: None,
+        is_dynamic_alias: true,
+        sharing,
+        guest_writable: true,
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation,
+    };
+    let ready = carrick_hal::El1FrameGrantReady {
+        physical_ipa: semantic_ipa,
+        frame_id: inventory_mapping.frame.raw(),
+        mapping_id: inventory_mapping.mapping.raw(),
+        owner_generation,
+        inventory_revision: receipt.revision(),
+    };
+    owner_rollback.commit();
+    Ok(PublishedFrameGrant { region, ready })
+}
+
 #[derive(Debug)]
 struct AllocationLayout {
     offset: u64,
@@ -295,6 +512,55 @@ fn file_view_allocation_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_grant_backend_accepts_only_one_exact_coherent_mm_span() {
+        let identity = carrick_hal::FrameCowIdentity {
+            linux_pid: 7,
+            linux_tid: 8,
+            mm: 9,
+            asid: 10,
+        };
+        let request = carrick_hal::El1FrameGrantRequest {
+            mm_key: identity.mm,
+            request_generation: 11,
+            fault_va: 0x4000_4123,
+            access: 2,
+            semantic_base: 0x4000_0000,
+            len: 0x20_0000,
+            permissions: 3,
+        };
+        assert!(frame_grant_request_is_valid(identity, request));
+        for invalid in [
+            carrick_hal::El1FrameGrantRequest {
+                mm_key: 12,
+                ..request
+            },
+            carrick_hal::El1FrameGrantRequest {
+                request_generation: 0,
+                ..request
+            },
+            carrick_hal::El1FrameGrantRequest {
+                fault_va: request.semantic_base + request.len,
+                ..request
+            },
+            carrick_hal::El1FrameGrantRequest {
+                semantic_base: request.semantic_base + 1,
+                ..request
+            },
+            carrick_hal::El1FrameGrantRequest { len: 0, ..request },
+            carrick_hal::El1FrameGrantRequest {
+                len: carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE + 4096,
+                ..request
+            },
+            carrick_hal::El1FrameGrantRequest {
+                access: 4,
+                ..request
+            },
+        ] {
+            assert!(!frame_grant_request_is_valid(identity, invalid));
+        }
+    }
 
     #[test]
     fn anonymous_first_touch_never_allocates_a_block_of_padding() {

@@ -920,6 +920,69 @@ impl HvfVmState {
         )
     }
 
+    pub(crate) fn prepare_el1_frame_grant(
+        &mut self,
+        request: carrick_hal::El1FrameGrantRequest,
+    ) -> Result<Option<carrick_hal::El1FrameGrantReady>, TrapError> {
+        let Some(identity) = self.cow_identity else {
+            return Ok(None);
+        };
+        if !sparse_materialization::frame_grant_request_is_valid(identity, request) {
+            return Ok(None);
+        }
+        let publication = sparse_materialization::PublicationContext::for_local(
+            std::sync::Arc::clone(&self.mm_access),
+            self.carrier_vm_custody(),
+            identity,
+        )?;
+        let semantic_len =
+            usize::try_from(request.len).map_err(|_| TrapError::MappingTooLarge(request.len))?;
+        let end = request
+            .semantic_base
+            .checked_add(request.len)
+            .ok_or_else(|| TrapError::Hypervisor("EL1 frame-grant range overflow".to_owned()))?;
+        if self.mappings.iter().any(|mapping| {
+            mapping.start < end
+                && mapping.end > request.semantic_base
+                && global_frame_region_owner_matches_in(self.custody(), mapping)
+        }) {
+            return Ok(None);
+        }
+        if !alias_registry()
+            .lock()
+            .overlapping_process_aliases(
+                request.semantic_base,
+                semantic_len,
+                self.mm_root_slot,
+                self.container_root,
+            )
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(deferred_state) = self.deferred_anonymous_state() else {
+            return Ok(None);
+        };
+        let transition = match deferred_state.begin_materialization(
+            carrick_guest_mem::GuestVa(request.semantic_base),
+            semantic_len,
+        ) {
+            Ok(transition) => transition,
+            Err(_) => return Ok(None),
+        };
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
+            identity.linux_pid,
+            identity.linux_tid,
+        );
+        let published =
+            sparse_materialization::publish_frame_grant(&publication, request, &registry)?;
+        drop(registry);
+        self.mappings.insert(published.region);
+        transition.commit();
+        Ok(Some(published.ready))
+    }
+
     pub(crate) fn materialize_sparse_mmap_extent_inner(
         &mut self,
         start: u64,

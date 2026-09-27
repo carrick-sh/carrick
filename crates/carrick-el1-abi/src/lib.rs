@@ -826,6 +826,19 @@ impl FrameGrantMailbox {
         }
     }
 
+    fn permissions_allow_access(permissions: u64, access: u64) -> bool {
+        match access {
+            // Carrick's current AArch64 stage-1 lowering makes every
+            // accessible Linux VMA readable, including PROT_WRITE-only and
+            // PROT_EXEC-only mappings. Keep the grant check identical to the
+            // established first-touch protection rule.
+            1 => permissions != 0,
+            2 => permissions & 2 != 0,
+            4 => permissions & 4 != 0,
+            _ => false,
+        }
+    }
+
     fn ready_is_valid(request: FrameGrantRequest, ready: FrameGrantReady) -> bool {
         let Some(end) = ready.semantic_base.checked_add(ready.len) else {
             return false;
@@ -841,7 +854,7 @@ impl FrameGrantMailbox {
             && request.fault_va < end
             && ready.permissions != 0
             && ready.permissions & !Self::PERMISSION_MASK == 0
-            && ready.permissions & request.access == request.access
+            && Self::permissions_allow_access(ready.permissions, request.access)
             && ready.frame_id != 0
             && ready.mapping_id != 0
             && ready.owner_generation != 0
@@ -2904,5 +2917,33 @@ mod tests {
             })
         );
         assert!(mailbox.finish_response(request.mm_key, request.request_generation));
+    }
+
+    #[test]
+    fn frame_grant_read_accepts_every_accessible_linux_vma_permission() {
+        for permissions in [1, 2, 4] {
+            let mailbox = FrameGrantMailbox::new();
+            let request = FrameGrantRequest {
+                mm_key: 301,
+                request_generation: permissions,
+                fault_va: 0x6000_1000,
+                requested_len: 4096,
+                access: 1,
+            };
+            assert!(mailbox.try_publish_request(request));
+            assert_eq!(mailbox.claim_request(), Some(request));
+            assert!(mailbox.publish_ready(FrameGrantReady {
+                mm_key: request.mm_key,
+                request_generation: request.request_generation,
+                semantic_base: 0x6000_1000,
+                physical_ipa: 0xb000_1000,
+                len: 4096,
+                permissions,
+                frame_id: 401,
+                mapping_id: 402,
+                owner_generation: 403,
+                inventory_revision: 404,
+            }));
+        }
     }
 }

@@ -2587,6 +2587,32 @@ pub struct FrameCowIdentity {
     pub asid: u16,
 }
 
+/// Exact host-side input for preparing one unpublished EL1 frame grant. The
+/// runtime has already claimed the shared mailbox request and clipped the
+/// semantic range to one same-protection VMA window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct El1FrameGrantRequest {
+    pub mm_key: u64,
+    pub request_generation: u64,
+    pub fault_va: u64,
+    pub access: u64,
+    pub semantic_base: u64,
+    pub len: u64,
+    pub permissions: u64,
+}
+
+/// Backend-authenticated physical authority returned only after stage-2,
+/// inventory and owner publication are live. The runtime publishes these
+/// fields to the guest mailbox as the final infallible step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct El1FrameGrantReady {
+    pub physical_ipa: u64,
+    pub frame_id: u64,
+    pub mapping_id: u64,
+    pub owner_generation: u64,
+    pub inventory_revision: u64,
+}
+
 /// Exact kernel-graph identity of the address space an in-place `execve`
 /// replaces. Unlike a carrier-directory registration, this also exists for
 /// the bootstrap task that entered the persistent executor pool directly.
@@ -2813,6 +2839,17 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         _authority: std::sync::Arc<dyn FrameCowAuthority>,
         _identity: FrameCowIdentity,
     ) {
+    }
+
+    /// Prepare real stage-2 backing and publish its exact inventory/owner
+    /// authority for one claimed EL1 frame grant. `None` means this backend
+    /// cannot service the request and the guest must consume a refusal before
+    /// the existing host leaf path runs.
+    fn prepare_el1_frame_grant(
+        &mut self,
+        _request: El1FrameGrantRequest,
+    ) -> Result<Option<El1FrameGrantReady>, TrapError> {
+        Ok(None)
     }
 
     /// Refresh fork-private backend state after the child frame inventory and
