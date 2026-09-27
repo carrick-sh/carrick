@@ -72,21 +72,24 @@ fn extent(start: GuestVa, len: usize) -> Result<Range<u64>, DeferredAnonymousErr
     Ok(start.raw()..end)
 }
 
+/// Cut `cut` out of a sorted, disjoint range set (the shape [`insert`]
+/// maintains). Only the run of entries the cut touches is spliced: every
+/// guest `mmap`/`munmap` reaches here, and rebuilding the whole set made
+/// each call pay for every other extent the process holds.
 fn remove(ranges: &mut Vec<Range<u64>>, cut: &Range<u64>) {
-    let mut next = Vec::with_capacity(ranges.len() + 1);
-    for old in ranges.drain(..) {
-        if old.end <= cut.start || old.start >= cut.end {
-            next.push(old);
-        } else {
-            if old.start < cut.start {
-                next.push(old.start..cut.start);
-            }
-            if old.end > cut.end {
-                next.push(cut.end..old.end);
-            }
-        }
+    if cut.start >= cut.end {
+        return;
     }
-    *ranges = next;
+    let first = ranges.partition_point(|r| r.end <= cut.start);
+    let last = first + ranges[first..].partition_point(|r| r.start < cut.end);
+    if first >= last {
+        return;
+    }
+    let head = ranges[first].start;
+    let tail = ranges[last - 1].end;
+    let left = (head < cut.start).then_some(head..cut.start);
+    let right = (tail > cut.end).then_some(cut.end..tail);
+    ranges.splice(first..last, left.into_iter().chain(right));
 }
 
 fn insert(ranges: &mut Vec<Range<u64>>, mut added: Range<u64>) {
@@ -170,28 +173,27 @@ impl DeferredAnonymousState {
         remove(&mut state.resident, &range);
         drop(state);
         let mut files = self.files.lock();
-        let mut retained = Vec::with_capacity(files.views.len() + 1);
-        for view in files.views.drain(..) {
-            if view.range.end <= range.start || view.range.start >= range.end {
-                retained.push(view);
-                continue;
-            }
-            if view.range.start < range.start {
-                let mut left = view.clone();
+        // Views are sorted and disjoint (`reserve_private_file` refuses an
+        // overlap and keeps the order), so only the touched run is spliced.
+        let views = &mut files.views;
+        let first = views.partition_point(|view| view.range.end <= range.start);
+        let last = first + views[first..].partition_point(|view| view.range.start < range.end);
+        if first < last {
+            let left = (views[first].range.start < range.start).then(|| {
+                let mut left = views[first].clone();
                 left.range.end = range.start;
-                retained.push(left);
-            }
-            if view.range.end > range.end {
-                let mut right = view;
+                left
+            });
+            let right = (views[last - 1].range.end > range.end).then(|| {
+                let mut right = views[last - 1].clone();
                 right.file_offset = right
                     .file_offset
                     .saturating_add(range.end.saturating_sub(right.range.start));
                 right.range.start = range.end;
-                retained.push(right);
-            }
+                right
+            });
+            views.splice(first..last, left.into_iter().chain(right));
         }
-        retained.sort_by_key(|view| view.range.start);
-        files.views = retained;
         Ok(())
     }
 
