@@ -1,0 +1,13 @@
+schema = "carrick.conformance-exemption.v1"
+base = "4a939f00fe2dab8f700363f8df6c5a692de3c221"
+head = "9d521e6bedb6d07d9e4e351b4c2354b1551a80fa"
+contracts = [
+  "kernel.el1.gic",
+  "kernel.el1.stage1-publication",
+  "kernel.fork.stage1-image",
+  "kernel.mm.metadata-refusal",
+]
+paths = [
+  "crates/carrick-mmu-core/src/aarch64.rs",
+]
+rationale = "The exact product diff corrects live fork-snapshot fidelity after the registered EL1 publication transaction allocates a primary hierarchy page beyond the host manager's cached cursor. Snapshot discovery follows only the reachable four-level graph against live capacity, then copies through the highest linked primary page; it neither scans/copies the whole arena nor allocates traversal metadata. GIC output exclusion, transaction rollback and metadata-refusal behavior are unchanged. The red-first dual-editor snapshot test fails on the base with a missing translation and passes on the head; all 98 MMU tests, the warmed recycled-image allocation witness, warning-denied MMU Clippy and formatting pass."
