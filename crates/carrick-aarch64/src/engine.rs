@@ -68,33 +68,9 @@ pub fn reserve_hvpatch_process_apertures(
     )
 }
 
-/// Lower a [`PageTableError`] from page table operations into [`MemoryError`],
-/// preserving [`PageTableError::MetadataAllocation`] without allocating error strings.
-pub fn page_table_error_to_memory_error(error: PageTableError) -> MemoryError {
-    match error {
-        PageTableError::MetadataAllocation => MemoryError::MetadataAllocation,
-        PageTableError::OutOfTables => {
-            MemoryError::HostMap("stage-1 page-table pool exhausted".to_owned())
-        }
-        PageTableError::BadAddress | PageTableError::GicWindowOutput => MemoryError::OutOfBounds {
-            address: 0,
-            length: 0,
-        },
-        PageTableError::MissingArenaSource => {
-            MemoryError::HostMap("stage-1 page-table manager has no arena source".to_owned())
-        }
-        PageTableError::ConflictingArenaSource => {
-            MemoryError::HostMap("stage-1 page-table manager conflicting arena source".to_owned())
-        }
-        PageTableError::UnresolvedArena(base) => MemoryError::HostMap(format!(
-            "stage-1 page-table manager unresolved arena 0x{base:x}"
-        )),
-    }
-}
-
 /// Lower a [`PageTableError`] from `sync_to_host` into [`MemoryError`], preserving
 /// [`PageTableError::MetadataAllocation`] without allocating error strings.
-pub fn page_table_sync_error_to_memory_error(error: PageTableError) -> MemoryError {
+pub(crate) fn page_table_sync_error_to_memory_error(error: PageTableError) -> MemoryError {
     match error {
         PageTableError::MetadataAllocation => MemoryError::MetadataAllocation,
         other => MemoryError::HostMap(format!(
@@ -105,7 +81,7 @@ pub fn page_table_sync_error_to_memory_error(error: PageTableError) -> MemoryErr
 
 /// Lower a [`PageTableError`] from `rollback_undo` into [`MemoryError`], preserving
 /// [`PageTableError::MetadataAllocation`] without allocating error strings.
-pub fn page_table_rollback_error_to_memory_error(error: PageTableError) -> MemoryError {
+pub(crate) fn page_table_rollback_error_to_memory_error(error: PageTableError) -> MemoryError {
     match error {
         PageTableError::MetadataAllocation => MemoryError::MetadataAllocation,
         other => MemoryError::HostMap(format!("stage-1 rollback failed: {other:?}")),
@@ -114,7 +90,7 @@ pub fn page_table_rollback_error_to_memory_error(error: PageTableError) -> Memor
 
 /// Lower a [`MemoryError`] into [`TrapError`], preserving [`MemoryError::MetadataAllocation`]
 /// as typed [`TrapError::MetadataAllocation`] without allocating strings.
-pub fn memory_error_to_trap_error(error: MemoryError, context: &str) -> TrapError {
+pub(crate) fn memory_error_to_trap_error(error: MemoryError, context: &str) -> TrapError {
     match error {
         MemoryError::MetadataAllocation => TrapError::MetadataAllocation,
         other => TrapError::Hypervisor(format!("{context}: {other}")),
@@ -5532,10 +5508,5 @@ mod tests {
         assert_eq!(rollback_mem_err, MemoryError::MetadataAllocation);
         let rollback_trap_err = memory_error_to_trap_error(rollback_mem_err, "test rollback");
         assert!(matches!(rollback_trap_err, TrapError::MetadataAllocation));
-
-        let general_mem_err = page_table_error_to_memory_error(pt_err);
-        assert_eq!(general_mem_err, MemoryError::MetadataAllocation);
-        let general_trap_err = memory_error_to_trap_error(general_mem_err, "test general");
-        assert!(matches!(general_trap_err, TrapError::MetadataAllocation));
     }
 }

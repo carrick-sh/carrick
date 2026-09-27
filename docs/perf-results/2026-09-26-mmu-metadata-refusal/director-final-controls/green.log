@@ -1,0 +1,14 @@
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.08s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-1d1f88d6a1eb2090)
+
+running 1 test
+scale=1 admission_allocations=31 admission_bytes=137356 max_allocs=46 max_bytes=139141 rollback_allocations=0 rollback_bytes=0 popped_len=1
+scale=8 admission_allocations=50 admission_bytes=1099684 max_allocs=65 max_bytes=1103978 rollback_allocations=0 rollback_bytes=0 popped_len=8
+scale=32 admission_allocations=84 admission_bytes=4400180 max_allocs=99 max_bytes=4414104 rollback_allocations=0 rollback_bytes=0 popped_len=32
+scale=128 admission_allocations=190 admission_bytes=17602116 max_allocs=205 max_bytes=17654470 rollback_allocations=0 rollback_bytes=0 popped_len=128
+test aarch64::tests::test_metadata_refusal_witness_rollback_allocations ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 92 filtered out; finished in 0.29s
+
