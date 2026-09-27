@@ -1,0 +1,74 @@
+{
+  "header": {
+    "schema": "carrick.signed-embed-test.v1",
+    "record_type": "header",
+    "source_head": "863e81757b066105ff9dd8696723983a20fdbc67",
+    "package": "carrick-conformance-next",
+    "arguments": [
+      "case_",
+      "--nocapture"
+    ],
+    "requested_test_filter": "case_",
+    "carrick_run_id": "el1-public-probes-20260926-863e81757",
+    "enabled_features": []
+  },
+  "receipt_sha256": "48ee314073b18e4988426efe3bc18db5a2ab99ce336628ad2b8525e43ff27c3c",
+  "artifacts": [
+    {
+      "schema": "carrick.signed-embed-test.v1",
+      "record_type": "executable",
+      "executable_id": "7da366a4e61ba92c22c489b954fdb140918f94cdf51ab8d6e1cc24b64f48a320:/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/private_file_cow_lanes-6c4a057643b21880",
+      "canonical_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/private_file_cow_lanes-6c4a057643b21880",
+      "sha256": "7da366a4e61ba92c22c489b954fdb140918f94cdf51ab8d6e1cc24b64f48a320",
+      "cdhash": "82aed2287870e585c7a79ca0857e8dd571d5f52d",
+      "lc_uuid": "AC43DF4F-9AD8-3C07-A247-E237F713FEBF",
+      "entitlement_digest": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "entitlement_present": true,
+      "dof_carrick_present": true,
+      "enabled_features": [],
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-integrated/dedicated-frozen-863e81757/7da366a4e61ba92c22c489b954fdb140918f94cdf51ab8d6e1cc24b64f48a320-private_file_cow_lanes-6c4a057643b21880"
+    },
+    {
+      "schema": "carrick.signed-embed-test.v1",
+      "record_type": "executable",
+      "executable_id": "6664bb73cba56e9cb6b6ff06f77fbea268f81bb2d46d888745338487632bf91a:/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/inotify_lifecycle-2dc6a6241a89085f",
+      "canonical_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/inotify_lifecycle-2dc6a6241a89085f",
+      "sha256": "6664bb73cba56e9cb6b6ff06f77fbea268f81bb2d46d888745338487632bf91a",
+      "cdhash": "cd0e4b31470d955595ddf01687fa7889b4f3fc02",
+      "lc_uuid": "D633AAD2-A213-32BD-BB84-882A8F3B971D",
+      "entitlement_digest": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "entitlement_present": true,
+      "dof_carrick_present": true,
+      "enabled_features": [],
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-integrated/dedicated-frozen-863e81757/6664bb73cba56e9cb6b6ff06f77fbea268f81bb2d46d888745338487632bf91a-inotify_lifecycle-2dc6a6241a89085f"
+    },
+    {
+      "schema": "carrick.signed-embed-test.v1",
+      "record_type": "executable",
+      "executable_id": "0eb09ce03ca434c13ae3778e7d95109dbc0eb83ca6f7e77b5e9a4a05dc32b4ee:/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/conformance_cases-0afeefc56eb25036",
+      "canonical_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/conformance_cases-0afeefc56eb25036",
+      "sha256": "0eb09ce03ca434c13ae3778e7d95109dbc0eb83ca6f7e77b5e9a4a05dc32b4ee",
+      "cdhash": "00f8935f168dc8e04dbeea331925a77e6b884ac2",
+      "lc_uuid": "C6ECA68D-C9A1-3A84-ADD0-79D095D84ADE",
+      "entitlement_digest": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "entitlement_present": true,
+      "dof_carrick_present": true,
+      "enabled_features": [],
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-integrated/dedicated-frozen-863e81757/0eb09ce03ca434c13ae3778e7d95109dbc0eb83ca6f7e77b5e9a4a05dc32b4ee-conformance_cases-0afeefc56eb25036"
+    },
+    {
+      "schema": "carrick.signed-embed-test.v1",
+      "record_type": "executable",
+      "executable_id": "24dc53b695f7dde7015985fa5d98276e94a85b08e94e5bde16058abec1e4b54d:/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/immutable_private_file-2cc8267c470830e1",
+      "canonical_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/immutable_private_file-2cc8267c470830e1",
+      "sha256": "24dc53b695f7dde7015985fa5d98276e94a85b08e94e5bde16058abec1e4b54d",
+      "cdhash": "28c76b6185873051692014cf741dc9138968a34b",
+      "lc_uuid": "E3BB0BFD-D31E-33B8-988B-3DCF7741A7EA",
+      "entitlement_digest": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "entitlement_present": true,
+      "dof_carrick_present": true,
+      "enabled_features": [],
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-integrated/dedicated-frozen-863e81757/24dc53b695f7dde7015985fa5d98276e94a85b08e94e5bde16058abec1e4b54d-immutable_private_file-2cc8267c470830e1"
+    }
+  ]
+}

@@ -526,3 +526,12 @@ The existing full CI process remains live against `d35c88001` (only plan
 documentation changed afterward); it has reached runtime tests. No final
 CI success or fault-entry acceptance is claimed. The latest status-only turn
 was no implementation progress; this dispatch advances the next prerequisite.
+
+2026-09-26: the existing authority-reconciled `just ci` process completed
+with exit 0 on `d35c88001`: 6,180 passed, zero failed, 12 ignored across
+101 result groups. Raw evidence is in
+`docs/perf-results/2026-09-26-el1-live-table-review/ci-authority-reconciled/`.
+The dedicated public-probe executables were frozen and hash-verified (four
+executables, 32 passing execution rows). The earlier generic-stage artifacts
+remain unavailable in their original signed form; a stale-receipt capture
+was rejected before copying. Fault-entry worker turn 1 remains active.
