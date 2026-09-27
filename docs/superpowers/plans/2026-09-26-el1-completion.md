@@ -583,3 +583,11 @@ and final fixture/test to prepare signed red against the existing dispatcher
 and vectors. The actual fault-entry implementation remains unintegrated until
 this witness proves the missing entry. Full signed and performance gates stay
 open. Final worker verification is retained under the director evidence tree.
+
+2026-09-26: signed fault-entry red is established at `d409be2c7`: Linux
+fixture checks succeed, but the expected positive EL1 entry counter is zero.
+Negative entitlement control and scoped cleanup pass. Frozen signed identity
+and exact native-matching fixture hash are retained in the director signed-red
+receipt. Merged reviewed worker `a6fe8d4af` as `0c30348a2` and started signed
+green using the same fixture. The worker converged in three review rounds;
+EL1-off/GIC-off controls and higher promotion gates remain outstanding.
