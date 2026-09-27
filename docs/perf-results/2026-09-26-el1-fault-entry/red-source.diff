@@ -1,0 +1,79 @@
+diff --git a/crates/carrick-el1/src/lib.rs b/crates/carrick-el1/src/lib.rs
+index bc9f4eec4..6c856c4a5 100644
+--- a/crates/carrick-el1/src/lib.rs
++++ b/crates/carrick-el1/src/lib.rs
+@@ -111,9 +111,6 @@ pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
+     if frame.esr == 0 {
+         return dispatch_irq(frame, counters);
+     }
+-    if ((frame.esr >> 26) & 0x3F) == 0x24 {
+-        return dispatch_fault(frame, counters);
+-    }
+     dispatch_syscall(frame, counters)
+ }
+ 
+@@ -1365,4 +1362,25 @@ mod tests {
+         assert_eq!(action, Action::Forward);
+         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
+     }
++
++    #[test]
++    fn test_dispatch_entry_routes_syscall() {
++        let counters = Counters::default();
++        let mut frame = TrapFrame {
++            esr: (0xCAFE_0000_u64 << 32) | (0x15 << 26) | (1 << 25), // SVC64
++            far: 0,
++            x: {
++                let mut x = [0u64; 31];
++                x[8] = 172; // SYS_getpid
++                x
++            },
++            ..TrapFrame::default()
++        };
++
++        let action = dispatch_entry(&mut frame, &counters);
++        assert_eq!(action, Action::Forward);
++        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
++        assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 1);
++        assert_eq!(counters.served[172].load(Ordering::Relaxed), 0);
++    }
+ }
+diff --git a/crates/carrick-mem/src/memory.rs b/crates/carrick-mem/src/memory.rs
+index 1652f77c1..ad5b3fbd5 100644
+--- a/crates/carrick-mem/src/memory.rs
++++ b/crates/carrick-mem/src/memory.rs
+@@ -5394,20 +5394,6 @@ pub fn el1_vectors_bytes_mailbox_irq(
+     emit(&mut bytes, &mut cursor, AARCH64_HVC_FAULT_OPCODE);
+ 
+     let not_svc = cursor;
+-    emit(&mut bytes, &mut cursor, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
+-    emit(&mut bytes, &mut cursor, AARCH64_MRS_ESR_EL1_X16_OPCODE);
+-    emit(&mut bytes, &mut cursor, AARCH64_UBFX_X16_X16_26_6_OPCODE);
+-    emit(&mut bytes, &mut cursor, AARCH64_CMP_X16_DATA_ABORT_OPCODE);
+-    let not_data_abort_branch = cursor;
+-    emit(&mut bytes, &mut cursor, 0);
+-
+-    // Data abort (EC 0x24):
+-    emit(&mut bytes, &mut cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
+-    let fault_dest_branch = cursor;
+-    emit(&mut bytes, &mut cursor, 0);
+-
+-    // Other non-SVC, non-data-abort exception:
+-    let not_data_abort = cursor;
+     emit(&mut bytes, &mut cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
+     let other_dest_branch = cursor;
+     emit(&mut bytes, &mut cursor, 0);
+@@ -5417,11 +5403,8 @@ pub fn el1_vectors_bytes_mailbox_irq(
+         not_svc_branch,
+         enc_bne(not_svc_branch as u64, not_svc as u64),
+     );
+-    put(
+-        &mut bytes,
+-        not_data_abort_branch,
+-        enc_bne(not_data_abort_branch as u64, not_data_abort as u64),
+-    );
++    let fault_dest_branch = 0;
++    let not_data_abort_branch = 0;
+     let fault_target = if el1_enabled {
+         EL0_FAULT_HOOK_OFFSET as u64
+     } else {

@@ -1,6 +1,6 @@
 # EL1 Data-Abort Entry and Context Preservation Witness
 
-Source revision: `a7d3138df40561d57b61fc88ff040a4de389ec7a` + Review Round 1 updates.
+Source revision: `a7d3138df40561d57b61fc88ff040a4de389ec7a` + Review Rounds 1 & 2 updates.
 
 ## Summary
 
@@ -26,6 +26,7 @@ This is prerequisite entry/forwarding infrastructure, not first-touch or COW ser
 
 3. **Classification & Exception Routing**:
    - Exception Class (EC) is decoded as bits [31:26] via `ubfx x16, x16, #26, #6` (`AARCH64_UBFX_X16_X16_26_6_OPCODE` = `0xd35a_7e10`) in generated vectors and `((esr >> 26) & 0x3F)` in Rust.
+   - Real kernel entry `carrick_el1_syscall` in `crates/carrick-el1/src/entry.rs` routes directly through `carrick_el1::dispatch_entry`.
    - Lower-EL Data Abort (`EC = 0x24`): routed to `EL0_FAULT_HOOK_OFFSET` when EL1 is enabled, or branched directly to `legacy_hvc` when disabled (`CARRICK_EL1=0`).
    - Non-data-abort exceptions (such as Instruction Abort `EC = 0x20`) and non-matching syndromes follow standard non-SVC / HVC fallbacks without modifying ELR_EL1 or entering EL1 fault hooks.
    - High 32-bit syndrome bits (bits 32..63) are masked out and cannot misdirect classification.
@@ -45,14 +46,14 @@ This is prerequisite entry/forwarding infrastructure, not first-touch or COW ser
 
 ## Fixture and Conformance Contract
 
-- Fixture: `embed-el1-sched` with subcommand `fault-entry`.
+- Fixture: `embed-el1-sched` with subcommand `fault-entry` (`target/embed-fixtures/el1-sched-aarch64`, SHA256: `bb8d9a5ed1c3dad40db9edce5fe554464843ae2fd1ea3f8e24abfe51b0b98131`).
   - Maps an anonymous page with `PROT_READ | PROT_WRITE` and touches it to establish backing.
   - Demotes page to `PROT_READ` via `mprotect` to ensure a genuine stage-1 permission fault.
   - Sets up canary values across all 31 GPRs `x0..x30` (including `x8 = 172` / `libc::SYS_getpid` to verify non-dispatch as a syscall) and captures pre-fault SP.
   - Catches `SIGSEGV` in `sa_sigaction` handler with bounds checking (terminates via `libc::_exit` on repeated delivery or failure to avoid infinite retry loops).
   - Asserts `info.si_addr() == target_page`.
   - Upgrades permissions to `PROT_READ | PROT_WRITE` via `mprotect` and returns.
-  - Retries store instruction; verifies successful write and verifies that all 31 GPRs and SP are preserved intact.
+  - Retries store instruction; verifies successful write, verifies explicit before/after SP equality and alignment, and verifies that all 31 GPRs are preserved intact.
 - Signed Embed Test: `crates/carrick-embed/tests/el1_sched.rs::el1_memory_fault_entry_preserves_context`.
   - Asserts `reset_el1_counters()` clears stale snapshots.
   - Asserts fixture `fault-entry` succeeds and stdout contains `"fault-entry ok"`.
@@ -62,15 +63,18 @@ This is prerequisite entry/forwarding infrastructure, not first-touch or COW ser
 
 ## Red-First Witness and Verification
 
-A semantic red witness was demonstrated by temporarily reverting vector hook installation and fault classification, resulting in assertion failures in `carrick-mem` (`fault hook must read FAR_EL1` and opcode mismatches). Restoring the implementation yielded green across all 244 unit tests.
+A real semantic red witness was demonstrated by disabling fault routing in `dispatch_entry` and vector table data-abort classification.
+- Source delta preserved in: `docs/perf-results/2026-09-26-el1-fault-entry/red-source.diff`
+- Raw failure log preserved in: `docs/perf-results/2026-09-26-el1-fault-entry/red-test.log` (command exited with code 101, failing `test_dispatch_entry_routes_fault_with_high_bits_and_arbitrary_x8` due to `left: 0, right: 1` on `counters.fault_taken` and failing `el1_data_abort_vector_routing_and_hook_installation`).
+- Restoring the implementation yielded green across all 245 unit tests.
 
 Verification commands:
 
-1. `RUSTC_WRAPPER= cargo test -p carrick-el1-abi -p carrick-el1 -p carrick-mem --lib` (20 + 50 + 174 = 244 passed)
-2. `RUSTC_WRAPPER= cargo build -p carrick-el1-image` (bare-metal EL1 image built successfully)
-3. `RUSTC_WRAPPER= cargo test -p carrick-conformance-contract` (contract, surface, and inventory checks passed)
-4. `cargo fmt --all -- --check` (clean formatting)
-5. `RUSTC_WRAPPER= scripts/build-embed-el1-sched.sh` (static aarch64 musl fixture built with zero warnings)
-6. `RUSTC_WRAPPER= cargo test -p carrick-embed --test el1_sched --no-run` (embed test executable compiled successfully)
+1. `RUSTC_WRAPPER= cargo test -p carrick-el1-abi -p carrick-el1 -p carrick-mem --lib` (20 + 50 + 175 = 245 passed, exit code 0)
+2. `RUSTC_WRAPPER= cargo build -p carrick-el1-image` (bare-metal EL1 image built successfully, exit code 0)
+3. `RUSTC_WRAPPER= cargo test -p carrick-conformance-contract` (contract, surface, and inventory checks passed, exit code 0)
+4. `cargo fmt --all -- --check` (clean formatting, exit code 0)
+5. `RUSTC_WRAPPER= scripts/build-embed-el1-sched.sh` (static aarch64 musl fixture built with zero warnings, exit code 0)
+6. `RUSTC_WRAPPER= cargo test -p carrick-embed --test el1_sched --no-run` (embed test executable compiled successfully, exit code 0)
 
 Director acceptance will perform signed guest runs on hardware via `./scripts/test-signed.sh carrick-embed el1_memory_fault_entry_preserves_context`.

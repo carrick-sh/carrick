@@ -40,23 +40,4 @@ mod tests {
         assert_eq!(counters.forwarded[42].load(Ordering::Relaxed), 0);
         assert_eq!(counters.served[42].load(Ordering::Relaxed), 0);
     }
-
-    #[test]
-    fn test_ec_classification_bits_31_to_26() {
-        // Lower-EL Data Abort EC = 0x24
-        let data_abort_clean = 0x24_u64 << 26;
-        let data_abort_with_high_bits = (0xDEAD_BEEF_u64 << 32) | (0x24 << 26) | (1 << 25) | 0x3F;
-        assert_eq!((data_abort_clean >> 26) & 0x3F, 0x24);
-        assert_eq!((data_abort_with_high_bits >> 26) & 0x3F, 0x24);
-
-        // Instruction Abort EC = 0x20
-        let inst_abort_with_high_bits = (0xDEAD_BEEF_u64 << 32) | (0x20 << 26) | 0x15;
-        assert_ne!((inst_abort_with_high_bits >> 26) & 0x3F, 0x24);
-        assert_eq!((inst_abort_with_high_bits >> 26) & 0x3F, 0x20);
-
-        // SVC64 EC = 0x15
-        let svc_with_high_bits = (0xCAFE_BABE_u64 << 32) | (0x15 << 26);
-        assert_ne!((svc_with_high_bits >> 26) & 0x3F, 0x24);
-        assert_eq!((svc_with_high_bits >> 26) & 0x3F, 0x15);
-    }
 }

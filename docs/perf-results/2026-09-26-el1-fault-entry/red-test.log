@@ -1,0 +1,81 @@
+warning: unused variable: `not_data_abort_branch`
+    --> crates/carrick-mem/src/memory.rs:5407:9
+     |
+5407 |     let not_data_abort_branch = 0;
+     |         ^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_not_data_abort_branch`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `carrick-mem` (lib test) generated 1 warning (run `cargo fix --lib -p carrick-mem --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1-5dacaf448aea3bd0)
+
+running 50 tests
+test alloc::tests::test_bump_allocator ... ok
+test fault::tests::test_dispatch_fault_increments_counter_and_forwards ... ok
+test file::tests::test_lseek_model ... ok
+test file::tests::test_fixup_fault_interception ... ok
+test file::tests::test_read_and_pread64_model ... ok
+test file::tests::test_extension_gap_pages_tracked_in_zero_filled_mask ... ok
+test file::tests::test_write_and_pwrite64_model ... ok
+test inotify::tests::a_short_read_of_a_non_inotify_fd_forwards ... ok
+test lock::tests::test_spinlock_mutual_exclusion ... ok
+test inotify::tests::a_large_read_returns_every_whole_record_that_fits ... ok
+test file::tests::test_write_extension_zeroes_hole ... ok
+test inotify::tests::a_spilled_instance_forwards_reads_to_the_host ... ok
+test file::tests::test_efault_forward_semantics ... ok
+test inotify::tests::an_unwritable_buffer_forwards_without_consuming_records ... ok
+test sched::tests::a_kick_taken_at_el0_forwards ... ok
+test sched::tests::a_futex_wait_switches_the_vcpu_to_another_process_in_guest ... ok
+test sched::tests::a_futex_handoff_switches_threads_in_guest_and_preserves_state ... ok
+test sched::tests::a_slice_ending_before_a_host_runnable_thread_leaves_for_the_host ... ok
+test sched::tests::a_raised_gate_sends_the_thread_to_its_executor ... ok
+test sched::tests::a_vcpu_in_wfi_holds_no_address_space ... ok
+test sched::tests::a_park_before_a_host_runnable_thread_leaves_for_the_host ... ok
+test sched::tests::a_switch_without_fpsimd_save_is_detected ... ok
+test sched::tests::a_wait_with_nothing_runnable_idles_until_host_work ... ok
+test sched::tests::a_wait_on_a_changed_word_returns_eagain_without_parking ... ok
+test sched::tests::a_timed_wait_ends_in_guest_with_etimedout ... ok
+test sched::tests::a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to ... ok
+test sched::tests::an_idle_vcpu_parks_in_wfi_after_its_spin ... ok
+test sched::tests::the_idle_entry_runs_no_thread_itself ... ok
+test sched::tests::an_idle_vcpu_steals_a_queued_thread ... ok
+test sched::tests::the_idle_entry_runs_a_queued_thread_or_leaves_for_the_host ... ok
+test sched::tests::the_virtual_timer_preempts_a_compute_loop ... ok
+test sched::tests::threads_of_another_process_are_not_woken ... ok
+test tests::test_dispatch_entry_routes_irq ... ok
+test tests::test_dispatch_entry_routes_syscall ... ok
+test sched::tests::timed_waits_this_vcpu_cannot_keep_forward ... ok
+test tests::test_dispatch_entry_routes_fault_with_high_bits_and_arbitrary_x8 ... FAILED
+test tests::test_dispatch_forwards_all_and_counts ... ok
+test sched::tests::unserved_futex_operations_forward ... ok
+test sched::tests::an_owed_cow_invalidation_runs_before_the_install ... ok
+test sched::tests::queued_threads_do_not_send_other_syscalls_to_the_host ... ok
+test tests::test_dispatch_syscall_with_regions_entry_pending_work ... ok
+test tests::test_dispatch_syscall_with_regions_exit_pending_work ... ok
+test tests::test_concurrent_dispatch_increments ... ok
+test tests::test_in_guest_read_queues_in_access_and_owes_an_observed_waiter_a_wake ... ok
+test tests::test_dispatch_syscall_with_regions_served ... ok
+test tests::test_inotify_add_watch_write_rm_watch_read_served ... ok
+test tests::test_inotify_cache_miss_forwards ... ok
+test tests::test_stale_handle_interleaving_forwards ... ok
+test tests::test_thread_sleep_survives_task_generation_bump ... ok
+test tests::test_two_open_files_share_one_inode_with_independent_offsets ... ok
+
+failures:
+
+---- tests::test_dispatch_entry_routes_fault_with_high_bits_and_arbitrary_x8 stdout ----
+
+thread 'tests::test_dispatch_entry_routes_fault_with_high_bits_and_arbitrary_x8' (12839301) panicked at crates/carrick-el1/src/lib.rs:1347:9:
+assertion `left == right` failed
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::test_dispatch_entry_routes_fault_with_high_bits_and_arbitrary_x8
+
+test result: FAILED. 49 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-el1 --lib`
