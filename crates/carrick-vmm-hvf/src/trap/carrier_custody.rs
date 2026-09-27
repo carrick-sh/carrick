@@ -479,6 +479,7 @@ pub(crate) struct CarrierVmCustodyState {
 #[derive(Debug)]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub(crate) struct CarrierVmCustody {
+    pub(crate) metadata_aperture: parking_lot::Mutex<crate::metadata_grant::HostApertureState>,
     pub(crate) state: parking_lot::Mutex<CarrierVmCustodyState>,
     pub(crate) structural_backings: parking_lot::Mutex<
         std::collections::BTreeMap<
@@ -532,6 +533,9 @@ impl Default for CarrierVmCustody {
 impl CarrierVmCustody {
     pub(crate) fn new() -> Self {
         Self {
+            metadata_aperture: parking_lot::Mutex::new(
+                crate::metadata_grant::HostApertureState::new(),
+            ),
             state: parking_lot::Mutex::new(CarrierVmCustodyState {
                 next_generation: 1,
                 lifecycle: CarrierVmLifecycle::Vacant,
@@ -754,6 +758,9 @@ impl CarrierVmCustody {
                 ) {
                     pool.forget_backend_mapping();
                 }
+                self.metadata_aperture
+                    .lock()
+                    .release_destroyed_vm(generation.0);
                 state.lifecycle = CarrierVmLifecycle::Vacant;
                 Ok(())
             }

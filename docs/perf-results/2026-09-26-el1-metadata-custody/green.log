@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-d63dbca9ffee398f)
+
+running 4 tests
+test metadata_grant::tests::failed_return_keeps_backing_and_aperture_reserved ... ok
+test metadata_grant::tests::metadata_apertures_are_owned_by_their_carrier ... ok
+test metadata_grant::tests::metadata_backing_follows_exact_vm_terminal_transition ... ok
+test metadata_grant::tests::test_host_aperture_multi_slot_reservation_and_overlap_rejection ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 567 filtered out; finished in 0.00s
+

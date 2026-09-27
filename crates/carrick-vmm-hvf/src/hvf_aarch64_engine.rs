@@ -127,6 +127,8 @@ pub(crate) fn from_neutral(s: &Aarch64VcpuSnapshot) -> VcpuSnapshot {
 /// panics. A live vCPU is destroyed only through `destroy_raw_vcpu`, at VM
 /// teardown (EL1 plan 1a D2).
 pub(crate) struct LiveHvfVcpu {
+    custody: Arc<crate::trap::CarrierVmCustody>,
+    vm_generation: Option<crate::trap::CarrierVmGeneration>,
     pub(crate) inner: std::mem::ManuallyDrop<applevisor::vcpu::Vcpu>,
     pub(crate) mailbox: MailboxBinding,
     /// Whether this vCPU has run; its first run seals the VM's topology.
@@ -160,9 +162,15 @@ fn staged_error(operation: &str) -> TrapError {
 }
 
 impl HvfAarch64Vcpu {
-    pub(crate) fn new(vcpu: applevisor::vcpu::Vcpu, mailbox: MailboxBinding) -> Self {
+    pub(crate) fn new(
+        vcpu: applevisor::vcpu::Vcpu,
+        mailbox: MailboxBinding,
+        custody: Arc<crate::trap::CarrierVmCustody>,
+    ) -> Self {
         Self {
             backing: HvfVcpuBacking::Live(LiveHvfVcpu {
+                vm_generation: custody.setup_generation(),
+                custody,
                 inner: std::mem::ManuallyDrop::new(vcpu),
                 mailbox,
                 ran: false,
@@ -578,7 +586,12 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
             crate::trap::admit_vcpu_first_run();
             live.ran = true;
         }
-        let exit = HvfInner::run_to_exit(&mut live.inner, &mut live.mailbox);
+        let exit = HvfInner::run_to_exit(
+            &mut live.inner,
+            &mut live.mailbox,
+            &live.custody,
+            live.vm_generation,
+        );
         if tidstamp_debug {
             use applevisor::prelude::SysReg;
             // Does the tid stamp SURVIVE a run/trap round trip? The stamp itself
@@ -1472,12 +1485,13 @@ impl HvpatchPersistentExecutorFactoryAuthority {
 
     pub fn create_executor_parts(&self) -> Result<(HvfAarch64Vmm, HvfAarch64Vcpu), TrapError> {
         let (state, vcpu, mailbox) = HvfVmState::from_persistent_executor_spec(&self.spec)?;
+        let custody = state.carrier_vm_custody();
         Ok((
             HvfAarch64Vmm {
                 state,
                 host_writes: Default::default(),
             },
-            HvfAarch64Vcpu::new(vcpu, mailbox),
+            HvfAarch64Vcpu::new(vcpu, mailbox, custody),
         ))
     }
 }
@@ -2095,7 +2109,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
         let (vcpu, mailbox) = self.state.add_vcpu()?;
-        Ok(HvfAarch64Vcpu::new(vcpu, mailbox))
+        let custody = self.state.carrier_vm_custody();
+        Ok(HvfAarch64Vcpu::new(vcpu, mailbox, custody))
     }
 
     fn execve_rebuild(
@@ -2108,7 +2123,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         let plan = GuestMappingPlan::from_address_space(new_image)?;
         let live = vcpu.live_mut()?;
         self.state
-            .execve_rebuild(&mut live.inner, &mut live.mailbox, &plan)
+            .execve_rebuild(&mut live.inner, &mut live.mailbox, &plan)?;
+        live.custody = self.state.carrier_vm_custody();
+        live.vm_generation = live.custody.setup_generation();
+        Ok(())
     }
 
     fn exec_page_tables(&self) -> Option<carrick_mmu_core::aarch64::PageTableManager> {
@@ -2151,12 +2169,13 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // pair; the engine restores the seeded snapshot via `restore_thread_start`
         // (HVF's EL0-trampoline thread-start for a brand-new vCPU).
         let (state, vcpu, mailbox) = HvfVmState::from_thread_spec(builder)?;
+        let custody = state.carrier_vm_custody();
         Ok((
             Self {
                 state,
                 host_writes: Default::default(),
             },
-            HvfAarch64Vcpu::new(vcpu, mailbox),
+            HvfAarch64Vcpu::new(vcpu, mailbox, custody),
         ))
     }
 
@@ -2172,12 +2191,13 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn materialize_process(builder: Self::ProcessBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
         let (state, vcpu, mailbox) = HvfVmState::from_process_spec(builder)?;
+        let custody = state.carrier_vm_custody();
         Ok((
             Self {
                 state,
                 host_writes: Default::default(),
             },
-            HvfAarch64Vcpu::new(vcpu, mailbox),
+            HvfAarch64Vcpu::new(vcpu, mailbox, custody),
         ))
     }
 
