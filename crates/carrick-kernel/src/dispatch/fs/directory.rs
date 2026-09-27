@@ -284,8 +284,8 @@ impl<'a> FsView<'a> {
                 &resolved_old,
                 &resolved_new,
                 || {
-                    let moved_executable = self.executable_object_id_at(&resolved_old);
-                    let replaced_executable = self.executable_object_id_at(&resolved_new);
+                    let (moved_executable, replaced_executable) =
+                        self.executable_object_ids_for_rename(&resolved_old, &resolved_new);
                     let same_executable_object =
                         moved_executable.is_some() && moved_executable == replaced_executable;
                     let moved_directory = self
@@ -372,8 +372,8 @@ impl<'a> FsView<'a> {
                 // Mounted VFS renames use that mount's own namespace
                 // authority. RootFs snapshots are captured only after its
                 // separate admission below.
-                let moved_executable = self.executable_object_id_at(&resolved_old);
-                let replaced_executable = self.executable_object_id_at(&resolved_new);
+                let (moved_executable, replaced_executable) =
+                    self.executable_object_ids_for_rename(&resolved_old, &resolved_new);
                 let same_executable_object =
                     moved_executable.is_some() && moved_executable == replaced_executable;
                 let moved_directory = self
@@ -405,8 +405,8 @@ impl<'a> FsView<'a> {
             &resolved_new,
             no_replace,
             || {
-                let moved_executable = self.executable_object_id_at(&resolved_old);
-                let replaced_executable = self.executable_object_id_at(&resolved_new);
+                let (moved_executable, replaced_executable) =
+                    self.executable_object_ids_for_rename(&resolved_old, &resolved_new);
                 let same_executable_object =
                     moved_executable.is_some() && moved_executable == replaced_executable;
                 let moved_directory = self
@@ -1385,7 +1385,7 @@ impl<'a> FsView<'a> {
             // shares (`legacyfs`: unlink of the second name must lower the
             // first name's nlink). One `fstatat` on a cache miss.
             let _ = this.fs.rootfs_vfs.dentry_stat(&resolved, false);
-            let unlinked_executable = this.executable_object_id_at(&resolved);
+            let unlinked_executable = this.executable_object_id_for_unlink(&resolved);
             if let Some(m) = this.fs.vfs_mounts.resolve(&resolved)
                 && m.vfs.overridable()
             {
