@@ -2756,7 +2756,8 @@ impl HvfTaskState {
                                 .repoint_preserving_attributes(span.va, new_ipa, span.len as u64)
                                 .map_err(|error| {
                                     TrapError::Hypervisor(format!(
-                                        "repoint HVPatch COW stage-1 compound: {error:?}"
+                                        "repoint HVPatch COW stage-1 compound: {error:?} EL1DBG va=0x{:x} len=0x{:x} walk={:x?}",
+                                        span.va, span.len, manager.debug_walk(span.va)
                                     ))
                                 })?;
                             let span_end = span.va.saturating_add(span.len as u64);

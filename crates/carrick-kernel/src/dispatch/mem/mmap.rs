@@ -97,6 +97,7 @@ impl MmapRequest {
             fd,
             offset,
         } = self;
+        eprintln!("EL1DBG MMAP-REFUSED addr=0x{addr:x} len=0x{length:x} prot={prot} flags=0x{flags:x} refusal={refusal:?} cause={cause}");
         match refusal {
             MmapRefusal::Spec(reason) => {
                 tracing::debug!(
@@ -2288,7 +2289,7 @@ impl<'a> MemView<'a> {
                 let Ok(len_usize) = usize::try_from(aligned_len) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
-                if cx.memory.unmap_range(address.0, len_usize).is_err() {
+                if cx.memory.unmap_range(address.0, len_usize).inspect_err(|e| eprintln!("EL1DBG UNMAP-ERR va=0x{:x} {e:?}", address.0)).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
@@ -2325,7 +2326,7 @@ impl<'a> MemView<'a> {
                     .iter()
                     .map(|alloc| this.snapshot_shared_writeback(&mut *cx.memory, alloc))
                     .collect::<Vec<_>>();
-                if cx.memory.unmap_range(address.0, len_usize).is_err() {
+                if cx.memory.unmap_range(address.0, len_usize).inspect_err(|e| eprintln!("EL1DBG UNMAP-ERR va=0x{:x} {e:?}", address.0)).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
@@ -2409,7 +2410,7 @@ impl<'a> MemView<'a> {
             };
             // Invalidate the freed range before removing any dispatcher VMA
             // metadata or returning it to the allocator.
-            if cx.memory.unmap_range(address.0, len_usize).is_err() {
+            if cx.memory.unmap_range(address.0, len_usize).inspect_err(|e| eprintln!("EL1DBG UNMAP-ERR va=0x{:x} {e:?}", address.0)).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             mark_range_unmapped(&mut *cx.memory, address.0, len_usize);

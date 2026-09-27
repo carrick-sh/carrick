@@ -104,6 +104,10 @@ pub const FRAME_GRANT_MAILBOX_REQUESTED: u32 = 2;
 pub const FRAME_GRANT_MAILBOX_HOST_WORKING: u32 = 3;
 pub const FRAME_GRANT_MAILBOX_RESPONSE: u32 = 4;
 pub const FRAME_GRANT_MAILBOX_GUEST_CONSUMING: u32 = 5;
+/// Guest EL1 claimed a successful response but could not publish its leaves
+/// (no table room in its arena half, or tables EL1 cannot reach). The Ready
+/// grant stays here for the host to publish on the forwarded fault.
+pub const FRAME_GRANT_MAILBOX_GUEST_FAILED: u32 = 6;
 
 pub const FRAME_GRANT_SUCCESS: u64 = 0;
 pub const FRAME_GRANT_ERR_DENIED: u64 = 1;
@@ -1137,6 +1141,59 @@ impl FrameGrantMailbox {
     ) -> Option<FrameGrantResponse> {
         let response = self.response_for_fault(mm_key, fault_va, access)?;
         self.claim_response(mm_key, response.request.request_generation)
+    }
+
+    /// Guest: hand a claimed successful response back unpublished.
+    pub fn fail_response(&self, mm_key: u64, request_generation: u64) -> bool {
+        if self.mm_key.load(Ordering::Relaxed) != mm_key
+            || self.request_generation.load(Ordering::Relaxed) != request_generation
+            || self.status.load(Ordering::Relaxed) != FRAME_GRANT_SUCCESS
+        {
+            return false;
+        }
+        self.state
+            .compare_exchange(
+                FRAME_GRANT_MAILBOX_GUEST_CONSUMING,
+                FRAME_GRANT_MAILBOX_GUEST_FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Host: whether this mailbox holds a grant guest EL1 handed back.
+    pub fn has_failed_publication(&self) -> bool {
+        self.state.load(Ordering::Acquire) == FRAME_GRANT_MAILBOX_GUEST_FAILED
+    }
+
+    /// Host: take a grant guest EL1 handed back for this MM whose range
+    /// covers `fault_va`, releasing the mailbox. The caller publishes it.
+    pub fn take_failed_publication(&self, mm_key: u64, fault_va: u64) -> Option<FrameGrantReady> {
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_GUEST_FAILED {
+            return None;
+        }
+        let request = self.load_request();
+        if request.mm_key != mm_key {
+            return None;
+        }
+        let ready = self.load_response(request).ready?;
+        let covers = ready.semantic_base <= fault_va
+            && ready
+                .semantic_base
+                .checked_add(ready.len)
+                .is_some_and(|end| fault_va < end);
+        if !covers {
+            return None;
+        }
+        self.state
+            .compare_exchange(
+                FRAME_GRANT_MAILBOX_GUEST_FAILED,
+                FRAME_GRANT_MAILBOX_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        Some(ready)
     }
 
     pub fn finish_response(&self, mm_key: u64, request_generation: u64) -> bool {

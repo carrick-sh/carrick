@@ -980,6 +980,27 @@ pub unsafe fn walk_descriptors_host(host: *const u8, len: usize, base: u64, va: 
 /// cursor over those live tables would re-hand them out and corrupt the walk.
 /// Taking one-past-the-LAST non-zero page (not the first all-zero page) also
 /// treats any zeroed hole as used — safe (wasted at worst), never re-issued.
+/// The part of the primary arena a manager allocates table pages from.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TableRegion {
+    /// The whole arena (a manager that is the only table allocator).
+    #[default]
+    Whole,
+    /// Below [`guest_table_start`]: the host's copy beside a guest editor.
+    Host,
+    /// From [`guest_table_start`]: guest EL1's live editor.
+    Guest,
+}
+
+/// First primary-arena offset of guest EL1's table-page region: the top
+/// eighth. EL1 only builds tables for its anonymous-mmap window and hands a
+/// grant back to the host when this region is full, while the host builds
+/// every other table and must not be pushed into extension arenas early.
+fn guest_table_start(capacity: usize) -> u64 {
+    let capacity = capacity as u64;
+    ((capacity - capacity / 8) & !(PT_PAGE - 1)).max(SPARE_START_OFFSET)
+}
+
 fn discover_next_free_spare(bytes: &[u8]) -> u64 {
     let spare = bytes.get(SPARE_START_OFFSET as usize..).unwrap_or_default();
     discover_spare_pages(spare.chunks_exact(PT_PAGE as usize))
@@ -1421,6 +1442,12 @@ pub struct PageTableManager {
     /// Pre-images of every descriptor word written since [`Self::begin_undo`],
     /// in write order, with the scalar state to restore alongside them.
     undo: Option<UndoJournal>,
+    /// Which part of the primary arena this manager bump-allocates table
+    /// pages from. Guest EL1's live editor takes the top eighth and the
+    /// host's owned copy the rest. Neither can learn the other's
+    /// allocations from table content (a fresh table can be all zero), so
+    /// each half has exactly one allocator.
+    table_region: TableRegion,
 }
 
 impl core::fmt::Debug for PageTableManager {
@@ -1506,6 +1533,7 @@ impl PageTableManager {
             staged: hashbrown::HashMap::new(),
             resolver: None,
             undo: None,
+            table_region: TableRegion::Whole,
         }
     }
 
@@ -1552,7 +1580,73 @@ impl PageTableManager {
             staged: hashbrown::HashMap::new(),
             resolver: Some(resolver),
             undo: None,
+            table_region: TableRegion::Whole,
         })
+    }
+
+    /// Mark this live manager as guest EL1's editor: its table pages come
+    /// from the top eighth of the primary arena (see `table_region`).
+    pub fn use_guest_table_region(&mut self) {
+        self.table_region = TableRegion::Guest;
+        let start = guest_table_start(self.arenas[0].capacity);
+        self.arenas[0].next_free = self.arenas[0].next_free.max(start);
+    }
+
+    /// Host copy beside a guest EL1 editor: refresh this copy's view of the
+    /// guest half of the primary arena from the live image, up to EL1's
+    /// high-water mark. Every table EL1 allocated lives there, so a host
+    /// edit that walks into one reads what EL1 last published instead of a
+    /// missing page. The host never allocates in that half, so nothing of its
+    /// own is overwritten. Call only with no host edit in progress.
+    ///
+    /// # Safety
+    /// `live` must point to `live_len` readable bytes of this manager's
+    /// primary arena, and no guest editor may run concurrently.
+    pub unsafe fn refresh_guest_table_region(&mut self, live: *const u8, live_len: usize) {
+        if self.table_region != TableRegion::Host || !self.dirty.is_empty() {
+            return;
+        }
+        let capacity = self.arenas[0].capacity;
+        let start = guest_table_start(capacity) as usize;
+        let len = live_len.min(capacity);
+        if len <= start {
+            return;
+        }
+        let image = unsafe { core::slice::from_raw_parts(live, len) };
+        let high_water = (discover_next_free_spare(image) as usize).min(len);
+        if high_water <= start {
+            return;
+        }
+        let TableArenaStorage::Owned(ref mut bytes) = self.arenas[0].storage else {
+            return;
+        };
+        if bytes.len() < high_water {
+            if bytes.try_reserve(high_water - bytes.len()).is_err() {
+                return;
+            }
+            bytes.resize(high_water, 0);
+        }
+        bytes[start..high_water].copy_from_slice(&image[start..high_water]);
+        let region_start = self.arenas[0].base + start as u64;
+        self.free_tables.retain(|pa| *pa < region_start);
+    }
+
+    /// Mark this manager as the host's copy beside a guest EL1 editor: its
+    /// table pages come from below the guest region of the primary arena, and its
+    /// cursor ignores pages EL1 allocated there. Idempotent.
+    pub fn use_host_table_region(&mut self) {
+        if self.table_region == TableRegion::Host {
+            return;
+        }
+        self.table_region = TableRegion::Host;
+        let start = guest_table_start(self.arenas[0].capacity);
+        let lower = match self.arenas[0].storage {
+            TableArenaStorage::Owned(ref bytes) => {
+                discover_next_free_spare(&bytes[..(start as usize).min(bytes.len())])
+            }
+            TableArenaStorage::Live => self.arenas[0].next_free.min(start),
+        };
+        self.arenas[0].next_free = lower;
     }
 
     /// True if this manager is bound to live hardware-visible memory.
@@ -1600,7 +1694,12 @@ impl PageTableManager {
     /// primary capacity.
     fn live_reachable_primary_prefix(&self) -> Result<u64, PageTableError> {
         if !self.arenas[0].is_live() {
-            return Ok(self.arenas[0].next_free);
+            // The occupied prefix, not the allocation cursor: a host copy
+            // can hold guest EL1 table pages it adopted above its cursor.
+            return Ok(self
+                .arenas[0]
+                .allocated_span()
+                .min(self.arenas[0].capacity as u64));
         }
 
         fn arena_span_for_discovery(arena: &TableArena) -> u64 {
@@ -1701,6 +1800,7 @@ impl PageTableManager {
         target.undo = self.undo.clone();
         target.staged.clear();
         target.resolver = None;
+        target.table_region = self.table_region;
 
         while target.arenas.len() > self.arenas.len() {
             target.arenas.pop();
@@ -1733,7 +1833,13 @@ impl PageTableManager {
             } else {
                 src_arena.next_free
             };
-            target_arena.next_free = prefix_len;
+            // A host copy keeps its own allocation cursor below any guest
+            // EL1 table pages it holds; the copied prefix still covers them.
+            target_arena.next_free = if i == 0 && !src_arena.is_live() {
+                src_arena.next_free.min(prefix_len)
+            } else {
+                prefix_len
+            };
             target_arena.capacity = src_arena.capacity;
 
             let prefix_len = prefix_len as usize;
@@ -1824,6 +1930,7 @@ impl PageTableManager {
             staged: hashbrown::HashMap::new(),
             resolver: None,
             undo: None,
+            table_region: TableRegion::Whole,
         };
         self.snapshot_into(&mut target)?;
         Ok(target)
@@ -1843,9 +1950,14 @@ impl PageTableManager {
         self.arenas[1..].iter().map(|a| a.base).collect()
     }
 
-    /// Sum of the populated table bytes (`next_free`) across all arenas.
+    /// Sum of the populated table bytes across all arenas: each arena's
+    /// occupied prefix, which for a host copy beside guest EL1 extends past
+    /// its allocation cursor to the EL1 table pages it holds.
     pub fn copied_bytes(&self) -> u64 {
-        self.arenas.iter().map(|a| a.next_free).sum()
+        self.arenas
+            .iter()
+            .map(|a| a.allocated_span().min(a.capacity as u64))
+            .sum()
     }
 
     /// Pop all extension arenas. Returns the bases of the retired extension
@@ -2582,6 +2694,27 @@ impl PageTableManager {
         Ok(pages)
     }
 
+    /// Host fallback for a guest EL1 frame grant the guest could not publish
+    /// (its table half was full, or the range's tables live in an extension
+    /// arena EL1 cannot reach): map the granted pages exactly as EL1 would,
+    /// including the EL1 private-anonymous ownership tags.
+    pub fn publish_private_pages(
+        &mut self,
+        publication: GuestLeafPublication,
+        source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<(), GuestLeafPublicationError> {
+        self.map_private_aliased_with_permissions(
+            publication.va,
+            publication.ipa,
+            publication.len,
+            publication.writable,
+            publication.executable,
+            source,
+        )
+        .map_err(GuestLeafPublicationError::Manager)?;
+        self.mark_guest_private_publication(publication)
+    }
+
     fn mark_guest_private_publication(
         &mut self,
         publication: GuestLeafPublication,
@@ -2915,6 +3048,10 @@ impl PageTableManager {
 
     /// Spare sub-table pool occupancy for diagnostics/tracing:
     /// `(in_use, free_list, capacity, arenas)` pages.
+    pub fn table_region_for_debug(&self) -> TableRegion {
+        self.table_region
+    }
+
     pub fn pool_stats(&self) -> (u32, u32, u32, u32) {
         let primary_capacity = (self.arenas[0].capacity as u64 - SPARE_START_OFFSET) / PT_PAGE;
         let primary_bumped = (self.arenas[0].next_free - SPARE_START_OFFSET) / PT_PAGE;
@@ -3352,7 +3489,11 @@ impl PageTableManager {
                 self.arenas[0].next_free = self.arenas[0].next_free.max(discovered);
             }
         }
-        if self.arenas[0].next_free + PT_PAGE <= self.arenas[0].capacity as u64 {
+        let primary_limit = match self.table_region {
+            TableRegion::Whole | TableRegion::Guest => self.arenas[0].capacity as u64,
+            TableRegion::Host => guest_table_start(self.arenas[0].capacity),
+        };
+        if self.arenas[0].next_free + PT_PAGE <= primary_limit {
             let off = self.arenas[0].next_free;
             let needed = (off + PT_PAGE) as usize;
             if let TableArenaStorage::Owned(ref mut bytes) = self.arenas[0].storage

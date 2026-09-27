@@ -452,17 +452,24 @@ impl MmExecutorParticipation {
         ttbr0: u64,
         ttbr1: u64,
     ) -> Option<crate::kernel::AddressSpacePublication> {
-        let (brk_current, mmap_next) = {
+        let (brk_current, el1_anon_next, window_end) = {
             let state = self.authority.mem.lock();
-            (state.brk_current, state.mmap_next)
+            (
+                state.brk_current,
+                state.el1_anon_next,
+                state.layout.el1_anon_window().1,
+            )
         };
         crate::kernel::publish_address_space_with_layout(
             self.mm_id(),
             self.pt_quiesce(),
             ttbr0,
             ttbr1,
-            brk_current,
-            mmap_next,
+            crate::kernel::El1AnonLayout {
+                brk_current,
+                mmap_next: el1_anon_next,
+                mmap_window_end: window_end,
+            },
         )
     }
 

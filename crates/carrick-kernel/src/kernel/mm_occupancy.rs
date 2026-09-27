@@ -571,6 +571,37 @@ impl carrick_thread::fork_quiesce::FenceMirror for SpaceGate {
     }
 }
 
+/// The anonymous-memory layout guest EL1 continues from when an address
+/// space is published: the program break and EL1's mmap window cursor/end.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct El1AnonLayout {
+    pub brk_current: u64,
+    pub mmap_next: u64,
+    pub mmap_window_end: u64,
+}
+
+/// Whether guest EL1 served an anonymous mmap or brk for `mm` that the host
+/// has not replayed yet (unlocked hint).
+pub fn el1_reservations_pending(mm: u64) -> bool {
+    crate::el1_zone::zone().is_some_and(|zone| {
+        zone.spaces
+            .find(mm)
+            .is_some_and(|index| zone.spaces.has_pending(index))
+    })
+}
+
+/// Take guest EL1's unreplayed reservations for `mm`. The caller holds an
+/// [`El1EditorExclusion`] for `mm` (every `MmMutationGuard` does).
+pub fn take_el1_reservations(mm: u64) -> carrick_sched_core::PendingReservations {
+    crate::el1_zone::zone()
+        .and_then(|zone| {
+            zone.spaces
+                .find(mm)
+                .map(|index| zone.spaces.take_pending(index))
+        })
+        .unwrap_or_default()
+}
+
 /// Host stage-1 edit exclusion against guest EL1's editor of one MM. Guest
 /// EL1 publishes, protects and retires leaves in the live tables under the
 /// entry's editor token; a host edit racing it replays a stale descriptor
@@ -656,7 +687,7 @@ pub fn publish_address_space(
     ttbr0: u64,
     ttbr1: u64,
 ) -> Option<AddressSpacePublication> {
-    publish_address_space_with_layout(mm, fence, ttbr0, ttbr1, 0, 0)
+    publish_address_space_with_layout(mm, fence, ttbr0, ttbr1, El1AnonLayout::default())
 }
 
 /// Publish `mm`, whose translation roots are `ttbr0`/`ttbr1`, with initial
@@ -666,8 +697,7 @@ pub fn publish_address_space_with_layout(
     fence: &MmFence,
     ttbr0: u64,
     ttbr1: u64,
-    brk_current: u64,
-    mmap_next: u64,
+    layout: El1AnonLayout,
 ) -> Option<AddressSpacePublication> {
     if !switching_enabled() {
         return None;
@@ -683,8 +713,7 @@ pub fn publish_address_space_with_layout(
         fence,
         ttbr0,
         ttbr1,
-        brk_current,
-        mmap_next,
+        layout,
     )
 }
 
@@ -696,7 +725,7 @@ fn publish_in(
     ttbr0: u64,
     ttbr1: u64,
 ) -> Option<AddressSpacePublication> {
-    publish_in_with_layout(tables, mm, fence, ttbr0, ttbr1, 0, 0)
+    publish_in_with_layout(tables, mm, fence, ttbr0, ttbr1, El1AnonLayout::default())
 }
 
 fn publish_in_with_layout(
@@ -705,8 +734,7 @@ fn publish_in_with_layout(
     fence: &MmFence,
     ttbr0: u64,
     ttbr1: u64,
-    brk_current: u64,
-    mmap_next: u64,
+    layout: El1AnonLayout,
 ) -> Option<AddressSpacePublication> {
     let spaces = tables.spaces;
     let _serial = SPACES_LOCK.lock();
@@ -714,7 +742,14 @@ fn publish_in_with_layout(
         return None;
     }
     let index =
-        spaces.publish_closed_with_layout(mm.raw(), ttbr0, ttbr1, brk_current, mmap_next)?;
+        spaces.publish_closed_with_layout(
+            mm.raw(),
+            ttbr0,
+            ttbr1,
+            layout.brk_current,
+            layout.mmap_next,
+            layout.mmap_window_end,
+        )?;
     // Bound while closed: a pause in force now raises the gate before it
     // opens, and every later pause raises it before its occupancy scan.
     if !fence.bind_mirror(Arc::new(SpaceGate { tables, index })) {

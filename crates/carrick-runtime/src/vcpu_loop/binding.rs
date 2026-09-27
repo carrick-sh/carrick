@@ -4158,6 +4158,24 @@ where
                 );
                 let interrupted_pc = from_el0_direct.then_some(elr);
                 let faulting_tid = self.state.linux_tid;
+                // A first touch of an EL1-reserved range needs its host VMA.
+                if self.state.replay_el1_reservations(&self.kernel, engine)? {
+                    return Ok(executor::ExecutorExit::Syscall);
+                }
+                if let Some(mm_key) = self.state.zone_mm
+                    && signal::any_handed_back_frame_grant()
+                {
+                    let published = self
+                        .state
+                        .with_mm_mutation_authority(&self.kernel, |_guard| {
+                            signal::publish_handed_back_frame_grant(engine, mm_key, si_addr)
+                        })?
+                        .map_err(RuntimeError::Trap)?;
+                    if published {
+                        return Ok(executor::ExecutorExit::Syscall);
+                    }
+                }
+                eprintln!("EL1DBG FAULT tid={:?} addr=0x{:x} esr=0x{:x} elr=0x{:x} req_mm={} walk={:x?}", faulting_tid, si_addr, syndrome, elr, self.kernel.dispatcher.fault_requires_mm_mutation(si_addr), engine.diagnostic_fault_page_tables(far));
                 if self.kernel.dispatcher.fault_requires_mm_mutation(si_addr)
                     && self
                         .state
