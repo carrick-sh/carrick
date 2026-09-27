@@ -1965,6 +1965,7 @@ fn metadata_allocator_concurrent() -> i32 {
     }
     let mut host_calls = 0;
     let mut host_failures = 0;
+    let mut coordinator_failure_codes = Vec::new();
     for _ in 0..ROUNDS {
         barrier.wait();
         for _ in 0..64 {
@@ -1974,11 +1975,19 @@ fn metadata_allocator_concurrent() -> i32 {
             host_failures += usize::from(rc != 0 || &name[..5] != b"Linux");
         }
         barrier.wait();
+        // All four transactions have freed their allocations. Reclaim every
+        // pending extent before the next round so historical returns cannot
+        // consume the bounded 128-slot host aperture.
+        let drain = metadata_allocator_drain();
+        if drain != 0 {
+            coordinator_failure_codes.push(drain);
+        }
     }
     let mut failure_codes: Vec<i64> = workers
         .into_iter()
         .flat_map(|worker| worker.join().expect("allocator worker"))
         .collect();
+    failure_codes.extend(coordinator_failure_codes);
     let drain = metadata_allocator_drain();
     if drain != 0 {
         failure_codes.push(drain);
