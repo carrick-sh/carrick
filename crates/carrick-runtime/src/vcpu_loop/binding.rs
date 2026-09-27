@@ -4175,7 +4175,15 @@ where
                         return Ok(executor::ExecutorExit::Syscall);
                     }
                 }
-                eprintln!("EL1DBG FAULT tid={:?} addr=0x{:x} esr=0x{:x} elr=0x{:x} req_mm={} walk={:x?}", faulting_tid, si_addr, syndrome, elr, self.kernel.dispatcher.fault_requires_mm_mutation(si_addr), engine.diagnostic_fault_page_tables(far));
+                eprintln!(
+                    "EL1DBG FAULT tid={:?} addr=0x{:x} esr=0x{:x} elr=0x{:x} req_mm={} walk={:x?}",
+                    faulting_tid,
+                    si_addr,
+                    syndrome,
+                    elr,
+                    self.kernel.dispatcher.fault_requires_mm_mutation(si_addr),
+                    engine.diagnostic_fault_page_tables(far)
+                );
                 if self.kernel.dispatcher.fault_requires_mm_mutation(si_addr)
                     && self
                         .state

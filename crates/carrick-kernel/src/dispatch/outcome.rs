@@ -924,7 +924,10 @@ impl DispatchOutcome {
     #[inline]
     pub fn errno(errno: LinuxErrno) -> Self {
         if errno == carrick_abi::LINUX_ENOMEM {
-            eprintln!("EL1DBG ERRNO12 {}", std::backtrace::Backtrace::force_capture());
+            eprintln!(
+                "EL1DBG ERRNO12 {}",
+                std::backtrace::Backtrace::force_capture()
+            );
         }
         DispatchOutcome::Errno { errno }
     }
@@ -1087,7 +1090,10 @@ pub(crate) fn lower_handler_result(
     match result {
         Err(DispatchError::Errno(errno)) => {
             if errno == carrick_abi::LINUX_ENOMEM {
-                eprintln!("EL1DBG ERRNO12 {}", std::backtrace::Backtrace::force_capture());
+                eprintln!(
+                    "EL1DBG ERRNO12 {}",
+                    std::backtrace::Backtrace::force_capture()
+                );
             }
             Ok(DispatchOutcome::Errno { errno })
         }

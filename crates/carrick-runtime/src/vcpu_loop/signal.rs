@@ -461,7 +461,14 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     return Ok(true);
                 };
                 let prot = plan.prot();
-                eprintln!("EL1DBG ACCEPT addr=0x{:x} mm={} plan=0x{:x}+0x{:x} prot={}", address, request.mm_key, plan.start(), plan.len(), prot);
+                eprintln!(
+                    "EL1DBG ACCEPT addr=0x{:x} mm={} plan=0x{:x}+0x{:x} prot={}",
+                    address,
+                    request.mm_key,
+                    plan.start(),
+                    plan.len(),
+                    prot
+                );
                 crate::probes::hvpatch_el1_frame_grant_plan(
                     request.fault_va,
                     plan.start(),

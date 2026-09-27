@@ -618,7 +618,10 @@ impl KernelState {
     }
 
     fn record_fatal_signal(&self, record: FatalSignalRecord) {
-        eprintln!("EL1DBG FATAL tid={:?} signo={} code={} addr=0x{:x}", record.tid, record.signo, record.code, record.addr);
+        eprintln!(
+            "EL1DBG FATAL tid={:?} signo={} code={} addr=0x{:x}",
+            record.tid, record.signo, record.code, record.addr
+        );
         let _ = self.fatal_signal.record(record);
     }
 
@@ -1409,10 +1412,7 @@ where
         }
         for (number, args) in replays.into_iter().flatten() {
             eprintln!("EL1DBG REPLAY mm={mm} nr={number} args={args:x?}");
-            let request = SyscallRequest::new(
-                number,
-                crate::compat::SyscallArgs(args),
-            );
+            let request = SyscallRequest::new(number, crate::compat::SyscallArgs(args));
             let syscall = PreparedSyscall {
                 original_args: request.args,
                 request,

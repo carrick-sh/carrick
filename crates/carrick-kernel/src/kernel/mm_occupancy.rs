@@ -741,15 +741,14 @@ fn publish_in_with_layout(
     if spaces.find(mm.raw()).is_some() {
         return None;
     }
-    let index =
-        spaces.publish_closed_with_layout(
-            mm.raw(),
-            ttbr0,
-            ttbr1,
-            layout.brk_current,
-            layout.mmap_next,
-            layout.mmap_window_end,
-        )?;
+    let index = spaces.publish_closed_with_layout(
+        mm.raw(),
+        ttbr0,
+        ttbr1,
+        layout.brk_current,
+        layout.mmap_next,
+        layout.mmap_window_end,
+    )?;
     // Bound while closed: a pause in force now raises the gate before it
     // opens, and every later pause raises it before its occupancy scan.
     if !fence.bind_mirror(Arc::new(SpaceGate { tables, index })) {
