@@ -56,6 +56,20 @@ pub const EL1_CURRENT_TASKS_BASE: u64 = EL1_REGION_BASE + EL1_CURRENT_TASKS_OFFS
 /// Size of the per-vCPU current-task array area (1 MiB).
 pub const EL1_CURRENT_TASKS_SIZE: u64 = 0x10_0000;
 
+/// Shared single-flight metadata request mailbox. The guest publishes only
+/// bounded request data here, then unwinds to the ordinary pending-host-work
+/// boundary; the host never services a metadata grant on the guest's EL1
+/// allocator stack.
+pub const EL1_METADATA_MAILBOX_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x10_000;
+pub const EL1_METADATA_MAILBOX_BASE: u64 = EL1_REGION_BASE + EL1_METADATA_MAILBOX_OFFSET;
+
+pub const METADATA_MAILBOX_IDLE: u32 = 0;
+pub const METADATA_MAILBOX_GUEST_WRITING: u32 = 1;
+pub const METADATA_MAILBOX_REQUESTED: u32 = 2;
+pub const METADATA_MAILBOX_HOST_WORKING: u32 = 3;
+pub const METADATA_MAILBOX_RESPONSE: u32 = 4;
+pub const METADATA_MAILBOX_GUEST_CONSUMING: u32 = 5;
+
 /// Byte offset of the EL1 bootstrap metadata allocator arena within the region.
 pub const EL1_BOOTSTRAP_METADATA_OFFSET: u64 = 0x70_0000;
 
@@ -97,6 +111,10 @@ pub const METADATA_GRANT_ERR_OVERLAP: u64 = 4;
 
 /// Metadata grant hypercall outcome: extent alignment violation.
 pub const METADATA_GRANT_ERR_ALIGNMENT: u64 = 5;
+
+/// Test/control return used only to ask the caller to cross an EL0 host-work
+/// boundary and retry after an asynchronous metadata request completes.
+pub const METADATA_GRANT_PENDING: u64 = u64::MAX - 1;
 
 /// Unaliased Carrick-private test and diagnostic control syscall number (outside Linux 0..500 space).
 pub const SYS_CARRICK_EL1_CONTROL: u64 = 0xCA88_0001;
@@ -224,6 +242,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_STACKS_OFFSET,
         EL1_STACK_SIZE,
         EL1_CURRENT_TASKS_OFFSET,
+        EL1_METADATA_MAILBOX_OFFSET,
         EL1_BOOTSTRAP_METADATA_OFFSET,
         EL1_BOOTSTRAP_METADATA_SIZE,
         EL1_DYNAMIC_METADATA_BASE,
@@ -257,6 +276,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(CurrentTask, served_with_work) as u64,
         core::mem::offset_of!(CurrentTask, zone_mm) as u64,
         core::mem::offset_of!(CurrentTask, thread_serial) as u64,
+        core::mem::size_of::<MetadataGrantMailbox>() as u64,
+        core::mem::align_of::<MetadataGrantMailbox>() as u64,
         EL1_ZONE_OFFSET,
         core::mem::size_of::<ZoneTables>() as u64,
         core::mem::align_of::<ZoneTables>() as u64,
@@ -504,6 +525,148 @@ impl CurrentTask {
 }
 
 impl Default for CurrentTask {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataGrantRequest {
+    pub op: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+    pub arg3: u64,
+    pub cookie: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataGrantResponse {
+    pub op: u64,
+    pub status: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+    pub arg3: u64,
+    pub cookie: u64,
+}
+
+/// One carrier-wide single-flight request. The allocator lock serializes guest
+/// publication/consumption; the state word transfers ownership to and from the
+/// host with release/acquire ordering. Host service happens only after EL1 has
+/// unwound to its normal pending-host-work boundary.
+#[repr(C, align(64))]
+#[derive(Debug)]
+pub struct MetadataGrantMailbox {
+    pub state: AtomicU32,
+    op: AtomicU32,
+    status: AtomicU64,
+    arg1: AtomicU64,
+    arg2: AtomicU64,
+    arg3: AtomicU64,
+    cookie: AtomicU64,
+}
+
+impl MetadataGrantMailbox {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU32::new(METADATA_MAILBOX_IDLE),
+            op: AtomicU32::new(0),
+            status: AtomicU64::new(METADATA_GRANT_ERR_INVALID),
+            arg1: AtomicU64::new(0),
+            arg2: AtomicU64::new(0),
+            arg3: AtomicU64::new(0),
+            cookie: AtomicU64::new(0),
+        }
+    }
+
+    pub fn try_publish_request(&self, request: MetadataGrantRequest) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                METADATA_MAILBOX_IDLE,
+                METADATA_MAILBOX_GUEST_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.op.store(request.op as u32, Ordering::Relaxed);
+        self.status
+            .store(METADATA_GRANT_ERR_INVALID, Ordering::Relaxed);
+        self.arg1.store(request.arg1, Ordering::Relaxed);
+        self.arg2.store(request.arg2, Ordering::Relaxed);
+        self.arg3.store(request.arg3, Ordering::Relaxed);
+        self.cookie.store(request.cookie, Ordering::Relaxed);
+        self.state
+            .store(METADATA_MAILBOX_REQUESTED, Ordering::Release);
+        true
+    }
+
+    pub fn claim_request(&self) -> Option<MetadataGrantRequest> {
+        self.state
+            .compare_exchange(
+                METADATA_MAILBOX_REQUESTED,
+                METADATA_MAILBOX_HOST_WORKING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        Some(MetadataGrantRequest {
+            op: self.op.load(Ordering::Relaxed) as u64,
+            arg1: self.arg1.load(Ordering::Relaxed),
+            arg2: self.arg2.load(Ordering::Relaxed),
+            arg3: self.arg3.load(Ordering::Relaxed),
+            cookie: self.cookie.load(Ordering::Relaxed),
+        })
+    }
+
+    pub fn publish_response(&self, status: u64, arg1: u64, arg2: u64, arg3: u64) {
+        debug_assert_eq!(
+            self.state.load(Ordering::Acquire),
+            METADATA_MAILBOX_HOST_WORKING
+        );
+        self.status.store(status, Ordering::Relaxed);
+        self.arg1.store(arg1, Ordering::Relaxed);
+        self.arg2.store(arg2, Ordering::Relaxed);
+        self.arg3.store(arg3, Ordering::Relaxed);
+        self.state
+            .store(METADATA_MAILBOX_RESPONSE, Ordering::Release);
+    }
+
+    pub fn claim_response(&self) -> Option<MetadataGrantResponse> {
+        self.state
+            .compare_exchange(
+                METADATA_MAILBOX_RESPONSE,
+                METADATA_MAILBOX_GUEST_CONSUMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        Some(MetadataGrantResponse {
+            op: self.op.load(Ordering::Relaxed) as u64,
+            status: self.status.load(Ordering::Relaxed),
+            arg1: self.arg1.load(Ordering::Relaxed),
+            arg2: self.arg2.load(Ordering::Relaxed),
+            arg3: self.arg3.load(Ordering::Relaxed),
+            cookie: self.cookie.load(Ordering::Relaxed),
+        })
+    }
+
+    pub fn finish_response(&self) {
+        debug_assert_eq!(
+            self.state.load(Ordering::Acquire),
+            METADATA_MAILBOX_GUEST_CONSUMING
+        );
+        self.state.store(METADATA_MAILBOX_IDLE, Ordering::Release);
+    }
+
+    pub fn has_guest_work(&self) -> bool {
+        self.state.load(Ordering::Acquire) != METADATA_MAILBOX_IDLE
+    }
+}
+
+impl Default for MetadataGrantMailbox {
     fn default() -> Self {
         Self::new()
     }
@@ -1099,6 +1262,10 @@ const _: () = assert!(
     EL1_STACKS_OFFSET + EL1_STACK_SLOTS * EL1_STACK_SIZE <= EL1_STACKS_OFFSET + EL1_STACKS_SIZE
 );
 const _: () = assert!(EL1_STACKS_OFFSET + EL1_STACKS_SIZE <= EL1_CURRENT_TASKS_OFFSET);
+const _: () = assert!(
+    EL1_METADATA_MAILBOX_OFFSET + core::mem::size_of::<MetadataGrantMailbox>() as u64
+        <= EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE
+);
 const _: () =
     assert!(EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE <= EL1_BOOTSTRAP_METADATA_OFFSET);
 const _: () =
@@ -1122,6 +1289,40 @@ pub fn record_el1_region_host_ptr(ptr: usize) {
 /// Read the host virtual address of the mapped EL1 region.
 pub fn get_el1_region_host_ptr() -> usize {
     EL1_REGION_HOST_PTR.load(Ordering::Acquire)
+}
+
+/// Host view of the shared metadata mailbox, if an EL1 region is installed.
+pub fn metadata_mailbox_host() -> Option<&'static MetadataGrantMailbox> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: the EL1 region owner keeps this shared mapping alive until it
+    // first clears EL1_REGION_HOST_PTR; the mailbox contains only atomics.
+    Some(unsafe { &*((ptr + EL1_METADATA_MAILBOX_OFFSET as usize) as *const MetadataGrantMailbox) })
+}
+
+/// Guest view of the shared metadata mailbox. Call only while executing in
+/// the installed Carrick EL1 image.
+#[cfg(target_os = "none")]
+pub fn metadata_mailbox_guest() -> &'static MetadataGrantMailbox {
+    // SAFETY: EL1_METADATA_MAILBOX_BASE is part of the mapped kernel-only EL1
+    // ABI region and the object layout is included in EL1_ABI_LAYOUT_HASH.
+    unsafe { &*(EL1_METADATA_MAILBOX_BASE as *const MetadataGrantMailbox) }
+}
+
+/// Guest view of one current-task record.
+#[cfg(target_os = "none")]
+pub fn current_task_guest(slot: usize) -> Option<&'static CurrentTask> {
+    if slot >= EL1_STACK_SLOTS as usize {
+        return None;
+    }
+    // SAFETY: the array is part of the mapped kernel-only EL1 ABI region and
+    // CurrentTask's layout is included in EL1_ABI_LAYOUT_HASH.
+    Some(unsafe {
+        &*((EL1_CURRENT_TASKS_BASE as usize + slot * core::mem::size_of::<CurrentTask>())
+            as *const CurrentTask)
+    })
 }
 
 /// End the current-task record of mailbox `slot`: it names no thread, so EL1
@@ -2213,5 +2414,36 @@ mod tests {
         image[24..32].copy_from_slice(&60u64.to_le_bytes());
         image[4..8].copy_from_slice(&IMAGE_VERSION.to_le_bytes());
         assert_eq!(check_image_abi(&image), Err(ImageAbiError::HashOutOfBounds));
+    }
+
+    #[test]
+    fn metadata_mailbox_transfers_one_request_and_response_without_overwrite() {
+        let mailbox = MetadataGrantMailbox::new();
+        let request = MetadataGrantRequest {
+            op: METADATA_GRANT_OP_ALLOC,
+            arg1: 0x20_0000,
+            arg2: 0,
+            arg3: 0,
+            cookie: 17,
+        };
+        assert!(mailbox.try_publish_request(request));
+        assert!(!mailbox.try_publish_request(request));
+        assert_eq!(mailbox.claim_request(), Some(request));
+        assert_eq!(mailbox.claim_request(), None);
+        mailbox.publish_response(METADATA_GRANT_SUCCESS, 0x002d_0800_0000, 0x20_0000, 9);
+        assert_eq!(
+            mailbox.claim_response(),
+            Some(MetadataGrantResponse {
+                op: METADATA_GRANT_OP_ALLOC,
+                status: METADATA_GRANT_SUCCESS,
+                arg1: 0x002d_0800_0000,
+                arg2: 0x20_0000,
+                arg3: 9,
+                cookie: 17,
+            })
+        );
+        assert!(!mailbox.try_publish_request(request));
+        mailbox.finish_response();
+        assert!(mailbox.try_publish_request(request));
     }
 }

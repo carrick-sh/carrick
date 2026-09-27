@@ -355,11 +355,19 @@ where
         }
         #[cfg(feature = "allocator-test-control")]
         _ if (nr as u64) == carrick_el1_abi::SYS_CARRICK_EL1_CONTROL => {
+            let orig_x0 = frame.x[0];
             let res = match frame.x[0] {
                 1 => alloc::run_guest_allocator_test(frame.x[1], frame.x[2]),
                 _ => 1,
             };
             frame.x[0] = res;
+            if let Some(task) = cur_task
+                && task.has_pending_host_work()
+            {
+                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                task.served_with_work.store(1, Ordering::Release);
+                return Action::ServedWithWork;
+            }
             return Action::Served;
         }
         _ => {}

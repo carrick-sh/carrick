@@ -7729,6 +7729,10 @@ impl HvfInner {
                 return Ok(Aarch64Exit::Halt);
             }
             if is_aarch64_hvc_kick(exception.syndrome) {
+                // EL1 has unwound the syscall/allocator stack and explicitly
+                // requested the normal host-work boundary. Service at most one
+                // carrier-wide metadata request before the thread can resume.
+                crate::metadata_grant::service_pending_metadata_request(custody, vm_generation)?;
                 crate::gic::clear_kick(vcpu)?;
                 *kick_armed = false;
                 let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
@@ -7761,6 +7765,14 @@ impl HvfInner {
                 let mut overhead = SyscallTransportOverhead::default();
                 match decode_hvc_syscall_exit(exception.syndrome, vcpu, mailbox, &mut overhead)? {
                     HvcExitOutcome::Syscall(exit) => {
+                        // A served EL1 operation may have published bounded
+                        // metadata work before selecting this ordinary host
+                        // syscall boundary. The allocator stack and lock are
+                        // gone; complete at most the single-flight request.
+                        crate::metadata_grant::service_pending_metadata_request(
+                            custody,
+                            vm_generation,
+                        )?;
                         crate::probes::hvf_syscall_transport(
                             mailbox.transport().raw(),
                             0,
