@@ -70,6 +70,29 @@ pub const METADATA_MAILBOX_HOST_WORKING: u32 = 3;
 pub const METADATA_MAILBOX_RESPONSE: u32 = 4;
 pub const METADATA_MAILBOX_GUEST_CONSUMING: u32 = 5;
 
+/// Shared single-flight anonymous-frame grant mailbox. EL1 publishes a fault
+/// request here and leaves through the ordinary host boundary. The host may
+/// publish a successful response only after the named stage-2 owner and frame
+/// inventory mapping are live and authenticated.
+pub const EL1_FRAME_GRANT_MAILBOX_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x20_000;
+pub const EL1_FRAME_GRANT_MAILBOX_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_MAILBOX_OFFSET;
+
+/// Requested bulk extent. One successful host boundary can cover 512 Linux
+/// 4 KiB pages; the host may clamp the response at a VMA or alignment edge.
+pub const EL1_FRAME_GRANT_TARGET_SIZE: u64 = 2 * 1024 * 1024;
+
+pub const FRAME_GRANT_MAILBOX_IDLE: u32 = 0;
+pub const FRAME_GRANT_MAILBOX_GUEST_WRITING: u32 = 1;
+pub const FRAME_GRANT_MAILBOX_REQUESTED: u32 = 2;
+pub const FRAME_GRANT_MAILBOX_HOST_WORKING: u32 = 3;
+pub const FRAME_GRANT_MAILBOX_RESPONSE: u32 = 4;
+pub const FRAME_GRANT_MAILBOX_GUEST_CONSUMING: u32 = 5;
+
+pub const FRAME_GRANT_SUCCESS: u64 = 0;
+pub const FRAME_GRANT_ERR_DENIED: u64 = 1;
+pub const FRAME_GRANT_ERR_INVALID: u64 = 2;
+pub const FRAME_GRANT_ERR_STALE: u64 = 3;
+
 /// Byte offset of the EL1 bootstrap metadata allocator arena within the region.
 pub const EL1_BOOTSTRAP_METADATA_OFFSET: u64 = 0x70_0000;
 
@@ -243,6 +266,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_STACK_SIZE,
         EL1_CURRENT_TASKS_OFFSET,
         EL1_METADATA_MAILBOX_OFFSET,
+        EL1_FRAME_GRANT_MAILBOX_OFFSET,
+        EL1_FRAME_GRANT_TARGET_SIZE,
         EL1_BOOTSTRAP_METADATA_OFFSET,
         EL1_BOOTSTRAP_METADATA_SIZE,
         EL1_DYNAMIC_METADATA_BASE,
@@ -278,6 +303,22 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(CurrentTask, thread_serial) as u64,
         core::mem::size_of::<MetadataGrantMailbox>() as u64,
         core::mem::align_of::<MetadataGrantMailbox>() as u64,
+        core::mem::size_of::<FrameGrantMailbox>() as u64,
+        core::mem::align_of::<FrameGrantMailbox>() as u64,
+        core::mem::offset_of!(FrameGrantMailbox, state) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, status) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, mm_key) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, request_generation) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, fault_va) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, requested_len) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, permissions) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, semantic_base) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, physical_ipa) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, granted_len) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, frame_id) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, mapping_id) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, owner_generation) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, inventory_revision) as u64,
         EL1_ZONE_OFFSET,
         core::mem::size_of::<ZoneTables>() as u64,
         core::mem::align_of::<ZoneTables>() as u64,
@@ -670,6 +711,288 @@ impl MetadataGrantMailbox {
 }
 
 impl Default for MetadataGrantMailbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameGrantRequest {
+    /// Exact zone/MM key from the loaded [`CurrentTask`].
+    pub mm_key: u64,
+    /// Nonzero carrier-wide request incarnation chosen by EL1.
+    pub request_generation: u64,
+    /// The semantic address whose recoverable data abort created the request.
+    pub fault_va: u64,
+    /// Maximum semantic span the host may return.
+    pub requested_len: u64,
+    /// Linux protection bits requested for the eventual stage-1 leaves.
+    pub permissions: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameGrantReady {
+    pub mm_key: u64,
+    pub request_generation: u64,
+    pub semantic_base: u64,
+    pub physical_ipa: u64,
+    pub len: u64,
+    pub permissions: u64,
+    /// Raw kernel frame identity, exported only at this shared ABI boundary.
+    pub frame_id: u64,
+    /// Raw kernel mapping identity, exported only at this shared ABI boundary.
+    pub mapping_id: u64,
+    /// Exact global stage-2 owner incarnation authenticated by the host.
+    pub owner_generation: u64,
+    /// Exact committed inventory revision that contains `mapping_id`.
+    pub inventory_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameGrantResponse {
+    pub status: u64,
+    pub request: FrameGrantRequest,
+    pub ready: Option<FrameGrantReady>,
+}
+
+/// One carrier-wide anonymous-frame request. The request generation and MM key
+/// prevent a response from crossing address-space or request incarnations. A
+/// successful response carries identities rather than authority: EL1 may use
+/// them only to authenticate the exact host-published grant before installing
+/// a leaf.
+#[repr(C, align(64))]
+#[derive(Debug)]
+pub struct FrameGrantMailbox {
+    pub state: AtomicU32,
+    status: AtomicU64,
+    mm_key: AtomicU64,
+    request_generation: AtomicU64,
+    fault_va: AtomicU64,
+    requested_len: AtomicU64,
+    permissions: AtomicU64,
+    semantic_base: AtomicU64,
+    physical_ipa: AtomicU64,
+    granted_len: AtomicU64,
+    frame_id: AtomicU64,
+    mapping_id: AtomicU64,
+    owner_generation: AtomicU64,
+    inventory_revision: AtomicU64,
+}
+
+impl FrameGrantMailbox {
+    const PAGE_SIZE: u64 = 4096;
+    const PERMISSION_MASK: u64 = 0x7;
+
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU32::new(FRAME_GRANT_MAILBOX_IDLE),
+            status: AtomicU64::new(FRAME_GRANT_ERR_INVALID),
+            mm_key: AtomicU64::new(0),
+            request_generation: AtomicU64::new(0),
+            fault_va: AtomicU64::new(0),
+            requested_len: AtomicU64::new(0),
+            permissions: AtomicU64::new(0),
+            semantic_base: AtomicU64::new(0),
+            physical_ipa: AtomicU64::new(0),
+            granted_len: AtomicU64::new(0),
+            frame_id: AtomicU64::new(0),
+            mapping_id: AtomicU64::new(0),
+            owner_generation: AtomicU64::new(0),
+            inventory_revision: AtomicU64::new(0),
+        }
+    }
+
+    fn request_is_valid(request: FrameGrantRequest) -> bool {
+        request.mm_key != 0
+            && request.request_generation != 0
+            && request.requested_len != 0
+            && request.requested_len <= EL1_FRAME_GRANT_TARGET_SIZE
+            && request.requested_len.is_multiple_of(Self::PAGE_SIZE)
+            && request.permissions != 0
+            && request.permissions & !Self::PERMISSION_MASK == 0
+    }
+
+    fn load_request(&self) -> FrameGrantRequest {
+        FrameGrantRequest {
+            mm_key: self.mm_key.load(Ordering::Relaxed),
+            request_generation: self.request_generation.load(Ordering::Relaxed),
+            fault_va: self.fault_va.load(Ordering::Relaxed),
+            requested_len: self.requested_len.load(Ordering::Relaxed),
+            permissions: self.permissions.load(Ordering::Relaxed),
+        }
+    }
+
+    fn ready_is_valid(request: FrameGrantRequest, ready: FrameGrantReady) -> bool {
+        let Some(end) = ready.semantic_base.checked_add(ready.len) else {
+            return false;
+        };
+        ready.mm_key == request.mm_key
+            && ready.request_generation == request.request_generation
+            && ready.semantic_base.is_multiple_of(Self::PAGE_SIZE)
+            && ready.physical_ipa.is_multiple_of(Self::PAGE_SIZE)
+            && ready.len != 0
+            && ready.len <= request.requested_len
+            && ready.len.is_multiple_of(Self::PAGE_SIZE)
+            && ready.semantic_base <= request.fault_va
+            && request.fault_va < end
+            && ready.permissions == request.permissions
+            && ready.frame_id != 0
+            && ready.mapping_id != 0
+            && ready.owner_generation != 0
+            && ready.inventory_revision != 0
+    }
+
+    pub fn try_publish_request(&self, request: FrameGrantRequest) -> bool {
+        if !Self::request_is_valid(request)
+            || self
+                .state
+                .compare_exchange(
+                    FRAME_GRANT_MAILBOX_IDLE,
+                    FRAME_GRANT_MAILBOX_GUEST_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return false;
+        }
+        self.status
+            .store(FRAME_GRANT_ERR_INVALID, Ordering::Relaxed);
+        self.mm_key.store(request.mm_key, Ordering::Relaxed);
+        self.request_generation
+            .store(request.request_generation, Ordering::Relaxed);
+        self.fault_va.store(request.fault_va, Ordering::Relaxed);
+        self.requested_len
+            .store(request.requested_len, Ordering::Relaxed);
+        self.permissions
+            .store(request.permissions, Ordering::Relaxed);
+        self.semantic_base.store(0, Ordering::Relaxed);
+        self.physical_ipa.store(0, Ordering::Relaxed);
+        self.granted_len.store(0, Ordering::Relaxed);
+        self.frame_id.store(0, Ordering::Relaxed);
+        self.mapping_id.store(0, Ordering::Relaxed);
+        self.owner_generation.store(0, Ordering::Relaxed);
+        self.inventory_revision.store(0, Ordering::Relaxed);
+        self.state
+            .store(FRAME_GRANT_MAILBOX_REQUESTED, Ordering::Release);
+        true
+    }
+
+    pub fn claim_request(&self) -> Option<FrameGrantRequest> {
+        self.state
+            .compare_exchange(
+                FRAME_GRANT_MAILBOX_REQUESTED,
+                FRAME_GRANT_MAILBOX_HOST_WORKING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        Some(self.load_request())
+    }
+
+    pub fn publish_ready(&self, ready: FrameGrantReady) -> bool {
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING {
+            return false;
+        }
+        let request = self.load_request();
+        if !Self::ready_is_valid(request, ready) {
+            return false;
+        }
+        self.semantic_base
+            .store(ready.semantic_base, Ordering::Relaxed);
+        self.physical_ipa
+            .store(ready.physical_ipa, Ordering::Relaxed);
+        self.granted_len.store(ready.len, Ordering::Relaxed);
+        self.frame_id.store(ready.frame_id, Ordering::Relaxed);
+        self.mapping_id.store(ready.mapping_id, Ordering::Relaxed);
+        self.owner_generation
+            .store(ready.owner_generation, Ordering::Relaxed);
+        self.inventory_revision
+            .store(ready.inventory_revision, Ordering::Relaxed);
+        self.status.store(FRAME_GRANT_SUCCESS, Ordering::Relaxed);
+        self.state
+            .store(FRAME_GRANT_MAILBOX_RESPONSE, Ordering::Release);
+        true
+    }
+
+    pub fn publish_refusal(&self, status: u64) -> bool {
+        if status == FRAME_GRANT_SUCCESS
+            || !matches!(
+                status,
+                FRAME_GRANT_ERR_DENIED | FRAME_GRANT_ERR_INVALID | FRAME_GRANT_ERR_STALE
+            )
+            || self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING
+        {
+            return false;
+        }
+        self.status.store(status, Ordering::Relaxed);
+        self.state
+            .store(FRAME_GRANT_MAILBOX_RESPONSE, Ordering::Release);
+        true
+    }
+
+    pub fn claim_response(
+        &self,
+        mm_key: u64,
+        request_generation: u64,
+    ) -> Option<FrameGrantResponse> {
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_RESPONSE
+            || self.mm_key.load(Ordering::Relaxed) != mm_key
+            || self.request_generation.load(Ordering::Relaxed) != request_generation
+        {
+            return None;
+        }
+        self.state
+            .compare_exchange(
+                FRAME_GRANT_MAILBOX_RESPONSE,
+                FRAME_GRANT_MAILBOX_GUEST_CONSUMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        let request = self.load_request();
+        let status = self.status.load(Ordering::Relaxed);
+        let ready = (status == FRAME_GRANT_SUCCESS).then(|| FrameGrantReady {
+            mm_key: request.mm_key,
+            request_generation: request.request_generation,
+            semantic_base: self.semantic_base.load(Ordering::Relaxed),
+            physical_ipa: self.physical_ipa.load(Ordering::Relaxed),
+            len: self.granted_len.load(Ordering::Relaxed),
+            permissions: request.permissions,
+            frame_id: self.frame_id.load(Ordering::Relaxed),
+            mapping_id: self.mapping_id.load(Ordering::Relaxed),
+            owner_generation: self.owner_generation.load(Ordering::Relaxed),
+            inventory_revision: self.inventory_revision.load(Ordering::Relaxed),
+        });
+        Some(FrameGrantResponse {
+            status,
+            request,
+            ready,
+        })
+    }
+
+    pub fn finish_response(&self, mm_key: u64, request_generation: u64) -> bool {
+        if self.mm_key.load(Ordering::Relaxed) != mm_key
+            || self.request_generation.load(Ordering::Relaxed) != request_generation
+        {
+            return false;
+        }
+        self.state
+            .compare_exchange(
+                FRAME_GRANT_MAILBOX_GUEST_CONSUMING,
+                FRAME_GRANT_MAILBOX_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn has_guest_work(&self) -> bool {
+        self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_IDLE
+    }
+}
+
+impl Default for FrameGrantMailbox {
     fn default() -> Self {
         Self::new()
     }
@@ -1266,7 +1589,23 @@ const _: () = assert!(
 );
 const _: () = assert!(EL1_STACKS_OFFSET + EL1_STACKS_SIZE <= EL1_CURRENT_TASKS_OFFSET);
 const _: () = assert!(
+    EL1_CURRENT_TASKS_OFFSET + EL1_STACK_SLOTS * core::mem::size_of::<CurrentTask>() as u64
+        <= EL1_METADATA_MAILBOX_OFFSET
+);
+const _: () = assert!(
+    EL1_METADATA_MAILBOX_OFFSET
+        .is_multiple_of(core::mem::align_of::<MetadataGrantMailbox>() as u64)
+);
+const _: () = assert!(
     EL1_METADATA_MAILBOX_OFFSET + core::mem::size_of::<MetadataGrantMailbox>() as u64
+        <= EL1_FRAME_GRANT_MAILBOX_OFFSET
+);
+const _: () = assert!(
+    EL1_FRAME_GRANT_MAILBOX_OFFSET
+        .is_multiple_of(core::mem::align_of::<FrameGrantMailbox>() as u64)
+);
+const _: () = assert!(
+    EL1_FRAME_GRANT_MAILBOX_OFFSET + core::mem::size_of::<FrameGrantMailbox>() as u64
         <= EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE
 );
 const _: () =
@@ -1305,6 +1644,18 @@ pub fn metadata_mailbox_host() -> Option<&'static MetadataGrantMailbox> {
     Some(unsafe { &*((ptr + EL1_METADATA_MAILBOX_OFFSET as usize) as *const MetadataGrantMailbox) })
 }
 
+/// Host view of the shared anonymous-frame mailbox, if an EL1 region is
+/// installed.
+pub fn frame_grant_mailbox_host() -> Option<&'static FrameGrantMailbox> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: the EL1 region owner keeps this shared mapping alive until it
+    // first clears EL1_REGION_HOST_PTR; the mailbox contains only atomics.
+    Some(unsafe { &*((ptr + EL1_FRAME_GRANT_MAILBOX_OFFSET as usize) as *const FrameGrantMailbox) })
+}
+
 /// Guest view of the shared metadata mailbox. Call only while executing in
 /// the installed Carrick EL1 image.
 #[cfg(target_os = "none")]
@@ -1312,6 +1663,15 @@ pub fn metadata_mailbox_guest() -> &'static MetadataGrantMailbox {
     // SAFETY: EL1_METADATA_MAILBOX_BASE is part of the mapped kernel-only EL1
     // ABI region and the object layout is included in EL1_ABI_LAYOUT_HASH.
     unsafe { &*(EL1_METADATA_MAILBOX_BASE as *const MetadataGrantMailbox) }
+}
+
+/// Guest view of the shared anonymous-frame mailbox. Call only while executing
+/// in the installed Carrick EL1 image.
+#[cfg(target_os = "none")]
+pub fn frame_grant_mailbox_guest() -> &'static FrameGrantMailbox {
+    // SAFETY: EL1_FRAME_GRANT_MAILBOX_BASE is part of the mapped kernel-only
+    // EL1 ABI region and the object layout is included in EL1_ABI_LAYOUT_HASH.
+    unsafe { &*(EL1_FRAME_GRANT_MAILBOX_BASE as *const FrameGrantMailbox) }
 }
 
 /// Guest view of one current-task record.
@@ -2448,5 +2808,94 @@ mod tests {
         assert!(!mailbox.try_publish_request(request));
         mailbox.finish_response();
         assert!(mailbox.try_publish_request(request));
+    }
+
+    #[test]
+    fn frame_grant_mailbox_binds_ready_data_to_exact_request_and_mm() {
+        let mailbox = FrameGrantMailbox::new();
+        let request = FrameGrantRequest {
+            mm_key: 41,
+            request_generation: 7,
+            fault_va: 0x4000_3000,
+            requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+            permissions: 3,
+        };
+        assert!(mailbox.try_publish_request(request));
+        assert!(!mailbox.try_publish_request(request));
+        assert_eq!(mailbox.claim_request(), Some(request));
+
+        let ready = FrameGrantReady {
+            mm_key: request.mm_key,
+            request_generation: request.request_generation,
+            semantic_base: 0x4000_0000,
+            physical_ipa: 0x9000_0000,
+            len: EL1_FRAME_GRANT_TARGET_SIZE,
+            permissions: request.permissions,
+            frame_id: 101,
+            mapping_id: 102,
+            owner_generation: 103,
+            inventory_revision: 104,
+        };
+        assert!(mailbox.publish_ready(ready));
+        assert_eq!(mailbox.claim_response(42, 7), None);
+        assert_eq!(mailbox.claim_response(41, 8), None);
+        assert_eq!(
+            mailbox.claim_response(41, 7),
+            Some(FrameGrantResponse {
+                status: FRAME_GRANT_SUCCESS,
+                request,
+                ready: Some(ready),
+            })
+        );
+        assert!(!mailbox.finish_response(42, 7));
+        assert!(!mailbox.finish_response(41, 8));
+        assert!(mailbox.finish_response(41, 7));
+        assert!(mailbox.try_publish_request(request));
+    }
+
+    #[test]
+    fn frame_grant_mailbox_rejects_mismatched_or_unauthenticated_ready_data() {
+        let mailbox = FrameGrantMailbox::new();
+        let request = FrameGrantRequest {
+            mm_key: 51,
+            request_generation: 11,
+            fault_va: 0x5000_1000,
+            requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+            permissions: 1,
+        };
+        assert!(mailbox.try_publish_request(request));
+        assert_eq!(mailbox.claim_request(), Some(request));
+
+        let mut ready = FrameGrantReady {
+            mm_key: request.mm_key,
+            request_generation: request.request_generation,
+            semantic_base: 0x5000_0000,
+            physical_ipa: 0xa000_0000,
+            len: EL1_FRAME_GRANT_TARGET_SIZE,
+            permissions: request.permissions,
+            frame_id: 201,
+            mapping_id: 202,
+            owner_generation: 203,
+            inventory_revision: 204,
+        };
+        ready.mm_key += 1;
+        assert!(!mailbox.publish_ready(ready));
+        ready.mm_key = request.mm_key;
+        ready.owner_generation = 0;
+        assert!(!mailbox.publish_ready(ready));
+        ready.owner_generation = 203;
+        ready.semantic_base = request.fault_va + 0x1000;
+        assert!(!mailbox.publish_ready(ready));
+
+        assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
+        assert_eq!(
+            mailbox.claim_response(request.mm_key, request.request_generation),
+            Some(FrameGrantResponse {
+                status: FRAME_GRANT_ERR_DENIED,
+                request,
+                ready: None,
+            })
+        );
+        assert!(mailbox.finish_response(request.mm_key, request.request_generation));
     }
 }
