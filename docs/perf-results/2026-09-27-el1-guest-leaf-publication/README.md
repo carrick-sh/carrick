@@ -126,7 +126,10 @@ stage-1 AP bits, but EL1 could read and not update its own table image.
 backing to `ReadWriteExec` (the existing HVF writable-map policy) and leaves
 the mapping's `guest_writable` flag false. `stage2-write-green.log` and
 `stage2-write-clippy.log` preserve the focused green test and warning-denied
-Clippy. The prescribed host test gate reached the unchanged GIC source-shape
+Clippy. `stage2-write-gic-control.log` keeps the GIC-window exclusion negative
+control green, and `stage2-write-product-diff.log` records exact changed-surface
+coverage with a revision-bound exemption for that unchanged GIC contract. The
+prescribed host test gate reached the unchanged GIC source-shape
 assertion already documented by the host-service checkpoint; the new test and
 the affected production crate otherwise pass. A new exact signed artifact and
 256-page rerun remain the next acceptance step.
