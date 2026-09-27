@@ -657,3 +657,15 @@ Keep the task bounded to edit/publication/rollback; inventory remaining
 lifecycle allocation obligations for subsequent guest migration. The next
 impact milestone remains actual in-guest first-touch, not another host-only
 foundation checkpoint. The preceding user-facing status turn changed no code.
+
+2026-09-26: metadata-refusal candidate `f27a3f644` passes all five
+independent host checks and now exercises actual authority refusal and
+same-instance recovery. Review round 3 remains necessary: publication error
+conversion still allocates, conversion tests duplicate rather than call
+production logic, admission caps lack a data-structure derivation, and raw
+red/green files with source/fixture identity are not preserved. The same
+worker received its third and final review round; no fourth round is
+authorized. Evidence is in metadata-refusal-director/review-3/. Candidate
+integration and guest acceptance remain withheld. Previous turn was a
+verified wait on the same live worker; this turn completed independent
+verification and dispatched bounded corrections.
