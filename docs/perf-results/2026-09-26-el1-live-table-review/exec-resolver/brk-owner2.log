@@ -1,0 +1,621 @@
+(lldb) target create "target/release/deps/probes_shard_2-19749884b4f574cf"
+Current executable set to '/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_2-19749884b4f574cf' (arm64).
+(lldb) settings set -- target.run-args  "generic_probe_shard_2" "--exact" "--nocapture"
+(lldb) breakpoint set --file foreign_mm.rs --line 466 --condition "base == 0x9a00200000"
+Breakpoint 1: 2 locations.
+(lldb) run
+
+running 1 test
+test generic_probe_shard_2 ... RUN generic probe shard 2 aarch64-unknown-linux-musl:accessx
+warning: probes_shard_2-19749884b4f574cf was compiled with optimization - stepping may behave oddly; variables may not be available.
+Process 13273 launched: '/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_2-19749884b4f574cf' (arm64)
+Process 13273 stopped
+* thread #10, name = 'carrick-executor-0', stop reason = breakpoint 1.1
+       frame #0: 0x00000001004a3c3c probes_shard_2-19749884b4f574cf`_$LT$carrick_vmm_hvf..trap..foreign_mm..MmAccessLiveResolver$u20$as$u20$carrick_mmu_core..aarch64..HostArenaResolver$GT$::host_ptr_for_range::hebbcd56b52b11edb(self=0x0000000155a14880, base=661427060736, len=<unavailable>) at foreign_mm.rs:466:16 [opt]
+   463 	        if let Some((&logical, extent)) = inventory.extents.range(..=(base, u64::MAX)).next_back() {
+   464 	            let logical_end = logical.0.saturating_add(logical.1);
+   465 	            let stage2_end = extent.stage2_base.saturating_add(extent.stage2_length);
+-> 466 	            if base >= logical.0
+    	               ^
+   467 	                && base
+   468 	                    .checked_add(requested_len as u64)
+   469 	                    .is_some_and(|end| end <= logical_end)
+Target 0: (probes_shard_2-19749884b4f574cf) stopped.
+(lldb) frame variable --ptr-depth 3 --depth 12 state
+(alloc::sync::Arc<carrick_vmm_hvf::trap::foreign_mm::MmAccessState, alloc::alloc::Global>) state = {
+  ptr = {
+    pointer = 0x0000000155a222b0 {
+      strong = {
+        v = {
+          value = {
+            __0 = 2
+          }
+        }
+      }
+      weak = {
+        v = {
+          value = {
+            __0 = 4
+          }
+        }
+      }
+      data = {
+        deferred_anonymous = {
+          raw = {
+            state = {
+              v = {
+                value = {
+                  __0 = 0
+                }
+              }
+            }
+          }
+          data = {
+            value = {
+              $variants$ = {
+                $variant$0 = {
+                  $discr$ = 3
+                  value = {}
+                }
+                $variant$ = {
+                  value = {
+                    __0 = {
+                      __0 = {
+                        __0 = {...}
+                      }
+                      __1 = {
+                        ptr = {...}
+                        phantom = {...}
+                        alloc = {...}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        identity = {
+          raw = {
+            state = {
+              v = {
+                value = {
+                  __0 = 0
+                }
+              }
+            }
+          }
+          data = {
+            value = {
+              $variants$ = {
+                $variant$0 = {
+                  $discr$ = 3
+                  value = {}
+                }
+                $variant$ = {
+                  value = {
+                    __0 = {
+                      __0 = {
+                        __0 = {...}
+                      }
+                      __1 = {
+                        asid = {...}
+                        stage1_root = {...}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        live_resolver = {
+          raw = {
+            state = {
+              v = {
+                value = {
+                  __0 = 0
+                }
+              }
+            }
+          }
+          data = {
+            value = {
+              $variants$ = {
+                $variant$0 = {
+                  $discr$ = 5731600496
+                  value = {}
+                }
+                $variant$ = {
+                  value = {
+                    __0 = {
+                      ptr = {
+                        pointer = {...}
+                      }
+                      phantom = {}
+                      alloc = {}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        page_tables = {
+          raw = {
+            state = {
+              v = {
+                value = {
+                  __0 = 0
+                }
+              }
+            }
+          }
+          data = {
+            value = {
+              inner = {
+                ptr = {
+                  pointer = 0x0000000155a10210 {
+                    strong = {
+                      v = {
+                        value = {...}
+                      }
+                    }
+                    weak = {
+                      v = {
+                        value = {...}
+                      }
+                    }
+                    data = {
+                      raw = {
+                        state = {...}
+                      }
+                      data = {
+                        value = {...}
+                      }
+                    }
+                  }
+                }
+                phantom = {}
+                alloc = {}
+              }
+            }
+          }
+        }
+        protections = {
+          ptr = {
+            pointer = 0x0000000155a0ee80 {
+              strong = {
+                v = {
+                  value = {
+                    __0 = 1
+                  }
+                }
+              }
+              weak = {
+                v = {
+                  value = {
+                    __0 = 1
+                  }
+                }
+              }
+              data = {
+                state = {
+                  raw = {
+                    state = {
+                      v = {
+                        value = {...}
+                      }
+                    }
+                  }
+                  data = {
+                    value = {
+                      no_access = {
+                        ranges = {...}
+                      }
+                      unmapped = {
+                        ranges = {...}
+                      }
+                      no_write = {
+                        ranges = {...}
+                      }
+                      executable = {
+                        ranges = {...}
+                      }
+                      bus_fault = {
+                        ranges = {...}
+                      }
+                      mutable_shared_backing = {
+                        ranges = {...}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          phantom = {}
+          alloc = {}
+        }
+        frame_inventory = {
+          ledger = {
+            ptr = {
+              pointer = 0x0000000156820200 {
+                strong = {
+                  v = {
+                    value = {
+                      __0 = 3
+                    }
+                  }
+                }
+                weak = {
+                  v = {
+                    value = {
+                      __0 = 1
+                    }
+                  }
+                }
+                data = {
+                  raw = {
+                    state = {
+                      v = {
+                        value = {...}
+                      }
+                    }
+                  }
+                  data = {
+                    value = {
+                      initialized = true
+                      extents = {
+                        extents = {...}
+                        by_class = {...}
+                        class_counts = {...}
+                      }
+                      frames = {
+                        ptr = {...}
+                        phantom = {...}
+                        alloc = {...}
+                      }
+                      alias_reservation = {
+                        $variants$ = {...}
+                      }
+                      alias_commit = {
+                        $variants$ = {...}
+                      }
+                      alias_staged = {
+                        buf = {...}
+                        len = 0
+                      }
+                      process_reservation = {
+                        $variants$ = {...}
+                      }
+                      process_commit = {
+                        $variants$ = {...}
+                      }
+                      retired_reservation = {
+                        $variants$ = {...}
+                      }
+                      replacement_reservation = {
+                        $variants$ = {...}
+                      }
+                      exec_commits = {
+                        $variants$ = {...}
+                      }
+                      retirement_reservation = {
+                        $variants$ = {...}
+                      }
+                      retirement_commit = {
+                        $variants$ = {...}
+                      }
+                      retirement_expected = {
+                        buf = {...}
+                        len = 16
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            phantom = {}
+            alloc = {}
+          }
+        }
+        cow_armed = {
+          ptr = {
+            pointer = 0x0000000155a10120 {
+              strong = {
+                v = {
+                  value = {
+                    __0 = 1
+                  }
+                }
+              }
+              weak = {
+                v = {
+                  value = {
+                    __0 = 1
+                  }
+                }
+              }
+              data = {
+                raw = {
+                  state = {
+                    v = {
+                      value = {
+                        __0 = '\0'
+                      }
+                    }
+                  }
+                }
+                data = {
+                  value = {
+                    ranges = {
+                      buf = {
+                        inner = {...}
+                        _marker = {...}
+                      }
+                      len = 10
+                    }
+                  }
+                }
+              }
+            }
+          }
+          phantom = {}
+          alloc = {}
+        }
+        cow_deferred_publications = {
+          ptr = {
+            pointer = 0x0000000155a0eda0 {
+              strong = {
+                v = {
+                  value = {
+                    __0 = 1
+                  }
+                }
+              }
+              weak = {
+                v = {
+                  value = {
+                    __0 = 1
+                  }
+                }
+              }
+              data = {
+                raw = {
+                  state = {
+                    v = {
+                      value = {
+                        __0 = '\0'
+                      }
+                    }
+                  }
+                }
+                data = {
+                  value = {
+                    buf = {
+                      inner = {
+                        ptr = {...}
+                        cap = {...}
+                        alloc = {...}
+                      }
+                      _marker = {}
+                    }
+                    len = 0
+                  }
+                }
+              }
+            }
+          }
+          phantom = {}
+          alloc = {}
+        }
+        structural_owners = {
+          raw = {
+            state = {
+              v = {
+                value = {
+                  __0 = 0
+                }
+              }
+            }
+          }
+          data = {
+            value = {
+              root = {
+                $variants$ = {
+                  $variant$0 = {
+                    $discr$ = 5731657040
+                    value = {}
+                  }
+                  $variant$ = {
+                    value = {
+                      __0 = {
+                        height = 1
+                        node = {...}
+                        _marker = {...}
+                      }
+                    }
+                  }
+                }
+              }
+              length = 13
+              alloc = {
+                value = {
+                  __0 = {}
+                }
+              }
+              _marker = {}
+            }
+          }
+        }
+        mm_root_stage2 = {
+          raw = {
+            state = {
+              v = {
+                value = {
+                  __0 = '\0'
+                }
+              }
+            }
+          }
+          data = {
+            value = {
+              $variants$ = {
+                $variant$2 = {
+                  $discr$ = 1
+                  value = {}
+                }
+                $variant$ = {
+                  value = {
+                    __0 = {
+                      root_slot = {
+                        __0 = 661424963584
+                        __1 = 2097152
+                      }
+                      physical_extent = {
+                        __0 = 661424963584
+                        __1 = 2097152
+                      }
+                      owner = {
+                        ptr = {...}
+                        phantom = {...}
+                        alloc = {...}
+                      }
+                      record_identity = {
+                        record_id = {...}
+                        vm_generation = {...}
+                        logical_owner = {...}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        mutation_coordinator = {
+          raw = {
+            state = {
+              v = {
+                value = {
+                  __0 = '\0'
+                }
+              }
+            }
+          }
+          data = {}
+        }
+        cow_runtime = {
+          raw = {
+            state = {
+              v = {
+                value = {
+                  __0 = 0
+                }
+              }
+            }
+          }
+          data = {
+            value = {
+              $variants$ = {
+                $variant$2 = {
+                  $discr$ = 1
+                  value = {}
+                }
+                $variant$ = {
+                  value = {
+                    __0 = {
+                      authority = {
+                        ptr = {...}
+                        phantom = {...}
+                        alloc = {...}
+                      }
+                      identity = {
+                        linux_pid = 2
+                        linux_tid = 2
+                        mm = 3
+                        asid = 2
+                      }
+                      mm_root_slot = {
+                        $variants$ = {...}
+                      }
+                      container_root = {
+                        __0 = 2
+                      }
+                      persistent_vm_lifecycle = true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        cow_rollback_scratch = {
+          raw = {
+            state = {
+              v = {
+                value = {
+                  __0 = '\0'
+                }
+              }
+            }
+          }
+          data = {
+            value = {
+              $variants$ = {
+                $variant$0 = {
+                  $discr$ = 9223372036854775808
+                  value = {}
+                }
+                $variant$ = {
+                  value = {
+                    __0 = {
+                      arenas = {
+                        buf = {...}
+                        len = 5729470112
+                      }
+                      layout = {
+                        user_leaf_check_va = 0
+                        extension_arena_capacity = 0
+                        excluded_ipa_start = 0
+                        excluded_ipa_len = 0
+                      }
+                      asid_scoped_leaves = true
+                      free_tables = {
+                        buf = {...}
+                        len = 494666710833687106
+                      }
+                      multi_vcpu = true
+                      offline_private_image = true
+                      stage1_exclusive = true
+                      reclaim_pending = true
+                      dirty = {
+                        buf = {...}
+                        len = 0
+                      }
+                      staged = {
+                        hash_builder = {...}
+                        table = {...}
+                      }
+                      resolver = {
+                        $variants$ = {...}
+                      }
+                      undo = {
+                        $variants$ = {...}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  phantom = {}
+  alloc = {}
+}
+(lldb) process kill
+Process 13273 exited with status = 9 (0x00000009) killed

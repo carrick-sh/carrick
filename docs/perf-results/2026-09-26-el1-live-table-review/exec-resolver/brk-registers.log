@@ -1,0 +1,39 @@
+(lldb) target create "target/release/deps/probes_shard_2-19749884b4f574cf"
+Current executable set to '/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_2-19749884b4f574cf' (arm64).
+(lldb) settings set -- target.run-args  "generic_probe_shard_2" "--exact" "--nocapture"
+(lldb) breakpoint set --file foreign_mm.rs --line 466 --condition "base == 0x9a00200000"
+Breakpoint 1: 2 locations.
+(lldb) run
+
+running 1 test
+test generic_probe_shard_2 ... RUN generic probe shard 2 aarch64-unknown-linux-musl:accessx
+warning: probes_shard_2-19749884b4f574cf was compiled with optimization - stepping may behave oddly; variables may not be available.
+Process 12941 launched: '/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_2-19749884b4f574cf' (arm64)
+Process 12941 stopped
+* thread #10, name = 'carrick-executor-0', stop reason = breakpoint 1.1
+       frame #0: 0x00000001004a3c3c probes_shard_2-19749884b4f574cf`_$LT$carrick_vmm_hvf..trap..foreign_mm..MmAccessLiveResolver$u20$as$u20$carrick_mmu_core..aarch64..HostArenaResolver$GT$::host_ptr_for_range::hebbcd56b52b11edb(self=0x0000000149b13980, base=661427060736, len=<unavailable>) at foreign_mm.rs:466:16 [opt]
+   463 	        if let Some((&logical, extent)) = inventory.extents.range(..=(base, u64::MAX)).next_back() {
+   464 	            let logical_end = logical.0.saturating_add(logical.1);
+   465 	            let stage2_end = extent.stage2_base.saturating_add(extent.stage2_length);
+-> 466 	            if base >= logical.0
+    	               ^
+   467 	                && base
+   468 	                    .checked_add(requested_len as u64)
+   469 	                    .is_some_and(|end| end <= logical_end)
+Target 0: (probes_shard_2-19749884b4f574cf) stopped.
+(lldb) register read x8 x9 x10 x11 x20 x22 x25 x26
+      x8 = 0x000000014905bc58
+      x9 = 0x0000009a00400000
+     x10 = 0x0000009a00400000
+     x11 = 0x0000009a00200000
+     x20 = 0x0000009a00200000
+     x22 = 0x0000000000000008
+     x25 = 0x0000000000200000
+     x26 = 0x0000009a00200000
+(lldb) memory read --format x --size 8 --count 8 `$x8+0x80`
+0x14905bcd8: 0x0000009c48a98000 0x0000000000000054
+0x14905bce8: 0x0000000000000069 0x0000009a00200000
+0x14905bcf8: 0x0000000000200000 0x0000000107200000
+0x14905bd08: 0x0000000000000010 0x0000000000000000
+(lldb) process kill
+Process 12941 exited with status = 9 (0x00000009) killed

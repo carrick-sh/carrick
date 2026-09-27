@@ -1,0 +1,60 @@
+(lldb) target create "target/release/deps/probes_shard_2-19749884b4f574cf"
+Current executable set to '/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_2-19749884b4f574cf' (arm64).
+(lldb) settings set -- target.run-args  "generic_probe_shard_2" "--exact" "--nocapture"
+(lldb) breakpoint set --func-regex Aarch64EngineCore.*protect_range::h[0-9a-f]+$ --condition "address >= 0x4000000000 && address < 0x4008000000"
+Breakpoint 1: where = probes_shard_2-19749884b4f574cf`_$LT$carrick_aarch64..engine..Aarch64EngineCore$LT$V$GT$$u20$as$u20$carrick_guest_mem..GuestMemory$GT$::protect_range::h791e55c8ebe1a475 + 60 at engine.rs:2256:12, address = 0x000000010022179c
+(lldb) run
+
+running 1 test
+test generic_probe_shard_2 ... RUN generic probe shard 2 aarch64-unknown-linux-musl:accessx
+warning: probes_shard_2-19749884b4f574cf was compiled with optimization - stepping may behave oddly; variables may not be available.
+Process 11308 launched: '/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/probes_shard_2-19749884b4f574cf' (arm64)
+Process 11308 stopped
+* thread #11, name = 'carrick-executor-1', stop reason = breakpoint 1.1
+       frame #0: 0x000000010022179c probes_shard_2-19749884b4f574cf`_$LT$carrick_aarch64..engine..Aarch64EngineCore$LT$V$GT$$u20$as$u20$carrick_guest_mem..GuestMemory$GT$::protect_range::h791e55c8ebe1a475(self=0x00000001710eea10, address=274877906944, len=8192, prot=3) at engine.rs:2256:12 [opt]
+   2253	    /// are mapped executable at boot and never edited here.)
+   2254	    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+   2255	        use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
+-> 2256	        if prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
+    	           ^
+   2257	            self.ensure_sparse_mmap_backing(address, len)?;
+   2258	        }
+   2259	        let armed_cow = if prot & LINUX_PROT_WRITE != 0 {
+Target 0: (probes_shard_2-19749884b4f574cf) stopped.
+(lldb) expression -l c -- unsigned long $retbuf = $x8
+(lldb) breakpoint disable 1
+1 breakpoints disabled.
+(lldb) thread step-out
+Process 11308 stopped
+* thread #11, name = 'carrick-executor-1', stop reason = step out
+       frame #0: 0x0000000100156c2c probes_shard_2-19749884b4f574cf`core::result::Result$LT$T$C$E$GT$::is_ok::h1c6ef9cd9b8ca203(self=0x00000001710e9aa8) at result.rs:594:18 [opt] [inlined]
+   591 	    #[inline]
+   592 	    #[stable(feature = "rust1", since = "1.0.0")]
+   593 	    pub const fn is_ok(&self) -> bool {
+-> 594 	        matches!(*self, Ok(_))
+    	                 ^
+   595 	    }
+   596 	
+   597 	    /// Returns `true` if the result is [`Ok`] and the value inside of it matches a predicate.
+Target 0: (probes_shard_2-19749884b4f574cf) stopped.
+(lldb) frame variable *self
+(core::result::Result<(), carrick_guest_mem::MemoryError>) *self = {
+  $variants$ = {
+    $variant$2 = {
+      $discr$ = 92
+      value = {}
+    }
+    $variant$ = {
+      value = {
+        __0 = {
+          $variants$ = {...}
+        }
+      }
+    }
+  }
+}
+*** Some of the displayed variables have a greater depth of members than the debugger will show by default. To increase the limit, use the --depth option to frame variable, or raise the limit by changing the target.max-children-depth setting.
+(lldb) expression -l c -- (char*)*(unsigned long*)($retbuf+8)
+(char *) $0 = 0x0000000149d5b470 "stage-1 page-table manager unresolved arena 0x9a00200000"
+(lldb) process kill
+Process 11308 exited with status = 9 (0x00000009) killed

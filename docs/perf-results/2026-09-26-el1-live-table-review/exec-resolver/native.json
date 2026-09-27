@@ -1,0 +1,61 @@
+{
+  "image": "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+  "rootfs": {
+    "Type": "layers",
+    "Layers": [
+      "sha256:d9a56420aee7ff835e0c05fc666d1237d40f0da5fe338738e651b01db4672a5d"
+    ]
+  },
+  "rows": [
+    {
+      "libc": "musl",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--name",
+        "el1-exec-resolver-native-musl-20260926",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "-v",
+        "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release/accessx:/probe:ro",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/bin/sh",
+        "-c",
+        "/probe"
+      ],
+      "exit_code": 0,
+      "oracle_match": true,
+      "leftover": "",
+      "probe_sha256": "8eab98739c70ff0de093e1ddfcf5d17b2873ab52a0539b94779fc58c544427ef"
+    },
+    {
+      "libc": "gnu",
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--name",
+        "el1-exec-resolver-native-gnu-20260926",
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "-v",
+        "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/conformance-probes/target/aarch64-unknown-linux-gnu/release/accessx:/probe:ro",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/bin/sh",
+        "-c",
+        "/probe"
+      ],
+      "exit_code": 0,
+      "oracle_match": true,
+      "leftover": "",
+      "probe_sha256": "44235eddbf45be1b96015b45d60caaf6eba9d09ac61e4a265e4f3178cea331a0"
+    }
+  ]
+}

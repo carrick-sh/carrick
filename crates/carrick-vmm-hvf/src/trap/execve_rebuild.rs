@@ -1447,6 +1447,11 @@ impl HvfVmState {
             cow_armed,
             cow_deferred_publications,
         );
+        // Exec replaces the MM owner as well as its tables. Bind the successor
+        // before the engine adopts it, or its retained resolver still authenticates
+        // the predecessor root and rejects the replacement image's live backing.
+        let resolver = MmAccessLiveResolver::new(&self.mm_access, std::sync::Arc::clone(&custody));
+        self.mm_access.set_live_resolver(resolver);
         self.seed_readonly_spans_from_plan(plan);
         // Mature one-process VMM exec gets a fresh VM-local allocator. A
         // persistent HVPatch worker must retain its executor-local allocator

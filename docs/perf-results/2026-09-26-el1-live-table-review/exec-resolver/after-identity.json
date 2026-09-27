@@ -1,0 +1,6 @@
+{
+  "source_base": "33b590cd8762cb89cdba343fa95dff6d87508c81",
+  "source_patch_sha256": "803f19e7401865c830b4763dd34333ffca1923b503c9b436d1a2b39921fba1ea",
+  "binary_sha256": "de6b0edb2b00f93387ced4bfec1daee6a3e54a598c8bc7208d062413bd6c1069",
+  "frozen_binary": "target/el1-completion/live-integrated/brk-after-fix/probes_shard_2-19749884b4f574cf"
+}
