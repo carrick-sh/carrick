@@ -1,0 +1,9 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.93s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-6528256f6740d9d0)
+
+running 1 test
+test trap::stage2_backend::tests::el1_stage1_table_backing_is_stage2_writable_but_not_guest_writable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 0.00s
+

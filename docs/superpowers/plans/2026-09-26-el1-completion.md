@@ -1030,3 +1030,15 @@ bare-metal EL1 release build, targeted warning-denied Clippy and contract
 registry pass. This is still an unsigned candidate. Preserve one committed
 source, build and sign it, and run the 256-page witness next; a green VM-free
 manager test does not replace that acceptance boundary.
+
+The committed missing-hierarchy candidate was then built, signed and run. It
+crossed the `MissingTable` boundary and faulted one dependency later while EL1
+wrote the first new table descriptor through the fixed primary-table alias at
+alias plus `0xc008`. The root slot/extent and alias already cover that page;
+the initial allocator-backed root carried read-only stage-2 permissions from
+the semantic table region. A red-first production-shaped contract now requires
+the physical table backing to admit EL1 writes while keeping the EL0/syscall
+view non-writable. That narrow correction and warning-denied HVF Clippy pass.
+Freeze it as one commit, rebuild and re-sign, then rerun the 256-page witness;
+do not broaden into arena work unless the signed result reaches primary-pool
+exhaustion or names an extension-arena dependency.

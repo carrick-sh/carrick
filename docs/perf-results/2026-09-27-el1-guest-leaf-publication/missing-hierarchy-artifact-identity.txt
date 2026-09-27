@@ -1,0 +1,9 @@
+source_head=3a10e6b2ccbe7d23598482761eb7b99cf94f4c8b
+artifact=target/release/carrick
+sha256=d065f9f7a55c18cbe35031a2fe0d44a2931bc4a6d6df7b635e56fb703c7921bc
+identifier=carrick.tmp.12384
+cdhash=5e5f512e03d298e190efbca21bb848e25917e2bb
+lc_uuid=B3B71668-B59F-354F-8D6F-87CCA6B3C5F4
+signature=adhoc
+hypervisor_entitlement=true
+dof_section=__TEXT,__dof_carrick
