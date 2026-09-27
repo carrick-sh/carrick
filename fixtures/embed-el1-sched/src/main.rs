@@ -56,6 +56,10 @@
 //!   same inherited virtual range: verify zero fill, write distinct role values,
 //!   rendezvous via bounded pipes, and verify role values are preserved.
 //!
+//! - `fault-entry`: triggers a stage-1 permission fault on a PROT_READ mapping,
+//!   catches SIGSEGV with SA_SIGINFO, verifies si_addr, mprotects PROT_READ|PROT_WRITE,
+//!   retries store, and verifies store success and register preservation.
+//!
 //! Every wait in the checks is bounded, so a lost wake or a lost signal is a
 //! failed line, never a hung test.
 
@@ -1411,6 +1415,488 @@ fn first_touch(pages: usize) -> i32 {
     if parent_ok && child_ok { 0 } else { 1 }
 }
 
+static FAULT_COUNT: AtomicU32 = AtomicU32::new(0);
+static FAULT_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FAULT_MMAP_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn on_fault_segv(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _ucontext: *mut libc::c_void,
+) {
+    if sig != libc::SIGSEGV {
+        unsafe { libc::_exit(41) };
+    }
+    let count = FAULT_COUNT.fetch_add(1, Ordering::SeqCst);
+    if count >= 1 {
+        // Repeated fault: mprotect failed or store looped, terminate immediately to avoid hang
+        unsafe { libc::_exit(42) };
+    }
+    if info.is_null() {
+        unsafe { libc::_exit(43) };
+    }
+    let si_addr = unsafe { (*info).si_addr() as usize };
+    FAULT_ADDR.store(si_addr, Ordering::SeqCst);
+
+    let base = FAULT_MMAP_BASE.load(Ordering::SeqCst);
+    if base == 0 {
+        unsafe { libc::_exit(44) };
+    }
+    // Upgrade permissions to PROT_READ | PROT_WRITE so the retried store succeeds
+    let rc = unsafe {
+        libc::mprotect(
+            base as *mut libc::c_void,
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+        )
+    };
+    if rc != 0 {
+        unsafe { libc::_exit(45) };
+    }
+}
+
+#[repr(C, align(16))]
+struct FaultTestContext {
+    target_addr: u64,
+    store_val: u64,
+    captured_val: u64,
+    captured_sp_pre: u64,
+    captured_sp_post: u64,
+    captured_regs: [u64; 31],
+}
+
+#[inline(never)]
+unsafe fn execute_fault_sequence(ctx: &mut FaultTestContext) {
+    unsafe {
+        std::arch::asm!(
+        // Save callee-saved registers x19-x30 and frame context
+        "sub sp, sp, #128",
+        "stp x19, x20, [sp, #0]",
+        "stp x21, x22, [sp, #16]",
+        "stp x23, x24, [sp, #32]",
+        "stp x25, x26, [sp, #48]",
+        "stp x27, x28, [sp, #64]",
+        "stp x29, x30, [sp, #80]",
+        // Save ctx pointer to stack slot [sp, #96]
+        "str x0, [sp, #96]",
+
+        // Record pre-fault SP (offset 24 in ctx)
+        "mov x19, sp",
+        "str x19, [x0, #24]",
+
+        // Load target address (x1) and store value (x2)
+        "ldr x1, [x0, #0]",
+        "ldr x2, [x0, #8]",
+
+        // Set canary values in registers x3..x30
+        "movz x3, 0x0303, lsl #0",
+        "movk x3, 0x0303, lsl #16",
+        "movk x3, 0x0303, lsl #32",
+        "movk x3, 0x0303, lsl #48",
+
+        "movz x4, 0x0404, lsl #0",
+        "movk x4, 0x0404, lsl #16",
+        "movk x4, 0x0404, lsl #32",
+        "movk x4, 0x0404, lsl #48",
+
+        "movz x5, 0x0505, lsl #0",
+        "movk x5, 0x0505, lsl #16",
+        "movk x5, 0x0505, lsl #32",
+        "movk x5, 0x0505, lsl #48",
+
+        "movz x6, 0x0606, lsl #0",
+        "movk x6, 0x0606, lsl #16",
+        "movk x6, 0x0606, lsl #32",
+        "movk x6, 0x0606, lsl #48",
+
+        "movz x7, 0x0707, lsl #0",
+        "movk x7, 0x0707, lsl #16",
+        "movk x7, 0x0707, lsl #32",
+        "movk x7, 0x0707, lsl #48",
+
+        // x8 canary: 172 (libc::SYS_getpid on Linux AArch64) - valid served syscall
+        "mov x8, 172",
+
+        "movz x9, 0x0909, lsl #0",
+        "movk x9, 0x0909, lsl #16",
+        "movk x9, 0x0909, lsl #32",
+        "movk x9, 0x0909, lsl #48",
+
+        "movz x10, 0x0A0A, lsl #0",
+        "movk x10, 0x0A0A, lsl #16",
+        "movk x10, 0x0A0A, lsl #32",
+        "movk x10, 0x0A0A, lsl #48",
+
+        "movz x11, 0x0B0B, lsl #0",
+        "movk x11, 0x0B0B, lsl #16",
+        "movk x11, 0x0B0B, lsl #32",
+        "movk x11, 0x0B0B, lsl #48",
+
+        "movz x12, 0x0C0C, lsl #0",
+        "movk x12, 0x0C0C, lsl #16",
+        "movk x12, 0x0C0C, lsl #32",
+        "movk x12, 0x0C0C, lsl #48",
+
+        "movz x13, 0x0D0D, lsl #0",
+        "movk x13, 0x0D0D, lsl #16",
+        "movk x13, 0x0D0D, lsl #32",
+        "movk x13, 0x0D0D, lsl #48",
+
+        "movz x14, 0x0E0E, lsl #0",
+        "movk x14, 0x0E0E, lsl #16",
+        "movk x14, 0x0E0E, lsl #32",
+        "movk x14, 0x0E0E, lsl #48",
+
+        "movz x15, 0x0F0F, lsl #0",
+        "movk x15, 0x0F0F, lsl #16",
+        "movk x15, 0x0F0F, lsl #32",
+        "movk x15, 0x0F0F, lsl #48",
+
+        "movz x16, 0x1616, lsl #0",
+        "movk x16, 0x1616, lsl #16",
+        "movk x16, 0x1616, lsl #32",
+        "movk x16, 0x1616, lsl #48",
+
+        "movz x17, 0x1717, lsl #0",
+        "movk x17, 0x1717, lsl #16",
+        "movk x17, 0x1717, lsl #32",
+        "movk x17, 0x1717, lsl #48",
+
+        "movz x18, 0x1818, lsl #0",
+        "movk x18, 0x1818, lsl #16",
+        "movk x18, 0x1818, lsl #32",
+        "movk x18, 0x1818, lsl #48",
+
+        "movz x19, 0x1919, lsl #0",
+        "movk x19, 0x1919, lsl #16",
+        "movk x19, 0x1919, lsl #32",
+        "movk x19, 0x1919, lsl #48",
+
+        "movz x20, 0x2020, lsl #0",
+        "movk x20, 0x2020, lsl #16",
+        "movk x20, 0x2020, lsl #32",
+        "movk x20, 0x2020, lsl #48",
+
+        "movz x21, 0x2121, lsl #0",
+        "movk x21, 0x2121, lsl #16",
+        "movk x21, 0x2121, lsl #32",
+        "movk x21, 0x2121, lsl #48",
+
+        "movz x22, 0x2222, lsl #0",
+        "movk x22, 0x2222, lsl #16",
+        "movk x22, 0x2222, lsl #32",
+        "movk x22, 0x2222, lsl #48",
+
+        "movz x23, 0x2323, lsl #0",
+        "movk x23, 0x2323, lsl #16",
+        "movk x23, 0x2323, lsl #32",
+        "movk x23, 0x2323, lsl #48",
+
+        "movz x24, 0x2424, lsl #0",
+        "movk x24, 0x2424, lsl #16",
+        "movk x24, 0x2424, lsl #32",
+        "movk x24, 0x2424, lsl #48",
+
+        "movz x25, 0x2525, lsl #0",
+        "movk x25, 0x2525, lsl #16",
+        "movk x25, 0x2525, lsl #32",
+        "movk x25, 0x2525, lsl #48",
+
+        "movz x26, 0x2626, lsl #0",
+        "movk x26, 0x2626, lsl #16",
+        "movk x26, 0x2626, lsl #32",
+        "movk x26, 0x2626, lsl #48",
+
+        "movz x27, 0x2727, lsl #0",
+        "movk x27, 0x2727, lsl #16",
+        "movk x27, 0x2727, lsl #32",
+        "movk x27, 0x2727, lsl #48",
+
+        "movz x28, 0x2828, lsl #0",
+        "movk x28, 0x2828, lsl #16",
+        "movk x28, 0x2828, lsl #32",
+        "movk x28, 0x2828, lsl #48",
+
+        "movz x29, 0x2929, lsl #0",
+        "movk x29, 0x2929, lsl #16",
+        "movk x29, 0x2929, lsl #32",
+        "movk x29, 0x2929, lsl #48",
+
+        "movz x30, 0x3030, lsl #0",
+        "movk x30, 0x3030, lsl #16",
+        "movk x30, 0x3030, lsl #32",
+        "movk x30, 0x3030, lsl #48",
+
+        // Set x0 canary right before faulting store
+        "movz x0, 0x0000, lsl #0",
+        "movk x0, 0x1234, lsl #16",
+        "movk x0, 0x5678, lsl #32",
+        "movk x0, 0x9ABC, lsl #48",
+
+        // The faulting store: stage-1 permission fault taken at EL0 to EL1
+        "str x2, [x1]",
+
+        // Capture post-retry state:
+        // Save post-fault x0 and x1 to stack scratch slots [sp, #104] and [sp, #112]
+        "stp x0, x1, [sp, #104]",
+        // Reload ctx pointer from [sp, #96] into x0
+        "ldr x0, [sp, #96]",
+        // Record post-fault SP using x1 as scratch
+        "mov x1, sp",
+        "str x1, [x0, #32]",
+
+        // Store captured registers x2..x30 into ctx.captured_regs (offset 40 + r*8)
+        "str x2, [x0, #56]",
+        "str x3, [x0, #64]",
+        "str x4, [x0, #72]",
+        "str x5, [x0, #80]",
+        "str x6, [x0, #88]",
+        "str x7, [x0, #96]",
+        "str x8, [x0, #104]",
+        "str x9, [x0, #112]",
+        "str x10, [x0, #120]",
+        "str x11, [x0, #128]",
+        "str x12, [x0, #136]",
+        "str x13, [x0, #144]",
+        "str x14, [x0, #152]",
+        "str x15, [x0, #160]",
+        "str x16, [x0, #168]",
+        "str x17, [x0, #176]",
+        "str x18, [x0, #184]",
+        "str x19, [x0, #192]",
+        "str x20, [x0, #200]",
+        "str x21, [x0, #208]",
+        "str x22, [x0, #216]",
+        "str x23, [x0, #224]",
+        "str x24, [x0, #232]",
+        "str x25, [x0, #240]",
+        "str x26, [x0, #248]",
+        "str x27, [x0, #256]",
+        "str x28, [x0, #264]",
+        "str x29, [x0, #272]",
+        "str x30, [x0, #280]",
+
+        // Retrieve post-fault x0 and x1 from stack scratch slots into x1 and x2
+        "ldp x1, x2, [sp, #104]",
+        // Store post-fault x0 and x1 into ctx.captured_regs[0] and ctx.captured_regs[1]
+        "str x1, [x0, #40]",
+        "str x2, [x0, #48]",
+
+        // Read back written value from target_addr
+        "ldr x1, [x0, #0]",
+        "ldr x2, [x1]",
+        "str x2, [x0, #16]",
+
+        // Restore callee-saved registers x19-x30
+        "ldp x19, x20, [sp, #0]",
+        "ldp x21, x22, [sp, #16]",
+        "ldp x23, x24, [sp, #32]",
+        "ldp x25, x26, [sp, #48]",
+        "ldp x27, x28, [sp, #64]",
+        "ldp x29, x30, [sp, #80]",
+        "add sp, sp, #128",
+        inout("x0") ctx as *mut FaultTestContext => _,
+        out("x1") _,
+        out("x2") _,
+        out("x3") _,
+        out("x4") _,
+        out("x5") _,
+        out("x6") _,
+        out("x7") _,
+        out("x8") _,
+        out("x9") _,
+        out("x10") _,
+        out("x11") _,
+        out("x12") _,
+        out("x13") _,
+        out("x14") _,
+        out("x15") _,
+        out("x16") _,
+        out("x17") _,
+        out("x18") _,
+    );
+    }
+}
+
+fn fault_entry_mode() -> i32 {
+    let page_size = 4096;
+    // Step 1: Establish backing first by mapping read/write and initializing memory
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        println!("fault-entry mmap failed");
+        return 1;
+    }
+    let base = ptr as usize;
+    FAULT_MMAP_BASE.store(base, Ordering::SeqCst);
+
+    let target_addr = (base + 0x40) as u64;
+    let initial_val: u64 = 0x5555_AAAA_3333_CCCC;
+    unsafe {
+        std::ptr::write_volatile(target_addr as *mut u64, initial_val);
+    }
+
+    // Step 2: Demote page to read-only to create a genuine stage-1 permission fault condition
+    let prot_rc = unsafe { libc::mprotect(ptr, page_size, libc::PROT_READ) };
+    if prot_rc != 0 {
+        println!("fault-entry initial mprotect failed");
+        unsafe { libc::munmap(ptr, page_size) };
+        return 1;
+    }
+
+    // Step 3: Install SA_SIGINFO handler for SIGSEGV
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = on_fault_segv as *const () as usize;
+    sa.sa_flags = libc::SA_SIGINFO;
+    let rc = unsafe { libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut()) };
+    if rc != 0 {
+        println!("fault-entry sigaction failed");
+        unsafe { libc::munmap(ptr, page_size) };
+        return 1;
+    }
+
+    let store_val: u64 = 0xDEAD_BEEF_CAFE_BABE;
+    let mut ctx = FaultTestContext {
+        target_addr,
+        store_val,
+        captured_val: 0,
+        captured_sp_pre: 0,
+        captured_sp_post: 0,
+        captured_regs: [0; 31],
+    };
+
+    // Step 4: Execute faulting sequence with all register canaries and SP capture
+    unsafe {
+        execute_fault_sequence(&mut ctx);
+    }
+
+    let fault_count = FAULT_COUNT.load(Ordering::SeqCst);
+    let fault_addr = FAULT_ADDR.load(Ordering::SeqCst);
+
+    unsafe { libc::munmap(ptr, page_size) };
+
+    if fault_count != 1 {
+        println!("fault-entry unexpected fault_count={fault_count}");
+        return 1;
+    }
+    if fault_addr as u64 != target_addr {
+        println!("fault-entry unexpected fault_addr={fault_addr:#x} expected={target_addr:#x}");
+        return 1;
+    }
+    if ctx.captured_val != store_val {
+        println!(
+            "fault-entry store failed captured_val={:#x} expected={:#x}",
+            ctx.captured_val, store_val
+        );
+        return 1;
+    }
+    if ctx.captured_sp_pre == 0 || ctx.captured_sp_post == 0 {
+        println!("fault-entry SP not captured");
+        return 1;
+    }
+    if (ctx.captured_sp_pre & 0xF) != 0 {
+        println!("fault-entry SP unaligned pre={:#x}", ctx.captured_sp_pre);
+        return 1;
+    }
+    if ctx.captured_sp_pre != ctx.captured_sp_post {
+        println!(
+            "fault-entry SP mismatch pre={:#x} post={:#x}",
+            ctx.captured_sp_pre, ctx.captured_sp_post
+        );
+        return 1;
+    }
+
+    // Expected canary values for all 31 registers:
+    let make_canary = |b: u16| -> u64 {
+        let b = b as u64;
+        b | (b << 16) | (b << 32) | (b << 48)
+    };
+    let expected_x0 = 0x9ABC_5678_1234_0000_u64;
+    let expected_x8 = 172_u64; // libc::SYS_getpid
+    if ctx.captured_regs[0] != expected_x0 {
+        println!(
+            "fault-entry canary mismatch x0={:#x} expected={:#x}",
+            ctx.captured_regs[0], expected_x0
+        );
+        return 1;
+    }
+    if ctx.captured_regs[1] != target_addr {
+        println!(
+            "fault-entry canary mismatch x1={:#x} expected={:#x}",
+            ctx.captured_regs[1], target_addr
+        );
+        return 1;
+    }
+    if ctx.captured_regs[2] != store_val {
+        println!(
+            "fault-entry canary mismatch x2={:#x} expected={:#x}",
+            ctx.captured_regs[2], store_val
+        );
+        return 1;
+    }
+    if ctx.captured_regs[8] != expected_x8 {
+        println!(
+            "fault-entry canary mismatch x8={:#x} expected={:#x}",
+            ctx.captured_regs[8], expected_x8
+        );
+        return 1;
+    }
+    for r in 3..=30 {
+        if r == 8 {
+            continue;
+        }
+        let byte_val = match r {
+            3 => 0x0303,
+            4 => 0x0404,
+            5 => 0x0505,
+            6 => 0x0606,
+            7 => 0x0707,
+            9 => 0x0909,
+            10 => 0x0A0A,
+            11 => 0x0B0B,
+            12 => 0x0C0C,
+            13 => 0x0D0D,
+            14 => 0x0E0E,
+            15 => 0x0F0F,
+            16 => 0x1616,
+            17 => 0x1717,
+            18 => 0x1818,
+            19 => 0x1919,
+            20 => 0x2020,
+            21 => 0x2121,
+            22 => 0x2222,
+            23 => 0x2323,
+            24 => 0x2424,
+            25 => 0x2525,
+            26 => 0x2626,
+            27 => 0x2727,
+            28 => 0x2828,
+            29 => 0x2929,
+            30 => 0x3030,
+            _ => 0,
+        };
+        let expected = make_canary(byte_val);
+        if ctx.captured_regs[r] != expected {
+            println!(
+                "fault-entry canary mismatch x{r}={:#x} expected={:#x}",
+                ctx.captured_regs[r], expected
+            );
+            return 1;
+        }
+    }
+
+    println!("fault-entry ok");
+    0
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("pingpong");
@@ -1442,6 +1928,7 @@ fn main() {
                 }
             },
         },
+        "fault-entry" => fault_entry_mode(),
         "exec-child" => {
             println!("exec-child ok");
             0
