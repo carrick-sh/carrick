@@ -1,0 +1,27 @@
+{
+  "identities": [
+    {
+      "source_head": "8fc9c913aefe848c5da0218f622ad0e6d670de62",
+      "binary": "/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-concurrent/frozen/carrick",
+      "sha256": "7d79cb2c16dac56109168ad8fe7e9435cf3944ce5ba87668fd5f0eb27bfc3ea6",
+      "codesign": "Executable=/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-concurrent/frozen/carrick\nIdentifier=carrick.tmp.39070\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=70218 flags=0x2(adhoc) hashes=2184+7 location=embedded\nHash type=sha256 size=32\nCandidateCDHash sha256=62f54e2bb80ad168efa61b6d46304d4b56bfebf6\nCandidateCDHashFull sha256=62f54e2bb80ad168efa61b6d46304d4b56bfebf67d929cf6ea47456e02260bdd\nHash choices=sha256\nCMSDigest=62f54e2bb80ad168efa61b6d46304d4b56bfebf67d929cf6ea47456e02260bdd\nCMSDigestType=2\nCDHash=62f54e2bb80ad168efa61b6d46304d4b56bfebf6\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements count=0 size=12\nTotal signatures=1\nChosen signature=1\n",
+      "uuid": "UUID: 7DBEFE89-9105-3DFD-95A9-4526922517EB (arm64) /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-concurrent/frozen/carrick\n",
+      "entitlements": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"https://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\nExecutable=/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-concurrent/frozen/carrick\nwarning: Specifying ':' in the path is deprecated and will not work in a future release\n",
+      "dof_present": true
+    },
+    {
+      "source_head": "8fc9c913aefe848c5da0218f622ad0e6d670de62",
+      "binary": "/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-concurrent/frozen/el1_sched-ba795739d7a1a0f3",
+      "sha256": "2f7848b97eedd520818a6fb825f47266b3a91d80cd7faff8fabf8bb412303c20",
+      "codesign": "Executable=/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-concurrent/frozen/el1_sched-ba795739d7a1a0f3\nIdentifier=el1_sched-ba795739d7a1a0f3.tmp.39273\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=56893 flags=0x2(adhoc) hashes=1767+7 location=embedded\nHash type=sha256 size=32\nCandidateCDHash sha256=a2214e7f8390efd5fbbeb07fd7aad072b7bfb116\nCandidateCDHashFull sha256=a2214e7f8390efd5fbbeb07fd7aad072b7bfb11688b4212b37f98ad77a6e59b6\nHash choices=sha256\nCMSDigest=a2214e7f8390efd5fbbeb07fd7aad072b7bfb11688b4212b37f98ad77a6e59b6\nCMSDigestType=2\nCDHash=a2214e7f8390efd5fbbeb07fd7aad072b7bfb116\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements count=0 size=12\nTotal signatures=1\nChosen signature=1\n",
+      "uuid": "UUID: 9F410ED7-4F5D-3E06-B427-0266C6AFC0C1 (arm64) /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-concurrent/frozen/el1_sched-ba795739d7a1a0f3\n",
+      "entitlements": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"https://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\nExecutable=/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-concurrent/frozen/el1_sched-ba795739d7a1a0f3\nwarning: Specifying ':' in the path is deprecated and will not work in a future release\n",
+      "dof_present": true
+    }
+  ],
+  "fixture_sha256": "cadb92c882d0257ac6004410af69d972b34e95d0d81dc9390f9331a2788cfd9f",
+  "exit_code": 0,
+  "positive_tests_passed": 2,
+  "negative_control": "passed",
+  "scoped_remaining_processes": 0
+}
