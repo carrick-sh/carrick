@@ -97,7 +97,9 @@ impl MmapRequest {
             fd,
             offset,
         } = self;
-        eprintln!("EL1DBG MMAP-REFUSED addr=0x{addr:x} len=0x{length:x} prot={prot} flags=0x{flags:x} refusal={refusal:?} cause={cause}");
+        eprintln!(
+            "EL1DBG MMAP-REFUSED addr=0x{addr:x} len=0x{length:x} prot={prot} flags=0x{flags:x} refusal={refusal:?} cause={cause}"
+        );
         match refusal {
             MmapRefusal::Spec(reason) => {
                 tracing::debug!(
