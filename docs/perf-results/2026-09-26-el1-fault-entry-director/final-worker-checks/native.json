@@ -1,0 +1,25 @@
+{
+  "source_head": "a6fe8d4af4f4fb097a2801953b89c182678c1ea2",
+  "fixture_sha256": "e33f7cae1859cf978a1f1cb0e765deb1a903fbe1f40244a6fa36d321b416eb67",
+  "image": "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+  "command": [
+    "docker",
+    "run",
+    "--rm",
+    "--pull=never",
+    "--platform",
+    "linux/arm64",
+    "--network=none",
+    "--name",
+    "el1-fault-entry-native-20260926-final",
+    "--mount",
+    "type=bind,src=/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/fault-entry-final/el1-sched-aarch64,dst=/probe,readonly",
+    "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+    "/probe",
+    "fault-entry"
+  ],
+  "exit_code": 0,
+  "remaining_container_ids": "",
+  "stdout": "fault-entry ok\n",
+  "stderr": ""
+}

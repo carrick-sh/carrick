@@ -574,3 +574,12 @@ semantic red evidence are now present; the latter does not prove vector tests
 ran red because Cargo stopped at the earlier failed crate. Native evidence
 and review are preserved in the director review directory. No guest runtime
 regression is inferred from this fixture failure.
+
+2026-09-26: final fault-entry worker revision `a6fe8d4af` passes director
+fixture cross-compilation, host/image/contract/format/embed compilation checks
+and the pinned native arm64 fixture run. Three review rounds are complete;
+no further worker rounds are authorized. Imported only the ABI instrumentation
+and final fixture/test to prepare signed red against the existing dispatcher
+and vectors. The actual fault-entry implementation remains unintegrated until
+this witness proves the missing entry. Full signed and performance gates stay
+open. Final worker verification is retained under the director evidence tree.

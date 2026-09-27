@@ -1,0 +1,61 @@
+[
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-el1-abi",
+      "-p",
+      "carrick-el1",
+      "-p",
+      "carrick-mem",
+      "--lib"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/el1-fault-final-checks/0.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "carrick-el1-image"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/el1-fault-final-checks/1.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-conformance-contract"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/el1-fault-final-checks/2.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/el1-fault-final-checks/3.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "carrick-embed",
+      "--test",
+      "el1_sched",
+      "--no-run"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/el1-fault-final-checks/4.log"
+  }
+]
