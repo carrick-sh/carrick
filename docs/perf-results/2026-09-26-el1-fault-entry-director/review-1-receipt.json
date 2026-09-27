@@ -1,0 +1,23 @@
+{
+  "worker": "fault-entry",
+  "worker_revision": "99610317a",
+  "review_round": 1,
+  "accepted": false,
+  "director_checks": [
+    {
+      "command": "RUSTC_WRAPPER= cargo test -p carrick-el1-abi -p carrick-el1 -p carrick-mem --lib",
+      "exit_code": 0,
+      "passed": 239
+    },
+    {
+      "command": "RUSTC_WRAPPER= scripts/build-embed-el1-sched.sh",
+      "exit_code": 101,
+      "errors": [
+        "asm with clobber_abi must specify explicit registers for outputs",
+        "E0615: attempted to take value of method si_addr on type siginfo_t"
+      ]
+    }
+  ],
+  "signed_execution": "not attempted; fixture compile blocked",
+  "next": "same-worker turn 2 addresses review round 1"
+}
