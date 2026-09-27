@@ -419,6 +419,13 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     return Ok(true);
                 };
                 let prot = plan.prot();
+                crate::probes::hvpatch_el1_frame_grant_plan(
+                    request.fault_va,
+                    plan.start(),
+                    plan.len(),
+                    prot,
+                    request.request_generation,
+                );
                 if apply_first_touch(prot, access, || true, || {}) != Some(true) {
                     publish_frame_grant_refusal(
                         mailbox,

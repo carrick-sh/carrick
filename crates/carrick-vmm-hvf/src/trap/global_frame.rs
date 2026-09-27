@@ -136,11 +136,136 @@ impl GlobalFrameIpaAllocator {
     }
 }
 
+#[derive(Debug, Default)]
+struct El1FrameGrantLedger {
+    active: std::collections::BTreeSet<(u64, u64)>,
+    returned: std::collections::BTreeSet<(u64, u64)>,
+    stats: El1FrameGrantStats,
+}
+
+impl El1FrameGrantLedger {
+    fn mark_grant(&mut self, base: u64, length: u64) -> Result<(), TrapError> {
+        if length == 0
+            || !base.is_multiple_of(CowArmedRanges::COMPOUND_SIZE)
+            || !length.is_multiple_of(CowArmedRanges::COMPOUND_SIZE)
+            || base.checked_add(length).is_none()
+        {
+            return Err(TrapError::Hypervisor(format!(
+                "EL1 frame grant has an invalid physical extent: base=0x{base:x} length=0x{length:x}"
+            )));
+        }
+        let key = (base, length);
+        if !self.active.insert(key) {
+            return Err(TrapError::Hypervisor(format!(
+                "EL1 frame grant extent was tagged twice: base=0x{base:x} length=0x{length:x}"
+            )));
+        }
+        self.stats.grants_succeeded = self.stats.grants_succeeded.saturating_add(1);
+        self.stats.bytes_granted = self.stats.bytes_granted.saturating_add(length);
+        if self.returned.contains(&key) {
+            self.stats.reused_grants = self.stats.reused_grants.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn mark_return(&mut self, base: u64, length: u64) {
+        let key = (base, length);
+        if self.active.remove(&key) {
+            self.returned.insert(key);
+            self.stats.returns_completed = self.stats.returns_completed.saturating_add(1);
+            self.stats.bytes_returned = self.stats.bytes_returned.saturating_add(length);
+        }
+    }
+}
+
+#[cfg(test)]
+mod allocator_stats_tests {
+    use super::*;
+
+    #[test]
+    fn el1_grant_stats_count_owned_and_pooled_return_and_reuse() {
+        let mut allocator = GlobalFrameIpaAllocator::new();
+        let mut ledger = El1FrameGrantLedger::default();
+        let length = CowArmedRanges::COMPOUND_SIZE;
+        let first = allocator.allocate(length, length).expect("first extent");
+        ledger.mark_grant(first, length).expect("tag first grant");
+        assert_eq!(
+            ledger.stats,
+            El1FrameGrantStats {
+                grants_succeeded: 1,
+                returns_completed: 0,
+                reused_grants: 0,
+                bytes_granted: length,
+                bytes_returned: 0,
+            }
+        );
+        allocator
+            .release(first, length)
+            .expect("return first grant");
+        ledger.mark_return(first, length);
+
+        let second = allocator.allocate(length, length).expect("reuse extent");
+        assert_eq!(second, first, "best-fit allocator must reuse returned IPA");
+        ledger.mark_grant(second, length).expect("tag reused grant");
+        allocator
+            .release(second, length)
+            .expect("return reused grant");
+        ledger.mark_return(second, length);
+
+        let pooled = first + (16 * length);
+        ledger
+            .mark_grant(pooled, length)
+            .expect("tag pooled grant outside allocator exact extents");
+        ledger.mark_return(pooled, length);
+        ledger
+            .mark_grant(pooled, length)
+            .expect("reuse pooled grant");
+        ledger.mark_return(pooled, length);
+        assert_eq!(
+            ledger.stats,
+            El1FrameGrantStats {
+                grants_succeeded: 4,
+                returns_completed: 4,
+                reused_grants: 2,
+                bytes_granted: length * 4,
+                bytes_returned: length * 4,
+            }
+        );
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn global_frame_ipa_allocator() -> &'static parking_lot::Mutex<GlobalFrameIpaAllocator> {
     static ALLOCATOR: std::sync::OnceLock<parking_lot::Mutex<GlobalFrameIpaAllocator>> =
         std::sync::OnceLock::new();
     ALLOCATOR.get_or_init(|| parking_lot::Mutex::new(GlobalFrameIpaAllocator::new()))
+}
+
+fn el1_frame_grant_ledger() -> &'static parking_lot::Mutex<El1FrameGrantLedger> {
+    static LEDGER: std::sync::OnceLock<parking_lot::Mutex<El1FrameGrantLedger>> =
+        std::sync::OnceLock::new();
+    LEDGER.get_or_init(|| parking_lot::Mutex::new(El1FrameGrantLedger::default()))
+}
+
+pub(super) fn snapshot_el1_frame_grant_stats() -> El1FrameGrantStats {
+    el1_frame_grant_ledger().lock().stats
+}
+
+pub(crate) fn mark_el1_frame_grant_in(
+    custody: &CarrierVmCustody,
+    base: u64,
+    length: u64,
+) -> Result<(), TrapError> {
+    if global_frame_host_owner_identity_in(custody, base, length).is_none() {
+        return Err(TrapError::Hypervisor(format!(
+            "EL1 frame grant has no exact live host owner: base=0x{base:x} length=0x{length:x}"
+        )));
+    }
+    el1_frame_grant_ledger().lock().mark_grant(base, length)
+}
+
+fn mark_el1_frame_grant_return(base: u64, length: u64) {
+    el1_frame_grant_ledger().lock().mark_return(base, length);
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2575,10 +2700,13 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
             ipa,
             length,
             generation,
-        } => custody
-            .pending_global_frame_directory_retries
-            .lock()
-            .complete(((ipa, length), generation)),
+        } => {
+            custody
+                .pending_global_frame_directory_retries
+                .lock()
+                .complete(((ipa, length), generation));
+            mark_el1_frame_grant_return(ipa, length);
+        }
         _ => {}
     }
     record_cow_diagnostic_event(CowDiagnosticEvent::Retirement {

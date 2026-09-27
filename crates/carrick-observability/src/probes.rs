@@ -2489,6 +2489,12 @@ mod hvpatch_guest_probe_abi {
             "stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));",
             "fn hvpatch__first__touch__deliver(_: u64, _: u32, _: i32) {}",
             "stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));",
+            "fn hvpatch__el1__frame__grant__plan(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
+            "stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));",
+            "fn pt__fault__next__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
+            "pub fn pt_fault_next_with(va: u64, walk: impl Fn() -> Option<[u64; 4]>) {",
+            "fn hvpatch__sparse__boundary__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
+            "pub fn hvpatch_sparse_boundary_with(va: u64, walk: impl Fn() -> Option<[u64; 4]>) {",
             "fn stage1__arena__bind(_: u64, _: u32, _: u32, _: u32) {}",
             "stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));",
             "fn stage1__arena__install(_: u32, _: u32, _: u32, _: u64) {}",
@@ -5136,6 +5142,10 @@ mod real {
         /// (`HvpatchFirstTouchDeliverReason`), Linux TID. Fires once per
         /// delivered fault, never on a resolved one.
         fn hvpatch__first__touch__deliver(_: u64, _: u32, _: i32) {}
+        /// Host plan selected for one accepted EL1 anonymous frame-grant
+        /// request. Args: fault VA, semantic base, semantic length, Linux
+        /// protection bits, request generation.
+        fn hvpatch__el1__frame__grant__plan(_: u64, _: u64, _: u64, _: u64, _: u64) {}
         /// Stage-1 page-table authority (re)bound into a VMM task state. Args:
         /// authority pointer (identifies the shared `Arc`), manager present,
         /// manager has a table arena source, arena count. Fires only at bind
@@ -5780,6 +5790,16 @@ mod real {
         /// Exact TTBR0_EL1 observed alongside `pt-fault-walk`; includes the ASID
         /// in bits 63:48 and root IPA in bits 47:0.
         fn pt__fault__ttbr(_: u64, _: u64) {}
+        /// Live walk for the Linux page immediately after a faulting page.
+        /// Args: adjacent VA and its L0..L3 descriptors. This is a lazy
+        /// diagnostic for detecting a valid/stale neighbour that suppresses
+        /// the next expected fault at a publication-window boundary.
+        fn pt__fault__next__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Live descriptor walk at the first page beyond a host sparse-mmap
+        /// publication, emitted after the edited descriptors reach host memory.
+        /// Comparing this receipt with a later `pt-fault-next-walk` distinguishes
+        /// publication corruption from a subsequent EL1 edit.
+        fn hvpatch__sparse__boundary__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}
         /// Guest-memory copy mapping decision. `dir`: 0=guest->host read,
         /// 1=host->guest internal write, 2=host->guest syscall checked write.
         /// `addr`/`len` are the guest VA range. `stage1_ipa` is the live stage-1
@@ -6396,6 +6416,23 @@ mod real {
         tid: i32,
     ) {
         carrick_usdt::hvpatch__first__touch__deliver!(|| (far, reason.raw(), tid));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_el1_frame_grant_plan(
+        fault_va: u64,
+        semantic_base: u64,
+        semantic_len: u64,
+        permissions: u64,
+        request_generation: u64,
+    ) {
+        carrick_usdt::hvpatch__el1__frame__grant__plan!(|| (
+            fault_va,
+            semantic_base,
+            semantic_len,
+            permissions,
+            request_generation
+        ));
     }
 
     /// A task offered the MM-scoped frame-COW runtime binding. See the
@@ -7784,6 +7821,37 @@ mod real {
         });
     }
 
+    /// Emit the adjacent page's live descriptor walk only when a consumer
+    /// enables `pt-fault-next-walk`. The caller supplies a separately resolved
+    /// walk so the ordinary no-consumer fault path still performs no read.
+    pub fn pt_fault_next_with(va: u64, walk: impl Fn() -> Option<[u64; 4]>) {
+        carrick_usdt::pt__fault__next__walk!(|| {
+            let descriptors = walk().unwrap_or([0_u64; 4]);
+            (
+                va,
+                descriptors[0],
+                descriptors[1],
+                descriptors[2],
+                descriptors[3],
+            )
+        });
+    }
+
+    /// Emit the live walk immediately beyond a host sparse publication only
+    /// when a consumer enables `hvpatch-sparse-boundary-walk`.
+    pub fn hvpatch_sparse_boundary_with(va: u64, walk: impl Fn() -> Option<[u64; 4]>) {
+        carrick_usdt::hvpatch__sparse__boundary__walk!(|| {
+            let descriptors = walk().unwrap_or([0_u64; 4]);
+            (
+                va,
+                descriptors[0],
+                descriptors[1],
+                descriptors[2],
+                descriptors[3],
+            )
+        });
+    }
+
     pub mod guest_mem_dir {
         pub const READ_GUEST: u32 = 0;
         pub const WRITE_GUEST: u32 = 1;
@@ -8614,6 +8682,7 @@ mod stub {
     stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));
     stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));
     stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));
+    stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));
     stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));
     stub!(stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64));
     stub!(stage1_arena_replace(site: u32, source_before: u32, source_after: u32, authority: u64));
@@ -8734,6 +8803,12 @@ mod stub {
     stub!(pt_pool(in_use: u32, free_list: u32, capacity: u32, changed: i32));
     stub!(pt_fault_walk(far: u64, l0: u64, l1: u64, l2: u64, l3: u64));
     stub!(pt_fault_ttbr(far: u64, ttbr: u64));
+    pub fn pt_fault_next_with(va: u64, walk: impl Fn() -> Option<[u64; 4]>) {
+        let _ = (va, walk);
+    }
+    pub fn hvpatch_sparse_boundary_with(va: u64, walk: impl Fn() -> Option<[u64; 4]>) {
+        let _ = (va, walk);
+    }
     #[allow(dead_code, unused_variables)]
     #[inline(always)]
     pub fn pt_fault_with(far: u64, walk: impl Fn() -> Option<(u64, [u64; 4])>) {

@@ -1456,14 +1456,27 @@ impl<'a> MemView<'a> {
                 && this.linux_page_size() == 4096
                 && map_flags.contains(LinuxMmapFlags::PRIVATE)
                 && !map_flags.intersects(LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED)
-                && !fixed_anonymous;
+                // A fixed replacement inside the sparse arena is eligible once
+                // its exact predecessor has been retired below. Fixed holes
+                // outside that arena retain the alias path.
+                && (!fixed_anonymous || in_arena);
 
             if map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && (!address_uses_alias || defer_anonymous)
             {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 if fixed_anonymous {
-                    let _ = memory.unmap_range(address, length_usize);
+                    if let Err(error) = memory.unmap_range(address, length_usize)
+                        && defer_anonymous
+                    {
+                        return Ok(request.refused_by(
+                            MmapRefusal::Internal(
+                                "fixed anonymous predecessor retirement failed",
+                            ),
+                            LINUX_ENOMEM,
+                            format_args!("at {address:#x}+{length:#x}: {error}"),
+                        ));
+                    }
                     this.remove_mapping_metadata(address, length);
                 }
                 memory.set_mapping_protection_and_sharing(
@@ -1474,9 +1487,9 @@ impl<'a> MemView<'a> {
                     map_sharing.guest_mapping_sharing(),
                 );
                 // A backend opting in must service kernel copyin as well as
-                // guest faults from unmaterialized anonymous ranges. Keep
-                // fixed replacement eager until its unmap transaction proves
-                // that the previous backing has actually been retired.
+                // guest faults from unmaterialized anonymous ranges. A fixed
+                // sparse-arena replacement reaches this point only after its
+                // predecessor retirement succeeded above.
                 let initial_prot = if defer_anonymous { 0 } else { prot };
                 // Unconditional (see the PROT_NONE arm above): reserve across
                 // the whole arena for demand-paged backends; fatal only in-arena.

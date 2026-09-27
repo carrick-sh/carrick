@@ -226,8 +226,9 @@ pub use prepare::{
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use carrick_vmm_hvf::{
-    MetadataGrantStats, arm_deny_next_metadata_grant, metadata_grant_stats, read_el1_counters,
-    read_el1_region_host_ptr, reset_el1_counters, reset_metadata_grant_state,
+    El1FrameGrantStats, MetadataGrantStats, arm_deny_next_metadata_grant, el1_frame_grant_stats,
+    metadata_grant_stats, read_el1_counters, read_el1_region_host_ptr, reset_el1_counters,
+    reset_metadata_grant_state,
 };
 
 /// Carrier-wide count of vCPU exits to the host (every `hv_vcpu_run` return).
@@ -252,6 +253,21 @@ pub fn arm_deny_next_metadata_grant() {}
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn reset_metadata_grant_state() {}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct El1FrameGrantStats {
+    pub grants_succeeded: u64,
+    pub returns_completed: u64,
+    pub reused_grants: u64,
+    pub bytes_granted: u64,
+    pub bytes_returned: u64,
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn el1_frame_grant_stats() -> El1FrameGrantStats {
+    El1FrameGrantStats::default()
+}
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn vcpu_run_exits_total() -> u64 {

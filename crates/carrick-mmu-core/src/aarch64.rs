@@ -1623,29 +1623,28 @@ impl PageTableManager {
         false
     }
 
-    /// Zero a freed spare sub-table and return it to the reusable free list.
-    /// Only reached from `try_coalesce`, which is gated on an offline private
-    /// image, so no hardware walk cache can still reference the page.
-    fn free_table(&mut self, pa: u64) -> Result<(), PageTableError> {
+    /// Zero one unlinked spare table in the manager image. Live EL1 and host
+    /// editors share the same backing, so callers also use this immediately
+    /// before free-list reuse: zero-at-retirement alone is not a lasting fact.
+    fn zero_unlinked_table(&mut self, pa: u64, publish_owned: bool) -> Result<(), PageTableError> {
         let loc = self.pa_to_loc(pa)?;
+        let live = self.is_live();
         if let Some(journal) = self.undo.as_mut() {
             journal
                 .words
                 .try_reserve(512)
                 .map_err(|_| PageTableError::MetadataAllocation)?;
         }
-        if self.is_live() {
+        if live {
             self.staged
                 .try_reserve(512)
                 .map_err(|_| PageTableError::MetadataAllocation)?;
+        }
+        if live || publish_owned {
             self.dirty
                 .try_reserve(512)
                 .map_err(|_| PageTableError::MetadataAllocation)?;
         }
-        self.free_tables
-            .try_reserve(1)
-            .map_err(|_| PageTableError::MetadataAllocation)?;
-
         if self.undo.is_some() {
             for off in (loc.offset..loc.offset + PT_PAGE as usize).step_by(8) {
                 self.note_undo_unlinked(TableLocation::new(loc.arena, off))?;
@@ -1657,6 +1656,11 @@ impl PageTableManager {
                 for b in &mut bytes[loc.offset..loc.offset + PT_PAGE as usize] {
                     *b = 0;
                 }
+                if publish_owned {
+                    for off in (loc.offset..loc.offset + PT_PAGE as usize).step_by(8) {
+                        self.dirty.push((TableLocation::new(loc.arena, off), false));
+                    }
+                }
             }
             TableArenaStorage::Live => {
                 for off in (loc.offset..loc.offset + PT_PAGE as usize).step_by(8) {
@@ -1666,6 +1670,15 @@ impl PageTableManager {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Zero a freed spare sub-table and return it to the reusable free list.
+    fn free_table(&mut self, pa: u64) -> Result<(), PageTableError> {
+        self.free_tables
+            .try_reserve(1)
+            .map_err(|_| PageTableError::MetadataAllocation)?;
+        self.zero_unlinked_table(pa, false)?;
         self.free_tables.push(pa);
         Ok(())
     }
@@ -2597,7 +2610,14 @@ impl PageTableManager {
         &mut self,
         mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<u64, PageTableError> {
-        if let Some(pa) = self.free_tables.pop() {
+        if let Some(&pa) = self.free_tables.last() {
+            // A guest EL1 editor can write the shared live backing after the
+            // host cached this unlinked page as free. Re-establish the allocator
+            // invariant at handout time so a partial new table cannot expose
+            // descriptors from another VA or generation.
+            self.zero_unlinked_table(pa, true)?;
+            let popped = self.free_tables.pop();
+            debug_assert_eq!(popped, Some(pa));
             return Ok(pa);
         }
         // A guest editor can grow the same live primary arena between host
@@ -2662,8 +2682,11 @@ impl PageTableManager {
             }
         }
         if self.reclaim_all_invalid_tables()?
-            && let Some(pa) = self.free_tables.pop()
+            && let Some(&pa) = self.free_tables.last()
         {
+            self.zero_unlinked_table(pa, true)?;
+            let popped = self.free_tables.pop();
+            debug_assert_eq!(popped, Some(pa));
             return Ok(pa);
         }
         if let Some(source) = source.as_mut()
@@ -7037,6 +7060,74 @@ mod tests {
         fn record_populated_prefix(&self, base: u64, prefix_len: usize) {
             (*self).record_populated_prefix(base, prefix_len);
         }
+    }
+
+    #[test]
+    fn owned_host_image_reuse_clears_live_descriptors_written_by_an_el1_editor() {
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let retired = LINUX_MMAP_BASE + 2 * TWO_MIB;
+        let target = LINUX_MMAP_BASE + 3 * TWO_MIB;
+        let sentinel = LINUX_MMAP_BASE + 4 * TWO_MIB;
+        let old_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
+        let target_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+        let mut host = hvpatch_manager();
+        host.map_private_aliased(retired, old_ipa, 0x4000, true, None)
+            .expect("map table that will retire");
+        host.map_private_aliased(sentinel, old_ipa + TWO_MIB, 0x1000, true, None)
+            .expect("keep the shared L2 table live");
+        let reclaimed_l3 = host.debug_walk(retired)[2] & PA_MASK_TABLE;
+        let stale_leaf = terminal_descriptor(host.debug_walk(retired));
+        unsafe {
+            host.restore_quiesced_snapshot_to_host(&*resolver)
+                .expect("publish fixture");
+        }
+
+        host.unmap_aliased(retired, 0x4000, None)
+            .expect("retire and reclaim the old L3");
+        unsafe { host.sync_to_host(&*resolver).expect("publish retirement") };
+        assert_eq!(
+            host.free_tables.last().copied(),
+            Some(reclaimed_l3),
+            "the retired L3 must be next for reuse"
+        );
+
+        // EL1 and the host deliberately share the live table backing. Model a
+        // guest editor writing after the host cached this page as free. A later
+        // partial host publication must not expose that stale descriptor at an
+        // untouched neighbour.
+        let reclaimed_offset =
+            usize::try_from(reclaimed_l3 - LINUX_PAGE_TABLES_BASE).expect("reclaimed table offset");
+        resolver.write_word(
+            LINUX_PAGE_TABLES_BASE,
+            reclaimed_offset + 8 * core::mem::size_of::<u64>(),
+            stale_leaf,
+        );
+
+        host.map_private_aliased(target, target_ipa, 0x4000, true, None)
+            .expect("partially populate the reused L3");
+        unsafe {
+            host.sync_to_host(&*resolver)
+                .expect("publish partial reuse")
+        };
+
+        let observer = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                LINUX_PAGE_TABLES_SIZE as usize,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .expect("observe live reused table")
+        };
+        assert_eq!(
+            observer.translate(target + 8 * PT_PAGE),
+            None,
+            "allocating a live free-list page must clear descriptors written after retirement"
+        );
     }
 
     #[test]

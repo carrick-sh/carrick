@@ -1352,6 +1352,74 @@ fn el1_memory_first_touch_stays_in_guest() {
     }
 }
 
+/// Contract `kernel.el1.anonymous-retirement` (EL1 increment 2): repeated
+/// same-VA anonymous replacement must remain zero-filled, return every exact
+/// EL1 frame-grant lease, physically reuse a returned lease, and keep host
+/// exits sublinear in the number of guest pages.
+#[test]
+fn el1_anonymous_mapping_retirement_returns_and_reuses_frames() {
+    const SCALES: [u64; 3] = [256, 1024, 4096];
+    const ROUNDS: u64 = 4;
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let mut runs = Vec::new();
+
+    for pages in SCALES {
+        let before = carrick_embed::el1_frame_grant_stats();
+        let measured = run_fixture(
+            &carrier,
+            &[
+                "mapping-retirement",
+                &pages.to_string(),
+                &ROUNDS.to_string(),
+            ],
+            Duration::from_secs(120),
+        );
+        let after = carrick_embed::el1_frame_grant_stats();
+        let grants = after.grants_succeeded - before.grants_succeeded;
+        let returns = after.returns_completed - before.returns_completed;
+        let reused = after.reused_grants - before.reused_grants;
+        let bytes_granted = after.bytes_granted - before.bytes_granted;
+        let bytes_returned = after.bytes_returned - before.bytes_returned;
+        let stdout = measured.result.stdout_utf8();
+        println!(
+            "el1-sched mapping-retirement pages={pages} rounds={ROUNDS} exits={} grants={grants} returns={returns} reused={reused} bytes_granted={bytes_granted} bytes_returned={bytes_returned} {}",
+            measured.exits,
+            stdout.trim(),
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            stdout.contains(&format!("mapping-retirement pages={pages} rounds={ROUNDS}"))
+                && stdout.contains("zero=true writes=true unmaps=true"),
+            "signed fixture did not prove same-VA replacement semantics: {stdout:?}"
+        );
+        assert!(grants > 0, "workload published no EL1 frame grants");
+        assert_eq!(returns, grants, "every exact EL1 grant must return");
+        assert_eq!(
+            bytes_returned, bytes_granted,
+            "every granted physical byte must return"
+        );
+        assert!(reused > 0, "repeated mapping never reused a returned IPA");
+        runs.push((pages, measured.exits));
+    }
+
+    for pair in runs.windows(2) {
+        let (p0, exits0) = pair[0];
+        let (p1, exits1) = pair[1];
+        let added_pages = ROUNDS as f64 * (p1 - p0) as f64;
+        let exit_slope = (exits1 as f64 - exits0 as f64) / added_pages;
+        println!(
+            "el1-sched mapping-retirement slope {p0}->{p1} pages rounds={ROUNDS}: exits_diff={} slope={exit_slope:.4} exits/page/round",
+            exits1 as i64 - exits0 as i64,
+        );
+        assert!(
+            exit_slope < 0.125,
+            "mapping-retirement host-exit slope {exit_slope:.4} exceeds <0.125 exits per added page per round"
+        );
+    }
+}
+
 /// EL1 data-abort entry verification: a stage-1 permission fault in guest user code
 /// enters the EL1 vector image, increments EL1 fault_taken counter, restores complete
 /// architectural context and forwards through host fault handling to guest SIGSEGV.

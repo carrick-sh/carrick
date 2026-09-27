@@ -188,6 +188,26 @@ mod global_frame;
 pub(crate) mod host_writes;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use global_frame::*;
+
+/// Monotonic diagnostics for physical leases published through the EL1
+/// anonymous frame-grant path. A return is counted only when the exact tagged
+/// stage-2 lease reaches the global IPA allocator's successful release point.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct El1FrameGrantStats {
+    pub grants_succeeded: u64,
+    pub returns_completed: u64,
+    pub reused_grants: u64,
+    pub bytes_granted: u64,
+    pub bytes_returned: u64,
+}
+
+/// Snapshot EL1 anonymous frame-grant diagnostics.
+///
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn el1_frame_grant_stats() -> El1FrameGrantStats {
+    global_frame::snapshot_el1_frame_grant_stats()
+}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod execve_rebuild;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
