@@ -1,0 +1,94 @@
+diff --git a/crates/carrick-mmu-core/src/aarch64.rs b/crates/carrick-mmu-core/src/aarch64.rs
+index b21b8b973..eb610042c 100644
+--- a/crates/carrick-mmu-core/src/aarch64.rs
++++ b/crates/carrick-mmu-core/src/aarch64.rs
+@@ -3605,9 +3605,14 @@ mod tests {
+                 returned: Vec::with_capacity(scale),
+             };
+ 
++            // Publish setup before measuring this transaction, so the budget
++            // is independent of historical dirty entries from pool exhaustion.
++            unsafe { mgr.sync_to_host(resolver.as_slice()).unwrap() };
+             let initial_walk = mgr.debug_walk(LINUX_MMAP_BASE);
+             let initial_trans = mgr.translate(LINUX_MMAP_BASE);
+             let initial_arenas_len = mgr.arenas.len();
++            let initial_dirty_len = mgr.dirty.len();
++            let initial_free_len = mgr.free_tables.len();
+ 
+             snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+             snapshot_allocations::ALLOCATED_BYTES.with(|c| c.set(Some(0)));
+@@ -3637,19 +3642,53 @@ mod tests {
+                 "scale={scale}: source available slots must be exhausted"
+             );
+ 
+-            // Justified admission bounds detecting linear exact-reallocation defects:
+-            // Geometric reservation of journal words, first_written, returned_bases, and arenas
+-            // bounds reallocations logarithmically in scale rather than linear exact growth.
+-            // Each attached arena allocates its PT_PAGE data buffer (~64 KiB) plus amortized metadata.
+-            let (max_allocs, max_bytes) = match scale {
+-                1 => (30, 128 * 1024),
+-                8 => (60, 1024 * 1024),
+-                32 => (120, 4 * 1024 * 1024),
+-                128 => (250, 32 * 1024 * 1024),
+-                _ => (scale * 3, scale * 256 * 1024),
+-            };
++            // Each new L3 table writes 512 leaves, one parent link, and the
++            // selected leaf once more. This fixture pre-creates the L2 table
++            // and has exhausted reusable tables: no reclamation or staged
++            // (Live-storage) hash map contributes to this Owned-storage arm.
++            let writes = scale * (PT_PAGE as usize / core::mem::size_of::<u64>() + 2);
++            let journal = mgr.undo.as_ref().unwrap();
++            assert!(journal.words.len() <= writes);
++            assert!(journal.first_written.len() <= writes);
++            assert!(mgr.dirty.len() <= initial_dirty_len + writes);
++            assert!(mgr.staged.is_empty());
++            assert!(mgr.free_tables.is_empty());
++
++            // A doubling Vec needs at most log2(next_power_of_two(n)) + 2
++            // allocations and requests fewer than 4*max(n, 4)*sizeof(T)
++            // bytes in total, including a non-power-of-two initial capacity.
++            fn vector_budget<T>(elements: usize) -> (u64, usize) {
++                let slots = elements.max(4);
++                (
++                    u64::from(slots.next_power_of_two().ilog2()) + 2,
++                    4 * slots * core::mem::size_of::<T>(),
++                )
++            }
++            let vectors = [
++                vector_budget::<TableArena>(initial_arenas_len + scale),
++                vector_budget::<u64>(scale), // returned_bases
++                vector_budget::<(TableLocation, u64)>(writes),
++                vector_budget::<(TableLocation, bool)>(initial_dirty_len + writes),
++            ];
++            // hashbrown doubles power-of-two buckets at a maximum 7/8
++            // occupancy. Sum of bucket counts across growth is <2*final.
++            // Include each control byte and SIMD-group/alignment padding.
++            let buckets = (writes * 8).div_ceil(7).next_power_of_two().max(4);
++            let hash_allocations = u64::from(buckets.ilog2()) + 1;
++            let hash_bytes = 2 * buckets * (core::mem::size_of::<(usize, usize)>() + 1)
++                + hash_allocations as usize * (16 + core::mem::align_of::<(usize, usize)>() - 1);
++            // One exact allocation per 4 KiB extent; at most two exact
++            // snapshots when opening the journal (arena cursors/free list).
++            let max_allocs = scale as u64
++                + 2
++                + hash_allocations
++                + vectors.iter().map(|budget| budget.0).sum::<u64>();
++            let max_bytes = scale * PT_PAGE as usize
++                + (initial_arenas_len + initial_free_len) * core::mem::size_of::<u64>()
++                + hash_bytes
++                + vectors.iter().map(|budget| budget.1).sum::<usize>();
+             assert!(
+-                admission_allocations <= max_allocs as u64,
++                admission_allocations <= max_allocs,
+                 "scale={scale}: admission allocations {admission_allocations} exceeded justified bound {max_allocs}"
+             );
+             assert!(
+@@ -3670,7 +3709,7 @@ mod tests {
+                 .unwrap();
+ 
+             std::eprintln!(
+-                "scale={scale} admission_allocations={admission_allocations} admission_bytes={admission_bytes} rollback_allocations={rollback_allocations} rollback_bytes={rollback_bytes} popped_len={}",
++                "scale={scale} admission_allocations={admission_allocations} admission_bytes={admission_bytes} max_allocs={max_allocs} max_bytes={max_bytes} rollback_allocations={rollback_allocations} rollback_bytes={rollback_bytes} popped_len={}",
+                 popped.len()
+             );
+ 

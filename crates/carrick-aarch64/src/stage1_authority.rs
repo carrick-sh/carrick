@@ -838,8 +838,8 @@ impl<'a> Stage1Editor<'a> {
         self.arena_source.is_some()
     }
 
-    pub fn begin_undo(&mut self) {
-        self.manager.begin_undo();
+    pub fn begin_undo(&mut self) -> Result<(), PageTableError> {
+        self.manager.begin_undo()
     }
 
     pub fn commit_undo(&mut self) {
@@ -1432,7 +1432,7 @@ mod tests {
             .edit(
                 || panic!("manager must be present"),
                 |editor| {
-                    editor.begin_undo();
+                    editor.begin_undo().unwrap();
                     editor
                         .set_rw(va, 0x1000, false)
                         .expect("allocates extension arena from source");
@@ -1675,7 +1675,7 @@ mod tests {
             .edit(
                 || panic!("manager must be present"),
                 |editor| {
-                    editor.begin_undo();
+                    editor.begin_undo().unwrap();
                     editor
                         .set_readonly(va, 0x1000, false)
                         .expect("readonly edit");
@@ -1710,7 +1710,7 @@ mod tests {
             .edit(
                 || panic!("manager must be present"),
                 |editor| {
-                    editor.begin_undo();
+                    editor.begin_undo().unwrap();
                     editor
                         .set_readonly(va, 0x1000, false)
                         .expect("readonly edit");
@@ -1892,7 +1892,7 @@ mod tests {
             .edit(
                 || panic!("manager must be present"),
                 |editor| {
-                    editor.begin_undo();
+                    editor.begin_undo().unwrap();
                     editor.set_readonly(0x40_0000, 0x1000, false).unwrap();
                     let rollback_res = unsafe { editor.rollback_undo(FailingResolver) };
                     assert!(matches!(
@@ -1901,6 +1901,298 @@ mod tests {
                     ));
                     assert!(editor.undo_is_open(), "undo journal preserved on failure");
                     Ok::<(), ()>(())
+                },
+            )
+            .unwrap();
+    }
+
+    mod test_allocator {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+        std::thread_local! {
+            pub(super) static FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+            pub(super) static OP_COUNT: Cell<Option<u64>> = const { Cell::new(None) };
+            pub(super) static ALLOC_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
+            pub(super) static REFUSED_ALLOCS: Cell<usize> = const { Cell::new(0) };
+        }
+        struct CountingAllocator;
+        #[global_allocator]
+        static ALLOCATOR: CountingAllocator = CountingAllocator;
+        fn check_and_record(size: usize) -> bool {
+            let _ = OP_COUNT.try_with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n.checked_add(1).unwrap()));
+                }
+            });
+            let _ = ALLOC_BYTES.try_with(|bytes| {
+                if let Some(b) = bytes.get() {
+                    bytes.set(Some(b.saturating_add(size)));
+                }
+            });
+            let should_fail = FAIL_AFTER
+                .try_with(|limit_cell| {
+                    if let Some(limit) = limit_cell.get() {
+                        if limit == 0 {
+                            let _ = REFUSED_ALLOCS.try_with(|refused| {
+                                refused.set(refused.get().saturating_add(1));
+                            });
+                            true
+                        } else {
+                            limit_cell.set(Some(limit - 1));
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            !should_fail
+        }
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                if !check_and_record(layout.size()) {
+                    return std::ptr::null_mut();
+                }
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+    }
+
+    struct MultiBufferResolver {
+        arenas: std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>>,
+    }
+
+    impl MultiBufferResolver {
+        fn new() -> Self {
+            Self {
+                arenas: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+        fn register(&self, base: u64, size: usize) {
+            self.arenas.lock().unwrap().insert(base, vec![0u8; size]);
+        }
+    }
+
+    unsafe impl HostArenaResolver for MultiBufferResolver {
+        fn host_ptr_for_range(&self, base: u64, _len: usize) -> Option<*mut u8> {
+            self.arenas
+                .lock()
+                .unwrap()
+                .get_mut(&base)
+                .map(|v| v.as_mut_ptr())
+        }
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            self.host_ptr_for_range(base, 0)
+        }
+    }
+
+    unsafe impl HostArenaResolver for &MultiBufferResolver {
+        fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
+            (*self).host_ptr_for_range(base, len)
+        }
+        fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+            (*self).host_ptr_for_base(base)
+        }
+    }
+
+    #[test]
+    fn stage1_authority_metadata_refusal_propagation() {
+        let manager = test_manager();
+        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let resolver = Arc::new(BufferResolver {
+            buf: std::sync::Mutex::new(vec![0u8; LINUX_PAGE_TABLES_SIZE as usize]),
+            base: LINUX_PAGE_TABLES_BASE,
+        });
+        unsafe {
+            authority.bind_live_backing(
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>
+            );
+        }
+
+        let va1 = 0x40_0000;
+        let va2 = 0x50_0000;
+
+        // Establish initial valid mapping and commit
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    assert!(!editor.undo_is_open());
+                    editor.begin_undo().unwrap();
+                    assert!(editor.undo_is_open());
+                    editor.map_aliased(va1, 0x80_0000, 0x1000, true).unwrap();
+                    editor.set_readonly(va1, 0x1000, false).unwrap();
+                    unsafe { editor.sync_to_host(&*resolver).unwrap() };
+                    editor.commit_undo();
+                    assert!(!editor.undo_is_open());
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .unwrap();
+
+        authority.with_manager(|mgr| {
+            assert_eq!(mgr.translate(va1), Some(0x80_0000));
+        });
+
+        // Inject allocator refusal during map_aliased
+        test_allocator::REFUSED_ALLOCS.with(|c| c.set(0));
+        test_allocator::FAIL_AFTER.with(|c| c.set(Some(0)));
+        let edit_res = authority.edit(
+            || panic!("manager must be present"),
+            |editor| {
+                editor.begin_undo()?;
+                editor.map_aliased(va2, 0x90_0000, 0x1000, true)
+            },
+        );
+        test_allocator::FAIL_AFTER.with(|c| c.set(None));
+        let refused = test_allocator::REFUSED_ALLOCS.with(|c| c.get());
+
+        assert!(refused > 0, "must trigger allocator refusal");
+        assert_eq!(edit_res, Err(PageTableError::MetadataAllocation));
+
+        // Exercise nonallocating typed adapter lowering with refusal active
+        test_allocator::OP_COUNT.with(|c| c.set(Some(0)));
+        test_allocator::ALLOC_BYTES.with(|c| c.set(Some(0)));
+        test_allocator::FAIL_AFTER.with(|c| c.set(Some(0)));
+        let pt_err = edit_res.unwrap_err();
+        let mem_err = crate::engine::page_table_rollback_error_to_memory_error(pt_err);
+        assert_eq!(mem_err, carrick_guest_mem::MemoryError::MetadataAllocation);
+        let trap_err = crate::engine::memory_error_to_trap_error(mem_err, "stage1 authority edit");
+        assert!(matches!(
+            trap_err,
+            carrick_hal::TrapError::MetadataAllocation
+        ));
+        test_allocator::FAIL_AFTER.with(|c| c.set(None));
+        let conv_allocs = test_allocator::OP_COUNT.with(|c| c.replace(None)).unwrap();
+        let conv_bytes = test_allocator::ALLOC_BYTES
+            .with(|c| c.replace(None))
+            .unwrap();
+        assert_eq!(conv_allocs, 0, "error lowering must not allocate");
+        assert_eq!(conv_bytes, 0, "error lowering must not allocate bytes");
+
+        // Inject allocator refusal during set_rw with journal open and verify rollback on same authority
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    editor.begin_undo().unwrap();
+                    test_allocator::REFUSED_ALLOCS.with(|c| c.set(0));
+                    test_allocator::FAIL_AFTER.with(|c| c.set(Some(0)));
+                    let res = editor.set_rw(va1, 0x1000, true);
+                    test_allocator::FAIL_AFTER.with(|c| c.set(None));
+                    assert_eq!(res, Err(PageTableError::MetadataAllocation));
+                    assert!(editor.undo_is_open());
+                    unsafe { editor.rollback_undo(&*resolver).unwrap() };
+                    assert!(!editor.undo_is_open());
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .unwrap();
+
+        // Authority state is preserved: va1 is still translated, va2 is not translated
+        authority.with_manager(|mgr| {
+            assert_eq!(mgr.translate(va1), Some(0x80_0000));
+            assert_eq!(mgr.translate(va2), None);
+        });
+
+        // Subsequent transaction on the SAME authority succeeds
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    editor.begin_undo().unwrap();
+                    editor.map_aliased(va2, 0x90_0000, 0x1000, true).unwrap();
+                    unsafe { editor.sync_to_host(&*resolver).unwrap() };
+                    editor.commit_undo();
+                    assert!(!editor.undo_is_open());
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .unwrap();
+
+        authority.with_manager(|mgr| {
+            assert_eq!(mgr.translate(va1), Some(0x80_0000));
+            assert_eq!(mgr.translate(va2), Some(0x90_0000));
+        });
+
+        // Real >8-arena overflow-scratch refusal in sync_to_host flowing into production converter
+        let multi_resolver = Arc::new(MultiBufferResolver::new());
+        multi_resolver.register(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+        for i in 0..30 {
+            multi_resolver.register(0x90_0000_0000 + (i as u64) * 0x20_0000, 4096);
+        }
+
+        let mut layout = AARCH64_LINUX_PAGE_TABLE_LAYOUT;
+        layout.extension_arena_capacity = 4096;
+        let mut multi_mgr =
+            PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE, layout);
+        multi_mgr.arenas[0].next_free = multi_mgr.arenas[0].capacity as u64;
+        let multi_authority = Stage1Authority::new_with_manager(Some(multi_mgr));
+        let ext_bases: Vec<Gpa> = (0..30)
+            .map(|i| Gpa(0x90_0000_0000 + (i as u64) * 0x20_0000))
+            .collect();
+        let source = Box::new(CountingArenaSource {
+            id: TableArenaSourceId(SubstrateGpa(0x90_0000_0000)),
+            available: Arc::new(Mutex::new(ext_bases)),
+            returned: Arc::new(Mutex::new(Vec::new())),
+        });
+        multi_authority.install_source(source).unwrap();
+
+        unsafe {
+            multi_authority.bind_live_backing(
+                Arc::clone(&multi_resolver) as Arc<dyn HostArenaResolver + Send + Sync>
+            );
+        }
+
+        multi_authority
+            .edit(
+                || panic!("manager present"),
+                |editor| {
+                    // Attach extension arenas (>8 inline threshold in sync_to_host)
+                    for i in 0..10 {
+                        let va = 0x80_0000_0000 + (i as u64) * 0x20_0000;
+                        let ipa = 0x90_0000_0000 + (i as u64) * 0x20_0000;
+                        editor.map_aliased(va, ipa, 0x1000, true).unwrap();
+                    }
+                    assert!(editor.manager.arenas.len() > 8);
+
+                    // Inject refusal during sync_to_host (>8-arena overflow hosts vector reservation)
+                    test_allocator::FAIL_AFTER.with(|c| c.set(Some(0)));
+                    let sync_err = unsafe { editor.sync_to_host(&*multi_resolver) };
+                    assert_eq!(sync_err, Err(PageTableError::MetadataAllocation));
+
+                    // Lower through production converter under active refusal
+                    test_allocator::OP_COUNT.with(|c| c.set(Some(0)));
+                    test_allocator::ALLOC_BYTES.with(|c| c.set(Some(0)));
+                    let mem_err =
+                        crate::engine::page_table_sync_error_to_memory_error(sync_err.unwrap_err());
+                    assert_eq!(mem_err, carrick_guest_mem::MemoryError::MetadataAllocation);
+                    let trap_err =
+                        crate::engine::memory_error_to_trap_error(mem_err, "stage-1 sync");
+                    assert!(matches!(
+                        trap_err,
+                        carrick_hal::TrapError::MetadataAllocation
+                    ));
+                    test_allocator::FAIL_AFTER.with(|c| c.set(None));
+
+                    let sync_conv_allocs =
+                        test_allocator::OP_COUNT.with(|c| c.replace(None)).unwrap();
+                    let sync_conv_bytes = test_allocator::ALLOC_BYTES
+                        .with(|c| c.replace(None))
+                        .unwrap();
+                    assert_eq!(
+                        sync_conv_allocs, 0,
+                        "sync_to_host lowering must not allocate"
+                    );
+                    assert_eq!(
+                        sync_conv_bytes, 0,
+                        "sync_to_host lowering must not allocate bytes"
+                    );
+
+                    Ok::<(), PageTableError>(())
                 },
             )
             .unwrap();

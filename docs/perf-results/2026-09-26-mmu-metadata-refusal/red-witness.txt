@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-1d1f88d6a1eb2090)
+
+running 1 test
+scale=1 rollback_allocations=3 popped_len=1
+
+thread 'aarch64::tests::test_metadata_refusal_witness_rollback_allocations' (13200243) panicked at crates/carrick-mmu-core/src/aarch64.rs:3469:13:
+assertion `left == right` failed: scale=1: rollback allocated heap memory (3 allocs)
+  left: 3
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test aarch64::tests::test_metadata_refusal_witness_rollback_allocations ... FAILED
+
+failures:
+
+failures:
+    aarch64::tests::test_metadata_refusal_witness_rollback_allocations
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p carrick-mmu-core --lib`

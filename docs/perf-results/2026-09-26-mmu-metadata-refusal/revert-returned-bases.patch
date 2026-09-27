@@ -1,0 +1,6 @@
+--- a/crates/carrick-mmu-core/src/aarch64.rs
++++ b/crates/carrick-mmu-core/src/aarch64.rs
+@@ -1819,2 +1819,1 @@
+-        let mut popped = journal.returned_bases;
+-        popped.clear();
++        let mut popped = Vec::new();
