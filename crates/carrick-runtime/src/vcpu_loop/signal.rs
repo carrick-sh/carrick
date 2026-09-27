@@ -368,6 +368,58 @@ pub(super) fn cancel_frame_grant_request(
     }
 }
 
+/// Whether any vCPU mailbox holds a grant guest EL1 handed back (cheap,
+/// unlocked; the fault path takes the MM guard only when this is true).
+pub(super) fn any_handed_back_frame_grant() -> bool {
+    (0..carrick_el1_abi::EL1_STACK_SLOTS as usize).any(|slot| {
+        carrick_el1_abi::frame_grant_mailbox_host_for_slot(slot)
+            .is_some_and(carrick_el1_abi::FrameGrantMailbox::has_failed_publication)
+    })
+}
+
+/// Publish a grant guest EL1 claimed but could not publish itself (it needs
+/// a table page, and only the host allocates tables), possibly from another
+/// vCPU's mailbox. The caller holds the MM mutation guard. `Ok(true)`:
+/// published, retry the faulting instruction.
+pub(super) fn publish_handed_back_frame_grant<E: ThreadedEngine>(
+    engine: &mut E,
+    mm_key: u64,
+    address: u64,
+) -> Result<bool, TrapError> {
+    for slot in 0..carrick_el1_abi::EL1_STACK_SLOTS as usize {
+        let Some(ready) = carrick_el1_abi::frame_grant_mailbox_host_for_slot(slot)
+            .and_then(|mailbox| mailbox.take_failed_publication(mm_key, address))
+        else {
+            continue;
+        };
+        if !engine.publish_el1_frame_grant_on_host(
+            ready.semantic_base,
+            ready.physical_ipa,
+            ready.len,
+            ready.permissions,
+        )? {
+            carrick_fatal::carrick_fatal!(
+                "hvpatch::el1_frame_grant",
+                "backend cannot publish a handed-back EL1 frame grant: base={:#x} len={:#x}",
+                ready.semantic_base,
+                ready.len
+            );
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Guest EL1 bulk frame grants for first touch. `CARRICK_EL1_FRAME_GRANT=0`
+/// ignores EL1's requests (the fault path cancels them) so every first touch
+/// takes the host path.
+fn el1_frame_grants_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CARRICK_EL1_FRAME_GRANT").map_or(true, |value| value.trim() != "0")
+    })
+}
+
 /// Resolve a fault whose read-only outer classification placed it inside a
 /// first-touch or grow-down extent. This entry point cannot be called without
 /// structural mutation authority and is kept separate from ordinary signal
@@ -398,12 +450,22 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
             );
         }
     };
-    if let Some(mailbox) = engine
-        .mailbox_slot()
-        .and_then(carrick_el1_abi::frame_grant_mailbox_host_for_slot)
+    if !el1_frame_grants_enabled() {
+        cancel_frame_grant_request(
+            engine.mailbox_slot(),
+            mutation.host_alias_permit().mm().raw(),
+            address,
+            access,
+        );
+    }
+    if el1_frame_grants_enabled()
+        && let Some(mailbox) = engine
+            .mailbox_slot()
+            .and_then(carrick_el1_abi::frame_grant_mailbox_host_for_slot)
     {
         let mm_key = mutation.host_alias_permit().mm().raw();
-        match claim_frame_grant_request(mailbox, mm_key, address, access) {
+        let claim = claim_frame_grant_request(mailbox, mm_key, address, access);
+        match claim {
             FrameGrantClaim::None => {}
             FrameGrantClaim::ResponsePending => return Ok(true),
             FrameGrantClaim::Accepted(request) => {
@@ -479,7 +541,8 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     }
     {
         let permit = mutation.host_alias_permit();
-        if let Some(plan) = dispatcher.resident_fault_plan(&permit, address) {
+        let plan = dispatcher.resident_fault_plan(&permit, address);
+        if let Some(plan) = plan {
             let page = plan.page();
             let prot = plan.prot();
             match apply_first_touch(
