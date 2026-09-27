@@ -1,0 +1,10 @@
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-guest-mem)
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-observability)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.81s
+     Running unittests src/lib.rs (target/debug/deps/carrick_observability-ffcad747f5800c8d)
+
+running 1 test
+test probes::hvpatch_guest_probe_abi::mn_clone_tid_output_provider_keeps_role_and_memory_error_typed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 82 filtered out; finished in 0.00s
+

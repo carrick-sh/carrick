@@ -143,6 +143,9 @@ impl CloneTidOutputTransaction {
             Err(carrick_guest_mem::MemoryError::Unsupported) => {
                 carrick_observability::probes::HvpatchCloneTidWriteResult::Unsupported
             }
+            Err(carrick_guest_mem::MemoryError::MetadataAllocation) => {
+                carrick_observability::probes::HvpatchCloneTidWriteResult::MetadataAllocation
+            }
             Err(carrick_guest_mem::MemoryError::HostMap(detail))
                 if detail.starts_with("HVPatch sparse mmap backing:") =>
             {
@@ -413,6 +416,7 @@ mod clone_tid_output_tests {
     struct Memory {
         bytes: std::collections::BTreeMap<u64, Vec<u8>>,
         fail_write: Option<u64>,
+        refuse_metadata: bool,
     }
 
     impl CloneTidMemory for Memory {
@@ -433,6 +437,9 @@ mod clone_tid_output_tests {
             bytes: &[u8],
         ) -> Result<(), carrick_guest_mem::MemoryError> {
             if self.fail_write == Some(address) {
+                if self.refuse_metadata {
+                    return Err(carrick_guest_mem::MemoryError::MetadataAllocation);
+                }
                 return Err(carrick_guest_mem::MemoryError::HostMap(
                     "injected clone TID copyout failure".to_owned(),
                 ));
@@ -452,6 +459,25 @@ mod clone_tid_output_tests {
         let transaction = CloneTidOutputTransaction::capture(&memory, parent, child).unwrap();
         memory.fail_write = Some(child);
         assert!(!transaction.publish(&mut memory, 7, ThreadId::synthetic_for_tests(77),));
+        memory.fail_write = None;
+        transaction.rollback(&mut memory).unwrap();
+        assert_eq!(memory.bytes[&parent], 11_i32.to_le_bytes());
+        assert_eq!(memory.bytes[&child], 22_i32.to_le_bytes());
+    }
+
+    #[test]
+    fn metadata_refusal_during_tid_copyout_retains_rollback_preimages() {
+        let parent = 0x1000;
+        let child = 0x2000;
+        let mut memory = Memory::default();
+        memory.bytes.insert(parent, 11_i32.to_le_bytes().to_vec());
+        memory.bytes.insert(child, 22_i32.to_le_bytes().to_vec());
+        let transaction = CloneTidOutputTransaction::capture(&memory, parent, child).unwrap();
+        memory.fail_write = Some(child);
+        memory.refuse_metadata = true;
+        assert!(!transaction.publish(&mut memory, 7, ThreadId::synthetic_for_tests(77)));
+        assert_eq!(memory.bytes[&parent], 7_i32.to_le_bytes());
+        assert_eq!(memory.bytes[&child], 22_i32.to_le_bytes());
         memory.fail_write = None;
         transaction.rollback(&mut memory).unwrap();
         assert_eq!(memory.bytes[&parent], 11_i32.to_le_bytes());
