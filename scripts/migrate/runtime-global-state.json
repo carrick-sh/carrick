@@ -131,6 +131,22 @@
     },
     {
       "kind": "env_var",
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "symbol": "guest_scheduling_hatch_enabled::CARRICK_EL1_SCHED",
+      "fingerprint": "cb3b9c148759403b19dc9014874e8a5b750ffa331d6a0ef63638cf3bb4bc54d9",
+      "classification": "config_debug",
+      "rationale": "Exact =0 bisection hatch CARRICK_EL1_SCHED in crates/carrick-kernel/src/el1_zone.rs that turns off guest scheduling (EL1 plan 1d: host run queues and condvar parks again, the futex zone still on), read once per carrier process."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "symbol": "hatch_enabled::CARRICK_EL1_FUTEX",
+      "fingerprint": "19c0f730e072b8b68f1b7fc838c00ba90cc2deba3a2bf4733bc6fbd571e3d8f8",
+      "classification": "config_debug",
+      "rationale": "Exact =0 bisection hatch CARRICK_EL1_FUTEX in crates/carrick-kernel/src/el1_zone.rs that turns off the in-guest futex handoff (EL1 plan 1b), read once per carrier process."
+    },
+    {
+      "kind": "env_var",
       "file": "crates/carrick-kernel/src/event_ring.rs",
       "symbol": "dir::CARRICK_EVENTRING",
       "fingerprint": "848bb7eaeede7522988b8e1d1d0365d8dda85785b89b671b0bfddf598ec1acdd",
@@ -203,6 +219,14 @@
     },
     {
       "kind": "env_var",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "switching_enabled::CARRICK_EL1_MM_SWITCH",
+      "fingerprint": "ef331b74c9689eaec22956f8528cd60e9b7f80f542b29271da5268bdf11fc92e",
+      "classification": "config_debug",
+      "rationale": "Exact =0 bisection hatch CARRICK_EL1_MM_SWITCH in crates/carrick-kernel/src/kernel/mm_occupancy.rs that stops publishing address spaces for guest EL1 to install itself (EL1 increment 2, step 2: threads of another process reach a vCPU through its executor again), read once per carrier process."
+    },
+    {
+      "kind": "env_var",
       "file": "crates/carrick-kernel/src/vdso_policy.rs",
       "symbol": "vdso_debug_mode::CARRICK_DISABLE_VDSO",
       "fingerprint": "50d9306ef0f992272a2c4c6776c1a2566d149ea7bd29ab3824ea4a3014278448",
@@ -248,6 +272,14 @@
       "fingerprint": "d0eab53b3bdca61a0d38973031cf88d0ea84564679fdf423da6ef171543335b5",
       "classification": "test_only",
       "rationale": "Unit test of the CARRICK_TRACE_POST_CHILD_LINGER_S hatch contract; reads and restores the variable inside one serialized test."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "snapshot::CARRICK_RUN_ID",
+      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
+      "classification": "config_debug",
+      "rationale": "The run id is copied into an EL1 census file so the CLI can join it to a conformance result; diagnostic only, it selects no container state."
     },
     {
       "kind": "env_var",
@@ -555,6 +587,14 @@
     },
     {
       "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/gic.rs",
+      "symbol": "interrupt_model::CARRICK_HVF_GIC",
+      "fingerprint": "3bde60465826719e4dd145cc14f3d67a871b5272be175ca9d9599915098363e0",
+      "classification": "config_debug",
+      "rationale": "Bisection hatch: CARRICK_HVF_GIC=0 (exact string) restores the GIC-less carrier VM, the SDK IRQ-line kick vehicle and the pre-GIC EL1 vector bytes (EL1 plan 1a)."
+    },
+    {
+      "kind": "env_var",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "atomic_permit_enabled::CARRICK_HVF_ATOMIC_PERMIT",
       "fingerprint": "7c1104910ed6f736c037002331d4485a6a5586982025257244ca54fb28cd25cf",
@@ -824,6 +864,14 @@
       "fingerprint": "ac8124cbc29687037b55a81ab069be0cf9a4462aadd314e5102b4014a46f0403",
       "classification": "test_only",
       "rationale": "The cfg(test) artifact environment guard snapshots each test-owned key so serial runtime tests can restore the process environment after exercising public shutdown publication."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "init_from_env::CARRICK_EL1_CENSUS",
+      "fingerprint": "b5d19b3f216428d054961abf0597b6df0b065599a654e73d7021b504670feac7",
+      "classification": "config_debug",
+      "rationale": "Opt-in diagnostic: names the directory an EL1 census is written to at carrier teardown. Unset, the census records nothing; set, it only counts and times syscall service and cannot change guest-visible state."
     },
     {
       "kind": "env_var_os",
@@ -1500,6 +1548,14 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "ACTIVE_DELEGATIONS",
+      "fingerprint": "1e8fa6fb5c12e287dd86f54fe48e87bb1ae92129184b68eddbf3284d2735ecc8",
+      "classification": "carrier_infra",
+      "rationale": "Count of inodes the EL1 zone currently owns; carrier-wide because the EL1 aperture is one per VM carrier."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "symbol": "ALLOCATED_HANDLES",
       "fingerprint": "7a81dbddfe836aaa3157b9b85c8e1bb33b960cfb01969d131cdc050a741177fc",
       "classification": "carrier_infra",
@@ -1508,42 +1564,10 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "HOST_HOLDER_SITES",
-      "fingerprint": "20429e67df0ae5c0da137d74e007372b4eee0575155daf1da034824e7a80d66a",
+      "symbol": "ALLOCATED_OPEN_FILES",
+      "fingerprint": "2d2e1fbb94cbea659ba3116b3ff792447f80e23f089cf5daf135a1d7bb013de4",
       "classification": "carrier_infra",
-      "rationale": "Call site of the last host acquisition of each carrier-wide EL1 inode lock; read only to name the holder in a lock-timeout fatal."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "HOST_HOLDER_THREADS",
-      "fingerprint": "ca03dcbdfddc5bd53a51fd20298d96448940cb9ce75357df5d58147451b2f32f",
-      "classification": "carrier_infra",
-      "rationale": "Host thread of the last host acquisition of each carrier-wide EL1 inode lock; read only to name the holder in a lock-timeout fatal."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "NEXT_INCARNATION",
-      "fingerprint": "d61fa36f4ea30df3c347972b3d7041a2f1df505a9b50fa254c7cb47195314b8c",
-      "classification": "monotonic_allocator",
-      "rationale": "Monotonic counter allocating generation numbers for delegated file incarnations."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "YIELD_COUNT",
-      "fingerprint": "75c603212e7c7f80bc9213c618bc4b11b19cc9176043d8b39ebdb073f7867948",
-      "classification": "test_only",
-      "rationale": "Test-only counter tracking thread yields in lock_delegated_file."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "ACTIVE_DELEGATIONS",
-      "fingerprint": "1e8fa6fb5c12e287dd86f54fe48e87bb1ae92129184b68eddbf3284d2735ecc8",
-      "classification": "carrier_infra",
-      "rationale": "Count of inodes the EL1 zone currently owns; carrier-wide because the EL1 aperture is one per VM carrier."
+      "rationale": "Allocation bitmap of in-zone open-file records (one per open description of an in-zone inode) in the carrier-wide EL1 aperture."
     },
     {
       "kind": "static",
@@ -1572,10 +1596,34 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "HOST_HOLDER_SITES",
+      "fingerprint": "20429e67df0ae5c0da137d74e007372b4eee0575155daf1da034824e7a80d66a",
+      "classification": "carrier_infra",
+      "rationale": "Call site of the last host acquisition of each carrier-wide EL1 inode lock; read only to name the holder in a lock-timeout fatal."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "HOST_HOLDER_THREADS",
+      "fingerprint": "ca03dcbdfddc5bd53a51fd20298d96448940cb9ce75357df5d58147451b2f32f",
+      "classification": "carrier_infra",
+      "rationale": "Host thread of the last host acquisition of each carrier-wide EL1 inode lock; read only to name the holder in a lock-timeout fatal."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "symbol": "HOST_SERVED",
       "fingerprint": "6a287028f65dc3407f3daf5db18ac6b1faa78288a3adf06aea54ca01d7a86b9f",
       "classification": "carrier_infra",
       "rationale": "Population counter of forwarded file operations the host served against in-zone objects; diagnostics only."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "NEXT_INCARNATION",
+      "fingerprint": "d61fa36f4ea30df3c347972b3d7041a2f1df505a9b50fa254c7cb47195314b8c",
+      "classification": "monotonic_allocator",
+      "rationale": "Monotonic counter allocating generation numbers for delegated file incarnations."
     },
     {
       "kind": "static",
@@ -1636,6 +1684,14 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "YIELD_COUNT",
+      "fingerprint": "75c603212e7c7f80bc9213c618bc4b11b19cc9176043d8b39ebdb073f7867948",
+      "classification": "test_only",
+      "rationale": "Test-only counter tracking thread yields in lock_delegated_file."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "symbol": "tests::PAUSE_HOOK",
       "fingerprint": "19230ee4d66b22a3b70ce50e36582c966edb18518b5955f6ef5f6a2bf4c64c0f",
       "classification": "test_only",
@@ -1651,11 +1707,59 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "symbol": "ALLOCATED_OPEN_FILES",
-      "fingerprint": "2d2e1fbb94cbea659ba3116b3ff792447f80e23f089cf5daf135a1d7bb013de4",
+      "file": "crates/carrick-kernel/src/el1_inotify.rs",
+      "symbol": "ALLOCATED_INOTIFY_HANDLES",
+      "fingerprint": "8293ec39d01c673ab285f92855c0e0e3db7704a84b520b763b54b77d14b63d5b",
       "classification": "carrier_infra",
-      "rationale": "Allocation bitmap of in-zone open-file records (one per open description of an in-zone inode) in the carrier-wide EL1 aperture."
+      "rationale": "Allocation bitmap of in-zone inotify instance slots in the carrier-wide EL1 aperture."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_inotify.rs",
+      "symbol": "INSTANCE_STATES",
+      "fingerprint": "168e6ab4d62e6e115c6cd1b7618fe1ffbff304ea7d87ae3fd07671082b704841",
+      "classification": "carrier_infra",
+      "rationale": "Weak map from in-zone inotify handle to its fronting InotifyState, so host paths reach the one authoritative instance."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "symbol": "GUEST_SCHEDULER",
+      "fingerprint": "251d655ecc801957aefbd83859fd2b60a9368d939cbc385c9ae9ce46a071b524",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide switch in crates/carrick-kernel/src/el1_zone.rs, set once when the persistent executor pool starts: whether the carrier VM has the in-kernel GIC the in-guest scheduler needs (EL1 plan 1c); without it the zone stays off."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "symbol": "HANDBACK_PUBLISHER",
+      "fingerprint": "05fc3bd6e0dfa2579b35ad4d020da4f829fbd9f72bee178fae545baa236e10d5",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide hook in crates/carrick-kernel/src/el1_zone.rs through which the kernel hands a zone thread back to its host continuation; each start of the persistent executor pool registers its own scheduler's publisher (a carrier may run several containers in turn), and the zone tables it serves are per carrier VM."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "symbol": "SLOT_KICKER",
+      "fingerprint": "a61c7e6bad2a01d1b207915523be0e025e13ce2de78db7734d46c14109668727",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide hook in crates/carrick-kernel/src/el1_zone.rs through which the kernel kicks the vCPU on an EL1 mailbox slot (registered once by the HVF carrier); the zone tables it serves are per carrier VM."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "symbol": "guest_scheduling_hatch_enabled::ENABLED",
+      "fingerprint": "d3bce58c23c5a39148597c742d4efc3d23c0c671f159649ee582aae719dda689",
+      "classification": "config_debug",
+      "rationale": "Cached value of the CARRICK_EL1_SCHED bisection hatch in crates/carrick-kernel/src/el1_zone.rs; read once, immutable for the carrier's life."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_zone.rs",
+      "symbol": "hatch_enabled::ENABLED",
+      "fingerprint": "d3bce58c23c5a39148597c742d4efc3d23c0c671f159649ee582aae719dda689",
+      "classification": "config_debug",
+      "rationale": "Cached value of the CARRICK_EL1_FUTEX bisection hatch in crates/carrick-kernel/src/el1_zone.rs; read once, immutable for the carrier's life."
     },
     {
       "kind": "static",
@@ -1804,10 +1908,50 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/kernel/ids.rs",
+      "symbol": "CARRIER_MM_IDS",
+      "fingerprint": "db15e3d493982cb11591b2d88a7d6de71eb5deb0650ee8aa29b537383473f0b4",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide monotonic source of MmIds in crates/carrick-kernel/src/kernel/ids.rs: MM identities must be unique across every kernel (container) in one carrier process, because the EL1 zone occupancy words and published address spaces key on them and all containers share the carrier VM; carrier scope by design, never reset."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/ids.rs",
       "symbol": "NEXT_FILE_DESCRIPTION_ID",
       "fingerprint": "e5de473ba863b6f4206b47d69226d2dbe46e9f2b22d11a52622aea523cfa8623",
       "classification": "monotonic_allocator",
       "rationale": "Carrier-wide monotonic allocator NEXT_FILE_DESCRIPTION_ID in crates/carrick-runtime/src/kernel/ids.rs generating unique IDs across the host process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "HOST_TABLE",
+      "fingerprint": "6bc2e6e1746fce0d6af84c46de81fc57d846465e85c2b7a64451025c12593f5f",
+      "classification": "carrier_infra",
+      "rationale": "The host-memory half of the address-space occupancy authority (carrick_sched_core::Occupancy) in crates/carrick-kernel/src/kernel/mm_occupancy.rs: the words of host-only execution slots, and of every slot while the carrier does not schedule in the guest (zone slots otherwise live in the shared EL1 region); carrier VM scope like the mailbox slots it is indexed by (one HVF VM per process)."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "PORTS",
+      "fingerprint": "f55653b286f94e0f93d81d3b76eb4639336defd7c3fa4aaefaacca7936e0ad91",
+      "classification": "carrier_infra",
+      "rationale": "Per-vCPU-execution-slot port table of the address-space occupancy authority in crates/carrick-kernel/src/kernel/mm_occupancy.rs: the pause endpoint and fence of the MM each slot runs, written under its slot lock by the executor that occupies the slot; carrier VM scope like the mailbox slots it is indexed by, and scoped per kernel graph by the MM's fence object."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "SPACES_LOCK",
+      "fingerprint": "ce764b981fd018aae03602b1b3e13f434f71b1a4272909814bb1680953f17f51",
+      "classification": "carrier_infra",
+      "rationale": "Serializes publication and freeing of address-space entries in the shared EL1 region (carrick_sched_core::AddressSpaces, the only host mutations of that table) in crates/carrick-kernel/src/kernel/mm_occupancy.rs; carrier VM scope like the zone tables it guards."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "switching_enabled::ENABLED",
+      "fingerprint": "810e6edc6ac71f37c4eb86f28b68168eb8d1faac13e5facea0127a51501d3002",
+      "classification": "config_debug",
+      "rationale": "Cached value of the CARRICK_EL1_MM_SWITCH bisection hatch in crates/carrick-kernel/src/kernel/mm_occupancy.rs; read once, immutable for the carrier's life."
     },
     {
       "kind": "static",
@@ -2048,6 +2192,46 @@
       "fingerprint": "14ede0199364dcf8fdea889dab6dd3e191dde639a0fa144484728c8feb4ed7b0",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static STDOUT_FP in crates/carrick-runtime/src/dtrace_consumer.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "DIRECTORY",
+      "fingerprint": "a76960aa7858750ad743cfba833e7c7e3f858cdfcae2ed77790caa138bca5057",
+      "classification": "config_debug",
+      "rationale": "Census output directory, read once from CARRICK_EL1_CENSUS; diagnostic only."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "ENABLED",
+      "fingerprint": "c96e6b69ce52fbad881d65ee889d26d2b181c0ff114b861e315c1c27624df699",
+      "classification": "config_debug",
+      "rationale": "Whether the EL1 census is recording (CARRICK_EL1_CENSUS set); gates counting only. Process-wide: several embedded containers in one host process share one census, a per-carrier-process measurement."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "STARTED",
+      "fingerprint": "77537edcbc492939d3374a9cf9a63a516cc476b40aed08b36191d52a95f6a8e3",
+      "classification": "config_debug",
+      "rationale": "Wall-clock start of the census window for the carrier process; diagnostic only."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "TABLE",
+      "fingerprint": "5f625142c8812c33cbfa3051ade028cdc07081b8bb4ba99d7fcae304858f38e8",
+      "classification": "config_debug",
+      "rationale": "Per-syscall atomic counters and host service time for the EL1 census; diagnostic accounting that no dispatch decision reads."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/el1_census.rs",
+      "symbol": "WRITTEN",
+      "fingerprint": "95eb755f799704565536668d09ba2c6301503b2f00fb15627cf52183ab9c1306",
+      "classification": "config_debug",
+      "rationale": "Once-flag so the census file is written exactly once at carrier teardown; diagnostic only."
     },
     {
       "kind": "static",
@@ -2355,6 +2539,38 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/gic.rs",
+      "symbol": "CARRIER_GIC",
+      "fingerprint": "fa483063c426ee2f4d80f211a0f64a27464c418553aea4a7985e3f987617329b",
+      "classification": "carrier_infra",
+      "rationale": "The in-kernel GIC of the carrier process's one live Hypervisor.framework VM generation (affinity counter and capacity); created with the VM and reset when custody releases it."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/gic.rs",
+      "symbol": "VTIMER_PROBE",
+      "fingerprint": "cdb3df8c7ff960bc50bc54498d6deb7885e2dffc968f9a9388bec6e1d3ae990c",
+      "classification": "config_debug",
+      "rationale": "Signed-test probe of the guest virtual timer (EL1 plan 1a): the marker request, the probed vCPU and its exit accounting until EL1 takes the timer. Idle in every production run."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/gic.rs",
+      "symbol": "VTIMER_PROBE_ACTIVE",
+      "fingerprint": "436806f13bde761bc802e1a42c15cbbb592ce65008c6ffa0be19e0aefcdec495",
+      "classification": "config_debug",
+      "rationale": "Gate of the signed-test virtual-timer probe: one relaxed load per hv_vcpu_run entry and exit when no probe is armed."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/gic.rs",
+      "symbol": "interrupt_model::MODEL",
+      "fingerprint": "322db3c4b4842d4c05a98442b2f4cf4f9528db30bfd597925c6c0aeceaa91e9a",
+      "classification": "carrier_infra",
+      "rationale": "Carrier interrupt model latched once from CARRICK_HVF_GIC so the VM, the kick vehicle and the EL1 vector bytes cannot disagree within one carrier process."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
       "symbol": "INSTALLED",
       "fingerprint": "d292bc3528e37c718f947eb3c3a25a92f37f114cd282b223cdb2064793f947e5",
@@ -2451,6 +2667,78 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/metadata_grant.rs",
+      "symbol": "BYTES_GRANTED",
+      "fingerprint": "89e2fc4531d37d1b1086d67211cd43e3d102bd04856e8e85a3867d9f4e84a103",
+      "classification": "carrier_infra",
+      "rationale": "Cumulative bytes granted to EL1 metadata pool across carrier lifecycle."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/metadata_grant.rs",
+      "symbol": "BYTES_RETURNED",
+      "fingerprint": "64400c91338244feeabbccb093b9d39c15634b92dff83abe6245f938d151a726",
+      "classification": "carrier_infra",
+      "rationale": "Cumulative bytes returned from EL1 metadata pool across carrier lifecycle."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/metadata_grant.rs",
+      "symbol": "FAILPOINT_DENY_NEXT",
+      "fingerprint": "7915fc935a561fa23323c601a095e12a1dd46108822491343acf3285a6ef53a8",
+      "classification": "test_only",
+      "rationale": "Test-only failpoint flag to simulate denial of metadata grant requests."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/metadata_grant.rs",
+      "symbol": "GRANTS_DENIED",
+      "fingerprint": "3dab4f9062dc786f9ea3748ba01e3bffef2163f026a2d2627beef6fbe506f796",
+      "classification": "carrier_infra",
+      "rationale": "Cumulative metadata grant denials across carrier lifecycle."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/metadata_grant.rs",
+      "symbol": "GRANTS_REQUESTED",
+      "fingerprint": "8ad44e67261adc0c9f7bdd29652e014547a7a6fbff4606ba93c8b3974c5c8809",
+      "classification": "carrier_infra",
+      "rationale": "Cumulative metadata grant requests across carrier lifecycle."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/metadata_grant.rs",
+      "symbol": "GRANTS_SUCCEEDED",
+      "fingerprint": "783d895195bf0ac62e1f71113f15d20f2977f7fb5d7c7d30aab1ed226c499c73",
+      "classification": "carrier_infra",
+      "rationale": "Cumulative metadata grant successes across carrier lifecycle."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/metadata_grant.rs",
+      "symbol": "INLINE_HVC_TRAPS",
+      "fingerprint": "20171520cd036682aa76f36bc7d33d5b8dcc126f610931a2abca862e185eb16f",
+      "classification": "carrier_infra",
+      "rationale": "Diagnostic counter for inline HVC traps processed by metadata grant handler."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/metadata_grant.rs",
+      "symbol": "NEXT_TOKEN",
+      "fingerprint": "0d8a9ee74d3904804c9d0b00e79a5b33680598105ff5cd1fc6a765090238ee9d",
+      "classification": "monotonic_allocator",
+      "rationale": "Monotonic token generator for tracking EL1 metadata grant allocations."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/metadata_grant.rs",
+      "symbol": "RETURNS_COMPLETED",
+      "fingerprint": "feff7a7596ea6cce91356b4bf55518a61fcfd045286919152a3c1392d86960ca",
+      "classification": "carrier_infra",
+      "rationale": "Cumulative metadata return completions across carrier lifecycle."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/syscall_mailbox.rs",
       "symbol": "MAILBOX_SLOT_CLAIMS_TOTAL",
       "fingerprint": "5a593f4138619701dd637712dd2bca39e908728b40b41b5b44eaa47f37dc2ac3",
@@ -2515,11 +2803,11 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/vcpu_topology.rs",
-      "symbol": "carrier_vcpu_topology::TOPOLOGY",
-      "fingerprint": "216999d50e5af27fd902fece5bc84652163d08f4cf74c99a152c15adc1cbdd2c",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "VCPU_RUN_EXITS_TOTAL",
+      "fingerprint": "a94d07f6c32ea0f4275a9c5e826877fbd2c9719b58ca802ae8f1e40ae7473aaa",
       "classification": "carrier_infra",
-      "rationale": "Carrier-wide vCPU topology lifetime of the one Hypervisor.framework VM this process may own (EL1 plan 1a D2): gates every hv_vcpu_create, first hv_vcpu_run and hv_vcpu_destroy against the VM generation's phase."
+      "rationale": "Carrier-wide diagnostic counter VCPU_RUN_EXITS_TOTAL in crates/carrick-vmm-hvf/src/trap.rs counting every hv_vcpu_run return (host exits), read by signed tests as deltas."
     },
     {
       "kind": "static",
@@ -2772,6 +3060,14 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
+      "symbol": "el1_frame_grant_ledger::LEDGER",
+      "fingerprint": "2a10731eca66b1a77032d21ff0362b9d41b63f20f67aa31b74a6a998c5cf9d71",
+      "classification": "carrier_infra",
+      "rationale": "Process-wide ledger tracking active EL1 frame grants in the HVF carrier."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
       "symbol": "fork_debug_ipa::CELL",
       "fingerprint": "cc3f21d07848ecf292592d67a15c1705782e6f022e25f6936acd6d67fc592f23",
       "classification": "config_debug",
@@ -2906,6 +3202,22 @@
       "rationale": "Carrier-wide host infrastructure static park_for_slot::GATE_MUTEX in crates/carrick-vmm-hvf/src/trap/vcpu_gate.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/vcpu_topology.rs",
+      "symbol": "carrier_vcpu_topology::TOPOLOGY",
+      "fingerprint": "216999d50e5af27fd902fece5bc84652163d08f4cf74c99a152c15adc1cbdd2c",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide vCPU topology lifetime of the one Hypervisor.framework VM this process may own (EL1 plan 1a D2): gates every hv_vcpu_create, first hv_vcpu_run and hv_vcpu_destroy against the VM generation's phase."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/vcpu_kick.rs",
+      "symbol": "ZONE_SLOT_VCPU",
+      "fingerprint": "049e4652fa654904786636503a4192196dd78ebed87344d5550539b0583e88f3",
+      "classification": "carrier_infra",
+      "rationale": "Per-EL1-mailbox-slot vCPU id table in crates/carrick-vmm-hvf/src/vcpu_kick.rs, written by the executor that loads a task on the slot, so a zone kick reaches the vCPU running that slot; carrier VM scope like the mailbox slots."
+    },
+    {
       "kind": "thread_local",
       "file": "crates/carrick-embed/src/deadline.rs",
       "symbol": "LAST_RUN_PLAN",
@@ -3027,6 +3339,14 @@
     },
     {
       "kind": "thread_local",
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "symbol": "THREAD_HOST_SLOT",
+      "fingerprint": "6ef2a8d6b2ee33d06a93c59140912d1194df7ef60869e145e644aa4bbdec5e53",
+      "classification": "carrier_infra",
+      "rationale": "The host-only execution slot of an executor thread whose vCPU has no mailbox lease, in crates/carrick-kernel/src/kernel/mm_occupancy.rs; a vCPU is bound to the thread that runs it, so the slot lives as long as the thread and is freed at its exit when vacant."
+    },
+    {
+      "kind": "thread_local",
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "symbol": "SYSTEM_CHARGE_WINDOW",
       "fingerprint": "761f744a623027ad2ff9fefe442521860f8fcfae43bd03d5dd2c8dbd9b920fee",
@@ -3067,6 +3387,14 @@
     },
     {
       "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
+      "symbol": "DRIVEN_ZONE_SLOT",
+      "fingerprint": "177e888108131b293f8547b9a19fd5342add7f305f239d3db5035946b7cf7726",
+      "classification": "carrier_infra",
+      "rationale": "Per-executor-thread record in crates/carrick-runtime/src/vcpu_loop/executor/backend.rs of the EL1 zone slot the executor drives now (EL1 plan 1d): a slot follows its vCPU's mailbox lease, which a task can carry, so an executor that moves to another slot leaves the one it drove; it names only this host thread's own vCPU and selects no container state."
+    },
+    {
+      "kind": "thread_local",
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
       "symbol": "tests::activation_allocator::ALLOCATIONS",
       "fingerprint": "480d1f5fd037a29e0b2ad0a60678eb0c97a67e97f9c300f2a09bdcd6cfc71a51",
@@ -3075,11 +3403,43 @@
     },
     {
       "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "CENSUS_EL1_BOUNDARY",
+      "fingerprint": "20029c1924cfffe7112bbb00c5a94704c22f081affec8c641ab4929c304271d4",
+      "classification": "config_debug",
+      "rationale": "Per-executor-thread flag marking that the current syscall crossed the EL1 boundary, read only by census accounting."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "CENSUS_IN_SERVICE",
+      "fingerprint": "7f3f3f597f23ef37ceefba377e332515df61380edd1e58629bcada3d7d17cf26",
+      "classification": "config_debug",
+      "rationale": "Per-executor-thread flag so a redispatch nested inside a host service is not double-counted by the census; accounting only."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "test_execution_slot::SLOTS",
+      "fingerprint": "246b5ffc039f22f07d217116ff90095a959f7c55465974f6ec7017a3dead0b3f",
+      "classification": "test_only",
+      "rationale": "Test-only per-thread list of host-only execution slots handed to test admissions in crates/carrick-runtime/src/vcpu_loop/mod.rs, freed at the test thread's exit; never compiled outside cfg(test)."
+    },
+    {
+      "kind": "thread_local",
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
       "symbol": "SIGNAL_PROGRESS",
       "fingerprint": "7755e08c063b13aa58b05d249ee9449b42430aeb6fce85646cf2bb3f9a460ad5",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell SIGNAL_PROGRESS in crates/carrick-runtime/src/vcpu_loop/signal.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
+      "symbol": "PENDING_ADOPTION",
+      "fingerprint": "59a1aeac5323936cf6068660fe5ec9df9d56c8865c8f60d77947254f0ff8facb",
+      "classification": "carrier_infra",
+      "rationale": "Per-executor-thread slot in crates/carrick-runtime/src/vcpu_loop/zone.rs holding the one zone thread EL1 ran on this executor's vCPU that exited to the host (EL1 plan 1d); the executor claims it before its next run, so it never outlives one exit and belongs to exactly one executor thread."
     },
     {
       "kind": "thread_local",
@@ -3164,18 +3524,18 @@
     {
       "kind": "thread_local",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "TASK_MAPPING_ROWS_SCANNED",
-      "fingerprint": "476e97a36c4b9a69f322816d15b90d5552754fc54380db16c752f072c69abf7f",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local counter of TaskMappingIndex rows one lookup offered its consumer, read by the per-fault mapping-index census probe and by a_lookup_walks_a_bounded_number_of_rows_regardless_of_table_size. Same per-host-thread scope and rationale as ALIAS_STATE_ROWS_SCANNED and FORK_MAPPING_ROWS_SCANNED: it measures the faulting thread's own walk length and carries no Linux process semantics."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "FRAME_EXTENTS_SCANNED",
       "fingerprint": "b663d748820d9278fab2ba18e5cbb193c7a6703f5bf99fb090f4d903cf5f1c62",
       "classification": "carrier_infra",
       "rationale": "Host thread-local counter of frame-inventory extents one containment lookup visited, read by the hvpatch-mm-maintenance census probe and by exclusive_claim_extent_lookup_is_bounded_by_size_classes. Same per-host-thread scope and rationale as ALIAS_STATE_ROWS_SCANNED and TASK_MAPPING_ROWS_SCANNED: it measures the calling thread's own walk length and carries no Linux process semantics."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "TASK_MAPPING_ROWS_SCANNED",
+      "fingerprint": "476e97a36c4b9a69f322816d15b90d5552754fc54380db16c752f072c69abf7f",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local counter of TaskMappingIndex rows one lookup offered its consumer, read by the per-fault mapping-index census probe and by a_lookup_walks_a_bounded_number_of_rows_regardless_of_table_size. Same per-host-thread scope and rationale as ALIAS_STATE_ROWS_SCANNED and FORK_MAPPING_ROWS_SCANNED: it measures the faulting thread's own walk length and carries no Linux process semantics."
     },
     {
       "kind": "thread_local",
@@ -3208,286 +3568,6 @@
       "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
       "classification": "test_only",
       "rationale": "Test-only thread-local cell STAGE2_AUDIT_STATE in crates/carrick-vmm-hvf/src/trap.rs enabling hypervisor stage-2 audit and failure injection in unit tests."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_inotify.rs",
-      "symbol": "ALLOCATED_INOTIFY_HANDLES",
-      "fingerprint": "8293ec39d01c673ab285f92855c0e0e3db7704a84b520b763b54b77d14b63d5b",
-      "classification": "carrier_infra",
-      "rationale": "Allocation bitmap of in-zone inotify instance slots in the carrier-wide EL1 aperture."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_inotify.rs",
-      "symbol": "INSTANCE_STATES",
-      "fingerprint": "168e6ab4d62e6e115c6cd1b7618fe1ffbff304ea7d87ae3fd07671082b704841",
-      "classification": "carrier_infra",
-      "rationale": "Weak map from in-zone inotify handle to its fronting InotifyState, so host paths reach the one authoritative instance."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/el1_census.rs",
-      "symbol": "snapshot::CARRICK_RUN_ID",
-      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
-      "classification": "config_debug",
-      "rationale": "The run id is copied into an EL1 census file so the CLI can join it to a conformance result; diagnostic only, it selects no container state."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/el1_census.rs",
-      "symbol": "init_from_env::CARRICK_EL1_CENSUS",
-      "fingerprint": "b5d19b3f216428d054961abf0597b6df0b065599a654e73d7021b504670feac7",
-      "classification": "config_debug",
-      "rationale": "Opt-in diagnostic: names the directory an EL1 census is written to at carrier teardown. Unset, the census records nothing; set, it only counts and times syscall service and cannot change guest-visible state."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/el1_census.rs",
-      "symbol": "DIRECTORY",
-      "fingerprint": "a76960aa7858750ad743cfba833e7c7e3f858cdfcae2ed77790caa138bca5057",
-      "classification": "config_debug",
-      "rationale": "Census output directory, read once from CARRICK_EL1_CENSUS; diagnostic only."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/el1_census.rs",
-      "symbol": "ENABLED",
-      "fingerprint": "c96e6b69ce52fbad881d65ee889d26d2b181c0ff114b861e315c1c27624df699",
-      "classification": "config_debug",
-      "rationale": "Whether the EL1 census is recording (CARRICK_EL1_CENSUS set); gates counting only. Process-wide: several embedded containers in one host process share one census, a per-carrier-process measurement."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/el1_census.rs",
-      "symbol": "STARTED",
-      "fingerprint": "77537edcbc492939d3374a9cf9a63a516cc476b40aed08b36191d52a95f6a8e3",
-      "classification": "config_debug",
-      "rationale": "Wall-clock start of the census window for the carrier process; diagnostic only."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/el1_census.rs",
-      "symbol": "TABLE",
-      "fingerprint": "5f625142c8812c33cbfa3051ade028cdc07081b8bb4ba99d7fcae304858f38e8",
-      "classification": "config_debug",
-      "rationale": "Per-syscall atomic counters and host service time for the EL1 census; diagnostic accounting that no dispatch decision reads."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/el1_census.rs",
-      "symbol": "WRITTEN",
-      "fingerprint": "95eb755f799704565536668d09ba2c6301503b2f00fb15627cf52183ab9c1306",
-      "classification": "config_debug",
-      "rationale": "Once-flag so the census file is written exactly once at carrier teardown; diagnostic only."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "CENSUS_EL1_BOUNDARY",
-      "fingerprint": "20029c1924cfffe7112bbb00c5a94704c22f081affec8c641ab4929c304271d4",
-      "classification": "config_debug",
-      "rationale": "Per-executor-thread flag marking that the current syscall crossed the EL1 boundary, read only by census accounting."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "CENSUS_IN_SERVICE",
-      "fingerprint": "7f3f3f597f23ef37ceefba377e332515df61380edd1e58629bcada3d7d17cf26",
-      "classification": "config_debug",
-      "rationale": "Per-executor-thread flag so a redispatch nested inside a host service is not double-counted by the census; accounting only."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/gic.rs",
-      "symbol": "interrupt_model::CARRICK_HVF_GIC",
-      "fingerprint": "3bde60465826719e4dd145cc14f3d67a871b5272be175ca9d9599915098363e0",
-      "classification": "config_debug",
-      "rationale": "Bisection hatch: CARRICK_HVF_GIC=0 (exact string) restores the GIC-less carrier VM, the SDK IRQ-line kick vehicle and the pre-GIC EL1 vector bytes (EL1 plan 1a)."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/gic.rs",
-      "symbol": "interrupt_model::MODEL",
-      "fingerprint": "322db3c4b4842d4c05a98442b2f4cf4f9528db30bfd597925c6c0aeceaa91e9a",
-      "classification": "carrier_infra",
-      "rationale": "Carrier interrupt model latched once from CARRICK_HVF_GIC so the VM, the kick vehicle and the EL1 vector bytes cannot disagree within one carrier process."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/gic.rs",
-      "symbol": "CARRIER_GIC",
-      "fingerprint": "fa483063c426ee2f4d80f211a0f64a27464c418553aea4a7985e3f987617329b",
-      "classification": "carrier_infra",
-      "rationale": "The in-kernel GIC of the carrier process's one live Hypervisor.framework VM generation (affinity counter and capacity); created with the VM and reset when custody releases it."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/gic.rs",
-      "symbol": "VTIMER_PROBE",
-      "fingerprint": "cdb3df8c7ff960bc50bc54498d6deb7885e2dffc968f9a9388bec6e1d3ae990c",
-      "classification": "config_debug",
-      "rationale": "Signed-test probe of the guest virtual timer (EL1 plan 1a): the marker request, the probed vCPU and its exit accounting until EL1 takes the timer. Idle in every production run."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/gic.rs",
-      "symbol": "VTIMER_PROBE_ACTIVE",
-      "fingerprint": "436806f13bde761bc802e1a42c15cbbb592ce65008c6ffa0be19e0aefcdec495",
-      "classification": "config_debug",
-      "rationale": "Gate of the signed-test virtual-timer probe: one relaxed load per hv_vcpu_run entry and exit when no probe is armed."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "VCPU_RUN_EXITS_TOTAL",
-      "fingerprint": "a94d07f6c32ea0f4275a9c5e826877fbd2c9719b58ca802ae8f1e40ae7473aaa",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide diagnostic counter VCPU_RUN_EXITS_TOTAL in crates/carrick-vmm-hvf/src/trap.rs counting every hv_vcpu_run return (host exits), read by signed tests as deltas."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "symbol": "hatch_enabled::CARRICK_EL1_FUTEX",
-      "fingerprint": "19c0f730e072b8b68f1b7fc838c00ba90cc2deba3a2bf4733bc6fbd571e3d8f8",
-      "classification": "config_debug",
-      "rationale": "Exact =0 bisection hatch CARRICK_EL1_FUTEX in crates/carrick-kernel/src/el1_zone.rs that turns off the in-guest futex handoff (EL1 plan 1b), read once per carrier process."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "symbol": "SLOT_KICKER",
-      "fingerprint": "a61c7e6bad2a01d1b207915523be0e025e13ce2de78db7734d46c14109668727",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide hook in crates/carrick-kernel/src/el1_zone.rs through which the kernel kicks the vCPU on an EL1 mailbox slot (registered once by the HVF carrier); the zone tables it serves are per carrier VM."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "symbol": "hatch_enabled::ENABLED",
-      "fingerprint": "d3bce58c23c5a39148597c742d4efc3d23c0c671f159649ee582aae719dda689",
-      "classification": "config_debug",
-      "rationale": "Cached value of the CARRICK_EL1_FUTEX bisection hatch in crates/carrick-kernel/src/el1_zone.rs; read once, immutable for the carrier's life."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "symbol": "GUEST_SCHEDULER",
-      "fingerprint": "251d655ecc801957aefbd83859fd2b60a9368d939cbc385c9ae9ce46a071b524",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide switch in crates/carrick-kernel/src/el1_zone.rs, set once when the persistent executor pool starts: whether the carrier VM has the in-kernel GIC the in-guest scheduler needs (EL1 plan 1c); without it the zone stays off."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/vcpu_kick.rs",
-      "symbol": "ZONE_SLOT_VCPU",
-      "fingerprint": "049e4652fa654904786636503a4192196dd78ebed87344d5550539b0583e88f3",
-      "classification": "carrier_infra",
-      "rationale": "Per-EL1-mailbox-slot vCPU id table in crates/carrick-vmm-hvf/src/vcpu_kick.rs, written by the executor that loads a task on the slot, so a zone kick reaches the vCPU running that slot; carrier VM scope like the mailbox slots."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "symbol": "guest_scheduling_hatch_enabled::ENABLED",
-      "fingerprint": "d3bce58c23c5a39148597c742d4efc3d23c0c671f159649ee582aae719dda689",
-      "classification": "config_debug",
-      "rationale": "Cached value of the CARRICK_EL1_SCHED bisection hatch in crates/carrick-kernel/src/el1_zone.rs; read once, immutable for the carrier's life."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "symbol": "guest_scheduling_hatch_enabled::CARRICK_EL1_SCHED",
-      "fingerprint": "cb3b9c148759403b19dc9014874e8a5b750ffa331d6a0ef63638cf3bb4bc54d9",
-      "classification": "config_debug",
-      "rationale": "Exact =0 bisection hatch CARRICK_EL1_SCHED in crates/carrick-kernel/src/el1_zone.rs that turns off guest scheduling (EL1 plan 1d: host run queues and condvar parks again, the futex zone still on), read once per carrier process."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/el1_zone.rs",
-      "symbol": "HANDBACK_PUBLISHER",
-      "fingerprint": "05fc3bd6e0dfa2579b35ad4d020da4f829fbd9f72bee178fae545baa236e10d5",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide hook in crates/carrick-kernel/src/el1_zone.rs through which the kernel hands a zone thread back to its host continuation; each start of the persistent executor pool registers its own scheduler's publisher (a carrier may run several containers in turn), and the zone tables it serves are per carrier VM."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/kernel/ids.rs",
-      "symbol": "CARRIER_MM_IDS",
-      "fingerprint": "db15e3d493982cb11591b2d88a7d6de71eb5deb0650ee8aa29b537383473f0b4",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide monotonic source of MmIds in crates/carrick-kernel/src/kernel/ids.rs: MM identities must be unique across every kernel (container) in one carrier process, because the EL1 zone occupancy words and published address spaces key on them and all containers share the carrier VM; carrier scope by design, never reset."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
-      "symbol": "PENDING_ADOPTION",
-      "fingerprint": "59a1aeac5323936cf6068660fe5ec9df9d56c8865c8f60d77947254f0ff8facb",
-      "classification": "carrier_infra",
-      "rationale": "Per-executor-thread slot in crates/carrick-runtime/src/vcpu_loop/zone.rs holding the one zone thread EL1 ran on this executor's vCPU that exited to the host (EL1 plan 1d); the executor claims it before its next run, so it never outlives one exit and belongs to exactly one executor thread."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
-      "symbol": "DRIVEN_ZONE_SLOT",
-      "fingerprint": "177e888108131b293f8547b9a19fd5342add7f305f239d3db5035946b7cf7726",
-      "classification": "carrier_infra",
-      "rationale": "Per-executor-thread record in crates/carrick-runtime/src/vcpu_loop/executor/backend.rs of the EL1 zone slot the executor drives now (EL1 plan 1d): a slot follows its vCPU's mailbox lease, which a task can carry, so an executor that moves to another slot leaves the one it drove; it names only this host thread's own vCPU and selects no container state."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
-      "symbol": "PORTS",
-      "fingerprint": "f55653b286f94e0f93d81d3b76eb4639336defd7c3fa4aaefaacca7936e0ad91",
-      "classification": "carrier_infra",
-      "rationale": "Per-vCPU-execution-slot port table of the address-space occupancy authority in crates/carrick-kernel/src/kernel/mm_occupancy.rs: the pause endpoint and fence of the MM each slot runs, written under its slot lock by the executor that occupies the slot; carrier VM scope like the mailbox slots it is indexed by, and scoped per kernel graph by the MM's fence object."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
-      "symbol": "HOST_TABLE",
-      "fingerprint": "6bc2e6e1746fce0d6af84c46de81fc57d846465e85c2b7a64451025c12593f5f",
-      "classification": "carrier_infra",
-      "rationale": "The host-memory half of the address-space occupancy authority (carrick_sched_core::Occupancy) in crates/carrick-kernel/src/kernel/mm_occupancy.rs: the words of host-only execution slots, and of every slot while the carrier does not schedule in the guest (zone slots otherwise live in the shared EL1 region); carrier VM scope like the mailbox slots it is indexed by (one HVF VM per process)."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
-      "symbol": "switching_enabled::CARRICK_EL1_MM_SWITCH",
-      "fingerprint": "ef331b74c9689eaec22956f8528cd60e9b7f80f542b29271da5268bdf11fc92e",
-      "classification": "config_debug",
-      "rationale": "Exact =0 bisection hatch CARRICK_EL1_MM_SWITCH in crates/carrick-kernel/src/kernel/mm_occupancy.rs that stops publishing address spaces for guest EL1 to install itself (EL1 increment 2, step 2: threads of another process reach a vCPU through its executor again), read once per carrier process."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
-      "symbol": "switching_enabled::ENABLED",
-      "fingerprint": "810e6edc6ac71f37c4eb86f28b68168eb8d1faac13e5facea0127a51501d3002",
-      "classification": "config_debug",
-      "rationale": "Cached value of the CARRICK_EL1_MM_SWITCH bisection hatch in crates/carrick-kernel/src/kernel/mm_occupancy.rs; read once, immutable for the carrier's life."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
-      "symbol": "SPACES_LOCK",
-      "fingerprint": "ce764b981fd018aae03602b1b3e13f434f71b1a4272909814bb1680953f17f51",
-      "classification": "carrier_infra",
-      "rationale": "Serializes publication and freeing of address-space entries in the shared EL1 region (carrick_sched_core::AddressSpaces, the only host mutations of that table) in crates/carrick-kernel/src/kernel/mm_occupancy.rs; carrier VM scope like the zone tables it guards."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
-      "symbol": "THREAD_HOST_SLOT",
-      "fingerprint": "6ef2a8d6b2ee33d06a93c59140912d1194df7ef60869e145e644aa4bbdec5e53",
-      "classification": "carrier_infra",
-      "rationale": "The host-only execution slot of an executor thread whose vCPU has no mailbox lease, in crates/carrick-kernel/src/kernel/mm_occupancy.rs; a vCPU is bound to the thread that runs it, so the slot lives as long as the thread and is freed at its exit when vacant."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "test_execution_slot::SLOTS",
-      "fingerprint": "246b5ffc039f22f07d217116ff90095a959f7c55465974f6ec7017a3dead0b3f",
-      "classification": "test_only",
-      "rationale": "Test-only per-thread list of host-only execution slots handed to test admissions in crates/carrick-runtime/src/vcpu_loop/mod.rs, freed at the test thread's exit; never compiled outside cfg(test)."
     }
   ]
 }

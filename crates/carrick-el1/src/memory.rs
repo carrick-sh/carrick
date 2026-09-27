@@ -232,7 +232,7 @@ pub fn try_serve_brk<E: AnonymousRetirementEditor>(
     if requested == 0 {
         return BrkDisposition::Return(current);
     }
-    if requested < LINUX_HEAP_BASE || requested > LINUX_HEAP_BASE + LINUX_HEAP_SIZE {
+    if !(LINUX_HEAP_BASE..=LINUX_HEAP_BASE + LINUX_HEAP_SIZE).contains(&requested) {
         return BrkDisposition::Return(current);
     }
     let Some(old_page_end) = current

@@ -27,6 +27,17 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
+      "function": "HvfAarch64Vcpu::executor_vcpu",
+      "ordinal_in_function": 1,
+      "fingerprint": "79c378105ab7464aa786d5e5c99d3dbd618840f6b1096f723944c44088740924",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvf::vcpu_lifetime",
+      "rationale": "A persistent executor's vCPU half holds a staged root CPU instead of its own live vCPU: the executor lease was assembled from a task's backing, so kick handles, mailbox slots and vCPU identity would name no hardware.",
+      "sink": "fatal",
+      "domain": "hvf::vcpu_lifetime"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
       "function": "HvpatchTaskOnlyEngineState::activate_child",
       "ordinal_in_function": 1,
       "fingerprint": "0da731d28c0f33b72e8c669a24a82892158b8048ee2b91bfb958ccf746ec0ca3",
@@ -244,6 +255,39 @@
       "rationale": "As #5 for the REPLAY half: a version id present in replay_version_owner whose ReplayVersionChain is missing means the replay version registry and its index disagree.",
       "sink": "fatal",
       "domain": "hvpatch::host_alias"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfInner::run_to_exit_inner",
+      "ordinal_in_function": 1,
+      "fingerprint": "4bcff2b05426933ff2ac4d3036f218da652a3ed7d4eb7cb15e8c3cabc86b59ab",
+      "verdict": "carrier_fault",
+      "failure_domain": "trap::run_to_exit",
+      "rationale": "vCPU exceeded 1000 consecutive EL1 resumes without making forward progress to user mode or host boundary, indicating EL1 loop deadlock or infinite trap recursion.",
+      "sink": "fatal",
+      "domain": "trap::run_to_exit"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfInner::run_to_exit_inner",
+      "ordinal_in_function": 2,
+      "fingerprint": "4bcff2b05426933ff2ac4d3036f218da652a3ed7d4eb7cb15e8c3cabc86b59ab",
+      "verdict": "carrier_fault",
+      "failure_domain": "trap::run_to_exit",
+      "rationale": "Unresolvable stage-2 abort taken from EL1 inside the kernel image indicating kernel corruption.",
+      "sink": "fatal",
+      "domain": "trap::run_to_exit"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfInner::run_to_exit_inner",
+      "ordinal_in_function": 3,
+      "fingerprint": "4bcff2b05426933ff2ac4d3036f218da652a3ed7d4eb7cb15e8c3cabc86b59ab",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1",
+      "rationale": "EL1 in-guest panic handler invoked and forwarded fatal marker via hvc #3 with panic sentinel.",
+      "sink": "fatal",
+      "domain": "el1"
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -786,34 +830,34 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
-      "function": "HvfVmState::commit_process_alias_retirement",
+      "function": "HvfVmState::commit_process_alias_retirement_inner",
       "ordinal_in_function": 1,
       "fingerprint": "cb85086ebf650aeb738d172594935676e4258f48287b4dd8e25f6bc35806a27a",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
-      "rationale": "Global alias registry mutated unexpectedly under topology lock during alias unregistration, corrupting planned alias and stage-2 lease retirement.",
+      "rationale": "HVPatch alias registry changed concurrently under the mm guard during process alias retirement.",
       "sink": "fatal",
       "domain": "hvpatch::host_alias"
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
-      "function": "HvfVmState::commit_process_alias_retirement",
+      "function": "HvfVmState::commit_process_alias_retirement_inner",
       "ordinal_in_function": 2,
-      "fingerprint": "61a5927bcaa2e6e900b2f9924838f3c1f0ba43add8b4d797e0b3035e35640e32",
+      "fingerprint": "a390803906a26af241b266f20734bc65fcb671870bb21ecc696f25c54f940f27",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Applying alias retirement inventory commit to Kernel authority failed after unregistering aliases, desynchronizing alias state from Kernel frame inventory authority.",
+      "rationale": "Applying alias retirement inventory failed in the carrier frame authority, leaving unmapped physical allocations.",
       "sink": "fatal",
       "domain": "hvpatch::frame_inventory"
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
-      "function": "HvfVmState::commit_process_alias_retirement",
+      "function": "HvfVmState::commit_process_alias_retirement_inner",
       "ordinal_in_function": 3,
       "fingerprint": "01b3f0e769642447c147922ddb0326a92967cd6a5aa1509976035a2e31724e2b",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Committing alias lease retirement to backend inventory ledger failed after Kernel commit, leaving carrier ledger and Kernel authority diverged.",
+      "rationale": "Committing alias retirement backend inventory lease failed in the local frame inventory ledger.",
       "sink": "fatal",
       "domain": "hvpatch::frame_inventory"
     },
@@ -926,6 +970,28 @@
       "rationale": "Arithmetic overflow when recalculating expected IPA for split trailing pending COW publication indicates corrupted address translation state.",
       "sink": "fatal",
       "domain": "hvpatch::cow_token"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "function": "HvfVmState::prepare_el1_frame_grant",
+      "ordinal_in_function": 1,
+      "fingerprint": "92e4ecfae9a218497c2ef787d9833c71c2310dfebf9a1c0cc384229dd1f0e724",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::el1_frame_grant",
+      "rationale": "Committed EL1 frame grant replacement could not retire its predecessor in the alias registry, leaving conflicting mapping metadata.",
+      "sink": "fatal",
+      "domain": "hvpatch::el1_frame_grant"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "function": "HvfVmState::prepare_el1_frame_grant",
+      "ordinal_in_function": 2,
+      "fingerprint": "2a0d4b312777bb9986093e96b06b5a02630d566ef918b5dd4e31cb6fde2dc09e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::el1_frame_grant",
+      "rationale": "Published EL1 frame grant failed to bind allocator diagnostics into the custody registry.",
+      "sink": "fatal",
+      "domain": "hvpatch::el1_frame_grant"
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs",
@@ -1732,6 +1798,83 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish_frame_grant",
+      "ordinal_in_function": 1,
+      "fingerprint": "bb857b24e31f03aed23ca6b4b15430815d850bd97d6a61cdfda61e9751bbb9ad",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::el1_frame_grant",
+      "rationale": "Anonymous EL1 frame grant unexpectedly required page-granular COW arming during range setup.",
+      "sink": "fatal",
+      "domain": "hvpatch::el1_frame_grant"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish_frame_grant",
+      "ordinal_in_function": 2,
+      "fingerprint": "a250c98437b9d3d9d5954829afa36ffb0b3def59654f95fe731ec0672c5e67c8",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::el1_frame_grant",
+      "rationale": "Prepared EL1 frame grant has invalid zero physical length.",
+      "sink": "fatal",
+      "domain": "hvpatch::el1_frame_grant"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish_frame_grant",
+      "ordinal_in_function": 3,
+      "fingerprint": "6a8d04f40275867091402bedffecafab85f852f2e8a8fd8513c2afb13c5aa806",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::el1_frame_grant",
+      "rationale": "Backend frame grant rollback failed after kernel authority refusal during frame grant application.",
+      "sink": "fatal",
+      "domain": "hvpatch::el1_frame_grant"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish_frame_grant",
+      "ordinal_in_function": 4,
+      "fingerprint": "2b5f839985243c9f9d113f02d3cded1a667b6463e62648900e75c17dc1f0d490",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::el1_frame_grant",
+      "rationale": "EL1 frame grant request reached inventory with invalid zero MM identity.",
+      "sink": "fatal",
+      "domain": "hvpatch::el1_frame_grant"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish_frame_grant",
+      "ordinal_in_function": 5,
+      "fingerprint": "3fc96b7fb1c3254c3d2955fab1a3abf2ab0845d930b714577c096f15dd94fc01",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::el1_frame_grant",
+      "rationale": "Combined replacement grant failed post-commit authentication with an unrecoverable retirement present.",
+      "sink": "fatal",
+      "domain": "hvpatch::el1_frame_grant"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish_frame_grant",
+      "ordinal_in_function": 6,
+      "fingerprint": "3fc96b7fb1c3254c3d2955fab1a3abf2ab0845d930b714577c096f15dd94fc01",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::el1_frame_grant",
+      "rationale": "Kernel authority frame grant rollback failed after receipt mismatch during post-commit authentication.",
+      "sink": "fatal",
+      "domain": "hvpatch::el1_frame_grant"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish_frame_grant",
+      "ordinal_in_function": 7,
+      "fingerprint": "3fc96b7fb1c3254c3d2955fab1a3abf2ab0845d930b714577c096f15dd94fc01",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::el1_frame_grant",
+      "rationale": "Backend unpublished mapping rollback failed after receipt mismatch during post-commit authentication.",
+      "sink": "fatal",
+      "domain": "hvpatch::el1_frame_grant"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
       "function": "publish_replacing",
       "ordinal_in_function": 1,
       "fingerprint": "f5507e259087c123f39d8b67c43696b635d97bf2c8d7008b6050a12aacfb4fa7",
@@ -1861,50 +2004,6 @@
       "rationale": "Physical stage-2 mapping or unmapping transition already completed in the hypervisor while typed receipt construction failed, leaving the physical boundary unpublishable and unverifiable.",
       "sink": "fatal",
       "domain": "hvpatch::frame_inventory"
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfInner::run_to_exit_inner",
-      "ordinal_in_function": 1,
-      "fingerprint": "7b28b99375534b600b23aac77a90d88f2bfcee0d3a7b57eec2d1f8efd6726bb6",
-      "verdict": "carrier_fault",
-      "failure_domain": "trap::run_to_exit",
-      "rationale": "vCPU exceeded 1000 consecutive EL1 resumes without making forward progress to user mode or host boundary, indicating EL1 loop deadlock or infinite trap recursion.",
-      "sink": "fatal",
-      "domain": "trap::run_to_exit"
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfInner::run_to_exit_inner",
-      "ordinal_in_function": 2,
-      "fingerprint": "7b28b99375534b600b23aac77a90d88f2bfcee0d3a7b57eec2d1f8efd6726bb6",
-      "verdict": "carrier_fault",
-      "failure_domain": "trap::run_to_exit",
-      "rationale": "Unresolvable stage-2 abort taken from EL1 inside the kernel image indicating kernel corruption.",
-      "sink": "fatal",
-      "domain": "trap::run_to_exit"
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfInner::run_to_exit_inner",
-      "ordinal_in_function": 3,
-      "fingerprint": "7b28b99375534b600b23aac77a90d88f2bfcee0d3a7b57eec2d1f8efd6726bb6",
-      "verdict": "carrier_fault",
-      "failure_domain": "el1",
-      "rationale": "EL1 in-guest panic handler invoked and forwarded fatal marker via hvc #3 with panic sentinel.",
-      "sink": "fatal",
-      "domain": "el1"
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
-      "function": "HvfAarch64Vcpu::executor_vcpu",
-      "ordinal_in_function": 1,
-      "fingerprint": "79c378105ab7464aa786d5e5c99d3dbd618840f6b1096f723944c44088740924",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvf::vcpu_lifetime",
-      "rationale": "A persistent executor's vCPU half holds a staged root CPU instead of its own live vCPU: the executor lease was assembled from a task's backing, so kick handles, mailbox slots and vCPU identity would name no hardware.",
-      "sink": "fatal",
-      "domain": "hvf::vcpu_lifetime"
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/vcpu_topology.rs",

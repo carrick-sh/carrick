@@ -343,3 +343,61 @@ impl ThreadCpu for HardwareCpu {
         super::sgi_target_of(mpidr)
     }
 }
+
+/// Read the current stack pointer at EL1.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[inline(always)]
+pub fn read_current_sp() -> u64 {
+    let sp: u64;
+    unsafe {
+        core::arch::asm!("mov {0}, sp", out(reg) sp, options(nomem, nostack));
+    }
+    sp
+}
+
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+#[inline(always)]
+pub fn read_current_sp() -> u64 {
+    0
+}
+
+/// Guard structure capturing saved DAIF interrupt flags.
+pub struct IrqGuard {
+    #[allow(dead_code)]
+    pub saved_daif: u64,
+}
+
+#[inline(always)]
+pub fn disable_irq_save() -> IrqGuard {
+    let daif: u64;
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, daif",
+            "msr daifset, #2",
+            out(reg) daif,
+            options(nomem, nostack)
+        );
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        daif = 0;
+    }
+    IrqGuard { saved_daif: daif }
+}
+
+#[inline(always)]
+pub fn restore_irq(guard: IrqGuard) {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    unsafe {
+        core::arch::asm!(
+            "msr daif, {0}",
+            in(reg) guard.saved_daif,
+            options(nomem, nostack)
+        );
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = guard;
+    }
+}

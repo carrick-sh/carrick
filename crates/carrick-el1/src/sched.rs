@@ -666,7 +666,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     }
 }
 
-mod hw;
+pub(crate) mod hw;
 #[cfg(target_os = "none")]
 pub use hw::HardwareCpu;
 pub use hw::HardwareUserWord;

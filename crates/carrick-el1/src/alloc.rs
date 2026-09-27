@@ -703,59 +703,17 @@ pub struct AllocatorDiagnostics {
     pub active_bins_mask: u32,
 }
 
+pub use crate::sched::hw::{IrqGuard, disable_irq_save, restore_irq};
+
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(always)]
 fn current_el1_slot() -> Option<usize> {
-    let sp: u64;
-    unsafe {
-        core::arch::asm!("mov {0}, sp", out(reg) sp, options(nomem, nostack));
-    }
+    let sp = crate::sched::hw::read_current_sp();
     let offset = sp.checked_sub(carrick_el1_abi::EL1_STACKS_BASE)?;
     if offset >= carrick_el1_abi::EL1_STACK_SLOTS * carrick_el1_abi::EL1_STACK_SIZE {
         return None;
     }
     Some((offset / carrick_el1_abi::EL1_STACK_SIZE) as usize)
-}
-
-/// Guard structure capturing saved DAIF interrupt flags.
-pub struct IrqGuard {
-    #[allow(dead_code)]
-    saved_daif: u64,
-}
-
-#[inline(always)]
-pub fn disable_irq_save() -> IrqGuard {
-    let daif: u64;
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    unsafe {
-        core::arch::asm!(
-            "mrs {0}, daif",
-            "msr daifset, #2",
-            out(reg) daif,
-            options(nomem, nostack)
-        );
-    }
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-    {
-        daif = 0;
-    }
-    IrqGuard { saved_daif: daif }
-}
-
-#[inline(always)]
-pub fn restore_irq(guard: IrqGuard) {
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    unsafe {
-        core::arch::asm!(
-            "msr daif, {0}",
-            in(reg) guard.saved_daif,
-            options(nomem, nostack)
-        );
-    }
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-    {
-        let _ = guard;
-    }
 }
 
 /// Safe thread-safe wrapper around `MetadataAllocatorCore` with IRQ save/restore spinlock.

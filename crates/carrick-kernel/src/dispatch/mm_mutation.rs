@@ -313,6 +313,20 @@ pub fn from_sole_executor<'authority>(
     }
 }
 
+pub fn from_executor<'authority>(
+    participation: &'authority mut super::MmExecutorParticipation,
+) -> MmMutationGuard<'authority> {
+    let coordinator = participation.mutation_coordinator();
+    let mm = participation.mm_id();
+    MmMutationGuard {
+        coordinator,
+        mm,
+        operation: carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+        foreign_authority: None,
+        _authority: PhantomData,
+    }
+}
+
 #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
 pub(crate) fn from_frame_cow<'authority>(
     authority: &'authority mut super::mm_quiesce::FrameCowExactMmGuard,

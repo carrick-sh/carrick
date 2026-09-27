@@ -2280,27 +2280,10 @@ impl<'a> IpcView<'a> {
                 .mm_executor
                 .as_deref_mut()
                 .ok_or(DispatchError::MmExecutorParticipationUnavailable)?;
-            let coordinator = executor.mutation_coordinator();
-            let mm = executor.mm_id();
-            if mm != cx.kernel.shared().mm().id() {
+            if executor.mm_id() != cx.kernel.shared().mm().id() {
                 return Err(DispatchError::MmMutationPeerExecutor);
             }
-            let mut authority = match super::mm_quiesce::acquire_mm_stage1_authority(
-                executor,
-                tid,
-                super::mm_quiesce::PtPauseBudget::DEFAULT,
-            ) {
-                Ok(authority) => authority,
-                Err(super::mm_quiesce::PtPauseError::TimedOut) => return Ok(DispatchOutcome::errno(linux_errno::ENOMEM)),
-            };
-            let mutation = match &mut authority {
-                super::mm_quiesce::MmStage1Authority::Sole(sole) => {
-                    super::mm_mutation::from_sole_executor(sole, coordinator, mm)
-                }
-                super::mm_quiesce::MmStage1Authority::Paused(pause) => {
-                    super::mm_mutation::from_pt_pause(pause)
-                }
-            };
+            let mutation = super::mm_mutation::from_executor(executor);
             let permit = mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             if cx.memory.unmap_alias_range(addr, len).is_err() {
