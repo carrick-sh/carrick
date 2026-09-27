@@ -1,0 +1,31 @@
+schema_version = 1
+id = "kernel.el1.anonymous-permissions"
+title = "Guest EL1 owns resident anonymous protection transitions and permission faults"
+guest_surfaces = [
+  "syscall:mmap",
+  "syscall:mprotect",
+  "syscall:munmap",
+  "fault:permission",
+  "signal:SIGSEGV",
+  "kernel:stage1-mmu",
+  "kernel:frame-inventory",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "man 2 mprotect: mprotect changes access protections for every page intersecting the requested mapped range and returns zero on success",
+  "man 2 sigaction: a protection violation delivers SIGSEGV with siginfo describing the faulting address",
+  "sigaction(2) SEGV_ACCERR: the address was mapped but the attempted access was not permitted",
+  "Arm A-profile translation architecture: permission changes use break-before-make and invalidate stale translations before EL0 retries",
+]
+fixture = "embed:el1-sched permission-transitions pages=256|1024|4096 rounds=4; pages=256 rounds=2|18"
+scale_points = [256, 1024, 4096]
+rationale = "EL1 increment 2 permission-transition checkpoint. A resident private anonymous mapping is initialized once, then each round changes the complete range to read-only, proves one write is denied with SIGSEGV/SEGV_ACCERR, restores RW, changes the range to PROT_NONE, proves one read is denied the same way, restores RW and verifies every sampled page. Four target-range mprotect calls per round must be counted as served in EL1; the only forwarded mprotect is the process's fixed one-page signal-stack guard until signal setup moves into EL1. The page-scale witness rejects page-granular host work at >=0.125 exits per added page per round. The round-scale witness permits the measured four exits for the two synchronous-signal cycles that remain until the signal increment, while rejecting a host exit for each target-range mprotect and the extra frame-grant refusal retry. Initial first-touch grants must return exactly; increasing only the transition count must allocate no additional grants or bytes."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-mmu-core::aarch64::tests::{allocation_free_guest_permission_edit_cycles_existing_l3_leaves,allocation_free_guest_permission_edit_updates_complete_l2_block,live_guest_permission_transaction_preserves_frames_and_refuses_widening,live_host_unmap_preserves_adjacent_guest_private_leaf}; carrick-el1::memory::tests::{resident_anonymous_mprotect_rounds_and_edits_under_exact_mm_guard,ineligible_mapping_forwards_and_permission_widening_returns_eacces}; carrick-el1::fault::tests::permission_fault_never_requests_a_first_touch_frame_grant; carrick-vmm-hvf::trap::frame_inventory::tests::el1_owned_live_leaf_overrides_stale_host_shadow_without_weakening_untagged_parity"
+embed = "carrick-embed::el1_sched::el1_anonymous_permission_transitions_stay_in_guest"
+
+[bindings.unresolved]
+docker = "Bind the same permission-transitions fixture to pinned native arm64 Linux; signed Carrick semantics are green, but the same-source Docker receipt remains open."
+production = "Exact complete-range resident private-anonymous mprotect now runs under the guest's exact-MM editor across tagged L1/L2 blocks and L3 leaves, preserves output identity and permission ceilings, performs ASID invalidation, and refuses partial coarse blocks or widening to the host fallback. Permission faults no longer request first-touch grants; host syscall-copy paths read the live tagged permissions; host edits adopt guest-grown hierarchy before mutation; and COW parity accepts a stale shadow only for an exact tagged live leaf. The signed 256/1024/4096-page fixture serves all four target-range transitions per round in EL1, preserves bytes, reports SEGV_ACCERR for every denied read/write, returns every initial frame byte, and remains nearly page-scale flat. One fixed one-page signal-stack guard mprotect still forwards per process and each denied-access signal cycle still exits to the host pending the signal increment. Broader mmap-family ownership, fork-COW authority and final host page-table pause removal remain open checkpoint-2 work."

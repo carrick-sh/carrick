@@ -13,6 +13,7 @@ pub mod fault;
 pub mod file;
 pub mod inotify;
 pub mod lock;
+pub mod memory;
 pub mod sched;
 
 pub use fault::dispatch_fault;
@@ -183,16 +184,39 @@ where
 {
     let slot = frame.slot as usize;
     let cur_task = current_tasks.get(slot);
+    let nr = frame.x[8] as usize;
 
     // Entry check: if pending_host_work is set, forward immediately without serving.
     if let Some(task) = cur_task
         && task.has_pending_host_work()
     {
-        let nr = frame.x[8] as usize;
         if nr < 512 {
             counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
         }
         return Action::Forward;
+    }
+
+    #[cfg(target_os = "none")]
+    if nr == 226
+        && let Some(zone) = zone.as_ref()
+    {
+        let orig_x0 = frame.x[0];
+        let mut editor = memory::HardwareAnonymousPermissionEditor;
+        match memory::try_serve_mprotect(frame, current_tasks, &zone.tables.spaces, &mut editor) {
+            memory::MprotectDisposition::Forward => {}
+            memory::MprotectDisposition::Return(result) => {
+                frame.x[0] = result as u64;
+                counters.served[nr].fetch_add(1, Ordering::Relaxed);
+                if let Some(task) = cur_task {
+                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                    if task.has_pending_host_work() {
+                        task.served_with_work.store(1, Ordering::Release);
+                        return Action::ServedWithWork;
+                    }
+                }
+                return Action::Served;
+            }
+        }
     }
 
     // Threads queued on this vCPU wait for the running one to block in a
@@ -233,7 +257,6 @@ where
         }
     }
 
-    let nr = frame.x[8] as usize;
     match nr {
         27 => {
             let orig_x0 = frame.x[0];
