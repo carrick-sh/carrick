@@ -912,6 +912,14 @@ impl MetadataStorage {
     fn service_mailbox(core: &mut MetadataAllocatorCore, slot: usize) -> MailboxSync {
         let outcome = Self::synchronize_response(core, slot);
         Self::publish_pending_return(core, slot);
+        // The mailbox is carrier-wide. A participant that lost publication
+        // to another vCPU must still leave through a host boundary; otherwise
+        // it can consume its entire bounded retry budget in EL1 before the
+        // request owner is scheduled. Any participant may service the exact
+        // single-flight request once its allocator stack has unwound.
+        if Self::host_work_pending(core) {
+            Self::mark_pending_host_work(slot);
+        }
         outcome
     }
 
