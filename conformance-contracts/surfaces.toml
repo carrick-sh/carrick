@@ -6,7 +6,7 @@ contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.
 
 [[surfaces]]
 path = "crates/carrick-mem/src/memory.rs"
-contracts = ["hvpatch.syscall.portal", "kernel.el1.transparent", "kernel.vcpu.kick-el0-boundary", "kernel.el1.gic", "kernel.el1.guest-scheduler"]
+contracts = ["hvpatch.syscall.portal", "kernel.el1.transparent", "kernel.vcpu.kick-el0-boundary", "kernel.el1.gic", "kernel.el1.guest-scheduler", "kernel.el1.fault-entry"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_transparent.rs"
@@ -493,7 +493,15 @@ contracts = ["kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/lib.rs"
-contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue"]
+contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue", "kernel.el1.fault-entry"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/entry.rs"
+contracts = ["kernel.el1.fault-entry"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/fault.rs"
+contracts = ["kernel.el1.fault-entry"]
 
 [[surfaces]]
 path = "fixtures/linux-aarch64-hello/src/el1_vtimer_loop.rs"
@@ -533,7 +541,7 @@ contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.e
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_sched.rs"
-contracts = ["kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy"]
+contracts = ["kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.fault-entry"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/sigframe.rs"
@@ -545,7 +553,7 @@ contracts = ["kernel.el1.guest-scheduler"]
 
 [[surfaces]]
 path = "fixtures/embed-el1-sched/src/main.rs"
-contracts = ["kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy"]
+contracts = ["kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.fault-entry"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/hvpatch/asid.rs"

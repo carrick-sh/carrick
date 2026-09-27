@@ -1,0 +1,28 @@
+schema_version = 1
+id = "kernel.el1.fault-entry"
+title = "Guest EL1 lower-EL data-abort entry and architectural context preservation with host fallback"
+guest_surfaces = [
+  "kernel:el1_fault_entry",
+  "kernel:sparse_materialization",
+  "syscall:mprotect",
+  "syscall:mmap",
+  "syscall:sigaction",
+  "vmm:hvf",
+]
+semantic_authority = [
+  "Arm Architecture Reference Manual Armv8-A D1.14: Synchronous exceptions taken to EL1 from EL0 (EC 0x24 Data Abort) deliver faulting syndrome in ESR_EL1 and faulting address in FAR_EL1 without advancing ELR_EL1",
+  "man 2 sigaction / man 2 mprotect: a SIGSEGV signal delivered on a memory access violation carries the faulting address in si_addr; when the signal handler changes memory permissions via mprotect and returns, the faulting instruction is retried with the original CPU register state",
+]
+fixture = "embed:el1-sched fault-entry"
+scale_points = [1]
+rationale = "EL1 data-abort entry and context preservation contract. EL0 data aborts (EC 0x24) are trapped through the EL1 vector table and routed to the in-guest EL1 kernel image. The EL1 vector and image preserve complete architectural state (all 31 GPRs including x16/x17 and arbitrary x8, SP_EL0, ELR_EL1, SPSR_EL1, ESR_EL1, and FAR_EL1), increment precise provenance counters (fault_taken), and forward unhandled faults to the host carrier via HVC without incrementing ELR_EL1. The host delivers SIGSEGV to the guest signal handler with the exact faulting address. After the handler upgrades permissions via mprotect, the store is retried and succeeds with all register canaries preserved. When EL1 is disabled, standard host fault handling is preserved and no EL1 fault entries are recorded."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-el1-abi::tests (trap_frame_layout_and_offsets, counters_abi_layout); carrick-el1::fault::tests (dispatch_fault_increments_counter_and_forwards); carrick-mem::memory::el1_shim_tests (el1_data_abort_vector_routing_and_hook_installation); carrick-mem::memory::el1_hook_kick (fault_hook_forward_restores_complete_architectural_context)"
+embed = "carrick-embed::el1_sched (signed; el1_memory_fault_entry_preserves_context verifies stage-1 permission fault entry, SIGSEGV si_addr accuracy, mprotect retry, complete register canary preservation, and positive fault_taken counter in live carrier)"
+
+[bindings.unresolved]
+docker = "Docker execution pending signed acceptance; differential oracle capture and comparison are maintained during director acceptance."
+embed_structural = "Entry counter (fault_taken >= 1) and architectural register preservation are verified; complete first-touch in-guest service is part of the subsequent memory milestone."
+embed_timing = "Timing is not asserted for entry/forwarding acceptance."
