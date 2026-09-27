@@ -6,10 +6,13 @@
 #![cfg_attr(target_os = "none", no_std)]
 
 pub mod alloc;
+pub mod fault;
 pub mod file;
 pub mod inotify;
 pub mod lock;
 pub mod sched;
+
+pub use fault::dispatch_fault;
 
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,

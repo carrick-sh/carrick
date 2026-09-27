@@ -98,6 +98,7 @@ struct Machine {
     elr: u64,
     spsr: u64,
     esr: u64,
+    far: u64,
     pc: usize,
     equal: bool,
     bytes: Vec<u8>,
@@ -118,6 +119,13 @@ impl Machine {
     fn bytes(irq: El1IrqMode) -> Vec<u8> {
         let mut bytes = vec![0u8; LINUX_EL1_VECTORS_SIZE as usize];
         write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, CAPTURE, irq);
+        write_el1_hook(
+            &mut bytes,
+            EL0_FAULT_HOOK_OFFSET,
+            CAPTURE,
+            irq,
+            HookEntry::Fault,
+        );
         if irq == El1IrqMode::Gic {
             let _ = write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);
         }
@@ -133,6 +141,7 @@ impl Machine {
             elr: GUEST_ELR,
             spsr: EL0_DAIF_MASKED,
             esr: SVC_ESR,
+            far: 0x4000_1000,
             pc: EL1_VECTOR_HOOK_OFFSET,
             equal: false,
             bytes: Self::bytes(irq),
@@ -208,7 +217,9 @@ impl Machine {
     /// becomes pending host work, as `Sched::take_irqs` does.
     fn el1_image(&mut self) {
         let frame = self.regs[0];
-        let irq = self.read(frame + 264) == 0;
+        let esr = self.read(frame + 264);
+        let irq = esr == 0;
+        let is_fault = (esr >> 26) == 0x24;
         if irq {
             self.irq_frames += 1;
             if self.kick_pending {
@@ -218,7 +229,9 @@ impl Machine {
             }
         }
         let pending = self.read(Self::pending_host_work_addr()) != 0;
-        self.regs[0] = if pending {
+        self.regs[0] = if is_fault {
+            1
+        } else if pending {
             1
         } else if self.image == Image::Idle {
             IDLE
@@ -276,7 +289,7 @@ impl Machine {
                 0xD503_3FDF | 0xD503_201F => continue, // isb, nop
                 _ => {}
             }
-            // mrs/msr of ELR_EL1, SPSR_EL1, ESR_EL1 with any Xt.
+            // mrs/msr of ELR_EL1, SPSR_EL1, ESR_EL1, FAR_EL1 with any Xt.
             let handled = match op & !31 {
                 0xD538_4020 => {
                     self.set_xd_zr(rd, self.elr);
@@ -290,6 +303,10 @@ impl Machine {
                     self.set_xd_zr(rd, self.esr);
                     true
                 }
+                0xD538_6000 => {
+                    self.set_xd_zr(rd, self.far);
+                    true
+                }
                 0xD518_4020 => {
                     self.elr = self.xn_zr(rd);
                     true
@@ -300,6 +317,10 @@ impl Machine {
                 }
                 0xD518_5200 => {
                     self.esr = self.xn_zr(rd);
+                    true
+                }
+                0xD518_6000 => {
+                    self.far = self.xn_zr(rd);
                     true
                 }
                 _ => false,
@@ -698,4 +719,41 @@ fn the_idle_entry_runs_a_switched_in_thread_or_leaves_idle() {
             sp: LINUX_SYSCALL_MAILBOX_BASE + SLOT * 256
         }
     );
+}
+
+#[test]
+fn fault_hook_forward_restores_complete_architectural_context() {
+    let mut m = Machine {
+        pc: EL0_FAULT_HOOK_OFFSET,
+        regs: std::array::from_fn(|i| 0xCAFE_0000 + i as u64),
+        elr: 0x4000_2000,
+        spsr: EL0_DAIF_MASKED,
+        esr: (0x24 << 26) | 0x47,
+        far: 0x1000_5000,
+        image: Image::Serve, // image returns Action::Forward for faults
+        ..Machine::syscall(El1IrqMode::Masked)
+    };
+    let original_regs = m.regs;
+    let exit = m.run(None);
+    assert_eq!(exit, Exit::Host, "forwarding fault must reach host exit");
+    assert_eq!(
+        m.elr, 0x4000_2000,
+        "ELR_EL1 must be preserved on fault forward"
+    );
+    assert_eq!(
+        m.spsr, EL0_DAIF_MASKED,
+        "SPSR_EL1 must be preserved on fault forward"
+    );
+    assert_eq!(
+        m.esr,
+        (0x24 << 26) | 0x47,
+        "ESR_EL1 must be preserved on fault forward"
+    );
+    assert_eq!(
+        m.far, 0x1000_5000,
+        "FAR_EL1 must be preserved on fault forward"
+    );
+    for (i, (&actual, &expected)) in m.regs.iter().zip(original_regs.iter()).enumerate() {
+        assert_eq!(actual, expected, "x{i} must be preserved on fault forward");
+    }
 }

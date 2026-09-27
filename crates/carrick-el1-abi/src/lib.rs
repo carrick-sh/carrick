@@ -198,6 +198,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::size_of::<TrapFrame>() as u64,
         core::mem::size_of::<Counters>() as u64,
         core::mem::offset_of!(Counters, irq_taken) as u64,
+        core::mem::offset_of!(Counters, fault_taken) as u64,
         core::mem::size_of::<CurrentTask>() as u64,
         core::mem::offset_of!(CurrentTask, file_table) as u64,
         core::mem::offset_of!(CurrentTask, pending_host_work) as u64,
@@ -340,6 +341,8 @@ pub struct TrapFrame {
     pub esr: u64,
     /// Syscall mailbox / vCPU slot index derived from SP_EL1.
     pub slot: u64,
+    /// Fault Address Register (FAR_EL1) for data/instruction aborts.
+    pub far: u64,
 }
 
 pub use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -950,6 +953,8 @@ pub struct Counters {
     /// GIC interrupts EL1 took and completed, by INTID (SGIs 0-15, PPIs
     /// 16-31); written by the vector page's IRQ hook.
     pub irq_taken: [AtomicU64; 32],
+    /// Data/memory abort exceptions taken into EL1.
+    pub fault_taken: AtomicU64,
 }
 
 impl Counters {
@@ -958,6 +963,7 @@ impl Counters {
             served: [const { AtomicU64::new(0) }; 512],
             forwarded: [const { AtomicU64::new(0) }; 512],
             irq_taken: [const { AtomicU64::new(0) }; 32],
+            fault_taken: AtomicU64::new(0),
         }
     }
 
@@ -972,6 +978,9 @@ impl Counters {
             snapshot.irq_taken[i]
                 .store(self.irq_taken[i].load(Ordering::Relaxed), Ordering::Relaxed);
         }
+        snapshot
+            .fault_taken
+            .store(self.fault_taken.load(Ordering::Relaxed), Ordering::Relaxed);
         snapshot
     }
 }
@@ -1799,13 +1808,14 @@ mod tests {
 
     #[test]
     fn test_trap_frame_layout() {
-        assert_eq!(core::mem::size_of::<TrapFrame>(), 280);
+        assert_eq!(core::mem::size_of::<TrapFrame>(), 288);
         assert_eq!(core::mem::align_of::<TrapFrame>(), 8);
         assert_eq!(core::mem::offset_of!(TrapFrame, x), 0);
         assert_eq!(core::mem::offset_of!(TrapFrame, elr), 31 * 8);
         assert_eq!(core::mem::offset_of!(TrapFrame, spsr), 32 * 8);
         assert_eq!(core::mem::offset_of!(TrapFrame, esr), 33 * 8);
         assert_eq!(core::mem::offset_of!(TrapFrame, slot), 34 * 8);
+        assert_eq!(core::mem::offset_of!(TrapFrame, far), 35 * 8);
     }
 
     #[test]
@@ -1817,11 +1827,15 @@ mod tests {
 
     #[test]
     fn test_counters_layout() {
-        assert_eq!(core::mem::size_of::<Counters>(), (1024 + 32) * 8);
+        assert_eq!(core::mem::size_of::<Counters>(), (1024 + 32 + 1) * 8);
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);
         // The vector page's IRQ hook addresses this array directly.
         assert_eq!(core::mem::offset_of!(Counters, irq_taken), 1024 * 8);
+        assert_eq!(
+            core::mem::offset_of!(Counters, fault_taken),
+            (1024 + 32) * 8
+        );
     }
 
     #[test]
