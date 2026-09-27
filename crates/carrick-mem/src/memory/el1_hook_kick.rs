@@ -254,9 +254,7 @@ impl Machine {
             }
         }
         let pending = self.read(Self::pending_host_work_addr()) != 0;
-        self.regs[0] = if is_fault {
-            1
-        } else if pending {
+        self.regs[0] = if is_fault || pending {
             1
         } else if self.image == Image::Idle {
             IDLE

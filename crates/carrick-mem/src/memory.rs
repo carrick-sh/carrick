@@ -8450,9 +8450,11 @@ mod el1_shim_tests {
         );
 
         // Assert vector regions fit in 16 KiB without overlapping
-        assert!(EL1_VECTOR_HOOK_OFFSET + 0x1000 <= EL0_IRQ_HOOK_OFFSET);
-        assert!(EL0_IRQ_HOOK_OFFSET + 0x1000 <= EL0_FAULT_HOOK_OFFSET);
-        assert!(EL0_FAULT_HOOK_OFFSET + 0x1000 <= LINUX_EL1_VECTORS_SIZE as usize);
+        const {
+            assert!(EL1_VECTOR_HOOK_OFFSET + 0x1000 <= EL0_IRQ_HOOK_OFFSET);
+            assert!(EL0_IRQ_HOOK_OFFSET + 0x1000 <= EL0_FAULT_HOOK_OFFSET);
+            assert!(EL0_FAULT_HOOK_OFFSET + 0x1000 <= LINUX_EL1_VECTORS_SIZE as usize);
+        }
     }
 }
 
