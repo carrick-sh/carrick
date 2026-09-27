@@ -351,6 +351,34 @@ pub(crate) fn fork_mapping_requires_base_translation(
         || size != crate::memory::LINUX_SHARED_FILE_SIZE as usize
 }
 
+/// Project an authenticated inherited alias into an invalid child leaf without
+/// making an untouched page accessible.
+///
+/// Private anonymous mappings can be armed for first touch before `fork`: the
+/// leaf is invalid but retains its old output address, while the current alias
+/// registry and frame inventory already name the exact live global frame. The
+/// child image must retain that authenticated output for its later fault, with
+/// every validity and permission bit unchanged.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn repoint_inherited_invalid_alias(
+    page_tables: &mut carrick_mmu_core::aarch64::PageTableManager,
+    start: u64,
+    current_ipa: u64,
+    len: usize,
+    eligible: bool,
+) -> Result<bool, carrick_mmu_core::aarch64::PageTableError> {
+    if !eligible || page_tables.translate(start).is_some() {
+        return Ok(false);
+    }
+    let Some(retained) = page_tables.translate_retained_output(start) else {
+        return Ok(false);
+    };
+    if retained == current_ipa {
+        return Ok(false);
+    }
+    page_tables.repoint_preserving_attributes(start, current_ipa, len as u64, None)
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
     #[allow(clippy::too_many_arguments)]
@@ -1183,6 +1211,21 @@ impl HvfTaskState {
         let overlay_index =
             ForkTranslationOverlayIndex::build(&mappings, fork_mm_root_slot, fork_container_root);
         for (index, mapping) in mappings.iter().enumerate() {
+            repoint_inherited_invalid_alias(
+                page_tables,
+                mapping.start,
+                mapping.ipa,
+                mapping.size,
+                mapping.inherited_frame.is_some()
+                    && mapping.is_dynamic_alias
+                    && mapping.sharing == GuestMappingSharing::Private,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "repoint untouched child alias at VA 0x{:x} to IPA 0x{:x}: {error:?}",
+                    mapping.start, mapping.ipa,
+                ))
+            })?;
             let Some(translated) = page_tables
                 .translate(mapping.start)
                 .or_else(|| page_tables.translate_retained_output(mapping.start))
@@ -1536,5 +1579,50 @@ impl HvfTaskState {
             0,
         );
         Ok(plan)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untouched_private_alias_repoints_retained_leaf_without_making_it_valid() {
+        let mut page_tables = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let va = crate::memory::LINUX_MMAP_BASE + 0x1000;
+        let old_ipa = va;
+        let current_ipa = 0x009b_4000_1000;
+        let len = 0x4000;
+        page_tables
+            .map_private_aliased(va, old_ipa, len, true, None)
+            .expect("seed deferred anonymous range");
+        page_tables
+            .set_prot_none(va, len as usize, None)
+            .expect("arm first touch");
+        assert_eq!(page_tables.translate(va), None);
+        assert_eq!(page_tables.translate_retained_output(va), Some(old_ipa));
+
+        repoint_inherited_invalid_alias(&mut page_tables, va, current_ipa, len as usize, true)
+            .expect("project authenticated alias into child image");
+
+        assert_eq!(
+            page_tables.translate(va),
+            None,
+            "fork projection must not make an untouched page accessible"
+        );
+        assert_eq!(
+            page_tables.translate_retained_output(va),
+            Some(current_ipa),
+            "the invalid leaf must retain the authenticated current alias"
+        );
+        assert_eq!(
+            page_tables.translate_retained_output(va + len - 1),
+            Some(current_ipa + len - 1),
+            "the complete inherited alias span must be projected"
+        );
     }
 }
