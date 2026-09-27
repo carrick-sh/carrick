@@ -1,0 +1,18 @@
+{
+  "source_head": "d409be2c71d918d0509f429a3d67cdd5a15f914c",
+  "sha256": "0fe7d9ecb59d1aea53c4135af6b415bcdcf57529fc6c1606956760a4c023cada",
+  "cdhash": "20a68f8bc945007c5f1c3ef7efea7e2f2672fef8",
+  "lc_uuid": "309652C1-D76D-3A28-A390-89C9D74E92EF",
+  "entitlement_digest": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+  "entitlement_present": true,
+  "dof_carrick_present": true,
+  "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/fault-entry-final/red-frozen/el1_sched-ba795739d7a1a0f3",
+  "fixture_sha256": "e33f7cae1859cf978a1f1cb0e765deb1a903fbe1f40244a6fa36d321b416eb67",
+  "native_fixture_sha256": "e33f7cae1859cf978a1f1cb0e765deb1a903fbe1f40244a6fa36d321b416eb67",
+  "run_id": "el1-fault-entry-red-20260926-d409be2c7",
+  "test": "el1_memory_fault_entry_preserves_context",
+  "exit_code": 1,
+  "failure": "expected at least 1 EL1 fault entry, got 0",
+  "unentitled_negative_control": "passed",
+  "remaining_processes": 0
+}
