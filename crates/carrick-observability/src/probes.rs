@@ -425,6 +425,7 @@ pub enum HvpatchCloneTidWriteResult {
     HostMap = 3,
     SparseBacking = 4,
     FrameCow = 5,
+    MetadataAllocation = 6,
 }
 
 impl HvpatchCloneTidWriteResult {
@@ -3320,6 +3321,7 @@ mod hvpatch_guest_probe_abi {
         assert_eq!(HvpatchCloneTidWriteResult::HostMap.raw(), 3);
         assert_eq!(HvpatchCloneTidWriteResult::SparseBacking.raw(), 4);
         assert_eq!(HvpatchCloneTidWriteResult::FrameCow.raw(), 5);
+        assert_eq!(HvpatchCloneTidWriteResult::MetadataAllocation.raw(), 6);
         let source = include_str!("probes.rs");
         for declaration in [
             "fn mn__clone__tid__output(_: i32, _: u32, _: u64, _: u32) {}",

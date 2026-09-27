@@ -690,3 +690,12 @@ without changing verdicts or rationale, but host-authority compiler capture
 produced no candidate. Inspect the direct capture diagnostics before accepting
 inventory or CI closure; this is a verification failure, not a reason to bless
 an old capture. Implementation source is otherwise integrated.
+
+2026-09-26: direct compiler-capture diagnostics identify the integration
+failure as a missing MetadataAllocation arm in runtime clone TID output
+classification. Added the explicit result and appended provider ordinal 6;
+all five serial clone TID tests and the provider ABI test pass, including
+refusal with restoration of both preimages. This is a compile correction,
+not a semantic-red claim. Raw failure and validation evidence are under
+metadata-refusal-director/integrated-runtime/. Fresh clean-source capture,
+full CI and signed promotion remain pending.
