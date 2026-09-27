@@ -1,0 +1,19 @@
+schema = "carrick.conformance-exemption.v1"
+base = "afdf580392fd8244253b4a19c219e1f96d48885a"
+head = "eca6f64ea0cf9679c7b909624f0ff23015cdb559"
+contracts = [
+  "kernel.el1.fault-entry",
+  "kernel.el1.gic",
+  "kernel.el1.guest-run-queue",
+  "kernel.el1.guest-scheduler",
+  "kernel.fork.stage1-image",
+  "kernel.transport.exit-overhead",
+  "kernel.vcpu.kick-el0-boundary",
+  "kernel.vcpu.vm-lifetime",
+]
+paths = [
+  "crates/carrick-el1/src/entry.rs",
+  "crates/carrick-el1/src/fault.rs",
+  "crates/carrick-vmm-hvf/src/trap.rs",
+]
+rationale = "The exact product diff adds a fail-loud diagnostic to the registered kernel.el1.stage1-publication transaction: EL1 preserves its panic source coordinates and stable leaf-publication refusal code in HVC registers, and HVF includes those values in the existing fatal record. Fault routing, the trap exit decision, task scheduling, vCPU lifetime, fork stage-1 ownership, kick behavior, GIC behavior and transport counts are unchanged. The focused stable-code test, bare-metal EL1 release build, warning-denied EL1/HVF Clippy and signed MissingTable diagnostic cover the changed boundary."
