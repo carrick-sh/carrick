@@ -705,7 +705,9 @@ pub(super) fn publish_replacing(
                     ))
                 },
                 |editor| -> Result<(), TrapError> {
-                    editor.begin_undo();
+                    editor.begin_undo().map_err(|error| {
+                        sparse_mmap_stage1_error(editor.manager, "begin_undo", error, has_source)
+                    })?;
                     HvfVmState::refresh_stage1_exclusivity(editor.manager);
                     let aligned_start = align_up(start, TWO_MIB)?.min(end);
                     if start < aligned_start {

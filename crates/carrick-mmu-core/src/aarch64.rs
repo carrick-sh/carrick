@@ -276,6 +276,8 @@ pub enum PageTableError {
     /// (the caller-supplied excluded IPA interval): a stage-1 leaf there would
     /// give the guest MMIO access to the distributor or a redistributor.
     GicWindowOutput,
+    /// Metadata allocation failed or was refused.
+    MetadataAllocation,
 }
 
 impl core::fmt::Display for PageTableError {
@@ -293,6 +295,7 @@ impl core::fmt::Display for PageTableError {
                 )
             }
             Self::GicWindowOutput => write!(f, "output address in the in-kernel GIC window"),
+            Self::MetadataAllocation => write!(f, "metadata allocation failed"),
         }
     }
 }
@@ -881,6 +884,9 @@ struct UndoJournal {
     /// Locations already journalled by this transaction, so only the first
     /// pre-image of each word decides `replaced_valid`.
     first_written: hashbrown::HashSet<(usize, usize)>,
+    /// Pre-admitted storage for extension arena bases popped during rollback,
+    /// ensuring rollback_undo performs zero heap allocations.
+    returned_bases: Vec<u64>,
 }
 
 impl PageTableManager {
@@ -1344,33 +1350,49 @@ impl PageTableManager {
     }
 
     /// Zero a freed spare sub-table and return it to the reusable free list.
-    /// Zero a freed spare sub-table and return it to the reusable free list.
     /// Only reached from `try_coalesce`, which is gated on an offline private
     /// image, so no hardware walk cache can still reference the page.
     fn free_table(&mut self, pa: u64) -> Result<(), PageTableError> {
-        if let Ok(loc) = self.pa_to_loc(pa) {
-            if self.undo.is_some() {
-                for off in (loc.offset..loc.offset + PT_PAGE as usize).step_by(8) {
-                    self.note_undo_unlinked(TableLocation::new(loc.arena, off))?;
-                }
-            }
-            let arena = &mut self.arenas[loc.arena];
-            match arena.storage {
-                TableArenaStorage::Owned(ref mut bytes) => {
-                    for b in &mut bytes[loc.offset..loc.offset + PT_PAGE as usize] {
-                        *b = 0;
-                    }
-                }
-                TableArenaStorage::Live => {
-                    for off in (loc.offset..loc.offset + PT_PAGE as usize).step_by(8) {
-                        let word_loc = TableLocation::new(loc.arena, off);
-                        self.staged.insert(word_loc, (0, false));
-                        self.dirty.push((word_loc, false));
-                    }
-                }
-            }
-            self.free_tables.push(pa);
+        let loc = self.pa_to_loc(pa)?;
+        if let Some(journal) = self.undo.as_mut() {
+            journal
+                .words
+                .try_reserve(512)
+                .map_err(|_| PageTableError::MetadataAllocation)?;
         }
+        if self.is_live() {
+            self.staged
+                .try_reserve(512)
+                .map_err(|_| PageTableError::MetadataAllocation)?;
+            self.dirty
+                .try_reserve(512)
+                .map_err(|_| PageTableError::MetadataAllocation)?;
+        }
+        self.free_tables
+            .try_reserve(1)
+            .map_err(|_| PageTableError::MetadataAllocation)?;
+
+        if self.undo.is_some() {
+            for off in (loc.offset..loc.offset + PT_PAGE as usize).step_by(8) {
+                self.note_undo_unlinked(TableLocation::new(loc.arena, off))?;
+            }
+        }
+        let arena = &mut self.arenas[loc.arena];
+        match arena.storage {
+            TableArenaStorage::Owned(ref mut bytes) => {
+                for b in &mut bytes[loc.offset..loc.offset + PT_PAGE as usize] {
+                    *b = 0;
+                }
+            }
+            TableArenaStorage::Live => {
+                for off in (loc.offset..loc.offset + PT_PAGE as usize).step_by(8) {
+                    let word_loc = TableLocation::new(loc.arena, off);
+                    self.staged.insert(word_loc, (0, false));
+                    self.dirty.push((word_loc, false));
+                }
+            }
+        }
+        self.free_tables.push(pa);
         Ok(())
     }
 
@@ -1456,6 +1478,39 @@ impl PageTableManager {
     /// Write a leaf/child descriptor (a block, page, or sub-table entry that is
     /// not itself newly pointing the walker at a fresh table).
     fn write_desc(&mut self, loc: TableLocation, desc: u64) -> Result<(), PageTableError> {
+        if let Some(journal) = self.undo.as_mut() {
+            journal
+                .words
+                .try_reserve(1)
+                .map_err(|_| PageTableError::MetadataAllocation)?;
+            if !journal.first_written.contains(&(loc.arena, loc.offset)) {
+                journal
+                    .first_written
+                    .try_reserve(1)
+                    .map_err(|_| PageTableError::MetadataAllocation)?;
+            }
+        }
+        let arena = &mut self.arenas[loc.arena];
+        match arena.storage {
+            TableArenaStorage::Owned(ref mut bytes) => {
+                if loc.offset + 8 > bytes.len() {
+                    bytes
+                        .try_reserve((loc.offset + 8) - bytes.len())
+                        .map_err(|_| PageTableError::MetadataAllocation)?;
+                }
+            }
+            TableArenaStorage::Live => {
+                if !self.staged.contains_key(&loc) {
+                    self.staged
+                        .try_reserve(1)
+                        .map_err(|_| PageTableError::MetadataAllocation)?;
+                }
+            }
+        }
+        self.dirty
+            .try_reserve(1)
+            .map_err(|_| PageTableError::MetadataAllocation)?;
+
         self.note_undo(loc)?;
         let arena = &mut self.arenas[loc.arena];
         match arena.storage {
@@ -1479,6 +1534,16 @@ impl PageTableManager {
         if self.undo.is_some() {
             let previous = self.read_desc(loc)?;
             if let Some(journal) = self.undo.as_mut() {
+                journal
+                    .words
+                    .try_reserve(1)
+                    .map_err(|_| PageTableError::MetadataAllocation)?;
+                if !journal.first_written.contains(&(loc.arena, loc.offset)) {
+                    journal
+                        .first_written
+                        .try_reserve(1)
+                        .map_err(|_| PageTableError::MetadataAllocation)?;
+                }
                 journal.words.push((loc, previous));
                 if journal.first_written.insert((loc.arena, loc.offset)) {
                     journal.replaced_valid |= previous & 1 != 0;
@@ -1495,6 +1560,10 @@ impl PageTableManager {
         if self.undo.is_some() {
             let previous = self.read_desc(loc)?;
             if let Some(journal) = self.undo.as_mut() {
+                journal
+                    .words
+                    .try_reserve(1)
+                    .map_err(|_| PageTableError::MetadataAllocation)?;
                 journal.words.push((loc, previous));
             }
         }
@@ -1505,6 +1574,39 @@ impl PageTableManager {
     /// the walker. Tagged so the host sync orders it AFTER the sub-table's
     /// entries are visible.
     fn write_table_desc(&mut self, loc: TableLocation, desc: u64) -> Result<(), PageTableError> {
+        if let Some(journal) = self.undo.as_mut() {
+            journal
+                .words
+                .try_reserve(1)
+                .map_err(|_| PageTableError::MetadataAllocation)?;
+            if !journal.first_written.contains(&(loc.arena, loc.offset)) {
+                journal
+                    .first_written
+                    .try_reserve(1)
+                    .map_err(|_| PageTableError::MetadataAllocation)?;
+            }
+        }
+        let arena = &mut self.arenas[loc.arena];
+        match arena.storage {
+            TableArenaStorage::Owned(ref mut bytes) => {
+                if loc.offset + 8 > bytes.len() {
+                    bytes
+                        .try_reserve((loc.offset + 8) - bytes.len())
+                        .map_err(|_| PageTableError::MetadataAllocation)?;
+                }
+            }
+            TableArenaStorage::Live => {
+                if !self.staged.contains_key(&loc) {
+                    self.staged
+                        .try_reserve(1)
+                        .map_err(|_| PageTableError::MetadataAllocation)?;
+                }
+            }
+        }
+        self.dirty
+            .try_reserve(1)
+            .map_err(|_| PageTableError::MetadataAllocation)?;
+
         self.note_undo(loc)?;
         let arena = &mut self.arenas[loc.arena];
         match arena.storage {
@@ -1540,7 +1642,11 @@ impl PageTableManager {
         let hosts = if self.arenas.len() <= inline_hosts.len() {
             &mut inline_hosts[..self.arenas.len()]
         } else {
-            overflow_hosts = vec![None; self.arenas.len()];
+            overflow_hosts = Vec::new();
+            overflow_hosts
+                .try_reserve_exact(self.arenas.len())
+                .map_err(|_| PageTableError::MetadataAllocation)?;
+            overflow_hosts.resize(self.arenas.len(), None);
             &mut overflow_hosts[..]
         };
         for (loc, _) in &self.dirty {
@@ -1593,19 +1699,33 @@ impl PageTableManager {
 
     /// Open an undo journal covering every descriptor edit from here until
     /// [`Self::commit_undo`] or [`Self::rollback_undo`].
-    pub fn begin_undo(&mut self) {
+    pub fn begin_undo(&mut self) -> Result<(), PageTableError> {
         if self.undo.is_none() {
+            let mut arena_next_frees = Vec::new();
+            arena_next_frees
+                .try_reserve_exact(self.arenas.len())
+                .map_err(|_| PageTableError::MetadataAllocation)?;
+            arena_next_frees.extend(self.arenas.iter().map(|a| a.next_free));
+
+            let mut free_tables = Vec::new();
+            free_tables
+                .try_reserve_exact(self.free_tables.len())
+                .map_err(|_| PageTableError::MetadataAllocation)?;
+            free_tables.extend_from_slice(&self.free_tables);
+
             self.undo = Some(UndoJournal {
                 words: Vec::new(),
-                arena_next_frees: self.arenas.iter().map(|a| a.next_free).collect(),
+                arena_next_frees,
                 arenas_len: self.arenas.len(),
-                free_tables: self.free_tables.clone(),
+                free_tables,
                 reclaim_pending: self.reclaim_pending,
                 dirty_len: self.dirty.len(),
                 replaced_valid: false,
                 first_written: hashbrown::HashSet::new(),
+                returned_bases: Vec::new(),
             });
         }
+        Ok(())
     }
 
     /// Whether the open undo transaction has overwritten a walker-visible
@@ -1696,7 +1816,8 @@ impl PageTableManager {
         self.free_tables = journal.free_tables;
         self.reclaim_pending = journal.reclaim_pending;
         self.dirty.truncate(journal.dirty_len);
-        let mut popped = Vec::new();
+        let mut popped = journal.returned_bases;
+        popped.clear();
         while self.arenas.len() > journal.arenas_len {
             let Some(arena) = self.arenas.pop() else {
                 break;
@@ -2035,25 +2156,31 @@ impl PageTableManager {
         }
         if self.arenas[0].next_free + PT_PAGE <= self.arenas[0].capacity as u64 {
             let off = self.arenas[0].next_free;
-            self.arenas[0].next_free += PT_PAGE;
-            let needed = self.arenas[0].next_free as usize;
+            let needed = (off + PT_PAGE) as usize;
             if let TableArenaStorage::Owned(ref mut bytes) = self.arenas[0].storage
                 && bytes.len() < needed
             {
+                bytes
+                    .try_reserve(needed - bytes.len())
+                    .map_err(|_| PageTableError::MetadataAllocation)?;
                 bytes.resize(needed, 0);
             }
+            self.arenas[0].next_free += PT_PAGE;
             return Ok(self.arenas[0].base + off);
         }
         for arena in &mut self.arenas[1..] {
             if arena.next_free + PT_PAGE <= arena.capacity as u64 {
                 let off = arena.next_free;
-                arena.next_free += PT_PAGE;
-                let needed = arena.next_free as usize;
+                let needed = (off + PT_PAGE) as usize;
                 if let TableArenaStorage::Owned(ref mut bytes) = arena.storage
                     && bytes.len() < needed
                 {
+                    bytes
+                        .try_reserve(needed - bytes.len())
+                        .map_err(|_| PageTableError::MetadataAllocation)?;
                     bytes.resize(needed, 0);
                 }
+                arena.next_free += PT_PAGE;
                 return Ok(arena.base + off);
             }
         }
@@ -2069,12 +2196,32 @@ impl PageTableManager {
             let capacity = self.layout.extension_arena_capacity;
             let storage = match self.arenas[0].storage {
                 TableArenaStorage::Owned(_) => {
-                    let mut bytes = Vec::with_capacity(capacity);
+                    let mut bytes = Vec::new();
+                    if bytes.try_reserve_exact(capacity).is_err() {
+                        source.return_arena(gpa);
+                        return Err(PageTableError::MetadataAllocation);
+                    }
                     bytes.resize(PT_PAGE as usize, 0);
                     TableArenaStorage::Owned(bytes)
                 }
                 TableArenaStorage::Live => TableArenaStorage::Live,
             };
+            if self.arenas.try_reserve(1).is_err() {
+                source.return_arena(gpa);
+                return Err(PageTableError::MetadataAllocation);
+            }
+            if let Some(journal) = self.undo.as_mut() {
+                let needed_capacity = self.arenas.len().saturating_sub(journal.arenas_len) + 1;
+                if journal.returned_bases.capacity() < needed_capacity
+                    && journal
+                        .returned_bases
+                        .try_reserve_exact(needed_capacity)
+                        .is_err()
+                {
+                    source.return_arena(gpa);
+                    return Err(PageTableError::MetadataAllocation);
+                }
+            }
             let arena = TableArena {
                 snapshot_scratch: Vec::new(),
                 base,
@@ -3215,7 +3362,7 @@ mod tests {
                 base,
                 PageTableLayoutConfig::new(0, 524288, 0, 0),
             );
-            manager.begin_undo();
+            manager.begin_undo().unwrap();
             manager.write_desc_for_test(base, 0x1234).unwrap();
             let backing = Revocable {
                 words: (0..65536).map(|_| AtomicU64::new(0)).collect(),
@@ -3251,7 +3398,7 @@ mod tests {
                 base,
                 PageTableLayoutConfig::new(0, 524288, 0, 0),
             );
-            manager.begin_undo();
+            manager.begin_undo().unwrap();
             manager.write_desc_for_test(base, 0x1234).unwrap();
             manager.write_desc_for_test(base + 8, 0x5678).unwrap();
             let backing = CutoffBacking {
@@ -3276,11 +3423,16 @@ mod tests {
     mod snapshot_allocations {
         use std::alloc::{GlobalAlloc, Layout, System};
         use std::cell::Cell;
-        std::thread_local! { pub(super) static LARGE: Cell<Option<u64>> = const { Cell::new(None) }; }
+        std::thread_local! {
+            pub(super) static LARGE: Cell<Option<u64>> = const { Cell::new(None) };
+            pub(super) static OP_COUNT: Cell<Option<u64>> = const { Cell::new(None) };
+            pub(super) static FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+            pub(super) static REFUSED_ALLOCS: Cell<usize> = const { Cell::new(0) };
+        }
         struct CountingAllocator;
         #[global_allocator]
         static ALLOCATOR: CountingAllocator = CountingAllocator;
-        fn allocated(size: usize) {
+        fn check_and_record(size: usize) -> bool {
             if size >= super::LINUX_PAGE_TABLES_SIZE as usize {
                 let _ = LARGE.try_with(|count| {
                     if let Some(n) = count.get() {
@@ -3288,19 +3440,48 @@ mod tests {
                     }
                 });
             }
+            let _ = OP_COUNT.try_with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n.checked_add(1).unwrap()));
+                }
+            });
+            let should_fail = FAIL_AFTER
+                .try_with(|limit_cell| {
+                    if let Some(limit) = limit_cell.get() {
+                        if limit == 0 {
+                            let _ = REFUSED_ALLOCS.try_with(|refused| {
+                                refused.set(refused.get().saturating_add(1));
+                            });
+                            true
+                        } else {
+                            limit_cell.set(Some(limit - 1));
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            !should_fail
         }
         // SAFETY: forwards each allocation unchanged; const TLS does not allocate.
         unsafe impl GlobalAlloc for CountingAllocator {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                allocated(layout.size());
+                if !check_and_record(layout.size()) {
+                    return core::ptr::null_mut();
+                }
                 unsafe { System.alloc(layout) }
             }
             unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-                allocated(layout.size());
+                if !check_and_record(layout.size()) {
+                    return core::ptr::null_mut();
+                }
                 unsafe { System.alloc_zeroed(layout) }
             }
             unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-                allocated(size);
+                if !check_and_record(size) {
+                    return core::ptr::null_mut();
+                }
                 unsafe { System.realloc(ptr, layout, size) }
             }
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -3343,6 +3524,377 @@ mod tests {
                 allocations, 0,
                 "warmed live image reuse allocated arena buffers at scale {scale}"
             );
+        }
+    }
+
+    #[derive(Debug)]
+    struct NonAllocTestArenaSource {
+        id: TableArenaSourceId,
+        available: Vec<SubstrateGpa>,
+        returned: Vec<SubstrateGpa>,
+    }
+
+    impl TableArenaSource for NonAllocTestArenaSource {
+        fn id(&self) -> TableArenaSourceId {
+            self.id
+        }
+        fn take_arena(&mut self) -> Option<SubstrateGpa> {
+            self.available.pop()
+        }
+        fn return_arena(&mut self, base: SubstrateGpa) {
+            self.returned.push(base);
+        }
+    }
+
+    #[test]
+    fn test_metadata_refusal_witness_rollback_allocations() {
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        for scale in [1, 8, 32, 128] {
+            let mut mgr = hvpatch_manager();
+            mgr.set_rw(
+                LINUX_MMAP_BASE + 512 * TWO_MIB + 0x1000,
+                0x1000,
+                false,
+                None,
+            )
+            .expect("pre-create L2 table");
+            mgr.layout.extension_arena_capacity = PT_PAGE as usize;
+            exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
+
+            let ext_bases: Vec<SubstrateGpa> = (0..scale)
+                .map(|i| SubstrateGpa(0x80_0000_0000 + (i as u64) * 0x20_0000))
+                .collect();
+            let mut host_arenas: Vec<Vec<u8>> = (0..scale + 1)
+                .map(|_| vec![0u8; LINUX_PAGE_TABLES_SIZE as usize])
+                .collect();
+            let mut resolver: Vec<(u64, *mut u8)> = Vec::with_capacity(scale + 1);
+            resolver.push((LINUX_PAGE_TABLES_BASE, host_arenas[0].as_mut_ptr()));
+            for (i, base) in ext_bases.iter().enumerate() {
+                resolver.push((base.0, host_arenas[i + 1].as_mut_ptr()));
+            }
+
+            let mut source = NonAllocTestArenaSource {
+                id: TableArenaSourceId(SubstrateGpa(LINUX_PAGE_TABLES_BASE)),
+                available: ext_bases.clone(),
+                returned: Vec::with_capacity(scale),
+            };
+
+            let initial_walk = mgr.debug_walk(LINUX_MMAP_BASE);
+            let initial_trans = mgr.translate(LINUX_MMAP_BASE);
+            let initial_arenas_len = mgr.arenas.len();
+
+            mgr.begin_undo().unwrap();
+
+            let mut edit_va = LINUX_MMAP_BASE + 513 * TWO_MIB;
+            for _ in 0..scale {
+                mgr.set_rw(edit_va + 0x1000, 0x1000, false, Some(&mut source))
+                    .expect("mapping succeeds");
+                edit_va += TWO_MIB;
+            }
+
+            assert_eq!(
+                mgr.arenas.len(),
+                initial_arenas_len + scale,
+                "scale={scale}: expected to attach {scale} extension arenas"
+            );
+            assert_eq!(
+                source.available.len(),
+                0,
+                "scale={scale}: source available slots must be exhausted"
+            );
+
+            // Scope allocation count around rollback_undo only.
+            snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+            let popped = unsafe { mgr.rollback_undo(resolver.as_slice(), Some(&mut source)) }
+                .expect("rollback must succeed");
+            let rollback_allocations = snapshot_allocations::OP_COUNT
+                .with(|c| c.replace(None))
+                .unwrap();
+
+            std::eprintln!(
+                "scale={scale} rollback_allocations={rollback_allocations} popped_len={}",
+                popped.len()
+            );
+
+            // Capture state after rollback
+            assert_eq!(
+                mgr.arenas.len(),
+                initial_arenas_len,
+                "scale={scale}: arenas restored to initial"
+            );
+            assert_eq!(
+                source.returned.len(),
+                scale,
+                "scale={scale}: all attached arenas returned to source"
+            );
+            assert_eq!(
+                mgr.debug_walk(LINUX_MMAP_BASE),
+                initial_walk,
+                "scale={scale}: initial descriptor walk preserved"
+            );
+            assert_eq!(
+                mgr.translate(LINUX_MMAP_BASE),
+                initial_trans,
+                "scale={scale}: translation preserved"
+            );
+
+            // Structural invariant requirement: rollback must perform zero allocations.
+            assert_eq!(
+                rollback_allocations, 0,
+                "scale={scale}: rollback allocated heap memory ({rollback_allocations} allocs)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_metadata_refusal_at_begin_undo() {
+        let mut mgr = hvpatch_manager();
+        snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(0)));
+        let res = mgr.begin_undo();
+        snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+        assert_eq!(res, Err(PageTableError::MetadataAllocation));
+        assert!(!mgr.undo_is_open());
+
+        // Subsequent begin_undo and edit succeed cleanly
+        assert!(mgr.begin_undo().is_ok());
+        assert!(mgr.undo_is_open());
+        mgr.set_readonly(LINUX_HEAP_BASE, 0x1000, false, None)
+            .unwrap();
+        mgr.commit_undo();
+        assert!(!mgr.undo_is_open());
+    }
+
+    #[test]
+    fn test_metadata_refusal_sweep_during_transaction_mutations_and_recovery() {
+        for fail_point in 0..10 {
+            let mut mgr = hvpatch_manager();
+            let initial_walk = mgr.debug_walk(LINUX_MMAP_BASE);
+            let mut host = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+            let resolver = [(mgr.base(), host.as_mut_ptr())];
+
+            mgr.begin_undo().unwrap();
+
+            snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(fail_point)));
+            let edit_res = mgr.set_rw(LINUX_MMAP_BASE + 0x1000, 0x4000, false, None);
+            snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+
+            match edit_res {
+                Ok(_) => {
+                    // Succeeded with this limit; rollback or commit
+                    unsafe { mgr.rollback_undo(&resolver[..], None).unwrap() };
+                }
+                Err(e) => {
+                    assert_eq!(e, PageTableError::MetadataAllocation);
+                    assert!(mgr.undo_is_open());
+                    // Rollback must succeed without allocating
+                    snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+                    unsafe { mgr.rollback_undo(&resolver[..], None).unwrap() };
+                    let rollback_allocs = snapshot_allocations::OP_COUNT
+                        .with(|c| c.replace(None))
+                        .unwrap();
+                    assert_eq!(rollback_allocs, 0, "rollback must not allocate");
+                    assert!(!mgr.undo_is_open());
+                    assert_eq!(mgr.debug_walk(LINUX_MMAP_BASE), initial_walk);
+                }
+            }
+
+            // Verify a fresh transaction succeeds following the previous failure/rollback
+            mgr.begin_undo().unwrap();
+            mgr.set_readonly(LINUX_HEAP_BASE, 0x1000, false, None)
+                .unwrap();
+            unsafe { mgr.rollback_undo(&resolver[..], None).unwrap() };
+            assert!(!mgr.undo_is_open());
+        }
+    }
+
+    #[test]
+    fn test_metadata_refusal_during_extension_arena_attach_returns_grant_exactly_once() {
+        for fail_point in 0..5 {
+            let mut mgr = hvpatch_manager();
+            exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
+
+            const TWO_MIB: u64 = 2 * 1024 * 1024;
+            let va = LINUX_MMAP_BASE + 600 * TWO_MIB + 0x1000;
+            let ext_base = SubstrateGpa(0xb0_0000_0000);
+
+            let mut source = NonAllocTestArenaSource {
+                id: TableArenaSourceId(ext_base),
+                available: vec![ext_base],
+                returned: Vec::with_capacity(1),
+            };
+
+            let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+            let resolver = [(mgr.base(), host_arena0.as_mut_ptr())];
+
+            mgr.begin_undo().unwrap();
+
+            snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(fail_point)));
+            let edit_res = mgr.set_rw(va, 0x1000, false, Some(&mut source));
+            snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+
+            match edit_res {
+                Ok(_) => {
+                    // Grew arena successfully
+                    assert_eq!(mgr.arenas.len(), 2);
+                    assert_eq!(source.available.len(), 0);
+                    let mut host_arena1 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+                    let full_resolver = [
+                        (mgr.base(), host_arena0.as_mut_ptr()),
+                        (ext_base.0, host_arena1.as_mut_ptr()),
+                    ];
+                    unsafe {
+                        mgr.rollback_undo(&full_resolver[..], Some(&mut source))
+                            .unwrap()
+                    };
+                    assert_eq!(mgr.arenas.len(), 1);
+                    assert_eq!(source.returned.as_slice(), &[ext_base]);
+                }
+                Err(e) => {
+                    assert_eq!(e, PageTableError::MetadataAllocation);
+                    assert!(mgr.undo_is_open());
+                    // Rollback must succeed without allocating and return any attached arenas to source
+                    snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+                    let _ = unsafe { mgr.rollback_undo(&resolver[..], Some(&mut source)) }
+                        .expect("rollback must succeed");
+                    let rollback_allocs = snapshot_allocations::OP_COUNT
+                        .with(|c| c.replace(None))
+                        .unwrap();
+                    assert_eq!(rollback_allocs, 0, "rollback must not allocate");
+                    assert!(!mgr.undo_is_open());
+                    assert_eq!(
+                        source.returned.as_slice(),
+                        &[ext_base],
+                        "fail_point={fail_point}: arena must be returned to source exactly once"
+                    );
+                    assert_eq!(mgr.arenas.len(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_metadata_refusal_sync_to_host_overflow_scratch() {
+        // Build a manager with 9 arenas (>8 inline resolvers in sync_to_host)
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let mut mgr = hvpatch_manager();
+        mgr.set_rw(
+            LINUX_MMAP_BASE + 512 * TWO_MIB + 0x1000,
+            0x1000,
+            false,
+            None,
+        )
+        .expect("pre-create L2 table");
+        mgr.layout.extension_arena_capacity = PT_PAGE as usize;
+        exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
+
+        const SCALE: usize = 9;
+        let ext_bases: Vec<SubstrateGpa> = (0..SCALE)
+            .map(|i| SubstrateGpa(0x80_0000_0000 + (i as u64) * 0x20_0000))
+            .collect();
+        let mut host_arenas: Vec<Vec<u8>> = (0..SCALE + 1)
+            .map(|_| vec![0u8; LINUX_PAGE_TABLES_SIZE as usize])
+            .collect();
+        let mut resolver: Vec<(u64, *mut u8)> = Vec::with_capacity(SCALE + 1);
+        resolver.push((LINUX_PAGE_TABLES_BASE, host_arenas[0].as_mut_ptr()));
+        for (i, base) in ext_bases.iter().enumerate() {
+            resolver.push((base.0, host_arenas[i + 1].as_mut_ptr()));
+        }
+
+        let mut source = NonAllocTestArenaSource {
+            id: TableArenaSourceId(SubstrateGpa(LINUX_PAGE_TABLES_BASE)),
+            available: ext_bases.clone(),
+            returned: Vec::with_capacity(SCALE),
+        };
+
+        let mut edit_va = LINUX_MMAP_BASE + 513 * TWO_MIB;
+        for _ in 0..SCALE {
+            mgr.set_rw(edit_va + 0x1000, 0x1000, false, Some(&mut source))
+                .unwrap();
+            edit_va += TWO_MIB;
+        }
+        assert_eq!(mgr.arenas.len(), SCALE + 1);
+        assert!(!mgr.dirty.is_empty());
+        let dirty_count_before = mgr.dirty.len();
+
+        // Fail allocation during sync_to_host (when allocating the >8 resolved vector)
+        snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(0)));
+        let sync_err = unsafe { mgr.sync_to_host(resolver.as_slice()) };
+        snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+
+        assert_eq!(sync_err, Err(PageTableError::MetadataAllocation));
+        assert_eq!(
+            mgr.dirty.len(),
+            dirty_count_before,
+            "dirty list must be preserved when sync_to_host fails"
+        );
+
+        // Retrying sync_to_host without refusal succeeds and drains dirty entries
+        unsafe { mgr.sync_to_host(resolver.as_slice()).unwrap() };
+        assert!(
+            mgr.dirty.is_empty(),
+            "dirty list drained on successful sync"
+        );
+    }
+
+    #[test]
+    fn test_rollback_zero_allocations_repeated_cycles() {
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        const SCALE: usize = 8;
+        let ext_bases: Vec<SubstrateGpa> = (0..SCALE)
+            .map(|i| SubstrateGpa(0x80_0000_0000 + (i as u64) * 0x20_0000))
+            .collect();
+        let mut host_arenas: Vec<Vec<u8>> = (0..SCALE + 1)
+            .map(|_| vec![0u8; LINUX_PAGE_TABLES_SIZE as usize])
+            .collect();
+        let mut resolver: Vec<(u64, *mut u8)> = Vec::with_capacity(SCALE + 1);
+        resolver.push((LINUX_PAGE_TABLES_BASE, host_arenas[0].as_mut_ptr()));
+        for (i, base) in ext_bases.iter().enumerate() {
+            resolver.push((base.0, host_arenas[i + 1].as_mut_ptr()));
+        }
+
+        let mut mgr = hvpatch_manager();
+        mgr.set_rw(
+            LINUX_MMAP_BASE + 512 * TWO_MIB + 0x1000,
+            0x1000,
+            false,
+            None,
+        )
+        .expect("pre-create L2 table");
+        mgr.layout.extension_arena_capacity = PT_PAGE as usize;
+        exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
+
+        for cycle in 0..5 {
+            let mut source = NonAllocTestArenaSource {
+                id: TableArenaSourceId(SubstrateGpa(LINUX_PAGE_TABLES_BASE)),
+                available: ext_bases.clone(),
+                returned: Vec::with_capacity(SCALE),
+            };
+
+            mgr.begin_undo().unwrap();
+
+            let mut edit_va = LINUX_MMAP_BASE + 513 * TWO_MIB;
+            for _ in 0..SCALE {
+                mgr.set_rw(edit_va + 0x1000, 0x1000, false, Some(&mut source))
+                    .unwrap();
+                edit_va += TWO_MIB;
+            }
+            assert_eq!(mgr.arenas.len(), 1 + SCALE);
+
+            snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+            let popped = unsafe { mgr.rollback_undo(resolver.as_slice(), Some(&mut source)) }
+                .expect("rollback must succeed");
+            let rollback_allocs = snapshot_allocations::OP_COUNT
+                .with(|c| c.replace(None))
+                .unwrap();
+
+            assert_eq!(
+                rollback_allocs, 0,
+                "cycle {cycle}: rollback must perform 0 allocations"
+            );
+            assert_eq!(popped.len(), SCALE);
+            assert_eq!(source.returned.len(), SCALE);
+            assert_eq!(mgr.arenas.len(), 1);
+            assert!(!mgr.undo_is_open());
         }
     }
 
@@ -3588,7 +4140,7 @@ mod tests {
                 .ok();
 
             let oracle = journalled.snapshot_image().expect("snapshot oracle");
-            journalled.begin_undo();
+            journalled.begin_undo().unwrap();
             assert!(journalled.undo_is_open());
             for edit in edits.iter().take(length) {
                 edit(&mut journalled);
@@ -3639,7 +4191,7 @@ mod tests {
             assert_eq!(fresh.translate(LINUX_MMAP_BASE + page * 0x1000), None);
         }
         assert!(!fresh.undo_replaced_valid_descriptor(), "closed journal");
-        fresh.begin_undo();
+        fresh.begin_undo().unwrap();
         fresh
             .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, false, None)
             .expect("map fresh hole");
@@ -3658,7 +4210,7 @@ mod tests {
         replacing
             .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, false, None)
             .expect("map before the transaction");
-        replacing.begin_undo();
+        replacing.begin_undo().unwrap();
         replacing
             .set_prot_none(LINUX_MMAP_BASE, 0x4000, None)
             .expect("replace a live valid word");
@@ -3676,7 +4228,7 @@ mod tests {
     #[test]
     fn undo_journal_commit_keeps_the_transaction() {
         let mut mgr = manager();
-        mgr.begin_undo();
+        mgr.begin_undo().unwrap();
         mgr.set_readonly(LINUX_HEAP_BASE, 0x4000, false, None)
             .expect("protect heap");
         let after = mgr.snapshot_image().expect("snapshot after");
@@ -5098,7 +5650,7 @@ mod tests {
             returned: Arc::clone(&returned),
         };
 
-        mgr.begin_undo();
+        mgr.begin_undo().unwrap();
         mgr.set_rw(va, 0x1000, false, Some(&mut source))
             .expect("mapping succeeds by allocating extension arena");
         assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas during tx");
@@ -5256,7 +5808,7 @@ mod tests {
             returned: Arc::clone(&returned),
         };
 
-        mgr.begin_undo();
+        mgr.begin_undo().unwrap();
         mgr.set_rw(va, 0x1000, false, Some(&mut source))
             .expect("mapping succeeds with extension arena");
         assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas");
@@ -5704,7 +6256,7 @@ mod tests {
         assert_eq!(mgr.translate(va), Some(ipa_a));
 
         // Begin transaction
-        mgr.begin_undo();
+        mgr.begin_undo().unwrap();
 
         // Mutate to ipa_b
         let ipa_b = 0x90_0000;
