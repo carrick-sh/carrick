@@ -828,3 +828,33 @@ witnesses. These are required by the accepted allocator brief, not new scope.
 Use the resulting allocator for shared MMU publication and EL1 first-touch;
 the existing <0.125 host-exits/page target remains red. No end-to-end speedup
 is claimed and all later checkpoints remain required.
+
+2026-09-26: correction checkout advanced through coherent metadata backing
+(fa557cc7d), exact carrier ownership/generation (1c22dcdb3), and shared stage-2
+record publication/retirement (b61195767). Five focused metadata and 48 existing
+custody tests pass. The exact signed sequential allocator witness passes on
+b61195767, including denial recovery and complete return of 5,767,168 bytes.
+
+8fc9c913a adds a concurrent signed witness: four allocator users, sixteen rounds
+of growth/free, and 1,024 successful host-forwarded uname calls. Both allocator
+tests pass with matching grant/return counts and bytes, no concurrent grant
+denial, the unchanged watchdog, negative entitlement control and zero scoped
+processes. See [concurrent evidence](../../perf-results/2026-09-26-el1-allocator-concurrent/README.md).
+This is concurrent completion/progress proof, not an interrupt-latency measurement.
+
+5b2da6bef gates private allocator controls behind an explicit embedded-image
+test feature enabled by embed dev dependencies. Default and enabled shared
+dispatcher tests (57 each), both image builds, embed compile-check and Clippy
+pass. Signed verification is running in the correction checkout at
+target/el1-completion/allocator-gated-signed/signed.log. No allocator product
+changes have been integrated into this controller checkout.
+
+Remaining required allocator work: IRQ/host-wait protocol and complete
+deterministic work/retention witnesses. Source confirms EL1 intentionally
+never unmasks IRQs; restoring saved DAIF before synchronous HVC #6 therefore
+does not prove the brief's no-host-wait-while-masked requirement. Current-EL
+IRQ slots fail loud, so simply unmasking interrupts is not a valid correction.
+Resolve this protocol before claiming allocator acceptance. Then continue
+shared MMU publication/frame grants and real first-touch handling. The first-touch
+exit-slope gate and full per-workload 2x acceptance remain open, as do all later
+checkpoints.
