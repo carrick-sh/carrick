@@ -9,13 +9,15 @@ frame-grant request, ready receipt, exact-MM claim or authenticated authority
 fields existed.
 
 The shared ABI now binds every request and response to one nonzero MM key and
-request generation. A successful response must contain the fault within the
-requested span and name nonzero frame, mapping, stage-2 owner-generation and
-committed inventory-revision identities. Wrong-MM and stale-generation
-participants cannot claim the response; mismatched or unauthenticated host
-data cannot become Ready. The 2 MiB target span permits one successful host
-boundary to cover up to 512 Linux pages, subject to later host clamping at
-VMA, permission and alignment boundaries.
+request generation. EL1 supplies only the read, write or execute access that
+faulted; the host supplies authoritative VMA permissions. A successful
+response must contain the fault within the requested span, permit the faulting
+access, and name nonzero frame, mapping, stage-2 owner-generation and committed
+inventory-revision identities. Wrong-MM and stale-generation participants
+cannot claim the response; mismatched or unauthenticated host data cannot
+become Ready. The 2 MiB target span permits one successful host boundary to
+cover up to 512 Linux pages, subject to later host clamping at VMA, permission
+and alignment boundaries.
 
 Evidence in this directory:
 

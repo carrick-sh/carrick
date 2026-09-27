@@ -311,10 +311,11 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(FrameGrantMailbox, request_generation) as u64,
         core::mem::offset_of!(FrameGrantMailbox, fault_va) as u64,
         core::mem::offset_of!(FrameGrantMailbox, requested_len) as u64,
-        core::mem::offset_of!(FrameGrantMailbox, permissions) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, access) as u64,
         core::mem::offset_of!(FrameGrantMailbox, semantic_base) as u64,
         core::mem::offset_of!(FrameGrantMailbox, physical_ipa) as u64,
         core::mem::offset_of!(FrameGrantMailbox, granted_len) as u64,
+        core::mem::offset_of!(FrameGrantMailbox, permissions) as u64,
         core::mem::offset_of!(FrameGrantMailbox, frame_id) as u64,
         core::mem::offset_of!(FrameGrantMailbox, mapping_id) as u64,
         core::mem::offset_of!(FrameGrantMailbox, owner_generation) as u64,
@@ -726,8 +727,9 @@ pub struct FrameGrantRequest {
     pub fault_va: u64,
     /// Maximum semantic span the host may return.
     pub requested_len: u64,
-    /// Linux protection bits requested for the eventual stage-1 leaves.
-    pub permissions: u64,
+    /// Exact access that faulted: one Linux read, write or execute bit. The
+    /// host returns authoritative VMA permissions separately.
+    pub access: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -769,10 +771,11 @@ pub struct FrameGrantMailbox {
     request_generation: AtomicU64,
     fault_va: AtomicU64,
     requested_len: AtomicU64,
-    permissions: AtomicU64,
+    access: AtomicU64,
     semantic_base: AtomicU64,
     physical_ipa: AtomicU64,
     granted_len: AtomicU64,
+    permissions: AtomicU64,
     frame_id: AtomicU64,
     mapping_id: AtomicU64,
     owner_generation: AtomicU64,
@@ -791,10 +794,11 @@ impl FrameGrantMailbox {
             request_generation: AtomicU64::new(0),
             fault_va: AtomicU64::new(0),
             requested_len: AtomicU64::new(0),
-            permissions: AtomicU64::new(0),
+            access: AtomicU64::new(0),
             semantic_base: AtomicU64::new(0),
             physical_ipa: AtomicU64::new(0),
             granted_len: AtomicU64::new(0),
+            permissions: AtomicU64::new(0),
             frame_id: AtomicU64::new(0),
             mapping_id: AtomicU64::new(0),
             owner_generation: AtomicU64::new(0),
@@ -808,8 +812,8 @@ impl FrameGrantMailbox {
             && request.requested_len != 0
             && request.requested_len <= EL1_FRAME_GRANT_TARGET_SIZE
             && request.requested_len.is_multiple_of(Self::PAGE_SIZE)
-            && request.permissions != 0
-            && request.permissions & !Self::PERMISSION_MASK == 0
+            && request.access.is_power_of_two()
+            && request.access & !Self::PERMISSION_MASK == 0
     }
 
     fn load_request(&self) -> FrameGrantRequest {
@@ -818,7 +822,7 @@ impl FrameGrantMailbox {
             request_generation: self.request_generation.load(Ordering::Relaxed),
             fault_va: self.fault_va.load(Ordering::Relaxed),
             requested_len: self.requested_len.load(Ordering::Relaxed),
-            permissions: self.permissions.load(Ordering::Relaxed),
+            access: self.access.load(Ordering::Relaxed),
         }
     }
 
@@ -835,7 +839,9 @@ impl FrameGrantMailbox {
             && ready.len.is_multiple_of(Self::PAGE_SIZE)
             && ready.semantic_base <= request.fault_va
             && request.fault_va < end
-            && ready.permissions == request.permissions
+            && ready.permissions != 0
+            && ready.permissions & !Self::PERMISSION_MASK == 0
+            && ready.permissions & request.access == request.access
             && ready.frame_id != 0
             && ready.mapping_id != 0
             && ready.owner_generation != 0
@@ -864,11 +870,11 @@ impl FrameGrantMailbox {
         self.fault_va.store(request.fault_va, Ordering::Relaxed);
         self.requested_len
             .store(request.requested_len, Ordering::Relaxed);
-        self.permissions
-            .store(request.permissions, Ordering::Relaxed);
+        self.access.store(request.access, Ordering::Relaxed);
         self.semantic_base.store(0, Ordering::Relaxed);
         self.physical_ipa.store(0, Ordering::Relaxed);
         self.granted_len.store(0, Ordering::Relaxed);
+        self.permissions.store(0, Ordering::Relaxed);
         self.frame_id.store(0, Ordering::Relaxed);
         self.mapping_id.store(0, Ordering::Relaxed);
         self.owner_generation.store(0, Ordering::Relaxed);
@@ -903,6 +909,7 @@ impl FrameGrantMailbox {
         self.physical_ipa
             .store(ready.physical_ipa, Ordering::Relaxed);
         self.granted_len.store(ready.len, Ordering::Relaxed);
+        self.permissions.store(ready.permissions, Ordering::Relaxed);
         self.frame_id.store(ready.frame_id, Ordering::Relaxed);
         self.mapping_id.store(ready.mapping_id, Ordering::Relaxed);
         self.owner_generation
@@ -958,7 +965,7 @@ impl FrameGrantMailbox {
             semantic_base: self.semantic_base.load(Ordering::Relaxed),
             physical_ipa: self.physical_ipa.load(Ordering::Relaxed),
             len: self.granted_len.load(Ordering::Relaxed),
-            permissions: request.permissions,
+            permissions: self.permissions.load(Ordering::Relaxed),
             frame_id: self.frame_id.load(Ordering::Relaxed),
             mapping_id: self.mapping_id.load(Ordering::Relaxed),
             owner_generation: self.owner_generation.load(Ordering::Relaxed),
@@ -2818,7 +2825,7 @@ mod tests {
             request_generation: 7,
             fault_va: 0x4000_3000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
-            permissions: 3,
+            access: 2,
         };
         assert!(mailbox.try_publish_request(request));
         assert!(!mailbox.try_publish_request(request));
@@ -2830,7 +2837,7 @@ mod tests {
             semantic_base: 0x4000_0000,
             physical_ipa: 0x9000_0000,
             len: EL1_FRAME_GRANT_TARGET_SIZE,
-            permissions: request.permissions,
+            permissions: 3,
             frame_id: 101,
             mapping_id: 102,
             owner_generation: 103,
@@ -2861,7 +2868,7 @@ mod tests {
             request_generation: 11,
             fault_va: 0x5000_1000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
-            permissions: 1,
+            access: 1,
         };
         assert!(mailbox.try_publish_request(request));
         assert_eq!(mailbox.claim_request(), Some(request));
@@ -2872,7 +2879,7 @@ mod tests {
             semantic_base: 0x5000_0000,
             physical_ipa: 0xa000_0000,
             len: EL1_FRAME_GRANT_TARGET_SIZE,
-            permissions: request.permissions,
+            permissions: 1,
             frame_id: 201,
             mapping_id: 202,
             owner_generation: 203,

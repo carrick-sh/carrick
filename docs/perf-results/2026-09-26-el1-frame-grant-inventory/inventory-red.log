@@ -1,0 +1,53 @@
+   Compiling tempfile v3.27.0
+   Compiling darling_core v0.20.11
+   Compiling dof v0.4.0
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-image)
+   Compiling carrick-el1 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1)
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-vmm-hvf)
+   Compiling carrick-signal-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-signal-core)
+   Compiling rusty-fork v0.3.1
+   Compiling proptest v1.11.0
+   Compiling usdt-impl v0.6.0
+   Compiling usdt v0.6.0
+   Compiling carrick-observability v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-observability)
+   Compiling darling_macro v0.20.11
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-hal)
+   Compiling derive_builder_macro v0.20.2
+   Compiling derive_builder v0.20.2
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-conformance-contract)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-aarch64)
+   Compiling oci-spec v0.8.4
+   Compiling oci-client v0.15.0
+   Compiling carrick-spec v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-spec)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-vfs)
+   Compiling carrick-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-image)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-kernel)
+   Compiling carrick-kernel-example v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/experiments/native-syscall-slice)
+error[E0599]: no method named `apply_frame_grant` found for struct `std::sync::Arc<dyn FrameCowAuthority>` in the current scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:3549:14
+     |
+3548 |           let (receipt, authenticated_owner) = authority
+     |  ______________________________________________-
+3549 | |             .apply_frame_grant(reservation.commit(()), mapping, frame, gpa, length)
+     | |             -^^^^^^^^^^^^^^^^^ method not found in `std::sync::Arc<dyn FrameCowAuthority>`
+     | |_____________|
+     |
+
+error[E0599]: no method named `rollback_frame_grant` found for struct `std::sync::Arc<dyn FrameCowAuthority>` in the current scope
+    --> crates/carrick-runtime/src/vcpu_loop/memory.rs:3564:14
+     |
+3563 | /         authority
+3564 | |             .rollback_frame_grant(&receipt)
+     | |             -^^^^^^^^^^^^^^^^^^^^ method not found in `std::sync::Arc<dyn FrameCowAuthority>`
+     | |_____________|
+     |
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `carrick-runtime` (lib test) due to 2 previous errors

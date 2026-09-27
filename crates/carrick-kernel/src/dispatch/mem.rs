@@ -2127,6 +2127,17 @@ impl SyscallDispatcher {
         self.mem_view().resident_fault_plan(permit, address)
     }
 
+    #[inline]
+    pub fn resident_frame_grant_plan<'permit>(
+        &self,
+        permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        address: u64,
+        max_len: u64,
+    ) -> Option<ResidentFrameGrantPlan<'permit>> {
+        self.mem_view()
+            .resident_frame_grant_plan(permit, address, max_len)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[inline]
     pub fn seed_resident_fault_for_test(&self, page: u64, prot: u64) {
@@ -2144,9 +2155,26 @@ impl SyscallDispatcher {
             .with_resident_fault_plan_for_test(page, use_plan)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[inline]
+    pub fn with_resident_frame_grant_plan_for_test<T>(
+        &self,
+        address: u64,
+        max_len: u64,
+        use_plan: impl FnOnce(ResidentFrameGrantPlan<'_>) -> T,
+    ) -> Option<T> {
+        self.mem_view()
+            .with_resident_frame_grant_plan_for_test(address, max_len, use_plan)
+    }
+
     #[inline]
     pub fn commit_resident_fault(&self, plan: ResidentFaultPlan) {
         self.mem_view().commit_resident_fault(plan);
+    }
+
+    #[inline]
+    pub fn commit_resident_frame_grant(&self, plan: ResidentFrameGrantPlan<'_>) {
+        self.mem_view().commit_resident_frame_grant(plan);
     }
 
     #[cfg(test)]

@@ -1,0 +1,8 @@
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.66s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-000a5bade7be9689)
+
+running 1 test
+test dispatch::mem::fault::tests::frame_grant_plan_clips_to_one_bulk_window_and_commits_the_whole_span ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2236 filtered out; finished in 0.01s

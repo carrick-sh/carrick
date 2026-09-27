@@ -74,6 +74,29 @@ impl FirstTouchArming {
             .map(|(_, arm)| arm.prot)
     }
 
+    /// The armed range around `page`, clipped to one `max_len`-aligned bulk
+    /// window. A host frame grant may make the complete result resident in one
+    /// transaction without crossing a VMA/protection boundary.
+    fn grant_for_page(&self, page: u64, max_len: u64) -> Option<ResidentFaultRange> {
+        if max_len == 0 {
+            return None;
+        }
+        let (&arm_start, arm) = self.extents.range(..=page).next_back()?;
+        if page >= arm.end {
+            return None;
+        }
+        let window_start = page - page % max_len;
+        let window_end = window_start.checked_add(max_len)?;
+        let range = carrick_vfs::GuestMemoryRange::new(
+            GuestVa(arm_start.max(window_start)),
+            GuestVa(arm.end.min(window_end)),
+        )?;
+        Some(ResidentFaultRange {
+            range,
+            prot: arm.prot,
+        })
+    }
+
     /// Drop `range` from the set, keeping the parts of any extent that lie
     /// outside it. This is the commit path for one page, so it must not touch
     /// entries the range does not overlap.
@@ -213,6 +236,33 @@ pub struct ResidentFaultPlan<'permit> {
     pub(crate) page: u64,
     pub(crate) prot: u64,
     pub(crate) exclusion: super::HostAliasDispatchGuard<'permit>,
+}
+
+/// Owns alias exclusion from a bulk first-touch lookup through host backing
+/// preparation and whole-span residency publication.
+pub struct ResidentFrameGrantPlan<'permit> {
+    pub(crate) start: u64,
+    pub(crate) len: u64,
+    pub(crate) prot: u64,
+    pub(crate) exclusion: super::HostAliasDispatchGuard<'permit>,
+}
+
+impl ResidentFrameGrantPlan<'_> {
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn prot(&self) -> u64 {
+        self.prot
+    }
 }
 
 impl ResidentFaultPlan<'_> {
@@ -456,6 +506,29 @@ impl<'a> MemView<'a> {
         })
     }
 
+    pub(crate) fn resident_frame_grant_plan<'permit>(
+        &self,
+        permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        address: u64,
+        max_len: u64,
+    ) -> Option<ResidentFrameGrantPlan<'permit>> {
+        let page_size = self.linux_page_size();
+        if max_len == 0 || !max_len.is_multiple_of(page_size) {
+            return None;
+        }
+        let exclusion = self.begin_host_alias_dispatch(permit);
+        let page = page_floor(address, page_size);
+        let mem_authority = self.mem();
+        let mem = mem_authority.lock();
+        let grant = mem.resident_fault_ranges.grant_for_page(page, max_len)?;
+        Some(ResidentFrameGrantPlan {
+            start: grant.range.start().raw(),
+            len: grant.range.end().raw() - grant.range.start().raw(),
+            prot: grant.prot.bits(),
+            exclusion,
+        })
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn seed_resident_fault_for_test(&self, page: u64, prot: u64) {
         self.track_resident_fault_range(
@@ -476,6 +549,19 @@ impl<'a> MemView<'a> {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_resident_frame_grant_plan_for_test<T>(
+        &self,
+        addr: u64,
+        max_len: u64,
+        use_plan: impl FnOnce(ResidentFrameGrantPlan<'_>) -> T,
+    ) -> Option<T> {
+        super::mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
+            self.resident_frame_grant_plan(permit, addr, max_len)
+                .map(use_plan)
+        })
+    }
+
     pub(crate) fn commit_resident_fault(&self, plan: ResidentFaultPlan) {
         if !self.owns_host_alias_dispatch(&plan.exclusion) {
             carrick_fatal!(
@@ -492,6 +578,26 @@ impl<'a> MemView<'a> {
         };
         let mem_authority_33 = self.mem();
         let mut mem = mem_authority_33.lock();
+        locked_ranges_insert(&mut mem.resident_ranges, range);
+        mem.resident_fault_ranges.disarm(range);
+    }
+
+    pub(crate) fn commit_resident_frame_grant(&self, plan: ResidentFrameGrantPlan<'_>) {
+        if !self.owns_host_alias_dispatch(&plan.exclusion) {
+            carrick_fatal!(
+                "dispatch::resident_frame_grant",
+                "caller lacks host alias dispatch exclusion during commit_resident_frame_grant"
+            );
+        }
+        let Some(end) = plan.start.checked_add(plan.len) else {
+            return;
+        };
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(plan.start), GuestVa(end))
+        else {
+            return;
+        };
+        let mem_authority = self.mem();
+        let mut mem = mem_authority.lock();
         locked_ranges_insert(&mut mem.resident_ranges, range);
         mem.resident_fault_ranges.disarm(range);
     }
