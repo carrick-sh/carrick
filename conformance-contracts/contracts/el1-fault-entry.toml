@@ -23,6 +23,6 @@ vm_free = "carrick-el1-abi::tests (trap_frame_layout_and_offsets, counters_abi_l
 embed = "carrick-embed::el1_sched (signed; el1_memory_fault_entry_preserves_context verifies stage-1 permission fault entry, SIGSEGV si_addr accuracy, mprotect retry, complete register canary preservation, and positive fault_taken counter in live carrier)"
 
 [bindings.unresolved]
-docker = "The fault-entry fixture runs the same POSIX signal and mprotect retry protocol that passes on Linux Docker; differential oracle capture and comparison are maintained."
+docker = "Docker execution pending signed acceptance; differential oracle capture and comparison are maintained during director acceptance."
 embed_structural = "Entry counter (fault_taken >= 1) and architectural register preservation are verified; complete first-touch in-guest service is part of the subsequent memory milestone."
 embed_timing = "Timing is not asserted for entry/forwarding acceptance."

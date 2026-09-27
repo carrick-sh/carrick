@@ -40,8 +40,8 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
     if frame_ref.esr == 0 {
         return carrick_el1::dispatch_irq(frame_ref, counters_ref) as u64;
     }
-    // Lower-EL data abort (EC = 0x24):
-    if (frame_ref.esr >> 26) == 0x24 {
+    // Lower-EL data abort (EC = 0x24, bits 31:26):
+    if ((frame_ref.esr >> 26) & 0x3F) == 0x24 {
         return carrick_el1::dispatch_fault(frame_ref, counters_ref) as u64;
     }
     carrick_el1::dispatch_syscall(frame_ref, counters_ref) as u64

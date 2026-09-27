@@ -1356,11 +1356,15 @@ fn el1_memory_first_touch_stays_in_guest() {
 /// enters the EL1 vector image, increments EL1 fault_taken counter, restores complete
 /// architectural context and forwards through host fault handling to guest SIGSEGV.
 /// After the signal handler upgrades permissions with mprotect, store retry succeeds
-/// and all registers (including arbitrary x8, x16/x17, GPRs) are preserved.
+/// and all registers (including arbitrary x8, x16/x17, GPRs) and SP are preserved.
 #[test]
 fn el1_memory_fault_entry_preserves_context() {
     let _guard = common::guest_lock();
     reset_el1_counters();
+    assert!(
+        read_el1_counters().is_none(),
+        "reset_el1_counters must clear any stale snapshot before carrier execution"
+    );
     let carrier = carrier_or_fail();
     let measured = run_fixture(&carrier, &["fault-entry"], Duration::from_secs(30));
     assert!(measured.result.success(), "{}", describe(&measured));
@@ -1370,12 +1374,24 @@ fn el1_memory_fault_entry_preserves_context() {
         "fixture fault-entry must succeed and preserve context: {stdout:?}"
     );
 
-    let counters = read_el1_counters().expect("EL1 counters should be populated");
-    let faults = counters
-        .fault_taken
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert!(
-        faults >= 1,
-        "expected at least 1 EL1 fault entry in live carrier counters, got {faults}"
-    );
+    let el1_active = std::env::var("CARRICK_EL1").as_deref() != Ok("0");
+    if el1_active {
+        let counters =
+            read_el1_counters().expect("EL1 counters must be populated when EL1 is enabled");
+        let faults = counters
+            .fault_taken
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            faults >= 1,
+            "expected at least 1 EL1 fault entry in live carrier counters under EL1 enabled, got {faults}"
+        );
+    } else {
+        let faults = read_el1_counters()
+            .map(|c| c.fault_taken.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0);
+        assert_eq!(
+            faults, 0,
+            "disabled EL1 control (CARRICK_EL1=0) must report 0 EL1 fault entries, got {faults}"
+        );
+    }
 }
