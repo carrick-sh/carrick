@@ -1,0 +1,10 @@
+{
+  "source_head": "084c9a2725e34ecc58269ebcbb13bf73a90505f0",
+  "command": "RUSTC_WRAPPER= just ci",
+  "exit_code": 0,
+  "log_sha256": "2ece8cdf40c4185e4ccb359cf3cf98f5ee56b071fa66d91cdc1b3617bb0a938c",
+  "rust_test_result_groups": 101,
+  "passed": 6188,
+  "failed": 0,
+  "ignored": 12
+}
