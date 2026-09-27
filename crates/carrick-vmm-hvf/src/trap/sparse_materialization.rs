@@ -748,9 +748,14 @@ pub(super) fn publish_replacing(
                             context.state.protections.range_executable(start, semantic_len))
                     } else {
                         editor.set_prot_none(start, semantic_len)
-                    }.map_err(|error| TrapError::Hypervisor(format!(
-                        "publish sparse HVPatch mmap stage-1 permissions: {error:?}"
-                    )))?;
+                    }.map_err(|error| match error {
+                        carrick_mmu_core::aarch64::PageTableError::MetadataAllocation => {
+                            TrapError::MetadataAllocation
+                        }
+                        other => TrapError::Hypervisor(format!(
+                            "publish sparse HVPatch mmap stage-1 permissions: {other:?}"
+                        )),
+                    })?;
                     context.state.publish_stage1_extension_arenas_into(
                         // The root region's guest-visible mapping is read-only,
                         // but structural table backing must remain writable for
@@ -764,10 +769,13 @@ pub(super) fn publish_replacing(
                     let page_table_resolver = context
                         .state
                         .pinned_stage1_arenas(&context.custody, editor.base())?;
-                    unsafe { editor.sync_to_host(&page_table_resolver) }.map_err(|e| {
-                        TrapError::Hypervisor(format!(
-                            "sparse HVPatch mmap sync_to_host failed: {e:?}"
-                        ))
+                    unsafe { editor.sync_to_host(&page_table_resolver) }.map_err(|e| match e {
+                        carrick_mmu_core::aarch64::PageTableError::MetadataAllocation => {
+                            TrapError::MetadataAllocation
+                        }
+                        other => TrapError::Hypervisor(format!(
+                            "sparse HVPatch mmap sync_to_host failed: {other:?}"
+                        )),
                     })?;
                     replaced_valid_descriptor = editor.manager.undo_replaced_valid_descriptor();
                     #[cfg(test)]
@@ -825,7 +833,14 @@ pub(super) fn publish_replacing(
                 unsafe {
                     editor.rollback_undo_retiring(
                         resolver,
-                        |e| TrapError::Hypervisor(format!("failed to rollback stage1 undo: {e:?}")),
+                        |e| match e {
+                            carrick_mmu_core::aarch64::PageTableError::MetadataAllocation => {
+                                TrapError::MetadataAllocation
+                            }
+                            other => TrapError::Hypervisor(format!(
+                                "failed to rollback stage1 undo: {other:?}"
+                            )),
+                        },
                         |popped| {
                             flush_stage1()?;
                             let journal = extension_regions

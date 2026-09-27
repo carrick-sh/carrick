@@ -2565,6 +2565,9 @@ fn sparse_mmap_stage1_error(
     error: carrick_mmu_core::aarch64::PageTableError,
     source: bool,
 ) -> TrapError {
+    if error == carrick_mmu_core::aarch64::PageTableError::MetadataAllocation {
+        return TrapError::MetadataAllocation;
+    }
     let (in_use, free, capacity, arenas) = manager.pool_stats();
     let (multi_vcpu, exclusive, reclaim_pending) = manager.coalesce_policy();
     TrapError::Hypervisor(format!(

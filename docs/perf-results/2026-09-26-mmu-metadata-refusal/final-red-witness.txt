@@ -1,0 +1,54 @@
+# Final Red Witness and Reproducer Diffs
+
+## 1. Zero-Allocation Rollback Structural Red Witness (Final Fixture Shape)
+
+### Source Diff (Reverting Pre-Admitted Returned Bases Production Code)
+```diff
+--- a/crates/carrick-mmu-core/src/aarch64.rs
++++ b/crates/carrick-mmu-core/src/aarch64.rs
+@@ -1819,2 +1819,1 @@
+-        let mut popped = journal.returned_bases;
+-        popped.clear();
++        let mut popped = Vec::new();
+```
+
+### Verification Command
+```bash
+RUSTC_WRAPPER= cargo test -p carrick-mmu-core --lib test_metadata_refusal_witness_rollback_allocations -- --nocapture
+```
+
+### Verbatim Raw Failure Output
+```
+    Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+    Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+     Finished `test` profile [unoptimized + debuginfo] target(s) in 1.06s
+      Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-1d1f88d6a1eb2090)
+
+running 1 test
+scale=1 admission_allocations=22 admission_bytes=88300 rollback_allocations=1 rollback_bytes=32 popped_len=1
+
+thread 'aarch64::tests::test_metadata_refusal_witness_rollback_allocations' (13696349) panicked at crates/carrick-mmu-core/src/aarch64.rs:3699:13:
+assertion `left == right` failed: scale=1: rollback allocated heap memory (1 allocs)
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test aarch64::tests::test_metadata_refusal_witness_rollback_allocations ... FAILED
+
+failures:
+
+failures:
+    aarch64::tests::test_metadata_refusal_witness_rollback_allocations
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 92 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p carrick-mmu-core --lib`
+```
+
+## 2. Coalescing and Reclaim Refusal Ordering Witness Citation
+
+- **Authentic Review Round 1 Coalescing Failure:** Tested via director witness `/tmp/el1-metadata-review1/coalesce-witness.diff` and log `/tmp/el1-metadata-review1/coalesce-witness.log`.
+- **Finding:** In unpatched source, `try_coalesce` and reclaim helpers ignored errors from `write_desc` and `free_table`. Allocator refusal during parent descriptor write resulted in freeing the child table and returning `coalesced = true`, leaving `translation None` instead of original `Some(...)`.
+- **Durable Regressions Tested:**
+  - `director_coalesce_refusal_preserves_linked_table` (write-failure ordering: parent write refusal keeps child table linked and preserved).
+  - `test_coalesce_free_tables_refusal_preserves_state` (free-bookkeeping ordering: `free_tables` reservation refusal aborts before mutating parent descriptor).
+  - `test_reclaim_refusal_preserves_linked_tables` (reclamation sweep refusal preserves `reclaim_pending` and linked child tables).

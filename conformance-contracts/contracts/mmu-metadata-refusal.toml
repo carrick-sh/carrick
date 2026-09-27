@@ -10,7 +10,7 @@ guest_surfaces = [
 ]
 semantic_authority = [
   "man 2 mmap: MAP_PRIVATE | MAP_ANONYMOUS creates a private mapping whose pages and protections are preserved upon transaction failure",
-  "man 2 mprotect: a failed protection change preserves existing memory permissions and mappings without corrupting address space state",
+  "Linux mm semantics: Carrick kernel preserves internal page table consistency and stage-1 descriptor authority on failed memory management transactions, avoiding corrupted state or descriptor authority leakage (distinguished from an unproven blanket guarantee that all failed mprotect calls are atomic across partial range splits)",
   "Arm Architecture Reference Manual Armv8-A D5: stage-1 translation preserves existing descriptor authority when a table update transaction is rolled back or aborted",
 ]
 fixture = "mmu:metadata-refusal 1|8|32|128"

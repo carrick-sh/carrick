@@ -2184,7 +2184,7 @@ impl PageTableManager {
                 return Ok(arena.base + off);
             }
         }
-        if self.reclaim_all_invalid_tables()
+        if self.reclaim_all_invalid_tables()?
             && let Some(pa) = self.free_tables.pop()
         {
             return Ok(pa);
@@ -2213,10 +2213,7 @@ impl PageTableManager {
             if let Some(journal) = self.undo.as_mut() {
                 let needed_capacity = self.arenas.len().saturating_sub(journal.arenas_len) + 1;
                 if journal.returned_bases.capacity() < needed_capacity
-                    && journal
-                        .returned_bases
-                        .try_reserve_exact(needed_capacity)
-                        .is_err()
+                    && journal.returned_bases.try_reserve(needed_capacity).is_err()
                 {
                     source.return_arena(gpa);
                     return Err(PageTableError::MetadataAllocation);
@@ -2371,18 +2368,18 @@ impl PageTableManager {
     /// which the one-batch editor cannot express. Only spare tables are touched
     /// (the boot L2_A/L2_B/L3_A — null guard + kernel hole — are never uniform
     /// and never spare, so are doubly safe).
-    fn try_coalesce(&mut self, va: u64) -> bool {
+    fn try_coalesce(&mut self, va: u64) -> Result<bool, PageTableError> {
         if self.multi_vcpu || !self.offline_private_image {
-            return false;
+            return Ok(false);
         }
         let mut coalesced = false;
         let idx = indices(va);
         let l0_entry = TableLocation::new(0, idx[0] * 8);
         let Some(l1_pa) = self.child_table_pa(l0_entry) else {
-            return false;
+            return Ok(false);
         };
         let Ok(l1_loc) = self.pa_to_loc(l1_pa) else {
-            return false;
+            return Ok(false);
         };
         let l1_entry = l1_loc.entry(idx[1]);
 
@@ -2397,8 +2394,11 @@ impl PageTableManager {
                 && let Some((base, attrs)) =
                     self.uniform_block(l3_loc, PA_MASK_4KIB, 1 << 12, TYPE_TABLE_OR_PAGE)
             {
-                let _ = self.write_desc(l2_entry, (base & PA_MASK_2MIB) | attrs | TYPE_BLOCK);
-                let _ = self.free_table(l3_pa);
+                self.free_tables
+                    .try_reserve(1)
+                    .map_err(|_| PageTableError::MetadataAllocation)?;
+                self.write_desc(l2_entry, (base & PA_MASK_2MIB) | attrs | TYPE_BLOCK)?;
+                self.free_table(l3_pa)?;
                 coalesced = true;
             }
         }
@@ -2410,11 +2410,14 @@ impl PageTableManager {
             && let Some((base, attrs)) =
                 self.uniform_block(l2_loc, PA_MASK_2MIB, 1 << 21, TYPE_BLOCK)
         {
-            let _ = self.write_desc(l1_entry, (base & PA_MASK_1GIB) | attrs | TYPE_BLOCK);
-            let _ = self.free_table(l2_pa);
+            self.free_tables
+                .try_reserve(1)
+                .map_err(|_| PageTableError::MetadataAllocation)?;
+            self.write_desc(l1_entry, (base & PA_MASK_1GIB) | attrs | TYPE_BLOCK)?;
+            self.free_table(l2_pa)?;
             coalesced = true;
         }
-        coalesced
+        Ok(coalesced)
     }
 
     /// Block size in bytes mapped by a leaf at `level` (0=512 GiB, 1=1 GiB, 2=2 MiB,
@@ -2675,7 +2678,7 @@ impl PageTableManager {
                     block = next_l1.max(block + (1 << 21));
                     continue;
                 };
-                if self.try_coalesce(block) {
+                if self.try_coalesce(block)? {
                     flush_required = true;
                 }
                 block += 1 << 21;
@@ -2736,7 +2739,7 @@ impl PageTableManager {
         source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
         let mut outcome = self.invalidate(va, len, source)?;
-        let reclaimed = self.reclaim_invalid_tables(va, len);
+        let reclaimed = self.reclaim_invalid_tables(va, len)?;
         outcome.changed |= reclaimed;
         if reclaimed {
             outcome.flush_required = true;
@@ -2750,13 +2753,18 @@ impl PageTableManager {
     /// Single-vCPU/PMR only — a freed table must not be reused under a sibling's
     /// stale walk-cache (same break-before-make rule as coalesce). Returns
     /// whether anything was freed.
-    fn reclaim_invalid_tables(&mut self, va: u64, len: usize) -> bool {
-        self.reclaim_invalid_tables_counting(va, len).0
+    fn reclaim_invalid_tables(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
+        self.reclaim_invalid_tables_counting(va, len)
+            .map(|(freed, _)| freed)
     }
 
-    fn reclaim_invalid_tables_counting(&mut self, va: u64, len: usize) -> (bool, usize) {
+    fn reclaim_invalid_tables_counting(
+        &mut self,
+        va: u64,
+        len: usize,
+    ) -> Result<(bool, usize), PageTableError> {
         if self.multi_vcpu {
-            return (false, 0);
+            return Ok((false, 0));
         }
         let end = va + (len as u64).div_ceil(PT_PAGE) * PT_PAGE;
         let mut block = va & !((1 << 21) - 1);
@@ -2782,10 +2790,10 @@ impl PageTableManager {
                 block = next_l1.max(block + (1 << 21));
                 continue;
             };
-            freed |= self.reclaim_invalid_block(block);
+            freed |= self.reclaim_invalid_block(block)?;
             block += 1 << 21;
         }
-        (freed, steps)
+        Ok((freed, steps))
     }
 
     /// Walk the LIVE table structure and free every spare sub-table that is
@@ -2803,13 +2811,10 @@ impl PageTableManager {
     /// reaching it is the same break-before-make hazard that gates the eager
     /// paths. Under `stage1_exclusive` there is no such sibling. Returns whether
     /// anything was freed.
-    fn reclaim_all_invalid_tables(&mut self) -> bool {
+    fn reclaim_all_invalid_tables(&mut self) -> Result<bool, PageTableError> {
         if !self.stage1_exclusive || !self.reclaim_pending {
-            return false;
+            return Ok(false);
         }
-        // One sweep per teardown epoch. Re-walking with nothing newly
-        // invalidated cannot find anything the last walk missed.
-        self.reclaim_pending = false;
         let mut freed = false;
         for l0 in 0..512usize {
             let Some(l1_pa) = self.child_table_pa(TableLocation::new(0, l0 * 8)) else {
@@ -2835,29 +2840,38 @@ impl PageTableManager {
                         && let Ok(l3_loc) = self.pa_to_loc(l3_pa)
                         && self.table_reclaimable(l3_loc, l3_table_va, 3)
                     {
-                        let _ = self.write_desc(l2_entry, 0);
-                        let _ = self.free_table(l3_pa);
+                        self.free_tables
+                            .try_reserve(1)
+                            .map_err(|_| PageTableError::MetadataAllocation)?;
+                        self.write_desc(l2_entry, 0)?;
+                        self.free_table(l3_pa)?;
                         freed = true;
                     }
                 }
                 if self.is_spare_table(l2_pa) && self.table_reclaimable(l2_loc, l2_table_va, 2) {
-                    let _ = self.write_desc(l1_entry, 0);
-                    let _ = self.free_table(l2_pa);
+                    self.free_tables
+                        .try_reserve(1)
+                        .map_err(|_| PageTableError::MetadataAllocation)?;
+                    self.write_desc(l1_entry, 0)?;
+                    self.free_table(l2_pa)?;
                     freed = true;
                 }
             }
         }
-        freed
+        // One sweep per teardown epoch. Re-walking with nothing newly
+        // invalidated cannot find anything the last walk missed.
+        self.reclaim_pending = false;
+        Ok(freed)
     }
 
-    fn reclaim_invalid_block(&mut self, va: u64) -> bool {
+    fn reclaim_invalid_block(&mut self, va: u64) -> Result<bool, PageTableError> {
         let idx = indices(va);
         let l0_entry = TableLocation::new(0, idx[0] * 8);
         let Some(l1_pa) = self.child_table_pa(l0_entry) else {
-            return false;
+            return Ok(false);
         };
         let Ok(l1_loc) = self.pa_to_loc(l1_pa) else {
-            return false;
+            return Ok(false);
         };
         let l1_entry = l1_loc.entry(idx[1]);
         let mut freed = false;
@@ -2871,8 +2885,11 @@ impl PageTableManager {
                 && let Ok(l3_loc) = self.pa_to_loc(l3_pa)
                 && self.table_reclaimable(l3_loc, va & !((1 << 21) - 1), 3)
             {
-                let _ = self.write_desc(l2_entry, 0);
-                let _ = self.free_table(l3_pa);
+                self.free_tables
+                    .try_reserve(1)
+                    .map_err(|_| PageTableError::MetadataAllocation)?;
+                self.write_desc(l2_entry, 0)?;
+                self.free_table(l3_pa)?;
                 freed = true;
             }
         }
@@ -2882,11 +2899,14 @@ impl PageTableManager {
             && let Ok(l2_loc) = self.pa_to_loc(l2_pa)
             && self.table_reclaimable(l2_loc, va & !((1 << 30) - 1), 2)
         {
-            let _ = self.write_desc(l1_entry, 0);
-            let _ = self.free_table(l2_pa);
+            self.free_tables
+                .try_reserve(1)
+                .map_err(|_| PageTableError::MetadataAllocation)?;
+            self.write_desc(l1_entry, 0)?;
+            self.free_table(l2_pa)?;
             freed = true;
         }
-        freed
+        Ok(freed)
     }
 
     /// Whether the table at `table_loc`, whose entries are terminal
@@ -3214,7 +3234,7 @@ impl PageTableManager {
             // The budget is checked UP FRONT (see above), so this path returns
             // before `alloc_table` is ever called and its last-resort sweep
             // would never run. Take the same one-shot reclaim here, then re-ask.
-            self.reclaim_all_invalid_tables();
+            self.reclaim_all_invalid_tables()?;
             if source.is_none() && needed > self.spare_tables_available() {
                 return Err(PageTableError::OutOfTables);
             }
@@ -3315,7 +3335,7 @@ impl PageTableManager {
         source: Option<&mut dyn TableArenaSource>,
     ) -> Result<(PageTableApplyOutcome, usize), PageTableError> {
         let mut outcome = self.invalidate(va, len, source)?;
-        let (reclaimed, steps) = self.reclaim_invalid_tables_counting(va, len);
+        let (reclaimed, steps) = self.reclaim_invalid_tables_counting(va, len)?;
         outcome.changed |= reclaimed;
         if reclaimed {
             outcome.flush_required = true;
@@ -3426,6 +3446,7 @@ mod tests {
         std::thread_local! {
             pub(super) static LARGE: Cell<Option<u64>> = const { Cell::new(None) };
             pub(super) static OP_COUNT: Cell<Option<u64>> = const { Cell::new(None) };
+            pub(super) static ALLOCATED_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
             pub(super) static FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
             pub(super) static REFUSED_ALLOCS: Cell<usize> = const { Cell::new(0) };
         }
@@ -3443,6 +3464,11 @@ mod tests {
             let _ = OP_COUNT.try_with(|count| {
                 if let Some(n) = count.get() {
                     count.set(Some(n.checked_add(1).unwrap()));
+                }
+            });
+            let _ = ALLOCATED_BYTES.try_with(|bytes| {
+                if let Some(b) = bytes.get() {
+                    bytes.set(Some(b.saturating_add(size)));
                 }
             });
             let should_fail = FAIL_AFTER
@@ -3583,6 +3609,8 @@ mod tests {
             let initial_trans = mgr.translate(LINUX_MMAP_BASE);
             let initial_arenas_len = mgr.arenas.len();
 
+            snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+            snapshot_allocations::ALLOCATED_BYTES.with(|c| c.set(Some(0)));
             mgr.begin_undo().unwrap();
 
             let mut edit_va = LINUX_MMAP_BASE + 513 * TWO_MIB;
@@ -3591,6 +3619,12 @@ mod tests {
                     .expect("mapping succeeds");
                 edit_va += TWO_MIB;
             }
+            let admission_allocations = snapshot_allocations::OP_COUNT
+                .with(|c| c.replace(None))
+                .unwrap();
+            let admission_bytes = snapshot_allocations::ALLOCATED_BYTES
+                .with(|c| c.replace(None))
+                .unwrap();
 
             assert_eq!(
                 mgr.arenas.len(),
@@ -3603,16 +3637,40 @@ mod tests {
                 "scale={scale}: source available slots must be exhausted"
             );
 
+            // Justified admission bounds detecting linear exact-reallocation defects:
+            // Geometric reservation of journal words, first_written, returned_bases, and arenas
+            // bounds reallocations logarithmically in scale rather than linear exact growth.
+            // Each attached arena allocates its PT_PAGE data buffer (~64 KiB) plus amortized metadata.
+            let (max_allocs, max_bytes) = match scale {
+                1 => (30, 128 * 1024),
+                8 => (60, 1024 * 1024),
+                32 => (120, 4 * 1024 * 1024),
+                128 => (250, 32 * 1024 * 1024),
+                _ => (scale * 3, scale * 256 * 1024),
+            };
+            assert!(
+                admission_allocations <= max_allocs as u64,
+                "scale={scale}: admission allocations {admission_allocations} exceeded justified bound {max_allocs}"
+            );
+            assert!(
+                admission_bytes <= max_bytes,
+                "scale={scale}: admission bytes {admission_bytes} exceeded justified bound {max_bytes}"
+            );
+
             // Scope allocation count around rollback_undo only.
             snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+            snapshot_allocations::ALLOCATED_BYTES.with(|c| c.set(Some(0)));
             let popped = unsafe { mgr.rollback_undo(resolver.as_slice(), Some(&mut source)) }
                 .expect("rollback must succeed");
             let rollback_allocations = snapshot_allocations::OP_COUNT
                 .with(|c| c.replace(None))
                 .unwrap();
+            let rollback_bytes = snapshot_allocations::ALLOCATED_BYTES
+                .with(|c| c.replace(None))
+                .unwrap();
 
             std::eprintln!(
-                "scale={scale} rollback_allocations={rollback_allocations} popped_len={}",
+                "scale={scale} admission_allocations={admission_allocations} admission_bytes={admission_bytes} rollback_allocations={rollback_allocations} rollback_bytes={rollback_bytes} popped_len={}",
                 popped.len()
             );
 
@@ -3638,10 +3696,14 @@ mod tests {
                 "scale={scale}: translation preserved"
             );
 
-            // Structural invariant requirement: rollback must perform zero allocations.
+            // Structural invariant requirement: rollback must perform zero allocations and zero bytes.
             assert_eq!(
                 rollback_allocations, 0,
                 "scale={scale}: rollback allocated heap memory ({rollback_allocations} allocs)"
+            );
+            assert_eq!(
+                rollback_bytes, 0,
+                "scale={scale}: rollback allocated heap bytes ({rollback_bytes} bytes)"
             );
         }
     }
@@ -3666,7 +3728,18 @@ mod tests {
 
     #[test]
     fn test_metadata_refusal_sweep_during_transaction_mutations_and_recovery() {
-        for fail_point in 0..10 {
+        let mut measure_mgr = hvpatch_manager();
+        measure_mgr.begin_undo().unwrap();
+        snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+        measure_mgr
+            .set_rw(LINUX_MMAP_BASE + 0x1000, 0x4000, false, None)
+            .unwrap();
+        let total_alloc_attempts = snapshot_allocations::OP_COUNT
+            .with(|c| c.replace(None))
+            .unwrap();
+        assert!(total_alloc_attempts > 0);
+
+        for fail_point in 0..total_alloc_attempts as usize {
             let mut mgr = hvpatch_manager();
             let initial_walk = mgr.debug_walk(LINUX_MMAP_BASE);
             let mut host = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
@@ -3674,48 +3747,80 @@ mod tests {
 
             mgr.begin_undo().unwrap();
 
+            snapshot_allocations::REFUSED_ALLOCS.with(|c| c.set(0));
             snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(fail_point)));
             let edit_res = mgr.set_rw(LINUX_MMAP_BASE + 0x1000, 0x4000, false, None);
             snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+            let refused = snapshot_allocations::REFUSED_ALLOCS.with(|c| c.get());
 
-            match edit_res {
-                Ok(_) => {
-                    // Succeeded with this limit; rollback or commit
-                    unsafe { mgr.rollback_undo(&resolver[..], None).unwrap() };
-                }
-                Err(e) => {
-                    assert_eq!(e, PageTableError::MetadataAllocation);
-                    assert!(mgr.undo_is_open());
-                    // Rollback must succeed without allocating
-                    snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
-                    unsafe { mgr.rollback_undo(&resolver[..], None).unwrap() };
-                    let rollback_allocs = snapshot_allocations::OP_COUNT
-                        .with(|c| c.replace(None))
-                        .unwrap();
-                    assert_eq!(rollback_allocs, 0, "rollback must not allocate");
-                    assert!(!mgr.undo_is_open());
-                    assert_eq!(mgr.debug_walk(LINUX_MMAP_BASE), initial_walk);
-                }
-            }
+            assert!(refused > 0, "fail_point={fail_point}: must trigger refusal");
+            assert_eq!(edit_res, Err(PageTableError::MetadataAllocation));
+            assert!(mgr.undo_is_open());
 
-            // Verify a fresh transaction succeeds following the previous failure/rollback
+            // Rollback must succeed without allocating
+            snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+            unsafe { mgr.rollback_undo(&resolver[..], None).unwrap() };
+            let rollback_allocs = snapshot_allocations::OP_COUNT
+                .with(|c| c.replace(None))
+                .unwrap();
+            assert_eq!(rollback_allocs, 0, "rollback must not allocate");
+            assert!(!mgr.undo_is_open());
+            assert_eq!(mgr.debug_walk(LINUX_MMAP_BASE), initial_walk);
+
+            // Verify a fresh transaction succeeds following the previous failure/rollback on this SAME manager
             mgr.begin_undo().unwrap();
             mgr.set_readonly(LINUX_HEAP_BASE, 0x1000, false, None)
                 .unwrap();
             unsafe { mgr.rollback_undo(&resolver[..], None).unwrap() };
             assert!(!mgr.undo_is_open());
         }
+
+        // Boundary control: total_alloc_attempts succeeds without refusal
+        {
+            let mut mgr = hvpatch_manager();
+            let mut host = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+            let resolver = [(mgr.base(), host.as_mut_ptr())];
+            mgr.begin_undo().unwrap();
+            snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(total_alloc_attempts as usize)));
+            let edit_res = mgr.set_rw(LINUX_MMAP_BASE + 0x1000, 0x4000, false, None);
+            snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+            assert!(
+                edit_res.is_ok(),
+                "boundary control must succeed without refusal"
+            );
+            unsafe { mgr.rollback_undo(&resolver[..], None).unwrap() };
+        }
     }
 
     #[test]
     fn test_metadata_refusal_during_extension_arena_attach_returns_grant_exactly_once() {
-        for fail_point in 0..5 {
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let va = LINUX_MMAP_BASE + 600 * TWO_MIB + 0x1000;
+        let ext_base = SubstrateGpa(0xb0_0000_0000);
+
+        // Measure exact allocation attempts when attaching an extension arena
+        let total_alloc_attempts = {
+            let mut measure_mgr = hvpatch_manager();
+            exhaust_spare_pool(&mut measure_mgr, LINUX_MMAP_BASE);
+            let mut measure_source = NonAllocTestArenaSource {
+                id: TableArenaSourceId(ext_base),
+                available: vec![ext_base],
+                returned: Vec::with_capacity(1),
+            };
+            measure_mgr.begin_undo().unwrap();
+            snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+            measure_mgr
+                .set_rw(va, 0x1000, false, Some(&mut measure_source))
+                .unwrap();
+            snapshot_allocations::OP_COUNT
+                .with(|c| c.replace(None))
+                .unwrap()
+        };
+        assert!(total_alloc_attempts > 0);
+
+        for fail_point in 0..total_alloc_attempts as usize {
             let mut mgr = hvpatch_manager();
             exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
-
-            const TWO_MIB: u64 = 2 * 1024 * 1024;
-            let va = LINUX_MMAP_BASE + 600 * TWO_MIB + 0x1000;
-            let ext_base = SubstrateGpa(0xb0_0000_0000);
 
             let mut source = NonAllocTestArenaSource {
                 id: TableArenaSourceId(ext_base),
@@ -3724,51 +3829,86 @@ mod tests {
             };
 
             let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
-            let resolver = [(mgr.base(), host_arena0.as_mut_ptr())];
+            let mut host_arena1 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+            let full_resolver = [
+                (mgr.base(), host_arena0.as_mut_ptr()),
+                (ext_base.0, host_arena1.as_mut_ptr()),
+            ];
 
             mgr.begin_undo().unwrap();
 
+            snapshot_allocations::REFUSED_ALLOCS.with(|c| c.set(0));
             snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(fail_point)));
             let edit_res = mgr.set_rw(va, 0x1000, false, Some(&mut source));
             snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+            let refused = snapshot_allocations::REFUSED_ALLOCS.with(|c| c.get());
 
-            match edit_res {
-                Ok(_) => {
-                    // Grew arena successfully
-                    assert_eq!(mgr.arenas.len(), 2);
-                    assert_eq!(source.available.len(), 0);
-                    let mut host_arena1 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
-                    let full_resolver = [
-                        (mgr.base(), host_arena0.as_mut_ptr()),
-                        (ext_base.0, host_arena1.as_mut_ptr()),
-                    ];
-                    unsafe {
-                        mgr.rollback_undo(&full_resolver[..], Some(&mut source))
-                            .unwrap()
-                    };
-                    assert_eq!(mgr.arenas.len(), 1);
-                    assert_eq!(source.returned.as_slice(), &[ext_base]);
-                }
-                Err(e) => {
-                    assert_eq!(e, PageTableError::MetadataAllocation);
-                    assert!(mgr.undo_is_open());
-                    // Rollback must succeed without allocating and return any attached arenas to source
-                    snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
-                    let _ = unsafe { mgr.rollback_undo(&resolver[..], Some(&mut source)) }
-                        .expect("rollback must succeed");
-                    let rollback_allocs = snapshot_allocations::OP_COUNT
-                        .with(|c| c.replace(None))
-                        .unwrap();
-                    assert_eq!(rollback_allocs, 0, "rollback must not allocate");
-                    assert!(!mgr.undo_is_open());
-                    assert_eq!(
-                        source.returned.as_slice(),
-                        &[ext_base],
-                        "fail_point={fail_point}: arena must be returned to source exactly once"
-                    );
-                    assert_eq!(mgr.arenas.len(), 1);
-                }
-            }
+            assert!(refused > 0, "fail_point={fail_point}: must trigger refusal");
+            assert_eq!(edit_res, Err(PageTableError::MetadataAllocation));
+            assert!(mgr.undo_is_open());
+
+            // Rollback must succeed without allocating and return any attached arenas to source exactly once
+            snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+            let _ = unsafe { mgr.rollback_undo(&full_resolver[..], Some(&mut source)) }
+                .expect("rollback must succeed");
+            let rollback_allocs = snapshot_allocations::OP_COUNT
+                .with(|c| c.replace(None))
+                .unwrap();
+            assert_eq!(rollback_allocs, 0, "rollback must not allocate");
+            assert!(!mgr.undo_is_open());
+            assert_eq!(
+                source.returned.as_slice(),
+                &[ext_base],
+                "fail_point={fail_point}: arena must be returned to source exactly once"
+            );
+            assert_eq!(mgr.arenas.len(), 1);
+
+            // Verify subsequent retry on this SAME manager with new source succeeds
+            let mut retry_source = NonAllocTestArenaSource {
+                id: TableArenaSourceId(ext_base),
+                available: vec![ext_base],
+                returned: Vec::with_capacity(1),
+            };
+            mgr.begin_undo().unwrap();
+            mgr.set_rw(va, 0x1000, false, Some(&mut retry_source))
+                .unwrap();
+            assert_eq!(mgr.arenas.len(), 2);
+            assert_eq!(retry_source.available.len(), 0);
+            unsafe {
+                mgr.rollback_undo(&full_resolver[..], Some(&mut retry_source))
+                    .unwrap()
+            };
+            assert_eq!(mgr.arenas.len(), 1);
+            assert_eq!(retry_source.returned.as_slice(), &[ext_base]);
+        }
+
+        // Boundary control: total_alloc_attempts attaches arena cleanly without refusal
+        {
+            let mut mgr = hvpatch_manager();
+            exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
+            let mut source = NonAllocTestArenaSource {
+                id: TableArenaSourceId(ext_base),
+                available: vec![ext_base],
+                returned: Vec::with_capacity(1),
+            };
+            let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+            let mut host_arena1 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+            let full_resolver = [
+                (mgr.base(), host_arena0.as_mut_ptr()),
+                (ext_base.0, host_arena1.as_mut_ptr()),
+            ];
+            mgr.begin_undo().unwrap();
+            snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(total_alloc_attempts as usize)));
+            let edit_res = mgr.set_rw(va, 0x1000, false, Some(&mut source));
+            snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+            assert!(
+                edit_res.is_ok(),
+                "boundary control must attach arena without refusal"
+            );
+            unsafe {
+                mgr.rollback_undo(&full_resolver[..], Some(&mut source))
+                    .unwrap()
+            };
         }
     }
 
@@ -3834,6 +3974,226 @@ mod tests {
             mgr.dirty.is_empty(),
             "dirty list drained on successful sync"
         );
+    }
+
+    #[test]
+    fn director_coalesce_refusal_preserves_linked_table() {
+        let mut mgr = manager();
+        let block = LINUX_MMAP_BASE + 0x20_0000;
+        mgr.set_prot_none(block, 0x1000, None).unwrap();
+        mgr.set_rw(block, 1 << 21, true, None).unwrap();
+        let original = mgr.translate(block);
+        assert!(original.is_some());
+        mgr.declare_offline_private_image();
+        mgr.dirty = Vec::new();
+        mgr.free_tables.reserve(2);
+        snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(0)));
+        let coalesced = mgr.try_coalesce(block);
+        snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+        assert_eq!(coalesced, Err(PageTableError::MetadataAllocation));
+        assert_eq!(
+            mgr.translate(block),
+            original,
+            "failed parent write must not free its still-linked child"
+        );
+    }
+
+    #[test]
+    fn test_coalesce_free_tables_refusal_preserves_state() {
+        let mut mgr = manager();
+        let block = LINUX_MMAP_BASE + 0x20_0000;
+        mgr.set_prot_none(block, 0x1000, None).unwrap();
+        mgr.set_rw(block, 1 << 21, true, None).unwrap();
+        let original = mgr.translate(block);
+        assert!(original.is_some());
+        mgr.declare_offline_private_image();
+        mgr.dirty.reserve(10);
+        mgr.free_tables = Vec::new();
+        snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(0)));
+        let coalesced = mgr.try_coalesce(block);
+        snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+        assert_eq!(coalesced, Err(PageTableError::MetadataAllocation));
+        assert_eq!(
+            mgr.translate(block),
+            original,
+            "failed free_table bookkeeping must not modify parent or free child"
+        );
+    }
+
+    #[test]
+    fn test_reclaim_refusal_preserves_linked_tables() {
+        let mut mgr = manager();
+        mgr.set_multi_vcpu(true);
+        mgr.set_stage1_exclusive(true);
+        let block = LINUX_MMAP_BASE + 0x60_0000;
+        mgr.set_prot_none(block, 0x1000, None).expect("split");
+        mgr.set_prot_none(block, 1 << 21, None)
+            .expect("tear the block down");
+        assert!(mgr.free_tables.is_empty());
+
+        mgr.free_tables = Vec::new();
+        snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(0)));
+        let sweep_res = mgr.reclaim_all_invalid_tables();
+        snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+        assert_eq!(sweep_res, Err(PageTableError::MetadataAllocation));
+        assert!(mgr.free_tables.is_empty());
+
+        assert!(mgr.reclaim_all_invalid_tables().unwrap());
+        assert!(!mgr.free_tables.is_empty());
+    }
+
+    fn create_live_fixture() -> (PageTableManager, Arc<MockLiveResolver>) {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let mut mgr = hvpatch_manager();
+        unsafe {
+            mgr.restore_quiesced_snapshot_to_host(&*resolver).unwrap();
+            mgr.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        }
+
+        // Establish initial mappings in live backing
+        mgr.begin_undo().unwrap();
+        mgr.set_readonly(LINUX_HEAP_BASE, 0x4000, false, None)
+            .unwrap();
+        mgr.set_rw(LINUX_MMAP_BASE, 0x4000, false, None).unwrap();
+        unsafe { mgr.sync_to_host(&*resolver).unwrap() };
+        mgr.commit_undo();
+        (mgr, resolver)
+    }
+
+    #[test]
+    fn metadata_refusal_contract() {
+        let (mut mgr, resolver) = create_live_fixture();
+
+        let initial_trans_heap = mgr.translate(LINUX_HEAP_BASE);
+        let initial_trans_mmap = mgr.translate(LINUX_MMAP_BASE);
+        let initial_walk_heap = mgr.debug_walk(LINUX_HEAP_BASE);
+        let initial_walk_mmap = mgr.debug_walk(LINUX_MMAP_BASE);
+        assert!(initial_trans_heap.is_some());
+        assert!(initial_trans_mmap.is_some());
+
+        // Count total allocation attempts specifically within the multi-step transaction body
+        let (mut test_mgr, _test_resolver) = create_live_fixture();
+        test_mgr.begin_undo().unwrap();
+        snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+        test_mgr
+            .set_rw(LINUX_HEAP_BASE, 0x4000, false, None)
+            .unwrap();
+        test_mgr
+            .set_prot_none(LINUX_MMAP_BASE, 0x2000, None)
+            .unwrap();
+        test_mgr
+            .set_rw(LINUX_MMAP_BASE + 0x2000, 0x2000, false, None)
+            .unwrap();
+        // Repeated write covering prior staged/dirty entries
+        test_mgr
+            .set_readonly(LINUX_HEAP_BASE, 0x2000, false, None)
+            .unwrap();
+        let total_alloc_attempts = snapshot_allocations::OP_COUNT
+            .with(|c| c.replace(None))
+            .unwrap();
+        assert!(
+            total_alloc_attempts > 0,
+            "transaction must perform measurable allocations to sweep"
+        );
+
+        // Sweep actual allocation attempt population across the transaction
+        for fail_point in 0..total_alloc_attempts as usize {
+            let (mut trial_mgr, trial_resolver) = create_live_fixture();
+            trial_mgr.begin_undo().unwrap();
+
+            snapshot_allocations::REFUSED_ALLOCS.with(|c| c.set(0));
+            snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(fail_point)));
+            let res = (|| -> Result<(), PageTableError> {
+                trial_mgr.set_rw(LINUX_HEAP_BASE, 0x4000, false, None)?;
+                trial_mgr.set_prot_none(LINUX_MMAP_BASE, 0x2000, None)?;
+                trial_mgr.set_rw(LINUX_MMAP_BASE + 0x2000, 0x2000, false, None)?;
+                trial_mgr.set_readonly(LINUX_HEAP_BASE, 0x2000, false, None)?;
+                Ok(())
+            })();
+            snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+            let refused = snapshot_allocations::REFUSED_ALLOCS.with(|c| c.get());
+
+            assert!(refused > 0, "fail_point={fail_point}: must trigger refusal");
+            assert_eq!(
+                res,
+                Err(PageTableError::MetadataAllocation),
+                "fail_point={fail_point}: expected MetadataAllocation error"
+            );
+            assert!(trial_mgr.undo_is_open());
+
+            // Rollback must succeed with 0 allocations
+            snapshot_allocations::OP_COUNT.with(|c| c.set(Some(0)));
+            unsafe { trial_mgr.rollback_undo(&*trial_resolver, None).unwrap() };
+            let rollback_allocs = snapshot_allocations::OP_COUNT
+                .with(|c| c.replace(None))
+                .unwrap();
+            assert_eq!(
+                rollback_allocs, 0,
+                "fail_point={fail_point}: rollback under refusal must perform zero allocations"
+            );
+            assert!(!trial_mgr.undo_is_open());
+
+            // Descriptor bytes and translations must match exact pre-image
+            assert_eq!(
+                trial_mgr.translate(LINUX_HEAP_BASE),
+                initial_trans_heap,
+                "fail_point={fail_point}: heap translation restored"
+            );
+            assert_eq!(
+                trial_mgr.translate(LINUX_MMAP_BASE),
+                initial_trans_mmap,
+                "fail_point={fail_point}: mmap translation restored"
+            );
+            assert_eq!(
+                trial_mgr.debug_walk(LINUX_HEAP_BASE),
+                initial_walk_heap,
+                "fail_point={fail_point}: heap descriptor walk restored"
+            );
+            assert_eq!(
+                trial_mgr.debug_walk(LINUX_MMAP_BASE),
+                initial_walk_mmap,
+                "fail_point={fail_point}: mmap descriptor walk restored"
+            );
+
+            // Exercise recovery and subsequent transaction on the SAME trial manager
+            trial_mgr.begin_undo().unwrap();
+            trial_mgr
+                .set_rw(LINUX_HEAP_BASE, 0x2000, false, None)
+                .unwrap();
+            unsafe { trial_mgr.sync_to_host(&*trial_resolver).unwrap() };
+            trial_mgr.commit_undo();
+            assert!(!trial_mgr.undo_is_open());
+        }
+
+        // Boundary control: total_alloc_attempts without refusal succeeds to completion
+        {
+            let (mut trial_mgr, trial_resolver) = create_live_fixture();
+            trial_mgr.begin_undo().unwrap();
+            snapshot_allocations::FAIL_AFTER.with(|c| c.set(Some(total_alloc_attempts as usize)));
+            let res = (|| -> Result<(), PageTableError> {
+                trial_mgr.set_rw(LINUX_HEAP_BASE, 0x4000, false, None)?;
+                trial_mgr.set_prot_none(LINUX_MMAP_BASE, 0x2000, None)?;
+                trial_mgr.set_rw(LINUX_MMAP_BASE + 0x2000, 0x2000, false, None)?;
+                trial_mgr.set_readonly(LINUX_HEAP_BASE, 0x2000, false, None)?;
+                Ok(())
+            })();
+            snapshot_allocations::FAIL_AFTER.with(|c| c.set(None));
+            assert!(res.is_ok(), "boundary control must succeed without refusal");
+            unsafe { trial_mgr.sync_to_host(&*trial_resolver).unwrap() };
+            trial_mgr.commit_undo();
+            assert!(!trial_mgr.undo_is_open());
+        }
+
+        // Subsequent live transaction without refusal succeeds and updates live backing
+        mgr.begin_undo().unwrap();
+        mgr.set_rw(LINUX_HEAP_BASE, 0x4000, false, None).unwrap();
+        mgr.set_prot_none(LINUX_MMAP_BASE, 0x2000, None).unwrap();
+        unsafe { mgr.sync_to_host(&*resolver).unwrap() };
+        mgr.commit_undo();
+        assert!(!mgr.undo_is_open());
+        assert_eq!(mgr.translate(LINUX_MMAP_BASE), None);
     }
 
     #[test]
@@ -5084,7 +5444,10 @@ mod tests {
             mgr.free_tables.is_empty(),
             "eager reclaim must NOT have run for a multi-vCPU guest"
         );
-        assert!(mgr.reclaim_all_invalid_tables(), "sweep should free the L3");
+        assert!(
+            mgr.reclaim_all_invalid_tables().unwrap(),
+            "sweep should free the L3"
+        );
         assert!(!mgr.free_tables.is_empty(), "the emptied table came back");
     }
 
@@ -5097,7 +5460,7 @@ mod tests {
         mgr.set_prot_none(block, 0x1000, None).expect("split");
         mgr.set_prot_none(block, 1 << 21, None)
             .expect("tear the block down");
-        assert!(!mgr.reclaim_all_invalid_tables());
+        assert!(!mgr.reclaim_all_invalid_tables().unwrap());
         assert!(mgr.free_tables.is_empty(), "nothing may be reclaimed");
     }
 
@@ -5111,18 +5474,21 @@ mod tests {
         mgr.set_prot_none(block, 1 << 21, None)
             .expect("tear the block down");
         assert!(
-            mgr.reclaim_all_invalid_tables(),
+            mgr.reclaim_all_invalid_tables().unwrap(),
             "first sweep does the work"
         );
         assert!(
-            !mgr.reclaim_all_invalid_tables(),
+            !mgr.reclaim_all_invalid_tables().unwrap(),
             "a second sweep with no new teardown must decline"
         );
         let other = LINUX_MMAP_BASE + 0x80_0000;
         mgr.set_prot_none(other, 0x1000, None).expect("split");
         mgr.set_prot_none(other, 1 << 21, None)
             .expect("tear the block down");
-        assert!(mgr.reclaim_all_invalid_tables(), "new teardown re-arms");
+        assert!(
+            mgr.reclaim_all_invalid_tables().unwrap(),
+            "new teardown re-arms"
+        );
     }
 
     #[test]
@@ -5455,7 +5821,7 @@ mod tests {
         assert_eq!(mgr.translate_retained_output(probe), Some(ipa + 0x5000));
 
         exhaust_spare_pool(&mut mgr, va);
-        let reclaimed = mgr.reclaim_all_invalid_tables();
+        let reclaimed = mgr.reclaim_all_invalid_tables().unwrap();
         assert_eq!(
             mgr.translate_retained_output(probe),
             Some(ipa + 0x5000),
@@ -5485,7 +5851,7 @@ mod tests {
             "munmap keeps the retained output until the table is reclaimed"
         );
         assert!(
-            mgr.reclaim_all_invalid_tables(),
+            mgr.reclaim_all_invalid_tables().unwrap(),
             "the retired table is reclaimable"
         );
         let (in_use_after, _, _, _) = mgr.pool_stats();

@@ -1126,9 +1126,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                         )))
                     }
                     Err(PageTableError::MetadataAllocation) => {
-                        Err(MemoryError::HostMap(
-                            "stage-1 page-table manager metadata allocation refused".to_owned(),
-                        ))
+                        Err(MemoryError::MetadataAllocation)
                     }
                 }
             },
@@ -1200,7 +1198,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         unsafe {
             self.page_tables
                 .rollback_undo(resolver)
-                .map_err(|e| MemoryError::HostMap(format!("stage-1 rollback failed: {e}")))?;
+                .map_err(|e| match e {
+                    PageTableError::MetadataAllocation => MemoryError::MetadataAllocation,
+                    other => MemoryError::HostMap(format!("stage-1 rollback failed: {other}")),
+                })?;
         }
         self.run_stage1_maintenance()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
@@ -3463,18 +3464,20 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                         carrick_mem::memory::mmap_arena_size() as usize,
                     )
                 })
-                .map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "reserve sparse HVPatch root mmap arena: {error}"
-                    ))
+                .map_err(|error| match error {
+                    MemoryError::MetadataAllocation => TrapError::MetadataAllocation,
+                    other => TrapError::Hypervisor(format!(
+                        "reserve sparse HVPatch root mmap arena: {other}"
+                    )),
                 })?;
                 self.vm.retire_initial_mmap_arena()?;
             }
             self.pt_edit_and_flush(|editor| editor.reserve_hvpatch_process_apertures())
-                .map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "reserve hvpatch root-slot/global-frame apertures: {error}"
-                    ))
+                .map_err(|error| match error {
+                    MemoryError::MetadataAllocation => TrapError::MetadataAllocation,
+                    other => TrapError::Hypervisor(format!(
+                        "reserve hvpatch root-slot/global-frame apertures: {other}"
+                    )),
                 })?;
         }
         self.set_unmapped(
@@ -3807,10 +3810,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                         }
                         Ok(outcome)
                     })
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "arm hvpatch parent private fork leaves read-only: {error}"
-                        ))
+                    .map_err(|error| match error {
+                        MemoryError::MetadataAllocation => TrapError::MetadataAllocation,
+                        other => TrapError::Hypervisor(format!(
+                            "arm hvpatch parent private fork leaves read-only: {other}"
+                        )),
                     })?;
 
                     // Durable pre-write structural receipt: one live-backing walk
@@ -5468,5 +5472,21 @@ mod tests {
 
         let res = authority.install_source(Box::new(DummyArenaSource(source_id2)));
         assert_eq!(res.unwrap_err(), PageTableError::ConflictingArenaSource);
+    }
+
+    #[test]
+    fn test_metadata_allocation_error_propagation_is_nonallocating() {
+        let pt_err = PageTableError::MetadataAllocation;
+        let mem_err = match pt_err {
+            PageTableError::MetadataAllocation => MemoryError::MetadataAllocation,
+            other => MemoryError::HostMap(format!("{other:?}")),
+        };
+        assert_eq!(mem_err, MemoryError::MetadataAllocation);
+
+        let trap_err = match mem_err {
+            MemoryError::MetadataAllocation => TrapError::MetadataAllocation,
+            other => TrapError::Hypervisor(format!("{other:?}")),
+        };
+        assert!(matches!(trap_err, TrapError::MetadataAllocation));
     }
 }
