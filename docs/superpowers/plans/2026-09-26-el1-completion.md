@@ -1042,3 +1042,28 @@ view non-writable. That narrow correction and warning-denied HVF Clippy pass.
 Freeze it as one commit, rebuild and re-sign, then rerun the 256-page witness;
 do not broaden into arena work unless the signed result reaches primary-pool
 exhaustion or names an extension-arena dependency.
+
+### Guest-published hierarchy in fork snapshots (2026-09-27)
+
+The exact signed `4a939f00f` witness crossed both missing-hierarchy allocation
+and the primary-table stage-2 write boundary. It reached fork child preparation,
+where the child snapshot resolved `0x6000001000` to the inherited identity IPA
+instead of the newly granted global frame. The host manager had been created
+before EL1 allocated the new table page, so its cached populated prefix ended
+before the now-live hierarchy and the fork image truncated it.
+
+`9d521e6be` is the bounded correction. A red-first dual-editor MMU test publishes
+the same missing hierarchy through a guest live manager and snapshots it through
+the older host live manager. Snapshot discovery now follows only reachable
+table descriptors across the four architectural levels, using live physical
+capacity to discover a child beyond the cached cursor, and extends the copy
+through that highest primary page. It performs no full-arena scan and allocates
+no traversal metadata, preserving the recycled image-allocation budget. All 98
+MMU tests, the warmed recycling witness, warning-denied Clippy and formatting
+pass.
+
+Build and sign one exact artifact containing this commit, then rerun the
+256-page witness. A green result promotes the same frozen artifact to 1,024 and
+4,096 pages for the `<0.125` exits-per-added-page decision. Do not open a new
+allocator or fork campaign unless that signed witness names a new direct
+boundary; checkpoint 2 and measured impact remain open.

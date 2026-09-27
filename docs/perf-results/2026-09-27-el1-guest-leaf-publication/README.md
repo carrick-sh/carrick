@@ -133,3 +133,30 @@ prescribed host test gate reached the unchanged GIC source-shape
 assertion already documented by the host-service checkpoint; the new test and
 the affected production crate otherwise pass. A new exact signed artifact and
 256-page rerun remain the next acceptance step.
+
+The exact `4a939f00f` artifact is recorded in
+`stage2-write-artifact-identity.txt`, with signed build output in
+`stage2-write-signed-build.log`. The 256-page run
+`el1-stage2-table-write-first-touch-20260927` crossed the write-abort boundary:
+EL1 allocated and published the missing hierarchy and the carrier reached fork
+child preparation. It then failed because VA `0x6000001000` resolved in the
+child snapshot to the old identity IPA `0x6000001000` instead of the newly
+granted global IPA `0x9b40001000`. The negative entitlement control and scoped
+run-ID cleanup passed. This is signed discovery evidence, not a passing
+first-touch receipt.
+
+`live-snapshot-cursor-red.log` reduces that exact failure to two serialized
+live editors over one backing. The guest editor allocates and links hierarchy
+beyond the host manager's cached prefix; the base snapshot returns no
+translation. `9d521e6be` makes snapshot discovery walk the reachable four-level
+table graph against live physical capacity and extend the copied prefix only
+through the highest linked primary page. It does not scan or copy the whole
+1.75 MiB arena and adds no traversal allocation. The focused green receipt,
+all 98 MMU tests, warning-denied MMU Clippy and the existing warmed recycled
+snapshot allocation witness pass in `live-snapshot-cursor-green.log`,
+`live-snapshot-mmu-tests.log` and `live-snapshot-clippy.log`.
+
+The next decisive action remains the same 256-page signed witness on one exact
+artifact containing `9d521e6be`. If it passes, run 1,024 and 4,096 pages and
+measure the `<0.125` host-exit slope. Checkpoint 2 and any performance impact
+remain open until those signed results exist.
