@@ -1,0 +1,23 @@
+schema = "carrick.conformance-exemption.v1"
+base = "954a1353b448a773d60a7df7b38f3679e0158748"
+head = "a50198ec9f6d9d9b883165985f90655e859831bf"
+contracts = [
+  "kernel.el1.fault-entry",
+  "kernel.el1.gic",
+  "kernel.el1.guest-run-queue",
+  "kernel.el1.metadata-allocation",
+  "kernel.fork.mappings",
+  "kernel.fork.stage1-image",
+  "kernel.mm.backing-maintenance-lookup",
+  "kernel.mm.metadata-refusal",
+  "kernel.mm.syscall-code-write",
+  "kernel.time.realtime-calibration",
+]
+paths = [
+  "crates/carrick-el1-abi/src/lib.rs",
+  "crates/carrick-el1/src/fault.rs",
+  "crates/carrick-mmu-core/src/aarch64.rs",
+  "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+  "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
+]
+rationale = "The exact product diff completes the registered kernel.el1.anonymous-first-touch and kernel.el1.stage1-publication transactions. ABI and fault changes replace one carrier-wide frame-grant mailbox with independently authenticated per-vCPU-slot single-flight records; fault vector routing, GIC records, guest run-queue state and the metadata allocator mailbox are unchanged. MMU changes allow an older live host editor to follow authenticated guest-linked hierarchy through physical capacity and advance its allocation cursor before reuse; fork snapshot behavior, GIC output exclusion and metadata-refusal rollback remain covered by the complete 101-test MMU suite. The COW and inventory edits prepare, authenticate, retire and roll back only the new anonymous bulk grant; syscall-code-write, fork mapping/image projection, realtime calibration and backing-maintenance lookup logic are unchanged. Red-first ABI/MMU tests, 63 EL1 tests, 27 ABI tests, focused runtime/HVF tests, warning-denied Clippy, the personality boundary and the exact committed signed 256/1024/4096-page witness all pass."
