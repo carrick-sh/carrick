@@ -1899,6 +1899,43 @@ fn fault_entry_mode() -> i32 {
 
 /// Four guest threads grow/free the shared EL1 heap while a fifth thread
 /// completes host-served uname calls. The embed watchdog bounds every join.
+fn metadata_allocator_control(subtest: u64) -> i64 {
+    unsafe {
+        raw6(
+            carrick_el1_abi::SYS_CARRICK_EL1_CONTROL,
+            1,
+            subtest,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+fn metadata_allocator_phase(subtest: u64) -> i64 {
+    // One global mailbox can require one boundary per grant/return. The
+    // allocator admits at most 128 extents, so this bound covers a complete
+    // request and return for every descriptor without timing-based retries.
+    const MAX_BOUNDARIES: usize = 2 * 128 + 2;
+    for _ in 0..MAX_BOUNDARIES {
+        let rc = metadata_allocator_control(subtest);
+        if rc != carrick_el1_abi::METADATA_GRANT_PENDING as i64 {
+            if rc != 0 {
+                return rc;
+            }
+            for _ in 0..MAX_BOUNDARIES {
+                let drain = metadata_allocator_control(5);
+                if drain != carrick_el1_abi::METADATA_GRANT_PENDING as i64 {
+                    return drain;
+                }
+            }
+            return 0xCA88_0502;
+        }
+    }
+    0xCA88_0501
+}
+
 fn metadata_allocator_concurrent() -> i32 {
     const ROUNDS: usize = 16;
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
@@ -1909,9 +1946,7 @@ fn metadata_allocator_concurrent() -> i32 {
             let mut failures = 0;
             for _ in 0..ROUNDS {
                 barrier.wait();
-                let rc = unsafe {
-                    raw6(carrick_el1_abi::SYS_CARRICK_EL1_CONTROL, 1, 2, 0, 0, 0, 0)
-                };
+                let rc = metadata_allocator_phase(2);
                 failures += usize::from(rc != 0);
                 barrier.wait();
             }
@@ -1951,17 +1986,7 @@ fn metadata_allocator_mode(phase: &str) -> i32 {
             return 2;
         }
     };
-    let result = unsafe {
-        raw6(
-            carrick_el1_abi::SYS_CARRICK_EL1_CONTROL,
-            1,
-            subtest,
-            0,
-            0,
-            0,
-            0,
-        )
-    };
+    let result = metadata_allocator_phase(subtest);
     if result != 0 {
         println!("metadata-allocator {phase} failed: rc={result}");
         return 1;

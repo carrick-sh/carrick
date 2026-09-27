@@ -1397,7 +1397,7 @@ fn el1_memory_fault_entry_preserves_context() {
 }
 
 /// EL1 elastic metadata allocator verification: executes the real in-guest
-/// allocator and actual host extent grant/return hypercall transport (`HVC #6`),
+/// allocator and actual asynchronous host extent grant/return transport,
 /// forces dynamic growth beyond the bootstrap arena, verifies memory integrity
 /// and reuse, checks host grant and return counters, and exercises simulated
 /// host grant refusal followed by successful retry recovery.
@@ -1553,6 +1553,10 @@ fn el1_metadata_allocator_host_wait_requires_unmasked_irq() {
     assert!(
         stats.returns_completed > 0,
         "must exercise real return: {stats:?}"
+    );
+    assert_eq!(
+        stats.inline_hvc_traps, 0,
+        "metadata growth/return must unwind through pending host work, not synchronously trap from masked EL1: {stats:?}"
     );
     assert!(
         measured.result.success(),

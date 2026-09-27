@@ -1,7 +1,7 @@
 //! Bounded segregated-fit metadata allocator for Carrick EL1 kernel.
 //!
 //! Provides $O(1)$ allocation, deallocation, bidirectional coalescing, and
-//! dynamic extent expansion/return via host hypercall `HVC #6`.
+//! dynamic extent expansion/return through the shared pending-host-work mailbox.
 
 use crate::lock::SpinLock;
 use core::alloc::Layout;
@@ -72,6 +72,7 @@ pub enum ExtentState {
     Unused,
     Active,
     PendingReturn,
+    ReturnRequested,
     Returned,
 }
 
@@ -580,7 +581,12 @@ impl MetadataAllocatorCore {
 
     /// Complete dynamic extent return after host hypercall confirmation.
     pub fn complete_extent_return(&mut self, slot_idx: usize) {
-        if slot_idx < MAX_EXTENTS && self.extents[slot_idx].state == ExtentState::PendingReturn {
+        if slot_idx < MAX_EXTENTS
+            && matches!(
+                self.extents[slot_idx].state,
+                ExtentState::PendingReturn | ExtentState::ReturnRequested
+            )
+        {
             let size = self.extents[slot_idx].size;
             self.extents[slot_idx].state = ExtentState::Returned;
             self.active_extents_count = self.active_extents_count.saturating_sub(1);
@@ -590,7 +596,12 @@ impl MetadataAllocatorCore {
 
     /// Cancel dynamic extent return if host hypercall was refused or failed.
     pub fn cancel_extent_return(&mut self, slot_idx: usize) {
-        if slot_idx < MAX_EXTENTS && self.extents[slot_idx].state == ExtentState::PendingReturn {
+        if slot_idx < MAX_EXTENTS
+            && matches!(
+                self.extents[slot_idx].state,
+                ExtentState::PendingReturn | ExtentState::ReturnRequested
+            )
+        {
             self.extents[slot_idx].state = ExtentState::Active;
             unsafe {
                 let initial_block = self.extents[slot_idx].base_va as *mut BlockHeader;
@@ -607,6 +618,44 @@ impl MetadataAllocatorCore {
     /// Deallocate a previously allocated block.
     pub fn deallocate(&mut self, ptr: *mut u8, align: usize) -> Option<ExtentToReturn> {
         self.prepare_deallocate_extent(ptr, align)
+    }
+
+    #[cfg(target_os = "none")]
+    fn next_pending_return(&self) -> Option<ExtentToReturn> {
+        self.extents
+            .iter()
+            .enumerate()
+            .find_map(|(slot_idx, extent)| {
+                if extent.state != ExtentState::PendingReturn {
+                    return None;
+                }
+                let ExtentKind::Dynamic { token } = extent.kind else {
+                    return None;
+                };
+                Some(ExtentToReturn {
+                    base_va: extent.base_va,
+                    size: extent.size,
+                    token,
+                    slot_idx,
+                })
+            })
+    }
+
+    #[cfg(target_os = "none")]
+    fn mark_return_requested(&mut self, slot_idx: usize) {
+        if slot_idx < MAX_EXTENTS && self.extents[slot_idx].state == ExtentState::PendingReturn {
+            self.extents[slot_idx].state = ExtentState::ReturnRequested;
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    fn has_pending_return(&self) -> bool {
+        self.extents.iter().any(|extent| {
+            matches!(
+                extent.state,
+                ExtentState::PendingReturn | ExtentState::ReturnRequested
+            )
+        })
     }
 
     /// Read diagnostics snapshot.
@@ -631,105 +680,18 @@ pub struct AllocatorDiagnostics {
     pub active_bins_mask: u32,
 }
 
-// Test-image instrumentation is scoped to this guest image/VM. Sample the actual
-// execution state immediately before both host-wait instructions, not the saved
-// EL0 SPSR or a host-side approximation of the allocator lock state.
-#[cfg(feature = "allocator-test-control")]
-static MASKED_METADATA_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-#[cfg(all(
-    feature = "allocator-test-control",
-    target_os = "none",
-    target_arch = "aarch64"
-))]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(always)]
-fn observe_metadata_wait_irq_state() {
-    let daif: u64;
+fn current_el1_slot() -> Option<usize> {
+    let sp: u64;
     unsafe {
-        core::arch::asm!("mrs {0}, daif", out(reg) daif, options(nomem, nostack));
+        core::arch::asm!("mov {0}, sp", out(reg) sp, options(nomem, nostack));
     }
-    if daif & (1 << 7) != 0 {
-        MASKED_METADATA_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let offset = sp.checked_sub(carrick_el1_abi::EL1_STACKS_BASE)?;
+    if offset >= carrick_el1_abi::EL1_STACK_SLOTS * carrick_el1_abi::EL1_STACK_SIZE {
+        return None;
     }
-}
-
-/// Dynamic extent allocation helper invoking host hypercall HVC #6.
-#[inline(never)]
-pub fn request_host_extent_grant(requested_size: usize) -> Option<ExtentGrantReceipt> {
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    {
-        let mut status: u64;
-        let mut granted_base: u64;
-        let mut granted_size: u64;
-        let mut token: u64;
-
-        #[cfg(feature = "allocator-test-control")]
-        observe_metadata_wait_irq_state();
-        unsafe {
-            core::arch::asm!(
-                "hvc #6",
-                inout("x0") carrick_el1_abi::METADATA_GRANT_OP_ALLOC => status,
-                inout("x1") requested_size as u64 => granted_base,
-                inout("x2") 0u64 => granted_size,
-                inout("x3") 0u64 => token,
-                options(nostack)
-            );
-        }
-
-        if status == carrick_el1_abi::METADATA_GRANT_SUCCESS
-            && granted_base != 0
-            && granted_size > 0
-            && token != 0
-        {
-            Some(ExtentGrantReceipt {
-                base_va: granted_base,
-                size: granted_size as usize,
-                token,
-            })
-        } else {
-            None
-        }
-    }
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-    {
-        let _ = requested_size;
-        None
-    }
-}
-
-/// Dynamic extent return helper invoking host hypercall HVC #6.
-#[inline(never)]
-pub fn return_host_extent(base_va: u64, size: usize, token: u64) -> bool {
-    if token == 0 {
-        return false;
-    }
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    {
-        let mut status: u64;
-        let mut _out1: u64;
-        let mut _out2: u64;
-        let mut _out3: u64;
-
-        #[cfg(feature = "allocator-test-control")]
-        observe_metadata_wait_irq_state();
-        unsafe {
-            core::arch::asm!(
-                "hvc #6",
-                inout("x0") carrick_el1_abi::METADATA_GRANT_OP_FREE => status,
-                inout("x1") base_va => _out1,
-                inout("x2") size as u64 => _out2,
-                inout("x3") token => _out3,
-                options(nostack)
-            );
-        }
-
-        status == carrick_el1_abi::METADATA_GRANT_SUCCESS
-    }
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-    {
-        let _ = (base_va, size, token);
-        true
-    }
+    Some((offset / carrick_el1_abi::EL1_STACK_SIZE) as usize)
 }
 
 /// Guard structure capturing saved DAIF interrupt flags.
@@ -778,6 +740,15 @@ pub struct MetadataStorage {
     lock: SpinLock<MetadataAllocatorCore>,
 }
 
+#[cfg(target_os = "none")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MailboxSync {
+    None,
+    AllocReady,
+    AllocDenied,
+    ReturnFinished,
+}
+
 impl Default for MetadataStorage {
     fn default() -> Self {
         Self::new()
@@ -820,6 +791,119 @@ impl MetadataStorage {
         res
     }
 
+    #[cfg(target_os = "none")]
+    fn mark_pending_host_work(slot: usize) {
+        if let Some(task) = carrick_el1_abi::current_task_guest(slot) {
+            task.mark_pending_host_work();
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    fn publish_request(slot: usize, request: carrick_el1_abi::MetadataGrantRequest) -> bool {
+        if !carrick_el1_abi::metadata_mailbox_guest().try_publish_request(request) {
+            return false;
+        }
+        Self::mark_pending_host_work(slot);
+        true
+    }
+
+    #[cfg(target_os = "none")]
+    fn synchronize_response(core: &mut MetadataAllocatorCore, slot: usize) -> MailboxSync {
+        let mailbox = carrick_el1_abi::metadata_mailbox_guest();
+        let Some(response) = mailbox.claim_response() else {
+            return MailboxSync::None;
+        };
+        let outcome = match response.op {
+            carrick_el1_abi::METADATA_GRANT_OP_ALLOC => {
+                if response.status != carrick_el1_abi::METADATA_GRANT_SUCCESS {
+                    MailboxSync::AllocDenied
+                } else {
+                    let receipt = ExtentGrantReceipt {
+                        base_va: response.arg1,
+                        size: response.arg2 as usize,
+                        token: response.arg3,
+                    };
+                    if receipt.base_va == 0
+                        || receipt.size == 0
+                        || receipt.token == 0
+                        || core
+                            .admit_extent(
+                                receipt.base_va,
+                                receipt.size,
+                                ExtentKind::Dynamic {
+                                    token: receipt.token,
+                                },
+                            )
+                            .is_err()
+                    {
+                        mailbox.finish_response();
+                        if Self::publish_request(
+                            slot,
+                            carrick_el1_abi::MetadataGrantRequest {
+                                op: carrick_el1_abi::METADATA_GRANT_OP_FREE,
+                                arg1: receipt.base_va,
+                                arg2: receipt.size as u64,
+                                arg3: receipt.token,
+                                cookie: u64::MAX,
+                            },
+                        ) {
+                            return MailboxSync::AllocDenied;
+                        }
+                        return MailboxSync::AllocDenied;
+                    }
+                    MailboxSync::AllocReady
+                }
+            }
+            carrick_el1_abi::METADATA_GRANT_OP_FREE => {
+                let slot_idx = response.cookie as usize;
+                if slot_idx != usize::MAX {
+                    if response.status == carrick_el1_abi::METADATA_GRANT_SUCCESS {
+                        core.complete_extent_return(slot_idx);
+                    } else {
+                        core.cancel_extent_return(slot_idx);
+                    }
+                }
+                MailboxSync::ReturnFinished
+            }
+            _ => MailboxSync::None,
+        };
+        mailbox.finish_response();
+        outcome
+    }
+
+    #[cfg(target_os = "none")]
+    fn publish_pending_return(core: &mut MetadataAllocatorCore, slot: usize) -> bool {
+        let Some(to_return) = core.next_pending_return() else {
+            return false;
+        };
+        if !Self::publish_request(
+            slot,
+            carrick_el1_abi::MetadataGrantRequest {
+                op: carrick_el1_abi::METADATA_GRANT_OP_FREE,
+                arg1: to_return.base_va,
+                arg2: to_return.size as u64,
+                arg3: to_return.token,
+                cookie: to_return.slot_idx as u64,
+            },
+        ) {
+            return false;
+        }
+        core.mark_return_requested(to_return.slot_idx);
+        true
+    }
+
+    #[cfg(target_os = "none")]
+    fn service_mailbox(core: &mut MetadataAllocatorCore, slot: usize) -> MailboxSync {
+        let outcome = Self::synchronize_response(core, slot);
+        Self::publish_pending_return(core, slot);
+        outcome
+    }
+
+    #[cfg(target_os = "none")]
+    fn host_work_pending(core: &MetadataAllocatorCore) -> bool {
+        core.has_pending_return() || carrick_el1_abi::metadata_mailbox_guest().has_guest_work()
+    }
+
     pub fn allocate(&self, layout: Layout) -> Option<*mut u8> {
         let align = layout.align().max(16);
         let size = layout.size();
@@ -835,6 +919,10 @@ impl MetadataStorage {
                 ExtentKind::Bootstrap,
             );
         }
+        #[cfg(target_os = "none")]
+        let mailbox_sync = current_el1_slot()
+            .map(|slot| Self::service_mailbox(&mut core, slot))
+            .unwrap_or(MailboxSync::None);
         let p = core.allocate(size, align);
         if p.is_some() {
             core::mem::drop(core);
@@ -842,62 +930,66 @@ impl MetadataStorage {
             return p;
         }
 
-        let needed_size = core.needed_grant_size(size, align);
-        core::mem::drop(core);
-        restore_irq(guard);
-
-        // 2. Request host grant with lock DROPPED and IRQs restored
-        let granted = request_host_extent_grant(needed_size)?;
-
-        // 3. Re-acquire lock, admit extent, and fulfill allocation
-        let guard = disable_irq_save();
-        let mut core = self.lock.lock();
-        if core
-            .admit_extent(
-                granted.base_va,
-                granted.size,
-                ExtentKind::Dynamic {
-                    token: granted.token,
-                },
-            )
-            .is_err()
+        #[cfg(target_os = "none")]
         {
-            core::mem::drop(core);
-            restore_irq(guard);
-            return_host_extent(granted.base_va, granted.size, granted.token);
-            return None;
+            if mailbox_sync == MailboxSync::AllocDenied {
+                core::mem::drop(core);
+                restore_irq(guard);
+                return None;
+            }
+            let needed_size = core.needed_grant_size(size, align);
+            if let Some(slot) = current_el1_slot() {
+                Self::publish_request(
+                    slot,
+                    carrick_el1_abi::MetadataGrantRequest {
+                        op: carrick_el1_abi::METADATA_GRANT_OP_ALLOC,
+                        arg1: needed_size as u64,
+                        arg2: 0,
+                        arg3: 0,
+                        cookie: 0,
+                    },
+                );
+            }
         }
-
-        let ptr = core.allocate(size, align);
         core::mem::drop(core);
         restore_irq(guard);
-        ptr
+        None
     }
 
     pub fn deallocate(&self, ptr: *mut u8, layout: Layout) {
         let align = layout.align().max(16);
         let guard = disable_irq_save();
         let mut core = self.lock.lock();
-        let extent_to_return = core.prepare_deallocate_extent(ptr, align);
+        #[cfg(target_os = "none")]
+        if let Some(slot) = current_el1_slot() {
+            Self::service_mailbox(&mut core, slot);
+        }
+        core.prepare_deallocate_extent(ptr, align);
+        #[cfg(target_os = "none")]
+        if let Some(slot) = current_el1_slot() {
+            Self::publish_pending_return(&mut core, slot);
+        }
         core::mem::drop(core);
         restore_irq(guard);
+    }
 
-        // Return extent to host hypervisor with lock DROPPED
-        if let Some(to_return) = extent_to_return {
-            if return_host_extent(to_return.base_va, to_return.size, to_return.token) {
-                let guard = disable_irq_save();
-                let mut core = self.lock.lock();
-                core.complete_extent_return(to_return.slot_idx);
-                core::mem::drop(core);
-                restore_irq(guard);
-            } else {
-                let guard = disable_irq_save();
-                let mut core = self.lock.lock();
-                core.cancel_extent_return(to_return.slot_idx);
-                core::mem::drop(core);
-                restore_irq(guard);
-            }
-        }
+    #[cfg(all(feature = "allocator-test-control", target_os = "none"))]
+    fn service_test_host_work(&self) -> bool {
+        let Some(slot) = current_el1_slot() else {
+            return false;
+        };
+        let guard = disable_irq_save();
+        let mut core = self.lock.lock();
+        Self::service_mailbox(&mut core, slot);
+        let pending = Self::host_work_pending(&core);
+        core::mem::drop(core);
+        restore_irq(guard);
+        pending
+    }
+
+    #[cfg(all(feature = "allocator-test-control", not(target_os = "none")))]
+    fn service_test_host_work(&self) -> bool {
+        false
     }
 
     pub fn diagnostics(&self) -> AllocatorDiagnostics {
@@ -945,15 +1037,18 @@ pub fn init_bootstrap_allocator(bootstrap_base: u64, bootstrap_size: usize) {
 
 /// In-guest allocator test execution invoked by embed test fixture via `SYS_CARRICK_EL1_CONTROL`.
 #[cfg(feature = "allocator-test-control")]
+static DENIAL_TEST_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature = "allocator-test-control")]
 pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
     match subtest {
-        4 => {
-            MASKED_METADATA_WAITS.store(0, core::sync::atomic::Ordering::Relaxed);
-            let growth_result = run_guest_allocator_test(2, 0);
-            if growth_result != 0 {
-                return growth_result;
+        4 => run_guest_allocator_test(2, 0),
+        5 => {
+            if GLOBAL_ALLOCATOR.service_test_host_work() {
+                carrick_el1_abi::METADATA_GRANT_PENDING
+            } else {
+                0
             }
-            MASKED_METADATA_WAITS.load(core::sync::atomic::Ordering::Relaxed)
         }
         1 => {
             // Test 1: Arbitrary alignments (16, 32, 64, 128, 4096), payload pattern verification, and free
@@ -1011,6 +1106,9 @@ pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
                 for &p in ptrs.iter().take(count) {
                     GLOBAL_ALLOCATOR.deallocate(p, chunk_layout);
                 }
+                if GLOBAL_ALLOCATOR.service_test_host_work() {
+                    return carrick_el1_abi::METADATA_GRANT_PENDING;
+                }
                 return 201;
             }
 
@@ -1055,44 +1153,62 @@ pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
                 *slot = p;
             }
 
-            // Attempt 9th allocation (2 MiB chunk) which exceeds bootstrap and triggers host grant.
-            // Host failpoint is armed, so this request MUST be denied (returning None).
             let big_layout = match Layout::from_size_align(2 * 1024 * 1024, 64) {
                 Ok(l) => l,
                 Err(_) => return 302,
             };
-            let denied_p = GLOBAL_ALLOCATOR.allocate(big_layout);
-            if denied_p.is_some() {
-                // Should have been denied by failpoint
-                if let Some(p) = denied_p {
-                    GLOBAL_ALLOCATOR.deallocate(p, big_layout);
-                }
-                for &p in ptrs.iter() {
+            let stage = DENIAL_TEST_STAGE.load(core::sync::atomic::Ordering::Acquire);
+            let candidate = GLOBAL_ALLOCATOR.allocate(big_layout);
+            if stage == 0 && candidate.is_none() && GLOBAL_ALLOCATOR.service_test_host_work() {
+                for &p in &ptrs {
                     GLOBAL_ALLOCATOR.deallocate(p, chunk_layout);
                 }
-                return 303;
+                return carrick_el1_abi::METADATA_GRANT_PENDING;
             }
-
-            // Verify all existing 8 MiB allocations are intact
-            for (i, &p) in ptrs.iter().enumerate() {
-                unsafe {
-                    for j in (0..chunk_size).step_by(4096) {
-                        if *p.add(j) != (0x50 + i) as u8 {
-                            for &to_free in ptrs.iter() {
-                                GLOBAL_ALLOCATOR.deallocate(to_free, chunk_layout);
+            if stage == 0 {
+                if let Some(p) = candidate {
+                    GLOBAL_ALLOCATOR.deallocate(p, big_layout);
+                    for &p in &ptrs {
+                        GLOBAL_ALLOCATOR.deallocate(p, chunk_layout);
+                    }
+                    return 303;
+                }
+                // The denied host response has now been consumed. Existing
+                // allocations must remain intact before publishing the retry.
+                for (i, &p) in ptrs.iter().enumerate() {
+                    unsafe {
+                        for j in (0..chunk_size).step_by(4096) {
+                            if *p.add(j) != (0x50 + i) as u8 {
+                                for &to_free in &ptrs {
+                                    GLOBAL_ALLOCATOR.deallocate(to_free, chunk_layout);
+                                }
+                                return 304;
                             }
-                            return 304;
                         }
                     }
                 }
+                DENIAL_TEST_STAGE.store(1, core::sync::atomic::Ordering::Release);
+                let retry = GLOBAL_ALLOCATOR.allocate(big_layout);
+                for &p in &ptrs {
+                    GLOBAL_ALLOCATOR.deallocate(p, chunk_layout);
+                }
+                if retry.is_none() && GLOBAL_ALLOCATOR.service_test_host_work() {
+                    return carrick_el1_abi::METADATA_GRANT_PENDING;
+                }
+                if let Some(p) = retry {
+                    GLOBAL_ALLOCATOR.deallocate(p, big_layout);
+                }
+                return 305;
             }
 
-            // Retry the 2 MiB allocation: failpoint is now consumed, so host grant succeeds!
-            let retry_p = match GLOBAL_ALLOCATOR.allocate(big_layout) {
+            let retry_p = match candidate {
                 Some(p) => p,
                 None => {
-                    for &p in ptrs.iter() {
+                    for &p in &ptrs {
                         GLOBAL_ALLOCATOR.deallocate(p, chunk_layout);
+                    }
+                    if GLOBAL_ALLOCATOR.service_test_host_work() {
+                        return carrick_el1_abi::METADATA_GRANT_PENDING;
                     }
                     return 305;
                 }
@@ -1117,7 +1233,7 @@ pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
             for &p in ptrs.iter() {
                 GLOBAL_ALLOCATOR.deallocate(p, chunk_layout);
             }
-
+            DENIAL_TEST_STAGE.store(0, core::sync::atomic::Ordering::Release);
             0
         }
         _ => 1,

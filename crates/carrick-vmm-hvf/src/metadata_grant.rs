@@ -21,6 +21,7 @@ pub struct MetadataGrantStats {
     pub returns_completed: u64,
     pub bytes_granted: u64,
     pub bytes_returned: u64,
+    pub inline_hvc_traps: u64,
 }
 
 #[derive(Debug)]
@@ -153,6 +154,7 @@ static GRANTS_DENIED: AtomicU64 = AtomicU64::new(0);
 static RETURNS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static BYTES_GRANTED: AtomicU64 = AtomicU64::new(0);
 static BYTES_RETURNED: AtomicU64 = AtomicU64::new(0);
+static INLINE_HVC_TRAPS: AtomicU64 = AtomicU64::new(0);
 
 static FAILPOINT_DENY_NEXT: AtomicBool = AtomicBool::new(false);
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -200,6 +202,7 @@ pub fn metadata_grant_stats() -> MetadataGrantStats {
         returns_completed: RETURNS_COMPLETED.load(Ordering::Relaxed),
         bytes_granted: BYTES_GRANTED.load(Ordering::Relaxed),
         bytes_returned: BYTES_RETURNED.load(Ordering::Relaxed),
+        inline_hvc_traps: INLINE_HVC_TRAPS.load(Ordering::Relaxed),
     }
 }
 
@@ -217,6 +220,7 @@ pub fn reset_metadata_grant_state() {
     RETURNS_COMPLETED.store(0, Ordering::Relaxed);
     BYTES_GRANTED.store(0, Ordering::Relaxed);
     BYTES_RETURNED.store(0, Ordering::Relaxed);
+    INLINE_HVC_TRAPS.store(0, Ordering::Relaxed);
     FAILPOINT_DENY_NEXT.store(false, Ordering::SeqCst);
 }
 
@@ -228,35 +232,20 @@ fn request_has_live_vm(
     generation.is_some() && custody.live_generation() == generation
 }
 
-/// Handle a trapped metadata grant hypercall (`HVC #6`) from EL1.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn handle_metadata_grant_trap(
-    vcpu: &mut applevisor::vcpu::Vcpu,
+fn service_metadata_operation(
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
-) -> Result<(), TrapError> {
-    use applevisor::vcpu::Reg;
-
+    op: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> Result<[u64; 4], TrapError> {
     let generation = generation
         .filter(|_| request_has_live_vm(custody, generation))
         .ok_or_else(|| TrapError::Hypervisor("metadata request from a stale VM generation".into()))?
         .0;
     let aperture = metadata_aperture(custody);
-
-    let op = vcpu
-        .get_reg(Reg::X0)
-        .map_err(|e| TrapError::Hypervisor(format!("failed to read X0 for metadata grant: {e}")))?;
-    let arg1 = vcpu
-        .get_reg(Reg::X1)
-        .map_err(|e| TrapError::Hypervisor(format!("failed to read X1 for metadata grant: {e}")))?;
-    let arg2 = vcpu
-        .get_reg(Reg::X2)
-        .map_err(|e| TrapError::Hypervisor(format!("failed to read X2 for metadata grant: {e}")))?;
-    let arg3 = vcpu
-        .get_reg(Reg::X3)
-        .map_err(|e| TrapError::Hypervisor(format!("failed to read X3 for metadata grant: {e}")))?;
-    // HVF reports PC after the trapping HVC instruction. Preserve it: advancing
-    // again skips the first guest instruction consuming the completion registers.
 
     if op == METADATA_GRANT_OP_ALLOC {
         GRANTS_REQUESTED.fetch_add(1, Ordering::Relaxed);
@@ -264,9 +253,7 @@ pub(crate) fn handle_metadata_grant_trap(
         // 1. Check test failpoint denial
         if FAILPOINT_DENY_NEXT.swap(false, Ordering::SeqCst) {
             GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
-            vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
-                .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            return Ok(());
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         }
 
         let requested_size = arg1 as usize;
@@ -282,9 +269,7 @@ pub(crate) fn handle_metadata_grant_trap(
 
         let Some(slot_idx) = slot_idx else {
             GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
-            vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
-                .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            return Ok(());
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         };
 
         let ipa = EL1_DYNAMIC_METADATA_BASE
@@ -297,9 +282,7 @@ pub(crate) fn handle_metadata_grant_trap(
                 state.unreserve_slots(slot_idx, num_slots);
             }
             GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
-            vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
-                .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            return Ok(());
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         }
 
         // 3. Use host-page-aligned MAP_SHARED backing so HVF and the host
@@ -309,9 +292,7 @@ pub(crate) fn handle_metadata_grant_trap(
             Err(_) => {
                 aperture.lock().unreserve_slots(slot_idx, num_slots);
                 GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
-                vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
-                    .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-                return Ok(());
+                return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
         };
 
@@ -341,9 +322,7 @@ pub(crate) fn handle_metadata_grant_trap(
             Err(_) => {
                 state.unreserve_slots(slot_idx, num_slots);
                 GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
-                vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
-                    .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-                return Ok(());
+                return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
         };
         state.slots[slot_idx] = Some(GrantedSlotRecord {
@@ -357,16 +336,7 @@ pub(crate) fn handle_metadata_grant_trap(
 
         GRANTS_SUCCEEDED.fetch_add(1, Ordering::Relaxed);
         BYTES_GRANTED.fetch_add(extent_size as u64, Ordering::Relaxed);
-
-        vcpu.set_reg(Reg::X0, METADATA_GRANT_SUCCESS)
-            .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-        vcpu.set_reg(Reg::X1, ipa)
-            .map_err(|e| TrapError::Hypervisor(format!("set X1: {e}")))?;
-        vcpu.set_reg(Reg::X2, extent_size as u64)
-            .map_err(|e| TrapError::Hypervisor(format!("set X2: {e}")))?;
-        vcpu.set_reg(Reg::X3, token)
-            .map_err(|e| TrapError::Hypervisor(format!("set X3: {e}")))?;
-        Ok(())
+        Ok([METADATA_GRANT_SUCCESS, ipa, extent_size as u64, token])
     } else if op == METADATA_GRANT_OP_FREE {
         let ipa = arg1;
         let size = arg2 as usize;
@@ -378,17 +348,13 @@ pub(crate) fn handle_metadata_grant_trap(
             || !ipa.is_multiple_of(EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64)
             || token == 0
         {
-            vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_ALIGNMENT)
-                .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            return Ok(());
+            return Ok([METADATA_GRANT_ERR_ALIGNMENT, 0, 0, 0]);
         }
 
         let slot_idx = ((ipa - EL1_DYNAMIC_METADATA_BASE)
             / (EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64)) as usize;
         if slot_idx >= MAX_DYNAMIC_EXTENT_SLOTS {
-            vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_INVALID)
-                .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            return Ok(());
+            return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
         }
 
         let status =
@@ -408,14 +374,70 @@ pub(crate) fn handle_metadata_grant_trap(
             RETURNS_COMPLETED.fetch_add(1, Ordering::Relaxed);
             BYTES_RETURNED.fetch_add(size as u64, Ordering::Relaxed);
         }
-        vcpu.set_reg(Reg::X0, status)
-            .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-        Ok(())
+        Ok([status, 0, 0, 0])
     } else {
-        vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_INVALID)
-            .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-        Ok(())
+        Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0])
     }
+}
+
+/// Service one shared request after EL1 has unwound to its ordinary
+/// pending-host-work boundary. Returns whether this boundary claimed work.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn service_pending_metadata_request(
+    custody: &crate::trap::CarrierVmCustody,
+    generation: Option<crate::trap::CarrierVmGeneration>,
+) -> Result<bool, TrapError> {
+    let Some(mailbox) = carrick_el1_abi::metadata_mailbox_host() else {
+        return Ok(false);
+    };
+    let Some(request) = mailbox.claim_request() else {
+        return Ok(false);
+    };
+    let result = service_metadata_operation(
+        custody,
+        generation,
+        request.op,
+        request.arg1,
+        request.arg2,
+        request.arg3,
+    )?;
+    mailbox.publish_response(result[0], result[1], result[2], result[3]);
+    Ok(true)
+}
+
+/// Legacy synchronous transport retained only as a fail-closed compatibility
+/// decoder while the exact signed red/green evidence is promoted. Production
+/// guest allocation publishes the shared mailbox and never executes HVC #6.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn handle_metadata_grant_trap(
+    vcpu: &mut applevisor::vcpu::Vcpu,
+    custody: &crate::trap::CarrierVmCustody,
+    generation: Option<crate::trap::CarrierVmGeneration>,
+) -> Result<(), TrapError> {
+    use applevisor::vcpu::Reg;
+    INLINE_HVC_TRAPS.fetch_add(1, Ordering::Relaxed);
+    let op = vcpu
+        .get_reg(Reg::X0)
+        .map_err(|e| TrapError::Hypervisor(format!("failed to read X0 for metadata grant: {e}")))?;
+    let arg1 = vcpu
+        .get_reg(Reg::X1)
+        .map_err(|e| TrapError::Hypervisor(format!("failed to read X1 for metadata grant: {e}")))?;
+    let arg2 = vcpu
+        .get_reg(Reg::X2)
+        .map_err(|e| TrapError::Hypervisor(format!("failed to read X2 for metadata grant: {e}")))?;
+    let arg3 = vcpu
+        .get_reg(Reg::X3)
+        .map_err(|e| TrapError::Hypervisor(format!("failed to read X3 for metadata grant: {e}")))?;
+    let result = service_metadata_operation(custody, generation, op, arg1, arg2, arg3)?;
+    vcpu.set_reg(Reg::X0, result[0])
+        .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
+    vcpu.set_reg(Reg::X1, result[1])
+        .map_err(|e| TrapError::Hypervisor(format!("set X1: {e}")))?;
+    vcpu.set_reg(Reg::X2, result[2])
+        .map_err(|e| TrapError::Hypervisor(format!("set X2: {e}")))?;
+    vcpu.set_reg(Reg::X3, result[3])
+        .map_err(|e| TrapError::Hypervisor(format!("set X3: {e}")))?;
+    Ok(())
 }
 
 #[cfg(test)]

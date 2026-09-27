@@ -1,0 +1,7 @@
+error: only 13 GiB free (floor 20 GiB)
+       A near-full disk fails as a corrupt link, a truncated gate log,
+       or a guest dying somewhere unrelated — not as ENOSPC.
+       Reclaim agent build output:  just worktree-gc
+       Override for one run:        CARRICK_DISK_GUARD=0 just ...
+error: recipe `check-disk` failed with exit code 1
+error: recipe `build` failed with exit code 1
