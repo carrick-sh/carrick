@@ -11,6 +11,9 @@ missing exact-editor and host-drain API. `live-cursor-red.log` records
 `PageTableManager::new_live` resetting its cursor to 32 KiB even though the
 live image's last occupied spare page required a 48 KiB cursor.
 
+The accepted implementation is `5c131922259478f4255c14f2eba89f373151b04b`
+(`feat(el1): serialize shared stage1 publication`).
+
 The corrected shared entry contains one exact nonzero editor token. Guest EL1
 claims it and then rechecks the MM gate with SeqCst ordering. A host pause or
 retirement raises/closes the gate first and waits for the token to clear.
@@ -36,4 +39,7 @@ This checkpoint does not grant frames, expose a valid stage-1 leaf, service an
 EL0 fault in guest EL1, or improve the signed first-touch slope. Stage-2 owner
 and inventory readiness before leaf publication, rollback, frame return,
 signed execution and the `<0.125` host-exit/page gate remain open in the same
-contract.
+contract. The next bounded change is the authenticated frame-grant state
+machine: a host may expose a ready grant only after exact-MM stage-2 ownership
+and inventory publication, and EL1 must reject stale or mismatched grants
+before installing a leaf.

@@ -889,3 +889,37 @@ then connect recoverable EL0 data-abort entry to that authority. Re-run the
 existing three-scale first-touch witness after actual guest service. Further
 allocator work is out of scope unless this next contract exposes a direct
 allocator regression.
+
+### Shared stage-1 publication groundwork (2026-09-26)
+
+`5c1319222` establishes the first production boundary of
+`kernel.el1.stage1-publication`. Each published address space now has one exact
+guest editor token. Guest admission rechecks the MM gate after claiming the
+token, while host mutation and retirement raise or close that gate and drain
+the admitted editor before proceeding. The production `PtQuiesce` mirror and
+address-space retirement path use this protocol. A live `PageTableManager`
+also discovers occupied hardware-visible spare pages instead of resetting its
+allocation cursor over them.
+
+Red-first evidence captures the missing editor/drain API and the live cursor
+collision. All 45 scheduler-core tests, all 94 MMU-core tests, the focused
+production pause witness, warning-denied targeted Clippy, formatting and the
+contract registry pass. Exact evidence is under
+`docs/perf-results/2026-09-26-el1-stage1-guest-editor/`.
+
+This is VM-free mutation-exclusion and live-image-adoption groundwork. It does
+not grant frames, publish a guest leaf, execute a recoverable EL0 data abort in
+EL1, or improve the signed first-touch result. The signed structural slope
+therefore remains about 0.9954 host exits per page against `<0.125`.
+
+Next implement the authenticated bulk frame-grant state machine red-first.
+Bind each request and ready grant to the exact MM key and request generation,
+semantic VA/span, physical IPA/span, mapping/frame identity and owner
+generation. The host may publish `Ready` only after stage-2 ownership and
+inventory are committed and authenticated; refusal must roll those resources
+back. EL1 must reject stale or mismatched grants before leaf publication. Then
+connect the existing host fault boundary to grant preparation and the guest
+data-abort retry to grant consumption. Re-run the three-scale signed
+first-touch witness immediately after actual guest leaf service; do not open
+another allocator or extraction campaign unless that decisive path exposes a
+specific prerequisite failure.
