@@ -1424,6 +1424,213 @@ fn first_touch(pages: usize) -> i32 {
     if parent_ok && child_ok { 0 } else { 1 }
 }
 
+fn fork_cow_worker(
+    base: usize,
+    pages: usize,
+    page_size: usize,
+    role_magic: u64,
+    worker_id: usize,
+    workers: usize,
+    round: usize,
+) -> bool {
+    pin((worker_id % 4) as u32);
+    let start_page = (worker_id * pages) / workers;
+    let end_page = ((worker_id + 1) * pages) / workers;
+    let words_per_page = page_size / std::mem::size_of::<u64>();
+
+    for page_idx in start_page..end_page {
+        let page_ptr = (base + page_idx * page_size) as *mut u64;
+        let page_val = role_magic | ((round as u64) << 32) | ((worker_id as u64) << 16) | (page_idx as u64);
+        for w in 0..words_per_page {
+            let val = page_val ^ ((w as u64) << 48);
+            unsafe { page_ptr.add(w).write_volatile(val) };
+        }
+    }
+
+    for page_idx in start_page..end_page {
+        let page_ptr = (base + page_idx * page_size) as *mut u64;
+        let page_val = role_magic | ((round as u64) << 32) | ((worker_id as u64) << 16) | (page_idx as u64);
+        for w in 0..words_per_page {
+            let expected = page_val ^ ((w as u64) << 48);
+            let seen = unsafe { page_ptr.add(w).read_volatile() };
+            if seen != expected {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn fork_cow_process(
+    role: &str,
+    base: usize,
+    pages: usize,
+    page_size: usize,
+    round: usize,
+    write_fd: libc::c_int,
+    read_fd: libc::c_int,
+) -> bool {
+    let role_magic: u64 = if role == "child" {
+        0x4348_494C_0000_0000 // 'CHIL'
+    } else {
+        0x5041_5245_0000_0000 // 'PARE'
+    };
+    const WORKERS: usize = 4;
+    let mut handles = Vec::with_capacity(WORKERS);
+    for w in 0..WORKERS {
+        handles.push(std::thread::spawn(move || {
+            fork_cow_worker(base, pages, page_size, role_magic, w, WORKERS, round)
+        }));
+    }
+    let mut all_ok = true;
+    for h in handles {
+        if let Ok(worker_ok) = h.join() {
+            if !worker_ok {
+                all_ok = false;
+            }
+        } else {
+            all_ok = false;
+        }
+    }
+    if !all_ok {
+        return false;
+    }
+
+    const TIMEOUT_MS: libc::c_int = 10_000;
+    if !write_signal_byte(write_fd, b'W') || !poll_read_byte(read_fd, TIMEOUT_MS) {
+        return false;
+    }
+
+    // Verify after peer wrote that our memory is still intact
+    let words_per_page = page_size / std::mem::size_of::<u64>();
+    for page_idx in 0..pages {
+        let page_ptr = (base + page_idx * page_size) as *mut u64;
+        let worker_id = (page_idx * WORKERS) / pages;
+        let page_val = role_magic | ((round as u64) << 32) | ((worker_id as u64) << 16) | (page_idx as u64);
+        for w in 0..words_per_page {
+            let expected = page_val ^ ((w as u64) << 48);
+            let seen = unsafe { page_ptr.add(w).read_volatile() };
+            if seen != expected {
+                return false;
+            }
+        }
+    }
+
+    if !write_signal_byte(write_fd, b'D') || !poll_read_byte(read_fd, TIMEOUT_MS) {
+        return false;
+    }
+    true
+}
+
+fn fork_cow(forks: usize, pages: usize) -> i32 {
+    let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size_raw <= 0 {
+        println!("fork-cow invalid page size {page_size_raw}");
+        return 1;
+    }
+    let page_size = page_size_raw as usize;
+    if pages == 0 || pages > 65_536 || forks == 0 {
+        println!("fork-cow invalid parameters: forks={forks} pages={pages}");
+        return 1;
+    }
+    let len = match pages.checked_mul(page_size) {
+        Some(len) if len > 0 => len,
+        _ => {
+            println!("fork-cow overflowing len: pages={pages}");
+            return 1;
+        }
+    };
+
+    unsafe { libc::alarm(120) };
+    let region = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if region == libc::MAP_FAILED {
+        println!("fork-cow mmap failed");
+        return 1;
+    }
+    let base = region as usize;
+
+    let words_per_page = page_size / std::mem::size_of::<u64>();
+    for round in 0..forks {
+        // Pre-populate memory so all pages are resident before fork
+        for page_idx in 0..pages {
+            let page_ptr = (base + page_idx * page_size) as *mut u64;
+            let val = 0xAA00_0000_0000_0000u64 | ((round as u64) << 32) | (page_idx as u64);
+            for w in 0..words_per_page {
+                unsafe { page_ptr.add(w).write_volatile(val ^ ((w as u64) << 48)) };
+            }
+        }
+
+        let mut p2c = [0 as libc::c_int; 2];
+        let mut c2p = [0 as libc::c_int; 2];
+        if unsafe { libc::pipe(p2c.as_mut_ptr()) } != 0 || unsafe { libc::pipe(c2p.as_mut_ptr()) } != 0 {
+            println!("pipe failed round={round}");
+            unsafe { libc::munmap(region, len) };
+            return 1;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("fork failed round={round}");
+            unsafe {
+                libc::close(p2c[0]);
+                libc::close(p2c[1]);
+                libc::close(c2p[0]);
+                libc::close(c2p[1]);
+                libc::munmap(region, len);
+            }
+            return 1;
+        }
+
+        if pid == 0 {
+            unsafe {
+                libc::close(p2c[1]);
+                libc::close(c2p[0]);
+                libc::alarm(60);
+            }
+            let ok = fork_cow_process("child", base, pages, page_size, round, c2p[1], p2c[0]);
+            unsafe {
+                libc::close(c2p[1]);
+                libc::close(p2c[0]);
+                libc::munmap(region, len);
+            }
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+
+        unsafe {
+            libc::close(p2c[0]);
+            libc::close(c2p[1]);
+        }
+        let parent_ok = fork_cow_process("parent", base, pages, page_size, round, p2c[1], c2p[0]);
+        unsafe {
+            libc::close(p2c[1]);
+            libc::close(c2p[0]);
+        }
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let child_ok = waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+        if !parent_ok || !child_ok {
+            println!("fork-cow failed round={round} parent_ok={parent_ok} child_ok={child_ok}");
+            unsafe { libc::munmap(region, len) };
+            return 1;
+        }
+    }
+
+    unsafe { libc::munmap(region, len) };
+    println!("fork-cow forks={forks} pages={pages} ok=true");
+    0
+}
+
 fn mapping_retirement(pages: usize, rounds: usize) -> i32 {
     let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size_raw <= 0 {
@@ -2360,6 +2567,10 @@ fn main() {
                 }
             },
         },
+        "fork-cow" => fork_cow(
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100),
+            args.get(3).and_then(|n| n.parse().ok()).unwrap_or(16),
+        ),
         "mapping-retirement" => mapping_retirement(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),

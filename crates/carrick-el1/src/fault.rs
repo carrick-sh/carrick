@@ -75,6 +75,60 @@ fn frame_grant_access(esr: u64) -> Option<u64> {
     Some(if esr & (1 << 6) != 0 { 2 } else { 1 })
 }
 
+/// Decode an EL0 write permission fault that can be satisfied by in-guest COW resolution.
+pub fn is_write_permission_fault(esr: u64) -> bool {
+    let ec = (esr >> 26) & 0x3f;
+    let dfsc = esr & 0x3f;
+    let is_write = (esr & (1 << 6)) != 0;
+    matches!(ec, 0x24 | 0x25) && is_write && matches!(dfsc, 0x0c..=0x0f)
+}
+
+/// Operation needed to resolve a COW fault in EL1.
+pub trait CowResolver {
+    fn resolve_cow(&mut self, ttbr0: u64, far: u64) -> bool;
+}
+
+#[derive(Default)]
+pub struct NoopCowResolver;
+
+impl CowResolver for NoopCowResolver {
+    fn resolve_cow(&mut self, _ttbr0: u64, _far: u64) -> bool {
+        false
+    }
+}
+
+#[cfg(target_os = "none")]
+pub struct HardwareCowResolver;
+
+#[cfg(target_os = "none")]
+impl CowResolver for HardwareCowResolver {
+    fn resolve_cow(&mut self, ttbr0: u64, far: u64) -> bool {
+        const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+        let physical_base = ttbr0 & TTBR_BADDR_MASK;
+        let words =
+            carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut core::sync::atomic::AtomicU64;
+        let byte_len = carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize;
+        let aligned_va = far & !4095;
+        let outcome = unsafe {
+            carrick_mmu_core::aarch64::resolve_existing_el1_cow_page(
+                words,
+                physical_base,
+                byte_len,
+                aligned_va,
+            )
+        };
+        match outcome {
+            Ok(carrick_mmu_core::aarch64::GuestCowResolution::AlreadyWritable)
+            | Ok(carrick_mmu_core::aarch64::GuestCowResolution::Upgraded) => {
+                let mut cpu = crate::sched::HardwareCpu;
+                crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 /// The exact-MM page-table operation needed to consume one authenticated
 /// frame grant. Production publishes the leaves and broadcasts one ASID
 /// invalidation; host tests record the same boundary without touching tables.
@@ -162,7 +216,8 @@ impl FrameGrantLeafPublisher for HardwareFrameGrantLeafPublisher {
 /// Dispatch an EL0 data abort at EL1.
 ///
 /// Increments `counters.fault_taken`; at EL1, publishes or consumes an exact
-/// authenticated bulk-frame request. Host builds retain the forward-only path.
+/// authenticated bulk-frame request or resolves in-guest COW faults.
+/// Host builds retain the forward-only path.
 pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
     #[cfg(target_os = "none")]
     {
@@ -185,6 +240,7 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
             &zone.spaces,
             mailbox,
             &mut HardwareFrameGrantLeafPublisher,
+            &mut HardwareCowResolver,
         )
     }
     #[cfg(not(target_os = "none"))]
@@ -195,18 +251,45 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
     }
 }
 
-/// Fault dispatch with explicitly supplied shared regions and leaf publisher.
+/// Fault dispatch with explicitly supplied shared regions, leaf publisher, and COW resolver.
 /// A refusal or any inability to authenticate/edit the exact MM consumes the
 /// response and forwards once through the existing host fault path.
-pub fn dispatch_fault_with_regions<P: FrameGrantLeafPublisher>(
+pub fn dispatch_fault_with_regions<P: FrameGrantLeafPublisher, C: CowResolver>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
     spaces: &AddressSpaces,
     mailbox: &FrameGrantMailbox,
     publisher: &mut P,
+    cow_resolver: &mut C,
 ) -> Action {
     counters.fault_taken.fetch_add(1, Ordering::Relaxed);
+    if is_write_permission_fault(frame.esr) {
+        let Some(task) = current_tasks.get(frame.slot as usize) else {
+            return Action::Forward;
+        };
+        let mm_key = task.zone_mm.load(Ordering::Acquire);
+        if mm_key == 0 {
+            return Action::Forward;
+        }
+        let Some(index) = spaces.find(mm_key) else {
+            return Action::Forward;
+        };
+        let Some(grant) = spaces.grant(index, mm_key) else {
+            return Action::Forward;
+        };
+        let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
+            return Action::Forward;
+        };
+        let Some(_editor) = spaces.try_begin_edit(index, mm_key, owner) else {
+            return Action::Forward;
+        };
+        if cow_resolver.resolve_cow(grant.ttbr0, frame.far) {
+            return Action::Served;
+        }
+        return Action::Forward;
+    }
+
     let Some(access) = frame_grant_access(frame.esr) else {
         return Action::Forward;
     };
@@ -355,6 +438,19 @@ mod tests {
         spaces
     }
 
+    #[derive(Default)]
+    struct RecordingCowResolver {
+        succeeds: bool,
+        calls: Vec<(u64, u64)>,
+    }
+
+    impl CowResolver for RecordingCowResolver {
+        fn resolve_cow(&mut self, ttbr0: u64, far: u64) -> bool {
+            self.calls.push((ttbr0, far));
+            self.succeeds
+        }
+    }
+
     #[test]
     fn exact_frame_grant_response_publishes_once_and_serves_the_retry() {
         let mm = 7;
@@ -370,6 +466,7 @@ mod tests {
             succeeds: true,
             ..RecordingPublisher::default()
         };
+        let mut cow_resolver = NoopCowResolver;
         let mut frame = write_translation_fault(0, fault);
 
         assert_eq!(
@@ -380,6 +477,7 @@ mod tests {
                 &spaces,
                 &mailbox,
                 &mut publisher,
+                &mut cow_resolver,
             ),
             Action::Forward
         );
@@ -411,6 +509,7 @@ mod tests {
                 &spaces,
                 &mailbox,
                 &mut publisher,
+                &mut cow_resolver,
             ),
             Action::Served
         );
@@ -429,6 +528,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let counters = Counters::default();
         let mut publisher = RecordingPublisher::default();
+        let mut cow_resolver = NoopCowResolver;
         let mut frame = write_translation_fault(0, 0x5000_1000);
 
         assert_eq!(
@@ -439,6 +539,7 @@ mod tests {
                 &spaces,
                 &mailbox,
                 &mut publisher,
+                &mut cow_resolver,
             ),
             Action::Forward
         );
@@ -452,6 +553,7 @@ mod tests {
                 &spaces,
                 &mailbox,
                 &mut publisher,
+                &mut cow_resolver,
             ),
             Action::Forward
         );
@@ -470,6 +572,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let counters = Counters::default();
         let mut publisher = RecordingPublisher::default();
+        let mut cow_resolver = NoopCowResolver;
         let mut frame = write_permission_fault(0, 0x5300_1000);
 
         assert_eq!(
@@ -480,6 +583,7 @@ mod tests {
                 &spaces,
                 &mailbox,
                 &mut publisher,
+                &mut cow_resolver,
             ),
             Action::Forward
         );
@@ -506,6 +610,7 @@ mod tests {
             succeeds: true,
             ..RecordingPublisher::default()
         };
+        let mut cow_resolver = NoopCowResolver;
         let mut frame = write_translation_fault(0, 0x5200_1000);
 
         assert_eq!(
@@ -516,6 +621,7 @@ mod tests {
                 &spaces,
                 &mailbox,
                 &mut publisher,
+                &mut cow_resolver,
             ),
             Action::Forward
         );
@@ -543,6 +649,7 @@ mod tests {
                 &spaces,
                 &mailbox,
                 &mut publisher,
+                &mut cow_resolver,
             ),
             Action::Forward
         );
@@ -558,6 +665,7 @@ mod tests {
                 &spaces,
                 &mailbox,
                 &mut publisher,
+                &mut cow_resolver,
             ),
             Action::Served
         );
@@ -574,6 +682,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let counters = Counters::default();
         let mut publisher = RecordingPublisher::default();
+        let mut cow_resolver = NoopCowResolver;
         let mut frame = write_translation_fault(0, 0x6000_1000);
         frame.esr = (0x24 << 26) | 0x21;
 
@@ -585,11 +694,84 @@ mod tests {
                 &spaces,
                 &mailbox,
                 &mut publisher,
+                &mut cow_resolver,
             ),
             Action::Forward
         );
         assert!(!mailbox.has_guest_work());
         assert!(publisher.calls.is_empty());
+    }
+
+    #[test]
+    fn cow_write_permission_fault_serves_in_guest_when_resolved() {
+        let mm = 90;
+        let ttbr0 = (36_u64 << 48) | 0x8d00_0000_0000;
+        let fault = 0x4000_3000;
+        let task = CurrentTask::new();
+        task.zone_mm.store(mm, Ordering::Release);
+        let tasks = [task];
+        let spaces = published_space(mm, ttbr0);
+        let mailbox = FrameGrantMailbox::new();
+        let counters = Counters::default();
+        let mut publisher = RecordingPublisher::default();
+        let mut cow_resolver = RecordingCowResolver {
+            succeeds: true,
+            ..RecordingCowResolver::default()
+        };
+        let mut frame = write_permission_fault(0, fault);
+
+        assert_eq!(
+            dispatch_fault_with_regions(
+                &mut frame,
+                &counters,
+                &tasks,
+                &spaces,
+                &mailbox,
+                &mut publisher,
+                &mut cow_resolver,
+            ),
+            Action::Served
+        );
+        assert_eq!(cow_resolver.calls, vec![(ttbr0, fault)]);
+        assert!(!mailbox.has_guest_work());
+        assert!(publisher.calls.is_empty());
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn cow_write_permission_fault_forwards_when_not_authorized() {
+        let mm = 91;
+        let ttbr0 = (37_u64 << 48) | 0x8e00_0000_0000;
+        let fault = 0x4000_4000;
+        let task = CurrentTask::new();
+        task.zone_mm.store(mm, Ordering::Release);
+        let tasks = [task];
+        let spaces = published_space(mm, ttbr0);
+        let mailbox = FrameGrantMailbox::new();
+        let counters = Counters::default();
+        let mut publisher = RecordingPublisher::default();
+        let mut cow_resolver = RecordingCowResolver {
+            succeeds: false,
+            ..RecordingCowResolver::default()
+        };
+        let mut frame = write_permission_fault(0, fault);
+
+        assert_eq!(
+            dispatch_fault_with_regions(
+                &mut frame,
+                &counters,
+                &tasks,
+                &spaces,
+                &mailbox,
+                &mut publisher,
+                &mut cow_resolver,
+            ),
+            Action::Forward
+        );
+        assert_eq!(cow_resolver.calls, vec![(ttbr0, fault)]);
+        assert!(!mailbox.has_guest_work());
+        assert!(publisher.calls.is_empty());
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
     }
 
     #[test]
