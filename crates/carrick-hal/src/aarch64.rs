@@ -88,14 +88,25 @@ pub fn is_aarch64_hvc_idle(syndrome: u64) -> bool {
     is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == AARCH64_HVC_IDLE_IMM
 }
 
+/// HVC immediate of the EL1 metadata extent grant / return hypercall (`hvc #6`).
+pub const AARCH64_HVC_METADATA_GRANT_IMM: u64 = 6;
+
+/// True for the EL1 metadata extent grant / return hypercall (`hvc #6`).
+pub fn is_aarch64_hvc_metadata_grant(syndrome: u64) -> bool {
+    is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == AARCH64_HVC_METADATA_GRANT_IMM
+}
+
 /// True for syscall-shaped traps a host can dispatch identically: EL0 `svc #0`
 /// (`EC = 0x15`) and an EL1 vector's `hvc #2` re-trap (`EC = 0x16`). Both
 /// deliver the syscall ABI registers unchanged.
 pub fn is_aarch64_syscall_exception(syndrome: u64) -> bool {
     is_aarch64_svc_exception(syndrome)
         || (is_aarch64_hvc_exception(syndrome)
+            && !is_aarch64_hvc_maintenance(syndrome)
+            && !is_aarch64_hvc_fault(syndrome)
             && !is_aarch64_hvc_kick(syndrome)
-            && !is_aarch64_hvc_idle(syndrome))
+            && !is_aarch64_hvc_idle(syndrome)
+            && !is_aarch64_hvc_metadata_grant(syndrome))
 }
 
 /// Whether a captured vCPU PC is genuine guest userspace (EL0) or inside
@@ -145,12 +156,23 @@ mod tests {
         assert!(is_aarch64_hvc_maintenance(esr(0x16, 1)));
         assert!(!is_aarch64_hvc_maintenance(esr(0x16, 2)));
         assert!(!is_aarch64_hvc_maintenance(esr(0x15, 1)));
+        assert!(!is_aarch64_syscall_exception(esr(0x16, 1)));
         // hvc #3 is the unexpected-current-EL-exception (fail-loud) marker,
         // distinct from the maintenance (#1) and syscall (#2) immediates.
         assert!(is_aarch64_hvc_fault(esr(0x16, 3)));
         assert!(!is_aarch64_hvc_fault(esr(0x16, 1)));
         assert!(!is_aarch64_hvc_fault(esr(0x16, 2)));
         assert!(!is_aarch64_hvc_fault(esr(0x15, 3)));
+        assert!(!is_aarch64_syscall_exception(esr(0x16, 3)));
+        // hvc #4 is the kick marker.
+        assert!(is_aarch64_hvc_kick(esr(0x16, 4)));
+        assert!(!is_aarch64_syscall_exception(esr(0x16, 4)));
+        // hvc #5 is the idle marker.
+        assert!(is_aarch64_hvc_idle(esr(0x16, 5)));
+        assert!(!is_aarch64_syscall_exception(esr(0x16, 5)));
+        // hvc #6 is the metadata grant marker.
+        assert!(is_aarch64_hvc_metadata_grant(esr(0x16, 6)));
+        assert!(!is_aarch64_syscall_exception(esr(0x16, 6)));
         // A #3 HVC must NOT be mistaken for the maintenance marker, and vice
         // versa — the run loop dispatches on these to wholly different paths.
         assert!(!is_aarch64_hvc_maintenance(esr(0x16, 3)));

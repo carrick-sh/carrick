@@ -1,58 +1,1122 @@
-//! Bump allocator over the EL1 heap region.
+//! Elastic segregated-fit metadata allocator for the in-guest EL1 kernel.
+//!
+//! Provides bounded O(1) allocation and deallocation over admitted memory extents,
+//! supports dynamic growth through host extent grants (`HVC #6`), and returns
+//! completely unused dynamic extents to the host.
 
-use carrick_el1_abi::{EL1_HEAP_BASE, EL1_HEAP_SIZE};
-use core::sync::atomic::{AtomicUsize, Ordering};
+#[allow(unused_imports)]
+use carrick_el1_abi::{
+    EL1_BOOTSTRAP_METADATA_BASE, EL1_BOOTSTRAP_METADATA_SIZE, METADATA_GRANT_ERR_DENIED,
+    METADATA_GRANT_OP_ALLOC, METADATA_GRANT_OP_FREE, METADATA_GRANT_SUCCESS,
+};
+use core::alloc::Layout;
 
-pub struct BumpAllocator {
-    offset: AtomicUsize,
+/// Maximum number of distinct extents tracked concurrently.
+pub const MAX_EXTENTS: usize = 128;
+
+/// Number of segregated size bins.
+pub const NUM_BINS: usize = 28;
+
+/// Minimum block size in bytes (32-byte header + 16-byte free node aligned to 16 bytes).
+pub const MIN_BLOCK_SIZE: usize = 64;
+
+/// Sentinel indicating that a block has no preceding physical block in the extent.
+pub const NO_PREV_BLOCK: usize = usize::MAX;
+
+/// Kind and authentication provenance of an admitted extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtentKind {
+    /// Statically mapped bootstrap arena in the EL1 region (0x70_0000..0x100_0000).
+    Bootstrap,
+    /// Dynamically granted extent with host owner token.
+    Dynamic { token: u64 },
 }
 
-impl BumpAllocator {
-    pub const fn new() -> Self {
+/// Lifecycle state of an extent descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtentState {
+    /// Actively serving allocations and free blocks.
+    Active,
+    /// Dynamic extent fully drained and returned to the host.
+    Returned,
+    /// Unused slot in the extent descriptor table.
+    Unused,
+}
+
+/// Descriptor tracking an individual memory extent.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtentDescriptor {
+    pub base_va: u64,
+    pub size: usize,
+    pub kind: ExtentKind,
+    pub state: ExtentState,
+    pub live_allocations: usize,
+}
+
+impl ExtentDescriptor {
+    pub const fn unused() -> Self {
         Self {
-            offset: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn allocate(&self, size: usize, align: usize) -> Option<*mut u8> {
-        let align_mask = align.checked_sub(1)?;
-        let mut current = self.offset.load(Ordering::Relaxed);
-        loop {
-            let aligned = (current.checked_add(align_mask)?) & !align_mask;
-            let next = aligned.checked_add(size)?;
-            if next > EL1_HEAP_SIZE as usize {
-                return None;
-            }
-            match self.offset.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some((EL1_HEAP_BASE as usize + aligned) as *mut u8),
-                Err(prev) => current = prev,
-            }
+            base_va: 0,
+            size: 0,
+            kind: ExtentKind::Bootstrap,
+            state: ExtentState::Unused,
+            live_allocations: 0,
         }
     }
 }
 
-impl Default for BumpAllocator {
+/// Receipt indicating an extent that has become completely empty and was returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtentToReturn {
+    pub base_va: u64,
+    pub size: usize,
+    pub token: u64,
+}
+
+/// Typed errors when admitting an extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtentAdmissionError {
+    CapacityExceeded,
+    InvalidSize,
+    InvalidAlignment,
+    OverlapWithExisting,
+}
+
+/// Physical header prepended to every memory chunk in an extent.
+#[repr(C, align(16))]
+pub struct BlockHeader {
+    /// Total block size in bytes (header + payload).
+    pub size: usize,
+    /// Offset from extent base to preceding physical block, or `NO_PREV_BLOCK`.
+    pub prev_phys_offset: usize,
+    /// Index into extents table (0..127).
+    pub extent_idx: u8,
+    /// True if allocated to a caller; false if free in a segregated bin.
+    pub is_allocated: bool,
+    /// Alignment padding to ensure 32-byte header size.
+    pub _pad: [u8; 6],
+}
+
+const _: () = assert!(core::mem::size_of::<BlockHeader>() == 32);
+const _: () = assert!(core::mem::align_of::<BlockHeader>() == 16);
+
+/// Embedded free-list node located in the payload area of a free block.
+#[repr(C)]
+pub struct FreeNode {
+    pub next: *mut BlockHeader,
+    pub prev: *mut BlockHeader,
+}
+
+/// Core single-threaded allocator state machine.
+pub struct MetadataAllocatorCore {
+    /// Segregated free-list heads.
+    bins: [*mut BlockHeader; NUM_BINS],
+    /// Bitmask of non-empty bins for O(1) search (`trailing_zeros`).
+    active_bins: u32,
+    /// Bounded descriptor table of admitted extents.
+    extents: [ExtentDescriptor; MAX_EXTENTS],
+    /// Number of extents admitted over time.
+    extents_admitted_count: usize,
+    /// Current number of active extents.
+    active_extents_count: usize,
+    /// Total bytes in active extents.
+    total_capacity_bytes: usize,
+    /// Total bytes currently occupied by live allocations (including headers).
+    allocated_bytes: usize,
+}
+
+// SAFETY: All raw pointers point into admitted memory buffers protected by synchronization.
+unsafe impl Send for MetadataAllocatorCore {}
+
+impl Default for MetadataAllocatorCore {
     fn default() -> Self {
         Self::new()
     }
 }
 
+impl MetadataAllocatorCore {
+    /// Create a new empty allocator state.
+    pub const fn new() -> Self {
+        Self {
+            bins: [core::ptr::null_mut(); NUM_BINS],
+            active_bins: 0,
+            extents: [ExtentDescriptor::unused(); MAX_EXTENTS],
+            extents_admitted_count: 0,
+            active_extents_count: 0,
+            total_capacity_bytes: 0,
+            allocated_bytes: 0,
+        }
+    }
+
+    /// Calculate bin index for a given required block size.
+    #[inline]
+    pub fn bin_for_size(size: usize) -> usize {
+        if size <= 64 {
+            return 0;
+        }
+        // Size classes spaced by powers of 2 and sub-ranges:
+        // 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144,
+        // 8192, 12288, 16384, 24576, 32768, 49152, 65536, 131072, 262144, 524288,
+        // 1048576, 2097152, 4194304, 8388608.
+        let fls = (usize::BITS - 1 - size.leading_zeros()) as usize;
+        if fls <= 6 {
+            0
+        } else if fls >= 23 {
+            NUM_BINS - 1
+        } else {
+            let base = (fls - 6) * 2;
+            let mid = (1 << fls) + (1 << (fls - 1));
+            let offset = if size > mid { 1 } else { 0 };
+            (base + offset).min(NUM_BINS - 1)
+        }
+    }
+
+    /// Insert a free block into its appropriate size bin.
+    fn insert_free_block(&mut self, block: *mut BlockHeader) {
+        unsafe {
+            let size = (*block).size;
+            let bin_idx = Self::bin_for_size(size);
+            let node_ptr = (block as usize + core::mem::size_of::<BlockHeader>()) as *mut FreeNode;
+
+            let old_head = self.bins[bin_idx];
+            (*node_ptr).next = old_head;
+            (*node_ptr).prev = core::ptr::null_mut();
+
+            if !old_head.is_null() {
+                let old_head_node =
+                    (old_head as usize + core::mem::size_of::<BlockHeader>()) as *mut FreeNode;
+                (*old_head_node).prev = block;
+            }
+
+            self.bins[bin_idx] = block;
+            self.active_bins |= 1 << bin_idx;
+        }
+    }
+
+    /// Unlink a block from its segregated size bin.
+    fn unlink_free_block(&mut self, block: *mut BlockHeader) {
+        unsafe {
+            let size = (*block).size;
+            let bin_idx = Self::bin_for_size(size);
+            let node_ptr = (block as usize + core::mem::size_of::<BlockHeader>()) as *mut FreeNode;
+            let prev = (*node_ptr).prev;
+            let next = (*node_ptr).next;
+
+            if !prev.is_null() {
+                let prev_node =
+                    (prev as usize + core::mem::size_of::<BlockHeader>()) as *mut FreeNode;
+                (*prev_node).next = next;
+            } else {
+                self.bins[bin_idx] = next;
+                if next.is_null() {
+                    self.active_bins &= !(1 << bin_idx);
+                }
+            }
+
+            if !next.is_null() {
+                let next_node =
+                    (next as usize + core::mem::size_of::<BlockHeader>()) as *mut FreeNode;
+                (*next_node).prev = prev;
+            }
+
+            (*node_ptr).next = core::ptr::null_mut();
+            (*node_ptr).prev = core::ptr::null_mut();
+        }
+    }
+
+    /// Admit a new memory extent into the allocator.
+    pub fn admit_extent(
+        &mut self,
+        base_va: u64,
+        size: usize,
+        kind: ExtentKind,
+    ) -> Result<usize, ExtentAdmissionError> {
+        if size < MIN_BLOCK_SIZE || !size.is_multiple_of(16) {
+            return Err(ExtentAdmissionError::InvalidSize);
+        }
+        if base_va == 0 || !(base_va as usize).is_multiple_of(16) {
+            return Err(ExtentAdmissionError::InvalidAlignment);
+        }
+
+        let end_va = base_va
+            .checked_add(size as u64)
+            .ok_or(ExtentAdmissionError::InvalidSize)?;
+
+        // Authenticate non-overlap with any currently active extents
+        for ext in &self.extents {
+            if ext.state == ExtentState::Active {
+                let ext_end = ext.base_va.saturating_add(ext.size as u64);
+                if base_va < ext_end && end_va > ext.base_va {
+                    return Err(ExtentAdmissionError::OverlapWithExisting);
+                }
+            }
+        }
+
+        // Find a free descriptor slot
+        let slot_idx = self
+            .extents
+            .iter()
+            .position(|e| e.state == ExtentState::Unused || e.state == ExtentState::Returned)
+            .ok_or(ExtentAdmissionError::CapacityExceeded)?;
+
+        self.extents[slot_idx] = ExtentDescriptor {
+            base_va,
+            size,
+            kind,
+            state: ExtentState::Active,
+            live_allocations: 0,
+        };
+        self.extents_admitted_count += 1;
+        self.active_extents_count += 1;
+        self.total_capacity_bytes += size;
+
+        // Initialize the entire extent as one initial free block
+        let initial_block = base_va as *mut BlockHeader;
+        unsafe {
+            (*initial_block).size = size;
+            (*initial_block).prev_phys_offset = NO_PREV_BLOCK;
+            (*initial_block).extent_idx = slot_idx as u8;
+            (*initial_block).is_allocated = false;
+            (*initial_block)._pad = [0; 6];
+        }
+
+        self.insert_free_block(initial_block);
+        Ok(slot_idx)
+    }
+
+    /// Allocate memory according to the given layout without taking locks.
+    pub fn allocate(&mut self, layout: Layout) -> Option<*mut u8> {
+        let align = layout.align().max(16);
+        let header_size = core::mem::size_of::<BlockHeader>();
+        // Calculate needed block size: header + payload, rounded up to 16 bytes, minimum MIN_BLOCK_SIZE
+        let needed_payload = layout.size().max(1);
+        let raw_block_size = header_size.checked_add(needed_payload)?;
+        let aligned_block_size = (raw_block_size.checked_add(align - 1)?) & !(align - 1);
+        let needed_size = aligned_block_size.max(MIN_BLOCK_SIZE);
+
+        let bin_idx = Self::bin_for_size(needed_size);
+        let mask = !0u32 << bin_idx;
+        let candidate = self.active_bins & mask;
+        if candidate == 0 {
+            return None;
+        }
+
+        let target_bin = candidate.trailing_zeros() as usize;
+        let mut block = self.bins[target_bin];
+        if block.is_null() {
+            return None;
+        }
+
+        // Find a suitable block in the bin (first-fit within smallest non-empty bin)
+        while !block.is_null() {
+            unsafe {
+                if (*block).size >= needed_size {
+                    break;
+                }
+                let node = (block as usize + header_size) as *const FreeNode;
+                block = (*node).next;
+            }
+        }
+
+        if block.is_null() {
+            // Search subsequent active bins if any
+            let remaining_mask = candidate & !((1 << (target_bin + 1)) - 1);
+            if remaining_mask != 0 {
+                let next_bin = remaining_mask.trailing_zeros() as usize;
+                block = self.bins[next_bin];
+            } else {
+                return None;
+            }
+        }
+
+        if block.is_null() {
+            return None;
+        }
+
+        self.unlink_free_block(block);
+
+        unsafe {
+            let total_size = (*block).size;
+            let extent_idx = (*block).extent_idx as usize;
+            let extent_base = self.extents[extent_idx].base_va as usize;
+            let extent_size = self.extents[extent_idx].size;
+
+            if total_size >= needed_size + MIN_BLOCK_SIZE {
+                // Split block into allocated prefix and free remainder
+                let remainder_size = total_size - needed_size;
+                (*block).size = needed_size;
+
+                let remainder = (block as usize + needed_size) as *mut BlockHeader;
+                (*remainder).size = remainder_size;
+                (*remainder).prev_phys_offset = (block as usize) - extent_base;
+                (*remainder).extent_idx = extent_idx as u8;
+                (*remainder).is_allocated = false;
+                (*remainder)._pad = [0; 6];
+
+                // Update physical successor's prev_phys_offset if it exists in the extent
+                let succ_offset = (block as usize + total_size) - extent_base;
+                if succ_offset < extent_size {
+                    let succ = (extent_base + succ_offset) as *mut BlockHeader;
+                    (*succ).prev_phys_offset = (remainder as usize) - extent_base;
+                }
+
+                self.insert_free_block(remainder);
+            }
+
+            (*block).is_allocated = true;
+            self.extents[extent_idx].live_allocations += 1;
+            self.allocated_bytes += (*block).size;
+
+            let payload_ptr = (block as usize + header_size) as *mut u8;
+            Some(payload_ptr)
+        }
+    }
+
+    /// Deallocate a previously allocated memory block without taking locks.
+    ///
+    /// Returns `Some(ExtentToReturn)` if the containing dynamic extent has been
+    /// completely drained of live allocations and can now be returned to the host.
+    pub fn deallocate(&mut self, ptr: *mut u8, _layout: Layout) -> Option<ExtentToReturn> {
+        if ptr.is_null() {
+            return None;
+        }
+
+        let header_size = core::mem::size_of::<BlockHeader>();
+        let mut block = (ptr as usize - header_size) as *mut BlockHeader;
+
+        unsafe {
+            if !(*block).is_allocated {
+                // Double free or invalid pointer; ignore or fail-safe
+                return None;
+            }
+
+            let extent_idx = (*block).extent_idx as usize;
+            if extent_idx >= MAX_EXTENTS {
+                return None;
+            }
+            if self.extents[extent_idx].state != ExtentState::Active {
+                return None;
+            }
+
+            (*block).is_allocated = false;
+            self.extents[extent_idx].live_allocations =
+                self.extents[extent_idx].live_allocations.saturating_sub(1);
+            self.allocated_bytes = self.allocated_bytes.saturating_sub((*block).size);
+
+            let extent_base = self.extents[extent_idx].base_va as usize;
+            let extent_size = self.extents[extent_idx].size;
+
+            // 1. Coalesce with next physical block if it is free
+            let next_offset = (block as usize + (*block).size) - extent_base;
+            if next_offset < extent_size {
+                let next_phys = (extent_base + next_offset) as *mut BlockHeader;
+                if !(*next_phys).is_allocated {
+                    self.unlink_free_block(next_phys);
+                    (*block).size += (*next_phys).size;
+
+                    let after_next_offset = (block as usize + (*block).size) - extent_base;
+                    if after_next_offset < extent_size {
+                        let after_next = (extent_base + after_next_offset) as *mut BlockHeader;
+                        (*after_next).prev_phys_offset = (block as usize) - extent_base;
+                    }
+                }
+            }
+
+            // 2. Coalesce with preceding physical block if it is free
+            if (*block).prev_phys_offset != NO_PREV_BLOCK {
+                let prev_phys = (extent_base + (*block).prev_phys_offset) as *mut BlockHeader;
+                if !(*prev_phys).is_allocated {
+                    self.unlink_free_block(prev_phys);
+                    (*prev_phys).size += (*block).size;
+
+                    let after_offset = (prev_phys as usize + (*prev_phys).size) - extent_base;
+                    if after_offset < extent_size {
+                        let after = (extent_base + after_offset) as *mut BlockHeader;
+                        (*after).prev_phys_offset = (prev_phys as usize) - extent_base;
+                    }
+
+                    block = prev_phys;
+                }
+            }
+
+            // 3. Check for dynamic extent reclamation
+            if let ExtentKind::Dynamic { token } = self.extents[extent_idx].kind
+                && self.extents[extent_idx].live_allocations == 0
+                && (*block).size == extent_size
+            {
+                // Whole extent is free! Reclaim and return to host
+                self.extents[extent_idx].state = ExtentState::Returned;
+                self.active_extents_count = self.active_extents_count.saturating_sub(1);
+                self.total_capacity_bytes = self.total_capacity_bytes.saturating_sub(extent_size);
+
+                return Some(ExtentToReturn {
+                    base_va: self.extents[extent_idx].base_va,
+                    size: extent_size,
+                    token,
+                });
+            }
+
+            self.insert_free_block(block);
+            None
+        }
+    }
+
+    /// Read current allocator diagnostics.
+    pub fn diagnostics(&self) -> AllocatorDiagnostics {
+        AllocatorDiagnostics {
+            extents_admitted: self.extents_admitted_count,
+            active_extents: self.active_extents_count,
+            total_capacity_bytes: self.total_capacity_bytes,
+            allocated_bytes: self.allocated_bytes,
+            active_bins_mask: self.active_bins,
+        }
+    }
+}
+
+/// Snapshot of allocator operational counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocatorDiagnostics {
+    pub extents_admitted: usize,
+    pub active_extents: usize,
+    pub total_capacity_bytes: usize,
+    pub allocated_bytes: usize,
+    pub active_bins_mask: u32,
+}
+
+/// Request a dynamic extent grant from the host via hypercall (`HVC #6`).
+#[inline]
+pub fn request_host_extent_grant(requested_size: usize) -> Result<(u64, usize, u64), u64> {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let mut status: u64 = METADATA_GRANT_OP_ALLOC;
+        let mut base_ipa: u64 = requested_size as u64;
+        let mut granted_size: u64 = 0;
+        let mut token: u64 = 0;
+        unsafe {
+            core::arch::asm!(
+                "hvc #6",
+                inlateout("x0") status,
+                inlateout("x1") base_ipa,
+                inlateout("x2") granted_size,
+                inlateout("x3") token,
+                options(nostack)
+            );
+        }
+        if status == METADATA_GRANT_SUCCESS {
+            Ok((base_ipa, granted_size as usize, token))
+        } else {
+            Err(status)
+        }
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = requested_size;
+        Err(METADATA_GRANT_ERR_DENIED)
+    }
+}
+
+/// Return an unused dynamic extent to the host via hypercall (`HVC #6`).
+#[inline]
+pub fn return_host_extent(base_ipa: u64, size: usize, token: u64) -> Result<(), u64> {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let mut status: u64;
+        unsafe {
+            core::arch::asm!(
+                "hvc #6",
+                inlateout("x0") METADATA_GRANT_OP_FREE => status,
+                in("x1") base_ipa,
+                in("x2") size as u64,
+                in("x3") token,
+                options(nostack)
+            );
+        }
+        if status == METADATA_GRANT_SUCCESS {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = (base_ipa, size, token);
+        Ok(())
+    }
+}
+
+/// Mask IRQs on the calling vCPU and return previous DAIF flags.
+#[inline]
+pub fn disable_irq_save() -> u64 {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let daif: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {}, daif",
+                "msr daifset, #2",
+                out(reg) daif,
+                options(nostack, nomem)
+            );
+        }
+        daif
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        0
+    }
+}
+
+/// Restore previous IRQ state from saved DAIF flags.
+#[inline]
+pub fn restore_irq(flags: u64) {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        unsafe {
+            core::arch::asm!(
+                "msr daif, {}",
+                in(reg) flags,
+                options(nostack, nomem)
+            );
+        }
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = flags;
+    }
+}
+
+/// Thread-safe and IRQ-safe global metadata storage wrapping [`MetadataAllocatorCore`].
+pub struct MetadataStorage {
+    core: crate::lock::SpinLock<MetadataAllocatorCore>,
+}
+
+impl MetadataStorage {
+    /// Create an uninitialized storage wrapper.
+    pub const fn new() -> Self {
+        Self {
+            core: crate::lock::SpinLock::new(MetadataAllocatorCore::new()),
+        }
+    }
+
+    /// Admit the statically reserved bootstrap arena.
+    pub fn init_bootstrap(&self, base_va: u64, size: usize) -> Result<(), ExtentAdmissionError> {
+        let daif = disable_irq_save();
+        let mut guard = self.core.lock();
+        let res = guard.admit_extent(base_va, size, ExtentKind::Bootstrap);
+        drop(guard);
+        restore_irq(daif);
+        res.map(|_| ())
+    }
+
+    /// Allocate memory from active extents, requesting dynamic host grants if needed.
+    pub fn allocate(&self, layout: Layout) -> Option<*mut u8> {
+        // Step 1: Attempt allocation under lock
+        let daif = disable_irq_save();
+        let mut guard = self.core.lock();
+        if let Some(ptr) = guard.allocate(layout) {
+            drop(guard);
+            restore_irq(daif);
+            return Some(ptr);
+        }
+        // Need growth: drop spinlock and unmask IRQs before issuing host hypercall
+        drop(guard);
+        restore_irq(daif);
+
+        // Step 2: Request extent grant from host (no locks held, IRQs unmasked)
+        let needed_bytes = layout.size().max(64 * 1024);
+        let grant_size = (needed_bytes + 0xFFFF) & !0xFFFF;
+        let (base_ipa, granted_size, token) = request_host_extent_grant(grant_size).ok()?;
+
+        // Step 3: Reacquire lock and admit granted extent
+        let daif = disable_irq_save();
+        let mut guard = self.core.lock();
+        if guard
+            .admit_extent(base_ipa, granted_size, ExtentKind::Dynamic { token })
+            .is_err()
+        {
+            drop(guard);
+            restore_irq(daif);
+            let _ = return_host_extent(base_ipa, granted_size, token);
+            return None;
+        }
+
+        let ptr = guard.allocate(layout);
+        drop(guard);
+        restore_irq(daif);
+        ptr
+    }
+
+    /// Deallocate memory, returning empty dynamic extents to the host outside the lock.
+    pub fn deallocate(&self, ptr: *mut u8, layout: Layout) {
+        let daif = disable_irq_save();
+        let mut guard = self.core.lock();
+        let to_return = guard.deallocate(ptr, layout);
+        drop(guard);
+        restore_irq(daif);
+
+        if let Some(ret) = to_return {
+            let _ = return_host_extent(ret.base_va, ret.size, ret.token);
+        }
+    }
+
+    /// Read diagnostics under lock.
+    pub fn diagnostics(&self) -> AllocatorDiagnostics {
+        let daif = disable_irq_save();
+        let guard = self.core.lock();
+        let diag = guard.diagnostics();
+        drop(guard);
+        restore_irq(daif);
+        diag
+    }
+}
+
+impl Default for MetadataStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global metadata allocator instance used by EL1.
+pub static GLOBAL_METADATA_STORAGE: MetadataStorage = MetadataStorage::new();
+
+/// Initialize the global EL1 metadata allocator with the bootstrap arena.
+pub fn init_el1_metadata_allocator() -> Result<(), ExtentAdmissionError> {
+    GLOBAL_METADATA_STORAGE.init_bootstrap(
+        EL1_BOOTSTRAP_METADATA_BASE,
+        EL1_BOOTSTRAP_METADATA_SIZE as usize,
+    )
+}
+
+/// Test runner for in-guest EL1 metadata allocator executed via syscall 448.
+pub fn run_guest_allocator_test(sub_cmd: u64, _arg: u64) -> i64 {
+    // Ensure bootstrap extent is admitted
+    let _ = init_el1_metadata_allocator();
+
+    match sub_cmd {
+        1 => {
+            // Basic allocation, alignment, write, verify, and deallocation
+            let layout64 = match Layout::from_size_align(64, 16) {
+                Ok(l) => l,
+                Err(_) => return 100,
+            };
+            let p1 = match GLOBAL_METADATA_STORAGE.allocate(layout64) {
+                Some(p) => p,
+                None => return 101,
+            };
+            unsafe {
+                core::ptr::write_bytes(p1, 0xAA, 64);
+                for i in 0..64 {
+                    if *p1.add(i) != 0xAA {
+                        GLOBAL_METADATA_STORAGE.deallocate(p1, layout64);
+                        return 102;
+                    }
+                }
+            }
+
+            let layout256 = match Layout::from_size_align(256, 32) {
+                Ok(l) => l,
+                Err(_) => return 100,
+            };
+            let p2 = match GLOBAL_METADATA_STORAGE.allocate(layout256) {
+                Some(p) => p,
+                None => {
+                    GLOBAL_METADATA_STORAGE.deallocate(p1, layout64);
+                    return 103;
+                }
+            };
+            unsafe {
+                core::ptr::write_bytes(p2, 0x55, 256);
+                for i in 0..256 {
+                    if *p2.add(i) != 0x55 {
+                        GLOBAL_METADATA_STORAGE.deallocate(p1, layout64);
+                        GLOBAL_METADATA_STORAGE.deallocate(p2, layout256);
+                        return 104;
+                    }
+                }
+            }
+
+            GLOBAL_METADATA_STORAGE.deallocate(p1, layout64);
+            GLOBAL_METADATA_STORAGE.deallocate(p2, layout256);
+            0
+        }
+        2 => {
+            // Force growth beyond bootstrap capacity into dynamic extents, write, verify, and free
+            let chunk_layout = match Layout::from_size_align(64 * 1024, 64) {
+                Ok(l) => l,
+                Err(_) => return 200,
+            };
+            let mut ptrs = [core::ptr::null_mut(); 4];
+            let mut count = 0;
+            for (i, slot) in ptrs.iter_mut().enumerate() {
+                if let Some(p) = GLOBAL_METADATA_STORAGE.allocate(chunk_layout) {
+                    unsafe {
+                        core::ptr::write_bytes(p, (0x10 + i) as u8, 64 * 1024);
+                    }
+                    *slot = p;
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            if count == 0 {
+                return 201;
+            }
+            // Verify and free all
+            for (i, &p) in ptrs.iter().take(count).enumerate() {
+                unsafe {
+                    for j in 0..64 * 1024 {
+                        if *p.add(j) != (0x10 + i) as u8 {
+                            return 202;
+                        }
+                    }
+                }
+                GLOBAL_METADATA_STORAGE.deallocate(p, chunk_layout);
+            }
+            0
+        }
+        3 => {
+            // Exercise denied grant and recovery
+            let base_layout = match Layout::from_size_align(128, 16) {
+                Ok(l) => l,
+                Err(_) => return 300,
+            };
+            let p_base = match GLOBAL_METADATA_STORAGE.allocate(base_layout) {
+                Some(p) => p,
+                None => return 301,
+            };
+            unsafe {
+                core::ptr::write_bytes(p_base, 0x42, 128);
+            }
+
+            // Attempt an allocation that triggers host grant while failpoint is active
+            let huge_layout = match Layout::from_size_align(512 * 1024, 64) {
+                Ok(l) => l,
+                Err(_) => return 300,
+            };
+            let p_huge = GLOBAL_METADATA_STORAGE.allocate(huge_layout);
+            // Must have failed due to denied grant failpoint
+            if p_huge.is_some() {
+                if let Some(p) = p_huge {
+                    GLOBAL_METADATA_STORAGE.deallocate(p, huge_layout);
+                }
+                GLOBAL_METADATA_STORAGE.deallocate(p_base, base_layout);
+                return 302;
+            }
+
+            // Verify p_base is untouched
+            unsafe {
+                for i in 0..128 {
+                    if *p_base.add(i) != 0x42 {
+                        GLOBAL_METADATA_STORAGE.deallocate(p_base, base_layout);
+                        return 303;
+                    }
+                }
+            }
+
+            // Now retry allocation without failpoint (host allows grant)
+            let p_retry = match GLOBAL_METADATA_STORAGE.allocate(huge_layout) {
+                Some(p) => p,
+                None => {
+                    GLOBAL_METADATA_STORAGE.deallocate(p_base, base_layout);
+                    return 304;
+                }
+            };
+            unsafe {
+                core::ptr::write_bytes(p_retry, 0x84, 512 * 1024);
+                for i in 0..512 * 1024 {
+                    if *p_retry.add(i) != 0x84 {
+                        GLOBAL_METADATA_STORAGE.deallocate(p_retry, huge_layout);
+                        GLOBAL_METADATA_STORAGE.deallocate(p_base, base_layout);
+                        return 305;
+                    }
+                }
+            }
+
+            GLOBAL_METADATA_STORAGE.deallocate(p_retry, huge_layout);
+            GLOBAL_METADATA_STORAGE.deallocate(p_base, base_layout);
+            0
+        }
+        _ => -22, // EINVAL
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
+    extern crate std;
+    use std::boxed::Box;
+    use std::vec;
+    use std::vec::Vec;
 
     #[test]
-    fn test_bump_allocator() {
-        let alloc = BumpAllocator::new();
-        let p1 = alloc.allocate(64, 8).expect("alloc p1");
-        assert_eq!(p1 as usize % 8, 0);
-        let p2 = alloc.allocate(128, 16).expect("alloc p2");
-        assert_eq!(p2 as usize % 16, 0);
-        assert!(p2 as usize >= p1 as usize + 64);
+    fn test_basic_allocation_and_free() {
+        let mut arena = vec![0u8; 128 * 1024];
+        let base = arena.as_mut_ptr() as u64;
+        let mut alloc = MetadataAllocatorCore::new();
+        alloc
+            .admit_extent(base, arena.len(), ExtentKind::Bootstrap)
+            .expect("admit bootstrap");
+
+        let p1 = alloc
+            .allocate(Layout::from_size_align(64, 16).unwrap())
+            .expect("p1");
+        assert_eq!(p1 as usize % 16, 0);
+        unsafe {
+            core::ptr::write_bytes(p1, 0xAA, 64);
+            for i in 0..64 {
+                assert_eq!(*p1.add(i), 0xAA);
+            }
+        }
+
+        let p2 = alloc
+            .allocate(Layout::from_size_align(256, 32).unwrap())
+            .expect("p2");
+        assert_eq!(p2 as usize % 32, 0);
+        unsafe {
+            core::ptr::write_bytes(p2, 0x55, 256);
+            for i in 0..256 {
+                assert_eq!(*p2.add(i), 0x55);
+            }
+        }
+
+        alloc.deallocate(p1, Layout::from_size_align(64, 16).unwrap());
+        alloc.deallocate(p2, Layout::from_size_align(256, 32).unwrap());
+
+        let diag = alloc.diagnostics();
+        assert_eq!(diag.allocated_bytes, 0);
+    }
+
+    #[test]
+    fn test_fragmentation_coalescing_and_reuse() {
+        let mut arena = vec![0u8; 64 * 1024];
+        let base = arena.as_mut_ptr() as u64;
+        let mut alloc = MetadataAllocatorCore::new();
+        alloc
+            .admit_extent(base, arena.len(), ExtentKind::Bootstrap)
+            .expect("admit");
+
+        let layout = Layout::from_size_align(128, 16).unwrap();
+        let p_a = alloc.allocate(layout).expect("p_a");
+        let p_b = alloc.allocate(layout).expect("p_b");
+        let p_c = alloc.allocate(layout).expect("p_c");
+        let p_d = alloc.allocate(layout).expect("p_d");
+
+        // Free middle blocks B and C
+        alloc.deallocate(p_b, layout);
+        alloc.deallocate(p_c, layout);
+
+        // Allocate a combined block that fits into coalesced (B + C)
+        let double_layout = Layout::from_size_align(256, 16).unwrap();
+        let p_bc = alloc.allocate(double_layout).expect("p_bc");
+        assert_eq!(
+            p_bc, p_b,
+            "coalesced B+C should be reused for 256-byte request"
+        );
+
+        alloc.deallocate(p_a, layout);
+        alloc.deallocate(p_bc, double_layout);
+        alloc.deallocate(p_d, layout);
+
+        let diag = alloc.diagnostics();
+        assert_eq!(diag.allocated_bytes, 0);
+    }
+
+    #[test]
+    fn test_extent_admission_validation_and_overlap_rejection() {
+        let mut arena1 = vec![0u8; 64 * 1024];
+        let base1 = arena1.as_mut_ptr() as u64;
+        let mut alloc = MetadataAllocatorCore::new();
+        alloc
+            .admit_extent(base1, arena1.len(), ExtentKind::Bootstrap)
+            .expect("admit 1");
+
+        // Duplicate admission of identical base
+        let err = alloc.admit_extent(base1, arena1.len(), ExtentKind::Dynamic { token: 1 });
+        assert_eq!(err, Err(ExtentAdmissionError::OverlapWithExisting));
+
+        // Overlapping sub-range
+        let err2 = alloc.admit_extent(base1 + 4096, 32 * 1024, ExtentKind::Dynamic { token: 2 });
+        assert_eq!(err2, Err(ExtentAdmissionError::OverlapWithExisting));
+
+        // Invalid size or alignment
+        let err3 = alloc.admit_extent(base1 + 0x10_0000, 15, ExtentKind::Dynamic { token: 3 });
+        assert_eq!(err3, Err(ExtentAdmissionError::InvalidSize));
+
+        let err4 = alloc.admit_extent(0, 64 * 1024, ExtentKind::Dynamic { token: 4 });
+        assert_eq!(err4, Err(ExtentAdmissionError::InvalidAlignment));
+    }
+
+    #[test]
+    fn test_dynamic_growth_and_exact_once_return() {
+        let mut bootstrap = vec![0u8; 4096];
+        let boot_base = bootstrap.as_mut_ptr() as u64;
+        let mut alloc = MetadataAllocatorCore::new();
+        alloc
+            .admit_extent(boot_base, bootstrap.len(), ExtentKind::Bootstrap)
+            .expect("admit boot");
+
+        // Exhaust bootstrap extent
+        let mut boot_ptrs = Vec::new();
+        while let Some(ptr) = alloc.allocate(Layout::from_size_align(256, 16).unwrap()) {
+            boot_ptrs.push(ptr);
+        }
+        assert!(boot_ptrs.len() >= 5);
+
+        // Try allocate larger block: fails on bootstrap
+        let large_layout = Layout::from_size_align(8192, 16).unwrap();
+        assert!(alloc.allocate(large_layout).is_none());
+
+        // Admit dynamic extent
+        let mut dynamic_backing = vec![0u8; 16 * 1024];
+        let dyn_base = dynamic_backing.as_mut_ptr() as u64;
+        alloc
+            .admit_extent(
+                dyn_base,
+                dynamic_backing.len(),
+                ExtentKind::Dynamic { token: 42 },
+            )
+            .expect("admit dyn");
+
+        // Now allocate large block: succeeds from dynamic extent
+        let p_dyn = alloc.allocate(large_layout).expect("alloc from dyn");
+        assert!(p_dyn as usize >= dyn_base as usize);
+        assert!((p_dyn as usize) < dyn_base as usize + dynamic_backing.len());
+
+        // Free dynamic allocation: triggers exact-once ExtentToReturn
+        let ret = alloc.deallocate(p_dyn, large_layout);
+        assert_eq!(
+            ret,
+            Some(ExtentToReturn {
+                base_va: dyn_base,
+                size: dynamic_backing.len(),
+                token: 42,
+            })
+        );
+
+        // Free bootstrap allocations
+        for p in boot_ptrs {
+            alloc.deallocate(p, Layout::from_size_align(256, 16).unwrap());
+        }
+
+        let diag = alloc.diagnostics();
+        assert_eq!(diag.allocated_bytes, 0);
+        assert_eq!(
+            diag.active_extents, 1,
+            "only bootstrap extent remains active"
+        );
+    }
+
+    #[test]
+    fn test_grant_refusal_preserves_state_and_allows_subsequent_retry() {
+        let mut bootstrap = vec![0u8; 4096];
+        let boot_base = bootstrap.as_mut_ptr() as u64;
+        let mut alloc = MetadataAllocatorCore::new();
+        alloc
+            .admit_extent(boot_base, bootstrap.len(), ExtentKind::Bootstrap)
+            .expect("admit boot");
+
+        let p1 = alloc
+            .allocate(Layout::from_size_align(256, 16).unwrap())
+            .expect("p1");
+        unsafe {
+            core::ptr::write_bytes(p1, 0x77, 256);
+        }
+
+        // Simulate grant refusal: allocation returning None leaves existing data intact
+        let large_layout = Layout::from_size_align(16 * 1024, 16).unwrap();
+        assert!(alloc.allocate(large_layout).is_none());
+
+        // Verify prior allocation p1 is uncorrupted
+        unsafe {
+            for i in 0..256 {
+                assert_eq!(*p1.add(i), 0x77);
+            }
+        }
+
+        // Now simulate subsequent successful grant
+        let mut dynamic_backing = vec![0u8; 32 * 1024];
+        let dyn_base = dynamic_backing.as_mut_ptr() as u64;
+        alloc
+            .admit_extent(
+                dyn_base,
+                dynamic_backing.len(),
+                ExtentKind::Dynamic { token: 101 },
+            )
+            .expect("retry grant succeeds");
+
+        let p2 = alloc
+            .allocate(large_layout)
+            .expect("retry allocate succeeds");
+        unsafe {
+            core::ptr::write_bytes(p2, 0x88, 16 * 1024);
+            for i in 0..16 * 1024 {
+                assert_eq!(*p2.add(i), 0x88);
+            }
+        }
+
+        alloc.deallocate(p1, Layout::from_size_align(256, 16).unwrap());
+        let ret = alloc.deallocate(p2, large_layout);
+        assert!(ret.is_some());
+    }
+
+    #[test]
+    fn test_bounded_operations_and_bytes_at_scales_1_8_32_128() {
+        for &num_extents in &[1, 8, 32, 128] {
+            let mut alloc = MetadataAllocatorCore::new();
+            let mut backings: Vec<Box<[u8]>> = Vec::new();
+
+            for i in 0..num_extents {
+                let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
+                let base = buf.as_mut_ptr() as u64;
+                alloc
+                    .admit_extent(
+                        base,
+                        buf.len(),
+                        if i == 0 {
+                            ExtentKind::Bootstrap
+                        } else {
+                            ExtentKind::Dynamic { token: i as u64 }
+                        },
+                    )
+                    .expect("admit extent");
+                backings.push(buf);
+            }
+
+            let diag = alloc.diagnostics();
+            assert_eq!(diag.active_extents, num_extents);
+            assert_eq!(diag.total_capacity_bytes, num_extents * 64 * 1024);
+
+            // Perform allocations across all admitted extents (one large chunk per extent)
+            let layout = Layout::from_size_align(48 * 1024, 16).unwrap();
+            let mut ptrs = Vec::new();
+            for _ in 0..num_extents {
+                let p = alloc.allocate(layout).expect("alloc scale point");
+                unsafe {
+                    core::ptr::write_bytes(p, 0xCC, 48 * 1024);
+                }
+                ptrs.push(p);
+            }
+
+            // Deallocate all and verify complete return of dynamic extents
+            let mut returned_count = 0;
+            for p in ptrs {
+                if let Some(ret) = alloc.deallocate(p, layout) {
+                    assert!(ret.token > 0);
+                    returned_count += 1;
+                }
+            }
+
+            if num_extents > 1 {
+                assert_eq!(
+                    returned_count,
+                    num_extents - 1,
+                    "all dynamic extents must be returned"
+                );
+                assert_eq!(alloc.diagnostics().active_extents, 1);
+            } else {
+                assert_eq!(returned_count, 0);
+                assert_eq!(alloc.diagnostics().active_extents, 1);
+            }
+        }
     }
 }

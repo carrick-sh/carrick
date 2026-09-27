@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1-5dacaf448aea3bd0)
+
+running 6 tests
+test alloc::tests::test_extent_admission_validation_and_overlap_rejection ... ok
+test alloc::tests::test_fragmentation_coalescing_and_reuse ... ok
+test alloc::tests::test_basic_allocation_and_free ... ok
+test alloc::tests::test_dynamic_growth_and_exact_once_return ... ok
+test alloc::tests::test_grant_refusal_preserves_state_and_allows_subsequent_retry ... ok
+test alloc::tests::test_bounded_operations_and_bytes_at_scales_1_8_32_128 ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.00s

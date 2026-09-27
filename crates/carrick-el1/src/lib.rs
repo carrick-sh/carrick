@@ -353,6 +353,14 @@ where
                 return Action::Served;
             }
         }
+        448 => {
+            let res = alloc::run_guest_allocator_test(frame.x[0], frame.x[1]);
+            frame.x[0] = res as u64;
+            if nr < 512 {
+                counters.served[nr].fetch_add(1, Ordering::Relaxed);
+            }
+            return Action::Served;
+        }
         _ => {}
     }
 

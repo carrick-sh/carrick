@@ -56,6 +56,45 @@ pub const EL1_CURRENT_TASKS_BASE: u64 = EL1_REGION_BASE + EL1_CURRENT_TASKS_OFFS
 /// Size of the per-vCPU current-task array area (1 MiB).
 pub const EL1_CURRENT_TASKS_SIZE: u64 = 0x10_0000;
 
+/// Byte offset of the EL1 bootstrap metadata allocator arena within the region.
+pub const EL1_BOOTSTRAP_METADATA_OFFSET: u64 = 0x70_0000;
+
+/// Base guest virtual address of the EL1 bootstrap metadata allocator arena.
+pub const EL1_BOOTSTRAP_METADATA_BASE: u64 = EL1_REGION_BASE + EL1_BOOTSTRAP_METADATA_OFFSET;
+
+/// Size of the EL1 bootstrap metadata allocator arena (9 MiB).
+pub const EL1_BOOTSTRAP_METADATA_SIZE: u64 = 0x90_0000;
+
+/// Base guest virtual address of the dynamic metadata grant aperture (64 MiB window).
+pub const EL1_DYNAMIC_METADATA_BASE: u64 = 0x2D_0800_0000;
+
+/// Total size of the dynamic metadata grant aperture (64 MiB).
+pub const EL1_DYNAMIC_METADATA_SIZE: u64 = 0x0400_0000;
+
+/// Operation code for requesting an extent grant from the host (HVC #6).
+pub const METADATA_GRANT_OP_ALLOC: u64 = 1;
+
+/// Operation code for returning an unused extent to the host (HVC #6).
+pub const METADATA_GRANT_OP_FREE: u64 = 2;
+
+/// Metadata grant hypercall outcome: successful extent allocation or return.
+pub const METADATA_GRANT_SUCCESS: u64 = 0;
+
+/// Metadata grant hypercall outcome: host denied allocation request.
+pub const METADATA_GRANT_ERR_DENIED: u64 = 1;
+
+/// Metadata grant hypercall outcome: invalid arguments or parameters.
+pub const METADATA_GRANT_ERR_INVALID: u64 = 2;
+
+/// Metadata grant hypercall outcome: extent not found in active grant registry.
+pub const METADATA_GRANT_ERR_NOT_FOUND: u64 = 3;
+
+/// Metadata grant hypercall outcome: extent overlaps existing allocation or region.
+pub const METADATA_GRANT_ERR_OVERLAP: u64 = 4;
+
+/// Metadata grant hypercall outcome: extent alignment violation.
+pub const METADATA_GRANT_ERR_ALIGNMENT: u64 = 5;
+
 /// Byte offset of the EL1 kernel heap within the region.
 pub const EL1_HEAP_OFFSET: u64 = 0x100_0000;
 
@@ -179,6 +218,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_STACKS_OFFSET,
         EL1_STACK_SIZE,
         EL1_CURRENT_TASKS_OFFSET,
+        EL1_BOOTSTRAP_METADATA_OFFSET,
+        EL1_BOOTSTRAP_METADATA_SIZE,
         EL1_OBJECT_TABLE_OFFSET,
         EL1_FD_MAP_OFFSET,
         EL1_OPEN_FILE_TABLE_OFFSET,
@@ -1047,7 +1088,10 @@ const _: () = assert!(
     EL1_STACKS_OFFSET + EL1_STACK_SLOTS * EL1_STACK_SIZE <= EL1_STACKS_OFFSET + EL1_STACKS_SIZE
 );
 const _: () = assert!(EL1_STACKS_OFFSET + EL1_STACKS_SIZE <= EL1_CURRENT_TASKS_OFFSET);
-const _: () = assert!(EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE <= EL1_HEAP_OFFSET);
+const _: () =
+    assert!(EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE <= EL1_BOOTSTRAP_METADATA_OFFSET);
+const _: () =
+    assert!(EL1_BOOTSTRAP_METADATA_OFFSET + EL1_BOOTSTRAP_METADATA_SIZE <= EL1_HEAP_OFFSET);
 const _: () = assert!(EL1_OBJECT_TABLE_OFFSET + EL1_OBJECT_TABLE_SIZE <= EL1_FD_MAP_OFFSET);
 const _: () = assert!(EL1_FD_MAP_OFFSET + EL1_FD_MAP_SIZE <= EL1_CACHE_OFFSET);
 const _: () = assert!(EL1_CACHE_OFFSET + EL1_CACHE_SIZE <= EL1_INOTIFY_TABLE_OFFSET);
