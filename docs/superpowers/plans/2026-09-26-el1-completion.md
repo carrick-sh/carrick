@@ -1125,7 +1125,7 @@ fault, access and inventory authentication remains intact.
 
 The signed three-scale witness is green. Both parent and child pass zero-fill,
 private write and post-rendezvous checks at 256, 1,024 and 4,096 pages. Host
-exits are 99, 102 and 119, yielding 0.0020 and 0.0028 exits per added page
+exits are 99, 107 and 113, yielding 0.0052 and 0.0010 exits per added page
 against the strict `<0.125` gate. The entitlement negative control passes and
 scoped cleanup is zero. This is the first measured impact closure inside
 checkpoint 2: the earlier 612/2,148/8,292 semantic-green result has become
