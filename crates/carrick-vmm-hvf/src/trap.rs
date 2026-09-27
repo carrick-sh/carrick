@@ -7447,9 +7447,11 @@ impl HvfInner {
     pub(crate) fn run_to_exit(
         vcpu: &mut applevisor::vcpu::Vcpu,
         mailbox: &mut MailboxBinding,
+        custody: &CarrierVmCustody,
+        vm_generation: Option<CarrierVmGeneration>,
     ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
         let mut kick_armed = false;
-        let exit = Self::run_to_exit_inner(vcpu, mailbox, &mut kick_armed);
+        let exit = Self::run_to_exit_inner(vcpu, mailbox, custody, vm_generation, &mut kick_armed);
         // A kick re-armed for an EL1 critical section is owed only until the
         // next surfaced exit, which is the host boundary it asked for. The
         // legacy IRQ line died with the run's return by itself; under the
@@ -7464,6 +7466,8 @@ impl HvfInner {
     fn run_to_exit_inner(
         vcpu: &mut applevisor::vcpu::Vcpu,
         mailbox: &mut MailboxBinding,
+        custody: &CarrierVmCustody,
+        vm_generation: Option<CarrierVmGeneration>,
         kick_armed: &mut bool,
     ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
         use applevisor::prelude::*;
@@ -7735,7 +7739,7 @@ impl HvfInner {
                 return Ok(Aarch64Exit::Kicked);
             }
             if carrick_hal::is_aarch64_hvc_metadata_grant(exception.syndrome) {
-                crate::metadata_grant::handle_metadata_grant_trap(vcpu)?;
+                crate::metadata_grant::handle_metadata_grant_trap(vcpu, custody, vm_generation)?;
                 continue;
             }
             // Maintenance completion is a control exit, not a syscall. It
