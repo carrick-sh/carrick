@@ -1,0 +1,5 @@
+first_slot=0 granted_bytes=1114112 next_slot=1 next_offset=524288
+
+thread 'main' (14700852) panicked at /tmp/el1-allocator-review2/slot-overlap.rs.txt:92:2:
+production slot policy proposes an overlapping second extent
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
