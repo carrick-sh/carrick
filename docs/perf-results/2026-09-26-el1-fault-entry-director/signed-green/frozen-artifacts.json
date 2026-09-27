@@ -1,0 +1,33 @@
+{
+  "header": {
+    "schema": "carrick.signed-embed-test.v1",
+    "record_type": "header",
+    "source_head": "0c30348a22c322e2ef528687a0e0994f4a5cab4a",
+    "package": "carrick-embed",
+    "arguments": [
+      "el1_memory_fault_entry_preserves_context",
+      "--exact",
+      "--nocapture"
+    ],
+    "requested_test_filter": "el1_memory_fault_entry_preserves_context",
+    "carrick_run_id": "el1-fault-entry-green-20260926",
+    "enabled_features": []
+  },
+  "receipt_sha256": "26b87e6add0e221b27da978ad8c03e4e8e377268b6caf016d4f0549982deeab5",
+  "artifacts": [
+    {
+      "schema": "carrick.signed-embed-test.v1",
+      "record_type": "executable",
+      "executable_id": "8fc03453e05af357039d6273b6ff6c8ea3ac0be00183d340d34a7f104f16f1de:/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-ba795739d7a1a0f3",
+      "canonical_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_sched-ba795739d7a1a0f3",
+      "sha256": "8fc03453e05af357039d6273b6ff6c8ea3ac0be00183d340d34a7f104f16f1de",
+      "cdhash": "dff0c9ec4b582eb8b7614ad72bec98003c76a4dc",
+      "lc_uuid": "FA6A2FE5-21D2-3CAC-9B12-09F94649A4D5",
+      "entitlement_digest": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "entitlement_present": true,
+      "dof_carrick_present": true,
+      "enabled_features": [],
+      "frozen_path": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/fault-entry-final/green-frozen/8fc03453e05af357039d6273b6ff6c8ea3ac0be00183d340d34a7f104f16f1de-el1_sched-ba795739d7a1a0f3"
+    }
+  ]
+}

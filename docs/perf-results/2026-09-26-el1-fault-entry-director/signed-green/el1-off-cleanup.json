@@ -1,0 +1,14 @@
+[
+  {
+    "run_id": "el1-fault-entry-el1-off-20260926",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id el1-fault-entry-el1-off-20260926) = 0\n",
+    "stderr": ""
+  },
+  {
+    "run_id": "el1-fault-entry-el1-off-20260926-cli",
+    "exit_code": 0,
+    "stdout": "remaining carrick procs (run-id el1-fault-entry-el1-off-20260926-cli) = 0\n",
+    "stderr": ""
+  }
+]

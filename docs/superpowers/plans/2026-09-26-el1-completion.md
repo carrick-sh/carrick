@@ -591,3 +591,12 @@ and exact native-matching fixture hash are retained in the director signed-red
 receipt. Merged reviewed worker `a6fe8d4af` as `0c30348a2` and started signed
 green using the same fixture. The worker converged in three review rounds;
 EL1-off/GIC-off controls and higher promotion gates remain outstanding.
+
+2026-09-26: signed fault-entry green completed on `0c30348a2` using the
+exact red/native fixture. The tested signed executable was frozen; both
+EL1-off and GIC-off controls pass on that same artifact, with negative
+entitlement and scoped zero-process cleanup evidence preserved under
+`docs/perf-results/2026-09-26-el1-fault-entry-director/signed-green/`.
+This closes focused fault-entry acceptance, not first-touch service or full
+promotion. Integrated CI is the next check; the broad EL1 gate still includes
+the deliberately red anonymous-first-touch contract.
