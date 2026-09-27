@@ -86,7 +86,7 @@ pub mod spaces;
 pub use occupancy::{
     AddressSpaceKey, EXECUTION_SLOTS, ExecutionSlot, HOST_EXECUTION_SLOTS, Occupancy, SlotBusy,
 };
-pub use spaces::{ADDRESS_SPACES, AddressSpaces, GATE_CLOSED, SpaceGrant, SpaceIndex};
+pub use spaces::{ADDRESS_SPACES, AddressSpaces, GATE_CLOSED, SpaceEditor, SpaceGrant, SpaceIndex};
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};

@@ -28,9 +28,11 @@
 //! an empty entry and skips freed ones, and a key is never published again
 //! after its entry is freed (the MM is gone), so a reader that re-checks the
 //! key after the gate knows the gate was that MM's. All-zero bytes are an
-//! empty table. Only the host mutates entries, serialized by its own lock;
-//! EL1 only reads them and records COW coverage.
+//! empty table. Only the host publishes/frees entries, serialized by its own
+//! lock; EL1 reads them, records COW coverage, and claims the exact entry's
+//! single page-table editor word before mutating live descriptors.
 
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Entries in the table: the address spaces the host has published at once.
@@ -57,6 +59,9 @@ pub struct SpaceEntry {
     cow_published: AtomicU64,
     /// Publications an EL1 broadcast invalidation covered.
     cow_covered: AtomicU64,
+    /// The exact guest EL1 page-table editor, or zero. A host pause raises
+    /// `gate` and waits for this word to clear before mutating the same tables.
+    active_editor: AtomicU64,
 }
 
 /// The table, in the shared EL1 region inside the zone.
@@ -97,6 +102,26 @@ pub struct SpaceGrant {
     pub cow_owed: Option<u64>,
 }
 
+/// Exclusive guest EL1 mutation ownership for one published address space.
+/// Dropping the guard acknowledges a host pause or retirement waiting after
+/// it closed the entry's gate.
+pub struct SpaceEditor<'a> {
+    entry: &'a SpaceEntry,
+    owner: NonZeroU64,
+}
+
+impl Drop for SpaceEditor<'_> {
+    fn drop(&mut self) {
+        let released = self.entry.active_editor.compare_exchange(
+            self.owner.get(),
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        debug_assert_eq!(released, Ok(self.owner.get()));
+    }
+}
+
 impl Default for AddressSpaces {
     fn default() -> Self {
         Self::new()
@@ -115,6 +140,7 @@ impl AddressSpaces {
                     gate: AtomicU64::new(0),
                     cow_published: AtomicU64::new(0),
                     cow_covered: AtomicU64::new(0),
+                    active_editor: AtomicU64::new(0),
                 }
             }; ADDRESS_SPACES],
         }
@@ -178,6 +204,7 @@ impl AddressSpaces {
             entry.ttbr1.store(ttbr1, Ordering::Relaxed);
             entry.cow_published.store(0, Ordering::Relaxed);
             entry.cow_covered.store(0, Ordering::Relaxed);
+            entry.active_editor.store(0, Ordering::Relaxed);
             // The key last: a reader that finds it sees the rest.
             entry.key.store(key, Ordering::SeqCst);
             return SpaceIndex::from_index(index);
@@ -201,10 +228,29 @@ impl AddressSpaces {
             .fetch_or(GATE_CLOSED, Ordering::SeqCst);
     }
 
+    /// Host: permanently close the entry and wait for its admitted guest
+    /// editor before retiring the roots or reusing the entry.
+    pub fn close_and_wait_for_editor(&self, index: SpaceIndex, mut wait: impl FnMut()) {
+        self.close(index);
+        while self.entry(index).active_editor.load(Ordering::SeqCst) != 0 {
+            wait();
+        }
+    }
+
     /// Host: a page-table pause of the space began; EL1 may not install it
     /// until [`Self::lower`]. Before the pause scans the occupancy table.
     pub fn raise(&self, index: SpaceIndex) {
         self.entry(index).gate.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Host: raise the page-table gate and wait until an already admitted
+    /// guest editor acknowledges completion. SeqCst ordering makes the race
+    /// exhaustive: the host sees the editor, or the guest sees the gate.
+    pub fn raise_and_wait_for_editor(&self, index: SpaceIndex, mut wait: impl FnMut()) {
+        self.raise(index);
+        while self.entry(index).active_editor.load(Ordering::SeqCst) != 0 {
+            wait();
+        }
     }
 
     /// Host: the pause [`Self::raise`] counted ended.
@@ -225,6 +271,7 @@ impl AddressSpaces {
     /// Host: free a closed entry whose space runs nowhere.
     pub fn free(&self, index: SpaceIndex) {
         let entry = self.entry(index);
+        debug_assert_eq!(entry.active_editor.load(Ordering::SeqCst), 0);
         entry.key.store(FREED, Ordering::SeqCst);
         entry.ttbr0.store(0, Ordering::Relaxed);
         entry.ttbr1.store(0, Ordering::Relaxed);
@@ -270,11 +317,45 @@ impl AddressSpaces {
             .cow_covered
             .fetch_max(published, Ordering::AcqRel);
     }
+
+    /// Guest EL1: try to become the only page-table editor for the exact MM.
+    /// Ownership is visible before the gate is re-read, so a racing host pause
+    /// either waits for this guard or makes this attempt release and fail.
+    pub fn try_begin_edit(
+        &self,
+        index: SpaceIndex,
+        key: u64,
+        owner: NonZeroU64,
+    ) -> Option<SpaceEditor<'_>> {
+        let entry = self.entry(index);
+        entry
+            .active_editor
+            .compare_exchange(0, owner.get(), Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        if entry.gate.load(Ordering::SeqCst) != 0 || entry.key.load(Ordering::SeqCst) != key {
+            let released = entry.active_editor.compare_exchange(
+                owner.get(),
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            debug_assert_eq!(released, Ok(owner.get()));
+            return None;
+        }
+        Some(SpaceEditor { entry, owner })
+    }
+
+    /// Exact active guest editor (tests and diagnostics).
+    pub fn active_editor(&self, index: SpaceIndex) -> Option<NonZeroU64> {
+        NonZeroU64::new(self.entry(index).active_editor.load(Ordering::SeqCst))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::num::NonZeroU64;
+    use std::sync::{Arc, mpsc};
 
     #[test]
     fn a_published_space_is_granted_only_while_its_gate_is_open() {
@@ -336,5 +417,96 @@ mod tests {
         assert_eq!(spaces.grant(index, 3).unwrap().cow_owed, Some(3));
         spaces.cover_cow(index, 3);
         assert_eq!(spaces.grant(index, 3).unwrap().cow_owed, None);
+    }
+
+    #[test]
+    fn one_exact_guest_editor_owns_a_space_at_a_time() {
+        let spaces = AddressSpaces::new();
+        let index = spaces.publish_closed(7, 0x1_0000, 0x1_0000).unwrap();
+        spaces.open(index);
+
+        let owner = NonZeroU64::new(11).unwrap();
+        let editor = spaces
+            .try_begin_edit(index, 7, owner)
+            .expect("open exact space admits its first editor");
+        assert_eq!(spaces.active_editor(index), Some(owner));
+        assert!(
+            spaces
+                .try_begin_edit(index, 7, NonZeroU64::new(12).unwrap())
+                .is_none(),
+            "a second editor cannot mutate the same live tables"
+        );
+        assert!(
+            spaces.try_begin_edit(index, 8, owner).is_none(),
+            "the editor claim is bound to the exact MM key"
+        );
+
+        drop(editor);
+        assert_eq!(spaces.active_editor(index), None);
+        assert!(spaces.try_begin_edit(index, 7, owner).is_some());
+    }
+
+    #[test]
+    fn a_host_pause_closes_the_gate_before_waiting_for_the_guest_editor() {
+        let spaces = Arc::new(AddressSpaces::new());
+        let index = spaces.publish_closed(9, 0x2_0000, 0x2_0000).unwrap();
+        spaces.open(index);
+        let editor = spaces
+            .try_begin_edit(index, 9, NonZeroU64::new(21).unwrap())
+            .expect("guest editor enters before the pause");
+
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let host_spaces = Arc::clone(&spaces);
+        let host = std::thread::spawn(move || {
+            let mut reported = false;
+            host_spaces.raise_and_wait_for_editor(index, || {
+                if !reported {
+                    waiting_tx.send(()).unwrap();
+                    reported = true;
+                }
+                std::thread::yield_now();
+            });
+            done_tx.send(()).unwrap();
+        });
+
+        waiting_rx.recv().unwrap();
+        assert_ne!(spaces.gate(index), 0, "the gate closes before the wait");
+        assert!(
+            spaces
+                .try_begin_edit(index, 9, NonZeroU64::new(22).unwrap())
+                .is_none(),
+            "no editor may enter behind the raised host pause"
+        );
+        assert!(
+            done_rx.try_recv().is_err(),
+            "host still waits for the owner"
+        );
+
+        drop(editor);
+        done_rx.recv().unwrap();
+        host.join().unwrap();
+        assert_eq!(spaces.active_editor(index), None);
+        spaces.lower(index);
+        assert!(
+            spaces
+                .try_begin_edit(index, 9, NonZeroU64::new(23).unwrap())
+                .is_some(),
+            "ending the pause admits the next exact editor"
+        );
+    }
+
+    #[test]
+    fn a_closed_space_refuses_an_editor_without_leaking_the_claim() {
+        let spaces = AddressSpaces::new();
+        let index = spaces.publish_closed(13, 0x3_0000, 0x3_0000).unwrap();
+        let owner = NonZeroU64::new(31).unwrap();
+
+        assert!(spaces.try_begin_edit(index, 13, owner).is_none());
+        assert_eq!(spaces.active_editor(index), None);
+        spaces.open(index);
+        spaces.close(index);
+        assert!(spaces.try_begin_edit(index, 13, owner).is_none());
+        assert_eq!(spaces.active_editor(index), None);
     }
 }

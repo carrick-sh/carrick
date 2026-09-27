@@ -558,7 +558,9 @@ struct SpaceGate {
 impl carrick_thread::fork_quiesce::FenceMirror for SpaceGate {
     fn raise(&self) {
         if self.tables.live() {
-            self.tables.spaces.raise(self.index);
+            self.tables
+                .spaces
+                .raise_and_wait_for_editor(self.index, std::thread::yield_now);
         }
     }
 
@@ -655,7 +657,9 @@ impl AddressSpacePublication {
     /// No EL1 install of the space from now on (its ASID starts retiring).
     pub fn close(&self) {
         if self.tables.live() {
-            self.tables.spaces.close(self.index);
+            self.tables
+                .spaces
+                .close_and_wait_for_editor(self.index, std::thread::yield_now);
         }
     }
 
@@ -692,7 +696,9 @@ impl Drop for AddressSpacePublication {
         if !self.tables.live() {
             return;
         }
-        self.tables.spaces.close(self.index);
+        self.tables
+            .spaces
+            .close_and_wait_for_editor(self.index, std::thread::yield_now);
         drain_space(self.tables.occupancy, self.mm);
         let _serial = SPACES_LOCK.lock();
         self.tables.spaces.free(self.index);

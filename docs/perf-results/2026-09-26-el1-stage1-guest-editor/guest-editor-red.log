@@ -1,0 +1,140 @@
+   Compiling carrick-sched-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-sched-core)
+error[E0599]: no method named `try_begin_edit` found for struct `spaces::AddressSpaces` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:351:14
+    |
+ 64 |   pub struct AddressSpaces {
+    |   ------------------------ method `try_begin_edit` not found for this struct
+...
+350 |           let editor = spaces
+    |  ______________________-
+351 | |             .try_begin_edit(index, 7, owner)
+    | |             -^^^^^^^^^^^^^^ method not found in `spaces::AddressSpaces`
+    | |_____________|
+    |
+
+error[E0599]: no method named `active_editor` found for struct `spaces::AddressSpaces` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:353:27
+    |
+ 64 | pub struct AddressSpaces {
+    | ------------------------ method `active_editor` not found for this struct
+...
+353 |         assert_eq!(spaces.active_editor(index), Some(owner));
+    |                           ^^^^^^^^^^^^^ method not found in `spaces::AddressSpaces`
+
+error[E0599]: no method named `try_begin_edit` found for struct `spaces::AddressSpaces` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:356:18
+    |
+ 64 |   pub struct AddressSpaces {
+    |   ------------------------ method `try_begin_edit` not found for this struct
+...
+355 | /             spaces
+356 | |                 .try_begin_edit(index, 7, NonZeroU64::new(12).unwrap())
+    | |                 -^^^^^^^^^^^^^^ method not found in `spaces::AddressSpaces`
+    | |_________________|
+    |
+
+error[E0599]: no method named `try_begin_edit` found for struct `spaces::AddressSpaces` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:361:20
+    |
+ 64 | pub struct AddressSpaces {
+    | ------------------------ method `try_begin_edit` not found for this struct
+...
+361 |             spaces.try_begin_edit(index, 8, owner).is_none(),
+    |                    ^^^^^^^^^^^^^^ method not found in `spaces::AddressSpaces`
+
+error[E0599]: no method named `active_editor` found for struct `spaces::AddressSpaces` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:366:27
+    |
+ 64 | pub struct AddressSpaces {
+    | ------------------------ method `active_editor` not found for this struct
+...
+366 |         assert_eq!(spaces.active_editor(index), None);
+    |                           ^^^^^^^^^^^^^ method not found in `spaces::AddressSpaces`
+
+error[E0599]: no method named `try_begin_edit` found for struct `spaces::AddressSpaces` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:367:24
+    |
+ 64 | pub struct AddressSpaces {
+    | ------------------------ method `try_begin_edit` not found for this struct
+...
+367 |         assert!(spaces.try_begin_edit(index, 7, owner).is_some());
+    |                        ^^^^^^^^^^^^^^ method not found in `spaces::AddressSpaces`
+
+error[E0599]: no method named `try_begin_edit` found for struct `Arc<spaces::AddressSpaces>` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:376:14
+    |
+375 |           let editor = spaces
+    |  ______________________-
+376 | |             .try_begin_edit(index, 9, NonZeroU64::new(21).unwrap())
+    | |             -^^^^^^^^^^^^^^ method not found in `Arc<spaces::AddressSpaces>`
+    | |_____________|
+    |
+
+error[E0599]: no method named `raise_and_wait_for_editor` found for struct `Arc<spaces::AddressSpaces>` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:384:25
+    |
+384 |             host_spaces.raise_and_wait_for_editor(index, || {
+    |             ------------^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `Arc<spaces::AddressSpaces>`
+
+error[E0599]: no method named `try_begin_edit` found for struct `Arc<spaces::AddressSpaces>` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:398:18
+    |
+397 | /             spaces
+398 | |                 .try_begin_edit(index, 9, NonZeroU64::new(22).unwrap())
+    | |                 -^^^^^^^^^^^^^^ method not found in `Arc<spaces::AddressSpaces>`
+    | |_________________|
+    |
+
+error[E0599]: no method named `active_editor` found for struct `Arc<spaces::AddressSpaces>` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:407:27
+    |
+407 |         assert_eq!(spaces.active_editor(index), None);
+    |                           ^^^^^^^^^^^^^ method not found in `Arc<spaces::AddressSpaces>`
+
+error[E0599]: no method named `try_begin_edit` found for struct `Arc<spaces::AddressSpaces>` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:411:18
+    |
+410 | /             spaces
+411 | |                 .try_begin_edit(index, 9, NonZeroU64::new(23).unwrap())
+    | |                 -^^^^^^^^^^^^^^ method not found in `Arc<spaces::AddressSpaces>`
+    | |_________________|
+    |
+
+error[E0599]: no method named `try_begin_edit` found for struct `spaces::AddressSpaces` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:423:24
+    |
+ 64 | pub struct AddressSpaces {
+    | ------------------------ method `try_begin_edit` not found for this struct
+...
+423 |         assert!(spaces.try_begin_edit(index, 13, owner).is_none());
+    |                        ^^^^^^^^^^^^^^ method not found in `spaces::AddressSpaces`
+
+error[E0599]: no method named `active_editor` found for struct `spaces::AddressSpaces` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:424:27
+    |
+ 64 | pub struct AddressSpaces {
+    | ------------------------ method `active_editor` not found for this struct
+...
+424 |         assert_eq!(spaces.active_editor(index), None);
+    |                           ^^^^^^^^^^^^^ method not found in `spaces::AddressSpaces`
+
+error[E0599]: no method named `try_begin_edit` found for struct `spaces::AddressSpaces` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:427:24
+    |
+ 64 | pub struct AddressSpaces {
+    | ------------------------ method `try_begin_edit` not found for this struct
+...
+427 |         assert!(spaces.try_begin_edit(index, 13, owner).is_none());
+    |                        ^^^^^^^^^^^^^^ method not found in `spaces::AddressSpaces`
+
+error[E0599]: no method named `active_editor` found for struct `spaces::AddressSpaces` in the current scope
+   --> crates/carrick-sched-core/src/spaces.rs:428:27
+    |
+ 64 | pub struct AddressSpaces {
+    | ------------------------ method `active_editor` not found for this struct
+...
+428 |         assert_eq!(spaces.active_editor(index), None);
+    |                           ^^^^^^^^^^^^^ method not found in `spaces::AddressSpaces`
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `carrick-sched-core` (lib test) due to 15 previous errors

@@ -78,7 +78,11 @@ contracts = ["kernel.fork.filetable", "kernel.fork.mappings"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration", "kernel.mm.backing-maintenance-lookup", "kernel.el1.gic", "kernel.mm.metadata-refusal"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration", "kernel.mm.backing-maintenance-lookup", "kernel.el1.gic", "kernel.mm.metadata-refusal", "kernel.el1.stage1-publication"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs"
+contracts = ["kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-mem/src/vdso.rs"
@@ -102,7 +106,7 @@ contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel
 
 [[surfaces]]
 path = "crates/carrick-mmu-core/src/aarch64.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.el1.gic", "kernel.mm.metadata-refusal"]
+contracts = ["kernel.fork.stage1-image", "kernel.el1.gic", "kernel.mm.metadata-refusal", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/quiesce.rs"
@@ -405,11 +409,11 @@ contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.mm.address-spac
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/mm_occupancy.rs"
-contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.mm.address-space-occupancy", "kernel.mm.executor-admission", "kernel.el1.address-space-switch"]
+contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.mm.address-space-occupancy", "kernel.mm.executor-admission", "kernel.el1.address-space-switch", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/mm_occupancy/tests.rs"
-contracts = ["kernel.mm.address-space-occupancy", "kernel.mm.executor-admission", "kernel.el1.address-space-switch"]
+contracts = ["kernel.mm.address-space-occupancy", "kernel.mm.executor-admission", "kernel.el1.address-space-switch", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/occupancy.rs"
@@ -417,7 +421,7 @@ contracts = ["kernel.mm.address-space-occupancy", "kernel.el1.address-space-swit
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/spaces.rs"
-contracts = ["kernel.el1.address-space-switch"]
+contracts = ["kernel.el1.address-space-switch", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/threaded.rs"
@@ -501,7 +505,7 @@ contracts = ["kernel.el1.fault-entry"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/fault.rs"
-contracts = ["kernel.el1.fault-entry"]
+contracts = ["kernel.el1.fault-entry", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/alloc.rs"
