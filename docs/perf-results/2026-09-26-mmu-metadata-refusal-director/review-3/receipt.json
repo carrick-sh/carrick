@@ -1,0 +1,13 @@
+{
+  "reviewed_source": "f27a3f644e92fd1de2d4cdf9a52c07be45daa9a5",
+  "accepted": false,
+  "files": {
+    "0.log": "4b350e1724d9a25a78fb55f068d9977b9bc60b378a6dfb5b56f51d11a81d36f1",
+    "1.log": "22e0df986057b9ba5be07526ac5fb348862a3dedef42108383cc3e088acbb889",
+    "2.log": "59639588a6f1826f129cbcd121edc07279dab94786f5fa5bde6b3439b2e845cc",
+    "3.log": "a9ca737b7fcfc5ea9d6b47ef54cca6f0b52c28f2fc8b31cb929aa23a7a74478e",
+    "4.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "findings.md": "50b99887314a3ee9779116cede4a270696629217bb50c19e298bd7f50746f79f",
+    "results.json": "ef6254c1f89ede746897d72b67115f6c0698442f831a0d0dba8558ec6215d4a7"
+  }
+}
