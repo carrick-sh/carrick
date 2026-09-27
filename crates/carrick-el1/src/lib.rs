@@ -353,12 +353,12 @@ where
                 return Action::Served;
             }
         }
-        448 => {
-            let res = alloc::run_guest_allocator_test(frame.x[0], frame.x[1]);
-            frame.x[0] = res as u64;
-            if nr < 512 {
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-            }
+        _ if (nr as u64) == carrick_el1_abi::SYS_CARRICK_EL1_CONTROL => {
+            let res = match frame.x[0] {
+                1 => alloc::run_guest_allocator_test(frame.x[1], frame.x[2]),
+                _ => 1,
+            };
+            frame.x[0] = res;
             return Action::Served;
         }
         _ => {}

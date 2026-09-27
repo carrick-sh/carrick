@@ -495,8 +495,11 @@ pub const fn is_carrick_kernel_only_range(start: u64, end: u64) -> bool {
     }
     let hole_end = LINUX_KERNEL_REGION_BASE + LINUX_KERNEL_REGION_SIZE;
     let el1_end = LINUX_EL1_KERNEL_BASE + LINUX_EL1_KERNEL_SIZE;
+    let dynamic_metadata_end =
+        carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE;
     (start >= LINUX_KERNEL_REGION_BASE && end <= hole_end)
         || (start >= LINUX_EL1_KERNEL_BASE && end <= el1_end)
+        || (start >= carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE && end <= dynamic_metadata_end)
 }
 
 /// Is `va` inside carrick's EL1 trap trampoline (the VBAR_EL1 vector table)?
@@ -3627,6 +3630,16 @@ pub fn stage1_carrier_maintenance_page_tables() -> Vec<u8> {
     let el1_first = ((LINUX_EL1_KERNEL_BASE - LINUX_KERNEL_REGION_BASE) >> 21) as usize;
     let el1_blocks = (LINUX_EL1_KERNEL_SIZE >> 21) as usize;
     for index in el1_first..el1_first + el1_blocks {
+        let pa = LINUX_KERNEL_REGION_BASE + ((index as u64) << 21);
+        let desc = (pa & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS | NON_GLOBAL;
+        let off = l2_off + index * 8;
+        bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
+    }
+
+    let dyn_first =
+        ((carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE - LINUX_KERNEL_REGION_BASE) >> 21) as usize;
+    let dyn_blocks = (carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE >> 21) as usize;
+    for index in dyn_first..dyn_first + dyn_blocks {
         let pa = LINUX_KERNEL_REGION_BASE + ((index as u64) << 21);
         let desc = (pa & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS | NON_GLOBAL;
         let off = l2_off + index * 8;
