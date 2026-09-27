@@ -757,3 +757,12 @@ bounds are incomplete. Documentation claims absent footer/counter structures.
 Integration is withheld. Same worker received review round1 (turn2), with
 all evidence under el1-elastic-metadata-director/review-1/. No signed allocator
 acceptance is claimed and no later goal stage is removed from scope.
+
+2026-09-26: allocator candidate dc2b83706 passes all eight independent host
+checks and fixes the original alignment/grant-sizing reds. Acceptance remains
+withheld: standalone fixture cross-build fails an undeclared dependency; a
+real host slot-policy screen proposes overlapping extents for >512KiB grants;
+bootstrap initialization, process-root mapping, token/register ABI, owner
+lifetime and denial-phase ordering remain incomplete. Evidence is under
+el1-elastic-metadata-director/review-2/. Same worker received review round2
+(turn3); one review round remains. No signed allocator candidate was run.

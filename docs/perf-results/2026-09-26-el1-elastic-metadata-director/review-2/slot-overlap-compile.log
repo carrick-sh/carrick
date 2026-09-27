@@ -1,0 +1,40 @@
+warning: fields `host_ptr`, `layout`, `size`, and `token` are never read
+  --> /tmp/el1-allocator-review2/slot-overlap.rs.txt:15:5
+   |
+14 | struct GrantedSlotRecord {
+   |        ----------------- fields in this struct
+15 |     host_ptr: *mut u8,
+   |     ^^^^^^^^
+16 |     layout: std::alloc::Layout,
+   |     ^^^^^^
+17 |     size: usize,
+   |     ^^^^
+18 |     token: u64,
+   |     ^^^^^
+   |
+   = note: `GrantedSlotRecord` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `slots` is never read
+  --> /tmp/el1-allocator-review2/slot-overlap.rs.txt:28:5
+   |
+26 | struct HostApertureState {
+   |        ----------------- field in this struct
+27 |     occupied_bitmap: [u64; 2],
+28 |     slots: [Option<GrantedSlotRecord>; MAX_DYNAMIC_EXTENT_SLOTS],
+   |     ^^^^^
+
+warning: methods `clear_slot_occupied` and `is_slot_occupied` are never used
+  --> /tmp/el1-allocator-review2/slot-overlap.rs.txt:63:8
+   |
+31 | impl HostApertureState {
+   | ---------------------- methods in this implementation
+...
+63 |     fn clear_slot_occupied(&mut self, slot: usize) {
+   |        ^^^^^^^^^^^^^^^^^^^
+...
+71 |     fn is_slot_occupied(&self, slot: usize) -> bool {
+   |        ^^^^^^^^^^^^^^^^
+
+warning: 3 warnings emitted
+
