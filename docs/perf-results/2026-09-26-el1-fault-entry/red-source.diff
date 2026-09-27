@@ -1,0 +1,14 @@
+diff --git a/crates/carrick-el1/src/lib.rs b/crates/carrick-el1/src/lib.rs
+index 3d0c3e00d..6c856c4a5 100644
+--- a/crates/carrick-el1/src/lib.rs
++++ b/crates/carrick-el1/src/lib.rs
+@@ -111,9 +111,6 @@ pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
+     if frame.esr == 0 {
+         return dispatch_irq(frame, counters);
+     }
+-    if ((frame.esr >> 26) & 0x3F) == 0x24 {
+-        return dispatch_fault(frame, counters);
+-    }
+     dispatch_syscall(frame, counters)
+ }
+ 

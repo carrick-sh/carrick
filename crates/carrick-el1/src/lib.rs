@@ -6,10 +6,13 @@
 #![cfg_attr(target_os = "none", no_std)]
 
 pub mod alloc;
+pub mod fault;
 pub mod file;
 pub mod inotify;
 pub mod lock;
 pub mod sched;
+
+pub use fault::dispatch_fault;
 
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
@@ -101,6 +104,17 @@ pub fn dispatch_irq(frame: &mut TrapFrame, counters: &Counters) -> Action {
         let _ = (frame, counters);
         Action::Forward
     }
+}
+
+/// Unified entry dispatch (interrupts, lower-EL data aborts, and syscalls).
+pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
+    if frame.esr == 0 {
+        return dispatch_irq(frame, counters);
+    }
+    if ((frame.esr >> 26) & 0x3F) == 0x24 {
+        return dispatch_fault(frame, counters);
+    }
+    dispatch_syscall(frame, counters)
 }
 
 /// [`dispatch_irq`] with explicitly supplied tables (EL1 and host tests).
@@ -1315,5 +1329,61 @@ mod tests {
         assert_eq!(action, Action::Forward);
         assert_eq!(counters.forwarded[27].load(Ordering::Relaxed), 1);
         assert_eq!(counters.served[27].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_dispatch_entry_routes_fault_with_high_bits_and_arbitrary_x8() {
+        let counters = Counters::default();
+        let mut frame = TrapFrame {
+            esr: (0xDEAD_BEEF_u64 << 32) | (0x24 << 26) | (1 << 25) | 0x47,
+            far: 0x1000_3000,
+            x: {
+                let mut x = [0u64; 31];
+                x[8] = 172; // SYS_getpid
+                x
+            },
+            ..TrapFrame::default()
+        };
+
+        let action = dispatch_entry(&mut frame, &counters);
+        assert_eq!(action, Action::Forward);
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
+        // Arbitrary x8 is not treated as a syscall
+        assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 0);
+        assert_eq!(counters.served[172].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_dispatch_entry_routes_irq() {
+        let counters = Counters::default();
+        let mut frame = TrapFrame {
+            esr: 0,
+            ..TrapFrame::default()
+        };
+
+        let action = dispatch_entry(&mut frame, &counters);
+        assert_eq!(action, Action::Forward);
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_dispatch_entry_routes_syscall() {
+        let counters = Counters::default();
+        let mut frame = TrapFrame {
+            esr: (0xCAFE_0000_u64 << 32) | (0x15 << 26) | (1 << 25), // SVC64
+            far: 0,
+            x: {
+                let mut x = [0u64; 31];
+                x[8] = 172; // SYS_getpid
+                x
+            },
+            ..TrapFrame::default()
+        };
+
+        let action = dispatch_entry(&mut frame, &counters);
+        assert_eq!(action, Action::Forward);
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.served[172].load(Ordering::Relaxed), 0);
     }
 }

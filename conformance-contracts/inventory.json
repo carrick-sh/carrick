@@ -3078,6 +3078,7 @@
       "contracts": [
         "kernel.el1.address-space-switch",
         "kernel.el1.anonymous-first-touch",
+        "kernel.el1.fault-entry",
         "kernel.el1.zone-entry-at-open",
         "kernel.fork.mappings",
         "kernel.mm.address-space-occupancy",
@@ -3138,6 +3139,7 @@
       "authority": "hybrid",
       "contracts": [
         "kernel.el1.address-space-switch",
+        "kernel.el1.fault-entry",
         "kernel.mm.address-space-occupancy",
         "kernel.mm.current-read-reuse",
         "kernel.mm.native-data-activation",
