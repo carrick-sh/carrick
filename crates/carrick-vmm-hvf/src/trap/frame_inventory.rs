@@ -580,6 +580,16 @@ impl CowArmedRanges {
 
     pub(crate) fn disarm(&mut self, span: CowArmedSpan) {
         let span_end = span.va.saturating_add(span.len as u64);
+        // Ranges may overlap (a page arm inside a compound arm), so there is no
+        // order to search; but when none intersects the span the rebuild below
+        // is the identity, and it runs once per span on every munmap.
+        if !self
+            .ranges
+            .iter()
+            .any(|range| range.va < span_end && span.va < range.va.saturating_add(range.len as u64))
+        {
+            return;
+        }
         let mut replacement = Vec::with_capacity(self.ranges.len().saturating_add(1));
         for range in self.ranges.drain(..) {
             let range_end = range.va.saturating_add(range.len as u64);

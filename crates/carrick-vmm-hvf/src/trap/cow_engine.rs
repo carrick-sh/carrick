@@ -1323,7 +1323,13 @@ impl HvfVmState {
             return;
         };
         let mut receipts = self.cow_deferred_publications.lock();
-        if receipts.is_empty() {
+        // Every munmap and repoint reaches here. When no receipt names the
+        // range the rebuild below would reproduce the same vector in the same
+        // order, so skip its allocation and moves.
+        if !receipts
+            .iter()
+            .any(|receipt| receipt.va < end && va < receipt.va.saturating_add(receipt.len as u64))
+        {
             return;
         }
         let mut remaining = Vec::with_capacity(receipts.len());
@@ -5616,6 +5622,20 @@ impl HvfTaskState {
         &mut self,
         manager: &carrick_mmu_core::aarch64::PageTableManager,
     ) -> Result<(), TrapError> {
+        // Called after every descriptor-changing stage-1 edit, and almost every
+        // edit adds no arena. The root row lookup below scans every mapping row
+        // of the task, so answer "nothing new" from the owner map first.
+        const TWO_MIB: usize = 2 * 1024 * 1024;
+        let unpublished = {
+            let owners = self.mm_access.structural_owners.read();
+            manager
+                .extension_arena_bases()
+                .into_iter()
+                .any(|base| !owners.contains_key(&(base, TWO_MIB)))
+        };
+        if !unpublished {
+            return Ok(());
+        }
         let root_perms = self
             .mm_root_slot
             .and_then(|(root_base, _)| {
