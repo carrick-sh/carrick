@@ -302,6 +302,46 @@ the next planned memory slice, before broader mmap-family ownership and fork
 COW. The existing retirement trace is closed and is not a reason to continue
 instrumenting that path.
 
+### Accepted anonymous permission boundary (2026-09-27)
+
+The permission vertical landed in `f1bff2ec4`. Exact complete-range resident
+private-anonymous `mprotect` now runs under the guest's exact-MM editor across
+tagged L1/L2 blocks and L3 leaves. It validates the whole range and permission
+ceiling before the first store, preserves output identity, invalidates the
+ASID, and refuses partial coarse blocks or permission widening to the existing
+host fallback. Permission faults no longer request first-touch grants, and host
+syscall-buffer access consults the same live permission descriptor.
+
+Two apparent detours were direct authority bugs in this slice. A host unmap
+from an older shadow erased an adjacent guest-grown live subtree; the host
+editor now adopts the complete reachable table pages for its exact range before
+mutation. Larger fixture ranges retained complete 2 MiB terminals; the
+allocation-free guest editor now handles those terminals without splitting
+them. Red-first MMU tests preserve both failures. The COW winner path permits
+shadow/live divergence only for an exact tagged live leaf and retains the
+fail-closed parity rule for every untagged mapping.
+
+The exact committed signed witness is green. At 256/1,024/4,096 pages it uses
+57/59/65 exits and serves all 16 target transitions in EL1. The incremental
+slopes are 0.0007 and 0.0005 exits per added page per round against the strict
+0.125 gate. A 2-to-18-round control allocates no additional frames or bytes and
+measures four exits per round for the two denied-access signal cycles. Every
+semantic row preserves bytes, reports `SEGV_ACCERR`, returns every initially
+granted byte and unmaps successfully. One fixed signal-stack guard `mprotect`
+still forwards per process. The unentitled negative control passes, scoped
+cleanup is zero, and the same-source 256/1,024/4,096 fixture passes on the pinned
+native arm64 Docker oracle. Exact receipts are in
+[the permission acceptance](../../perf-results/2026-09-27-el1-anonymous-permissions/README.md).
+
+Checkpoint 2 remains open. The next bounded implementation task is resident
+private-anonymous `munmap` ownership in EL1: invalidate or retire the exact
+range under the same editor, hand physical extents back through one authenticated
+bulk return, and preserve the accepted zero-fill/reuse and structural witness.
+Then move the remaining anonymous `mmap`/`brk` bookkeeping, establish fork-COW
+authority, and remove the host page-table writer and pause only after no path
+needs them. The permission trace is closed; do not keep instrumenting it absent
+a new failing contract.
+
 ### Scheduler personality split and mechanical gate
 
 The reviewed scheduler split and checker are integrated as `26f104341` and
