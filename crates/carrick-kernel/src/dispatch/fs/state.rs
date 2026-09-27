@@ -689,8 +689,13 @@ impl FsState {
         self.host_sparse_extents.has_host_sparse_extents()
     }
 
-    pub(crate) fn reset_host_sparse_extents(&self, fd: i32, len: u64) {
-        self.host_sparse_extents.reset_host_sparse_extents(fd, len);
+    pub(crate) fn reset_host_sparse_extents_for_inode(
+        &self,
+        inode: carrick_vfs::vfs::InodeIdentity,
+        len: u64,
+    ) {
+        self.host_sparse_extents
+            .reset_host_sparse_extents_for_inode(inode, len);
     }
 
     pub(crate) fn truncate_host_sparse_extents(&self, fd: i32, len: u64) {
@@ -737,14 +742,28 @@ impl HostSparseExtentsRegistry {
         self.has_sparse.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub(crate) fn reset_host_sparse_extents(&self, fd: i32, len: u64) {
-        if let Some(identity) = host_file_identity(fd) {
-            self.has_sparse
-                .store(true, std::sync::atomic::Ordering::Release);
-            self.extents
-                .lock()
-                .insert(identity, HostSparseExtents::empty(len));
-        }
+    /// Start a fresh (empty, `len`-byte) sparse-extent record for the host
+    /// inode `inode`, read by the caller from the descriptor being opened.
+    pub(crate) fn reset_host_sparse_extents_for_inode(
+        &self,
+        inode: carrick_vfs::vfs::InodeIdentity,
+        len: u64,
+    ) {
+        self.reset_identity(
+            HostFileIdentity {
+                device: inode.dev,
+                inode: inode.ino,
+            },
+            len,
+        );
+    }
+
+    fn reset_identity(&self, identity: HostFileIdentity, len: u64) {
+        self.has_sparse
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.extents
+            .lock()
+            .insert(identity, HostSparseExtents::empty(len));
     }
 
     pub(crate) fn truncate_host_sparse_extents(&self, fd: i32, len: u64) {
@@ -813,11 +832,11 @@ mod sparse_identity_tests {
         let owner = HostFdRef::new(std::fs::File::create(&path).unwrap().into_raw_fd());
         let alias = owner.clone();
         let fs = FsState::new_with_host_resolver(None);
-        fs.reset_host_sparse_extents(owner.raw(), 16384);
+        fs.reset_host_sparse_extents_for_inode(owner.inode_identity().unwrap(), 16384);
         fs.record_host_sparse_write(&owner, 4096, 64);
         std::fs::remove_file(&path).unwrap();
         let replacement = HostFdRef::new(std::fs::File::create(&path).unwrap().into_raw_fd());
-        fs.reset_host_sparse_extents(replacement.raw(), 16384);
+        fs.reset_host_sparse_extents_for_inode(replacement.inode_identity().unwrap(), 16384);
         fs.record_host_sparse_write(&alias, 8192, 64);
         fs.record_host_sparse_write(&replacement, 12288, 64);
         assert_eq!(

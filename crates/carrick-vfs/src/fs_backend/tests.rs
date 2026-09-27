@@ -2462,6 +2462,89 @@ mod serial_host {
         );
     }
 
+    /// A FILE rename changes exactly two names, never which inode an existing
+    /// directory path names, so it must keep every cached dirfd (in this and
+    /// every other process) — the `create + rename over` atomic-write idiom
+    /// runs once per file written by go/cpython/node builds. Directory and
+    /// symlink renames still invalidate: the cache holds real directories and
+    /// the symlink hops it resolved under the link's own path.
+    ///
+    /// Red-first receipt: before the kind gate, every rename bumped the shared
+    /// directory generation and its parents' generations; the three file
+    /// renames below then measured 11 path-walk opens instead of 0.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn file_rename_keeps_dir_cache_but_dir_and_symlink_renames_invalidate() {
+        use crate::fs_resolve_cache::current_dir_generation;
+
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        for dir in ["/a", "/a/b", "/a/b/c", "/a/b/d", "/a/b/moved"] {
+            b.make_dir(dir).unwrap();
+        }
+        b.set_file_contents("/a/b/c/f", b"x".to_vec()).unwrap();
+        b.set_file_contents("/a/b/c/over", b"y".to_vec()).unwrap();
+        b.symlink("c", "/a/b/link").unwrap();
+        b.dir_fd_for(Path::new("a/b/c")).unwrap();
+        b.dir_fd_for(Path::new("a/b/d")).unwrap();
+
+        let generation = current_dir_generation();
+        b.reset_path_walk_host_opens();
+        // Same directory, onto a fresh name.
+        assert!(matches!(
+            b.rename_overlay_entry("/a/b/c/f", "/a/b/c/g"),
+            Ok(crate::fs_backend::OverlayRenameOutcome::Renamed)
+        ));
+        // Same directory, replacing an existing regular file.
+        assert!(matches!(
+            b.rename_overlay_entry("/a/b/c/g", "/a/b/c/over"),
+            Ok(crate::fs_backend::OverlayRenameOutcome::Renamed)
+        ));
+        // Across directories.
+        assert!(matches!(
+            b.rename_overlay_entry("/a/b/c/over", "/a/b/d/over"),
+            Ok(crate::fs_backend::OverlayRenameOutcome::Renamed)
+        ));
+        b.dir_fd_for(Path::new("a/b/c")).unwrap();
+        b.dir_fd_for(Path::new("a/b/d")).unwrap();
+        assert_eq!(
+            b.path_walk_host_opens(),
+            0,
+            "a file rename must not force a directory re-walk"
+        );
+        assert_eq!(
+            current_dir_generation(),
+            generation,
+            "a file rename must not flush every process's directory cache"
+        );
+        // The move really happened (both physical names).
+        assert!(!b.root_path.join("a/b/c/f").exists());
+        assert!(!b.root_path.join("a/b/c/over").exists());
+        assert_eq!(std::fs::read(b.root_path.join("a/b/d/over")).unwrap(), b"x");
+
+        // A symlink rename re-points the link's path: it must invalidate.
+        assert!(matches!(
+            b.rename_overlay_entry("/a/b/link", "/a/b/link2"),
+            Ok(crate::fs_backend::OverlayRenameOutcome::Renamed)
+        ));
+        assert_ne!(current_dir_generation(), generation);
+
+        // A directory rename must invalidate, and the next walk re-opens.
+        let generation = current_dir_generation();
+        b.dir_fd_for(Path::new("a/b/d")).unwrap();
+        assert!(matches!(
+            b.rename_overlay_entry("/a/b/d", "/a/b/moved/d"),
+            Ok(crate::fs_backend::OverlayRenameOutcome::Renamed)
+        ));
+        assert_ne!(current_dir_generation(), generation);
+        b.reset_path_walk_host_opens();
+        b.dir_fd_for(Path::new("a/b/c")).unwrap();
+        assert!(
+            b.path_walk_host_opens() > 0,
+            "positive control: a directory rename must be seen by the walk counter"
+        );
+    }
+
     /// THE MEASURED INVARIANT: on a warm `dir_cache`, one guest-level
     /// `mkdirat` / `unlinkat` / `openat` under an already-resolved parent costs
     /// at most 2 host `openat` calls spent walking the path — and in practice
