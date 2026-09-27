@@ -730,6 +730,8 @@ impl CarrierVmCustody {
         &self,
         generation: CarrierVmGeneration,
     ) -> Result<(), CarrierVmCustodyError> {
+        // Match grant publication/return: aperture precedes lifecycle state.
+        let mut metadata = self.metadata_aperture.lock();
         let mut state = self.state.lock();
         match state.lifecycle {
             CarrierVmLifecycle::Destroying(current) if current == generation => {
@@ -758,9 +760,9 @@ impl CarrierVmCustody {
                 ) {
                     pool.forget_backend_mapping();
                 }
-                self.metadata_aperture
-                    .lock()
-                    .release_destroyed_vm(generation.0);
+                metadata.release_destroyed_vm(generation.0, |identity| {
+                    state.stage2_records.remove(&identity.record_id);
+                });
                 state.lifecycle = CarrierVmLifecycle::Vacant;
                 Ok(())
             }
@@ -1037,10 +1039,38 @@ impl CarrierVmCustody {
         &self,
         spec: CarrierStage2RecordSpec,
     ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
+        Self::register_stage2_record_locked(&mut self.state.lock(), spec)
+    }
+
+    /// Commit backend mapping and its exact record under one lifecycle lock.
+    /// The backend callback must not re-enter custody. All fallible record
+    /// admission happens before map; a failed map removes the unpublished record.
+    pub(crate) fn publish_stage2_record_using(
+        &self,
+        spec: CarrierStage2RecordSpec,
+        map: impl FnOnce() -> i32,
+    ) -> Result<CarrierStage2RecordIdentity, TrapError> {
+        let mut state = self.state.lock();
+        let identity = Self::register_stage2_record_locked(&mut state, spec).map_err(|error| {
+            TrapError::Hypervisor(format!("stage-2 record admission: {error:?}"))
+        })?;
+        let rc = map();
+        if rc != 0 {
+            state.stage2_records.remove(&identity.record_id);
+            return Err(TrapError::Hypervisor(format!(
+                "stage-2 map failed: {rc:#x}"
+            )));
+        }
+        Ok(identity)
+    }
+
+    fn register_stage2_record_locked(
+        state: &mut CarrierVmCustodyState,
+        spec: CarrierStage2RecordSpec,
+    ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
         if spec.len == 0 || (spec.mapped && spec.host_addr == 0) {
             return Err(CarrierStage2RecordError::InvalidExtent);
         }
-        let mut state = self.state.lock();
         match state.lifecycle {
             CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation)
                 if generation == spec.vm_generation => {}
