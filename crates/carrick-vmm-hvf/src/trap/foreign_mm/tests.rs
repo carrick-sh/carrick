@@ -10116,6 +10116,65 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
 
 mod syscall_writes;
 
+/// Guest EL1 allocates stage-1 table pages at the top of the primary arena,
+/// above every page the host manager's cursor covers. Retiring the root slot
+/// must record a populated prefix that reaches them, or the pool hands the
+/// slot to the next address space with EL1's stale tables still in it: the
+/// next process's host manager then discovered its cursor past them and
+/// spilled its first table into an extension arena.
+#[test]
+fn root_retirement_zeroes_guest_el1_tables_above_the_host_cursor() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let pool = Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        1,
+    ));
+    let root = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
+    let root_slot = (root, 0x20_0000_u64);
+    let installed = install_mm(&transport, 303, root, 0x9b00_7a00_0000, *b"test");
+
+    let root_mapping = pool.allocate_slot_at(root).expect("allocate pooled root");
+    let host = root_mapping.as_mut_ptr();
+    let mut root_lease = GlobalFrameStage2Lease::fixed(root_slot.0, root_slot.1);
+    root_lease.mark_mapped();
+    let root_owner = StructuralBackingOwner::new_pooled_root_in(
+        &transport.custody,
+        root_mapping,
+        root_lease,
+        3,
+        next_structural_epoch().expect("root structural epoch"),
+        root_slot.0,
+        root_slot.1 as usize,
+    )
+    .expect("create root structural owner");
+    installed
+        .state
+        .install_structural_mapping_authority(Some(root_slot), Arc::clone(&root_owner))
+        .expect("install root structural authority");
+
+    // An EL1 table page near the top of the 1.75 MiB primary arena.
+    let el1_table = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize - 0x1000;
+    let copied = installed
+        .state
+        .page_tables_authority()
+        .with_manager(|manager| manager.copied_bytes())
+        .expect("installed manager") as usize;
+    assert!(copied < el1_table, "the host cursor stops below EL1's page");
+    unsafe { host.add(el1_table).cast::<u64>().write(0x9020_0000 | 0b11) };
+
+    installed
+        .state
+        .retire_mm_root_stage2_in_using(&transport.custody, root_slot, &mut |_, _| Ok(()))
+        .expect("retire pooled root slot");
+    let reissued = pool.allocate_slot_at(root).expect("reissue the root slot");
+    assert_eq!(
+        unsafe { reissued.as_ptr().add(el1_table).cast::<u64>().read() },
+        0,
+        "the next occupant of the slot must not inherit EL1's table page"
+    );
+}
+
 #[test]
 fn live_resolver_records_extension_prefix_before_pool_reuse() {
     use carrick_mmu_core::aarch64::HostArenaResolver;

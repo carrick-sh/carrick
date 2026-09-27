@@ -2378,6 +2378,159 @@ fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reu
     );
 }
 
+/// A process that grew its stage-1 tables into an extension arena returns
+/// that slot to the runtime's allocator with its retirement, so the arena's
+/// structural record must be terminal (and a pooled slot back in the pool)
+/// when retirement returns. Terminal retirement used to forget every row it
+/// did not retire from the inventory, extension arenas included: the slot
+/// stayed mapped and checked out, and the next address space given the same
+/// slot failed "stage-1 extension arena IPA ... is still held by the
+/// root-slot pool".
+#[test]
+fn process_retirement_terminalizes_its_stage1_extension_arenas() {
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let root_slot = (0x7d40_0000_0000_u64, 0x20_0000_u64);
+    let root_len = 0x1c_0000_u64;
+    let table_perms = carrick_mem::elf::SegmentPerms {
+        read: true,
+        write: true,
+        execute: false,
+    };
+    let root_mapping = GuestMapping {
+        guest_start: carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        ipa_start: root_slot.0,
+        mapped_size: root_len,
+        offset_in_mapping: 0,
+        payload_size: root_len,
+        perms: table_perms,
+        shared: false,
+        image: std::sync::Arc::new(vec![0; root_len as usize]),
+        private_file_backing: None,
+    };
+    let root_region = map_region_raw_in(custody, &root_mapping, false, true)
+        .expect("map exact structural root-slot fixture");
+    let root_owner = root_region
+        .structural_owner
+        .as_ref()
+        .cloned()
+        .expect("root slot has structural custody");
+    let stage2_owner = mapped_region_stage2_owner_identity(&root_region)
+        .expect("structural root has exact owner identity");
+
+    // An extension arena slot out of the root-slot arena, published the way
+    // `publish_stage1_extension_arenas` publishes one.
+    let ext_ipa = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + 0x7e * 0x20_0000;
+    let ext_len = 0x20_0000_u64;
+    let ext_mapping = GuestMapping {
+        guest_start: ext_ipa,
+        ipa_start: ext_ipa,
+        mapped_size: ext_len,
+        offset_in_mapping: 0,
+        payload_size: ext_len,
+        perms: table_perms,
+        shared: false,
+        image: std::sync::Arc::new(Vec::new()),
+        private_file_backing: None,
+    };
+    let ext_region = map_region_raw_in(custody, &ext_mapping, false, true)
+        .expect("map stage-1 extension arena fixture");
+    let ext_owner = ext_region
+        .structural_owner
+        .as_ref()
+        .cloned()
+        .expect("extension arena has structural custody");
+    let ext_identity = ext_owner.record_identity();
+
+    let frame = carrick_hal::FrameId::from_kernel_allocation(id(461));
+    let mapping = carrick_hal::MappingId::from_kernel_allocation(id(462));
+    let mut task = hvpatch_task_state_test_fixture(13, root_slot.0, 13);
+    task.mm_root_slot = Some(root_slot);
+    task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(2)));
+    task.mappings = TaskMappingIndex::from_region(root_region);
+    task.mappings.insert(ext_region);
+    task.mm_access
+        .install_structural_mapping_authority(Some(root_slot), std::sync::Arc::clone(&root_owner))
+        .expect("install exact root authority");
+    task.mm_access
+        .install_structural_mapping_authority(None, std::sync::Arc::clone(&ext_owner))
+        .expect("install extension arena authority");
+    {
+        let mut inventory = task.frame_inventory.lock();
+        inventory.initialized = true;
+        inventory.extents.insert(
+            (root_slot.0, root_len),
+            InventoryExtent {
+                frame,
+                mapping,
+                backing: InventoryBackingIdentity::Private(461),
+                stage2_base: root_slot.0,
+                stage2_length: root_len,
+                stage2_owner,
+            },
+        );
+        {
+            let mut frames = inventory.frames.lock();
+            frames.references.insert(frame, 1);
+            frames
+                .extent_references
+                .insert((frame, root_slot.0, root_len), 1);
+            frames.stage2_references.insert((root_slot.0, root_len), 1);
+        }
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+        inventory.retirement_reservation = Some(
+            carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                carrick_hal::FrameInventoryProvenance::from_kernel_entropy([96; 32]),
+                carrick_hal::FrameInventoryBatch::prepare(
+                    carrick_hal::KernelTransactionId::from_kernel_allocation(id(96)),
+                    capacity,
+                )
+                .unwrap(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+    }
+
+    HvfVmState::retire_task_state_process_mappings_with_root_proof(&mut task, root_slot)
+        .expect("retire a process that owns an extension arena");
+
+    let ext_remained_live = custody
+        .stage2_record_snapshot(ext_identity.record_id)
+        .is_some();
+    let ext_still_owned = task
+        .mm_access
+        .structural_owners
+        .read()
+        .contains_key(&(ext_ipa, ext_len as usize));
+    // Keep a RED run from leaking the extension's custody row into later
+    // host tests.
+    if ext_remained_live {
+        ext_owner
+            .retained
+            .owner_retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        retry_structural_backing_identities_in_using(
+            custody,
+            &[ext_identity],
+            &mut unmap_global_frame_stage2_record,
+            &mut release_retired_stage2_ipa,
+        )
+        .expect("clean leaked RED extension fixture");
+    }
+    drop(ext_owner);
+    drop(root_owner);
+
+    assert!(
+        !ext_remained_live,
+        "MM retirement returned while its stage-1 extension arena was still mapped"
+    );
+    assert!(
+        !ext_still_owned,
+        "the retired mm still holds its extension arena's structural owner"
+    );
+}
+
 fn shared_inventory_root_fixture(
     root_slot: (u64, u64),
 ) -> (

@@ -2827,6 +2827,15 @@ impl HvfVmState {
         if let Some(root) = &retired_root {
             extents.insert(root.physical_extent);
         }
+        // The runtime returns this mm's stage-1 extension slots with its
+        // retirement; their structural records must be terminal and their
+        // pooled slots back in the pool first.
+        for extent in task
+            .mm_access
+            .retire_stage1_extension_owners_in(custody, task.mm_root_slot)?
+        {
+            extents.insert(extent);
+        }
         let retiring_aliases = if cow_refusal_diagnostics_enabled() {
             alias_registry()
                 .lock()
@@ -2887,6 +2896,8 @@ impl HvfVmState {
         let retired = task
             .mm_access
             .retire_mm_root_stage2_in(custody, expected_root_slot)?;
+        task.mm_access
+            .retire_stage1_extension_owners_in(custody, Some(expected_root_slot))?;
         task.mm_root_slot = None;
         Ok(retired.proof)
     }
