@@ -1,0 +1,1 @@
+inventory drift check passed: 338 syscalls (246 bring-up, 90 deferred, 2 planned; 14 with claims, 324 without claims)

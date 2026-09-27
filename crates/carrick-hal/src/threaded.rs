@@ -2418,6 +2418,43 @@ pub trait FrameCowAuthority: Send + Sync {
         )))
     }
 
+    /// Apply an unpublished EL1 frame grant and authenticate the exact
+    /// post-commit mapping plus the independently retained host owner. The
+    /// caller may expose the returned identities to EL1 only after this
+    /// method succeeds.
+    fn apply_frame_grant(
+        &self,
+        _commit: crate::FrameInventoryCommit<()>,
+        _mapping: crate::MappingId,
+        _frame: crate::FrameId,
+        _gpa: carrick_guest_mem::Gpa,
+        _length: crate::FrameLength,
+    ) -> Result<
+        (
+            crate::FrameInventoryApplyReceipt,
+            crate::ForeignOwnerGeneration,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "frame COW authority does not apply EL1 frame grants",
+        )))
+    }
+
+    /// Roll back a frame grant whose inventory became live but whose guest
+    /// leaf was never published. The opaque receipt prevents a backend from
+    /// choosing which MM or mapping the kernel removes.
+    fn rollback_frame_grant(
+        &self,
+        _receipt: &crate::FrameInventoryApplyReceipt,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "frame COW authority does not roll back EL1 frame grants",
+        )))
+    }
+
     /// Atomically apply one foreign-COW inventory commit and mint an opaque
     /// runtime-private proof binding its exact semantic COW span, mapping,
     /// physical extent, and host-owner generation. The backend may carry this

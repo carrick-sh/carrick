@@ -1,0 +1,17 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-000a5bade7be9689)
+
+running 11 tests
+test dispatch::mem::fault::tests::first_touch_arming_coalesces_adjacent_equal_protections ... ok
+test dispatch::mem::fault::tests::first_touch_arming_answers_and_splits_exactly_like_a_scan ... ok
+test dispatch::mem::fault::tests::committed_first_touch_page_still_routes_to_mutation_authority ... ok
+test dispatch::mem::fault::tests::growdown_metadata_is_trimmed_with_mapping_teardown ... ok
+test dispatch::mem::fault::tests::committed_growdown_page_still_routes_to_mutation_authority ... ok
+test dispatch::mem::fault::tests::frame_grant_plan_clips_to_one_bulk_window_and_commits_the_whole_span ... ok
+test dispatch::mem::fault::tests::growdown_cannot_claim_raw_clock_transport ... ok
+test dispatch::mem::fault::tests::mprotect_over_armed_first_touch_page_keeps_the_leaf_invalid_with_new_prot ... ok
+test dispatch::mem::fault::tests::mprotect_over_committed_first_touch_page_does_not_rearm_it ... ok
+test dispatch::mem::fault::tests::mprotect_none_over_armed_first_touch_page_retires_and_rearms_the_pending_edit ... ok
+test dispatch::mem::fault::tests::dontneed_first_touch_restores_an_executable_leaf ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 2226 filtered out; finished in 0.01s

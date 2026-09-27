@@ -304,6 +304,82 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    fn apply_frame_grant(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        gpa: carrick_guest_mem::Gpa,
+        length: carrick_hal::FrameLength,
+    ) -> Result<
+        (
+            carrick_hal::FrameInventoryApplyReceipt,
+            carrick_hal::ForeignOwnerGeneration,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let owner = self.owner_inventory.retain_current(gpa, length)?;
+        let owner_generation = owner.generation();
+        let ((), receipt) = self
+            .kernel
+            .frame_inventory()
+            .apply_with_receipt(self.mm, commit)
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+        let expected_mm = std::num::NonZeroU64::new(self.mm.raw()).ok_or_else(|| {
+            Box::new(std::io::Error::other(
+                "frame grant authority carries a zero MM identity",
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        let authenticated = receipt.mm() == expected_mm
+            && receipt.authorizes(mapping, frame)
+            && self
+                .kernel
+                .frame_inventory()
+                .mapping_is_live_exact_at_revision(
+                    self.mm,
+                    receipt.revision(),
+                    mapping,
+                    frame,
+                    gpa,
+                    length,
+                )
+            && owner.is_current();
+        if !authenticated {
+            self.kernel
+                .frame_inventory()
+                .rollback_unpublished_apply(&receipt)
+                .map_err(|error| {
+                    Box::new(std::io::Error::other(format!(
+                        "frame grant authentication and rollback failed: {error}"
+                    ))) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+            return Err(Box::new(std::io::Error::other(
+                "frame grant inventory or host-owner authentication failed",
+            )));
+        }
+        Ok((receipt, owner_generation))
+    }
+
+    fn rollback_frame_grant(
+        &self,
+        receipt: &carrick_hal::FrameInventoryApplyReceipt,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let expected_mm = std::num::NonZeroU64::new(self.mm.raw()).ok_or_else(|| {
+            Box::new(std::io::Error::other(
+                "frame grant authority carries a zero MM identity",
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        if receipt.mm() != expected_mm {
+            return Err(Box::new(std::io::Error::other(
+                "frame grant rollback receipt names another MM",
+            )));
+        }
+        self.kernel
+            .frame_inventory()
+            .rollback_unpublished_apply(receipt)
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
     fn apply_foreign_cow(
         &self,
         commit: carrick_hal::FrameInventoryCommit<()>,
@@ -3495,6 +3571,78 @@ mod tests {
                 transport_chosen_owner,
             ),
             "transport-selected owner generation was accepted by the kernel proof issuer"
+        );
+    }
+
+    #[test]
+    fn frame_grant_inventory_receipt_is_exact_and_rollbackable_before_leaf_publication() {
+        let (kernel, root) = bootstrap(31_130);
+        let mm = root.shared().mm().id();
+        let tid = ThreadId::synthetic_for_tests(31_130);
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+        let mut reservation = kernel.reserve_frame_inventory(1, 1, capacity).unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation =
+            carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::new(1).unwrap());
+        let gpa = Gpa(0xe000);
+        let length =
+            carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(0x20_0000).unwrap());
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa,
+                length,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        let current_owner =
+            carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(71).unwrap());
+        let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
+            Arc::clone(&kernel),
+            mm,
+            tid,
+            7,
+            crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(current_owner),
+        );
+
+        let (receipt, authenticated_owner) = authority
+            .apply_frame_grant(reservation.commit(()), mapping, frame, gpa, length)
+            .expect("apply frame-grant inventory transaction");
+        assert_eq!(receipt.mm().get(), mm.raw());
+        assert!(receipt.authorizes(mapping, frame));
+        assert_eq!(authenticated_owner, current_owner);
+        assert!(kernel.frame_inventory().mapping_is_live_exact_at_revision(
+            mm,
+            receipt.revision(),
+            mapping,
+            frame,
+            gpa,
+            length,
+        ));
+
+        authority
+            .rollback_frame_grant(&receipt)
+            .expect("roll back unpublished frame grant");
+        assert!(
+            !kernel
+                .frame_inventory()
+                .mapping_is_live_exact(mm, mapping, frame, gpa, length)
         );
     }
 

@@ -530,6 +530,53 @@ fn first_touch_arming_answers_and_splits_exactly_like_a_scan() {
 }
 
 #[test]
+fn frame_grant_plan_clips_to_one_bulk_window_and_commits_the_whole_span() {
+    const GRANT: u64 = 2 * 1024 * 1024;
+    let dispatcher = SyscallDispatcher::new();
+    let page = dispatcher.linux_page_size();
+    let base = LINUX_MMAP_BASE + 3 * page;
+    let end = base + GRANT + 5 * page;
+    let fault = base + 8 * page + 17;
+    let prot = LinuxProtFlags::READ | LinuxProtFlags::WRITE;
+    dispatcher.track_resident_fault_range(base, end - base, prot);
+
+    let window_start = fault / GRANT * GRANT;
+    let expected_start = base.max(window_start);
+    let expected_end = end.min(window_start + GRANT);
+    dispatcher
+        .with_resident_frame_grant_plan_for_test(fault, GRANT, |plan| {
+            assert_eq!(plan.start(), expected_start);
+            assert_eq!(plan.len(), expected_end - expected_start);
+            assert_eq!(plan.prot(), prot.bits());
+            dispatcher.commit_resident_frame_grant(plan);
+        })
+        .expect("bulk first-touch grant plan");
+
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(fault, |plan| drop(plan))
+            .is_none(),
+        "the whole granted span must leave the arming set"
+    );
+    if base < expected_start {
+        assert!(
+            dispatcher
+                .with_resident_fault_plan_for_test(base, |plan| drop(plan))
+                .is_some(),
+            "prefix outside the bulk window must remain armed"
+        );
+    }
+    if expected_end < end {
+        assert!(
+            dispatcher
+                .with_resident_fault_plan_for_test(expected_end, |plan| drop(plan))
+                .is_some(),
+            "suffix outside the bulk window must remain armed"
+        );
+    }
+}
+
+#[test]
 fn first_touch_arming_coalesces_adjacent_equal_protections() {
     let page = LINUX_PAGE_SIZE;
     let base = crate::memory::LINUX_HIGH_VA_THRESHOLD;

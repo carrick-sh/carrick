@@ -1,0 +1,50 @@
+   Compiling carrick-el1-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-abi)
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-image)
+   Compiling carrick-kernel v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-kernel)
+   Compiling carrick-el1 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-hal)
+   Compiling carrick-host-bsd v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-thread)
+   Compiling carrick-vfs v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-vfs)
+error[E0599]: no method named `with_resident_frame_grant_plan_for_test` found for struct `dispatch::dispatcher::SyscallDispatcher` in the current scope
+    --> crates/carrick-kernel/src/dispatch/mem/fault/tests.rs:547:10
+     |
+ 546 | /     dispatcher
+ 547 | |         .with_resident_frame_grant_plan_for_test(fault, GRANT, |plan| {
+     | |_________-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+    ::: crates/carrick-kernel/src/dispatch/dispatcher.rs:31:1
+     |
+  31 |   pub struct SyscallDispatcher {
+     |   ---------------------------- method `with_resident_frame_grant_plan_for_test` not found for this struct
+     |
+help: there is a method `with_resident_fault_plan_for_test` with a similar name, but with different arguments
+    --> crates/carrick-kernel/src/dispatch/mem.rs:2138:5
+     |
+2138 | /     pub fn with_resident_fault_plan_for_test<T>(
+2139 | |         &self,
+2140 | |         page: u64,
+2141 | |         use_plan: impl FnOnce(ResidentFaultPlan<'_>) -> T,
+2142 | |     ) -> Option<T> {
+     | |__________________^
+
+error[E0599]: no method named `commit_resident_frame_grant` found for struct `dispatch::dispatcher::SyscallDispatcher` in the current scope
+   --> crates/carrick-kernel/src/dispatch/mem/fault/tests.rs:551:24
+    |
+551 |             dispatcher.commit_resident_frame_grant(plan);
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+   ::: crates/carrick-kernel/src/dispatch/dispatcher.rs:31:1
+    |
+ 31 | pub struct SyscallDispatcher {
+    | ---------------------------- method `commit_resident_frame_grant` not found for this struct
+    |
+help: there is a method `commit_resident_fault` with a similar name
+    |
+551 -             dispatcher.commit_resident_frame_grant(plan);
+551 +             dispatcher.commit_resident_fault(plan);
+    |
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `carrick-kernel` (lib test) due to 2 previous errors
