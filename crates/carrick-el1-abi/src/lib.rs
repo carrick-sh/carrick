@@ -89,6 +89,15 @@ pub const AARCH64_STAGE1_TABLES_ALIAS_BASE: u64 = 0x2D_0002_0000;
 /// publication must reject every descriptor outside this primary arena.
 pub const AARCH64_STAGE1_TABLES_PRIMARY_SIZE: u64 = 0x1C_0000;
 
+/// Canonical accessible user address used when adopting a live AArch64 table
+/// image and detecting its ASID-scoped construction mode.
+pub const AARCH64_USER_LEAF_CHECK_VA: u64 = 0x1_0000;
+
+/// Guest-physical window reserved for the in-kernel GIC implementation.
+/// A stage-1 publication must never expose this range as ordinary memory.
+pub const AARCH64_GIC_WINDOW_BASE: u64 = 0x2F_0000_0000;
+pub const AARCH64_GIC_WINDOW_SIZE: u64 = 0x1000_0000;
+
 pub const FRAME_GRANT_MAILBOX_IDLE: u32 = 0;
 pub const FRAME_GRANT_MAILBOX_GUEST_WRITING: u32 = 1;
 pub const FRAME_GRANT_MAILBOX_REQUESTED: u32 = 2;

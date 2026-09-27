@@ -1013,3 +1013,20 @@ child-before-parent, and roll back or refuse cleanly on exhaustion. Run the
 256-page signed witness immediately. Broaden to the other two scales only after
 that passes; do not reopen general allocator design unless the focused witness
 proves the existing elastic table source cannot satisfy this transaction.
+
+The bounded correction is now implemented in the isolated line. A red-first
+MMU contract required a live range with no L3 table to publish three private
+pages as RW/UXN/nG while adjacent pages remained invalid. The shared live
+`PageTableManager` now preflights the complete range, journals the edit, allocates
+the missing hierarchy from the currently backed pool, publishes terminal
+descriptors before table pointers and descendant pointers before ancestors,
+then commits. A second control exhausts the table pool and proves the call
+returns `OutOfTables` with byte-identical hardware backing. Production EL1
+adopts the exact TTBR0 primary arena through its fixed alias and uses this
+transaction before the existing ASID invalidation.
+
+The full 97-test MMU and 174-test memory suites, focused EL1 stable-error test,
+bare-metal EL1 release build, targeted warning-denied Clippy and contract
+registry pass. This is still an unsigned candidate. Preserve one committed
+source, build and sign it, and run the 256-page witness next; a green VM-free
+manager test does not replace that acceptance boundary.

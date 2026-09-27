@@ -86,9 +86,26 @@ scoped cleanup passed.
 The diagnostic reruns contain uncommitted panic instrumentation and therefore
 are discovery evidence, not acceptance receipts for `afdf58039`. The previous
 signed three-scale witness remains red at about 0.9954 host exits per page
-versus the `<0.125` contract, so no performance improvement is claimed. The
-next bounded task is transactional creation of the missing hierarchy under the
-same guest editor, with whole-range preflight, RW/UXN/nG preservation, rollback
-and explicit capacity refusal. Run the 256-page signed witness immediately;
-only after it passes run the 1,024- and 4,096-page scales. Checkpoint 2, full CI
-and full EL1 migration completion remain open.
+versus the `<0.125` contract, so no performance improvement is claimed.
+
+The current correction replaces the existing-leaf-only publisher with the
+shared live `PageTableManager`. It reconstructs the occupied primary cursor,
+preflights the complete semantic span, allocates missing hierarchy under the
+admitted guest editor, publishes terminal RW/UXN/nG descriptors before table
+pointers, synchronizes descendant pointers before ancestors, and uses the
+existing undo journal for every error. Current-pool exhaustion refuses before
+any hardware-visible byte changes; guest extension-arena growth remains a
+separate stage-2-backed protocol rather than fabricated capacity.
+
+`missing-hierarchy-red.log` is the compile-red for the absent transaction.
+`missing-hierarchy-green.log` covers successful missing-hierarchy publication,
+neighbor isolation, permission bits, nG and whole-range occupied refusal.
+The same test group covers byte-identical capacity refusal. The full 97-test
+MMU suite, 174-test memory suite, targeted warning-denied Clippy, bare-metal
+EL1 release build and 62-contract registry pass; focused retained receipts are
+beside this file.
+
+This source has not yet run as one frozen signed artifact. The next gate is the
+256-page signed witness; only after it passes run the 1,024- and 4,096-page
+scales. Checkpoint 2, extension growth, full CI and full EL1 migration
+completion remain open.
