@@ -645,3 +645,15 @@ allocator-prerequisite/layout-census/. These are possible bootstrap intervals,
 not an elastic allocator or guest execution proof. Keep extent growth/return,
 pointer-domain identity and IRQ/lock ordering in the allocator prerequisite;
 do not fix the dormant bump allocator by moving it into another reserved table.
+
+2026-09-26: metadata-refusal director review round 2 confirms all five
+prescribed commands pass on `0f395e825`, including the prior coalescing
+corruption witness. Acceptance remains withheld: genuine adapter refusal,
+nonallocating engine error conversion, aligned injection/counting scopes,
+same-instance recovery, bounded admission work and authentic raw red evidence
+need correction. The same worker is active; one review round remains after
+this response. Evidence is preserved under metadata-refusal-director/review-2/.
+Keep the task bounded to edit/publication/rollback; inventory remaining
+lifecycle allocation obligations for subsequent guest migration. The next
+impact milestone remains actual in-guest first-touch, not another host-only
+foundation checkpoint. The preceding user-facing status turn changed no code.
