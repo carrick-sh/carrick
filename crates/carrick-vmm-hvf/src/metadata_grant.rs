@@ -180,9 +180,8 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
     let arg3 = vcpu
         .get_reg(Reg::X3)
         .map_err(|e| TrapError::Hypervisor(format!("failed to read X3 for metadata grant: {e}")))?;
-    let pc = vcpu
-        .get_reg(Reg::PC)
-        .map_err(|e| TrapError::Hypervisor(format!("failed to read PC for metadata grant: {e}")))?;
+    // HVF reports PC after the trapping HVC instruction. Preserve it: advancing
+    // again skips the first guest instruction consuming the completion registers.
 
     if op == METADATA_GRANT_OP_ALLOC {
         GRANTS_REQUESTED.fetch_add(1, Ordering::Relaxed);
@@ -192,8 +191,6 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            vcpu.set_reg(Reg::PC, pc + 4)
-                .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
             return Ok(());
         }
 
@@ -212,8 +209,6 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            vcpu.set_reg(Reg::PC, pc + 4)
-                .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
             return Ok(());
         };
 
@@ -229,8 +224,6 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            vcpu.set_reg(Reg::PC, pc + 4)
-                .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
             return Ok(());
         }
 
@@ -245,8 +238,6 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
                 GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
                 vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
                     .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-                vcpu.set_reg(Reg::PC, pc + 4)
-                    .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
                 return Ok(());
             }
         };
@@ -260,8 +251,6 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            vcpu.set_reg(Reg::PC, pc + 4)
-                .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
             return Ok(());
         }
 
@@ -281,8 +270,6 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            vcpu.set_reg(Reg::PC, pc + 4)
-                .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
             return Ok(());
         }
 
@@ -312,8 +299,6 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             .map_err(|e| TrapError::Hypervisor(format!("set X2: {e}")))?;
         vcpu.set_reg(Reg::X3, token)
             .map_err(|e| TrapError::Hypervisor(format!("set X3: {e}")))?;
-        vcpu.set_reg(Reg::PC, pc + 4)
-            .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
         Ok(())
     } else if op == METADATA_GRANT_OP_FREE {
         let ipa = arg1;
@@ -328,8 +313,6 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
         {
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_ALIGNMENT)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            vcpu.set_reg(Reg::PC, pc + 4)
-                .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
             return Ok(());
         }
 
@@ -338,8 +321,6 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
         if slot_idx >= MAX_DYNAMIC_EXTENT_SLOTS {
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_INVALID)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            vcpu.set_reg(Reg::PC, pc + 4)
-                .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
             return Ok(());
         }
 
@@ -355,8 +336,6 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
         let Some(record) = record_opt else {
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_NOT_FOUND)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            vcpu.set_reg(Reg::PC, pc + 4)
-                .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
             return Ok(());
         };
 
@@ -366,8 +345,6 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             state.slots[slot_idx] = Some(record);
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_INVALID)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            vcpu.set_reg(Reg::PC, pc + 4)
-                .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
             return Ok(());
         }
 
@@ -379,8 +356,6 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
             state.slots[slot_idx] = Some(record);
             vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
                 .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            vcpu.set_reg(Reg::PC, pc + 4)
-                .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
             return Ok(());
         }
 
@@ -398,14 +373,10 @@ pub fn handle_metadata_grant_trap(vcpu: &mut applevisor::vcpu::Vcpu) -> Result<(
 
         vcpu.set_reg(Reg::X0, METADATA_GRANT_SUCCESS)
             .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-        vcpu.set_reg(Reg::PC, pc + 4)
-            .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
         Ok(())
     } else {
         vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_INVALID)
             .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-        vcpu.set_reg(Reg::PC, pc + 4)
-            .map_err(|e| TrapError::Hypervisor(format!("set PC: {e}")))?;
         Ok(())
     }
 }

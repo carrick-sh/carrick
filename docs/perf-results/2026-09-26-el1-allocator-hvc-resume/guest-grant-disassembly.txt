@@ -1,0 +1,26 @@
+0000002d04001fa4 <carrick_el1::alloc::request_host_extent_grant::hd6774884ccc8167a>:
+2d04001fa4: a9bf7bfd   	stp	x29, x30, [sp, #-0x10]!
+2d04001fa8: 910003fd   	mov	x29, sp
+2d04001fac: aa0003e1   	mov	x1, x0
+2d04001fb0: 52800020   	mov	w0, #0x1                // =1
+2d04001fb4: aa1f03e2   	mov	x2, xzr
+2d04001fb8: aa1f03e3   	mov	x3, xzr
+2d04001fbc: aa1f03e9   	mov	x9, xzr
+2d04001fc0: d40000c2   	hvc	#0x6
+2d04001fc4: f100001f   	cmp	x0, #0x0
+2d04001fc8: fa400824   	ccmp	x1, #0x0, #0x4, eq
+2d04001fcc: fa401844   	ccmp	x2, #0x0, #0x4, ne
+2d04001fd0: fa401864   	ccmp	x3, #0x0, #0x4, ne
+2d04001fd4: 54000080   	b.eq	0x2d04001fe4 <carrick_el1::alloc::request_host_extent_grant::hd6774884ccc8167a+0x40>
+2d04001fd8: 52800029   	mov	w9, #0x1                // =1
+2d04001fdc: a9008901   	stp	x1, x2, [x8, #0x8]
+2d04001fe0: f9000d03   	str	x3, [x8, #0x18]
+2d04001fe4: f9000109   	str	x9, [x8]
+2d04001fe8: a8c17bfd   	ldp	x29, x30, [sp], #0x10
+2d04001fec: d65f03c0   	ret
+
+0000002d04001ff0 <carrick_el1::dispatch_entry::hfb6b174e525c83c0>:
+2d04001ff0: d10203ff   	sub	sp, sp, #0x80
+2d04001ff4: a9047bfd   	stp	x29, x30, [sp, #0x40]
+2d04001ff8: a9055ff8   	stp	x24, x23, [sp, #0x50]
+2d04001ffc: a90657f6   	stp	x22, x21, [sp, #0x60]
