@@ -1125,6 +1125,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                             "stage-1 page-table manager unresolved arena 0x{base:x}",
                         )))
                     }
+                    Err(PageTableError::MetadataAllocation) => {
+                        Err(MemoryError::HostMap(
+                            "stage-1 page-table manager metadata allocation refused".to_owned(),
+                        ))
+                    }
                 }
             },
         );
@@ -3787,7 +3792,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     })?;
 
                     self.pt_edit_and_flush(|manager| {
-                        manager.begin_undo();
+                        manager.begin_undo()?;
                         let mut outcome = PageTableApplyOutcome::default();
                         for range in &unarmed_ranges {
                             outcome |= if range.kernel_only {

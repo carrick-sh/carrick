@@ -1449,7 +1449,11 @@ impl HvfVmState {
                         ))
                     },
                     |editor| -> Result<(), TrapError> {
-                        editor.begin_undo();
+                        editor.begin_undo().map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "begin undo HVPatch retained reuse leaves: {error:?}"
+                            ))
+                        })?;
                         Self::refresh_stage1_exclusivity(editor.manager);
                         editor
                             .repoint_preserving_attributes(page_va, new_ipa, span_len as u64)
@@ -2580,7 +2584,11 @@ impl HvfTaskState {
                         // a rollback log; the manager's `dirty` list is not one, because
                         // `sync_to_host` drains the NEW edits. `begin_undo` journals the
                         // pre-image of every descriptor this transaction writes.
-                        manager.begin_undo();
+                        manager.begin_undo().map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "begin undo HVPatch COW page-table manager: {error:?}"
+                            ))
+                        })?;
                         // The leaf authentication below needs the AP bits each page held
                         // BEFORE this transaction, which it used to read by walking a full
                         // cloned pre-image. The span is a single 16 KiB compound, so

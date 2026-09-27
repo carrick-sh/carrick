@@ -838,8 +838,8 @@ impl<'a> Stage1Editor<'a> {
         self.arena_source.is_some()
     }
 
-    pub fn begin_undo(&mut self) {
-        self.manager.begin_undo();
+    pub fn begin_undo(&mut self) -> Result<(), PageTableError> {
+        self.manager.begin_undo()
     }
 
     pub fn commit_undo(&mut self) {
@@ -1432,7 +1432,7 @@ mod tests {
             .edit(
                 || panic!("manager must be present"),
                 |editor| {
-                    editor.begin_undo();
+                    editor.begin_undo().unwrap();
                     editor
                         .set_rw(va, 0x1000, false)
                         .expect("allocates extension arena from source");
@@ -1675,7 +1675,7 @@ mod tests {
             .edit(
                 || panic!("manager must be present"),
                 |editor| {
-                    editor.begin_undo();
+                    editor.begin_undo().unwrap();
                     editor
                         .set_readonly(va, 0x1000, false)
                         .expect("readonly edit");
@@ -1710,7 +1710,7 @@ mod tests {
             .edit(
                 || panic!("manager must be present"),
                 |editor| {
-                    editor.begin_undo();
+                    editor.begin_undo().unwrap();
                     editor
                         .set_readonly(va, 0x1000, false)
                         .expect("readonly edit");
@@ -1892,7 +1892,7 @@ mod tests {
             .edit(
                 || panic!("manager must be present"),
                 |editor| {
-                    editor.begin_undo();
+                    editor.begin_undo().unwrap();
                     editor.set_readonly(0x40_0000, 0x1000, false).unwrap();
                     let rollback_res = unsafe { editor.rollback_undo(FailingResolver) };
                     assert!(matches!(

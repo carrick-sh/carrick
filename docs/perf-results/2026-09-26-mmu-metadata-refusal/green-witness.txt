@@ -1,0 +1,17 @@
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.94s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-1d1f88d6a1eb2090)
+
+running 5 tests
+test aarch64::tests::test_metadata_refusal_at_begin_undo ... ok
+scale=1 rollback_allocations=0 popped_len=1
+test aarch64::tests::test_metadata_refusal_sync_to_host_overflow_scratch ... ok
+scale=8 rollback_allocations=0 popped_len=8
+test aarch64::tests::test_metadata_refusal_sweep_during_transaction_mutations_and_recovery ... ok
+scale=32 rollback_allocations=0 popped_len=32
+test aarch64::tests::test_metadata_refusal_during_extension_arena_attach_returns_grant_exactly_once ... ok
+scale=128 rollback_allocations=0 popped_len=128
+test aarch64::tests::test_metadata_refusal_witness_rollback_allocations ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 84 filtered out; finished in 0.26s
