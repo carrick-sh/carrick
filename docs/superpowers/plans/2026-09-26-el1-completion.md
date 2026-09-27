@@ -766,3 +766,29 @@ bootstrap initialization, process-root mapping, token/register ABI, owner
 lifetime and denial-phase ordering remain incomplete. Evidence is under
 el1-elastic-metadata-director/review-2/. Same worker received review round2
 (turn3); one review round remains. No signed allocator candidate was run.
+
+### Delivery acceleration ruling (2026-09-26)
+
+Owner asked how to expedite delivery after two allocator reviews exposed
+host-green candidates with a broken standalone fixture and incomplete guest
+transport/lifetime. The critical path stays allocator -> signed guest
+growth/return -> actual first-touch; all later goal stages remain required.
+
+Let the currently live elastic metadata turn3 (review round2) finish; do not
+restart or replace it. Review its actual source and reproduce decisive checks.
+The director will directly resolve remaining integration defects rather than
+send another broad allocator repair round. This ends that broad delegation
+loop earlier than its maximum three reviews, not by accepting unfinished work.
+Do not edit the worker's tree until its process is confirmed terminal.
+
+Build the modified standalone Linux fixture alongside the cheap focused
+contracts. Once source review rules out known unsafe grant/lifetime paths, run
+the focused signed guest growth/return witness immediately; compile-only embed
+checks are insufficient. Fix the first decisive failure before broadening.
+Run full CI and required exact-artifact promotion at stable integrated
+checkpoints, not repeatedly on intermediate rejected implementations. Do not
+weaken semantics, work budgets, concurrency, provenance or final acceptance.
+
+No additional cleanup or architecture extraction is admitted unless a
+reproduced blocker directly prevents guest allocation or first-touch service.
+Report milestones in guest behavior and host-exit slope, not commit/test count.
