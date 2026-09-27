@@ -209,10 +209,8 @@ pub(crate) struct PreparedProcessAliasRetirement {
     pub(crate) planned_leases: std::collections::BTreeSet<(u64, u64)>,
     pub(crate) diagnostic_before: Vec<AliasBacking>,
     pub(crate) disarm_spans: Vec<CowArmedSpan>,
-    pub(crate) inventory: Option<(
-        InventoryLeaseRetirement,
-        carrick_hal::FrameInventoryReservation,
-    )>,
+    pub(crate) inventory: Option<InventoryLeaseRetirement>,
+    pub(crate) reservation: Option<carrick_hal::FrameInventoryReservation>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -170,7 +170,12 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
         };
         let zone =
             unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
-        let mailbox = carrick_el1_abi::frame_grant_mailbox_guest();
+        let Some(mailbox) =
+            carrick_el1_abi::frame_grant_mailbox_guest_for_slot(frame.slot as usize)
+        else {
+            counters.fault_taken.fetch_add(1, Ordering::Relaxed);
+            return Action::Forward;
+        };
         dispatch_fault_with_regions(
             frame,
             counters,

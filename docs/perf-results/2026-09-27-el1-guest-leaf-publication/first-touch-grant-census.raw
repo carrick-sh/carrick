@@ -1,0 +1,13 @@
+EL1GRANT1|start|ns=225106382456750|target=31874
+EL1GRANT1|summary|mmap_xlate=516|stage2_maps=6|stage2_unmaps=20|alias_replays=0|cow_triggers=7|delivered=0|drops=0|errors=0
+EL1GRANT1|fault_access|write|3
+EL1GRANT1|fault_access|read|513
+EL1GRANT1|stage2_map_len|0x8000|1
+EL1GRANT1|stage2_map_len|0x4000|5
+EL1GRANT1|stage2_unmap_len|0x8000|1
+EL1GRANT1|stage2_unmap_len|0xb0000|1
+EL1GRANT1|stage2_unmap_len|0x1c0000|1
+EL1GRANT1|stage2_unmap_len|0x800000|1
+EL1GRANT1|stage2_unmap_len|0x8000000|1
+EL1GRANT1|stage2_unmap_len|0x80000000|2
+EL1GRANT1|stage2_unmap_len|0x4000|13

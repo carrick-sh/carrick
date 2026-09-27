@@ -5,6 +5,12 @@
 use super::*;
 use carrick_fatal::carrick_fatal;
 
+#[derive(Clone, Copy)]
+enum AliasRetirementAuthorityState {
+    Pending,
+    AppliedWithReplacement,
+}
+
 impl HvfVmState {
     /// Live private semantic mappings that a process fork must arm read-only in
     /// both stage-1 graphs. This includes a currently-read-only or PROT_NONE
@@ -941,42 +947,101 @@ impl HvfVmState {
             .semantic_base
             .checked_add(request.len)
             .ok_or_else(|| TrapError::Hypervisor("EL1 frame-grant range overflow".to_owned()))?;
-        if self.mappings.iter().any(|mapping| {
-            mapping.start < end
-                && mapping.end > request.semantic_base
-                && global_frame_region_owner_matches_in(self.custody(), mapping)
-        }) {
-            return Ok(None);
-        }
-        if !alias_registry()
-            .lock()
-            .overlapping_process_aliases(
-                request.semantic_base,
-                semantic_len,
-                self.mm_root_slot,
-                self.container_root,
-            )
-            .is_empty()
-        {
+        let aliases = alias_registry().lock().overlapping_process_aliases(
+            request.semantic_base,
+            semantic_len,
+            self.mm_root_slot,
+            self.container_root,
+        );
+        let forbidden_alias = aliases.iter().any(|(_, alias)| {
+            alias.sharing != GuestMappingSharing::Private
+                || !global_frame_host_owner_matches_in(
+                    self.custody(),
+                    alias.physical_ipa,
+                    alias.physical_size as u64,
+                    alias.physical_host_addr,
+                    alias.owner_generation,
+                )
+        });
+        let overlapping_mappings: Vec<_> = self
+            .mappings
+            .iter()
+            .filter(|mapping| {
+                mapping.start < end
+                    && mapping.end > request.semantic_base
+                    && global_frame_region_owner_matches_in(self.custody(), mapping)
+            })
+            .collect();
+        let forbidden_mapping = overlapping_mappings.iter().any(|mapping| {
+            !mapping.is_dynamic_alias || mapping.sharing != GuestMappingSharing::Private
+        });
+        if forbidden_alias || forbidden_mapping {
             return Ok(None);
         }
         let Some(deferred_state) = self.deferred_anonymous_state() else {
             return Ok(None);
         };
-        let transition = match deferred_state.begin_materialization(
+        let transition = match deferred_state.begin_pristine_materialization(
             carrick_guest_mem::GuestVa(request.semantic_base),
             semantic_len,
         ) {
-            Ok(transition) => transition,
+            Ok(Some(transition)) => transition,
+            Ok(None) => return Ok(None),
             Err(_) => return Ok(None),
+        };
+        let replacement_leases: std::collections::BTreeSet<_> = aliases
+            .iter()
+            .map(|(_, alias)| (alias.physical_ipa, alias.physical_size as u64))
+            .chain(
+                overlapping_mappings
+                    .iter()
+                    .map(|mapping| (mapping.physical_ipa, mapping.physical_size as u64)),
+            )
+            .collect();
+        let mut retirement = if replacement_leases.is_empty() {
+            None
+        } else {
+            let planned =
+                self.plan_process_alias_retirement(request.semantic_base, semantic_len)?;
+            if planned.inventory.is_none()
+                || !replacement_leases
+                    .iter()
+                    .all(|lease| planned.planned_leases.contains(lease))
+            {
+                return Ok(None);
+            }
+            Some(planned)
         };
         let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
             carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
             identity.linux_pid,
             identity.linux_tid,
         );
-        let published =
-            sparse_materialization::publish_frame_grant(&publication, request, &registry)?;
+        let published = sparse_materialization::publish_frame_grant(
+            &publication,
+            request,
+            retirement
+                .as_ref()
+                .and_then(|retirement| retirement.inventory.as_ref()),
+            &registry,
+        )?;
+        if let Some(retirement) = retirement.take() {
+            self.commit_preapplied_process_alias_retirement(
+                request.semantic_base,
+                semantic_len,
+                retirement,
+                &registry,
+            )
+            .unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::el1_frame_grant",
+                    "committed EL1 frame-grant replacement could not retire its predecessor: start=0x{:x} len=0x{:x} error={error}",
+                    request.semantic_base,
+                    request.len,
+                );
+            });
+        }
+        register_shared_alias(published.alias);
         drop(registry);
         self.mappings.insert(published.region);
         transition.commit();
@@ -4533,6 +4598,36 @@ impl HvfVmState {
         va: u64,
         len: usize,
     ) -> Result<PreparedProcessAliasRetirement, TrapError> {
+        let mut prepared = self.plan_process_alias_retirement(va, len)?;
+        if let Some(retirement) = prepared.inventory.as_ref() {
+            let event_count = retirement
+                .mappings
+                .len()
+                .saturating_add(retirement.frames.len());
+            let authority = self.cow_authority.as_ref().ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "HVPatch alias retirement has no inventory authority".to_owned(),
+                )
+            })?;
+            let mut reservation = authority.reserve(0, 0, event_count).map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "reserve HVPatch alias retirement inventory: {error}"
+                ))
+            })?;
+            Self::stage_inventory_lease_retirement(&mut reservation, retirement)?;
+            prepared.reservation = Some(reservation);
+        }
+        Ok(prepared)
+    }
+
+    /// Plan exact process-alias retirement without reserving an independent
+    /// kernel transaction. EL1 frame-grant replacement folds this plan into
+    /// the grant's single inventory commit so Ready names the final revision.
+    fn plan_process_alias_retirement(
+        &self,
+        va: u64,
+        len: usize,
+    ) -> Result<PreparedProcessAliasRetirement, TrapError> {
         let authority = self.cow_authority.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch alias retirement has no inventory authority".to_owned())
         })?;
@@ -4575,17 +4670,7 @@ impl HvfVmState {
             if retirement.mappings.is_empty() {
                 None
             } else {
-                let event_count = retirement
-                    .mappings
-                    .len()
-                    .saturating_add(retirement.frames.len());
-                let mut reservation = authority.reserve(0, 0, event_count).map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "reserve HVPatch alias retirement inventory: {error}"
-                    ))
-                })?;
-                Self::stage_inventory_lease_retirement(&mut reservation, &retirement)?;
-                Some((retirement, reservation))
+                Some(retirement)
             }
         };
         Ok(PreparedProcessAliasRetirement {
@@ -4593,6 +4678,7 @@ impl HvfVmState {
             diagnostic_before,
             disarm_spans,
             inventory,
+            reservation: None,
         })
     }
 
@@ -4611,6 +4697,39 @@ impl HvfVmState {
         prepared: PreparedProcessAliasRetirement,
         registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
     ) -> Result<(), TrapError> {
+        self.commit_process_alias_retirement_inner(
+            va,
+            len,
+            prepared,
+            registry,
+            AliasRetirementAuthorityState::Pending,
+        )
+    }
+
+    fn commit_preapplied_process_alias_retirement(
+        &mut self,
+        va: u64,
+        len: usize,
+        prepared: PreparedProcessAliasRetirement,
+        registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
+    ) -> Result<(), TrapError> {
+        self.commit_process_alias_retirement_inner(
+            va,
+            len,
+            prepared,
+            registry,
+            AliasRetirementAuthorityState::AppliedWithReplacement,
+        )
+    }
+
+    fn commit_process_alias_retirement_inner(
+        &mut self,
+        va: u64,
+        len: usize,
+        prepared: PreparedProcessAliasRetirement,
+        registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
+        authority_state: AliasRetirementAuthorityState,
+    ) -> Result<(), TrapError> {
         let _ = registry;
         let authority = self.cow_authority.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch alias retirement has no inventory authority".to_owned())
@@ -4624,6 +4743,7 @@ impl HvfVmState {
             diagnostic_before,
             disarm_spans,
             inventory,
+            reservation,
         } = prepared;
         self.supersede_cow_receipts("process-alias-unmap", va, len as u64);
         let actual_leases = unregister_alias(va, len, self.mm_root_slot, self.container_root);
@@ -4641,7 +4761,12 @@ impl HvfVmState {
             self.container_root,
             &diagnostic_before,
         );
-        let Some((retirement, reservation)) = inventory else {
+        let Some(retirement) = inventory else {
+            if reservation.is_some() {
+                return Err(TrapError::Hypervisor(
+                    "alias retirement reserved inventory without a retirement plan".to_owned(),
+                ));
+            }
             self.split_local_rows_for_unmap(va, len);
             // A surviving fragment of a compound still needs its COW arm.
             // The planner emits spans only for leases it actually retires.
@@ -4651,7 +4776,26 @@ impl HvfVmState {
             }
             return Ok(());
         };
-        if let Err(error) = authority.apply(reservation.commit(())) {
+        let apply_result = match authority_state {
+            AliasRetirementAuthorityState::Pending => {
+                let reservation = reservation.ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "alias retirement has no prepared inventory reservation".to_owned(),
+                    )
+                })?;
+                authority.apply(reservation.commit(()))
+            }
+            AliasRetirementAuthorityState::AppliedWithReplacement => {
+                if reservation.is_some() {
+                    return Err(TrapError::Hypervisor(
+                        "preapplied alias retirement retained a second inventory reservation"
+                            .to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+        };
+        if let Err(error) = apply_result {
             // Name the retirement, not just the id that failed. This abort used
             // to print one MappingId and nothing else, which cannot distinguish
             // a double-retire from a mapping the authority never saw, and gives

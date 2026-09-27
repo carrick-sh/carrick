@@ -4053,9 +4053,18 @@ where
                 from_el0_direct,
                 ..
             }) => {
+                let fault_access = signal::el0_fault_access(syndrome);
                 if let carrick_hal::CowFaultResolution::Resolved { translation } =
                     engine.resolve_frame_cow_fault(syndrome, far)?
                 {
+                    if let Some(mm_key) = self.state.zone_mm {
+                        signal::cancel_frame_grant_request(
+                            engine.mailbox_slot(),
+                            mm_key,
+                            far,
+                            fault_access,
+                        );
+                    }
                     self.state.note_cow_resolution(far, syndrome, translation)?;
                     return Ok(executor::ExecutorExit::Syscall);
                 }
@@ -4150,7 +4159,7 @@ where
                                 &self.kernel.dispatcher,
                                 engine,
                                 si_addr,
-                                signal::el0_fault_access(syndrome),
+                                fault_access,
                                 faulting_tid,
                                 mutation,
                             )
@@ -4158,6 +4167,14 @@ where
                         .map_err(RuntimeError::Trap)?
                 {
                     return Ok(executor::ExecutorExit::Syscall);
+                }
+                if let Some(mm_key) = self.state.zone_mm {
+                    signal::cancel_frame_grant_request(
+                        engine.mailbox_slot(),
+                        mm_key,
+                        si_addr,
+                        fault_access,
+                    );
                 }
                 // Captured only now: a first touch resolved above never
                 // delivers a signal, and this capture is an `RwLock` read plus

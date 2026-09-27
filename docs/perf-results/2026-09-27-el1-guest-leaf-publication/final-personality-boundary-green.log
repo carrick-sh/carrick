@@ -1,0 +1,6 @@
+   Compiling carrick-conformance-contract v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-conformance-contract)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running `target/debug/check-personality-boundary --root . --metadata-file target/cargo-metadata.json`
+personality boundary checked: 2 substrate crate(s) clean
+  [PASS] crate `carrick-sched-core` (shipped deps: [], dev deps: [], scanned files: 4)
+  [PASS] crate `carrick-mmu-core` (shipped deps: ["foldhash", "hashbrown"], dev deps: ["carrick-mem"], scanned files: 2)

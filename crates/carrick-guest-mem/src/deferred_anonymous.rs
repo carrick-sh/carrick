@@ -435,6 +435,29 @@ impl DeferredAnonymousState {
             range: extent(start, len)?,
         })
     }
+
+    /// Lock an exact pristine zero span through physical publication. A
+    /// materialized hole refuses the bulk transaction without changing either
+    /// pristine provenance or logical zero-read residency.
+    pub fn begin_pristine_materialization(
+        &self,
+        start: GuestVa,
+        len: usize,
+    ) -> Result<Option<DeferredAnonymousTransition<'_>>, DeferredAnonymousError> {
+        let range = extent(start, len)?;
+        let state = self.state.lock();
+        let index = state
+            .pristine
+            .partition_point(|candidate| candidate.end <= range.start);
+        if !state
+            .pristine
+            .get(index)
+            .is_some_and(|candidate| candidate.start <= range.start && range.end <= candidate.end)
+        {
+            return Ok(None);
+        }
+        Ok(Some(DeferredAnonymousTransition { state, range }))
+    }
 }
 
 #[must_use]
@@ -586,6 +609,41 @@ mod tests {
         state.retire(GuestVa(0x3000), 4096).unwrap();
         assert!(!state.covers_pristine(GuestVa(0x3001), 2));
         assert!(state.snapshot().zero_read_resident.is_empty());
+    }
+
+    #[test]
+    fn pristine_materialization_transition_refuses_a_materialized_hole_without_mutation() {
+        let state = DeferredAnonymousState::new();
+        let base = GuestVa(0x40_0000);
+        state.reserve_fresh(base, 3 * PAGE as usize).unwrap();
+
+        let untouched = state
+            .begin_pristine_materialization(base, 3 * PAGE as usize)
+            .unwrap()
+            .expect("the complete untouched span is eligible");
+        drop(untouched);
+        assert_eq!(
+            state.snapshot().pristine,
+            vec![base..GuestVa(base.raw() + 3 * PAGE)]
+        );
+
+        state
+            .begin_materialization(GuestVa(base.raw() + PAGE), PAGE as usize)
+            .unwrap()
+            .commit();
+        let before = state.snapshot();
+        assert!(
+            state
+                .begin_pristine_materialization(base, 3 * PAGE as usize)
+                .unwrap()
+                .is_none(),
+            "a bulk zero grant must not erase a resident middle page"
+        );
+        assert_eq!(
+            state.snapshot(),
+            before,
+            "refusal must not mutate provenance"
+        );
     }
 
     #[test]

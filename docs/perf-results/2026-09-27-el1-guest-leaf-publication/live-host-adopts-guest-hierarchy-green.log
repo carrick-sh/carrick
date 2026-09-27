@@ -1,0 +1,12 @@
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-image)
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.13s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-438fb741d9d260b3)
+
+running 3 tests
+test aarch64::tests::live_host_allocator_never_reissues_guest_grown_table_pages ... ok
+test aarch64::tests::live_host_permission_edit_preserves_independently_updated_output ... ok
+test aarch64::tests::live_host_edit_adopts_hierarchy_allocated_by_guest_editor ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 0.04s

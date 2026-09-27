@@ -1,0 +1,26 @@
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+   Compiling carrick-guest-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-guest-mem)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.31s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-438fb741d9d260b3)
+
+running 1 test
+test aarch64::tests::live_guest_publication_replaces_a_retired_leaf_with_the_new_grant ... FAILED
+
+failures:
+
+---- aarch64::tests::live_guest_publication_replaces_a_retired_leaf_with_the_new_grant stdout ----
+
+thread 'aarch64::tests::live_guest_publication_replaces_a_retired_leaf_with_the_new_grant' (15388994) panicked at crates/carrick-mmu-core/src/aarch64.rs:7602:9:
+assertion `left == right` failed
+  left: Err(RetiredLeaf)
+ right: Ok(1)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    aarch64::tests::live_guest_publication_replaces_a_retired_leaf_with_the_new_grant
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 98 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p carrick-mmu-core --lib`

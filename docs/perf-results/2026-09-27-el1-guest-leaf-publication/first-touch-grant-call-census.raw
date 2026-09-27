@@ -1,0 +1,3 @@
+EL1GRANTCALL1|start|ns=225191560339041|target=31997
+EL1GRANTCALL1|summary|all_faults=522|target_faults=522|claims=516|plans=0|prepares=1|grant_commits=0|page_commits=514|drops=0|errors=0
+EL1GRANTCALL1|fault_pid|31997|522

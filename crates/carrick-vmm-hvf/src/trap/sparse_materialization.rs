@@ -21,6 +21,7 @@ pub(super) struct PreparedSparseBacking {
 
 pub(super) struct PublishedFrameGrant {
     pub(super) region: HvfMappedRegion,
+    pub(super) alias: AliasBacking,
     pub(super) ready: carrick_hal::El1FrameGrantReady,
 }
 
@@ -263,6 +264,7 @@ pub(super) fn prepare(
 pub(super) fn publish_frame_grant(
     context: &PublicationContext<'_>,
     request: carrick_hal::El1FrameGrantRequest,
+    retirement: Option<&InventoryLeaseRetirement>,
     _registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
 ) -> Result<PublishedFrameGrant, TrapError> {
     let end = request
@@ -271,9 +273,21 @@ pub(super) fn publish_frame_grant(
         .ok_or_else(|| TrapError::Hypervisor("EL1 frame-grant range overflow".to_owned()))?;
     let semantic_len =
         usize::try_from(request.len).map_err(|_| TrapError::MappingTooLarge(request.len))?;
-    let mut reservation = context.authority.reserve(1, 1, 2).map_err(|error| {
-        TrapError::Hypervisor(format!("reserve EL1 frame-grant inventory: {error}"))
-    })?;
+    let retirement_events = retirement.map_or(0, |retirement| {
+        retirement
+            .mappings
+            .len()
+            .saturating_add(retirement.frames.len())
+    });
+    let mut reservation = context
+        .authority
+        .reserve(1, 1, 2usize.saturating_add(retirement_events))
+        .map_err(|error| {
+            TrapError::Hypervisor(format!("reserve EL1 frame-grant inventory: {error}"))
+        })?;
+    if let Some(retirement) = retirement {
+        HvfVmState::stage_inventory_lease_retirement(&mut reservation, retirement)?;
+    }
     let PreparedSparseBacking {
         physical_host,
         semantic_host,
@@ -367,6 +381,15 @@ pub(super) fn publish_frame_grant(
         || !receipt.authorizes(inventory_mapping.mapping, inventory_mapping.frame)
         || authenticated_owner_generation.raw_for_probe() != owner_generation
     {
+        if retirement.is_some() {
+            carrick_fatal!(
+                "hvpatch::el1_frame_grant",
+                "combined replacement grant failed post-commit authentication: mm={} semantic_base=0x{:x} len=0x{:x}",
+                request.mm_key,
+                request.semantic_base,
+                request.len,
+            );
+        }
         if let Err(error) = context.authority.rollback_frame_grant(&receipt) {
             carrick_fatal!(
                 "hvpatch::el1_frame_grant",
@@ -388,7 +411,7 @@ pub(super) fn publish_frame_grant(
     }
 
     let sharing = GuestMappingSharing::Private;
-    register_shared_alias(AliasBacking {
+    let alias = AliasBacking {
         start: request.semantic_base,
         ipa: semantic_ipa,
         host_addr: semantic_host as usize,
@@ -408,7 +431,7 @@ pub(super) fn publish_frame_grant(
         shared_key_base: 0,
         shared_key_offset: 0,
         owner_generation,
-    });
+    };
     let region = HvfMappedRegion {
         start: request.semantic_base,
         ipa: semantic_ipa,
@@ -437,7 +460,11 @@ pub(super) fn publish_frame_grant(
         inventory_revision: receipt.revision(),
     };
     owner_rollback.commit();
-    Ok(PublishedFrameGrant { region, ready })
+    Ok(PublishedFrameGrant {
+        region,
+        alias,
+        ready,
+    })
 }
 
 #[derive(Debug)]

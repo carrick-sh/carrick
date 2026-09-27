@@ -1,0 +1,48 @@
+FAULTCLASS|start|ns=224966684874583|target=31451
+
+FAULTCLASS|end|ns=224966755203625|faults=522
+
+FAULTCLASS|TABLE1 faults by class/kind/access
+class    kind     rw         faults
+heap     perm     w               2
+low      perm     w               2
+stack    perm     w               2
+mmap     xlate    w               3
+mmap     xlate    r             513
+
+FAULTCLASS|TABLE2 distinct granules touched, per class
+class          faults       new_4k      new_16k      new_64k
+heap                2
+low                 2
+stack               2
+mmap              516
+FAULTCLASS|new4k|heap                1
+FAULTCLASS|new4k|stack               1
+FAULTCLASS|new4k|low                 2
+FAULTCLASS|new4k|mmap              257
+FAULTCLASS|new16k|heap                1
+FAULTCLASS|new16k|low                 1
+FAULTCLASS|new16k|stack               1
+FAULTCLASS|new16k|mmap               65
+FAULTCLASS|new64k|heap                1
+FAULTCLASS|new64k|low                 1
+FAULTCLASS|new64k|stack               1
+FAULTCLASS|new64k|mmap               17
+
+FAULTCLASS|TABLE3 first vs repeat page, per class
+FAULTCLASS|repeat|heap     first               1
+FAULTCLASS|repeat|heap     repeat              1
+FAULTCLASS|repeat|stack    first               1
+FAULTCLASS|repeat|stack    repeat              1
+FAULTCLASS|repeat|low      first               2
+FAULTCLASS|repeat|mmap     first             257
+FAULTCLASS|repeat|mmap     repeat            259
+
+FAULTCLASS|TABLE4 service arm
+FAULTCLASS|arm|stale_retries=0|delivered=0|serviced_by_plan=522
+
+FAULTCLASS|TOTALS
+FAULTCLASS|total|faults=522
+FAULTCLASS|total|distinct_4k=261
+FAULTCLASS|total|distinct_16k=68
+FAULTCLASS|total|distinct_64k=20

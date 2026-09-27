@@ -258,6 +258,8 @@ fn main() {
     // stale image whose object layout silently disagrees with the host.
     println!("cargo:rerun-if-changed=../carrick-inotify-core/src");
     println!("cargo:rerun-if-changed=../carrick-inotify-core/Cargo.toml");
+    println!("cargo:rerun-if-changed=../carrick-mmu-core/src");
+    println!("cargo:rerun-if-changed=../carrick-mmu-core/Cargo.toml");
     println!("cargo:rerun-if-changed=../carrick-sched-core/src");
     println!("cargo:rerun-if-changed=../carrick-sched-core/Cargo.toml");
 }
