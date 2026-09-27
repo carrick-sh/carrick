@@ -546,3 +546,11 @@ is active on turn 2. Details are in
 `docs/perf-results/2026-09-26-el1-fault-entry-director/`. No implementation
 was integrated and no signed acceptance was attempted. The initial reset
 concern was withdrawn after inspecting its pointer/snapshot lifecycle.
+
+2026-09-26: while fault-entry review round 1 runs, static MMU allocation
+audit identified an additional prerequisite beyond the existing heap-overlap
+red: journal/staged/dirty collection growth is infallible, including returned
+arena bookkeeping after rollback consumes its journal. A reclaiming allocator
+alone cannot prove metadata-refusal recovery. Evidence and required witness
+cases are in `docs/perf-results/2026-09-26-el1-first-touch/allocator-prerequisite/mmu-allocation-audit.md`.
+No current guest OOM reproduction or new allocator acceptance is claimed.
