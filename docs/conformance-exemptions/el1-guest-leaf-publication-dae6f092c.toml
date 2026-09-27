@@ -1,0 +1,22 @@
+schema = "carrick.conformance-exemption.v1"
+base = "a6be856b9b3fd5601148c057a739f81fb39ffb6b"
+head = "dae6f092c3a8eed2f574f93231d320edd6cc96b8"
+contracts = [
+  "hvpatch.syscall.portal",
+  "kernel.el1.fault-entry",
+  "kernel.el1.gic",
+  "kernel.el1.guest-run-queue",
+  "kernel.el1.guest-scheduler",
+  "kernel.el1.metadata-allocation",
+  "kernel.el1.transparent",
+  "kernel.fork.stage1-image",
+  "kernel.mm.metadata-refusal",
+  "kernel.vcpu.kick-el0-boundary",
+]
+paths = [
+  "crates/carrick-el1-abi/src/lib.rs",
+  "crates/carrick-el1/src/fault.rs",
+  "crates/carrick-mem/src/memory.rs",
+  "crates/carrick-mmu-core/src/aarch64.rs",
+]
+rationale = "The exact product diff adds the registered kernel.el1.stage1-publication guest transaction and its source-local red-first tests. Shared ABI, fault-entry, memory-layout and neutral-MMU files are also classified under older contracts whose behavior is unchanged: the new ABI items do not alter shared record layout, the existing fault vector routing is retained, page-table address constants keep identical values, and the stale dynamic-metadata layout assertion is corrected to the already-shipped kernel-only mapping. Focused EL1, ABI, MMU, memory, runtime and embedded-image tests cover those unchanged boundaries."

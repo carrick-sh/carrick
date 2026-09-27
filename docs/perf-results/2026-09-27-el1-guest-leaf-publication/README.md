@@ -5,6 +5,8 @@ to the production EL1 data-abort path. It is source and VM-free validation for
 the impact-bearing path; signed first-touch acceptance is deliberately not
 claimed here.
 
+Product commit: `dae6f092c3a8eed2f574f93231d320edd6cc96b8`.
+
 On the first recoverable translation or permission fault, EL1 publishes one
 carrier-wide request bound to the loaded task's exact MM, FAR, access class and
 nonzero generation, then forwards through the existing host boundary. On the
