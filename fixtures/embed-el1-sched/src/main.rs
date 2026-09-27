@@ -56,6 +56,10 @@
 //!   same inherited virtual range: verify zero fill, write distinct role values,
 //!   rendezvous via bounded pipes, and verify role values are preserved.
 //!
+//! - `fault-entry`: triggers a stage-1 permission fault on a PROT_READ mapping,
+//!   catches SIGSEGV with SA_SIGINFO, verifies si_addr, mprotects PROT_READ|PROT_WRITE,
+//!   retries store, and verifies store success and register preservation.
+//!
 //! Every wait in the checks is bounded, so a lost wake or a lost signal is a
 //! failed line, never a hung test.
 
@@ -1411,6 +1415,207 @@ fn first_touch(pages: usize) -> i32 {
     if parent_ok && child_ok { 0 } else { 1 }
 }
 
+static FAULT_COUNT: AtomicU32 = AtomicU32::new(0);
+static FAULT_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FAULT_MMAP_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn on_fault_segv(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _ucontext: *mut libc::c_void,
+) {
+    if sig != libc::SIGSEGV {
+        return;
+    }
+    FAULT_COUNT.fetch_add(1, Ordering::SeqCst);
+    if !info.is_null() {
+        let si_addr = unsafe { (*info).si_addr as usize };
+        FAULT_ADDR.store(si_addr, Ordering::SeqCst);
+    }
+    let base = FAULT_MMAP_BASE.load(Ordering::SeqCst);
+    if base != 0 {
+        // Upgrade permissions to PROT_READ | PROT_WRITE so the retried store succeeds
+        unsafe {
+            libc::mprotect(
+                base as *mut libc::c_void,
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+            );
+        }
+    }
+}
+
+fn fault_entry_mode() -> i32 {
+    let page_size = 4096;
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            page_size,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        println!("fault-entry mmap failed");
+        return 1;
+    }
+    let base = ptr as usize;
+    FAULT_MMAP_BASE.store(base, Ordering::SeqCst);
+
+    // Install SA_SIGINFO handler for SIGSEGV
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = on_fault_segv as usize;
+    sa.sa_flags = libc::SA_SIGINFO;
+    let rc = unsafe { libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut()) };
+    if rc != 0 {
+        println!("fault-entry sigaction failed");
+        unsafe { libc::munmap(ptr, page_size) };
+        return 1;
+    }
+
+    let target_addr = base + 0x40;
+    let store_val: u64 = 0xDEAD_BEEF_CAFE_BABE;
+    let mut out_val: u64 = 0;
+    let mut r1: u64 = 0;
+    let mut r2: u64 = 0;
+    let mut r3: u64 = 0;
+    let mut r4: u64 = 0;
+    let mut r5: u64 = 0;
+    let mut r6: u64 = 0;
+    let mut r7: u64 = 0;
+    let mut r8: u64 = 0;
+    let mut r9: u64 = 0;
+    let mut r10: u64 = 0;
+    let mut r11: u64 = 0;
+    let mut r12: u64 = 0;
+    let mut r13: u64 = 0;
+    let mut r14: u64 = 0;
+    let mut r15: u64 = 0;
+    let mut r16: u64 = 0;
+    let mut r17: u64 = 0;
+    let mut r19: u64 = 0;
+    let mut r20: u64 = 0;
+
+    // We execute the store with canaries in registers to verify full architectural state preservation:
+    // x1..x15, x16, x17, arbitrary x8, callee-saved registers.
+    unsafe {
+        std::arch::asm!(
+            "mov x1, 0x1111",
+            "mov x2, 0x2222",
+            "mov x3, 0x3333",
+            "mov x4, 0x4444",
+            "mov x5, 0x5555",
+            "mov x6, 0x6666",
+            "mov x7, 0x7777",
+            "mov x8, 0x8888",
+            "mov x9, 0x9999",
+            "mov x10, 0xAAAA",
+            "mov x11, 0xBBBB",
+            "mov x12, 0xCCCC",
+            "mov x13, 0xDDDD",
+            "mov x14, 0xEEEE",
+            "mov x15, 0xFFFF",
+            "mov x16, 0x1616",
+            "mov x17, 0x1717",
+            "mov x19, 0x1919",
+            "mov x20, 0x2020",
+            // The faulting store:
+            "str {val}, [{target}]",
+            // Capture register values post-store / post-handler-retry:
+            "mov {r1}, x1",
+            "mov {r2}, x2",
+            "mov {r3}, x3",
+            "mov {r4}, x4",
+            "mov {r5}, x5",
+            "mov {r6}, x6",
+            "mov {r7}, x7",
+            "mov {r8}, x8",
+            "mov {r9}, x9",
+            "mov {r10}, x10",
+            "mov {r11}, x11",
+            "mov {r12}, x12",
+            "mov {r13}, x13",
+            "mov {r14}, x14",
+            "mov {r15}, x15",
+            "mov {r16}, x16",
+            "mov {r17}, x17",
+            "mov {r19}, x19",
+            "mov {r20}, x20",
+            // Read back the stored value:
+            "ldr {out_val}, [{target}]",
+            target = in(reg) target_addr,
+            val = in(reg) store_val,
+            r1 = out(reg) r1,
+            r2 = out(reg) r2,
+            r3 = out(reg) r3,
+            r4 = out(reg) r4,
+            r5 = out(reg) r5,
+            r6 = out(reg) r6,
+            r7 = out(reg) r7,
+            r8 = out(reg) r8,
+            r9 = out(reg) r9,
+            r10 = out(reg) r10,
+            r11 = out(reg) r11,
+            r12 = out(reg) r12,
+            r13 = out(reg) r13,
+            r14 = out(reg) r14,
+            r15 = out(reg) r15,
+            r16 = out(reg) r16,
+            r17 = out(reg) r17,
+            r19 = out(reg) r19,
+            r20 = out(reg) r20,
+            out_val = out(reg) out_val,
+            clobber_abi("C"),
+        );
+    }
+
+    let fault_count = FAULT_COUNT.load(Ordering::SeqCst);
+    let fault_addr = FAULT_ADDR.load(Ordering::SeqCst);
+
+    unsafe { libc::munmap(ptr, page_size) };
+
+    if fault_count != 1 {
+        println!("fault-entry unexpected fault_count={fault_count}");
+        return 1;
+    }
+    if fault_addr != target_addr {
+        println!("fault-entry unexpected fault_addr={fault_addr:#x} expected={target_addr:#x}");
+        return 1;
+    }
+    if out_val != store_val {
+        println!("fault-entry store failed out_val={out_val:#x} expected={store_val:#x}");
+        return 1;
+    }
+    if r1 != 0x1111
+        || r2 != 0x2222
+        || r3 != 0x3333
+        || r4 != 0x4444
+        || r5 != 0x5555
+        || r6 != 0x6666
+        || r7 != 0x7777
+        || r8 != 0x8888
+        || r9 != 0x9999
+        || r10 != 0xAAAA
+        || r11 != 0xBBBB
+        || r12 != 0xCCCC
+        || r13 != 0xDDDD
+        || r14 != 0xEEEE
+        || r15 != 0xFFFF
+        || r16 != 0x1616
+        || r17 != 0x1717
+        || r19 != 0x1919
+        || r20 != 0x2020
+    {
+        println!("fault-entry register preservation failed");
+        return 1;
+    }
+
+    println!("fault-entry ok");
+    0
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("pingpong");
@@ -1442,6 +1647,7 @@ fn main() {
                 }
             },
         },
+        "fault-entry" => fault_entry_mode(),
         "exec-child" => {
             println!("exec-child ok");
             0

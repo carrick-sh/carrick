@@ -561,6 +561,9 @@ const AARCH64_MRS_TPIDR_EL1_X16_OPCODE: u32 = 0xd538_d090;
 const AARCH64_MRS_ESR_EL1_X16_OPCODE: u32 = 0xd538_5210;
 const AARCH64_LSR_X16_X16_26_OPCODE: u32 = 0xd35a_fe10;
 const AARCH64_CMP_X16_SVC64_OPCODE: u32 = 0xf100_561f;
+const AARCH64_CMP_X16_DATA_ABORT_OPCODE: u32 = 0xf100_921f;
+const AARCH64_MRS_FAR_EL1_X17_OPCODE: u32 = 0xd538_6011;
+const AARCH64_MSR_FAR_EL1_X17_OPCODE: u32 = 0xd518_6011;
 const AARCH64_MRS_ELR_EL1_X16_OPCODE: u32 = 0xd538_4030;
 const AARCH64_MRS_SPSR_EL1_X16_OPCODE: u32 = 0xd538_4010;
 const AARCH64_MRS_SP_EL0_X16_OPCODE: u32 = 0xd538_4110;
@@ -4520,6 +4523,10 @@ const EL1_VECTOR_HOOK_OFFSET: usize = 0x1000;
 /// The EL0 IRQ hook ([`El1IrqMode::Gic`]): the lower-EL IRQ slot branches
 /// here, and it enters the EL1 image with an interrupt frame.
 const EL0_IRQ_HOOK_OFFSET: usize = 0x2000;
+/// The EL0 Data Abort hook: the lower-EL sync slot branches here for EC 0x24 data aborts,
+/// saving all architectural registers, ESR and FAR, calling the EL1 image, and forwarding
+/// via legacy HVC if unhandled.
+const EL0_FAULT_HOOK_OFFSET: usize = 0x3000;
 
 /// Whether guest EL0 takes interrupts into Carrick's EL1 kernel. The HVF
 /// carrier chooses it (`carrick_vmm_hvf::gic`), one reader for the VM, the
@@ -4551,6 +4558,9 @@ enum HookEntry {
     /// syndrome is 0, and a forward leaves through `hvc #4` at that EL0
     /// boundary.
     Irq,
+    /// An EL0 Data Abort (EC 0x24): a forward restores all registers and
+    /// leaves through `legacy_hvc` (`hvc #2`).
+    Fault,
 }
 
 /// Emit an EL1 hook: save the EL0 frame on the slot's EL1 stack, call the
@@ -4658,19 +4668,24 @@ fn write_el1_hook(
     emit(bytes, &mut cursor, enc_str_xt_xn(0, 16, 136)); // x[17]
     emit(bytes, &mut cursor, enc_ldr_xt_xn(0, 16, 0)); // restore x0
 
-    // 5. Save slot, elr, spsr, esr
+    // 5. Save slot, elr, spsr, esr, far
     emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 272)); // slot at offset 272
     emit(bytes, &mut cursor, 0xD538_4031); // mrs x17, elr_el1
     emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 248)); // elr at offset 248
     emit(bytes, &mut cursor, 0xD538_4011); // mrs x17, spsr_el1
     emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 256)); // spsr at offset 256
     match entry {
-        HookEntry::Syscall => {
+        HookEntry::Syscall | HookEntry::Fault => {
             emit(bytes, &mut cursor, 0xD538_5211); // mrs x17, esr_el1
             emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 264)); // esr at offset 264
+            emit(bytes, &mut cursor, 0xD538_6011); // mrs x17, far_el1
+            emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 280)); // far at offset 280
         }
         // An interrupt frame: syndrome 0 (an SVC's never is).
-        HookEntry::Irq => emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264)),
+        HookEntry::Irq => {
+            emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264));
+            emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 280));
+        }
     }
 
     // 6. Switch SP to TrapFrame and prepare x0 as frame argument. The idle
@@ -4849,14 +4864,16 @@ fn write_el1_hook(
     );
     emit(bytes, &mut cursor, 0x8B11_2031); // add x17, x1, x17, lsl #8
     emit(bytes, &mut cursor, 0x9100_023F); // mov sp, x17 (restores SP_EL1)
-    // Restore ELR, SPSR, and ESR
+    // Restore ELR, SPSR, ESR, and FAR
     emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 248)); // elr
     emit(bytes, &mut cursor, 0xD518_4031); // msr elr_el1, x17
     emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 256)); // spsr
     emit(bytes, &mut cursor, 0xD518_4011); // msr spsr_el1, x17
-    if entry == HookEntry::Syscall {
+    if entry == HookEntry::Syscall || entry == HookEntry::Fault {
         emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 264)); // esr
         emit(bytes, &mut cursor, 0xD518_5211); // msr esr_el1, x17
+        emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 280)); // far
+        emit(bytes, &mut cursor, 0xD518_6011); // msr far_el1, x17
     }
     // Restore x0..x15, x18..x30
     for r in 0..=15 {
@@ -4882,6 +4899,15 @@ fn write_el1_hook(
             // and PSTATE.
             emit(bytes, &mut cursor, AARCH64_HVC_KICK_OPCODE);
             emit(bytes, &mut cursor, AARCH64_ERET_OPCODE);
+        }
+        HookEntry::Fault => {
+            // The unhandled fault exit: restore registers, leave with hvc #2 to legacy_hvc
+            let branch_to_legacy = cursor;
+            emit(
+                bytes,
+                &mut cursor,
+                enc_b(branch_to_legacy as u64, mailbox_capture as u64),
+            );
         }
     }
 
@@ -5031,7 +5057,7 @@ pub fn el1_vectors_bytes_mailbox_irq(
     emit(&mut bytes, &mut cursor, AARCH64_LSR_X16_X16_26_OPCODE);
     emit(&mut bytes, &mut cursor, AARCH64_CMP_X16_SVC64_OPCODE);
     emit(&mut bytes, &mut cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
-    let non_svc_branch = cursor;
+    let not_svc_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
     // A mailbox image with no identity shim still needs the independent fstat/close
@@ -5366,10 +5392,49 @@ pub fn el1_vectors_bytes_mailbox_irq(
     let invalid_action = cursor;
     emit(&mut bytes, &mut cursor, AARCH64_HVC_FAULT_OPCODE);
 
+    let not_svc = cursor;
+    emit(&mut bytes, &mut cursor, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
+    emit(&mut bytes, &mut cursor, AARCH64_MRS_ESR_EL1_X16_OPCODE);
+    emit(&mut bytes, &mut cursor, AARCH64_LSR_X16_X16_26_OPCODE);
+    emit(&mut bytes, &mut cursor, AARCH64_CMP_X16_DATA_ABORT_OPCODE);
+    let not_data_abort_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+
+    // Data abort (EC 0x24):
+    emit(&mut bytes, &mut cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
+    let fault_dest_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+
+    // Other non-SVC, non-data-abort exception:
+    let not_data_abort = cursor;
+    emit(&mut bytes, &mut cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
+    let other_dest_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+
     put(
         &mut bytes,
-        non_svc_branch,
-        enc_bne(non_svc_branch as u64, legacy_hvc as u64),
+        not_svc_branch,
+        enc_bne(not_svc_branch as u64, not_svc as u64),
+    );
+    put(
+        &mut bytes,
+        not_data_abort_branch,
+        enc_bne(not_data_abort_branch as u64, not_data_abort as u64),
+    );
+    let fault_target = if el1_enabled {
+        EL0_FAULT_HOOK_OFFSET as u64
+    } else {
+        legacy_hvc as u64
+    };
+    put(
+        &mut bytes,
+        fault_dest_branch,
+        enc_b(fault_dest_branch as u64, fault_target),
+    );
+    put(
+        &mut bytes,
+        other_dest_branch,
+        enc_b(other_dest_branch as u64, legacy_hvc as u64),
     );
     if let Some(handler) = mailbox_fstat_handler {
         write_fstat_ceiling_handler(&mut bytes, handler, mailbox_capture, false);
@@ -5476,6 +5541,13 @@ pub fn el1_vectors_bytes_mailbox_irq(
     debug_assert!(cursor <= MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE);
     if el1_enabled {
         write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, mailbox_capture, irq);
+        write_el1_hook(
+            &mut bytes,
+            EL0_FAULT_HOOK_OFFSET,
+            legacy_hvc,
+            irq,
+            HookEntry::Fault,
+        );
         if irq == El1IrqMode::Gic {
             let _ = write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);
         }
@@ -8304,8 +8376,8 @@ mod el1_shim_tests {
         );
         // The mailbox capture code is identical, shifted by 4 bytes (the hook branch at 0xA18)
         assert_eq!(
-            vectors_disabled[0xA18..0xC00],
-            vectors_enabled[0xA1C..0xC04],
+            vectors_disabled[0xA18..0xB88],
+            vectors_enabled[0xA1C..0xB8C],
             "mailbox capture code must be identical (modulo 4-byte hook branch shift)"
         );
         // Hook is installed at 0x1000
@@ -8314,6 +8386,62 @@ mod el1_shim_tests {
             &vec![0u8; 0x100][..],
             "hook must be written at 0x1000"
         );
+    }
+
+    #[test]
+    fn el1_data_abort_vector_routing_and_hook_installation() {
+        let enabled = el1_vectors_bytes_mailbox_configured(true, false, true);
+        let disabled = el1_vectors_bytes_mailbox_configured(true, false, false);
+
+        // Verify Data Abort opcode is emitted
+        assert!(
+            enabled
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                .any(|op| op == AARCH64_CMP_X16_DATA_ABORT_OPCODE),
+            "vectors must contain cmp x16, #0x24"
+        );
+
+        // Fault hook is installed at EL0_FAULT_HOOK_OFFSET (0x3000) in enabled vectors
+        assert_ne!(
+            &enabled[EL0_FAULT_HOOK_OFFSET..EL0_FAULT_HOOK_OFFSET + 0x100],
+            &vec![0u8; 0x100][..],
+            "fault hook must be written at 0x3000"
+        );
+        // And all nops in disabled vectors
+        assert!(
+            disabled[EL0_FAULT_HOOK_OFFSET..EL0_FAULT_HOOK_OFFSET + 0x100]
+                .chunks_exact(4)
+                .all(|w| u32::from_le_bytes(w.try_into().unwrap()) == AARCH64_NOP_OPCODE),
+            "fault hook must be empty (nop) when EL1 is disabled"
+        );
+
+        // Verify that the fault hook saves FAR_EL1 at offset 280
+        let fault_words: Vec<u32> = enabled[EL0_FAULT_HOOK_OFFSET..EL0_FAULT_HOOK_OFFSET + 0x1000]
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        assert!(
+            fault_words.contains(&AARCH64_MRS_FAR_EL1_X17_OPCODE),
+            "fault hook must read FAR_EL1"
+        );
+        assert!(
+            fault_words.contains(&enc_str_xt_xn(17, 16, 280)),
+            "fault hook must store FAR_EL1 at TrapFrame offset 280"
+        );
+        assert!(
+            fault_words.contains(&enc_ldr_xt_xn(17, 16, 280)),
+            "fault hook must restore FAR_EL1 from TrapFrame offset 280 on forward"
+        );
+        assert!(
+            fault_words.contains(&AARCH64_MSR_FAR_EL1_X17_OPCODE),
+            "fault hook must write back to FAR_EL1"
+        );
+
+        // Assert vector regions fit in 16 KiB without overlapping
+        assert!(EL1_VECTOR_HOOK_OFFSET + 0x1000 <= EL0_IRQ_HOOK_OFFSET);
+        assert!(EL0_IRQ_HOOK_OFFSET + 0x1000 <= EL0_FAULT_HOOK_OFFSET);
+        assert!(EL0_FAULT_HOOK_OFFSET + 0x1000 <= LINUX_EL1_VECTORS_SIZE as usize);
     }
 }
 

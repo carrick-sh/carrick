@@ -22,15 +22,15 @@
 
 ## Task 1: capture and classify data aborts
 
-- [ ] Add red-first ABI and emitted-vector/classifier tests proving FAR capture, exact saved register offsets, lower-EL data-abort routing and distinct SVC/IRQ/other behavior.
-- [ ] Extend TrapFrame and generated vector entry using existing machinery. Introduce a typed internal fault dispatch entry returning explicit host fallback until a later memory service is installed.
-- [ ] Wire entry provenance accounting through the existing EL1 counters and their snapshot/reset paths without shifting or overlapping reserved ABI regions.
-- [ ] Prove the emitted forward branch restores the saved fault context and preserves the existing non-EL1 path.
+- [x] Add red-first ABI and emitted-vector/classifier tests proving FAR capture, exact saved register offsets, lower-EL data-abort routing and distinct SVC/IRQ/other behavior.
+- [x] Extend TrapFrame and generated vector entry using existing machinery. Introduce a typed internal fault dispatch entry returning explicit host fallback until a later memory service is installed.
+- [x] Wire entry provenance accounting through the existing EL1 counters and their snapshot/reset paths without shifting or overlapping reserved ABI regions.
+- [x] Prove the emitted forward branch restores the saved fault context and preserves the existing non-EL1 path.
 
 ## Task 2: real guest witness and contract
 
-- [ ] Extend the existing static embed-el1-sched fixture with a bounded fault-entry mode, and add a named signed embed test. Trigger a real EL0 stage-1 permission fault and validate si_addr/fault behavior plus retry and register preservation. Require a positive EL1 fault-entry counter; the disabled-EL1 control must preserve Linux behavior and report no EL1 fault entries.
-- [ ] Register a precise fault-entry conformance contract/bindings and retain the full anonymous-first-touch contract unchanged. This increment is entry/forwarding acceptance only.
+- [x] Extend the existing static embed-el1-sched fixture with a bounded fault-entry mode, and add a named signed embed test. Trigger a real EL0 stage-1 permission fault and validate si_addr/fault behavior plus retry and register preservation. Require a positive EL1 fault-entry counter; the disabled-EL1 control must preserve Linux behavior and report no EL1 fault entries.
+- [x] Register a precise fault-entry conformance contract/bindings and retain the full anonymous-first-touch contract unchanged. This increment is entry/forwarding acceptance only.
 - [ ] Run VM-free tests and the bare-metal image build. Director captures signed red/green execution on the old/new source, same-image native behavior, default/EL1-off/GIC-off controls, exact artifacts and cleanup.
 
 ## Commands
