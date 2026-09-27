@@ -699,3 +699,11 @@ refusal with restoration of both preimages. This is a compile correction,
 not a semantic-red claim. Raw failure and validation evidence are under
 metadata-refusal-director/integrated-runtime/. Fresh clean-source capture,
 full CI and signed promotion remain pending.
+
+2026-09-26: clean-source inventory capture after `3b45df0ee` succeeds.
+Reconciliation moves 31 authority sites and one K1 operation position;
+mechanical comparison confirms all 588 authority rows retain classifications,
+identities and rationale bodies. The four earlier abort fingerprints remain
+reviewed. Full integrated CI starts after committing these inventory updates;
+no full CI or signed acceptance is yet claimed. Non-macOS profiles remain
+pending as before.
