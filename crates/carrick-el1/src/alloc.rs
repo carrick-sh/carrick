@@ -126,6 +126,8 @@ pub struct MetadataAllocatorCore {
     active_extents_count: usize,
     total_capacity_bytes: usize,
     allocated_bytes: usize,
+    #[cfg(target_os = "none")]
+    grant_denied_pending: bool,
 }
 
 // SAFETY: All raw pointers point into admitted memory buffers protected by external synchronization.
@@ -148,7 +150,19 @@ impl MetadataAllocatorCore {
             active_extents_count: 0,
             total_capacity_bytes: 0,
             allocated_bytes: 0,
+            #[cfg(target_os = "none")]
+            grant_denied_pending: false,
         }
+    }
+
+    #[cfg(target_os = "none")]
+    fn note_grant_denied(&mut self) {
+        self.grant_denied_pending = true;
+    }
+
+    #[cfg(target_os = "none")]
+    fn take_grant_denied(&mut self) -> bool {
+        core::mem::replace(&mut self.grant_denied_pending, false)
     }
 
     /// Calculate bin index for a given required block size.
@@ -816,6 +830,7 @@ impl MetadataStorage {
         let outcome = match response.op {
             carrick_el1_abi::METADATA_GRANT_OP_ALLOC => {
                 if response.status != carrick_el1_abi::METADATA_GRANT_SUCCESS {
+                    core.note_grant_denied();
                     MailboxSync::AllocDenied
                 } else {
                     let receipt = ExtentGrantReceipt {
@@ -836,6 +851,7 @@ impl MetadataStorage {
                             )
                             .is_err()
                     {
+                        core.note_grant_denied();
                         mailbox.finish_response();
                         if Self::publish_request(
                             slot,
@@ -920,7 +936,7 @@ impl MetadataStorage {
             );
         }
         #[cfg(target_os = "none")]
-        let mailbox_sync = current_el1_slot()
+        let _mailbox_sync = current_el1_slot()
             .map(|slot| Self::service_mailbox(&mut core, slot))
             .unwrap_or(MailboxSync::None);
         let p = core.allocate(size, align);
@@ -932,7 +948,10 @@ impl MetadataStorage {
 
         #[cfg(target_os = "none")]
         {
-            if mailbox_sync == MailboxSync::AllocDenied {
+            // A refusal belongs to the capacity miss that required a grant,
+            // not to an unrelated smaller allocation that happened to consume
+            // the shared response while bootstrap capacity remained.
+            if core.take_grant_denied() {
                 core::mem::drop(core);
                 restore_irq(guard);
                 return None;

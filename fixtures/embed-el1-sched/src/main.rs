@@ -1913,10 +1913,21 @@ fn metadata_allocator_control(subtest: u64) -> i64 {
     }
 }
 
-fn metadata_allocator_phase(subtest: u64) -> i64 {
+fn metadata_allocator_drain() -> i64 {
     // One global mailbox can require one boundary per grant/return. The
     // allocator admits at most 128 extents, so this bound covers a complete
     // request and return for every descriptor without timing-based retries.
+    const MAX_BOUNDARIES: usize = 2 * 128 + 2;
+    for _ in 0..MAX_BOUNDARIES {
+        let drain = metadata_allocator_control(5);
+        if drain != carrick_el1_abi::METADATA_GRANT_PENDING as i64 {
+            return drain;
+        }
+    }
+    0xCA88_0502
+}
+
+fn metadata_allocator_phase(subtest: u64, drain_on_success: bool) -> i64 {
     const MAX_BOUNDARIES: usize = 2 * 128 + 2;
     for _ in 0..MAX_BOUNDARIES {
         let rc = metadata_allocator_control(subtest);
@@ -1924,13 +1935,10 @@ fn metadata_allocator_phase(subtest: u64) -> i64 {
             if rc != 0 {
                 return rc;
             }
-            for _ in 0..MAX_BOUNDARIES {
-                let drain = metadata_allocator_control(5);
-                if drain != carrick_el1_abi::METADATA_GRANT_PENDING as i64 {
-                    return drain;
-                }
+            if drain_on_success {
+                return metadata_allocator_drain();
             }
-            return 0xCA88_0502;
+            return 0;
         }
     }
     0xCA88_0501
@@ -1946,7 +1954,7 @@ fn metadata_allocator_concurrent() -> i32 {
             let mut failures = 0;
             for _ in 0..ROUNDS {
                 barrier.wait();
-                let rc = metadata_allocator_phase(2);
+                let rc = metadata_allocator_phase(2, false);
                 failures += usize::from(rc != 0);
                 barrier.wait();
             }
@@ -1965,7 +1973,8 @@ fn metadata_allocator_concurrent() -> i32 {
         }
         barrier.wait();
     }
-    let failures: usize = workers.into_iter().map(|w| w.join().expect("allocator worker")).sum();
+    let mut failures: usize = workers.into_iter().map(|w| w.join().expect("allocator worker")).sum();
+    failures += usize::from(metadata_allocator_drain() != 0);
     println!("metadata-allocator concurrent workers=4 rounds={ROUNDS} failures={failures} host_calls={host_calls} host_failures={host_failures}");
     i32::from(failures != 0 || host_failures != 0)
 }
@@ -1986,7 +1995,7 @@ fn metadata_allocator_mode(phase: &str) -> i32 {
             return 2;
         }
     };
-    let result = metadata_allocator_phase(subtest);
+    let result = metadata_allocator_phase(subtest, true);
     if result != 0 {
         println!("metadata-allocator {phase} failed: rc={result}");
         return 1;
