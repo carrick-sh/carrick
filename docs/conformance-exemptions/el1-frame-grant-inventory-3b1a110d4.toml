@@ -1,0 +1,18 @@
+schema = "carrick.conformance-exemption.v1"
+base = "cc3647b4a337bda2893fba363c2a333454e100b6"
+head = "3b1a110d4b54471896d3d85158d45378d21de5a9"
+paths = [
+  "crates/carrick-el1-abi/src/lib.rs",
+  "crates/carrick-hal/src/threaded.rs",
+  "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+]
+contracts = [
+  "kernel.el1.gic",
+  "kernel.el1.guest-run-queue",
+  "kernel.el1.fault-entry",
+  "kernel.el1.metadata-allocation",
+  "kernel.mm.pt-pause-drain-acknowledgement",
+  "kernel.mm.native-code-content",
+  "kernel.mm.native-code-drain",
+]
+rationale = "The exact product diff adds the frame-grant mailbox access/permission split and exact grant inventory endpoints. It does not change the registered GIC, run-queue, fault-entry, metadata allocator, page-table drain, native-code content, or native-code drain behavior of these shared source files; kernel.el1.stage1-publication carries the changed semantics and red-first evidence."

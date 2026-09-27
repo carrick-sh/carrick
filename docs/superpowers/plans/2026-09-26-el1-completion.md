@@ -923,3 +923,34 @@ data-abort retry to grant consumption. Re-run the three-scale signed
 first-touch witness immediately after actual guest leaf service; do not open
 another allocator or extraction campaign unless that decisive path exposes a
 specific prerequisite failure.
+
+### Authenticated frame-grant host authority (2026-09-27)
+
+`cc3647b4a` defines a carrier-wide single-flight frame-grant mailbox. A guest
+request carries one exact MM key, request generation, fault VA, bounded length
+and fault access class. The host response separately carries authoritative VMA
+permissions plus semantic and physical spans, frame and mapping identities,
+owner generation and inventory revision. Wrong-MM, stale-generation and
+unauthenticated responses cannot be consumed.
+
+`3b1a110d4` adds the kernel-side publication authority. It applies an exact
+inventory transaction, authenticates its returned revision against the live
+MM/mapping/frame/GPA/span and an independently retained current owner, and can
+roll back an unpublished grant through the opaque receipt. The dispatcher now
+plans one same-protection span clipped to the VMA and one 2 MiB window, then
+commits residency for that complete span under existing MM/alias exclusion.
+ABI, kernel fault, runtime inventory, Clippy, contract registry and generated
+inventory checks pass. The exact product diff also passes the contract-change
+gate with a revision-bound exemption for unchanged contracts sharing the ABI,
+HAL and runtime files. Evidence is under
+`docs/perf-results/2026-09-26-el1-frame-grant-mailbox/` and
+`docs/perf-results/2026-09-26-el1-frame-grant-inventory/`.
+
+This is VM-free host authority. It does not yet prepare real HVF stage-2
+backing, publish mailbox Ready, install a guest stage-1 leaf or change the
+signed first-touch slope, which remains about 0.9954 host exits per page versus
+the `<0.125` target. The next bounded task is the direct production join:
+claim the request at the existing forwarded-fault boundary, reuse sparse
+stage-2 preparation, apply and authenticate the inventory receipt, retain the
+alias/backing, and publish Ready last. Then implement guest leaf publication
+and rerun the signed three-scale witness before broadening checkpoint 2.
