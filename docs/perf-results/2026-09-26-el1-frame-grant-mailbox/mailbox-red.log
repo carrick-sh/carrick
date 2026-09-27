@@ -1,0 +1,112 @@
+   Compiling carrick-el1-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-abi)
+error[E0422]: cannot find struct, variant or union type `FrameGrantRequest` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2456:23
+     |
+2456 |         let request = FrameGrantRequest {
+     |                       ^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `EL1_FRAME_GRANT_TARGET_SIZE` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2460:28
+     |
+2460 |             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0422]: cannot find struct, variant or union type `FrameGrantReady` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2467:21
+     |
+2467 |         let ready = FrameGrantReady {
+     |                     ^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `EL1_FRAME_GRANT_TARGET_SIZE` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2472:18
+     |
+2472 |             len: EL1_FRAME_GRANT_TARGET_SIZE,
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0422]: cannot find struct, variant or union type `FrameGrantResponse` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2484:18
+     |
+2484 |             Some(FrameGrantResponse {
+     |                  ^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `FRAME_GRANT_SUCCESS` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2485:25
+     |
+2485 |                 status: FRAME_GRANT_SUCCESS,
+     |                         ^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0422]: cannot find struct, variant or union type `FrameGrantRequest` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2499:23
+     |
+2499 |         let request = FrameGrantRequest {
+     |                       ^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `EL1_FRAME_GRANT_TARGET_SIZE` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2503:28
+     |
+2503 |             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0422]: cannot find struct, variant or union type `FrameGrantReady` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2509:25
+     |
+2509 |         let mut ready = FrameGrantReady {
+     |                         ^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `EL1_FRAME_GRANT_TARGET_SIZE` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2514:18
+     |
+2514 |             len: EL1_FRAME_GRANT_TARGET_SIZE,
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `FRAME_GRANT_ERR_DENIED` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2530:41
+     |
+ 101 | pub const METADATA_GRANT_ERR_DENIED: u64 = 1;
+     | --------------------------------------------- similarly named constant `METADATA_GRANT_ERR_DENIED` defined here
+...
+2530 |         assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
+     |                                         ^^^^^^^^^^^^^^^^^^^^^^
+     |
+help: a constant with a similar name exists
+     |
+2530 -         assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
+2530 +         assert!(mailbox.publish_refusal(METADATA_GRANT_ERR_DENIED));
+     |
+
+error[E0422]: cannot find struct, variant or union type `FrameGrantResponse` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2533:18
+     |
+2533 |             Some(FrameGrantResponse {
+     |                  ^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `FRAME_GRANT_ERR_DENIED` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2534:25
+     |
+ 101 | pub const METADATA_GRANT_ERR_DENIED: u64 = 1;
+     | --------------------------------------------- similarly named constant `METADATA_GRANT_ERR_DENIED` defined here
+...
+2534 |                 status: FRAME_GRANT_ERR_DENIED,
+     |                         ^^^^^^^^^^^^^^^^^^^^^^
+     |
+help: a constant with a similar name exists
+     |
+2534 -                 status: FRAME_GRANT_ERR_DENIED,
+2534 +                 status: METADATA_GRANT_ERR_DENIED,
+     |
+
+error[E0433]: cannot find type `FrameGrantMailbox` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2455:23
+     |
+2455 |         let mailbox = FrameGrantMailbox::new();
+     |                       ^^^^^^^^^^^^^^^^^ use of undeclared type `FrameGrantMailbox`
+
+error[E0433]: cannot find type `FrameGrantMailbox` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:2498:23
+     |
+2498 |         let mailbox = FrameGrantMailbox::new();
+     |                       ^^^^^^^^^^^^^^^^^ use of undeclared type `FrameGrantMailbox`
+
+Some errors have detailed explanations: E0422, E0425, E0433.
+For more information about an error, try `rustc --explain E0422`.
+error: could not compile `carrick-el1-abi` (lib test) due to 15 previous errors

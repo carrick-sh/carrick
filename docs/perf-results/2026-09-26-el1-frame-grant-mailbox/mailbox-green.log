@@ -1,0 +1,10 @@
+   Compiling carrick-el1-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-abi)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1_abi-4e2a4b7ae8790423)
+
+running 2 tests
+test tests::frame_grant_mailbox_binds_ready_data_to_exact_request_and_mm ... ok
+test tests::frame_grant_mailbox_rejects_mismatched_or_unauthenticated_ready_data ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s
+
