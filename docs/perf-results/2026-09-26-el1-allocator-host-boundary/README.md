@@ -2,12 +2,12 @@
 
 This receipt closes the allocator's synchronous-host-wait and concurrent
 single-flight progress requirements on source
-`d31f0705504dd6dede35c6b4300dad9af196008d`.
+`ef57645821299226da00ad4bf4b676c2ba7c8bb4`.
 
 The exact signed command was:
 
 ```text
-CARRICK_RUN_ID=el1-allocator-all-green-3-20260926 RUSTC_WRAPPER= \
+CARRICK_RUN_ID=el1-allocator-final-receipt-ef5764582-20260926 RUSTC_WRAPPER= \
   just test-embed el1_metadata_allocator_ --nocapture
 ```
 
@@ -23,32 +23,33 @@ All three invoked witnesses passed together:
   `HVC #6` from masked EL1.
 
 The entitlement negative control passed. Cleanup reported zero processes for
-both `el1-allocator-all-green-3-20260926` and its `-cli` scope. The raw run is
-[`signed-all-green.log`](signed-all-green.log), and the harness receipt is
-[`signed-artifacts.jsonl`](signed-artifacts.jsonl).
+both `el1-allocator-final-receipt-ef5764582-20260926` and its `-cli` scope. The
+raw run is [`signed-final-ef5764582.log`](signed-final-ef5764582.log), and the
+harness receipt is
+[`signed-final-artifacts.jsonl`](signed-final-artifacts.jsonl).
 
 ## Exact tested artifact
 
 - signed test executable:
   `target/release/deps/el1_sched-f0f1569da0c4c729`
 - executable SHA-256:
-  `03163bb3320e3c8004d01cd719b437fe8f8b070c3d06ea6b8f6238e0936aaef2`
-- CDHash: `2628dae16e3ab3e2d38176b14c47a5c3c3408be7`
-- LC_UUID: `56026F4C-AB46-34C3-8C20-6245E23A5FC0`
-- signature identifier: `el1_sched-f0f1569da0c4c729.tmp.70991`
+  `eb7b3e20a4808141e57cc98ea6c2a7131f84ba2610c4f78f93f20f974f7d5cb6`
+- CDHash: `8e121283ee847d774c632ae16afc8c283def237d`
+- LC_UUID: `93E349B9-74E7-373D-B5B0-44F6B21D0504`
+- signature identifier: `el1_sched-f0f1569da0c4c729.tmp.76958`
 - entitlement: `com.apple.security.hypervisor = true`
 - `__TEXT,__dof_carrick`: present, size `0xc27c`
 - signed CLI SHA-256:
-  `76dd358f7ce6d089819176b380dbc86e2472b16fb9d6ac186af0bdeb069a0ea4`
+  `234362e8d2ac4903913e7b28324cf1d8d3b54dcf51144d5b216139ee2def2ff4`
 - Linux fixture SHA-256:
   `01656c4a7944507845ed7c12011f0e02e702ebf757a5f9fb066e7cdf8cfff7b4`
 - harness receipt SHA-256:
-  `ba238c28c98fdb81d9edfb02a038034ff62fe4f9ceba8a0fab00861a5bee15ad`
+  `aa54c8310d31b182554f8ac70873092f94ee649ba6eb94b96b67b242a2bc97d7`
 - raw green log SHA-256:
-  `922f6382148d35ec18eefda42c5c58561047b0a96f7c14e90840232304bda0b7`
+  `e517ae08e595fbfa608c99a33a01dfef082691fa5def1bda87ac5aa89a2dcb3d`
 
 Frozen copies of the executable, CLI, fixture, and receipt remain under
-`target/el1-completion/allocator-all-green-3/frozen/`; rebuilding or re-signing
+`target/el1-completion/allocator-final-ef5764582/frozen/`; rebuilding or re-signing
 the working artifacts does not alter this receipt.
 
 ## Decisive progress red
@@ -82,8 +83,8 @@ allocator state, rejects invalid host sizes before reserving the aperture, and
 exhausts metadata tokens without issuing zero or wrapping. The VM-free work
 contract now records the allocator's existing constant bounds at scales 1, 8,
 32, and 128: at most two bin checks, block inspections, splits, and merges,
-with exactly 64 KiB of admitted capacity per scale unit. These controls do not
-replace the final signed rerun required for the changed source.
+with exactly 64 KiB of admitted capacity per scale unit. The exact final signed
+run above covers the changed source after these controls were green.
 
 This is allocator acceptance evidence. It does not claim shared MMU
 publication, anonymous first-touch closure, a better host-exit slope, memory
