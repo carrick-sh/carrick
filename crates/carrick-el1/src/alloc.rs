@@ -631,6 +631,28 @@ pub struct AllocatorDiagnostics {
     pub active_bins_mask: u32,
 }
 
+// Test-image instrumentation is scoped to this guest image/VM. Sample the actual
+// execution state immediately before both host-wait instructions, not the saved
+// EL0 SPSR or a host-side approximation of the allocator lock state.
+#[cfg(feature = "allocator-test-control")]
+static MASKED_METADATA_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(
+    feature = "allocator-test-control",
+    target_os = "none",
+    target_arch = "aarch64"
+))]
+#[inline(always)]
+fn observe_metadata_wait_irq_state() {
+    let daif: u64;
+    unsafe {
+        core::arch::asm!("mrs {0}, daif", out(reg) daif, options(nomem, nostack));
+    }
+    if daif & (1 << 7) != 0 {
+        MASKED_METADATA_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Dynamic extent allocation helper invoking host hypercall HVC #6.
 #[inline(never)]
 pub fn request_host_extent_grant(requested_size: usize) -> Option<ExtentGrantReceipt> {
@@ -641,6 +663,8 @@ pub fn request_host_extent_grant(requested_size: usize) -> Option<ExtentGrantRec
         let mut granted_size: u64;
         let mut token: u64;
 
+        #[cfg(feature = "allocator-test-control")]
+        observe_metadata_wait_irq_state();
         unsafe {
             core::arch::asm!(
                 "hvc #6",
@@ -686,6 +710,8 @@ pub fn return_host_extent(base_va: u64, size: usize, token: u64) -> bool {
         let mut _out2: u64;
         let mut _out3: u64;
 
+        #[cfg(feature = "allocator-test-control")]
+        observe_metadata_wait_irq_state();
         unsafe {
             core::arch::asm!(
                 "hvc #6",
@@ -921,6 +947,14 @@ pub fn init_bootstrap_allocator(bootstrap_base: u64, bootstrap_size: usize) {
 #[cfg(feature = "allocator-test-control")]
 pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
     match subtest {
+        4 => {
+            MASKED_METADATA_WAITS.store(0, core::sync::atomic::Ordering::Relaxed);
+            let growth_result = run_guest_allocator_test(2, 0);
+            if growth_result != 0 {
+                return growth_result;
+            }
+            MASKED_METADATA_WAITS.load(core::sync::atomic::Ordering::Relaxed)
+        }
         1 => {
             // Test 1: Arbitrary alignments (16, 32, 64, 128, 4096), payload pattern verification, and free
             let alignments = [16, 32, 64, 128, 4096];

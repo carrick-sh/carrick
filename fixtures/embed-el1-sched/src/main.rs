@@ -1945,8 +1945,9 @@ fn metadata_allocator_mode(phase: &str) -> i32 {
         "basic" => 1,
         "growth" => 2,
         "denial" => 3,
+        "irq" => 4,
         _ => {
-            eprintln!("metadata-allocator requires basic, growth, or denial");
+            eprintln!("metadata-allocator requires basic, growth, denial, or irq");
             return 2;
         }
     };
