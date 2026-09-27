@@ -511,3 +511,18 @@ Reconciliation preserves 588 reviewed rows, classifications and rationale
 bodies, updating only the shifted spans/location prefixes and machine capture.
 Non-macOS authority profiles remain pending. Full CI rerun, artifact-preserving
 strict probe acceptance, smoke/full and actual EL1 first-touch remain open.
+
+2026-09-26: dispatched bounded fault-entry implementation to Antigravity
+worker `fault-entry`, conversation `7b92561f-8c12-400a-9c0d-82f515281049`,
+in the reused isolated `el1-memory-corrections` checkout at `a7d3138df`.
+The prior checkout tip is preserved by
+`archive/el1-memory-corrections-before-fault-entry`. The exact task is
+[the fault-entry plan](2026-09-26-el1-fault-entry.md); worker execution is
+limited to host tests and image compilation. Director owns diff review,
+signed red/green witnesses, native controls and integration. This new entry
+task does not reopen the exhausted live-table worker review rounds.
+
+The existing full CI process remains live against `d35c88001` (only plan
+documentation changed afterward); it has reached runtime tests. No final
+CI success or fault-entry acceptance is claimed. The latest status-only turn
+was no implementation progress; this dispatch advances the next prerequisite.
