@@ -412,6 +412,10 @@ path = "crates/carrick-kernel/src/dispatch/mm_quiesce.rs"
 contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.mm.address-space-occupancy"]
 
 [[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/mm_mutation.rs"
+contracts = ["kernel.el1.stage1-publication"]
+
+[[surfaces]]
 path = "crates/carrick-kernel/src/kernel/mm_occupancy.rs"
 contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.mm.address-space-occupancy", "kernel.mm.executor-admission", "kernel.el1.address-space-switch", "kernel.el1.stage1-publication"]
 
