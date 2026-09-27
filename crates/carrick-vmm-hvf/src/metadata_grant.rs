@@ -26,6 +26,8 @@ pub struct MetadataGrantStats {
 #[derive(Debug)]
 struct GrantedSlotRecord {
     backing: OwnedHostMapping,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    identity: crate::trap::CarrierStage2RecordIdentity,
     num_slots: usize,
     token: u64,
     generation: u64,
@@ -55,7 +57,7 @@ impl HostApertureState {
         size: usize,
         token: u64,
         generation: u64,
-        unmap: impl FnOnce(u64, usize) -> bool,
+        unmap: impl FnOnce(&GrantedSlotRecord) -> bool,
     ) -> u64 {
         let Some(record) = self.slots.get(slot).and_then(Option::as_ref) else {
             return METADATA_GRANT_ERR_NOT_FOUND;
@@ -64,8 +66,7 @@ impl HostApertureState {
         {
             return METADATA_GRANT_ERR_INVALID;
         }
-        let ipa = EL1_DYNAMIC_METADATA_BASE + slot as u64 * EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64;
-        if !unmap(ipa, record.backing.len()) {
+        if !unmap(record) {
             return METADATA_GRANT_ERR_DENIED;
         }
         let count = record.num_slots;
@@ -75,12 +76,18 @@ impl HostApertureState {
     }
 
     /// Called only after the exact VM generation has been destroyed by HVF.
-    pub(crate) fn release_destroyed_vm(&mut self, generation: u64) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn release_destroyed_vm(
+        &mut self,
+        generation: u64,
+        mut retire: impl FnMut(crate::trap::CarrierStage2RecordIdentity),
+    ) {
         for i in 0..self.slots.len() {
             if let Some(record) = &self.slots[i]
                 && record.generation == generation
             {
                 let count = record.num_slots;
+                retire(record.identity);
                 self.slots[i] = None;
                 self.unreserve_slots(i, count);
             }
@@ -157,6 +164,31 @@ fn metadata_aperture(custody: &crate::trap::CarrierVmCustody) -> &Mutex<HostAper
 
 fn allocate_metadata_backing(size: usize) -> Result<OwnedHostMapping, std::io::Error> {
     OwnedHostMapping::map_shared_anon(size, HostMappingKind::SharedAnon)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn publish_metadata_mapping_using(
+    custody: &crate::trap::CarrierVmCustody,
+    spec: crate::trap::CarrierStage2RecordSpec,
+    map: impl FnOnce() -> i32,
+) -> Result<crate::trap::CarrierStage2RecordIdentity, TrapError> {
+    custody.publish_stage2_record_using(spec, map)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retire_metadata_record_using(
+    custody: &crate::trap::CarrierVmCustody,
+    identity: crate::trap::CarrierStage2RecordIdentity,
+    unmap: impl FnOnce(u64, usize) -> Result<(), crate::trap::CarrierStage2BackendError>,
+) -> bool {
+    use crate::trap::CarrierStage2RetireOutcome;
+    match custody.retire_stage2_record_using(identity, unmap) {
+        CarrierStage2RetireOutcome::RetiredUnmapped
+        | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+            custody.remove_terminal_stage2_record(identity).is_some()
+        }
+        _ => false,
+    }
 }
 
 /// Return a snapshot of metadata grant counters.
@@ -285,31 +317,43 @@ pub(crate) fn handle_metadata_grant_trap(
 
         // 4. Map into stage-2 with Read/Write permissions (strictly non-executable)
         let permissions = 0b011; // HV_MEMORY_READ | HV_MEMORY_WRITE
-        let rc = unsafe {
-            crate::trap::inventory_hv_vm_map(backing.as_ptr().cast(), ipa, extent_size, permissions)
-        };
-        if rc != 0 {
-            {
-                let mut state = aperture.lock();
-                state.unreserve_slots(slot_idx, num_slots);
-            }
-            GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
-            vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
-                .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
-            return Ok(());
-        }
-
-        // 5. Register in slot table
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut state = aperture.lock();
-            state.slots[slot_idx] = Some(GrantedSlotRecord {
-                backing,
-                num_slots,
-                token,
-                generation,
-            });
-        }
+        let spec = crate::trap::CarrierStage2RecordSpec {
+            vm_generation: crate::trap::CarrierVmGeneration(generation),
+            ipa,
+            len: extent_size,
+            host_addr: backing.as_ptr() as usize,
+            mapped: true,
+            backend_map_installed: true,
+            release_ipa: false,
+            perms: permissions,
+            logical_owner: Some(crate::trap::CarrierLogicalOwner {
+                id: token,
+                generation: token,
+            }),
+        };
+        let mut state = aperture.lock();
+        let publication = publish_metadata_mapping_using(custody, spec, || unsafe {
+            crate::trap::inventory_hv_vm_map(backing.as_ptr().cast(), ipa, extent_size, permissions)
+        });
+        let identity = match publication {
+            Ok(identity) => identity,
+            Err(_) => {
+                state.unreserve_slots(slot_idx, num_slots);
+                GRANTS_DENIED.fetch_add(1, Ordering::Relaxed);
+                vcpu.set_reg(Reg::X0, METADATA_GRANT_ERR_DENIED)
+                    .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
+                return Ok(());
+            }
+        };
+        state.slots[slot_idx] = Some(GrantedSlotRecord {
+            backing,
+            identity,
+            num_slots,
+            token,
+            generation,
+        });
+        drop(state);
 
         GRANTS_SUCCEEDED.fetch_add(1, Ordering::Relaxed);
         BYTES_GRANTED.fetch_add(extent_size as u64, Ordering::Relaxed);
@@ -347,13 +391,19 @@ pub(crate) fn handle_metadata_grant_trap(
             return Ok(());
         }
 
-        let status = aperture.lock().return_extent_using(
-            slot_idx,
-            size,
-            token,
-            generation,
-            |ipa, size| unsafe { crate::trap::inventory_hv_vm_unmap(ipa, size) == 0 },
-        );
+        let status =
+            aperture
+                .lock()
+                .return_extent_using(slot_idx, size, token, generation, |record| {
+                    retire_metadata_record_using(custody, record.identity, |ipa, size| {
+                        let rc = unsafe { crate::trap::inventory_hv_vm_unmap(ipa, size) };
+                        if rc == 0 {
+                            Ok(())
+                        } else {
+                            Err(crate::trap::CarrierStage2BackendError::HvReturn(rc as u32))
+                        }
+                    })
+                });
         if status == METADATA_GRANT_SUCCESS {
             RETURNS_COMPLETED.fetch_add(1, Ordering::Relaxed);
             BYTES_RETURNED.fetch_add(size as u64, Ordering::Relaxed);
@@ -372,6 +422,83 @@ pub(crate) fn handle_metadata_grant_trap(
 mod tests {
     use super::*;
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn test_record(
+        custody: &crate::trap::CarrierVmCustody,
+        generation: crate::trap::CarrierVmGeneration,
+        backing: &OwnedHostMapping,
+        token: u64,
+    ) -> crate::trap::CarrierStage2RecordIdentity {
+        publish_metadata_mapping_using(
+            custody,
+            crate::trap::CarrierStage2RecordSpec {
+                vm_generation: generation,
+                ipa: EL1_DYNAMIC_METADATA_BASE,
+                len: backing.len(),
+                host_addr: backing.as_ptr() as usize,
+                mapped: true,
+                backend_map_installed: true,
+                release_ipa: false,
+                perms: 3,
+                logical_owner: Some(crate::trap::CarrierLogicalOwner {
+                    id: token,
+                    generation: token,
+                }),
+            },
+            || 0,
+        )
+        .expect("publish fake backend record")
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn metadata_publication_has_an_exact_stage2_record() {
+        let custody = crate::trap::CarrierVmCustody::new();
+        let generation = custody.begin_create().expect("create");
+        custody.commit_create(generation).expect("live");
+        let spec = crate::trap::CarrierStage2RecordSpec {
+            vm_generation: generation,
+            ipa: EL1_DYNAMIC_METADATA_BASE,
+            len: EL1_DYNAMIC_METADATA_EXTENT_SIZE,
+            host_addr: 0x10000,
+            mapped: true,
+            backend_map_installed: true,
+            release_ipa: false,
+            perms: 3,
+            logical_owner: Some(crate::trap::CarrierLogicalOwner {
+                id: 19,
+                generation: 19,
+            }),
+        };
+        let mut calls = 0;
+        assert!(
+            publish_metadata_mapping_using(&custody, spec, || {
+                calls += 1;
+                -1
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+        assert!(
+            custody.stage2_record_identities().is_empty(),
+            "failed map published a record"
+        );
+        let mut stale = spec;
+        stale.vm_generation = crate::trap::CarrierVmGeneration(generation.0 + 1);
+        assert!(
+            publish_metadata_mapping_using(&custody, stale, || panic!("stale VM must not map"))
+                .is_err()
+        );
+        assert!(custody.stage2_record_identities().is_empty());
+        let identity = publish_metadata_mapping_using(&custody, spec, || 0).expect("map");
+        let record = custody
+            .stage2_record_snapshot(identity.record_id)
+            .expect("record");
+        assert_eq!(record.vm_generation, generation);
+        assert_eq!(record.logical_owner, spec.logical_owner);
+        assert!(record.mapped && record.backend_map_installed);
+    }
+
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn metadata_backing_follows_exact_vm_terminal_transition() {
@@ -387,6 +514,7 @@ mod tests {
             let mut aperture = metadata_aperture(&custody).lock();
             assert_eq!(aperture.find_and_reserve_slots(1), Some(0));
             aperture.slots[0] = Some(GrantedSlotRecord {
+                identity: test_record(&custody, first, &backing, 91),
                 backing,
                 num_slots: 1,
                 token: 91,
@@ -408,6 +536,10 @@ mod tests {
             .commit_destroy(first)
             .expect("successful raw VM destroy");
         assert!(metadata_aperture(&custody).lock().slots[0].is_none());
+        assert!(
+            custody.stage2_record_identities().is_empty(),
+            "destroy left stale metadata records"
+        );
         assert!(!metadata_aperture(&custody).lock().is_slot_occupied(0));
         let second = custody.begin_create().expect("create successor");
         custody.commit_create(second).expect("publish successor");
@@ -433,7 +565,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn failed_return_keeps_backing_and_aperture_reserved() {
+        let custody = crate::trap::CarrierVmCustody::new();
+        let generation = custody.begin_create().expect("create");
+        custody.commit_create(generation).expect("live");
         let mut state = HostApertureState::new();
         let slot = state.find_and_reserve_slots(2).expect("reserve");
         let size = 2 * EL1_DYNAMIC_METADATA_EXTENT_SIZE;
@@ -442,6 +578,7 @@ mod tests {
         let ptr = backing.as_ptr();
         unsafe { ptr.write(0xa5) };
         state.slots[slot] = Some(GrantedSlotRecord {
+            identity: test_record(&custody, generation, &backing, 7),
             backing,
             num_slots: 2,
             token: 7,
@@ -449,39 +586,53 @@ mod tests {
         });
         for (token, generation) in [(0, 1), (8, 1), (7, 2)] {
             assert_eq!(
-                state.return_extent_using(slot, size, token, generation, |_, _| panic!(
+                state.return_extent_using(slot, size, token, generation, |_| panic!(
                     "mismatched identity must not unmap"
                 )),
                 METADATA_GRANT_ERR_INVALID
             );
         }
         assert_eq!(
-            state.return_extent_using(slot, size, 7, 1, |_, _| false),
+            state.return_extent_using(slot, size, 7, 1, |record| retire_metadata_record_using(
+                &custody,
+                record.identity,
+                |_, _| Err(crate::trap::CarrierStage2BackendError::HvReturn(1))
+            )),
             METADATA_GRANT_ERR_DENIED
         );
         let retained = state.slots[slot]
             .as_ref()
             .expect("failed unmap lost backing");
+        let snapshot = custody
+            .stage2_record_snapshot(retained.identity.record_id)
+            .expect("retained record");
+        assert!(snapshot.mapped && snapshot.retry_pending.is_some());
         assert_eq!(retained.backing.as_ptr(), ptr);
         assert_eq!(unsafe { ptr.read() }, 0xa5);
         assert!(state.is_slot_occupied(slot) && state.is_slot_occupied(slot + 1));
         assert_eq!(state.find_and_reserve_slots(1), Some(2));
         assert_eq!(
-            state.return_extent_using(slot, size, 7, 1, |ipa, bytes| {
-                assert_eq!(ipa, EL1_DYNAMIC_METADATA_BASE);
-                assert_eq!(bytes, size);
-                true
+            state.return_extent_using(slot, size, 7, 1, |record| {
+                retire_metadata_record_using(&custody, record.identity, |ipa, bytes| {
+                    assert_eq!(ipa, EL1_DYNAMIC_METADATA_BASE);
+                    assert_eq!(bytes, size);
+                    Ok(())
+                })
             }),
             METADATA_GRANT_SUCCESS
         );
         assert!(state.slots[slot].is_none());
+        assert!(
+            custody.stage2_record_identities().is_empty(),
+            "return left stale record"
+        );
         assert_eq!(state.find_and_reserve_slots(2), Some(0));
         assert!(
             state.is_slot_occupied(2),
             "unpublished reservation must remain occupied"
         );
         assert_eq!(
-            state.return_extent_using(slot, size, 7, 1, |_, _| panic!(
+            state.return_extent_using(slot, size, 7, 1, |_| panic!(
                 "already returned backing must not unmap twice"
             )),
             METADATA_GRANT_ERR_NOT_FOUND

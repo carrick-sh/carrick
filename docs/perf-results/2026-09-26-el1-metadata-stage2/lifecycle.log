@@ -1,0 +1,55 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-d63dbca9ffee398f)
+
+running 48 tests
+test trap::carrier_custody::carrier_vm_custody_tests::abort_destroy_preserves_the_exact_live_generation_for_retry ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::aborted_create_returns_custody_to_vacant_without_reusing_the_generation ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::backend_create_failure_returns_custody_to_vacant_and_skips_publication ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::backend_create_success_commits_generation_before_publication ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::backend_destroy_failure_preserves_live_custody_and_skips_release_publication ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::backend_destroy_success_terminalizes_before_release_publication ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::bounded_idle_retry_rotates_past_persistent_prefix_and_services_detached_work ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::carrier_exit_propagates_terminal_owner_cleanup_failure_after_destroy_success ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::carrier_mm_logical_authority_follows_g1_record_rebind_and_retires_g2_once ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::carrier_safe_point_failure_retains_directory_identity_until_exact_retry_finishes ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::committed_destroy_prevents_a_stale_generation_from_mutating_its_successor ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::concurrent_exact_owner_finalization_cannot_republish_removed_owner ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::create_cleanup_retains_failed_vcpu_then_retries_terminal_finalization_only ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::creation_funnels_hold_transaction_through_setup_and_prepared_writes_hold_pin_static_audit ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::cross_generation_same_key_rejects_old_vm_and_owner_identities ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::executor_cleanup_funnels_guarantee_a_post_drop_idle_maintenance_turn_static_audit ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::executor_idle_safe_point_never_duplicates_an_in_flight_turn ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::executor_idle_safe_point_requeues_one_transient_backend_failure ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::explicit_offset_structural_retirement_unmaps_with_physical_sized_projection ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::failed_vm_destroy_preserves_records_and_live_generation ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::foreign_mm_drop_release_only_enqueues_until_the_executor_idle_safe_point ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::frame_pool_and_commit_destroy_concurrent_lock_order ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::fresh_vm_vcpu_and_permit_wrappers_remain_guarded_until_commit_static_audit ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::global_frame_owner_directory_is_isolated_per_carrier_custody ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::global_owner_collision_retains_failed_rollback_candidate_until_safe_point ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::global_owner_late_final_pin_defers_persistent_failure_without_abort_then_retries ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::global_owner_retirement_publishes_pending_before_backend_unmap_without_holding_directory ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::global_owner_stale_same_key_generation_never_retires_successor ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::initial_fallible_input_failure_precedes_vm_and_admission_permit_acquisition ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::last_pin_drop_is_non_panicking_and_only_marks_retry_eligibility ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::late_g1_carrier_mm_retirement_request_cannot_mutate_same_key_g2_record ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::later_exact_retirement_retries_a_transient_backend_failure_once ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::live_structural_owner_rebinds_exactly_to_g2_before_late_drop ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::pending_vcpu_wrapper_never_runs_raii_destroy_before_exact_cleanup ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::persistent_unmap_failure_retains_the_exact_record_for_retry ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::pinned_structural_retirement_refuses_root_slot_reuse_until_terminal ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::post_raw_create_failures_never_publish_live_and_terminalize_exact_setup_generation ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::production_global_frame_owner_operations_require_carrier_custody_static_audit ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::reconcile_deferred_owner_enqueues_for_idle_retry_after_pin_drop ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::retirement_retains_backing_if_the_claimed_directory_slot_disappears ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::structural_owner_drop_requests_then_safe_point_retires_with_backing_intact ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::successful_vm_destroy_terminalizes_generation_without_post_destroy_unmap ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::synchronous_retirement_removes_queued_storage_before_key_reuse ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::terminal_release_claim_aborts_for_retry_and_commits_removal_exactly_once ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::terminal_release_claim_blocks_generation_rebind_until_abort ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::vm_destroy_success_terminalizes_pending_owner_but_failure_preserves_exact_g1 ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::vm_rebuild_funnels_reconcile_owner_generation_before_guest_entry_static_audit ... ok
+test trap::carrier_custody::carrier_vm_custody_tests::vm_rebuild_rebinds_live_owner_to_g2_and_transfers_release_authority_once ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 524 filtered out; finished in 0.02s
+
