@@ -1,0 +1,191 @@
+disk: 44 GiB free — below the 75 GiB mark; 'just worktree-gc' to reclaim
+frame pointers: enforced
+cargo fmt --all -- --check
+    Checking carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+    Checking carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-runtime)
+    Checking carrick-engine v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-engine)
+    Checking carrick-embed v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-embed)
+    Checking carrick-cli v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-cli)
+    Checking carrick-conformance-next v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-conformance-next)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.20s
+python3 scripts/conformance/check-next-strategy.py
+conformance-next strategy: enforced
+python3 scripts/conformance/regen-next-shards.py --check
+492 generic probes; shards [164, 164, 164]; cached [157, 150, 149]
+./scripts/lint-domains.sh
+# The self-tests run FIRST and in the same gate as --check: every one of
+# these scanners keys at least one rule on an exact source PATH, so a crate
+# move can leave a rule matching nothing while --check still exits 0. The
+# self-test fixtures are the only thing that notices (Task 2.9 moved
+# `kernel/crash_capture.rs` into carrick-kernel and the CrashQuorum rule
+# went vacuous under a green `just ci`).
+python3 scripts/migrate/check-task-participant-witnesses.py --self-test
+task participant witness self-test: 14 negative and 14 positive fixtures passed
+python3 scripts/migrate/check-mm-authority.py --self-test
+mm authority self-test: 20 negative and 17 positive fixtures passed
+python3 scripts/migrate/check-dispatch-lock-authority.py --self-test
+Running check-dispatch-lock-authority self-tests...
+All check-dispatch-lock-authority self-tests PASSED (22 fixtures).
+python3 scripts/migrate/check-k1-burndown.py --self-test
+check-k1-burndown self-test OK
+python3 scripts/migrate/check-serial-host-tests.py --self-test
+check-serial-host-tests: self-test ok (19/19 passed)
+# The two inventory-maintenance tools carry their own unittest files
+# rather than a `--self-test` flag, and until now no gate executed
+# them -- a test no gate runs is not a test. They belong here for the
+# same reason as the self-tests above: both tools REWRITE the
+# line-pinned inventories (a rename map, a rehome of pinned positions),
+# so a silent break in either corrupts the very files
+# `check-host-authority-transitions.py --check` then validates below.
+# NAMED, not `unittest discover`: `scripts/tests/` also holds
+# `test_host_authority_transitions.py`, which is red at this branch's
+# base, and a discover run would turn that pre-existing red into a
+# blocked gate for every unrelated change.
+python3 -m unittest scripts/migrate/tests/test_reconcile_rename.py scripts/tests/test_rehome_line_pinned_inventories.py
+......................
+----------------------------------------------------------------------
+Ran 22 tests in 0.100s
+
+OK
+positions updated: 0
+rationale site references rebound: 0
+inventory rows: 1; capture rows: 0
+positions updated: 0
+rationale site references rebound: 0
+inventory rows: 1; capture rows: 0
+positions updated: 1
+rationale site references rebound: 1
+inventory rows: 1; capture rows: 0
+positions updated: 1
+rationale site references rebound: 1
+inventory rows: 1; capture rows: 0
+python3 -m unittest scripts/tests/test_conformance_contract_policy.py
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.001s
+
+OK
+cargo run -p carrick-conformance-contract --bin check-contracts -- --root .
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running `target/debug/check-contracts --root .`
+conformance contracts checked: 58 contracts, 15 claims, 135 surfaces (inventory: 338 syscalls, 14 with claims)
+cargo metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
+cargo run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running `target/debug/check-personality-boundary --root . --metadata-file target/cargo-metadata.json`
+personality boundary checked: 2 substrate crate(s) clean
+  [PASS] crate `carrick-sched-core` (shipped deps: [], dev deps: [], scanned files: 4)
+  [PASS] crate `carrick-mmu-core` (shipped deps: ["foldhash", "hashbrown"], dev deps: ["carrick-mem"], scanned files: 2)
+python3 -m unittest scripts/tests/test_check_contract_change.py
+[main (root-commit) 61cf748] initial commit
+ 4 files changed, 611 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 0590226] modify guest file
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+.[main (root-commit) 61cf748] initial commit
+ 4 files changed, 611 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 8b6d0aa] modify guest and binding
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+.[main (root-commit) 61cf748] initial commit
+ 4 files changed, 611 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 1299e15] rename guest file byte-identical
+ 1 file changed, 0 insertions(+), 0 deletions(-)
+ rename crates/carrick-kernel/src/dispatch/{futex.rs => futex_renamed.rs} (100%)
+.[main (root-commit) f5441ae] initial commit
+ 4 files changed, 611 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 6abbcf3] rename and edit guest file
+ 2 files changed, 1 insertion(+), 1 deletion(-)
+ delete mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex_renamed.rs
+.[main (root-commit) f5441ae] initial commit
+ 4 files changed, 611 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main a033043] add unclassified file
+ 1 file changed, 1 insertion(+)
+ create mode 100644 crates/unclassified/new_file.rs
+.[main (root-commit) f5441ae] initial commit
+ 4 files changed, 611 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 21c3b13] modify with glob exemption
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+ create mode 100644 docs/conformance-exemptions/exemption.toml
+.[main (root-commit) f5441ae] initial commit
+ 4 files changed, 611 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main ac0905d] modify with bad exemption revisions
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+ create mode 100644 docs/conformance-exemptions/exemption.toml
+.[main (root-commit) f5441ae] initial commit
+ 4 files changed, 611 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main d6638e8] modify with bad rationale
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+ create mode 100644 docs/conformance-exemptions/exemption.toml
+.[main (root-commit) e4b27cb] initial commit
+ 4 files changed, 611 insertions(+)
+ create mode 100644 conformance-contracts/contracts/futex-contention.toml
+ create mode 100644 conformance-contracts/surfaces.toml
+ create mode 100644 crates/carrick-kernel-example/tests/semantics/futex_contention.rs
+ create mode 100644 crates/carrick-kernel/src/dispatch/futex.rs
+[main 9472cc7] modify guest file
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+[main 4beb4af] modify guest with valid exemption
+ Date: Sat Sep 26 17:43:07 2026 -0700
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+ create mode 100644 docs/conformance-exemptions/exemption.toml
+[main d1f8d45] update exemption with exact head sha
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+[main 7f6f9c5] final exemption head
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+[main 804ff61] final exemption head
+ Date: Sat Sep 26 17:43:07 2026 -0700
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+[main 804ff61] final exemption head
+ Date: Sat Sep 26 17:43:07 2026 -0700
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+.
+----------------------------------------------------------------------
+Ran 9 tests in 1.930s
+
+OK
+python3 scripts/migrate/check-runtime-global-state.py --check
+python3 scripts/migrate/check-runtime-aborts.py --check
+OK: shard runtime.json valid (226 aborts: 221 carrier_fault, 5 typed_error_debt)
+OK: shard hvf.json valid (174 aborts: 174 carrier_fault, 0 typed_error_debt)
+OK: shard vcpu-loop.json valid (157 aborts: 157 carrier_fault, 0 typed_error_debt)
+OK: shard other.json valid (49 aborts: 49 carrier_fault, 0 typed_error_debt)
+python3 scripts/migrate/check-task-participant-witnesses.py --check
+task participant witness gate: ok (301 Rust leaves)
+python3 scripts/migrate/check-mm-authority.py --check
+mm authority gate: ok (431 Rust leaves)
+python3 scripts/migrate/check-host-authority-transitions.py --check
+error: inventory drift: new=['{"catalog_id":"HA-CATALOG-PROCESS-GETPID","expansion":null,"operation":"libc::getpid","source":{"byte_end":343488,"byte_start":343476,"column":21,"column_end":33,"column_start":21,"file":"crates/carrick-vmm-hvf/src/trap.rs","line":7636,"line_end":7636,"line_start":7636}}', '{"catalog_id":"HA-CATALOG-PROCESS-GETPID","expansion":null,"operation":"libc::getpid","source":{"byte_end":347377,"byte_start":347365,"column":36,"column_end":48,"column_start":36,"file":"crates/carrick-vmm-hvf/src/trap.rs","line":7707,"line_end":7707,"line_start":7707}}', '{"catalog_id":"HA-CATALOG-PROCESS-GETPID","expansion":null,"operation":"libc::getpid","source":{"byte_end":351041,"byte_start":351029,"column":29,"column_end":41,"column_start":29,"file":"crates/carrick-vmm-hvf/src/trap.rs","line":7774,"line_end":7774,"line_start":7774}}'], removed=['{"catalog_id":"HA-CATALOG-PROCESS-GETPID","expansion":null,"operation":"libc::getpid","source":{"byte_end":343241,"byte_start":343229,"column":21,"column_end":33,"column_start":21,"file":"crates/carrick-vmm-hvf/src/trap.rs","line":7633,"line_end":7633,"line_start":7633}}', '{"catalog_id":"HA-CATALOG-PROCESS-GETPID","expansion":null,"operation":"libc::getpid","source":{"byte_end":347130,"byte_start":347118,"column":36,"column_end":48,"column_start":36,"file":"crates/carrick-vmm-hvf/src/trap.rs","line":7704,"line_end":7704,"line_start":7704}}', '{"catalog_id":"HA-CATALOG-PROCESS-GETPID","expansion":null,"operation":"libc::getpid","source":{"byte_end":350794,"byte_start":350782,"column":29,"column_end":41,"column_start":29,"file":"crates/carrick-vmm-hvf/src/trap.rs","line":7771,"line_end":7771,"line_start":7771}}'], changed=[]
+error: recipe `lint-domains` failed on line 166 with exit code 2
+error: recipe `ci` failed with exit code 2

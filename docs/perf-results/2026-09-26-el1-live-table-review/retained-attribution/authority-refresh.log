@@ -1,0 +1,1 @@
+error: wrote an explicitly partial, non-authoritative candidate; pending profiles: linux-cli, linux-runtime, freebsd-cli, freebsd-runtime, netbsd-cli, netbsd-runtime

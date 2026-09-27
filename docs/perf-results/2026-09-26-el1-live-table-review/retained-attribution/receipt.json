@@ -1,0 +1,311 @@
+{
+  "native_image": "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+  "rootfs": {
+    "Type": "layers",
+    "Layers": [
+      "sha256:d9a56420aee7ff835e0c05fc666d1237d40f0da5fe338738e651b01db4672a5d"
+    ]
+  },
+  "rows": [
+    {
+      "venue": "aa5d55dd6",
+      "probe": "ppollwaitset",
+      "sample": 1,
+      "command": [
+        "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-integrated/cli-frozen-aa5d55dd6",
+        "run",
+        "--platform",
+        "linux/arm64",
+        "--fs",
+        "host",
+        "ubuntu:24.04",
+        "/bin/sh",
+        "-c",
+        "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"
+      ],
+      "run_id": "el1-retained-aa5d55dd6-ppollwaitset-1-20260926",
+      "exit_code": 0,
+      "probe_sha256": "77bca1fbab356fb24083e9a69fe56698700c2002bcd5ab69cd5b66c558e60351",
+      "observations": [
+        "wake_after_ms_bucket=lt1"
+      ],
+      "cleanup": "remaining carrick procs (run-id el1-retained-aa5d55dd6-ppollwaitset-1-20260926) = 0\n"
+    },
+    {
+      "venue": "aa5d55dd6",
+      "probe": "ppollwaitset",
+      "sample": 2,
+      "command": [
+        "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-integrated/cli-frozen-aa5d55dd6",
+        "run",
+        "--platform",
+        "linux/arm64",
+        "--fs",
+        "host",
+        "ubuntu:24.04",
+        "/bin/sh",
+        "-c",
+        "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"
+      ],
+      "run_id": "el1-retained-aa5d55dd6-ppollwaitset-2-20260926",
+      "exit_code": 0,
+      "probe_sha256": "77bca1fbab356fb24083e9a69fe56698700c2002bcd5ab69cd5b66c558e60351",
+      "observations": [
+        "wake_after_ms_bucket=lt1"
+      ],
+      "cleanup": "remaining carrick procs (run-id el1-retained-aa5d55dd6-ppollwaitset-2-20260926) = 0\n"
+    },
+    {
+      "venue": "aa5d55dd6",
+      "probe": "sigprofvdso",
+      "sample": 1,
+      "command": [
+        "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-integrated/cli-frozen-aa5d55dd6",
+        "run",
+        "--platform",
+        "linux/arm64",
+        "--fs",
+        "host",
+        "ubuntu:24.04",
+        "/bin/sh",
+        "-c",
+        "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"
+      ],
+      "run_id": "el1-retained-aa5d55dd6-sigprofvdso-1-20260926",
+      "exit_code": 0,
+      "probe_sha256": "c41b75e88cf1598906768b388c3bbf206a9ce306943a0958874a9aeac9757e5d",
+      "observations": [
+        "timer_pc_in_text=1"
+      ],
+      "cleanup": "remaining carrick procs (run-id el1-retained-aa5d55dd6-sigprofvdso-1-20260926) = 0\n"
+    },
+    {
+      "venue": "aa5d55dd6",
+      "probe": "sigprofvdso",
+      "sample": 2,
+      "command": [
+        "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-integrated/cli-frozen-aa5d55dd6",
+        "run",
+        "--platform",
+        "linux/arm64",
+        "--fs",
+        "host",
+        "ubuntu:24.04",
+        "/bin/sh",
+        "-c",
+        "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"
+      ],
+      "run_id": "el1-retained-aa5d55dd6-sigprofvdso-2-20260926",
+      "exit_code": 0,
+      "probe_sha256": "c41b75e88cf1598906768b388c3bbf206a9ce306943a0958874a9aeac9757e5d",
+      "observations": [
+        "timer_pc_in_text=1"
+      ],
+      "cleanup": "remaining carrick procs (run-id el1-retained-aa5d55dd6-sigprofvdso-2-20260926) = 0\n"
+    },
+    {
+      "venue": "863e81757",
+      "probe": "ppollwaitset",
+      "sample": 1,
+      "command": [
+        "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-integrated/cli-frozen-863e81757",
+        "run",
+        "--platform",
+        "linux/arm64",
+        "--fs",
+        "host",
+        "ubuntu:24.04",
+        "/bin/sh",
+        "-c",
+        "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"
+      ],
+      "run_id": "el1-retained-863e81757-ppollwaitset-1-20260926",
+      "exit_code": 0,
+      "probe_sha256": "77bca1fbab356fb24083e9a69fe56698700c2002bcd5ab69cd5b66c558e60351",
+      "observations": [
+        "wake_after_ms_bucket=lt1"
+      ],
+      "cleanup": "remaining carrick procs (run-id el1-retained-863e81757-ppollwaitset-1-20260926) = 0\n"
+    },
+    {
+      "venue": "863e81757",
+      "probe": "ppollwaitset",
+      "sample": 2,
+      "command": [
+        "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-integrated/cli-frozen-863e81757",
+        "run",
+        "--platform",
+        "linux/arm64",
+        "--fs",
+        "host",
+        "ubuntu:24.04",
+        "/bin/sh",
+        "-c",
+        "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"
+      ],
+      "run_id": "el1-retained-863e81757-ppollwaitset-2-20260926",
+      "exit_code": 0,
+      "probe_sha256": "77bca1fbab356fb24083e9a69fe56698700c2002bcd5ab69cd5b66c558e60351",
+      "observations": [
+        "wake_after_ms_bucket=lt1"
+      ],
+      "cleanup": "remaining carrick procs (run-id el1-retained-863e81757-ppollwaitset-2-20260926) = 0\n"
+    },
+    {
+      "venue": "863e81757",
+      "probe": "sigprofvdso",
+      "sample": 1,
+      "command": [
+        "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-integrated/cli-frozen-863e81757",
+        "run",
+        "--platform",
+        "linux/arm64",
+        "--fs",
+        "host",
+        "ubuntu:24.04",
+        "/bin/sh",
+        "-c",
+        "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"
+      ],
+      "run_id": "el1-retained-863e81757-sigprofvdso-1-20260926",
+      "exit_code": 0,
+      "probe_sha256": "c41b75e88cf1598906768b388c3bbf206a9ce306943a0958874a9aeac9757e5d",
+      "observations": [
+        "timer_pc_in_text=1"
+      ],
+      "cleanup": "remaining carrick procs (run-id el1-retained-863e81757-sigprofvdso-1-20260926) = 0\n"
+    },
+    {
+      "venue": "863e81757",
+      "probe": "sigprofvdso",
+      "sample": 2,
+      "command": [
+        "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/live-integrated/cli-frozen-863e81757",
+        "run",
+        "--platform",
+        "linux/arm64",
+        "--fs",
+        "host",
+        "ubuntu:24.04",
+        "/bin/sh",
+        "-c",
+        "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"
+      ],
+      "run_id": "el1-retained-863e81757-sigprofvdso-2-20260926",
+      "exit_code": 0,
+      "probe_sha256": "c41b75e88cf1598906768b388c3bbf206a9ce306943a0958874a9aeac9757e5d",
+      "observations": [
+        "timer_pc_in_text=1"
+      ],
+      "cleanup": "remaining carrick procs (run-id el1-retained-863e81757-sigprofvdso-2-20260926) = 0\n"
+    },
+    {
+      "venue": "docker",
+      "probe": "ppollwaitset",
+      "sample": 1,
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--name",
+        "el1-retained-docker-ppollwaitset-1-20260926",
+        "--platform",
+        "linux/arm64",
+        "-i",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/bin/sh",
+        "-c",
+        "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"
+      ],
+      "run_id": "el1-retained-docker-ppollwaitset-1-20260926",
+      "exit_code": 0,
+      "probe_sha256": "77bca1fbab356fb24083e9a69fe56698700c2002bcd5ab69cd5b66c558e60351",
+      "observations": [
+        "wake_after_ms_bucket=lt1"
+      ],
+      "cleanup": ""
+    },
+    {
+      "venue": "docker",
+      "probe": "ppollwaitset",
+      "sample": 2,
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--name",
+        "el1-retained-docker-ppollwaitset-2-20260926",
+        "--platform",
+        "linux/arm64",
+        "-i",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/bin/sh",
+        "-c",
+        "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"
+      ],
+      "run_id": "el1-retained-docker-ppollwaitset-2-20260926",
+      "exit_code": 0,
+      "probe_sha256": "77bca1fbab356fb24083e9a69fe56698700c2002bcd5ab69cd5b66c558e60351",
+      "observations": [
+        "wake_after_ms_bucket=lt1"
+      ],
+      "cleanup": ""
+    },
+    {
+      "venue": "docker",
+      "probe": "sigprofvdso",
+      "sample": 1,
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--name",
+        "el1-retained-docker-sigprofvdso-1-20260926",
+        "--platform",
+        "linux/arm64",
+        "-i",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/bin/sh",
+        "-c",
+        "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"
+      ],
+      "run_id": "el1-retained-docker-sigprofvdso-1-20260926",
+      "exit_code": 0,
+      "probe_sha256": "c41b75e88cf1598906768b388c3bbf206a9ce306943a0958874a9aeac9757e5d",
+      "observations": [
+        "timer_pc_in_text=1"
+      ],
+      "cleanup": ""
+    },
+    {
+      "venue": "docker",
+      "probe": "sigprofvdso",
+      "sample": 2,
+      "command": [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--name",
+        "el1-retained-docker-sigprofvdso-2-20260926",
+        "--platform",
+        "linux/arm64",
+        "-i",
+        "ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05",
+        "/bin/sh",
+        "-c",
+        "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"
+      ],
+      "run_id": "el1-retained-docker-sigprofvdso-2-20260926",
+      "exit_code": 0,
+      "probe_sha256": "c41b75e88cf1598906768b388c3bbf206a9ce306943a0958874a9aeac9757e5d",
+      "observations": [
+        "timer_pc_in_text=1"
+      ],
+      "cleanup": ""
+    }
+  ]
+}

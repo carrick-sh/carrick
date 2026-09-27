@@ -493,3 +493,21 @@ receipts are preserved, with the generic artifact re-signing limitation stated
 in the [public probe receipt](../../perf-results/2026-09-26-el1-live-table-review/public-probes-863e81757/README.md).
 Full CI on this revision is running. Smoke/full, strict probe acceptance and
 actual EL1 first-touch remain open with the full goal scope intact.
+
+### Retained GNU attribution and authority inventory reconciliation
+
+Two fixed samples per retained probe on each frozen Carrick artifact
+(`aa5d55dd6`, `863e81757`), followed by matching-image native arm64 Docker,
+all exit zero with empty cleanup. Every venue reports `ppollwaitset` wake
+bucket `lt1` and `sigprofvdso` timer text sampling `1` in both samples. Thus the
+public latency difference did not reproduce in the isolated screen, and the
+timer value also occurs in native Linux despite cached `0`. These observations
+support probe/oracle investigation; they do not repair the original receipt or
+close strict acceptance. No oracle or threshold changed. See the
+[bounded attribution receipt](../../perf-results/2026-09-26-el1-live-table-review/retained-attribution/README.md).
+
+CI stopped on three source-position changes in the host-authority inventory.
+Reconciliation preserves 588 reviewed rows, classifications and rationale
+bodies, updating only the shifted spans/location prefixes and machine capture.
+Non-macOS authority profiles remain pending. Full CI rerun, artifact-preserving
+strict probe acceptance, smoke/full and actual EL1 first-touch remain open.
