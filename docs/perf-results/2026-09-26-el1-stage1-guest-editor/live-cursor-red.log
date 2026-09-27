@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-438fb741d9d260b3)
+
+running 1 test
+test aarch64::tests::new_live_discovers_the_last_occupied_spare_page_before_allocating ... FAILED
+
+failures:
+
+---- aarch64::tests::new_live_discovers_the_last_occupied_spare_page_before_allocating stdout ----
+
+thread 'aarch64::tests::new_live_discovers_the_last_occupied_spare_page_before_allocating' (15022764) panicked at crates/carrick-mmu-core/src/aarch64.rs:6980:9:
+assertion `left == right` failed: live construction must not reissue a table page already visible to hardware
+  left: 32768
+ right: 49152
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    aarch64::tests::new_live_discovers_the_last_occupied_spare_page_before_allocating
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 93 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-mmu-core --lib`

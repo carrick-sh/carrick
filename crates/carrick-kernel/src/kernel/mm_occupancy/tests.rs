@@ -497,6 +497,48 @@ fn a_published_gate_follows_the_mm_fence() {
     drop(publication);
 }
 
+#[test]
+fn a_published_fence_waits_for_the_exact_guest_editor() {
+    let (spaces, occupancy) = space_tables();
+    let mm_fence = fence();
+    let publication = publish_for_test(spaces, occupancy, mm(42_051), &mm_fence, 0x1800).unwrap();
+    let index = spaces.find(42_051).unwrap();
+    let editor = spaces
+        .try_begin_edit(index, 42_051, std::num::NonZeroU64::new(7).unwrap())
+        .expect("EL1 owns the open space before the host pause");
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let host_fence = Arc::clone(&mm_fence);
+    let host = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        host_fence.set_quiescing();
+        done_tx.send(()).unwrap();
+    });
+    started_rx.recv().unwrap();
+    for _ in 0..1_000_000 {
+        if spaces.gate(index) != 0 {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_ne!(spaces.gate(index), 0, "host closes the gate first");
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "the host pause must not pass the live guest editor"
+    );
+
+    drop(editor);
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("guest editor release acknowledges the pause");
+    host.join().unwrap();
+    mm_fence.end();
+    drop(publication);
+}
+
 /// Retirement: closing the gate refuses every later install, and dropping
 /// the publication frees the entry and unbinds the fence, after no vCPU in
 /// the guest holds the space.

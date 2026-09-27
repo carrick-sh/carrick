@@ -943,12 +943,19 @@ impl PageTableManager {
             walk_descriptors_host(host_ptr, primary_capacity, base, layout.user_leaf_check_va)
         };
         let asid_scoped_leaves = terminal_descriptor(walk) & NON_GLOBAL != 0;
+        // The live image may already contain sub-tables allocated after the
+        // boot template was copied (for example by the ELF read-only-span
+        // pass). Reconstruct the bump cursor from hardware-visible bytes;
+        // resetting it to SPARE_START_OFFSET would hand an occupied table page
+        // out again and let the next edit corrupt the active walk.
+        let live_bytes = unsafe { core::slice::from_raw_parts(host_ptr, primary_capacity) };
+        let next_free = discover_next_free_spare(live_bytes);
         Ok(Self {
             arenas: vec![TableArena {
                 snapshot_scratch: Vec::new(),
                 base,
                 storage: TableArenaStorage::Live,
-                next_free: SPARE_START_OFFSET,
+                next_free,
                 capacity: primary_capacity,
             }],
             layout,
@@ -6956,6 +6963,35 @@ mod tests {
             mgr.snapshot_image().err(),
             Some(PageTableError::UnresolvedArena(LINUX_PAGE_TABLES_BASE)),
             "snapshot_image on short backing must fail closed"
+        );
+    }
+
+    #[test]
+    fn new_live_discovers_the_last_occupied_spare_page_before_allocating() {
+        let resolver = MockLiveResolver::new();
+        let capacity = SPARE_START_OFFSET as usize + 8 * PT_PAGE as usize;
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, capacity);
+        let occupied_page = SPARE_START_OFFSET + 3 * PT_PAGE;
+        resolver.write_word(LINUX_PAGE_TABLES_BASE, occupied_page as usize, VALID);
+
+        let mut manager = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                capacity,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .expect("bind live page-table backing")
+        };
+        let expected_next = occupied_page + PT_PAGE;
+        assert_eq!(
+            manager.arenas[0].next_free, expected_next,
+            "live construction must not reissue a table page already visible to hardware"
+        );
+        assert_eq!(
+            manager.alloc_table(None).unwrap(),
+            LINUX_PAGE_TABLES_BASE + expected_next,
+            "the first allocation follows the last occupied live spare page"
         );
     }
 }
