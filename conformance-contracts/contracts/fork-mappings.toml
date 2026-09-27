@@ -10,10 +10,10 @@ semantic_authority = [
 ]
 fixture = "probe:forksnapshot"
 scale_points = [1, 8, 32, 128]
-rationale = "Fork memory mapping projection must scale affinely with populated VMAs and avoid unbounded hashing, allocation, or full-table scans when unpopulated mappings exist."
+rationale = "Fork memory mapping projection must scale affinely with populated VMAs and avoid unbounded hashing, allocation, or full-table scans when unpopulated mappings exist. A deferred private alias remains inaccessible in the child, but its invalid leaf must retain the alias registry's authenticated current output instead of a superseded identity address so the child's later first touch resolves the same live frame authority."
 
 [bindings]
-vm_free = "carrick-kernel-example::fork_mappings_contract"
+vm_free = "carrick-kernel-example::fork_mappings_contract; carrick-vmm-hvf::trap::process_plan::tests::untouched_private_alias_repoints_retained_leaf_without_making_it_valid"
 embed = "carrick-embed::fork_mappings_contract"
 docker = "probe:forksnapshot"
 ecosystem = ["ltp:fork14"]
