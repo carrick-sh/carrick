@@ -1,0 +1,9 @@
+Review round 3 (final allowed round) at 8c5bd3ee1af7f4e595d4664a0063233119e3e1f6.
+
+Director reproduced a new fixture regression on pinned native arm64 Docker, exit 1:
+fault-entry canary mismatch x16=0xffffca4980d0 expected=0x1616161616161616
+Fixture SHA256 bb8d9a5ed1c3dad40db9edce5fe554464843ae2fd1ea3f8e24abfe51b0b98131. Same pinned image as review 2. No remaining container. The fixture cross-compiles, but its new SP capture executes mov x16, sp before storing captured_regs[16], thereby destroying exactly the x16 canary we require. Fix capture ordering/storage so every original post-fault GPR is retained before reusing any register for SP or pointers. Keep actual pre/post SP equality and all 31 GPR checks; do not weaken or skip x16. Preserve callee saves and stack alignment. This should be a narrow fixture correction, not another redesign.
+
+Entry wiring and actual dispatcher semantic red are now present. Retain red-test.log. Be accurate that it records failure in the dispatcher test and Cargo stops before memory tests: it is not evidence that an emitted-vector test ran red in that invocation. The red-source.diff contains unrelated added test lines and sets branch offsets to zero; clean up reproduction instructions so the dispatcher-only red is reproducible with the intended classifier omission and does not corrupt unrelated vectors. Preserve original evidence and describe its scope rather than claiming more.
+
+Rerun all six requested commands and report actual test counts parsed from their output. Mechanically review the capture sequence to prevent another clobber-before-save. No guest/Docker runs by you; director will rebuild and run the corrected fixture natively immediately, then signed red/green. Return the same schema, commit narrowly, state limitations honestly. This is round 3 of 3: no further worker correction round after this.

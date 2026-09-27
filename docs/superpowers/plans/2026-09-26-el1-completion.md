@@ -564,3 +564,13 @@ but does not assert SP; and claimed semantic red has no preserved raw receipt.
 The same worker is addressing these narrow findings on turn 3 (review round 2).
 Evidence: `docs/perf-results/2026-09-26-el1-fault-entry-director/review-2-*`.
 No worker implementation has yet been integrated.
+
+2026-09-26: fault-entry review round 3 at `8c5bd3ee1` found a fixture
+regression: SP capture overwrites x16 before recording its canary. The pinned
+native arm64 oracle confirms exit 1 with x16 containing SP instead of the
+canary. The same worker is addressing this narrow correction on turn 4, its
+third and final review round. Real-entry dispatch wiring and raw dispatcher
+semantic red evidence are now present; the latter does not prove vector tests
+ran red because Cargo stopped at the earlier failed crate. Native evidence
+and review are preserved in the director review directory. No guest runtime
+regression is inferred from this fixture failure.
