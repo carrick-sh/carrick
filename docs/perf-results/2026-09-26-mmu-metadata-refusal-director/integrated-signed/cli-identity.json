@@ -1,0 +1,10 @@
+{
+  "source_head": "a6ac6935ca96c37947a23749481120bd3933876f",
+  "sha256": "732a93d2b4a51c23757d0dc56fff8820bcba30d5502212440abd826c137552e0",
+  "cdhash": "9a0d53b4d04ce34636d1d89f02ad7d03f43f7a55",
+  "lc_uuid": "53419093-BADC-3670-B3EC-E86F1463A1E5",
+  "hypervisor_entitlement": true,
+  "dof_present": true,
+  "binary": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/carrick",
+  "frozen_binary": "/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/el1-completion/metadata-integrated/signed/cli-frozen/carrick"
+}

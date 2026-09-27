@@ -1,0 +1,5 @@
+grant_size=65536 requested_payload=65536 allocation_succeeded=false
+
+thread 'main' (14392053) panicked at /tmp/el1-allocator-director-screen/grant-size.rs:472:2:
+host grant request must include allocator overhead
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

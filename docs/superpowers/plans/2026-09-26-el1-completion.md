@@ -707,3 +707,185 @@ identities and rationale bodies. The four earlier abort fingerprints remain
 reviewed. Full integrated CI starts after committing these inventory updates;
 no full CI or signed acceptance is yet claimed. Non-macOS profiles remain
 pending as before.
+
+2026-09-26: full CI on `bc5500391` stopped at generated contract inventory
+validation after workspace Clippy and earlier domain checks passed. Regenerated
+inventory adds only the metadata-refusal claim to mmap/munmap/mprotect; full
+CI reruns after commit. Failure evidence is under metadata-refusal-director/
+integrated-ci/. No full CI acceptance is claimed.
+
+Dispatched the next distinct implementation, `el1-elastic-metadata`, through
+Antigravity (cid `bce3369a-a045-4632-a3f0-736bab05eae1`) in the clean reused
+el1-memory-corrections checkout at `bc5500391`. Its director-written brief is
+2026-09-26-el1-elastic-metadata.md. It requires real guest allocator/grant/
+return wiring and an embed fixture, not host-only allocation. Worker runs host
+checks and compilation only; director retains signed execution and acceptance.
+This task has zero review rounds used; metadata-refusal is terminal after
+three rounds and director correction, not reopened.
+
+2026-09-26: full integrated CI on clean `b8a3ccea7` exits zero: 6,201
+passing tests, zero failures, 12 existing ignores across 101 Rust result
+groups. Complete hashed evidence is under metadata-refusal-director/
+integrated-ci/green/. This closes the host gate only; signed guest validation,
+first-touch structural acceptance and every later checkpoint remain open.
+The separate elastic metadata worker is active on its first turn; its exact
+dispatch brief is preserved under el1-elastic-metadata-director/dispatch.md.
+
+2026-09-26: the preceding user status turn was no implementation progress.
+Resumed the same live elastic metadata worker, with no replacement or review
+round consumed. A read-only in-progress core screen reproduces two behavioral
+failures: 64-byte alignment returns remainder 32, and payload-only grant sizing
+cannot fit its header. Raw source and red output are preserved under
+el1-elastic-metadata-director/in-progress-screen/. Recheck against the terminal
+candidate before review; no worker source was modified. Signed release build
+on a6ac6935c completed and its exact CLI artifact is frozen. The integrated EL1
+gate is running; no result or first-touch acceptance is claimed yet.
+
+2026-09-26: signed integrated metadata gate on a6ac6935c finishes with only
+the existing first-touch failure: 621/2150/8294 exits at 512/2048/8192 total
+pages; slope 0.9954 versus <0.125. Forty-one other EL1 tests and negative
+control pass, including the 30-round oversubscribed kick witness. Both scoped
+cleanup counts are zero. CLI and eight executed test artifacts are frozen;
+raw logs/manifest are under metadata-refusal-director/integrated-signed/.
+Public probes/LTP/inotify steps did not run; no timing acceptance is claimed.
+
+2026-09-26: elastic metadata candidate ae6c3a17b passes all eight independent
+host verification commands but fails allocator review. Final-source screens
+reproduce alignment and grant-overhead failures; actual guest stage-1 mapping,
+owner lifetime, global allocation wiring, growth/refusal fixture and structural
+bounds are incomplete. Documentation claims absent footer/counter structures.
+Integration is withheld. Same worker received review round1 (turn2), with
+all evidence under el1-elastic-metadata-director/review-1/. No signed allocator
+acceptance is claimed and no later goal stage is removed from scope.
+
+2026-09-26: allocator candidate dc2b83706 passes all eight independent host
+checks and fixes the original alignment/grant-sizing reds. Acceptance remains
+withheld: standalone fixture cross-build fails an undeclared dependency; a
+real host slot-policy screen proposes overlapping extents for >512KiB grants;
+bootstrap initialization, process-root mapping, token/register ABI, owner
+lifetime and denial-phase ordering remain incomplete. Evidence is under
+el1-elastic-metadata-director/review-2/. Same worker received review round2
+(turn3); one review round remains. No signed allocator candidate was run.
+
+### Delivery acceleration ruling (2026-09-26)
+
+Owner asked how to expedite delivery after two allocator reviews exposed
+host-green candidates with a broken standalone fixture and incomplete guest
+transport/lifetime. The critical path stays allocator -> signed guest
+growth/return -> actual first-touch; all later goal stages remain required.
+
+Let the currently live elastic metadata turn3 (review round2) finish; do not
+restart or replace it. Review its actual source and reproduce decisive checks.
+The director will directly resolve remaining integration defects rather than
+send another broad allocator repair round. This ends that broad delegation
+loop earlier than its maximum three reviews, not by accepting unfinished work.
+Do not edit the worker's tree until its process is confirmed terminal.
+
+Build the modified standalone Linux fixture alongside the cheap focused
+contracts. Once source review rules out known unsafe grant/lifetime paths, run
+the focused signed guest growth/return witness immediately; compile-only embed
+checks are insufficient. Fix the first decisive failure before broadening.
+Run full CI and required exact-artifact promotion at stable integrated
+checkpoints, not repeatedly on intermediate rejected implementations. Do not
+weaken semantics, work budgets, concurrency, provenance or final acceptance.
+
+No additional cleanup or architecture extraction is admitted unless a
+reproduced blocker directly prevents guest allocation or first-touch service.
+Report milestones in guest behavior and host-exit slope, not commit/test count.
+
+2026-09-26: elastic metadata worker is terminal after initial implementation
+plus two review rounds (three turns); the broad delegation loop is now closed
+per the delivery ruling. No third review is dispatched. Its uncommitted final
+changes are preserved in worker checkpoint83972685e, explicitly unaccepted.
+Director takes over the same now-idle correction checkout. Fixed the actual
+Linux fixture to execute exactly one requested basic/growth/denial phase in
+2d3b55cc9; the prior fixture ignored the phase argument and ran all three.
+The static fixture cross-build passes. Started the focused signed witness via
+`CARRICK_RUN_ID=el1-allocator-director-red-20260926 RUSTC_WRAPPER= just test-embed
+el1_metadata_allocator_grows_and_returns_extents --nocapture` on that source.
+Log is in correction checkout target/el1-completion/allocator-director-red/.
+Do not edit its product source or relink while the run is active. No signed
+allocator result, integration acceptance or first-touch improvement is claimed.
+Remaining review includes coherent shared host backing and carrier-owned
+lifetime; use the actual focused failure to order direct corrections.
+
+2026-09-26: the director reproduced and corrected two guest integration
+failures in the correction checkout. bd604a876 restores maintenance HVC #1
+routing after strict syscall classification; c33e1d152 removes the extra PC
+advance after HVC #6 (LLDB and exact guest disassembly prove the skipped
+status comparison). The focused signed allocator witness now passes on
+c33e1d152766d5802e1b6b86f152ccb204b8ab10: basic alignment/writes, 10 MiB
+allocation beyond the 9 MiB bootstrap, three grants/returns totaling 5,767,168
+bytes, and one denied grant followed by recovery. Negative entitlement control
+and both scoped cleanups pass. Exact identities and raw log are preserved in
+[focused guest evidence](../../perf-results/2026-09-26-el1-allocator-focused-guest/README.md).
+
+This is focused guest proof, not allocator integration or memory checkpoint
+acceptance. Source remains in the correction checkout (receipt commit
+188114c43). Next directly close carrier-owned coherent backing, exact VM/owner
+lifetime and failed-unmap retention, then concurrency/IRQ and bounded-work
+witnesses. These are required by the accepted allocator brief, not new scope.
+Use the resulting allocator for shared MMU publication and EL1 first-touch;
+the existing <0.125 host-exits/page target remains red. No end-to-end speedup
+is claimed and all later checkpoints remain required.
+
+2026-09-26: correction checkout advanced through coherent metadata backing
+(fa557cc7d), exact carrier ownership/generation (1c22dcdb3), and shared stage-2
+record publication/retirement (b61195767). Five focused metadata and 48 existing
+custody tests pass. The exact signed sequential allocator witness passes on
+b61195767, including denial recovery and complete return of 5,767,168 bytes.
+
+8fc9c913a adds a concurrent signed witness: four allocator users, sixteen rounds
+of growth/free, and 1,024 successful host-forwarded uname calls. Both allocator
+tests pass with matching grant/return counts and bytes, no concurrent grant
+denial, the unchanged watchdog, negative entitlement control and zero scoped
+processes. See [concurrent evidence](../../perf-results/2026-09-26-el1-allocator-concurrent/README.md).
+This is concurrent completion/progress proof, not an interrupt-latency measurement.
+
+5b2da6bef gates private allocator controls behind an explicit embedded-image
+test feature enabled by embed dev dependencies. Default and enabled shared
+dispatcher tests (57 each), both image builds, embed compile-check and Clippy
+pass. Signed verification is running in the correction checkout at
+target/el1-completion/allocator-gated-signed/signed.log. No allocator product
+changes have been integrated into this controller checkout.
+
+Remaining required allocator work: IRQ/host-wait protocol and complete
+deterministic work/retention witnesses. Source confirms EL1 intentionally
+never unmasks IRQs; restoring saved DAIF before synchronous HVC #6 therefore
+does not prove the brief's no-host-wait-while-masked requirement. Current-EL
+IRQ slots fail loud, so simply unmasking interrupts is not a valid correction.
+Resolve this protocol before claiming allocator acceptance. Then continue
+shared MMU publication/frame grants and real first-touch handling. The first-touch
+exit-slope gate and full per-workload 2x acceptance remain open, as do all later
+checkpoints.
+
+### Accepted EL1 metadata allocator boundary (2026-09-26)
+
+The correction line closes the remaining allocator obligations through
+`7e08a6108`. Metadata capacity misses now publish one carrier-wide
+single-flight request and unwind through the ordinary pending-host-work
+boundary before the host maps or unmaps storage. A participant observing
+unfinished mailbox work forces its own boundary, refusal stays with the
+capacity miss that owns it, fully unused dynamic extents return exactly once,
+and no synchronous metadata HVC runs on the masked allocator stack.
+
+Exact signed source `ef5764582` passes sequential 10 MiB growth beyond the
+9 MiB bootstrap, complete return, refusal with preserved live data and retry,
+four-user concurrent progress with 1,024 unrelated host services, and the IRQ
+boundary witness together. Real grant and return accounting matches with
+`inline_hvc_traps == 0`; the entitlement negative control and both scoped
+cleanup checks pass. Checked-arithmetic controls reject oversized guest and
+host requests without mutation or panic, metadata tokens cannot wrap or issue
+zero, and registered VM-free budgets prove constant allocation/deallocation
+work at scales 1, 8, 32, and 128. Exact identities and raw evidence are under
+`docs/perf-results/2026-09-26-el1-allocator-host-boundary/`.
+
+This closes the allocator prerequisite, not checkpoint 2. It does not improve
+the signed first-touch slope, which remains about 0.9954 host exits per page
+against the `<0.125` target. The next bounded implementation is shared MMU
+publication and frame grants: define the live-table publication/rollback
+contract, prove stage-2 and inventory readiness precede a valid stage-1 leaf,
+then connect recoverable EL0 data-abort entry to that authority. Re-run the
+existing three-scale first-touch witness after actual guest service. Further
+allocator work is out of scope unless this next contract exposes a direct
+allocator regression.

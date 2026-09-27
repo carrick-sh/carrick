@@ -1,0 +1,48 @@
+head a6ac6935c
+sha256 732a93d2b4a51c23757d0dc56fff8820bcba30d5502212440abd826c137552e0
+CDHash=9a0d53b4d04ce34636d1d89f02ad7d03f43f7a55
+    uuid 53419093-BADC-3670-B3EC-E86F1463A1E5
+com.apple.security.hypervisor
+dof present
+el1-gate: step el1-embed failed; tail of target/el1-gate/a6ac6935c/el1-embed.log:
+test el1_zone_entry_at_open_contract ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.74s
+
+test-signed: running /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_vcpu_lifetime-721cf0b5e1096e04 el1_
+
+running 1 test
+test el1_vcpus_live_for_the_vm_lifetime_across_a_second_root ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+test-signed: running /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_inotify-2fab4762834f2e91 el1_
+
+running 4 tests
+test el1_inotify09_contract ... ok
+test el1_inotify_contract ... ok
+test el1_inotify_queue_shape ... ok
+test el1_inotify_recall_on_dir_watch ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.83s
+
+test-signed: running /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/el1_gic-2e52deb07bcbc0e1 el1_
+
+running 2 tests
+test el1_gic_el0_id_view_hides_the_gic ... ok
+test el1_gic_vtimer_reaches_el1_without_host_exits ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-2b17a9dc788a7ac7.noent.96331: replacing existing signature
+test-signed: negative control on /Users/tjfontaine/.codex/worktrees/el1-completion/carrick/target/release/deps/entitlement_negative-2b17a9dc788a7ac7.noent.96331
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+test-signed: FAILED (carrick-embed)
+remaining carrick procs (run-id el1-metadata-gate-20260926-a6ac6935c) = 0
+remaining carrick procs (run-id el1-metadata-gate-20260926-a6ac6935c-cli) = 0
+error: recipe `el1-gate` failed with exit code 1
