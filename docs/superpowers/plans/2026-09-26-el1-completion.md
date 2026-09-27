@@ -554,3 +554,13 @@ arena bookkeeping after rollback consumes its journal. A reclaiming allocator
 alone cannot prove metadata-refusal recovery. Evidence and required witness
 cases are in `docs/perf-results/2026-09-26-el1-first-touch/allocator-prerequisite/mmu-allocation-audit.md`.
 No current guest OOM reproduction or new allocator acceptance is claimed.
+
+2026-09-26: director review round 2 of fault-entry at `eb2d4f6a3` confirms
+244 host tests and fixture cross-compilation pass. The frozen fixture also
+passes on the pinned matching-image native arm64 Docker oracle with exit 0
+and no remaining container. Acceptance remains open: the bare-metal entry
+duplicates rather than calls its tested dispatch helper; the fixture captures
+but does not assert SP; and claimed semantic red has no preserved raw receipt.
+The same worker is addressing these narrow findings on turn 3 (review round 2).
+Evidence: `docs/perf-results/2026-09-26-el1-fault-entry-director/review-2-*`.
+No worker implementation has yet been integrated.
