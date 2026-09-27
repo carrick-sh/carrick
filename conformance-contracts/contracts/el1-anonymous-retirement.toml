@@ -20,9 +20,9 @@ rationale = "EL1 increment 2 mapping-retirement checkpoint. Each run repeatedly 
 structural_budgets = []
 
 [bindings]
+vm_free = "carrick-mmu-core::aarch64::tests::owned_host_image_reuse_clears_live_descriptors_written_by_an_el1_editor; carrick-kernel::dispatch::mem::tests::lazy_fixed_anonymous_replacement_rearms_first_touch_after_retirement; carrick-vmm-hvf::trap::global_frame::allocator_stats_tests::el1_grant_stats_count_owned_and_pooled_return_and_reuse"
 embed = "carrick-embed::el1_sched::el1_anonymous_mapping_retirement_returns_and_reuses_frames"
+docker = "native-arm64 same-source mapping-retirement fixture at 256, 1024 and 4096 pages; docs/perf-results/2026-09-27-el1-anonymous-retirement"
 
 [bindings.unresolved]
-vm_free = "Inventory and allocator unit contracts cover exact retirement transactions, but cannot execute the EL1 fault path or prove that signed guest munmap returns its frame-grant leases."
-docker = "Run the same mapping-retirement fixture on native arm64 Linux and bind the transcript before checkpoint-2 acceptance."
-production = "Signed guest execution, exact frame-grant return counters, repeated physical IPA reuse, permission-denial coverage and EL1 syscall ownership remain open until the bound witness and later permission migration pass."
+production = "This checkpoint proves exact retirement, zeroed reuse and bounded bulk work through the existing mmap-family service boundary. Permission-denial coverage and migration of mmap-family syscall ownership into EL1 remain later increments."
