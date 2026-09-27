@@ -464,6 +464,7 @@ dependencies = [
  "carrick-abi",
  "carrick-conformance-contract",
  "carrick-el1-abi",
+ "carrick-el1-image",
  "carrick-engine",
  "carrick-guest-mem",
  "carrick-hal",

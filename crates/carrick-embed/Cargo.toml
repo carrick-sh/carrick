@@ -69,6 +69,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+carrick-el1-image = { path = "../carrick-el1-image", features = ["allocator-test-control"] }
 flate2.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

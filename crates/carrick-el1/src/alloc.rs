@@ -918,6 +918,7 @@ pub fn init_bootstrap_allocator(bootstrap_base: u64, bootstrap_size: usize) {
 }
 
 /// In-guest allocator test execution invoked by embed test fixture via `SYS_CARRICK_EL1_CONTROL`.
+#[cfg(feature = "allocator-test-control")]
 pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
     match subtest {
         1 => {

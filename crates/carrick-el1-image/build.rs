@@ -212,6 +212,10 @@ fn main() {
         .arg("--target-dir")
         .arg(&el1_target_dir);
 
+    if std::env::var_os("CARGO_FEATURE_ALLOCATOR_TEST_CONTROL").is_some() {
+        build_cmd.arg("--features").arg("allocator-test-control");
+    }
+
     // Remove cargo env vars that might interfere with nested cargo invocation
     build_cmd.env_remove("CARGO_MAKEFLAGS");
     build_cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
