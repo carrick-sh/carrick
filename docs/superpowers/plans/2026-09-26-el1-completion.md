@@ -808,3 +808,23 @@ Do not edit its product source or relink while the run is active. No signed
 allocator result, integration acceptance or first-touch improvement is claimed.
 Remaining review includes coherent shared host backing and carrier-owned
 lifetime; use the actual focused failure to order direct corrections.
+
+2026-09-26: the director reproduced and corrected two guest integration
+failures in the correction checkout. bd604a876 restores maintenance HVC #1
+routing after strict syscall classification; c33e1d152 removes the extra PC
+advance after HVC #6 (LLDB and exact guest disassembly prove the skipped
+status comparison). The focused signed allocator witness now passes on
+c33e1d152766d5802e1b6b86f152ccb204b8ab10: basic alignment/writes, 10 MiB
+allocation beyond the 9 MiB bootstrap, three grants/returns totaling 5,767,168
+bytes, and one denied grant followed by recovery. Negative entitlement control
+and both scoped cleanups pass. Exact identities and raw log are preserved in
+[focused guest evidence](../../perf-results/2026-09-26-el1-allocator-focused-guest/README.md).
+
+This is focused guest proof, not allocator integration or memory checkpoint
+acceptance. Source remains in the correction checkout (receipt commit
+188114c43). Next directly close carrier-owned coherent backing, exact VM/owner
+lifetime and failed-unmap retention, then concurrency/IRQ and bounded-work
+witnesses. These are required by the accepted allocator brief, not new scope.
+Use the resulting allocator for shared MMU publication and EL1 first-touch;
+the existing <0.125 host-exits/page target remains red. No end-to-end speedup
+is claimed and all later checkpoints remain required.
