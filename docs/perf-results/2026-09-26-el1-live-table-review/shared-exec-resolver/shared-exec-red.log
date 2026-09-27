@@ -1,0 +1,21 @@
+   Compiling carrick-vmm-hvf v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-completion/carrick/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.73s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-d63dbca9ffee398f)
+
+running 1 test
+test trap::frame_inventory::tests::shared_process_exec_splits_inventory_without_retiring_parent_ledger ... 
+thread 'trap::frame_inventory::tests::shared_process_exec_splits_inventory_without_retiring_parent_ledger' (12248072) panicked at crates/carrick-vmm-hvf/src/trap/frame_inventory/tests.rs:1411:5:
+assertion `left == right` failed: preparing a vfork child exec must preserve the live parent's table authority
+  left: None
+ right: Some(170426298793984)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    trap::frame_inventory::tests::shared_process_exec_splits_inventory_without_retiring_parent_ledger
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`

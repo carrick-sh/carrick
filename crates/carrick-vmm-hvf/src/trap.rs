@@ -1650,8 +1650,11 @@ impl HvfTaskState {
                 std::sync::Arc::clone(&self.cow_armed),
                 std::sync::Arc::clone(&self.cow_deferred_publications),
             );
-            let resolver = MmAccessLiveResolver::new(&self.mm_access, self.custody_arc());
-            self.mm_access.set_live_resolver(resolver);
+            // This provisional state only separates the replacement inventory.
+            // Its table authority still belongs to the live parent: installing
+            // a child resolver here would redirect every parent table read to
+            // the child's empty ledger. Exec rebuild binds a new resolver only
+            // after creating the successor's independent table authority.
         }
         self.frame_inventory
             .begin_exec_inventory(retired, replacement)

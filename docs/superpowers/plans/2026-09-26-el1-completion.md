@@ -461,3 +461,21 @@ and cleanup is empty. Exact red/green artifacts and the correction are in the
 [exec resolver receipt](../../perf-results/2026-09-26-el1-live-table-review/exec-resolver/README.md).
 Full probe promotion and CI still need rerunning; smoke/full and actual EL1
 first-touch service remain open. The complete migration scope is unchanged.
+
+### Shared exec resolver isolation
+
+Full CI on `aa5d55dd6` passes 6,180 tests. Public probe promotion passed generic
+shards 0 and 1, then aborted on GNU `forkexecstorm` after 798 completed probe
+rows: anonymous discard could not resolve the parent root. A focused core
+capture reproduces it; fresh native Docker passes both libc variants.
+
+The VM-free shared-exec inventory test now proves parent translation survives
+child exec preparation. It failed before correction because preparing the
+child installed its empty-ledger resolver on the parent's shared authority.
+Removing that premature binding turns the witness green, preserves 564 serial
+HVF test passes, and makes signed `forkexecstorm` pass both libc variants with
+negative entitlement and zero leftovers. The successor resolver remains bound
+when exec creates its independent authority. See the
+[shared exec receipt](../../perf-results/2026-09-26-el1-live-table-review/shared-exec-resolver/README.md).
+Full CI and public probe promotion on this correction remain pending, followed
+by smoke/full and real EL1 first-touch service. No scope or budget is reduced.
