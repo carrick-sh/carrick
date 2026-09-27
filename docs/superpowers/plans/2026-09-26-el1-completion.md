@@ -259,6 +259,49 @@ The complete transcript is `docs/perf-results/2026-09-26-el1-first-touch/mmu-int
 The red remains unchanged while the isolated live-table worker implements the
 shared storage authority.
 
+### Anonymous first touch and retirement acceptance (2026-09-27)
+
+Checkpoint 2 has two accepted memory substrates. Bulk anonymous first touch
+landed in `a44e510db` with its bound acceptance in `2b2c5cb05`: the signed
+256/1024/4096-page witness completed at 99/107/113 exits, with incremental
+slopes 0.0052 and 0.0010 exits per added page, below the 0.125 contract limit.
+
+Anonymous mapping replacement, retirement and physical frame reuse then landed
+in `8b1af0a19`, with exact committed evidence in `3aa775e81`. The red path grew
+at 1.5000 exits per added page per round. The accepted signed path grows at
+0.0033 and 0.0018, a 455x to 833x reduction; total exits at 4,096 pages fell
+from 24,631 to 101. Every scale returns exactly all granted bytes and reuses a
+returned extent. Same-source native arm64 Docker passes zero-fill, writes and
+unmap/replacement at all three scales. The lifecycle trace reports 35 faults,
+23 grant plans, 15 stage-2 maps, 29 unmaps, target exit, zero errors/drops, and
+no stale descriptor beyond a partial publication. Exact source, binary,
+fixture, oracle, red/green and cleanup receipts are in
+[the retirement acceptance](../../perf-results/2026-09-27-el1-anonymous-retirement/README.md).
+
+The investigation found a real shared-authority bug rather than a workload
+specific workaround: a table cached free in the host-owned image could receive
+an EL1 descriptor in live backing, and partial reuse did not overwrite that
+untouched descriptor. Free-list handout now re-zeroes and publishes the whole
+table before reuse. The red-first VM-free test preserves this interleaving.
+
+Checkpoint 2 is not complete. `mmap`, `munmap`, `mprotect` and permission-fault
+authority still cross the host service boundary; fork COW and final removal of
+the host page-table pause remain later steps. The aggregate source gate also
+retains two inherited failures outside this increment: three existing EL1
+allocator inline-assembly lint findings and the existing GIC source-text
+ratchet. The accepted checkpoint does not claim those aggregate gates green.
+
+Next bounded implementation task: register a red-first permission-transition
+contract and same-source fixture, then move resident anonymous `mprotect`
+bookkeeping and permission-fault leaf edits into EL1 as one rollback-capable
+vertical. The witness must cycle RW, read-only, `PROT_NONE` and restored access;
+preserve bytes; deliver Linux `SEGV_ACCERR` for denied reads/writes; refuse
+permission widening; prove pure permission transitions neither allocate nor
+retire frame grants; and bound host exits independently of page count. This is
+the next planned memory slice, before broader mmap-family ownership and fork
+COW. The existing retirement trace is closed and is not a reason to continue
+instrumenting that path.
+
 ### Scheduler personality split and mechanical gate
 
 The reviewed scheduler split and checker are integrated as `26f104341` and
