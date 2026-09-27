@@ -740,3 +740,20 @@ el1-elastic-metadata-director/in-progress-screen/. Recheck against the terminal
 candidate before review; no worker source was modified. Signed release build
 on a6ac6935c completed and its exact CLI artifact is frozen. The integrated EL1
 gate is running; no result or first-touch acceptance is claimed yet.
+
+2026-09-26: signed integrated metadata gate on a6ac6935c finishes with only
+the existing first-touch failure: 621/2150/8294 exits at 512/2048/8192 total
+pages; slope 0.9954 versus <0.125. Forty-one other EL1 tests and negative
+control pass, including the 30-round oversubscribed kick witness. Both scoped
+cleanup counts are zero. CLI and eight executed test artifacts are frozen;
+raw logs/manifest are under metadata-refusal-director/integrated-signed/.
+Public probes/LTP/inotify steps did not run; no timing acceptance is claimed.
+
+2026-09-26: elastic metadata candidate ae6c3a17b passes all eight independent
+host verification commands but fails allocator review. Final-source screens
+reproduce alignment and grant-overhead failures; actual guest stage-1 mapping,
+owner lifetime, global allocation wiring, growth/refusal fixture and structural
+bounds are incomplete. Documentation claims absent footer/counter structures.
+Integration is withheld. Same worker received review round1 (turn2), with
+all evidence under el1-elastic-metadata-director/review-1/. No signed allocator
+acceptance is claimed and no later goal stage is removed from scope.

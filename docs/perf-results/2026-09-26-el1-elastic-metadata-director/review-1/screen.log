@@ -1,0 +1,7 @@
+alignment=64 observed_remainder=32
+
+thread 'main' (14494380) panicked at /tmp/el1-allocator-review1/screen.rs.txt:482:2:
+assertion `left == right` failed: allocator must honor Layout alignment
+  left: 32
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

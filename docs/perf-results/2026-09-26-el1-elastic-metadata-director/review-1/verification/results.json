@@ -1,0 +1,42 @@
+[
+  {
+    "name": "lib-tests",
+    "command": "cargo test -p carrick-el1 -p carrick-el1-abi -p carrick-mmu-core -p carrick-aarch64 --lib",
+    "exit_code": 0
+  },
+  {
+    "name": "clippy",
+    "command": "cargo clippy -p carrick-el1 -p carrick-el1-abi -p carrick-mmu-core -p carrick-aarch64 -p carrick-vmm-hvf --all-targets -- -D warnings",
+    "exit_code": 0
+  },
+  {
+    "name": "baremetal",
+    "command": "cargo check -p carrick-el1 --bin carrick-el1 --target aarch64-unknown-none-softfloat",
+    "exit_code": 0
+  },
+  {
+    "name": "cli",
+    "command": "cargo check -p carrick-cli",
+    "exit_code": 0
+  },
+  {
+    "name": "embed-compile",
+    "command": "cargo test -p carrick-embed --no-run",
+    "exit_code": 0
+  },
+  {
+    "name": "contract",
+    "command": "cargo test -p carrick-conformance-contract",
+    "exit_code": 0
+  },
+  {
+    "name": "format",
+    "command": "cargo fmt --all -- --check",
+    "exit_code": 0
+  },
+  {
+    "name": "image",
+    "command": "cargo test -p carrick-el1-image --lib",
+    "exit_code": 0
+  }
+]
