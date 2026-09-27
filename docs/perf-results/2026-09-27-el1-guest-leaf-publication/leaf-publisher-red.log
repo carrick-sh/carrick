@@ -1,0 +1,25 @@
+   Compiling carrick-el1-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-abi)
+   Compiling carrick-el1-image v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-image)
+   Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+error[E0425]: cannot find function `publish_existing_invalid_private_pages` in this scope
+    --> crates/carrick-mmu-core/src/aarch64.rs:7014:13
+     |
+7014 |             publish_existing_invalid_private_pages(
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0433]: cannot find type `GuestLeafPublicationError` in this scope
+    --> crates/carrick-mmu-core/src/aarch64.rs:7025:32
+     |
+7025 |         assert_eq!(result, Err(GuestLeafPublicationError::AlreadyValid));
+     |                                ^^^^^^^^^^^^^^^^^^^^^^^^^ use of undeclared type `GuestLeafPublicationError`
+
+error[E0425]: cannot find function `publish_existing_invalid_private_pages` in this scope
+    --> crates/carrick-mmu-core/src/aarch64.rs:7032:17
+     |
+7032 |                 publish_existing_invalid_private_pages(
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+Some errors have detailed explanations: E0425, E0433.
+For more information about an error, try `rustc --explain E0425`.
+error: could not compile `carrick-mmu-core` (lib test) due to 3 previous errors

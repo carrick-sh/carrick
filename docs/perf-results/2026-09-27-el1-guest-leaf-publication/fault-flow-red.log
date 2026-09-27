@@ -1,0 +1,47 @@
+   Compiling carrick-el1 v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1)
+error[E0432]: unresolved import `carrick_el1_abi::AddressSpaces`
+  --> crates/carrick-el1/src/fault.rs:22:27
+   |
+22 |     use carrick_el1_abi::{AddressSpaces, CurrentTask};
+   |                           ^^^^^^^^^^^^^ no `AddressSpaces` in the root
+
+error[E0405]: cannot find trait `FrameGrantLeafPublisher` in this scope
+  --> crates/carrick-el1/src/fault.rs:30:10
+   |
+30 |     impl FrameGrantLeafPublisher for RecordingPublisher {
+   |          ^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `dispatch_fault_with_regions` in this scope
+  --> crates/carrick-el1/src/fault.rs:71:13
+   |
+71 |             dispatch_fault_with_regions(
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `dispatch_fault_with_regions` in this scope
+   --> crates/carrick-el1/src/fault.rs:102:13
+    |
+102 |             dispatch_fault_with_regions(
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `dispatch_fault_with_regions` in this scope
+   --> crates/carrick-el1/src/fault.rs:130:13
+    |
+130 |             dispatch_fault_with_regions(
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `dispatch_fault_with_regions` in this scope
+   --> crates/carrick-el1/src/fault.rs:143:13
+    |
+143 |             dispatch_fault_with_regions(
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `dispatch_fault_with_regions` in this scope
+   --> crates/carrick-el1/src/fault.rs:171:13
+    |
+171 |             dispatch_fault_with_regions(
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+Some errors have detailed explanations: E0405, E0425, E0432.
+For more information about an error, try `rustc --explain E0405`.
+error: could not compile `carrick-el1` (lib test) due to 7 previous errors
+warning: build failed, waiting for other jobs to finish...

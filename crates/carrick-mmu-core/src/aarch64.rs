@@ -180,6 +180,154 @@ pub fn terminal_descriptor_permits_el0(descriptor: u64, access: LeafAccess) -> b
     }
 }
 
+/// Why a guest EL1 frame grant could not replace an already-provisioned span
+/// of invalid L3 leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestLeafPublicationError {
+    BadRange,
+    TableOutsidePrimary,
+    MissingTable,
+    InvalidLeafShape,
+    AlreadyValid,
+    RetiredLeaf,
+}
+
+/// One exact semantic-to-physical leaf span and its Linux permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestLeafPublication {
+    pub va: u64,
+    pub ipa: u64,
+    pub len: u64,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+unsafe fn live_primary_descriptor(
+    words: *mut core::sync::atomic::AtomicU64,
+    physical_base: u64,
+    byte_len: usize,
+    descriptor_pa: u64,
+) -> Result<*mut core::sync::atomic::AtomicU64, GuestLeafPublicationError> {
+    let offset = descriptor_pa
+        .checked_sub(physical_base)
+        .ok_or(GuestLeafPublicationError::TableOutsidePrimary)?;
+    let offset =
+        usize::try_from(offset).map_err(|_| GuestLeafPublicationError::TableOutsidePrimary)?;
+    if !offset.is_multiple_of(core::mem::size_of::<u64>())
+        || offset
+            .checked_add(core::mem::size_of::<u64>())
+            .is_none_or(|end| end > byte_len)
+    {
+        return Err(GuestLeafPublicationError::TableOutsidePrimary);
+    }
+    // SAFETY: the caller guarantees a live, aligned array covering byte_len;
+    // the checked offset above stays within it.
+    Ok(unsafe { words.add(offset / core::mem::size_of::<u64>()) })
+}
+
+unsafe fn existing_l3_descriptor(
+    words: *mut core::sync::atomic::AtomicU64,
+    physical_base: u64,
+    byte_len: usize,
+    va: u64,
+) -> Result<*mut core::sync::atomic::AtomicU64, GuestLeafPublicationError> {
+    use core::sync::atomic::Ordering;
+
+    let indexes = indices(va);
+    let mut table = physical_base;
+    for &index in &indexes[..3] {
+        let descriptor_pa = table
+            .checked_add((index * core::mem::size_of::<u64>()) as u64)
+            .ok_or(GuestLeafPublicationError::TableOutsidePrimary)?;
+        // SAFETY: forwarded from publish_existing_invalid_private_pages.
+        let descriptor = unsafe {
+            (*live_primary_descriptor(words, physical_base, byte_len, descriptor_pa)?)
+                .load(Ordering::Acquire)
+        };
+        if descriptor & VALID == 0 || descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+            return Err(GuestLeafPublicationError::MissingTable);
+        }
+        table = descriptor & PA_MASK_TABLE;
+    }
+    let leaf_pa = table
+        .checked_add((indexes[3] * core::mem::size_of::<u64>()) as u64)
+        .ok_or(GuestLeafPublicationError::TableOutsidePrimary)?;
+    // SAFETY: forwarded from publish_existing_invalid_private_pages.
+    unsafe { live_primary_descriptor(words, physical_base, byte_len, leaf_pa) }
+}
+
+/// Publish one exact linear IPA span into L3 leaves whose table hierarchy
+/// already exists. The whole span is validated before the first descriptor is
+/// exposed, so a late valid/retired/missing leaf cannot leave a partial map.
+/// This path allocates no table pages and always emits per-MM `nG` leaves.
+///
+/// The caller performs the architectural `DSB`/`TLBI`/`DSB`/`ISB` sequence
+/// after success and holds exclusive mutation authority for this table graph.
+///
+/// # Safety
+///
+/// `words` must be an aligned, writable, hardware-visible array of atomic
+/// descriptor words covering `byte_len`. `physical_base` must name that same
+/// primary page-table arena in every live table descriptor reachable here.
+pub unsafe fn publish_existing_invalid_private_pages(
+    words: *mut core::sync::atomic::AtomicU64,
+    physical_base: u64,
+    byte_len: usize,
+    publication: GuestLeafPublication,
+) -> Result<usize, GuestLeafPublicationError> {
+    use core::sync::atomic::Ordering;
+
+    if words.is_null()
+        || !(words as usize).is_multiple_of(core::mem::align_of::<core::sync::atomic::AtomicU64>())
+        || !physical_base.is_multiple_of(PT_PAGE)
+        || !publication.va.is_multiple_of(PT_PAGE)
+        || !publication.ipa.is_multiple_of(PT_PAGE)
+        || publication.len == 0
+        || !publication.len.is_multiple_of(PT_PAGE)
+        || publication.va.checked_add(publication.len).is_none()
+        || publication.ipa.checked_add(publication.len).is_none()
+    {
+        return Err(GuestLeafPublicationError::BadRange);
+    }
+    let pages = usize::try_from(publication.len / PT_PAGE)
+        .map_err(|_| GuestLeafPublicationError::BadRange)?;
+
+    for page in 0..pages {
+        let page_va = publication.va + page as u64 * PT_PAGE;
+        // SAFETY: this function's caller owns the checked live descriptor
+        // array, and the exact-MM editor excludes concurrent table mutation.
+        let leaf = unsafe { existing_l3_descriptor(words, physical_base, byte_len, page_va)? };
+        let descriptor = unsafe { (*leaf).load(Ordering::Acquire) };
+        if descriptor & VALID != 0 {
+            return Err(GuestLeafPublicationError::AlreadyValid);
+        }
+        if descriptor & SW_RETIRED != 0 {
+            return Err(GuestLeafPublicationError::RetiredLeaf);
+        }
+        if descriptor != 0 && descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+            return Err(GuestLeafPublicationError::InvalidLeafShape);
+        }
+    }
+
+    let mut flags = if publication.writable {
+        USER_PAGE_FLAGS | NON_GLOBAL
+    } else {
+        (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL
+    };
+    if !publication.executable {
+        flags |= UXN;
+    }
+    for page in 0..pages {
+        let page_va = publication.va + page as u64 * PT_PAGE;
+        let page_ipa = publication.ipa + page as u64 * PT_PAGE;
+        // SAFETY: the identical walk succeeded during the complete validation
+        // pass while the caller's exact-MM editor remained held.
+        let leaf = unsafe { existing_l3_descriptor(words, physical_base, byte_len, page_va)? };
+        unsafe { (*leaf).store((page_ipa & PA_MASK_4KIB) | flags, Ordering::Release) };
+    }
+    Ok(pages)
+}
+
 // User leaf flags (must match memory.rs USER_BLOCK_FLAGS / USER_PAGE_FLAGS).
 const USER_BLOCK_FLAGS: u64 = (1u64 << 53) | (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01;
 const USER_PAGE_FLAGS: u64 = USER_BLOCK_FLAGS | 0b10;
@@ -6993,5 +7141,75 @@ mod tests {
             LINUX_PAGE_TABLES_BASE + expected_next,
             "the first allocation follows the last occupied live spare page"
         );
+    }
+
+    #[test]
+    fn guest_leaf_publication_validates_the_whole_span_before_exposing_it() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        let root = 0x8800_0000_0000;
+        let va = 0x4000_0000;
+        let ipa = 0x9000_0000;
+        let mut words: Vec<AtomicU64> = (0..(4 * 512)).map(|_| AtomicU64::new(0)).collect();
+        let indexes = indices(va);
+        words[indexes[0]].store((root + 0x1000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[512 + indexes[1]].store((root + 0x2000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[1024 + indexes[2]].store((root + 0x3000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        let l3 = 1536 + indexes[3];
+        words[l3 + 2].store(USER_PAGE_FLAGS | NON_GLOBAL, Ordering::Relaxed);
+
+        let result = unsafe {
+            publish_existing_invalid_private_pages(
+                words.as_mut_ptr(),
+                root,
+                words.len() * core::mem::size_of::<AtomicU64>(),
+                GuestLeafPublication {
+                    va,
+                    ipa,
+                    len: 3 * PT_PAGE,
+                    writable: true,
+                    executable: false,
+                },
+            )
+        };
+        assert_eq!(result, Err(GuestLeafPublicationError::AlreadyValid));
+        assert_eq!(words[l3].load(Ordering::Relaxed), 0);
+        assert_eq!(words[l3 + 1].load(Ordering::Relaxed), 0);
+
+        words[l3 + 2].store(0, Ordering::Relaxed);
+        assert_eq!(
+            unsafe {
+                publish_existing_invalid_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    words.len() * core::mem::size_of::<AtomicU64>(),
+                    GuestLeafPublication {
+                        va,
+                        ipa,
+                        len: 3 * PT_PAGE,
+                        writable: true,
+                        executable: false,
+                    },
+                )
+            },
+            Ok(3)
+        );
+        for page in 0..3 {
+            let descriptor = words[l3 + page].load(Ordering::Acquire);
+            assert_eq!(descriptor & PA_MASK_4KIB, ipa + page as u64 * PT_PAGE);
+            assert!(terminal_descriptor_permits_el0(
+                descriptor,
+                LeafAccess::Read
+            ));
+            assert!(terminal_descriptor_permits_el0(
+                descriptor,
+                LeafAccess::Write
+            ));
+            assert!(!terminal_descriptor_permits_el0(
+                descriptor,
+                LeafAccess::Execute
+            ));
+            assert_ne!(descriptor & NON_GLOBAL, 0);
+        }
     }
 }

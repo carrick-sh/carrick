@@ -1,0 +1,34 @@
+python3 scripts/conformance/check-next-strategy.py
+conformance-next strategy: enforced
+python3 scripts/conformance/regen-next-shards.py --check
+492 generic probes; shards [164, 164, 164]; cached [157, 150, 149]
+./scripts/lint-domains.sh
+                   
+                   
+┌─────────────────┐
+│ 3 Code Findings │
+└─────────────────┘
+                                   
+    crates/carrick-el1/src/alloc.rs
+   ❯❯❱ semgrep.carrick-no-unreviewed-inline-assembly
+          ❰❰ Blocking ❱❱
+          Inline assembly bypasses resolved-operation review. Add the host operation to the compiler host-
+          authority catalog or isolate it behind the typed host-capability facade in a reviewed boundary  
+          module.                                                                                         
+                                                                                                          
+          711┆ core::arch::asm!("mov {0}, sp", out(reg) sp, options(nomem, nostack));
+            ⋮┆----------------------------------------
+          731┆ core::arch::asm!(
+          732┆     "mrs {0}, daif",
+          733┆     "msr daifset, #2",
+          734┆     out(reg) daif,
+          735┆     options(nomem, nostack)
+          736┆ );
+            ⋮┆----------------------------------------
+          749┆ core::arch::asm!(
+          750┆     "msr daif, {0}",
+          751┆     in(reg) guard.saved_daif,
+          752┆     options(nomem, nostack)
+          753┆ );
+
+error: recipe `lint-domains` failed on line 133 with exit code 1

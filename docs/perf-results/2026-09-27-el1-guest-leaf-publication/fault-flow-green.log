@@ -1,0 +1,17 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1-239b8b914094a294)
+
+running 4 tests
+test fault::tests::non_translation_or_permission_fault_never_requests_a_grant ... ok
+test fault::tests::exact_frame_grant_response_publishes_once_and_serves_the_retry ... ok
+test fault::tests::test_dispatch_fault_increments_counter_and_forwards ... ok
+test fault::tests::refused_frame_grant_falls_back_without_republishing_in_the_same_dispatch ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 0.00s
+
+     Running unittests src/entry.rs (target/debug/deps/carrick_el1-a4d2808f7d54d73f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

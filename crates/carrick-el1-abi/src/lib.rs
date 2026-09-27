@@ -81,6 +81,14 @@ pub const EL1_FRAME_GRANT_MAILBOX_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_
 /// 4 KiB pages; the host may clamp the response at a VMA or alignment edge.
 pub const EL1_FRAME_GRANT_TARGET_SIZE: u64 = 2 * 1024 * 1024;
 
+/// EL1-only virtual alias of the current MM's primary AArch64 stage-1 table
+/// arena. Every published address space maps its own arena at this fixed VA.
+pub const AARCH64_STAGE1_TABLES_ALIAS_BASE: u64 = 0x2D_0002_0000;
+
+/// Bytes available through [`AARCH64_STAGE1_TABLES_ALIAS_BASE`]. Guest leaf
+/// publication must reject every descriptor outside this primary arena.
+pub const AARCH64_STAGE1_TABLES_PRIMARY_SIZE: u64 = 0x1C_0000;
+
 pub const FRAME_GRANT_MAILBOX_IDLE: u32 = 0;
 pub const FRAME_GRANT_MAILBOX_GUEST_WRITING: u32 = 1;
 pub const FRAME_GRANT_MAILBOX_REQUESTED: u32 = 2;
@@ -951,6 +959,46 @@ impl FrameGrantMailbox {
         true
     }
 
+    fn load_response(&self, request: FrameGrantRequest) -> FrameGrantResponse {
+        let status = self.status.load(Ordering::Relaxed);
+        let ready = (status == FRAME_GRANT_SUCCESS).then(|| FrameGrantReady {
+            mm_key: request.mm_key,
+            request_generation: request.request_generation,
+            semantic_base: self.semantic_base.load(Ordering::Relaxed),
+            physical_ipa: self.physical_ipa.load(Ordering::Relaxed),
+            len: self.granted_len.load(Ordering::Relaxed),
+            permissions: self.permissions.load(Ordering::Relaxed),
+            frame_id: self.frame_id.load(Ordering::Relaxed),
+            mapping_id: self.mapping_id.load(Ordering::Relaxed),
+            owner_generation: self.owner_generation.load(Ordering::Relaxed),
+            inventory_revision: self.inventory_revision.load(Ordering::Relaxed),
+        });
+        FrameGrantResponse {
+            status,
+            request,
+            ready,
+        }
+    }
+
+    /// Observe, without consuming, a response bound to this exact fault. EL1
+    /// uses this before acquiring the MM editor; the host uses it to retry a
+    /// fault whose Ready response is waiting behind a closed MM gate.
+    pub fn response_for_fault(
+        &self,
+        mm_key: u64,
+        fault_va: u64,
+        access: u64,
+    ) -> Option<FrameGrantResponse> {
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_RESPONSE {
+            return None;
+        }
+        let request = self.load_request();
+        if request.mm_key != mm_key || request.fault_va != fault_va || request.access != access {
+            return None;
+        }
+        Some(self.load_response(request))
+    }
+
     pub fn claim_response(
         &self,
         mm_key: u64,
@@ -971,24 +1019,22 @@ impl FrameGrantMailbox {
             )
             .ok()?;
         let request = self.load_request();
-        let status = self.status.load(Ordering::Relaxed);
-        let ready = (status == FRAME_GRANT_SUCCESS).then(|| FrameGrantReady {
-            mm_key: request.mm_key,
-            request_generation: request.request_generation,
-            semantic_base: self.semantic_base.load(Ordering::Relaxed),
-            physical_ipa: self.physical_ipa.load(Ordering::Relaxed),
-            len: self.granted_len.load(Ordering::Relaxed),
-            permissions: self.permissions.load(Ordering::Relaxed),
-            frame_id: self.frame_id.load(Ordering::Relaxed),
-            mapping_id: self.mapping_id.load(Ordering::Relaxed),
-            owner_generation: self.owner_generation.load(Ordering::Relaxed),
-            inventory_revision: self.inventory_revision.load(Ordering::Relaxed),
-        });
-        Some(FrameGrantResponse {
-            status,
-            request,
-            ready,
-        })
+        Some(self.load_response(request))
+    }
+
+    /// Guest: claim the response only when it belongs to this exact fault.
+    /// The generation is read from the immutable published request, then
+    /// rechecked by [`Self::claim_response`] during the state transition. This
+    /// lets a retried fault find its own response without storing a second
+    /// generation shadow in a per-vCPU record.
+    pub fn claim_response_for_fault(
+        &self,
+        mm_key: u64,
+        fault_va: u64,
+        access: u64,
+    ) -> Option<FrameGrantResponse> {
+        let response = self.response_for_fault(mm_key, fault_va, access)?;
+        self.claim_response(mm_key, response.request.request_generation)
     }
 
     pub fn finish_response(&self, mm_key: u64, request_generation: u64) -> bool {
@@ -2945,5 +2991,45 @@ mod tests {
                 inventory_revision: 404,
             }));
         }
+    }
+
+    #[test]
+    fn frame_grant_guest_claims_only_the_exact_fault_response() {
+        let mailbox = FrameGrantMailbox::new();
+        let request = FrameGrantRequest {
+            mm_key: 501,
+            request_generation: 502,
+            fault_va: 0x7000_2123,
+            requested_len: 4096,
+            access: 2,
+        };
+        assert!(mailbox.try_publish_request(request));
+        assert_eq!(mailbox.claim_request(), Some(request));
+        assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
+
+        assert_eq!(
+            mailbox.claim_response_for_fault(request.mm_key + 1, request.fault_va, request.access),
+            None
+        );
+        assert_eq!(
+            mailbox.claim_response_for_fault(
+                request.mm_key,
+                request.fault_va + 4096,
+                request.access
+            ),
+            None
+        );
+        assert_eq!(
+            mailbox.claim_response_for_fault(request.mm_key, request.fault_va, 1),
+            None
+        );
+        assert_eq!(
+            mailbox.claim_response_for_fault(request.mm_key, request.fault_va, request.access),
+            Some(FrameGrantResponse {
+                status: FRAME_GRANT_ERR_DENIED,
+                request,
+                ready: None,
+            })
+        );
     }
 }
