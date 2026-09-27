@@ -1155,11 +1155,105 @@ impl PageTableManager {
         self.resolver = Some(resolver);
     }
 
+    /// Return the primary-arena prefix needed to contain every table page
+    /// reachable from the live root.
+    ///
+    /// A second serialized editor can allocate and link a table page directly
+    /// in hardware after this manager was constructed. Its cached bump cursor
+    /// then predates that page. Walk the reachable table graph against each
+    /// live arena's physical capacity so snapshots and later bump allocations
+    /// do not truncate or reissue externally published hierarchy. The walk is
+    /// bounded by the populated table graph (four levels), not the 1.75 MiB
+    /// primary capacity.
+    fn live_reachable_primary_prefix(&self) -> Result<u64, PageTableError> {
+        if !self.arenas[0].is_live() {
+            return Ok(self.arenas[0].next_free);
+        }
+
+        fn arena_span_for_discovery(arena: &TableArena) -> u64 {
+            if arena.is_live() {
+                arena.capacity as u64
+            } else {
+                arena.allocated_span()
+            }
+        }
+
+        fn locate_child(
+            manager: &PageTableManager,
+            pa: u64,
+        ) -> Result<TableLocation, PageTableError> {
+            for (arena_index, arena) in manager.arenas.iter().enumerate() {
+                let span = arena_span_for_discovery(arena);
+                let Some(end) = arena.base.checked_add(span) else {
+                    return Err(PageTableError::BadAddress);
+                };
+                let Some(child_end) = pa.checked_add(PT_PAGE) else {
+                    return Err(PageTableError::BadAddress);
+                };
+                if pa >= arena.base && child_end <= end {
+                    return Ok(TableLocation::new(arena_index, (pa - arena.base) as usize));
+                }
+            }
+            Err(PageTableError::BadAddress)
+        }
+
+        fn visit(
+            manager: &PageTableManager,
+            table: TableLocation,
+            level: usize,
+            ancestors: &mut [Option<TableLocation>; 4],
+            primary_prefix: &mut u64,
+        ) -> Result<(), PageTableError> {
+            if level >= 4 || ancestors[..level].contains(&Some(table)) {
+                return Err(PageTableError::BadAddress);
+            }
+            let arena = manager
+                .arenas
+                .get(table.arena)
+                .ok_or(PageTableError::BadAddress)?;
+            let span = arena_span_for_discovery(arena);
+            let table_end = (table.offset as u64)
+                .checked_add(PT_PAGE)
+                .ok_or(PageTableError::BadAddress)?;
+            if !table.offset.is_multiple_of(PT_PAGE as usize) || table_end > span {
+                return Err(PageTableError::BadAddress);
+            }
+            if table.arena == 0 {
+                *primary_prefix = (*primary_prefix).max(table_end);
+            }
+            ancestors[level] = Some(table);
+            if level < 3 {
+                for index in 0..512usize {
+                    let descriptor = manager.read_desc(table.entry(index))?;
+                    if descriptor & VALID == 0 || descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+                        continue;
+                    }
+                    let child = locate_child(manager, descriptor & PA_MASK_TABLE)?;
+                    visit(manager, child, level + 1, ancestors, primary_prefix)?;
+                }
+            }
+            ancestors[level] = None;
+            Ok(())
+        }
+
+        let mut primary_prefix = self.arenas[0].next_free;
+        visit(
+            self,
+            TableLocation::new(0, 0),
+            0,
+            &mut [None; 4],
+            &mut primary_prefix,
+        )?;
+        Ok(primary_prefix)
+    }
+
     /// Snapshot this manager into `target`, reusing `target`'s existing buffers.
     ///
     /// Descriptors from live hardware backing are read atomically word-by-word with acquire ordering.
     pub fn snapshot_into(&self, target: &mut PageTableManager) -> Result<(), PageTableError> {
         use core::sync::atomic::{AtomicU64, Ordering};
+
+        let live_primary_prefix = self.live_reachable_primary_prefix()?;
 
         target.layout = self.layout;
         target.asid_scoped_leaves = self.asid_scoped_leaves;
@@ -1181,13 +1275,18 @@ impl PageTableManager {
         while target.arenas.len() < self.arenas.len() {
             let i = target.arenas.len();
             let src = &self.arenas[i];
+            let prefix_len = if i == 0 {
+                live_primary_prefix
+            } else {
+                src.next_free
+            };
             let mut bytes = Vec::with_capacity(src.capacity);
-            bytes.resize(src.next_free as usize, 0);
+            bytes.resize(prefix_len as usize, 0);
             target.arenas.push(TableArena {
                 snapshot_scratch: Vec::new(),
                 base: src.base,
                 storage: TableArenaStorage::Owned(bytes),
-                next_free: src.next_free,
+                next_free: prefix_len,
                 capacity: src.capacity,
             });
         }
@@ -1196,10 +1295,15 @@ impl PageTableManager {
             let target_arena = &mut target.arenas[i];
             target_arena.prepare_owned_storage();
             target_arena.base = src_arena.base;
-            target_arena.next_free = src_arena.next_free;
+            let prefix_len = if i == 0 {
+                live_primary_prefix
+            } else {
+                src_arena.next_free
+            };
+            target_arena.next_free = prefix_len;
             target_arena.capacity = src_arena.capacity;
 
-            let prefix_len = src_arena.next_free as usize;
+            let prefix_len = prefix_len as usize;
             match (&mut target_arena.storage, &src_arena.storage) {
                 (TableArenaStorage::Owned(dst_bytes), TableArenaStorage::Owned(src_bytes)) => {
                     dst_bytes.clear();
@@ -7458,6 +7562,57 @@ mod tests {
             live.translate(va + 3 * PT_PAGE),
             None,
             "whole-range preflight must reject before exposing a later page"
+        );
+    }
+
+    #[test]
+    fn live_snapshot_includes_hierarchy_allocated_by_guest_editor() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+
+        let mut host = hvpatch_manager();
+        unsafe {
+            host.restore_quiesced_snapshot_to_host(&*resolver)
+                .expect("publish fixture");
+            host.make_live(Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>);
+        }
+        let host_prefix_before = host.copied_bytes();
+
+        let mut guest = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                LINUX_PAGE_TABLES_SIZE as usize,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .expect("adopt live fixture in guest editor")
+        };
+        let va = LINUX_MMAP_BASE + 0x4080_0000;
+        let ipa = 0x009b_4000_1000;
+        assert_eq!(
+            guest.publish_live_private_pages_transaction(GuestLeafPublication {
+                va,
+                ipa,
+                len: PT_PAGE,
+                writable: true,
+                executable: false,
+            }),
+            Ok(1)
+        );
+        assert!(
+            guest.copied_bytes() > host_prefix_before,
+            "guest publication must allocate hierarchy beyond the host's cached prefix"
+        );
+
+        let snapshot = host.snapshot_image().expect("snapshot host authority");
+        assert_eq!(
+            snapshot.translate(va),
+            Some(ipa),
+            "fork snapshot must include a live hierarchy page allocated by EL1"
+        );
+        assert!(
+            snapshot.copied_bytes() >= guest.copied_bytes(),
+            "snapshot prefix must cover the guest-published hierarchy"
         );
     }
 
