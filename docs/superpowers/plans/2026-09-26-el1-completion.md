@@ -1090,3 +1090,17 @@ Build and sign one exact artifact containing this commit, then rerun the same
 256-page witness. Only a green result promotes the frozen artifact to 1,024 and
 4,096 pages. If it remains red, use the next exact signed boundary; do not turn
 this into a general fork rewrite.
+
+The frozen `58c76fdfd` signed result clears the semantic boundary at all three
+scales. Both parent and child verify zero-fill, distinct private writes and
+post-rendezvous values at 256, 1,024 and 4,096 pages. Exit counts are 612,
+2,148 and 8,292, so both incremental slopes are exactly 1.0000 exit per added
+page. The `<0.125` structural gate remains red; the entitlement negative
+control and run-ID cleanup pass.
+
+This is the checkpoint transition from functional bring-up to its intended
+performance effect. Run one bounded exit-class census on the same fixture and
+artifact before changing code. The result must name whether the remaining
+per-page exit is grant/first-touch, stage-1 frame COW, stage-2 replay or another
+typed boundary. Fix that boundary against the existing slope gate; do not
+broaden into general MM or fork redesign without evidence from the census.
