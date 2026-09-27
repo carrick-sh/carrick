@@ -1531,3 +1531,38 @@ fn el1_metadata_allocator_concurrent_growth() {
         "uname must execute through host service, not just a guest fast path"
     );
 }
+
+/// Sample live DAIF immediately before real guest metadata grant/return HVCs.
+/// Growth completion alone cannot prove the no-host-wait-while-masked contract.
+#[test]
+fn el1_metadata_allocator_host_wait_requires_unmasked_irq() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    carrick_runtime::reset_metadata_grant_state();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["metadata-allocator", "irq"],
+        Duration::from_secs(30),
+    );
+    let stats = carrick_runtime::metadata_grant_stats();
+    assert!(
+        stats.grants_succeeded > 0,
+        "must exercise real growth: {stats:?}"
+    );
+    assert!(
+        stats.returns_completed > 0,
+        "must exercise real return: {stats:?}"
+    );
+    assert!(
+        measured.result.success(),
+        "metadata host waits must enter with DAIF.I clear; fixture rc counts masked waits: {}",
+        describe(&measured)
+    );
+    assert!(
+        measured
+            .result
+            .stdout_utf8()
+            .contains("metadata-allocator irq ok")
+    );
+}

@@ -1,0 +1,25 @@
+{
+  "source_head": "5b2da6bef1636509e6d30d1a36231e658e7990bf",
+  "artifacts": [
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-gated-signed/frozen/el1_sched-f0f1569da0c4c729",
+      "sha256": "eccb5f965dd4b202878aa351ea171db88c20e6511818a35953b0348cbe4afe83",
+      "codesign": "Executable=/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-gated-signed/frozen/el1_sched-f0f1569da0c4c729\nIdentifier=el1_sched-f0f1569da0c4c729.tmp.42376\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=56893 flags=0x2(adhoc) hashes=1767+7 location=embedded\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements count=0 size=12\nTotal signatures=1\nChosen signature=1\n",
+      "uuid": "UUID: 1211238F-CE7D-3690-B330-2277EF4CF3CD (arm64) /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-gated-signed/frozen/el1_sched-f0f1569da0c4c729\n",
+      "entitlements": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"https://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\n",
+      "dof_carrick_present": true
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-gated-signed/frozen/carrick",
+      "sha256": "bd46cfdf77add383a78126d346bb360e972c83391c3ae9a588129313a3c39a31",
+      "codesign": "Executable=/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-gated-signed/frozen/carrick\nIdentifier=carrick.tmp.41835\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=70186 flags=0x2(adhoc) hashes=2183+7 location=embedded\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements count=0 size=12\nTotal signatures=1\nChosen signature=1\n",
+      "uuid": "UUID: 93407FB7-2EA1-3DD7-B795-5FC5485F306F (arm64) /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-gated-signed/frozen/carrick\n",
+      "entitlements": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"https://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\n",
+      "dof_carrick_present": true
+    },
+    {
+      "path": "/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/target/el1-completion/allocator-gated-signed/frozen/el1-sched-aarch64",
+      "sha256": "cadb92c882d0257ac6004410af69d972b34e95d0d81dc9390f9331a2788cfd9f"
+    }
+  ]
+}
