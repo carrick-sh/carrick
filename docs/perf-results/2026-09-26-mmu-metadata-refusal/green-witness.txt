@@ -1,17 +1,19 @@
-   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
    Compiling carrick-mmu-core v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mmu-core)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.94s
+   Compiling carrick-mem v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-mem)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.23s
      Running unittests src/lib.rs (target/debug/deps/carrick_mmu_core-1d1f88d6a1eb2090)
 
-running 5 tests
+running 6 tests
 test aarch64::tests::test_metadata_refusal_at_begin_undo ... ok
-scale=1 rollback_allocations=0 popped_len=1
+scale=1 admission_allocations=22 admission_bytes=88300 rollback_allocations=0 rollback_bytes=0 popped_len=1
 test aarch64::tests::test_metadata_refusal_sync_to_host_overflow_scratch ... ok
-scale=8 rollback_allocations=0 popped_len=8
+scale=8 admission_allocations=38 admission_bytes=706564 rollback_allocations=0 rollback_bytes=0 popped_len=8
+test aarch64::tests::metadata_refusal_contract ... ok
+scale=32 admission_allocations=70 admission_bytes=2827412 rollback_allocations=0 rollback_bytes=0 popped_len=32
 test aarch64::tests::test_metadata_refusal_sweep_during_transaction_mutations_and_recovery ... ok
-scale=32 rollback_allocations=0 popped_len=32
-test aarch64::tests::test_metadata_refusal_during_extension_arena_attach_returns_grant_exactly_once ... ok
-scale=128 rollback_allocations=0 popped_len=128
+scale=128 admission_allocations=175 admission_bytes=23893668 rollback_allocations=0 rollback_bytes=0 popped_len=128
 test aarch64::tests::test_metadata_refusal_witness_rollback_allocations ... ok
+test aarch64::tests::test_metadata_refusal_during_extension_arena_attach_returns_grant_exactly_once ... ok
 
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 84 filtered out; finished in 0.26s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 87 filtered out; finished in 0.58s
+

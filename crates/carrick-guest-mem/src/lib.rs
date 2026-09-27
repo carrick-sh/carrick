@@ -1011,6 +1011,9 @@ pub enum MemoryError {
     /// A host-side mapping operation (mmap/hv_vm_map/...) failed.
     #[error("host mapping operation failed: {0}")]
     HostMap(String),
+    /// Host metadata allocation refused during page table edit/publication.
+    #[error("metadata allocation refused")]
+    MetadataAllocation,
 }
 
 #[cfg(test)]

@@ -1905,4 +1905,174 @@ mod tests {
             )
             .unwrap();
     }
+
+    mod test_allocator {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+        std::thread_local! {
+            pub(super) static FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+            pub(super) static OP_COUNT: Cell<Option<u64>> = const { Cell::new(None) };
+            pub(super) static REFUSED_ALLOCS: Cell<usize> = const { Cell::new(0) };
+        }
+        struct CountingAllocator;
+        #[global_allocator]
+        static ALLOCATOR: CountingAllocator = CountingAllocator;
+        fn check_and_record() -> bool {
+            let _ = OP_COUNT.try_with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n.checked_add(1).unwrap()));
+                }
+            });
+            let should_fail = FAIL_AFTER
+                .try_with(|limit_cell| {
+                    if let Some(limit) = limit_cell.get() {
+                        if limit == 0 {
+                            let _ = REFUSED_ALLOCS.try_with(|refused| {
+                                refused.set(refused.get().saturating_add(1));
+                            });
+                            true
+                        } else {
+                            limit_cell.set(Some(limit - 1));
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            !should_fail
+        }
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                if !check_and_record() {
+                    return std::ptr::null_mut();
+                }
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+    }
+
+    #[test]
+    fn stage1_authority_metadata_refusal_propagation() {
+        let manager = test_manager();
+        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let resolver = Arc::new(BufferResolver {
+            buf: std::sync::Mutex::new(vec![0u8; LINUX_PAGE_TABLES_SIZE as usize]),
+            base: LINUX_PAGE_TABLES_BASE,
+        });
+        unsafe {
+            authority.bind_live_backing(
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>
+            );
+        }
+
+        let va1 = 0x40_0000;
+        let va2 = 0x50_0000;
+
+        // Establish initial valid mapping and commit
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    assert!(!editor.undo_is_open());
+                    editor.begin_undo().unwrap();
+                    assert!(editor.undo_is_open());
+                    editor.map_aliased(va1, 0x80_0000, 0x1000, true).unwrap();
+                    editor.set_readonly(va1, 0x1000, false).unwrap();
+                    unsafe { editor.sync_to_host(&*resolver).unwrap() };
+                    editor.commit_undo();
+                    assert!(!editor.undo_is_open());
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .unwrap();
+
+        authority.with_manager(|mgr| {
+            assert_eq!(mgr.translate(va1), Some(0x80_0000));
+        });
+
+        // Inject allocator refusal during map_aliased
+        test_allocator::REFUSED_ALLOCS.with(|c| c.set(0));
+        test_allocator::FAIL_AFTER.with(|c| c.set(Some(0)));
+        let edit_res = authority.edit(
+            || panic!("manager must be present"),
+            |editor| {
+                editor.begin_undo()?;
+                editor.map_aliased(va2, 0x90_0000, 0x1000, true)
+            },
+        );
+        test_allocator::FAIL_AFTER.with(|c| c.set(None));
+        let refused = test_allocator::REFUSED_ALLOCS.with(|c| c.get());
+
+        assert!(refused > 0, "must trigger allocator refusal");
+        assert_eq!(edit_res, Err(PageTableError::MetadataAllocation));
+
+        // Exercise nonallocating typed adapter lowering
+        let pt_err = edit_res.unwrap_err();
+        let mem_err = match pt_err {
+            PageTableError::MetadataAllocation => {
+                carrick_guest_mem::MemoryError::MetadataAllocation
+            }
+            other => carrick_guest_mem::MemoryError::HostMap(format!("{other:?}")),
+        };
+        assert_eq!(mem_err, carrick_guest_mem::MemoryError::MetadataAllocation);
+        let trap_err = match mem_err {
+            carrick_guest_mem::MemoryError::MetadataAllocation => {
+                carrick_hal::TrapError::MetadataAllocation
+            }
+            other => carrick_hal::TrapError::Hypervisor(format!("{other:?}")),
+        };
+        assert!(matches!(
+            trap_err,
+            carrick_hal::TrapError::MetadataAllocation
+        ));
+
+        // Inject allocator refusal during set_rw with journal open and verify rollback on same authority
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    editor.begin_undo().unwrap();
+                    test_allocator::REFUSED_ALLOCS.with(|c| c.set(0));
+                    test_allocator::FAIL_AFTER.with(|c| c.set(Some(0)));
+                    let res = editor.set_rw(va1, 0x1000, true);
+                    test_allocator::FAIL_AFTER.with(|c| c.set(None));
+                    assert_eq!(res, Err(PageTableError::MetadataAllocation));
+                    assert!(editor.undo_is_open());
+                    unsafe { editor.rollback_undo(&*resolver).unwrap() };
+                    assert!(!editor.undo_is_open());
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .unwrap();
+
+        // Authority state is preserved: va1 is still translated, va2 is not translated
+        authority.with_manager(|mgr| {
+            assert_eq!(mgr.translate(va1), Some(0x80_0000));
+            assert_eq!(mgr.translate(va2), None);
+        });
+
+        // Subsequent transaction on the SAME authority succeeds
+        authority
+            .edit(
+                || panic!("manager must be present"),
+                |editor| {
+                    editor.begin_undo().unwrap();
+                    editor.map_aliased(va2, 0x90_0000, 0x1000, true).unwrap();
+                    unsafe { editor.sync_to_host(&*resolver).unwrap() };
+                    editor.commit_undo();
+                    assert!(!editor.undo_is_open());
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .unwrap();
+
+        authority.with_manager(|mgr| {
+            assert_eq!(mgr.translate(va1), Some(0x80_0000));
+            assert_eq!(mgr.translate(va2), Some(0x90_0000));
+        });
+    }
 }

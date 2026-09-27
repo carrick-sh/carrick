@@ -511,6 +511,9 @@ pub enum TrapError {
         si_code: i32,
         fault_addr: u64,
     },
+    /// Host metadata allocation refused during stage-1 page table edit/publication.
+    #[error("stage-1 metadata allocation refused")]
+    MetadataAllocation,
 }
 
 impl TrapError {

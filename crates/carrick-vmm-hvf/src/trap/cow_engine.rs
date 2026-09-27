@@ -1449,10 +1449,13 @@ impl HvfVmState {
                         ))
                     },
                     |editor| -> Result<(), TrapError> {
-                        editor.begin_undo().map_err(|error| {
-                            TrapError::Hypervisor(format!(
-                                "begin undo HVPatch retained reuse leaves: {error:?}"
-                            ))
+                        editor.begin_undo().map_err(|error| match error {
+                            carrick_mmu_core::aarch64::PageTableError::MetadataAllocation => {
+                                TrapError::MetadataAllocation
+                            }
+                            other => TrapError::Hypervisor(format!(
+                                "begin undo HVPatch retained reuse leaves: {other:?}"
+                            )),
                         })?;
                         Self::refresh_stage1_exclusivity(editor.manager);
                         editor
@@ -2584,10 +2587,13 @@ impl HvfTaskState {
                         // a rollback log; the manager's `dirty` list is not one, because
                         // `sync_to_host` drains the NEW edits. `begin_undo` journals the
                         // pre-image of every descriptor this transaction writes.
-                        manager.begin_undo().map_err(|error| {
-                            TrapError::Hypervisor(format!(
-                                "begin undo HVPatch COW page-table manager: {error:?}"
-                            ))
+                        manager.begin_undo().map_err(|error| match error {
+                            carrick_mmu_core::aarch64::PageTableError::MetadataAllocation => {
+                                TrapError::MetadataAllocation
+                            }
+                            other => TrapError::Hypervisor(format!(
+                                "begin undo HVPatch COW page-table manager: {other:?}"
+                            )),
                         })?;
                         // The leaf authentication below needs the AP bits each page held
                         // BEFORE this transaction, which it used to read by walking a full
