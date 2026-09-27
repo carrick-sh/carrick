@@ -838,6 +838,13 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     ) {
     }
 
+    fn prepare_el1_frame_grant(
+        &mut self,
+        _request: carrick_hal::El1FrameGrantRequest,
+    ) -> Result<Option<carrick_hal::El1FrameGrantReady>, TrapError> {
+        Ok(None)
+    }
+
     /// Refresh fork-private process state after the child frame inventory and
     /// exact MM/COW authority are live, but before the child enters guest code.
     fn refresh_fork_process_state(

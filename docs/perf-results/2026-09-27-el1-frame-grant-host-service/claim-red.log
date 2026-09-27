@@ -1,0 +1,40 @@
+   Compiling carrick-runtime v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-runtime)
+error[E0425]: cannot find function `claim_frame_grant_request` in this scope
+    --> crates/carrick-runtime/src/vcpu_loop/signal.rs:1282:50
+     |
+1282 |         let FrameGrantClaim::Accepted(claimed) = claim_frame_grant_request(
+     |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `claim_frame_grant_request` in this scope
+    --> crates/carrick-runtime/src/vcpu_loop/signal.rs:1326:17
+     |
+1326 |                 claim_frame_grant_request(&mailbox, mm, fault, access),
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `claim_frame_grant_request` in this scope
+    --> crates/carrick-runtime/src/vcpu_loop/signal.rs:1336:13
+     |
+1336 |             claim_frame_grant_request(
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0433]: cannot find type `FrameGrantClaim` in this scope
+    --> crates/carrick-runtime/src/vcpu_loop/signal.rs:1282:13
+     |
+1282 |         let FrameGrantClaim::Accepted(claimed) = claim_frame_grant_request(
+     |             ^^^^^^^^^^^^^^^ use of undeclared type `FrameGrantClaim`
+
+error[E0433]: cannot find type `FrameGrantClaim` in this scope
+    --> crates/carrick-runtime/src/vcpu_loop/signal.rs:1327:17
+     |
+1327 |                 FrameGrantClaim::Refused
+     |                 ^^^^^^^^^^^^^^^ use of undeclared type `FrameGrantClaim`
+
+error[E0433]: cannot find type `FrameGrantClaim` in this scope
+    --> crates/carrick-runtime/src/vcpu_loop/signal.rs:1342:13
+     |
+1342 |             FrameGrantClaim::None
+     |             ^^^^^^^^^^^^^^^ use of undeclared type `FrameGrantClaim`
+
+Some errors have detailed explanations: E0425, E0433.
+For more information about an error, try `rustc --explain E0425`.
+error: could not compile `carrick-runtime` (lib test) due to 6 previous errors

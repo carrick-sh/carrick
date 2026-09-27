@@ -3237,6 +3237,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.bind_frame_cow(authority, identity);
     }
 
+    fn prepare_el1_frame_grant(
+        &mut self,
+        request: carrick_hal::El1FrameGrantRequest,
+    ) -> Result<Option<carrick_hal::El1FrameGrantReady>, TrapError> {
+        self.vm.prepare_el1_frame_grant(request)
+    }
+
     fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;

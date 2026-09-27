@@ -297,6 +297,72 @@ fn apply_first_touch(
     Some(true)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameGrantClaim {
+    None,
+    Refused,
+    Accepted(carrick_el1_abi::FrameGrantRequest),
+}
+
+fn frame_grant_access(access: Option<carrick_mmu_core::aarch64::LeafAccess>) -> Option<u64> {
+    use carrick_mmu_core::aarch64::LeafAccess;
+    match access? {
+        LeafAccess::Read => Some(crate::linux_abi::LINUX_PROT_READ),
+        LeafAccess::Write => Some(crate::linux_abi::LINUX_PROT_WRITE),
+        LeafAccess::Execute => Some(crate::linux_abi::LINUX_PROT_EXEC),
+    }
+}
+
+fn claim_frame_grant_request(
+    mailbox: &carrick_el1_abi::FrameGrantMailbox,
+    mm_key: u64,
+    fault_va: u64,
+    access: Option<carrick_mmu_core::aarch64::LeafAccess>,
+) -> FrameGrantClaim {
+    let Some(request) = mailbox.claim_request() else {
+        return FrameGrantClaim::None;
+    };
+    let status = if request.mm_key != mm_key {
+        Some(carrick_el1_abi::FRAME_GRANT_ERR_STALE)
+    } else if request.fault_va != fault_va
+        || frame_grant_access(access).is_none_or(|actual| request.access != actual)
+    {
+        Some(carrick_el1_abi::FRAME_GRANT_ERR_INVALID)
+    } else {
+        None
+    };
+    if let Some(status) = status {
+        if !mailbox.publish_refusal(status) {
+            carrick_fatal::carrick_fatal!(
+                "hvpatch::el1_frame_grant",
+                "claimed frame-grant request could not publish refusal: mm={} generation={} status={}",
+                request.mm_key,
+                request.request_generation,
+                status
+            );
+        }
+        FrameGrantClaim::Refused
+    } else {
+        FrameGrantClaim::Accepted(request)
+    }
+}
+
+fn publish_frame_grant_refusal(
+    mailbox: &carrick_el1_abi::FrameGrantMailbox,
+    request: carrick_el1_abi::FrameGrantRequest,
+    status: u64,
+) {
+    if !mailbox.publish_refusal(status) {
+        carrick_fatal::carrick_fatal!(
+            "hvpatch::el1_frame_grant",
+            "claimed frame-grant request could not publish backend refusal: mm={} generation={} status={}",
+            request.mm_key,
+            request.request_generation,
+            status
+        );
+    }
+}
+
 /// Resolve a fault whose read-only outer classification placed it inside a
 /// first-touch or grow-down extent. This entry point cannot be called without
 /// structural mutation authority and is kept separate from ordinary signal
@@ -327,6 +393,75 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
             );
         }
     };
+    if let Some(mailbox) = carrick_el1_abi::frame_grant_mailbox_host() {
+        let mm_key = mutation.host_alias_permit().mm().raw();
+        match claim_frame_grant_request(mailbox, mm_key, address, access) {
+            FrameGrantClaim::None => {}
+            FrameGrantClaim::Refused => return Ok(true),
+            FrameGrantClaim::Accepted(request) => {
+                let permit = mutation.host_alias_permit();
+                let Some(plan) =
+                    dispatcher.resident_frame_grant_plan(&permit, address, request.requested_len)
+                else {
+                    publish_frame_grant_refusal(
+                        mailbox,
+                        request,
+                        carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
+                    );
+                    return Ok(true);
+                };
+                let prot = plan.prot();
+                if apply_first_touch(prot, access, || true, || {}) != Some(true) {
+                    publish_frame_grant_refusal(
+                        mailbox,
+                        request,
+                        carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
+                    );
+                    return Ok(true);
+                }
+                let service = carrick_hal::El1FrameGrantRequest {
+                    mm_key: request.mm_key,
+                    request_generation: request.request_generation,
+                    fault_va: request.fault_va,
+                    access: request.access,
+                    semantic_base: plan.start(),
+                    len: plan.len(),
+                    permissions: prot,
+                };
+                let Some(ready) = engine.prepare_el1_frame_grant(service)? else {
+                    publish_frame_grant_refusal(
+                        mailbox,
+                        request,
+                        carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
+                    );
+                    return Ok(true);
+                };
+                if !mailbox.publish_ready(carrick_el1_abi::FrameGrantReady {
+                    mm_key: request.mm_key,
+                    request_generation: request.request_generation,
+                    semantic_base: service.semantic_base,
+                    physical_ipa: ready.physical_ipa,
+                    len: service.len,
+                    permissions: service.permissions,
+                    frame_id: ready.frame_id,
+                    mapping_id: ready.mapping_id,
+                    owner_generation: ready.owner_generation,
+                    inventory_revision: ready.inventory_revision,
+                }) {
+                    carrick_fatal::carrick_fatal!(
+                        "hvpatch::el1_frame_grant",
+                        "authenticated frame grant could not publish Ready: mm={} generation={} semantic_base={:#x} len={:#x}",
+                        request.mm_key,
+                        request.request_generation,
+                        service.semantic_base,
+                        service.len
+                    );
+                }
+                dispatcher.commit_resident_frame_grant(plan);
+                return Ok(true);
+            }
+        }
+    }
     {
         let permit = mutation.host_alias_permit();
         if let Some(plan) = dispatcher.resident_fault_plan(&permit, address) {
@@ -1267,6 +1402,81 @@ mod tests {
 mod first_touch_access_tests {
     use super::*;
     use carrick_mmu_core::aarch64::LeafAccess;
+
+    #[test]
+    fn frame_grant_claim_requires_the_exact_mm_fault_and_access() {
+        let request = carrick_el1_abi::FrameGrantRequest {
+            mm_key: 7,
+            request_generation: 11,
+            fault_va: 0x4000_3123,
+            requested_len: carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE,
+            access: crate::linux_abi::LINUX_PROT_WRITE,
+        };
+        let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+        assert!(mailbox.try_publish_request(request));
+        let FrameGrantClaim::Accepted(claimed) = claim_frame_grant_request(
+            &mailbox,
+            request.mm_key,
+            request.fault_va,
+            Some(LeafAccess::Write),
+        ) else {
+            panic!("exact request must be accepted");
+        };
+        assert_eq!(claimed, request);
+        assert!(mailbox.publish_refusal(carrick_el1_abi::FRAME_GRANT_ERR_DENIED));
+        let response = mailbox
+            .claim_response(request.mm_key, request.request_generation)
+            .expect("claimed response");
+        assert_eq!(response.status, carrick_el1_abi::FRAME_GRANT_ERR_DENIED);
+        assert!(mailbox.finish_response(request.mm_key, request.request_generation));
+
+        for (mm, fault, access, expected_status) in [
+            (
+                request.mm_key + 1,
+                request.fault_va,
+                Some(LeafAccess::Write),
+                carrick_el1_abi::FRAME_GRANT_ERR_STALE,
+            ),
+            (
+                request.mm_key,
+                request.fault_va + 4096,
+                Some(LeafAccess::Write),
+                carrick_el1_abi::FRAME_GRANT_ERR_INVALID,
+            ),
+            (
+                request.mm_key,
+                request.fault_va,
+                Some(LeafAccess::Read),
+                carrick_el1_abi::FRAME_GRANT_ERR_INVALID,
+            ),
+            (
+                request.mm_key,
+                request.fault_va,
+                None,
+                carrick_el1_abi::FRAME_GRANT_ERR_INVALID,
+            ),
+        ] {
+            assert!(mailbox.try_publish_request(request));
+            assert!(matches!(
+                claim_frame_grant_request(&mailbox, mm, fault, access),
+                FrameGrantClaim::Refused
+            ));
+            let response = mailbox
+                .claim_response(request.mm_key, request.request_generation)
+                .expect("refusal response");
+            assert_eq!(response.status, expected_status);
+            assert!(mailbox.finish_response(request.mm_key, request.request_generation));
+        }
+        assert!(matches!(
+            claim_frame_grant_request(
+                &mailbox,
+                request.mm_key,
+                request.fault_va,
+                Some(LeafAccess::Write)
+            ),
+            FrameGrantClaim::None
+        ));
+    }
 
     #[test]
     fn denied_first_touch_does_not_edit_or_commit_residency() {

@@ -60,13 +60,14 @@ pub use futex::{
 };
 pub mod threaded;
 pub use threaded::{
-    Aarch64CoreRegisters, CowFaultResolution, ExecPredecessorIdentity, ForkLeafDisposition,
-    ForkProjectionError, ForkProjectionPlan, ForkProjectionRange, FrameCowAuthority,
-    FrameCowIdentity, FrameCowOwnerInventory, FrameCowOwnerLease, FrameCowQuiesce, FutexOutcome,
-    GenericVcpuRegistry, GuestEntryRegs, GuestLeaveWake, GuestLeaveWatch, GuestWaitRegisters,
-    HostVa, HvpatchChildKernelToken, HvpatchChildTokenIssuer, HvpatchChildTokenVerifier,
-    HvpatchVerifiedChildKernelBinding, InGuestFlag, PlatformFutex, ProcessForkRequest, RegAccess,
-    SharedFutexLocation, SignalPumpControl, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn,
+    Aarch64CoreRegisters, CowFaultResolution, El1FrameGrantReady, El1FrameGrantRequest,
+    ExecPredecessorIdentity, ForkLeafDisposition, ForkProjectionError, ForkProjectionPlan,
+    ForkProjectionRange, FrameCowAuthority, FrameCowIdentity, FrameCowOwnerInventory,
+    FrameCowOwnerLease, FrameCowQuiesce, FutexOutcome, GenericVcpuRegistry, GuestEntryRegs,
+    GuestLeaveWake, GuestLeaveWatch, GuestWaitRegisters, HostVa, HvpatchChildKernelToken,
+    HvpatchChildTokenIssuer, HvpatchChildTokenVerifier, HvpatchVerifiedChildKernelBinding,
+    InGuestFlag, PlatformFutex, ProcessForkRequest, RegAccess, SharedFutexLocation,
+    SignalPumpControl, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn,
     VcpuLeaseChangeSubscription, VcpuLeaseDrainEnrollment, VcpuLeaseDrainGuard, VcpuLeaseDrainPoll,
     VcpuRegistrationEnrollment, VcpuRegistry, X86SignalXstate, X86XstateCapabilities,
     X86XstateComponent, aarch64_signal_pstate_source, lookup_fork_projection,

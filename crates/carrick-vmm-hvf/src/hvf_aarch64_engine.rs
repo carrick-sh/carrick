@@ -1951,6 +1951,13 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.bind_frame_cow(authority, identity);
     }
 
+    fn prepare_el1_frame_grant(
+        &mut self,
+        request: carrick_hal::El1FrameGrantRequest,
+    ) -> Result<Option<carrick_hal::El1FrameGrantReady>, TrapError> {
+        self.state.prepare_el1_frame_grant(request)
+    }
+
     fn refresh_fork_process_state(
         &mut self,
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,

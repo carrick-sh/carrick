@@ -1,0 +1,30 @@
+   Compiling carrick-el1-abi v0.1.0 (/Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick/crates/carrick-el1-abi)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1_abi-4e2a4b7ae8790423)
+
+running 1 test
+
+thread 'tests::frame_grant_read_accepts_every_accessible_linux_vma_permission' (15087654) panicked at crates/carrick-el1-abi/src/lib.rs:2922:13:
+assertion failed: mailbox.publish_ready(FrameGrantReady {
+        mm_key: request.mm_key,
+        request_generation: request.request_generation,
+        semantic_base: 0x6000_1000,
+        physical_ipa: 0xb000_1000,
+        len: 4096,
+        permissions,
+        frame_id: 401,
+        mapping_id: 402,
+        owner_generation: 403,
+        inventory_revision: 404,
+    })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::frame_grant_read_accepts_every_accessible_linux_vma_permission ... FAILED
+
+failures:
+
+failures:
+    tests::frame_grant_read_accepts_every_accessible_linux_vma_permission
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-el1-abi --lib`
