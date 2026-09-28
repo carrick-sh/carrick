@@ -15837,5 +15837,110 @@
       "line_end": 1427,
       "line_start": 1427
     }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the run-scoped lldb-run manifest (`<out-dir>/<run-id>.manifest.txt`)"
+    },
+    "expansion": null,
+    "operation": "std::fs::OpenOptions::new",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/debug.rs:739 in `record_kernel_capture`, `std::fs::OpenOptions::new` accesses only the run-scoped lldb-run manifest (`<out-dir>/<run-id>.manifest.txt`). It appends the kernel-capture outcome line; the directory is the operator's `--out-dir` and nothing about the path is derived from guest state.",
+    "review_id": "HA-000684",
+    "source": {
+      "byte_end": 28026,
+      "byte_start": 28010,
+      "column": 25,
+      "column_end": 41,
+      "column_start": 25,
+      "file": "crates/carrick-cli/src/debug.rs",
+      "line": 739,
+      "line_end": 739,
+      "line_start": 739
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the run-scoped lldb-run manifest (`<out-dir>/<run-id>.manifest.txt`)"
+    },
+    "expansion": null,
+    "operation": "std::fs::OpenOptions::open",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/debug.rs:742 in `record_kernel_capture`, `std::fs::OpenOptions::open` accesses only the run-scoped lldb-run manifest (`<out-dir>/<run-id>.manifest.txt`). It appends the kernel-capture outcome line; the directory is the operator's `--out-dir` and nothing about the path is derived from guest state.",
+    "review_id": "HA-000685",
+    "source": {
+      "byte_end": 28086,
+      "byte_start": 28082,
+      "column": 10,
+      "column_end": 14,
+      "column_start": 10,
+      "file": "crates/carrick-cli/src/debug.rs",
+      "line": 742,
+      "line_end": 742,
+      "line_start": 742
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-WRITE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the run-scoped kernel-capture error artifact (`<out-dir>/<run-id>.kernel-debug.error.txt`)"
+    },
+    "expansion": null,
+    "operation": "std::fs::write",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/debug.rs:708 in `record_kernel_capture`, `std::fs::write` accesses only the run-scoped kernel-capture error artifact (`<out-dir>/<run-id>.kernel-debug.error.txt`). It records why no kernel snapshot was captured; a failed write is itself recorded and never stops the lldb dump.",
+    "review_id": "HA-000686",
+    "source": {
+      "byte_end": 26829,
+      "byte_start": 26820,
+      "column": 22,
+      "column_end": 31,
+      "column_start": 22,
+      "file": "crates/carrick-cli/src/debug.rs",
+      "line": 708,
+      "line_end": 708,
+      "line_start": 708
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-WRITE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the post-mortem high-rate event-ring JSONL inside the operator-selected post-mortem directory"
+    },
+    "expansion": null,
+    "operation": "std::fs::write",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:505 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem high-rate event-ring JSONL inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "review_id": "HA-000687",
+    "source": {
+      "byte_end": 21000,
+      "byte_start": 20986,
+      "column": 9,
+      "column_end": 23,
+      "column_start": 9,
+      "file": "crates/carrick-kernel/src/kernel/debug/post_mortem.rs",
+      "line": 505,
+      "line_end": 505,
+      "line_start": 505
+    }
   }
 ]
