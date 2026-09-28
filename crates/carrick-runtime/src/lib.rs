@@ -233,7 +233,9 @@ pub use carrick_vmm_hvf::{
 
 /// Carrier-wide count of vCPU exits to the host (every `hv_vcpu_run` return).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use carrick_vmm_hvf::{vcpu_hvc_not_svc_total, vcpu_run_exit_classes, vcpu_run_exits_total};
+pub use carrick_vmm_hvf::{
+    vcpu_hvc_not_svc_reasons, vcpu_hvc_not_svc_total, vcpu_run_exit_classes, vcpu_run_exits_total,
+};
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -277,6 +279,16 @@ pub fn vcpu_run_exits_total() -> u64 {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn vcpu_hvc_not_svc_total() -> u64 {
     0
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn vcpu_hvc_not_svc_reasons() -> carrick_el1_abi::HvcNotSvcCounts {
+    carrick_el1_abi::HvcNotSvcCounts {
+        by_ec: [0; carrick_el1_abi::HvcNotSvcReason::COUNT],
+        fault_status: [0; carrick_el1_abi::HvcNotSvcReason::COUNT],
+        sysreg: [0; carrick_el1_abi::HvcSysregKind::COUNT],
+        emulated_sys64: 0,
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

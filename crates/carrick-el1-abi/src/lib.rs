@@ -1732,6 +1732,76 @@ impl HostExitClass {
     }
 }
 
+/// Saved ESR_EL1 reason behind an HVC #2 vector trampoline. The HVF HVC
+/// immediate is always 2; the exception class and fault status distinguish
+/// the underlying EL0 exception from an actual forwarded syscall.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvcNotSvcReason {
+    pub ec: u8,
+    pub fault_status: Option<u8>,
+}
+
+impl HvcNotSvcReason {
+    pub const COUNT: usize = 64;
+
+    pub const fn from_esr(esr: u64) -> Self {
+        let ec = ((esr >> 26) & 0x3f) as u8;
+        let fault_status = if matches!(ec, 0x20 | 0x21 | 0x24 | 0x25) {
+            Some((esr & 0x3f) as u8)
+        } else {
+            None
+        };
+        Self { ec, fault_status }
+    }
+}
+
+/// Process-lifetime HVC #2 returns that were not SVC, grouped by the saved
+/// ESR_EL1 exception class and (for aborts) fault status code.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HvcNotSvcCounts {
+    pub by_ec: [u64; HvcNotSvcReason::COUNT],
+    pub fault_status: [u64; HvcNotSvcReason::COUNT],
+    pub sysreg: [u64; HvcSysregKind::COUNT],
+    pub emulated_sys64: u64,
+}
+
+/// A SYS64 MRS register behind the EL1 HVC #2 vector trampoline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum HvcSysregKind {
+    Cntfrq,
+    Cntvct,
+    Ctr,
+    Dczid,
+    FeatureId,
+    Other,
+}
+
+impl HvcSysregKind {
+    pub const COUNT: usize = 6;
+}
+
+/// Decode the register fields of ESR_EL1 for EC=0x18 (SYS64).
+pub const fn sys64_sysreg_kind(esr: u64) -> HvcSysregKind {
+    if esr & 1 == 0 {
+        return HvcSysregKind::Other;
+    }
+    let op0 = (esr >> 20) & 0x3;
+    let op1 = (esr >> 14) & 0x7;
+    let crn = (esr >> 10) & 0xf;
+    let crm = (esr >> 1) & 0xf;
+    let op2 = (esr >> 17) & 0x7;
+    let enc = (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2;
+    match enc {
+        0xdf00 => HvcSysregKind::Cntfrq,
+        0xdf02 => HvcSysregKind::Cntvct,
+        0xd801 => HvcSysregKind::Ctr,
+        0xd807 => HvcSysregKind::Dczid,
+        _ if op0 == 3 && op1 == 0 && crn == 0 => HvcSysregKind::FeatureId,
+        _ => HvcSysregKind::Other,
+    }
+}
+
 /// EL1's reason for an `Idle` or `Kick` HVC. These counters complement the
 /// HVF class: an HVC can be attributed to host work, a service queue, or a
 /// failed address-space switch without guessing from total exit counts.
@@ -2033,6 +2103,28 @@ pub fn prepare_idle_entry(slot: usize) -> Option<u64> {
     Some(frame)
 }
 
+/// Host publication path for a vCPU's pending-work bit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum HostWorkPublishReason {
+    DirectSlot,
+    AllSlots,
+    ExactTask,
+    FileTable,
+}
+
+impl HostWorkPublishReason {
+    pub const COUNT: usize = 4;
+}
+
+static HOST_WORK_PUBLICATIONS: [AtomicU64; HostWorkPublishReason::COUNT] =
+    [const { AtomicU64::new(0) }; HostWorkPublishReason::COUNT];
+
+/// Process-lifetime count of pending-host-work publications by source.
+pub fn host_work_publication_counts() -> [u64; HostWorkPublishReason::COUNT] {
+    core::array::from_fn(|i| HOST_WORK_PUBLICATIONS[i].load(Ordering::Relaxed))
+}
+
 /// Mark return-to-user work pending for the vCPU at `slot`.
 pub fn mark_pending_host_work(slot: usize) {
     let ptr = get_el1_region_host_ptr();
@@ -2042,6 +2134,8 @@ pub fn mark_pending_host_work(slot: usize) {
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
     current_task.pending_host_work.store(1, Ordering::Release);
+    HOST_WORK_PUBLICATIONS[HostWorkPublishReason::DirectSlot as usize]
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 /// Clear return-to-user work for the vCPU at `slot`.
@@ -2061,6 +2155,8 @@ pub fn mark_pending_host_work_all() {
     if ptr == 0 {
         return;
     }
+    HOST_WORK_PUBLICATIONS[HostWorkPublishReason::AllSlots as usize]
+        .fetch_add(1, Ordering::Relaxed);
     for slot in 0..EL1_STACK_SLOTS as usize {
         let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
         let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
@@ -2079,6 +2175,8 @@ pub fn mark_pending_host_work_for_task(tid: El1TaskId) {
         let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
         if current_task.task_id.load(Ordering::Relaxed) == tid.raw() {
             current_task.pending_host_work.store(1, Ordering::Release);
+            HOST_WORK_PUBLICATIONS[HostWorkPublishReason::ExactTask as usize]
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -2102,6 +2200,8 @@ pub fn mark_pending_host_work_for_file_tables(tables: &[u64]) {
         let ft = current_task.file_table.load(Ordering::Relaxed);
         if tables.contains(&ft) {
             current_task.pending_host_work.store(1, Ordering::Release);
+            HOST_WORK_PUBLICATIONS[HostWorkPublishReason::FileTable as usize]
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -2794,6 +2894,23 @@ mod tests {
     }
 
     #[test]
+    fn hvc_not_svc_reason_keeps_el0_syndrome_and_fault_status() {
+        let data_abort = HvcNotSvcReason::from_esr((0x24_u64 << 26) | 0x45);
+        assert_eq!(data_abort.ec, 0x24);
+        assert_eq!(data_abort.fault_status, Some(0x05));
+        let sys64 = HvcNotSvcReason::from_esr(0x18_u64 << 26);
+        assert_eq!(sys64.ec, 0x18);
+        assert_eq!(sys64.fault_status, None);
+        assert_eq!(
+            sys64_sysreg_kind(
+                (0x18_u64 << 26) | (3 << 20) | (2 << 17) | (3 << 14) | (14 << 10) | 1
+            ),
+            HvcSysregKind::Cntvct
+        );
+        assert_eq!(sys64_sysreg_kind(0x6232c021), HvcSysregKind::Ctr);
+    }
+
+    #[test]
     fn test_image_header_layout() {
         assert_eq!(core::mem::size_of::<ImageHeader>(), 32);
         assert_eq!(core::mem::offset_of!(ImageHeader, abi_hash_offset), 24);
@@ -2919,7 +3036,13 @@ mod tests {
         record_el1_region_host_ptr(ptr);
         assert_eq!(get_el1_region_host_ptr(), ptr);
 
+        let publications_before = host_work_publication_counts();
         mark_pending_host_work(5);
+        let publications_after = host_work_publication_counts();
+        assert_eq!(
+            publications_after[HostWorkPublishReason::DirectSlot as usize],
+            publications_before[HostWorkPublishReason::DirectSlot as usize] + 1
+        );
         let task_5 =
             unsafe { &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 5 * 64) as *const CurrentTask) };
         assert!(task_5.has_pending_host_work());
