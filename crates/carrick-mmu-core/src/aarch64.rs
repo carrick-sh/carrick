@@ -133,6 +133,12 @@ fn el1_cow(descriptor: u64) -> bool {
     descriptor & (VALID | SW_EL1_PRIVATE | SW_EL1_COW) == (VALID | SW_EL1_PRIVATE | SW_EL1_COW)
 }
 
+/// A valid EL1-private leaf whose bit 55 is a fork COW arm, rather than the
+/// retirement marker that bit represents on an invalid leaf.
+pub fn terminal_descriptor_is_fork_cow(descriptor: u64) -> bool {
+    el1_cow(descriptor)
+}
+
 fn arm_private_cow(descriptor: u64) -> u64 {
     if descriptor & (VALID | SW_EL1_PRIVATE) != (VALID | SW_EL1_PRIVATE) || el1_cow(descriptor) {
         return descriptor;
@@ -297,16 +303,6 @@ pub fn terminal_descriptor_permits_host_buffer(descriptor: u64, access: LeafAcce
 /// the host invalidated for `PROT_NONE` (which then carries kernel-only AP).
 pub fn terminal_descriptor_is_prepared_private(descriptor: u64) -> bool {
     el1_private_leaf_state(descriptor) == El1PrivateLeafState::Prepared
-}
-
-/// Whether an invalid private grant has never exposed its backing to EL0 or
-/// host copyout, so a DONTNEED edge has no physical bytes to scrub.
-pub fn terminal_descriptor_is_uncommitted_private_grant(descriptor: u64) -> bool {
-    // Host copyout commits a prepared page before writing it. A previously
-    // resident PROT_NONE leaf is invalid too, but its AP_PRIV_RO marker means
-    // its old physical contents still require backing maintenance.
-    el1_private_leaf_state(descriptor) == El1PrivateLeafState::Prepared
-        && descriptor & AP_EL0_ACCESS != 0
 }
 
 /// Extend the guest permission ceiling after an authorized host protection edit.
@@ -9995,59 +9991,6 @@ mod tests {
             terminal_descriptor_permits_host_buffer(child, LeafAccess::Write),
             "fork must not turn an untouched writable altstack into a host-denied leaf"
         );
-    }
-
-    #[test]
-    fn forked_prepared_grant_needs_no_discard_edge_scrub() {
-        let mut mgr = manager();
-        let va = LINUX_HIGH_VA_THRESHOLD;
-        let ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
-        mgr.publish_private_pages(
-            GuestLeafPublication {
-                va,
-                ipa,
-                len: 12 * PT_PAGE,
-                writable: true,
-                executable: false,
-            },
-            va + 2 * PT_PAGE,
-            None,
-        )
-        .unwrap();
-        let mut child = mgr.snapshot_image().expect("fork snapshot");
-        child
-            .set_fork_readonly(va, (12 * PT_PAGE) as usize, None)
-            .unwrap();
-        // DONTNEED [page 1, page 11): retire its aligned 16 KiB interior;
-        // the two short edges still contain never-committed grant leaves.
-        child
-            .unmap_aliased(va + 4 * PT_PAGE, (4 * PT_PAGE) as usize, None)
-            .unwrap();
-        for page in [1, 3, 8, 9, 10] {
-            let leaf = terminal_descriptor(child.debug_walk(va + page * PT_PAGE));
-            assert_eq!(el1_private_leaf_state(leaf), El1PrivateLeafState::Prepared);
-            assert!(
-                terminal_descriptor_is_uncommitted_private_grant(leaf),
-                "untouched forked edge page {page} has no bytes to scrub"
-            );
-        }
-        let resident = terminal_descriptor(child.debug_walk(va + 2 * PT_PAGE));
-        assert!(!terminal_descriptor_is_uncommitted_private_grant(resident));
-        let retired = terminal_descriptor(child.debug_walk(va + 4 * PT_PAGE));
-        assert!(!terminal_descriptor_is_uncommitted_private_grant(retired));
-        assert!(mgr.translate(va + 4 * PT_PAGE).is_none());
-        assert!(terminal_descriptor_is_prepared_private(
-            terminal_descriptor(mgr.debug_walk(va + 4 * PT_PAGE))
-        ));
-        child
-            .set_prot_none_denying_host_buffers(va + 2 * PT_PAGE, PT_PAGE as usize, None)
-            .unwrap();
-        let protected = terminal_descriptor(child.debug_walk(va + 2 * PT_PAGE));
-        assert_eq!(
-            el1_private_leaf_state(protected),
-            El1PrivateLeafState::Prepared
-        );
-        assert!(!terminal_descriptor_is_uncommitted_private_grant(protected));
     }
 
     #[test]

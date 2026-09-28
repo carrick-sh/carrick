@@ -968,12 +968,6 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         backing: HostAliasBacking,
     ) -> Result<(u64, bool), TrapError>;
 
-    /// Minimum aligned unit accepted by anonymous retirement. This also opts
-    /// into retiring an aligned interior before authenticating partial edges.
-    fn anonymous_discard_granule(&self) -> Option<u64> {
-        None
-    }
-
     /// Prepare private-anonymous backing retirement before any stage-1 edit.
     /// `None` refuses without mutation. The caller owns MM mutation exclusion.
     fn prepare_anonymous_discard(

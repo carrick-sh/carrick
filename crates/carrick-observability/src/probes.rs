@@ -5208,6 +5208,13 @@ mod real {
         /// Byte-copy authentication computed only when this probe is enabled.
         /// Args: old FrameId/IPA, source/destination FNV-1a, exact byte length.
         fn hvpatch__frame__cow__copy(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// A private-anonymous discard reached the HVPatch backend. Args:
+        /// semantic VA, byte length, host retirement granule.
+        fn hvpatch__anonymous__discard__entry(_: u64, _: u64, _: u64) {}
+        /// Exact inventory coverage refused a COW source. Args: fault VA,
+        /// selected physical IPA, compound size, live terminal descriptor,
+        /// bit flags (1 EL1 private, 2 prepared, 4 EL1 fork COW).
+        fn hvpatch__frame__cow__inventory__miss(_: u64, _: u64, _: u64, _: u64, _: u32) {}
         /// Arms the per-fault mapping-index census and marks its start.
         /// Args: live rows and displaced rows in the faulting task's index.
         /// Row-visit counting is OFF until this probe is enabled, so an
@@ -6636,6 +6643,28 @@ mod real {
             fnv1a(source),
             fnv1a(dest),
             source.len() as u64
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_anonymous_discard_entry(va: u64, len: u64, granule: u64) {
+        carrick_usdt::hvpatch__anonymous__discard__entry!(|| (va, len, granule));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_frame_cow_inventory_miss(
+        va: u64,
+        ipa: u64,
+        compound_size: u64,
+        descriptor: u64,
+        flags: u32,
+    ) {
+        carrick_usdt::hvpatch__frame__cow__inventory__miss!(|| (
+            va,
+            ipa,
+            compound_size,
+            descriptor,
+            flags
         ));
     }
 
@@ -8744,6 +8773,8 @@ mod stub {
     stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));
     stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));
     stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));
+    stub!(hvpatch_anonymous_discard_entry(va: u64, len: u64, granule: u64));
+    stub!(hvpatch_frame_cow_inventory_miss(va: u64, ipa: u64, compound_size: u64, descriptor: u64, flags: u32));
     stub!(hvpatch_fault_delivery(far: u64, incoming: i32, delivered: i32, bus: bool, tid: i32));
     stub!(hvpatch_fault_signal_frame_failure(far: u64, signum: i32, tid: i32));
     stub!(hvpatch_signal_frame_step(step: u32, va: u64, len: u64, error: i32));

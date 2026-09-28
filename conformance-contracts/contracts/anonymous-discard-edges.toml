@@ -1,23 +1,23 @@
 schema_version = 1
 id = "kernel.mm.anonymous-discard-edges"
-title = "Unaligned anonymous discard scrubs only partial host-page edges"
+title = "Unaligned anonymous discard retires exact Linux pages"
 guest_surfaces = ["syscall:madvise"]
 semantic_authority = ["Linux private anonymous DONTNEED zero-fill, outside-range preservation and fork isolation"]
-fixture = "unit:anonymous-discard-edges"
-scale_points = [1, 8, 32, 128]
-rationale = "A capable backend retires the aligned interior before authenticated edge scrubbing. Whole-range scrub must not scale with interior size."
+fixture = "unit:forked-el1-stack-grant-discard"
+scale_points = [1]
+rationale = "HVPatch retires every 4 KiB Linux page through exact-MM alias and inventory authority, including partial 16 KiB host compounds. The old edge scrub invoked frame COW on retained outputs whose compound inventory had already been split. Fresh-zero provenance makes a later touch allocate new backing; fork peers retain their own image."
 [bindings]
-vm_free = "carrick-aarch64::anonymous_discard::tests::unaligned_discard_bounds_scrub_and_preserves_neighbors"
+vm_free = "carrick-vmm-hvf::hvf_aarch64_engine::persistent_worker_tests::forked_el1_stack_grant_discards_64k_and_8m_without_edge_cow"
 embed = "carrick-conformance-next::deferred_anonymous_unaligned_discard"
 docker = "Same-source fixtures/unaligned_discard.py; pinned native ARM64 cpython-test image; discard-edges/oracle.json"
 [bindings.unresolved]
-production_carrier = "VM-free real-carrier failure injection still pending; scripted edge failures and signed fork semantics covered."
-embed_structural = "Node diagnostic scrub census exists; registered scale-dependent production work binding remains pending."
+production_carrier = "VM-free physical alias and inventory retirement failure injection remains pending."
+embed_structural = "Signed discard and fork tests must confirm zero physical edge scrubs."
 promotion = "Full signed probe/smoke/ecosystem and concurrent scaling gates pending."
 [[structural_budgets]]
 kind = "affine"
 metric = "guest_memory_zero_bytes"
-base = 24576
+base = 0
 per_unit = 0
 layers = ["vm-free"]
-rationale = "Maximum actual scripted zero_backing bytes over all 4 KiB boundary offsets on 16 KiB host granules; this is orchestration proof, not physical COW or allocation proof."
+rationale = "The VM-free forked-grant model admits both observed discard lengths at 4 KiB alignment and retires their complete stage-1 ranges; the backend no longer invokes edge zero_backing. Signed physical retirement remains a separate gate."
