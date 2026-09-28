@@ -873,7 +873,7 @@ where
                             .flatten()
                     })
                     .or_else(|| {
-                        carrick_signal_core::child_watch::take_siginfo(tid.raw(), pending).map(
+                        carrick_signal_linux::child_watch::take_siginfo(tid.raw(), pending).map(
                             |info| {
                                 const CLD_EXITED: i32 = 1;
                                 let ns_pid = carrick_kernel::namespace::pid::host_to_ns_or_self_for(

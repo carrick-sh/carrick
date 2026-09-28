@@ -689,8 +689,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/host_signal.rs:249 in `hold_for_fork`, `libc::getpid` acts only on the current carrier signal-state guard used by `hold_for_fork`; no guest identity selects its host target.",
     "review_id": "HA-000039",
     "source": {
-      "byte_end": 13589,
-      "byte_start": 13577,
+      "byte_end": 13600,
+      "byte_start": 13588,
       "column": 33,
       "column_end": 45,
       "column_start": 33,
@@ -717,8 +717,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/host_signal.rs:265 in `drop`, `libc::getpid` acts only on the current carrier signal-state guard used by `drop`; no guest identity selects its host target.",
     "review_id": "HA-000040",
     "source": {
-      "byte_end": 14041,
-      "byte_start": 14029,
+      "byte_end": 14052,
+      "byte_start": 14040,
       "column": 21,
       "column_end": 33,
       "column_start": 21,
@@ -745,8 +745,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/host_signal.rs:1365 in `raise_for_self`, the host result from `libc::getpid` determines the guest signal sender PID used by `raise_for_self`.",
     "review_id": "HA-000041",
     "source": {
-      "byte_end": 62266,
-      "byte_start": 62254,
+      "byte_end": 62308,
+      "byte_start": 62296,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
@@ -11091,8 +11091,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2223 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000498",
     "source": {
-      "byte_end": 89504,
-      "byte_start": 89488,
+      "byte_end": 89506,
+      "byte_start": 89490,
       "column": 39,
       "column_end": 55,
       "column_start": 39,
@@ -11118,8 +11118,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2438 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000499",
     "source": {
-      "byte_end": 98115,
-      "byte_start": 98099,
+      "byte_end": 98117,
+      "byte_start": 98101,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
@@ -11361,8 +11361,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/signal.rs:1713 in `kill`, the host result from `std::process::id` determines the guest self-signal target decision used by `kill`.",
     "review_id": "HA-000509",
     "source": {
-      "byte_end": 71702,
-      "byte_start": 71686,
+      "byte_end": 71704,
+      "byte_start": 71688,
       "column": 51,
       "column_end": 67,
       "column_start": 51,
@@ -11388,8 +11388,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/signal.rs:2520 in `sigqueueinfo_common`, the host result from `std::process::id` determines the guest signal sender and recipient identity used by `sigqueueinfo_common`.",
     "review_id": "HA-000510",
     "source": {
-      "byte_end": 111893,
-      "byte_start": 111877,
+      "byte_end": 111895,
+      "byte_start": 111879,
       "column": 24,
       "column_end": 40,
       "column_start": 24,
@@ -11415,8 +11415,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/signal.rs:3442 in `bootstrap_signal_send_as`, the host result from `std::process::id` determines the guest signal recipient identity used by `bootstrap_signal_send_as`.",
     "review_id": "HA-000512",
     "source": {
-      "byte_end": 144180,
-      "byte_start": 144164,
+      "byte_end": 144182,
+      "byte_start": 144166,
       "column": 20,
       "column_end": 36,
       "column_start": 20,
@@ -13547,7 +13547,7 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-signal-core/src/xsig.rs:161 in `xsig_self_host_pid`, the host result from `std::process::id` determines the host carrier identity used for guest signal routing used by `xsig_self_host_pid`.",
+    "rationale": "At crates/carrick-signal-linux/src/xsig.rs:161 in `xsig_self_host_pid`, the host result from `std::process::id` determines the host carrier identity used for guest signal routing used by `xsig_self_host_pid`.",
     "review_id": "HA-000569",
     "source": {
       "byte_end": 6314,
@@ -13555,7 +13555,7 @@
       "column": 19,
       "column_end": 35,
       "column_start": 19,
-      "file": "crates/carrick-signal-core/src/xsig.rs",
+      "file": "crates/carrick-signal-linux/src/xsig.rs",
       "line": 161,
       "line_end": 161,
       "line_start": 161
@@ -13575,7 +13575,7 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-signal-core/src/xsig.rs:173 in `xsig_refresh_self_host_pid`, the host result from `std::process::id` determines the host carrier identity used for guest signal routing used by `xsig_refresh_self_host_pid`.",
+    "rationale": "At crates/carrick-signal-linux/src/xsig.rs:173 in `xsig_refresh_self_host_pid`, the host result from `std::process::id` determines the host carrier identity used for guest signal routing used by `xsig_refresh_self_host_pid`.",
     "review_id": "HA-000570",
     "source": {
       "byte_end": 6761,
@@ -13583,7 +13583,7 @@
       "column": 30,
       "column_end": 46,
       "column_start": 30,
-      "file": "crates/carrick-signal-core/src/xsig.rs",
+      "file": "crates/carrick-signal-linux/src/xsig.rs",
       "line": 173,
       "line_end": 173,
       "line_start": 173
@@ -13850,8 +13850,8 @@
     "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:344 in `KickerTimerFiring::spawn_itimer_fallback`, `std::thread::Builder::new` acts only on the current kick+futex interval-timer helper thread used by `spawn_itimer_fallback`; no guest identity selects its host target.",
     "review_id": "HA-000656",
     "source": {
-      "byte_end": 14369,
-      "byte_start": 14344,
+      "byte_end": 14371,
+      "byte_start": 14346,
       "column": 17,
       "column_end": 42,
       "column_start": 17,
@@ -13878,8 +13878,8 @@
     "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:366 in `KickerTimerFiring::spawn_posix_firing`, `std::thread::Builder::new` acts only on the current kick+futex POSIX-timer helper thread used by `spawn_posix_firing`; no guest identity selects its host target.",
     "review_id": "HA-000657",
     "source": {
-      "byte_end": 15355,
-      "byte_start": 15330,
+      "byte_end": 15357,
+      "byte_start": 15332,
       "column": 17,
       "column_end": 42,
       "column_start": 17,
@@ -13906,8 +13906,8 @@
     "rationale": "At crates/carrick-hal/src/timer_delivery.rs:42 in `arm_fallback_posix_timer`, `std::thread::Builder::new` acts only on the current carrier timer-delivery helper thread used by `arm_fallback_posix_timer`; no guest identity selects its host target.",
     "review_id": "HA-000576",
     "source": {
-      "byte_end": 1907,
-      "byte_start": 1882,
+      "byte_end": 1908,
+      "byte_start": 1883,
       "column": 17,
       "column_end": 42,
       "column_start": 17,

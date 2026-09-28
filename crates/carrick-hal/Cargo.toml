@@ -29,9 +29,9 @@ carrick-mmu-core = { path = "../carrick-mmu-core" }
 # carrick-abi/portable/host (none of which depend on carrick-hal).
 carrick-timer-core = { path = "../carrick-timer-core" }
 # The shared async host-signal PUMP (`signal_pump`) needs the neutral pending
-# store + child-watch + the `HostSignalGlue` seam. No cycle: carrick-signal-core
+# store + child-watch + the `HostSignalGlue` seam. No cycle: carrick-signal-linux
 # depends only on libc (not carrick-hal).
-carrick-signal-core = { path = "../carrick-signal-core" }
+carrick-signal-linux = { path = "../carrick-signal-linux" }
 thiserror.workspace = true
 libc.workspace = true
 zerocopy.workspace = true
