@@ -698,6 +698,13 @@ pub trait GuestMemory {
     /// backend and unit tests don't model protections).
     fn set_no_access(&mut self, _address: u64, _len: usize, _no_access: bool) {}
 
+    /// A private-file page wholly beyond EOF must not retain EL1-private
+    /// authority from prepared backing. Called after its guest protection is
+    /// invalidated and before the BUS fault range becomes visible.
+    fn mark_bus_fault(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
     /// Mark a guest range read-only for syscall writes (`no_write=true`) or clear
     /// it when the range becomes writable/unmapped. This is the host-side EFAULT
     /// counterpart to guest-visible page-table write protection: a syscall that

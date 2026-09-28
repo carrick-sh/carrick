@@ -4094,6 +4094,51 @@ impl PageTableManager {
         Ok(PageTableApplyOutcome::new(changed, false))
     }
 
+    /// Remove EL1-private authority from an invalid file BUS tail. The output
+    /// remains recorded for the owning stage-2 lease, but no EL1 permission or
+    /// prepared-backing decision may use it after the file fault is published.
+    pub fn mark_bus_fault(
+        &mut self,
+        va: u64,
+        len: usize,
+        mut source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
+        let end = va
+            .checked_add(len as u64)
+            .ok_or(PageTableError::BadAddress)?;
+        if len == 0 || !va.is_multiple_of(PT_PAGE) || !len.is_multiple_of(PT_PAGE as usize) {
+            return Err(PageTableError::BadAddress);
+        }
+        let mut current = va;
+        let mut changed = false;
+        while current < end {
+            let (location, level) = self.leaf_offset(current, false, None)?;
+            let descriptor = self.read_desc(location)?;
+            let (span, mask) = Self::level_span(level);
+            let block_start = current & mask;
+            let block_end = block_start
+                .checked_add(span)
+                .ok_or(PageTableError::BadAddress)?;
+            if descriptor & SW_EL1_PRIVATE != 0 {
+                if descriptor & VALID != 0 {
+                    return Err(PageTableError::BadAddress);
+                }
+                if block_start < va || block_end > end {
+                    self.split_block(location, level, source.as_deref_mut())?;
+                    changed = true;
+                    continue;
+                }
+                self.write_desc(
+                    location,
+                    descriptor & !(SW_EL1_PRIVATE | SW_EL1_MAY_WRITE | SW_EL1_MAY_EXEC),
+                )?;
+                changed = true;
+            }
+            current = block_end;
+        }
+        Ok(PageTableApplyOutcome::new(changed, false))
+    }
+
     /// Host-forwarded `mprotect(PROT_NONE)` over EL1-private leaves. The
     /// invalidation alone leaves the same shape as a bulk-prepared, untouched
     /// leaf (invalid, tagged, output retained, AP read-write), and host buffer
@@ -9672,6 +9717,47 @@ mod tests {
         assert!(!terminal_descriptor_permits_host_buffer(
             (descriptor & !AP_MASK) | AP_PRIV_RO,
             LeafAccess::Read
+        ));
+    }
+
+    #[test]
+    fn forked_bus_tail_does_not_inherit_prepared_el1_private_authority() {
+        let mut parent = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        parent
+            .publish_private_pages(
+                GuestLeafPublication {
+                    va,
+                    ipa: LINUX_ALIAS_IPA_BASE + 0x20_0000,
+                    len: 4 * PT_PAGE,
+                    writable: true,
+                    executable: false,
+                },
+                va,
+                None,
+            )
+            .unwrap();
+        let bus_page = va + 3 * PT_PAGE;
+        // The file's last page is wholly beyond EOF. Host protection leaves
+        // an invalid descriptor that the fork snapshot carries to its child.
+        parent
+            .set_prot_none(bus_page, PT_PAGE as usize, None)
+            .unwrap();
+        parent
+            .mark_bus_fault(bus_page, PT_PAGE as usize, None)
+            .unwrap();
+        parent
+            .set_fork_readonly(va, (4 * PT_PAGE) as usize, None)
+            .unwrap();
+        let child_bus = terminal_descriptor(parent.debug_walk(bus_page));
+        assert_eq!(child_bus & VALID, 0);
+        assert!(!terminal_descriptor_is_prepared_private(child_bus));
+        assert!(
+            !terminal_descriptor_has_el1_private_authority(child_bus),
+            "a BUS leaf cannot inherit EL1-private prepared backing"
+        );
+        assert!(terminal_descriptor_is_prepared_private(
+            terminal_descriptor(parent.debug_walk(va + 2 * PT_PAGE))
         ));
     }
 

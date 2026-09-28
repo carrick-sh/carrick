@@ -2136,6 +2136,14 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         self.vm.set_no_access(address, len, no_access);
     }
 
+    fn mark_bus_fault(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.pt_edit_and_flush_after_adopting(address, len, |editor| {
+            editor
+                .manager
+                .mark_bus_fault(address, len, editor.arena_source.as_deref_mut())
+        })
+    }
+
     fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
         if let Some(protections) = self.vm.protections() {
             protections.set_no_write(address, len, no_write);
