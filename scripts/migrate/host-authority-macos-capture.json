@@ -587,8 +587,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 13589,
-        "byte_start": 13577,
+        "byte_end": 13600,
+        "byte_start": 13588,
         "column": 33,
         "column_end": 45,
         "column_start": 33,
@@ -608,8 +608,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 14041,
-        "byte_start": 14029,
+        "byte_end": 14052,
+        "byte_start": 14040,
         "column": 21,
         "column_end": 33,
         "column_start": 21,
@@ -629,8 +629,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 62266,
-        "byte_start": 62254,
+        "byte_end": 62308,
+        "byte_start": 62296,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
@@ -8273,8 +8273,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 89504,
-        "byte_start": 89488,
+        "byte_end": 89506,
+        "byte_start": 89490,
         "column": 39,
         "column_end": 55,
         "column_start": 39,
@@ -8293,8 +8293,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 98115,
-        "byte_start": 98099,
+        "byte_end": 98117,
+        "byte_start": 98101,
         "column": 47,
         "column_end": 63,
         "column_start": 47,
@@ -8473,8 +8473,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 71702,
-        "byte_start": 71686,
+        "byte_end": 71704,
+        "byte_start": 71688,
         "column": 51,
         "column_end": 67,
         "column_start": 51,
@@ -8493,8 +8493,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 111893,
-        "byte_start": 111877,
+        "byte_end": 111895,
+        "byte_start": 111879,
         "column": 24,
         "column_end": 40,
         "column_start": 24,
@@ -8513,8 +8513,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 144180,
-        "byte_start": 144164,
+        "byte_end": 144182,
+        "byte_start": 144166,
         "column": 20,
         "column_end": 36,
         "column_start": 20,
@@ -10107,7 +10107,7 @@
         "column": 19,
         "column_end": 35,
         "column_start": 19,
-        "file": "crates/carrick-signal-core/src/xsig.rs",
+        "file": "crates/carrick-signal-linux/src/xsig.rs",
         "line": 161,
         "line_end": 161,
         "line_start": 161
@@ -10128,7 +10128,7 @@
         "column": 30,
         "column_end": 46,
         "column_start": 30,
-        "file": "crates/carrick-signal-core/src/xsig.rs",
+        "file": "crates/carrick-signal-linux/src/xsig.rs",
         "line": 173,
         "line_end": 173,
         "line_start": 173
@@ -10325,8 +10325,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 14369,
-        "byte_start": 14344,
+        "byte_end": 14371,
+        "byte_start": 14346,
         "column": 17,
         "column_end": 42,
         "column_start": 17,
@@ -10346,8 +10346,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 15355,
-        "byte_start": 15330,
+        "byte_end": 15357,
+        "byte_start": 15332,
         "column": 17,
         "column_end": 42,
         "column_start": 17,
@@ -10367,8 +10367,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 1907,
-        "byte_start": 1882,
+        "byte_end": 1908,
+        "byte_start": 1883,
         "column": 17,
         "column_end": 42,
         "column_start": 17,
@@ -11803,9 +11803,9 @@
       }
     }
   ],
-  "rows_sha256": "c7db2b76869d92d2fb05091de7895a62401136fd7b0224169f552ddef3962a53",
+  "rows_sha256": "34a6177b9d14f26bdb479067fded768dfebd2fd7121efb28b94a39481860b415",
   "schema": 1,
-  "source_head": "3473769c7f16fe1e0a967407b8742dd5bf7dcc77",
+  "source_head": "dcb84b62e5bf681f1c4877063a8b87a821071f76",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
