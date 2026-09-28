@@ -512,6 +512,7 @@ struct ThreadExecutionRecord {
     state: ThreadExecutionState,
     task_state: Option<Box<MigratableTaskState>>,
     blocked_continuation: Option<Box<crate::kernel::continuation::BlockedContinuation>>,
+    leased_continuation: Option<crate::kernel::continuation::ContinuationId>,
     next_executor_epoch: u64,
     exec_invalidation_pending: bool,
     control_quantum: Option<SchedulerControlQuantum>,
@@ -538,6 +539,7 @@ impl ThreadExecutionRecord {
             state: ThreadExecutionState::Uninitialized,
             task_state: None,
             blocked_continuation: None,
+            leased_continuation: None,
             next_executor_epoch: 1,
             exec_invalidation_pending: false,
             control_quantum: None,
@@ -752,9 +754,15 @@ impl ThreadExecutionLease {
     pub(crate) fn take_blocked_continuation(
         &mut self,
     ) -> Option<crate::kernel::continuation::BlockedContinuation> {
-        self.blocked_continuation
-            .take()
-            .map(|continuation| *continuation)
+        let owner = self.owner.upgrade();
+        let mut execution = owner.as_ref().map(|owner| owner.execution.lock());
+        let continuation = self.blocked_continuation.take()?;
+        if let Some(execution) = execution.as_mut()
+            && execution.leased_continuation == Some(continuation.id())
+        {
+            execution.leased_continuation = None;
+        }
+        Some(*continuation)
     }
 }
 
@@ -1190,14 +1198,14 @@ impl Thread {
 
     /// Decide one exact scheduler wake targeting a specific execution generation.
     ///
-    /// If the target generation is stale (the thread exited, failed, or moved
-    /// past this execution generation), returns `Ok(ThreadSchedulerAction::None)`
-    /// so the stale wake edge is dropped as a benign no-op without failing
-    /// the carrier.
+    /// A registered continuation may remain owned after control quanta move
+    /// the thread beyond the registration's original generation. A retired
+    /// continuation or generation returns `None` as a benign wake no-op.
     pub(crate) fn scheduler_wake_exact(
         &self,
         expected: ThreadKey,
         target_generation: ExecutionGeneration,
+        continuation: Option<crate::kernel::continuation::ContinuationId>,
     ) -> Result<ThreadSchedulerAction, ThreadExecutionError> {
         if expected != self.key {
             return Err(ThreadExecutionError::SchedulerThreadMismatch {
@@ -1207,16 +1215,16 @@ impl Thread {
         }
         let mut execution = self.execution.lock();
         let found = execution.state;
-        // A control quantum may advance the scheduler generation without
-        // consuming the blocked continuation. Its original authority remains
-        // the wake target until the continuation is retired.
-        let owns_continuation =
+        // A registration remains the same producer authority while control
+        // quanta advance the scheduler generation. A claimed lease moves the
+        // continuation out of this record, retaining its ID separately.
+        let owns_continuation = continuation.is_some_and(|id| {
             execution
                 .blocked_continuation
                 .as_ref()
-                .is_some_and(|continuation| {
-                    continuation.authority().execution_generation() == target_generation
-                });
+                .is_some_and(|owned| owned.id() == id)
+                || execution.leased_continuation == Some(id)
+        });
         let is_stale = match execution.state {
             ThreadExecutionState::Uninitialized
             | ThreadExecutionState::Exited { .. }
@@ -1633,6 +1641,7 @@ impl Thread {
             });
         };
         let blocked_continuation = execution.blocked_continuation.take();
+        execution.leased_continuation = blocked_continuation.as_ref().map(|owned| owned.id());
         execution.next_executor_epoch = next_executor_epoch;
         if let Some(quantum) = execution.control_quantum.as_mut() {
             quantum.requeue_pending = false;
@@ -1685,6 +1694,7 @@ impl Thread {
             });
         };
         let blocked_continuation = execution.blocked_continuation.take();
+        execution.leased_continuation = blocked_continuation.as_ref().map(|owned| owned.id());
         execution.state = ThreadExecutionState::Running {
             generation,
             executor,
@@ -1868,6 +1878,7 @@ impl Thread {
         let Some(generation) = lease.generation.next() else {
             return Err((ThreadExecutionError::GenerationExhausted, lease));
         };
+        execution.leased_continuation = None;
         execution.task_state = None;
         let _ = lease.task_state.take();
         cancel_continuation_slot(
@@ -2059,6 +2070,7 @@ impl Thread {
         if wake_pending && !scheduler_owned && !matches!(settlement, ExecutionSettlement::Exited) {
             return Err((ThreadExecutionError::SchedulerSettlementRequired, lease));
         }
+        execution.leased_continuation = None;
         let mut action = ThreadSchedulerAction::None;
         let mut settle_kind = match settlement {
             ExecutionSettlement::Runnable => crate::probes::HvpatchLeaseSettlementKind::Runnable,

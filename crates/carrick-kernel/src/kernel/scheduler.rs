@@ -52,15 +52,16 @@ pub enum WakeDisposition {
 
 /// Exact target identity for a scheduler wake.
 ///
-/// Binds the wake to a specific `TaskKey`, `ThreadKey`, and
-/// `ExecutionGeneration`. If the target task has already been reaped or the
-/// execution generation has advanced past this wake edge, the wake is dropped
-/// as a benign no-op (`WakeDisposition::Pending`) without failing the carrier.
+/// Binds the wake to a specific `TaskKey`, `ThreadKey`, and source
+/// `ExecutionGeneration`. A registered continuation also names its exact ID:
+/// that registration can remain live through later control quanta. Reaped
+/// tasks and retired generations return `Pending` without failing the carrier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExactWakeTarget {
     pub task: TaskKey,
     pub thread: ThreadKey,
     pub generation: ExecutionGeneration,
+    continuation: Option<crate::kernel::continuation::ContinuationId>,
 }
 
 impl ExactWakeTarget {
@@ -69,7 +70,18 @@ impl ExactWakeTarget {
             task,
             thread,
             generation,
+            continuation: None,
         }
+    }
+
+    /// The registration authenticates the continuation even after control
+    /// quanta have advanced its scheduler execution generation.
+    pub const fn for_continuation(
+        mut self,
+        continuation: crate::kernel::continuation::ContinuationId,
+    ) -> Self {
+        self.continuation = Some(continuation);
+        self
     }
 
     pub const fn task(&self) -> TaskKey {
@@ -3711,10 +3723,9 @@ impl Scheduler {
     /// Wake the exact target task and execution generation.
     ///
     /// Unlike untyped `wake`, `wake_exact` authenticates that the wake target
-    /// belongs to the intended `TaskKey` and `ExecutionGeneration`. If the
-    /// target task has already been reaped or the execution generation has
-    /// advanced past this wake edge, the wake is dropped as a benign no-op
-    /// (`WakeDisposition::Pending`) without failing the carrier.
+    /// belongs to the intended `TaskKey` and either the live generation or
+    /// the registered continuation carried through later control quanta.
+    /// Reaped tasks and retired generations return `Pending`.
     pub fn wake_exact(&self, target: ExactWakeTarget) -> Result<WakeDisposition, SchedulerError> {
         let _transition = self.generation_transition.lock();
 
@@ -3750,10 +3761,13 @@ impl Scheduler {
             Err(err) => return Err(SchedulerError::Queue(err)),
         };
 
-        // 3. Authenticate exact execution generation under the thread lock.
-        // A stale generation (e.g. thread moved on, exited, or failed) returns None
-        // and is dropped cleanly as pending without failing the carrier.
-        let action = match thread.scheduler_wake_exact(target.thread, target.generation) {
+        // 3. Authenticate the generation or still-owned continuation under
+        // the thread lock. A retired owner is dropped cleanly as pending.
+        let action = match thread.scheduler_wake_exact(
+            target.thread,
+            target.generation,
+            target.continuation,
+        ) {
             Ok(action) => action,
             Err(ThreadExecutionError::InvalidTransition { .. }) => {
                 return Ok(WakeDisposition::Pending);
