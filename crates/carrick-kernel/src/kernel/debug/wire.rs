@@ -19,6 +19,15 @@ pub const MAX_REQUEST_BYTES: usize = 4 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Both sides use the same two-second budget.
 pub const DEADLINE: Duration = Duration::from_secs(2);
+/// How long the server lets the coherent snapshot wait for its authorities.
+/// Strictly inside [`DEADLINE`]: a snapshot allowed the whole budget made a
+/// wedged carrier's named `Busy`/`TimedOut` reply lose the race to the
+/// client's own deadline, so the client could only report "timed out".
+pub const STRICT_SNAPSHOT_BUDGET: Duration = Duration::from_millis(900);
+/// How long the degraded capture that follows a refused strict snapshot may
+/// spend on try-locks. [`STRICT_SNAPSHOT_BUDGET`] + this leaves the rest of
+/// [`DEADLINE`] to encode and write the reply.
+pub const DEGRADED_BUDGET: Duration = Duration::from_millis(400);
 
 /// Frame length prefix, sized from the type actually encoded rather than
 /// written down, so the reader and writer cannot drift apart.
