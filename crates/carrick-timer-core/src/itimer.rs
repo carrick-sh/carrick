@@ -112,15 +112,6 @@ pub fn next_ident(which: usize) -> usize {
     TIMER_IDENT_BASE + epoch.wrapping_mul(WHICH_COUNT) + which
 }
 
-/// Linux signal number delivered when `which`'s timer expires.
-pub fn signum_for(which: usize) -> i32 {
-    match which {
-        1 => carrick_abi::LINUX_SIGVTALRM, // ITIMER_VIRTUAL
-        2 => carrick_abi::LINUX_SIGPROF,   // ITIMER_PROF
-        _ => carrick_abi::LINUX_SIGALRM,   // ITIMER_REAL
-    }
-}
-
 /// Whether `which` is a CPU-time timer (`ITIMER_VIRTUAL`/`ITIMER_PROF`) rather
 /// than wall-time `ITIMER_REAL`. ITIMER_VIRTUAL(1) / ITIMER_PROF(2) measure
 /// GUEST CPU time, not wall-clock.
@@ -697,13 +688,6 @@ mod tests {
         // Disarm forgets the live ident (back to the base fallback).
         disarm(which);
         assert_eq!(live_ident(which), ident_for(which));
-    }
-
-    #[test]
-    fn signum_mapping() {
-        assert_eq!(signum_for(0), carrick_abi::LINUX_SIGALRM);
-        assert_eq!(signum_for(1), carrick_abi::LINUX_SIGVTALRM);
-        assert_eq!(signum_for(2), carrick_abi::LINUX_SIGPROF);
     }
 
     #[test]

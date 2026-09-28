@@ -1212,18 +1212,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1222 in `raise_host_nofile_backing`, `libc::getrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1210 in `raise_host_nofile_backing`, `libc::getrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
     "review_id": "HA-000059",
     "source": {
-      "byte_end": 60959,
-      "byte_start": 60944,
+      "byte_end": 60280,
+      "byte_start": 60265,
       "column": 15,
       "column_end": 30,
       "column_start": 15,
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 1222,
-      "line_end": 1222,
-      "line_start": 1222
+      "line": 1210,
+      "line_end": 1210,
+      "line_start": 1210
     }
   },
   {
@@ -1612,18 +1612,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1291 in `raise_host_nofile_backing`, `libc::setrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1279 in `raise_host_nofile_backing`, `libc::setrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
     "review_id": "HA-000076",
     "source": {
-      "byte_end": 64266,
-      "byte_start": 64251,
+      "byte_end": 63587,
+      "byte_start": 63572,
       "column": 9,
       "column_end": 24,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 1291,
-      "line_end": 1291,
-      "line_start": 1291
+      "line": 1279,
+      "line_end": 1279,
+      "line_start": 1279
     }
   },
   {
@@ -5903,18 +5903,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1258 in `host_open_descriptor_count`, `std::fs::read_dir` acts only on the current carrier open host-descriptor census used by `host_open_descriptor_count` (the `/dev/fd` listing that backs guest `/proc/sys/fs/file-nr`); no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1246 in `host_open_descriptor_count`, `std::fs::read_dir` acts only on the current carrier open host-descriptor census used by `host_open_descriptor_count` (the `/dev/fd` listing that backs guest `/proc/sys/fs/file-nr`); no guest identity selects its host target.",
     "review_id": "HA-000642",
     "source": {
-      "byte_end": 62708,
-      "byte_start": 62691,
+      "byte_end": 62029,
+      "byte_start": 62012,
       "column": 5,
       "column_end": 22,
       "column_start": 5,
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 1258,
-      "line_end": 1258,
-      "line_start": 1258
+      "line": 1246,
+      "line_end": 1246,
+      "line_start": 1246
     }
   },
   {
@@ -13847,18 +13847,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:344 in `KickerTimerFiring::spawn_itimer_fallback`, `std::thread::Builder::new` acts only on the current kick+futex interval-timer helper thread used by `spawn_itimer_fallback`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:375 in `KickerTimerFiring::spawn_itimer_fallback`, `std::thread::Builder::new` acts only on the current kick+futex interval-timer helper thread used by `spawn_itimer_fallback`; no guest identity selects its host target.",
     "review_id": "HA-000656",
     "source": {
-      "byte_end": 14369,
-      "byte_start": 14344,
+      "byte_end": 15452,
+      "byte_start": 15427,
       "column": 17,
       "column_end": 42,
       "column_start": 17,
       "file": "crates/carrick-hal/src/guest_timer_bridge.rs",
-      "line": 344,
-      "line_end": 344,
-      "line_start": 344
+      "line": 375,
+      "line_end": 375,
+      "line_start": 375
     }
   },
   {
@@ -13875,18 +13875,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:366 in `KickerTimerFiring::spawn_posix_firing`, `std::thread::Builder::new` acts only on the current kick+futex POSIX-timer helper thread used by `spawn_posix_firing`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:397 in `KickerTimerFiring::spawn_posix_firing`, `std::thread::Builder::new` acts only on the current kick+futex POSIX-timer helper thread used by `spawn_posix_firing`; no guest identity selects its host target.",
     "review_id": "HA-000657",
     "source": {
-      "byte_end": 15355,
-      "byte_start": 15330,
+      "byte_end": 16438,
+      "byte_start": 16413,
       "column": 17,
       "column_end": 42,
       "column_start": 17,
       "file": "crates/carrick-hal/src/guest_timer_bridge.rs",
-      "line": 366,
-      "line_end": 366,
-      "line_start": 366
+      "line": 397,
+      "line_end": 397,
+      "line_start": 397
     }
   },
   {
@@ -13987,8 +13987,8 @@
     "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:614 in `arm_posix`, `std::thread::Builder::new` acts only on the current HVPatch timer helper and compatibility bootstrap seam used by `arm_posix`; no guest identity selects its host target.",
     "review_id": "HA-000580",
     "source": {
-      "byte_end": 23417,
-      "byte_start": 23392,
+      "byte_end": 23357,
+      "byte_start": 23332,
       "column": 21,
       "column_end": 46,
       "column_start": 21,
@@ -14363,18 +14363,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/itimer.rs:20 in `spawn_fallback_timer`, `std::thread::Builder::new` acts only on the current HVF interval-timer helper used by `spawn_fallback_timer`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/itimer.rs:30 in `spawn_fallback_timer`, `std::thread::Builder::new` acts only on the current HVF interval-timer helper used by `spawn_fallback_timer`; no guest identity selects its host target.",
     "review_id": "HA-000589",
     "source": {
-      "byte_end": 1091,
-      "byte_start": 1066,
+      "byte_end": 1358,
+      "byte_start": 1333,
       "column": 13,
       "column_end": 38,
       "column_start": 13,
       "file": "crates/carrick-vmm-hvf/src/itimer.rs",
-      "line": 20,
-      "line_end": 20,
-      "line_start": 20
+      "line": 30,
+      "line_end": 30,
+      "line_start": 30
     }
   },
   {
@@ -15057,18 +15057,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-timer-core/src/itimer.rs:382 in `run_fallback`, `std::thread::sleep` acts only on the current carrier interval-timer helper used by `run_fallback`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-timer-core/src/itimer.rs:373 in `run_fallback`, `std::thread::sleep` acts only on the current carrier interval-timer helper used by `run_fallback`; no guest identity selects its host target.",
     "review_id": "HA-000615",
     "source": {
-      "byte_end": 16686,
-      "byte_start": 16668,
+      "byte_end": 16377,
+      "byte_start": 16359,
       "column": 5,
       "column_end": 23,
       "column_start": 5,
       "file": "crates/carrick-timer-core/src/itimer.rs",
-      "line": 382,
-      "line_end": 382,
-      "line_start": 382
+      "line": 373,
+      "line_end": 373,
+      "line_start": 373
     }
   },
   {
@@ -15085,18 +15085,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-timer-core/src/itimer.rs:392 in `run_fallback`, `std::thread::sleep` acts only on the current carrier interval-timer helper used by `run_fallback`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-timer-core/src/itimer.rs:383 in `run_fallback`, `std::thread::sleep` acts only on the current carrier interval-timer helper used by `run_fallback`; no guest identity selects its host target.",
     "review_id": "HA-000616",
     "source": {
-      "byte_end": 16974,
-      "byte_start": 16956,
+      "byte_end": 16665,
+      "byte_start": 16647,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
       "file": "crates/carrick-timer-core/src/itimer.rs",
-      "line": 392,
-      "line_end": 392,
-      "line_start": 392
+      "line": 383,
+      "line_end": 383,
+      "line_start": 383
     }
   },
   {
@@ -15113,18 +15113,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-timer-core/src/itimer.rs:418 in `run_fallback_cpu`, `std::thread::sleep` acts only on the current carrier interval-timer helper used by `run_fallback_cpu`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-timer-core/src/itimer.rs:409 in `run_fallback_cpu`, `std::thread::sleep` acts only on the current carrier interval-timer helper used by `run_fallback_cpu`; no guest identity selects its host target.",
     "review_id": "HA-000617",
     "source": {
-      "byte_end": 18202,
-      "byte_start": 18184,
+      "byte_end": 17893,
+      "byte_start": 17875,
       "column": 17,
       "column_end": 35,
       "column_start": 17,
       "file": "crates/carrick-timer-core/src/itimer.rs",
-      "line": 418,
-      "line_end": 418,
-      "line_start": 418
+      "line": 409,
+      "line_end": 409,
+      "line_start": 409
     }
   },
   {
@@ -15141,18 +15141,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-timer-core/src/posix.rs:277 in `run_fallback`, `std::thread::sleep` acts only on the current carrier POSIX-timer helper used by `run_fallback`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-timer-core/src/posix.rs:279 in `run_fallback`, `std::thread::sleep` acts only on the current carrier POSIX-timer helper used by `run_fallback`; no guest identity selects its host target.",
     "review_id": "HA-000618",
     "source": {
-      "byte_end": 11476,
-      "byte_start": 11458,
+      "byte_end": 11109,
+      "byte_start": 11091,
       "column": 5,
       "column_end": 23,
       "column_start": 5,
       "file": "crates/carrick-timer-core/src/posix.rs",
-      "line": 277,
-      "line_end": 277,
-      "line_start": 277
+      "line": 279,
+      "line_end": 279,
+      "line_start": 279
     }
   },
   {
@@ -15169,18 +15169,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-timer-core/src/posix.rs:286 in `run_fallback`, `std::thread::sleep` acts only on the current carrier POSIX-timer helper used by `run_fallback`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-timer-core/src/posix.rs:288 in `run_fallback`, `std::thread::sleep` acts only on the current carrier POSIX-timer helper used by `run_fallback`; no guest identity selects its host target.",
     "review_id": "HA-000619",
     "source": {
-      "byte_end": 11684,
-      "byte_start": 11666,
+      "byte_end": 11317,
+      "byte_start": 11299,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
       "file": "crates/carrick-timer-core/src/posix.rs",
-      "line": 286,
-      "line_end": 286,
-      "line_start": 286
+      "line": 288,
+      "line_end": 288,
+      "line_start": 288
     }
   },
   {
@@ -15197,18 +15197,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-timer-core/src/posix.rs:332 in `run_fallback_cpu`, `std::thread::sleep` acts only on the current carrier POSIX-timer helper used by `run_fallback_cpu`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-timer-core/src/posix.rs:333 in `run_fallback_cpu`, `std::thread::sleep` acts only on the current carrier POSIX-timer helper used by `run_fallback_cpu`; no guest identity selects its host target.",
     "review_id": "HA-000620",
     "source": {
-      "byte_end": 13145,
-      "byte_start": 13127,
+      "byte_end": 12752,
+      "byte_start": 12734,
       "column": 13,
       "column_end": 31,
       "column_start": 13,
       "file": "crates/carrick-timer-core/src/posix.rs",
-      "line": 332,
-      "line_end": 332,
-      "line_start": 332
+      "line": 333,
+      "line_end": 333,
+      "line_start": 333
     }
   },
   {
