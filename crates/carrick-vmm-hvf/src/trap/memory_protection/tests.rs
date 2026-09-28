@@ -1897,6 +1897,68 @@ mod alias_registry_tests {
     }
 
     #[test]
+    fn forked_stack_grant_keeps_neighbor_and_child_leases_during_partial_discard() {
+        let va = 0x0060_0269_0000_u64;
+        let ipa = 0x009b_0443_4000_u64;
+        let stack_len = 8 * 1024 * 1024;
+        let parent_slot = (0x5000_0000, 0x4000);
+        let child_slot = (0x6000_0000, 0x4000);
+        let parent_scope = AliasOwnershipScope::MmRootSlot {
+            base: parent_slot.0,
+            size: parent_slot.1,
+        };
+        let child_scope = AliasOwnershipScope::MmRootSlot {
+            base: child_slot.0,
+            size: child_slot.1,
+        };
+        let mut registry = AliasRegistry::default();
+        registry.push(make_test_alias(va, stack_len, ipa, stack_len, parent_scope));
+        registry.push(make_test_alias(va, stack_len, ipa, stack_len, child_scope));
+        for len in [0x10000, 0x7de000] {
+            let (planned, _) = registry.plan_unregister_process_alias(
+                va + 0x1000,
+                len,
+                Some(parent_slot),
+                ContainerRootToken::ROOT,
+            );
+            let actual = unregister_alias_entries(
+                &mut registry,
+                va + 0x1000,
+                len,
+                Some(parent_slot),
+                ContainerRootToken::ROOT,
+            );
+            assert_eq!(planned, actual);
+            assert!(
+                actual.is_empty(),
+                "outside-range parent pages still hold the lease"
+            );
+            assert!(
+                registry
+                    .process_alias_containing_va_candidates(
+                        va,
+                        Some(parent_slot),
+                        ContainerRootToken::ROOT,
+                        |_| true
+                    )
+                    .iter()
+                    .any(|alias| alias.physical_ipa == ipa)
+            );
+            assert!(
+                registry
+                    .process_alias_containing_va_candidates(
+                        va + 0x1000,
+                        Some(child_slot),
+                        ContainerRootToken::ROOT,
+                        |_| true
+                    )
+                    .iter()
+                    .any(|alias| alias.physical_ipa == ipa)
+            );
+        }
+    }
+
+    #[test]
     fn planned_unmap_matches_legacy_snapshot_oracle() {
         let root_slot = Some((0x5000_0000, 0x4000));
         let owned_scope = AliasOwnershipScope::MmRootSlot {
