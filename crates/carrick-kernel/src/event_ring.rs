@@ -15,11 +15,11 @@
 //! `carrick eventring` (works on a live `lldb -p <pid>` too).
 //!
 //! There are two fixed rings with the same slot protocol. [`is_high_rate`]
-//! kinds (per-dispatch scheduler, per-poll epoll/eventfd/futex) go to the
+//! kinds (per-dispatch scheduler, per-poll `EP*`/eventfd/futex) go to the
 //! high-rate ring, read with `carrick eventring --high-rate`; every other kind
 //! goes to the lifecycle ring. A spinning guest therefore cannot evict fork,
 //! exec, fd, wait, fault or grant history (the `gbhang4` capture of a hung
-//! `go build` held 8192 scheduler/epoll records and nothing else).
+//! `go build` held 8192 scheduler and `EPWAIT` records and nothing else).
 //!
 //! Only the perturbing, autonomous FILE dump is opt-in: build with the
 //! `event-ring-dump` feature and set `CARRICK_EVENTRING` to a directory; a 1 Hz
@@ -60,7 +60,7 @@ const EMPTY: Slot = Slot {
 /// The lifecycle ring: fork/exec/fd/wait/signal/fault/grant history.
 static RING: [Slot; N] = [EMPTY; N];
 static IDX: AtomicU64 = AtomicU64::new(0);
-/// The high-rate ring: per-dispatch scheduler and per-poll epoll/eventfd/futex
+/// The high-rate ring: per-dispatch scheduler and per-poll `EP*`/eventfd/futex
 /// records (see [`is_high_rate`]). A spinning guest fills THIS ring, so a
 /// scheduler spin can no longer evict the lifecycle history above. Same
 /// geometry and slot protocol, so one reader serves both.
@@ -435,7 +435,7 @@ pub fn payload_starts_at_ar_member_header(payload: &[u8]) -> bool {
 pub enum RingSelect {
     /// Lifecycle, fault, grant, fd, wait and signal history.
     Lifecycle,
-    /// Per-dispatch scheduler and per-poll epoll/eventfd/futex records.
+    /// Per-dispatch scheduler and per-poll `EP*`/eventfd/futex records.
     HighRate,
 }
 

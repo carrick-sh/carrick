@@ -330,7 +330,7 @@ pub struct PostMortem {
     /// The always-on event ring, oldest to newest. A slot the reader could
     /// not decode is kept as its named read error.
     pub event_ring: Vec<EventRingRecord>,
-    /// The high-rate ring (per-dispatch scheduler and per-poll epoll,
+    /// The high-rate ring (per-dispatch scheduler and per-poll `EP*`,
     /// eventfd and futex records), kept apart so a spin cannot evict
     /// `event_ring`.
     #[serde(default)]
