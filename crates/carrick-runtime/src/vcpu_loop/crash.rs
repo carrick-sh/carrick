@@ -676,27 +676,36 @@ where
                     if sub_len == 0 {
                         continue;
                     }
-                    let to_read =
-                        sub_len.min(usize::try_from(remaining_budget).unwrap_or(usize::MAX));
-                    if to_read == 0 {
-                        break;
-                    }
-                    let bytes = engine
-                        .read_core_bytes(sub_start, to_read)
-                        .map_err(|error| {
+                    let mut consumed = 0usize;
+                    while consumed < sub_len && remaining_budget != 0 {
+                        // Bound temporary memory even for a large materialized
+                        // VMA. Zero pages consume no file-storage budget, so
+                        // continue scanning past them to later nonzero data.
+                        let to_read = (sub_len - consumed).min(64 * 1024);
+                        let address = sub_start + consumed as u64;
+                        let bytes = engine.read_core_bytes(address, to_read).map_err(|error| {
                             RuntimeError::Trap(TrapError::Hypervisor(format!(
-                                "read core region {:#x}..{:#x}: {error}",
-                                sub_start,
-                                sub_start.saturating_add(to_read as u64)
+                                "read core region {address:#x}..{:#x}: {error}",
+                                address.saturating_add(to_read as u64)
                             )))
                         })?;
-                    let relative_offset = sub_start.saturating_sub(map.start);
-                    let file_offset = seg_offset.saturating_add(relative_offset);
-                    remaining_budget = remaining_budget.saturating_sub(bytes.len() as u64);
-                    extents.push(carrick_kernel::core_dump::CoreExtent {
-                        offset: file_offset,
-                        bytes,
-                    });
+                        // Bulk preparation is not guest residency. Zero-filled
+                        // pages can be holes without omitting host-written data.
+                        for run in carrick_kernel::dispatch::mem::core_data_runs(&bytes) {
+                            let emitted = run
+                                .len()
+                                .min(usize::try_from(remaining_budget).unwrap_or(usize::MAX));
+                            if emitted == 0 {
+                                break;
+                            }
+                            remaining_budget -= emitted as u64;
+                            extents.push(carrick_kernel::core_dump::CoreExtent {
+                                offset: seg_offset + address - map.start + run.start as u64,
+                                bytes: bytes[run.start..run.start + emitted].to_vec(),
+                            });
+                        }
+                        consumed += to_read;
+                    }
                 }
             }
             let payload = dump

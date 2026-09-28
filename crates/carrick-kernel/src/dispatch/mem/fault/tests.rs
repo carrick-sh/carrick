@@ -530,7 +530,7 @@ fn first_touch_arming_answers_and_splits_exactly_like_a_scan() {
 }
 
 #[test]
-fn frame_grant_plan_clips_to_one_bulk_window_and_commits_the_whole_span() {
+fn frame_grant_plan_clips_backing_window_and_commits_only_the_fault_page() {
     const GRANT: u64 = 2 * 1024 * 1024;
     let dispatcher = SyscallDispatcher::new();
     let page = dispatcher.linux_page_size();
@@ -556,7 +556,13 @@ fn frame_grant_plan_clips_to_one_bulk_window_and_commits_the_whole_span() {
         dispatcher
             .with_resident_fault_plan_for_test(fault, |plan| drop(plan))
             .is_none(),
-        "the whole granted span must leave the arming set"
+        "the faulting page must leave the arming set"
+    );
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(expected_start, |plan| drop(plan))
+            .is_some(),
+        "untouched prefix inside the grant must remain armed"
     );
     if base < expected_start {
         assert!(
@@ -616,4 +622,57 @@ fn first_touch_arming_coalesces_adjacent_equal_protections() {
             (base + 8 * page, base + 9 * page, LinuxProtFlags::READ),
         ]
     );
+}
+
+// Grant allocation is not Linux residency: the untouched middle page must
+// remain observable even when its physical backing was prepared in bulk.
+#[test]
+fn frame_grant_sparse_mincore_tracks_only_faulting_pages() {
+    let dispatcher = SyscallDispatcher::new();
+    let base = LINUX_MMAP_BASE;
+    let page = dispatcher.linux_page_size();
+    let prot = LinuxProtFlags::READ | LinuxProtFlags::WRITE;
+    dispatcher.record_dynamic_mapping(base, 3 * page, prot, ProcMapSharing::Private, String::new());
+    dispatcher.track_resident_fault_range(base, 3 * page, prot);
+    let memory = LinearMemory::new(base, vec![0; 3 * page as usize]);
+    dispatcher
+        .with_resident_frame_grant_plan_for_test(base, 2 * 1024 * 1024, |plan| {
+            assert_eq!(plan.len(), 3 * page, "retain bulk backing preparation");
+            dispatcher.commit_resident_frame_grant(plan);
+        })
+        .unwrap();
+    assert_eq!(
+        dispatcher.mincore_residency_vector(&memory, base, 3, page),
+        Some(vec![1, 0, 0])
+    );
+    dispatcher
+        .with_resident_fault_plan_for_test(base + 2 * page, |plan| {
+            dispatcher.commit_resident_fault(plan);
+        })
+        .expect("prepared pages still require first-touch publication");
+    assert_eq!(
+        dispatcher.mincore_residency_vector(&memory, base, 3, page),
+        Some(vec![1, 0, 1])
+    );
+}
+
+#[test]
+fn frame_grant_core_omits_speculative_zero_pages_without_losing_host_writes() {
+    let page = LINUX_PAGE_SIZE as usize;
+    let mut backing = vec![0; 512 * page];
+    backing[0] = 17;
+    backing[511 * page] = 29;
+    assert_eq!(
+        core_data_runs(&backing),
+        vec![0..page, 511 * page..512 * page]
+    );
+    // A host copyout can write without a guest first-touch trap. Its bytes
+    // must survive even when residency metadata has not observed that page.
+    backing[128 * page + 13] = 91;
+    assert_eq!(
+        core_data_runs(&backing),
+        vec![0..page, 128 * page..129 * page, 511 * page..512 * page]
+    );
+    assert!(core_data_runs(&vec![0; 512 * page]).is_empty());
+    assert!(core_data_runs(&[]).is_empty());
 }
