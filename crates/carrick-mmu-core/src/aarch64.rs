@@ -139,6 +139,12 @@ pub fn terminal_descriptor_is_fork_cow(descriptor: u64) -> bool {
     el1_cow(descriptor)
 }
 
+/// An invalid terminal whose retained output belongs to a retired lease.
+/// This applies to both EL1-private grants and older untagged host aliases.
+pub fn terminal_descriptor_is_retired(descriptor: u64) -> bool {
+    descriptor & VALID == 0 && descriptor & SW_RETIRED != 0
+}
+
 fn arm_private_cow(descriptor: u64) -> u64 {
     if descriptor & (VALID | SW_EL1_PRIVATE) != (VALID | SW_EL1_PRIVATE) || el1_cow(descriptor) {
         return descriptor;
@@ -4174,21 +4180,29 @@ impl PageTableManager {
         Ok(PageTableApplyOutcome::new(changed, false))
     }
 
-    /// A fork child cannot consume a speculative EL1 grant whose physical
-    /// output was not inherited in its frame inventory. Drop just this
-    /// prepared leaf so its first translation fault requests a child grant.
-    /// The fork image is offline; the parent descriptor is never changed.
-    pub fn clear_prepared_for_fork_regrant(&mut self, va: u64) -> Result<(), PageTableError> {
+    /// Drop one invalid output which is retired or which the fork child did
+    /// not inherit in its frame inventory. A retired block may be split, but
+    /// must never be repointed into a new retired output. The child is offline;
+    /// the parent and neighboring invalid leaves retain their descriptors.
+    pub fn clear_inaccessible_invalid_fork_leaf(&mut self, va: u64) -> Result<(), PageTableError> {
         if !va.is_multiple_of(PT_PAGE) {
             return Err(PageTableError::BadAddress);
         }
-        let (location, level) = self.leaf_offset(va, true, None)?;
-        if level != 3
-            || el1_private_leaf_state(self.read_desc(location)?) != El1PrivateLeafState::Prepared
-        {
-            return Err(PageTableError::BadAddress);
+        loop {
+            let (location, level) = self.leaf_offset(va, false, None)?;
+            let descriptor = self.read_desc(location)?;
+            if descriptor & VALID != 0
+                || level == 0
+                || !Self::records_output(descriptor, level)
+                || (level < 3 && descriptor & (TYPE_TABLE_OR_PAGE & !VALID) != 0)
+            {
+                return Err(PageTableError::BadAddress);
+            }
+            if level == 3 {
+                return self.write_desc(location, 0);
+            }
+            self.split_block(location, level, None)?;
         }
-        self.write_desc(location, 0)
     }
 
     /// Remove EL1-private authority from an invalid file BUS tail. The output
@@ -6530,6 +6544,77 @@ mod tests {
             .expect("child first touch revalidates only its private alias");
         assert_eq!(mgr.translate(va + 0x77_000), Some(new_ipa + 0x77_000));
         assert_eq!(mgr.translate(va + 0x76_000), None);
+    }
+
+    #[test]
+    fn repoint_prepared_el1_invalid_block_splits_without_losing_grant_tags() {
+        let mut mgr = PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            LINUX_PAGE_TABLES_BASE,
+            test_layout(),
+        );
+        mgr.declare_offline_private_image();
+        let va = LINUX_PRIVATE_OVERLAY_BASE + 0x20_0000;
+        let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+        mgr.map_private_aliased(va, ipa, 0x20_0000, true, None)
+            .expect("seed a block grant");
+        mgr.mark_guest_private_publication(GuestLeafPublication {
+            va,
+            ipa,
+            len: 0x20_0000,
+            writable: true,
+            executable: false,
+        })
+        .expect("tag the block grant");
+        mgr.set_prot_none(va, 0x20_0000, None)
+            .expect("leave the grant prepared");
+        let child_va = va + 0x3c_000;
+        assert_eq!(
+            el1_private_leaf_state(terminal_descriptor(mgr.debug_walk(child_va))),
+            El1PrivateLeafState::Prepared
+        );
+        let child_ipa = ipa + 0x40_0000 + 0x7c_000;
+        mgr.repoint_preserving_attributes(child_va, child_ipa, 0x4000, None)
+            .expect("repoint an untouched child alias within the block");
+        assert_eq!(mgr.translate(child_va), None);
+        assert_eq!(mgr.translate_retained_output(child_va), Some(child_ipa));
+        assert_eq!(
+            el1_private_leaf_state(terminal_descriptor(mgr.debug_walk(child_va))),
+            El1PrivateLeafState::Prepared
+        );
+        assert_eq!(
+            mgr.translate_retained_output(child_va - 0x1000),
+            Some(ipa + 0x3b_000)
+        );
+
+        let retired_va = va + 0x20_0000;
+        let retired_ipa = ipa + 0x80_0000;
+        mgr.map_private_aliased(retired_va, retired_ipa, 0x20_0000, true, None)
+            .expect("seed the next block grant");
+        mgr.mark_guest_private_publication(GuestLeafPublication {
+            va: retired_va,
+            ipa: retired_ipa,
+            len: 0x20_0000,
+            writable: true,
+            executable: false,
+        })
+        .expect("tag the next block grant");
+        mgr.invalidate(retired_va, 0x20_0000, None)
+            .expect("retire the entire block lease");
+        let stale = retired_va + 0x3c_000;
+        assert!(terminal_descriptor_is_retired(terminal_descriptor(
+            mgr.debug_walk(stale)
+        )));
+        mgr.clear_inaccessible_invalid_fork_leaf(stale)
+            .expect("split a retired EL1 block and clear just the stale alias");
+        assert_eq!(mgr.translate_retained_output(stale), None);
+        assert_eq!(
+            mgr.translate_retained_output(stale - PT_PAGE),
+            Some(retired_ipa + 0x3b_000)
+        );
+        assert!(terminal_descriptor_is_retired(terminal_descriptor(
+            mgr.debug_walk(stale - PT_PAGE)
+        )));
     }
 
     #[test]
