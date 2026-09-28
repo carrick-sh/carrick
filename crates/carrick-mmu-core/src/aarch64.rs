@@ -4174,6 +4174,23 @@ impl PageTableManager {
         Ok(PageTableApplyOutcome::new(changed, false))
     }
 
+    /// A fork child cannot consume a speculative EL1 grant whose physical
+    /// output was not inherited in its frame inventory. Drop just this
+    /// prepared leaf so its first translation fault requests a child grant.
+    /// The fork image is offline; the parent descriptor is never changed.
+    pub fn clear_prepared_for_fork_regrant(&mut self, va: u64) -> Result<(), PageTableError> {
+        if !va.is_multiple_of(PT_PAGE) {
+            return Err(PageTableError::BadAddress);
+        }
+        let (location, level) = self.leaf_offset(va, true, None)?;
+        if level != 3
+            || el1_private_leaf_state(self.read_desc(location)?) != El1PrivateLeafState::Prepared
+        {
+            return Err(PageTableError::BadAddress);
+        }
+        self.write_desc(location, 0)
+    }
+
     /// Remove EL1-private authority from an invalid file BUS tail. The output
     /// remains recorded for the owning stage-2 lease, but no EL1 permission or
     /// prepared-backing decision may use it after the file fault is published.
