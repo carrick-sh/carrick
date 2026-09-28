@@ -386,13 +386,16 @@ fn repoint_inherited_invalid_alias(
     let Some(retained) = page_tables.translate_retained_output(start) else {
         return Ok(false);
     };
-    if retained == current_ipa {
+    if retained == current_ipa
+        && (private_state(page_tables, start) != El1PrivateLeafState::Prepared
+            || inventory_covers_compound(align_down(retained, CowArmedRanges::COMPOUND_SIZE)))
+    {
         return Ok(false);
     }
     const PAGE: u64 = 4 * 1024;
     const COMPOUND: u64 = CowArmedRanges::COMPOUND_SIZE;
     let pages = (len as u64).div_ceil(PAGE);
-    let mut needs_repoint = false;
+    let mut needs_edit = false;
     // Preflight the complete offline edit against the child's planned frame
     // inventory. A covered retained output is an authenticated fork snapshot,
     // even when this older alias row names a different IPA. A missing output
@@ -419,17 +422,18 @@ fn repoint_inherited_invalid_alias(
             continue;
         };
         if page_tables.translate(page_va).is_some()
-            || output == target
             || inventory_covers_compound(align_down(output, COMPOUND))
         {
             continue;
         }
-        if !inventory_covers_compound(align_down(target, COMPOUND)) {
+        if !inventory_covers_compound(align_down(target, COMPOUND))
+            && private_state(page_tables, page_va) != El1PrivateLeafState::Prepared
+        {
             return Err(carrick_mmu_core::aarch64::PageTableError::BadAddress);
         }
-        needs_repoint = true;
+        needs_edit = true;
     }
-    if !needs_repoint {
+    if !needs_edit {
         return Ok(false);
     }
     let mut changed = false;
@@ -440,10 +444,17 @@ fn repoint_inherited_invalid_alias(
             continue;
         };
         if page_tables.translate(page_va).is_none()
-            && output != target
             && !inventory_covers_compound(align_down(output, COMPOUND))
         {
-            changed |= page_tables.repoint_preserving_attributes(page_va, target, PAGE, None)?;
+            if inventory_covers_compound(align_down(target, COMPOUND)) {
+                if output != target {
+                    changed |=
+                        page_tables.repoint_preserving_attributes(page_va, target, PAGE, None)?;
+                }
+            } else if private_state(page_tables, page_va) == El1PrivateLeafState::Prepared {
+                page_tables.clear_prepared_for_fork_regrant(page_va)?;
+                changed = true;
+            }
         }
     }
     Ok(changed)
@@ -1842,6 +1853,72 @@ mod tests {
             Err(carrick_mmu_core::aarch64::PageTableError::BadAddress),
             "a retired output cannot be authenticated as an inherited grant"
         );
+    }
+
+    #[test]
+    fn fork_partly_untouched_el1_grant_without_child_inventory_regrants_on_touch() {
+        use carrick_mmu_core::aarch64::{
+            El1PrivateLeafState, GuestLeafPublication, el1_private_leaf_state, terminal_descriptor,
+        };
+
+        let mut parent = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        parent.declare_offline_private_image();
+        let block_va = crate::memory::LINUX_MMAP_BASE + 0x20_0000;
+        let grant_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+        let alias_va = block_va + 0x77_000;
+        let new_ipa = grant_ipa + 0x40_0000 + 0x77_000;
+        parent
+            .publish_private_pages(
+                GuestLeafPublication {
+                    va: block_va,
+                    ipa: grant_ipa,
+                    len: 0x20_0000,
+                    writable: true,
+                    executable: false,
+                },
+                block_va,
+                None,
+            )
+            .expect("grant a partly untouched 2 MiB block");
+        let mut child = parent.snapshot_image().expect("fork child image");
+        child
+            .set_fork_readonly(block_va, 0x20_0000, None)
+            .expect("arm parent grant for fork");
+        assert_eq!(
+            el1_private_leaf_state(terminal_descriptor(child.debug_walk(alias_va))),
+            El1PrivateLeafState::Prepared
+        );
+
+        repoint_inherited_invalid_alias(&mut child, alias_va, new_ipa, 0x4000, true, |_| false)
+            .expect("an unowned child alias must not abort fork");
+        assert_eq!(child.translate_retained_output(alias_va), None);
+        assert_eq!(
+            el1_private_leaf_state(terminal_descriptor(child.debug_walk(alias_va))),
+            El1PrivateLeafState::Unowned
+        );
+        assert_eq!(
+            child.translate_retained_output(alias_va - 0x1000),
+            Some(grant_ipa + 0x76_000),
+            "the rest of the inherited grant is unchanged"
+        );
+        child
+            .publish_private_pages(
+                GuestLeafPublication {
+                    va: alias_va,
+                    ipa: new_ipa,
+                    len: 0x4000,
+                    writable: true,
+                    executable: false,
+                },
+                alias_va,
+                None,
+            )
+            .expect("first touch can publish a child-owned grant");
+        assert_eq!(child.translate(alias_va), Some(new_ipa));
     }
 
     #[test]
