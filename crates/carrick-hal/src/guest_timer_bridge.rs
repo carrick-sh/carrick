@@ -39,7 +39,7 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use carrick_timer_core::TimerSpecNs;
-use carrick_timer_core::posix::PosixArm;
+use crate::posix_timer::PosixArm;
 
 use crate::{PosixTimerSpec, ThreadId, TimerDelivery, VcpuRegistry};
 
@@ -222,6 +222,16 @@ pub trait TimerFiring: 'static {
 
     /// The backend [`TimerDelivery`] the run loop registered, if any.
     fn delivery() -> Option<Arc<dyn TimerDelivery>>;
+
+    /// Read the current guest CPU runtime in nanoseconds, if supported by the lane.
+    fn sample_cpu_now() -> Option<u64> {
+        None
+    }
+
+    /// Read the active guest vCPU count, if supported by the lane.
+    fn active_vcpus() -> u64 {
+        0
+    }
 }
 
 /// A [`GuestTimerBridge`] over the neutral `carrick-timer-core` registry —
@@ -251,7 +261,12 @@ impl<F: TimerFiring> std::fmt::Debug for TimerCoreBridge<F> {
 
 impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
     fn itimer_arm(&self, which: usize, spec: TimerSpecNs, needs_periodic: bool) -> u64 {
-        carrick_timer_core::itimer::arm(which, spec, needs_periodic)
+        let cpu_now = if carrick_timer_core::itimer::is_cpu_timer(which) {
+            F::sample_cpu_now().unwrap_or(0)
+        } else {
+            0
+        };
+        carrick_timer_core::itimer::arm_with_cpu_now(which, spec, needs_periodic, cpu_now)
     }
 
     fn itimer_disarm(&self, which: usize) {
@@ -280,7 +295,7 @@ impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
         } else {
             carrick_timer_core::ClockKind::Wall
         };
-        carrick_timer_core::posix::create_with_clock_kind(
+        crate::posix_timer::create_with_clock_kind(
             clock_id, clock_kind, signum, target_tid, si_value,
         )
     }
@@ -290,7 +305,7 @@ impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
     /// any firing thread); a non-zero value hands the arm to the lane's
     /// firing.
     fn posix_arm(&self, id: i32, spec: TimerSpecNs) -> Option<PosixTimerSpec> {
-        let armed = carrick_timer_core::posix::arm(id, spec)?;
+        let armed = crate::posix_timer::arm(id, spec)?;
         if spec.value > 0 {
             F::spawn_posix_firing(id, &armed, spec);
         }
@@ -298,27 +313,27 @@ impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
     }
 
     fn posix_remaining(&self, id: i32) -> Option<TimerSpecNs> {
-        carrick_timer_core::posix::remaining(id)
+        crate::posix_timer::remaining(id)
     }
 
     fn posix_getoverrun(&self, id: i32) -> Option<u32> {
-        carrick_timer_core::posix::getoverrun(id)
+        crate::posix_timer::getoverrun(id)
     }
 
     fn posix_seed_overrun(&self, id: i32, count: u32) {
-        carrick_timer_core::posix::seed_overrun(id, count);
+        crate::posix_timer::seed_overrun(id, count);
     }
 
     fn posix_exists(&self, id: i32) -> bool {
-        carrick_timer_core::posix::exists(id)
+        crate::posix_timer::exists(id)
     }
 
     fn posix_clock_id(&self, id: i32) -> i32 {
-        carrick_timer_core::posix::clock_id(id)
+        crate::posix_timer::clock_id(id)
     }
 
     fn posix_delete(&self, id: i32) -> bool {
-        carrick_timer_core::posix::delete(id)
+        crate::posix_timer::delete(id)
     }
 
     fn deliver(&self, signum: i32) {
@@ -375,7 +390,7 @@ impl TimerFiring for KickerTimerFiring {
         let _ = std::thread::Builder::new()
             .name(format!("carrick-itimer-{which}"))
             .spawn(move || {
-                carrick_timer_core::itimer::run_fallback(which, generation, spec, || {
+                crate::timer_delivery::run_fallback(which, generation, spec, || {
                     deliver(signum);
                 });
             });
@@ -397,7 +412,7 @@ impl TimerFiring for KickerTimerFiring {
         let _ = std::thread::Builder::new()
             .name(format!("carrick-ptimer-{id}"))
             .spawn(move || {
-                carrick_timer_core::posix::run_fallback(slot, generation, spec, on_fire);
+                crate::posix_timer::run_fallback(slot, generation, spec, on_fire);
             });
     }
 

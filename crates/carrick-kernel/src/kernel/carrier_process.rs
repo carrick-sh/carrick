@@ -566,7 +566,7 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
         id: i32,
         spec: carrick_hal::TimerSpecNs,
     ) -> Option<carrick_hal::PosixTimerSpec> {
-        let armed = carrick_timer_core::posix::arm(id, spec)?;
+        let armed = carrick_hal::posix_timer::arm(id, spec)?;
         if spec.value > 0 {
             let target = self.target.clone();
             let signum = armed.signum;
@@ -614,7 +614,7 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
             let _ = std::thread::Builder::new()
                 .name(format!("carrick-hvpatch-ptimer-{id}"))
                 .spawn(move || {
-                    carrick_timer_core::posix::run_fallback_with_cpu(
+                    carrick_hal::posix_timer::run_fallback_with_cpu(
                         slot, generation, spec, cpu_now, on_fire,
                     );
                 });
@@ -623,7 +623,7 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
     }
 
     fn disarm_posix(&self, id: i32) {
-        let _ = carrick_timer_core::posix::arm(id, carrick_hal::TimerSpecNs::DISARM);
+        let _ = carrick_hal::posix_timer::arm(id, carrick_hal::TimerSpecNs::DISARM);
     }
 
     fn current_arm(&self, _which: usize) -> Option<carrick_hal::TimerArm> {
