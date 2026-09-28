@@ -5,7 +5,7 @@
 //! `timer_delivery::HvfTimerFiring::spawn_posix_firing`, reached through the
 //! shared `TimerCoreBridge` body rather than a second arm path here.
 
-pub use carrick_timer_core::posix::{
+pub use carrick_hal::posix_timer::{
     PosixTimerSlot, PosixTimerSpec, clear, clock_id, create, create_with_target,
     create_with_target_and_value, delete, exists, getoverrun, remaining, seed_overrun,
 };

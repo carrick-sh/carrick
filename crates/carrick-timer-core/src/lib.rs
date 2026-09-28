@@ -11,10 +11,25 @@
 //! `itimer` / `posix_timer` wrapper module via `pub use ...::itimer::*` /
 //! `pub use ...::posix::*`.
 
+#![no_std]
+
+#[cfg(test)]
+extern crate std;
+
 pub mod itimer;
 pub mod posix;
 
-use std::time::Duration;
+use core::time::Duration;
+
+/// Source of guest CPU time and active vCPU concurrency for CPU-time timers.
+pub trait CpuSampler {
+    /// Aggregate guest CPU nanoseconds.
+    fn total_cpu_ns(&self) -> u64;
+    /// Number of active vCPUs running guest code.
+    fn active_vcpus(&self) -> u64 {
+        1
+    }
+}
 
 // ─── Time-domain newtypes (value/interval adjacency + wall-vs-CPU axis) ─────
 //
