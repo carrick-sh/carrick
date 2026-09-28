@@ -300,6 +300,7 @@ impl ContinuationWakeToken {
 
     pub const fn exact_target(self) -> ExactWakeTarget {
         ExactWakeTarget::new(self.task, self.thread, self.execution)
+            .for_continuation(self.continuation)
     }
 
     #[cfg(test)]

@@ -1234,8 +1234,9 @@ fn control_quantum_preserves_sleep_poll_and_futex_until_real_readiness() {
         }
         let ready = fixture
             .scheduler
-            .take(&fixture.executor)
-            .expect("claim real readiness");
+            .try_take(&fixture.executor)
+            .expect("claim real readiness")
+            .unwrap_or_else(|| panic!("real {family:?} readiness was not queued"));
         let resumed = ready
             .lease()
             .blocked_continuation()
@@ -1251,6 +1252,91 @@ fn control_quantum_preserves_sleep_poll_and_futex_until_real_readiness() {
             .settle_exited(ready)
             .expect("retire fixture");
     }
+}
+
+#[test]
+fn futex_readiness_during_control_quantum_wakes_live_continuation() {
+    let (mut fixture, futex) = control_quantum_fixture(15_144, ContinuationFamily::FutexWait);
+    let futex = futex.expect("futex table");
+    fixture
+        .scheduler
+        .begin_switch_out(&fixture.running)
+        .expect("switch out");
+    fixture
+        .service
+        .enroll(&mut fixture.registration)
+        .expect("enroll");
+    let token = fixture.registration.wake_token();
+    let continuation_id = fixture.continuation.id();
+    fixture
+        .scheduler
+        .settle_blocked_continuation(fixture.running, fixture.continuation, fixture.registration)
+        .expect("park");
+    fixture
+        .scheduler
+        .wake_control(fixture.context.thread().key())
+        .expect("control wake");
+    let running = fixture
+        .scheduler
+        .take(&fixture.executor)
+        .expect("control quantum");
+    assert_eq!(futex.wake(0xcafe, 1), 1, "exact futex producer");
+    assert!(
+        fixture.service.registration_timing(token).is_ok(),
+        "registration remains owned while control quantum runs"
+    );
+    let quantum = fixture
+        .context
+        .thread()
+        .finish_scheduler_control_quantum(fixture.context.thread().key())
+        .expect("finish control quantum");
+    fixture
+        .scheduler
+        .settle_blocked(running, quantum.blocked_reason.expect("blocked reason"))
+        .expect("settle control quantum");
+    let mut ready = fixture
+        .scheduler
+        .try_take(&fixture.executor)
+        .expect("claim exact futex readiness")
+        .expect("live continuation was not queued");
+    let continuation = ready
+        .lease_mut()
+        .take_blocked_continuation()
+        .expect("preserved continuation");
+    assert_eq!(continuation.id(), continuation_id);
+    assert_eq!(
+        continuation.ready_event().expect("ready event"),
+        ContinuationEvent::Ready
+    );
+    drop(continuation);
+    assert_eq!(
+        fixture
+            .scheduler
+            .wake_exact(token.exact_target())
+            .expect("consumed continuation wake"),
+        crate::kernel::WakeDisposition::Pending,
+        "a consumed continuation no longer owns the running lease"
+    );
+    fixture
+        .scheduler
+        .settle_runnable(ready)
+        .expect("continue without completed wait");
+    assert_eq!(
+        fixture
+            .scheduler
+            .wake_exact(token.exact_target())
+            .expect("stale continuation wake"),
+        crate::kernel::WakeDisposition::Pending,
+        "a consumed continuation no longer owns the running generation"
+    );
+    let next = fixture
+        .scheduler
+        .take(&fixture.executor)
+        .expect("claim successor");
+    fixture
+        .scheduler
+        .settle_exited(next)
+        .expect("retire fixture");
 }
 
 #[test]
