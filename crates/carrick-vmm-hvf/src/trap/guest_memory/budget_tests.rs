@@ -1,10 +1,10 @@
-//! Budget test for zero_guest_backing in the HVF backend.
+//! Scoped task-row budgets for backing maintenance.
 //!
-//! A brk shrink (and other backing zeroing) scrubs a range of guest memory.
-//! Work must be proportional to the range's distinct backing extents, NOT
-//! its 4 KiB pages, with O(1) lock acquisitions across the operation.
-//! On unbatched code, scanning scales linearly with the page count (e.g. 256
-//! TaskMapping visits and lock round-trips for 256 pages).
+//! The resolver selects and authenticates each Linux page independently.
+//! These fixtures measure only TaskMappings rows, bounded per page by the
+//! existing kernel.mm.backing-maintenance-lookup contract. They do not measure
+//! stage-1 walks, registry visits, locks, write runs, or end-to-end overhead.
+//! In particular, there is no extent-proportional total-work claim.
 
 use crate::trap::{
     CarrierForeignMmTransport, HotPathScan, HvfSyscallTransport, HvfTaskState, HvfVmState,
@@ -12,18 +12,17 @@ use crate::trap::{
 };
 
 const PAGE_SIZE: usize = 4096;
-const SMALL_PAGES: usize = 1;
 const LARGE_PAGES: usize = 256;
 const HEAP_START: u64 = 0x2000_0000;
-const TASK_ROWS_BUDGET: u64 = 2;
+const TASK_ROWS_PER_PAGE_BUDGET: u64 = 2;
 
-struct MmapBuffer {
-    ptr: *mut u8,
+pub(super) struct MmapBuffer {
+    pub(super) ptr: *mut u8,
     len: usize,
 }
 
 impl MmapBuffer {
-    fn new(len: usize) -> Self {
+    pub(super) fn new(len: usize) -> Self {
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -50,7 +49,7 @@ impl Drop for MmapBuffer {
     }
 }
 
-fn test_vm_state(task: HvfTaskState) -> HvfVmState {
+pub(super) fn test_vm_state(task: HvfTaskState) -> HvfVmState {
     HvfVmState {
         _vm: std::mem::ManuallyDrop::new(unsafe { std::mem::zeroed() }),
         task,
@@ -65,54 +64,48 @@ fn test_vm_state(task: HvfTaskState) -> HvfVmState {
     }
 }
 
+// Neutral tasks share the default registry scope. Other serial tests may leave
+// rows there; exclude that unrelated population from these no-alias fixtures.
+fn isolated_alias_registry() -> crate::trap::foreign_mm::tests::ExternalAliasStateRestore {
+    let restore = crate::trap::foreign_mm::tests::ExternalAliasStateRestore::capture();
+    crate::trap::mutate_external_alias_state(|registry| *registry = Default::default());
+    restore
+}
+
 #[test]
-fn zero_guest_backing_budget_is_proportional_to_extents_not_pages() {
+fn zero_guest_backing_fallback_task_rows_are_bounded_per_page() {
+    let _registry = isolated_alias_registry();
     let mut task = HvfTaskState::neutral();
     let total_size = LARGE_PAGES * PAGE_SIZE;
     let mmap = MmapBuffer::new(total_size);
     let mut region = mapped_region(HEAP_START, HEAP_START + total_size as u64, HEAP_START);
     region.host_addr = mmap.ptr;
     task.mappings.insert(region);
-
     let mut vm = test_vm_state(task);
-
-    // 1. Measure zeroing 1 page
-    unsafe {
-        core::ptr::write_bytes(mmap.ptr, 0xaa, total_size);
+    for pages in [1, 16, LARGE_PAGES] {
+        unsafe {
+            core::ptr::write_bytes(mmap.ptr, 0xaa, total_size);
+        }
+        let before = hot_path_rows_scanned(HotPathScan::TaskMappings);
+        vm.zero_guest_backing(HEAP_START, pages * PAGE_SIZE)
+            .expect("zero range");
+        let scanned = hot_path_rows_scanned(HotPathScan::TaskMappings) - before;
+        assert!(
+            scanned > 0 && scanned <= pages as u64 * TASK_ROWS_PER_PAGE_BUDGET,
+            "{pages} pages visited {scanned} task rows"
+        );
+        for i in 0..total_size {
+            assert_eq!(
+                unsafe { *mmap.ptr.add(i) },
+                if i < pages * PAGE_SIZE { 0 } else { 0xaa }
+            );
+        }
     }
-    let before_small = hot_path_rows_scanned(HotPathScan::TaskMappings);
-    vm.zero_guest_backing(HEAP_START, SMALL_PAGES * PAGE_SIZE)
-        .expect("zero small range");
-    let scanned_small = hot_path_rows_scanned(HotPathScan::TaskMappings) - before_small;
-
-    // Verify exactly the requested page was zeroed
-    assert_eq!(unsafe { *mmap.ptr }, 0);
-    assert_eq!(unsafe { *mmap.ptr.add(PAGE_SIZE - 1) }, 0);
-    assert_eq!(unsafe { *mmap.ptr.add(PAGE_SIZE) }, 0xaa);
-
-    // 2. Measure zeroing 256 pages (single backing extent)
-    unsafe {
-        core::ptr::write_bytes(mmap.ptr, 0xbb, total_size);
-    }
-    let before_large = hot_path_rows_scanned(HotPathScan::TaskMappings);
-    vm.zero_guest_backing(HEAP_START, LARGE_PAGES * PAGE_SIZE)
-        .expect("zero large range");
-    let scanned_large = hot_path_rows_scanned(HotPathScan::TaskMappings) - before_large;
-
-    // Verify all 256 pages were zeroed
-    for i in 0..total_size {
-        assert_eq!(unsafe { *mmap.ptr.add(i) }, 0);
-    }
-
-    assert!(
-        scanned_large <= TASK_ROWS_BUDGET,
-        "zeroing {LARGE_PAGES} pages visited {scanned_large} task mapping rows \
-         (budget {TASK_ROWS_BUDGET}); small scale ({SMALL_PAGES} page) visited {scanned_small}"
-    );
 }
 
 #[test]
-fn zero_guest_backing_multi_extent_budget_is_proportional_to_extents() {
+fn zero_guest_backing_two_mappings_task_rows_are_bounded_per_page() {
+    let _registry = isolated_alias_registry();
     let mut task = HvfTaskState::neutral();
     let extent1_pages = 128;
     let extent2_pages = 128;
@@ -156,16 +149,17 @@ fn zero_guest_backing_multi_extent_budget_is_proportional_to_extents() {
         assert_eq!(unsafe { *mmap2.ptr.add(i) }, 0);
     }
 
-    // Two extents: visited at most 2 * TASK_ROWS_BUDGET rows
+    // Each page selects its mapping independently; this counts only task rows.
     assert!(
-        scanned <= 2 * TASK_ROWS_BUDGET,
+        scanned <= total_pages as u64 * TASK_ROWS_PER_PAGE_BUDGET,
         "zeroing 2 extents visited {scanned} task mapping rows (budget {})",
-        2 * TASK_ROWS_BUDGET
+        total_pages as u64 * TASK_ROWS_PER_PAGE_BUDGET
     );
 }
 
 #[test]
 fn zero_guest_backing_unaligned_partial_range_preserves_surrounding_bytes() {
+    let _registry = isolated_alias_registry();
     let mut task = HvfTaskState::neutral();
     let total_size = 4 * PAGE_SIZE;
     let mmap = MmapBuffer::new(total_size);
@@ -212,6 +206,7 @@ fn zero_guest_backing_unaligned_partial_range_preserves_surrounding_bytes() {
 
 #[test]
 fn zero_guest_backing_unmapped_hole_leaves_neighbors_zeroed() {
+    let _registry = isolated_alias_registry();
     let mut task = HvfTaskState::neutral();
     let extent1_len = 2 * PAGE_SIZE;
     let hole_len = 2 * PAGE_SIZE;
