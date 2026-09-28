@@ -41,6 +41,7 @@ pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
     "carrick-timer-core",
     "carrick-fd-core",
     "carrick-pipe-core",
+    "carrick-el1",
 ];
 
 /// Designated Linux personality or ABI crates forbidden in substrate dependency closures.
@@ -377,11 +378,21 @@ pub fn check_substrate_boundary(
         };
 
         // 1. Audit Dependency Closure via Resolved Metadata
+        let mixed_el1 = crate_name == "carrick-el1";
+        let el1_forbidden = forbidden_crates
+            .iter()
+            .filter(|name| name.as_str() != "carrick-el1-abi")
+            .cloned()
+            .collect();
         let substrate_pkg = audit_crate_dependencies_metadata(
             root,
             crate_name,
             &metadata,
-            &forbidden_crates,
+            if mixed_el1 {
+                &el1_forbidden
+            } else {
+                &forbidden_crates
+            },
             &forbidden_host_crates,
             &mut report,
         )?;
@@ -392,7 +403,11 @@ pub fn check_substrate_boundary(
             .to_path_buf();
 
         // 2. Audit Source Code via Target Roots and Module Tree Traversal
-        audit_crate_source(crate_name, substrate_pkg, &forbidden_symbols, &mut report)?;
+        if mixed_el1 {
+            audit_el1_modules(&report.crate_path.clone(), &forbidden_symbols, &mut report)?;
+        } else {
+            audit_crate_source(crate_name, substrate_pkg, &forbidden_symbols, &mut report)?;
+        }
 
         // Fail-closed: check that at least 1 production source file was scanned
         if report.scanned_source_files.is_empty() {
@@ -779,6 +794,60 @@ fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
 // Source Code & Module Tree Traversal
 // ---------------------------------------------------------------------------
 
+/// The EL1 image is mixed: Linux adapters and the untouched fault/memory
+/// migration are not substrate. Everything else (including orphan files) is
+/// checked, and every required neutral root must exist. The shared-record ABI
+/// is permitted here; this does not certify that crate as neutral substrate.
+fn audit_el1_modules(
+    crate_dir: &Path,
+    forbidden_symbols: &BTreeSet<String>,
+    report: &mut CrateAuditReport,
+) -> Result<(), BoundaryError> {
+    let src = crate_dir.join("src");
+    let mut visited = BTreeSet::new();
+    let mut symbols = forbidden_symbols.clone();
+    symbols.extend(
+        [
+            "personality",
+            "inotify",
+            "memory",
+            "fault",
+            "dispatch_syscall",
+            "serve_futex",
+            "carrick_inotify_core",
+        ]
+        .map(str::to_string),
+    );
+    for name in ["substrate/mod.rs", "alloc.rs", "lock.rs"] {
+        audit_source_file_tree(
+            "carrick-el1",
+            &src.join(name),
+            0,
+            &symbols,
+            &mut visited,
+            report,
+        )?;
+    }
+    let mut files = Vec::new();
+    collect_rs_files(&src, &mut files)?;
+    for path in files {
+        let relative = path.strip_prefix(&src).unwrap_or(&path);
+        if relative.starts_with("personality")
+            || matches!(
+                relative.to_str(),
+                Some("lib.rs" | "entry.rs" | "fault.rs" | "memory.rs")
+            )
+        {
+            continue;
+        }
+        let canonical = fs::canonicalize(&path).unwrap_or(path.clone());
+        if !visited.contains(&canonical) {
+            audit_source_file_tree("carrick-el1", &path, 0, &symbols, &mut visited, report)?;
+        }
+    }
+    Ok(())
+}
+
 fn audit_crate_source(
     substrate_crate: &str,
     substrate_pkg: &MetadataPackage,
@@ -1054,6 +1123,74 @@ impl<'a> SourceCheckerVisitor<'a> {
         self.test_depth > 0
     }
 
+    fn check_el1_path(&mut self, parts: &[String], span: proc_macro2::Span) {
+        if self.substrate_crate != "carrick-el1" || self.is_in_test_context() || parts.is_empty() {
+            return;
+        }
+        let mut resolved = Vec::new();
+        let mut rest = parts;
+        if parts[0] == "crate" {
+            rest = &parts[1..];
+        } else if parts[0] == "super" {
+            let canonical =
+                fs::canonicalize(self.file_path).unwrap_or_else(|_| self.file_path.to_path_buf());
+            let text = canonical.to_string_lossy();
+            let relative = text.rsplit("/src/").next().unwrap_or("");
+            let module = relative.trim_end_matches(".rs").trim_end_matches("/mod");
+            resolved = module.split('/').map(str::to_string).collect();
+            if matches!(relative, "file.rs" | "sched.rs" | "sched/hw.rs") {
+                resolved.insert(0, "substrate".to_string());
+            }
+            while rest.first().is_some_and(|p| p == "super") {
+                resolved.pop();
+                rest = &rest[1..];
+            }
+        } else {
+            return;
+        }
+        resolved.extend_from_slice(rest);
+        if !resolved
+            .first()
+            .is_some_and(|p| matches!(p.as_str(), "substrate" | "alloc" | "lock" | "rust_alloc"))
+        {
+            let start = span.start();
+            self.violations.push(SourceViolation {
+                substrate_crate: self.substrate_crate.to_string(), file_path: self.file_path.to_path_buf(),
+                line: start.line, column: start.column, symbol_or_literal: parts.join("::"),
+                reason: "EL1 substrate may reference only neutral modules, never a root personality facade".to_string(),
+            });
+        }
+    }
+
+    fn check_el1_use(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        use syn::spanned::Spanned;
+        match tree {
+            syn::UseTree::Path(p) => {
+                prefix.push(p.ident.to_string());
+                self.check_el1_use(&p.tree, prefix);
+                prefix.pop();
+            }
+            syn::UseTree::Group(g) => {
+                for t in &g.items {
+                    self.check_el1_use(t, prefix);
+                }
+            }
+            syn::UseTree::Name(n) => {
+                prefix.push(n.ident.to_string());
+                self.check_el1_path(prefix, tree.span());
+                prefix.pop();
+            }
+            syn::UseTree::Rename(n) => {
+                prefix.push(n.ident.to_string());
+                self.check_el1_path(prefix, tree.span());
+                prefix.pop();
+            }
+            syn::UseTree::Glob(_) => {
+                self.check_el1_path(prefix, tree.span());
+            }
+        }
+    }
+
     fn check_span_for_symbol(&mut self, ident: &syn::Ident) {
         if self.is_in_test_context() {
             return;
@@ -1169,6 +1306,26 @@ impl<'a> SourceCheckerVisitor<'a> {
 }
 
 impl<'ast, 'a> Visit<'ast> for SourceCheckerVisitor<'a> {
+    fn visit_visibility(&mut self, _: &'ast syn::Visibility) {}
+
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        self.check_el1_use(&node.tree, &mut Vec::new());
+        syn::visit::visit_item_use(self, node);
+    }
+
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        use syn::spanned::Spanned;
+        self.check_el1_path(
+            &node
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect::<Vec<_>>(),
+            node.span(),
+        );
+        syn::visit::visit_path(self, node);
+    }
+
     fn visit_item(&mut self, item: &'ast syn::Item) {
         let attrs = match item {
             syn::Item::Const(i) => &i.attrs,
@@ -1334,6 +1491,54 @@ mod tests {
                 .push(json!({
                     "name":alias,"pkg":to,"dep_kinds":[{"kind":kind,"target":target}]
                 }));
+        }
+    }
+
+    #[test]
+    fn declared_hyphenated_dependency_matches_cargo_rust_name() {
+        let mut f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        f.package("bridge", "neutral-bridge");
+        f.edge(0, "bridge", "neutral_bridge", None, None);
+        f.metadata["packages"][0]["dependencies"] =
+            json!([{"name":"neutral-bridge", "optional":false}]);
+        assert!(f.check().is_ok());
+    }
+
+    #[test]
+    fn el1_module_audit_is_fail_closed_and_scans_orphans() {
+        let f = Fixture::new("src/substrate/mod.rs", "pub fn neutral() {}");
+        let dir = f.root.path().join("crates/carrick-sched-core");
+        let mut report = CrateAuditReport::default();
+        assert!(audit_el1_modules(&dir, &BTreeSet::new(), &mut report).is_err());
+        fs::write(dir.join("src/alloc.rs"), "").unwrap();
+        fs::write(dir.join("src/lock.rs"), "").unwrap();
+        fs::write(dir.join("src/orphan.rs"), "use carrick_abi::LinuxErrno;").unwrap();
+        let mut report = CrateAuditReport::default();
+        audit_el1_modules(&dir, &BTreeSet::new(), &mut report).unwrap();
+        assert!(!report.source_violations.is_empty());
+    }
+
+    #[test]
+    fn el1_substrate_rejects_personality_imports_and_root_facades() {
+        for code in [
+            "use crate::personality::sched as linux;",
+            "use crate::file::read_with;",
+            "use crate::*;",
+            "use super::super::sched::Sched;",
+        ] {
+            let fixture = Fixture::new("src/substrate/core.rs", code);
+            let dir = fixture.root.path().join("crates/carrick-sched-core");
+            let mut report = CrateAuditReport::default();
+            audit_source_file_tree(
+                "carrick-el1",
+                &dir.join("src/substrate/core.rs"),
+                0,
+                &BTreeSet::new(),
+                &mut BTreeSet::new(),
+                &mut report,
+            )
+            .unwrap();
+            assert!(!report.source_violations.is_empty(), "accepted {code}");
         }
     }
 

@@ -1,14 +1,20 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+use carrick_el1_abi::{
+    CurrentTask, GIC_KICK_INTID, GIC_RESCHED_INTID, GIC_VTIMER_INTID, SlotId, ThreadCtx,
+    ThreadIdentity, ZoneTables,
+};
 
 extern crate std;
 
-use super::*;
+use crate::personality::sched::*;
+use carrick_el1_abi::TrapFrame;
 use carrick_el1_abi::{
     Claim, Counters, DelegatedFile, DelegatedInotify, DelegatedOpenFile, El1TaskId, FdMapSlot,
     Handback, InotifyNameCache, RecordId,
 };
 use carrick_sched_core::LockWait;
 use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering;
 use std::boxed::Box;
 
 const MM: u64 = 7;
@@ -441,7 +447,7 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
         user: &HardwareUserWord,
         counters,
     }
-    .idle(&mut frame_b);
+    .idle(&mut frame_b, ETIMEDOUT_RESULT);
     assert_eq!(served, Served::Returned { switched: true });
     let mut expected = b_before;
     expected.x[0] = 0;
