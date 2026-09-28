@@ -11880,9 +11880,9 @@
       }
     }
   ],
-  "rows_sha256": "c1ac3d1c1511a5eb643a3e7ec04563c50970d272b2b4922bed62b1c0fd4fc356",
+  "rows_sha256": "5e844140c20be59f1be3bc2ee887bf73632f6274ae422f9e51b2385f02a33fef",
   "schema": 1,
-  "source_head": "1f1677064cb702e6571c0adf9ae26984c35f2ee9",
+  "source_head": "0c5d14fb4e7389105b0db4b9e5eb6862a00fa643",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
