@@ -811,7 +811,7 @@ impl AliasRegistry {
     /// occurrences still mask duplicate keys in the suffix. Tail unmaps leave
     /// the existing prefix tree intact instead of allocating it again.
     /// Re-establish `exact_first_by_scope` for exactly the keys a mutation
-    /// disturbed, by asking `va_classes` for the surviving row with the
+    /// disturbed, by asking the scope's VA index for the surviving row with the
     /// lowest sequence — the same promotion the batch-remove path already
     /// performs, and the reason this scope's row order no longer has to be
     /// rescanned. Cost is O(touched keys * rows sharing that guest VA), never
@@ -822,12 +822,13 @@ impl AliasRegistry {
         keys: &std::collections::BTreeSet<(u64, u64)>,
     ) {
         for &(start, ipa) in keys {
-            let next_remaining = self
-                .va_classes
-                .rows_at_start(start)
-                .filter(|r| r.1.ownership_scope == scope && r.1.ipa == ipa)
-                .min_by_key(|r| r.0)
-                .copied();
+            let next_remaining = self.va_classes_by_scope.get(&scope).and_then(|index| {
+                index
+                    .rows_at_start(start)
+                    .filter(|r| r.1.ipa == ipa)
+                    .min_by_key(|r| r.0)
+                    .copied()
+            });
             match next_remaining {
                 Some((next_seq, next_alias)) => {
                     self.exact_first_by_scope
@@ -965,6 +966,7 @@ impl AliasRegistry {
 
     /// Every row whose guest-VA window can overlap `[start, end)`, in
     /// unspecified order, each visited at most once.
+    #[cfg(test)]
     pub(crate) fn va_window_rows(
         &self,
         start: u64,
@@ -3061,10 +3063,11 @@ pub(crate) fn unregister_alias_entries(
         return std::collections::BTreeSet::new();
     }
     let mut overlapping = Vec::new();
-    for &(seq, alias) in registry.va_window_rows(va, end) {
-        if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
-            && alias.start.saturating_add(alias.size as u64) > va
-        {
+    for &(seq, alias) in registry
+        .process_va_indexes(mm_root_slot, container_root)
+        .flat_map(|index| index.window_rows(va, end))
+    {
+        if alias.start.saturating_add(alias.size as u64) > va {
             overlapping.push((seq, alias));
         }
     }
@@ -3381,11 +3384,12 @@ pub(crate) fn unregister_alias_in(
     let mut keys = std::collections::BTreeSet::new();
     let mut replay_before =
         std::collections::BTreeMap::<(AliasOwnershipScope, u64), Vec<ReplayMappingKey>>::new();
-    for (_, entry) in registry.va_window_rows(va, end) {
+    for (_, entry) in registry
+        .process_va_indexes(mm_root_slot, container_root)
+        .flat_map(|index| index.window_rows(va, end))
+    {
         let entry_end = entry.start.saturating_add(entry.size as u64);
-        if !alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
-            || entry_end <= va
-        {
+        if entry_end <= va {
             continue;
         }
         if let Some(bucket) = registry.by_scope.get(&entry.ownership_scope) {

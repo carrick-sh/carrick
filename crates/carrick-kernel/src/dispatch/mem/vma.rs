@@ -831,7 +831,7 @@ pub(crate) fn project_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
             || (vma.start >= mem.layout.heap_base && vma.end <= mem.brk_current))
             && vma.start < vma.end
         {
-            trim_dynamic_maps_for_range(&mut maps, vma.start, vma.end.saturating_sub(vma.start));
+            trim_proc_maps_for_range(&mut maps, vma.start, vma.end.saturating_sub(vma.start));
             maps.push(ProcMapsEntry {
                 start: vma.start,
                 end: vma.end,
@@ -844,7 +844,7 @@ pub(crate) fn project_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
         }
     }
     for dynamic in &mem.dynamic_maps {
-        trim_dynamic_maps_for_range(
+        trim_proc_maps_for_range(
             &mut maps,
             dynamic.start,
             dynamic.end.saturating_sub(dynamic.start),
@@ -1018,11 +1018,44 @@ pub(crate) fn boot_region_source_intersects_hidden_backing(
     boot_region_is_hidden_heap_backing(map, mem.layout) && end > mem.brk_current
 }
 
+/// Cut `[start, start+len)` out of `MemState::dynamic_maps`, which is kept
+/// sorted by start and disjoint (`insert_dynamic_map_coalescing` inserts at its
+/// sorted position only after this trim). O(log n + touched) instead of a
+/// rebuild of every live mapping per `mmap`/`munmap`.
 pub(crate) fn trim_dynamic_maps_for_range(maps: &mut Vec<ProcMapsEntry>, start: u64, len: u64) {
     let Some(end) = start.checked_add(len) else {
         maps.clear();
         return;
     };
+    cut_sorted_disjoint(
+        maps,
+        start,
+        end,
+        |map| (map.start, map.end),
+        |map, start, end| {
+            let mut piece = map.clone();
+            piece.start = start;
+            piece.end = end;
+            Some(piece)
+        },
+    );
+}
+
+/// Cut `[start, start+len)` out of a proc-maps projection in ANY order (boot
+/// regions, the `/proc/<pid>/maps` builder). Unlike
+/// [`trim_dynamic_maps_for_range`] it cannot rely on sortedness, so it skips the
+/// rebuild only when nothing overlaps.
+pub(crate) fn trim_proc_maps_for_range(maps: &mut Vec<ProcMapsEntry>, start: u64, len: u64) {
+    let Some(end) = start.checked_add(len) else {
+        maps.clear();
+        return;
+    };
+    if !maps
+        .iter()
+        .any(|map| ranges_overlap(start, len, map.start, map.end))
+    {
+        return;
+    }
     let mut next = Vec::with_capacity(maps.len());
     for map in maps.drain(..) {
         if !ranges_overlap(start, len, map.start, map.end) {

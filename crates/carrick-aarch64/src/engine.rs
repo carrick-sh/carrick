@@ -1363,7 +1363,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let result = loop {
             match vcpu.run() {
                 Ok(Aarch64Exit::MaintenanceDone) => {
-                    if std::env::var_os("CARRICK_MAINT_DEBUG").is_some() {
+                    if maint_debug() {
                         eprintln!("[MAINTDBG tid={}] stage-1 TLBI completed", debug_tid());
                     }
                     break Ok(());
@@ -1868,6 +1868,14 @@ fn trap_to_os(e: TrapError) -> OsError {
 /// The OS thread id for a diagnostic line, portably: `gettid(2)` on Linux (where
 /// the KVM lane runs), `0` elsewhere (this crate also compiles on macOS for the
 /// later HVF migration, where `SYS_gettid` is absent).
+/// Cached `CARRICK_MAINT_DEBUG` presence. Every stage-1 TLBI completion checks
+/// it; reading the environment there took the process-wide environment lock
+/// per flush.
+fn maint_debug() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| std::env::var_os("CARRICK_MAINT_DEBUG").is_some())
+}
+
 fn debug_tid() -> i64 {
     #[cfg(target_os = "linux")]
     {

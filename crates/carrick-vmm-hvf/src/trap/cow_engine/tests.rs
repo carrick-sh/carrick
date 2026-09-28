@@ -5,6 +5,25 @@
 use std::path::Path;
 
 #[test]
+fn alias_unmap_takes_frame_registry_guard_only_for_inventory_publication() {
+    let source = include_str!("../cow_engine.rs");
+    let unmap = source
+        .split("pub(crate) fn unregister_process_alias(")
+        .nth(1)
+        .expect("alias unmap entry point")
+        .split("pub(crate) fn prepare_process_alias_retirement(")
+        .next()
+        .expect("alias unmap end");
+    let publication = unmap
+        .find("if prepared.inventory.is_some()")
+        .expect("inventory publication branch must precede guard acquisition");
+    let guard = unmap
+        .find("FrameRegistryGuard::acquire(")
+        .expect("inventory publication needs a frame registry guard");
+    assert!(publication < guard);
+}
+
+#[test]
 fn frame_publication_sites_contain_no_carrier_topology_lock() {
     let cow_engine_src = include_str!("../cow_engine.rs");
     let foreign_mm_src = include_str!("../foreign_mm.rs");

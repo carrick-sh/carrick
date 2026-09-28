@@ -12,9 +12,27 @@ pub struct NamespaceMutationCoordinator {
     topology: RwLock<()>,
     state: Mutex<ParentAdmissionState>,
     changed: Condvar,
+    proven_parents: Mutex<ProvenParentIdentities>,
     #[cfg(test)]
     observed: Condvar,
 }
+
+/// Inode identities already read for live parent dirfds.
+///
+/// A descriptor's device/inode cannot change while it is open, so a parent
+/// dirfd admitted once needs no second `fstat` on the revalidation pass or on
+/// any later transaction that resolves the same cached descriptor. Entries are
+/// keyed by the descriptor's `Arc` allocation and hold a `Weak` to it: the
+/// weak reference keeps that allocation from being reused, so an address match
+/// whose upgrade is pointer-equal names exactly the descriptor that was
+/// probed. A dead entry is refreshed; the table is cleared when it reaches its
+/// bound, which only costs probes, never an answer.
+#[derive(Debug, Default)]
+struct ProvenParentIdentities {
+    by_fd: std::collections::HashMap<usize, (std::sync::Weak<std::os::fd::OwnedFd>, InodeIdentity)>,
+}
+
+const PROVEN_PARENT_IDENTITIES_MAX: usize = 1024;
 
 #[derive(Debug, Default)]
 struct ParentAdmissionState {
@@ -114,6 +132,32 @@ impl NamespaceMutationCoordinator {
             coordinator: self,
             parents,
         }
+    }
+
+    /// Identity of an admitted parent dirfd, probing the host only the first
+    /// time this exact descriptor is seen. See `ProvenParentIdentities`.
+    pub fn parent_fd_identity(
+        &self,
+        fd: &std::sync::Arc<std::os::fd::OwnedFd>,
+        probe: impl FnOnce(&std::os::fd::OwnedFd) -> Option<InodeIdentity>,
+    ) -> Option<InodeIdentity> {
+        let key = std::sync::Arc::as_ptr(fd) as usize;
+        if let Some((known, identity)) = self.proven_parents.lock().by_fd.get(&key)
+            && known
+                .upgrade()
+                .is_some_and(|live| std::sync::Arc::ptr_eq(&live, fd))
+        {
+            return Some(*identity);
+        }
+        let identity = probe(fd)?;
+        let mut proven = self.proven_parents.lock();
+        if proven.by_fd.len() >= PROVEN_PARENT_IDENTITIES_MAX {
+            proven.by_fd.clear();
+        }
+        proven
+            .by_fd
+            .insert(key, (std::sync::Arc::downgrade(fd), identity));
+        Some(identity)
     }
 
     pub fn with_parents<R, ResolveError, OperationError>(

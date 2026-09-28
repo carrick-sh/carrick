@@ -1323,7 +1323,13 @@ impl HvfVmState {
             return;
         };
         let mut receipts = self.cow_deferred_publications.lock();
-        if receipts.is_empty() {
+        // Every munmap and repoint reaches here. When no receipt names the
+        // range the rebuild below would reproduce the same vector in the same
+        // order, so skip its allocation and moves.
+        if !receipts
+            .iter()
+            .any(|receipt| receipt.va < end && va < receipt.va.saturating_add(receipt.len as u64))
+        {
             return;
         }
         let mut remaining = Vec::with_capacity(receipts.len());
@@ -4587,12 +4593,22 @@ impl HvfVmState {
         // syscall set, whose runtime dispatch already owns the process-wide
         // MM exclusion across invalidate + TLBI + this backend retirement.
         let prepared = self.prepare_process_alias_retirement(va, len)?;
-        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
-            carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
-            identity.linux_pid,
-            identity.linux_tid,
-        );
-        self.commit_process_alias_retirement(va, len, prepared, &registry)
+        if prepared.inventory.is_some() {
+            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
+                identity.linux_pid,
+                identity.linux_tid,
+            );
+            self.commit_process_alias_retirement(va, len, prepared, &registry)
+        } else {
+            self.commit_process_alias_retirement_inner(
+                va,
+                len,
+                prepared,
+                None,
+                AliasRetirementAuthorityState::Pending,
+            )
+        }
     }
 
     /// Prepare while the caller holds topology exclusion. Dropping this value
@@ -4705,7 +4721,7 @@ impl HvfVmState {
             va,
             len,
             prepared,
-            registry,
+            Some(registry),
             AliasRetirementAuthorityState::Pending,
         )
     }
@@ -4721,7 +4737,7 @@ impl HvfVmState {
             va,
             len,
             prepared,
-            registry,
+            Some(registry),
             AliasRetirementAuthorityState::AppliedWithReplacement,
         )
     }
@@ -4731,10 +4747,14 @@ impl HvfVmState {
         va: u64,
         len: usize,
         prepared: PreparedProcessAliasRetirement,
-        registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
+        registry: Option<&crate::fork_quiesce::FrameRegistryGuard<'_>>,
         authority_state: AliasRetirementAuthorityState,
     ) -> Result<(), TrapError> {
-        let _ = registry;
+        if prepared.inventory.is_some() && registry.is_none() {
+            return Err(TrapError::Hypervisor(
+                "alias retirement inventory publication lacks frame registry guard".to_owned(),
+            ));
+        }
         let authority = self.cow_authority.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch alias retirement has no inventory authority".to_owned())
         })?;
@@ -5422,7 +5442,11 @@ impl HvfTaskState {
     ) -> Option<PhysicalCowSource> {
         let physical_ipa = align_down(ipa, CowArmedRanges::COMPOUND_SIZE);
         let physical_end = physical_ipa.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
-        let semantic_end = semantic_va.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
+        // The source question concerns this physical compound, not the next
+        // 16 KiB starting at the queried Linux page. Near a mapping boundary
+        // the latter offers unrelated next-extent rows to every trailing page.
+        let semantic_start = semantic_va.checked_sub(ipa - physical_ipa)?;
+        let semantic_end = semantic_start.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
         let affine_translation_matches = |mapping_start: u64, mapping_ipa: u64| {
             if semantic_va < mapping_start {
                 ipa.checked_add(mapping_start - semantic_va) == Some(mapping_ipa)
@@ -5433,7 +5457,7 @@ impl HvfTaskState {
         // Geometry under the registry lock; owner authentication on the
         // released candidates (lock order, see `containing_candidates`).
         let alias_candidates = alias_registry().lock().process_va_overlap_candidates(
-            semantic_va,
+            semantic_start,
             CowArmedRanges::COMPOUND_SIZE,
             self.mm_root_slot,
             self.container_root,
@@ -5492,7 +5516,7 @@ impl HvfTaskState {
         }
         let mapping = self
             .mappings
-            .candidates_for_range(GuestVa(semantic_va), CowArmedRanges::COMPOUND_SIZE)
+            .candidates_for_range(GuestVa(semantic_start), CowArmedRanges::COMPOUND_SIZE)
             .find(|mapping| {
                 let physical_mapping_end = mapping
                     .physical_ipa
@@ -5616,6 +5640,20 @@ impl HvfTaskState {
         &mut self,
         manager: &carrick_mmu_core::aarch64::PageTableManager,
     ) -> Result<(), TrapError> {
+        // Called after every descriptor-changing stage-1 edit, and almost every
+        // edit adds no arena. The root row lookup below scans every mapping row
+        // of the task, so answer "nothing new" from the owner map first.
+        const TWO_MIB: usize = 2 * 1024 * 1024;
+        let unpublished = {
+            let owners = self.mm_access.structural_owners.read();
+            manager
+                .extension_arena_bases()
+                .into_iter()
+                .any(|base| !owners.contains_key(&(base, TWO_MIB)))
+        };
+        if !unpublished {
+            return Ok(());
+        }
         let root_perms = self
             .mm_root_slot
             .and_then(|(root_base, _)| {

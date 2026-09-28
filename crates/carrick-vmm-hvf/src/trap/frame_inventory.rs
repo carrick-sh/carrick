@@ -298,6 +298,8 @@ pub(crate) fn reconcile_carrier_stage2_authority_retention(
 #[derive(Debug, Default)]
 pub(crate) struct InventoryExtentMap {
     extents: std::collections::BTreeMap<(u64, u64), InventoryExtent>,
+    /// Exact stage-2 lease to the per-mm logical extent keys it owns.
+    by_lease: std::collections::BTreeMap<(u64, u64), std::collections::BTreeSet<(u64, u64)>>,
     /// `(class, start, length)` for every key, where every member of
     /// `class` has `length <= 1 << class`. A key can contain `ipa` only if it
     /// starts within its class's width below `ipa`.
@@ -317,6 +319,19 @@ impl InventoryExtentMap {
         extent: InventoryExtent,
     ) -> Option<InventoryExtent> {
         let previous = self.extents.insert(key, extent);
+        if let Some(old) = previous {
+            let lease = (old.stage2_base, old.stage2_length);
+            if let Some(keys) = self.by_lease.get_mut(&lease) {
+                keys.remove(&key);
+                if keys.is_empty() {
+                    self.by_lease.remove(&lease);
+                }
+            }
+        }
+        self.by_lease
+            .entry((extent.stage2_base, extent.stage2_length))
+            .or_default()
+            .insert(key);
         if previous.is_none() {
             let class = Self::class(key.1);
             self.by_class.insert((class, key.0, key.1));
@@ -327,6 +342,13 @@ impl InventoryExtentMap {
 
     pub(crate) fn remove(&mut self, key: &(u64, u64)) -> Option<InventoryExtent> {
         let removed = self.extents.remove(key)?;
+        let lease = (removed.stage2_base, removed.stage2_length);
+        if let Some(keys) = self.by_lease.get_mut(&lease) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.by_lease.remove(&lease);
+            }
+        }
         let class = Self::class(key.1);
         self.by_class.remove(&(class, key.0, key.1));
         if let std::collections::btree_map::Entry::Occupied(mut count) =
@@ -342,6 +364,7 @@ impl InventoryExtentMap {
 
     pub(crate) fn clear(&mut self) {
         self.extents.clear();
+        self.by_lease.clear();
         self.by_class.clear();
         self.class_counts.clear();
     }
@@ -374,6 +397,26 @@ impl InventoryExtentMap {
             }
         }
         self.extents.get_key_value(&first?)
+    }
+
+    pub(crate) fn for_leases(
+        &self,
+        leases: &std::collections::BTreeSet<(u64, u64)>,
+    ) -> Vec<((u64, u64), InventoryExtent)> {
+        let mut mappings = Vec::new();
+        for lease in leases {
+            if let Some(keys) = self.by_lease.get(lease) {
+                for key in keys {
+                    note_hot_path_rows(HotPathScan::FrameExtents, 1);
+                    if let Some(&extent) = self.extents.get(key) {
+                        mappings.push((*key, extent));
+                    }
+                }
+            }
+        }
+        // Preserve the former BTreeMap iteration order for inventory events.
+        mappings.sort_unstable_by_key(|&(key, _)| key);
+        mappings
     }
 }
 
@@ -580,6 +623,16 @@ impl CowArmedRanges {
 
     pub(crate) fn disarm(&mut self, span: CowArmedSpan) {
         let span_end = span.va.saturating_add(span.len as u64);
+        // Ranges may overlap (a page arm inside a compound arm), so there is no
+        // order to search; but when none intersects the span the rebuild below
+        // is the identity, and it runs once per span on every munmap.
+        if !self
+            .ranges
+            .iter()
+            .any(|range| range.va < span_end && span.va < range.va.saturating_add(range.len as u64))
+        {
+            return;
+        }
         let mut replacement = Vec::with_capacity(self.ranges.len().saturating_add(1));
         for range in self.ranges.drain(..) {
             let range_end = range.va.saturating_add(range.len as u64);
@@ -1355,12 +1408,7 @@ impl HvfVmState {
         leases: &std::collections::BTreeSet<(u64, u64)>,
         authority_mapping_count: &dyn Fn(carrick_hal::FrameId) -> Result<Option<usize>, TrapError>,
     ) -> Result<InventoryLeaseRetirement, TrapError> {
-        let mappings: Vec<_> = inventory
-            .extents
-            .iter()
-            .filter(|(_, extent)| leases.contains(&(extent.stage2_base, extent.stage2_length)))
-            .map(|(&key, &extent)| (key, extent))
-            .collect();
+        let mappings = inventory.extents.for_leases(leases);
         let mut removed_frames = std::collections::BTreeMap::new();
         let mut removed_leases = std::collections::BTreeMap::new();
         for (_, extent) in &mappings {

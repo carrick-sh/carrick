@@ -100,6 +100,35 @@ pub fn reset_test_host_parent_fstat_count() {
     TEST_HOST_PARENT_FSTAT_COUNT.with(|c| c.set(0));
 }
 
+/// Exhaustive process-wide count of host BSD syscalls, from the kernel's own
+/// per-task accounting (`proc_pidinfo(PROC_PIDTASKINFO).pti_syscalls_unix`).
+///
+/// The thread-local counters above only see call sites routed through the
+/// counting macros; this one sees every host syscall any carrick layer makes
+/// (dentry cache, dispatcher, `std::fs`), so a structural budget built on it
+/// cannot be evaded by a raw `libc::` call. It is PROCESS-wide: read it only
+/// from a `serial_host` test, and subtract the one syscall the reading itself
+/// costs (`proc_pidinfo`; Darwin's libc serves `getpid` from a cache).
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+pub fn host_bsd_syscall_count() -> u64 {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    assert_eq!(written, size, "proc_pidinfo(PROC_PIDTASKINFO) failed");
+    // SAFETY: fully written above.
+    let info = unsafe { info.assume_init() };
+    u64::try_from(info.pti_syscalls_unix).unwrap_or(0)
+}
+
 macro_rules! host_openat {
     ($($arg:expr),* $(,)?) => {{
         #[cfg(any(test, feature = "test-support"))]
@@ -4328,18 +4357,17 @@ impl FsBackend for HostFsBackend {
             return Some(OverlayEntryKind::Dir);
         }
         let rel = Self::rel_path(&normalized)?;
+        // ONE `fstatat(parent, leaf, AT_SYMLINK_NOFOLLOW)` answers every
+        // outcome. The contained fast lane and the fallback below issue the
+        // identical call against the identical cached parent dirfd, so when
+        // the lane is available its answer is final: a miss (the first probe
+        // of every guest `open(O_CREAT)` of a new name) or a symlink/FIFO leaf
+        // must not pay the same `fstatat` a second time.
         #[cfg(target_os = "macos")]
-        if let Some((_, kind)) = self.fast_lstat_contained(rel, false) {
-            if !self.name_matches_on_disk(rel) {
-                return None;
-            }
-            return match kind {
-                RootFsEntryKind::Directory => Some(OverlayEntryKind::Dir),
-                RootFsEntryKind::File => Some(OverlayEntryKind::File),
-                _ => None,
-            };
-        }
-        if self.sparse_upper_nofollow_absent(path) {
+        let fast_lane = self.fast_fs && self.root_prefix.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let fast_lane = false;
+        if !fast_lane && self.sparse_upper_nofollow_absent(path) {
             return None;
         }
         let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
@@ -4352,21 +4380,25 @@ impl FsBackend for HostFsBackend {
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         };
-        if rc != 0 || !self.name_matches_on_disk(rel) {
+        if rc != 0 {
             return None;
         }
         let mode = st.st_mode as u32;
         let file_type = mode & (libc::S_IFMT as u32);
-        if file_type == libc::S_IFDIR as u32 {
-            return Some(OverlayEntryKind::Dir);
-        }
-        if file_type == libc::S_IFREG as u32
+        let kind = if file_type == libc::S_IFDIR as u32 {
+            OverlayEntryKind::Dir
+        } else if file_type == libc::S_IFREG as u32
             || file_type == libc::S_IFLNK as u32
             || file_type == libc::S_IFIFO as u32
         {
-            return Some(OverlayEntryKind::File);
+            OverlayEntryKind::File
+        } else {
+            return None;
+        };
+        if !self.name_matches_on_disk(rel) {
+            return None;
         }
-        None
+        Some(kind)
     }
 
     fn fast_nofollow_metadata(&self, path: &str) -> Option<RootFsMetadata> {
@@ -5344,16 +5376,30 @@ impl FsBackend for HostFsBackend {
             };
         }
         let mut dst_stat: libc::stat = unsafe { std::mem::zeroed() };
-        let same_object = unsafe {
+        let dst_exists = unsafe {
             host_fstatat!(
                 dst_pfd,
                 dst_name_c.as_ptr(),
                 &mut dst_stat,
                 libc::AT_SYMLINK_NOFOLLOW,
             ) == 0
-                && src_stat.st_dev == dst_stat.st_dev
-                && src_stat.st_ino == dst_stat.st_ino
         };
+        let same_object =
+            dst_exists && src_stat.st_dev == dst_stat.st_dev && src_stat.st_ino == dst_stat.st_ino;
+        // Whether this rename can change which inode an EXISTING directory
+        // path names. Only a directory or a symlink can: the directory cache
+        // holds dirfds for real directories and for the symlink hops it
+        // resolved (published under the link's own path). rename(2) refuses to
+        // put a non-directory over a directory, so a rename between two other
+        // kinds changes exactly the old and new names — which the exact
+        // evictions below cover — and must not flush every process's
+        // directory cache and the parents' child stat entries with them.
+        let topology_kind = |mode: libc::mode_t| {
+            let file_type = mode & libc::S_IFMT;
+            file_type == libc::S_IFDIR || file_type == libc::S_IFLNK
+        };
+        let changes_dir_topology =
+            topology_kind(src_stat.st_mode) || (dst_exists && topology_kind(dst_stat.st_mode));
         let rc =
             unsafe { libc::renameat(src_pfd, src_name_c.as_ptr(), dst_pfd, dst_name_c.as_ptr()) };
         if rc != 0 {
@@ -5365,7 +5411,11 @@ impl FsBackend for HostFsBackend {
         if same_object {
             return Ok(OverlayRenameOutcome::SameObject);
         }
-        self.propagate_marker_dir(src_pfd, dst_pfd, dst_rel.as_path());
+        // A rename within one directory cannot give that directory a marker it
+        // lacked; only a move to another parent carries the flag across.
+        if src_pfd != dst_pfd {
+            self.propagate_marker_dir(src_pfd, dst_pfd, dst_rel.as_path());
+        }
 
         #[cfg(not(target_os = "macos"))]
         {
@@ -5395,17 +5445,19 @@ impl FsBackend for HostFsBackend {
         }
 
         crate::fs_resolve_cache::bump_generation();
-        crate::fs_resolve_cache::bump_dir_generation();
-        let src_parent = src_rel.parent().unwrap_or_else(|| Path::new(""));
-        let dst_parent = dst_rel.parent().unwrap_or_else(|| Path::new(""));
-        self.dir_gen_for(src_parent)
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.dir_gen_for(dst_parent)
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.dir_gen_for(src_rel.as_path())
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.dir_gen_for(dst_rel.as_path())
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if changes_dir_topology {
+            crate::fs_resolve_cache::bump_dir_generation();
+            let src_parent = src_rel.parent().unwrap_or_else(|| Path::new(""));
+            let dst_parent = dst_rel.parent().unwrap_or_else(|| Path::new(""));
+            self.dir_gen_for(src_parent)
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.dir_gen_for(dst_parent)
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.dir_gen_for(src_rel.as_path())
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.dir_gen_for(dst_rel.as_path())
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.evict_dir_cache_subtree(src_rel.as_path());
         self.evict_dir_cache_subtree(dst_rel.as_path());
         self.evict_stat_cache_subtree(src_rel.as_path());

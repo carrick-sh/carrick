@@ -83,30 +83,6 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
-      "symbol": "debug_mmap_next_lowering::CARRICK_FORK_DEBUG_VA",
-      "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in debug_mmap_next_lowering::CARRICK_FORK_DEBUG_VA (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
-      "symbol": "free_regions_insert::CARRICK_FORK_DEBUG_VA",
-      "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in free_regions_insert::CARRICK_FORK_DEBUG_VA (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
-      "symbol": "next_mmap_address::CARRICK_FORK_DEBUG_VA",
-      "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in next_mmap_address::CARRICK_FORK_DEBUG_VA (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
       "file": "crates/carrick-kernel/src/dispatch/mem/madvise.rs",
       "symbol": "madvise::CARRICK_MINCORE_EXACT",
       "fingerprint": "4a6206a3e2aa3f4e04f5c34445cd1c90feb37bd6c3bd184e83a49cad3b165ad6",
@@ -696,14 +672,6 @@
       "fingerprint": "f3814f075ae168bea59b99647f7a4fd37ef9e7d97ac8b1e8c28e1a1e26402c68",
       "classification": "config_debug",
       "rationale": "Environment variable CARRICK_STRICT_DURABILITY read in flush::CARRICK_STRICT_DURABILITY (crates/carrick-kernel/src/dispatch/host_io.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
-      "symbol": "next_mmap_address::CARRICK_MMAP_GRANT_DEBUG",
-      "fingerprint": "80c748ba662570f06454f1cac60f540e89547595e0d2450b758d1f396f4774c4",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_MMAP_GRANT_DEBUG read in next_mmap_address::CARRICK_MMAP_GRANT_DEBUG (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var_os",
@@ -3568,6 +3536,54 @@
       "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
       "classification": "test_only",
       "rationale": "Test-only thread-local cell STAGE2_AUDIT_STATE in crates/carrick-vmm-hvf/src/trap.rs enabling hypervisor stage-2 audit and failure injection in unit tests."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
+      "symbol": "fork_debug_va::CARRICK_FORK_DEBUG_VA",
+      "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
+      "classification": "config_debug",
+      "rationale": "CARRICK_FORK_DEBUG_VA names one guest VA for the mmap allocator audits (free-list insert, bump lowering, grant). Parsed once into a OnceLock so the mmap/munmap hot path no longer takes the environment lock per call; read-only carrier-wide debug configuration."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
+      "symbol": "mmap_grant_debug::CARRICK_MMAP_GRANT_DEBUG",
+      "fingerprint": "80c748ba662570f06454f1cac60f540e89547595e0d2450b758d1f396f4774c4",
+      "classification": "config_debug",
+      "rationale": "CARRICK_MMAP_GRANT_DEBUG enables the non-FIXED mmap grant overlap audit. Read once into a OnceLock so every mmap no longer reads the environment; read-only carrier-wide debug configuration."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
+      "symbol": "fork_debug_va::DEBUG_VA",
+      "fingerprint": "eee6d1eaef30155d4b9adc490539fa86a1c0392d01bb5e45abae9a493d04b321",
+      "classification": "config_debug",
+      "rationale": "OnceLock cache of CARRICK_FORK_DEBUG_VA for the mmap allocator audits; initialized from the environment once and never written again."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
+      "symbol": "mmap_grant_debug::GRANT_DEBUG",
+      "fingerprint": "cef02c115b2f038821466dd2a48bd68b8e1687595c7a388e2bfcbe9a9ebde21c",
+      "classification": "config_debug",
+      "rationale": "OnceLock cache of CARRICK_MMAP_GRANT_DEBUG presence; initialized from the environment once and never written again."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/dispatch/mem/metadata_budget_tests.rs",
+      "symbol": "allocation_meter::ALLOCATOR",
+      "fingerprint": "d4c9d80202765523c1138ceb045009150abc1fa333ebf119f3328aebba0ab748",
+      "classification": "test_only",
+      "rationale": "Test-only counting allocator ALLOCATOR used by the mmap/munmap/brk metadata budget tests to measure host-heap bytes per call; compiled under cfg(test) only."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-kernel/src/dispatch/mem/metadata_budget_tests.rs",
+      "symbol": "allocation_meter::BYTES",
+      "fingerprint": "1979ac4a51ecee9d3c94d37d8386815313eafbb8eb78938ef944a88407cd3f15",
+      "classification": "test_only",
+      "rationale": "Test-only per-thread byte counter for the mmap/munmap/brk metadata budget tests; compiled under cfg(test) only."
     },
     {
       "kind": "env_var",
