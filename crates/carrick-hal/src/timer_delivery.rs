@@ -236,7 +236,7 @@ mod tests {
         carrick_signal_core::clear_proc_pending();
     }
 
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::guest_timer_bridge::TIMER_REGISTRY_TEST_LOCK as TEST_LOCK;
 
     #[derive(Clone, Copy, Debug, Default)]
     struct MockCpuSampler(u64, u64);
