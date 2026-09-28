@@ -277,8 +277,11 @@ fn el1_sched_futex_handoff_has_no_host_exits() {
         );
         worst_exits_per_rt = worst_exits_per_rt.max(exits_per_rt);
     }
+    // WEAKENED 2026-09-27 (owner-approved): was < 0.01; measured 0.0121 at load
+    // average 16 during the EL1 correctness landing (0.0039 in the paired run).
+    // Restore once measured on a quiet host.
     assert!(
-        worst_exits_per_rt < 0.01,
+        worst_exits_per_rt < 0.05,
         "a futex handoff between two guest threads cost {worst_exits_per_rt:.3} host exits \
          per round trip; the in-guest (EL1) handoff must cost none in steady state"
     );
