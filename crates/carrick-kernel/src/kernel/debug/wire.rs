@@ -224,12 +224,26 @@ pub trait SocketDeadline {
 
 impl SocketDeadline for std::os::unix::net::UnixStream {
     fn set_read_deadline(&mut self, budget: Option<Duration>) -> Result<(), WireError> {
-        self.set_read_timeout(budget)?;
+        let budget = budget.map(|d| d.max(Duration::from_micros(1)));
+        if let Err(error) = self.set_read_timeout(budget) {
+            // Darwin / BSD returns EINVAL from `setsockopt(SO_RCVTIMEO)` when
+            // the socket has already been shut down or its peer has closed.
+            // Any data previously written by the peer is already buffered and
+            // readable without blocking; once drained, read returns EOF.
+            if error.raw_os_error() != Some(libc::EINVAL) {
+                return Err(WireError::Io(error));
+            }
+        }
         Ok(())
     }
 
     fn set_write_deadline(&mut self, budget: Option<Duration>) -> Result<(), WireError> {
-        self.set_write_timeout(budget)?;
+        let budget = budget.map(|d| d.max(Duration::from_micros(1)));
+        if let Err(error) = self.set_write_timeout(budget) {
+            if error.raw_os_error() != Some(libc::EINVAL) {
+                return Err(WireError::Io(error));
+            }
+        }
         Ok(())
     }
 
@@ -451,10 +465,46 @@ mod tests {
             "client-write",
         )
         .expect("client writes the request");
+        // The server worker thread is joined before the client reads the response.
+        // This makes deterministic the worst-case timing race observed under
+        // heavy host load: the server thread exits and closes its socket half
+        // before the client calls `read_frame`. On Darwin, calling `setsockopt(SO_RCVTIMEO)`
+        // on a socket whose write half was shut down and whose peer is already
+        // closed returns `EINVAL`, but the client must still read the buffered
+        // response bytes without aborting.
+        worker.join().expect("server thread");
         let response = read_frame(&mut client, MAX_RESPONSE_BYTES, deadline, "client-read")
             .expect("client reads the response");
+
         assert_eq!(response, b"pong");
-        worker.join().expect("server thread");
+    }
+
+    #[test]
+    fn an_expired_deadline_over_a_real_socket_reports_a_timeout_not_an_io_error() {
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        drop(server);
+
+        // Expired deadline with peer closed must report a named timeout, not an IO error.
+        let error = read_frame(
+            &mut client,
+            MAX_RESPONSE_BYTES,
+            Instant::now() - Duration::from_millis(1),
+            "client-read",
+        )
+        .expect_err("expired deadline must fail");
+        assert!(
+            error.is_timeout(),
+            "expected a named timeout, got {error:?}"
+        );
+
+        // Explicit zero budget must be clamped to a non-zero timeout rather than
+        // rejected as InvalidInput by the runtime.
+        client
+            .set_read_deadline(Some(Duration::ZERO))
+            .expect("zero read deadline must be clamped");
+        client
+            .set_write_deadline(Some(Duration::ZERO))
+            .expect("zero write deadline must be clamped");
     }
 
     #[test]
