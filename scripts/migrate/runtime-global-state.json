@@ -3351,7 +3351,7 @@
       "symbol": "SYSTEM_CHARGE_WINDOW",
       "fingerprint": "761f744a623027ad2ff9fefe442521860f8fcfae43bd03d5dd2c8dbd9b920fee",
       "classification": "carrier_infra",
-      "rationale": "Host thread-local cell SYSTEM_CHARGE_WINDOW in crates/carrick-runtime/src/kernel/objects.rs holding this HOST thread's open system-CPU charge window for the logical guest thread its executor is currently running. It is per-host-thread by construction \u2014 the CLOCK_THREAD_CPUTIME_ID reading it brackets describes this host thread and no other \u2014 and it selects no container state: the logical thread it charges is named by a WEAK reference that every use upgrades, so it neither keeps a retired Thread alive nor can be aliased by a recycled allocation, and the executor closes it at every boundary audit."
+      "rationale": "Host thread-local cell SYSTEM_CHARGE_WINDOW in crates/carrick-runtime/src/kernel/objects.rs holding this HOST thread's open system-CPU charge window for the logical guest thread its executor is currently running. It is per-host-thread by construction — the CLOCK_THREAD_CPUTIME_ID reading it brackets describes this host thread and no other — and it selects no container state: the logical thread it charges is named by a WEAK reference that every use upgrades, so it neither keeps a retired Thread alive nor can be aliased by a recycled allocation, and the executor closes it at every boundary audit."
     },
     {
       "kind": "thread_local",
@@ -3632,6 +3632,54 @@
       "fingerprint": "810e6edc6ac71f37c4eb86f28b68168eb8d1faac13e5facea0127a51501d3002",
       "classification": "config_debug",
       "rationale": "Cached value of the CARRICK_EL1_FRAME_GRANT bisection hatch in crates/carrick-runtime/src/vcpu_loop/signal.rs; read once, immutable for the carrier's life."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vfs/src/fs_resolve_cache.rs",
+      "symbol": "LOCAL_PATH_BUMPS",
+      "fingerprint": "e8cf50950e19a23bf12a62c17b964003216162466f208e3d1977d40b48de2d6b",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide monotonic count of path-generation bumps published by this host process (crates/carrick-vfs/src/fs_resolve_cache.rs); compared with the shared generation so a dentry hook keeps unaffected local names only when every intervening bump came from this process. Host-process lifecycle state, not Linux process state."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
+      "symbol": "CORE_FILE_MAPPING_VISITS",
+      "fingerprint": "79b984444e40f4c60a83e6cf0b61540cf2b107108dd76a5985b03008673457a2",
+      "classification": "test_only",
+      "rationale": "cfg(test) per-thread counter of file-mapping rows visited by core-dump selection, read by the mmap/munmap structural budget tests."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-kernel/src/dispatch/mem/metadata_budget_tests.rs",
+      "symbol": "allocation_meter::CALLS",
+      "fingerprint": "fcbb46529d9f212a87507c71261580ad1302f22c6ec60daf7632cd08076b1903",
+      "classification": "test_only",
+      "rationale": "Test-only per-thread allocation call counter for the mmap/munmap/brk and openat metadata budget tests; compiled under cfg(test) only."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-kernel/src/dispatch/mem/vma.rs",
+      "symbol": "VMA_SHIFT_COUNT",
+      "fingerprint": "6e1d019fa1282e92d6e8b36565bc4aadacdb1cc52c9bafe216cb5a426d3cba58",
+      "classification": "test_only",
+      "rationale": "cfg(test) per-thread counter of VMA rows shifted by an insert or trim, read by the brk structural budget tests."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
+      "symbol": "TEST_HOST_READDIR_COUNT",
+      "fingerprint": "d673674e1f23acbae19b05fcbd30890fb5305434162bcd5c18a70069804f450d",
+      "classification": "test_only",
+      "rationale": "Test-support per-thread counter of host readdir calls, read by the getdents64 structural budget tests; compiled only with cfg(test) or the test-support feature."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
+      "symbol": "TEST_LAYER_MERGE_COUNT",
+      "fingerprint": "01d48838d3f02daf38e4e4d4a4fb2bdd5658df122fdedd08f234c4b8ffecac7f",
+      "classification": "test_only",
+      "rationale": "Test-support per-thread counter of OCI layer merges, read by the getdents64 structural budget tests; compiled only with cfg(test) or the test-support feature."
     }
   ]
 }
