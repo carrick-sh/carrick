@@ -309,3 +309,28 @@ fn brk_grow_shrink_work_is_independent_of_mapping_population() {
         );
     });
 }
+
+#[test]
+fn brk_existing_heap_growth_does_not_shift_unrelated_vmas() {
+    for population in [SMALL, 256, LARGE] {
+        let mut process = process_with_population(population);
+        let base = process.call(SYS_BRK, [0; 6]) as u64;
+        let current = base + 4 * PAGE;
+        assert_eq!(
+            process.call(SYS_BRK, [current, 0, 0, 0, 0, 0]) as u64,
+            current
+        );
+        VmaMap::reset_shift_count();
+        let grown = current + 4 * PAGE;
+        assert_eq!(process.call(SYS_BRK, [grown, 0, 0, 0, 0, 0]) as u64, grown);
+        assert_eq!(
+            process.call(SYS_BRK, [current, 0, 0, 0, 0, 0]) as u64,
+            current
+        );
+        let shifts = VmaMap::shift_count();
+        assert_eq!(
+            shifts, 0,
+            "brk moved {shifts} unrelated VMAs at population {population}"
+        );
+    }
+}
