@@ -685,6 +685,11 @@ static VCPU_RUN_EXIT_CLASSES: [std::sync::atomic::AtomicU64;
     carrick_el1_abi::HostExitClass::COUNT] =
     [const { std::sync::atomic::AtomicU64::new(0) }; carrick_el1_abi::HostExitClass::COUNT];
 
+/// `hvc #2` returns whose saved EL1 syndrome was not an EL0 syscall. The
+/// coarse HVC class alone cannot distinguish these from forwarded syscalls.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static VCPU_HVC_NOT_SVC_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The carrier's total count of vCPU exits to the host (`hv_vcpu_run`
 /// returns). Tests read deltas across a workload to count host exits per
 /// operation; the counter is carrier-global, so hold the guest lock.
@@ -698,6 +703,11 @@ pub fn vcpu_run_exits_total() -> u64 {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn vcpu_run_exit_classes() -> [u64; carrick_el1_abi::HostExitClass::COUNT] {
     std::array::from_fn(|i| VCPU_RUN_EXIT_CLASSES[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn vcpu_hvc_not_svc_total() -> u64 {
+    VCPU_HVC_NOT_SVC_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 thread_local! {
@@ -7830,6 +7840,7 @@ impl HvfInner {
                         return Ok(Aarch64Exit::MaintenanceDone);
                     }
                     HvcExitOutcome::NotSvc { esr } => {
+                        VCPU_HVC_NOT_SVC_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if HvfVmState::emulate_el0_sys64_read_inner(vcpu, esr)? {
                             // Serviced (ELR_EL1 advanced, target GPR written) — re-run.
                             continue;
