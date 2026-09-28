@@ -20,7 +20,7 @@ use super::tests::{CountingMmapMemory, returned};
 use super::*;
 use crate::memory::LINUX_MMAP_BASE;
 
-mod allocation_meter {
+pub(crate) mod allocation_meter {
     use std::{
         alloc::{GlobalAlloc, Layout, System},
         cell::Cell,
@@ -28,6 +28,7 @@ mod allocation_meter {
 
     thread_local! {
         static BYTES: Cell<Option<u64>> = const { Cell::new(None) };
+        static CALLS: Cell<Option<u64>> = const { Cell::new(None) };
     }
 
     struct CountingAllocator;
@@ -39,6 +40,11 @@ mod allocation_meter {
         let _ = BYTES.try_with(|count| {
             if let Some(total) = count.get() {
                 count.set(Some(total.saturating_add(bytes as u64)));
+            }
+        });
+        let _ = CALLS.try_with(|count| {
+            if let Some(total) = count.get() {
+                count.set(Some(total.saturating_add(1)));
             }
         });
     }
@@ -66,12 +72,26 @@ mod allocation_meter {
         }
     }
 
-    /// Host-heap bytes requested by this thread while `run` executes.
-    pub(super) fn measure<T>(run: impl FnOnce() -> T) -> (T, u64) {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct AllocationStats {
+        pub bytes: u64,
+        pub calls: u64,
+    }
+
+    /// Host-heap allocations and bytes requested by this thread while `run` executes.
+    pub(crate) fn measure_stats<T>(run: impl FnOnce() -> T) -> (T, AllocationStats) {
         BYTES.with(|count| count.set(Some(0)));
+        CALLS.with(|count| count.set(Some(0)));
         let value = run();
         let bytes = BYTES.with(|count| count.replace(None)).unwrap_or(0);
-        (value, bytes)
+        let calls = CALLS.with(|count| count.replace(None)).unwrap_or(0);
+        (value, AllocationStats { bytes, calls })
+    }
+
+    /// Host-heap bytes requested by this thread while `run` executes.
+    pub(super) fn measure<T>(run: impl FnOnce() -> T) -> (T, u64) {
+        let (val, stats) = measure_stats(run);
+        (val, stats.bytes)
     }
 }
 

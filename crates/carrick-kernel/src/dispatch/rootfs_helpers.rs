@@ -158,30 +158,64 @@ pub(super) fn blocks_512(size: usize) -> i64 {
     }
 }
 
-pub(super) fn dirent64_record(entry: &RootFsDirEntry, next_offset: usize) -> Vec<u8> {
-    // `entry.name` is in the VFS layer's reversible escape form; decode back to
-    // the opaque directory-entry BYTES so an undecodable filename round-trips
-    // through getdents (Linux d_name is raw bytes, not UTF-8). Valid-UTF-8
-    // names decode to themselves.
-    let name_bytes = carrick_vfs::pathcodec::decode_to_bytes(&entry.name);
-    let name = name_bytes.as_slice();
-    let record_len = align_to(LINUX_DIRENT64_HEADER_SIZE + name.len() + 1, 8);
-    let header = LinuxDirent64Header {
-        // Real host inode when known, so scandir's DirEntry.inode() matches a
-        // later stat()'s st_ino; else a stable path-hash (in-memory/synthetic).
-        d_ino: if entry.ino != 0 {
-            entry.ino
-        } else {
-            inode_for_path(&entry.metadata.path)
-        },
-        d_off: next_offset as i64,
-        d_reclen: record_len as u16,
-        d_type: linux_dirent_type(entry.metadata.kind),
+#[inline]
+pub(super) fn dirent64_record_len(entry: &RootFsDirEntry) -> usize {
+    let name_len = if carrick_vfs::pathcodec::has_escaped_bytes(&entry.name) {
+        carrick_vfs::pathcodec::decode_to_bytes(&entry.name).len()
+    } else {
+        entry.name.len()
     };
+    align_to(LINUX_DIRENT64_HEADER_SIZE + name_len + 1, 8)
+}
 
-    let mut out = vec![0; record_len];
-    out[..LINUX_DIRENT64_HEADER_SIZE].copy_from_slice(header.as_bytes());
-    out[LINUX_DIRENT64_HEADER_SIZE..LINUX_DIRENT64_HEADER_SIZE + name.len()].copy_from_slice(name);
+pub(super) fn append_dirent64_record(
+    entry: &RootFsDirEntry,
+    next_offset: usize,
+    out: &mut Vec<u8>,
+) {
+    let start = out.len();
+    let d_ino = if entry.ino != 0 {
+        entry.ino
+    } else {
+        inode_for_path(&entry.metadata.path)
+    };
+    let d_type = linux_dirent_type(entry.metadata.kind);
+
+    if !carrick_vfs::pathcodec::has_escaped_bytes(&entry.name) {
+        let name_bytes = entry.name.as_bytes();
+        let record_len = align_to(LINUX_DIRENT64_HEADER_SIZE + name_bytes.len() + 1, 8);
+        let header = LinuxDirent64Header {
+            d_ino,
+            d_off: next_offset as i64,
+            d_reclen: record_len as u16,
+            d_type,
+        };
+        out.resize(start + record_len, 0);
+        out[start..start + LINUX_DIRENT64_HEADER_SIZE].copy_from_slice(header.as_bytes());
+        out[start + LINUX_DIRENT64_HEADER_SIZE
+            ..start + LINUX_DIRENT64_HEADER_SIZE + name_bytes.len()]
+            .copy_from_slice(name_bytes);
+    } else {
+        let name_bytes = carrick_vfs::pathcodec::decode_to_bytes(&entry.name);
+        let record_len = align_to(LINUX_DIRENT64_HEADER_SIZE + name_bytes.len() + 1, 8);
+        let header = LinuxDirent64Header {
+            d_ino,
+            d_off: next_offset as i64,
+            d_reclen: record_len as u16,
+            d_type,
+        };
+        out.resize(start + record_len, 0);
+        out[start..start + LINUX_DIRENT64_HEADER_SIZE].copy_from_slice(header.as_bytes());
+        out[start + LINUX_DIRENT64_HEADER_SIZE
+            ..start + LINUX_DIRENT64_HEADER_SIZE + name_bytes.len()]
+            .copy_from_slice(&name_bytes);
+    }
+}
+
+#[allow(dead_code)]
+pub(super) fn dirent64_record(entry: &RootFsDirEntry, next_offset: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(dirent64_record_len(entry));
+    append_dirent64_record(entry, next_offset, &mut out);
     out
 }
 
