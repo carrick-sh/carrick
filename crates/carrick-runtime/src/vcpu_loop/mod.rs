@@ -1671,6 +1671,9 @@ where
         } else {
             SyscallMmPhase::Ordinary(mm_executor)
         };
+        if let SyscallMmPhase::Mutation(ref guard) = mm_phase {
+            signal::reconcile_guest_frame_commits(&kernel.dispatcher, engine, guard);
+        }
         // The parked-slice, sleep/poll deadline and child-wait trace state that
         // used to live here belonged to the in-loop compatibility wait arms.
         // Every blocking outcome now escapes to the executor's continuation

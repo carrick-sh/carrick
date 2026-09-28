@@ -981,6 +981,9 @@ where
                 );
             });
         if owns_final_mm {
+            if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+                table.retire_overlapping(terminal_mm.raw(), 0, u64::MAX);
+            }
             let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
                 carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
                 process.pid(),

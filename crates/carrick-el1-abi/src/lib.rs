@@ -1223,6 +1223,7 @@ const GRANT_EMPTY: u64 = 0;
 const GRANT_RETIRED: u64 = 1;
 const GRANT_WRITING: u64 = 2;
 const GRANT_LIVE: u64 = 3;
+const GRANT_STATE_MASK: u64 = 3;
 const GRANT_PAGE_SIZE: u64 = 4096;
 const GRANT_PROBES: usize = 64;
 
@@ -1267,6 +1268,7 @@ pub struct FrameGrantResidencyPage {
     pub slot: usize,
     pub identity: FrameGrantResidencyIdentity,
     pub expected_ipa: u64,
+    epoch: u64,
     bit: usize,
 }
 
@@ -1334,7 +1336,11 @@ impl FrameGrantResidencyRecord {
         for word in &self.committed {
             word.store(0, Ordering::Relaxed);
         }
-        self.state.store(GRANT_LIVE, Ordering::Release);
+        let writing = self.state.load(Ordering::Relaxed);
+        self.state.store(
+            (writing & !GRANT_STATE_MASK) | GRANT_LIVE,
+            Ordering::Release,
+        );
     }
 }
 
@@ -1350,12 +1356,14 @@ impl Default for FrameGrantResidencyRecord {
 #[derive(Debug)]
 pub struct FrameGrantResidencyTable {
     slots: [FrameGrantResidencyRecord; FRAME_GRANT_RESIDENCY_SLOTS],
+    dirty: [AtomicU64; FRAME_GRANT_RESIDENCY_SLOTS / 64],
 }
 
 impl FrameGrantResidencyTable {
     pub const fn new() -> Self {
         Self {
             slots: [const { FrameGrantResidencyRecord::new() }; FRAME_GRANT_RESIDENCY_SLOTS],
+            dirty: [const { AtomicU64::new(0) }; FRAME_GRANT_RESIDENCY_SLOTS / 64],
         }
     }
 
@@ -1381,7 +1389,7 @@ impl FrameGrantResidencyTable {
             let slot = Self::probe(identity.mm_key, identity.semantic_base, probe);
             let record = &self.slots[slot];
             let state = record.state.load(Ordering::Acquire);
-            if state == GRANT_LIVE {
+            if state & GRANT_STATE_MASK == GRANT_LIVE {
                 let prior = record.identity();
                 if prior.mm_key == identity.mm_key
                     && prior.semantic_base < identity.semantic_base + identity.len
@@ -1392,7 +1400,7 @@ impl FrameGrantResidencyTable {
             } else if state == GRANT_EMPTY {
                 available.get_or_insert(slot);
                 break;
-            } else if state == GRANT_RETIRED {
+            } else if state & GRANT_STATE_MASK == GRANT_RETIRED {
                 available.get_or_insert(slot);
             }
         }
@@ -1401,7 +1409,12 @@ impl FrameGrantResidencyTable {
         let state = record.state.load(Ordering::Acquire);
         record
             .state
-            .compare_exchange(state, GRANT_WRITING, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                state,
+                (state & !GRANT_STATE_MASK).wrapping_add(4) | GRANT_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .ok()?;
         record.publish(identity);
         Some(slot)
@@ -1413,19 +1426,22 @@ impl FrameGrantResidencyTable {
         for probe in 0..GRANT_PROBES {
             let slot = Self::probe(mm_key, page, probe);
             let record = &self.slots[slot];
-            match record.state.load(Ordering::Acquire) {
+            let epoch = record.state.load(Ordering::Acquire);
+            match epoch & GRANT_STATE_MASK {
                 GRANT_EMPTY => return None,
                 GRANT_LIVE => {
                     let identity = record.identity();
                     if identity.mm_key == mm_key
                         && page >= identity.semantic_base
                         && page - identity.semantic_base < identity.len
+                        && record.state.load(Ordering::Acquire) == epoch
                     {
                         let bit = ((page - identity.semantic_base) / GRANT_PAGE_SIZE) as usize;
                         return Some(FrameGrantResidencyPage {
                             slot,
                             identity,
                             expected_ipa: identity.physical_ipa + bit as u64 * GRANT_PAGE_SIZE,
+                            epoch,
                             bit,
                         });
                     }
@@ -1441,7 +1457,7 @@ impl FrameGrantResidencyTable {
         let Some(record) = self.slots.get(page.slot) else {
             return false;
         };
-        if record.state.load(Ordering::Acquire) != GRANT_LIVE
+        if record.state.load(Ordering::Acquire) != page.epoch
             || record.identity() != page.identity
             || page.bit >= (page.identity.len / GRANT_PAGE_SIZE) as usize
             || page.expected_ipa != page.identity.physical_ipa + page.bit as u64 * GRANT_PAGE_SIZE
@@ -1449,6 +1465,63 @@ impl FrameGrantResidencyTable {
             return false;
         }
         record.committed[page.bit / 64].fetch_or(1 << (page.bit % 64), Ordering::Release);
+        self.dirty[page.slot / 64].fetch_or(1 << (page.slot % 64), Ordering::Release);
+        true
+    }
+
+    /// Host mincore view. The slot must still be live for this exact MM and
+    /// grant; retirement removes visibility before backing can be reused.
+    pub fn is_guest_committed(&self, mm_key: u64, va: u64) -> bool {
+        let Some(page) = self.lookup(mm_key, va) else {
+            return false;
+        };
+        let record = &self.slots[page.slot];
+        record.state.load(Ordering::Acquire) == page.epoch
+            && record.identity() == page.identity
+            && record.committed[page.bit / 64].load(Ordering::Acquire) & (1 << (page.bit % 64)) != 0
+            && record.state.load(Ordering::Acquire) == page.epoch
+    }
+
+    /// Host: visit only records changed since their last reconciliation. The
+    /// callback must validate the live leaf and update host residency before
+    /// `ack_dirty` is called; exact-MM exclusion prevents same-MM new bits.
+    pub fn for_each_dirty_mm(
+        &self,
+        mm_key: u64,
+        mut visit: impl FnMut(usize, FrameGrantResidencyIdentity, [u64; 8]),
+    ) {
+        for (word_index, word) in self.dirty.iter().enumerate() {
+            let mut pending = word.load(Ordering::Acquire);
+            while pending != 0 {
+                let bit = pending.trailing_zeros() as usize;
+                pending &= pending - 1;
+                let slot = word_index * 64 + bit;
+                let record = &self.slots[slot];
+                let epoch = record.state.load(Ordering::Acquire);
+                if epoch & GRANT_STATE_MASK == GRANT_LIVE {
+                    let identity = record.identity();
+                    if identity.mm_key == mm_key && record.state.load(Ordering::Acquire) == epoch {
+                        let bits =
+                            core::array::from_fn(|i| record.committed[i].load(Ordering::Acquire));
+                        if record.state.load(Ordering::Acquire) == epoch {
+                            visit(slot, identity, bits);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn ack_dirty(&self, slot: usize, identity: FrameGrantResidencyIdentity) -> bool {
+        let Some(record) = self.slots.get(slot) else {
+            return false;
+        };
+        if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE
+            || record.identity() != identity
+        {
+            return false;
+        }
+        self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
         true
     }
 
@@ -1459,8 +1532,12 @@ impl FrameGrantResidencyTable {
         identity: FrameGrantResidencyIdentity,
     ) -> Option<[u64; 8]> {
         let record = self.slots.get(slot)?;
-        (record.state.load(Ordering::Acquire) == GRANT_LIVE && record.identity() == identity)
-            .then(|| core::array::from_fn(|i| record.committed[i].load(Ordering::Acquire)))
+        let epoch = record.state.load(Ordering::Acquire);
+        if epoch & GRANT_STATE_MASK != GRANT_LIVE || record.identity() != identity {
+            return None;
+        }
+        let bits = core::array::from_fn(|i| record.committed[i].load(Ordering::Acquire));
+        (record.state.load(Ordering::Acquire) == epoch).then_some(bits)
     }
 
     /// Host: retire this exact grant before unmapping or reusing its owner.
@@ -1468,11 +1545,43 @@ impl FrameGrantResidencyTable {
         let Some(record) = self.slots.get(slot) else {
             return false;
         };
-        if record.state.load(Ordering::Acquire) != GRANT_LIVE || record.identity() != identity {
+        let epoch = record.state.load(Ordering::Acquire);
+        if epoch & GRANT_STATE_MASK != GRANT_LIVE || record.identity() != identity {
             return false;
         }
-        record.state.store(GRANT_RETIRED, Ordering::Release);
+        if record
+            .state
+            .compare_exchange(
+                epoch,
+                (epoch & !GRANT_STATE_MASK) | GRANT_RETIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
         true
+    }
+
+    /// Host: revoke every intersecting grant before backing retirement or
+    /// replacement. Revoking a partially covered grant merely sends its other
+    /// pages through the existing host fault path.
+    pub fn retire_overlapping(&self, mm_key: u64, start: u64, len: u64) {
+        let end = start.saturating_add(len);
+        for (slot, record) in self.slots.iter().enumerate() {
+            if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE {
+                continue;
+            }
+            let identity = record.identity();
+            if identity.mm_key == mm_key
+                && identity.semantic_base < end
+                && start < identity.semantic_base.saturating_add(identity.len)
+            {
+                let _ = self.retire(slot, identity);
+            }
+        }
     }
 }
 
@@ -3406,6 +3515,14 @@ mod tests {
         assert_eq!(page.expected_ipa, first.physical_ipa + 4096);
         assert!(table.record_commit(page));
         assert_eq!(table.committed_words(slot, first).unwrap()[0], 0b10);
+        let mut dirty = 0;
+        table.for_each_dirty_mm(41, |seen, identity, bits| {
+            assert_eq!((seen, identity, bits[0]), (slot, first, 0b10));
+            dirty += 1;
+            assert!(table.ack_dirty(seen, identity));
+        });
+        assert_eq!(dirty, 1);
+        table.for_each_dirty_mm(41, |_, _, _| panic!("dirty bit was acknowledged"));
         assert!(table.retire(slot, first));
         assert!(table.lookup(41, first.semantic_base + 4096).is_none());
         assert!(!table.record_commit(page));
@@ -3419,6 +3536,17 @@ mod tests {
         assert!(!table.record_commit(page));
         assert!(table.record_commit(table.lookup(41, first.semantic_base).unwrap()));
         assert_eq!(table.committed_words(reused, second).unwrap()[0], 1);
+        table.retire_overlapping(41, second.semantic_base, 4096);
+        assert!(table.lookup(41, first.semantic_base).is_none());
+        // Even a byte-for-byte recycled identity cannot reuse a captured
+        // page token from a retired publication.
+        let stale = table.lookup(41, second.semantic_base);
+        assert!(stale.is_none());
+        let fresh_slot = table.publish(second).unwrap();
+        let stale_page = table.lookup(41, second.semantic_base).unwrap();
+        assert!(table.retire(fresh_slot, second));
+        table.publish(second).unwrap();
+        assert!(!table.record_commit(stale_page));
     }
 
     #[test]

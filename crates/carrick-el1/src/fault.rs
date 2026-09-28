@@ -37,6 +37,20 @@ fn frame_grant_access(esr: u64) -> Option<u64> {
     Some(if esr & (1 << 6) != 0 { 2 } else { 1 })
 }
 
+fn prepared_fault_access(esr: u64) -> Option<LeafAccess> {
+    let ec = (esr >> 26) & 0x3f;
+    let status = esr & 0x3f;
+    if !(0x04..=0x07).contains(&status) {
+        return None;
+    }
+    match ec {
+        0x20 | 0x21 => Some(LeafAccess::Execute),
+        0x24 | 0x25 if esr & (1 << 6) != 0 => Some(LeafAccess::Write),
+        0x24 | 0x25 => Some(LeafAccess::Read),
+        _ => None,
+    }
+}
+
 /// Decode an EL0 write permission fault that can be satisfied by in-guest COW resolution.
 pub fn is_write_permission_fault(esr: u64) -> bool {
     let ec = (esr >> 26) & 0x3f;
@@ -70,6 +84,11 @@ pub trait PreparedPageResolver {
 }
 
 pub struct NoopPreparedResolver;
+
+pub struct PreparedFaultPath<'a, P: PreparedPageResolver> {
+    pub residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
+    pub resolver: &'a mut P,
+}
 
 impl PreparedPageResolver for NoopPreparedResolver {
     fn commit_prepared(
@@ -173,8 +192,10 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 own: mailbox,
                 peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
             },
-            Some(carrick_el1_abi::frame_grant_residency_guest()),
-            &mut HardwarePreparedResolver,
+            Some(PreparedFaultPath {
+                residency: carrick_el1_abi::frame_grant_residency_guest(),
+                resolver: &mut HardwarePreparedResolver,
+            }),
             &mut HardwareCowResolver,
         )
     }
@@ -218,8 +239,7 @@ pub fn dispatch_fault_with_regions<C: CowResolver>(
         current_tasks,
         spaces,
         mailboxes,
-        None,
-        &mut NoopPreparedResolver,
+        None::<PreparedFaultPath<'_, NoopPreparedResolver>>,
         cow_resolver,
     )
 }
@@ -230,8 +250,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
     current_tasks: &[CurrentTask],
     spaces: &AddressSpaces,
     mailboxes: GrantMailboxes<'_>,
-    residency: Option<&carrick_el1_abi::FrameGrantResidencyTable>,
-    prepared_resolver: &mut P,
+    mut prepared: Option<PreparedFaultPath<'_, P>>,
     cow_resolver: &mut C,
 ) -> Action {
     let GrantMailboxes {
@@ -265,7 +284,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         return Action::Forward;
     }
 
-    let Some(access) = frame_grant_access(frame.esr) else {
+    let Some(prepared_access) = prepared_fault_access(frame.esr) else {
         return Action::Forward;
     };
     let Some(task) = current_tasks.get(frame.slot as usize) else {
@@ -276,7 +295,10 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         return Action::Forward;
     }
 
-    if let Some(page) = residency.and_then(|table| table.lookup(mm_key, frame.far)) {
+    if let Some(page) = prepared
+        .as_ref()
+        .and_then(|path| path.residency.lookup(mm_key, frame.far))
+    {
         let Some(index) = spaces.find(mm_key) else {
             return Action::Forward;
         };
@@ -289,25 +311,25 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         let Some(_editor) = spaces.try_begin_edit(index, mm_key, owner) else {
             return Action::Forward;
         };
-        let access = if access == 2 {
-            LeafAccess::Write
-        } else {
-            LeafAccess::Read
-        };
-        match prepared_resolver.commit_prepared(
+        let path = prepared.as_mut().expect("prepared grant path");
+        match path.resolver.commit_prepared(
             grant.ttbr0,
             frame.far & !4095,
             page.expected_ipa,
-            access,
+            prepared_access,
         ) {
             Ok(GuestPreparedCommit::Committed) => {
-                assert!(residency.is_some_and(|table| table.record_commit(page)));
+                assert!(path.residency.record_commit(page));
                 return Action::Served;
             }
             Ok(GuestPreparedCommit::AlreadyResident) => return Action::Served,
             Err(_) => {}
         }
     }
+
+    let Some(access) = frame_grant_access(frame.esr) else {
+        return Action::Forward;
+    };
 
     let found = mailbox
         .response_for_fault(mm_key, frame.far, access)
@@ -403,8 +425,10 @@ mod tests {
                 &tasks,
                 &spaces,
                 GrantMailboxes::own(&mailbox),
-                Some(&table),
-                &mut prepared,
+                Some(PreparedFaultPath {
+                    residency: &table,
+                    resolver: &mut prepared,
+                }),
                 &mut NoopCowResolver,
             ),
             Action::Served
@@ -412,6 +436,47 @@ mod tests {
         assert_eq!(prepared.calls, vec![(0x8800_0000, va, 0x9000_1000)]);
         assert_eq!(table.committed_words(slot, identity).unwrap()[0], 0b10);
         assert!(!mailbox.has_guest_work());
+    }
+
+    #[test]
+    fn prepared_executable_leaf_commits_on_instruction_translation_fault() {
+        let mm = 78;
+        let va = 0x4000_0000;
+        let table = carrick_el1_abi::FrameGrantResidencyTable::new();
+        let identity = carrick_el1_abi::FrameGrantResidencyIdentity {
+            mm_key: mm,
+            semantic_base: va,
+            physical_ipa: 0x9000_0000,
+            len: 4096,
+            mapping_id: 11,
+            frame_id: 12,
+            owner_generation: 13,
+            inventory_revision: 14,
+        };
+        table.publish(identity).unwrap();
+        let task = CurrentTask::new();
+        task.zone_mm.store(mm, Ordering::Release);
+        let mut frame = TrapFrame {
+            esr: (0x20 << 26) | 0x07,
+            far: va,
+            ..TrapFrame::default()
+        };
+        assert_eq!(
+            dispatch_fault_with_prepared(
+                &mut frame,
+                &Counters::default(),
+                &[task],
+                &published_space(mm, 0x8800_0000),
+                GrantMailboxes::own(&FrameGrantMailbox::new()),
+                Some(PreparedFaultPath {
+                    residency: &table,
+                    resolver: &mut RecordingPreparedResolver::default(),
+                }),
+                &mut NoopCowResolver,
+            ),
+            Action::Served
+        );
+        assert!(table.is_guest_committed(mm, va));
     }
 
     #[derive(Default)]
