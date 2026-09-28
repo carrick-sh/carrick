@@ -2315,56 +2315,63 @@ mod persistent_worker_tests {
             terminal_descriptor,
         };
 
-        let va = crate::memory::LINUX_MMAP_BASE + 0x2000_0000;
-        for len in [0x10000, 0x7de000] {
-            assert!(super::hvpatch_discard_admits(true, va + 0x1000, len));
-        }
-        let ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x3000_0000;
-        let stack_len = 8 * 1024 * 1024;
-        let mut parent = PageTableManager::new(
-            carrick_mem::memory::stage1_hvpatch_page_tables(),
-            crate::memory::LINUX_PAGE_TABLES_BASE,
-            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
-        );
-        parent.declare_offline_private_image();
-        parent
-            .publish_private_pages(
-                GuestLeafPublication {
-                    va,
-                    ipa,
-                    len: stack_len,
-                    writable: true,
-                    executable: false,
-                },
-                va + 0x1000,
-                None,
-            )
-            .expect("bulk grant with a resident stack edge");
-        let mut child = parent.snapshot_image().expect("fork image");
-        parent
-            .set_fork_readonly(va, stack_len as usize, None)
-            .unwrap();
-        child
-            .set_fork_readonly(va, stack_len as usize, None)
-            .unwrap();
-        for len in [0x10000, 0x7de000] {
-            parent
-                .unmap_aliased(va + 0x1000, len, None)
-                .expect("retire parent pages without frame COW");
-            assert_eq!(
-                el1_private_leaf_state(terminal_descriptor(parent.debug_walk(va + 0x1000))),
-                El1PrivateLeafState::Retired
+        let base_va = crate::memory::LINUX_MMAP_BASE + 0x2000_0000;
+        let base_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x3000_0000;
+        const STACK_LEN: u64 = 8 * 1024 * 1024;
+        for stack_count in [1_u64, 2, 4] {
+            let mut parent = PageTableManager::new(
+                carrick_mem::memory::stage1_hvpatch_page_tables(),
+                crate::memory::LINUX_PAGE_TABLES_BASE,
+                carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
             );
-            assert_eq!(
-                el1_private_leaf_state(terminal_descriptor(child.debug_walk(va + 0x1000))),
-                El1PrivateLeafState::Resident
-            );
-            assert_eq!(
-                el1_private_leaf_state(terminal_descriptor(
-                    child.debug_walk(va + len as u64 - 0x1000)
-                )),
-                El1PrivateLeafState::Prepared
-            );
+            parent.declare_offline_private_image();
+            for stack in 0..stack_count {
+                let va = base_va + stack * 4 * STACK_LEN;
+                let ipa = base_ipa + stack * 4 * STACK_LEN;
+                parent
+                    .publish_private_pages(
+                        GuestLeafPublication {
+                            va,
+                            ipa,
+                            len: STACK_LEN,
+                            writable: true,
+                            executable: false,
+                        },
+                        va + 0x1000,
+                        None,
+                    )
+                    .expect("bulk grant with a resident stack edge");
+            }
+            let mut child = parent.snapshot_image().expect("fork image");
+            for stack in 0..stack_count {
+                let va = base_va + stack * 4 * STACK_LEN;
+                parent
+                    .set_fork_readonly(va, STACK_LEN as usize, None)
+                    .unwrap();
+                child
+                    .set_fork_readonly(va, STACK_LEN as usize, None)
+                    .unwrap();
+                for len in [0x10000, 0x7de000] {
+                    assert!(super::hvpatch_discard_admits(true, va + 0x1000, len));
+                    parent
+                        .unmap_aliased(va + 0x1000, len, None)
+                        .expect("retire parent pages without frame COW");
+                    assert_eq!(
+                        el1_private_leaf_state(terminal_descriptor(parent.debug_walk(va + 0x1000))),
+                        El1PrivateLeafState::Retired
+                    );
+                    assert_eq!(
+                        el1_private_leaf_state(terminal_descriptor(child.debug_walk(va + 0x1000))),
+                        El1PrivateLeafState::Resident
+                    );
+                    assert_eq!(
+                        el1_private_leaf_state(terminal_descriptor(
+                            child.debug_walk(va + len as u64 - 0x1000)
+                        )),
+                        El1PrivateLeafState::Prepared
+                    );
+                }
+            }
         }
     }
 
