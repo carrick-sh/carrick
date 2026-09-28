@@ -268,6 +268,11 @@ fn a_wait_with_nothing_runnable_idles_until_host_work() {
     );
     assert_eq!(zone.counters.el1_idle_entries.load(Ordering::Relaxed), 1);
     assert_eq!(zone.counters.el1_idle_exits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        counters.exit_reasons[carrick_el1_abi::El1ExitReason::IdleHostWork as usize]
+            .load(Ordering::Relaxed),
+        1
+    );
     let home = zone
         .slot(SLOT)
         .host_record()
@@ -712,6 +717,7 @@ fn host_runnable(zone: &ZoneTables, slot: SlotId, tid: u64) -> RecordId {
 #[test]
 fn a_park_before_a_host_runnable_thread_leaves_for_the_host() {
     let zone = zone();
+    let counters = counters();
     let word = AtomicU32::new(0);
     let uaddr = word.as_ptr() as u64;
     let task = task_for(101);
@@ -720,7 +726,7 @@ fn a_park_before_a_host_runnable_thread_leaves_for_the_host() {
     let service = host_runnable(&zone, SLOT, 303);
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_PRIVATE, 0);
     assert_eq!(
-        serve(&mut frame, &task, &zone, &mut cpu),
+        serve_on(SLOT, &mut frame, &task, &zone, &mut cpu, counters),
         Some(Served::Idle)
     );
     assert_eq!(zone.slot(SLOT).current(), None);
@@ -729,6 +735,11 @@ fn a_park_before_a_host_runnable_thread_leaves_for_the_host() {
     assert!(zone.head_needs_host(SLOT));
     assert_eq!(zone.runnable_head(SLOT), Some(service));
     assert_eq!(zone.counters.el1_service_exits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        counters.exit_reasons[carrick_el1_abi::El1ExitReason::Service as usize]
+            .load(Ordering::Relaxed),
+        1
+    );
     assert_eq!(cpu.wfis, 0, "it did not idle");
 }
 

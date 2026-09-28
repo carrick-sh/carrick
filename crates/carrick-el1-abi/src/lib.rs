@@ -1693,6 +1693,61 @@ pub const PANIC_SENTINEL: u64 = 0xDEAD_CAFE_DEAD_BEEF;
 /// Syscall counter index used by the panic handler to store the sentinel.
 pub const PANIC_SENTINEL_SYSCALL_NR: usize = 511;
 
+/// Stable classes for one `hv_vcpu_run` return. The host increments exactly
+/// one class at the return boundary, including exits it resumes internally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum HostExitClass {
+    Canceled,
+    Idle,
+    Kick,
+    Syscall,
+    Metadata,
+    Maintenance,
+    Fault,
+    Other,
+}
+
+impl HostExitClass {
+    pub const COUNT: usize = 8;
+
+    /// `exception` means HVF reported EXCEPTION; `canceled` means CANCELED.
+    /// The syndrome is authoritative only for EXCEPTION. Keep every unknown
+    /// exception in `Fault` so the accounting remains exhaustive.
+    pub const fn from_hvf(canceled: bool, exception: bool, syndrome: u64) -> Self {
+        if canceled {
+            return Self::Canceled;
+        }
+        if !exception {
+            return Self::Other;
+        }
+        match ((syndrome >> 26) & 0x3f, syndrome & 0xffff) {
+            (0x16, 5) => Self::Idle,
+            (0x16, 4) => Self::Kick,
+            (0x16, 2) | (0x15, _) => Self::Syscall,
+            (0x16, 6) => Self::Metadata,
+            (0x16, 1) => Self::Maintenance,
+            _ => Self::Fault,
+        }
+    }
+}
+
+/// EL1's reason for an `Idle` or `Kick` HVC. These counters complement the
+/// HVF class: an HVC can be attributed to host work, a service queue, or a
+/// failed address-space switch without guessing from total exit counts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum El1ExitReason {
+    IdleHostWork,
+    IdleEntryHostWork,
+    Service,
+    InterruptHostWork,
+}
+
+impl El1ExitReason {
+    pub const COUNT: usize = 4;
+}
+
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
 #[repr(C)]
 pub struct Counters {
@@ -1705,6 +1760,8 @@ pub struct Counters {
     pub irq_taken: [AtomicU64; 32],
     /// Data/memory abort exceptions taken into EL1.
     pub fault_taken: AtomicU64,
+    /// EL1 scheduler exits indexed by [`El1ExitReason`].
+    pub exit_reasons: [AtomicU64; El1ExitReason::COUNT],
 }
 
 impl Counters {
@@ -1714,6 +1771,7 @@ impl Counters {
             forwarded: [const { AtomicU64::new(0) }; 512],
             irq_taken: [const { AtomicU64::new(0) }; 32],
             fault_taken: AtomicU64::new(0),
+            exit_reasons: [const { AtomicU64::new(0) }; El1ExitReason::COUNT],
         }
     }
 
@@ -1731,6 +1789,12 @@ impl Counters {
         snapshot
             .fault_taken
             .store(self.fault_taken.load(Ordering::Relaxed), Ordering::Relaxed);
+        for i in 0..El1ExitReason::COUNT {
+            snapshot.exit_reasons[i].store(
+                self.exit_reasons[i].load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
         snapshot
     }
 }
@@ -2668,7 +2732,10 @@ mod tests {
 
     #[test]
     fn test_counters_layout() {
-        assert_eq!(core::mem::size_of::<Counters>(), (1024 + 32 + 1) * 8);
+        assert_eq!(
+            core::mem::size_of::<Counters>(),
+            (1024 + 32 + 1 + El1ExitReason::COUNT) * 8
+        );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);
         // The vector page's IRQ hook addresses this array directly.
@@ -2676,6 +2743,10 @@ mod tests {
         assert_eq!(
             core::mem::offset_of!(Counters, fault_taken),
             (1024 + 32) * 8
+        );
+        assert_eq!(
+            core::mem::offset_of!(Counters, exit_reasons),
+            (1024 + 32 + 1) * 8
         );
     }
 
@@ -2691,16 +2762,35 @@ mod tests {
         counters.served[10].store(20, Ordering::Relaxed);
         counters.forwarded[30].store(40, Ordering::Relaxed);
         counters.irq_taken[2].store(8, Ordering::Relaxed);
+        counters.exit_reasons[El1ExitReason::Service as usize].store(3, Ordering::Relaxed);
 
         let snap = counters.copy_snapshot();
         assert_eq!(snap.fault_taken.load(Ordering::Relaxed), 5);
         assert_eq!(snap.served[10].load(Ordering::Relaxed), 20);
         assert_eq!(snap.forwarded[30].load(Ordering::Relaxed), 40);
         assert_eq!(snap.irq_taken[2].load(Ordering::Relaxed), 8);
+        assert_eq!(
+            snap.exit_reasons[El1ExitReason::Service as usize].load(Ordering::Relaxed),
+            3
+        );
 
         // Modifying original doesn't affect snapshot
         counters.fault_taken.store(100, Ordering::Relaxed);
         assert_eq!(snap.fault_taken.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn host_exit_classes_keep_hvf_and_el1_reasons_distinct() {
+        use HostExitClass::*;
+        let hvc = |imm| (0x16_u64 << 26) | imm;
+        assert_eq!(HostExitClass::from_hvf(true, false, 0), Canceled);
+        assert_eq!(HostExitClass::from_hvf(false, true, hvc(5)), Idle);
+        assert_eq!(HostExitClass::from_hvf(false, true, hvc(4)), Kick);
+        assert_eq!(HostExitClass::from_hvf(false, true, hvc(2)), Syscall);
+        assert_eq!(HostExitClass::from_hvf(false, true, hvc(6)), Metadata);
+        assert_eq!(HostExitClass::from_hvf(false, true, hvc(1)), Maintenance);
+        assert_eq!(HostExitClass::from_hvf(false, true, 0x24_u64 << 26), Fault);
+        assert_eq!(HostExitClass::from_hvf(false, false, 0), Other);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::time::Duration;
 use carrick_abi::{NsGid, NsUid};
 use carrick_embed::{
     Carrier, ContainerResult, EmbedError, InMemoryFileVfs, PullPolicy, read_el1_counters,
-    reset_el1_counters, vcpu_run_exits_total,
+    reset_el1_counters, vcpu_run_exit_classes, vcpu_run_exits_total,
 };
 
 const FIXTURE: &str = "/opt/carrick/el1-sched";
@@ -167,6 +167,8 @@ impl ZoneCounts {
 struct Measured {
     result: ContainerResult,
     exits: u64,
+    exit_classes: [u64; carrick_el1_abi::HostExitClass::COUNT],
+    el1_exit_reasons: [u64; carrick_el1_abi::El1ExitReason::COUNT],
     cpu_ns: u64,
     wall: Duration,
     zone: ZoneCounts,
@@ -177,6 +179,11 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
     command.extend(args.iter().map(|arg| (*arg).to_owned()));
     let watchdog = common::Watchdog::start(timeout);
     let exits_before = vcpu_run_exits_total();
+    let classes_before = vcpu_run_exit_classes();
+    let reasons_before = read_el1_counters()
+        .map_or([0; carrick_el1_abi::El1ExitReason::COUNT], |c| {
+            std::array::from_fn(|i| c.exit_reasons[i].load(std::sync::atomic::Ordering::Relaxed))
+        });
     let zone_before = ZoneCounts::read();
     let cpu_before = carrier_cpu_ns();
     let start = std::time::Instant::now();
@@ -191,11 +198,28 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
     let wall = start.elapsed();
     let cpu_ns = carrier_cpu_ns() - cpu_before;
     let exits = vcpu_run_exits_total() - exits_before;
+    let exit_classes = vcpu_run_exit_classes();
+    let exit_classes = std::array::from_fn(|i| exit_classes[i] - classes_before[i]);
+    assert_eq!(
+        exit_classes.iter().sum::<u64>(),
+        exits,
+        "unattributed HVF return"
+    );
+    let el1_exit_reasons =
+        read_el1_counters().map_or([0; carrick_el1_abi::El1ExitReason::COUNT], |c| {
+            std::array::from_fn(|i| {
+                c.exit_reasons[i]
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(reasons_before[i])
+            })
+        });
     let zone = ZoneCounts::read().since(zone_before);
     watchdog.disarm();
     Measured {
         result,
         exits,
+        exit_classes,
+        el1_exit_reasons,
         cpu_ns,
         wall,
         zone,
@@ -209,6 +233,34 @@ fn describe(measured: &Measured) -> String {
         measured.result.signal,
         measured.result.stdout_utf8(),
         measured.result.stderr_utf8()
+    )
+}
+
+fn exit_breakdown(measured: &Measured) -> String {
+    use carrick_el1_abi::HostExitClass as C;
+    let c = &measured.exit_classes;
+    format!(
+        "canceled:{} idle:{} kick:{} syscall:{} metadata:{} maintenance:{} fault:{} other:{}",
+        c[C::Canceled as usize],
+        c[C::Idle as usize],
+        c[C::Kick as usize],
+        c[C::Syscall as usize],
+        c[C::Metadata as usize],
+        c[C::Maintenance as usize],
+        c[C::Fault as usize],
+        c[C::Other as usize],
+    )
+}
+
+fn el1_reason_breakdown(measured: &Measured) -> String {
+    use carrick_el1_abi::El1ExitReason as R;
+    let r = &measured.el1_exit_reasons;
+    format!(
+        "idle_host_work:{} idle_entry_host_work:{} service:{} interrupt_host_work:{}",
+        r[R::IdleHostWork as usize],
+        r[R::IdleEntryHostWork as usize],
+        r[R::Service as usize],
+        r[R::InterruptHostWork as usize],
     )
 }
 
@@ -244,8 +296,10 @@ fn el1_sched_futex_handoff_has_no_host_exits() {
         assert!(measured.result.success(), "{}", describe(&measured));
         let stdout = measured.result.stdout_utf8();
         println!(
-            "el1-sched pingpong iters={iters} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+            "el1-sched pingpong iters={iters} exits={} host_classes={} el1_reasons={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
             measured.exits,
+            exit_breakdown(&measured),
+            el1_reason_breakdown(&measured),
             measured.cpu_ns,
             measured.wall.as_millis(),
             measured.zone,
@@ -472,8 +526,10 @@ fn el1_sched_timed_wait_times_out_in_guest() {
         );
         let stdout = measured.result.stdout_utf8();
         println!(
-            "el1-sched timed-wait iters={iters} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+            "el1-sched timed-wait iters={iters} exits={} host_classes={} el1_reasons={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
             measured.exits,
+            exit_breakdown(&measured),
+            el1_reason_breakdown(&measured),
             measured.cpu_ns,
             measured.wall.as_millis(),
             measured.zone,
