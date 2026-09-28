@@ -8,6 +8,16 @@ pub use carrick_timer_core::itimer::*;
 
 use carrick_timer_core::TimerSpecNs;
 
+/// Linux signal number delivered when `which`'s timer expires.
+#[inline]
+pub fn signum_for(which: usize) -> i32 {
+    match which {
+        1 => carrick_abi::LINUX_SIGVTALRM,
+        2 => carrick_abi::LINUX_SIGPROF,
+        _ => carrick_abi::LINUX_SIGALRM,
+    }
+}
+
 /// Fallback delivery for runtimes that do not have a signal-pump kqueue. The
 /// threaded runtime uses EVFILT_TIMER so a busy-waiting vCPU can be kicked; this
 /// fallback is for single-threaded fork/exec children parked in host waits, where

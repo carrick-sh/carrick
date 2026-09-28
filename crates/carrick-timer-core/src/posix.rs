@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::{CpuNs, TimerSpecNs, WallNs};
+use crate::{ClockKind, CpuNs, TimerSpecNs, WallNs};
 
 /// One POSIX timer's arm spec (`timer_settime` value/interval + the signum to
 /// deliver). `si_value` carries the `sigev_value` payload for the `SI_TIMER`
@@ -38,6 +38,8 @@ pub struct PosixTimerSpec {
 
 pub struct PosixTimerSlot {
     pub clock_id: i32,
+    /// Clock domain measured by this timer slot.
+    pub clock_kind: ClockKind,
     /// Optional thread target (e.g. SIGEV_THREAD_ID). If set, expiries are
     /// directed to this specific guest tid rather than process-wide.
     pub target_tid: Option<i32>,
@@ -57,9 +59,16 @@ pub struct PosixTimerSlot {
 }
 
 impl PosixTimerSlot {
-    fn new(clock_id: i32, signum: i32, target_tid: Option<i32>, si_value: i64) -> Self {
+    fn new(
+        clock_id: i32,
+        clock_kind: ClockKind,
+        signum: i32,
+        target_tid: Option<i32>,
+        si_value: i64,
+    ) -> Self {
         Self {
             clock_id,
+            clock_kind,
             target_tid,
             spec: Mutex::new(PosixTimerSpec {
                 signum,
@@ -122,12 +131,25 @@ pub fn create_with_target_and_value(
     target_tid: Option<i32>,
     si_value: i64,
 ) -> i32 {
+    create_with_clock_kind(clock_id, ClockKind::Wall, signum, target_tid, si_value)
+}
+
+/// Allocate a new timer with an explicit [`ClockKind`], target thread, and `sigev_value` payload.
+pub fn create_with_clock_kind(
+    clock_id: i32,
+    clock_kind: ClockKind,
+    signum: i32,
+    target_tid: Option<i32>,
+    si_value: i64,
+) -> i32 {
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let mut guard = registry();
     let map = ensure_registry(&mut guard);
     map.insert(
         id,
-        std::sync::Arc::new(PosixTimerSlot::new(clock_id, signum, target_tid, si_value)),
+        std::sync::Arc::new(PosixTimerSlot::new(
+            clock_id, clock_kind, signum, target_tid, si_value,
+        )),
     );
     id
 }
@@ -222,32 +244,13 @@ pub fn seed_overrun(id: i32, count: u32) {
     }
 }
 
-/// Linux CPU-time clocks whose POSIX timers must fire off AGGREGATE GUEST CPU
-/// time, not wall-clock: `CLOCK_PROCESS_CPUTIME_ID` (2), `CLOCK_THREAD_CPUTIME_ID`
-/// (3), or Linux dynamic CPU clock IDs (negative).
-pub fn is_cpu_clock(clock_id: i32) -> bool {
-    clock_id < 0 || clock_id == 2 || clock_id == 3
-}
-
-/// Linux per-thread CPU-time clock: `CLOCK_THREAD_CPUTIME_ID` (3) or dynamic
-/// per-thread CPU clock IDs (negative with `CPUCLOCK_PERTHREAD_MASK` bit 2 set).
-pub fn is_thread_cpu_clock(clock_id: i32) -> bool {
-    clock_id == 3 || (clock_id < 0 && (clock_id & 4) != 0)
-}
-
-/// Linux per-process CPU-time clock: `CLOCK_PROCESS_CPUTIME_ID` (2) or dynamic
-/// per-process CPU clock IDs (negative with `CPUCLOCK_PERTHREAD_MASK` bit 2 clear).
-pub fn is_process_cpu_clock(clock_id: i32) -> bool {
-    clock_id == 2 || (clock_id < 0 && (clock_id & 4) == 0)
-}
-
 /// Drive a POSIX per-process timer's expiries on a backend firing thread. SHARED
 /// by every backend (KVM/bhyve/NVMM kick+futex, the HVF wall-clock fallback, and
 /// the runtime's inline arm) — the THREAD SPAWN and the per-fire action
 /// (`on_fire`: publish the process signal + kick) are backend-specific; only this
 /// timing loop is shared. Was copied ~4× and NONE of the copies handled
 /// CPU-time clocks (they all fired off wall-clock). Branches on the timer's
-/// clock: a CPU-time clock drives off the aggregate guest CPU total (so the timer
+/// clock kind: a CPU-time clock drives off the aggregate guest CPU total (so the timer
 /// only advances while the guest actually burns CPU); every other clock is
 /// wall-clock. `spec.value` is the first expiry, `spec.interval == 0` is
 /// one-shot. Retires on a generation bump (disarm/re-arm).
@@ -261,8 +264,7 @@ pub fn run_fallback(
 }
 
 /// Drive a POSIX per-process timer's expiries on a backend firing thread, optionally
-/// using a custom CPU-time sampler (`cpu_now`) for CPU-time clocks (`CLOCK_PROCESS_CPUTIME_ID`
-/// / `CLOCK_THREAD_CPUTIME_ID`).
+/// using a custom CPU-time sampler (`cpu_now`) for CPU-time clocks.
 pub fn run_fallback_with_cpu(
     slot: std::sync::Arc<PosixTimerSlot>,
     generation: u64,
@@ -270,7 +272,7 @@ pub fn run_fallback_with_cpu(
     cpu_now: Option<std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
     on_fire: impl Fn(),
 ) {
-    if is_cpu_clock(slot.clock_id) {
+    if slot.clock_kind.is_cpu() {
         run_fallback_cpu(&slot, generation, spec, cpu_now.as_ref(), &on_fire);
         return;
     }
@@ -302,7 +304,6 @@ fn run_fallback_cpu(
     cpu_now: Option<&std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
     on_fire: &impl Fn(),
 ) {
-    let clock = slot.clock_id;
     let sample = || -> Option<u64> {
         if let Some(sampler) = cpu_now {
             sampler()
@@ -324,7 +325,7 @@ fn run_fallback_cpu(
         };
         if now < due {
             let remaining = CpuNs(due - now);
-            let delay = if is_thread_cpu_clock(clock) {
+            let delay = if slot.clock_kind.is_thread_cpu() {
                 WallNs(remaining.raw().clamp(1, 1_000_000))
             } else {
                 crate::itimer::cpu_timer_recheck_delay_ns(remaining)
@@ -407,6 +408,13 @@ pub fn clock_id(id: i32) -> i32 {
     let mut guard = registry();
     let map = ensure_registry(&mut guard);
     map.get(&id).map(|s| s.clock_id).unwrap_or(0)
+}
+
+/// The clock domain a timer measures ([`ClockKind`]). Returns `None` for an unknown id.
+pub fn clock_kind(id: i32) -> Option<ClockKind> {
+    let mut guard = registry();
+    let map = ensure_registry(&mut guard);
+    map.get(&id).map(|s| s.clock_kind)
 }
 
 /// Clear the whole registry; called by `reinit_after_fork` so a forked
@@ -492,8 +500,9 @@ mod tests {
     #[test]
     fn create_with_target_carries_target_tid() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let id = create_with_target(3, 27, Some(42)); // CLOCK_THREAD_CPUTIME_ID=3, SIGPROF=27, tid=42
+        let id = create_with_clock_kind(3, ClockKind::ThreadCpu, 27, Some(42), 0);
         assert!(exists(id));
+        assert_eq!(clock_kind(id), Some(ClockKind::ThreadCpu));
         let armed = arm(
             id,
             TimerSpecNs {
@@ -505,6 +514,31 @@ mod tests {
         assert_eq!(armed.target_tid, Some(42));
         assert_eq!(armed.signum, 27);
         assert_eq!(armed.slot.target_tid, Some(42));
+        assert_eq!(armed.slot.clock_kind, ClockKind::ThreadCpu);
         assert!(delete(id));
+    }
+
+    #[test]
+    fn create_with_clock_kind_preserves_domain() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let id_wall = create(0, 14);
+        assert_eq!(clock_kind(id_wall), Some(ClockKind::Wall));
+        assert!(!clock_kind(id_wall).unwrap().is_cpu());
+
+        let id_proc = create_with_clock_kind(2, ClockKind::ProcessCpu, 27, None, 0);
+        assert_eq!(clock_kind(id_proc), Some(ClockKind::ProcessCpu));
+        assert!(clock_kind(id_proc).unwrap().is_cpu());
+        assert!(clock_kind(id_proc).unwrap().is_process_cpu());
+        assert!(!clock_kind(id_proc).unwrap().is_thread_cpu());
+
+        let id_thread = create_with_clock_kind(3, ClockKind::ThreadCpu, 27, Some(10), 0);
+        assert_eq!(clock_kind(id_thread), Some(ClockKind::ThreadCpu));
+        assert!(clock_kind(id_thread).unwrap().is_cpu());
+        assert!(clock_kind(id_thread).unwrap().is_thread_cpu());
+        assert!(!clock_kind(id_thread).unwrap().is_process_cpu());
+
+        assert!(delete(id_wall));
+        assert!(delete(id_proc));
+        assert!(delete(id_thread));
     }
 }

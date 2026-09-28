@@ -34,7 +34,11 @@ use syn::visit::Visit;
 use thiserror::Error;
 
 /// Default allowlist of substrate crates subject to boundary verification.
-pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &["carrick-sched-core", "carrick-mmu-core"];
+pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
+    "carrick-sched-core",
+    "carrick-mmu-core",
+    "carrick-timer-core",
+];
 
 /// Designated Linux personality or ABI crates forbidden in substrate dependency closures.
 pub const FORBIDDEN_PERSONALITY_CRATES: &[&str] = &[
@@ -471,10 +475,11 @@ fn audit_crate_dependencies_metadata<'a>(
     for dep in &substrate_pkg.dependencies {
         let is_dev = dep.kind.as_deref() == Some("dev");
         if !is_dev {
-            let is_resolved = substrate_node
-                .deps
-                .iter()
-                .any(|d| d.name == dep.name || dep.rename.as_deref() == Some(&d.name));
+            let is_resolved = substrate_node.deps.iter().any(|d| {
+                d.name == dep.name
+                    || d.name == dep.name.replace('-', "_")
+                    || dep.rename.as_deref() == Some(&d.name)
+            });
             if !is_resolved && !dep.optional {
                 return Err(BoundaryError::UnresolvedDependencyGraph {
                     crate_name: dep.name.clone(),

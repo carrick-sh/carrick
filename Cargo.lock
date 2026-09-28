@@ -859,7 +859,6 @@ dependencies = [
 name = "carrick-timer-core"
 version = "0.1.0"
 dependencies = [
- "carrick-abi",
  "carrick-host",
  "carrick-portable",
 ]

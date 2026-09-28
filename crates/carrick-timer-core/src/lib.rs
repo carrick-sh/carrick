@@ -92,3 +92,35 @@ impl TimerSpecNs {
         }
     }
 }
+
+/// The clock domain a timer measures.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub enum ClockKind {
+    /// Wall-clock time (elapses with real time).
+    #[default]
+    Wall,
+    /// Aggregate guest process CPU time.
+    ProcessCpu,
+    /// Aggregate guest thread CPU time.
+    ThreadCpu,
+}
+
+impl ClockKind {
+    /// Whether this clock measures guest CPU time rather than wall-clock time.
+    #[inline]
+    pub const fn is_cpu(self) -> bool {
+        matches!(self, Self::ProcessCpu | Self::ThreadCpu)
+    }
+
+    /// Whether this clock measures per-thread guest CPU time.
+    #[inline]
+    pub const fn is_thread_cpu(self) -> bool {
+        matches!(self, Self::ThreadCpu)
+    }
+
+    /// Whether this clock measures per-process guest CPU time.
+    #[inline]
+    pub const fn is_process_cpu(self) -> bool {
+        matches!(self, Self::ProcessCpu)
+    }
+}

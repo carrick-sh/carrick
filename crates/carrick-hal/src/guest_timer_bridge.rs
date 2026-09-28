@@ -259,7 +259,7 @@ impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
     }
 
     fn itimer_signum_for(&self, which: usize) -> i32 {
-        carrick_timer_core::itimer::signum_for(which)
+        itimer_signum_for(which)
     }
 
     fn itimer_spawn_fallback_timer(&self, which: usize, generation: u64, spec: TimerSpecNs) {
@@ -273,8 +273,15 @@ impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
         target_tid: Option<i32>,
         si_value: i64,
     ) -> i32 {
-        carrick_timer_core::posix::create_with_target_and_value(
-            clock_id, signum, target_tid, si_value,
+        let clock_kind = if is_thread_cpu_clock(clock_id) {
+            carrick_timer_core::ClockKind::ThreadCpu
+        } else if is_process_cpu_clock(clock_id) {
+            carrick_timer_core::ClockKind::ProcessCpu
+        } else {
+            carrick_timer_core::ClockKind::Wall
+        };
+        carrick_timer_core::posix::create_with_clock_kind(
+            clock_id, clock_kind, signum, target_tid, si_value,
         )
     }
 
@@ -323,6 +330,30 @@ impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
     }
 }
 
+/// Linux signal number delivered when `which`'s timer expires.
+#[inline]
+pub fn itimer_signum_for(which: usize) -> i32 {
+    match which {
+        1 => carrick_abi::LINUX_SIGVTALRM,
+        2 => carrick_abi::LINUX_SIGPROF,
+        _ => carrick_abi::LINUX_SIGALRM,
+    }
+}
+
+/// Linux per-thread CPU clock: `CLOCK_THREAD_CPUTIME_ID` or dynamic per-thread CPU clock.
+#[inline]
+pub fn is_thread_cpu_clock(clock_id: i32) -> bool {
+    clock_id == (carrick_abi::LINUX_CLOCK_THREAD_CPUTIME_ID as i32)
+        || (clock_id < 0 && (clock_id & 4) != 0)
+}
+
+/// Linux per-process CPU clock: `CLOCK_PROCESS_CPUTIME_ID` or dynamic per-process CPU clock.
+#[inline]
+pub fn is_process_cpu_clock(clock_id: i32) -> bool {
+    clock_id == (carrick_abi::LINUX_CLOCK_PROCESS_CPUTIME_ID as i32)
+        || (clock_id < 0 && (clock_id & 4) == 0)
+}
+
 /// The kick+futex lanes' [`TimerFiring`]: a helper thread per armed timer that
 /// runs the shared timer-core timing loop and delivers each expiry through
 /// the process-global [`deliver`] (publish the process-directed signal + kick
@@ -340,7 +371,7 @@ impl TimerFiring for KickerTimerFiring {
     /// while the guest is idle. At most one thread per `which` is live — a
     /// disarm/re-arm bumps the generation so the old thread exits.
     fn spawn_itimer_fallback(which: usize, generation: u64, spec: TimerSpecNs) {
-        let signum = carrick_timer_core::itimer::signum_for(which);
+        let signum = itimer_signum_for(which);
         let _ = std::thread::Builder::new()
             .name(format!("carrick-itimer-{which}"))
             .spawn(move || {
