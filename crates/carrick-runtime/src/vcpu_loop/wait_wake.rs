@@ -42,19 +42,9 @@ impl HvpatchRuntimeEndpoint {
             return Ok(false);
         };
         let mut delivered = false;
-        let task_key = snapshot.context().task().key();
         for thread in snapshot.threads() {
-            let generation = thread
-                .execution_generation()
-                .unwrap_or(carrick_kernel::kernel::objects::ExecutionGeneration::INITIAL);
-            let target =
-                carrick_kernel::kernel::ExactWakeTarget::new(task_key, thread.key(), generation);
-            match scheduler.wake_exact(target) {
-                Ok(disposition) => {
-                    if disposition != carrick_kernel::kernel::WakeDisposition::Pending {
-                        delivered = true;
-                    }
-                }
+            match scheduler.wake(thread.key()) {
+                Ok(_) => delivered = true,
                 Err(
                     carrick_kernel::kernel::scheduler::SchedulerError::Thread(
                         carrick_kernel::kernel::objects::ThreadExecutionError::InvalidTransition {
