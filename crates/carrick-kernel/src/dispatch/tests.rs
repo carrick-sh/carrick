@@ -10390,3 +10390,72 @@ mod inzone_tcp {
         }
     }
 }
+
+#[test]
+fn exec_image_cache_builds_distinct_keys_without_serializing() {
+    // Contract kernel.exec.image-cache-independent-builds: an exec of a
+    // different image must not wait for another image's ELF parse/patch pass.
+    // The channel counts builders actually entered, not elapsed throughput.
+    for count in [1, 8, 32] {
+        let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
+        let (entered, arrivals) = std::sync::mpsc::channel();
+        let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        std::thread::scope(|scope| {
+            for index in 0..count {
+                let dispatcher = std::sync::Arc::clone(&dispatcher);
+                let entered = entered.clone();
+                let release = std::sync::Arc::clone(&release);
+                scope.spawn(move || {
+                    dispatcher
+                        .with_hvpatch_exec_cache(Some(format!("image-{index}")), || {
+                            entered.send(()).expect("builder arrival receiver");
+                            let (lock, ready) = &*release;
+                            let mut released = lock.lock().expect("release lock");
+                            while !*released {
+                                released = ready.wait(released).expect("release wait");
+                            }
+                            crate::memory::AddressSpace::from_regions(0x4000, Vec::new())
+                        })
+                        .expect("prepared image");
+                });
+            }
+            drop(entered);
+            let mut admitted = 0;
+            for _ in 0..count {
+                if arrivals.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+                    break;
+                }
+                admitted += 1;
+            }
+            let (lock, ready) = &*release;
+            *lock.lock().expect("release lock") = true;
+            ready.notify_all();
+            assert_eq!(admitted, count, "distinct exec image builds serialized");
+        });
+    }
+}
+
+#[test]
+fn exec_image_cache_single_flights_one_key() {
+    let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
+    let builds = std::sync::atomic::AtomicUsize::new(0);
+    let start = std::sync::Barrier::new(33);
+    std::thread::scope(|scope| {
+        for _ in 0..32 {
+            let dispatcher = std::sync::Arc::clone(&dispatcher);
+            let builds = &builds;
+            let start = &start;
+            scope.spawn(move || {
+                start.wait();
+                dispatcher
+                    .with_hvpatch_exec_cache(Some("same-image".to_owned()), || {
+                        builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::memory::AddressSpace::from_regions(0x4000, Vec::new())
+                    })
+                    .expect("prepared image");
+            });
+        }
+        start.wait();
+    });
+    assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
