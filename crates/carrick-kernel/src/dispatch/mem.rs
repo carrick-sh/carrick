@@ -2518,7 +2518,7 @@ mod tests;
 
 #[cfg(test)]
 #[path = "mem/metadata_budget_tests.rs"]
-mod metadata_budget_tests;
+pub(crate) mod metadata_budget_tests;
 
 #[cfg(test)]
 mod routing_characterization_tests {

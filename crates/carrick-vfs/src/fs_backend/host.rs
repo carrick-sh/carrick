@@ -48,6 +48,8 @@ const SCRATCH_SYNC_CLEANUP_LIMIT: usize = 256;
 thread_local! {
     static TEST_HOST_OPENAT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static TEST_HOST_STAT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TEST_HOST_READDIR_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TEST_LAYER_MERGE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -78,6 +80,36 @@ pub fn test_host_stat_count() -> u64 {
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_test_host_stat_count() {
     TEST_HOST_STAT_COUNT.with(|c| c.set(0));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn record_test_host_readdir() {
+    TEST_HOST_READDIR_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_host_readdir_count() -> u64 {
+    TEST_HOST_READDIR_COUNT.with(|c| c.get())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_test_host_readdir_count() {
+    TEST_HOST_READDIR_COUNT.with(|c| c.set(0));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn record_test_layer_merge() {
+    TEST_LAYER_MERGE_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_layer_merge_count() -> u64 {
+    TEST_LAYER_MERGE_COUNT.with(|c| c.get())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_test_layer_merge_count() {
+    TEST_LAYER_MERGE_COUNT.with(|c| c.set(0));
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -3184,6 +3216,8 @@ impl HostFsBackend {
         dir: &Path,
         mut f: impl FnMut(&std::ffi::CStr, u8, Option<u64>) -> Option<T>,
     ) -> std::io::Result<Vec<T>> {
+        #[cfg(any(test, feature = "test-support"))]
+        record_test_host_readdir();
         use std::os::fd::AsRawFd as _;
         let parent_fd = self
             .dir_fd_for(dir)
@@ -4167,6 +4201,48 @@ pub(crate) fn write_owner_xattr(
             fset_u32_xattr(fd, CARRICK_GID_XATTR, gid.raw());
         }
     });
+}
+
+fn read_whiteout_leaf_from_marker(
+    parent_fd: i32,
+    marker_bytes: &[u8],
+    normalized_dir: Option<&Path>,
+) -> Option<String> {
+    let marker_c = std::ffi::CString::new(marker_bytes).ok()?;
+    let fd = unsafe {
+        host_openat!(
+            parent_fd,
+            marker_c.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut leaf = Vec::new();
+    if file.read_to_end(&mut leaf).is_err() {
+        return None;
+    }
+    use std::os::unix::ffi::OsStringExt as _;
+    let leaf_path = PathBuf::from(std::ffi::OsString::from_vec(leaf));
+    if leaf_path.components().count() == 1
+        && matches!(leaf_path.components().next(), Some(Component::Normal(_)))
+    {
+        if let Some(normalized) = normalized_dir {
+            if !host_whiteout_sidecar_rel(&normalized.join(&leaf_path))
+                .and_then(|path| path.file_name().map(ToOwned::to_owned))
+                .is_some_and(|expected| {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    expected.as_os_str().as_bytes() == marker_c.as_bytes()
+                })
+            {
+                return None;
+            }
+        }
+        return Some(leaf_path.to_string_lossy().into_owned());
+    }
+    None
 }
 
 impl FsBackend for HostFsBackend {
@@ -5200,6 +5276,18 @@ impl FsBackend for HostFsBackend {
         read_plain_host_dir_entries(parent.as_raw_fd(), dir)
     }
 
+    #[cfg(target_os = "macos")]
+    fn stream_dirents_with_deleted(&self, dir: &str) -> Option<(Vec<RootFsDirEntry>, Vec<String>)> {
+        use std::os::fd::AsRawFd;
+        if self.dir_has_overlay_interference(dir) {
+            return None;
+        }
+        let normalized = normalize(dir)?;
+        let rel = Self::rel_path(&normalized).unwrap_or_else(|| Path::new(""));
+        let parent = self.dir_fd_for(rel).ok()?;
+        read_plain_host_dir_entries_with_deleted(parent.as_raw_fd(), dir, self.may_have_whiteouts())
+    }
+
     fn child_names_bounded(
         &self,
         dir: &str,
@@ -5243,7 +5331,6 @@ impl FsBackend for HostFsBackend {
         dir: &str,
         limit: usize,
     ) -> Result<Vec<String>, BackendError> {
-        use std::os::unix::ffi::OsStringExt as _;
         if !self.may_have_whiteouts() {
             return Ok(Vec::new());
         }
@@ -5267,35 +5354,12 @@ impl FsBackend for HostFsBackend {
         let bound = limit.saturating_add(1);
         let mut deleted = Vec::with_capacity(entries.len().min(bound));
         for marker_bytes in entries {
-            let Ok(marker_c) = std::ffi::CString::new(marker_bytes) else {
-                continue;
-            };
-            let fd = unsafe {
-                host_openat!(
-                    parent_fd.as_raw_fd(),
-                    marker_c.as_ptr(),
-                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                )
-            };
-            if fd < 0 {
-                continue;
-            }
-            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-            let mut leaf = Vec::new();
-            if file.read_to_end(&mut leaf).is_err() {
-                continue;
-            }
-            let leaf_path = PathBuf::from(std::ffi::OsString::from_vec(leaf));
-            if leaf_path.components().count() == 1
-                && matches!(leaf_path.components().next(), Some(Component::Normal(_)))
-                && host_whiteout_sidecar_rel(&normalized.join(&leaf_path))
-                    .and_then(|path| path.file_name().map(ToOwned::to_owned))
-                    .is_some_and(|expected| {
-                        use std::os::unix::ffi::OsStrExt as _;
-                        expected.as_os_str().as_bytes() == marker_c.as_bytes()
-                    })
-            {
-                deleted.push(leaf_path.to_string_lossy().into_owned());
+            if let Some(leaf) = read_whiteout_leaf_from_marker(
+                parent_fd.as_raw_fd(),
+                &marker_bytes,
+                Some(&normalized),
+            ) {
+                deleted.push(leaf);
                 if deleted.len() >= bound {
                     break;
                 }
@@ -6996,6 +7060,8 @@ pub fn layered_directory_entries(
     rootfs: Option<&RootFs>,
     dir: &str,
 ) -> Result<Vec<RootFsDirEntry>, RootFsError> {
+    #[cfg(any(test, feature = "test-support"))]
+    record_test_layer_merge();
     let mut out: Vec<RootFsDirEntry> = Vec::new();
     let deleted: HashSet<String> = overlay.deleted_child_names(dir).into_iter().collect();
     // The upper's contribution to THIS directory, read ONCE. `child_names`
@@ -7147,10 +7213,13 @@ pub fn layered_directory_entries(
 /// sidecar names. `None` on any surprise (`DT_UNKNOWN`, an unmappable type,
 /// `fdopendir` failure) ⇒ the caller takes the exact layered path.
 #[cfg(target_os = "macos")]
-pub fn read_plain_host_dir_entries(
+pub fn read_plain_host_dir_entries_with_deleted(
     host_dir_fd: i32,
     dir_path: &str,
-) -> Option<Vec<RootFsDirEntry>> {
+    collect_deleted: bool,
+) -> Option<(Vec<RootFsDirEntry>, Vec<String>)> {
+    #[cfg(any(test, feature = "test-support"))]
+    record_test_host_readdir();
     struct Dirp(*mut libc::DIR);
     impl Drop for Dirp {
         fn drop(&mut self) {
@@ -7189,6 +7258,7 @@ pub fn read_plain_host_dir_entries(
     let dirp = Dirp(raw_dirp);
 
     let mut out = Vec::new();
+    let mut whiteout_markers = Vec::new();
     loop {
         // SAFETY: dirp.0 is a live DIR*; readdir returns null at end.
         let ent = unsafe { libc::readdir(dirp.0) };
@@ -7206,6 +7276,12 @@ pub fn read_plain_host_dir_entries(
             )
         };
         if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        if name_bytes.starts_with(HOST_WHITEOUT_SIDECAR_PREFIX.as_bytes()) {
+            if collect_deleted {
+                whiteout_markers.push(name_bytes.to_vec());
+            }
             continue;
         }
         // On-disk names are valid UTF-8 by construction (APFS rejects raw
@@ -7253,19 +7329,24 @@ pub fn read_plain_host_dir_entries(
             // d_type faithfully — layered path for the WHOLE directory.
             _ => return None,
         };
-        let path = if dir_path == "/" {
-            format!("/{name}")
+        // getdents64 consumes only `kind` (→ d_type), the name and the ino;
+        // mode/size mirror the layered merge's defaults for entries it does not open.
+        // `path` is only queried when `ino == 0` for hashing; host entries have
+        // non-zero inodes, so we skip the formatting allocation.
+        let path = if d_ino == 0 {
+            if dir_path == "/" {
+                std::path::PathBuf::from(format!("/{name}"))
+            } else {
+                std::path::PathBuf::from(format!("{dir_path}/{name}"))
+            }
         } else {
-            format!("{dir_path}/{name}")
+            std::path::PathBuf::new()
         };
         out.push(RootFsDirEntry {
             name,
             metadata: RootFsMetadata {
-                path: std::path::PathBuf::from(path),
+                path,
                 kind,
-                // getdents64 consumes only `kind` (→ d_type), the name and
-                // the ino; mode/size mirror the layered merge's defaults for
-                // entries it does not open.
                 mode: if kind == RootFsEntryKind::Directory {
                     0o755
                 } else {
@@ -7276,7 +7357,29 @@ pub fn read_plain_host_dir_entries(
             ino: d_ino,
         });
     }
-    Some(out)
+
+    let mut deleted = Vec::new();
+    if !whiteout_markers.is_empty() {
+        let normalized = normalize(dir_path);
+        for marker_bytes in whiteout_markers {
+            if let Some(leaf) =
+                read_whiteout_leaf_from_marker(host_dir_fd, &marker_bytes, normalized.as_deref())
+            {
+                deleted.push(leaf);
+            }
+        }
+    }
+
+    Some((out, deleted))
+}
+
+#[cfg(target_os = "macos")]
+pub fn read_plain_host_dir_entries(
+    host_dir_fd: i32,
+    dir_path: &str,
+) -> Option<Vec<RootFsDirEntry>> {
+    read_plain_host_dir_entries_with_deleted(host_dir_fd, dir_path, false)
+        .map(|(entries, _)| entries)
 }
 
 /// Trusted host dirfds are only ever minted by the macOS `--fs host` fast
@@ -7289,6 +7392,15 @@ pub fn read_plain_host_dir_entries(
     None
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn read_plain_host_dir_entries_with_deleted(
+    _host_dir_fd: i32,
+    _dir_path: &str,
+    _collect_deleted: bool,
+) -> Option<(Vec<RootFsDirEntry>, Vec<String>)> {
+    None
+}
+
 /// Dirent-only layered merge, with the same upper shadowing and whiteout
 /// precedence as layered_directory_entries. None requests its exact fallback.
 /// Returned mode/size fields are placeholders, never stat metadata.
@@ -7297,13 +7409,15 @@ pub fn try_layered_stream_dirents(
     rootfs: Option<&RootFs>,
     dir: &str,
 ) -> Option<Vec<RootFsDirEntry>> {
-    let upper = match overlay.stream_dirents(dir) {
-        Some(u) => u,
+    #[cfg(any(test, feature = "test-support"))]
+    record_test_layer_merge();
+    let (upper, deleted) = match overlay.stream_dirents_with_deleted(dir) {
+        Some((u, d)) => (u, d.into_iter().collect::<HashSet<String>>()),
         None => {
             if overlay.lookup_kind(dir) == Some(OverlayEntryKind::Dir) {
                 return None;
             }
-            Vec::new()
+            (Vec::new(), HashSet::new())
         }
     };
     let lower = match rootfs {
@@ -7325,7 +7439,6 @@ pub fn try_layered_stream_dirents(
             return None;
         }
     }
-    let deleted: HashSet<String> = overlay.deleted_child_names(dir).into_iter().collect();
     let upper_names: HashSet<&str> = upper.iter().map(|row| row.name.as_str()).collect();
     let mut out: Vec<_> = lower
         .into_iter()

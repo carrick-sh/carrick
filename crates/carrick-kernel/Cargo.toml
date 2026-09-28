@@ -36,7 +36,7 @@ event-ring-dump = []
 # impls over the ordinary public surface, which is what a real backend author
 # gets. The product build never enables it either (root `default-members` =
 # carrick-cli, and `just check-layering` fails if that selection does).
-test-support = ["carrick-hal/test-support"]
+test-support = ["carrick-hal/test-support", "carrick-vfs/test-support"]
 conformance-metrics = ["carrick-observability/conformance-metrics"]
 
 # NOTE: no `platform-*` features. This crate selects no VMM and no host
