@@ -2495,6 +2495,8 @@ mod hvpatch_guest_probe_abi {
             "stub!(hvpatch_fault_delivery(far: u64, incoming: i32, delivered: i32, bus: bool, tid: i32));",
             "fn hvpatch__fault__signal__frame__failure(_: u64, _: i32, _: i32) {}",
             "stub!(hvpatch_fault_signal_frame_failure(far: u64, signum: i32, tid: i32));",
+            "fn hvpatch__signal__frame__step(_: u32, _: u64, _: u64, _: i32) {}",
+            "stub!(hvpatch_signal_frame_step(step: u32, va: u64, len: u64, error: i32));",
             "fn hvpatch__fault__terminal(_: u64, _: i32, _: i32, _: i32) {}",
             "stub!(hvpatch_fault_terminal(far: u64, signum: i32, si_code: i32, tid: i32));",
             "fn pt__fault__next__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
@@ -5136,6 +5138,10 @@ mod real {
         /// installed, so Linux force-SIGSEGV replaces the classified signal.
         /// Args: FAR, classified signal, Linux TID.
         fn hvpatch__fault__signal__frame__failure(_: u64, _: i32, _: i32) {}
+        /// AArch64 sigframe refusal. Args: step (1 first touch, 2 host-buffer
+        /// permission, 3 frame copy), frame VA, frame bytes, error class
+        /// (1 bounds/denied, 2 unsupported, 3 host map, 4 metadata allocation).
+        fn hvpatch__signal__frame__step(_: u32, _: u64, _: u64, _: i32) {}
         /// A synchronous fault's final default-action exit (including a
         /// sigframe failure). Args: FAR, terminal signal, si_code, Linux TID.
         fn hvpatch__fault__terminal(_: u64, _: i32, _: i32, _: i32) {}
@@ -6459,6 +6465,11 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_fault_signal_frame_failure(far: u64, signum: i32, tid: i32) {
         carrick_usdt::hvpatch__fault__signal__frame__failure!(|| (far, signum, tid));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_signal_frame_step(step: u32, va: u64, len: u64, error: i32) {
+        carrick_usdt::hvpatch__signal__frame__step!(|| (step, va, len, error));
     }
 
     #[inline(never)]
@@ -8716,6 +8727,7 @@ mod stub {
     stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));
     stub!(hvpatch_fault_delivery(far: u64, incoming: i32, delivered: i32, bus: bool, tid: i32));
     stub!(hvpatch_fault_signal_frame_failure(far: u64, signum: i32, tid: i32));
+    stub!(hvpatch_signal_frame_step(step: u32, va: u64, len: u64, error: i32));
     stub!(hvpatch_fault_terminal(far: u64, signum: i32, si_code: i32, tid: i32));
     stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));
     stub!(stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64));

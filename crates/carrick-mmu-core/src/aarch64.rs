@@ -3860,6 +3860,13 @@ impl PageTableManager {
                     // would turn "no output recorded" into a descriptor that a
                     // later in-place edit or split treats as carrying one.
                     PtOp::Invalidate | PtOp::Retire if empty => true,
+                    // A speculative EL1 grant leaf has no live EL0 write
+                    // permission to revoke at fork. Keep its current AP as
+                    // Linux intent until first touch publishes the page under
+                    // the backend's armed physical COW authority.
+                    PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
+                        desc & NON_GLOBAL != 0
+                    }
                     _ => self.satisfies(
                         op,
                         desc & VALID != 0,
@@ -3901,6 +3908,9 @@ impl PageTableManager {
                         if !empty =>
                     {
                         let ap = match op {
+                            PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
+                                desc & AP_MASK
+                            }
                             PtOp::ForkReadOnly if desc & AP_MASK == AP_PRIV_RO => AP_PRIV_RO,
                             PtOp::ReadOnly { .. } | PtOp::ForkReadOnly => AP_RO,
                             PtOp::KernelReadOnly { .. } => AP_PRIV_RO,
@@ -9718,6 +9728,46 @@ mod tests {
             (descriptor & !AP_MASK) | AP_PRIV_RO,
             LeafAccess::Read
         ));
+    }
+
+    #[test]
+    fn fork_keeps_prepared_private_leaf_write_intent_for_sigframe_copyout() {
+        let mut mgr = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        let ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
+        mgr.publish_private_pages(
+            GuestLeafPublication {
+                va,
+                ipa,
+                len: 4 * PT_PAGE,
+                writable: true,
+                executable: false,
+            },
+            va,
+            None,
+        )
+        .unwrap();
+        let altstack = va + 2 * PT_PAGE;
+        let before = terminal_descriptor(mgr.debug_walk(altstack));
+        assert!(terminal_descriptor_is_prepared_private(before));
+        assert!(terminal_descriptor_permits_host_buffer(
+            before,
+            LeafAccess::Write
+        ));
+
+        mgr.set_fork_readonly(va, (4 * PT_PAGE) as usize, None)
+            .unwrap();
+        let child = terminal_descriptor(mgr.debug_walk(altstack));
+        assert!(terminal_descriptor_is_prepared_private(child));
+        assert_eq!(mgr.translate(altstack), None);
+        assert_eq!(
+            mgr.translate_retained_output(altstack),
+            Some(ipa + 2 * PT_PAGE)
+        );
+        assert!(
+            terminal_descriptor_permits_host_buffer(child, LeafAccess::Write),
+            "fork must not turn an untouched writable altstack into a host-denied leaf"
+        );
     }
 
     #[test]
