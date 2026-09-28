@@ -743,7 +743,11 @@ impl HvfVmState {
                                 && retained_fragment.is_none()
                                 && zero_anonymous_remap_enabled();
                             let eligible = scrub_remap_eligible(eligible_without_cow, || {
-                                self.physical_cow_source(chunk_va, mapping.ipa).is_some()
+                                mapping
+                                    .ipa
+                                    .checked_add(offset as u64)
+                                    .and_then(|ipa| self.physical_cow_source(chunk_va, ipa))
+                                    .is_some()
                             });
                             Some((target, eligible))
                         })
