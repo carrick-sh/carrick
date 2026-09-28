@@ -475,6 +475,9 @@ pub struct MemState {
     /// Exact NT_FILE provenance. Boot PT_LOAD records are replaced on exec;
     /// file-backed mmap records are added/trimmed with dynamic VMA commits.
     pub(super) core_file_mappings: Vec<crate::core_dump::FileMapping>,
+    /// Boot NT_FILE rows are normalized once before range edits. Dynamic
+    /// publication preserves their sorted, disjoint shape.
+    core_file_mappings_disjoint: Option<bool>,
     // NOTE: the alias-IPA cursor used to live here, but a per-process field is
     // COPIED on fork, so sibling guest processes reused the same IPAs into the
     // shared `hv_vm` (whose stage-2 TLB can't be flushed) and read each other's
@@ -529,6 +532,7 @@ impl MemState {
             secretmem_maps: Vec::new(),
             linux_auxv_image: Vec::new(),
             core_file_mappings: Vec::new(),
+            core_file_mappings_disjoint: None,
         }
     }
 
@@ -2522,6 +2526,16 @@ pub(crate) mod metadata_budget_tests;
 
 #[cfg(test)]
 pub(crate) use metadata_budget_tests::measure_host_heap;
+
+#[cfg(test)]
+thread_local! {
+    static CORE_FILE_MAPPING_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn count_core_file_mapping_visit() {
+    CORE_FILE_MAPPING_VISITS.with(|visits| visits.set(visits.get() + 1));
+}
 
 #[cfg(test)]
 mod routing_characterization_tests {

@@ -136,6 +136,7 @@ impl std::error::Error for VmaOverlapError {}
 #[cfg(test)]
 thread_local! {
     static VMA_VISIT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static VMA_SHIFT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Sorted, non-overlapping collection of `SemanticVma` entries for an address space.
@@ -157,6 +158,21 @@ impl VmaMap {
     #[cfg(test)]
     pub fn visit_count() -> usize {
         VMA_VISIT_COUNT.with(|c| c.get())
+    }
+
+    #[cfg(test)]
+    pub fn reset_shift_count() {
+        VMA_SHIFT_COUNT.with(|c| c.set(0));
+    }
+
+    #[cfg(test)]
+    pub fn shift_count() -> usize {
+        VMA_SHIFT_COUNT.with(|c| c.get())
+    }
+
+    #[cfg(test)]
+    fn record_shifts(count: usize) {
+        VMA_SHIFT_COUNT.with(|c| c.set(c.get() + count));
     }
 
     #[cfg(test)]
@@ -217,6 +233,8 @@ impl VmaMap {
         if can_merge {
             let new_end = self.vmas[left_idx + 1].end;
             self.vmas[left_idx].end = new_end;
+            #[cfg(test)]
+            Self::record_shifts(self.vmas.len() - left_idx - 2);
             self.vmas.remove(left_idx + 1);
             true
         } else {
@@ -435,6 +453,8 @@ impl VmaMap {
             }
         }
 
+        #[cfg(test)]
+        Self::record_shifts(self.vmas.len() - idx);
         self.vmas.insert(idx, vma);
 
         self.try_merge_adjacent(idx);
@@ -574,8 +594,43 @@ impl VmaMap {
     /// Grow or trim the program break heap pages.
     pub fn update_heap_pages(&mut self, old_page_end: u64, new_page_end: u64) {
         if new_page_end < old_page_end {
+            let index = self.vmas.partition_point(|vma| vma.end <= new_page_end);
+            if let Some(tail) = self.vmas.get_mut(index)
+                && tail.start < new_page_end
+                && tail.end == old_page_end
+                && tail.path == "[heap]"
+            {
+                // Trimming within one heap VMA changes no other row, even if
+                // mprotect or madvise changed this tail's attributes.
+                tail.end = new_page_end;
+                return;
+            }
             self.remove_range(new_page_end, old_page_end);
         } else if new_page_end > old_page_end {
+            let next = self.vmas.partition_point(|vma| vma.end <= old_page_end);
+            if next > 0
+                && self.vmas[next - 1].end == old_page_end
+                && self.vmas[next - 1].start < old_page_end
+                && self.vmas[next - 1].path == "[heap]"
+                && self.vmas[next - 1].read
+                && self.vmas[next - 1].write
+                && !self.vmas[next - 1].execute
+                && self.vmas[next - 1].provenance == VmaBackingProvenance::PrivateAnonymous
+                && self.vmas[next - 1].fork_policy == carrick_abi::VmaForkPolicy::DEFAULT
+                && self.vmas[next - 1].dump_policy == carrick_abi::VmaDumpPolicy::Include
+                && !self.vmas[next - 1].droppable
+                && self.vmas[next - 1].file_page_offset.is_none()
+                && self
+                    .vmas
+                    .get(next)
+                    .is_none_or(|following| following.start > new_page_end)
+            {
+                // The added pages have Linux's default anonymous-heap
+                // attributes. Extending this already-default tail avoids
+                // inserting and then merging a row before every other VMA.
+                self.vmas[next - 1].end = new_page_end;
+                return;
+            }
             let grown = SemanticVma {
                 start: old_page_end,
                 end: new_page_end,
@@ -944,6 +999,8 @@ pub(crate) fn semantic_vmas_from_boot_regions(
         let mut boundaries = vec![start, end];
         if !is_stack && !is_heap && !is_special {
             for mapping in file_mappings {
+                #[cfg(test)]
+                super::count_core_file_mapping_visit();
                 if mapping.start < end && mapping.end > start {
                     boundaries.push(mapping.start.max(start));
                     boundaries.push(mapping.end.min(end));
@@ -955,9 +1012,11 @@ pub(crate) fn semantic_vmas_from_boot_regions(
         for window in boundaries.windows(2) {
             let start = window[0];
             let end = window[1];
-            let file_mapping = file_mappings
-                .iter()
-                .find(|fm| fm.start <= start && fm.end >= end);
+            let file_mapping = file_mappings.iter().find(|fm| {
+                #[cfg(test)]
+                super::count_core_file_mapping_visit();
+                fm.start <= start && fm.end >= end
+            });
             let file_page_offset = file_mapping.map(|fm| {
                 fm.file_page_offset + ((start - fm.start) / crate::core_dump::GUEST_PAGE as u64)
             });
