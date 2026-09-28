@@ -112,10 +112,36 @@ pub struct OwnedVmaSnapshot {
     pub vmas: Vec<VmaSummary>,
 }
 
+/// What an MM's structural-mutation coordinator is doing right now, read
+/// without waiting for it. This is the degraded-snapshot view of a
+/// coordinator a wedged carrier holds: the strict snapshot waits for the host
+/// alias phase to end, this only reports it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MmMutationObservation {
+    /// A host-alias phase is in progress; strict snapshots wait for it.
+    pub alias_active: bool,
+    /// Host OS thread id of the alias holder (the `tid` lldb prints), when
+    /// the coordinator recorded one.
+    pub alias_holder_host_thread: Option<u64>,
+    /// How long the current alias phase has been held.
+    pub alias_held_for: Option<std::time::Duration>,
+    /// Threads queued to begin their own alias phase.
+    pub alias_waiters: usize,
+    /// Snapshots currently reading under the coordinator.
+    pub snapshot_readers: usize,
+}
+
 /// Read-only K1 adapter over the runtime's sole production VMA authority.
 pub trait VmaSnapshotSource: Debug + Send + Sync {
     fn snapshot(&self, deadline: Instant) -> Result<OwnedVmaSnapshot, SnapshotError>;
     fn revision(&self) -> VmaRevision;
+
+    /// Non-waiting view of the mutation coordinator guarding this source,
+    /// for a degraded snapshot. `None` when there is no coordinator or its
+    /// state lock could not be taken without waiting.
+    fn mutation_observation(&self) -> Option<MmMutationObservation> {
+        None
+    }
 
     /// Run `publish` while this source's observable VMA revision cannot change.
     ///
@@ -210,6 +236,11 @@ pub trait MmBackend: Send + Sync {
     fn revision(&self) -> u64;
     fn vma_revision(&self, _deadline: Instant) -> Result<Option<VmaRevision>, SnapshotError> {
         Ok(None)
+    }
+    /// Non-waiting view of this MM's mutation coordinator (see
+    /// [`VmaSnapshotSource::mutation_observation`]).
+    fn mutation_observation(&self) -> Option<MmMutationObservation> {
+        None
     }
 }
 

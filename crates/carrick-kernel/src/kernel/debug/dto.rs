@@ -1620,3 +1620,121 @@ where
     }
     Ok(())
 }
+/// Schema tag of a degraded response. Distinct from
+/// [`KERNEL_DEBUG_RESPONSE_SCHEMA`] so a consumer can never mistake a
+/// best-effort, non-coherent capture for a validated snapshot.
+pub const KERNEL_DEBUG_DEGRADED_SCHEMA: &str = "carrick.kernel-debug-degraded.v1";
+
+/// The response a runtime sends when the coherent snapshot could not complete
+/// (typically because a wedge holds an MM mutation coordinator): what each
+/// task and thread is doing, read one object at a time with deadline-bounded
+/// try-locks, and which coordinators are busy and who holds them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelDebugDegraded {
+    pub schema: String,
+    /// Why the coherent snapshot was refused.
+    pub strict_error: String,
+    pub tasks: Vec<DegradedTaskDto>,
+    pub mm_coordinators: Vec<DegradedMmCoordinatorDto>,
+    /// Objects whose lock was held past the deadline.
+    pub unreadable: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DegradedTaskDto {
+    pub key: DebugTaskKey,
+    pub diagnostic_name: String,
+    /// `None`: unreadable within the deadline.
+    pub lifecycle: Option<String>,
+    pub mm: u64,
+    /// `None`: unreadable within the deadline.
+    pub threads: Option<Vec<DegradedThreadDto>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DegradedThreadDto {
+    pub key: DebugThreadKey,
+    /// `None`: unreadable within the deadline.
+    pub execution: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DegradedMmCoordinatorDto {
+    pub mm: u64,
+    pub has_backend: bool,
+    /// `false` with `has_backend`: the coordinator state was contended.
+    pub observed: bool,
+    pub alias_active: Option<bool>,
+    /// Host OS thread id (lldb `tid`) of the alias-phase holder.
+    pub alias_holder_host_thread: Option<u64>,
+    pub alias_held_ms: Option<u64>,
+    pub alias_waiters: Option<u64>,
+    pub snapshot_readers: Option<u64>,
+}
+
+impl KernelDebugDegraded {
+    pub fn project(
+        strict_error: String,
+        degraded: &super::super::snapshot::DegradedKernelSnapshot,
+    ) -> Self {
+        Self {
+            schema: KERNEL_DEBUG_DEGRADED_SCHEMA.to_owned(),
+            strict_error,
+            tasks: degraded
+                .tasks
+                .iter()
+                .map(|row| DegradedTaskDto {
+                    key: task_key(row.key),
+                    diagnostic_name: row.diagnostic_name.clone(),
+                    lifecycle: row.lifecycle.map(|lifecycle| match lifecycle {
+                        super::super::objects::TaskLifecycle::Live => "live".to_owned(),
+                        super::super::objects::TaskLifecycle::Exiting => "exiting".to_owned(),
+                    }),
+                    mm: row.mm.raw(),
+                    threads: row.threads.as_ref().map(|threads| {
+                        threads
+                            .iter()
+                            .map(|thread| DegradedThreadDto {
+                                key: thread_key(thread.key),
+                                execution: thread.execution.clone(),
+                            })
+                            .collect()
+                    }),
+                })
+                .collect(),
+            mm_coordinators: degraded
+                .mm_coordinators
+                .iter()
+                .map(|row| {
+                    let observation = row.observation;
+                    DegradedMmCoordinatorDto {
+                        mm: row.mm.raw(),
+                        has_backend: row.has_backend,
+                        observed: observation.is_some(),
+                        alias_active: observation.map(|o| o.alias_active),
+                        alias_holder_host_thread: observation
+                            .and_then(|o| o.alias_holder_host_thread),
+                        alias_held_ms: observation.and_then(|o| {
+                            o.alias_held_for
+                                .map(|held| u64::try_from(held.as_millis()).unwrap_or(u64::MAX))
+                        }),
+                        alias_waiters: observation.map(|o| o.alias_waiters as u64),
+                        snapshot_readers: observation.map(|o| o.snapshot_readers as u64),
+                    }
+                })
+                .collect(),
+            unreadable: degraded.unreadable.clone(),
+        }
+    }
+
+    /// The coordinators a strict snapshot would wait on.
+    pub fn busy_coordinators(&self) -> impl Iterator<Item = &DegradedMmCoordinatorDto> {
+        self.mm_coordinators
+            .iter()
+            .filter(|row| row.alias_active == Some(true))
+    }
+}

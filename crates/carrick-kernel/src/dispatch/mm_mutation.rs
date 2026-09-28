@@ -19,6 +19,8 @@ pub(crate) enum AliasOperation {
 struct AliasHolder {
     #[allow(dead_code)] // Acquisition identity retained for offline core inspection.
     host_thread: std::thread::ThreadId,
+    host_os_thread: Option<u64>,
+    since: std::time::Instant,
     guest_tid: Option<carrick_hal::ThreadId>,
     operation: AliasOperation,
 }
@@ -28,6 +30,26 @@ struct CoordinatorState {
     alias_holder: Option<AliasHolder>,
     alias_waiters: usize,
     snapshot_readers: usize,
+}
+
+/// The calling thread's host OS thread id, as lldb prints it (`tid = ...`).
+///
+/// macOS only, where `carrick debug lldb-run` runs: other hosts have no
+/// reviewed, non-raw-syscall thread-id operation yet, so their degraded
+/// snapshot reports the holder as unknown rather than inventing one.
+fn current_host_thread_id() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut id = 0_u64;
+        // SAFETY: a zero (null) thread names the calling thread; `id` is a valid
+        // out-pointer for the duration of the call.
+        let rc = unsafe { libc::pthread_threadid_np(0, &mut id) };
+        (rc == 0).then_some(id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 /// Per-MM observation point for structural mutation/alias ownership.
@@ -77,6 +99,8 @@ impl MmMutationCoordinator {
         }
         let holder = AliasHolder {
             host_thread: std::thread::current().id(),
+            host_os_thread: current_host_thread_id(),
+            since: std::time::Instant::now(),
             guest_tid: permit.guest_tid,
             operation,
         };
@@ -130,6 +154,23 @@ impl MmMutationCoordinator {
         state.snapshot_readers += 1;
         Some(MmSnapshotGuard {
             coordinator: Arc::clone(self),
+        })
+    }
+
+    /// Report the coordinator's state without waiting for it: the state
+    /// lock is only ever held for a few instructions, so a bounded try-lock
+    /// that fails means contention, not a wedge, and reads as `None`.
+    pub(crate) fn observe(&self) -> Option<crate::kernel::MmMutationObservation> {
+        let state = self
+            .state
+            .try_lock_for(std::time::Duration::from_millis(10))?;
+        let holder = state.alias_holder.as_ref();
+        Some(crate::kernel::MmMutationObservation {
+            alias_active: holder.is_some(),
+            alias_holder_host_thread: holder.and_then(|h| h.host_os_thread),
+            alias_held_for: holder.map(|h| h.since.elapsed()),
+            alias_waiters: state.alias_waiters,
+            snapshot_readers: state.snapshot_readers,
         })
     }
 
@@ -630,6 +671,42 @@ mod tests {
             assert!(!permit.authorizes(&coordinator, mm(12)));
             assert!(!permit.authorizes(&Arc::new(MmMutationCoordinator::new(mm(11))), mm(11)));
         });
+    }
+
+    /// A degraded kernel snapshot must be able to name who holds the alias
+    /// phase a strict snapshot is waiting on, without entering it.
+    #[test]
+    fn observation_names_the_alias_holder_without_waiting() {
+        let coordinator = Arc::new(MmMutationCoordinator::new(mm(21)));
+        let idle = coordinator.observe().expect("uncontended state");
+        assert!(!idle.alias_active);
+        assert_eq!(idle.alias_holder_host_thread, None);
+
+        super::test_support::with_permit(Arc::clone(&coordinator), |permit| {
+            let alias = coordinator.begin_alias(permit);
+            let held = coordinator.observe().expect("uncontended state");
+            assert!(held.alias_active);
+            assert_eq!(
+                held.alias_holder_host_thread,
+                super::current_host_thread_id()
+            );
+            assert!(held.alias_held_for.is_some());
+            // The strict snapshot path is what a wedge blocks; it must time
+            // out rather than report a snapshot.
+            assert!(
+                coordinator
+                    .begin_snapshot_until(
+                        std::time::Instant::now() + std::time::Duration::from_millis(5)
+                    )
+                    .is_none()
+            );
+            drop(alias);
+        });
+
+        let released = coordinator.observe().expect("uncontended state");
+        assert!(!released.alias_active);
+        assert_eq!(released.alias_holder_host_thread, None);
+        assert_eq!(released.alias_held_for, None);
     }
 }
 
