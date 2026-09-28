@@ -28,6 +28,7 @@ mod allocation_meter {
 
     thread_local! {
         static BYTES: Cell<Option<u64>> = const { Cell::new(None) };
+        static CALLS: Cell<Option<u64>> = const { Cell::new(None) };
     }
 
     struct CountingAllocator;
@@ -39,6 +40,11 @@ mod allocation_meter {
         let _ = BYTES.try_with(|count| {
             if let Some(total) = count.get() {
                 count.set(Some(total.saturating_add(bytes as u64)));
+            }
+        });
+        let _ = CALLS.try_with(|count| {
+            if let Some(total) = count.get() {
+                count.set(Some(total.saturating_add(1)));
             }
         });
     }
@@ -68,11 +74,22 @@ mod allocation_meter {
 
     /// Host-heap bytes requested by this thread while `run` executes.
     pub(super) fn measure<T>(run: impl FnOnce() -> T) -> (T, u64) {
-        BYTES.with(|count| count.set(Some(0)));
-        let value = run();
-        let bytes = BYTES.with(|count| count.replace(None)).unwrap_or(0);
+        let (value, bytes, _) = measure_with_count(run);
         (value, bytes)
     }
+
+    pub(super) fn measure_with_count<T>(run: impl FnOnce() -> T) -> (T, u64, u64) {
+        BYTES.with(|count| count.set(Some(0)));
+        CALLS.with(|count| count.set(Some(0)));
+        let value = run();
+        let bytes = BYTES.with(|count| count.replace(None)).unwrap_or(0);
+        let calls = CALLS.with(|count| count.replace(None)).unwrap_or(0);
+        (value, bytes, calls)
+    }
+}
+
+pub(crate) fn measure_host_heap<T>(run: impl FnOnce() -> T) -> (T, u64, u64) {
+    allocation_meter::measure_with_count(run)
 }
 
 const SYS_BRK: u64 = 214;
