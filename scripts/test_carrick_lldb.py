@@ -266,6 +266,45 @@ class CarrickLldbHelperTests(unittest.TestCase):
             "FAULTSIG_MBOX tid=74001 slot=21 state=host-working",
         )
 
+    def test_eventring_high_rate_kinds_match_rust_routing(self):
+        """The plugin's split must be the runtime's `is_high_rate` exactly."""
+        import re
+
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "crates/carrick-kernel/src/event_ring.rs"
+        ).read_text()
+        constants = {
+            name: int(value)
+            for name, value in re.findall(r"pub const ([A-Z0-9_]+): u8 = (\d+);", source)
+        }
+        body = re.search(
+            r"pub const fn is_high_rate\(kind: u8\) -> bool \{\s*matches!\(\s*kind,(.*?)\)\s*\}",
+            source,
+            re.S,
+        )
+        self.assertIsNotNone(body)
+        names = [name.strip() for name in body.group(1).split("|")]
+        rust = {constants[name] for name in names}
+        self.assertEqual(rust, set(PLUGIN._EVENTRING_HIGH_RATE_KINDS))
+        for kind in rust:
+            self.assertIn(kind, PLUGIN._EVENTRING_KINDS)
+
+    def test_eventring_arguments_select_ring_and_window(self):
+        parse = PLUGIN._parse_eventring_args
+        self.assertEqual(parse(""), ("lifecycle", PLUGIN._EVENTRING_DEFAULT_COUNT, None))
+        self.assertEqual(parse("8192"), ("lifecycle", 8192, None))
+        self.assertEqual(parse("--high-rate 8192"), ("high-rate", 8192, None))
+        self.assertEqual(parse("--sched 10:5"), ("high-rate", 5, 10))
+        self.assertEqual(parse("7 --sched"), ("high-rate", 7, None))
+        for bad in ("0", "-3", "x", "1 2", "--sched 1:0"):
+            with self.assertRaises(ValueError):
+                parse(bad)
+        self.assertEqual(
+            PLUGIN._EVENTRING_RINGS,
+            {"lifecycle": ("RING", "IDX"), "high-rate": ("SCHED_RING", "SCHED_IDX")},
+        )
+
     def test_eventring_formats_mm_occupancy_refusal(self):
         self.assertEqual(
             self._fmt(80, 75, 4, 9),
