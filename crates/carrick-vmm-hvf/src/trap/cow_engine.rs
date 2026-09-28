@@ -4593,12 +4593,22 @@ impl HvfVmState {
         // syscall set, whose runtime dispatch already owns the process-wide
         // MM exclusion across invalidate + TLBI + this backend retirement.
         let prepared = self.prepare_process_alias_retirement(va, len)?;
-        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
-            carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
-            identity.linux_pid,
-            identity.linux_tid,
-        );
-        self.commit_process_alias_retirement(va, len, prepared, &registry)
+        if prepared.inventory.is_some() {
+            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
+                identity.linux_pid,
+                identity.linux_tid,
+            );
+            self.commit_process_alias_retirement(va, len, prepared, &registry)
+        } else {
+            self.commit_process_alias_retirement_inner(
+                va,
+                len,
+                prepared,
+                None,
+                AliasRetirementAuthorityState::Pending,
+            )
+        }
     }
 
     /// Prepare while the caller holds topology exclusion. Dropping this value
@@ -4711,7 +4721,7 @@ impl HvfVmState {
             va,
             len,
             prepared,
-            registry,
+            Some(registry),
             AliasRetirementAuthorityState::Pending,
         )
     }
@@ -4727,7 +4737,7 @@ impl HvfVmState {
             va,
             len,
             prepared,
-            registry,
+            Some(registry),
             AliasRetirementAuthorityState::AppliedWithReplacement,
         )
     }
@@ -4737,10 +4747,14 @@ impl HvfVmState {
         va: u64,
         len: usize,
         prepared: PreparedProcessAliasRetirement,
-        registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
+        registry: Option<&crate::fork_quiesce::FrameRegistryGuard<'_>>,
         authority_state: AliasRetirementAuthorityState,
     ) -> Result<(), TrapError> {
-        let _ = registry;
+        if prepared.inventory.is_some() && registry.is_none() {
+            return Err(TrapError::Hypervisor(
+                "alias retirement inventory publication lacks frame registry guard".to_owned(),
+            ));
+        }
         let authority = self.cow_authority.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch alias retirement has no inventory authority".to_owned())
         })?;
