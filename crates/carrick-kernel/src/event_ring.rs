@@ -14,6 +14,13 @@
 //! the lldb plugin: `lldb -c <core> target/release/carrick` then
 //! `carrick eventring` (works on a live `lldb -p <pid>` too).
 //!
+//! There are two fixed rings with the same slot protocol. [`is_high_rate`]
+//! kinds (per-dispatch scheduler, per-poll epoll/eventfd/futex) go to the
+//! high-rate ring, read with `carrick eventring --high-rate`; every other kind
+//! goes to the lifecycle ring. A spinning guest therefore cannot evict fork,
+//! exec, fd, wait, fault or grant history (the `gbhang4` capture of a hung
+//! `go build` held 8192 scheduler/epoll records and nothing else).
+//!
 //! Only the perturbing, autonomous FILE dump is opt-in: build with the
 //! `event-ring-dump` feature and set `CARRICK_EVENTRING` to a directory; a 1 Hz
 //! watchdog thread (OFF the vCPU thread, so guest syscall timing is intact)
@@ -50,8 +57,15 @@ const EMPTY: Slot = Slot {
     hi: AtomicU64::new(0),
 };
 
+/// The lifecycle ring: fork/exec/fd/wait/signal/fault/grant history.
 static RING: [Slot; N] = [EMPTY; N];
 static IDX: AtomicU64 = AtomicU64::new(0);
+/// The high-rate ring: per-dispatch scheduler and per-poll epoll/eventfd/futex
+/// records (see [`is_high_rate`]). A spinning guest fills THIS ring, so a
+/// scheduler spin can no longer evict the lifecycle history above. Same
+/// geometry and slot protocol, so one reader serves both.
+static SCHED_RING: [Slot; N] = [EMPTY; N];
+static SCHED_IDX: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG: AtomicBool = AtomicBool::new(false);
 static NEXT_HVPWAIT_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -416,18 +430,76 @@ pub fn payload_starts_at_ar_member_header(payload: &[u8]) -> bool {
     payload[0].is_ascii_graphic()
 }
 
+/// Which ring a record kind is published into.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RingSelect {
+    /// Lifecycle, fault, grant, fd, wait and signal history.
+    Lifecycle,
+    /// Per-dispatch scheduler and per-poll epoll/eventfd/futex records.
+    HighRate,
+}
+
+/// Kinds a spinning guest can emit once per dispatch or per poll. They go to
+/// the separate high-rate ring so a spin cannot overwrite lifecycle records.
+pub const fn is_high_rate(kind: u8) -> bool {
+    matches!(
+        kind,
+        EPWAIT
+            | EPWFD
+            | EPMASK
+            | EPMASKFD
+            | EPEDGE
+            | EFDWRITE
+            | EFDREAD
+            | FUTEXWAIT
+            | FUTEXWAKE
+            | FUTEXEND
+            | EPREADY
+            | EPWAKE
+            | EPCMSUM
+            | SCHED_DISPATCH
+            | SCHED_PREEMPT
+            | SCHED_BUDGET
+            | SCHED_DEADLINE
+    )
+}
+
+/// The ring `kind` is published into.
+pub const fn ring_for_kind(kind: u8) -> RingSelect {
+    if is_high_rate(kind) {
+        RingSelect::HighRate
+    } else {
+        RingSelect::Lifecycle
+    }
+}
+
+#[inline]
+fn ring_storage(ring: RingSelect) -> (&'static [Slot; N], &'static AtomicU64) {
+    match ring {
+        RingSelect::Lifecycle => (&RING, &IDX),
+        RingSelect::HighRate => (&SCHED_RING, &SCHED_IDX),
+    }
+}
+
 pub fn rec(kind: u8, a: i32, b: i32, c: i32) {
+    let (ring, idx) = ring_storage(ring_for_kind(kind));
+    publish(ring, idx, kind, a, b, c);
+    #[cfg(feature = "event-ring-dump")]
+    maybe_start_watchdog();
+}
+
+/// Reserve the next logical index of one ring and publish into its slot.
+#[inline]
+fn publish(ring: &[Slot; N], idx: &AtomicU64, kind: u8, a: i32, b: i32, c: i32) {
     let lo = (a as u32 as u64) | ((b as u32 as u64) << 32);
     let hi = (c as u32 as u64) | ((kind as u64) << 32);
-    let Ok(logical_index) = IDX.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    let Ok(logical_index) = idx.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
         next.checked_add(1)
     }) else {
         return;
     };
-    let slot = &RING[(logical_index % N as u64) as usize];
+    let slot = &ring[(logical_index % N as u64) as usize];
     let _published = write_reserved(slot, logical_index, lo, hi);
-    #[cfg(feature = "event-ring-dump")]
-    maybe_start_watchdog();
 }
 
 #[inline]
@@ -1079,22 +1151,36 @@ fn read_slot(slot: &Slot, logical_index: u64) -> Result<EventRecord, RingReadErr
 /// capture that cannot tell them apart is not evidence. Lock-free and
 /// allocation-bounded; safe to call from a frozen carrier.
 pub fn drain_recent(max: usize) -> Vec<Result<EventRecord, RingReadError>> {
-    let total = IDX.load(Ordering::Acquire);
+    drain_ring(RingSelect::Lifecycle, max)
+}
+
+/// [`drain_recent`] for the high-rate ring.
+pub fn drain_recent_high_rate(max: usize) -> Vec<Result<EventRecord, RingReadError>> {
+    drain_ring(RingSelect::HighRate, max)
+}
+
+fn drain_ring(ring: RingSelect, max: usize) -> Vec<Result<EventRecord, RingReadError>> {
+    let (slots, idx) = ring_storage(ring);
+    let total = idx.load(Ordering::Acquire);
     let window = max.min(N) as u64;
     let start = total.saturating_sub(window);
     (start..total)
-        .map(|logical_index| read_slot(&RING[(logical_index % N as u64) as usize], logical_index))
+        .map(|logical_index| read_slot(&slots[(logical_index % N as u64) as usize], logical_index))
         .collect()
 }
 
+/// Whether the ring `kind` routes to still holds `(kind, a, b, c)`.
 #[cfg(test)]
 pub(crate) fn contains_event(kind: u8, a: i32, b: i32, c: i32) -> bool {
-    let total = IDX.load(Ordering::Acquire);
-    let start = total.saturating_sub(N as u64);
-    (start..total).any(|logical_index| {
-        read_slot(&RING[(logical_index % N as u64) as usize], logical_index)
-            .is_ok_and(|event| event.kind == kind && event.a == a && event.b == b && event.c == c)
-    })
+    ring_contains(ring_for_kind(kind), kind, a, b, c)
+}
+
+#[cfg(test)]
+pub(crate) fn ring_contains(ring: RingSelect, kind: u8, a: i32, b: i32, c: i32) -> bool {
+    drain_ring(ring, N)
+        .into_iter()
+        .filter_map(Result::ok)
+        .any(|event| event.kind == kind && event.a == a && event.b == b && event.c == c)
 }
 
 #[inline]
@@ -1150,10 +1236,12 @@ pub fn path_hash(path: &[u8]) -> i32 {
 /// event history from here, so a per-process core shows that process's events.
 pub fn reinit_after_fork() {
     // Only the forking thread survives, so no writer can race this reset.
-    for slot in &RING {
-        slot.generation.store(0, Ordering::SeqCst);
+    for (slots, idx) in [(&RING, &IDX), (&SCHED_RING, &SCHED_IDX)] {
+        for slot in slots {
+            slot.generation.store(0, Ordering::SeqCst);
+        }
+        idx.store(0, Ordering::SeqCst);
     }
-    IDX.store(0, Ordering::SeqCst);
     NEXT_HVPWAIT_ID.store(1, Ordering::SeqCst);
     WATCHDOG.store(false, Ordering::SeqCst);
 }
@@ -1737,17 +1825,31 @@ pub fn rec_syslog_wake(owner_id: u32, event_type: i32, wake_count: u64, poll_fd:
 #[cfg(feature = "event-ring-dump")]
 fn dump(path: &str) {
     use std::io::Write;
-    let total = IDX.load(Ordering::Acquire);
+    let mut out = String::new();
+    for (label, ring) in [
+        ("lifecycle", RingSelect::Lifecycle),
+        ("high-rate", RingSelect::HighRate),
+    ] {
+        dump_ring(&mut out, label, ring);
+    }
+    if let Ok(mut f) = std::fs::File::create(path) {
+        let _ = f.write_all(out.as_bytes());
+    }
+}
+
+#[cfg(feature = "event-ring-dump")]
+fn dump_ring(out: &mut String, label: &str, ring: RingSelect) {
+    let (slots, idx) = ring_storage(ring);
+    let total = idx.load(Ordering::Acquire);
     let count = total.min(N as u64);
     let start = total.saturating_sub(count);
-    let mut out = String::with_capacity(count as usize * 64);
     out.push_str(&format!(
-        "# carrick event ring pid={} events={}\n",
+        "# carrick event ring ({label}) pid={} events={}\n",
         std::process::id(),
         total
     ));
     for logical_index in start..total {
-        match read_slot(&RING[(logical_index % N as u64) as usize], logical_index) {
+        match read_slot(&slots[(logical_index % N as u64) as usize], logical_index) {
             Ok(event) => {
                 let line = decode(event.kind, event.a, event.b, event.c);
                 if line.is_empty() {
@@ -1761,9 +1863,6 @@ fn dump(path: &str) {
             }
             Err(error) => out.push_str(&format!("{logical_index:6} ERROR {error}\n")),
         }
-    }
-    if let Ok(mut f) = std::fs::File::create(path) {
-        let _ = f.write_all(out.as_bytes());
     }
 }
 
@@ -2596,6 +2695,134 @@ mod tests {
         assert_eq!(
             decode(MMOCC_REFUSE, 75, 4, 9),
             "MMOCC_REFUSE slot=75 running_mm=4 requested_mm=9"
+        );
+    }
+
+    /// A private copy of the two-ring geometry, so a flood cannot evict the
+    /// records other tests in this binary publish into the global rings.
+    struct LocalRings {
+        lifecycle: Box<[Slot; N]>,
+        lifecycle_idx: AtomicU64,
+        high_rate: Box<[Slot; N]>,
+        high_rate_idx: AtomicU64,
+    }
+
+    impl LocalRings {
+        fn new() -> Self {
+            Self {
+                lifecycle: Box::new(std::array::from_fn(|_| empty_slot())),
+                lifecycle_idx: AtomicU64::new(0),
+                high_rate: Box::new(std::array::from_fn(|_| empty_slot())),
+                high_rate_idx: AtomicU64::new(0),
+            }
+        }
+
+        /// Exactly `rec`'s routing, into the private rings.
+        fn rec(&self, kind: u8, a: i32, b: i32, c: i32) {
+            match ring_for_kind(kind) {
+                RingSelect::Lifecycle => {
+                    publish(&self.lifecycle, &self.lifecycle_idx, kind, a, b, c)
+                }
+                RingSelect::HighRate => {
+                    publish(&self.high_rate, &self.high_rate_idx, kind, a, b, c)
+                }
+            }
+        }
+
+        fn lifecycle_contains(&self, kind: u8, a: i32, b: i32, c: i32) -> bool {
+            let total = self.lifecycle_idx.load(Ordering::Acquire);
+            (total.saturating_sub(N as u64)..total).any(|logical_index| {
+                read_slot(
+                    &self.lifecycle[(logical_index % N as u64) as usize],
+                    logical_index,
+                )
+                .is_ok_and(|event| {
+                    event.kind == kind && event.a == a && event.b == b && event.c == c
+                })
+            })
+        }
+    }
+
+    /// A spinning scheduler must not evict lifecycle history. The `go build`
+    /// hang capture (gbhang4) held 8192 SCHED_DISPATCH/SCHED_BUDGET/EPWAIT
+    /// records from one tid and nothing else.
+    #[test]
+    fn a_scheduler_spin_does_not_evict_lifecycle_records() {
+        let rings = LocalRings::new();
+        let marker = 0x5eed_0001;
+        rings.rec(FORK, marker, 0, 0);
+        for index in 0..(N as i32 + 64) {
+            rings.rec(SCHED_DISPATCH, 0x5eed_0002, 1, index);
+            rings.rec(SCHED_BUDGET, 0x5eed_0002, 4, index);
+            rings.rec(EPWAIT, 0x5eed_0002, 0, index);
+        }
+        assert!(
+            rings.lifecycle_contains(FORK, marker, 0, 0),
+            "a lifecycle record was overwritten by high-rate scheduler records"
+        );
+        assert_eq!(rings.lifecycle_idx.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn each_kind_lands_in_exactly_its_ring() {
+        let high_rate = [
+            EPWAIT,
+            EPWFD,
+            EPMASK,
+            EPMASKFD,
+            EPEDGE,
+            EFDWRITE,
+            EFDREAD,
+            FUTEXWAIT,
+            FUTEXWAKE,
+            FUTEXEND,
+            EPREADY,
+            EPWAKE,
+            EPCMSUM,
+            SCHED_DISPATCH,
+            SCHED_PREEMPT,
+            SCHED_BUDGET,
+            SCHED_DEADLINE,
+        ];
+        for kind in BIND..=LAST_KIND {
+            let expected = if high_rate.contains(&kind) {
+                RingSelect::HighRate
+            } else {
+                RingSelect::Lifecycle
+            };
+            assert_eq!(ring_for_kind(kind), expected, "kind {kind}");
+            let other = match expected {
+                RingSelect::Lifecycle => RingSelect::HighRate,
+                RingSelect::HighRate => RingSelect::Lifecycle,
+            };
+            let marker = 0x7a00_0000 | i32::from(kind);
+            rec(kind, marker, -1, 0x7a7a);
+            assert!(
+                ring_contains(expected, kind, marker, -1, 0x7a7a),
+                "kind {kind} missing from {expected:?}"
+            );
+            assert!(
+                !ring_contains(other, kind, marker, -1, 0x7a7a),
+                "kind {kind} leaked into {other:?}"
+            );
+        }
+        // The fault/grant/fd forensics this ring split exists to protect.
+        for kind in [
+            FORK,
+            EXEC,
+            FDOPEN,
+            FDCLOSE,
+            HVPWAIT,
+            FAULTSIG,
+            EL1GRANT_CLAIM,
+        ] {
+            assert_eq!(ring_for_kind(kind), RingSelect::Lifecycle);
+        }
+        assert!(
+            drain_recent_high_rate(N)
+                .into_iter()
+                .filter_map(Result::ok)
+                .all(|event| is_high_rate(event.kind))
         );
     }
 }

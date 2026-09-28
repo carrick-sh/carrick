@@ -899,8 +899,53 @@ def cmd_guest_threads(debugger, command, exe_ctx, result, internal_dict):
     result.AppendMessage("\n".join(lines))
 
 
+# Kinds the runtime publishes into the separate high-rate ring
+# (`event_ring::is_high_rate`): per-dispatch scheduler and per-poll
+# epoll/eventfd/futex records. Mirrors the Rust routing exactly.
+_EVENTRING_HIGH_RATE_KINDS = frozenset(
+    {6, 12, 13, 14, 15, 21, 22, 23, 24, 25, 36, 52, 53, 64, 65, 66, 67}
+)
+_EVENTRING_RINGS = {
+    "lifecycle": ("RING", "IDX"),
+    "high-rate": ("SCHED_RING", "SCHED_IDX"),
+}
+_EVENTRING_USAGE = (
+    "usage: carrick eventring [--high-rate|--sched] [positive-count|start:positive-count]"
+)
+
+
+def _parse_eventring_args(command: str):
+    """Return (ring, requested, requested_start) or raise ValueError."""
+    ring = "lifecycle"
+    requested = _EVENTRING_DEFAULT_COUNT
+    requested_start = None
+    rest = []
+    for token in command.split():
+        if token in ("--high-rate", "--sched"):
+            ring = "high-rate"
+        else:
+            rest.append(token)
+    if len(rest) > 1:
+        raise ValueError(_EVENTRING_USAGE)
+    if rest:
+        argument = rest[0]
+        if ":" in argument:
+            start_text, count_text = argument.split(":", 1)
+            requested_start = int(start_text, 10)
+            requested = int(count_text, 10)
+        else:
+            requested = int(argument, 10)
+        if requested <= 0 or requested_start is not None and requested_start < 0:
+            raise ValueError("eventring count must be positive")
+    return ring, requested, requested_start
+
+
 def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
-    """carrick eventring [COUNT|START:COUNT] — decode the event ring."""
+    """carrick eventring [--high-rate] [COUNT|START:COUNT] — decode an event ring.
+
+    The default is the lifecycle ring (fork/exec/fd/wait/signal/fault/grant).
+    `--high-rate` (alias `--sched`) reads the separate per-dispatch scheduler
+    and per-poll epoll/eventfd/futex ring, which a spinning guest fills."""
     target = exe_ctx.GetTarget() or debugger.GetSelectedTarget()
     if not target or not target.IsValid():
         result.SetError("no target; `lldb <binary>` (attach) or `lldb -c <core> <binary>`")
@@ -912,12 +957,20 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
             "or load a core (`lldb -c <core> target/release/carrick`)."
         )
         return
-    idx_addr = _static_load_addr(target, "carrick_runtime::event_ring::IDX")
-    ring_addr = _static_load_addr(target, "carrick_runtime::event_ring::RING")
+    try:
+        ring_name, requested, requested_start = _parse_eventring_args(command)
+    except ValueError as error:
+        message = str(error)
+        result.SetError(message if message.startswith(("usage", "eventring")) else _EVENTRING_USAGE)
+        return
+    ring_symbol, idx_symbol = _EVENTRING_RINGS[ring_name]
+    idx_addr = _static_load_addr(target, f"carrick_kernel::event_ring::{idx_symbol}")
+    ring_addr = _static_load_addr(target, f"carrick_kernel::event_ring::{ring_symbol}")
     if idx_addr is None or ring_addr is None:
         result.SetError(
-            "event_ring RING/IDX symbols not found — the binary must retain "
-            "symbols (release keeps them unless explicitly stripped)."
+            f"event_ring {ring_symbol}/{idx_symbol} symbols not found — the binary "
+            "must retain symbols (release keeps them unless explicitly stripped), "
+            "and a binary older than the ring split has no high-rate ring."
         )
         return
     err = lldb.SBError()
@@ -926,23 +979,6 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
         result.SetError(f"read IDX @ {_fmt_hex(idx_addr)} failed: {err.GetCString()}")
         return
     total = int.from_bytes(raw_idx, "little")
-    requested = _EVENTRING_DEFAULT_COUNT
-    requested_start = None
-    argument = command.strip()
-    if argument:
-        try:
-            if ":" in argument:
-                start_text, count_text = argument.split(":", 1)
-                requested_start = int(start_text, 10)
-                requested = int(count_text, 10)
-            else:
-                requested = int(argument, 10)
-        except ValueError:
-            result.SetError("usage: carrick eventring [positive-count|start:positive-count]")
-            return
-        if requested <= 0 or requested_start is not None and requested_start < 0:
-            result.SetError("eventring count must be positive")
-            return
     oldest = max(0, total - _EVENTRING_N)
     if requested_start is None:
         count = min(total, _EVENTRING_N, requested)
@@ -966,7 +1002,7 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
         return
     pid = process.GetProcessID()
     out = [
-        f"# carrick event ring  pid={pid}  total={total}  "
+        f"# carrick event ring ({ring_name})  pid={pid}  total={total}  "
         f"showing={count}  start={start}  oldest={oldest}"
     ]
     errors = 0

@@ -1796,6 +1796,22 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/event_ring.rs",
+      "symbol": "SCHED_IDX",
+      "fingerprint": "72d6e03af8e0e2e7278f889b8b1695d7170e991ce682b5a67f4d375b9ddaca9e",
+      "classification": "carrier_infra",
+      "rationale": "Logical write index of the high-rate event ring SCHED_RING in crates/carrick-kernel/src/event_ring.rs; lock-free reservation counter, reset only in reinit_after_fork."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/event_ring.rs",
+      "symbol": "SCHED_RING",
+      "fingerprint": "29902818ebdd04b19125a4cc62699652ab9c4e0eb59666fc7f71da3c0779cb3f",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide always-on high-rate event ring in crates/carrick-kernel/src/event_ring.rs: per-dispatch scheduler and per-poll epoll/eventfd/futex records kept apart from RING so a spin cannot evict lifecycle history; read post-mortem by the lldb plugin."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/event_ring.rs",
       "symbol": "WATCHDOG",
       "fingerprint": "ee057f3981134b986886500eec0a6b454ff540fbc5b1db0a0eb60d1264875e89",
       "classification": "carrier_infra",

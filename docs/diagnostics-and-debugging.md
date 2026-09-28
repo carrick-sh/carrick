@@ -421,6 +421,21 @@ ring is per-process and is reset on each guest fork (so a per-process core shows
 that process's own history); AF_UNIX `bind`/`connect` carry a `pathhash` so you
 can match a `connect` to the `bind` of the same socket across processes.
 
+There are **two rings of 8192 records each**. Per-dispatch scheduler records
+(`SCHED_*`) and per-poll epoll, eventfd and futex records (`EPWAIT`, `EPWFD`,
+`EPMASK*`, `EPEDGE`, `EPREADY`, `EPWAKE`, `EPCMSUM`, `EFD*`, `FUTEX*`) go to
+the **high-rate ring**. Everything else stays in the **lifecycle ring**: fork,
+exec, fd, wait, signal, fault and grant records. The list is
+`event_ring::is_high_rate`. The split exists because of a hung `go build`
+capture (`gbhang4`) whose single ring held 8192 `SCHED_DISPATCH` /
+`SCHED_BUDGET` / `EPWAIT` records from one tid and nothing else. A spin now
+fills only the high-rate ring. `carrick eventring` reads the lifecycle ring
+and `carrick eventring --high-rate` (alias `--sched`) reads the other.
+`carrick debug lldb-run` captures both in full, and a post-mortem writes
+`event-ring.jsonl` and `event-ring-high-rate.jsonl`. Order across the two
+rings comes from the surrounding records, not from their separate logical
+indexes.
+
 > [!IMPORTANT]
 > Use the event ring when `carrick trace` perturbs the bug away. dtrace's
 > per-syscall probes change a timing-sensitive race's outcome (it stops
