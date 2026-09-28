@@ -1093,7 +1093,7 @@ impl<'a> SourceCheckerVisitor<'a> {
             let relative = text.rsplit("/src/").next().unwrap_or("");
             let module = relative.trim_end_matches(".rs").trim_end_matches("/mod");
             resolved = module.split('/').map(str::to_string).collect();
-            if relative == "file.rs" || relative == "sched/hw.rs" {
+            if matches!(relative, "file.rs" | "sched.rs" | "sched/hw.rs") {
                 resolved.insert(0, "substrate".to_string());
             }
             while rest.first().is_some_and(|p| p == "super") {
