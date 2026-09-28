@@ -21,7 +21,7 @@ pub use carrick_hal::{
 
 use super::Kernel;
 use super::objects::{
-    BlockedReason, ExecutionGeneration, ExecutorId, Thread, ThreadExecutionError,
+    BlockedReason, ExecutionGeneration, ExecutorId, TaskKey, Thread, ThreadExecutionError,
     ThreadExecutionLease, ThreadExecutionState, ThreadKey, ThreadSchedulerAction,
 };
 
@@ -48,6 +48,41 @@ pub enum WakeDisposition {
     Coalesced,
     Kicked,
     Pending,
+}
+
+/// Exact target identity for a scheduler wake.
+///
+/// Binds the wake to a specific `TaskKey`, `ThreadKey`, and
+/// `ExecutionGeneration`. If the target task has already been reaped or the
+/// execution generation has advanced past this wake edge, the wake is dropped
+/// as a benign no-op (`WakeDisposition::Pending`) without failing the carrier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactWakeTarget {
+    pub task: TaskKey,
+    pub thread: ThreadKey,
+    pub generation: ExecutionGeneration,
+}
+
+impl ExactWakeTarget {
+    pub const fn new(task: TaskKey, thread: ThreadKey, generation: ExecutionGeneration) -> Self {
+        Self {
+            task,
+            thread,
+            generation,
+        }
+    }
+
+    pub const fn task(&self) -> TaskKey {
+        self.task
+    }
+
+    pub const fn thread(&self) -> ThreadKey {
+        self.thread
+    }
+
+    pub const fn generation(&self) -> ExecutionGeneration {
+        self.generation
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -3673,6 +3708,67 @@ impl Scheduler {
         }
     }
 
+    /// Wake the exact target task and execution generation.
+    ///
+    /// Unlike untyped `wake`, `wake_exact` authenticates that the wake target
+    /// belongs to the intended `TaskKey` and `ExecutionGeneration`. If the
+    /// target task has already been reaped or the execution generation has
+    /// advanced past this wake edge, the wake is dropped as a benign no-op
+    /// (`WakeDisposition::Pending`) without failing the carrier.
+    pub fn wake_exact(&self, target: ExactWakeTarget) -> Result<WakeDisposition, SchedulerError> {
+        let _transition = self.generation_transition.lock();
+
+        // 1. Check whether target task and thread are live in the kernel graph.
+        let thread = {
+            let state = self.kernel.registry().state.read();
+            let Some(record) = state.tasks.get(&target.task.id) else {
+                tracing::debug!(
+                    ?target,
+                    "wake_exact of reaped/absent task dropped as pending"
+                );
+                return Ok(WakeDisposition::Pending);
+            };
+            if record.task.key() != target.task {
+                tracing::debug!(?target, "wake_exact of recycled task dropped as pending");
+                return Ok(WakeDisposition::Pending);
+            }
+            let Some(thread) = record.task.thread(target.thread.tid) else {
+                tracing::debug!(?target, "wake_exact of retired thread dropped as pending");
+                return Ok(WakeDisposition::Pending);
+            };
+            if thread.key() != target.thread {
+                tracing::debug!(?target, "wake_exact of recycled thread dropped as pending");
+                return Ok(WakeDisposition::Pending);
+            }
+            Arc::clone(&thread)
+        };
+
+        // 2. Thread is live in the kernel graph: admit wake.
+        let admission = match self.queue.inner.try_admit_wake() {
+            Ok(admission) => admission,
+            Err(RunQueueError::Closed) => return Err(SchedulerError::Queue(RunQueueError::Closed)),
+            Err(err) => return Err(SchedulerError::Queue(err)),
+        };
+
+        // 3. Authenticate exact execution generation under the thread lock.
+        // A stale generation (e.g. thread moved on, exited, or failed) returns None
+        // and is dropped cleanly as pending without failing the carrier.
+        let action = match thread.scheduler_wake_exact(target.thread, target.generation) {
+            Ok(action) => action,
+            Err(ThreadExecutionError::InvalidTransition { .. }) => {
+                return Ok(WakeDisposition::Pending);
+            }
+            Err(err) => return Err(SchedulerError::Thread(err)),
+        };
+
+        let wake_action = self.translate_scheduler_action(&thread, action);
+
+        self.commit_wake(PendingWake {
+            action: wake_action,
+            _admission: admission,
+        })
+    }
+
     /// Classify a rejected wake for the auditors.
     ///
     /// The verdict is read from the TYPED execution state and from exact key
@@ -3818,33 +3914,21 @@ impl Scheduler {
         result
     }
 
-    fn decide_wake(&self, key: ThreadKey) -> Result<WakeAction, SchedulerError> {
-        let thread = self
-            .kernel
-            .exact_thread_for_scheduler(key)
-            .ok_or(SchedulerError::UnknownThread)?;
-        let action = thread.scheduler_wake(key)?;
-        Ok(match action {
+    fn translate_scheduler_action(
+        &self,
+        thread: &Arc<Thread>,
+        action: ThreadSchedulerAction,
+    ) -> WakeAction {
+        match action {
             ThreadSchedulerAction::Queue {
                 key,
                 predecessor,
                 generation,
                 closing_authorized,
             } => {
-                // `TargetReaped` is the ONLY outcome that is not `Recorded`
-                // here (a live disagreement aborts inside the observer, and
-                // the match is exhaustive, so this cannot widen into "any
-                // error is benign"). Linux answers a wake of an exited task
-                // with a no-op, so this is a no-op wake — NOT an error for the
-                // waker to carry. Round 1 stopped at "reject instead of abort"
-                // and left the rejection to propagate, which killed the
-                // executor that raised it ("executor worker died error=exact
-                // thread generation is not live", `conf-35614-c00`) and
-                // cascaded into a carrier FATAL: no better than the abort it
-                // replaced.
                 if let Some(predecessor) = predecessor {
                     match self.observe_generation_transition(
-                        &thread,
+                        thread,
                         key,
                         predecessor,
                         generation,
@@ -3853,18 +3937,15 @@ impl Scheduler {
                         GenerationTransitionOutcome::Recorded => {}
                         GenerationTransitionOutcome::TargetReaped => {
                             tracing::debug!(?key, "wake of a reaped task is a no-op");
-                            return Ok(WakeAction::Pending);
+                            return WakeAction::Pending;
                         }
-                        // The carrier is already being aborted; a wake that
-                        // would publish a generation the observer refused must
-                        // not also strand it.
                         GenerationTransitionOutcome::LostExactTransition => {
-                            return Ok(WakeAction::Pending);
+                            return WakeAction::Pending;
                         }
                     }
                 }
                 WakeAction::Queue {
-                    thread,
+                    thread: Arc::clone(thread),
                     key: QueueKey {
                         thread: key,
                         generation,
@@ -3884,7 +3965,16 @@ impl Scheduler {
                 generation,
             }),
             ThreadSchedulerAction::None => WakeAction::Pending,
-        })
+        }
+    }
+
+    fn decide_wake(&self, key: ThreadKey) -> Result<WakeAction, SchedulerError> {
+        let thread = self
+            .kernel
+            .exact_thread_for_scheduler(key)
+            .ok_or(SchedulerError::UnknownThread)?;
+        let action = thread.scheduler_wake(key)?;
+        Ok(self.translate_scheduler_action(&thread, action))
     }
 
     fn decide_control_wake(&self, key: ThreadKey) -> Result<WakeAction, SchedulerError> {
@@ -3893,67 +3983,7 @@ impl Scheduler {
             .exact_thread_for_scheduler(key)
             .ok_or(SchedulerError::UnknownThread)?;
         let action = thread.scheduler_control_wake(key)?;
-        Ok(match action {
-            ThreadSchedulerAction::Queue {
-                key,
-                predecessor,
-                generation,
-                closing_authorized,
-            } => {
-                // `TargetReaped` is the ONLY outcome that is not `Recorded`
-                // here (a live disagreement aborts inside the observer, and
-                // the match is exhaustive, so this cannot widen into "any
-                // error is benign"). Linux answers a wake of an exited task
-                // with a no-op, so this is a no-op wake — NOT an error for the
-                // waker to carry. Round 1 stopped at "reject instead of abort"
-                // and left the rejection to propagate, which killed the
-                // executor that raised it ("executor worker died error=exact
-                // thread generation is not live", `conf-35614-c00`) and
-                // cascaded into a carrier FATAL: no better than the abort it
-                // replaced.
-                if let Some(predecessor) = predecessor {
-                    match self.observe_generation_transition(
-                        &thread,
-                        key,
-                        predecessor,
-                        generation,
-                        SchedulerGenerationTransition::Runnable,
-                    ) {
-                        GenerationTransitionOutcome::Recorded => {}
-                        GenerationTransitionOutcome::TargetReaped => {
-                            tracing::debug!(?key, "wake of a reaped task is a no-op");
-                            return Ok(WakeAction::Pending);
-                        }
-                        // The carrier is already being aborted; a wake that
-                        // would publish a generation the observer refused must
-                        // not also strand it.
-                        GenerationTransitionOutcome::LostExactTransition => {
-                            return Ok(WakeAction::Pending);
-                        }
-                    }
-                }
-                WakeAction::Queue {
-                    thread,
-                    key: QueueKey {
-                        thread: key,
-                        generation,
-                    },
-                    closing_authorized,
-                }
-            }
-            ThreadSchedulerAction::Kick {
-                executor,
-                executor_epoch,
-                key,
-                generation,
-            } => WakeAction::Kick(ExecutorKickToken {
-                executor,
-                executor_epoch,
-                thread: key,
-                generation,
-            }),
-            ThreadSchedulerAction::None => WakeAction::Pending,
-        })
+        Ok(self.translate_scheduler_action(&thread, action))
     }
 
     fn deliver_wake(&self, action: WakeAction) -> Result<WakeDisposition, SchedulerError> {
@@ -5442,8 +5472,8 @@ mod tests {
     use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 
     use super::{
-        CpuAffinity, ExecutorBinding, ExecutorKick, ExecutorKickToken, GuestCpuId, GuestCpuPolicy,
-        QueueKey, RunQueueError, Scheduler, SchedulerGenerationObserver,
+        CpuAffinity, ExactWakeTarget, ExecutorBinding, ExecutorKick, ExecutorKickToken, GuestCpuId,
+        GuestCpuPolicy, QueueKey, RunQueueError, Scheduler, SchedulerGenerationObserver,
         SchedulerGenerationTransition, SettlementDisposition, TrapError, WakeDisposition,
     };
     use crate::compat::SyscallArgs;
@@ -5615,6 +5645,100 @@ mod tests {
             *recorder.rejections.lock(),
             vec![(child_task, crate::observe::WakeRejectionReason::Exited)]
         );
+    }
+
+    #[test]
+    fn wake_exact_of_reaped_task_is_dropped_as_pending_without_audit() {
+        let (kernel, root) = bootstrap(12_462);
+        let child = process_child(&kernel, &root, 9_462, "wake-exact-reaped");
+        let child_thread = child.thread().key();
+        let child_task = child.task().key();
+
+        let recorder = Arc::new(RecordingWakeAuditor::default());
+        kernel.set_auditors(Arc::new(crate::observe::auditor::AuditorChain::new(vec![
+            Arc::clone(&recorder) as Arc<dyn crate::observe::KernelAuditor>,
+        ])));
+
+        drop(child);
+        kernel
+            .exit_task_key_eventually(child_task, LinuxWaitStatus::from_wait_encoding(0))
+            .expect("exit the child");
+        kernel
+            .wait_child(
+                root.task().key().id,
+                Some(child_task.id),
+                crate::kernel::WaitMode::Consume,
+            )
+            .expect("reap the child");
+        assert!(!kernel.task_exists(child_task.id), "the child is reaped");
+
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let target = ExactWakeTarget::new(
+            child_task,
+            child_thread,
+            crate::kernel::objects::ExecutionGeneration::INITIAL,
+        );
+        let disposition = scheduler
+            .wake_exact(target)
+            .expect("wake_exact should not fail");
+        assert_eq!(disposition, WakeDisposition::Pending);
+        assert!(
+            recorder.rejections.lock().is_empty(),
+            "wake_exact of a reaped task must not trigger auditor rejection: {:?}",
+            *recorder.rejections.lock()
+        );
+    }
+
+    #[test]
+    fn wake_exact_of_live_task_with_stale_generation_is_dropped_without_audit() {
+        let (kernel, root) = bootstrap(12_463);
+        let child = process_child(&kernel, &root, 9_463, "wake-exact-stale");
+        let child_thread = child.thread().key();
+        let child_task = child.task().key();
+        child
+            .thread()
+            .publish_initial_task_state(task_state(&child, 0x12463))
+            .expect("initial task state");
+
+        let recorder = Arc::new(RecordingWakeAuditor::default());
+        kernel.set_auditors(Arc::new(crate::observe::auditor::AuditorChain::new(vec![
+            Arc::clone(&recorder) as Arc<dyn crate::observe::KernelAuditor>,
+        ])));
+
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let target = ExactWakeTarget::new(
+            child_task,
+            child_thread,
+            crate::kernel::objects::ExecutionGeneration::from_raw(9999),
+        );
+        let disposition = scheduler
+            .wake_exact(target)
+            .expect("wake_exact should not fail");
+        assert_eq!(disposition, WakeDisposition::Pending);
+        assert!(
+            recorder.rejections.lock().is_empty(),
+            "wake_exact with stale generation must not trigger auditor rejection: {:?}",
+            *recorder.rejections.lock()
+        );
+    }
+
+    #[test]
+    fn wake_exact_of_live_task_matching_generation_delivers_wake() {
+        let (kernel, root) = bootstrap(12_464);
+        let child = process_child(&kernel, &root, 9_464, "wake-exact-live");
+        let child_thread = child.thread().key();
+        let child_task = child.task().key();
+        let child_gen = child
+            .thread()
+            .publish_initial_task_state(task_state(&child, 0x12464))
+            .expect("initial task state");
+
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let target = ExactWakeTarget::new(child_task, child_thread, child_gen);
+        let disposition = scheduler
+            .wake_exact(target)
+            .expect("wake_exact should succeed");
+        assert_eq!(disposition, WakeDisposition::Queued);
     }
 
     #[derive(Debug, Default)]

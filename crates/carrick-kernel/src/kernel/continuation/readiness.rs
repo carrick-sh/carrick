@@ -14,8 +14,8 @@ use parking_lot::Mutex;
 
 use super::{
     BlockedContinuation, ContinuationDetail, ContinuationEvent, ContinuationFamily, ContinuationId,
-    ExecutionGeneration, FutexSource, FutexWait, MmId, OwnedFdRegistration, TaskKey, ThreadKey,
-    VforkParentWait, WaitFdAuthority,
+    ExactWakeTarget, ExecutionGeneration, FutexSource, FutexWait, MmId, OwnedFdRegistration,
+    TaskKey, ThreadKey, VforkParentWait, WaitFdAuthority,
 };
 use crate::dispatch::format_time::{BlockingTimerFdRead, TimerFdPollSource, TimerFdReadPlan};
 use crate::dispatch::{BlockingMqueue, BlockingSemop};
@@ -270,6 +270,7 @@ impl ReservedSignal {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContinuationWakeToken {
     pub(crate) continuation: ContinuationId,
+    pub(crate) task: TaskKey,
     pub(crate) thread: ThreadKey,
     pub(crate) thread_serial: u64,
     pub(crate) execution: ExecutionGeneration,
@@ -283,6 +284,22 @@ pub struct ContinuationWakeToken {
 impl ContinuationWakeToken {
     pub const fn continuation(self) -> ContinuationId {
         self.continuation
+    }
+
+    pub const fn task(self) -> TaskKey {
+        self.task
+    }
+
+    pub const fn thread(self) -> ThreadKey {
+        self.thread
+    }
+
+    pub const fn execution(self) -> ExecutionGeneration {
+        self.execution
+    }
+
+    pub const fn exact_target(self) -> ExactWakeTarget {
+        ExactWakeTarget::new(self.task, self.thread, self.execution)
     }
 
     #[cfg(test)]

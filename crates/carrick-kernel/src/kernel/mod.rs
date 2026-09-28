@@ -142,10 +142,10 @@ pub use registry::{
 pub use scheduler::HostWaitToken;
 pub use scheduler::SubmissionAuthority;
 pub use scheduler::{
-    DeliveryOutcome, ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration,
-    PreemptionDriverError, PreemptionReasons, PreemptionRequest, PreemptionWork, RunQueue,
-    RunQueueError, RunnableThread, Scheduler, SchedulerError, SchedulerRetargetError,
-    SettlementDisposition, WakeDisposition,
+    DeliveryOutcome, ExactWakeTarget, ExecutorBinding, ExecutorKick, ExecutorKickToken,
+    ExecutorRegistration, PreemptionDriverError, PreemptionReasons, PreemptionRequest,
+    PreemptionWork, RunQueue, RunQueueError, RunnableThread, Scheduler, SchedulerError,
+    SchedulerRetargetError, SettlementDisposition, WakeDisposition,
 };
 pub use snapshot::{
     CredentialsSnapshotRow, FileDescriptionSnapshotKind, FileDescriptionSnapshotRow,

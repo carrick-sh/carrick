@@ -6047,3 +6047,83 @@ mod wait_enrollment_gap {
         }
     }
 }
+
+#[derive(Default)]
+struct TestWakeAuditor {
+    rejections: parking_lot::Mutex<Vec<(TaskKey, crate::observe::WakeRejectionReason)>>,
+}
+
+impl crate::observe::KernelAuditor for TestWakeAuditor {
+    fn wake_rejected(
+        &self,
+        target: TaskKey,
+        reason: crate::observe::WakeRejectionReason,
+    ) -> crate::observe::AuditVerdict {
+        self.rejections.lock().push((target, reason));
+        crate::observe::AuditVerdict::Continue
+    }
+}
+
+#[test]
+fn continuation_publish_ready_racing_child_reap_is_dropped_without_abort() {
+    let (kernel, root) = bootstrap(15_900);
+    let child = kernel
+        .fork_task(
+            &root,
+            crate::kernel::ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+            ThreadId::synthetic_for_tests(15_901),
+            "reaped-wake-child".to_owned(),
+            None,
+        )
+        .expect("fork child");
+    let child_task = child.task().key();
+
+    let recorder = Arc::new(TestWakeAuditor::default());
+    kernel.set_auditors(Arc::new(crate::observe::auditor::AuditorChain::new(vec![
+        Arc::clone(&recorder) as Arc<dyn crate::observe::KernelAuditor>,
+    ])));
+
+    let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+    let wait_service = CarrierWaitService::new(Arc::clone(&scheduler));
+
+    let generation = publish(&child, 0x980);
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnSleep {
+            duration: Duration::from_secs(10),
+            remaining: None,
+        },
+        capture(&child, generation),
+    )
+    .expect("sleep continuation");
+
+    let mut registration = wait_service.prepare_registration(&continuation);
+    wait_service
+        .enroll(&mut registration)
+        .expect("enroll sleep");
+    let token = registration.wake_token();
+
+    drop(child);
+    kernel
+        .exit_task_key_eventually(
+            child_task,
+            crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+        )
+        .expect("exit child");
+    kernel
+        .wait_child(
+            root.task().key().id,
+            Some(child_task.id),
+            crate::kernel::WaitMode::Consume,
+        )
+        .expect("reap child");
+    assert!(!kernel.task_exists(child_task.id), "child is reaped");
+
+    let receipt = wait_service.publish_ready(token);
+    assert!(receipt.accepted());
+
+    assert!(
+        recorder.rejections.lock().is_empty(),
+        "wake of reaped task through continuation must not audit or abort, got: {:?}",
+        *recorder.rejections.lock()
+    );
+}
