@@ -620,6 +620,9 @@ impl HvfVmState {
         length: usize,
     ) -> Result<(), MemoryError> {
         let address = strip_pointer_tag(address);
+        let _ = address
+            .checked_add(length as u64)
+            .ok_or(MemoryError::OutOfBounds { address, length })?;
         // Scrub debug: CARRICK_FORK_DEBUG_VA=<hex> logs any zeroing whose range
         // covers that VA, with the caller — the instrument that named the agent
         // zeroing a live dict granule during the forkserver corruption hunt.
@@ -635,6 +638,12 @@ impl HvfVmState {
         }
         let mut cleared = 0usize;
         let mut active_run: Option<ScrubRun> = None;
+        let mut active_key = None;
+        // Resolve every Linux page before coalescing writes. A mapping row's
+        // extent proves neither stage-1 continuity nor registry lifetime edges.
+        // Lookup/translation/registry work remains page-proportional; only the
+        // final writes are batched. See kernel.mm.backing-maintenance-lookup.
+        let page_tables = self.page_tables_authority();
         while cleared < length {
             let (chunk_va, chunk_len) = Self::guest_copy_chunk(address, cleared, length)?;
             // munmap invalidates the leaf but intentionally preserves its PA.
@@ -643,10 +652,14 @@ impl HvfVmState {
             // identify a retained private-COW fragment here. Resolve that PA
             // through the typed invalid-leaf seam and scrub each page-bounded
             // physical fragment independently.
-            let retained_ipa = self
-                .page_tables_authority()
-                .with_manager(|manager| manager.translate_retained_output(chunk_va))
-                .flatten();
+            let (live_ipa, retained_ipa) = page_tables
+                .with_manager(|manager| {
+                    (
+                        manager.translate(chunk_va),
+                        manager.translate_retained_output(chunk_va),
+                    )
+                })
+                .unwrap_or((None, None));
             // A partial munmap can carve this 4 KiB Linux page out of a live
             // 16 KiB private frame while preserving the invalid leaf's output
             // IPA. Reusing that page does not pass through `add_alias`, so
@@ -675,21 +688,19 @@ impl HvfVmState {
             // NULL me_keys by every worker (the CPython multiprocessing
             // SIGSEGV cluster).
             //
-            // The scrub's purpose is to keep STALE BYTES from being observed
-            // through THIS VA. If neither the live walk nor the retained
-            // invalid-leaf output names an IPA, the guest has no translation
-            // here and cannot observe anything — there is nothing to scrub,
-            // and skipping is the correct amount of writing. With an IPA in
-            // hand, `mapping_for_live_ipa_range` demands VA/IPA consistency
-            // plus a live authenticated owner, so the write can only land in
-            // this mm's own backing.
-            let live_ipa = self.translate_va(chunk_va);
+            // With an IPA, prefer a VA/IPA-consistent authenticated owner.
+            // If that lookup fails (including when there is no translation),
+            // preserve the per-page boot/identity fallback below. Reusable
+            // global-frame backing is never eligible for that VA-only join.
             let ipa = live_ipa.or(retained_ipa);
+            let mut selected_mapping = None;
             let chunk_resolved = ipa
                 .and_then(|ipa| {
                     self.mapping_for_live_ipa_range(chunk_va, ipa, chunk_len)
                         .and_then(|mapping| {
                             let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
+                            selected_mapping =
+                                Some((mapping.start, mapping.end, mapping.ipa, mapping.host_addr));
                             let target = unsafe { mapping.host_addr.add(offset) };
                             let is_alias = is_reusable_global_frame_extent(mapping.ipa, 1);
                             let eligible_without_cow = mapping.sharing
@@ -723,6 +734,8 @@ impl HvfVmState {
                             }
                             let offset =
                                 usize::try_from(chunk_va.checked_sub(mapping.start)?).ok()?;
+                            selected_mapping =
+                                Some((mapping.start, mapping.end, mapping.ipa, mapping.host_addr));
                             let target = unsafe { mapping.host_addr.add(offset) };
                             let eligible_without_cow = mapping.sharing
                                 == GuestMappingSharing::Private
@@ -730,7 +743,11 @@ impl HvfVmState {
                                 && retained_fragment.is_none()
                                 && zero_anonymous_remap_enabled();
                             let eligible = scrub_remap_eligible(eligible_without_cow, || {
-                                self.physical_cow_source(chunk_va, mapping.ipa).is_some()
+                                mapping
+                                    .ipa
+                                    .checked_add(offset as u64)
+                                    .and_then(|ipa| self.physical_cow_source(chunk_va, ipa))
+                                    .is_some()
                             });
                             Some((target, eligible))
                         })
@@ -746,6 +763,23 @@ impl HvfVmState {
                     chunk_resolved.map(|(target, _)| target),
                 );
             }
+            // Registry coverage can change within otherwise contiguous retained
+            // output. Conservatively end a write run at every retained page;
+            // publish its lifetime edge even if the backing lookup found no row.
+            let key = (
+                live_ipa.map(|ipa| ipa.wrapping_sub(chunk_va)),
+                selected_mapping,
+            );
+            if retained_ipa.is_some() || active_key != Some(key) {
+                if let Some(run) = active_run.take() {
+                    run.flush();
+                }
+            }
+            active_key = if retained_ipa.is_some() {
+                None
+            } else {
+                Some(key)
+            };
             if let Some(fragment) = retained_fragment {
                 register_shared_alias(fragment);
             }
@@ -1045,6 +1079,9 @@ impl HvfVmState {
 }
 
 #[cfg(test)]
+mod budget_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1151,3 +1188,6 @@ impl HvfTaskState {
         Ok(write.view)
     }
 }
+
+#[cfg(test)]
+mod scrub_tests;

@@ -72,6 +72,18 @@ pub struct RootFsVfs {
         Arc<crate::vfs::namespace_mutation::NamespaceMutationCoordinator>,
 }
 
+/// A host file created for a guest `open(O_CREAT)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreatedHostFd {
+    /// The new descriptor; ownership passes to the caller.
+    pub fd: i32,
+    /// Whether the backend applied the guest mode natively at creation.
+    pub mode_applied: bool,
+    /// Device/inode of `fd`, read once from the descriptor itself so the
+    /// caller need not `fstat` it again. `None` if the host refused.
+    pub inode: Option<InodeIdentity>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenameOutcome {
     Renamed,
@@ -187,7 +199,11 @@ impl RootFsVfs {
                 let resolved = self.resolved_parent(path)?;
                 let identity = if let Some(ref fd) = resolved.parent_fd {
                     crate::vfs::namespace_mutation::NamespaceParentIdentity::Host(
-                        Self::host_fd_inode_identity(fd.as_raw_fd()).ok_or(LINUX_ENOENT)?,
+                        self.namespace_mutations
+                            .parent_fd_identity(fd, |fd| {
+                                Self::host_fd_inode_identity(fd.as_raw_fd())
+                            })
+                            .ok_or(LINUX_ENOENT)?,
                     )
                 } else {
                     crate::vfs::namespace_mutation::NamespaceParentIdentity::Logical(
@@ -530,6 +546,15 @@ impl RootFsVfs {
         }
     }
 
+    /// [`Self::invalidate_host_fd`] for a descriptor whose identity the
+    /// caller already holds, without re-reading it from the host.
+    pub fn invalidate_host_inode(&self, inode: InodeIdentity) {
+        if !self.dentry_cache.has_cached_inodes() {
+            return;
+        }
+        self.dentry_cache.inode_changed("", Some(inode));
+    }
+
     /// Notify that an inode's attributes or contents changed.
     pub fn notify_inode_changed(&self, path: &str, inode: Option<InodeIdentity>) {
         self.dentry_cache.inode_changed(path, inode);
@@ -557,14 +582,20 @@ impl RootFsVfs {
         path: &str,
         create_mode: u32,
         want_trunc: bool,
-    ) -> crate::fs_backend::HostFdOpen<(i32, bool)> {
+    ) -> crate::fs_backend::HostFdOpen<CreatedHostFd> {
         match self.with_namespace_batch(&[path], false, |_permit| {
-            let res = self.overlay.create_raw_fd(path, create_mode, want_trunc);
-            if let crate::fs_backend::HostFdOpen::Served((host_fd, _)) = &res {
-                let inode = Self::host_fd_inode_identity(*host_fd);
-                self.dentry_cache.entry_created(path, inode);
+            let res = self
+                .overlay
+                .create_raw_fd(path, create_mode, want_trunc)
+                .map(|(fd, mode_applied)| CreatedHostFd {
+                    fd,
+                    mode_applied,
+                    inode: Self::host_fd_inode_identity(fd),
+                });
+            if let crate::fs_backend::HostFdOpen::Served(created) = &res {
+                self.dentry_cache.entry_created(path, created.inode);
                 if want_trunc {
-                    self.dentry_cache.inode_changed(path, inode);
+                    self.dentry_cache.inode_changed(path, created.inode);
                 }
             }
             Ok::<_, LinuxErrno>(res)

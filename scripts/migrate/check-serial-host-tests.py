@@ -47,6 +47,7 @@ DIRECT_PATTERNS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
     ("HOST_XATTR_READS", (("HOST_XATTR_READS",),)),
     ("host_xattr_read_count", (("host_xattr_read_count",),)),
     ("reset_host_xattr_read_count", (("reset_host_xattr_read_count",),)),
+    ("host_bsd_syscall_count", (("host_bsd_syscall_count",),)),
     ("path_walk_host_opens", (("path_walk_host_opens",),)),
     ("reset_path_walk_host_opens", (("reset_path_walk_host_opens",),)),
     ("cache_eviction_visited_keys", (("cache_eviction_visited_keys",),)),

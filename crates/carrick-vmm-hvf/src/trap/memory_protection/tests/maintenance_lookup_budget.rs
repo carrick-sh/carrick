@@ -38,6 +38,51 @@ const FRAME_EXTENTS_BUDGET: u64 = 4;
 /// its immediate neighbour.
 const TASK_ROWS_BUDGET: u64 = 2;
 
+#[test]
+fn alias_unmap_visits_only_process_visible_rows() {
+    let mut observations = Vec::new();
+    for unrelated in [32_u64, 2048] {
+        let mut registry = AliasRegistry::default();
+        registry.push(alias(
+            TARGET_VA,
+            PAGE,
+            TARGET_PHYS,
+            TARGET_PHYS,
+            PAGE,
+            own_scope(),
+        ));
+        for index in 0..unrelated {
+            registry.push(alias(
+                TARGET_VA,
+                PAGE,
+                TARGET_PHYS + (index + 1) * PAGE,
+                TARGET_PHYS + (index + 1) * PAGE,
+                PAGE,
+                sibling_scope(index),
+            ));
+        }
+        let before = alias_state_rows_scanned();
+        let retired = unregister_alias_in(
+            &mut registry,
+            TARGET_VA,
+            PAGE as usize,
+            Some(OWN_SLOT),
+            ContainerRootToken::ROOT,
+        );
+        let visited = alias_state_rows_scanned() - before;
+        assert_eq!(
+            retired,
+            std::collections::BTreeSet::from([(TARGET_PHYS, PAGE)])
+        );
+        assert_eq!(registry.scope_rows(own_scope()).len(), 0);
+        observations.push((unrelated, visited));
+    }
+    assert!(
+        observations.iter().all(|&(_, visited)| visited <= 8),
+        "alias unmap must visit a bounded number of rows: {observations:?}"
+    );
+}
+
 fn own_scope() -> AliasOwnershipScope {
     AliasOwnershipScope::MmRootSlot {
         base: OWN_SLOT.0,

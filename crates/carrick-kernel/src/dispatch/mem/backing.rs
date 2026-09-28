@@ -233,6 +233,12 @@ impl PrivateFileMapEntry {
 
 pub(crate) fn trim_private_file_maps(maps: &mut Vec<PrivateFileMapEntry>, start: u64, len: u64) {
     let end = start.saturating_add(len);
+    if !maps
+        .iter()
+        .any(|entry| entry.start < end && start < entry.end)
+    {
+        return;
+    }
     let mut retained = Vec::with_capacity(maps.len() + 1);
     for entry in maps.drain(..) {
         if entry.end <= start || entry.start >= end {
@@ -279,6 +285,12 @@ pub(crate) fn trim_shared_file_alias_maps_for_range(
         maps.clear();
         return;
     };
+    if !maps
+        .iter()
+        .any(|entry| entry.range.start().raw() < end && start < entry.range.end().raw())
+    {
+        return;
+    }
     let mut retained = Vec::with_capacity(maps.len() + 1);
     for entry in maps.drain(..) {
         let range_start = entry.range.start().raw();
@@ -335,6 +347,12 @@ pub(crate) fn trim_writable_memfd_maps_for_range(
         maps.clear();
         return;
     };
+    if !maps
+        .iter()
+        .any(|(range, _)| range.start().raw() < end && start < range.end().raw())
+    {
+        return;
+    }
     let mut retained = Vec::with_capacity(maps.len() + 1);
     for (range, description) in maps.drain(..) {
         let range_start = range.start().raw();
@@ -368,6 +386,13 @@ pub(crate) fn trim_ranges_for_range(ranges: &mut Vec<(u64, u64)>, start: u64, le
         ranges.clear();
         return;
     };
+    if !ranges.iter().any(|&(range_start, range_len)| {
+        range_start
+            .checked_add(range_len)
+            .is_none_or(|range_end| ranges_overlap(start, len, range_start, range_end))
+    }) {
+        return;
+    }
     let mut next = Vec::with_capacity(ranges.len());
     for (range_start, range_len) in ranges.drain(..) {
         let Some(range_end) = range_start.checked_add(range_len) else {
@@ -396,6 +421,14 @@ pub(crate) fn trim_remap_snapshots_for_range(
         snapshots.clear();
         return;
     };
+    if !snapshots.iter().any(|(&snapshot_start, bytes)| {
+        u64::try_from(bytes.len())
+            .ok()
+            .and_then(|snapshot_len| snapshot_start.checked_add(snapshot_len))
+            .is_none_or(|snapshot_end| snapshot_start < end && start < snapshot_end)
+    }) {
+        return;
+    }
     let mut retained = std::collections::HashMap::with_capacity(snapshots.len() + 1);
     for (snapshot_start, bytes) in std::mem::take(snapshots) {
         let Some(snapshot_len) = u64::try_from(bytes.len()).ok() else {
@@ -469,6 +502,20 @@ pub(crate) fn trim_live_boot_regions_for_range(mem: &mut MemState, start: u64, l
         return;
     };
     let layout = mem.layout;
+    // Every `munmap` of an ordinary mapping reaches here, and almost none
+    // touch a boot region. When no visible region overlaps and the set is
+    // already in the order the rebuild would produce, the rebuild below is
+    // the identity: skip its allocation, partition and sort. (Strictly
+    // increasing starts, because the rebuild moves hidden reservations after
+    // visible regions and its stable sort would reorder a tie.)
+    if regions.is_sorted_by(|left, right| left.start < right.start)
+        && !regions.iter().any(|region| {
+            ranges_overlap(start, len, region.start, region.end)
+                && !boot_region_is_hidden_reservation(region, layout)
+        })
+    {
+        return;
+    }
     let mut visible = Vec::new();
     let mut reservations = Vec::new();
     for region in regions.drain(..) {
@@ -478,7 +525,7 @@ pub(crate) fn trim_live_boot_regions_for_range(mem: &mut MemState, start: u64, l
             visible.push(region);
         }
     }
-    trim_dynamic_maps_for_range(&mut visible, start, len);
+    trim_proc_maps_for_range(&mut visible, start, len);
     visible.extend(reservations);
     visible.sort_by_key(|region| region.start);
     *regions = visible;
@@ -531,7 +578,7 @@ pub(crate) fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len
     locked_ranges_remove(&mut mem.resident_tracked_ranges, remove);
     mem.resident_fault_ranges.disarm(remove);
     locked_ranges_remove(&mut mem.write_sealed_shared_maps, remove);
-    locked_ranges_remove(&mut mem.secretmem_maps, remove);
+    unsorted_ranges_remove(&mut mem.secretmem_maps, remove);
     locked_ranges_remove(&mut mem.read_only_shared_file_maps, remove);
     locked_ranges_remove(&mut mem.host_alias_backed_ranges, remove);
     locked_ranges_remove(&mut mem.alias_vma_ranges, remove);
@@ -546,6 +593,16 @@ pub(crate) fn trim_core_file_mappings_for_range(
         mappings.clear();
         return;
     };
+    // The rebuild is the identity when nothing overlaps and the set is
+    // already in its final order; skip it (every anonymous `mmap`/`munmap`
+    // reaches here while the process holds hundreds of file segments).
+    if mappings.is_sorted_by_key(|mapping| (mapping.start, mapping.end))
+        && !mappings
+            .iter()
+            .any(|mapping| start < mapping.end && mapping.start < end)
+    {
+        return;
+    }
     let mut next = Vec::with_capacity(mappings.len() + 1);
     for mapping in mappings.drain(..) {
         if end <= mapping.start || start >= mapping.end {
@@ -1194,7 +1251,7 @@ impl<'a> MemView<'a> {
         if let Some(range) =
             carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
-            locked_ranges_remove(&mut self.mem().lock().secretmem_maps, range);
+            unsorted_ranges_remove(&mut self.mem().lock().secretmem_maps, range);
         }
     }
 

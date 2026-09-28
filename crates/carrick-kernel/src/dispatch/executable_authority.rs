@@ -82,6 +82,21 @@ impl ExecutableAuthorityRegistry {
         });
     }
 
+    /// Whether any live display currently names exactly `path`.
+    ///
+    /// `notify_rename` and `notify_unlink` only ever touch a display whose
+    /// path equals the name being moved or removed, so when no display names
+    /// either side of a namespace operation, the object identity of that name
+    /// cannot affect any display and need not be read from the host.
+    fn has_display_path(&self, path: &str) -> bool {
+        let displays = self.displays.lock();
+        displays.values().flatten().any(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|display| display.read().path == path)
+        })
+    }
+
     fn rename_prefix(&self, from: &str, to: &str) {
         let mut displays = self.displays.lock();
         for entries in displays.values_mut() {
@@ -540,8 +555,37 @@ fn notify_unlink(fs: &crate::dispatch::fs::FsState, object_id: ExecutableObjectI
 }
 
 impl<'a> FsView<'a> {
-    pub(super) fn executable_object_id_at(&self, path: &str) -> Option<ExecutableObjectId> {
+    /// Identity of the object an unlink of `path` removes, for
+    /// [`Self::notify_executable_unlink`]. `None` when no retained executable
+    /// display names `path`: the notification could not change any display,
+    /// so the host lookup (a `fstatat` plus an `open`/`fstat`/`close` of the
+    /// target) is not paid on every guest unlink.
+    pub(super) fn executable_object_id_for_unlink(&self, path: &str) -> Option<ExecutableObjectId> {
+        if !self.fs.executable_authorities.has_display_path(path) {
+            return None;
+        }
         executable_object_id_at(self.fs, path)
+    }
+
+    /// Identities of the moved (`from`) and replaced (`to`) objects of a
+    /// rename or exchange. Both are read, or neither: the pair also decides
+    /// `same_executable_object` (a rename between two hardlinks of one image
+    /// must not retarget its display), so gating one side alone would change
+    /// that answer. When no display names either path, every notification the
+    /// caller could issue is a no-op and both are `None`.
+    pub(super) fn executable_object_ids_for_rename(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> (Option<ExecutableObjectId>, Option<ExecutableObjectId>) {
+        let registry = &self.fs.executable_authorities;
+        if !registry.has_display_path(from) && !registry.has_display_path(to) {
+            return (None, None);
+        }
+        (
+            executable_object_id_at(self.fs, from),
+            executable_object_id_at(self.fs, to),
+        )
     }
 
     pub(super) fn notify_executable_rename(

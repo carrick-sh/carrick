@@ -2423,6 +2423,221 @@ mod serial_host {
         );
     }
 
+    /// Exhaustive host-syscall budget for the three namespace operations the
+    /// 2026-09-24 workload census ranked costliest on `--fs host` (openat
+    /// 49.5 us/call, unlinkat 128 us, renameat 260 us). Every host BSD syscall
+    /// the process makes is counted (`host_bsd_syscall_count`), so a raw
+    /// `libc::` call in any layer is on the ledger. Budgets are per guest
+    /// operation, averaged over `N` warm operations on distinct names in a
+    /// three-deep directory; each is the essential host call(s) plus the
+    /// namespace-transaction leaf probes, nothing else:
+    ///
+    /// - `openat(O_RDONLY)` + `close` (4): leaf `fstatat`, `openat`, one
+    ///   `fstat` of the new fd, `close`. Was 5: EL1 registration re-`fstat`ed
+    ///   the descriptor whose identity the open had just read.
+    /// - `openat(O_CREAT)` + `close` (7): canonicalize leaf probe, parent
+    ///   `fstatat` (setgid group), one admitted leaf probe, `openat`, the
+    ///   backend's regular-file `fstat` and the VFS identity `fstat` of the
+    ///   new fd, `close`. Was 16: four parent-dirfd `fstat`s per create (two
+    ///   transactions x resolve + revalidate), four more `fstat`s of the new
+    ///   fd (sparse-extent reset, dentry invalidation, description inode, EL1
+    ///   registration) and a doubled `lookup_kind` miss probe.
+    /// - `unlinkat` (3): target identity `fstatat` (hardlink inode record),
+    ///   admitted-entry `fstatat`, `unlinkat`. Was 12: an executable-display
+    ///   identity lookup (`fstatat` x2, `openat`, `fstat` x2, `close`) ran for
+    ///   every unlink although no retained executable named the path, plus
+    ///   two parent `fstat`s.
+    /// - `renameat` same directory (5): admitted-entry `fstatat` for both
+    ///   names, the backend's hardlink same-object `fstatat` pair, `renameat`.
+    ///   Cross directory (7) adds the destination's canonicalize probe and the
+    ///   parent-marker `fgetxattr`. Was 29.7 / 34: two executable identity
+    ///   lookups, four parent `fstat`s, the marker `fgetxattr` on a same-parent
+    ///   move, and a global directory-cache flush on every FILE rename that
+    ///   made the next path walk re-open every directory component.
+    ///
+    /// Debug builds add two `fcntl`s to each open (the nonblocking
+    /// `debug_assert` and std's `OwnedFd` drop check); they are budgeted as
+    /// such, not hidden.
+    ///
+    /// Semantics are asserted alongside: each rename is a move (old name
+    /// ENOENT, new name opens), each unlink removes the name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn namespace_ops_host_syscall_budget() {
+        use carrick_vfs::fs_backend::host::host_bsd_syscall_count;
+        const N: u64 = 32;
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+        for dir in ["/a", "/a/b", "/a/b/c", "/a/b/d"] {
+            backend.make_dir(dir).unwrap();
+        }
+        for i in 0..N + 1 {
+            backend
+                .set_file_contents(&format!("/a/b/c/f{i}"), b"x".to_vec())
+                .unwrap();
+        }
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let creat = LINUX_O_CREAT | LINUX_O_WRONLY;
+        let set = |memory: &mut LinearMemory, at: u64, path: &str| {
+            memory
+                .write_bytes(at, format!("{path}\0").as_bytes())
+                .unwrap();
+        };
+        // Each phase: `op(i)` for i in 1..=N, returning the guest result.
+        let measure = |dispatcher: &mut SyscallDispatcher,
+                       memory: &mut LinearMemory,
+                       op: &mut dyn FnMut(&mut SyscallDispatcher, &mut LinearMemory, u64)|
+         -> u64 {
+            let before = host_bsd_syscall_count();
+            for i in 1..=N {
+                op(dispatcher, memory, i);
+            }
+            let after = host_bsd_syscall_count();
+            // One syscall is the first reading's own proc_pidinfo.
+            after - before - 1
+        };
+        // Warm every layer (dentry, dir-fd caches, markers) with op 0.
+        set(&mut memory, 0x4000, "/a/b/c/f0");
+        let fd = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            56,
+            [LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0],
+        );
+        assert!(fd >= 0);
+        assert_eq!(
+            lane_syscall(&mut dispatcher, &mut memory, 57, [fd as u64, 0, 0, 0, 0, 0]),
+            0
+        );
+        set(&mut memory, 0x4000, "/a/b/c/n0");
+        let fd = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            56,
+            [LINUX_AT_FDCWD, 0x4000, creat, 0o644, 0, 0],
+        );
+        assert!(fd >= 0);
+        assert_eq!(
+            lane_syscall(&mut dispatcher, &mut memory, 57, [fd as u64, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            lane_syscall(
+                &mut dispatcher,
+                &mut memory,
+                35,
+                [LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0]
+            ),
+            0
+        );
+        set(&mut memory, 0x4000, "/a/b/c/f0");
+        set(&mut memory, 0x4100, "/a/b/d/f0");
+        assert_eq!(
+            lane_syscall(
+                &mut dispatcher,
+                &mut memory,
+                38,
+                [LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4100, 0, 0]
+            ),
+            0
+        );
+        // Harness floor: a syscall that touches no host state.
+        let floor = measure(&mut dispatcher, &mut memory, &mut |d, m, _| {
+            assert!(lane_syscall(d, m, 172, [0; 6]) > 0);
+        });
+
+        let open_rdonly = measure(&mut dispatcher, &mut memory, &mut |d, m, i| {
+            set(m, 0x4000, &format!("/a/b/c/f{i}"));
+            let fd = lane_syscall(d, m, 56, [LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0]);
+            assert!(fd >= 0, "open f{i}: {fd}");
+            assert_eq!(lane_syscall(d, m, 57, [fd as u64, 0, 0, 0, 0, 0]), 0);
+        });
+        let open_creat = measure(&mut dispatcher, &mut memory, &mut |d, m, i| {
+            set(m, 0x4000, &format!("/a/b/c/n{i}"));
+            let fd = lane_syscall(d, m, 56, [LINUX_AT_FDCWD, 0x4000, creat, 0o644, 0, 0]);
+            assert!(fd >= 0, "create n{i}: {fd}");
+            assert_eq!(lane_syscall(d, m, 57, [fd as u64, 0, 0, 0, 0, 0]), 0);
+        });
+        let unlink = measure(&mut dispatcher, &mut memory, &mut |d, m, i| {
+            set(m, 0x4000, &format!("/a/b/c/n{i}"));
+            assert_eq!(
+                lane_syscall(d, m, 35, [LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0]),
+                0
+            );
+        });
+        let rename_same = measure(&mut dispatcher, &mut memory, &mut |d, m, i| {
+            set(m, 0x4000, &format!("/a/b/c/f{i}"));
+            set(m, 0x4100, &format!("/a/b/c/r{i}"));
+            assert_eq!(
+                lane_syscall(
+                    d,
+                    m,
+                    38,
+                    [LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4100, 0, 0]
+                ),
+                0
+            );
+        });
+        let rename_cross = measure(&mut dispatcher, &mut memory, &mut |d, m, i| {
+            set(m, 0x4000, &format!("/a/b/c/r{i}"));
+            set(m, 0x4100, &format!("/a/b/d/r{i}"));
+            assert_eq!(
+                lane_syscall(
+                    d,
+                    m,
+                    38,
+                    [LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4100, 0, 0]
+                ),
+                0
+            );
+        });
+
+        // Semantics: every unlink removed its name, every rename moved.
+        for i in 1..=N {
+            for (path, expect_present) in [
+                (format!("/a/b/c/n{i}"), false),
+                (format!("/a/b/c/f{i}"), false),
+                (format!("/a/b/c/r{i}"), false),
+                (format!("/a/b/d/r{i}"), true),
+            ] {
+                set(&mut memory, 0x4000, &path);
+                let fd = lane_syscall(
+                    &mut dispatcher,
+                    &mut memory,
+                    56,
+                    [LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0],
+                );
+                if expect_present {
+                    assert!(fd >= 0, "{path} must exist: {fd}");
+                    lane_syscall(&mut dispatcher, &mut memory, 57, [fd as u64, 0, 0, 0, 0, 0]);
+                } else {
+                    assert_eq!(fd, -i64::from(LINUX_ENOENT.get()), "{path} must be gone");
+                }
+            }
+        }
+
+        let per_op = |total: u64| (total - floor) as f64 / N as f64;
+        let report = format!(
+            "floor={floor} open_rdonly+close={:.2} open_creat+close={:.2} unlinkat={:.2} \
+             renameat_same_dir={:.2} renameat_cross_dir={:.2} (host syscalls per guest op)",
+            per_op(open_rdonly),
+            per_op(open_creat),
+            per_op(unlink),
+            per_op(rename_same),
+            per_op(rename_cross),
+        );
+        eprintln!("{report}");
+        let debug_open_checks = if cfg!(debug_assertions) { 2 } else { 0 };
+        assert_eq!(floor, 0, "{report}");
+        assert_eq!(open_rdonly, (4 + debug_open_checks) * N, "{report}");
+        assert_eq!(open_creat, (7 + debug_open_checks) * N, "{report}");
+        assert_eq!(unlink, 3 * N, "{report}");
+        assert_eq!(rename_same, 5 * N, "{report}");
+        assert_eq!(rename_cross, 7 * N, "{report}");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn test_guest_openat_1000_files_in_one_dir_host_openat_budget() {

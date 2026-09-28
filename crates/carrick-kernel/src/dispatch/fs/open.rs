@@ -132,22 +132,19 @@ impl<'a> FsView<'a> {
             let create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
             if let Some(host_fd) = self.fs.rootfs_vfs.overlay.open_anon_fd(create_mode) {
                 crate::dispatch::net::set_host_nonblocking(host_fd);
-                self.fs.reset_host_sparse_extents(host_fd, 0);
-                let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                let inode = if unsafe { libc::fstat(host_fd, &mut st) } == 0 {
-                    Some(carrick_vfs::InodeIdentity::new(
-                        st.st_dev as u64,
-                        st.st_ino as u64,
-                    ))
-                } else {
-                    None
-                };
+                let (host_fd_ref, inode) = HostFdRef::adopt_with_identity(
+                    host_fd,
+                    carrick_guest_mem::PrivateFileSource::Mutable,
+                );
+                if let Some(inode) = inode {
+                    self.fs.reset_host_sparse_extents_for_inode(inode, 0);
+                }
                 let mut base = OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC);
                 if let Some(inode) = inode {
                     base = base.with_inode(inode);
                 }
                 let description = OpenDescription::HostFile {
-                    host_fd: HostFdRef::new(host_fd),
+                    host_fd: host_fd_ref,
                     metadata: RootFsMetadata {
                         path: Path::new("/__carrick_o_tmpfile").to_path_buf(),
                         kind: RootFsEntryKind::File,
@@ -646,25 +643,20 @@ impl<'a> FsView<'a> {
                 writable,
             }) => {
                 debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(host_fd));
-                if want_trunc {
-                    self.fs.reset_host_sparse_extents(host_fd, 0);
-                    self.invalidate_dentry_host_fd(host_fd);
+                let (host_fd_ref, inode) = HostFdRef::adopt_with_identity(
+                    host_fd,
+                    carrick_guest_mem::PrivateFileSource::Mutable,
+                );
+                if want_trunc && let Some(inode) = inode {
+                    self.fs.reset_host_sparse_extents_for_inode(inode, 0);
+                    self.fs.rootfs_vfs.invalidate_host_inode(inode);
                 }
-                let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                let inode = if unsafe { libc::fstat(host_fd, &mut st) } == 0 {
-                    Some(carrick_vfs::InodeIdentity::new(
-                        st.st_dev as u64,
-                        st.st_ino as u64,
-                    ))
-                } else {
-                    None
-                };
                 let mut base = OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC);
                 if let Some(inode) = inode {
                     base = base.with_inode(inode);
                 }
                 OpenDescription::HostFile {
-                    host_fd: HostFdRef::new(host_fd),
+                    host_fd: host_fd_ref,
                     metadata,
                     base,
                     writable,
@@ -750,14 +742,25 @@ impl<'a> FsView<'a> {
                     }
                     carrick_vfs::fs_backend::HostFdOpen::Unavailable => None,
                 };
-                if let Some((host_fd, mode_applied)) = created {
-                    self.fs.reset_host_sparse_extents(host_fd, 0);
-                    self.invalidate_dentry_host_fd(host_fd);
+                if let Some(created) = created {
+                    let host_fd = created.fd;
+                    // One identity for the new descriptor, read by the VFS
+                    // from the descriptor itself inside the create
+                    // transaction; every consumer below reuses it.
+                    let (host_fd_ref, inode) = HostFdRef::adopt_with_known_identity(
+                        host_fd,
+                        carrick_guest_mem::PrivateFileSource::Mutable,
+                        created.inode,
+                    );
+                    if let Some(inode) = inode {
+                        self.fs.reset_host_sparse_extents_for_inode(inode, 0);
+                        self.fs.rootfs_vfs.invalidate_host_inode(inode);
+                    }
                     debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(host_fd));
                     // A backend that created with the host umask (or could not
                     // represent the mode natively) still needs the guest mode
                     // forced onto the new file.
-                    if !mode_applied {
+                    if !created.mode_applied {
                         let _ = self.fs.rootfs_vfs.set_mode(&path, create_mode);
                     }
                     if stamp_owner {
@@ -766,21 +769,12 @@ impl<'a> FsView<'a> {
                                 .rootfs_vfs
                                 .set_owner(&path, Some(create_uid), Some(create_gid));
                     }
-                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                    let inode = if unsafe { libc::fstat(host_fd, &mut st) } == 0 {
-                        Some(carrick_vfs::InodeIdentity::new(
-                            st.st_dev as u64,
-                            st.st_ino as u64,
-                        ))
-                    } else {
-                        None
-                    };
                     let mut base = OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC);
                     if let Some(inode) = inode {
                         base = base.with_inode(inode);
                     }
                     OpenDescription::HostFile {
-                        host_fd: HostFdRef::new(host_fd),
+                        host_fd: host_fd_ref,
                         metadata,
                         base,
                         // A newly-created file's GUEST writability is its
@@ -1216,21 +1210,13 @@ impl<'a> FsView<'a> {
                     mode: real.mode,
                     size: usize::try_from(real.size).unwrap_or(usize::MAX),
                 };
-                let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                let inode = if unsafe { libc::fstat(raw, &mut st) } == 0 {
-                    Some(carrick_vfs::InodeIdentity::new(
-                        st.st_dev as u64,
-                        st.st_ino as u64,
-                    ))
-                } else {
-                    None
-                };
+                let (host_fd_ref, inode) = HostFdRef::adopt_with_identity(raw, source);
                 let mut base = OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC);
                 if let Some(inode) = inode {
                     base = base.with_inode(inode);
                 }
                 let description = OpenDescription::HostFile {
-                    host_fd: HostFdRef::with_private_file_source(raw, source),
+                    host_fd: host_fd_ref,
                     metadata,
                     base,
                     writable: writable_request,
