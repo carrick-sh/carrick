@@ -2106,13 +2106,13 @@ impl SyscallDispatcher {
             }
         }
         if last_ref
-            && carrick_signal_core::fasync::any_armed()
+            && carrick_signal_linux::fasync::any_armed()
             && let Some(pipe_id) = self.fasync_pipe_id_for_open_file(open_file)
         {
             // FASYNC is owned by the open file description, not by a numeric
             // fd alias. Exact registration matching prevents the other end of
             // a pipe (which shares the join key) from disarming this arm.
-            carrick_signal_core::fasync::disarm(pipe_id, open_file.description.id().raw());
+            carrick_signal_linux::fasync::disarm(pipe_id, open_file.description.id().raw());
         }
         let mut pty_master_index = None;
         let mut fifo_writer_closed = false;

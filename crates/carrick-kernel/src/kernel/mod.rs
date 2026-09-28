@@ -38,9 +38,9 @@ pub mod wait_set;
 mod tests;
 
 pub use address::{
-    Asid, MmBackend, MmBackendSnapshot, MmBackendStamp, MmBinding, OwnedVmaSnapshot,
-    SharedVmaSnapshotSource, SnapshotError, SnapshotTable, Stage1Root, Stage1RootError, Ttbr0,
-    VmaAccess, VmaRevision, VmaSnapshotSource, VmaSummary,
+    Asid, MmBackend, MmBackendSnapshot, MmBackendStamp, MmBinding, MmMutationObservation,
+    OwnedVmaSnapshot, SharedVmaSnapshotSource, SnapshotError, SnapshotTable, Stage1Root,
+    Stage1RootError, Ttbr0, VmaAccess, VmaRevision, VmaSnapshotSource, VmaSummary,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use builder::KernelBuilder;
@@ -78,9 +78,9 @@ pub use core::{
 };
 pub use debug::{
     ClientError as KernelDebugClientError, DebugEndpoint,
-    EndpointError as KernelDebugEndpointError, KernelDebugAuxProvider, KernelDebugDtoError,
-    KernelDebugRequest, KernelDebugServer, KernelDebugSnapshot, KernelDebugTable,
-    ServerError as KernelDebugServerError, UnknownTable as UnknownKernelTable,
+    EndpointError as KernelDebugEndpointError, KernelDebugAuxProvider, KernelDebugDegraded,
+    KernelDebugDtoError, KernelDebugRequest, KernelDebugServer, KernelDebugSnapshot,
+    KernelDebugTable, ServerError as KernelDebugServerError, UnknownTable as UnknownKernelTable,
     abort as kernel_debug_abort, fetch as kernel_debug_fetch,
 };
 pub use exec::{ExecError, ExecPrepareError, PreparedExec};
@@ -96,8 +96,9 @@ pub use ids::{
 };
 pub use mm_occupancy::{
     AddressSpacePublication, ExecutionSlot, HostExecutionSlot, MmOccupancy, MmOccupancyError,
-    execution_slot_for_current_thread, note_foreign_cow, publish_address_space,
-    publish_address_space_with_layout, publish_idle_root,
+    SlotVacancyEnrollment, SlotVacancySubscription, execution_slot_for_current_thread,
+    note_foreign_cow, publish_address_space, publish_address_space_with_layout, publish_idle_root,
+    subscribe_slot_vacancy,
 };
 pub use netns::{NetNs, UtsNs};
 pub use objects::{
@@ -148,7 +149,8 @@ pub use scheduler::{
     SchedulerRetargetError, SettlementDisposition, WakeDisposition,
 };
 pub use snapshot::{
-    CredentialsSnapshotRow, FileDescriptionSnapshotKind, FileDescriptionSnapshotRow,
+    CredentialsSnapshotRow, DegradedKernelSnapshot, DegradedMmCoordinatorRow, DegradedTaskRow,
+    DegradedThreadRow, FileDescriptionSnapshotKind, FileDescriptionSnapshotRow,
     FileSlotSnapshotRow, FileTableSnapshotRow, ForensicSnapshot, FsContextSnapshotRow,
     KERNEL_SNAPSHOT_V1_SCHEMA, KernelSnapshotError, KernelSnapshotV1, MmSnapshotRow,
     ObjectSnapshotClass, ProcessGroupSnapshotRow, SessionSnapshotRow, SighandSnapshotRow,

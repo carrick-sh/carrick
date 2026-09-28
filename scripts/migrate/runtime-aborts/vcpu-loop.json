@@ -370,6 +370,28 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
       "ordinal_in_function": 1,
+      "fingerprint": "9d929b2761728fe1fbb19c8d7201484109f5dc89f2503985b5c718f7b3094458",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::slot_admission",
+      "rationale": "MM participation vanished during slot admission: guest_execution was checked Some before the admission loop and only this job clears it; parking for slot release keeps the participation.",
+      "sink": "fatal",
+      "domain": "vcpu_loop::slot_admission"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
+      "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
+      "ordinal_in_function": 2,
+      "fingerprint": "9d929b2761728fe1fbb19c8d7201484109f5dc89f2503985b5c718f7b3094458",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::slot_admission",
+      "rationale": "Admitted MM vanished before address-space publication: slot admission just succeeded with this job's participation, which only this job clears.",
+      "sink": "fatal",
+      "domain": "vcpu_loop::slot_admission"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
+      "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
+      "ordinal_in_function": 3,
       "fingerprint": "9bab859303753b232f6aab25397b8801f9b652938e2e4f4bd826826272cfbd81",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
@@ -1597,6 +1619,17 @@
       "rationale": "Claimed frame-grant request could not publish backend refusal status to the guest mailbox.",
       "sink": "fatal",
       "domain": "hvpatch::el1_frame_grant"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "function": "abort_on_guest_fault_signal_if_armed",
+      "ordinal_in_function": 1,
+      "fingerprint": "dcd33cd1e62e98c8c563b84903081200888cfb7d12d426d31405ee2eb3425b18",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_fault_signal",
+      "rationale": "Operator-armed diagnostic hatch CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL=1: the first SIGSEGV/SIGBUS bound for a guest thread aborts so a core captures the event ring, CARRICK_LAST_FATAL and every stack at the fault. Unarmed runs never reach it.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_fault_signal"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",

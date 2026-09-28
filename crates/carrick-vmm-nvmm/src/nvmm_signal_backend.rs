@@ -4,7 +4,7 @@
 //! The irreducible vCPU KICK lives in [`crate::nvmm_kicker`] (NetBSD `SIGRTMIN` =
 //! 33); only its signal NUMBER is named here.
 
-use carrick_signal_core::HostSignalGlue;
+use carrick_signal_linux::HostSignalGlue;
 
 /// Zero-sized marker carrying NVMM's host-signal policy.
 pub struct NvmmGlue;
@@ -54,7 +54,7 @@ impl HostSignalGlue for NvmmGlue {
 mod tests {
     use super::NvmmGlue;
     use carrick_host_bsd::native_glue::BsdNativeGlue;
-    use carrick_signal_core::HostSignalGlue;
+    use carrick_signal_linux::HostSignalGlue;
 
     /// Drift guard for the aarch64 BSD lanes — the NetBSD twin of
     /// `carrick_vmm_bhyve::bhyve_signal_backend`'s test. On NetBSD/aarch64 there

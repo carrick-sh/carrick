@@ -3,7 +3,7 @@
 //! `SIGQUIT`/`SIGTERM` — the ones a supervisor or tty sends, which carrick never
 //! injects itself) and turn them into a guest-deliverable pending signal, plus
 //! run the child-exit reaper. This is the byte-identical `kvm/bhyve/nvmm_signal_pump`
-//! collapsed into ONE module, generic over the backend's [`HostSignalGlue`](carrick_signal_core::HostSignalGlue) for the
+//! collapsed into ONE module, generic over the backend's [`HostSignalGlue`](carrick_signal_linux::HostSignalGlue) for the
 //! single delta: `pump_handler` translates the host signum to the guest's Linux
 //! signum (KVM identity; the BSD backends use their table). HVF has a different
 //! (kqueue) pump and does NOT use this.
@@ -31,7 +31,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use carrick_signal_core::HostSignalGlue;
+use carrick_signal_linux::HostSignalGlue;
 
 use crate::{PlatformFutex, VcpuRegistry};
 
@@ -141,7 +141,7 @@ pub fn publish_exited_child_watches() {
     const CLD_EXITED: i32 = 1;
     const CLD_KILLED: i32 = 2;
     const CLD_DUMPED: i32 = 3;
-    for pid in carrick_signal_core::child_watch::tracked_pids() {
+    for pid in carrick_signal_linux::child_watch::tracked_pids() {
         if pid <= 0 {
             continue;
         }
@@ -157,7 +157,7 @@ pub fn publish_exited_child_watches() {
         if rc != 0 {
             let errno = std::io::Error::last_os_error().raw_os_error();
             if errno == Some(libc::ECHILD) || errno == Some(libc::ESRCH) {
-                let _ = carrick_signal_core::child_watch::take(pid);
+                let _ = carrick_signal_linux::child_watch::take(pid);
             }
             continue;
         }
@@ -167,13 +167,13 @@ pub fn publish_exited_child_watches() {
         if si_pid != pid || !matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED) {
             continue;
         }
-        if let Some((parent_tid, exit_signal)) = carrick_signal_core::child_watch::take(pid)
+        if let Some((parent_tid, exit_signal)) = carrick_signal_linux::child_watch::take(pid)
             && exit_signal != 0
         {
-            carrick_signal_core::child_watch::record_siginfo(
+            carrick_signal_linux::child_watch::record_siginfo(
                 parent_tid,
                 exit_signal,
-                carrick_signal_core::child_watch::ChildExitSiginfo {
+                carrick_signal_linux::child_watch::ChildExitSiginfo {
                     si_code: info.si_code,
                     host_pid: si_pid,
                     // SAFETY: POSIX siginfo child-exit payload fields.
@@ -182,7 +182,7 @@ pub fn publish_exited_child_watches() {
                     host_status: unsafe { info.si_status() },
                 },
             );
-            carrick_signal_core::publish_pending_for(parent_tid, exit_signal);
+            carrick_signal_linux::publish_pending_for(parent_tid, exit_signal);
         }
     }
 }
@@ -193,8 +193,8 @@ pub fn publish_exited_child_watches() {
 /// allocation, locks, or non-reentrant libc.
 extern "C" fn pump_handler<G: HostSignalGlue>(signum: libc::c_int) {
     let linux_signum = G::host_to_linux(signum);
-    if let Some(bit) = carrick_signal_core::pending_bit(linux_signum) {
-        carrick_signal_core::proc_pending_fetch_or(bit);
+    if let Some(bit) = carrick_signal_linux::pending_bit(linux_signum) {
+        carrick_signal_linux::proc_pending_fetch_or(bit);
     }
     let w = SELF_PIPE_W.load(Ordering::Relaxed);
     if w >= 0 {
@@ -375,7 +375,7 @@ pub fn reinit_after_fork<G: HostSignalGlue>(
     }
     *PUMP_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
     PUMP_STOP.store(false, Ordering::SeqCst);
-    carrick_signal_core::child_watch::clear();
+    carrick_signal_linux::child_watch::clear();
     PUMP_STARTED.store(false, Ordering::SeqCst);
     SIGCHLD_INSTALLED.store(false, Ordering::SeqCst);
     start_pump::<G>(registry, futex);
@@ -400,7 +400,7 @@ pub fn reset_state_for_supervisor_fork() {
     }
     *PUMP_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
     PUMP_STOP.store(false, Ordering::SeqCst);
-    carrick_signal_core::child_watch::clear();
+    carrick_signal_linux::child_watch::clear();
     PUMP_STARTED.store(false, Ordering::SeqCst);
     SIGCHLD_INSTALLED.store(false, Ordering::SeqCst);
 }
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn pump_signal_bits_match_proc_pending_convention() {
         for &sig in &PUMP_SIGNALS {
-            let bit = carrick_signal_core::pending_bit(sig).expect("pumped signum in 1..=64");
+            let bit = carrick_signal_linux::pending_bit(sig).expect("pumped signum in 1..=64");
             assert_eq!(bit, 1u64 << (sig - 1));
         }
     }

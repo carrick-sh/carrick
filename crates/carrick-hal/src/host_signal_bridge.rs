@@ -10,14 +10,14 @@
 //! plugs in its own signal delivery by implementing this trait.
 //!
 //! Every method keeps the argument and return types of the free function it
-//! replaced (`carrick-signal-core` / the HVF `host_signal` module): a bare
+//! replaced (`carrick-signal-linux` / the HVF `host_signal` module): a bare
 //! `i32` signum or tid stays bare here; typing that surface is a follow-up.
 //!
 //! Two implementations live in this crate:
 //!
 //! - [`GenericHostSignalBridge`], the shared body for every kick+futex lane
 //!   (KVM, bhyve, NVMM, native BSD), generic over the lane's
-//!   [`HostSignalGlue`](carrick_signal_core::HostSignalGlue) exactly as the
+//!   [`HostSignalGlue`](carrick_signal_linux::HostSignalGlue) exactly as the
 //!   kick+futex `signal_pump` and `fork_coord` modules are (both cfg'd off
 //!   this crate's macOS docs). It replaces the runtime's former inline Linux
 //!   `host_signal` module, which was parameterised the same way through an
@@ -31,9 +31,9 @@ use std::marker::PhantomData;
 use std::os::fd::RawFd;
 
 use carrick_abi::{SigBlockMask, SigSet};
-use carrick_signal_core::HostSignalGlue;
+use carrick_signal_linux::HostSignalGlue;
 
-pub use carrick_signal_core::NO_PENDING_SIGNAL;
+pub use carrick_signal_linux::NO_PENDING_SIGNAL;
 
 /// One host fd (plus poll events) a blocking wait parks on. `anchored` marks a
 /// descriptor the waiter must NOT pin (dup) because the caller already holds
@@ -170,9 +170,9 @@ impl std::fmt::Debug for dyn HostSignalBridge {
 
 /// The shared [`HostSignalBridge`] of every kick+futex lane, generic over the
 /// lane's [`HostSignalGlue`] (KVM identity numbering; the BSD lanes' signum
-/// tables). The pending bookkeeping is the neutral `carrick-signal-core`
+/// tables). The pending bookkeeping is the neutral `carrick-signal-linux`
 /// store; the host-disposition mirror, the xsignal nudge and the signum
-/// translation go through `carrick_signal_core::host_glue::<G>`.
+/// translation go through `carrick_signal_linux::host_glue::<G>`.
 ///
 /// There is no per-thread waiter registry on these lanes (the waiter is a
 /// stateless `ppoll` woken by the kick's `EINTR`), so `wake_all_waiters` is a
@@ -204,53 +204,53 @@ impl<G: HostSignalGlue> HostSignalBridge for GenericHostSignalBridge<G> {
         // A cross-process guest signal may be sitting in the shared xsignal
         // ring: peek it WITHOUT consuming so a temporary ppoll/epoll_pwait mask
         // keeps genuinely blocked signals pending until the syscall returns.
-        if carrick_signal_core::xsig::xsig_has_unblocked_for_self(block_mask) {
+        if carrick_signal_linux::xsig::xsig_has_unblocked_for_self(block_mask) {
             return true;
         }
-        carrick_signal_core::has_unblocked_pending_for(tid, block_mask)
+        carrick_signal_linux::has_unblocked_pending_for(tid, block_mask)
     }
 
     fn take_pending_for(&self, tid: i32) -> i32 {
-        carrick_signal_core::take_pending_for(tid)
+        carrick_signal_linux::take_pending_for(tid)
     }
 
     fn take_pending_in_for(&self, tid: i32, wait_set: SigSet) -> i32 {
-        carrick_signal_core::take_pending_in_for(tid, wait_set)
+        carrick_signal_linux::take_pending_in_for(tid, wait_set)
     }
 
     fn publish_pending_for(&self, tid: i32, signum: i32) {
-        carrick_signal_core::publish_pending_for(tid, signum);
+        carrick_signal_linux::publish_pending_for(tid, signum);
     }
 
     fn publish_process_signal(&self, signum: i32) {
-        carrick_signal_core::publish_process_signal(signum);
+        carrick_signal_linux::publish_process_signal(signum);
     }
 
     fn last_sender_for(&self, signum: i32) -> i32 {
-        carrick_signal_core::last_sender_for(signum)
+        carrick_signal_linux::last_sender_for(signum)
     }
 
     fn raise_for_self(&self, signum: i32) {
         // No host pump: the same-thread syscall return re-checks pending.
-        carrick_signal_core::publish_process_signal(signum);
+        carrick_signal_linux::publish_process_signal(signum);
     }
 
     fn wake_all_waiters(&self) {}
 
     fn ensure_host_handler(&self, linux_signum: i32) {
-        carrick_signal_core::host_glue::ensure_host_handler::<G>(linux_signum);
+        carrick_signal_linux::host_glue::ensure_host_handler::<G>(linux_signum);
     }
 
     fn set_host_ignore(&self, linux_signum: i32) {
-        carrick_signal_core::host_glue::set_host_ignore::<G>(linux_signum);
+        carrick_signal_linux::host_glue::set_host_ignore::<G>(linux_signum);
     }
 
     fn set_host_default(&self, linux_signum: i32) {
-        carrick_signal_core::host_glue::set_host_default::<G>(linux_signum);
+        carrick_signal_linux::host_glue::set_host_default::<G>(linux_signum);
     }
 
     fn reset_routed_handlers_after_execve(&self, ignored: SigSet) {
-        carrick_signal_core::host_glue::reset_routed_handlers_after_execve::<G>(ignored);
+        carrick_signal_linux::host_glue::reset_routed_handlers_after_execve::<G>(ignored);
     }
 
     fn xsig_enqueue(
@@ -263,7 +263,7 @@ impl<G: HostSignalGlue> HostSignalBridge for GenericHostSignalBridge<G> {
         value: i64,
         target_ns_tid: i32,
     ) -> bool {
-        carrick_signal_core::xsig::xsig_enqueue(
+        carrick_signal_linux::xsig::xsig_enqueue(
             target_host_pid,
             signum,
             code,
@@ -275,19 +275,19 @@ impl<G: HostSignalGlue> HostSignalBridge for GenericHostSignalBridge<G> {
     }
 
     fn xsig_nudge(&self, target_host_pid: i32) {
-        carrick_signal_core::host_glue::xsig_nudge::<G>(target_host_pid);
+        carrick_signal_linux::host_glue::xsig_nudge::<G>(target_host_pid);
     }
 
     fn xsig_drain_for_self(&self) -> Vec<(i32, i32, i32, u32, i64, i32)> {
-        carrick_signal_core::xsig::xsig_drain_for_self()
+        carrick_signal_linux::xsig::xsig_drain_for_self()
     }
 
     fn host_to_linux_signum(&self, host_signum: i32) -> i32 {
-        carrick_signal_core::host_glue::glue_host_to_linux::<G>(host_signum)
+        carrick_signal_linux::host_glue::glue_host_to_linux::<G>(host_signum)
     }
 
     fn linux_to_host_signum(&self, linux_signum: i32) -> i32 {
-        carrick_signal_core::host_glue::glue_linux_to_host::<G>(linux_signum)
+        carrick_signal_linux::host_glue::glue_linux_to_host::<G>(linux_signum)
     }
 }
 
@@ -299,7 +299,7 @@ impl<G: HostSignalGlue> HostSignalBridge for GenericHostSignalBridge<G> {
 /// [`NullHostSignalBridge`], the bridge a dispatcher boots with when no
 /// carrier has handed it one (`SyscallDispatcher::new()`, the example
 /// backend). It is one instantiation of the shared body, not a second
-/// implementation: the neutral `carrick-signal-core` pending store and xsignal
+/// implementation: the neutral `carrick-signal-linux` pending store and xsignal
 /// ring it reads and writes are kernel (compat-zone) state — which is why a
 /// test that publishes a signal and expects the dispatcher to see it still
 /// exercises the kernel — while nothing behind them happens: no host
@@ -381,10 +381,10 @@ mod tests {
         // The shared install mask is the observable: a mirrored route marks
         // it, and the Null glue must never mark it.
         for signum in 1..=64 {
-            carrick_signal_core::host_disposition::clear_installed(signum);
+            carrick_signal_linux::host_disposition::clear_installed(signum);
             bridge.ensure_host_handler(signum);
             assert!(
-                !carrick_signal_core::host_disposition::is_installed(signum),
+                !carrick_signal_linux::host_disposition::is_installed(signum),
                 "signal {signum} must not be routed onto the host by the Null glue"
             );
             bridge.set_host_ignore(signum);

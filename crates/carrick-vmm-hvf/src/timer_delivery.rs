@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use carrick_hal::guest_timer_bridge::{TimerCoreBridge, TimerFiring};
+use carrick_hal::posix_timer::PosixArm;
 use carrick_hal::{GuestTimerBridge, PosixTimerSpec, TimerArm, TimerDelivery, TimerSpecNs};
-use carrick_timer_core::posix::PosixArm;
 use carrick_timer_core::{CpuNs, WallNs};
 
 pub struct HvfTimerDelivery;
@@ -59,7 +59,21 @@ impl TimerFiring for HvfTimerFiring {
         let _ = std::thread::Builder::new()
             .name("carrick-posix-timer".to_owned())
             .spawn(move || {
-                carrick_timer_core::posix::run_fallback(slot, generation, spec, on_fire);
+                let cpu_sampler = if slot.clock_kind.is_cpu() {
+                    Some(std::sync::Arc::new(|| {
+                        Some(carrick_host::guest_cpu::total_ns_including_active())
+                    })
+                        as std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>)
+                } else {
+                    None
+                };
+                carrick_hal::posix_timer::run_fallback_with_cpu(
+                    slot,
+                    generation,
+                    spec,
+                    cpu_sampler,
+                    on_fire,
+                );
             });
     }
 
@@ -71,6 +85,14 @@ impl TimerFiring for HvfTimerFiring {
 
     fn delivery() -> Option<Arc<dyn TimerDelivery>> {
         carrick_hal::guest_timer_bridge::delivery()
+    }
+
+    fn sample_cpu_now() -> Option<u64> {
+        Some(carrick_host::guest_cpu::total_ns_including_active())
+    }
+
+    fn active_vcpus() -> u64 {
+        carrick_host::guest_cpu::active_count() as u64
     }
 }
 

@@ -407,6 +407,7 @@ pub(crate) struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
     pub(super) state: ThreadRuntimeState<E>,
     pub(super) phase: HvpatchProductionPhase,
     pub(super) registration_wait: Option<carrick_hal::VcpuLeaseChangeSubscription>,
+    pub(super) slot_wait: Option<carrick_kernel::kernel::SlotVacancySubscription>,
     pub(super) terminal_settlement: HvpatchExternalTerminalSettlement,
     pub(super) terminal_result: Option<Result<VcpuLoopOutcome, RuntimeError>>,
     pub(super) completion: continuation::LogicalJobCompletion,
@@ -1097,7 +1098,6 @@ where
             ),
         };
         let process_exit_event = process.record_process_exit_begin(exit_code, self.state.this_tid);
-        let child = process.is_child();
         if let Some(work) = self.external_exec.take() {
             let out = self.kernel.dispatcher.stdout();
             let err = self.kernel.dispatcher.stderr();
@@ -1129,14 +1129,10 @@ where
         let status = carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(wait_encoding);
         let orphan_adopter = self.kernel.dispatcher.hvpatch_orphan_adopter();
         let publish_result = process.publish_exit_status(status, orphan_adopter, |parent| {
-            if child {
-                self.kernel.notify_hvpatch_parent_exit(parent);
-            } else if let Some(parent) = parent {
-                tracing::error!(
-                    parent = ?parent,
-                    "child exit notification dropped: is_child() said no parent but the exit transaction named one"
-                );
-            }
+            // The exit transaction's exact parent key is authoritative. A
+            // pre-commit parent snapshot cannot decide current parentage after
+            // reparenting or an overlapping parent exit.
+            self.kernel.notify_hvpatch_parent_exit(parent);
         });
         if publish_result.is_ok() {
             if let Some(chain) = self.kernel.dispatcher.observers() {
@@ -3366,6 +3362,42 @@ where
         decision
     }
 
+    /// A live owner keeps its pause port until it unloads. Park this logical
+    /// job on the port's release, so the executor can save the task and run
+    /// another job while the previous owner's host thread is delayed.
+    fn park_for_slot_release(
+        &mut self,
+        slot: carrick_kernel::kernel::ExecutionSlot,
+    ) -> Result<Option<executor::ExecutorExit>, ProductionHvpatchPollError> {
+        let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("slot admission lost exact Kernel context".to_owned())
+        })?;
+        let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("slot admission lost scheduler".to_owned())
+        })?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let pending_control_quantum = self.control_quantum()?.is_some();
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let pending_control_quantum = false;
+        let callback = registration_wake_callback(
+            runtime.continuation_services(context.kernel()).0,
+            context.thread().key(),
+            registration_wake_uses_control(&self.phase, pending_control_quantum),
+        );
+        match carrick_kernel::kernel::subscribe_slot_vacancy(slot, callback) {
+            carrick_kernel::kernel::SlotVacancyEnrollment::Vacant => Ok(None),
+            carrick_kernel::kernel::SlotVacancyEnrollment::Waiting(subscription) => {
+                self.slot_wait = Some(subscription);
+                Ok(Some(self.suspend(
+                    HvpatchLoopSuspension::InitialAdmission,
+                    executor::ExecutorExit::Blocked(
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    ),
+                )))
+            }
+        }
+    }
+
     pub(super) fn poll_with_engine(
         &mut self,
         engine: &mut E,
@@ -3377,6 +3409,7 @@ where
             self.phase = HvpatchProductionPhase::Complete;
             return Ok(executor::ExecutorExit::Exited);
         }
+        drop(self.slot_wait.take());
         if self.state.guest_execution.is_none() {
             drop(self.registration_wait.take());
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3404,18 +3437,27 @@ where
             let slot =
                 carrick_kernel::kernel::execution_slot_for_current_thread(engine.mailbox_slot())
                     .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            let (participation, enrollment) = enter_mm_executor_then_register(
-                &self.kernel.dispatcher,
-                self.state.kernel_thread.as_ref().map(Arc::clone),
-                Arc::clone(&self.state.kicker),
-                self.state.this_tid,
-                slot,
-                || {
-                    self.state
-                        .subscribe_register_vcpu(engine, wake_registration)
-                },
-            )
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            let (participation, enrollment) = loop {
+                match enter_mm_executor_then_register(
+                    &self.kernel.dispatcher,
+                    self.state.kernel_thread.as_ref().map(Arc::clone),
+                    Arc::clone(&self.state.kicker),
+                    self.state.this_tid,
+                    slot,
+                    || {
+                        self.state
+                            .subscribe_register_vcpu(engine, Arc::clone(&wake_registration))
+                    },
+                ) {
+                    Ok(entered) => break entered,
+                    Err(carrick_kernel::kernel::MmOccupancyError::SlotBusy { .. }) => {
+                        if let Some(exit) = self.park_for_slot_release(slot)? {
+                            return Ok(exit);
+                        }
+                    }
+                    Err(error) => return Err(RuntimeError::Configuration(error.to_string()).into()),
+                }
+            };
             self.state.guest_execution = Some(participation);
             match enrollment {
                 carrick_hal::VcpuRegistrationEnrollment::Registered => {}
@@ -3434,19 +3476,39 @@ where
         // The task is loaded on this vCPU: it occupies the vCPU's execution
         // slot with its MM from here until the executor unloads it
         // (`end_residency`), even across syscall boundaries that preempt it.
-        if let Some(participation) = self.state.guest_execution.as_mut() {
+        if self.state.guest_execution.is_some() {
             let slot =
                 carrick_kernel::kernel::execution_slot_for_current_thread(engine.mailbox_slot())
                     .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            participation
-                .occupy_slot(slot)
-                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            loop {
+                let Some(participation) = self.state.guest_execution.as_mut() else {
+                    carrick_fatal!(
+                        "vcpu_loop::slot_admission",
+                        "MM participation vanished during slot admission"
+                    );
+                };
+                let admission = participation.occupy_slot(slot);
+                match admission {
+                    Ok(()) => break,
+                    Err(carrick_kernel::kernel::MmOccupancyError::SlotBusy { .. }) => {
+                        if let Some(exit) = self.park_for_slot_release(slot)? {
+                            return Ok(exit);
+                        }
+                    }
+                    Err(error) => return Err(RuntimeError::Configuration(error.to_string()).into()),
+                }
+            }
             // The first load of an address space that guest EL1 could
             // install itself publishes it (its roots, its gate following
             // this MM's fence), so EL1 can switch a vCPU running another
             // process's thread to this process's threads without an exit.
             if let Some(binding) = control.binding {
-                let participation = &*participation;
+                let Some(participation) = self.state.guest_execution.as_ref() else {
+                    carrick_fatal!(
+                        "vcpu_loop::slot_admission",
+                        "admitted MM vanished before publication"
+                    );
+                };
                 binding.publish_address_space(|lease_ttbr0| {
                     let (ttbr0, ttbr1) = engine.el1_switchable_roots()?;
                     (ttbr0 == lease_ttbr0)
@@ -4158,7 +4220,9 @@ where
                 );
                 let interrupted_pc = from_el0_direct.then_some(elr);
                 let faulting_tid = self.state.linux_tid;
-                if self.kernel.dispatcher.fault_requires_mm_mutation(si_addr)
+                let requires_mm_mutation =
+                    self.kernel.dispatcher.fault_requires_mm_mutation(si_addr);
+                if requires_mm_mutation
                     && self
                         .state
                         .with_mm_mutation_authority(&self.kernel, |mutation| {
@@ -4197,6 +4261,29 @@ where
                             "capture synchronous-fault signal context: {error}"
                         ))
                     })?;
+                // Post-mortem record of the delivery decision: the live
+                // stage-1 walk and the frame-grant mailbox census are read
+                // here, off the resolved-fault hot path, with no allocation
+                // or lock. `carrick eventring` decodes it from a core.
+                let fault_record = carrick_kernel::event_ring::FaultSignalRecord {
+                    tid: faulting_tid.raw(),
+                    mm_key: self.state.zone_mm,
+                    signum,
+                    si_code,
+                    fault_address: si_addr,
+                    esr: syndrome,
+                    pc: elr,
+                    requires_mm_mutation,
+                    from_el0_direct,
+                    access: signal::ring_access(fault_access),
+                    walk: signal::ring_stage1_walk(&*engine, far, fault_access),
+                };
+                carrick_kernel::event_ring::rec_fault_signal(
+                    &fault_record,
+                    engine.mailbox_slot(),
+                    signal::busy_frame_grant_mailboxes(),
+                );
+                signal::abort_on_guest_fault_signal_if_armed(&fault_record);
                 if let Some(outcome) = deliver_fault_signal(
                     &self.kernel,
                     &fault_context,
@@ -4227,12 +4314,14 @@ where
                 let si_code = carrick_kernel::kernel::objects::signal::upgrade_protection_si_code(
                     &*engine, signum, si_code, fault_addr,
                 );
-                let interrupted_pc = Some(engine.current_pc()?);
+                let fault_pc = engine.current_pc()?;
+                let interrupted_pc = Some(fault_pc);
                 let faulting_tid = self.state.linux_tid;
-                if self
+                let requires_mm_mutation = self
                     .kernel
                     .dispatcher
-                    .fault_requires_mm_mutation(fault_addr)
+                    .fault_requires_mm_mutation(fault_addr);
+                if requires_mm_mutation
                     && self
                         .state
                         .with_mm_mutation_authority(&self.kernel, |mutation| {
@@ -4263,6 +4352,27 @@ where
                             "capture guest-fault signal context: {error}"
                         ))
                     })?;
+                // Same post-mortem record as the aarch64 arm; the ISA-neutral
+                // triple carries no syndrome and no decodable access.
+                let fault_record = carrick_kernel::event_ring::FaultSignalRecord {
+                    tid: faulting_tid.raw(),
+                    mm_key: self.state.zone_mm,
+                    signum,
+                    si_code,
+                    fault_address: fault_addr,
+                    esr: 0,
+                    pc: fault_pc,
+                    requires_mm_mutation,
+                    from_el0_direct: false,
+                    access: carrick_kernel::event_ring::RingAccess::Unknown,
+                    walk: None,
+                };
+                carrick_kernel::event_ring::rec_fault_signal(
+                    &fault_record,
+                    engine.mailbox_slot(),
+                    signal::busy_frame_grant_mailboxes(),
+                );
+                signal::abort_on_guest_fault_signal_if_armed(&fault_record);
                 if let Some(outcome) = deliver_fault_signal(
                     &self.kernel,
                     &fault_context,
@@ -5131,6 +5241,7 @@ where
             )
         },
         registration_wait: None,
+        slot_wait: None,
         terminal_settlement: terminal_settlement.clone(),
         terminal_result: None,
         completion: completion.clone(),
@@ -5887,7 +5998,7 @@ mod tests {
         let compatibility_wake = Arc::new(EndpointRecordingWaker::default());
         context.task().set_waker(compatibility_wake.clone());
 
-        directory.notify_child_exit(context.task().key());
+        directory.notify_child_exit(context.task().key(), context.kernel());
         assert_eq!(scheduler.queued_len(), 1);
         assert_eq!(
             compatibility_wake
@@ -5928,7 +6039,7 @@ mod tests {
         let compatibility_wake = Arc::new(EndpointRecordingWaker::default());
         context.task().set_waker(compatibility_wake.clone());
 
-        directory.notify_child_exit(context.task().key());
+        directory.notify_child_exit(context.task().key(), context.kernel());
 
         assert_eq!(
             compatibility_wake
@@ -6123,6 +6234,7 @@ mod tests {
             state,
             phase: HvpatchProductionPhase::Resident,
             registration_wait: None,
+            slot_wait: None,
             terminal_settlement: root_settlement,
             terminal_result: None,
             completion: root_completion.clone(),

@@ -2489,6 +2489,8 @@ mod hvpatch_guest_probe_abi {
             "stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));",
             "fn hvpatch__first__touch__deliver(_: u64, _: u32, _: i32) {}",
             "stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));",
+            "fn hvpatch__first__touch__refused(_: u64, _: u32, _: u32, _: &str) {}",
+            "stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));",
             "fn hvpatch__el1__frame__grant__plan(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
             "stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));",
             "fn pt__fault__next__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
@@ -5142,6 +5144,10 @@ mod real {
         /// (`HvpatchFirstTouchDeliverReason`), Linux TID. Fires once per
         /// delivered fault, never on a resolved one.
         fn hvpatch__first__touch__deliver(_: u64, _: u32, _: i32) {}
+        /// A first-touch or grow-down resolution was refused by the backend.
+        /// Args: fault page VA, access class (0=Read, 1=Write, 2=Execute, 3=Unknown),
+        /// site id (1=resident fault plan, 2=mmap growdown plan), formatted error.
+        fn hvpatch__first__touch__refused(_: u64, _: u32, _: u32, _: &str) {}
         /// Host plan selected for one accepted EL1 anonymous frame-grant
         /// request. Args: fault VA, semantic base, semantic length, Linux
         /// protection bits, request generation.
@@ -5522,6 +5528,10 @@ mod real {
         /// HVPatch thread-clone outcome: Linux tid, stable
         /// `HvpatchCloneThreadPhase` ordinal, and Linux errno (zero on success).
         fn mn__clone__outcome(_: i32, _: u32, _: i32) {}
+        /// Host MM port refusal. Slot, current MM, requested MM, installing
+        /// guest tid, and current port owner's guest tid identify both sides
+        /// of a delayed unload without inferring ownership from a host pid.
+        fn mm__slot__busy(_: u32, _: u64, _: u64, _: i32, _: i32) {}
         /// Persistent executor identity and exact task/ASID generation at one
         /// owner-thread lifecycle boundary.
         fn hvpatch__executor__lifecycle(_: u32, _: u32, _: u64, _: u64, _: u64) {}
@@ -6255,6 +6265,22 @@ mod real {
         carrick_usdt::mn__clone__outcome!(|| (tid, phase.raw(), errno));
     }
 
+    pub fn mm_slot_busy(
+        slot: u32,
+        running_mm: u64,
+        requested_mm: u64,
+        installing_tid: i32,
+        owner_tid: i32,
+    ) {
+        carrick_usdt::mm__slot__busy!(|| (
+            slot,
+            running_mm,
+            requested_mm,
+            installing_tid,
+            owner_tid
+        ));
+    }
+
     pub fn hvpatch_executor_lifecycle(
         executor: u32,
         phase: super::HvpatchExecutorLifecyclePhase,
@@ -6416,6 +6442,18 @@ mod real {
         tid: i32,
     ) {
         carrick_usdt::hvpatch__first__touch__deliver!(|| (far, reason.raw(), tid));
+    }
+
+    /// A first-touch or grow-down resolution was refused by the backend.
+    /// Formatting occurs only when a consumer is attached.
+    #[inline(never)]
+    pub fn hvpatch_first_touch_refused(
+        page: u64,
+        access: u32,
+        site: u32,
+        error: &dyn std::fmt::Display,
+    ) {
+        carrick_usdt::hvpatch__first__touch__refused!(|| (page, access, site, format!("{error}")));
     }
 
     #[inline(never)]
@@ -8633,6 +8671,7 @@ mod stub {
     stub!(mn_admit(tid: i32, slot: u32, budget: u32));
     stub!(mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32));
     stub!(mn_clone_outcome(tid: i32, phase: super::HvpatchCloneThreadPhase, errno: i32));
+    stub!(mm_slot_busy(slot: u32, running_mm: u64, requested_mm: u64, installing_tid: i32, owner_tid: i32));
     stub!(hvpatch_executor_lifecycle(
         executor: u32,
         phase: super::HvpatchExecutorLifecyclePhase,
@@ -8682,6 +8721,7 @@ mod stub {
     stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));
     stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));
     stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));
+    stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));
     stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));
     stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));
     stub!(stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64));

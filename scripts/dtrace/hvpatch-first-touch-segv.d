@@ -15,16 +15,16 @@
  * protection denies the access class, the backend `protect_range` (sparse
  * materialization) REFUSED it, or the stale-leaf retry found a valid leaf
  * and did not retry. Only the refusal has a probe
- * (`resident-fault-protection-error`); this script pairs it with the fault
- * and the delivery so a SIGSEGV record says whether the backend refused the
- * page or the dispatcher never had a plan for it.
+ * (`resident-fault-protection-error` and `hvpatch-first-touch-refused`); this
+ * script pairs it with the fault and the delivery so a SIGSEGV record says
+ * whether the backend refused the page or the dispatcher never had a plan for it.
  *
  * Per host thread it latches the last `vcpu-fault` (ESR/ELR/FAR), the last
  * serialized stage-1 walk (`pt-fault-walk` L0..L3, `pt-fault-ttbr`), the last
  * mmap-family syscall entry/return (222=mmap, 215=munmap, 226=mprotect,
- * 233=madvise, 216=mremap) and whether a `resident-fault-protection-error`
- * or `hvpatch-stale-stage1-retry` fired since the fault. It prints ONE line
- * per `resident-fault-protection-error` (immediately, with the backend's
+ * 233=madvise, 216=mremap) and whether a `resident-fault-protection-error`,
+ * `hvpatch-first-touch-refused` or `hvpatch-stale-stage1-retry` fired since
+ * the fault. It prints ONE line per refusal (immediately, with the backend's
  * formatted error) and ONE line per `signal-deliver` of signum 11.
  *
  * (b) PROVIDER ABI (qualified live on macOS 26 / arm64, 2026-09-07,
@@ -36,7 +36,10 @@
  * ttbr0) fire from the engine's `resolve_frame_cow_fault` before the runtime
  * decides. carrick*:::resident-fault-protection-error (page, prot, error C
  * string) fires only when the backend refuses a logically allowed first
- * touch. carrick*:::hvpatch-stale-stage1-retry (far, access, linux_tid).
+ * touch. carrick*:::hvpatch-first-touch-refused (page, access, site, error C
+ * string) fires on backend refusal carrying the faulting access and site id
+ * (1 = resident fault plan, 2 = mmap growdown plan).
+ * carrick*:::hvpatch-stale-stage1-retry (far, access, linux_tid).
  * carrick*:::signal-deliver (linux_tid, signum) fires in
  * `inject_fault_signal` for a synchronous fault AND in ordinary signal
  * delivery; the signum filter keeps only SIGSEGV. syscall-entry (nr, name,
@@ -145,6 +148,15 @@ carrick*:::resident-fault-protection-error
     printf("FTSEGV|refusal|ts=%d|host_pid=%d|host_tid=%d|page=%x|prot=%x|far=%x|esr=%x|elr=%x|err=%s\n",
         timestamp, pid, tid, arg0, arg1, self->far, self->esr, self->elr,
         copyinstr(arg2));
+}
+
+carrick*:::hvpatch-first-touch-refused
+{
+    refusals++;
+    self->refused = 1;
+    printf("FTSEGV|refusal|ts=%d|host_pid=%d|host_tid=%d|page=%x|access=%d|site=%d|far=%x|esr=%x|elr=%x|err=%s\n",
+        timestamp, pid, tid, arg0, (uint32_t)arg1, (uint32_t)arg2, self->far,
+        self->esr, self->elr, copyinstr(arg3));
 }
 
 carrick*:::hvpatch-stale-stage1-retry

@@ -59,7 +59,7 @@
 //! process never count each other's executors.
 
 use std::cell::Cell;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use carrick_fatal::carrick_fatal;
 use carrick_sched_core::{AddressSpaceKey, AddressSpaces, EXECUTION_SLOTS, Occupancy, SpaceIndex};
@@ -72,8 +72,8 @@ use super::objects::ThreadKey;
 /// Host-only slots, and every slot while the zone is off.
 static HOST_TABLE: Occupancy = Occupancy::new();
 
-static PORTS: [Mutex<Option<Port>>; EXECUTION_SLOTS] =
-    [const { Mutex::new(None) }; EXECUTION_SLOTS];
+static PORTS: [Mutex<SlotPort>; EXECUTION_SLOTS] =
+    [const { Mutex::new(SlotPort::new()) }; EXECUTION_SLOTS];
 
 fn key(mm: MmId) -> AddressSpaceKey {
     AddressSpaceKey::new(mm.nonzero())
@@ -172,6 +172,51 @@ struct Port {
     mm: MmId,
     fence: MmFence,
     endpoint: PauseEndpoint,
+}
+
+type SlotWake = dyn Fn() + Send + Sync + 'static;
+
+/// The port and its release waiters share one lock. A subscriber either sees
+/// the vacant slot or is enrolled before the owner's drop takes the waiters.
+struct SlotPort {
+    running: Option<Port>,
+    waiters: Vec<Weak<SlotWake>>,
+}
+
+impl SlotPort {
+    const fn new() -> Self {
+        Self {
+            running: None,
+            waiters: Vec::new(),
+        }
+    }
+}
+
+/// A parked installer keeps its callback live until it retries or retires.
+pub struct SlotVacancySubscription {
+    _callback: Arc<SlotWake>,
+}
+
+pub enum SlotVacancyEnrollment {
+    Vacant,
+    Waiting(SlotVacancySubscription),
+}
+
+/// Enroll after a refused install. The shared port lock closes the gap
+/// between observing the previous owner and arming its release wake.
+pub fn subscribe_slot_vacancy(
+    slot: ExecutionSlot,
+    callback: Arc<SlotWake>,
+) -> SlotVacancyEnrollment {
+    let mut state = PORTS[slot.index()].lock();
+    if state.running.is_none() {
+        return SlotVacancyEnrollment::Vacant;
+    }
+    state.waiters.retain(|waiter| waiter.strong_count() != 0);
+    state.waiters.push(Arc::downgrade(&callback));
+    SlotVacancyEnrollment::Waiting(SlotVacancySubscription {
+        _callback: callback,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -308,21 +353,30 @@ impl MmOccupancy {
         fence: &MmFence,
         endpoint: PauseEndpoint,
     ) -> Result<Self, MmOccupancyError> {
-        let mut port = PORTS[slot.index()].lock();
-        if let Some(running) = port.as_ref() {
+        let mut state = PORTS[slot.index()].lock();
+        if let Some(running) = state.running.as_ref() {
+            crate::event_ring::rec_mm_occupancy_refused(slot.index(), running.mm.raw(), mm.raw());
+            carrick_observability::probes::mm_slot_busy(
+                u32::try_from(slot.index()).unwrap_or(u32::MAX),
+                running.mm.raw(),
+                mm.raw(),
+                endpoint.tid().raw(),
+                running.endpoint.tid().raw(),
+            );
             return Err(MmOccupancyError::SlotBusy {
                 slot,
                 running: running.mm.raw(),
             });
         }
-        table
-            .install(slot, key(mm))
-            .map_err(|busy| MmOccupancyError::SlotWordWithoutOwner {
+        table.install(slot, key(mm)).map_err(|busy| {
+            crate::event_ring::rec_mm_occupancy_refused(slot.index(), busy.running.raw(), mm.raw());
+            MmOccupancyError::SlotWordWithoutOwner {
                 slot,
                 running: busy.running.raw(),
                 requested: mm.raw(),
-            })?;
-        *port = Some(Port {
+            }
+        })?;
+        state.running = Some(Port {
             mm,
             fence: Arc::clone(fence),
             endpoint,
@@ -348,8 +402,8 @@ impl MmOccupancy {
     /// fence exactly as an install does.
     #[cfg(any(test, feature = "test-support"))]
     pub fn switch_for_test(&mut self, mm: MmId, fence: &MmFence) {
-        let mut port = PORTS[self.slot.index()].lock();
-        let Some(port) = port.as_mut() else {
+        let mut state = PORTS[self.slot.index()].lock();
+        let Some(port) = state.running.as_mut() else {
             carrick_fatal!("kernel::mm_occupancy", "switched a vacant slot");
         };
         if !self.table.switch(self.slot, key(self.mm), key(mm)) {
@@ -379,8 +433,11 @@ impl MmOccupancy {
 
 impl Drop for MmOccupancy {
     fn drop(&mut self) {
-        let mut port = PORTS[self.slot.index()].lock();
-        let own_port = port.as_ref().is_some_and(|port| port.mm == self.mm);
+        let mut state = PORTS[self.slot.index()].lock();
+        let own_port = state
+            .running
+            .as_ref()
+            .is_some_and(|port| port.mm == self.mm);
         // The vCPU is out of the guest. In the zone's table EL1 may have
         // switched the word to another address space, or emptied it, since
         // the task was loaded; whatever it holds now ends with this stretch.
@@ -398,7 +455,14 @@ impl Drop for MmOccupancy {
                 self.mm
             );
         }
-        *port = None;
+        state.running = None;
+        let waiters = std::mem::take(&mut state.waiters);
+        drop(state);
+        for waiter in waiters {
+            if let Some(wake) = waiter.upgrade() {
+                wake();
+            }
+        }
     }
 }
 
@@ -461,7 +525,7 @@ pub(crate) fn residents(mm: MmId, fence: &MmFence, except: Option<ExecutionSlot>
             if Some(slot) == except {
                 return;
             }
-            if let Some(port) = PORTS[slot.index()].lock().as_ref() {
+            if let Some(port) = PORTS[slot.index()].lock().running.as_ref() {
                 members.push(Resident::zone(zone, slot, mm, port.endpoint.clone()));
             }
         });
@@ -470,7 +534,7 @@ pub(crate) fn residents(mm: MmId, fence: &MmFence, except: Option<ExecutionSlot>
         if Some(slot) == except {
             return;
         }
-        if let Some(port) = PORTS[slot.index()].lock().as_ref()
+        if let Some(port) = PORTS[slot.index()].lock().running.as_ref()
             && port.mm == mm
             && Arc::ptr_eq(&port.fence, fence)
         {
@@ -812,7 +876,7 @@ fn drain_space(occupancy: &'static Occupancy, mm: MmId) {
     loop {
         let mut members = Vec::new();
         occupancy.for_each_running(key(mm), |slot| {
-            if let Some(port) = PORTS[slot.index()].lock().as_ref() {
+            if let Some(port) = PORTS[slot.index()].lock().running.as_ref() {
                 members.push(Resident::zone(occupancy, slot, mm, port.endpoint.clone()));
             }
         });

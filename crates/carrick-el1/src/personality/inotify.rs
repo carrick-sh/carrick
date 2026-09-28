@@ -1,7 +1,7 @@
 //! In-guest inotify operations for delegated inotify instances at EL1.
 
 use carrick_el1_abi::{
-    Action, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify, DelegatedMark,
+    Action, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
     EL1_GUEST_LOCK_SPINS, FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES, MAX_DELEGATED_INOTIFY,
     MAX_NAME_CACHE_PATH_LEN, fd_map_lookup_inotify, hash_path,
 };
@@ -103,59 +103,7 @@ pub fn el1_inotify_add_watch(
         _ => return Err(Action::Forward),
     };
 
-    // Lock hierarchy: file lock first, then inotify lock (bounded retry before forward)
-    let file_locked = file.lock_guest_bounded(EL1_GUEST_LOCK_SPINS);
-    if !file_locked {
-        return Err(Action::Forward);
-    }
-
-    let inotify_locked = inotify.lock_guest_bounded(EL1_GUEST_LOCK_SPINS);
-    if !inotify_locked {
-        file.unlock();
-        return Err(Action::Forward);
-    }
-
-    // Check if watch already exists on this inotify instance for this file
-    let mut existing_wd = None;
-    let watches = unsafe { &mut *inotify.watches.get() };
-    for w in watches.iter_mut() {
-        if w.alive != 0 && w.file_handle == target_file_handle {
-            w.mask = mask;
-            existing_wd = Some(w.wd);
-            break;
-        }
-    }
-
-    let res = if let Some(wd) = existing_wd {
-        file.add_mark(DelegatedMark {
-            inotify_handle,
-            wd,
-            mask,
-            _pad: 0,
-        });
-        Ok(wd as i64)
-    } else {
-        match inotify.alloc_wd() {
-            Ok(wd) => {
-                if inotify.add_watch(wd, target_file_handle, mask) {
-                    file.add_mark(DelegatedMark {
-                        inotify_handle,
-                        wd,
-                        mask,
-                        _pad: 0,
-                    });
-                    Ok(wd as i64)
-                } else {
-                    Err(Action::Forward)
-                }
-            }
-            Err(_) => Err(Action::Forward),
-        }
-    };
-
-    inotify.unlock();
-    file.unlock();
-    res
+    crate::substrate::watches::add(file, inotify, inotify_handle, target_file_handle, mask)
 }
 
 /// Service `inotify_rm_watch(fd, wd)` (nr 28) at EL1.
@@ -198,39 +146,14 @@ pub fn el1_inotify_rm_watch(
         _ => return Err(Action::Forward),
     };
 
-    // Lock hierarchy: file lock first, then inotify lock (bounded retry before forward)
-    let file_locked = file.lock_guest_bounded(EL1_GUEST_LOCK_SPINS);
-    if !file_locked {
-        return Err(Action::Forward);
-    }
-
-    let inotify_locked = inotify.lock_guest_bounded(EL1_GUEST_LOCK_SPINS);
-    if !inotify_locked {
-        file.unlock();
-        return Err(Action::Forward);
-    }
-
-    // Re-verify under locks
-    let watch_matches = match inotify.find_watch(wd) {
-        Some((_, w)) => w.file_handle == target_file_handle,
-        None => false,
-    };
-    if !watch_matches {
-        inotify.unlock();
-        file.unlock();
-        return Err(Action::Forward);
-    }
-
-    // Remove mark from file
-    file.remove_mark(inotify_handle, wd);
-    // Remove watch from inotify
-    inotify.remove_watch(wd);
-    // Push IN_IGNORED as last event for this wd
-    inotify.push_record(wd, LINUX_IN_IGNORED, 0, None);
-
-    inotify.unlock();
-    file.unlock();
-    Ok(0)
+    crate::substrate::watches::remove(
+        file,
+        inotify,
+        inotify_handle,
+        target_file_handle,
+        wd,
+        LINUX_IN_IGNORED,
+    )
 }
 
 /// Service `read(inotify_fd, buf, count)` (nr 63) on a delegated inotify instance at EL1.

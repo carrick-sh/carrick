@@ -3447,6 +3447,7 @@ pub(crate) mod tests {
             state,
             phase: HvpatchProductionPhase::Resident,
             registration_wait: None,
+            slot_wait: None,
             terminal_settlement: HvpatchExternalTerminalSettlement::new(
                 job_result,
                 job_completion.clone(),
@@ -3724,6 +3725,7 @@ pub(crate) mod tests {
                 state,
                 phase: HvpatchProductionPhase::Resident,
                 registration_wait: None,
+                slot_wait: None,
                 terminal_settlement: HvpatchExternalTerminalSettlement::new(
                     job_result,
                     job_completion.clone(),
@@ -3974,6 +3976,7 @@ pub(crate) mod tests {
                 state,
                 phase: HvpatchProductionPhase::Resident,
                 registration_wait: None,
+                slot_wait: None,
                 terminal_settlement: HvpatchExternalTerminalSettlement::new(
                     job_result,
                     job_completion.clone(),
@@ -4229,6 +4232,7 @@ pub(crate) mod tests {
             state,
             phase: HvpatchProductionPhase::Resident,
             registration_wait: None,
+            slot_wait: None,
             terminal_settlement: HvpatchExternalTerminalSettlement::new(
                 job_result,
                 job_completion.clone(),
