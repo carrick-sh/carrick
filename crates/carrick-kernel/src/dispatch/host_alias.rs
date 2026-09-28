@@ -63,7 +63,10 @@ impl HostAliasTransaction {
         // Re-enter the alias coordinator under the caller's still-live outer
         // permit. The pending transaction owns no alias phase, so safe code
         // cannot smuggle exclusion through an owned DispatchOutcome.
-        let structural = self.authority.mutation_coordinator.begin_alias(permit);
+        let structural = self
+            .authority
+            .mutation_coordinator
+            .begin_alias_for(permit, mm_mutation::AliasOperation::Install);
         let mut phase = self.transactions.phase.lock();
         let HostAliasPhase::Pending { id, commit } = &mut *phase else {
             return None;
@@ -207,6 +210,8 @@ pub struct HostAliasTransactions {
     pub(crate) phase: parking_lot::Mutex<HostAliasPhase>,
     pub(crate) idle: parking_lot::Condvar,
     pub(crate) next_id: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    wait_observer: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl HostAliasTransactions {
@@ -215,6 +220,8 @@ impl HostAliasTransactions {
             phase: parking_lot::Mutex::new(HostAliasPhase::Idle),
             idle: parking_lot::Condvar::new(),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            #[cfg(test)]
+            wait_observer: parking_lot::Mutex::new(None),
         }
     }
 
@@ -223,18 +230,31 @@ impl HostAliasTransactions {
         permit: &'permit mm_mutation::HostAliasPermit<'_>,
         coordinator: &Arc<mm_mutation::MmMutationCoordinator>,
     ) -> HostAliasDispatchGuard<'permit> {
-        let structural = coordinator.begin_alias(permit);
         let mut phase = self.phase.lock();
         while !matches!(*phase, HostAliasPhase::Idle) {
+            #[cfg(test)]
+            if let Some(observer) = self.wait_observer.lock().take() {
+                observer.send(()).expect("wait observer alive");
+            }
             self.idle.wait(&mut phase);
         }
         *phase = HostAliasPhase::Dispatching;
+        let admission = HostAliasDispatchAdmission {
+            transactions: Arc::clone(self),
+            active: true,
+            vma_revision: None,
+        };
+        drop(phase);
+        // Reserve Idle before acquiring structural exclusion. A Pending
+        // install needs that exclusion to claim and complete; waiting for it
+        // while holding the coordinator creates a permanent cycle. Admission
+        // owns rollback even if coordinator acquisition unwinds.
+        let structural = coordinator.begin_alias_for(permit, mm_mutation::AliasOperation::Dispatch);
         HostAliasDispatchGuard {
             _structural: structural,
             authority: None,
             transactions: Arc::clone(self),
-            active: true,
-            vma_revision: None,
+            admission,
         }
     }
 
@@ -264,11 +284,19 @@ impl HostAliasTransactions {
 }
 
 pub struct HostAliasDispatchGuard<'permit> {
+    // Publish the VMA revision and retire Dispatching before exclusion drops.
+    admission: HostAliasDispatchAdmission,
     pub(crate) _structural: mm_mutation::HostAliasCoordinatorGuard<'permit>,
     pub(crate) authority: Option<Arc<DispatchMmAuthority>>,
     pub(crate) transactions: Arc<HostAliasTransactions>,
-    pub(crate) active: bool,
-    pub(crate) vma_revision: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+/// Owns Dispatching independently of structural exclusion. In particular,
+/// waiting for admission never owns an alias coordinator guard.
+struct HostAliasDispatchAdmission {
+    transactions: Arc<HostAliasTransactions>,
+    active: bool,
+    vma_revision: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl HostAliasDispatchGuard<'_> {
@@ -284,12 +312,12 @@ impl HostAliasDispatchGuard<'_> {
     }
 
     pub(crate) fn with_vma_revision(mut self, revision: Arc<std::sync::atomic::AtomicU64>) -> Self {
-        self.vma_revision = Some(revision);
+        self.admission.vma_revision = Some(revision);
         self
     }
 
     pub(crate) fn mark_vma_revision(&mut self, revision: Arc<std::sync::atomic::AtomicU64>) {
-        self.vma_revision = Some(revision);
+        self.admission.vma_revision = Some(revision);
     }
 
     pub fn publish(
@@ -327,7 +355,7 @@ impl HostAliasDispatchGuard<'_> {
             commit: Some(commit),
         };
         self.transactions.idle.notify_all();
-        self.active = false;
+        self.admission.active = false;
         let authority = self.authority.take().unwrap_or_else(|| {
             tracing::error!("host-alias publication lacks MM authority");
             carrick_fatal!(
@@ -344,7 +372,7 @@ impl HostAliasDispatchGuard<'_> {
     }
 }
 
-impl Drop for HostAliasDispatchGuard<'_> {
+impl Drop for HostAliasDispatchAdmission {
     fn drop(&mut self) {
         if !self.active {
             return;
@@ -481,5 +509,87 @@ impl SyscallDispatcher {
         transactions.idle.notify_all();
         install.disarm();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn dispatch_admission_rolls_back_when_coordinator_refuses_permit() {
+        let authority =
+            DispatchMmAuthority::new_for_test_with_revision(crate::kernel::VmaRevision::INITIAL);
+        let wrong = Arc::new(mm_mutation::MmMutationCoordinator::new(authority.mm_id));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mm_mutation::test_support::with_permit(wrong, |permit| {
+                authority
+                    .host_alias_transactions
+                    .begin_dispatch(permit, &authority.mutation_coordinator);
+            });
+        }));
+        assert!(rejected.is_err());
+        assert!(matches!(
+            *authority.host_alias_transactions.phase.lock(),
+            HostAliasPhase::Idle
+        ));
+        mm_mutation::test_support::with_permit(
+            Arc::clone(&authority.mutation_coordinator),
+            |permit| {
+                drop(
+                    authority
+                        .host_alias_transactions
+                        .begin_dispatch(permit, &authority.mutation_coordinator),
+                );
+            },
+        );
+    }
+
+    // Contract: a pending mmap installation must remain claimable while a
+    // sibling fault waits to dispatch. Waiting dispatchers own zero structural
+    // alias guards; snapshots must remain admissible at this boundary.
+    #[test]
+    fn pending_install_waiter_does_not_hold_coordinator() {
+        let authority = Arc::new(DispatchMmAuthority::new_for_test_with_revision(
+            crate::kernel::VmaRevision::INITIAL,
+        ));
+        let coordinator = Arc::clone(&authority.mutation_coordinator);
+        let transactions = Arc::clone(&authority.host_alias_transactions);
+        let pending = mm_mutation::test_support::with_permit(Arc::clone(&coordinator), |permit| {
+            transactions
+                .begin_dispatch(permit, &coordinator)
+                .with_authority(Arc::clone(&authority))
+                .publish(HostAliasCommit::empty_for_test())
+                .expect("publish")
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        *transactions.wait_observer.lock() = Some(tx);
+        let worker_coordinator = Arc::clone(&coordinator);
+        let worker = std::thread::spawn(move || {
+            mm_mutation::test_support::with_permit(Arc::clone(&worker_coordinator), |permit| {
+                drop(transactions.begin_dispatch(permit, &worker_coordinator));
+            });
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("sibling reached phase wait");
+        let snapshot =
+            coordinator.begin_snapshot_until(Instant::now() + Duration::from_millis(100));
+        let admissible = snapshot.is_some();
+        drop(snapshot);
+        // Unblock and join even on the broken implementation: never leave a
+        // wedged test thread behind when reporting the structural failure.
+        if admissible {
+            pending
+                .with_claim_for_test(|install| drop(install))
+                .expect("pending install remains claimable");
+        } else {
+            drop(pending);
+        }
+        worker.join().expect("sibling completes after abort");
+        assert!(
+            admissible,
+            "pending-install waiter holds the alias coordinator needed by claim"
+        );
     }
 }

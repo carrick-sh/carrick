@@ -55,6 +55,14 @@ static IDX: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG: AtomicBool = AtomicBool::new(false);
 static NEXT_HVPWAIT_ID: AtomicU32 = AtomicU32::new(1);
 
+// Alias coordinator lifecycle: a:b is the full coordinator address, c is
+// guest TID (0 when no guest identity is available). Holder state additionally
+// records the acquiring Rust host thread ID for offline core inspection.
+pub const ALIAS_MUTATION: u8 = 90;
+pub const ALIAS_DISPATCH: u8 = 91;
+pub const ALIAS_INSTALL: u8 = 92;
+pub const ALIAS_END: u8 = 93;
+
 // Event kinds.
 pub const BIND: u8 = 1;
 pub const LISTEN: u8 = 2;
