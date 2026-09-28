@@ -13031,7 +13031,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/continuation/wait_service.rs",
-      "line": 1325,
+      "line": 1326,
       "categories": [
         "epoll"
       ],
@@ -15983,7 +15983,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread.rs",
-      "line": 2799,
+      "line": 2860,
       "categories": [
         "lifecycle"
       ],
