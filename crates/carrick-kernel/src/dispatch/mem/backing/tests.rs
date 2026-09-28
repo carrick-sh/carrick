@@ -1507,6 +1507,33 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
 }
 
 #[test]
+fn core_file_trim_preserves_disjoint_neighbors_and_split_offsets() {
+    let mut mem = MemState::new();
+    let page = crate::core_dump::GUEST_PAGE as u64;
+    for (start, pages, offset) in [(0x1000, 1, 1), (0x4000, 4, 10), (0xa000, 1, 20)] {
+        mem.core_file_mappings.push(crate::core_dump::FileMapping {
+            start,
+            end: start + pages * page,
+            file_page_offset: offset,
+            path: format!("/file-{start:x}"),
+        });
+    }
+    mem.trim_core_file_mappings(0x5000, page);
+    assert_eq!(
+        mem.core_file_mappings
+            .iter()
+            .map(|entry| (entry.start, entry.end, entry.file_page_offset))
+            .collect::<Vec<_>>(),
+        vec![
+            (0x1000, 0x2000, 1),
+            (0x4000, 0x5000, 10),
+            (0x6000, 0x8000, 12),
+            (0xa000, 0xb000, 20),
+        ]
+    );
+}
+
+#[test]
 fn host_alias_inventory_commits_trims_and_fork_clones_exact_ranges() {
     let parent = SyscallDispatcher::new();
     let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
