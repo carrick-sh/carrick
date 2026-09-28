@@ -2243,14 +2243,25 @@ impl OpenDescription {
 }
 
 impl super::SyscallDispatcher {
-    pub(in crate::dispatch) fn rename_open_paths(&self, resolved_old: &str, resolved_new: &str) {
+    pub(in crate::dispatch) fn rename_open_paths(
+        &self,
+        resolved_old: &str,
+        resolved_new: &str,
+    ) -> usize {
         let file_table = self.captured_file_table();
-        for (_, open_file) in file_table.read_open_files().iter() {
-            if let Some(mut desc) = open_file.description.write_for_io() {
+        // Keep the slot census stable while the path index is renamed. The
+        // index is updated on every recorded insert/remove, so unrelated open
+        // descriptions never need a write lock for this namespace operation.
+        let open_files = file_table.read_open_files();
+        let (affected, visited) = file_table.rename_fd_open_paths(resolved_old, resolved_new);
+        for fd in affected {
+            if let Some(open_file) = open_files.get(&fd)
+                && let Some(mut desc) = open_file.description.write_for_io()
+            {
                 desc.rename_path(resolved_old, resolved_new);
             }
         }
-        file_table.rename_fd_open_paths(resolved_old, resolved_new);
+        visited
     }
 }
 
