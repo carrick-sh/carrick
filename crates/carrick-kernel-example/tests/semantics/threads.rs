@@ -12,6 +12,46 @@
 
 use crate::common::*;
 
+/// A fork from a multithreaded process creates a single-threaded child whose
+/// `_exit(0)` is reported as a normal zero status while the parent's sibling
+/// remains parked. The VM-free layer checks the kernel's process graph and
+/// wait encoding; COW materialization belongs to the signed VMM binding.
+#[test]
+fn fork_from_multithreaded_parent_reaps_child_exit_zero() {
+    let script = vec![
+        pipe_to_slots(0, 1),
+        Step::Sys(sys::clone_thread(0).save(2)),
+        Step::ChildMarker(vec![
+            Step::Sys(call(
+                "sibling_parked_read",
+                nr::READ,
+                [
+                    slot(0),
+                    Operand::Out(1),
+                    1.into(),
+                    0.into(),
+                    0.into(),
+                    0.into(),
+                ],
+            )),
+            Step::Sys(sys::exit_thread(0)),
+        ]),
+        await_parked(slot(2), "sibling_parked_read"),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![Step::Sys(sys::exit_group(0))]),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        Step::Sys(sys::write(slot(1), b"x").ret(1)),
+        Step::Sys(sys::exit_group(0)),
+    ];
+
+    let run = run(script);
+    assert_eq!(run.exit_code(), 0);
+    assert_eq!(run.tasks_started(), 3);
+    let status = wait_status(&run, "wait4");
+    assert!(wifexited(status));
+    assert_eq!(wexitstatus(status), 0);
+}
+
 /// `clone` with thread flags shares the fd table and memory with its process;
 /// `exit_group` from the thread terminates the entire process and reports its status
 /// to the waiting parent process.

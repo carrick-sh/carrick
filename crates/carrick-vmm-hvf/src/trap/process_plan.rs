@@ -366,6 +366,7 @@ fn repoint_inherited_invalid_alias(
     current_ipa: u64,
     len: usize,
     eligible: bool,
+    inventory_covers_compound: impl Fn(u64) -> bool,
 ) -> Result<bool, carrick_mmu_core::aarch64::PageTableError> {
     if !eligible || page_tables.translate(start).is_some() {
         return Ok(false);
@@ -376,7 +377,58 @@ fn repoint_inherited_invalid_alias(
     if retained == current_ipa {
         return Ok(false);
     }
-    page_tables.repoint_preserving_attributes(start, current_ipa, len as u64, None)
+    const PAGE: u64 = 4 * 1024;
+    const COMPOUND: u64 = CowArmedRanges::COMPOUND_SIZE;
+    let pages = (len as u64).div_ceil(PAGE);
+    let mut needs_repoint = false;
+    // Preflight the complete offline edit against the child's planned frame
+    // inventory. A covered retained output is an authenticated fork snapshot,
+    // even when this older alias row names a different IPA. A missing output
+    // may be replaced only by a compound the child will actually inherit.
+    // Checking every page keeps one old row from overwriting a newer overlay
+    // in the middle of its semantic span.
+    for index in 0..pages {
+        let offset = index
+            .checked_mul(PAGE)
+            .ok_or(carrick_mmu_core::aarch64::PageTableError::BadAddress)?;
+        let page_va = start
+            .checked_add(offset)
+            .ok_or(carrick_mmu_core::aarch64::PageTableError::BadAddress)?;
+        let target = current_ipa
+            .checked_add(offset)
+            .ok_or(carrick_mmu_core::aarch64::PageTableError::BadAddress)?;
+        let Some(output) = page_tables.translate_retained_output(page_va) else {
+            continue;
+        };
+        if page_tables.translate(page_va).is_some()
+            || output == target
+            || inventory_covers_compound(align_down(output, COMPOUND))
+        {
+            continue;
+        }
+        if !inventory_covers_compound(align_down(target, COMPOUND)) {
+            return Err(carrick_mmu_core::aarch64::PageTableError::BadAddress);
+        }
+        needs_repoint = true;
+    }
+    if !needs_repoint {
+        return Ok(false);
+    }
+    let mut changed = false;
+    for index in 0..pages {
+        let page_va = start + index * PAGE;
+        let target = current_ipa + index * PAGE;
+        let Some(output) = page_tables.translate_retained_output(page_va) else {
+            continue;
+        };
+        if page_tables.translate(page_va).is_none()
+            && output != target
+            && !inventory_covers_compound(align_down(output, COMPOUND))
+        {
+            changed |= page_tables.repoint_preserving_attributes(page_va, target, PAGE, None)?;
+        }
+    }
+    Ok(changed)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1210,6 +1262,36 @@ impl HvfTaskState {
         // Built once for the whole fork; see `ForkTranslationOverlayIndex`.
         let overlay_index =
             ForkTranslationOverlayIndex::build(&mappings, fork_mm_root_slot, fork_container_root);
+        // The inherited inventory is immutable from this point until the
+        // child plan is committed. Build its interval index only if an invalid
+        // alias actually needs a different output; the usual fork has no such
+        // repoint and pays neither a sort nor an allocation.
+        let inventory_coverage = std::cell::OnceCell::new();
+        let inventory_covers_compound = |compound: u64| {
+            let spans = inventory_coverage.get_or_init(|| {
+                let mut spans: Vec<(u64, u64)> = inventory_mappings
+                    .iter()
+                    .filter_map(|mapping| {
+                        mapping
+                            .gpa
+                            .checked_add(mapping.length)
+                            .map(|end| (mapping.gpa, end))
+                    })
+                    .collect();
+                spans.sort_unstable_by_key(|(start, _)| *start);
+                let mut furthest = 0;
+                for (_, end) in &mut spans {
+                    furthest = furthest.max(*end);
+                    *end = furthest;
+                }
+                spans
+            });
+            let bound = spans.partition_point(|(start, _)| *start <= compound);
+            bound > 0
+                && compound
+                    .checked_add(CowArmedRanges::COMPOUND_SIZE)
+                    .is_some_and(|end| spans[bound - 1].1 >= end)
+        };
         for (index, mapping) in mappings.iter().enumerate() {
             repoint_inherited_invalid_alias(
                 page_tables,
@@ -1219,6 +1301,7 @@ impl HvfTaskState {
                 mapping.inherited_frame.is_some()
                     && mapping.is_dynamic_alias
                     && mapping.sharing == GuestMappingSharing::Private,
+                inventory_covers_compound,
             )
             .map_err(|error| {
                 TrapError::Hypervisor(format!(
@@ -1606,8 +1689,18 @@ mod tests {
         assert_eq!(page_tables.translate(va), None);
         assert_eq!(page_tables.translate_retained_output(va), Some(old_ipa));
 
-        repoint_inherited_invalid_alias(&mut page_tables, va, current_ipa, len as usize, true)
-            .expect("project authenticated alias into child image");
+        repoint_inherited_invalid_alias(
+            &mut page_tables,
+            va,
+            current_ipa,
+            len as usize,
+            true,
+            |compound| {
+                compound >= align_down(current_ipa, CowArmedRanges::COMPOUND_SIZE)
+                    && compound < current_ipa + len
+            },
+        )
+        .expect("project authenticated alias into child image");
 
         assert_eq!(
             page_tables.translate(va),
@@ -1623,6 +1716,138 @@ mod tests {
             page_tables.translate_retained_output(va + len - 1),
             Some(current_ipa + len - 1),
             "the complete inherited alias span must be projected"
+        );
+    }
+
+    #[test]
+    fn fork_repoints_untouched_alias_inside_invalid_parent_block() {
+        let mut page_tables = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        page_tables.declare_offline_private_image();
+        let block_va = crate::memory::LINUX_MMAP_BASE + 0x20_0000;
+        let old_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+        let child_ipa = old_ipa + 0x20_0000;
+        let alias_va = block_va + 0x77_000;
+        let alias_ipa = child_ipa + 0x77_000;
+        page_tables
+            .map_private_aliased(block_va, old_ipa, 0x20_0000, true, None)
+            .expect("map parent block");
+        page_tables
+            .set_prot_none(block_va, 0x20_0000, None)
+            .expect("arm untouched parent block");
+
+        assert!(
+            repoint_inherited_invalid_alias(
+                &mut page_tables,
+                alias_va,
+                alias_ipa,
+                0x4000,
+                true,
+                |compound| {
+                    compound >= align_down(alias_ipa, CowArmedRanges::COMPOUND_SIZE)
+                        && compound < alias_ipa + 0x4000
+                },
+            )
+            .expect("repoint fork child alias")
+        );
+        assert_eq!(page_tables.translate(alias_va), None);
+        assert_eq!(
+            page_tables.translate_retained_output(alias_va),
+            Some(alias_ipa)
+        );
+        assert_eq!(
+            page_tables.translate_retained_output(alias_va - 0x1000),
+            Some(old_ipa + 0x76_000),
+            "unprojected neighbor retains its parent snapshot output"
+        );
+    }
+
+    #[test]
+    fn fork_keeps_inventoried_overlay_when_older_alias_row_is_visited_later() {
+        let mut page_tables = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        page_tables.declare_offline_private_image();
+        let va = crate::memory::LINUX_MMAP_BASE + 0x40_0000;
+        let old_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+        let overlay_ipa = old_ipa + 0x20_0000;
+        page_tables
+            .map_private_aliased(va, overlay_ipa, 0x20_0000, true, None)
+            .expect("map current COW overlay");
+        page_tables
+            .set_prot_none(va, 0x20_0000, None)
+            .expect("re-arm first touch over the overlay");
+        let alias_va = va + 0x77_000;
+        assert_eq!(
+            page_tables.translate_retained_output(alias_va),
+            Some(overlay_ipa + 0x77_000)
+        );
+
+        let changed = repoint_inherited_invalid_alias(
+            &mut page_tables,
+            alias_va,
+            old_ipa + 0x77_000,
+            0x4000,
+            true,
+            |compound| {
+                compound >= align_down(overlay_ipa + 0x77_000, CowArmedRanges::COMPOUND_SIZE)
+                    && compound < overlay_ipa + 0x7b_000
+            },
+        )
+        .expect("older alias must not replace an inventoried overlay");
+        assert!(!changed);
+        assert_eq!(
+            page_tables.translate_retained_output(alias_va),
+            Some(overlay_ipa + 0x77_000),
+            "the child must retain the parent's snapshot output"
+        );
+    }
+
+    #[test]
+    fn fork_repoint_refuses_an_uninventoried_compound_before_editing_any_leaf() {
+        let mut page_tables = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        page_tables.declare_offline_private_image();
+        let va = crate::memory::LINUX_MMAP_BASE + 0x60_0000;
+        let old_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x80_0000;
+        let target_ipa = old_ipa + 0x20_0000;
+        page_tables
+            .map_private_aliased(va, old_ipa, 0x20_0000, true, None)
+            .expect("map parent block");
+        page_tables
+            .set_prot_none(va, 0x20_0000, None)
+            .expect("arm first touch");
+        let first = va + 0x70_000;
+        let target_first = target_ipa + 0x70_000;
+        let first_compound = align_down(target_first, CowArmedRanges::COMPOUND_SIZE);
+        assert_eq!(
+            repoint_inherited_invalid_alias(
+                &mut page_tables,
+                first,
+                target_first,
+                0x8000,
+                true,
+                |compound| compound == first_compound,
+            ),
+            Err(carrick_mmu_core::aarch64::PageTableError::BadAddress),
+            "the second compound has no child inventory publication"
+        );
+        assert_eq!(
+            page_tables.translate_retained_output(first),
+            Some(old_ipa + 0x70_000)
+        );
+        assert_eq!(
+            page_tables.translate_retained_output(first + 0x4000),
+            Some(old_ipa + 0x74_000),
+            "preflight must leave the offline image unchanged"
         );
     }
 }

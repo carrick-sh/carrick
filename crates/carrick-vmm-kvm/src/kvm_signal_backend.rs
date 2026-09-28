@@ -1,5 +1,5 @@
 //! KVM's [`HostSignalGlue`] — the ~15-line backend seam the shared host-signal
-//! driver (`carrick_signal_core::host_glue` + `carrick_hal::signal_pump`) is
+//! driver (`carrick_signal_linux::host_glue` + `carrick_hal::signal_pump`) is
 //! generic over. This is the ENTIRE KVM host-signal footprint now: the routed +
 //! nudge + pump handlers, the disposition install mask, the daemon-thread pump,
 //! and the fork/execve lifecycle all live in the shared crates and inherit these
@@ -12,7 +12,7 @@
 //! SIGNAL NUMBER is named here, to derive the xsig nudge and exclude it from
 //! disposition mirroring.
 
-use carrick_signal_core::HostSignalGlue;
+use carrick_signal_linux::HostSignalGlue;
 
 /// Zero-sized marker carrying KVM's host-signal policy.
 pub struct KvmGlue;

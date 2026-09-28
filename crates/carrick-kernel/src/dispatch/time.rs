@@ -86,19 +86,7 @@ syscall_table! {
     nr::CLOCK_ADJTIME => clock_adjtime,
 }
 
-/// Pack a timer's `(value, interval)` ns pair into a `LinuxItimerspec` (the
-/// Linux kernel ABI `struct __kernel_itimerspec`). Used by `timer_settime`'s
-/// `old_value` and `timer_gettime`'s `cur_value` writes.
-fn build_itimerspec_ns(spec: TimerSpecNs) -> LinuxItimerspec {
-    let split = |ns: u64| LinuxTimespec {
-        tv_sec: i64::try_from(ns / 1_000_000_000).unwrap_or(i64::MAX),
-        tv_nsec: i64::try_from(ns % 1_000_000_000).unwrap_or(0),
-    };
-    // WIRE order: `LinuxItimerspec::new(it_interval, it_value)` — interval
-    // FIRST, matching the struct's field order. Taking the typed pair means no
-    // caller ever has to re-perform (and possibly re-swap) that transposition.
-    LinuxItimerspec::new(split(spec.interval), split(spec.value))
-}
+use crate::timer_personality::build_itimerspec_ns;
 
 impl SyscallDispatcher {
     /// This process's limit for `resource`, from the TASK — the one authority
@@ -696,7 +684,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // Only TIMER_ABSTIME is a valid flag; reject any other bit. (audit M4)
-            if flags & !LINUX_TIMER_ABSTIME != 0 {
+            if crate::timer_personality::validate_timer_settime_flags(flags).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // A NULL `new_value` is EINVAL, not EFAULT: Linux rejects the absent
