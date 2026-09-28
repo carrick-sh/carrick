@@ -2169,7 +2169,9 @@ impl<'a> MemView<'a> {
                 && let Ok(bus_len_usize) = usize::try_from(bus_len)
             {
                 memory.set_no_access(bus_start, bus_len_usize, true);
-                if let Err(error) = memory.protect_range(bus_start, bus_len_usize, 0)
+                if let Err(error) = memory
+                    .protect_range(bus_start, bus_len_usize, 0)
+                    .and_then(|()| memory.mark_bus_fault(bus_start, bus_len_usize))
                     && memory.supports_concurrent_exec_protection()
                 {
                     if deferred_file_backed_len.is_some() {

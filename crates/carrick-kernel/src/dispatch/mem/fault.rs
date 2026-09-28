@@ -186,6 +186,14 @@ impl FirstTouchArming {
     }
 }
 
+fn bus_fault_contains(ranges: &[(u64, u64)], address: u64) -> bool {
+    ranges.iter().any(|&(start, len)| {
+        start
+            .checked_add(len)
+            .is_some_and(|end| address >= start && address < end)
+    })
+}
+
 /// The pages of `range` that lie inside a first-touch tracked extent and have
 /// not been committed resident: exactly the pages whose leaf must stay
 /// invalid so their first touch is still observed.
@@ -289,15 +297,7 @@ impl<'a> MemView<'a> {
     }
 
     pub(crate) fn mmap_fault_is_sigbus(&self, addr: u64) -> bool {
-        self.mem()
-            .lock()
-            .bus_fault_ranges
-            .iter()
-            .any(|&(start, len)| {
-                start
-                    .checked_add(len)
-                    .is_some_and(|end| addr >= start && addr < end)
-            })
+        bus_fault_contains(&self.mem().lock().bus_fault_ranges, addr)
     }
 
     /// Read-only classifier used at the trap boundary before it chooses the
@@ -503,6 +503,9 @@ impl<'a> MemView<'a> {
         let page = page_floor(address, self.linux_page_size());
         let mem_authority_32 = self.mem();
         let mem = mem_authority_32.lock();
+        if bus_fault_contains(&mem.bus_fault_ranges, page) {
+            return None;
+        }
         let prot = mem.resident_fault_ranges.prot_for_page(page)?.bits();
         Some(ResidentFaultPlan {
             page,
@@ -526,10 +529,30 @@ impl<'a> MemView<'a> {
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
         let grant = mem.resident_fault_ranges.grant_for_page(page, max_len)?;
+        let mut start = grant.range.start().raw();
+        let mut end = grant.range.end().raw();
+        // First-touch arming may cover an eager private-file snapshot's BUS
+        // tail. A bulk grant may prepare only the contiguous backed span
+        // containing the faulting page; otherwise publication tags the BUS
+        // page as live EL1-private backing before signal classification.
+        for &(bus_start, bus_len) in &mem.bus_fault_ranges {
+            let bus_end = bus_start.checked_add(bus_len)?;
+            if bus_start <= page && page < bus_end {
+                return None;
+            }
+            if bus_end <= page {
+                start = start.max(bus_end);
+            } else if bus_start > page {
+                end = end.min(bus_start);
+            }
+        }
+        if start >= end {
+            return None;
+        }
         Some(ResidentFrameGrantPlan {
             fault_page: page,
-            start: grant.range.start().raw(),
-            len: grant.range.end().raw() - grant.range.start().raw(),
+            start,
+            len: end - start,
             prot: grant.prot.bits(),
             exclusion,
         })

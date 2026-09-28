@@ -114,25 +114,85 @@ const NON_GLOBAL: u64 = 1 << 11;
 // matching Linux. PXN (bit 53, already in USER_*_FLAGS) keeps EL1 from fetching.
 const UXN: u64 = 1 << 54;
 
-// Software-reserved descriptor bit (IGNORED by the MMU, bits [58:55] are
-// implementation-defined/software use). Set on an INVALID leaf whose retained
-// output address names a stage-2 lease that `munmap` has RETIRED, as opposed to
-// a `PROT_NONE`/`MADV_DONTNEED`/first-touch-armed leaf whose frame is still
-// owned by this mm. Only the retired kind may be dropped by the spare-table
-// reclaim sweep; the live kind is the normal shape of every untouched mapping
-// and freeing its table loses the outputs the next protection commit
-// republishes. Cleared whenever the leaf is revalidated or rewritten.
+// EL1 leaf layout (software bits 58:55, ignored by AArch64 hardware):
+// 55: invalid = retired lease; valid private = fork COW.
+// 56: private-anonymous grant authority, valid OR invalid. An invalid private
+//     leaf with a retained output and bit 55 clear is prepared/owned, including
+//     untouched bulk grants and host PROT_NONE leaves. No second prepared bit.
+// 57: write ceiling, or current Linux write intent while valid COW is armed.
+// 58: execute ceiling. These two bits have meaning only with bit 56 set.
+// AP on a prepared leaf records host-buffer permission even while invalid;
+// AP_PRIV_RO denies a host-forwarded PROT_NONE access. Retired leaves retain
+// their output only for lease accounting, never access or permission authority.
 const SW_RETIRED: u64 = 1 << 55;
-/// Leaf belongs to a resident private-anonymous span published by Carrick EL1.
-/// Bits 58:55 are software-defined in an AArch64 stage-1 descriptor.
+/// Bit 55 is retirement only on invalid leaves. On valid EL1-private leaves
+/// it marks fork COW, separating hardware write restriction from mprotect.
+const SW_EL1_COW: u64 = SW_RETIRED;
+
+fn el1_cow(descriptor: u64) -> bool {
+    descriptor & (VALID | SW_EL1_PRIVATE | SW_EL1_COW) == (VALID | SW_EL1_PRIVATE | SW_EL1_COW)
+}
+
+/// A valid EL1-private leaf whose bit 55 is a fork COW arm, rather than the
+/// retirement marker that bit represents on an invalid leaf.
+pub fn terminal_descriptor_is_fork_cow(descriptor: u64) -> bool {
+    el1_cow(descriptor)
+}
+
+/// An invalid terminal whose retained output belongs to a retired lease.
+/// This applies to both EL1-private grants and older untagged host aliases.
+pub fn terminal_descriptor_is_retired(descriptor: u64) -> bool {
+    descriptor & VALID == 0 && descriptor & SW_RETIRED != 0
+}
+
+fn arm_private_cow(descriptor: u64) -> u64 {
+    if descriptor & (VALID | SW_EL1_PRIVATE) != (VALID | SW_EL1_PRIVATE) || el1_cow(descriptor) {
+        return descriptor;
+    }
+    // A previous EL1 mprotect may have kept the ceiling while revoking
+    // current write access. Capture actual permission before lowering AP.
+    (descriptor & !SW_EL1_MAY_WRITE)
+        | SW_EL1_COW
+        | if terminal_descriptor_permits_el0(descriptor, LeafAccess::Write) {
+            SW_EL1_MAY_WRITE
+        } else {
+            0
+        }
+}
 const SW_EL1_PRIVATE: u64 = 1 << 56;
-/// The originating Linux VMA permits a later `mprotect(PROT_WRITE)`.
+/// EL1 write ceiling; on a COW-marked leaf, current Linux write permission.
 const SW_EL1_MAY_WRITE: u64 = 1 << 57;
-/// The originating Linux VMA permits a later `mprotect(PROT_EXEC)`.
+/// EL1 execute ceiling.
 const SW_EL1_MAY_EXEC: u64 = 1 << 58;
-// With SW_EL1_PRIVATE clear, this bit instead authenticates a prepared grant
-// output. Host copyin must still treat the leaf as first-touch armed.
-const SW_EL1_PREPARED: u64 = SW_EL1_MAY_EXEC;
+
+/// The only EL1-private terminal states encoded by the software bits and
+/// descriptor validity. This is the authority gate for prepared backing,
+/// retirement, and host-buffer access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum El1PrivateLeafState {
+    Unowned,
+    Prepared,
+    Resident,
+    Retired,
+    Malformed,
+}
+
+pub fn el1_private_leaf_state(descriptor: u64) -> El1PrivateLeafState {
+    if descriptor & SW_EL1_PRIVATE == 0 {
+        return El1PrivateLeafState::Unowned;
+    }
+    if descriptor & VALID != 0 {
+        return El1PrivateLeafState::Resident;
+    }
+    if descriptor & SW_RETIRED != 0 {
+        return El1PrivateLeafState::Retired;
+    }
+    if descriptor & PA_MASK_4KIB != 0 {
+        El1PrivateLeafState::Prepared
+    } else {
+        El1PrivateLeafState::Malformed
+    }
+}
 
 // PA field masks per level (identical to memory.rs).
 const PA_MASK_1GIB: u64 = 0x0000_FFFF_C000_0000;
@@ -209,7 +269,7 @@ pub fn terminal_descriptor_permits_el0(descriptor: u64, access: LeafAccess) -> b
 /// mirrors.
 #[inline]
 pub fn terminal_descriptor_has_el1_private_authority(descriptor: u64) -> bool {
-    descriptor & SW_EL1_PRIVATE != 0
+    el1_private_leaf_state(descriptor) != El1PrivateLeafState::Unowned
 }
 
 /// Whether a terminal descriptor carries EL1's private-anonymous write permission
@@ -217,6 +277,49 @@ pub fn terminal_descriptor_has_el1_private_authority(descriptor: u64) -> bool {
 #[inline]
 pub fn terminal_descriptor_may_write(descriptor: u64) -> bool {
     descriptor & SW_EL1_MAY_WRITE != 0
+}
+
+/// Host buffer access for an EL1-owned leaf. COW writes are admitted only
+/// while Linux write intent survives; the caller must privatize before copyout.
+/// Non-EL1 mappings remain subject to the caller's ordinary permission checks.
+pub fn terminal_descriptor_permits_host_buffer(descriptor: u64, access: LeafAccess) -> bool {
+    // Invalid, non-retired leaves retain prepared backing and the current AP
+    // permissions. Admission here is not residency publication. EL1-served
+    // PROT_NONE remains VALID with AP_PRIV_RO; host-forwarded PROT_NONE is
+    // invalid with AP_PRIV_RO (`set_prot_none_denying_host_buffers`), so the
+    // AP check below denies both.
+    match el1_private_leaf_state(descriptor) {
+        El1PrivateLeafState::Unowned => true,
+        El1PrivateLeafState::Prepared => {
+            terminal_descriptor_permits_el0(descriptor | VALID, access)
+        }
+        El1PrivateLeafState::Resident => {
+            (access == LeafAccess::Write
+                && terminal_descriptor_permits_el0(descriptor, LeafAccess::Read)
+                && el1_cow(descriptor)
+                && terminal_descriptor_may_write(descriptor))
+                || terminal_descriptor_permits_el0(descriptor, access)
+        }
+        El1PrivateLeafState::Retired | El1PrivateLeafState::Malformed => false,
+    }
+}
+
+/// An EL1-private leaf that is invalid, not retired and still records its
+/// granted output: bulk-prepared backing never touched by the guest, or a page
+/// the host invalidated for `PROT_NONE` (which then carries kernel-only AP).
+pub fn terminal_descriptor_is_prepared_private(descriptor: u64) -> bool {
+    el1_private_leaf_state(descriptor) == El1PrivateLeafState::Prepared
+}
+
+/// Extend the guest permission ceiling after an authorized host protection edit.
+/// Fork COW must not call this: its hardware restriction is not an mprotect.
+fn private_permission_tags(descriptor: u64, writable: bool, executable: bool) -> u64 {
+    if descriptor & SW_EL1_PRIVATE == 0 {
+        return descriptor;
+    }
+    descriptor
+        | if writable { SW_EL1_MAY_WRITE } else { 0 }
+        | if executable { SW_EL1_MAY_EXEC } else { 0 }
 }
 
 /// Why a guest EL1 frame grant could not replace an already-provisioned span
@@ -363,7 +466,7 @@ unsafe fn existing_terminal_descriptor(
             }
             1 if descriptor_type == TYPE_BLOCK
                 || (descriptor_type == 0
-                    && descriptor & (SW_EL1_PRIVATE | SW_EL1_PREPARED) != 0) =>
+                    && el1_private_leaf_state(descriptor) != El1PrivateLeafState::Unowned) =>
             {
                 return Ok(ExistingTerminalDescriptor {
                     word,
@@ -373,7 +476,7 @@ unsafe fn existing_terminal_descriptor(
             }
             2 if descriptor_type == TYPE_BLOCK
                 || (descriptor_type == 0
-                    && descriptor & (SW_EL1_PRIVATE | SW_EL1_PREPARED) != 0) =>
+                    && el1_private_leaf_state(descriptor) != El1PrivateLeafState::Unowned) =>
             {
                 return Ok(ExistingTerminalDescriptor {
                     word,
@@ -529,13 +632,11 @@ pub unsafe fn protect_existing_el1_private_pages(
             return Err(GuestPermissionEditError::NotPrivateAnonymous);
         }
         let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-        if descriptor & VALID == 0
-            || descriptor & SW_RETIRED != 0
-            || descriptor & SW_EL1_PRIVATE == 0
-        {
+        if el1_private_leaf_state(descriptor) != El1PrivateLeafState::Resident {
             return Err(GuestPermissionEditError::NotPrivateAnonymous);
         }
-        if (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
+        if el1_cow(descriptor)
+            || (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
             || (edit.executable && descriptor & SW_EL1_MAY_EXEC == 0)
         {
             return Err(GuestPermissionEditError::PermissionWidening);
@@ -620,10 +721,10 @@ pub unsafe fn retire_existing_el1_private_pages(
             return Err(GuestRetirementError::NotPrivateAnonymous);
         }
         let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-        if descriptor & SW_RETIRED != 0
-            || (descriptor & SW_EL1_PRIVATE == 0
-                && (descriptor & SW_EL1_PREPARED == 0 || descriptor & PA_MASK_4KIB == 0))
-        {
+        if !matches!(
+            el1_private_leaf_state(descriptor),
+            El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident
+        ) {
             return Err(GuestRetirementError::NotPrivateAnonymous);
         }
         current = terminal_end;
@@ -696,7 +797,7 @@ pub unsafe fn resolve_existing_el1_cow_page(
         })?
     };
     let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-    if descriptor & VALID == 0 || descriptor & SW_RETIRED != 0 {
+    if descriptor & VALID == 0 {
         return Err(GuestCowError::NotMapped);
     }
     if descriptor & SW_EL1_PRIVATE == 0 {
@@ -759,11 +860,13 @@ pub unsafe fn arm_existing_el1_fork_pages(
             .checked_add(terminal.span)
             .ok_or(GuestCowError::BadAddress)?;
         let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-        if descriptor & VALID != 0
-            && descriptor & SW_RETIRED == 0
-            && descriptor & SW_EL1_PRIVATE != 0
-        {
-            let updated = (descriptor & !AP_MASK) | AP_RO | NON_GLOBAL;
+        if descriptor & VALID != 0 && descriptor & SW_EL1_PRIVATE != 0 {
+            let ap = if descriptor & AP_MASK == AP_PRIV_RO {
+                AP_PRIV_RO
+            } else {
+                AP_RO
+            };
+            let updated = (arm_private_cow(descriptor) & !AP_MASK) | ap | NON_GLOBAL;
             unsafe { (*terminal.word).store(updated, Ordering::Release) };
         }
         current = terminal_end;
@@ -2617,8 +2720,9 @@ impl PageTableManager {
     }
 
     /// Publish bulk backing while exposing only the faulting Linux page.
-    /// Speculative leaves retain their output IPA, but remain invalid and
-    /// untagged: host copyin must not mistake them for EL1-served PROT_NONE.
+    /// Speculative leaves retain their output IPA and private authority while
+    /// remaining invalid. First-touch commits must preserve that authority so
+    /// a fully touched range can subsequently change permissions in EL1.
     /// The caller holds exact-MM exclusion and flushes after this entire edit.
     pub fn publish_private_pages(
         &mut self,
@@ -2643,45 +2747,14 @@ impl PageTableManager {
             source.as_deref_mut(),
         )
         .map_err(GuestLeafPublicationError::Manager)?;
+        self.mark_guest_private_publication(publication)?;
         for (start, stop) in [(publication.va, page), (page + PT_PAGE, end)] {
             if start < stop {
                 self.set_prot_none(start, (stop - start) as usize, source.as_deref_mut())
                     .map_err(GuestLeafPublicationError::Manager)?;
             }
         }
-        // An untouched grant leaf owns prepared backing even though it must
-        // remain invalid and lack SW_EL1_PRIVATE for host first-touch copyin.
-        // Its separate software marker lets EL1 retire the whole lease later.
-        let mut untouched = publication.va;
-        while untouched < end {
-            if untouched != page {
-                let (location, level) = self
-                    .leaf_offset(untouched, false, None)
-                    .map_err(GuestLeafPublicationError::Manager)?;
-                if level != 3 {
-                    return Err(GuestLeafPublicationError::InvalidLeafShape);
-                }
-                let descriptor = self
-                    .read_desc(location)
-                    .map_err(GuestLeafPublicationError::Manager)?;
-                let expected = publication.ipa + untouched - publication.va;
-                if descriptor & VALID != 0 && descriptor & ACCESS_FLAG != 0
-                    || descriptor & SW_RETIRED != 0
-                    || descriptor & PA_MASK_4KIB != expected & PA_MASK_4KIB
-                {
-                    return Err(GuestLeafPublicationError::InvalidLeafShape);
-                }
-                self.write_desc(location, descriptor | SW_EL1_PREPARED)
-                    .map_err(GuestLeafPublicationError::Manager)?;
-            }
-            untouched += PT_PAGE;
-        }
-        self.mark_guest_private_publication(GuestLeafPublication {
-            va: page,
-            ipa: publication.ipa + page - publication.va,
-            len: PT_PAGE,
-            ..publication
-        })
+        Ok(())
     }
 
     fn mark_guest_private_publication(
@@ -2749,13 +2822,11 @@ impl PageTableManager {
             let descriptor = self
                 .read_desc(location)
                 .map_err(GuestPermissionEditError::Manager)?;
-            if descriptor & VALID == 0
-                || descriptor & SW_RETIRED != 0
-                || descriptor & SW_EL1_PRIVATE == 0
-            {
+            if el1_private_leaf_state(descriptor) != El1PrivateLeafState::Resident {
                 return Err(GuestPermissionEditError::NotPrivateAnonymous);
             }
-            if (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
+            if el1_cow(descriptor)
+                || (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
                 || (edit.executable && descriptor & SW_EL1_MAY_EXEC == 0)
             {
                 return Err(GuestPermissionEditError::PermissionWidening);
@@ -2781,7 +2852,8 @@ impl PageTableManager {
 
     /// Transactionally change permissions on a completely resident
     /// private-anonymous span previously published by guest EL1. The leaf's
-    /// output address and software ownership ceiling remain unchanged.
+    /// output address and software permission ceiling remain unchanged. COW
+    /// leaves forward to the host, which owns shared-frame privatization.
     pub fn protect_live_private_pages_transaction(
         &mut self,
         edit: GuestPermissionEdit,
@@ -3818,7 +3890,7 @@ impl PageTableManager {
             PtOp::Retire => !valid && scoped && retired,
             PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set != exec && scoped,
             PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set != exec && scoped,
-            PtOp::ForkReadOnly => ap == AP_RO && non_global,
+            PtOp::ForkReadOnly => (ap == AP_RO || ap == AP_PRIV_RO) && non_global,
             PtOp::KernelReadOnly { exec } => valid && ap == AP_PRIV_RO && uxn_set != exec && scoped,
         }
     }
@@ -3848,22 +3920,38 @@ impl PageTableManager {
             let block_end = block_start + span;
             let desc = self.read_desc(off)?;
             let empty = !Self::records_output(desc, level);
-            let already = match op {
-                // An EMPTY descriptor is already as invalid as it can be, and
-                // nothing about it (nG, retirement) survives to a revalidation
-                // — which rebuilds it from scratch. Writing anything into it
-                // would turn "no output recorded" into a descriptor that a
-                // later in-place edit or split treats as carrying one.
-                PtOp::Invalidate | PtOp::Retire if empty => true,
-                _ => self.satisfies(
-                    op,
-                    desc & VALID != 0,
-                    desc & AP_MASK,
-                    desc & UXN != 0,
-                    desc & NON_GLOBAL != 0,
-                    desc & SW_RETIRED != 0,
-                ),
+            let tagged = match op {
+                PtOp::ReadWrite { exec } => private_permission_tags(desc & !SW_EL1_COW, true, exec),
+                PtOp::ReadOnly { exec } | PtOp::KernelReadOnly { exec } => {
+                    private_permission_tags(desc & !SW_EL1_COW, false, exec)
+                }
+                PtOp::ForkReadOnly => arm_private_cow(desc),
+                PtOp::Invalidate | PtOp::Retire => desc,
             };
+            let already = tagged == desc
+                && match op {
+                    // An EMPTY descriptor is already as invalid as it can be, and
+                    // nothing about it (nG, retirement) survives to a revalidation
+                    // — which rebuilds it from scratch. Writing anything into it
+                    // would turn "no output recorded" into a descriptor that a
+                    // later in-place edit or split treats as carrying one.
+                    PtOp::Invalidate | PtOp::Retire if empty => true,
+                    // A speculative EL1 grant leaf has no live EL0 write
+                    // permission to revoke at fork. Keep its current AP as
+                    // Linux intent until first touch publishes the page under
+                    // the backend's armed physical COW authority.
+                    PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
+                        desc & NON_GLOBAL != 0
+                    }
+                    _ => self.satisfies(
+                        op,
+                        desc & VALID != 0,
+                        desc & AP_MASK,
+                        desc & UXN != 0,
+                        desc & NON_GLOBAL != 0,
+                        desc & SW_RETIRED != 0,
+                    ),
+                };
             if already {
                 // The covering block is ALREADY at the target — skip its whole
                 // span with no split (this is what keeps RW-on-already-RW, and a
@@ -3885,7 +3973,9 @@ impl PageTableManager {
                         } else {
                             0
                         };
-                        (desc & !VALID) | scope | retired
+                        (desc & !VALID & !if el1_cow(desc) { SW_EL1_COW } else { 0 })
+                            | scope
+                            | retired
                     }
                     PtOp::ReadOnly { .. }
                     | PtOp::ForkReadOnly
@@ -3894,6 +3984,10 @@ impl PageTableManager {
                         if !empty =>
                     {
                         let ap = match op {
+                            PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
+                                desc & AP_MASK
+                            }
+                            PtOp::ForkReadOnly if desc & AP_MASK == AP_PRIV_RO => AP_PRIV_RO,
                             PtOp::ReadOnly { .. } | PtOp::ForkReadOnly => AP_RO,
                             PtOp::KernelReadOnly { .. } => AP_PRIV_RO,
                             _ => AP_RW,
@@ -3927,8 +4021,14 @@ impl PageTableManager {
                         // A revalidated output is live again by definition;
                         // retirement only survives an edit that keeps the
                         // leaf invalid.
-                        let retired = if validity == 0 { desc & SW_RETIRED } else { 0 };
-                        (desc & !AP_MASK & !UXN & !SW_RETIRED)
+                        let retired = if validity == 0 {
+                            desc & SW_RETIRED
+                        } else if matches!(op, PtOp::ForkReadOnly) {
+                            tagged & SW_EL1_COW
+                        } else {
+                            0
+                        };
+                        (tagged & !AP_MASK & !UXN & !SW_RETIRED)
                             | ap
                             | uxn
                             | non_global
@@ -4018,6 +4118,194 @@ impl PageTableManager {
         // where the reclaim sweep becomes worth re-running.
         self.reclaim_pending = true;
         self.apply(va, len, PtOp::Invalidate, source)
+    }
+
+    /// Begin a newly admitted mapping at a reused VA. Retired terminals name
+    /// only the predecessor's frame lease; neither their output nor their EL1
+    /// permission tags may become authority for the successor. A live private
+    /// terminal (including a prepared one) is not a vacant mapping slot.
+    pub fn clear_retired_for_new_mapping(
+        &mut self,
+        va: u64,
+        len: usize,
+        mut source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
+        let end = va
+            .checked_add(len as u64)
+            .ok_or(PageTableError::BadAddress)?;
+        if len == 0 || !va.is_multiple_of(PT_PAGE) || !len.is_multiple_of(PT_PAGE as usize) {
+            return Err(PageTableError::BadAddress);
+        }
+        let mut current = va;
+        while current < end {
+            let (location, level) = self.leaf_offset(current, false, None)?;
+            let descriptor = self.read_desc(location)?;
+            let (span, mask) = Self::level_span(level);
+            if matches!(
+                el1_private_leaf_state(descriptor),
+                El1PrivateLeafState::Prepared
+                    | El1PrivateLeafState::Resident
+                    | El1PrivateLeafState::Malformed
+            ) {
+                return Err(PageTableError::BadAddress);
+            }
+            current = (current & mask)
+                .checked_add(span)
+                .ok_or(PageTableError::BadAddress)?;
+        }
+        let mut changed = false;
+        current = va;
+        while current < end {
+            let (location, level) = self.leaf_offset(current, false, None)?;
+            let descriptor = self.read_desc(location)?;
+            let (span, mask) = Self::level_span(level);
+            let block_start = current & mask;
+            let block_end = block_start
+                .checked_add(span)
+                .ok_or(PageTableError::BadAddress)?;
+            // Only EL1-private retired leaves carry predecessor permission
+            // authority; other retired leaves keep their retained output for
+            // same-VA reuse and file-mapping fault classification.
+            if el1_private_leaf_state(descriptor) == El1PrivateLeafState::Retired {
+                if block_start < va || block_end > end {
+                    self.split_block(location, level, source.as_deref_mut())?;
+                    changed = true;
+                    continue;
+                }
+                self.write_desc(location, 0)?;
+                changed = true;
+            }
+            current = block_end;
+        }
+        Ok(PageTableApplyOutcome::new(changed, false))
+    }
+
+    /// Drop one invalid output which is retired or which the fork child did
+    /// not inherit in its frame inventory. A retired block may be split, but
+    /// must never be repointed into a new retired output. The child is offline;
+    /// the parent and neighboring invalid leaves retain their descriptors.
+    pub fn clear_inaccessible_invalid_fork_leaf(&mut self, va: u64) -> Result<(), PageTableError> {
+        if !va.is_multiple_of(PT_PAGE) {
+            return Err(PageTableError::BadAddress);
+        }
+        loop {
+            let (location, level) = self.leaf_offset(va, false, None)?;
+            let descriptor = self.read_desc(location)?;
+            if descriptor & VALID != 0
+                || level == 0
+                || !Self::records_output(descriptor, level)
+                || (level < 3 && descriptor & (TYPE_TABLE_OR_PAGE & !VALID) != 0)
+            {
+                return Err(PageTableError::BadAddress);
+            }
+            if level == 3 {
+                return self.write_desc(location, 0);
+            }
+            self.split_block(location, level, None)?;
+        }
+    }
+
+    /// Remove EL1-private authority from an invalid file BUS tail. The output
+    /// remains recorded for the owning stage-2 lease, but no EL1 permission or
+    /// prepared-backing decision may use it after the file fault is published.
+    pub fn mark_bus_fault(
+        &mut self,
+        va: u64,
+        len: usize,
+        mut source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
+        let end = va
+            .checked_add(len as u64)
+            .ok_or(PageTableError::BadAddress)?;
+        if len == 0 || !va.is_multiple_of(PT_PAGE) || !len.is_multiple_of(PT_PAGE as usize) {
+            return Err(PageTableError::BadAddress);
+        }
+        let mut current = va;
+        let mut changed = false;
+        while current < end {
+            let (location, level) = self.leaf_offset(current, false, None)?;
+            let descriptor = self.read_desc(location)?;
+            let (span, mask) = Self::level_span(level);
+            let block_start = current & mask;
+            let block_end = block_start
+                .checked_add(span)
+                .ok_or(PageTableError::BadAddress)?;
+            match el1_private_leaf_state(descriptor) {
+                El1PrivateLeafState::Resident | El1PrivateLeafState::Malformed => {
+                    return Err(PageTableError::BadAddress);
+                }
+                El1PrivateLeafState::Prepared => {
+                    if block_start < va || block_end > end {
+                        self.split_block(location, level, source.as_deref_mut())?;
+                        changed = true;
+                        continue;
+                    }
+                    self.write_desc(
+                        location,
+                        descriptor & !(SW_EL1_PRIVATE | SW_EL1_MAY_WRITE | SW_EL1_MAY_EXEC),
+                    )?;
+                    changed = true;
+                }
+                El1PrivateLeafState::Unowned | El1PrivateLeafState::Retired => {}
+            }
+            current = block_end;
+        }
+        Ok(PageTableApplyOutcome::new(changed, false))
+    }
+
+    /// Host-forwarded `mprotect(PROT_NONE)` over EL1-private leaves. The
+    /// invalidation alone leaves the same shape as a bulk-prepared, untouched
+    /// leaf (invalid, tagged, output retained, AP read-write), and host buffer
+    /// access admits the latter. Record kernel-only AP in the invalid
+    /// descriptor, which hardware ignores while VALID is clear, so the host
+    /// buffer predicate denies it. Any later revalidation rebuilds AP.
+    pub fn set_prot_none_denying_host_buffers(
+        &mut self,
+        va: u64,
+        len: usize,
+        source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
+        let end = va
+            .checked_add(len as u64)
+            .ok_or(PageTableError::BadAddress)?;
+        // Only leaves the guest could observe (VALID, EL1-private) are marked:
+        // stale invalid leaves under a fresh PROT_NONE reservation stay as they
+        // are, and publication rebuilds them when the range is granted again.
+        let mut resident = Vec::new();
+        let mut current = va & !(PT_PAGE - 1);
+        while current < end {
+            let (location, level) = self.leaf_offset(current, false, None)?;
+            let (span, mask) = Self::level_span(level);
+            let descriptor = self.read_desc(location)?;
+            let run_start = (current & mask).max(va & !(PT_PAGE - 1));
+            let run_end = (current & mask)
+                .checked_add(span)
+                .ok_or(PageTableError::BadAddress)?;
+            if el1_private_leaf_state(descriptor) == El1PrivateLeafState::Resident
+                && (level == 3 || descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE)
+            {
+                resident.push((run_start, run_end.min(end)));
+            }
+            current = run_end;
+        }
+        let outcome = self.set_prot_none(va, len, source)?;
+        for (start, stop) in resident {
+            let mut page = start;
+            while page < stop {
+                let (location, level) = self.leaf_offset(page, false, None)?;
+                let (span, mask) = Self::level_span(level);
+                let descriptor = self.read_desc(location)?;
+                if el1_private_leaf_state(descriptor) == El1PrivateLeafState::Prepared
+                    && descriptor & AP_MASK != AP_PRIV_RO
+                {
+                    self.write_desc(location, (descriptor & !AP_MASK) | AP_PRIV_RO)?;
+                }
+                page = (page & mask)
+                    .checked_add(span)
+                    .ok_or(PageTableError::BadAddress)?;
+            }
+        }
+        Ok(outcome)
     }
 
     /// `munmap`: invalidate `[va, va+len)` (the freed range faults until
@@ -6256,6 +6544,77 @@ mod tests {
             .expect("child first touch revalidates only its private alias");
         assert_eq!(mgr.translate(va + 0x77_000), Some(new_ipa + 0x77_000));
         assert_eq!(mgr.translate(va + 0x76_000), None);
+    }
+
+    #[test]
+    fn repoint_prepared_el1_invalid_block_splits_without_losing_grant_tags() {
+        let mut mgr = PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            LINUX_PAGE_TABLES_BASE,
+            test_layout(),
+        );
+        mgr.declare_offline_private_image();
+        let va = LINUX_PRIVATE_OVERLAY_BASE + 0x20_0000;
+        let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+        mgr.map_private_aliased(va, ipa, 0x20_0000, true, None)
+            .expect("seed a block grant");
+        mgr.mark_guest_private_publication(GuestLeafPublication {
+            va,
+            ipa,
+            len: 0x20_0000,
+            writable: true,
+            executable: false,
+        })
+        .expect("tag the block grant");
+        mgr.set_prot_none(va, 0x20_0000, None)
+            .expect("leave the grant prepared");
+        let child_va = va + 0x3c_000;
+        assert_eq!(
+            el1_private_leaf_state(terminal_descriptor(mgr.debug_walk(child_va))),
+            El1PrivateLeafState::Prepared
+        );
+        let child_ipa = ipa + 0x40_0000 + 0x7c_000;
+        mgr.repoint_preserving_attributes(child_va, child_ipa, 0x4000, None)
+            .expect("repoint an untouched child alias within the block");
+        assert_eq!(mgr.translate(child_va), None);
+        assert_eq!(mgr.translate_retained_output(child_va), Some(child_ipa));
+        assert_eq!(
+            el1_private_leaf_state(terminal_descriptor(mgr.debug_walk(child_va))),
+            El1PrivateLeafState::Prepared
+        );
+        assert_eq!(
+            mgr.translate_retained_output(child_va - 0x1000),
+            Some(ipa + 0x3b_000)
+        );
+
+        let retired_va = va + 0x20_0000;
+        let retired_ipa = ipa + 0x80_0000;
+        mgr.map_private_aliased(retired_va, retired_ipa, 0x20_0000, true, None)
+            .expect("seed the next block grant");
+        mgr.mark_guest_private_publication(GuestLeafPublication {
+            va: retired_va,
+            ipa: retired_ipa,
+            len: 0x20_0000,
+            writable: true,
+            executable: false,
+        })
+        .expect("tag the next block grant");
+        mgr.invalidate(retired_va, 0x20_0000, None)
+            .expect("retire the entire block lease");
+        let stale = retired_va + 0x3c_000;
+        assert!(terminal_descriptor_is_retired(terminal_descriptor(
+            mgr.debug_walk(stale)
+        )));
+        mgr.clear_inaccessible_invalid_fork_leaf(stale)
+            .expect("split a retired EL1 block and clear just the stale alias");
+        assert_eq!(mgr.translate_retained_output(stale), None);
+        assert_eq!(
+            mgr.translate_retained_output(stale - PT_PAGE),
+            Some(retired_ipa + 0x3b_000)
+        );
+        assert!(terminal_descriptor_is_retired(terminal_descriptor(
+            mgr.debug_walk(stale - PT_PAGE)
+        )));
     }
 
     #[test]
@@ -8519,6 +8878,40 @@ mod tests {
     }
 
     #[test]
+    fn host_protection_retags_private_write_intent_and_fork_preserves_it() {
+        let mut mgr = manager();
+        let va = 0x4000_0000;
+        mgr.set_rw(va, PT_PAGE as usize, true, None).unwrap();
+        let (off, _) = mgr.leaf_offset(va, false, None).unwrap();
+        let initial = mgr.read_desc(off).unwrap() | SW_EL1_PRIVATE;
+        mgr.write_desc(off, initial).unwrap();
+        // Even an already-RW hardware leaf needs its software intent updated.
+        mgr.set_rw(va, PT_PAGE as usize, true, None).unwrap();
+        let writable = terminal_descriptor(mgr.debug_walk(va));
+        assert!(terminal_descriptor_may_write(writable));
+        assert_ne!(writable & SW_EL1_MAY_EXEC, 0);
+        mgr.set_fork_readonly(va, PT_PAGE as usize, None).unwrap();
+        let cow = terminal_descriptor(mgr.debug_walk(va));
+        assert!(terminal_descriptor_may_write(cow));
+        assert!(terminal_descriptor_permits_host_buffer(
+            cow,
+            LeafAccess::Write
+        ));
+        assert!(!terminal_descriptor_permits_el0(cow, LeafAccess::Write));
+        mgr.set_readonly(va, PT_PAGE as usize, false, None).unwrap();
+        let readonly = terminal_descriptor(mgr.debug_walk(va));
+        assert!(!terminal_descriptor_permits_host_buffer(
+            readonly,
+            LeafAccess::Write
+        ));
+        assert!(!el1_cow(readonly));
+        mgr.set_rw(va, PT_PAGE as usize, false, None).unwrap();
+        assert!(terminal_descriptor_may_write(terminal_descriptor(
+            mgr.debug_walk(va)
+        )));
+    }
+
+    #[test]
     fn allocation_free_guest_permission_edit_cycles_existing_l3_leaves() {
         use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -8565,6 +8958,11 @@ mod tests {
             .expect("permission transition");
             for page in 0..2 {
                 let descriptor = words[l3 + page].load(Ordering::Acquire);
+                assert!(
+                    terminal_descriptor_permits_host_buffer(descriptor, LeafAccess::Write)
+                        == writable,
+                    "host copyout must follow current EL1 permissions"
+                );
                 assert_eq!(descriptor & PA_MASK_4KIB, ipa + page as u64 * PT_PAGE);
                 assert_eq!(
                     terminal_descriptor_permits_el0(descriptor, LeafAccess::Read),
@@ -8811,7 +9209,10 @@ mod tests {
         words[1024 + indexes[2]].store((root + 0x3000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
         let leaf = 1536 + indexes[3];
         let prepared = (ipa & PA_MASK_4KIB) | (USER_PAGE_FLAGS & !VALID) | NON_GLOBAL | UXN;
-        words[leaf].store(prepared | SW_EL1_PREPARED, Ordering::Relaxed);
+        words[leaf].store(
+            prepared | SW_EL1_PRIVATE | SW_EL1_MAY_WRITE,
+            Ordering::Relaxed,
+        );
         words[leaf + 1].store(
             ((ipa + PT_PAGE) & PA_MASK_4KIB)
                 | (USER_PAGE_FLAGS & !ACCESS_FLAG)
@@ -8833,7 +9234,7 @@ mod tests {
                 | USER_PAGE_FLAGS
                 | NON_GLOBAL
                 | UXN
-                | SW_EL1_PREPARED,
+                | SW_EL1_PRIVATE,
             Ordering::Relaxed,
         );
         words[leaf + 4].store(
@@ -8841,7 +9242,7 @@ mod tests {
                 | (USER_PAGE_FLAGS & !ACCESS_FLAG)
                 | NON_GLOBAL
                 | UXN
-                | SW_EL1_PREPARED,
+                | SW_EL1_PRIVATE,
             Ordering::Relaxed,
         );
 
@@ -8863,6 +9264,31 @@ mod tests {
             assert_ne!(descriptor & SW_RETIRED, 0);
             assert_eq!(descriptor & PA_MASK_4KIB, ipa + page as u64 * PT_PAGE);
         }
+        // The former second representation (bit 58 without private authority)
+        // cannot license retirement of a new grant.
+        words[leaf].store(prepared | SW_EL1_MAY_EXEC, Ordering::Release);
+        assert_eq!(
+            unsafe {
+                retire_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    words.len() * core::mem::size_of::<AtomicU64>(),
+                    va,
+                    PT_PAGE,
+                )
+            },
+            Err(GuestRetirementError::NotPrivateAnonymous)
+        );
+    }
+
+    #[test]
+    fn private_marker_without_a_retained_output_is_not_a_grant() {
+        let descriptor = (USER_PAGE_FLAGS & !VALID) | SW_EL1_PRIVATE;
+        assert!(!terminal_descriptor_is_prepared_private(descriptor));
+        assert!(!terminal_descriptor_permits_host_buffer(
+            descriptor,
+            LeafAccess::Write
+        ));
     }
 
     #[test]
@@ -9533,7 +9959,476 @@ mod tests {
         assert_ne!(armed & NON_GLOBAL, 0);
         assert_ne!(armed & SW_EL1_PRIVATE, 0);
         assert_ne!(armed & SW_EL1_MAY_WRITE, 0);
+        assert!(el1_cow(armed));
+        assert!(terminal_descriptor_permits_host_buffer(
+            armed,
+            LeafAccess::Write
+        ));
+        assert_eq!(
+            unsafe {
+                protect_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    byte_len,
+                    GuestPermissionEdit {
+                        va,
+                        len: PT_PAGE,
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                    },
+                )
+            },
+            Err(GuestPermissionEditError::PermissionWidening)
+        );
+        assert_eq!(words[l3].load(Ordering::Acquire), armed);
+
+        // A narrowed page must not gain write intent or EL0 access at fork.
+        for ap in [AP_RO, AP_PRIV_RO] {
+            words[l3].store((active & !AP_MASK) | ap, Ordering::Relaxed);
+            unsafe { arm_existing_el1_fork_pages(words.as_mut_ptr(), root, byte_len, va, PT_PAGE) }
+                .unwrap();
+            let protected = words[l3].load(Ordering::Acquire);
+            assert_eq!(protected & AP_MASK, ap);
+            assert!(!terminal_descriptor_permits_host_buffer(
+                protected,
+                LeafAccess::Write
+            ));
+            assert_eq!(
+                unsafe {
+                    retire_existing_el1_private_pages(
+                        words.as_mut_ptr(),
+                        root,
+                        byte_len,
+                        va,
+                        PT_PAGE,
+                    )
+                },
+                Ok(1)
+            );
+            assert_eq!(words[l3].load(Ordering::Acquire) & VALID, 0);
+        }
     }
+    #[test]
+    fn retained_private_backing_permits_copyout_without_guest_residency() {
+        let mut mgr = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        mgr.publish_private_pages(
+            GuestLeafPublication {
+                va,
+                ipa: LINUX_ALIAS_IPA_BASE + 0x20_0000,
+                len: PT_PAGE,
+                writable: true,
+                executable: false,
+            },
+            va,
+            None,
+        )
+        .unwrap();
+        mgr.set_prot_none(va, PT_PAGE as usize, None).unwrap();
+        let descriptor = terminal_descriptor(mgr.debug_walk(va));
+        assert!(terminal_descriptor_has_el1_private_authority(descriptor));
+        assert_eq!(mgr.translate(va), None);
+        assert!(terminal_descriptor_permits_host_buffer(
+            descriptor,
+            LeafAccess::Write
+        ));
+        assert!(terminal_descriptor_permits_host_buffer(
+            descriptor,
+            LeafAccess::Read
+        ));
+        assert!(!terminal_descriptor_permits_host_buffer(
+            descriptor,
+            LeafAccess::Execute
+        ));
+        assert!(!terminal_descriptor_permits_host_buffer(
+            descriptor | SW_RETIRED,
+            LeafAccess::Write
+        ));
+        assert!(!terminal_descriptor_permits_host_buffer(
+            (descriptor & !AP_MASK) | AP_RO,
+            LeafAccess::Write
+        ));
+        assert!(!terminal_descriptor_permits_host_buffer(
+            (descriptor & !AP_MASK) | AP_PRIV_RO,
+            LeafAccess::Read
+        ));
+    }
+
+    #[test]
+    fn fork_keeps_prepared_private_leaf_write_intent_for_sigframe_copyout() {
+        let mut mgr = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        let ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
+        mgr.publish_private_pages(
+            GuestLeafPublication {
+                va,
+                ipa,
+                len: 4 * PT_PAGE,
+                writable: true,
+                executable: false,
+            },
+            va,
+            None,
+        )
+        .unwrap();
+        let altstack = va + 2 * PT_PAGE;
+        let before = terminal_descriptor(mgr.debug_walk(altstack));
+        assert!(terminal_descriptor_is_prepared_private(before));
+        assert!(terminal_descriptor_permits_host_buffer(
+            before,
+            LeafAccess::Write
+        ));
+
+        mgr.set_fork_readonly(va, (4 * PT_PAGE) as usize, None)
+            .unwrap();
+        let child = terminal_descriptor(mgr.debug_walk(altstack));
+        assert!(terminal_descriptor_is_prepared_private(child));
+        assert_eq!(mgr.translate(altstack), None);
+        assert_eq!(
+            mgr.translate_retained_output(altstack),
+            Some(ipa + 2 * PT_PAGE)
+        );
+        assert!(
+            terminal_descriptor_permits_host_buffer(child, LeafAccess::Write),
+            "fork must not turn an untouched writable altstack into a host-denied leaf"
+        );
+    }
+
+    #[test]
+    fn forked_bus_tail_does_not_inherit_prepared_el1_private_authority() {
+        let mut parent = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        parent
+            .publish_private_pages(
+                GuestLeafPublication {
+                    va,
+                    ipa: LINUX_ALIAS_IPA_BASE + 0x20_0000,
+                    len: 4 * PT_PAGE,
+                    writable: true,
+                    executable: false,
+                },
+                va,
+                None,
+            )
+            .unwrap();
+        let bus_page = va + 3 * PT_PAGE;
+        // The file's last page is wholly beyond EOF. Host protection leaves
+        // an invalid descriptor that the fork snapshot carries to its child.
+        parent
+            .set_prot_none(bus_page, PT_PAGE as usize, None)
+            .unwrap();
+        parent
+            .mark_bus_fault(bus_page, PT_PAGE as usize, None)
+            .unwrap();
+        parent
+            .set_fork_readonly(va, (4 * PT_PAGE) as usize, None)
+            .unwrap();
+        let child_bus = terminal_descriptor(parent.debug_walk(bus_page));
+        assert_eq!(child_bus & VALID, 0);
+        assert!(!terminal_descriptor_is_prepared_private(child_bus));
+        assert!(
+            !terminal_descriptor_has_el1_private_authority(child_bus),
+            "a BUS leaf cannot inherit EL1-private prepared backing"
+        );
+        assert!(terminal_descriptor_is_prepared_private(
+            terminal_descriptor(parent.debug_walk(va + 2 * PT_PAGE))
+        ));
+    }
+
+    #[test]
+    fn retired_prot_none_leaf_cannot_deny_a_fresh_writable_mapping() {
+        let mut mgr = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        let old_ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
+        mgr.publish_private_pages(
+            GuestLeafPublication {
+                va,
+                ipa: old_ipa,
+                len: PT_PAGE,
+                writable: true,
+                executable: false,
+            },
+            va,
+            None,
+        )
+        .unwrap();
+        mgr.set_prot_none_denying_host_buffers(va, PT_PAGE as usize, None)
+            .unwrap();
+        assert!(!terminal_descriptor_permits_host_buffer(
+            terminal_descriptor(mgr.debug_walk(va)),
+            LeafAccess::Write
+        ));
+        assert_eq!(
+            mgr.clear_retired_for_new_mapping(va, PT_PAGE as usize, None),
+            Err(PageTableError::BadAddress),
+            "a protected live mapping cannot be mistaken for a vacant VA"
+        );
+        mgr.invalidate(va, PT_PAGE as usize, None).unwrap();
+        // A new anonymous VMA at the same VA is initially a cold reservation.
+        // The predecessor output and protection cannot describe that VMA.
+        mgr.clear_retired_for_new_mapping(va, PT_PAGE as usize, None)
+            .unwrap();
+        mgr.set_prot_none(va, PT_PAGE as usize, None).unwrap();
+        let descriptor = terminal_descriptor(mgr.debug_walk(va));
+        assert_eq!(descriptor & (SW_RETIRED | SW_EL1_PRIVATE | PA_MASK_4KIB), 0);
+        assert!(terminal_descriptor_permits_host_buffer(
+            descriptor,
+            LeafAccess::Write
+        ));
+        let new_ipa = old_ipa + 0x40_0000;
+        mgr.publish_private_pages(
+            GuestLeafPublication {
+                va,
+                ipa: new_ipa,
+                len: 2 * PT_PAGE,
+                writable: true,
+                executable: false,
+            },
+            va,
+            None,
+        )
+        .unwrap();
+        let prepared = terminal_descriptor(mgr.debug_walk(va + PT_PAGE));
+        assert_eq!(prepared & PA_MASK_4KIB, new_ipa + PT_PAGE);
+        assert!(terminal_descriptor_permits_host_buffer(
+            prepared,
+            LeafAccess::Write
+        ));
+        mgr.set_readonly(va + PT_PAGE, PT_PAGE as usize, false, None)
+            .unwrap();
+        let readonly = terminal_descriptor(mgr.debug_walk(va + PT_PAGE));
+        assert!(terminal_descriptor_permits_host_buffer(
+            readonly,
+            LeafAccess::Read
+        ));
+        assert!(!terminal_descriptor_permits_host_buffer(
+            readonly,
+            LeafAccess::Write
+        ));
+        mgr.set_prot_none_denying_host_buffers(va + PT_PAGE, PT_PAGE as usize, None)
+            .unwrap();
+        assert!(!terminal_descriptor_permits_host_buffer(
+            terminal_descriptor(mgr.debug_walk(va + PT_PAGE)),
+            LeafAccess::Read
+        ));
+    }
+
+    /// Descriptor witness for roreadwrite/protnonesyscall beside a still-cold
+    /// prepared page. This does not model the backend's copyout transport.
+    #[test]
+    fn el1_single_page_protection_survives_neighbor_first_touch_and_discard() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+        unsafe {
+            hvpatch_manager()
+                .restore_quiesced_snapshot_to_host(&*resolver)
+                .unwrap();
+        }
+        let mut live = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                LINUX_PAGE_TABLES_SIZE as usize,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .unwrap()
+        };
+        let va = LINUX_MMAP_BASE + 0x4080_0000;
+        let ipa = 0x009b_4000_0000;
+        live.publish_private_pages(
+            GuestLeafPublication {
+                va,
+                ipa,
+                len: 3 * PT_PAGE,
+                writable: true,
+                executable: false,
+            },
+            va,
+            None,
+        )
+        .unwrap();
+        unsafe {
+            live.sync_to_host(&*resolver).unwrap();
+        }
+        let words = resolver
+            .host_ptr_for_base(LINUX_PAGE_TABLES_BASE)
+            .unwrap()
+            .cast();
+        for readable in [true, false] {
+            let edit = GuestPermissionEdit {
+                va,
+                len: PT_PAGE,
+                readable,
+                writable: false,
+                executable: false,
+            };
+            assert_eq!(
+                unsafe {
+                    protect_existing_el1_private_pages(
+                        words,
+                        LINUX_PAGE_TABLES_BASE,
+                        LINUX_PAGE_TABLES_SIZE as usize,
+                        edit,
+                    )
+                },
+                Ok(1)
+            );
+            // A later first touch and DONTNEED re-arm on a different page must
+            // not republish the host's original RW permission over this page.
+            live.set_rw(va + 2 * PT_PAGE, PT_PAGE as usize, false, None)
+                .unwrap();
+            unsafe {
+                live.sync_to_host(&*resolver).unwrap();
+            }
+            assert_eq!(live.translate(va + PT_PAGE), None);
+            let protected = terminal_descriptor(live.debug_walk(va));
+            assert!(!terminal_descriptor_permits_host_buffer(
+                protected,
+                LeafAccess::Write
+            ));
+            assert_eq!(
+                terminal_descriptor_permits_host_buffer(protected, LeafAccess::Read),
+                readable
+            );
+            assert_eq!(protected & PA_MASK_4KIB, ipa);
+            live.set_prot_none(va + 2 * PT_PAGE, PT_PAGE as usize, None)
+                .unwrap();
+            unsafe {
+                live.sync_to_host(&*resolver).unwrap();
+            }
+            assert_eq!(live.translate(va + 2 * PT_PAGE), None);
+            assert_eq!(
+                live.translate_retained_output(va + 2 * PT_PAGE),
+                Some(ipa + 2 * PT_PAGE)
+            );
+            assert_eq!(terminal_descriptor(live.debug_walk(va)), protected);
+            assert_eq!(
+                unsafe {
+                    protect_existing_el1_private_pages(
+                        words,
+                        LINUX_PAGE_TABLES_BASE,
+                        LINUX_PAGE_TABLES_SIZE as usize,
+                        GuestPermissionEdit {
+                            readable: true,
+                            writable: true,
+                            ..edit
+                        },
+                    )
+                },
+                Ok(1)
+            );
+            assert!(terminal_descriptor_permits_host_buffer(
+                terminal_descriptor(live.debug_walk(va)),
+                LeafAccess::Write
+            ));
+        }
+        // Only touched leaves are hardware-accessible. The private tag does
+        // not make the middle leaf valid or prove dispatcher residency.
+        live.set_rw(va + 2 * PT_PAGE, PT_PAGE as usize, false, None)
+            .unwrap();
+        unsafe {
+            live.sync_to_host(&*resolver).unwrap();
+        }
+        assert_eq!(
+            (0..3)
+                .map(|page| live.translate(va + page * PT_PAGE).is_some())
+                .collect::<Vec<_>>(),
+            [true, false, true]
+        );
+        for page in 0..3 {
+            assert!(terminal_descriptor_has_el1_private_authority(
+                terminal_descriptor(live.debug_walk(va + page * PT_PAGE))
+            ));
+        }
+    }
+
+    #[test]
+    fn host_grant_first_touch_then_permission_cycles_stay_in_guest() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+        unsafe {
+            hvpatch_manager()
+                .restore_quiesced_snapshot_to_host(&*resolver)
+                .unwrap();
+        }
+        let mut live = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                LINUX_PAGE_TABLES_SIZE as usize,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .unwrap()
+        };
+        let va = LINUX_MMAP_BASE + 0x4080_0000;
+        let ipa = 0x009b_4000_0000;
+        const PAGES: u64 = 256;
+        live.publish_private_pages(
+            GuestLeafPublication {
+                va,
+                ipa,
+                len: PAGES * PT_PAGE,
+                writable: true,
+                executable: false,
+            },
+            va,
+            None,
+        )
+        .unwrap();
+        // Mirror later host first-touch protection commits, without new grants.
+        for page in 1..PAGES {
+            assert_eq!(live.translate(va + page * PT_PAGE), None);
+            live.set_rw(va + page * PT_PAGE, PT_PAGE as usize, false, None)
+                .unwrap();
+        }
+        unsafe {
+            live.sync_to_host(&*resolver).unwrap();
+        }
+        let words = resolver
+            .host_ptr_for_base(LINUX_PAGE_TABLES_BASE)
+            .unwrap()
+            .cast();
+        let mut served = 0;
+        for _ in 0..4 {
+            for (readable, writable) in [(true, false), (true, true), (false, false), (true, true)]
+            {
+                let edit = GuestPermissionEdit {
+                    va,
+                    len: PAGES * PT_PAGE,
+                    readable,
+                    writable,
+                    executable: false,
+                };
+                assert_eq!(
+                    unsafe {
+                        protect_existing_el1_private_pages(
+                            words,
+                            LINUX_PAGE_TABLES_BASE,
+                            LINUX_PAGE_TABLES_SIZE as usize,
+                            edit,
+                        )
+                    },
+                    Ok(PAGES as usize)
+                );
+                served += 1;
+                for page in 0..PAGES {
+                    let descriptor = terminal_descriptor(live.debug_walk(va + page * PT_PAGE));
+                    assert_eq!(descriptor & PA_MASK_4KIB, ipa + page * PT_PAGE);
+                    assert_eq!(
+                        terminal_descriptor_permits_host_buffer(descriptor, LeafAccess::Write),
+                        writable
+                    );
+                    assert_eq!(
+                        terminal_descriptor_permits_host_buffer(descriptor, LeafAccess::Read),
+                        readable
+                    );
+                }
+            }
+        }
+        assert_eq!(served, 16);
+    }
+
     #[test]
     fn frame_grant_retains_speculative_outputs_without_exposing_pages() {
         let mut mgr = manager();
@@ -9559,14 +10454,21 @@ mod tests {
                 Some(ipa + page * PT_PAGE)
             );
             assert!(
-                !terminal_descriptor_has_el1_private_authority(terminal_descriptor(
+                terminal_descriptor_has_el1_private_authority(terminal_descriptor(
                     mgr.debug_walk(address)
                 )),
-                "an untouched page must not be mistaken for EL1 PROT_NONE by host copyin"
+                "first-touch must retain the grant's private authority"
             );
-            assert_ne!(
-                terminal_descriptor(mgr.debug_walk(address)) & SW_EL1_PREPARED,
-                0,
+            assert!(
+                terminal_descriptor_permits_host_buffer(
+                    terminal_descriptor(mgr.debug_walk(address)),
+                    LeafAccess::Write
+                ),
+                "prepared writable backing must admit host copyout without guest residency"
+            );
+            assert_eq!(
+                el1_private_leaf_state(terminal_descriptor(mgr.debug_walk(address))),
+                El1PrivateLeafState::Prepared,
                 "an untouched grant page must retain its retirement authority"
             );
         }

@@ -2125,6 +2125,11 @@ impl SyscallDispatcher {
         self.mem_view().mmap_fault_is_sigbus(addr)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_mmap_bus_fault_range_for_test(&self, start: u64, len: u64) {
+        self.mem_view().record_mmap_bus_fault_range(start, len);
+    }
+
     #[inline]
     pub fn fault_requires_mm_mutation(&self, addr: u64) -> bool {
         self.mem_view().fault_requires_mm_mutation(addr)
@@ -2240,6 +2245,29 @@ impl SyscallDispatcher {
     #[inline]
     pub fn commit_resident_fault(&self, plan: ResidentFaultPlan) {
         self.mem_view().commit_resident_fault(plan);
+    }
+
+    /// Publish a host copyout's first touch through the same resident-fault
+    /// plan as an EL0 translation fault. The caller holds exact-MM stage-1
+    /// exclusion; an unarmed page needs no publication.
+    pub fn commit_host_first_touch(
+        &self,
+        authority: &mut super::mm_quiesce::FrameCowExactMmGuard,
+        address: u64,
+        protect: &mut dyn FnMut(u64, u64) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let mutation = super::mm_mutation::from_frame_cow(authority);
+        let permit = mutation.host_alias_permit();
+        let Some(plan) = self.resident_fault_plan(&permit, address) else {
+            return Ok(false);
+        };
+        let prot = plan.prot();
+        if prot & carrick_abi::LINUX_PROT_WRITE == 0 {
+            return Err("armed host write page lacks Linux write permission".to_owned());
+        }
+        protect(plan.page(), prot)?;
+        self.commit_resident_fault(plan);
+        Ok(true)
     }
 
     #[inline]

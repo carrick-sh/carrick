@@ -540,6 +540,7 @@ dependencies = [
  "carrick-guest-mem",
  "carrick-mem",
  "carrick-mmu-core",
+ "carrick-observability",
  "carrick-signal-linux",
  "carrick-timer-core",
  "libc",

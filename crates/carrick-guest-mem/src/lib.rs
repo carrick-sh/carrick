@@ -617,6 +617,14 @@ pub trait GuestMemory {
         self.write_bytes_raw(address, bytes)
     }
 
+    /// Make a writable guest range resident before a privileged host copyout.
+    /// Backends with eager backing need no preparation. A lazy backend must
+    /// publish first-touch residency through its exact-MM authority here;
+    /// retaining an invalid leaf's output address alone is insufficient.
+    fn prepare_host_write(&mut self, _address: u64, _length: usize) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
     /// Zero `[address, address+len)` in the PHYSICAL backing, bypassing the
     /// guest-visible protection (`set_no_access` / a non-writable mapping).
     /// Used to scrub a reused anon region whose stale content must never reach
@@ -697,6 +705,13 @@ pub trait GuestMemory {
     /// memory error to EFAULT gets it for free. Default: no-op (the in-memory
     /// backend and unit tests don't model protections).
     fn set_no_access(&mut self, _address: u64, _len: usize, _no_access: bool) {}
+
+    /// A private-file page wholly beyond EOF must not retain EL1-private
+    /// authority from prepared backing. Called after its guest protection is
+    /// invalidated and before the BUS fault range becomes visible.
+    fn mark_bus_fault(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
+        Ok(())
+    }
 
     /// Mark a guest range read-only for syscall writes (`no_write=true`) or clear
     /// it when the range becomes writable/unmapped. This is the host-side EFAULT

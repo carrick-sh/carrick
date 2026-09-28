@@ -252,6 +252,8 @@ mod tests {
     /// `write_bytes` / `read_bytes`.
     struct SigframeEngine {
         mem: std::collections::HashMap<u64, u8>,
+        prepared_page: Option<u64>,
+        resident: bool,
         /// x0..x30 (31 GPRs).
         x: [u64; 31],
         sp: u64,
@@ -264,6 +266,32 @@ mod tests {
     }
 
     impl carrick_guest_mem::GuestMemory for SigframeEngine {
+        fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
+            !self.prepared_page.is_some_and(|page| {
+                !self.resident
+                    && address < page + 4096
+                    && address
+                        .checked_add(length as u64)
+                        .is_some_and(|end| end > page)
+            })
+        }
+
+        fn prepare_host_write(
+            &mut self,
+            address: u64,
+            length: usize,
+        ) -> Result<(), carrick_guest_mem::MemoryError> {
+            if self.prepared_page.is_some_and(|page| {
+                address < page + 4096
+                    && address
+                        .checked_add(length as u64)
+                        .is_some_and(|end| end > page)
+            }) {
+                self.resident = true;
+            }
+            Ok(())
+        }
+
         fn read_bytes_raw(
             &self,
             a: u64,
@@ -278,6 +306,16 @@ mod tests {
             a: u64,
             b: &[u8],
         ) -> Result<(), carrick_guest_mem::MemoryError> {
+            if self.prepared_page.is_some_and(|page| {
+                !self.resident
+                    && a < page + 4096
+                    && a.checked_add(b.len() as u64).is_some_and(|end| end > page)
+            }) {
+                return Err(carrick_guest_mem::MemoryError::OutOfBounds {
+                    address: a,
+                    length: b.len(),
+                });
+            }
             for (i, &byte) in b.iter().enumerate() {
                 self.mem.insert(a.wrapping_add(i as u64), byte);
             }
@@ -341,6 +379,8 @@ mod tests {
     fn empty_engine() -> SigframeEngine {
         SigframeEngine {
             mem: std::collections::HashMap::new(),
+            prepared_page: None,
+            resident: false,
             x: [0; 31],
             sp: 0,
             pc: 0,
@@ -373,6 +413,31 @@ mod tests {
             fpsimd_enabled: true,
             sigreturn_trampoline_base: 0x6666_0000,
         }
+    }
+
+    #[test]
+    fn aarch64_sigbus_frame_commits_untouched_prepared_altstack() {
+        let mut e = empty_engine();
+        e.sp = 0x20_0000;
+        e.elr_el1 = 0xDEAD_BEE0;
+        let altstack = (0x4000, 0x8000);
+        let frame_sp = crate::sigframe::signal_frame_stack_pointer(
+            e.sp,
+            Some(altstack),
+            core::mem::size_of::<carrick_abi::CarrickSigframe>(),
+        )
+        .expect("frame lies inside alternate stack");
+        e.prepared_page = Some(frame_sp & !4095);
+        let mut params = inject_params(0);
+        params.signum = 7;
+        params.altstack = Some(altstack);
+        let frame = Aarch64GuestArch::build_sigframe(&mut e, params)
+            .expect("SIGBUS frame faults prepared alternate stack in before writing");
+        assert_eq!(frame.new_sp, frame_sp);
+        assert!(
+            e.resident,
+            "frame page is committed resident before copyout"
+        );
     }
 
     #[test]
