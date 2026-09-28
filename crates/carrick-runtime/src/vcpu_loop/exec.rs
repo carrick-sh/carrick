@@ -1803,10 +1803,19 @@ where
                     }
                 },
             };
-            let mutation = carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor)
-                .with_operation(
+            let mutation = match carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor) {
+                Ok(mutation) => mutation.with_operation(
                     carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
-                );
+                ),
+                Err(error) => {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!("acquire exact-MM exec authority: {error:?}"),
+                    )
+                    .map(Some);
+                }
+            };
             Some(mutation)
         } else {
             None
