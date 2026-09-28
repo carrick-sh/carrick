@@ -597,6 +597,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         if let Some(plan) = plan {
             let page = plan.page();
             let prot = plan.prot();
+            let access_code = access.map_or(3, |a| a as u32);
             match apply_first_touch(
                 prot,
                 access,
@@ -608,6 +609,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     Ok(()) => true,
                     Err(error) => {
                         crate::probes::resident_fault_protection_error(page, prot, &error);
+                        crate::probes::hvpatch_first_touch_refused(page, access_code, 1, &error);
                         false
                     }
                 },
@@ -639,18 +641,26 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         first_touch.growdown = match dispatcher.mmap_growdown_fault_plan(&permit, address) {
             None => FirstTouchGrowdown::NoPlan,
             Some(plan) => {
-                if engine
-                    .protect_range(
-                        plan.start(),
-                        plan.len(),
-                        crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
-                    )
-                    .is_ok()
-                {
-                    dispatcher.commit_mmap_growdown(plan);
-                    first_touch.growdown = FirstTouchGrowdown::Committed;
-                    ring::rec_first_touch(&first_touch);
-                    return Ok(true);
+                match engine.protect_range(
+                    plan.start(),
+                    plan.len(),
+                    crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+                ) {
+                    Ok(()) => {
+                        dispatcher.commit_mmap_growdown(plan);
+                        first_touch.growdown = FirstTouchGrowdown::Committed;
+                        ring::rec_first_touch(&first_touch);
+                        return Ok(true);
+                    }
+                    Err(error) => {
+                        let access_code = access.map_or(3, |a| a as u32);
+                        crate::probes::hvpatch_first_touch_refused(
+                            plan.start(),
+                            access_code,
+                            2,
+                            &error,
+                        );
+                    }
                 }
                 FirstTouchGrowdown::ProtectFailed
             }
@@ -1802,5 +1812,52 @@ mod first_touch_access_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn backend_refusal_fires_first_touch_refused_probe() {
+        let dispatcher = SyscallDispatcher::new();
+        let page = 0x4000_0000;
+        dispatcher.seed_resident_fault_for_test(page, 3);
+        let error =
+            carrick_guest_mem::MemoryError::HostMap("stage-1 table allocation failed".to_owned());
+        let refused_page = std::cell::Cell::new(0);
+        let refused_site = std::cell::Cell::new(0);
+        dispatcher
+            .with_resident_fault_plan_for_test(page, |plan| {
+                let access = LeafAccess::Write;
+                let access_code = access as u32;
+                let page = plan.page();
+                let prot = plan.prot();
+                assert_eq!(
+                    apply_first_touch(
+                        prot,
+                        Some(access),
+                        || {
+                            crate::probes::resident_fault_protection_error(page, prot, &error);
+                            crate::probes::hvpatch_first_touch_refused(
+                                page,
+                                access_code,
+                                1,
+                                &error,
+                            );
+                            refused_page.set(page);
+                            refused_site.set(1);
+                            false
+                        },
+                        || dispatcher.commit_resident_fault(plan)
+                    ),
+                    None
+                );
+            })
+            .expect("pending first touch");
+        assert_eq!(refused_page.get(), page);
+        assert_eq!(refused_site.get(), 1);
+        assert!(
+            dispatcher
+                .with_resident_fault_plan_for_test(page, |plan| drop(plan))
+                .is_some()
+        );
+        crate::probes::hvpatch_first_touch_refused(0x4000_1000, 3, 2, &error);
     }
 }

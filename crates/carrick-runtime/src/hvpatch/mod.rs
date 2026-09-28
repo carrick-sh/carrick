@@ -506,12 +506,6 @@ impl ProcessContext {
         Some((identity.task.id.raw(), u32::from(binding.asid.raw())))
     }
 
-    pub(crate) fn is_child(&self) -> bool {
-        self.kernel_graph()
-            .task_identity(self.task_id())
-            .is_ok_and(|identity| identity.parent.is_some())
-    }
-
     fn prepare_lifecycle_event(
         &self,
         phase: carrick_observability::probes::HvpatchGuestLifecyclePhase,
