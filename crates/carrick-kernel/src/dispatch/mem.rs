@@ -2521,6 +2521,9 @@ mod tests;
 pub(crate) mod metadata_budget_tests;
 
 #[cfg(test)]
+pub(crate) use metadata_budget_tests::measure_host_heap;
+
+#[cfg(test)]
 mod routing_characterization_tests {
     use super::*;
 
