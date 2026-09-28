@@ -135,7 +135,7 @@ impl NamespaceMutationCoordinator {
     }
 
     /// Identity of an admitted parent dirfd, probing the host only the first
-    /// time this exact descriptor is seen. See [`ProvenParentIdentities`].
+    /// time this exact descriptor is seen. See `ProvenParentIdentities`.
     pub fn parent_fd_identity(
         &self,
         fd: &std::sync::Arc<std::os::fd::OwnedFd>,
