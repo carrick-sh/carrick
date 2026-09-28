@@ -657,6 +657,47 @@ fn frame_grant_sparse_mincore_tracks_only_faulting_pages() {
 }
 
 #[test]
+fn forked_private_file_grant_excludes_wholly_beyond_eof_page() {
+    let parent = SyscallDispatcher::new();
+    let base = LINUX_MMAP_BASE;
+    let page = parent.linux_page_size();
+    let prot = LinuxProtFlags::READ | LinuxProtFlags::WRITE;
+    parent.record_dynamic_mapping(base, 4 * page, prot, ProcMapSharing::Private, String::new());
+    // Model a bulk-armed snapshot whose final page is wholly beyond EOF.
+    parent.track_resident_fault_range(base, 4 * page, prot);
+    parent
+        .mem()
+        .lock()
+        .bus_fault_ranges
+        .push((base + 3 * page, page));
+    let child = parent.fork_clone_in_process(
+        crate::thread::ThreadId::synthetic_for_tests(781),
+        crate::thread::ThreadId::synthetic_for_tests(782),
+        781,
+        782,
+    );
+    assert!(child.mmap_fault_is_sigbus(base + 3 * page + 8));
+    child
+        .with_resident_frame_grant_plan_for_test(base + page, 2 * 1024 * 1024, |plan| {
+            assert_eq!(plan.start(), base);
+            assert_eq!(plan.len(), 3 * page);
+        })
+        .expect("backed pages remain grantable in the child");
+    assert!(
+        child
+            .with_resident_frame_grant_plan_for_test(base + 3 * page + 8, 2 * 1024 * 1024, |_| ())
+            .is_none(),
+        "the BUS page cannot receive EL1-private prepared backing"
+    );
+    assert!(
+        child
+            .with_resident_fault_plan_for_test(base + 3 * page + 8, |_| ())
+            .is_none(),
+        "host first-touch must not validate the BUS page either"
+    );
+}
+
+#[test]
 fn frame_grant_core_omits_speculative_zero_pages_without_losing_host_writes() {
     let page = LINUX_PAGE_SIZE as usize;
     let mut backing = vec![0; 512 * page];
