@@ -1006,7 +1006,7 @@ mod tests {
     fn exec_table_capacity_refuses_new_admission() {
         let runtime = Arc::new(ExecRuntime::new_for_test(
             1,
-            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(5),
         ));
         runtime
             .install_waker(Arc::new(|| {}))
@@ -1018,6 +1018,10 @@ mod tests {
         while runtime.query(first) != ExecStatus::Pending {
             std::thread::yield_now();
         }
+        assert_eq!(
+            runtime.admit(first, minimal_exec_request()),
+            Err(ExecAdmissionError::Rejected),
+        );
         let second = ExecCapability::from(ControlNonce([0x52; 16]));
         assert_eq!(
             runtime.admit(second, minimal_exec_request()),
@@ -1028,6 +1032,16 @@ mod tests {
             first_submitter.join().expect("first submitter"),
             Err(ExecAdmissionError::Rejected),
         );
+        let third = ExecCapability::from(ControlNonce([0x53; 16]));
+        let third_runtime = Arc::clone(&runtime);
+        let third_submitter =
+            std::thread::spawn(move || third_runtime.admit(third, minimal_exec_request()));
+        while runtime.query(third) != ExecStatus::Pending {
+            std::thread::yield_now();
+        }
+        let mut work = runtime.try_take().expect("third work");
+        assert!(work.admit(ControlTaskKey { pid: 53, serial: 1 }));
+        assert_eq!(third_submitter.join().expect("third submitter"), Ok(third));
     }
 
     #[test]
