@@ -4,8 +4,8 @@
 //! and keeps only the HVF-specific wall-clock fallback thread spawn (the kqueue
 //! EVFILT_TIMER arming lives in the `setitimer` dispatch + signal pump).
 
-pub use carrick_timer_core::itimer::*;
 pub use carrick_hal::timer_delivery::{run_fallback, run_fallback_cpu};
+pub use carrick_timer_core::itimer::*;
 
 use carrick_timer_core::TimerSpecNs;
 

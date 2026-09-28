@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use crate::threaded::VcpuRegistry;
 
+pub use crate::posix_timer::PosixTimerSpec;
 pub use carrick_timer_core::TimerSpecNs;
 pub use carrick_timer_core::itimer::TimerArm;
-pub use crate::posix_timer::PosixTimerSpec;
 
 /// Arm a POSIX per-process timer using the shared fallback firing thread.
 ///

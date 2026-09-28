@@ -62,7 +62,8 @@ impl TimerFiring for HvfTimerFiring {
                 let cpu_sampler = if slot.clock_kind.is_cpu() {
                     Some(std::sync::Arc::new(|| {
                         Some(carrick_host::guest_cpu::total_ns_including_active())
-                    }) as std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>)
+                    })
+                        as std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>)
                 } else {
                     None
                 };
