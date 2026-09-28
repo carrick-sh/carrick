@@ -3,7 +3,7 @@
 use carrick_fatal::carrick_fatal;
 use carrick_hal::{ThreadedEngine, TrapError};
 use carrick_mem::memory::AddressSpace;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::Kernel;
 use carrick_kernel::dispatch::{DispatchError, SyscallDispatcher};
@@ -118,6 +118,7 @@ pub(crate) fn refuse_alias_install(
 }
 
 pub(crate) struct KernelFrameCowAuthority {
+    pub(crate) runtime: Weak<super::KernelState>,
     pub(crate) deferred_anonymous: Option<Arc<carrick_guest_mem::DeferredAnonymousState>>,
     pub(crate) kernel: Arc<carrick_kernel::kernel::Kernel>,
     pub(crate) mm: carrick_kernel::kernel::MmId,
@@ -211,6 +212,7 @@ pub(crate) fn kernel_frame_cow_authority_for_test(
     owner_inventory: Arc<dyn carrick_hal::FrameCowOwnerInventory>,
 ) -> Arc<dyn carrick_hal::FrameCowAuthority> {
     Arc::new(KernelFrameCowAuthority {
+        runtime: Weak::new(),
         deferred_anonymous: None,
         kernel,
         mm,
@@ -227,6 +229,30 @@ pub(crate) fn kernel_frame_cow_authority_for_test(
 }
 
 impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
+    fn commit_host_first_touch(
+        &self,
+        address: u64,
+        protect: &mut dyn FnMut(u64, u64) -> Result<(), String>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("host first touch lost its exact runtime"))?;
+        let dispatcher = &runtime.dispatcher;
+        let coordinator = dispatcher.mm_mutation_coordinator();
+        let mut guard = carrick_kernel::dispatch::mm_quiesce::acquire_host_write_mutation_quiesce(
+            &self.pt_quiesce,
+            self.mm,
+            coordinator,
+            self.tid,
+            carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
+        )
+        .map_err(|error| std::io::Error::other(format!("host first-touch quiesce: {error:?}")))?;
+        dispatcher
+            .commit_host_first_touch(&mut guard, address, protect)
+            .map_err(|error| Box::new(std::io::Error::other(error)) as _)
+    }
+
     fn deferred_anonymous_state(&self) -> Option<Arc<carrick_guest_mem::DeferredAnonymousState>> {
         self.deferred_anonymous.clone()
     }

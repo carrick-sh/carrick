@@ -2168,6 +2168,7 @@ where
             })?;
             let authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority> =
                 std::sync::Arc::new(super::KernelFrameCowAuthority {
+                    runtime: std::sync::Arc::downgrade(kernel),
                     deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(committed_mm),
                     kernel: std::sync::Arc::clone(committed_context.kernel()),
                     mm: committed_mm,

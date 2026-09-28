@@ -617,6 +617,14 @@ pub trait GuestMemory {
         self.write_bytes_raw(address, bytes)
     }
 
+    /// Make a writable guest range resident before a privileged host copyout.
+    /// Backends with eager backing need no preparation. A lazy backend must
+    /// publish first-touch residency through its exact-MM authority here;
+    /// retaining an invalid leaf's output address alone is insufficient.
+    fn prepare_host_write(&mut self, _address: u64, _length: usize) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
     /// Zero `[address, address+len)` in the PHYSICAL backing, bypassing the
     /// guest-visible protection (`set_no_access` / a non-writable mapping).
     /// Used to scrub a reused anon region whose stale content must never reach
