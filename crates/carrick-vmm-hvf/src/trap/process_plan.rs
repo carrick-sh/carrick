@@ -1625,4 +1625,40 @@ mod tests {
             "the complete inherited alias span must be projected"
         );
     }
+
+    #[test]
+    fn fork_repoints_untouched_alias_inside_invalid_parent_block() {
+        let mut page_tables = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        page_tables.declare_offline_private_image();
+        let block_va = crate::memory::LINUX_MMAP_BASE + 0x20_0000;
+        let old_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+        let child_ipa = old_ipa + 0x20_0000;
+        let alias_va = block_va + 0x77_000;
+        let alias_ipa = child_ipa + 0x77_000;
+        page_tables
+            .map_private_aliased(block_va, old_ipa, 0x20_0000, true, None)
+            .expect("map parent block");
+        page_tables
+            .set_prot_none(block_va, 0x20_0000, None)
+            .expect("arm untouched parent block");
+
+        assert!(
+            repoint_inherited_invalid_alias(&mut page_tables, alias_va, alias_ipa, 0x4000, true,)
+                .expect("repoint fork child alias")
+        );
+        assert_eq!(page_tables.translate(alias_va), None);
+        assert_eq!(
+            page_tables.translate_retained_output(alias_va),
+            Some(alias_ipa)
+        );
+        assert_eq!(
+            page_tables.translate_retained_output(alias_va - 0x1000),
+            Some(old_ipa + 0x76_000),
+            "unprojected neighbor retains its parent snapshot output"
+        );
+    }
 }
