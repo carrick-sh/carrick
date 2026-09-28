@@ -12,6 +12,37 @@ struct CoordinatorState {
     alias_active: bool,
     alias_waiters: usize,
     snapshot_readers: usize,
+    /// Who began the current alias phase and when. Diagnostic only: read by
+    /// a degraded kernel snapshot to name the holder a wedge is waiting on.
+    alias_holder: Option<AliasHolder>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AliasHolder {
+    host_thread: Option<u64>,
+    since: std::time::Instant,
+}
+
+/// The calling thread's host OS thread id, as lldb prints it (`tid = ...`).
+fn current_host_thread_id() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut id = 0_u64;
+        // SAFETY: a zero (null) thread names the calling thread; `id` is a valid
+        // out-pointer for the duration of the call.
+        let rc = unsafe { libc::pthread_threadid_np(0, &mut id) };
+        (rc == 0).then_some(id)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: gettid takes no arguments and cannot fail.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        u64::try_from(tid).ok()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }
 
 /// Per-MM observation point for structural mutation/alias ownership.
@@ -30,6 +61,7 @@ impl MmMutationCoordinator {
                 alias_active: false,
                 alias_waiters: 0,
                 snapshot_readers: 0,
+                alias_holder: None,
             }),
             idle: Condvar::new(),
         }
@@ -52,6 +84,10 @@ impl MmMutationCoordinator {
             state.alias_waiters -= 1;
         }
         state.alias_active = true;
+        state.alias_holder = Some(AliasHolder {
+            host_thread: current_host_thread_id(),
+            since: std::time::Instant::now(),
+        });
         drop(state);
         HostAliasCoordinatorGuard {
             coordinator: Arc::clone(self),
@@ -81,6 +117,23 @@ impl MmMutationCoordinator {
         state.snapshot_readers += 1;
         Some(MmSnapshotGuard {
             coordinator: Arc::clone(self),
+        })
+    }
+
+    /// Report the coordinator's state without waiting for it: the state
+    /// lock is only ever held for a few instructions, so a bounded try-lock
+    /// that fails means contention, not a wedge, and reads as `None`.
+    pub(crate) fn observe(&self) -> Option<crate::kernel::MmMutationObservation> {
+        let state = self
+            .state
+            .try_lock_for(std::time::Duration::from_millis(10))?;
+        let holder = state.alias_active.then_some(state.alias_holder).flatten();
+        Some(crate::kernel::MmMutationObservation {
+            alias_active: state.alias_active,
+            alias_holder_host_thread: holder.and_then(|holder| holder.host_thread),
+            alias_held_for: holder.map(|holder| holder.since.elapsed()),
+            alias_waiters: state.alias_waiters,
+            snapshot_readers: state.snapshot_readers,
         })
     }
 
@@ -446,6 +499,7 @@ impl Drop for HostAliasCoordinatorGuard<'_> {
         let mut state = self.coordinator.state.lock();
         assert!(state.alias_active, "host-alias coordinator underflow");
         state.alias_active = false;
+        state.alias_holder = None;
         self.coordinator.idle.notify_all();
     }
 }
@@ -500,6 +554,42 @@ mod tests {
             assert!(!permit.authorizes(&coordinator, mm(12)));
             assert!(!permit.authorizes(&Arc::new(MmMutationCoordinator::new(mm(11))), mm(11)));
         });
+    }
+
+    /// A degraded kernel snapshot must be able to name who holds the alias
+    /// phase a strict snapshot is waiting on, without entering it.
+    #[test]
+    fn observation_names_the_alias_holder_without_waiting() {
+        let coordinator = Arc::new(MmMutationCoordinator::new(mm(21)));
+        let idle = coordinator.observe().expect("uncontended state");
+        assert!(!idle.alias_active);
+        assert_eq!(idle.alias_holder_host_thread, None);
+
+        super::test_support::with_permit(Arc::clone(&coordinator), |permit| {
+            let alias = coordinator.begin_alias(permit);
+            let held = coordinator.observe().expect("uncontended state");
+            assert!(held.alias_active);
+            assert_eq!(
+                held.alias_holder_host_thread,
+                super::current_host_thread_id()
+            );
+            assert!(held.alias_held_for.is_some());
+            // The strict snapshot path is what a wedge blocks; it must time
+            // out rather than report a snapshot.
+            assert!(
+                coordinator
+                    .begin_snapshot_until(
+                        std::time::Instant::now() + std::time::Duration::from_millis(5)
+                    )
+                    .is_none()
+            );
+            drop(alias);
+        });
+
+        let released = coordinator.observe().expect("uncontended state");
+        assert!(!released.alias_active);
+        assert_eq!(released.alias_holder_host_thread, None);
+        assert_eq!(released.alias_held_for, None);
     }
 }
 

@@ -1189,6 +1189,10 @@ impl crate::kernel::VmaSnapshotSource for DispatchMmAuthority {
         self.mem.vma_revision()
     }
 
+    fn mutation_observation(&self) -> Option<crate::kernel::MmMutationObservation> {
+        self.mutation_coordinator.observe()
+    }
+
     fn publish_if_revision(
         &self,
         expected: crate::kernel::VmaRevision,

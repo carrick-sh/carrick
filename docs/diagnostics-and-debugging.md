@@ -431,7 +431,12 @@ capture (`gbhang4`) whose single ring held 8192 `SCHED_DISPATCH` /
 `SCHED_BUDGET` / `EPWAIT` records from one tid and nothing else. A spin now
 fills only the high-rate ring. `carrick eventring` reads the lifecycle ring
 and `carrick eventring --high-rate` (alias `--sched`) reads the other.
-`carrick debug lldb-run` captures both in full, and a post-mortem writes
+`carrick debug lldb-run` captures both in full. Its live kernel capture
+leaves `<run-id>.kernel-debug.json` for a coherent snapshot. When a held
+authority such as a wedge's MM mutation coordinator refuses the snapshot, it
+leaves `.kernel-debug.degraded.json` instead: per-task and per-thread state
+plus each coordinator's holder `tid`. With no capture at all it leaves
+`.kernel-debug.error.txt`. The manifest records which one. A post-mortem writes
 `event-ring.jsonl` and `event-ring-high-rate.jsonl`. Order across the two
 rings comes from the surrounding records, not from their separate logical
 indexes.
