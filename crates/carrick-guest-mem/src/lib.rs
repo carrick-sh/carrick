@@ -643,6 +643,13 @@ pub trait GuestMemory {
         })
     }
 
+    /// Clear a short `MADV_DONTNEED` edge. A never-committed prepared grant is
+    /// already zero and may be skipped; backends with no such state use the
+    /// ordinary physical scrub.
+    fn zero_anonymous_discard_edge(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.zero_backing(address, len)
+    }
+
     /// Discard private anonymous backing while preserving the semantic mapping
     /// and its exact permissions. The caller holds current-MM mutation exclusion
     /// and has authenticated private-anonymous VMA provenance. `Ok(false)` means
