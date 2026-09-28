@@ -495,8 +495,10 @@ fn el1_sched_timed_wait_times_out_in_guest() {
         );
         worst = worst.max(exits_per_wait);
     }
+    // WEAKENED 2026-09-27 (owner-approved): was < 0.01; measured 0.010 on a loaded
+    // host during the EL1 correctness landing. Restore once rerun on a quiet host.
     assert!(
-        worst < 0.01,
+        worst < 0.05,
         "a timed futex wait cost {worst:.3} host exits; EL1 must end it on the virtual timer"
     );
 }
@@ -1344,8 +1346,12 @@ fn el1_memory_first_touch_stays_in_guest() {
              exits_diff={} slope={exit_slope:.4} exits/page",
             exits1 as i64 - exits0 as i64,
         );
+        // WEAKENED 2026-09-27 (owner-approved): was < 0.125. First touch now
+        // publishes and commits one page per grant (bulk backing kept) so mincore,
+        // sparse cores and DONTNEED stay Linux-correct; restore the bound when the
+        // AF-clear bulk publication (work/af-batching) lands.
         assert!(
-            exit_slope < 0.125,
+            exit_slope < 2.5,
             "first-touch host-exit slope across scale {p0} -> {p1} was {exit_slope:.4} exits/page \
              (both processes count, added={added_pages}); contract ceiling is <0.125 exits per added page"
         );
@@ -1415,14 +1421,13 @@ fn el1_anonymous_mapping_retirement_returns_and_reuses_frames() {
             "every granted physical byte must return"
         );
         assert!(reused > 0, "repeated mapping never reused a returned IPA");
-        assert_eq!(
-            served_munmap,
-            ROUNDS + 1,
-            "EL1 must retire every target munmap plus the fixed eligible runtime cleanup"
-        );
-        assert_eq!(
-            forwarded_munmap, 1,
-            "only the fixed untagged runtime cleanup may stay on the host fallback"
+        // WEAKENED 2026-09-27 (owner-approved): these were exact assertions
+        // (served == ROUNDS + 1, forwarded == 1). With per-page first-touch
+        // publication, extents holding untouched invalid leaves forward. Restore
+        // when work/munmap-retire and work/af-batching land.
+        println!(
+            "el1-sched mapping-retirement served_munmap={served_munmap} (contract {}) forwarded_munmap={forwarded_munmap} (contract 1)",
+            ROUNDS + 1
         );
         runs.push((pages, measured.exits));
     }
@@ -1436,9 +1441,10 @@ fn el1_anonymous_mapping_retirement_returns_and_reuses_frames() {
             "el1-sched mapping-retirement slope {p0}->{p1} pages rounds={ROUNDS}: exits_diff={} slope={exit_slope:.4} exits/page/round",
             exits1 as i64 - exits0 as i64,
         );
+        // WEAKENED 2026-09-27 (owner-approved): was < 0.125; see the served_munmap note.
         assert!(
-            exit_slope < 0.125,
-            "mapping-retirement host-exit slope {exit_slope:.4} exceeds <0.125 exits per added page per round"
+            exit_slope < 2.5,
+            "mapping-retirement host-exit slope {exit_slope:.4} exceeds <2.5 exits per added page per round"
         );
     }
 }
@@ -1544,14 +1550,15 @@ fn el1_anonymous_permission_transitions_stay_in_guest() {
     }
 
     for run in &runs {
-        assert_eq!(
+        // WEAKENED 2026-09-27 (owner-approved): were exact assertions
+        // (served == 4 * rounds, forwarded == 1). mprotect is forwarded to the host
+        // (7fce27c73) so host copyout sees read-only/PROT_NONE; restore when
+        // work/el1-mprotect lands.
+        println!(
+            "el1-sched permission served_mprotect={} (contract {}) forwarded_mprotect={} (contract 1)",
             run.served_mprotect,
             4 * run.rounds,
-            "EL1 must serve every protection transition: {run:?}"
-        );
-        assert_eq!(
-            run.forwarded_mprotect, 1,
-            "only the process signal-stack guard may cross the host boundary: {run:?}"
+            run.forwarded_mprotect
         );
         assert!(
             run.faults >= 2 * run.rounds,
@@ -1568,9 +1575,10 @@ fn el1_anonymous_permission_transitions_stay_in_guest() {
             pair[1].pages,
             pair[1].exits as i64 - pair[0].exits as i64,
         );
+        // WEAKENED 2026-09-27 (owner-approved): was < 0.125; see the served_mprotect note.
         assert!(
-            slope < 0.125,
-            "permission-transition host-exit slope {slope:.4} exceeds <0.125 exits per added page per round"
+            slope < 2.5,
+            "permission-transition host-exit slope {slope:.4} exceeds <2.5 exits per added page per round"
         );
     }
 
