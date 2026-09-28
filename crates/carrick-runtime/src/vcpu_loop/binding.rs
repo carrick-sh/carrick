@@ -407,6 +407,7 @@ pub(crate) struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
     pub(super) state: ThreadRuntimeState<E>,
     pub(super) phase: HvpatchProductionPhase,
     pub(super) registration_wait: Option<carrick_hal::VcpuLeaseChangeSubscription>,
+    pub(super) slot_wait: Option<carrick_kernel::kernel::SlotVacancySubscription>,
     pub(super) terminal_settlement: HvpatchExternalTerminalSettlement,
     pub(super) terminal_result: Option<Result<VcpuLoopOutcome, RuntimeError>>,
     pub(super) completion: continuation::LogicalJobCompletion,
@@ -3366,6 +3367,42 @@ where
         decision
     }
 
+    /// A live owner keeps its pause port until it unloads. Park this logical
+    /// job on the port's release, so the executor can save the task and run
+    /// another job while the previous owner's host thread is delayed.
+    fn park_for_slot_release(
+        &mut self,
+        slot: carrick_kernel::kernel::ExecutionSlot,
+    ) -> Result<Option<executor::ExecutorExit>, ProductionHvpatchPollError> {
+        let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("slot admission lost exact Kernel context".to_owned())
+        })?;
+        let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("slot admission lost scheduler".to_owned())
+        })?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let pending_control_quantum = self.control_quantum()?.is_some();
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let pending_control_quantum = false;
+        let callback = registration_wake_callback(
+            runtime.continuation_services(context.kernel()).0,
+            context.thread().key(),
+            registration_wake_uses_control(&self.phase, pending_control_quantum),
+        );
+        match carrick_kernel::kernel::subscribe_slot_vacancy(slot, callback) {
+            carrick_kernel::kernel::SlotVacancyEnrollment::Vacant => Ok(None),
+            carrick_kernel::kernel::SlotVacancyEnrollment::Waiting(subscription) => {
+                self.slot_wait = Some(subscription);
+                Ok(Some(self.suspend(
+                    HvpatchLoopSuspension::InitialAdmission,
+                    executor::ExecutorExit::Blocked(
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    ),
+                )))
+            }
+        }
+    }
+
     pub(super) fn poll_with_engine(
         &mut self,
         engine: &mut E,
@@ -3377,6 +3414,7 @@ where
             self.phase = HvpatchProductionPhase::Complete;
             return Ok(executor::ExecutorExit::Exited);
         }
+        drop(self.slot_wait.take());
         if self.state.guest_execution.is_none() {
             drop(self.registration_wait.take());
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3404,18 +3442,27 @@ where
             let slot =
                 carrick_kernel::kernel::execution_slot_for_current_thread(engine.mailbox_slot())
                     .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            let (participation, enrollment) = enter_mm_executor_then_register(
-                &self.kernel.dispatcher,
-                self.state.kernel_thread.as_ref().map(Arc::clone),
-                Arc::clone(&self.state.kicker),
-                self.state.this_tid,
-                slot,
-                || {
-                    self.state
-                        .subscribe_register_vcpu(engine, wake_registration)
-                },
-            )
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            let (participation, enrollment) = loop {
+                match enter_mm_executor_then_register(
+                    &self.kernel.dispatcher,
+                    self.state.kernel_thread.as_ref().map(Arc::clone),
+                    Arc::clone(&self.state.kicker),
+                    self.state.this_tid,
+                    slot,
+                    || {
+                        self.state
+                            .subscribe_register_vcpu(engine, Arc::clone(&wake_registration))
+                    },
+                ) {
+                    Ok(entered) => break entered,
+                    Err(carrick_kernel::kernel::MmOccupancyError::SlotBusy { .. }) => {
+                        if let Some(exit) = self.park_for_slot_release(slot)? {
+                            return Ok(exit);
+                        }
+                    }
+                    Err(error) => return Err(RuntimeError::Configuration(error.to_string()).into()),
+                }
+            };
             self.state.guest_execution = Some(participation);
             match enrollment {
                 carrick_hal::VcpuRegistrationEnrollment::Registered => {}
@@ -3434,19 +3481,39 @@ where
         // The task is loaded on this vCPU: it occupies the vCPU's execution
         // slot with its MM from here until the executor unloads it
         // (`end_residency`), even across syscall boundaries that preempt it.
-        if let Some(participation) = self.state.guest_execution.as_mut() {
+        if self.state.guest_execution.is_some() {
             let slot =
                 carrick_kernel::kernel::execution_slot_for_current_thread(engine.mailbox_slot())
                     .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            participation
-                .occupy_slot(slot)
-                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            loop {
+                let Some(participation) = self.state.guest_execution.as_mut() else {
+                    carrick_fatal!(
+                        "vcpu_loop::slot_admission",
+                        "MM participation vanished during slot admission"
+                    );
+                };
+                let admission = participation.occupy_slot(slot);
+                match admission {
+                    Ok(()) => break,
+                    Err(carrick_kernel::kernel::MmOccupancyError::SlotBusy { .. }) => {
+                        if let Some(exit) = self.park_for_slot_release(slot)? {
+                            return Ok(exit);
+                        }
+                    }
+                    Err(error) => return Err(RuntimeError::Configuration(error.to_string()).into()),
+                }
+            }
             // The first load of an address space that guest EL1 could
             // install itself publishes it (its roots, its gate following
             // this MM's fence), so EL1 can switch a vCPU running another
             // process's thread to this process's threads without an exit.
             if let Some(binding) = control.binding {
-                let participation = &*participation;
+                let Some(participation) = self.state.guest_execution.as_ref() else {
+                    carrick_fatal!(
+                        "vcpu_loop::slot_admission",
+                        "admitted MM vanished before publication"
+                    );
+                };
                 binding.publish_address_space(|lease_ttbr0| {
                     let (ttbr0, ttbr1) = engine.el1_switchable_roots()?;
                     (ttbr0 == lease_ttbr0)
@@ -5131,6 +5198,7 @@ where
             )
         },
         registration_wait: None,
+        slot_wait: None,
         terminal_settlement: terminal_settlement.clone(),
         terminal_result: None,
         completion: completion.clone(),
@@ -6123,6 +6191,7 @@ mod tests {
             state,
             phase: HvpatchProductionPhase::Resident,
             registration_wait: None,
+            slot_wait: None,
             terminal_settlement: root_settlement,
             terminal_result: None,
             completion: root_completion.clone(),
