@@ -54,6 +54,52 @@ fn rename_open_descriptions_visits_only_matching_recorded_paths() {
     ));
 }
 
+#[test]
+fn rename_updates_description_when_recorded_fd_path_is_an_alias() {
+    let dispatcher = SyscallDispatcher::new();
+    let target = dispatcher.install_fd(
+        OpenDescription::File {
+            base: OpenDescriptionBase::new(LINUX_O_RDONLY),
+            path: "/real/file".to_owned(),
+            metadata: RootFsMetadata {
+                path: "/real/file".into(),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 0,
+            },
+            contents: FileContents::dense(Vec::new()),
+            offset: 0,
+            writable: false,
+        },
+        0,
+    );
+    let DispatchOutcome::Returned { value: fd } = target else {
+        panic!("install target file: {target:?}");
+    };
+    dispatcher.record_fd_open_path(fd as i32, "/alias/file".to_owned());
+
+    dispatcher.rename_open_paths("/real/file", "/real/renamed");
+    let open = dispatcher.open_file(fd as i32).unwrap();
+    let description = open.description.read_for_io().unwrap();
+    assert!(matches!(
+        &*description,
+        OpenDescription::File { path, .. } if path == "/real/renamed"
+    ));
+    assert_eq!(
+        dispatcher
+            .lookup_recorded_fd_open_path(fd as i32)
+            .as_deref(),
+        Some("/alias/file")
+    );
+    drop(description);
+    dispatcher.rename_open_paths("/real/renamed", "/real/again");
+    let description = open.description.read_for_io().unwrap();
+    assert!(matches!(
+        &*description,
+        OpenDescription::File { path, .. } if path == "/real/again"
+    ));
+}
+
 /// Exercise the production lease grant with an actual identity-page mapping.
 /// An alias write must advance the same Linux open-file-description offset.
 #[cfg(feature = "syscall-shim")]
