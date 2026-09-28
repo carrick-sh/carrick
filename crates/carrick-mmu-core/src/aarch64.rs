@@ -3597,7 +3597,18 @@ impl PageTableManager {
             if !allocate {
                 return Ok((entry_loc, level));
             }
-            if !valid {
+            // A full-block first-touch/PROT_NONE edit clears VALID without
+            // discarding the owned output. Fork may need to repoint only one
+            // child alias inside that block. Split the retained block exactly
+            // as a valid block, preserving its invalidity on every child leaf.
+            // Empty and retired descriptors have no live output to repoint;
+            // an invalidated table pointer is not a block output either.
+            if !valid
+                && (level == 0
+                    || desc & (TYPE_TABLE_OR_PAGE & !VALID) != 0
+                    || !Self::records_output(desc, level)
+                    || desc & SW_RETIRED != 0)
+            {
                 return Err(PageTableError::BadAddress);
             }
             self.split_block(entry_loc, level, source.as_deref_mut())?;
@@ -6176,6 +6187,47 @@ mod tests {
             mgr.is_valid(va.wrapping_sub(0x1000)),
             "prev page stays mapped"
         );
+    }
+
+    #[test]
+    fn repoint_untouched_fork_alias_splits_retained_invalid_block() {
+        let mut mgr = PageTableManager::new(
+            stage1_hvpatch_page_tables(),
+            LINUX_PAGE_TABLES_BASE,
+            test_layout(),
+        );
+        mgr.declare_offline_private_image();
+        let va = LINUX_PRIVATE_OVERLAY_BASE + 0x20_0000;
+        let old_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+        let new_ipa = old_ipa + 0x20_0000;
+        mgr.map_private_aliased(va, old_ipa, 0x20_0000, true, None)
+            .expect("map aligned private block");
+        mgr.set_prot_none(va, 0x20_0000, None)
+            .expect("arm untouched block for first touch");
+        assert_eq!(
+            mgr.translate_retained_output(va + 0x77_000),
+            Some(old_ipa + 0x77_000)
+        );
+        assert_eq!(mgr.debug_walk(va + 0x77_000)[2] & VALID, 0);
+
+        mgr.repoint_preserving_attributes(va + 0x77_000, new_ipa + 0x77_000, 0x4000, None)
+            .expect("repoint child alias in retained invalid block");
+
+        assert_eq!(mgr.translate(va + 0x77_000), None);
+        assert_eq!(
+            mgr.translate_retained_output(va + 0x77_000),
+            Some(new_ipa + 0x77_000)
+        );
+        assert_eq!(
+            mgr.translate_retained_output(va + 0x76_000),
+            Some(old_ipa + 0x76_000),
+            "neighbor retains its inherited output"
+        );
+        assert_eq!(mgr.translate(va + 0x76_000), None);
+        mgr.set_rw(va + 0x77_000, 0x4000, false, None)
+            .expect("child first touch revalidates only its private alias");
+        assert_eq!(mgr.translate(va + 0x77_000), Some(new_ipa + 0x77_000));
+        assert_eq!(mgr.translate(va + 0x76_000), None);
     }
 
     #[test]
