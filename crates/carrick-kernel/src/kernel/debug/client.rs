@@ -9,8 +9,8 @@ use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
 use super::dto::{
-    KERNEL_DEBUG_RESPONSE_SCHEMA, KernelDebugDtoError, KernelDebugRequest, KernelDebugSnapshot,
-    KernelDebugTable,
+    KERNEL_DEBUG_DEGRADED_SCHEMA, KERNEL_DEBUG_RESPONSE_SCHEMA, KernelDebugDegraded,
+    KernelDebugDtoError, KernelDebugRequest, KernelDebugSnapshot, KernelDebugTable,
 };
 use super::endpoint::{DebugEndpoint, EndpointError};
 use super::wire::{self, DEADLINE, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, WireError};
@@ -31,6 +31,11 @@ pub enum ClientError {
     Dto(#[from] KernelDebugDtoError),
     #[error("runtime refused the kernel debug request: {0}")]
     Refused(String),
+    /// The runtime could not produce a coherent snapshot and answered with
+    /// its degraded per-object view instead. The payload is evidence, not a
+    /// snapshot: callers must keep it apart from a validated graph.
+    #[error("kernel snapshot degraded ({}); per-task state and busy coordinators attached", .0.strict_error)]
+    Degraded(Box<KernelDebugDegraded>),
 }
 
 /// Fetch one coherent snapshot for `run_id`, restricted to `tables` when given.
@@ -142,6 +147,11 @@ pub fn fetch_at(
         && refusal.schema == KERNEL_DEBUG_RESPONSE_SCHEMA
     {
         return Err(ClientError::Refused(refusal.error));
+    }
+    if let Ok(degraded) = wire::decode_exact::<KernelDebugDegraded>(&payload)
+        && degraded.schema == KERNEL_DEBUG_DEGRADED_SCHEMA
+    {
+        return Err(ClientError::Degraded(Box::new(degraded)));
     }
 
     let snapshot: KernelDebugSnapshot = wire::decode_exact(&payload)?;

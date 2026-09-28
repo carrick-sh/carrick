@@ -254,18 +254,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/debug/server.rs:216 in `authenticate`, `libc::geteuid` acts only on the run-scoped kernel-debug server credentials used by `authenticate`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/server.rs:218 in `authenticate`, `libc::geteuid` acts only on the run-scoped kernel-debug server credentials used by `authenticate`; no guest identity selects its host target.",
     "review_id": "HA-000012",
     "source": {
-      "byte_end": 8074,
-      "byte_start": 8061,
+      "byte_end": 8150,
+      "byte_start": 8137,
       "column": 32,
       "column_end": 45,
       "column_start": 32,
       "file": "crates/carrick-kernel/src/kernel/debug/server.rs",
-      "line": 216,
-      "line_end": 216,
-      "line_start": 216
+      "line": 218,
+      "line_end": 218,
+      "line_start": 218
     }
   },
   {
@@ -1345,18 +1345,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:624 in `dump_lldb`, `libc::kill` acts only on the LLDB target child created by the debug command used by `dump_lldb`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:621 in `dump_lldb`, `libc::kill` acts only on the LLDB target child created by the debug command used by `dump_lldb`; no guest identity selects its host target.",
     "review_id": "HA-000065",
     "source": {
-      "byte_end": 23684,
-      "byte_start": 23674,
+      "byte_end": 23557,
+      "byte_start": 23547,
       "column": 17,
       "column_end": 27,
       "column_start": 17,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 624,
-      "line_end": 624,
-      "line_start": 624
+      "line": 621,
+      "line_end": 621,
+      "line_start": 621
     }
   },
   {
@@ -1371,18 +1371,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:767 in `terminate_scoped_run`, `libc::kill` acts only on the LLDB target child created by the debug command used by `terminate_scoped_run`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:878 in `terminate_scoped_run`, `libc::kill` acts only on the LLDB target child created by the debug command used by `terminate_scoped_run`; no guest identity selects its host target.",
     "review_id": "HA-000066",
     "source": {
-      "byte_end": 28600,
-      "byte_start": 28590,
+      "byte_end": 32784,
+      "byte_start": 32774,
       "column": 13,
       "column_end": 23,
       "column_start": 13,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 767,
-      "line_end": 767,
-      "line_start": 767
+      "line": 878,
+      "line_end": 878,
+      "line_start": 878
     }
   },
   {
@@ -1397,18 +1397,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:772 in `terminate_scoped_run`, `libc::kill` acts only on the LLDB target child created by the debug command used by `terminate_scoped_run`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:883 in `terminate_scoped_run`, `libc::kill` acts only on the LLDB target child created by the debug command used by `terminate_scoped_run`; no guest identity selects its host target.",
     "review_id": "HA-000067",
     "source": {
-      "byte_end": 28845,
-      "byte_start": 28835,
+      "byte_end": 33029,
+      "byte_start": 33019,
       "column": 13,
       "column_end": 23,
       "column_start": 13,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 772,
-      "line_end": 772,
-      "line_start": 772
+      "line": 883,
+      "line_end": 883,
+      "line_start": 883
     }
   },
   {
@@ -1423,18 +1423,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:780 in `terminate_scoped_run`, `libc::kill` acts only on the LLDB target child created by the debug command used by `terminate_scoped_run`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:891 in `terminate_scoped_run`, `libc::kill` acts only on the LLDB target child created by the debug command used by `terminate_scoped_run`; no guest identity selects its host target.",
     "review_id": "HA-000068",
     "source": {
-      "byte_end": 29197,
-      "byte_start": 29187,
+      "byte_end": 33381,
+      "byte_start": 33371,
       "column": 17,
       "column_end": 27,
       "column_start": 17,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 780,
-      "line_end": 780,
-      "line_start": 780
+      "line": 891,
+      "line_end": 891,
+      "line_start": 891
     }
   },
   {
@@ -1742,18 +1742,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:734 in `write_ps_log`, `std::fs::File::create` accesses only the user-selected LLDB process-list artifact.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:845 in `write_ps_log`, `std::fs::File::create` accesses only the user-selected LLDB process-list artifact.",
     "review_id": "HA-000082",
     "source": {
-      "byte_end": 27261,
-      "byte_start": 27249,
+      "byte_end": 31445,
+      "byte_start": 31433,
       "column": 9,
       "column_end": 21,
       "column_start": 9,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 734,
-      "line_end": 734,
-      "line_start": 734
+      "line": 845,
+      "line_end": 845,
+      "line_start": 845
     }
   },
   {
@@ -2209,6 +2209,32 @@
       "line": 561,
       "line_end": 561,
       "line_start": 561
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the run-scoped lldb-run manifest (`<out-dir>/<run-id>.manifest.txt`)"
+    },
+    "expansion": null,
+    "operation": "std::fs::OpenOptions::new",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/debug.rs:739 in `record_kernel_capture`, `std::fs::OpenOptions::new` accesses only the run-scoped lldb-run manifest (`<out-dir>/<run-id>.manifest.txt`). It appends the kernel-capture outcome line; the directory is the operator's `--out-dir` and nothing about the path is derived from guest state.",
+    "review_id": "HA-000684",
+    "source": {
+      "byte_end": 28026,
+      "byte_start": 28010,
+      "column": 25,
+      "column_end": 41,
+      "column_start": 25,
+      "file": "crates/carrick-cli/src/debug.rs",
+      "line": 739,
+      "line_end": 739,
+      "line_start": 739
     }
   },
   {
@@ -2744,6 +2770,32 @@
       "line": 564,
       "line_end": 564,
       "line_start": 564
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the run-scoped lldb-run manifest (`<out-dir>/<run-id>.manifest.txt`)"
+    },
+    "expansion": null,
+    "operation": "std::fs::OpenOptions::open",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/debug.rs:742 in `record_kernel_capture`, `std::fs::OpenOptions::open` accesses only the run-scoped lldb-run manifest (`<out-dir>/<run-id>.manifest.txt`). It appends the kernel-capture outcome line; the directory is the operator's `--out-dir` and nothing about the path is derived from guest state.",
+    "review_id": "HA-000685",
+    "source": {
+      "byte_end": 28086,
+      "byte_start": 28082,
+      "column": 10,
+      "column_end": 14,
+      "column_start": 10,
+      "file": "crates/carrick-cli/src/debug.rs",
+      "line": 742,
+      "line_end": 742,
+      "line_start": 742
     }
   },
   {
@@ -3426,18 +3478,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:1028 in `run_container_gate`, `std::fs::create_dir_all` accesses only the operator-selected container gate rendezvous directory.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:1157 in `run_container_gate`, `std::fs::create_dir_all` accesses only the operator-selected container gate rendezvous directory.",
     "review_id": "HA-000151",
     "source": {
-      "byte_end": 38371,
-      "byte_start": 38353,
+      "byte_end": 43300,
+      "byte_start": 43282,
       "column": 5,
       "column_end": 23,
       "column_start": 5,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 1028,
-      "line_end": 1028,
-      "line_start": 1028
+      "line": 1157,
+      "line_end": 1157,
+      "line_start": 1157
     }
   },
   {
@@ -3928,18 +3980,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:494 in `PostMortem::write_to_dir`, `std::fs::create_dir_all` accesses only the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:483 in `PostMortem::write_to_dir`, `std::fs::create_dir_all` accesses only the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
     "review_id": "HA-000646",
     "source": {
-      "byte_end": 20401,
-      "byte_start": 20378,
+      "byte_end": 20094,
+      "byte_start": 20071,
       "column": 9,
       "column_end": 32,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/kernel/debug/post_mortem.rs",
-      "line": 494,
-      "line_end": 494,
-      "line_start": 494
+      "line": 483,
+      "line_end": 483,
+      "line_start": 483
     }
   },
   {
@@ -9360,25 +9412,51 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
-      "resource": "run-scoped HVPatch kernel debug snapshot"
+      "resource": "the run-scoped kernel-capture error artifact (`<out-dir>/<run-id>.kernel-debug.error.txt`)"
     },
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:645 in `capture_hvpatch_kernel_snapshot`, `std::fs::write` accesses only the run-scoped HVPatch kernel debug snapshot.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:708 in `record_kernel_capture`, `std::fs::write` accesses only the run-scoped kernel-capture error artifact (`<out-dir>/<run-id>.kernel-debug.error.txt`). It records why no kernel snapshot was captured; a failed write is itself recorded and never stops the lldb dump.",
     "review_id": "HA-000403",
     "source": {
-      "byte_end": 24461,
-      "byte_start": 24452,
+      "byte_end": 26829,
+      "byte_start": 26820,
+      "column": 22,
+      "column_end": 31,
+      "column_start": 22,
+      "file": "crates/carrick-cli/src/debug.rs",
+      "line": 708,
+      "line_end": 708,
+      "line_start": 708
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-WRITE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the run-scoped HVPatch kernel debug snapshot or degraded capture (`<out-dir>/<run-id>.kernel-debug{,.degraded}.json`)"
+    },
+    "expansion": null,
+    "operation": "std::fs::write",
+    "profiles": [
+      "macos-cli-default"
+    ],
+    "rationale": "At crates/carrick-cli/src/debug.rs:755 in `write_json`, `std::fs::write` accesses only the run-scoped HVPatch kernel debug snapshot or degraded capture (`<out-dir>/<run-id>.kernel-debug{,.degraded}.json`).",
+    "review_id": "HA-000686",
+    "source": {
+      "byte_end": 28505,
+      "byte_start": 28496,
       "column": 5,
       "column_end": 14,
       "column_start": 5,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 645,
-      "line_end": 645,
-      "line_start": 645
+      "line": 755,
+      "line_end": 755,
+      "line_start": 755
     }
   },
   {
@@ -9393,18 +9471,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:1105 in `run_container_gate`, `std::fs::write` accesses only the operator-selected container gate receipt artifact.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:1234 in `run_container_gate`, `std::fs::write` accesses only the operator-selected container gate receipt artifact.",
     "review_id": "HA-000404",
     "source": {
-      "byte_end": 41923,
-      "byte_start": 41914,
+      "byte_end": 46852,
+      "byte_start": 46843,
       "column": 5,
       "column_end": 14,
       "column_start": 5,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 1105,
-      "line_end": 1105,
-      "line_start": 1105
+      "line": 1234,
+      "line_end": 1234,
+      "line_start": 1234
     }
   },
   {
@@ -9738,18 +9816,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:498 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem JSON inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:487 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem JSON inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
     "review_id": "HA-000647",
     "source": {
-      "byte_end": 20612,
-      "byte_start": 20598,
+      "byte_end": 20305,
+      "byte_start": 20291,
       "column": 9,
       "column_end": 23,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/kernel/debug/post_mortem.rs",
-      "line": 498,
-      "line_end": 498,
-      "line_start": 498
+      "line": 487,
+      "line_end": 487,
+      "line_start": 487
     }
   },
   {
@@ -9765,18 +9843,45 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:507 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem event-ring JSONL inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
-    "review_id": "HA-000648",
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:496 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem event-ring JSONL inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "review_id": "HA-000687",
     "source": {
-      "byte_end": 20938,
-      "byte_start": 20924,
+      "byte_end": 20631,
+      "byte_start": 20617,
       "column": 9,
       "column_end": 23,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/kernel/debug/post_mortem.rs",
-      "line": 507,
-      "line_end": 507,
-      "line_start": 507
+      "line": 496,
+      "line_end": 496,
+      "line_start": 496
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-WRITE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the post-mortem high-rate event-ring JSONL inside the operator-selected post-mortem directory"
+    },
+    "expansion": null,
+    "operation": "std::fs::write",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/post_mortem.rs:505 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem high-rate event-ring JSONL inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "review_id": "HA-000648",
+    "source": {
+      "byte_end": 21000,
+      "byte_start": 20986,
+      "column": 9,
+      "column_end": 23,
+      "column_start": 9,
+      "file": "crates/carrick-kernel/src/kernel/debug/post_mortem.rs",
+      "line": 505,
+      "line_end": 505,
+      "line_start": 505
     }
   },
   {
@@ -10084,18 +10189,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:593 in `dump_lldb`, `std::process::id` acts only on the current LLDB debug process exclusion used by `dump_lldb`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:590 in `dump_lldb`, `std::process::id` acts only on the current LLDB debug process exclusion used by `dump_lldb`; no guest identity selects its host target.",
     "review_id": "HA-000428",
     "source": {
-      "byte_end": 22521,
-      "byte_start": 22505,
+      "byte_end": 22394,
+      "byte_start": 22378,
       "column": 27,
       "column_end": 43,
       "column_start": 27,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 593,
-      "line_end": 593,
-      "line_start": 593
+      "line": 590,
+      "line_end": 590,
+      "line_start": 590
     }
   },
   {
@@ -10110,18 +10215,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:1097 in `run_container_gate`, `std::process::id` accesses only the run-scoped carrier identity recorded in the container gate receipt.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:1226 in `run_container_gate`, `std::process::id` accesses only the run-scoped carrier identity recorded in the container gate receipt.",
     "review_id": "HA-000429",
     "source": {
-      "byte_end": 41606,
-      "byte_start": 41590,
+      "byte_end": 46535,
+      "byte_start": 46519,
       "column": 24,
       "column_end": 40,
       "column_start": 24,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 1097,
-      "line_end": 1097,
-      "line_start": 1097
+      "line": 1226,
+      "line_end": 1226,
+      "line_start": 1226
     }
   },
   {
@@ -11817,18 +11922,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/debug/server.rs:98 in `start_at`, `std::process::id` acts only on the run-scoped kernel-debug server owner used by `start_at`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/server.rs:100 in `start_at`, `std::process::id` acts only on the run-scoped kernel-debug server owner used by `start_at`; no guest identity selects its host target.",
     "review_id": "HA-000530",
     "source": {
-      "byte_end": 3958,
-      "byte_start": 3942,
+      "byte_end": 4028,
+      "byte_start": 4012,
       "column": 24,
       "column_end": 40,
       "column_start": 24,
       "file": "crates/carrick-kernel/src/kernel/debug/server.rs",
-      "line": 98,
-      "line_end": 98,
-      "line_start": 98
+      "line": 100,
+      "line_end": 100,
+      "line_start": 100
     }
   },
   {
@@ -11844,18 +11949,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/debug/server.rs:145 in `shutdown`, `std::process::id` acts only on the run-scoped kernel-debug server owner used by `shutdown`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/server.rs:147 in `shutdown`, `std::process::id` acts only on the run-scoped kernel-debug server owner used by `shutdown`; no guest identity selects its host target.",
     "review_id": "HA-000531",
     "source": {
-      "byte_end": 5626,
-      "byte_start": 5610,
+      "byte_end": 5696,
+      "byte_start": 5680,
       "column": 12,
       "column_end": 28,
       "column_start": 12,
       "file": "crates/carrick-kernel/src/kernel/debug/server.rs",
-      "line": 145,
-      "line_end": 145,
-      "line_start": 145
+      "line": 147,
+      "line_end": 147,
+      "line_start": 147
     }
   },
   {
@@ -11871,18 +11976,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/debug/server.rs:172 in `server_nonce`, `std::process::id` acts only on the run-scoped kernel-debug server nonce fallback used by `server_nonce`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/server.rs:174 in `server_nonce`, `std::process::id` acts only on the run-scoped kernel-debug server nonce fallback used by `server_nonce`; no guest identity selects its host target.",
     "review_id": "HA-000532",
     "source": {
-      "byte_end": 6511,
-      "byte_start": 6495,
+      "byte_end": 6581,
+      "byte_start": 6565,
       "column": 16,
       "column_end": 32,
       "column_start": 16,
       "file": "crates/carrick-kernel/src/kernel/debug/server.rs",
-      "line": 172,
-      "line_end": 172,
-      "line_start": 172
+      "line": 174,
+      "line_end": 174,
+      "line_start": 174
     }
   },
   {
@@ -13793,18 +13898,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:1063 in `run_container_gate`, `std::thread::Builder::new` acts only on the carrier test runner created by `run_container_gate`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:1192 in `run_container_gate`, `std::thread::Builder::new` acts only on the carrier test runner created by `run_container_gate`; no guest identity selects its host target.",
     "review_id": "HA-000574",
     "source": {
-      "byte_end": 40009,
-      "byte_start": 39989,
+      "byte_end": 44938,
+      "byte_start": 44918,
       "column": 32,
       "column_end": 52,
       "column_start": 32,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 1063,
-      "line_end": 1063,
-      "line_start": 1063
+      "line": 1192,
+      "line_end": 1192,
+      "line_start": 1192
     }
   },
   {
@@ -13819,18 +13924,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:1071 in `run_container_gate`, `std::thread::Builder::new` acts only on the carrier test runner created by `run_container_gate`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:1200 in `run_container_gate`, `std::thread::Builder::new` acts only on the carrier test runner created by `run_container_gate`; no guest identity selects its host target.",
     "review_id": "HA-000575",
     "source": {
-      "byte_end": 40451,
-      "byte_start": 40431,
+      "byte_end": 45380,
+      "byte_start": 45360,
       "column": 31,
       "column_end": 51,
       "column_start": 31,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 1071,
-      "line_end": 1071,
-      "line_start": 1071
+      "line": 1200,
+      "line_end": 1200,
+      "line_start": 1200
     }
   },
   {
@@ -14092,18 +14197,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/debug/server.rs:86 in `start_at`, `std::thread::Builder::new` acts only on the run-scoped kernel-debug server thread used by `start_at`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/server.rs:88 in `start_at`, `std::thread::Builder::new` acts only on the run-scoped kernel-debug server thread used by `start_at`; no guest identity selects its host target.",
     "review_id": "HA-000582",
     "source": {
-      "byte_end": 3578,
-      "byte_start": 3553,
+      "byte_end": 3648,
+      "byte_start": 3623,
       "column": 20,
       "column_end": 45,
       "column_start": 20,
       "file": "crates/carrick-kernel/src/kernel/debug/server.rs",
-      "line": 86,
-      "line_end": 86,
-      "line_start": 86
+      "line": 88,
+      "line_end": 88,
+      "line_start": 88
     }
   },
   {
@@ -14254,18 +14359,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:4531 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:4579 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 193129,
-      "byte_start": 193104,
+      "byte_end": 195495,
+      "byte_start": 195470,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 4531,
-      "line_end": 4531,
-      "line_start": 4531
+      "line": 4579,
+      "line_end": 4579,
+      "line_start": 4579
     }
   },
   {
@@ -14471,18 +14576,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:626 in `dump_lldb`, `std::thread::sleep` acts only on the LLDB target child and polling worker created by the debug command used by `dump_lldb`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:623 in `dump_lldb`, `std::thread::sleep` acts only on the LLDB target child and polling worker created by the debug command used by `dump_lldb`; no guest identity selects its host target.",
     "review_id": "HA-000594",
     "source": {
-      "byte_end": 23753,
-      "byte_start": 23740,
+      "byte_end": 23626,
+      "byte_start": 23613,
       "column": 13,
       "column_end": 26,
       "column_start": 13,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 626,
-      "line_end": 626,
-      "line_start": 626
+      "line": 623,
+      "line_end": 623,
+      "line_start": 623
     }
   },
   {
@@ -14497,18 +14602,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/debug.rs:798 in `wait_for_child`, `std::thread::sleep` acts only on the LLDB target child and polling worker created by the debug command used by `wait_for_child`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/debug.rs:909 in `wait_for_child`, `std::thread::sleep` acts only on the LLDB target child and polling worker created by the debug command used by `wait_for_child`; no guest identity selects its host target.",
     "review_id": "HA-000595",
     "source": {
-      "byte_end": 29707,
-      "byte_start": 29694,
+      "byte_end": 33891,
+      "byte_start": 33878,
       "column": 9,
       "column_end": 22,
       "column_start": 9,
       "file": "crates/carrick-cli/src/debug.rs",
-      "line": 798,
-      "line_end": 798,
-      "line_start": 798
+      "line": 909,
+      "line_end": 909,
+      "line_start": 909
     }
   },
   {

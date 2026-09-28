@@ -1320,6 +1320,16 @@ fn deadline_error(deadline: Instant) -> SnapshotError {
 }
 
 impl MmBackend for Stage1MmBackend {
+    fn mutation_observation(&self) -> Option<carrick_kernel::kernel::MmMutationObservation> {
+        // Degraded-snapshot path: never wait. A contended source slot reads
+        // as "unobserved", which the snapshot reports as such.
+        let source = self
+            .vma_source
+            .try_read_for(std::time::Duration::from_millis(10))?
+            .clone()?;
+        source.mutation_observation()
+    }
+
     fn snapshot_stamp(
         &self,
         deadline: Instant,

@@ -330,6 +330,11 @@ pub struct PostMortem {
     /// The always-on event ring, oldest to newest. A slot the reader could
     /// not decode is kept as its named read error.
     pub event_ring: Vec<EventRingRecord>,
+    /// The high-rate ring (per-dispatch scheduler and per-poll `EP*`,
+    /// eventfd and futex records), kept apart so a spin cannot evict
+    /// `event_ring`.
+    #[serde(default)]
+    pub event_ring_high_rate: Vec<EventRingRecord>,
     pub truncated: Vec<Truncated>,
 }
 
@@ -389,27 +394,10 @@ impl PostMortem {
             },
         };
 
-        let event_ring = crate::event_ring::drain_recent(EVENT_RING_RECORDS)
-            .into_iter()
-            .map(|record| match record {
-                Ok(record) => EventRingRecord {
-                    logical_index: record.logical_index,
-                    kind: Some(record.kind),
-                    a: Some(record.a),
-                    b: Some(record.b),
-                    c: Some(record.c),
-                    unreadable: None,
-                },
-                Err(error) => EventRingRecord {
-                    logical_index: error_index(&error),
-                    kind: None,
-                    a: None,
-                    b: None,
-                    c: None,
-                    unreadable: Some(error.to_string()),
-                },
-            })
-            .collect();
+        let event_ring = ring_records(crate::event_ring::drain_recent(EVENT_RING_RECORDS));
+        let event_ring_high_rate = ring_records(crate::event_ring::drain_recent_high_rate(
+            EVENT_RING_RECORDS,
+        ));
 
         Self {
             schema: POST_MORTEM_SCHEMA.to_owned(),
@@ -422,6 +410,7 @@ impl PostMortem {
             kernel: kernel_snapshot,
             findings,
             event_ring,
+            event_ring_high_rate,
             truncated,
         }
     }
@@ -505,6 +494,15 @@ impl PostMortem {
             ring.push('\n');
         }
         std::fs::write(dir.join("event-ring.jsonl"), ring)?;
+
+        let mut high_rate = String::new();
+        for record in &self.event_ring_high_rate {
+            let line = serde_json::to_string(record)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            high_rate.push_str(&line);
+            high_rate.push('\n');
+        }
+        std::fs::write(dir.join("event-ring-high-rate.jsonl"), high_rate)?;
         Ok(json_path)
     }
 
@@ -532,6 +530,32 @@ impl PostMortem {
             }
         }
     }
+}
+
+fn ring_records(
+    records: Vec<Result<crate::event_ring::EventRecord, crate::event_ring::RingReadError>>,
+) -> Vec<EventRingRecord> {
+    records
+        .into_iter()
+        .map(|record| match record {
+            Ok(record) => EventRingRecord {
+                logical_index: record.logical_index,
+                kind: Some(record.kind),
+                a: Some(record.a),
+                b: Some(record.b),
+                c: Some(record.c),
+                unreadable: None,
+            },
+            Err(error) => EventRingRecord {
+                logical_index: error_index(&error),
+                kind: None,
+                a: None,
+                b: None,
+                c: None,
+                unreadable: Some(error.to_string()),
+            },
+        })
+        .collect()
 }
 
 fn error_index(error: &crate::event_ring::RingReadError) -> u64 {
@@ -589,6 +613,7 @@ mod tests {
     #[test]
     fn a_capture_round_trips_through_the_written_directory() {
         crate::event_ring::rec(crate::event_ring::FORK, 11, 22, 33);
+        crate::event_ring::rec(crate::event_ring::SCHED_DISPATCH, 11, 22, 33);
         let post_mortem = PostMortem::capture(
             None,
             liveness_reason(vec![ZombieSummary {
@@ -616,6 +641,16 @@ mod tests {
         assert!(
             !decoded.event_ring.is_empty(),
             "the always-on ring must reach the capture with nothing pre-armed"
+        );
+        assert!(
+            !decoded.event_ring_high_rate.is_empty(),
+            "the high-rate ring must reach the capture too"
+        );
+        let high_rate = std::fs::read_to_string(dir.path().join("event-ring-high-rate.jsonl"))
+            .expect("high-rate ring");
+        assert_eq!(
+            high_rate.lines().count(),
+            decoded.event_ring_high_rate.len()
         );
     }
 }
