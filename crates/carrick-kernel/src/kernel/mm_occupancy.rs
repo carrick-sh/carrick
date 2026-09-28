@@ -355,6 +355,7 @@ impl MmOccupancy {
     ) -> Result<Self, MmOccupancyError> {
         let mut state = PORTS[slot.index()].lock();
         if let Some(running) = state.running.as_ref() {
+            crate::event_ring::rec_mm_occupancy_refused(slot.index(), running.mm.raw(), mm.raw());
             carrick_observability::probes::mm_slot_busy(
                 u32::try_from(slot.index()).unwrap_or(u32::MAX),
                 running.mm.raw(),
@@ -367,13 +368,14 @@ impl MmOccupancy {
                 running: running.mm.raw(),
             });
         }
-        table
-            .install(slot, key(mm))
-            .map_err(|busy| MmOccupancyError::SlotWordWithoutOwner {
+        table.install(slot, key(mm)).map_err(|busy| {
+            crate::event_ring::rec_mm_occupancy_refused(slot.index(), busy.running.raw(), mm.raw());
+            MmOccupancyError::SlotWordWithoutOwner {
                 slot,
                 running: busy.running.raw(),
                 requested: mm.raw(),
-            })?;
+            }
+        })?;
         state.running = Some(Port {
             mm,
             fence: Arc::clone(fence),

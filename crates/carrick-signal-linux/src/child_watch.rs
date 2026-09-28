@@ -28,14 +28,10 @@
 //! a child reaped synchronously is removed before any async reaper could publish,
 //! and a `take` removes the entry so a later async wake can't re-deliver it.
 
-use std::collections::{HashMap, VecDeque};
+use carrick_abi::LINUX_SIGCHLD;
+use carrick_signal_core::PendingQueue;
+use std::collections::HashMap;
 use std::sync::Mutex;
-
-/// Linux SIGCHLD. The canonical definition is `carrick_abi::LINUX_SIGCHLD` (this
-/// neutral leaf crate does not depend on carrick-abi); the value MUST stay in
-/// sync (a unit test below asserts the fallback uses this number). macOS's SIGCHLD
-/// is 20, but the map stores the LINUX numbering on every backend.
-const LINUX_SIGCHLD: i32 = 17;
 
 /// Children the guest forked, mapped from their (host == guest, mirrored) pid to
 /// `(parent_tid, exit_signal)`: the guest tid to wake on the child's exit and the
@@ -62,7 +58,7 @@ pub struct ChildExitSiginfo {
 /// exit_signal)`. This intentionally sits beside the watch table instead of in a
 /// VMM backend: KVM and bhyve observe exits differently but need one neutral
 /// place to hand the CLD_* payload to the runtime's signal-frame builder.
-type ChildSiginfoQueue = HashMap<(i32, i32), VecDeque<ChildExitSiginfo>>;
+type ChildSiginfoQueue = HashMap<(i32, i32), PendingQueue<ChildExitSiginfo>>;
 
 static CHILD_SIGINFOS: Mutex<Option<ChildSiginfoQueue>> = Mutex::new(None);
 
@@ -156,10 +152,7 @@ pub fn record_siginfo(parent_tid: i32, exit_signal: i32, info: ChildExitSiginfo)
         .get_or_insert_with(HashMap::new)
         .entry((parent_tid, exit_signal))
         .or_default();
-    if exit_signal < 32 {
-        queue.clear();
-    }
-    queue.push_back(info);
+    queue.publish(info, exit_signal < 32);
 }
 
 /// Pop the queued child-exit payload for `(parent_tid, exit_signal)`, if any.
@@ -167,7 +160,7 @@ pub fn record_siginfo(parent_tid: i32, exit_signal: i32, info: ChildExitSiginfo)
 pub fn take_siginfo(parent_tid: i32, exit_signal: i32) -> Option<ChildExitSiginfo> {
     let mut guard = lock_siginfos();
     let queue = guard.as_mut()?.get_mut(&(parent_tid, exit_signal))?;
-    let front = queue.pop_front();
+    let front = queue.take();
     if queue.is_empty() {
         guard.as_mut()?.remove(&(parent_tid, exit_signal));
     }

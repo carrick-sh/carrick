@@ -4426,15 +4426,15 @@ fn legacy_aio_nowait_empty_pipe_publishes_eagain_completion() {
 fn final_pipe_description_close_disarms_fasync_registration() {
     const SYS_DUP: u64 = 23;
 
-    carrick_signal_core::fasync::fasync_init();
+    carrick_signal_linux::fasync::fasync_init();
     let mut rig = SpliceTestRig::new(0x10000);
     let (read_fd, write_fd) = rig.pipe2(0x4200);
     let pipe_id = rig
         .dispatcher
         .host_pipe_pipe_id(read_fd as i32)
         .expect("pipe id");
-    if let Some(owner) = carrick_signal_core::fasync::lookup(pipe_id) {
-        carrick_signal_core::fasync::disarm(pipe_id, owner.registration_id);
+    if let Some(owner) = carrick_signal_linux::fasync::lookup(pipe_id) {
+        carrick_signal_linux::fasync::disarm(pipe_id, owner.registration_id);
     }
 
     assert_eq!(
@@ -4451,7 +4451,7 @@ fn final_pipe_description_close_disarms_fasync_registration() {
         ),
         DispatchOutcome::Returned { value: 0 },
     );
-    assert!(carrick_signal_core::fasync::lookup(pipe_id).is_some());
+    assert!(carrick_signal_linux::fasync::lookup(pipe_id).is_some());
 
     let alias = match rig.run(SYS_DUP, [read_fd, 0, 0, 0, 0, 0]) {
         DispatchOutcome::Returned { value } => value as u64,
@@ -4459,12 +4459,12 @@ fn final_pipe_description_close_disarms_fasync_registration() {
     };
     rig.close(read_fd);
     assert!(
-        carrick_signal_core::fasync::lookup(pipe_id).is_some(),
+        carrick_signal_linux::fasync::lookup(pipe_id).is_some(),
         "closing one dup must retain the description's registration",
     );
     rig.close(alias);
     assert_eq!(
-        carrick_signal_core::fasync::lookup(pipe_id),
+        carrick_signal_linux::fasync::lookup(pipe_id),
         None,
         "the final description close must reclaim its FASYNC slot",
     );

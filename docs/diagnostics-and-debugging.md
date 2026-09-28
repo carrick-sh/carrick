@@ -421,6 +421,26 @@ ring is per-process and is reset on each guest fork (so a per-process core shows
 that process's own history); AF_UNIX `bind`/`connect` carry a `pathhash` so you
 can match a `connect` to the `bind` of the same socket across processes.
 
+There are **two rings of 8192 records each**. Per-dispatch scheduler records
+(`SCHED_*`) and per-poll epoll, eventfd and futex records (`EPWAIT`, `EPWFD`,
+`EPMASK*`, `EPEDGE`, `EPREADY`, `EPWAKE`, `EPCMSUM`, `EFD*`, `FUTEX*`) go to
+the **high-rate ring**. Everything else stays in the **lifecycle ring**: fork,
+exec, fd, wait, signal, fault and grant records. The list is
+`event_ring::is_high_rate`. The split exists because of a hung `go build`
+capture (`gbhang4`) whose single ring held 8192 `SCHED_DISPATCH` /
+`SCHED_BUDGET` / `EPWAIT` records from one tid and nothing else. A spin now
+fills only the high-rate ring. `carrick eventring` reads the lifecycle ring
+and `carrick eventring --high-rate` (alias `--sched`) reads the other.
+`carrick debug lldb-run` captures both in full. Its live kernel capture
+leaves `<run-id>.kernel-debug.json` for a coherent snapshot. When a held
+authority such as a wedge's MM mutation coordinator refuses the snapshot, it
+leaves `.kernel-debug.degraded.json` instead: per-task and per-thread state
+plus each coordinator's holder `tid`. With no capture at all it leaves
+`.kernel-debug.error.txt`. The manifest records which one. A post-mortem writes
+`event-ring.jsonl` and `event-ring-high-rate.jsonl`. Order across the two
+rings comes from the surrounding records, not from their separate logical
+indexes.
+
 > [!IMPORTANT]
 > Use the event ring when `carrick trace` perturbs the bug away. dtrace's
 > per-syscall probes change a timing-sensitive race's outcome (it stops
@@ -474,6 +494,46 @@ live-translation-arena campaign and was deleted with that mechanism in
 > `event_ring::{RING,IDX}` by symbol name) — the default release keeps them; a
 > stripped binary breaks the reader.
 
+### EL1 memory-fault forensics (ring kinds 68–80)
+
+Do not print-debug a guest memory fault. The host fault path records every
+decision it makes into the ring, keyed by Linux `tid` and the low 32 bits of
+the zone MM key, and `carrick eventring` decodes them. The packing of each
+kind is documented on its constant in `crates/carrick-kernel/src/event_ring.rs`.
+
+| Record | Where | What it says |
+|---|---|---|
+| `EL1GRANT_CLAIM` + `FAULT_VA` | `resolve_mutating_fault` | host claim of the EL1 frame-grant request: `none` / `response-pending` / `accepted`, access, request generation, fault VA |
+| `EL1GRANT_DECISION` (+ `EL1GRANT_BASE`, `EL1GRANT_IPA`) | same | `plan` (base, pages, prot), `refused/no-plan`, `refused/first-touch`, `refused/prepare`, or `ready` (semantic base, pages, physical IPA) |
+| `FIRST_TOUCH` + `FAULT_VA` | same, host first-touch path | resident plan (`committed` / `no-plan` / `arming-denied` / `backend-refused`), grow-down (`committed` / `no-plan` / `protect-failed`), stale stage-1 (`retried` / `not-retried` / `access-unknown`) |
+| `FAULTSIG` + `FAULTSIG_ADDR` / `_PC` / `_LEAF` / `_MBOXES` / `_MBOX` | `binding.rs` fault arms, just before `deliver_fault_signal` | signal, si_code, `fault_requires_mm_mutation`, the live stage-1 walk (`L<level>-valid|invalid-permits|denies`, full terminal descriptor), FAR/ESR/PC, and the non-idle frame-grant mailboxes (count, own slot, bitmask of slots 0–31, and up to 8 `slot=… state=…` rows) |
+| `MMOCC_REFUSE` | `MmOccupancy::install` | the `vCPU slot … already runs address space …` refusal: slot, running MM, requested MM |
+
+`CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL=1` turns the first SIGSEGV/SIGBUS the
+host is about to deliver to a guest thread into
+`carrick_fatal!("hvpatch::guest_fault_signal", …)`, after the `FAULTSIG`
+group is recorded. The ring, `CARRICK_LAST_FATAL` and every stack are then
+captured at the fault instead of after the guest handled or died of it. The
+variable is read once per carrier. The carrier inherits the `carrick run`
+environment, so setting it on `carrick debug lldb-run` reaches the carrier.
+`lldb-run` arms `CARRICK_FATAL_HOLD_SECS` by default and dumps on the hold
+line:
+
+```sh
+CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL=1 target/release/carrick debug lldb-run \
+  --deadline-seconds 35 --out-dir target/conformance/logs/lldb-runs \
+  --run-id <run-id> -- --fs host <image> <guest-command> <args>
+# then, from the core it wrote:
+lldb -c target/conformance/logs/lldb-runs/<run-id>.<pid>.core target/release/carrick \
+  -o "command script import scripts/carrick_lldb.py" \
+  -o "carrick eventring 512" -o "p CARRICK_LAST_FATAL" -o "thread backtrace all"
+```
+
+A runtime that raises SIGSEGV on purpose (Go nil-pointer panics, JVM safepoint
+polls, a probe testing `mprotect`) also trips the hatch. Use it only on a
+workload where the first fault signal is the bug. SIGTRAP from BRK or
+single-step never trips it.
+
 ### Guest address-space mapping: the debug-state JSON
 
 The `mappings`/`gva`/`info` subcommands translate guest VAs back to image /
@@ -510,6 +570,7 @@ violation (e.g. lost wake, dead child, poisoned lock, generation mismatch), it i
 - **Never use raw `std::process::abort()`**: raw abort carries no diagnosis into the core, and buffered stdout/stderr may not flush.
 - Always route fatal aborts through `carrick_fatal!(domain, ...)`. The macro formats into a non-allocating stack buffer, writes `carrick fatal [<domain>]: <msg>\n` directly to stderr (fd 2) via `libc::write`, fires any pre-abort hook registered via `carrick_fatal::set_hook`, publishes the event into the static `CARRICK_LAST_FATAL` record, and aborts via `std::process::abort()`.
 - To take a core of the exact failing graph, set `CARRICK_FATAL_HOLD_SECS=<n>` on the `carrick run` you are reproducing under: after the fatal line and `CARRICK_LAST_FATAL` are written the carrier prints `carrick fatal: holding <n> s for a debugger (pid <host pid>)` and sleeps before the hook and the abort, so `sudo lldb -p <pid> -o "process save-core <file>" -o "thread backtrace all" -o detach` captures it. `carrick debug lldb-run` attaches only at its deadline, which an invariant abort beats. Diagnostic only; unset or `0` leaves the fatal path unchanged.
+- To capture a guest memory fault at the moment the host decides to signal it, set `CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL=1`. The first SIGSEGV/SIGBUS bound for a guest thread becomes `carrick_fatal!("hvpatch::guest_fault_signal", …)` after the ring records the decision. See [EL1 memory-fault forensics](#el1-memory-fault-forensics-ring-kinds-6880). Diagnostic only; any other value leaves delivery unchanged.
 
 #### Format of `CARRICK_LAST_FATAL`
 The record is stored in a static global `CARRICK_LAST_FATAL` (crate `carrick-fatal`):
