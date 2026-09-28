@@ -944,6 +944,8 @@ pub(crate) fn semantic_vmas_from_boot_regions(
         let mut boundaries = vec![start, end];
         if !is_stack && !is_heap && !is_special {
             for mapping in file_mappings {
+                #[cfg(test)]
+                super::count_core_file_mapping_visit();
                 if mapping.start < end && mapping.end > start {
                     boundaries.push(mapping.start.max(start));
                     boundaries.push(mapping.end.min(end));
@@ -955,9 +957,11 @@ pub(crate) fn semantic_vmas_from_boot_regions(
         for window in boundaries.windows(2) {
             let start = window[0];
             let end = window[1];
-            let file_mapping = file_mappings
-                .iter()
-                .find(|fm| fm.start <= start && fm.end >= end);
+            let file_mapping = file_mappings.iter().find(|fm| {
+                #[cfg(test)]
+                super::count_core_file_mapping_visit();
+                fm.start <= start && fm.end >= end
+            });
             let file_page_offset = file_mapping.map(|fm| {
                 fm.file_page_offset + ((start - fm.start) / crate::core_dump::GUEST_PAGE as u64)
             });
