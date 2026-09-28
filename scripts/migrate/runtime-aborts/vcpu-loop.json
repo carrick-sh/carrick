@@ -1602,12 +1602,23 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
       "function": "resolve_mutating_fault",
       "ordinal_in_function": 1,
-      "fingerprint": "b65ff99eb202ca60c07a2de04ab973199fd1803f8223b2cc398768d42d358eea",
+      "fingerprint": "347b857190d6bdce8816af4cff9f72fbfb84623f3a52530d3f6341429360a860",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::el1_frame_grant",
       "rationale": "Authenticated frame grant could not publish Ready status to the guest mailbox.",
       "sink": "fatal",
       "domain": "hvpatch::el1_frame_grant"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "function": "abort_on_guest_fault_signal_if_armed",
+      "ordinal_in_function": 1,
+      "fingerprint": "dcd33cd1e62e98c8c563b84903081200888cfb7d12d426d31405ee2eb3425b18",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::guest_fault_signal",
+      "rationale": "Operator-armed diagnostic hatch CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL=1: the first SIGSEGV/SIGBUS bound for a guest thread aborts so a core captures the event ring, CARRICK_LAST_FATAL and every stack at the fault. Unarmed runs never reach it.",
+      "sink": "fatal",
+      "domain": "hvpatch::guest_fault_signal"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",

@@ -248,6 +248,69 @@ pub const SCHED_PREEMPT: u8 = 65;
 pub const SCHED_BUDGET: u8 = 66;
 /// Deadline scheduled for executor under contention. `a` is executor id, `b` is deadline delta in ms, `c` is demand ticket.
 pub const SCHED_DEADLINE: u8 = 67;
+/// Host claim of an EL1 frame-grant request on the forwarded-fault path.
+/// `a` is Linux TID, `b` is the low 32 bits of the zone MM key, `c` packs the
+/// claim outcome (bits 1:0, [`FrameGrantClaimOutcome`]), the faulting access
+/// (bits 3:2, [`RingAccess`]) and the low 28 bits of the claimed request
+/// generation (bits 31:4; zero unless the request was accepted). A
+/// [`FAULT_VA`] companion carries the full fault address.
+pub const EL1GRANT_CLAIM: u8 = 68;
+/// Full-width fault address companion of [`EL1GRANT_CLAIM`] and
+/// [`FIRST_TOUCH`]: `a:b` is the address, `c` the Linux TID.
+pub const FAULT_VA: u8 = 69;
+/// Host frame-grant decision. `a` is Linux TID, `b` is the low 32 bits of the
+/// request generation, `c` packs the [`FrameGrantDecision`] (bits 3:0), the
+/// Linux protection (bits 7:4) and the span in 4 KiB pages (bits 31:8,
+/// saturating). Plan and Ready decisions are followed by [`EL1GRANT_BASE`];
+/// Ready also by [`EL1GRANT_IPA`].
+pub const EL1GRANT_DECISION: u8 = 70;
+/// Semantic base of a granted/planned span: `a:b` is the VA, `c` the TID.
+pub const EL1GRANT_BASE: u8 = 71;
+/// Physical IPA of a published Ready grant: `a:b` is the IPA, `c` the TID.
+pub const EL1GRANT_IPA: u8 = 72;
+/// Host first-touch path result. `a` is Linux TID, `b` is the low 32 bits of
+/// the MM key, `c` packs the resident plan result (bits 2:0,
+/// [`FirstTouchResident`]), the grow-down result (bits 4:3,
+/// [`FirstTouchGrowdown`]), the stale-stage-1 result (bits 6:5,
+/// [`FirstTouchStale`]) and the access (bits 8:7, [`RingAccess`]). A
+/// [`FAULT_VA`] companion carries the address.
+pub const FIRST_TOUCH: u8 = 73;
+/// Synchronous fault signal about to be delivered to an EL0 thread. `a` is
+/// Linux TID, `b` the low 32 bits of the zone MM key (0 when none), `c` packs
+/// signal (bits 7:0), si_code (bits 15:8), `fault_requires_mm_mutation` (bit
+/// 16), live stage-1 walk available (bit 17), terminal descriptor valid (bit
+/// 18), terminal descriptor permits the access (bit 19), terminal level
+/// (bits 21:20), access (bits 23:22, [`RingAccess`]) and `from_el0_direct`
+/// (bit 24). Followed by [`FAULTSIG_ADDR`], [`FAULTSIG_PC`],
+/// [`FAULTSIG_LEAF`] and [`FAULTSIG_MBOXES`] (+ up to
+/// [`FAULTSIG_MBOX_RECORDS`] [`FAULTSIG_MBOX`]).
+pub const FAULTSIG: u8 = 74;
+/// `a:b` is the fault address (FAR), `c` the low 32 bits of ESR_EL1.
+pub const FAULTSIG_ADDR: u8 = 75;
+/// `a:b` is the faulting PC (ELR), `c` the Linux TID.
+pub const FAULTSIG_PC: u8 = 76;
+/// `a:b` is the terminal descriptor of the live stage-1 walk (0 when the walk
+/// was unavailable), `c` the Linux TID.
+pub const FAULTSIG_LEAF: u8 = 77;
+/// Frame-grant mailbox census at fault-signal time. `a` is Linux TID, `b`
+/// packs the number of non-idle mailboxes (bits 15:0) and the faulting vCPU's
+/// own mailbox slot plus one (bits 31:16; 0 = none), `c` is the non-idle
+/// bitmask of slots 0..=31.
+pub const FAULTSIG_MBOXES: u8 = 78;
+/// One non-idle frame-grant mailbox: `a` is Linux TID, `b` the slot, `c` the
+/// mailbox state (`FRAME_GRANT_MAILBOX_*`).
+pub const FAULTSIG_MBOX: u8 = 79;
+/// A vCPU slot refused an MM occupancy install. `a` is the execution slot,
+/// `b` the low 32 bits of the MM already running there, `c` the low 32 bits
+/// of the MM that asked to install.
+pub const MMOCC_REFUSE: u8 = 80;
+
+/// Highest event kind a reader accepts.
+const LAST_KIND: u8 = MMOCC_REFUSE;
+
+/// At most this many [`FAULTSIG_MBOX`] records follow one fault signal, so a
+/// census of all mailboxes never floods the ring.
+pub const FAULTSIG_MBOX_RECORDS: usize = 8;
 
 const HVPWAIT_ID_MASK: u32 = 0x00ff_ffff;
 
@@ -607,6 +670,299 @@ pub fn rec_hvpatch_blocked_continuation(
     );
 }
 
+/// The faulting access as recorded in fault records (2 bits).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RingAccess {
+    Unknown = 0,
+    Read = 1,
+    Write = 2,
+    Execute = 3,
+}
+
+/// Outcome of the host's claim of an EL1 frame-grant request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FrameGrantClaimOutcome {
+    /// No request for this exact fault (or no decodable access).
+    None = 0,
+    /// A response for this fault is already published; the fault retries.
+    ResponsePending = 1,
+    /// The host claimed the request and will answer it.
+    Accepted = 2,
+}
+
+/// Host decision for a claimed frame-grant request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FrameGrantDecision {
+    /// A resident plan names the span (base/len/prot follow).
+    PlanFound = 0,
+    /// Refused: no resident plan covers the fault.
+    NoPlan = 1,
+    /// Refused: the plan's protection denies the faulting access.
+    FirstTouchDenied = 2,
+    /// Refused: the backend could not prepare the grant.
+    PrepareRefused = 3,
+    /// Ready published to EL1 (base/len/IPA follow).
+    Ready = 4,
+}
+
+/// Host first-touch resident-plan result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FirstTouchResident {
+    NotReached = 0,
+    Committed = 1,
+    NoPlan = 2,
+    ArmingDenied = 3,
+    BackendRefused = 4,
+}
+
+/// Host grow-down stack extension result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FirstTouchGrowdown {
+    NotReached = 0,
+    Committed = 1,
+    NoPlan = 2,
+    ProtectFailed = 3,
+}
+
+/// Host stale-stage-1 leaf retry result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FirstTouchStale {
+    NotReached = 0,
+    Retried = 1,
+    NotRetried = 2,
+    AccessUnknown = 3,
+}
+
+#[inline]
+fn rec_u64(kind: u8, value: u64, detail: i32) {
+    rec(
+        kind,
+        value as u32 as i32,
+        (value >> 32) as u32 as i32,
+        detail,
+    );
+}
+
+#[inline]
+fn low32(value: u64) -> i32 {
+    value as u32 as i32
+}
+
+#[inline]
+fn encode_frame_grant_claim(
+    outcome: FrameGrantClaimOutcome,
+    access: RingAccess,
+    request_generation: u64,
+) -> i32 {
+    ((outcome as u32 & 0x3)
+        | ((access as u32 & 0x3) << 2)
+        | (((request_generation & 0x0fff_ffff) as u32) << 4)) as i32
+}
+
+/// Record the host's claim of an EL1 frame-grant request for one forwarded
+/// fault. `request_generation` is 0 unless the request was accepted.
+#[inline]
+pub fn rec_el1_frame_grant_claim(
+    tid: i32,
+    mm_key: u64,
+    fault_va: u64,
+    access: RingAccess,
+    outcome: FrameGrantClaimOutcome,
+    request_generation: u64,
+) {
+    rec(
+        EL1GRANT_CLAIM,
+        tid,
+        low32(mm_key),
+        encode_frame_grant_claim(outcome, access, request_generation),
+    );
+    rec_u64(FAULT_VA, fault_va, tid);
+}
+
+#[inline]
+fn encode_frame_grant_decision(decision: FrameGrantDecision, prot: u64, len: u64) -> i32 {
+    let pages = (len >> 12).min(0x00ff_ffff) as u32;
+    ((decision as u32 & 0xf) | (((prot & 0xf) as u32) << 4) | (pages << 8)) as i32
+}
+
+/// Record the host's decision for a claimed frame-grant request. `base` is
+/// the planned/granted semantic base (recorded for PlanFound and Ready);
+/// `physical_ipa` is recorded for Ready only. `len` is the planned/granted
+/// span, or the requested span for a NoPlan refusal.
+#[inline]
+pub fn rec_el1_frame_grant_decision(
+    tid: i32,
+    request_generation: u64,
+    decision: FrameGrantDecision,
+    prot: u64,
+    len: u64,
+    base: Option<u64>,
+    physical_ipa: Option<u64>,
+) {
+    rec(
+        EL1GRANT_DECISION,
+        tid,
+        low32(request_generation),
+        encode_frame_grant_decision(decision, prot, len),
+    );
+    if let Some(base) = base {
+        rec_u64(EL1GRANT_BASE, base, tid);
+    }
+    if let Some(ipa) = physical_ipa {
+        rec_u64(EL1GRANT_IPA, ipa, tid);
+    }
+}
+
+#[inline]
+fn encode_first_touch(
+    resident: FirstTouchResident,
+    growdown: FirstTouchGrowdown,
+    stale: FirstTouchStale,
+    access: RingAccess,
+) -> i32 {
+    ((resident as u32 & 0x7)
+        | ((growdown as u32 & 0x3) << 3)
+        | ((stale as u32 & 0x3) << 5)
+        | ((access as u32 & 0x3) << 7)) as i32
+}
+
+/// The host first-touch path result for one mutating fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirstTouchRecord {
+    pub tid: i32,
+    pub mm_key: u64,
+    pub fault_va: u64,
+    pub access: RingAccess,
+    pub resident: FirstTouchResident,
+    pub growdown: FirstTouchGrowdown,
+    pub stale: FirstTouchStale,
+}
+
+/// Record the host first-touch path result for one mutating fault.
+#[inline]
+pub fn rec_first_touch(record: &FirstTouchRecord) {
+    rec(
+        FIRST_TOUCH,
+        record.tid,
+        low32(record.mm_key),
+        encode_first_touch(
+            record.resident,
+            record.growdown,
+            record.stale,
+            record.access,
+        ),
+    );
+    rec_u64(FAULT_VA, record.fault_va, record.tid);
+}
+
+/// The live stage-1 walk of a fault address, summarized for the ring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RingStage1Walk {
+    /// Level (0..=3) of the descriptor that terminated the walk.
+    pub terminal_level: u8,
+    /// The terminating descriptor.
+    pub terminal_descriptor: u64,
+    /// Whether the terminating descriptor is valid.
+    pub terminal_valid: bool,
+    /// Whether it permits the faulting EL0 access.
+    pub permits_access: bool,
+}
+
+/// Everything a fault-signal delivery decision records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FaultSignalRecord {
+    pub tid: i32,
+    pub mm_key: Option<u64>,
+    pub signum: i32,
+    pub si_code: i32,
+    pub fault_address: u64,
+    pub esr: u64,
+    pub pc: u64,
+    pub requires_mm_mutation: bool,
+    pub from_el0_direct: bool,
+    pub access: RingAccess,
+    /// `None` when the live walk was unavailable.
+    pub walk: Option<RingStage1Walk>,
+}
+
+#[inline]
+fn encode_fault_signal(record: &FaultSignalRecord) -> i32 {
+    let mut packed = (record.signum as u32 & 0xff) | ((record.si_code as u32 & 0xff) << 8);
+    packed |= u32::from(record.requires_mm_mutation) << 16;
+    if let Some(walk) = record.walk {
+        packed |= 1 << 17;
+        packed |= u32::from(walk.terminal_valid) << 18;
+        packed |= u32::from(walk.permits_access) << 19;
+        packed |= (u32::from(walk.terminal_level) & 0x3) << 20;
+    }
+    packed |= (record.access as u32 & 0x3) << 22;
+    packed |= u32::from(record.from_el0_direct) << 24;
+    packed as i32
+}
+
+/// Record a fault-signal delivery decision and its live stage-1 walk, then a
+/// bounded census of non-idle frame-grant mailboxes. `mailboxes` yields every
+/// `(slot, state)` whose state is not idle; the census consumes it without
+/// allocating and records at most [`FAULTSIG_MBOX_RECORDS`] slots.
+pub fn rec_fault_signal(
+    record: &FaultSignalRecord,
+    own_mailbox_slot: Option<usize>,
+    mailboxes: impl IntoIterator<Item = (usize, u32)>,
+) {
+    let tid = record.tid;
+    rec(
+        FAULTSIG,
+        tid,
+        record.mm_key.map_or(0, low32),
+        encode_fault_signal(record),
+    );
+    rec_u64(FAULTSIG_ADDR, record.fault_address, low32(record.esr));
+    rec_u64(FAULTSIG_PC, record.pc, tid);
+    rec_u64(
+        FAULTSIG_LEAF,
+        record.walk.map_or(0, |walk| walk.terminal_descriptor),
+        tid,
+    );
+    let mut listed = [(0_u32, 0_u32); FAULTSIG_MBOX_RECORDS];
+    let mut count = 0_usize;
+    let mut low_mask = 0_u32;
+    for (slot, state) in mailboxes {
+        if slot < 32 {
+            low_mask |= 1 << slot;
+        }
+        if let Some(entry) = listed.get_mut(count) {
+            *entry = (slot.min(i32::MAX as usize) as u32, state);
+        }
+        count += 1;
+    }
+    let own = own_mailbox_slot.map_or(0, |slot| (slot.min(0xfffe) + 1) as u32);
+    rec(
+        FAULTSIG_MBOXES,
+        tid,
+        ((count.min(0xffff) as u32) | (own << 16)) as i32,
+        low_mask as i32,
+    );
+    for &(slot, state) in listed.iter().take(count) {
+        rec(FAULTSIG_MBOX, tid, slot as i32, state as i32);
+    }
+}
+
+/// Record a refused MM occupancy install of `slot`.
+#[inline]
+pub fn rec_mm_occupancy_refused(slot: usize, running_mm: u64, requested_mm: u64) {
+    rec(
+        MMOCC_REFUSE,
+        slot.min(i32::MAX as usize) as i32,
+        low32(running_mm),
+        low32(requested_mm),
+    );
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventRecord {
     pub logical_index: u64,
@@ -649,7 +1005,7 @@ pub enum RingReadError {
 }
 
 const fn known_kind(kind: u8) -> bool {
-    kind >= BIND && kind <= SCHED_DEADLINE
+    kind >= BIND && kind <= LAST_KIND
 }
 
 fn read_slot_after(
@@ -831,6 +1187,89 @@ fn maybe_start_watchdog() {
         });
 }
 
+#[cfg(any(test, feature = "event-ring-dump"))]
+fn join_u64(a: i32, b: i32) -> u64 {
+    (a as u32 as u64) | ((b as u32 as u64) << 32)
+}
+
+#[cfg(any(test, feature = "event-ring-dump"))]
+fn ring_access_name(code: u32) -> &'static str {
+    match code {
+        1 => "read",
+        2 => "write",
+        3 => "exec",
+        _ => "unknown",
+    }
+}
+
+#[cfg(any(test, feature = "event-ring-dump"))]
+fn ring_claim_outcome_name(code: u32) -> &'static str {
+    match code {
+        0 => "none",
+        1 => "response-pending",
+        2 => "accepted",
+        _ => "unknown",
+    }
+}
+
+#[cfg(any(test, feature = "event-ring-dump"))]
+fn ring_grant_decision_name(code: u32) -> &'static str {
+    match code {
+        0 => "plan",
+        1 => "refused/no-plan",
+        2 => "refused/first-touch",
+        3 => "refused/prepare",
+        4 => "ready",
+        _ => "unknown",
+    }
+}
+
+#[cfg(any(test, feature = "event-ring-dump"))]
+fn ring_first_touch_resident_name(code: u32) -> &'static str {
+    match code {
+        0 => "not-reached",
+        1 => "committed",
+        2 => "no-plan",
+        3 => "arming-denied",
+        4 => "backend-refused",
+        _ => "unknown",
+    }
+}
+
+#[cfg(any(test, feature = "event-ring-dump"))]
+fn ring_first_touch_growdown_name(code: u32) -> &'static str {
+    match code {
+        0 => "not-reached",
+        1 => "committed",
+        2 => "no-plan",
+        3 => "protect-failed",
+        _ => "unknown",
+    }
+}
+
+#[cfg(any(test, feature = "event-ring-dump"))]
+fn ring_first_touch_stale_name(code: u32) -> &'static str {
+    match code {
+        0 => "not-reached",
+        1 => "retried",
+        2 => "not-retried",
+        3 => "access-unknown",
+        _ => "unknown",
+    }
+}
+
+#[cfg(any(test, feature = "event-ring-dump"))]
+fn ring_mailbox_state_name(state: u32) -> &'static str {
+    match state {
+        carrick_el1_abi::FRAME_GRANT_MAILBOX_IDLE => "idle",
+        carrick_el1_abi::FRAME_GRANT_MAILBOX_GUEST_WRITING => "guest-writing",
+        carrick_el1_abi::FRAME_GRANT_MAILBOX_REQUESTED => "requested",
+        carrick_el1_abi::FRAME_GRANT_MAILBOX_HOST_WORKING => "host-working",
+        carrick_el1_abi::FRAME_GRANT_MAILBOX_RESPONSE => "response",
+        carrick_el1_abi::FRAME_GRANT_MAILBOX_GUEST_CONSUMING => "guest-consuming",
+        _ => "unknown",
+    }
+}
 #[cfg(any(test, feature = "event-ring-dump"))]
 fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
     match kind {
@@ -1140,6 +1579,99 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         SCHED_PREEMPT => format!("SCHED_PREEMPT tid={a} executor={b} reasons={:#x}", c as u32),
         SCHED_BUDGET => format!("SCHED_BUDGET executor={a} budget_ms={b} generation={c}"),
         SCHED_DEADLINE => format!("SCHED_DEADLINE executor={a} deadline_ms={b} ticket={c}"),
+        EL1GRANT_CLAIM => {
+            let packed = c as u32;
+            format!(
+                "EL1GRANT_CLAIM tid={a} mm={} outcome={} access={} generation={}",
+                b as u32,
+                ring_claim_outcome_name(packed & 0x3),
+                ring_access_name((packed >> 2) & 0x3),
+                packed >> 4
+            )
+        }
+        FAULT_VA => format!("FAULT_VA tid={c} va={:#018x}", join_u64(a, b)),
+        EL1GRANT_DECISION => {
+            let packed = c as u32;
+            format!(
+                "EL1GRANT_DECISION tid={a} generation={} decision={} prot={:#x} pages={}",
+                b as u32,
+                ring_grant_decision_name(packed & 0xf),
+                (packed >> 4) & 0xf,
+                packed >> 8
+            )
+        }
+        EL1GRANT_BASE => format!("EL1GRANT_BASE tid={c} base={:#018x}", join_u64(a, b)),
+        EL1GRANT_IPA => format!("EL1GRANT_IPA tid={c} ipa={:#018x}", join_u64(a, b)),
+        FIRST_TOUCH => {
+            let packed = c as u32;
+            format!(
+                "FIRST_TOUCH tid={a} mm={} resident={} growdown={} stale={} access={}",
+                b as u32,
+                ring_first_touch_resident_name(packed & 0x7),
+                ring_first_touch_growdown_name((packed >> 3) & 0x3),
+                ring_first_touch_stale_name((packed >> 5) & 0x3),
+                ring_access_name((packed >> 7) & 0x3)
+            )
+        }
+        FAULTSIG => {
+            let packed = c as u32;
+            let walk = if packed & (1 << 17) == 0 {
+                "unavailable".to_owned()
+            } else {
+                format!(
+                    "L{}-{}-{}",
+                    (packed >> 20) & 0x3,
+                    if packed & (1 << 18) != 0 {
+                        "valid"
+                    } else {
+                        "invalid"
+                    },
+                    if packed & (1 << 19) != 0 {
+                        "permits"
+                    } else {
+                        "denies"
+                    }
+                )
+            };
+            format!(
+                "FAULTSIG tid={a} mm={} signal={} si_code={} mutating={} walk={walk} access={} direct={}",
+                b as u32,
+                packed & 0xff,
+                (packed >> 8) & 0xff,
+                packed & (1 << 16) != 0,
+                ring_access_name((packed >> 22) & 0x3),
+                packed & (1 << 24) != 0
+            )
+        }
+        FAULTSIG_ADDR => format!(
+            "FAULTSIG_ADDR far={:#018x} esr={:#010x}",
+            join_u64(a, b),
+            c as u32
+        ),
+        FAULTSIG_PC => format!("FAULTSIG_PC tid={c} pc={:#018x}", join_u64(a, b)),
+        FAULTSIG_LEAF => format!("FAULTSIG_LEAF tid={c} leaf={:#018x}", join_u64(a, b)),
+        FAULTSIG_MBOXES => {
+            let packed = b as u32;
+            let own = packed >> 16;
+            format!(
+                "FAULTSIG_MBOXES tid={a} busy={} own_slot={} mask0_31={:#010x}",
+                packed & 0xffff,
+                if own == 0 {
+                    "none".to_owned()
+                } else {
+                    (own - 1).to_string()
+                },
+                c as u32
+            )
+        }
+        FAULTSIG_MBOX => format!(
+            "FAULTSIG_MBOX tid={a} slot={b} state={}",
+            ring_mailbox_state_name(c as u32)
+        ),
+        MMOCC_REFUSE => format!(
+            "MMOCC_REFUSE slot={a} running_mm={} requested_mm={}",
+            b as u32, c as u32
+        ),
         _ => String::new(),
     }
 }
@@ -1836,5 +2368,234 @@ mod tests {
         assert!(contains_event(SCHED_BUDGET, 5, 4, 12));
         assert!(contains_event(SCHED_DEADLINE, 5, 3, 42));
         assert!(contains_event(SCHED_PREEMPT, 101, 5, 0x01));
+    }
+
+    /// The next record after the most recent `(kind, a)` match, oldest first:
+    /// lets a test read back the packed words a helper actually published.
+    fn latest_event(kind: u8, a: i32) -> Option<EventRecord> {
+        drain_recent(N)
+            .into_iter()
+            .rev()
+            .filter_map(Result::ok)
+            .find(|event| event.kind == kind && event.a == a)
+    }
+
+    fn latest_companion(kind: u8, c: i32) -> Option<EventRecord> {
+        drain_recent(N)
+            .into_iter()
+            .rev()
+            .filter_map(Result::ok)
+            .find(|event| event.kind == kind && event.c == c)
+    }
+
+    fn decoded(event: EventRecord) -> String {
+        decode(event.kind, event.a, event.b, event.c)
+    }
+
+    #[test]
+    fn fault_forensics_kinds_are_contiguous_and_readable() {
+        assert_eq!(EL1GRANT_CLAIM, SCHED_DEADLINE + 1);
+        assert_eq!(MMOCC_REFUSE, 80);
+        for kind in EL1GRANT_CLAIM..=MMOCC_REFUSE {
+            assert!(known_kind(kind), "kind {kind} must be readable");
+            assert!(!decode(kind, 0, 0, 0).is_empty(), "kind {kind} decodes");
+        }
+        assert!(!known_kind(MMOCC_REFUSE + 1));
+    }
+
+    #[test]
+    fn el1_frame_grant_claim_round_trips() {
+        let tid = 71_001;
+        rec_el1_frame_grant_claim(
+            tid,
+            0x1_0000_0007,
+            0x0000_ffff_8000_1234,
+            RingAccess::Write,
+            FrameGrantClaimOutcome::Accepted,
+            0x1234_5678_9,
+        );
+        let claim = latest_event(EL1GRANT_CLAIM, tid).expect("claim record");
+        assert_eq!(
+            decoded(claim),
+            // The low 28 bits of 0x1_2345_6789.
+            "EL1GRANT_CLAIM tid=71001 mm=7 outcome=accepted access=write generation=54880137"
+        );
+        let va = latest_companion(FAULT_VA, tid).expect("fault va companion");
+        assert_eq!(decoded(va), "FAULT_VA tid=71001 va=0x0000ffff80001234");
+
+        rec_el1_frame_grant_claim(
+            tid + 1,
+            3,
+            0x4000,
+            RingAccess::Unknown,
+            FrameGrantClaimOutcome::ResponsePending,
+            0,
+        );
+        assert_eq!(
+            decoded(latest_event(EL1GRANT_CLAIM, tid + 1).expect("pending claim")),
+            "EL1GRANT_CLAIM tid=71002 mm=3 outcome=response-pending access=unknown generation=0"
+        );
+    }
+
+    #[test]
+    fn el1_frame_grant_decision_round_trips() {
+        let tid = 72_001;
+        rec_el1_frame_grant_decision(
+            tid,
+            41,
+            FrameGrantDecision::Ready,
+            0x3,
+            0x10_000,
+            Some(0x0000_aaaa_0000_0000),
+            Some(0x0000_0040_1234_5000),
+        );
+        assert_eq!(
+            decoded(latest_event(EL1GRANT_DECISION, tid).expect("decision")),
+            "EL1GRANT_DECISION tid=72001 generation=41 decision=ready prot=0x3 pages=16"
+        );
+        assert_eq!(
+            decoded(latest_companion(EL1GRANT_BASE, tid).expect("base")),
+            "EL1GRANT_BASE tid=72001 base=0x0000aaaa00000000"
+        );
+        assert_eq!(
+            decoded(latest_companion(EL1GRANT_IPA, tid).expect("ipa")),
+            "EL1GRANT_IPA tid=72001 ipa=0x0000004012345000"
+        );
+
+        rec_el1_frame_grant_decision(
+            tid + 1,
+            42,
+            FrameGrantDecision::NoPlan,
+            0,
+            u64::MAX,
+            None,
+            None,
+        );
+        assert_eq!(
+            decoded(latest_event(EL1GRANT_DECISION, tid + 1).expect("refusal")),
+            "EL1GRANT_DECISION tid=72002 generation=42 decision=refused/no-plan prot=0x0 pages=16777215"
+        );
+        assert!(latest_companion(EL1GRANT_BASE, tid + 1).is_none());
+    }
+
+    #[test]
+    fn first_touch_round_trips() {
+        let tid = 73_001;
+        rec_first_touch(&FirstTouchRecord {
+            tid,
+            mm_key: 9,
+            fault_va: 0xffff_0000,
+            access: RingAccess::Execute,
+            resident: FirstTouchResident::BackendRefused,
+            growdown: FirstTouchGrowdown::ProtectFailed,
+            stale: FirstTouchStale::NotRetried,
+        });
+        assert_eq!(
+            decoded(latest_event(FIRST_TOUCH, tid).expect("first touch")),
+            "FIRST_TOUCH tid=73001 mm=9 resident=backend-refused growdown=protect-failed stale=not-retried access=exec"
+        );
+        assert_eq!(
+            decoded(latest_companion(FAULT_VA, tid).expect("va")),
+            "FAULT_VA tid=73001 va=0x00000000ffff0000"
+        );
+    }
+
+    #[test]
+    fn fault_signal_round_trips_with_bounded_mailbox_census() {
+        let tid = 74_001;
+        let record = FaultSignalRecord {
+            tid,
+            mm_key: Some(0x5_0000_0011),
+            signum: 11,
+            si_code: 2,
+            fault_address: 0x0000_ffff_dead_b000,
+            esr: 0x9200_004f,
+            pc: 0x0000_aaaa_0000_1000,
+            requires_mm_mutation: true,
+            from_el0_direct: true,
+            access: RingAccess::Write,
+            walk: Some(RingStage1Walk {
+                terminal_level: 3,
+                terminal_descriptor: 0x0060_0000_1234_5f43,
+                terminal_valid: true,
+                permits_access: false,
+            }),
+        };
+        // Twelve busy mailboxes: the census counts all of them but lists
+        // only FAULTSIG_MBOX_RECORDS.
+        let busy = (0..12_usize).map(|index| (index * 3, 3_u32));
+        rec_fault_signal(&record, Some(2), busy);
+
+        assert_eq!(
+            decoded(latest_event(FAULTSIG, tid).expect("fault signal")),
+            "FAULTSIG tid=74001 mm=17 signal=11 si_code=2 mutating=true walk=L3-valid-denies access=write direct=true"
+        );
+        let addr = drain_recent(N)
+            .into_iter()
+            .rev()
+            .filter_map(Result::ok)
+            .find(|event| event.kind == FAULTSIG_ADDR && event.c == 0x9200_004f_u32 as i32)
+            .expect("address record");
+        assert_eq!(
+            decoded(addr),
+            "FAULTSIG_ADDR far=0x0000ffffdeadb000 esr=0x9200004f"
+        );
+        assert_eq!(
+            decoded(latest_companion(FAULTSIG_PC, tid).expect("pc")),
+            "FAULTSIG_PC tid=74001 pc=0x0000aaaa00001000"
+        );
+        assert_eq!(
+            decoded(latest_companion(FAULTSIG_LEAF, tid).expect("leaf")),
+            "FAULTSIG_LEAF tid=74001 leaf=0x0060000012345f43"
+        );
+        let mask = (0..11_u32)
+            .map(|index| index * 3)
+            .filter(|slot| *slot < 32)
+            .fold(0_u32, |mask, slot| mask | (1 << slot));
+        assert_eq!(
+            decoded(latest_event(FAULTSIG_MBOXES, tid).expect("census")),
+            format!("FAULTSIG_MBOXES tid=74001 busy=12 own_slot=2 mask0_31={mask:#010x}")
+        );
+        let listed = drain_recent(N)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|event| event.kind == FAULTSIG_MBOX && event.a == tid)
+            .count();
+        assert_eq!(listed, FAULTSIG_MBOX_RECORDS);
+        assert!(contains_event(FAULTSIG_MBOX, tid, 21, 3));
+        assert!(!contains_event(FAULTSIG_MBOX, tid, 24, 3));
+        assert_eq!(
+            decode(FAULTSIG_MBOX, tid, 21, 3),
+            "FAULTSIG_MBOX tid=74001 slot=21 state=host-working"
+        );
+
+        let unavailable = FaultSignalRecord {
+            tid: tid + 1,
+            mm_key: None,
+            walk: None,
+            requires_mm_mutation: false,
+            from_el0_direct: false,
+            access: RingAccess::Unknown,
+            ..record
+        };
+        rec_fault_signal(&unavailable, None, std::iter::empty());
+        assert_eq!(
+            decoded(latest_event(FAULTSIG, tid + 1).expect("no-walk signal")),
+            "FAULTSIG tid=74002 mm=0 signal=11 si_code=2 mutating=false walk=unavailable access=unknown direct=false"
+        );
+        assert_eq!(
+            decoded(latest_event(FAULTSIG_MBOXES, tid + 1).expect("empty census")),
+            "FAULTSIG_MBOXES tid=74002 busy=0 own_slot=none mask0_31=0x00000000"
+        );
+    }
+
+    #[test]
+    fn mm_occupancy_refusal_round_trips() {
+        rec_mm_occupancy_refused(75, 0x1_0000_0004, 9);
+        assert!(contains_event(MMOCC_REFUSE, 75, 4, 9));
+        assert_eq!(
+            decode(MMOCC_REFUSE, 75, 4, 9),
+            "MMOCC_REFUSE slot=75 running_mm=4 requested_mm=9"
+        );
     }
 }

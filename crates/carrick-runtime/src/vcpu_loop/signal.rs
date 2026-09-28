@@ -313,6 +313,20 @@ fn frame_grant_access(access: Option<carrick_mmu_core::aarch64::LeafAccess>) -> 
     }
 }
 
+/// The event-ring encoding of a decoded fault access.
+pub(super) fn ring_access(
+    access: Option<carrick_mmu_core::aarch64::LeafAccess>,
+) -> carrick_kernel::event_ring::RingAccess {
+    use carrick_kernel::event_ring::RingAccess;
+    use carrick_mmu_core::aarch64::LeafAccess;
+    match access {
+        None => RingAccess::Unknown,
+        Some(LeafAccess::Read) => RingAccess::Read,
+        Some(LeafAccess::Write) => RingAccess::Write,
+        Some(LeafAccess::Execute) => RingAccess::Execute,
+    }
+}
+
 fn claim_frame_grant_request(
     mailbox: &carrick_el1_abi::FrameGrantMailbox,
     mm_key: u64,
@@ -398,12 +412,33 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
             );
         }
     };
+    use carrick_kernel::event_ring::{
+        self as ring, FirstTouchGrowdown, FirstTouchResident, FirstTouchStale,
+        FrameGrantClaimOutcome, FrameGrantDecision,
+    };
+    let ring_tid = tid.raw();
+    let mm_key = mutation.host_alias_permit().mm().raw();
     if let Some(mailbox) = engine
         .mailbox_slot()
         .and_then(carrick_el1_abi::frame_grant_mailbox_host_for_slot)
     {
-        let mm_key = mutation.host_alias_permit().mm().raw();
-        match claim_frame_grant_request(mailbox, mm_key, address, access) {
+        let claim = claim_frame_grant_request(mailbox, mm_key, address, access);
+        let (outcome, generation) = match claim {
+            FrameGrantClaim::None => (FrameGrantClaimOutcome::None, 0),
+            FrameGrantClaim::ResponsePending => (FrameGrantClaimOutcome::ResponsePending, 0),
+            FrameGrantClaim::Accepted(request) => {
+                (FrameGrantClaimOutcome::Accepted, request.request_generation)
+            }
+        };
+        ring::rec_el1_frame_grant_claim(
+            ring_tid,
+            mm_key,
+            address,
+            ring_access(access),
+            outcome,
+            generation,
+        );
+        match claim {
             FrameGrantClaim::None => {}
             FrameGrantClaim::ResponsePending => return Ok(true),
             FrameGrantClaim::Accepted(request) => {
@@ -411,6 +446,15 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                 let Some(plan) =
                     dispatcher.resident_frame_grant_plan(&permit, address, request.requested_len)
                 else {
+                    ring::rec_el1_frame_grant_decision(
+                        ring_tid,
+                        request.request_generation,
+                        FrameGrantDecision::NoPlan,
+                        0,
+                        request.requested_len,
+                        None,
+                        None,
+                    );
                     publish_frame_grant_refusal(
                         mailbox,
                         request,
@@ -426,7 +470,25 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     prot,
                     request.request_generation,
                 );
+                ring::rec_el1_frame_grant_decision(
+                    ring_tid,
+                    request.request_generation,
+                    FrameGrantDecision::PlanFound,
+                    prot,
+                    plan.len(),
+                    Some(plan.start()),
+                    None,
+                );
                 if apply_first_touch(prot, access, || true, || {}) != Some(true) {
+                    ring::rec_el1_frame_grant_decision(
+                        ring_tid,
+                        request.request_generation,
+                        FrameGrantDecision::FirstTouchDenied,
+                        prot,
+                        plan.len(),
+                        None,
+                        None,
+                    );
                     publish_frame_grant_refusal(
                         mailbox,
                         request,
@@ -444,6 +506,15 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     permissions: prot,
                 };
                 let Some(ready) = engine.prepare_el1_frame_grant(service)? else {
+                    ring::rec_el1_frame_grant_decision(
+                        ring_tid,
+                        request.request_generation,
+                        FrameGrantDecision::PrepareRefused,
+                        prot,
+                        service.len,
+                        None,
+                        None,
+                    );
                     publish_frame_grant_refusal(
                         mailbox,
                         request,
@@ -472,11 +543,29 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         service.len
                     );
                 }
+                ring::rec_el1_frame_grant_decision(
+                    ring_tid,
+                    request.request_generation,
+                    FrameGrantDecision::Ready,
+                    service.permissions,
+                    service.len,
+                    Some(service.semantic_base),
+                    Some(ready.physical_ipa),
+                );
                 dispatcher.commit_resident_frame_grant(plan);
                 return Ok(true);
             }
         }
     }
+    let mut first_touch = ring::FirstTouchRecord {
+        tid: ring_tid,
+        mm_key,
+        fault_va: address,
+        access: ring_access(access),
+        resident: FirstTouchResident::NotReached,
+        growdown: FirstTouchGrowdown::NotReached,
+        stale: FirstTouchStale::NotReached,
+    };
     {
         let permit = mutation.host_alias_permit();
         if let Some(plan) = dispatcher.resident_fault_plan(&permit, address) {
@@ -498,42 +587,135 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                 },
                 || dispatcher.commit_resident_fault(plan),
             ) {
-                Some(true) => return Ok(true),
+                Some(true) => {
+                    first_touch.resident = FirstTouchResident::Committed;
+                    ring::rec_first_touch(&first_touch);
+                    return Ok(true);
+                }
                 Some(false) => {
                     notify_first_touch_deliver(DeliverReason::ArmingDenies);
+                    first_touch.resident = FirstTouchResident::ArmingDenied;
+                    ring::rec_first_touch(&first_touch);
                     return Ok(false);
                 }
-                None => notify_first_touch_deliver(DeliverReason::BackendRefused),
+                None => {
+                    notify_first_touch_deliver(DeliverReason::BackendRefused);
+                    first_touch.resident = FirstTouchResident::BackendRefused;
+                }
             }
         } else {
             notify_first_touch_deliver(DeliverReason::NoPendingEdit);
+            first_touch.resident = FirstTouchResident::NoPlan;
         }
     }
     {
         let permit = mutation.host_alias_permit();
-        if let Some(plan) = dispatcher.mmap_growdown_fault_plan(&permit, address)
-            && engine
-                .protect_range(
-                    plan.start(),
-                    plan.len(),
-                    crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
-                )
-                .is_ok()
-        {
-            dispatcher.commit_mmap_growdown(plan);
-            return Ok(true);
-        }
+        first_touch.growdown = match dispatcher.mmap_growdown_fault_plan(&permit, address) {
+            None => FirstTouchGrowdown::NoPlan,
+            Some(plan) => {
+                if engine
+                    .protect_range(
+                        plan.start(),
+                        plan.len(),
+                        crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
+                    )
+                    .is_ok()
+                {
+                    dispatcher.commit_mmap_growdown(plan);
+                    first_touch.growdown = FirstTouchGrowdown::Committed;
+                    ring::rec_first_touch(&first_touch);
+                    return Ok(true);
+                }
+                FirstTouchGrowdown::ProtectFailed
+            }
+        };
     }
     let Some(access) = access else {
+        first_touch.stale = FirstTouchStale::AccessUnknown;
+        ring::rec_first_touch(&first_touch);
         return Ok(false);
     };
     let retried = engine.resolve_stale_stage1_fault(address, access)?;
     if retried {
         crate::probes::hvpatch_stale_stage1_retry(address, access as u32, tid.raw());
+        first_touch.stale = FirstTouchStale::Retried;
     } else {
         notify_first_touch_deliver(DeliverReason::StaleLeafNotRetried);
+        first_touch.stale = FirstTouchStale::NotRetried;
     }
+    ring::rec_first_touch(&first_touch);
     Ok(retried)
+}
+
+/// `CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL=1`: turn the first synchronous
+/// SIGSEGV/SIGBUS the host is about to deliver to an EL0 guest thread into a
+/// `carrick_fatal!`, so a core or `carrick debug lldb-run` captures the event
+/// ring, `CARRICK_LAST_FATAL` and every stack at that instant. Read once per
+/// carrier; any other value (or unset) leaves delivery unchanged.
+fn abort_on_guest_fault_signal_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL").is_ok_and(|value| value.trim() == "1")
+    })
+}
+
+/// Whether `signum` is a synchronous memory-fault signal the abort hatch
+/// converts (SIGSEGV or SIGBUS; never the debug-class SIGTRAP).
+fn is_memory_fault_signal(signum: i32) -> bool {
+    signum == crate::linux_abi::LINUX_SIGSEGV || signum == crate::linux_abi::LINUX_SIGBUS
+}
+
+/// Abort instead of delivering a memory-fault signal when the
+/// `CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL` hatch is armed. The caller records
+/// the ring first, so the core holds the decision that led here.
+pub(super) fn abort_on_guest_fault_signal_if_armed(
+    record: &carrick_kernel::event_ring::FaultSignalRecord,
+) {
+    if !is_memory_fault_signal(record.signum) || !abort_on_guest_fault_signal_enabled() {
+        return;
+    }
+    carrick_fatal::carrick_fatal!(
+        "hvpatch::guest_fault_signal",
+        "CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL: tid={} mm={:?} signal={} si_code={} addr={:#x} pc={:#x} esr={:#x} mutating={} access={:?} walk={:?}",
+        record.tid,
+        record.mm_key,
+        record.signum,
+        record.si_code,
+        record.fault_address,
+        record.pc,
+        record.esr,
+        record.requires_mm_mutation,
+        record.access,
+        record.walk
+    );
+}
+
+/// Summarize the live stage-1 walk of `far` for the event ring.
+pub(super) fn ring_stage1_walk<E: ThreadedEngine>(
+    engine: &E,
+    far: u64,
+    access: Option<carrick_mmu_core::aarch64::LeafAccess>,
+) -> Option<carrick_kernel::event_ring::RingStage1Walk> {
+    let (_ttbr, walk) = engine.diagnostic_fault_page_tables(far)?;
+    let (level, descriptor) = carrick_mmu_core::aarch64::terminal_entry(walk);
+    Some(carrick_kernel::event_ring::RingStage1Walk {
+        terminal_level: level as u8,
+        terminal_descriptor: descriptor,
+        terminal_valid: carrick_mmu_core::aarch64::descriptor_is_valid(descriptor),
+        permits_access: access.is_some_and(|access| {
+            carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(descriptor, access)
+        }),
+    })
+}
+
+/// Every non-idle frame-grant mailbox as `(slot, state)`, read without locks
+/// or allocation (each state is one relaxed atomic load).
+pub(super) fn busy_frame_grant_mailboxes() -> impl Iterator<Item = (usize, u32)> {
+    (0..carrick_el1_abi::EL1_STACK_SLOTS as usize).filter_map(|slot| {
+        let mailbox = carrick_el1_abi::frame_grant_mailbox_host_for_slot(slot)?;
+        let state = mailbox.state.load(std::sync::atomic::Ordering::Relaxed);
+        (state != carrick_el1_abi::FRAME_GRANT_MAILBOX_IDLE).then_some((slot, state))
+    })
 }
 
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
@@ -1417,6 +1599,25 @@ mod tests {
 mod first_touch_access_tests {
     use super::*;
     use carrick_mmu_core::aarch64::LeafAccess;
+
+    #[test]
+    fn abort_hatch_converts_only_memory_fault_signals() {
+        assert!(is_memory_fault_signal(crate::linux_abi::LINUX_SIGSEGV));
+        assert!(is_memory_fault_signal(crate::linux_abi::LINUX_SIGBUS));
+        // BRK / single-step deliver SIGTRAP through the same arm; a debugger
+        // session must never trip the hatch.
+        assert!(!is_memory_fault_signal(5));
+        assert!(!is_memory_fault_signal(4));
+    }
+
+    #[test]
+    fn ring_access_preserves_the_decoded_direction() {
+        use carrick_kernel::event_ring::RingAccess;
+        assert_eq!(ring_access(None), RingAccess::Unknown);
+        assert_eq!(ring_access(Some(LeafAccess::Read)), RingAccess::Read);
+        assert_eq!(ring_access(Some(LeafAccess::Write)), RingAccess::Write);
+        assert_eq!(ring_access(Some(LeafAccess::Execute)), RingAccess::Execute);
+    }
 
     #[test]
     fn frame_grant_claim_requires_the_exact_mm_fault_and_access() {
