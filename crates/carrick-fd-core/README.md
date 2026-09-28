@@ -1,10 +1,30 @@
 # Descriptor substrate (checkpoint 3.1)
 
-`Core<T, F, O>` owns T fixed-capacity descriptor tables and O shared open file
- descriptions. F is 1..=4096 and is also the maximum advertised RLIMIT_NOFILE
-hard ceiling for this instance. No `std`, `alloc`, dependency, host lock, host
-fd, syscall, or venue binding is present. The workspace's `crates/*` membership
-includes this crate automatically. Larger/growable tables are not implemented.
+`Core<T, O>` owns T table identities and O shared open file descriptions.
+Each table borrows venue-provided descriptor slots and a hierarchical free-slot
+bitmap through `TableStorage`. No `std`, `alloc`, dependency, host lock, host fd,
+syscall, or venue binding is present. The workspace's `crates/*` membership
+includes this crate automatically.
+
+Descriptor backing capacity is independent of the configured soft limit. The
+venue validates that limit against RLIMIT_NOFILE's hard limit and `nr_open`;
+the core imposes only the signed descriptor number's representation limit.
+When the lowest free descriptor needs additional storage, `NeedsBacking`
+reports the required descriptor count without changing entries or refcounts.
+The venue supplies larger slots plus `bitmap_words(capacity)` u64 words, calls
+`grow_table`, and retries. Geometric growth amortizes storage replacement;
+`NeedsBacking` reports the minimum, not an allocation policy. The venue must
+never translate `NeedsBacking` to EMFILE.
+`TooManyFiles` means no free descriptor exists below the configured soft limit.
+A table may start with no backing, including with a 1,048,576 soft limit.
+
+`create_table` and `fork` consume a `TableStorage` only on success. `grow_table`
+swaps larger backing into an existing table, preserving its identity, flags,
+offsets, free holes and shared OFD reference counts. The argument receives the
+retired backing, which can be reused for another table or recovered with
+`into_parts`. `destroy_table` likewise returns its backing after finalization.
+No pointer into replaced storage is retained. Supply storage with a lifetime
+covering the authority; recycling slices does not require dropping the core.
 
 ## Contract: fd-core-lifecycle-v1
 
@@ -16,16 +36,20 @@ Authority: Linux man-pages [dup(2)](https://man7.org/linux/man-pages/man2/dup.2.
 Existing Carrick references: `dispatch/fs/close_dup.rs`, `dispatch/fs/locks.rs`,
 `kernel/objects.rs`. No Linux kernel sources were used.
 
-VM-free binding: this crate's unit tests. Scale points: 65, 130, 4096 fds;
-fully populated, descending single holes, sparse holes, and every minimum.
-Allocation examines at most two leaf bitmap words and one summary word;
-lookup indexes one table slot and one OFD slot. No loops on the open, dup,
-dup2/3, close, get/set flags or offset paths. OFD allocation is a free-list
-pop. All operations, including fork, allocate zero heap objects: the crate
-cannot link an allocator because it imports neither `alloc` nor `std`.
-Cold table creation/fork are O(T + F); range close/exec/teardown are O(F),
-never O(last) for an unbounded close_range endpoint. Table identity uses a
-non-wrapping generation plus authority identity; exhausted IDs fail closed.
+VM-free binding: this crate's unit tests. Scale points: 65, 130, 4096 and
+65,536 backed descriptors; fully populated, descending single holes, sparse
+holes, and every minimum. Growth tests start with zero/four slots and reach
+65,536 and 1,048,576 while preserving references across fork and exec.
+Allocation examines at most `2 * levels - 1` bitmap words, where each level
+summarizes 64 words below it: O(log64 capacity) independently of occupancy.
+Marking an allocated/freed slot updates one word per level. Lookup indexes one
+table slot and one OFD slot. OFD allocation remains a free-list pop.
+All core operations allocate zero heap objects; production code imports neither
+`alloc` nor `std`. Table creation/fork cost O(T + backed capacity) and growth
+costs O(backed capacity). Range close/exec/teardown scan backed capacity and
+update the bitmap in O(log64 capacity) per closed descriptor, never scanning
+O(last) for an unbounded close_range endpoint. Table identity uses a non-wrapping generation plus
+authority identity; exhausted IDs fail closed.
 
 Signed/EL1/host integration bindings and performance ratios are **not claimed**.
 The director owns those later gates. No existing runtime behavior changes.
@@ -69,7 +93,11 @@ The director owns those later gates. No existing runtime behavior changes.
   NoMemory to ENOMEM. StaleTable is a venue ownership bug, not a guest errno.
   Resource exhaustion differs from the per-table soft fd ceiling. Existing
   descriptors remain usable after lowering the soft limit, including dup2 onto
-  self, fork and close-on-exec above the new limit. Never advertise a limit > F.
+  self, fork and close-on-exec above the new limit. A storage request is not
+  a guest error: provision backing and retry, or report a genuine venue
+  allocation failure. T and O remain venue-selected authority object counts;
+  their exhaustion is NoMemory, distinct from descriptor backing and limits.
 
 Run `cargo test -p carrick-fd-core` and
-`cargo check -p carrick-fd-core --target aarch64-unknown-none` for the local proof.
+`cargo clippy -p carrick-fd-core --all-targets -- -D warnings` for this revision.
+The earlier bare-metal check is not rerun for this crate-scoped review fix.
