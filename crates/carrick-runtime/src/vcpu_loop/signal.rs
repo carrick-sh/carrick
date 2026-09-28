@@ -155,8 +155,25 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     dispatcher: &SyscallDispatcher,
     context: &carrick_kernel::kernel::KernelContext,
     this_tid: ThreadId,
-    fault: FaultSignal,
+    fault: &mut FaultSignal,
 ) -> Result<FaultSignalDisposition, RuntimeError> {
+    // This is the single synchronous-signal admission point, including a
+    // ptrace-resumed fault. Classify before ptrace, disposition and injection
+    // so none of those exits can bypass the file BUS range.
+    let incoming = fault.signum;
+    let bus = incoming == crate::linux_abi::LINUX_SIGSEGV
+        && dispatcher.mmap_fault_is_sigbus(fault.si_addr);
+    if bus {
+        fault.signum = crate::linux_abi::LINUX_SIGBUS;
+        fault.si_code = 2; // BUS_ADRERR
+    }
+    crate::probes::hvpatch_fault_delivery(
+        fault.si_addr,
+        incoming,
+        fault.signum,
+        bus,
+        this_tid.raw(),
+    );
     crate::probes::signal_deliver(this_tid.raw(), fault.signum);
     if let Ok(signal) = carrick_kernel::kernel::LinuxSignal::for_signal_number(fault.signum)
         && carrick_kernel::exec_helpers::stop_for_ptrace_fault(
@@ -207,7 +224,14 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
         restart_syscall: false,
     }) {
         Ok(()) => Ok(FaultSignalDisposition::Injected),
-        Err(TrapError::SignalDeliveryFault) => Ok(FaultSignalDisposition::Terminate(11)),
+        Err(TrapError::SignalDeliveryFault) => {
+            crate::probes::hvpatch_fault_signal_frame_failure(
+                fault.si_addr,
+                fault.signum,
+                this_tid.raw(),
+            );
+            Ok(FaultSignalDisposition::Terminate(11))
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -232,27 +256,13 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
     let dispatcher = &kernel.dispatcher;
-    const SIGSEGV: i32 = 11;
-    const SIGBUS: i32 = 7;
-    const BUS_ADRERR: i32 = 2;
-    let incoming = fault.signum;
-    let bus = incoming == SIGSEGV && dispatcher.mmap_fault_is_sigbus(fault.si_addr);
-    if fault.signum == SIGSEGV && bus {
-        fault.signum = SIGBUS;
-        fault.si_code = BUS_ADRERR;
-    }
-    crate::probes::hvpatch_fault_delivery(
-        fault.si_addr,
-        incoming,
-        fault.signum,
-        bus,
-        this_tid.raw(),
-    );
     // Capture the forked-child flag up front so the `terminate` closure does not
     // borrow `engine` — it is now also called in the inject-failure arm below,
     // after a &mut engine use, and a closure-held &engine would conflict. (M1b)
     let is_forked_child = engine.is_forked_child();
+    let disposition = inject_fault_signal(engine, dispatcher, context, this_tid, &mut fault)?;
     let terminate = |signum: i32| -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
+        crate::probes::hvpatch_fault_terminal(fault.si_addr, signum, fault.si_code, this_tid.raw());
         if super::requires_no_unwind_host_exit(kernel, is_forked_child) {
             let out = dispatcher.stdout();
             let err = dispatcher.stderr();
@@ -270,7 +280,7 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
         Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))))
     };
 
-    match inject_fault_signal(engine, dispatcher, context, this_tid, fault)? {
+    match disposition {
         FaultSignalDisposition::Stopped => Ok(None),
         FaultSignalDisposition::Injected => Ok(None),
         FaultSignalDisposition::Terminate(signum) => terminate(signum),
@@ -1231,7 +1241,7 @@ mod tests {
                 &dispatcher,
                 &context,
                 tid,
-                FaultSignal {
+                &mut FaultSignal {
                     signum: crate::linux_abi::LINUX_SIGSEGV,
                     si_code: 2,
                     si_addr: 0xfeed_0000,
@@ -1285,7 +1295,7 @@ mod tests {
                 &dispatcher,
                 &context,
                 tid,
-                FaultSignal {
+                &mut FaultSignal {
                     signum: crate::linux_abi::LINUX_SIGSEGV,
                     si_code: 2,
                     si_addr: 0xfeed_4000,
@@ -1307,7 +1317,7 @@ mod tests {
                 &dispatcher,
                 &context,
                 tid,
-                FaultSignal {
+                &mut FaultSignal {
                     signum: crate::linux_abi::LINUX_SIGSEGV,
                     si_code: 2,
                     si_addr: 0xfeed_4000,
@@ -1331,7 +1341,7 @@ mod tests {
                 &dispatcher,
                 &context,
                 tid,
-                FaultSignal {
+                &mut FaultSignal {
                     signum: crate::linux_abi::LINUX_SIGSEGV,
                     si_code: 2,
                     si_addr: 0xfeed_4000,
@@ -1340,6 +1350,41 @@ mod tests {
             ),
             Ok(FaultSignalDisposition::Terminate(
                 crate::linux_abi::LINUX_SIGSEGV
+            ))
+        ));
+    }
+
+    #[test]
+    fn forked_private_file_bus_tail_is_classified_at_synchronous_injection() {
+        let parent = SyscallDispatcher::new();
+        let base = 0x6000_00c0_0000;
+        let page = parent.linux_page_size();
+        parent.record_mmap_bus_fault_range_for_test(base + 3 * page, page);
+        let child = parent.fork_clone_in_process(
+            ThreadId::synthetic_for_tests(781),
+            ThreadId::synthetic_for_tests(782),
+            781,
+            782,
+        );
+        let fault_addr = base + 3 * page + 8;
+        assert!(child.mmap_fault_is_sigbus(fault_addr));
+        let context = child.exact_signal_context_for_test();
+        let tid = ThreadId::main_from_host_pid();
+        assert!(matches!(
+            inject_fault_signal(
+                &mut NoopTrap::default(),
+                &child,
+                &context,
+                tid,
+                &mut FaultSignal {
+                    signum: crate::linux_abi::LINUX_SIGSEGV,
+                    si_code: 1,
+                    si_addr: fault_addr,
+                    interrupted_pc: Some(0x2240d8),
+                },
+            ),
+            Ok(FaultSignalDisposition::Terminate(
+                crate::linux_abi::LINUX_SIGBUS
             ))
         ));
     }
