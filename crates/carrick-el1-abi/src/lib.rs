@@ -77,6 +77,12 @@ pub const METADATA_MAILBOX_GUEST_CONSUMING: u32 = 5;
 pub const EL1_FRAME_GRANT_MAILBOX_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x20_000;
 pub const EL1_FRAME_GRANT_MAILBOX_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_MAILBOX_OFFSET;
 
+/// Shared residency journal for up to 4096 live bulk grants. It occupies the
+/// otherwise unused tail of the current-task area, after the mailboxes.
+pub const EL1_FRAME_GRANT_RESIDENCY_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x30_000;
+pub const EL1_FRAME_GRANT_RESIDENCY_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_RESIDENCY_OFFSET;
+pub const FRAME_GRANT_RESIDENCY_SLOTS: usize = 4096;
+
 /// Requested bulk extent. One successful host boundary can cover 512 Linux
 /// 4 KiB pages; the host may clamp the response at a VMA or alignment edge.
 pub const EL1_FRAME_GRANT_TARGET_SIZE: u64 = 2 * 1024 * 1024;
@@ -286,6 +292,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_CURRENT_TASKS_OFFSET,
         EL1_METADATA_MAILBOX_OFFSET,
         EL1_FRAME_GRANT_MAILBOX_OFFSET,
+        EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+        FRAME_GRANT_RESIDENCY_SLOTS as u64,
         EL1_FRAME_GRANT_TARGET_SIZE,
         EL1_BOOTSTRAP_METADATA_OFFSET,
         EL1_BOOTSTRAP_METADATA_SIZE,
@@ -342,6 +350,10 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(FrameGrantMailbox, mapping_id) as u64,
         core::mem::offset_of!(FrameGrantMailbox, owner_generation) as u64,
         core::mem::offset_of!(FrameGrantMailbox, inventory_revision) as u64,
+        core::mem::size_of::<FrameGrantResidencyRecord>() as u64,
+        core::mem::align_of::<FrameGrantResidencyRecord>() as u64,
+        core::mem::size_of::<FrameGrantResidencyTable>() as u64,
+        core::mem::offset_of!(FrameGrantResidencyRecord, committed) as u64,
         EL1_ZONE_OFFSET,
         core::mem::size_of::<ZoneTables>() as u64,
         core::mem::align_of::<ZoneTables>() as u64,
@@ -1207,6 +1219,269 @@ impl Default for FrameGrantMailboxes {
     }
 }
 
+const GRANT_EMPTY: u64 = 0;
+const GRANT_RETIRED: u64 = 1;
+const GRANT_WRITING: u64 = 2;
+const GRANT_LIVE: u64 = 3;
+const GRANT_PAGE_SIZE: u64 = 4096;
+const GRANT_PROBES: usize = 64;
+
+/// Exact frame ownership carried beside the residency bits. A slot cannot
+/// authorize a reused mapping or frame with the same VA and IPA but a new
+/// owner generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameGrantResidencyIdentity {
+    pub mm_key: u64,
+    pub semantic_base: u64,
+    pub physical_ipa: u64,
+    pub len: u64,
+    pub mapping_id: u64,
+    pub frame_id: u64,
+    pub owner_generation: u64,
+    pub inventory_revision: u64,
+}
+
+impl FrameGrantResidencyIdentity {
+    fn valid(self) -> bool {
+        let Some(end) = self.semantic_base.checked_add(self.len) else {
+            return false;
+        };
+        self.mm_key != 0
+            && self.mapping_id != 0
+            && self.frame_id != 0
+            && self.owner_generation != 0
+            && self.inventory_revision != 0
+            && self.len != 0
+            && self.len <= EL1_FRAME_GRANT_TARGET_SIZE
+            && self.semantic_base.is_multiple_of(GRANT_PAGE_SIZE)
+            && self.physical_ipa.is_multiple_of(GRANT_PAGE_SIZE)
+            && self.len.is_multiple_of(GRANT_PAGE_SIZE)
+            && self.physical_ipa.checked_add(self.len).is_some()
+            && (self.semantic_base / EL1_FRAME_GRANT_TARGET_SIZE)
+                == ((end - 1) / EL1_FRAME_GRANT_TARGET_SIZE)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameGrantResidencyPage {
+    pub slot: usize,
+    pub identity: FrameGrantResidencyIdentity,
+    pub expected_ipa: u64,
+    bit: usize,
+}
+
+/// One grant's identity and 512 per-page residency bits. `GRANT_LIVE` is
+/// published last; retirement removes it first. All callers changing leaves
+/// or bits hold the exact-MM editor, including the host mutation pause.
+#[repr(C, align(64))]
+#[derive(Debug)]
+pub struct FrameGrantResidencyRecord {
+    state: AtomicU64,
+    mm_key: AtomicU64,
+    semantic_base: AtomicU64,
+    physical_ipa: AtomicU64,
+    len: AtomicU64,
+    mapping_id: AtomicU64,
+    frame_id: AtomicU64,
+    owner_generation: AtomicU64,
+    inventory_revision: AtomicU64,
+    committed: [AtomicU64; 8],
+}
+
+impl FrameGrantResidencyRecord {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU64::new(GRANT_EMPTY),
+            mm_key: AtomicU64::new(0),
+            semantic_base: AtomicU64::new(0),
+            physical_ipa: AtomicU64::new(0),
+            len: AtomicU64::new(0),
+            mapping_id: AtomicU64::new(0),
+            frame_id: AtomicU64::new(0),
+            owner_generation: AtomicU64::new(0),
+            inventory_revision: AtomicU64::new(0),
+            committed: [const { AtomicU64::new(0) }; 8],
+        }
+    }
+
+    fn identity(&self) -> FrameGrantResidencyIdentity {
+        FrameGrantResidencyIdentity {
+            mm_key: self.mm_key.load(Ordering::Relaxed),
+            semantic_base: self.semantic_base.load(Ordering::Relaxed),
+            physical_ipa: self.physical_ipa.load(Ordering::Relaxed),
+            len: self.len.load(Ordering::Relaxed),
+            mapping_id: self.mapping_id.load(Ordering::Relaxed),
+            frame_id: self.frame_id.load(Ordering::Relaxed),
+            owner_generation: self.owner_generation.load(Ordering::Relaxed),
+            inventory_revision: self.inventory_revision.load(Ordering::Relaxed),
+        }
+    }
+
+    fn publish(&self, identity: FrameGrantResidencyIdentity) {
+        self.mm_key.store(identity.mm_key, Ordering::Relaxed);
+        self.semantic_base
+            .store(identity.semantic_base, Ordering::Relaxed);
+        self.physical_ipa
+            .store(identity.physical_ipa, Ordering::Relaxed);
+        self.len.store(identity.len, Ordering::Relaxed);
+        self.mapping_id
+            .store(identity.mapping_id, Ordering::Relaxed);
+        self.frame_id.store(identity.frame_id, Ordering::Relaxed);
+        self.owner_generation
+            .store(identity.owner_generation, Ordering::Relaxed);
+        self.inventory_revision
+            .store(identity.inventory_revision, Ordering::Relaxed);
+        for word in &self.committed {
+            word.store(0, Ordering::Relaxed);
+        }
+        self.state.store(GRANT_LIVE, Ordering::Release);
+    }
+}
+
+impl Default for FrameGrantResidencyRecord {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Fixed shared open-addressed index. Lookup is bounded to 64 probes even
+/// when many MMs coexist; a full probe chain only declines the guest fast path.
+#[repr(C, align(64))]
+#[derive(Debug)]
+pub struct FrameGrantResidencyTable {
+    slots: [FrameGrantResidencyRecord; FRAME_GRANT_RESIDENCY_SLOTS],
+}
+
+impl FrameGrantResidencyTable {
+    pub const fn new() -> Self {
+        Self {
+            slots: [const { FrameGrantResidencyRecord::new() }; FRAME_GRANT_RESIDENCY_SLOTS],
+        }
+    }
+
+    fn first_slot(mm_key: u64, va: u64) -> usize {
+        let window = va / EL1_FRAME_GRANT_TARGET_SIZE;
+        let mixed =
+            mm_key.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ window.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        (mixed as usize) & (FRAME_GRANT_RESIDENCY_SLOTS - 1)
+    }
+
+    fn probe(mm_key: u64, va: u64, offset: usize) -> usize {
+        (Self::first_slot(mm_key, va) + offset) & (FRAME_GRANT_RESIDENCY_SLOTS - 1)
+    }
+
+    /// Host: publish an authenticated grant while the exact-MM mutation guard
+    /// excludes a guest editor. Failure leaves ordinary host first touch live.
+    pub fn publish(&self, identity: FrameGrantResidencyIdentity) -> Option<usize> {
+        if !identity.valid() {
+            return None;
+        }
+        let mut available = None;
+        for probe in 0..GRANT_PROBES {
+            let slot = Self::probe(identity.mm_key, identity.semantic_base, probe);
+            let record = &self.slots[slot];
+            let state = record.state.load(Ordering::Acquire);
+            if state == GRANT_LIVE {
+                let prior = record.identity();
+                if prior.mm_key == identity.mm_key
+                    && prior.semantic_base < identity.semantic_base + identity.len
+                    && identity.semantic_base < prior.semantic_base + prior.len
+                {
+                    return None;
+                }
+            } else if state == GRANT_EMPTY {
+                available.get_or_insert(slot);
+                break;
+            } else if state == GRANT_RETIRED {
+                available.get_or_insert(slot);
+            }
+        }
+        let slot = available?;
+        let record = &self.slots[slot];
+        let state = record.state.load(Ordering::Acquire);
+        record
+            .state
+            .compare_exchange(state, GRANT_WRITING, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        record.publish(identity);
+        Some(slot)
+    }
+
+    /// Guest: find the exact live grant covering a prepared leaf.
+    pub fn lookup(&self, mm_key: u64, va: u64) -> Option<FrameGrantResidencyPage> {
+        let page = va & !(GRANT_PAGE_SIZE - 1);
+        for probe in 0..GRANT_PROBES {
+            let slot = Self::probe(mm_key, page, probe);
+            let record = &self.slots[slot];
+            match record.state.load(Ordering::Acquire) {
+                GRANT_EMPTY => return None,
+                GRANT_LIVE => {
+                    let identity = record.identity();
+                    if identity.mm_key == mm_key
+                        && page >= identity.semantic_base
+                        && page - identity.semantic_base < identity.len
+                    {
+                        let bit = ((page - identity.semantic_base) / GRANT_PAGE_SIZE) as usize;
+                        return Some(FrameGrantResidencyPage {
+                            slot,
+                            identity,
+                            expected_ipa: identity.physical_ipa + bit as u64 * GRANT_PAGE_SIZE,
+                            bit,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Guest: record a committed VALID leaf before releasing the MM editor.
+    pub fn record_commit(&self, page: FrameGrantResidencyPage) -> bool {
+        let Some(record) = self.slots.get(page.slot) else {
+            return false;
+        };
+        if record.state.load(Ordering::Acquire) != GRANT_LIVE
+            || record.identity() != page.identity
+            || page.bit >= (page.identity.len / GRANT_PAGE_SIZE) as usize
+            || page.expected_ipa != page.identity.physical_ipa + page.bit as u64 * GRANT_PAGE_SIZE
+        {
+            return false;
+        }
+        record.committed[page.bit / 64].fetch_or(1 << (page.bit % 64), Ordering::Release);
+        true
+    }
+
+    /// Host: snapshot the guest commits while holding the exact-MM guard.
+    pub fn committed_words(
+        &self,
+        slot: usize,
+        identity: FrameGrantResidencyIdentity,
+    ) -> Option<[u64; 8]> {
+        let record = self.slots.get(slot)?;
+        (record.state.load(Ordering::Acquire) == GRANT_LIVE && record.identity() == identity)
+            .then(|| core::array::from_fn(|i| record.committed[i].load(Ordering::Acquire)))
+    }
+
+    /// Host: retire this exact grant before unmapping or reusing its owner.
+    pub fn retire(&self, slot: usize, identity: FrameGrantResidencyIdentity) -> bool {
+        let Some(record) = self.slots.get(slot) else {
+            return false;
+        };
+        if record.state.load(Ordering::Acquire) != GRANT_LIVE || record.identity() != identity {
+            return false;
+        }
+        record.state.store(GRANT_RETIRED, Ordering::Release);
+        true
+    }
+}
+
+impl Default for FrameGrantResidencyTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Lifecycle state of a delegated file object in the EL1 object table: Dead.
 pub const DELEGATED_STATE_DEAD: u32 = 0;
 /// Lifecycle state of a delegated file object in the EL1 object table: Guest-owned.
@@ -1815,6 +2090,14 @@ const _: () = assert!(
 );
 const _: () = assert!(
     EL1_FRAME_GRANT_MAILBOX_OFFSET + core::mem::size_of::<FrameGrantMailboxes>() as u64
+        <= EL1_FRAME_GRANT_RESIDENCY_OFFSET
+);
+const _: () = assert!(
+    EL1_FRAME_GRANT_RESIDENCY_OFFSET
+        .is_multiple_of(core::mem::align_of::<FrameGrantResidencyTable>() as u64)
+);
+const _: () = assert!(
+    EL1_FRAME_GRANT_RESIDENCY_OFFSET + core::mem::size_of::<FrameGrantResidencyTable>() as u64
         <= EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE
 );
 const _: () =
@@ -1867,6 +2150,24 @@ pub fn frame_grant_mailbox_host_for_slot(slot: usize) -> Option<&'static FrameGr
         &*((ptr + EL1_FRAME_GRANT_MAILBOX_OFFSET as usize) as *const FrameGrantMailboxes)
     };
     mailboxes.slot(slot)
+}
+
+pub fn frame_grant_residency_host() -> Option<&'static FrameGrantResidencyTable> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: the EL1 region owner retains this mapping; the table contains
+    // only atomics and its layout is checked against the image hash.
+    Some(unsafe {
+        &*((ptr + EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize) as *const FrameGrantResidencyTable)
+    })
+}
+
+#[cfg(target_os = "none")]
+pub fn frame_grant_residency_guest() -> &'static FrameGrantResidencyTable {
+    // SAFETY: the kernel-only EL1 region is installed before fault entry.
+    unsafe { &*(EL1_FRAME_GRANT_RESIDENCY_BASE as *const FrameGrantResidencyTable) }
 }
 
 /// Guest view of the shared metadata mailbox. Call only while executing in
@@ -3083,6 +3384,41 @@ mod tests {
         );
         assert_eq!(result, Ok(true));
         assert!(committed.get());
+    }
+
+    #[test]
+    fn grant_residency_rejects_retired_and_reused_identity() {
+        let table = FrameGrantResidencyTable::new();
+        let first = FrameGrantResidencyIdentity {
+            mm_key: 41,
+            semantic_base: 0x4000_0000,
+            physical_ipa: 0x9000_0000,
+            len: 3 * 4096,
+            mapping_id: 17,
+            frame_id: 19,
+            owner_generation: 23,
+            inventory_revision: 29,
+        };
+        let slot = table.publish(first).expect("first grant");
+        let page = table
+            .lookup(41, first.semantic_base + 4096)
+            .expect("prepared page");
+        assert_eq!(page.expected_ipa, first.physical_ipa + 4096);
+        assert!(table.record_commit(page));
+        assert_eq!(table.committed_words(slot, first).unwrap()[0], 0b10);
+        assert!(table.retire(slot, first));
+        assert!(table.lookup(41, first.semantic_base + 4096).is_none());
+        assert!(!table.record_commit(page));
+        let second = FrameGrantResidencyIdentity {
+            owner_generation: 31,
+            ..first
+        };
+        let reused = table.publish(second).expect("reused grant");
+        assert!(table.committed_words(reused, first).is_none());
+        assert_eq!(table.committed_words(reused, second).unwrap()[0], 0);
+        assert!(!table.record_commit(page));
+        assert!(table.record_commit(table.lookup(41, first.semantic_base).unwrap()));
+        assert_eq!(table.committed_words(reused, second).unwrap()[0], 1);
     }
 
     #[test]
