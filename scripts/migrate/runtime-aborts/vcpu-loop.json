@@ -1599,17 +1599,6 @@
       "domain": "hvpatch::el1_frame_grant"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "function": "resolve_mutating_fault",
-      "ordinal_in_function": 1,
-      "fingerprint": "b65ff99eb202ca60c07a2de04ab973199fd1803f8223b2cc398768d42d358eea",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::el1_frame_grant",
-      "rationale": "Authenticated frame grant could not publish Ready status to the guest mailbox.",
-      "sink": "fatal",
-      "domain": "hvpatch::el1_frame_grant"
-    },
-    {
       "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",
       "function": "<CloneAdmissionPermit as Drop>::drop",
       "ordinal_in_function": 1,
