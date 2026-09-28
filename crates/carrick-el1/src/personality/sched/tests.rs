@@ -1,4 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+use carrick_el1_abi::{
+    CurrentTask, GIC_KICK_INTID, GIC_RESCHED_INTID, GIC_VTIMER_INTID, SlotId, ThreadCtx,
+    ThreadIdentity, ZoneTables,
+};
 
 extern crate std;
 
@@ -441,7 +445,7 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
         user: &HardwareUserWord,
         counters,
     }
-    .idle(&mut frame_b);
+    .idle(&mut frame_b, ETIMEDOUT_RESULT);
     assert_eq!(served, Served::Returned { switched: true });
     let mut expected = b_before;
     expected.x[0] = 0;
