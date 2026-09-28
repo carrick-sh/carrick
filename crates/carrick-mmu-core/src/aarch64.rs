@@ -1421,6 +1421,11 @@ pub struct PageTableManager {
     /// Pre-images of every descriptor word written since [`Self::begin_undo`],
     /// in write order, with the scalar state to restore alongside them.
     undo: Option<UndoJournal>,
+    /// Guest EL1's editor never allocates table pages: the host's owned copy
+    /// cannot see EL1's allocations, and a fresh table can be all zero, so a
+    /// content-discovered cursor would hand one page to both. EL1 publishes
+    /// only into existing tables and hands the rest back to the host.
+    table_allocation_forbidden: bool,
 }
 
 impl core::fmt::Debug for PageTableManager {
@@ -1506,6 +1511,7 @@ impl PageTableManager {
             staged: hashbrown::HashMap::new(),
             resolver: None,
             undo: None,
+            table_allocation_forbidden: false,
         }
     }
 
@@ -1552,7 +1558,13 @@ impl PageTableManager {
             staged: hashbrown::HashMap::new(),
             resolver: Some(resolver),
             undo: None,
+            table_allocation_forbidden: false,
         })
+    }
+
+    /// Refuse every table-page allocation (see `table_allocation_forbidden`).
+    pub fn forbid_table_allocation(&mut self) {
+        self.table_allocation_forbidden = true;
     }
 
     /// True if this manager is bound to live hardware-visible memory.
@@ -1824,6 +1836,7 @@ impl PageTableManager {
             staged: hashbrown::HashMap::new(),
             resolver: None,
             undo: None,
+            table_allocation_forbidden: false,
         };
         self.snapshot_into(&mut target)?;
         Ok(target)
@@ -2582,6 +2595,47 @@ impl PageTableManager {
         Ok(pages)
     }
 
+    /// Publish bulk backing while exposing only the faulting Linux page.
+    /// Speculative leaves retain their output IPA, but remain invalid and
+    /// untagged: host copyin must not mistake them for EL1-served PROT_NONE.
+    /// The caller holds exact-MM exclusion and flushes after this entire edit.
+    pub fn publish_private_pages(
+        &mut self,
+        publication: GuestLeafPublication,
+        fault_va: u64,
+        mut source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<(), GuestLeafPublicationError> {
+        let end = publication
+            .va
+            .checked_add(publication.len)
+            .ok_or(GuestLeafPublicationError::BadRange)?;
+        let page = fault_va & !(PT_PAGE - 1);
+        if publication.len == 0 || page < publication.va || page >= end {
+            return Err(GuestLeafPublicationError::BadRange);
+        }
+        self.map_private_aliased_with_permissions(
+            publication.va,
+            publication.ipa,
+            publication.len,
+            publication.writable,
+            publication.executable,
+            source.as_deref_mut(),
+        )
+        .map_err(GuestLeafPublicationError::Manager)?;
+        for (start, stop) in [(publication.va, page), (page + PT_PAGE, end)] {
+            if start < stop {
+                self.set_prot_none(start, (stop - start) as usize, source.as_deref_mut())
+                    .map_err(GuestLeafPublicationError::Manager)?;
+            }
+        }
+        self.mark_guest_private_publication(GuestLeafPublication {
+            va: page,
+            ipa: publication.ipa + page - publication.va,
+            len: PT_PAGE,
+            ..publication
+        })
+    }
+
     fn mark_guest_private_publication(
         &mut self,
         publication: GuestLeafPublication,
@@ -3311,6 +3365,9 @@ impl PageTableManager {
         &mut self,
         mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<u64, PageTableError> {
+        if self.table_allocation_forbidden {
+            return Err(PageTableError::OutOfTables);
+        }
         if let Some(&pa) = self.free_tables.last() {
             // A guest EL1 editor can write the shared live backing after the
             // host cached this unlinked page as free. Re-establish the allocator
@@ -9293,5 +9350,42 @@ mod tests {
         assert_ne!(armed & NON_GLOBAL, 0);
         assert_ne!(armed & SW_EL1_PRIVATE, 0);
         assert_ne!(armed & SW_EL1_MAY_WRITE, 0);
+    }
+    #[test]
+    fn frame_grant_retains_speculative_outputs_without_exposing_pages() {
+        let mut mgr = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        let ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
+        mgr.publish_private_pages(
+            GuestLeafPublication {
+                va,
+                ipa,
+                len: 4 * PT_PAGE,
+                writable: true,
+                executable: false,
+            },
+            va + PT_PAGE,
+            None,
+        )
+        .unwrap();
+        for page in [0, 2, 3] {
+            let address = va + page * PT_PAGE;
+            assert_eq!(mgr.translate(address), None, "speculative page must fault");
+            assert_eq!(
+                mgr.translate_retained_output(address),
+                Some(ipa + page * PT_PAGE)
+            );
+            assert!(
+                !terminal_descriptor_has_el1_private_authority(terminal_descriptor(
+                    mgr.debug_walk(address)
+                )),
+                "an untouched page must not be mistaken for EL1 PROT_NONE by host copyin"
+            );
+        }
+        assert_eq!(mgr.translate(va + PT_PAGE), Some(ipa + PT_PAGE));
+        mgr.set_readonly(va + 2 * PT_PAGE, PT_PAGE as usize, false, None)
+            .unwrap();
+        assert_eq!(mgr.translate(va + 2 * PT_PAGE), Some(ipa + 2 * PT_PAGE));
+        assert_eq!(mgr.translate(va + 3 * PT_PAGE), None);
     }
 }

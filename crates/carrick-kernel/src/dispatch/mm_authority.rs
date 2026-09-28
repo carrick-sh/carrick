@@ -440,6 +440,17 @@ impl MmExecutorParticipation {
         }
     }
 
+    pub(crate) fn guest_tid(&self) -> Option<carrick_hal::ThreadId> {
+        match &self.admission {
+            MmExecutorAdmissionRecipe::NativeThread { thread, .. } => Some(
+                carrick_hal::ThreadId::from_guest_supplied_tid(thread.key().tid.raw()),
+            ),
+            MmExecutorAdmissionRecipe::Thread { tid, .. }
+            | MmExecutorAdmissionRecipe::AnonymousWithPauseEndpoint { tid, .. } => Some(*tid),
+            MmExecutorAdmissionRecipe::Anonymous => None,
+        }
+    }
+
     pub fn mm_id(&self) -> crate::kernel::MmId {
         self.authority.mm_id
     }

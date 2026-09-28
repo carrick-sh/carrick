@@ -104,6 +104,8 @@ pub const FRAME_GRANT_MAILBOX_REQUESTED: u32 = 2;
 pub const FRAME_GRANT_MAILBOX_HOST_WORKING: u32 = 3;
 pub const FRAME_GRANT_MAILBOX_RESPONSE: u32 = 4;
 pub const FRAME_GRANT_MAILBOX_GUEST_CONSUMING: u32 = 5;
+/// Reserved ABI value; host-owned publication has no guest hand-back state.
+pub const FRAME_GRANT_MAILBOX_GUEST_FAILED: u32 = 6;
 
 pub const FRAME_GRANT_SUCCESS: u64 = 0;
 pub const FRAME_GRANT_ERR_DENIED: u64 = 1;
@@ -320,6 +322,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(CurrentTask, thread_serial) as u64,
         core::mem::size_of::<MetadataGrantMailbox>() as u64,
         core::mem::align_of::<MetadataGrantMailbox>() as u64,
+        FRAME_GRANT_PROTOCOL_VERSION,
         core::mem::size_of::<FrameGrantMailbox>() as u64,
         core::mem::align_of::<FrameGrantMailbox>() as u64,
         core::mem::size_of::<FrameGrantMailboxes>() as u64,
@@ -738,6 +741,10 @@ impl Default for MetadataGrantMailbox {
     }
 }
 
+/// Included in the image ABI fingerprint: a host-published grant must never
+/// be paired with an EL1 image that still owns successful leaf publication.
+pub const FRAME_GRANT_PROTOCOL_VERSION: u64 = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameGrantRequest {
     /// Exact zone/MM key from the loaded [`CurrentTask`].
@@ -775,14 +782,38 @@ pub struct FrameGrantReady {
 pub struct FrameGrantResponse {
     pub status: u64,
     pub request: FrameGrantRequest,
-    pub ready: Option<FrameGrantReady>,
 }
 
-/// One slot-local anonymous-frame request. The request generation and MM key
-/// prevent a response from crossing address-space or request incarnations. A
-/// successful response carries identities rather than authority: EL1 may use
-/// them only to authenticate the exact host-published grant before installing
-/// a leaf.
+/// Host-published bulk first-touch protocol.
+///
+/// A slot transports a request, never ownership of unpublished leaves. EL1
+/// alone moves IDLE -> GUEST_WRITING -> REQUESTED, with release publication.
+/// The host claims REQUESTED -> HOST_WORKING with acquire/release CAS under
+/// the exact MM mutation guard. It authenticates the request and prepares up
+/// to 2 MiB of backing. `complete_grant` then publishes all leaves (allocating
+/// tables and completing TLB maintenance), commits residency/disarms first
+/// touch, and releases HOST_WORKING -> IDLE, in that order, under that guard.
+/// No successful Ready is transferred to EL1. Migration and overlapping faults
+/// consult the live MM mapping; they never wait for another vCPU to consume a
+/// response. The MM guard serializes publication with unmap/protect/replacement.
+///
+/// On refusal the host moves HOST_WORKING -> RESPONSE. EL1 claims RESPONSE ->
+/// GUEST_CONSUMING, discards the refusal, then releases -> IDLE and forwards
+/// once without issuing another request. Refusal carries no frame authority.
+/// GUEST_FAILED is a reserved ABI value: host publication handles missing table
+/// pages directly, so guest hand-back is no longer a reachable transition.
+/// Failed publication cannot commit or free the slot; the host must refuse or
+/// terminate the operation. Cancellation claims an exact REQUESTED request
+/// and releases HOST_WORKING -> IDLE without modifying residency.
+///
+/// Invariants: committed residency implies published leaves at the commit
+/// point; there is no guest-owned planned-but-unpublished interval; mailbox
+/// reuse is impossible before host completion; response identity is rechecked
+/// after claiming to exclude reuse ABA. A stale fault is retried only after a
+/// live access check, never merely because a mailbox is busy. No retry loop or
+/// additional host exit is required to publish a successful bulk extent.
+/// The response payload fields remain in the ABI layout, but successful grant
+/// metadata is host-local and is never a guest publication capability.
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub struct FrameGrantMailbox {
@@ -986,30 +1017,27 @@ impl FrameGrantMailbox {
         true
     }
 
-    pub fn publish_ready(&self, ready: FrameGrantReady) -> bool {
-        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING {
-            return false;
+    /// Publish the full extent before disarming first touch or releasing this
+    /// slot. The caller retains exact-MM mutation authority across both hooks.
+    /// A false/error publication leaves HOST_WORKING and never invokes commit.
+    pub fn complete_grant<E>(
+        &self,
+        ready: FrameGrantReady,
+        publish: impl FnOnce(FrameGrantReady) -> Result<bool, E>,
+        commit: impl FnOnce(),
+    ) -> Result<bool, E> {
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING
+            || !Self::ready_is_valid(self.load_request(), ready)
+        {
+            return Ok(false);
         }
-        let request = self.load_request();
-        if !Self::ready_is_valid(request, ready) {
-            return false;
+        if !publish(ready)? {
+            return Ok(false);
         }
-        self.semantic_base
-            .store(ready.semantic_base, Ordering::Relaxed);
-        self.physical_ipa
-            .store(ready.physical_ipa, Ordering::Relaxed);
-        self.granted_len.store(ready.len, Ordering::Relaxed);
-        self.permissions.store(ready.permissions, Ordering::Relaxed);
-        self.frame_id.store(ready.frame_id, Ordering::Relaxed);
-        self.mapping_id.store(ready.mapping_id, Ordering::Relaxed);
-        self.owner_generation
-            .store(ready.owner_generation, Ordering::Relaxed);
-        self.inventory_revision
-            .store(ready.inventory_revision, Ordering::Relaxed);
-        self.status.store(FRAME_GRANT_SUCCESS, Ordering::Relaxed);
+        commit();
         self.state
-            .store(FRAME_GRANT_MAILBOX_RESPONSE, Ordering::Release);
-        true
+            .store(FRAME_GRANT_MAILBOX_IDLE, Ordering::Release);
+        Ok(true)
     }
 
     pub fn publish_refusal(&self, status: u64) -> bool {
@@ -1030,28 +1058,11 @@ impl FrameGrantMailbox {
 
     fn load_response(&self, request: FrameGrantRequest) -> FrameGrantResponse {
         let status = self.status.load(Ordering::Relaxed);
-        let ready = (status == FRAME_GRANT_SUCCESS).then(|| FrameGrantReady {
-            mm_key: request.mm_key,
-            request_generation: request.request_generation,
-            semantic_base: self.semantic_base.load(Ordering::Relaxed),
-            physical_ipa: self.physical_ipa.load(Ordering::Relaxed),
-            len: self.granted_len.load(Ordering::Relaxed),
-            permissions: self.permissions.load(Ordering::Relaxed),
-            frame_id: self.frame_id.load(Ordering::Relaxed),
-            mapping_id: self.mapping_id.load(Ordering::Relaxed),
-            owner_generation: self.owner_generation.load(Ordering::Relaxed),
-            inventory_revision: self.inventory_revision.load(Ordering::Relaxed),
-        });
-        FrameGrantResponse {
-            status,
-            request,
-            ready,
-        }
+        FrameGrantResponse { status, request }
     }
 
-    /// Observe, without consuming, a response bound to this exact fault. EL1
-    /// uses this before acquiring the MM editor; the host uses it to retry a
-    /// fault whose Ready response is waiting behind a closed MM gate.
+    /// Observe a refusal bound to this exact fault. A preview is only a hint;
+    /// consumers must claim and recheck its identity before releasing it.
     pub fn response_for_fault(
         &self,
         mm_key: u64,
@@ -1068,8 +1079,8 @@ impl FrameGrantMailbox {
         Some(self.load_response(request))
     }
 
-    /// Observe, without consuming, a response for this MM whose granted
-    /// range covers `fault_va`, or a refusal for the same page. The EL1
+    /// Observe, without consuming, a refusal for the same MM, page and access.
+    /// The EL1
     /// scheduler migrates threads between vCPUs, so a retried fault can land
     /// on a vCPU other than the one whose mailbox holds its response; left
     /// unclaimed, that response would also wedge the original mailbox.
@@ -1087,17 +1098,8 @@ impl FrameGrantMailbox {
             return None;
         }
         let response = self.load_response(request);
-        let covers = match response.ready {
-            Some(ready) => {
-                ready.semantic_base <= fault_va
-                    && ready
-                        .semantic_base
-                        .checked_add(ready.len)
-                        .is_some_and(|end| fault_va < end)
-                    && Self::permissions_allow_access(ready.permissions, access)
-            }
-            None => request.fault_va / Self::PAGE_SIZE == fault_va / Self::PAGE_SIZE,
-        };
+        let covers = request.fault_va / Self::PAGE_SIZE == fault_va / Self::PAGE_SIZE
+            && request.access == access;
         covers.then_some(response)
     }
 
@@ -1121,6 +1123,11 @@ impl FrameGrantMailbox {
             )
             .ok()?;
         let request = self.load_request();
+        if request.mm_key != mm_key || request.request_generation != request_generation {
+            self.state
+                .store(FRAME_GRANT_MAILBOX_RESPONSE, Ordering::Release);
+            return None;
+        }
         Some(self.load_response(request))
     }
 
@@ -3026,6 +3033,107 @@ mod tests {
     }
 
     #[test]
+    fn frame_grant_commit_interleaving_never_exposes_unpublished_residency() {
+        use core::cell::Cell;
+        let mailbox = FrameGrantMailbox::new();
+        let request = FrameGrantRequest {
+            mm_key: 41,
+            request_generation: 7,
+            fault_va: 0x4000_3000,
+            requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+            access: 2,
+        };
+        let ready = FrameGrantReady {
+            mm_key: 41,
+            request_generation: 7,
+            semantic_base: 0x4000_0000,
+            physical_ipa: 0x9000_0000,
+            len: EL1_FRAME_GRANT_TARGET_SIZE,
+            permissions: 3,
+            frame_id: 1,
+            mapping_id: 2,
+            owner_generation: 3,
+            inventory_revision: 4,
+        };
+        assert!(mailbox.try_publish_request(request));
+        assert_eq!(mailbox.claim_request(), Some(request));
+        let published = Cell::new(false);
+        let committed = Cell::new(false);
+        let result = mailbox.complete_grant(
+            ready,
+            |_| {
+                published.set(true);
+                Ok::<_, ()>(true)
+            },
+            || {
+                committed.set(true);
+                // Pause slot A after claiming the old Ready, before publishing
+                // leaves. Slot B's covering fault now has no claimable response.
+                let _slot_a = mailbox.claim_response(41, 7);
+                assert!(
+                    mailbox
+                        .response_covering_fault(41, 0x4000_5000, 2)
+                        .is_none()
+                );
+                assert!(
+                    published.get(),
+                    "slot B would signal: plan committed, no response, no live leaf"
+                );
+            },
+        );
+        assert_eq!(result, Ok(true));
+        assert!(committed.get());
+    }
+
+    #[test]
+    fn frame_grant_publication_failure_keeps_arming_and_refuses_without_commit() {
+        use core::cell::Cell;
+        for publication in [Ok(false), Err(())] {
+            let mailbox = FrameGrantMailbox::new();
+            let request = FrameGrantRequest {
+                mm_key: 41,
+                request_generation: 7,
+                fault_va: 0x4000_3000,
+                requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
+                access: 2,
+            };
+            assert!(mailbox.try_publish_request(request));
+            assert_eq!(mailbox.claim_request(), Some(request));
+            let committed = Cell::new(false);
+            assert_eq!(
+                mailbox.complete_grant(
+                    FrameGrantReady {
+                        mm_key: 41,
+                        request_generation: 7,
+                        semantic_base: 0x4000_0000,
+                        physical_ipa: 0x9000_0000,
+                        len: EL1_FRAME_GRANT_TARGET_SIZE,
+                        permissions: 3,
+                        frame_id: 1,
+                        mapping_id: 2,
+                        owner_generation: 3,
+                        inventory_revision: 4,
+                    },
+                    |_| publication,
+                    || committed.set(true)
+                ),
+                publication
+            );
+            assert!(!committed.get());
+            assert_eq!(
+                mailbox.state.load(Ordering::Acquire),
+                FRAME_GRANT_MAILBOX_HOST_WORKING
+            );
+            assert!(!mailbox.try_publish_request(request));
+            assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
+            let response = mailbox.claim_response(41, 7).unwrap();
+            assert_eq!(response.status, FRAME_GRANT_ERR_DENIED);
+            assert!(mailbox.finish_response(41, 7));
+            assert!(!mailbox.has_guest_work());
+        }
+    }
+
+    #[test]
     fn frame_grant_mailbox_binds_ready_data_to_exact_request_and_mm() {
         let mailbox = FrameGrantMailbox::new();
         let request = FrameGrantRequest {
@@ -3051,20 +3159,12 @@ mod tests {
             owner_generation: 103,
             inventory_revision: 104,
         };
-        assert!(mailbox.publish_ready(ready));
-        assert_eq!(mailbox.claim_response(42, 7), None);
-        assert_eq!(mailbox.claim_response(41, 8), None);
         assert_eq!(
-            mailbox.claim_response(41, 7),
-            Some(FrameGrantResponse {
-                status: FRAME_GRANT_SUCCESS,
-                request,
-                ready: Some(ready),
-            })
+            mailbox.complete_grant(ready, |_| Ok::<_, ()>(true), || {}),
+            Ok(true)
         );
-        assert!(!mailbox.finish_response(42, 7));
-        assert!(!mailbox.finish_response(41, 8));
-        assert!(mailbox.finish_response(41, 7));
+        assert_eq!(mailbox.claim_response(41, 7), None);
+        assert!(!mailbox.has_guest_work());
         assert!(mailbox.try_publish_request(request));
     }
 
@@ -3166,13 +3266,22 @@ mod tests {
             inventory_revision: 204,
         };
         ready.mm_key += 1;
-        assert!(!mailbox.publish_ready(ready));
+        assert_eq!(
+            mailbox.complete_grant(ready, |_| Ok::<_, ()>(true), || {}),
+            Ok(false)
+        );
         ready.mm_key = request.mm_key;
         ready.owner_generation = 0;
-        assert!(!mailbox.publish_ready(ready));
+        assert_eq!(
+            mailbox.complete_grant(ready, |_| Ok::<_, ()>(true), || {}),
+            Ok(false)
+        );
         ready.owner_generation = 203;
         ready.semantic_base = request.fault_va + 0x1000;
-        assert!(!mailbox.publish_ready(ready));
+        assert_eq!(
+            mailbox.complete_grant(ready, |_| Ok::<_, ()>(true), || {}),
+            Ok(false)
+        );
 
         assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
         assert_eq!(
@@ -3180,7 +3289,6 @@ mod tests {
             Some(FrameGrantResponse {
                 status: FRAME_GRANT_ERR_DENIED,
                 request,
-                ready: None,
             })
         );
         assert!(mailbox.finish_response(request.mm_key, request.request_generation));
@@ -3199,18 +3307,25 @@ mod tests {
             };
             assert!(mailbox.try_publish_request(request));
             assert_eq!(mailbox.claim_request(), Some(request));
-            assert!(mailbox.publish_ready(FrameGrantReady {
-                mm_key: request.mm_key,
-                request_generation: request.request_generation,
-                semantic_base: 0x6000_1000,
-                physical_ipa: 0xb000_1000,
-                len: 4096,
-                permissions,
-                frame_id: 401,
-                mapping_id: 402,
-                owner_generation: 403,
-                inventory_revision: 404,
-            }));
+            assert_eq!(
+                mailbox.complete_grant(
+                    FrameGrantReady {
+                        mm_key: request.mm_key,
+                        request_generation: request.request_generation,
+                        semantic_base: 0x6000_1000,
+                        physical_ipa: 0xb000_1000,
+                        len: 4096,
+                        permissions,
+                        frame_id: 401,
+                        mapping_id: 402,
+                        owner_generation: 403,
+                        inventory_revision: 404,
+                    },
+                    |_| Ok::<_, ()>(true),
+                    || {}
+                ),
+                Ok(true)
+            );
         }
     }
 
@@ -3249,7 +3364,6 @@ mod tests {
             Some(FrameGrantResponse {
                 status: FRAME_GRANT_ERR_DENIED,
                 request,
-                ready: None,
             })
         );
     }

@@ -176,8 +176,18 @@ struct Port {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum MmOccupancyError {
-    #[error("vCPU slot {slot:?} already runs address space {running}")]
+    #[error(
+        "vCPU slot {slot:?} already runs address space {running} (host admission still owns slot)"
+    )]
     SlotBusy { slot: ExecutionSlot, running: u64 },
+    #[error(
+        "vCPU slot {slot:?} records address space {running} without a host owner while installing address space {requested}"
+    )]
+    SlotWordWithoutOwner {
+        slot: ExecutionSlot,
+        running: u64,
+        requested: u64,
+    },
     #[error("every host-only execution slot is allocated")]
     HostSlotsExhausted,
     #[error("thread {thread:?} already owns crash safe-point participation")]
@@ -288,6 +298,16 @@ impl MmOccupancy {
         endpoint: PauseEndpoint,
     ) -> Result<Self, MmOccupancyError> {
         let table = table_for(slot);
+        Self::install_in(table, slot, mm, fence, endpoint)
+    }
+
+    fn install_in(
+        table: &'static Occupancy,
+        slot: ExecutionSlot,
+        mm: MmId,
+        fence: &MmFence,
+        endpoint: PauseEndpoint,
+    ) -> Result<Self, MmOccupancyError> {
         let mut port = PORTS[slot.index()].lock();
         if let Some(running) = port.as_ref() {
             return Err(MmOccupancyError::SlotBusy {
@@ -297,9 +317,10 @@ impl MmOccupancy {
         }
         table
             .install(slot, key(mm))
-            .map_err(|busy| MmOccupancyError::SlotBusy {
+            .map_err(|busy| MmOccupancyError::SlotWordWithoutOwner {
                 slot,
                 running: busy.running.raw(),
+                requested: mm.raw(),
             })?;
         *port = Some(Port {
             mm,

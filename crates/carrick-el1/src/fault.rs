@@ -1,56 +1,17 @@
 //! In-guest EL1 fault handling and dispatch.
 
 use carrick_el1_abi::{
-    Action, Counters, CurrentTask, EL1_FRAME_GRANT_TARGET_SIZE, FRAME_GRANT_SUCCESS,
-    FrameGrantMailbox, FrameGrantMailboxes, FrameGrantReady, FrameGrantRequest, TrapFrame,
+    Action, Counters, CurrentTask, EL1_FRAME_GRANT_TARGET_SIZE, FrameGrantMailbox,
+    FrameGrantMailboxes, FrameGrantRequest, TrapFrame,
 };
 use carrick_sched_core::AddressSpaces;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_FRAME_GRANT_GENERATION: AtomicU64 = AtomicU64::new(1);
-static LAST_FRAME_GRANT_PUBLICATION_ERROR: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(any(target_os = "none", test))]
-fn publication_error_code(error: carrick_mmu_core::aarch64::GuestLeafPublicationError) -> u64 {
-    use carrick_mmu_core::aarch64::GuestLeafPublicationError;
-
-    match error {
-        GuestLeafPublicationError::BadRange => 1,
-        GuestLeafPublicationError::TableOutsidePrimary => 2,
-        GuestLeafPublicationError::MissingTable => 3,
-        GuestLeafPublicationError::InvalidLeafShape => 4,
-        GuestLeafPublicationError::AlreadyValid => 5,
-        GuestLeafPublicationError::RetiredLeaf => 6,
-        GuestLeafPublicationError::Manager(
-            carrick_mmu_core::aarch64::PageTableError::OutOfTables,
-        ) => 7,
-        GuestLeafPublicationError::Manager(
-            carrick_mmu_core::aarch64::PageTableError::BadAddress,
-        ) => 8,
-        GuestLeafPublicationError::Manager(
-            carrick_mmu_core::aarch64::PageTableError::MissingArenaSource,
-        ) => 9,
-        GuestLeafPublicationError::Manager(
-            carrick_mmu_core::aarch64::PageTableError::ConflictingArenaSource,
-        ) => 10,
-        GuestLeafPublicationError::Manager(
-            carrick_mmu_core::aarch64::PageTableError::UnresolvedArena(_),
-        ) => 11,
-        GuestLeafPublicationError::Manager(
-            carrick_mmu_core::aarch64::PageTableError::GicWindowOutput,
-        ) => 12,
-        GuestLeafPublicationError::Manager(
-            carrick_mmu_core::aarch64::PageTableError::MetadataAllocation,
-        ) => 13,
-        GuestLeafPublicationError::RollbackFailed => 14,
-    }
-}
-
-/// Return the last guest leaf-publication refusal for the EL1 panic bridge.
-/// Zero means the panic did not follow that publication boundary.
+/// The host now owns frame-grant publication; EL1 has no publication error.
 pub fn panic_publication_detail() -> u64 {
-    LAST_FRAME_GRANT_PUBLICATION_ERROR.load(Ordering::Relaxed)
+    0
 }
 
 fn next_frame_grant_generation() -> u64 {
@@ -128,94 +89,10 @@ impl CowResolver for HardwareCowResolver {
     }
 }
 
-/// The exact-MM page-table operation needed to consume one authenticated
-/// frame grant. Production publishes the leaves and broadcasts one ASID
-/// invalidation; host tests record the same boundary without touching tables.
-pub trait FrameGrantLeafPublisher {
-    fn publish_and_invalidate(&mut self, ttbr0: u64, ready: FrameGrantReady) -> bool;
-}
-
-#[cfg(target_os = "none")]
-struct HardwareFrameGrantLeafPublisher;
-
-#[cfg(target_os = "none")]
-#[derive(Debug)]
-struct GuestPrimaryArenaResolver {
-    physical_base: u64,
-    host_base: usize,
-    byte_len: usize,
-}
-
-#[cfg(target_os = "none")]
-unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for GuestPrimaryArenaResolver {
-    fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
-        (base == self.physical_base && len <= self.byte_len).then_some(self.host_base as *mut u8)
-    }
-}
-
-#[cfg(target_os = "none")]
-impl FrameGrantLeafPublisher for HardwareFrameGrantLeafPublisher {
-    fn publish_and_invalidate(&mut self, ttbr0: u64, ready: FrameGrantReady) -> bool {
-        use crate::rust_alloc::sync::Arc;
-        use carrick_mmu_core::aarch64::{
-            GuestLeafPublication, GuestLeafPublicationError, HostArenaResolver,
-            PageTableLayoutConfig, PageTableManager,
-        };
-
-        const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
-        LAST_FRAME_GRANT_PUBLICATION_ERROR.store(0, Ordering::Relaxed);
-        let physical_base = ttbr0 & TTBR_BADDR_MASK;
-        let byte_len = carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize;
-        let resolver: Arc<dyn HostArenaResolver + Send + Sync> =
-            Arc::new(GuestPrimaryArenaResolver {
-                physical_base,
-                host_base: carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as usize,
-                byte_len,
-            });
-        let mut manager = match unsafe {
-            PageTableManager::new_live(
-                physical_base,
-                PageTableLayoutConfig::new(
-                    carrick_el1_abi::AARCH64_USER_LEAF_CHECK_VA,
-                    byte_len,
-                    carrick_el1_abi::AARCH64_GIC_WINDOW_BASE,
-                    carrick_el1_abi::AARCH64_GIC_WINDOW_SIZE,
-                ),
-                byte_len,
-                resolver,
-            )
-        } {
-            Ok(manager) => manager,
-            Err(error) => {
-                LAST_FRAME_GRANT_PUBLICATION_ERROR.store(
-                    publication_error_code(GuestLeafPublicationError::Manager(error)),
-                    Ordering::Relaxed,
-                );
-                return false;
-            }
-        };
-        let result = manager.publish_live_private_pages_transaction(GuestLeafPublication {
-            va: ready.semantic_base,
-            ipa: ready.physical_ipa,
-            len: ready.len,
-            writable: ready.permissions & 2 != 0,
-            executable: ready.permissions & 4 != 0,
-        });
-        if let Err(error) = result {
-            LAST_FRAME_GRANT_PUBLICATION_ERROR
-                .store(publication_error_code(error), Ordering::Relaxed);
-            return false;
-        }
-        let mut cpu = crate::sched::HardwareCpu;
-        crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
-        true
-    }
-}
-
 /// Dispatch an EL0 data abort at EL1.
 ///
-/// Increments `counters.fault_taken`; at EL1, publishes or consumes an exact
-/// authenticated bulk-frame request or resolves in-guest COW faults.
+/// Increments `counters.fault_taken`; at EL1, requests host-published bulk
+/// frames, consumes refusals, or resolves in-guest COW faults.
 /// Host builds retain the forward-only path.
 pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
     #[cfg(target_os = "none")]
@@ -241,7 +118,6 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 own: mailbox,
                 peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
             },
-            &mut HardwareFrameGrantLeafPublisher,
             &mut HardwareCowResolver,
         )
     }
@@ -254,8 +130,8 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
 }
 
 /// The faulting vCPU's frame-grant mailbox, plus every vCPU's mailbox so a
-/// retry migrated by the EL1 scheduler can consume the grant its first fault
-/// was answered with elsewhere.
+/// retry migrated by the EL1 scheduler can consume a refusal left elsewhere.
+/// Successful grants leave no guest-owned response.
 #[derive(Clone, Copy)]
 pub struct GrantMailboxes<'a> {
     pub own: &'a FrameGrantMailbox,
@@ -268,16 +144,15 @@ impl<'a> GrantMailboxes<'a> {
     }
 }
 
-/// Fault dispatch with explicitly supplied shared regions, leaf publisher, and COW resolver.
-/// A refusal or any inability to authenticate/edit the exact MM consumes the
-/// response and forwards once through the existing host fault path.
-pub fn dispatch_fault_with_regions<P: FrameGrantLeafPublisher, C: CowResolver>(
+/// Fault dispatch with explicitly supplied shared regions and COW resolver.
+/// A refusal is consumed and forwarded once through the host fault path.
+/// Successful publication and first-touch commit both happen on the host.
+pub fn dispatch_fault_with_regions<C: CowResolver>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
     spaces: &AddressSpaces,
     mailboxes: GrantMailboxes<'_>,
-    publisher: &mut P,
     cow_resolver: &mut C,
 ) -> Action {
     let GrantMailboxes {
@@ -333,36 +208,12 @@ pub fn dispatch_fault_with_regions<P: FrameGrantLeafPublisher, C: CowResolver>(
         });
     if let Some((source, response)) = found {
         let generation = response.request.request_generation;
-        if response.status != FRAME_GRANT_SUCCESS {
-            if source.claim_response(mm_key, generation).is_some() {
-                assert!(source.finish_response(mm_key, generation));
-            }
-            return Action::Forward;
+        // Only refusals cross back to EL1. Successful grants have already
+        // published and released their slot on the host, even after migration.
+        if source.claim_response(mm_key, generation).is_some() {
+            assert!(source.finish_response(mm_key, generation));
         }
-        let Some(index) = spaces.find(mm_key) else {
-            return Action::Forward;
-        };
-        let Some(grant) = spaces.grant(index, mm_key) else {
-            return Action::Forward;
-        };
-        let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
-            return Action::Forward;
-        };
-        let Some(_editor) = spaces.try_begin_edit(index, mm_key, owner) else {
-            return Action::Forward;
-        };
-        let Some(response) = source.claim_response(mm_key, generation) else {
-            return Action::Forward;
-        };
-        let ready = response
-            .ready
-            .expect("successful frame-grant response carries Ready authority");
-        assert!(
-            publisher.publish_and_invalidate(grant.ttbr0, ready),
-            "authenticated frame-grant leaf publication failed after editor admission"
-        );
-        assert!(source.finish_response(mm_key, generation));
-        return Action::Served;
+        return Action::Forward;
     }
 
     let _ = mailbox.try_publish_request(FrameGrantRequest {
@@ -383,65 +234,6 @@ mod tests {
         EL1_FRAME_GRANT_TARGET_SIZE, FRAME_GRANT_ERR_DENIED, FrameGrantMailbox, FrameGrantReady,
     };
     use carrick_sched_core::AddressSpaces;
-
-    #[test]
-    fn guest_leaf_publication_errors_have_stable_panic_detail_codes() {
-        use carrick_mmu_core::aarch64::GuestLeafPublicationError;
-
-        assert_eq!(
-            publication_error_code(GuestLeafPublicationError::BadRange),
-            1
-        );
-        assert_eq!(
-            publication_error_code(GuestLeafPublicationError::TableOutsidePrimary),
-            2
-        );
-        assert_eq!(
-            publication_error_code(GuestLeafPublicationError::MissingTable),
-            3
-        );
-        assert_eq!(
-            publication_error_code(GuestLeafPublicationError::InvalidLeafShape),
-            4
-        );
-        assert_eq!(
-            publication_error_code(GuestLeafPublicationError::AlreadyValid),
-            5
-        );
-        assert_eq!(
-            publication_error_code(GuestLeafPublicationError::RetiredLeaf),
-            6
-        );
-        assert_eq!(
-            publication_error_code(GuestLeafPublicationError::Manager(
-                carrick_mmu_core::aarch64::PageTableError::OutOfTables
-            )),
-            7
-        );
-        assert_eq!(
-            publication_error_code(GuestLeafPublicationError::Manager(
-                carrick_mmu_core::aarch64::PageTableError::UnresolvedArena(0x1234)
-            )),
-            11
-        );
-        assert_eq!(
-            publication_error_code(GuestLeafPublicationError::RollbackFailed),
-            14
-        );
-    }
-
-    #[derive(Default)]
-    struct RecordingPublisher {
-        calls: Vec<(u64, FrameGrantReady)>,
-        succeeds: bool,
-    }
-
-    impl FrameGrantLeafPublisher for RecordingPublisher {
-        fn publish_and_invalidate(&mut self, ttbr0: u64, ready: FrameGrantReady) -> bool {
-            self.calls.push((ttbr0, ready));
-            self.succeeds
-        }
-    }
 
     fn write_translation_fault(slot: u64, address: u64) -> TrapFrame {
         TrapFrame {
@@ -481,149 +273,167 @@ mod tests {
         }
     }
 
+    /// Two slots can fault before either host boundary runs. Publication is
+    /// scoped to the MM extent, not the slot that happened to request it.
     #[test]
-    fn exact_frame_grant_response_publishes_once_and_serves_the_retry() {
-        let mm = 7;
-        let ttbr0 = (31_u64 << 48) | 0x8800_0000_0000;
-        let fault = 0x4000_2123;
-        let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
-        let tasks = [task];
-        let spaces = published_space(mm, ttbr0);
-        let mailbox = FrameGrantMailbox::new();
-        let counters = Counters::default();
-        let mut publisher = RecordingPublisher {
-            succeeds: true,
-            ..RecordingPublisher::default()
-        };
-        let mut cow_resolver = NoopCowResolver;
-        let mut frame = write_translation_fault(0, fault);
-
-        assert_eq!(
-            dispatch_fault_with_regions(
-                &mut frame,
-                &counters,
-                &tasks,
-                &spaces,
-                GrantMailboxes::own(&mailbox),
-                &mut publisher,
-                &mut cow_resolver,
-            ),
-            Action::Forward
-        );
-        let request = mailbox.claim_request().expect("one exact host request");
-        assert_eq!(request.mm_key, mm);
-        assert_eq!(request.fault_va, fault);
-        assert_eq!(request.requested_len, EL1_FRAME_GRANT_TARGET_SIZE);
-        assert_eq!(request.access, 2);
-        assert_ne!(request.request_generation, 0);
-        let ready = FrameGrantReady {
-            mm_key: mm,
-            request_generation: request.request_generation,
-            semantic_base: 0x4000_0000,
-            physical_ipa: 0x9000_0000,
-            len: 0x20_0000,
-            permissions: 3,
-            frame_id: 41,
-            mapping_id: 42,
-            owner_generation: 43,
-            inventory_revision: 44,
-        };
-        assert!(mailbox.publish_ready(ready));
-
-        assert_eq!(
-            dispatch_fault_with_regions(
-                &mut frame,
-                &counters,
-                &tasks,
-                &spaces,
-                GrantMailboxes::own(&mailbox),
-                &mut publisher,
-                &mut cow_resolver,
-            ),
-            Action::Served
-        );
-        assert_eq!(publisher.calls, vec![(ttbr0, ready)]);
-        assert!(!mailbox.has_guest_work());
-        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 2);
+    fn concurrent_and_migrated_faults_share_one_host_publication() {
+        use core::cell::Cell;
+        for pages in [1, 2, 512] {
+            let mm = 9;
+            let tasks = [CurrentTask::new(), CurrentTask::new()];
+            for task in &tasks {
+                task.zone_mm.store(mm, Ordering::Release);
+            }
+            let spaces = published_space(mm, 0x8800_0000);
+            let boxes = FrameGrantMailboxes::new();
+            let counters = Counters::default();
+            let origin = boxes.slot(0).unwrap();
+            let peer = boxes.slot(1).unwrap();
+            let mut cow = NoopCowResolver;
+            let base = 0x4000_0000;
+            let mut first = write_translation_fault(0, base);
+            let mut second = write_translation_fault(1, base + (pages - 1) * 4096);
+            for (frame, own) in [(&mut first, origin), (&mut second, peer)] {
+                assert_eq!(
+                    dispatch_fault_with_regions(
+                        frame,
+                        &counters,
+                        &tasks,
+                        &spaces,
+                        GrantMailboxes {
+                            own,
+                            peers: Some(&boxes)
+                        },
+                        &mut cow,
+                    ),
+                    Action::Forward
+                );
+            }
+            let request = origin.claim_request().unwrap();
+            let ready = FrameGrantReady {
+                mm_key: mm,
+                request_generation: request.request_generation,
+                semantic_base: base,
+                physical_ipa: 0x9000_0000,
+                len: pages * 4096,
+                permissions: 3,
+                frame_id: 1,
+                mapping_id: 2,
+                owner_generation: 3,
+                inventory_revision: 4,
+            };
+            let published = Cell::new(false);
+            let armed = Cell::new(true);
+            let publications = Cell::new(0);
+            assert_eq!(
+                origin.complete_grant(
+                    ready,
+                    |grant| {
+                        assert!(armed.get());
+                        assert_eq!(grant.len, pages * 4096);
+                        // The second fault cannot consume unpublished frame authority.
+                        assert!(
+                            origin
+                                .claim_response(mm, request.request_generation)
+                                .is_none()
+                        );
+                        publications.set(publications.get() + 1);
+                        published.set(true);
+                        Ok::<_, ()>(true)
+                    },
+                    || {
+                        assert!(published.get());
+                        armed.set(false);
+                    }
+                ),
+                Ok(true)
+            );
+            assert!(!armed.get());
+            assert!(!origin.has_guest_work());
+            // Slot 1's queued fault reaches the host after slot 0 committed.
+            // The live-leaf path resolves it and cancels its unused request.
+            assert!(published.get(), "stale fault must retry, not signal");
+            assert!(peer.cancel_request_for_fault(mm, second.far, 2));
+            // An already queued retry may migrate to the original slot. EL1
+            // forwards; it never republishes stale frame metadata on that slot.
+            second.slot = 0;
+            assert_eq!(
+                dispatch_fault_with_regions(
+                    &mut second,
+                    &counters,
+                    &tasks,
+                    &spaces,
+                    GrantMailboxes {
+                        own: origin,
+                        peers: Some(&boxes)
+                    },
+                    &mut cow,
+                ),
+                Action::Forward
+            );
+            assert!(published.get());
+            assert!(origin.cancel_request_for_fault(mm, second.far, 2));
+            assert_eq!(publications.get(), 1, "one bulk publication for the extent");
+            assert!(!peer.has_guest_work());
+        }
     }
 
-    /// A thread whose grant request was answered in vCPU 0's mailbox can be
-    /// migrated by the EL1 scheduler before it retries. The retry on vCPU 1
-    /// must consume that covering response instead of republishing: the
-    /// host has already committed the plan, so a new request is refused and
-    /// the fault becomes SIGSEGV, and the orphaned response wedges vCPU 0.
     #[test]
-    fn migrated_retry_consumes_the_covering_grant_from_another_vcpu() {
-        let mm = 9;
-        let ttbr0 = (33_u64 << 48) | 0x8a00_0000_0000;
-        let first = CurrentTask::new();
-        first.zone_mm.store(mm, Ordering::Release);
-        let second = CurrentTask::new();
-        second.zone_mm.store(mm, Ordering::Release);
-        let tasks = [first, second];
-        let spaces = published_space(mm, ttbr0);
-        let mailboxes = FrameGrantMailboxes::new();
-        let origin = mailboxes.slot(0).unwrap();
-        let current = mailboxes.slot(1).unwrap();
-        let counters = Counters::default();
-        let mut publisher = RecordingPublisher {
-            succeeds: true,
-            ..RecordingPublisher::default()
-        };
-        let mut cow_resolver = NoopCowResolver;
-
-        let mut on_origin = write_translation_fault(0, 0x4000_2123);
+    fn missing_guest_table_is_handled_before_commit_without_guest_handback() {
+        use core::cell::Cell;
+        let task = CurrentTask::new();
+        task.zone_mm.store(7, Ordering::Release);
+        let tasks = [task];
+        let spaces = published_space(7, 0x8800_0000);
+        let mailbox = FrameGrantMailbox::new();
+        let mut frame = write_translation_fault(0, 0x4000_1000);
         assert_eq!(
             dispatch_fault_with_regions(
-                &mut on_origin,
-                &counters,
+                &mut frame,
+                &Counters::default(),
                 &tasks,
                 &spaces,
-                GrantMailboxes {
-                    own: origin,
-                    peers: Some(&mailboxes),
-                },
-                &mut publisher,
-                &mut cow_resolver,
+                GrantMailboxes::own(&mailbox),
+                &mut NoopCowResolver,
             ),
             Action::Forward
         );
-        let request = origin.claim_request().expect("origin request");
-        let ready = FrameGrantReady {
-            mm_key: mm,
-            request_generation: request.request_generation,
-            semantic_base: 0x4000_0000,
-            physical_ipa: 0x9000_0000,
-            len: 0x20_0000,
-            permissions: 3,
-            frame_id: 51,
-            mapping_id: 52,
-            owner_generation: 53,
-            inventory_revision: 54,
-        };
-        assert!(origin.publish_ready(ready));
-
-        // Retried on another vCPU, at another page inside the grant.
-        let mut migrated = write_translation_fault(1, 0x4000_5008);
+        let request = mailbox.claim_request().unwrap();
+        let tables = Cell::new(false);
+        let leaves = Cell::new(false);
         assert_eq!(
-            dispatch_fault_with_regions(
-                &mut migrated,
-                &counters,
-                &tasks,
-                &spaces,
-                GrantMailboxes {
-                    own: current,
-                    peers: Some(&mailboxes),
+            mailbox.complete_grant(
+                FrameGrantReady {
+                    mm_key: 7,
+                    request_generation: request.request_generation,
+                    semantic_base: 0x4000_0000,
+                    physical_ipa: 0x9000_0000,
+                    len: EL1_FRAME_GRANT_TARGET_SIZE,
+                    permissions: 3,
+                    frame_id: 1,
+                    mapping_id: 2,
+                    owner_generation: 3,
+                    inventory_revision: 4,
                 },
-                &mut publisher,
-                &mut cow_resolver,
+                |_| {
+                    // This used to require GUEST_FAILED and another host exit. The
+                    // host publisher allocates the missing table in this transaction.
+                    tables.set(true);
+                    leaves.set(true);
+                    Ok::<_, ()>(true)
+                },
+                || {
+                    assert!(tables.get() && leaves.get());
+                }
             ),
-            Action::Served
+            Ok(true)
         );
-        assert_eq!(publisher.calls, vec![(ttbr0, ready)]);
-        assert!(!origin.has_guest_work(), "origin mailbox must be released");
-        assert!(!current.has_guest_work(), "no duplicate request published");
+        assert!(!mailbox.has_guest_work());
+        assert!(
+            mailbox
+                .claim_response(7, request.request_generation)
+                .is_none()
+        );
     }
 
     #[test]
@@ -635,7 +445,6 @@ mod tests {
         let spaces = published_space(mm, (32_u64 << 48) | 0x8900_0000_0000);
         let mailbox = FrameGrantMailbox::new();
         let counters = Counters::default();
-        let mut publisher = RecordingPublisher::default();
         let mut cow_resolver = NoopCowResolver;
         let mut frame = write_translation_fault(0, 0x5000_1000);
 
@@ -646,7 +455,6 @@ mod tests {
                 &tasks,
                 &spaces,
                 GrantMailboxes::own(&mailbox),
-                &mut publisher,
                 &mut cow_resolver,
             ),
             Action::Forward
@@ -660,13 +468,11 @@ mod tests {
                 &tasks,
                 &spaces,
                 GrantMailboxes::own(&mailbox),
-                &mut publisher,
                 &mut cow_resolver,
             ),
             Action::Forward
         );
         assert!(!mailbox.has_guest_work());
-        assert!(publisher.calls.is_empty());
         assert_ne!(request.request_generation, 0);
     }
 
@@ -679,7 +485,6 @@ mod tests {
         let spaces = published_space(mm, (35_u64 << 48) | 0x8c00_0000_0000);
         let mailbox = FrameGrantMailbox::new();
         let counters = Counters::default();
-        let mut publisher = RecordingPublisher::default();
         let mut cow_resolver = NoopCowResolver;
         let mut frame = write_permission_fault(0, 0x5300_1000);
 
@@ -690,7 +495,6 @@ mod tests {
                 &tasks,
                 &spaces,
                 GrantMailboxes::own(&mailbox),
-                &mut publisher,
                 &mut cow_resolver,
             ),
             Action::Forward
@@ -699,86 +503,7 @@ mod tests {
             !mailbox.has_guest_work(),
             "a mapped-page permission denial must not request new physical backing"
         );
-        assert!(publisher.calls.is_empty());
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn closed_mm_gate_preserves_ready_response_for_a_host_boundary_retry() {
-        let mm = 81;
-        let ttbr0 = (34_u64 << 48) | 0x8b00_0000_0000;
-        let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
-        let tasks = [task];
-        let spaces = published_space(mm, ttbr0);
-        let index = spaces.find(mm).unwrap();
-        let mailbox = FrameGrantMailbox::new();
-        let counters = Counters::default();
-        let mut publisher = RecordingPublisher {
-            succeeds: true,
-            ..RecordingPublisher::default()
-        };
-        let mut cow_resolver = NoopCowResolver;
-        let mut frame = write_translation_fault(0, 0x5200_1000);
-
-        assert_eq!(
-            dispatch_fault_with_regions(
-                &mut frame,
-                &counters,
-                &tasks,
-                &spaces,
-                GrantMailboxes::own(&mailbox),
-                &mut publisher,
-                &mut cow_resolver,
-            ),
-            Action::Forward
-        );
-        let request = mailbox.claim_request().unwrap();
-        let ready = FrameGrantReady {
-            mm_key: mm,
-            request_generation: request.request_generation,
-            semantic_base: 0x5200_0000,
-            physical_ipa: 0x9200_0000,
-            len: 0x20_0000,
-            permissions: 3,
-            frame_id: 51,
-            mapping_id: 52,
-            owner_generation: 53,
-            inventory_revision: 54,
-        };
-        assert!(mailbox.publish_ready(ready));
-        spaces.close(index);
-
-        assert_eq!(
-            dispatch_fault_with_regions(
-                &mut frame,
-                &counters,
-                &tasks,
-                &spaces,
-                GrantMailboxes::own(&mailbox),
-                &mut publisher,
-                &mut cow_resolver,
-            ),
-            Action::Forward
-        );
-        assert!(mailbox.has_guest_work());
-        assert!(publisher.calls.is_empty());
-
-        spaces.open(index);
-        assert_eq!(
-            dispatch_fault_with_regions(
-                &mut frame,
-                &counters,
-                &tasks,
-                &spaces,
-                GrantMailboxes::own(&mailbox),
-                &mut publisher,
-                &mut cow_resolver,
-            ),
-            Action::Served
-        );
-        assert_eq!(publisher.calls, vec![(ttbr0, ready)]);
-        assert!(!mailbox.has_guest_work());
     }
 
     #[test]
@@ -789,7 +514,6 @@ mod tests {
         let spaces = published_space(9, (33_u64 << 48) | 0x8a00_0000_0000);
         let mailbox = FrameGrantMailbox::new();
         let counters = Counters::default();
-        let mut publisher = RecordingPublisher::default();
         let mut cow_resolver = NoopCowResolver;
         let mut frame = write_translation_fault(0, 0x6000_1000);
         frame.esr = (0x24 << 26) | 0x21;
@@ -801,13 +525,11 @@ mod tests {
                 &tasks,
                 &spaces,
                 GrantMailboxes::own(&mailbox),
-                &mut publisher,
                 &mut cow_resolver,
             ),
             Action::Forward
         );
         assert!(!mailbox.has_guest_work());
-        assert!(publisher.calls.is_empty());
     }
 
     #[test]
@@ -821,7 +543,6 @@ mod tests {
         let spaces = published_space(mm, ttbr0);
         let mailbox = FrameGrantMailbox::new();
         let counters = Counters::default();
-        let mut publisher = RecordingPublisher::default();
         let mut cow_resolver = RecordingCowResolver {
             succeeds: true,
             ..RecordingCowResolver::default()
@@ -835,14 +556,12 @@ mod tests {
                 &tasks,
                 &spaces,
                 GrantMailboxes::own(&mailbox),
-                &mut publisher,
                 &mut cow_resolver,
             ),
             Action::Served
         );
         assert_eq!(cow_resolver.calls, vec![(ttbr0, fault)]);
         assert!(!mailbox.has_guest_work());
-        assert!(publisher.calls.is_empty());
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
     }
 
@@ -857,7 +576,6 @@ mod tests {
         let spaces = published_space(mm, ttbr0);
         let mailbox = FrameGrantMailbox::new();
         let counters = Counters::default();
-        let mut publisher = RecordingPublisher::default();
         let mut cow_resolver = RecordingCowResolver {
             succeeds: false,
             ..RecordingCowResolver::default()
@@ -871,14 +589,12 @@ mod tests {
                 &tasks,
                 &spaces,
                 GrantMailboxes::own(&mailbox),
-                &mut publisher,
                 &mut cow_resolver,
             ),
             Action::Forward
         );
         assert_eq!(cow_resolver.calls, vec![(ttbr0, fault)]);
         assert!(!mailbox.has_guest_work());
-        assert!(publisher.calls.is_empty());
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
     }
 
