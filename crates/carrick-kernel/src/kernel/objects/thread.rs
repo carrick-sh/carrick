@@ -1083,10 +1083,6 @@ impl Thread {
         self.execution.lock().state
     }
 
-    pub fn execution_generation(&self) -> Option<ExecutionGeneration> {
-        self.execution_state().generation()
-    }
-
     pub fn exec_invalidation_pending(&self) -> bool {
         self.execution.lock().exec_invalidation_pending
     }
