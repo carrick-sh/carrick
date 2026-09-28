@@ -698,15 +698,19 @@ impl KernelState {
     }
 
     fn notify_hvpatch_parent_exit(&self, parent: Option<carrick_kernel::kernel::TaskKey>) {
-        match (parent, self.hvpatch_runtime.as_ref()) {
-            (Some(parent), Some(directory)) => {
-                directory.notify_child_exit(parent);
+        match (
+            parent,
+            self.hvpatch_runtime.as_ref(),
+            self.hvpatch_process.as_ref(),
+        ) {
+            (Some(parent), Some(directory), Some(process)) => {
+                directory.notify_child_exit(parent, process.task_binding().kernel());
             }
-            (Some(parent), None) => tracing::error!(
+            (Some(parent), _, _) => tracing::error!(
                 parent = ?parent,
                 "child exit notification dropped: no HVPatch runtime directory"
             ),
-            (None, _) => {}
+            (None, _, _) => {}
         }
     }
 
