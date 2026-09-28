@@ -4,7 +4,7 @@ title = "Unaligned anonymous discard retires exact Linux pages"
 guest_surfaces = ["syscall:madvise"]
 semantic_authority = ["Linux private anonymous DONTNEED zero-fill, outside-range preservation and fork isolation"]
 fixture = "unit:forked-el1-stack-grant-discard"
-scale_points = [1]
+scale_points = [1, 2, 4]
 rationale = "HVPatch retires every 4 KiB Linux page through exact-MM alias and inventory authority, including partial 16 KiB host compounds. The old edge scrub invoked frame COW on retained outputs whose compound inventory had already been split. Fresh-zero provenance makes a later touch allocate new backing; fork peers retain their own image."
 [bindings]
 vm_free = "carrick-vmm-hvf::hvf_aarch64_engine::persistent_worker_tests::forked_el1_stack_grant_discards_64k_and_8m_without_edge_cow"
