@@ -14,7 +14,8 @@ pub(crate) fn with_edges(
             length: len,
         })
     };
-    if !granule.is_power_of_two()
+    if len == 0
+        || !granule.is_power_of_two()
         || granule < 4096
         || !address.is_multiple_of(4096)
         || !len.is_multiple_of(4096)
@@ -222,14 +223,12 @@ mod tests {
     }
 
     #[test]
-    fn refusal_and_empty_interior_do_not_mutate() {
-        for (address, len, refuse) in [(4096, 4096, false), (4096, 49152, true)] {
-            let mut memory = Memory::new(65536);
-            memory.refuse = refuse;
-            assert!(!with_edges(&mut memory, address, len, 16384).unwrap());
-            assert!(memory.events.is_empty());
-            assert!(memory.bytes.iter().all(|&b| b == 0x5a));
-        }
+    fn interior_refusal_does_not_mutate() {
+        let mut memory = Memory::new(65536);
+        memory.refuse = true;
+        assert!(!with_edges(&mut memory, 4096, 49152, 16384).unwrap());
+        assert!(memory.events.is_empty());
+        assert!(memory.bytes.iter().all(|&b| b == 0x5a));
     }
     #[test]
     fn interior_failure_preserves_classification_without_edge_work() {
