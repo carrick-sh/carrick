@@ -10810,287 +10810,291 @@ mod readonly_destination_offsets {
         out
     }
 
-    #[cfg(target_os = "macos")]
-    fn setup_layered_dir_fixture(
-        name: &str,
-        count: usize,
-    ) -> (tempfile::TempDir, tempfile::TempDir, SyscallDispatcher) {
-        let lower = tempfile::tempdir().unwrap();
-        let upper = tempfile::tempdir().unwrap();
-        let lower_dir = lower.path().join(name.trim_start_matches('/'));
-        std::fs::create_dir_all(&lower_dir).unwrap();
-        let half = count / 2;
-        for i in 0..half {
-            std::fs::write(lower_dir.join(format!("entry_{i:04}.txt")), b"lower").unwrap();
-        }
-        std::fs::write(lower_dir.join("whiteout_target.txt"), b"hidden").unwrap();
+    mod serial_host {
+        use super::*;
 
-        let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
-        let overlay = carrick_vfs::fs_backend::HostFsBackend::from_path(upper.path()).unwrap();
-        overlay.make_dir(name).unwrap();
-        overlay
-            .mark_deleted(&format!("{name}/whiteout_target.txt"))
-            .unwrap();
-        for i in half..count {
+        #[cfg(target_os = "macos")]
+        fn setup_layered_dir_fixture(
+            name: &str,
+            count: usize,
+        ) -> (tempfile::TempDir, tempfile::TempDir, SyscallDispatcher) {
+            let lower = tempfile::tempdir().unwrap();
+            let upper = tempfile::tempdir().unwrap();
+            let lower_dir = lower.path().join(name.trim_start_matches('/'));
+            std::fs::create_dir_all(&lower_dir).unwrap();
+            let half = count / 2;
+            for i in 0..half {
+                std::fs::write(lower_dir.join(format!("entry_{i:04}.txt")), b"lower").unwrap();
+            }
+            std::fs::write(lower_dir.join("whiteout_target.txt"), b"hidden").unwrap();
+
+            let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
+            let overlay = carrick_vfs::fs_backend::HostFsBackend::from_path(upper.path()).unwrap();
+            overlay.make_dir(name).unwrap();
             overlay
-                .set_file_contents(&format!("{name}/entry_{i:04}.txt"), b"upper".to_vec())
+                .mark_deleted(&format!("{name}/whiteout_target.txt"))
                 .unwrap();
-        }
-
-        let mut dispatcher = SyscallDispatcher::new();
-        dispatcher.set_fs_backend(Box::new(overlay));
-        dispatcher.set_rootfs_layer(rootfs);
-        (lower, upper, dispatcher)
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_getdents64_structural_budget_10_100_1000_entries() {
-        for count in [10, 100, 1000] {
-            let dir_name = format!("/dir_{count}");
-            let (_lower, _upper, mut dispatcher) = setup_layered_dir_fixture(&dir_name, count);
-            let mut memory = LinearMemory::new(0x4000, vec![0; 0x100000]);
-
-            let dir_fd = lane_openat(
-                &mut dispatcher,
-                &mut memory,
-                LINUX_AT_FDCWD,
-                &dir_name,
-                LINUX_O_DIRECTORY,
-            );
-            assert!(dir_fd >= 0, "open directory {dir_name} failed: {dir_fd}");
-
-            let buf_addr = 0x10000;
-            let chunk_size = 128u64;
-
-            // Call 1: initial listing materialization and first chunk.
-            carrick_vfs::fs_backend::reset_test_host_readdir_count();
-            carrick_vfs::fs_backend::reset_test_host_stat_count();
-            carrick_vfs::fs_backend::reset_test_layer_merge_count();
-
-            let n1 = lane_syscall(
-                &mut dispatcher,
-                &mut memory,
-                61,
-                [dir_fd as u64, buf_addr, chunk_size, 0, 0, 0],
-            );
-            assert!(n1 > 0, "Call 1 getdents64 must return bytes, got {n1}");
-
-            let readdir1 = carrick_vfs::fs_backend::test_host_readdir_count();
-            let stat1 = carrick_vfs::fs_backend::test_host_stat_count();
-            let merge1 = carrick_vfs::fs_backend::test_layer_merge_count();
-            assert!(
-                readdir1 <= 2,
-                "count={count}: Call 1 must issue at most 2 host readdir calls (upper + lower), got {readdir1}"
-            );
-            assert_eq!(
-                stat1, 0,
-                "count={count}: Call 1 must issue 0 host stats, got {stat1}"
-            );
-            assert_eq!(
-                merge1, 1,
-                "count={count}: Call 1 must perform exactly 1 layer merge, got {merge1}"
-            );
-
-            let bytes1 = memory.read_bytes(buf_addr, n1 as usize).unwrap();
-            let entries1 = parse_dirents(&bytes1);
-            assert!(
-                entries1.len() >= 2,
-                "count={count}: Call 1 must return at least . and .."
-            );
-            assert_eq!(entries1[0].name, ".");
-            assert_eq!(entries1[1].name, "..");
-            for e in &entries1 {
-                assert_ne!(
-                    e.name, "whiteout_target.txt",
-                    "count={count}: whiteout target must be hidden"
-                );
+            for i in half..count {
+                overlay
+                    .set_file_contents(&format!("{name}/entry_{i:04}.txt"), b"upper".to_vec())
+                    .unwrap();
             }
 
-            // Call 2: cursor continuation over the snapshot.
-            carrick_vfs::fs_backend::reset_test_host_readdir_count();
-            carrick_vfs::fs_backend::reset_test_host_stat_count();
-            carrick_vfs::fs_backend::reset_test_layer_merge_count();
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.set_fs_backend(Box::new(overlay));
+            dispatcher.set_rootfs_layer(rootfs);
+            (lower, upper, dispatcher)
+        }
 
-            let (n2, alloc_stats2) =
-                crate::dispatch::mem::metadata_budget_tests::allocation_meter::measure_stats(
-                    || {
-                        lane_syscall(
-                            &mut dispatcher,
-                            &mut memory,
-                            61,
-                            [dir_fd as u64, buf_addr, chunk_size, 0, 0, 0],
-                        )
-                    },
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn test_getdents64_structural_budget_10_100_1000_entries() {
+            for count in [10, 100, 1000] {
+                let dir_name = format!("/dir_{count}");
+                let (_lower, _upper, mut dispatcher) = setup_layered_dir_fixture(&dir_name, count);
+                let mut memory = LinearMemory::new(0x4000, vec![0; 0x100000]);
+
+                let dir_fd = lane_openat(
+                    &mut dispatcher,
+                    &mut memory,
+                    LINUX_AT_FDCWD,
+                    &dir_name,
+                    LINUX_O_DIRECTORY,
                 );
-            assert!(n2 > 0, "Call 2 getdents64 must return bytes, got {n2}");
+                assert!(dir_fd >= 0, "open directory {dir_name} failed: {dir_fd}");
 
-            let readdir2 = carrick_vfs::fs_backend::test_host_readdir_count();
-            let stat2 = carrick_vfs::fs_backend::test_host_stat_count();
-            let merge2 = carrick_vfs::fs_backend::test_layer_merge_count();
-            assert_eq!(
-                readdir2, 0,
-                "count={count}: Call 2 must issue 0 host readdir calls, got {readdir2}"
-            );
-            assert_eq!(
-                stat2, 0,
-                "count={count}: Call 2 must issue 0 host stats, got {stat2}"
-            );
-            assert_eq!(
-                merge2, 0,
-                "count={count}: Call 2 must issue 0 layer merges, got {merge2}"
-            );
+                let buf_addr = 0x10000;
+                let chunk_size = 128u64;
 
-            let bytes2 = memory.read_bytes(buf_addr, n2 as usize).unwrap();
-            let entries2 = parse_dirents(&bytes2);
-            assert!(
-                !entries2.is_empty(),
-                "count={count}: Call 2 must yield entries"
-            );
-            let entries_count2 = entries2.len() as u64;
-            // Budget requirement: allocations per entry must be 0 (no per-entry heap churn).
-            // A fixed per-call buffer allocation of at most 1 is permitted if non-zero, but per-entry churn must be 0.
-            let per_entry_allocs = alloc_stats2.calls.saturating_sub(1) / entries_count2;
-            assert_eq!(
-                per_entry_allocs, 0,
-                "count={count}: Call 2 must have 0 heap allocations per entry, got {} calls for {} entries",
-                alloc_stats2.calls, entries_count2
-            );
-
-            // Drain remaining entries.
-            let mut all_entries = entries1;
-            all_entries.extend(entries2);
-            loop {
+                // Call 1: initial listing materialization and first chunk.
                 carrick_vfs::fs_backend::reset_test_host_readdir_count();
                 carrick_vfs::fs_backend::reset_test_host_stat_count();
                 carrick_vfs::fs_backend::reset_test_layer_merge_count();
 
-                let n = lane_syscall(
+                let n1 = lane_syscall(
                     &mut dispatcher,
                     &mut memory,
                     61,
                     [dir_fd as u64, buf_addr, chunk_size, 0, 0, 0],
                 );
-                assert!(n >= 0, "getdents64 drain failed: {n}");
-                assert_eq!(
-                    carrick_vfs::fs_backend::test_host_readdir_count(),
-                    0,
-                    "drain must not re-list"
-                );
-                assert_eq!(
-                    carrick_vfs::fs_backend::test_host_stat_count(),
-                    0,
-                    "drain must not stat"
-                );
-                assert_eq!(
-                    carrick_vfs::fs_backend::test_layer_merge_count(),
-                    0,
-                    "drain must not re-merge"
-                );
+                assert!(n1 > 0, "Call 1 getdents64 must return bytes, got {n1}");
 
-                if n == 0 {
-                    break;
-                }
-                let bytes = memory.read_bytes(buf_addr, n as usize).unwrap();
-                all_entries.extend(parse_dirents(&bytes));
-            }
-
-            // Semantic check: total entries = count + 2 ('.' and '..').
-            assert_eq!(
-                all_entries.len(),
-                count + 2,
-                "count={count}: expected {} entries, got {}",
-                count + 2,
-                all_entries.len()
-            );
-            assert_eq!(all_entries[0].name, ".");
-            assert_eq!(all_entries[1].name, "..");
-            let mut seen_names = std::collections::HashSet::new();
-            for (idx, e) in all_entries.iter().enumerate() {
+                let readdir1 = carrick_vfs::fs_backend::test_host_readdir_count();
+                let stat1 = carrick_vfs::fs_backend::test_host_stat_count();
+                let merge1 = carrick_vfs::fs_backend::test_layer_merge_count();
                 assert!(
-                    seen_names.insert(e.name.clone()),
-                    "count={count}: duplicate entry: {}",
-                    e.name
-                );
-                assert_ne!(
-                    e.name, "whiteout_target.txt",
-                    "count={count}: whiteout target leaked into listing"
+                    readdir1 <= 2,
+                    "count={count}: Call 1 must issue at most 2 host readdir calls (upper + lower), got {readdir1}"
                 );
                 assert_eq!(
-                    e.off,
-                    (idx + 1) as i64,
-                    "count={count}: d_off cursor mismatch at index {idx}"
+                    stat1, 0,
+                    "count={count}: Call 1 must issue 0 host stats, got {stat1}"
                 );
-            }
-
-            // Cursors, seekdir, rewinddir test:
-            // 1. Rewind to beginning: lseek(fd, 0, SEEK_SET)
-            let rewind_res = lane_syscall(
-                &mut dispatcher,
-                &mut memory,
-                62,
-                [dir_fd as u64, 0, 0, 0, 0, 0],
-            );
-            assert_eq!(rewind_res, 0, "lseek(0, SEEK_SET) failed: {rewind_res}");
-
-            // Read after rewind: verify stable ordering.
-            let n_rewind = lane_syscall(
-                &mut dispatcher,
-                &mut memory,
-                61,
-                [dir_fd as u64, buf_addr, 0x80000, 0, 0, 0],
-            );
-            assert!(n_rewind > 0, "read after rewind failed: {n_rewind}");
-            let rewind_bytes = memory.read_bytes(buf_addr, n_rewind as usize).unwrap();
-            let rewind_entries = parse_dirents(&rewind_bytes);
-            assert_eq!(
-                rewind_entries.len(),
-                all_entries.len(),
-                "count={count}: rewind must return all entries"
-            );
-            for (orig, rewound) in all_entries.iter().zip(rewind_entries.iter()) {
                 assert_eq!(
-                    orig.name, rewound.name,
-                    "count={count}: ordering must be stable after rewind"
+                    merge1, 1,
+                    "count={count}: Call 1 must perform exactly 1 layer merge, got {merge1}"
                 );
-                assert_eq!(orig.off, rewound.off);
+
+                let bytes1 = memory.read_bytes(buf_addr, n1 as usize).unwrap();
+                let entries1 = parse_dirents(&bytes1);
+                assert!(
+                    entries1.len() >= 2,
+                    "count={count}: Call 1 must return at least . and .."
+                );
+                assert_eq!(entries1[0].name, ".");
+                assert_eq!(entries1[1].name, "..");
+                for e in &entries1 {
+                    assert_ne!(
+                        e.name, "whiteout_target.txt",
+                        "count={count}: whiteout target must be hidden"
+                    );
+                }
+
+                // Call 2: cursor continuation over the snapshot.
+                carrick_vfs::fs_backend::reset_test_host_readdir_count();
+                carrick_vfs::fs_backend::reset_test_host_stat_count();
+                carrick_vfs::fs_backend::reset_test_layer_merge_count();
+
+                let (n2, alloc_stats2) =
+                    crate::dispatch::mem::metadata_budget_tests::allocation_meter::measure_stats(
+                        || {
+                            lane_syscall(
+                                &mut dispatcher,
+                                &mut memory,
+                                61,
+                                [dir_fd as u64, buf_addr, chunk_size, 0, 0, 0],
+                            )
+                        },
+                    );
+                assert!(n2 > 0, "Call 2 getdents64 must return bytes, got {n2}");
+
+                let readdir2 = carrick_vfs::fs_backend::test_host_readdir_count();
+                let stat2 = carrick_vfs::fs_backend::test_host_stat_count();
+                let merge2 = carrick_vfs::fs_backend::test_layer_merge_count();
+                assert_eq!(
+                    readdir2, 0,
+                    "count={count}: Call 2 must issue 0 host readdir calls, got {readdir2}"
+                );
+                assert_eq!(
+                    stat2, 0,
+                    "count={count}: Call 2 must issue 0 host stats, got {stat2}"
+                );
+                assert_eq!(
+                    merge2, 0,
+                    "count={count}: Call 2 must issue 0 layer merges, got {merge2}"
+                );
+
+                let bytes2 = memory.read_bytes(buf_addr, n2 as usize).unwrap();
+                let entries2 = parse_dirents(&bytes2);
+                assert!(
+                    !entries2.is_empty(),
+                    "count={count}: Call 2 must yield entries"
+                );
+                let entries_count2 = entries2.len() as u64;
+                // Budget requirement: allocations per entry must be 0 (no per-entry heap churn).
+                // A fixed per-call buffer allocation of at most 1 is permitted if non-zero, but per-entry churn must be 0.
+                let per_entry_allocs = alloc_stats2.calls.saturating_sub(1) / entries_count2;
+                assert_eq!(
+                    per_entry_allocs, 0,
+                    "count={count}: Call 2 must have 0 heap allocations per entry, got {} calls for {} entries",
+                    alloc_stats2.calls, entries_count2
+                );
+
+                // Drain remaining entries.
+                let mut all_entries = entries1;
+                all_entries.extend(entries2);
+                loop {
+                    carrick_vfs::fs_backend::reset_test_host_readdir_count();
+                    carrick_vfs::fs_backend::reset_test_host_stat_count();
+                    carrick_vfs::fs_backend::reset_test_layer_merge_count();
+
+                    let n = lane_syscall(
+                        &mut dispatcher,
+                        &mut memory,
+                        61,
+                        [dir_fd as u64, buf_addr, chunk_size, 0, 0, 0],
+                    );
+                    assert!(n >= 0, "getdents64 drain failed: {n}");
+                    assert_eq!(
+                        carrick_vfs::fs_backend::test_host_readdir_count(),
+                        0,
+                        "drain must not re-list"
+                    );
+                    assert_eq!(
+                        carrick_vfs::fs_backend::test_host_stat_count(),
+                        0,
+                        "drain must not stat"
+                    );
+                    assert_eq!(
+                        carrick_vfs::fs_backend::test_layer_merge_count(),
+                        0,
+                        "drain must not re-merge"
+                    );
+
+                    if n == 0 {
+                        break;
+                    }
+                    let bytes = memory.read_bytes(buf_addr, n as usize).unwrap();
+                    all_entries.extend(parse_dirents(&bytes));
+                }
+
+                // Semantic check: total entries = count + 2 ('.' and '..').
+                assert_eq!(
+                    all_entries.len(),
+                    count + 2,
+                    "count={count}: expected {} entries, got {}",
+                    count + 2,
+                    all_entries.len()
+                );
+                assert_eq!(all_entries[0].name, ".");
+                assert_eq!(all_entries[1].name, "..");
+                let mut seen_names = std::collections::HashSet::new();
+                for (idx, e) in all_entries.iter().enumerate() {
+                    assert!(
+                        seen_names.insert(e.name.clone()),
+                        "count={count}: duplicate entry: {}",
+                        e.name
+                    );
+                    assert_ne!(
+                        e.name, "whiteout_target.txt",
+                        "count={count}: whiteout target leaked into listing"
+                    );
+                    assert_eq!(
+                        e.off,
+                        (idx + 1) as i64,
+                        "count={count}: d_off cursor mismatch at index {idx}"
+                    );
+                }
+
+                // Cursors, seekdir, rewinddir test:
+                // 1. Rewind to beginning: lseek(fd, 0, SEEK_SET)
+                let rewind_res = lane_syscall(
+                    &mut dispatcher,
+                    &mut memory,
+                    62,
+                    [dir_fd as u64, 0, 0, 0, 0, 0],
+                );
+                assert_eq!(rewind_res, 0, "lseek(0, SEEK_SET) failed: {rewind_res}");
+
+                // Read after rewind: verify stable ordering.
+                let n_rewind = lane_syscall(
+                    &mut dispatcher,
+                    &mut memory,
+                    61,
+                    [dir_fd as u64, buf_addr, 0x80000, 0, 0, 0],
+                );
+                assert!(n_rewind > 0, "read after rewind failed: {n_rewind}");
+                let rewind_bytes = memory.read_bytes(buf_addr, n_rewind as usize).unwrap();
+                let rewind_entries = parse_dirents(&rewind_bytes);
+                assert_eq!(
+                    rewind_entries.len(),
+                    all_entries.len(),
+                    "count={count}: rewind must return all entries"
+                );
+                for (orig, rewound) in all_entries.iter().zip(rewind_entries.iter()) {
+                    assert_eq!(
+                        orig.name, rewound.name,
+                        "count={count}: ordering must be stable after rewind"
+                    );
+                    assert_eq!(orig.off, rewound.off);
+                }
+
+                // 2. Seek to middle cursor: seekdir
+                let mid_idx = all_entries.len() / 2;
+                let mid_off = all_entries[mid_idx - 1].off;
+                let seek_res = lane_syscall(
+                    &mut dispatcher,
+                    &mut memory,
+                    62,
+                    [dir_fd as u64, mid_off as u64, 0, 0, 0, 0],
+                );
+                assert_eq!(
+                    seek_res, mid_off,
+                    "lseek(mid_off, SEEK_SET) failed: {seek_res}"
+                );
+
+                let n_seek = lane_syscall(
+                    &mut dispatcher,
+                    &mut memory,
+                    61,
+                    [dir_fd as u64, buf_addr, 0x80000, 0, 0, 0],
+                );
+                assert!(n_seek > 0, "read after seekdir failed: {n_seek}");
+                let seek_bytes = memory.read_bytes(buf_addr, n_seek as usize).unwrap();
+                let seek_entries = parse_dirents(&seek_bytes);
+                assert_eq!(
+                    seek_entries[0].name, all_entries[mid_idx].name,
+                    "count={count}: seekdir must resume at expected middle entry"
+                );
+
+                // Close dir_fd
+                lane_syscall(
+                    &mut dispatcher,
+                    &mut memory,
+                    57,
+                    [dir_fd as u64, 0, 0, 0, 0, 0],
+                );
             }
-
-            // 2. Seek to middle cursor: seekdir
-            let mid_idx = all_entries.len() / 2;
-            let mid_off = all_entries[mid_idx - 1].off;
-            let seek_res = lane_syscall(
-                &mut dispatcher,
-                &mut memory,
-                62,
-                [dir_fd as u64, mid_off as u64, 0, 0, 0, 0],
-            );
-            assert_eq!(
-                seek_res, mid_off,
-                "lseek(mid_off, SEEK_SET) failed: {seek_res}"
-            );
-
-            let n_seek = lane_syscall(
-                &mut dispatcher,
-                &mut memory,
-                61,
-                [dir_fd as u64, buf_addr, 0x80000, 0, 0, 0],
-            );
-            assert!(n_seek > 0, "read after seekdir failed: {n_seek}");
-            let seek_bytes = memory.read_bytes(buf_addr, n_seek as usize).unwrap();
-            let seek_entries = parse_dirents(&seek_bytes);
-            assert_eq!(
-                seek_entries[0].name, all_entries[mid_idx].name,
-                "count={count}: seekdir must resume at expected middle entry"
-            );
-
-            // Close dir_fd
-            lane_syscall(
-                &mut dispatcher,
-                &mut memory,
-                57,
-                [dir_fd as u64, 0, 0, 0, 0, 0],
-            );
         }
     }
 }
