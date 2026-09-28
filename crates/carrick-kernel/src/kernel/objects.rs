@@ -2288,16 +2288,14 @@ impl FileTable {
             next_fd = next;
         }
         let _ = *caller.next_fd.lock();
-        let fd_open_paths = caller
-            .fd_open_paths
-            .read()
+        let mut fd_open_paths = caller.fd_open_paths.read().clone();
+        let retired_paths = fd_open_paths
             .iter()
-            .filter_map(|(number, path)| {
-                open_files
-                    .contains_key(number)
-                    .then_some((*number, path.clone()))
-            })
-            .collect();
+            .filter_map(|(number, _)| (!open_files.contains_key(number)).then_some(*number))
+            .collect::<Vec<_>>();
+        for fd in retired_paths {
+            fd_open_paths.remove(&fd);
+        }
         let epoll_fds = caller
             .epoll_fds
             .read()
@@ -3470,6 +3468,29 @@ mod tests {
             Some("/child/second".to_owned())
         );
         assert_eq!(child.rename_fd_open_paths("/child", "/gone"), (vec![], 0));
+    }
+
+    #[test]
+    fn exec_copy_retains_description_alias_for_inherited_fd() {
+        let ids = ObjectIdRegistry::new();
+        let table = FileTable::new(ids.file_table_id().expect("table ID"));
+        let fd = FileSlotNumber::for_open_fd(7).expect("fd");
+        table.install(fd, regular_description(&ids), false);
+        table.write_fd_open_paths().insert_with_description_path(
+            7,
+            "/alias/file".to_owned(),
+            Some("/real/file".to_owned()),
+        );
+
+        let child = FileTable::for_exec(ids.file_table_id().expect("exec ID"), &table);
+        assert_eq!(
+            child.rename_fd_open_paths("/real/file", "/real/renamed"),
+            (vec![7], 1)
+        );
+        assert_eq!(
+            child.read_fd_open_paths().get(&7).map(String::as_str),
+            Some("/alias/file")
+        );
     }
 
     #[test]
