@@ -214,6 +214,10 @@ pub struct MmMutationGuard<'authority> {
 }
 
 impl<'authority> MmMutationGuard<'authority> {
+    pub fn mm_id(&self) -> MmId {
+        self.mm
+    }
+
     pub fn with_operation(
         mut self,
         operation: carrick_observability::probes::HvpatchTopologyOperation,

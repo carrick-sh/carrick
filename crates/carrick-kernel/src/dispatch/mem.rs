@@ -1693,6 +1693,8 @@ impl<'a> MemView<'a> {
         let live_residency = memory.resident_pages(GuestVa(address), pages, page_size);
         let mem_authority_30 = self.mem();
         let mem = mem_authority_30.lock();
+        let mm_key = self.mm_authority().mm_id.raw();
+        let guest_residency = carrick_el1_abi::frame_grant_residency_host();
         let zero_reads = mem.deferred_anonymous.snapshot().zero_read_resident;
         let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
         for index in 0..pages {
@@ -1703,6 +1705,7 @@ impl<'a> MemView<'a> {
                 .any(|m| page >= m.start && page < m.end);
             let resident = if in_dynamic {
                 ranges_contain_page(&mem.resident_ranges, page)
+                    || guest_residency.is_some_and(|table| table.is_guest_committed(mm_key, page))
                     || zero_reads
                         .iter()
                         .any(|r| r.start.raw() <= page && page < r.end.raw())
@@ -2028,6 +2031,30 @@ forward_mem_mutation_handlers! {
 }
 
 impl SyscallDispatcher {
+    /// Fold one authenticated live VALID grant leaf into the portable
+    /// residency/first-touch model before a host MM mutation uses that model.
+    pub fn reconcile_el1_resident_page(
+        &self,
+        guard: &super::mm_mutation::MmMutationGuard<'_>,
+        page: u64,
+    ) -> bool {
+        let view = self.mem_view();
+        let authority = view.mm_authority();
+        if authority.mm_id != guard.mm_id() || !page.is_multiple_of(view.linux_page_size()) {
+            return false;
+        }
+        let Some(end) = page.checked_add(view.linux_page_size()) else {
+            return false;
+        };
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(page), GuestVa(end)) else {
+            return false;
+        };
+        let mut mem = authority.mem.lock();
+        locked_ranges_insert(&mut mem.resident_ranges, range);
+        mem.resident_fault_ranges.disarm(range);
+        true
+    }
+
     #[inline]
     pub(super) fn commit_host_alias_mmap_observed(
         &self,
@@ -2257,6 +2284,14 @@ impl SyscallDispatcher {
         protect: &mut dyn FnMut(u64, u64) -> Result<(), String>,
     ) -> Result<bool, String> {
         let mutation = super::mm_mutation::from_frame_cow(authority);
+        // The descriptor may have been observed prepared before this guard
+        // excluded an EL1 editor. Its guest commit wins that race; the caller
+        // rechecks the live descriptor instead of validating it a second time.
+        if carrick_el1_abi::frame_grant_residency_host()
+            .is_some_and(|table| table.is_guest_committed(mutation.mm_id().raw(), address))
+        {
+            return Ok(false);
+        }
         let permit = mutation.host_alias_permit();
         let Some(plan) = self.resident_fault_plan(&permit, address) else {
             return Ok(false);

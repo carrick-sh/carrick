@@ -487,6 +487,9 @@ impl<'a> MemView<'a> {
             return;
         };
         let authority = self.mem();
+        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+            table.retire_overlapping(authority.mm_id.raw(), start, len);
+        }
         let mut mem = authority.lock();
         locked_ranges_remove(&mut mem.resident_ranges, range);
         let _ = mem

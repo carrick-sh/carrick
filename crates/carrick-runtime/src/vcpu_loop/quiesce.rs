@@ -1073,6 +1073,18 @@ where
                     )));
                 }
             };
+        if let Some(engine) = (memory as &dyn std::any::Any).downcast_ref::<E>() {
+            super::signal::reconcile_guest_frame_commits(
+                &kernel.dispatcher,
+                engine,
+                &parent_mutation,
+            );
+            // Fork can arm COW and repoint both committed and still-prepared
+            // leaves. No pre-fork grant may authorize a later guest commit.
+            if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+                table.retire_overlapping(parent_mm_id.raw(), 0, u64::MAX);
+            }
+        }
         let mut inventory_transaction = None;
         let mut inventory_reserve =
             |frame_candidates: usize,

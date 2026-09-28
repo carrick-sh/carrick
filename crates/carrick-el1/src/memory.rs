@@ -186,7 +186,11 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
         return MunmapDisposition::Forward;
     };
     match editor.retire_and_invalidate(grant.ttbr0, address, len) {
-        Ok(()) => MunmapDisposition::Retired,
+        Ok(()) => {
+            #[cfg(target_os = "none")]
+            carrick_el1_abi::frame_grant_residency_guest().retire_overlapping(mm_key, address, len);
+            MunmapDisposition::Retired
+        }
         Err(GuestRetirementError::BadRange) => MunmapDisposition::Return(-EINVAL),
         Err(
             GuestRetirementError::TableOutsidePrimary
@@ -255,6 +259,12 @@ pub fn try_serve_brk<E: AnonymousRetirementEditor>(
         {
             return BrkDisposition::Forward;
         }
+        #[cfg(target_os = "none")]
+        carrick_el1_abi::frame_grant_residency_guest().retire_overlapping(
+            mm_key,
+            new_page_end,
+            shrink_len,
+        );
     }
     editor_guard.set_brk_current(requested);
     BrkDisposition::Return(requested)
@@ -347,7 +357,17 @@ pub fn try_serve_mmap<E: AnonymousRetirementEditor>(
         if requested_addr < LINUX_MMAP_BASE || end > LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX {
             return MmapDisposition::Forward;
         }
-        let _ = editor.retire_and_invalidate(grant.ttbr0, requested_addr, len);
+        if editor
+            .retire_and_invalidate(grant.ttbr0, requested_addr, len)
+            .is_ok()
+        {
+            #[cfg(target_os = "none")]
+            carrick_el1_abi::frame_grant_residency_guest().retire_overlapping(
+                mm_key,
+                requested_addr,
+                len,
+            );
+        }
         MmapDisposition::Return(requested_addr as i64)
     }
 }

@@ -3495,6 +3495,19 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         Ok(true)
     }
 
+    fn live_el1_grant_page(&self, va: u64, expected_ipa: u64) -> bool {
+        if self.process_asid.is_none() {
+            return false;
+        }
+        let Ok(walk) = self.live_pt_debug_walk(va) else {
+            return false;
+        };
+        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(walk);
+        carrick_mmu_core::aarch64::el1_private_leaf_state(leaf)
+            == carrick_mmu_core::aarch64::El1PrivateLeafState::Resident
+            && leaf & 0x0000_FFFF_FFFF_F000 == expected_ipa
+    }
+
     fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;

@@ -2879,6 +2879,12 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         Ok(false)
     }
 
+    /// Authenticate a guest-committed grant page against the current live
+    /// stage-1 leaf before the host adopts its residency bitmap bit.
+    fn live_el1_grant_page(&self, _va: u64, _expected_ipa: u64) -> bool {
+        false
+    }
+
     /// Refresh fork-private backend state after the child frame inventory and
     /// exact MM/COW authority are live, but before the child enters guest code.
     fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {
