@@ -1097,7 +1097,6 @@ where
             ),
         };
         let process_exit_event = process.record_process_exit_begin(exit_code, self.state.this_tid);
-        let child = process.is_child();
         if let Some(work) = self.external_exec.take() {
             let out = self.kernel.dispatcher.stdout();
             let err = self.kernel.dispatcher.stderr();
@@ -1129,14 +1128,10 @@ where
         let status = carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(wait_encoding);
         let orphan_adopter = self.kernel.dispatcher.hvpatch_orphan_adopter();
         let publish_result = process.publish_exit_status(status, orphan_adopter, |parent| {
-            if child {
-                self.kernel.notify_hvpatch_parent_exit(parent);
-            } else if let Some(parent) = parent {
-                tracing::error!(
-                    parent = ?parent,
-                    "child exit notification dropped: is_child() said no parent but the exit transaction named one"
-                );
-            }
+            // The exit transaction's exact parent key is authoritative. A
+            // pre-commit parent snapshot cannot decide current parentage after
+            // reparenting or an overlapping parent exit.
+            self.kernel.notify_hvpatch_parent_exit(parent);
         });
         if publish_result.is_ok() {
             if let Some(chain) = self.kernel.dispatcher.observers() {
@@ -5935,7 +5930,7 @@ mod tests {
         let compatibility_wake = Arc::new(EndpointRecordingWaker::default());
         context.task().set_waker(compatibility_wake.clone());
 
-        directory.notify_child_exit(context.task().key());
+        directory.notify_child_exit(context.task().key(), context.kernel());
         assert_eq!(scheduler.queued_len(), 1);
         assert_eq!(
             compatibility_wake
@@ -5976,7 +5971,7 @@ mod tests {
         let compatibility_wake = Arc::new(EndpointRecordingWaker::default());
         context.task().set_waker(compatibility_wake.clone());
 
-        directory.notify_child_exit(context.task().key());
+        directory.notify_child_exit(context.task().key(), context.kernel());
 
         assert_eq!(
             compatibility_wake
