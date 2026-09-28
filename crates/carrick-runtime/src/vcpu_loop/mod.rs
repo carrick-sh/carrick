@@ -1342,7 +1342,12 @@ where
         executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
         run: impl FnOnce(&mut carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
     ) -> Result<T, RuntimeError> {
-        let mut mutation = carrick_kernel::dispatch::mm_mutation::from_executor(executor);
+        let mut mutation =
+            carrick_kernel::dispatch::mm_mutation::from_executor(executor).map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "fault page-table pause failed before mutation: {error:?}"
+                ))
+            })?;
         Ok(run(&mut mutation))
     }
 
@@ -1652,7 +1657,12 @@ where
 
         let edits_stage1 = syscall_edits_stage1(request.number.raw(), request.args.0[2]);
         let mut mm_phase = if edits_stage1 {
-            let guard = carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor);
+            let guard = match carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor) {
+                Ok(guard) => guard,
+                Err(carrick_kernel::dispatch::mm_quiesce::PtPauseError::TimedOut) => {
+                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOMEM));
+                }
+            };
             SyscallMmPhase::Mutation(guard)
         } else {
             SyscallMmPhase::Ordinary(mm_executor)

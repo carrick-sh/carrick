@@ -2283,7 +2283,12 @@ impl<'a> IpcView<'a> {
             if executor.mm_id() != cx.kernel.shared().mm().id() {
                 return Err(DispatchError::MmMutationPeerExecutor);
             }
-            let mutation = super::mm_mutation::from_executor(executor);
+            let mutation = match super::mm_mutation::from_executor(executor) {
+                Ok(mutation) => mutation,
+                Err(super::mm_quiesce::PtPauseError::TimedOut) => {
+                    return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOMEM));
+                }
+            };
             let permit = mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             if cx.memory.unmap_alias_range(addr, len).is_err() {
