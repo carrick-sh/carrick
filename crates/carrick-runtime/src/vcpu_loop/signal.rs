@@ -235,10 +235,19 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     const SIGSEGV: i32 = 11;
     const SIGBUS: i32 = 7;
     const BUS_ADRERR: i32 = 2;
-    if fault.signum == SIGSEGV && dispatcher.mmap_fault_is_sigbus(fault.si_addr) {
+    let incoming = fault.signum;
+    let bus = incoming == SIGSEGV && dispatcher.mmap_fault_is_sigbus(fault.si_addr);
+    if fault.signum == SIGSEGV && bus {
         fault.signum = SIGBUS;
         fault.si_code = BUS_ADRERR;
     }
+    crate::probes::hvpatch_fault_delivery(
+        fault.si_addr,
+        incoming,
+        fault.signum,
+        bus,
+        this_tid.raw(),
+    );
     // Capture the forked-child flag up front so the `terminate` closure does not
     // borrow `engine` — it is now also called in the inject-failure arm below,
     // after a &mut engine use, and a closure-held &engine would conflict. (M1b)
