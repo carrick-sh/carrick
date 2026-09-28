@@ -54,7 +54,7 @@
 //!     that are spinning in userspace (not parked in any host syscall, so the
 //!     self-pipe alone can't reach them). The pump is also where SIGCHLD comes
 //!     from: guest children are watched via `EVFILT_PROC`/`NOTE_EXIT` (the
-//!     neutral `carrick_signal_core::child_watch` registry records the parent
+//!     neutral `carrick_signal_linux::child_watch` registry records the parent
 //!     tid + exit signal) so no host SIGCHLD handler is installed — installing one
 //!     would break `wait4`'s host-`waitpid` passthrough, since carrick reaps
 //!     guest children with real host `waitpid`. `NOTE_EXIT` is readiness-only; it
@@ -63,7 +63,7 @@
 //! FORK COHERENCE. `fork(2)` does not inherit a kqueue, and the inherited
 //! self-pipe is shared with the parent. [`reinit_after_fork`] tears down the
 //! inherited channels and rebuilds private ones so a child's wakes are its own,
-//! and clears the inherited child-watch (`carrick_signal_core::child_watch`) /
+//! and clears the inherited child-watch (`carrick_signal_linux::child_watch`) /
 //! `THREAD_*` tables. Carrick-internal
 //! fds (self-pipes, kqueues) are relocated to a high fd range
 //! (`HOST_INTERNAL_FD_MIN`) above the guest's 1024-fd cap so fork
@@ -87,19 +87,19 @@ use std::sync::{Arc, LazyLock};
 use crate::linux_abi::LINUX_SIGINT;
 // The platform-NEUTRAL host-disposition mirroring policy (the shared INSTALLED_MASK
 // idempotency bitmask + the `is_host_routable` base excluded-signum set) lives in
-// `carrick_signal_core::host_disposition`, shared verbatim with the KVM backend so
+// `carrick_signal_linux::host_disposition`, shared verbatim with the KVM backend so
 // the two cannot drift. HVF's install/handler code below layers its own per-signum
 // SKIP set + the Linux<->macOS number translation on top.
-use carrick_signal_core::host_disposition;
+use carrick_signal_linux::host_disposition;
 
 // Platform-NEUTRAL pending bookkeeping (the THREAD_PENDING/PROC_PENDING store,
-// SENDER_PID, and their pure operations) lives in `carrick-signal-core`, shared
+// SENDER_PID, and their pure operations) lives in `carrick-signal-linux`, shared
 // verbatim with the KVM backend. Re-export the neutral surface; the HVF GLUE
 // below (the kqueue pump, self-pipe + per-thread wakes, and the cross-process
 // xsignal ring) layers on top. `publish_pending_for`, `has_pending_for`, and
 // `has_unblocked_pending_for` are NOT re-exported: HVF defines its own
 // glue-wrapped versions (wakes + xsignal peek) that call the core primitives.
-pub use carrick_signal_core::{
+pub use carrick_signal_linux::{
     NO_PENDING_SIGNAL, clear_proc_pending, clear_thread_pending, forget_thread,
     has_process_pending, last_sender_for, lowest_pending_signum, pending_bit, pending_thread_tids,
     proc_pending_fetch_or, record_sender, signal_unblocked_by_mask, take_pending_for,
@@ -107,16 +107,16 @@ pub use carrick_signal_core::{
 };
 
 // The platform-NEUTRAL cross-process xsignal ring core now lives in
-// `carrick-signal-core::xsig`; only the nudge SIGNAL number + nudge handler wake
+// `carrick-signal-linux::xsig`; only the nudge SIGNAL number + nudge handler wake
 // below is HVF glue. Re-export the ring surface so HVF's call sites are unchanged.
-pub use carrick_signal_core::xsig::{
+pub use carrick_signal_linux::xsig::{
     mark_xsig_dirty, xsig_drain_for_self, xsig_enqueue, xsig_has_pending,
     xsig_has_unblocked_for_self, xsig_init,
 };
 // The fork-coherent FASYNC (signal-driven I/O) registry shares the xsignal
 // ring's pre-fork MAP_SHARED lifetime; init it alongside the ring so every
 // guest process inherits the one table.
-pub use carrick_signal_core::fasync::fasync_init;
+pub use carrick_signal_linux::fasync::fasync_init;
 
 // The `(linux, host)` signal-number translation table that DIFFERS between Linux
 // and the BSDs (SIGUSR1/SIGCHLD/SIGSTOP/SIGURG/…) is the ONE BSD-family table in
@@ -181,7 +181,7 @@ pub fn block_hvf_private_thread_signals() -> HvfPrivateSignalMaskGuard {
 
 // The per-signum idempotency bitmask that records which signals have a mirrored
 // host disposition (so `ensure_host_handler`/`set_host_ignore` are idempotent) is
-// now the platform-NEUTRAL `carrick_signal_core::host_disposition::INSTALLED_MASK`
+// now the platform-NEUTRAL `carrick_signal_linux::host_disposition::INSTALLED_MASK`
 // (shared verbatim with the KVM backend, so the two cannot drift on the install
 // bookkeeping). HVF reads/writes it through the neutral
 // `mark_installed`/`clear_installed`/`is_installed`/`installed_mask`/`clear_all`
@@ -191,7 +191,7 @@ pub fn block_hvf_private_thread_signals() -> HvfPrivateSignalMaskGuard {
 // The `child_pid -> (parent_tid, exit_signal)` registry that records, for each
 // watched guest child, the guest tid to wake on the child's exit and the signal
 // the guest asked for (clone exit_signal / clone3 `exit_signal`), is now the
-// platform-NEUTRAL `carrick_signal_core::child_watch` core (shared verbatim with
+// platform-NEUTRAL `carrick_signal_linux::child_watch` core (shared verbatim with
 // the KVM backend). HVF's GLUE below layers the `EVFILT_PROC`/`NOTE_EXIT` kqueue
 // watch on top: the signal pump watches each registered child (macOS-native
 // process-lifecycle tracking); on the child's exit it resolves the pid through
@@ -367,7 +367,7 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
 /// Publish a thread-directed signal with an explicit vCPU wake owner.
 pub fn publish_pending_for_with_wake(tid: i32, signum: i32, wake: PublicationWake) {
     crate::probes::signal_publish(tid, signum, 1);
-    carrick_signal_core::publish_pending_for(tid, signum);
+    carrick_signal_linux::publish_pending_for(tid, signum);
     carrick_el1_abi::mark_pending_host_work_for_task(carrick_el1_abi::El1TaskId::from_linux_tid(
         tid,
     ));
@@ -395,8 +395,8 @@ pub fn publish_pending_for_with_wake(tid: i32, signum: i32, wake: PublicationWak
 pub struct SignalForkLocks {
     // Declared first so its child-side reset runs before the other guards drop.
     _waiters: ThreadWaitersForkGuard,
-    _child_watch: carrick_signal_core::child_watch::ChildWatchForkGuard,
-    _thread_pending: carrick_signal_core::ThreadPendingForkGuard,
+    _child_watch: carrick_signal_linux::child_watch::ChildWatchForkGuard,
+    _thread_pending: carrick_signal_linux::ThreadPendingForkGuard,
 }
 
 /// Acquire the atfork-prepare bundle (see [`SignalForkLocks`]). Call
@@ -404,8 +404,8 @@ pub struct SignalForkLocks {
 /// to unlock parent state or publish child replacements, strictly before any
 /// child-side signal reinit.
 pub fn hold_signal_locks_for_fork() -> SignalForkLocks {
-    let child_watch = carrick_signal_core::child_watch::hold_for_fork();
-    let thread_pending = carrick_signal_core::hold_thread_pending_for_fork();
+    let child_watch = carrick_signal_linux::child_watch::hold_for_fork();
+    let thread_pending = carrick_signal_linux::hold_thread_pending_for_fork();
     let waiters = THREAD_WAITERS.hold_for_fork();
     SignalForkLocks {
         _waiters: waiters,
@@ -418,7 +418,7 @@ pub fn hold_signal_locks_for_fork() -> SignalForkLocks {
 /// `EVFILT_PROC`/`NOTE_EXIT` watch for the child on the signal pump's kqueue so
 /// the pump publishes SIGCHLD to `parent_tid` when the child exits. Called from
 /// the runtime's fork parent branch (normal dispatch context). No host SIGCHLD
-/// handler is installed — see the neutral `carrick_signal_core::child_watch`
+/// handler is installed — see the neutral `carrick_signal_linux::child_watch`
 /// registry. If the pump kqueue is not yet
 /// registered, the mapping is still recorded and the pump arms the watch when it
 /// next learns the pid (we re-arm on every register). The `EV_ONESHOT` watch
@@ -429,7 +429,7 @@ pub fn register_child_exit_watch(child_pid: i32, parent_tid: i32, exit_signal: i
     }
     // Record the mapping (with the 0-sentinel / SIGCHLD-fallback sanitization) in
     // the neutral child-watch core; the EVFILT_PROC arming below is HVF glue.
-    carrick_signal_core::child_watch::register(child_pid, parent_tid, exit_signal);
+    carrick_signal_linux::child_watch::register(child_pid, parent_tid, exit_signal);
     let kq = PUMP_KQUEUE.load(Ordering::SeqCst);
     if kq >= 0 {
         let result = crate::darwin_kqueue::apply_changes(
@@ -457,7 +457,7 @@ pub fn rearm_child_watches(kq: i32) {
     if kq < 0 {
         return;
     }
-    let pids: Vec<i32> = carrick_signal_core::child_watch::tracked_pids();
+    let pids: Vec<i32> = carrick_signal_linux::child_watch::tracked_pids();
     for pid in pids {
         let result = crate::darwin_kqueue::apply_changes(
             kq,
@@ -522,7 +522,7 @@ fn publish_child_exit_if_waitable(child_pid: i32) -> bool {
 /// is one-shot). `None` if the pid was not a tracked guest child. Called only
 /// from the signal pump.
 pub fn take_child_exit_parent(child_pid: i32) -> Option<(i32, i32)> {
-    carrick_signal_core::child_watch::take(child_pid)
+    carrick_signal_linux::child_watch::take(child_pid)
 }
 
 /// Pop a backend-recorded child-exit `waitid` payload for the next delivery of
@@ -531,15 +531,15 @@ pub fn take_child_exit_parent(child_pid: i32) -> Option<(i32, i32)> {
 pub fn take_child_exit_siginfo(
     parent_tid: i32,
     exit_signal: i32,
-) -> Option<carrick_signal_core::child_watch::ChildExitSiginfo> {
-    carrick_signal_core::child_watch::take_siginfo(parent_tid, exit_signal)
+) -> Option<carrick_signal_linux::child_watch::ChildExitSiginfo> {
+    carrick_signal_linux::child_watch::take_siginfo(parent_tid, exit_signal)
 }
 
 /// True iff `child_pid` is a tracked guest child (a fired `EVFILT_PROC` event's
 /// `ident`). Lets the pump distinguish a child-exit event from its other wake
 /// sources without consuming the mapping.
 pub fn is_tracked_child(child_pid: i32) -> bool {
-    carrick_signal_core::child_watch::is_tracked(child_pid)
+    carrick_signal_linux::child_watch::is_tracked(child_pid)
 }
 
 /// Is a signal deliverable to `tid` pending? True for a thread-directed signal
@@ -551,7 +551,7 @@ pub fn has_pending_for(tid: i32) -> bool {
     if xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE) {
         return true;
     }
-    carrick_signal_core::has_pending_for(tid)
+    carrick_signal_linux::has_pending_for(tid)
 }
 
 /// Like [`has_pending_for`], but a signal blocked by `block_mask` does NOT
@@ -568,7 +568,7 @@ pub fn has_unblocked_pending_for(tid: i32, block_mask: carrick_abi::SigBlockMask
     if xsig_has_unblocked_for_self(block_mask) {
         return true;
     }
-    carrick_signal_core::has_unblocked_pending_for(tid, block_mask)
+    carrick_signal_linux::has_unblocked_pending_for(tid, block_mask)
 }
 
 /// Process-wide self-pipe used to wake threads parked in a blocking-I/O
@@ -836,7 +836,7 @@ pub use carrick_host_bsd::{duplicate_internal_fd, relocate_internal_fd};
 /// with the parent (cross-process spurious wakes). Give the child a fresh
 /// self-pipe so its parked-thread wakes are its own.
 pub fn reinit_after_fork() {
-    carrick_signal_core::xsig::xsig_refresh_self_host_pid();
+    carrick_signal_linux::xsig::xsig_refresh_self_host_pid();
     open_pending_pipe();
     // The parent's pump kqueue fd is meaningless in the child; the child
     // re-spawns its own pump (which calls set_pump_kqueue). Until then, no
@@ -860,7 +860,7 @@ pub fn reinit_after_fork() {
     // The inherited child-exit watches belong to the PARENT's children (this
     // child's siblings); the freshly-forked child must not deliver SIGCHLD for
     // them. Its own children are registered on its own re-spawned pump.
-    carrick_signal_core::child_watch::clear();
+    carrick_signal_linux::child_watch::clear();
     clear_thread_waiters();
     clear_proc_pending();
 }
@@ -870,7 +870,7 @@ pub fn reinit_after_fork() {
 /// installs default handlers, so the child does not inherit stale pending
 /// signals, routed-handler bookkeeping, or the supervisor's self-pipe fds.
 pub fn reset_after_supervisor_fork() {
-    carrick_signal_core::xsig::xsig_refresh_self_host_pid();
+    carrick_signal_linux::xsig::xsig_refresh_self_host_pid();
     INSTALLED.store(0, Ordering::SeqCst);
     host_disposition::clear_all();
     clear_thread_pending();
@@ -881,7 +881,7 @@ pub fn reset_after_supervisor_fork() {
     // supervisor forks before any guest fork, so the watch map is empty), but
     // matches the KVM runtime `reset_after_supervisor_fork` (lib.rs) and the
     // HVF guest-fork `reset_after_fork` above, both of which clear it.
-    carrick_signal_core::child_watch::clear();
+    carrick_signal_linux::child_watch::clear();
     open_pending_pipe();
 }
 
@@ -1015,7 +1015,7 @@ pub(crate) fn drain_fd(fd: RawFd) -> DrainResult {
 }
 
 // SENDER_PID, `record_sender`, and `last_sender_for` are neutral and live in
-// `carrick-signal-core` (re-exported above). `handle_routed` overwrites the
+// `carrick-signal-linux` (re-exported above). `handle_routed` overwrites the
 // sender on each cross-process arrival and `raise_for_self` records self, so a
 // stale cross-process value never leaks into a self-raise.
 
@@ -1042,7 +1042,7 @@ pub(crate) fn drain_fd(fd: RawFd) -> DrainResult {
 
 // The platform-NEUTRAL ring core (the slot/ring layout, the `MAP_SHARED|MAP_ANON`
 // allocation, enqueue, drain, dirty flag, and the deliverable-for-self peek) now
-// lives in `carrick_signal_core::xsig` (re-exported above). Only the nudge SIGNAL
+// lives in `carrick_signal_linux::xsig` (re-exported above). Only the nudge SIGNAL
 // number + the nudge handler wake below is HVF glue.
 
 /// Host SIGINFO — the "drain your xsignal ring" nudge (free; see above).
@@ -1056,7 +1056,7 @@ pub fn is_xsig_nudge(host_signum: i32) -> bool {
 /// Nudge this carrier to drain its xsignal entries. Guest tasks do not name
 /// host processes, so the historical host-pid argument is deliberately ignored.
 pub fn xsig_nudge(_target_host_pid: i32) {
-    carrick_signal_core::xsig::mark_xsig_dirty();
+    carrick_signal_linux::xsig::mark_xsig_dirty();
     notify_pending();
 }
 
@@ -1069,7 +1069,7 @@ extern "C" fn handle_xsig_nudge(
     _info: *mut libc::siginfo_t,
     _ctx: *mut libc::c_void,
 ) {
-    carrick_signal_core::xsig::mark_xsig_dirty();
+    carrick_signal_linux::xsig::mark_xsig_dirty();
     notify_pending();
 }
 
@@ -1136,19 +1136,19 @@ extern "C" fn handle_sigint(_signum: libc::c_int) {
     publish_pending(LINUX_SIGINT);
 }
 
-/// The HVF [`carrick_signal_core::HostSignalGlue`]: HVF's signal characteristics
-/// expressed for the SHARED `carrick_signal_core::host_glue` disposition driver,
+/// The HVF [`carrick_signal_linux::HostSignalGlue`]: HVF's signal characteristics
+/// expressed for the SHARED `carrick_signal_linux::host_glue` disposition driver,
 /// so HVF's `ensure_host_handler` / `set_host_ignore` / `set_host_default` /
 /// `reset_routed_handlers_after_execve` (and the routed handler,
 /// `host_glue::shared_routed_handler::<HvfGlue>`) are the SAME generic code
 /// KVM/bhyve/NVMM use. The old hand-rolled `handle_routed` + four disposition fns
 /// are gone; only this ~30-line glue remains, and it shares the cross-process
-/// pending table (HVF already uses `carrick_signal_core::proc_pending_fetch_or`).
+/// pending table (HVF already uses `carrick_signal_linux::proc_pending_fetch_or`).
 ///
 /// HVF differs from the signal-based backends in two load-bearing ways, both
 /// expressed here: (1) it ROUTES the synchronous-fault set (a sibling
 /// `kill -SEGV` must reach the guest) and tells a REAL CPU fault apart via
-/// [`is_synchronous_self_fault`](carrick_signal_core::HostSignalGlue::is_synchronous_self_fault)
+/// [`is_synchronous_self_fault`](carrick_signal_linux::HostSignalGlue::is_synchronous_self_fault)
 /// — under HVF a guest fault is a vmexit, so a host SIGSEGV with a
 /// kernel-generated `si_code` is always carrick's own bug and must crash visibly,
 /// not re-execute forever; (2) it kicks vCPUs with `hv_vcpus_exit`, NOT a signal,
@@ -1156,7 +1156,7 @@ extern "C" fn handle_sigint(_signum: libc::c_int) {
 /// them — every `skip_*` is overridden).
 pub struct HvfGlue;
 
-impl carrick_signal_core::HostSignalGlue for HvfGlue {
+impl carrick_signal_linux::HostSignalGlue for HvfGlue {
     // ── stubs: HVF kicks via `hv_vcpus_exit`, not a signal; never consulted by
     //    the disposition path (every `skip_*` below is overridden). ──
     fn kick_signal() -> i32 {
@@ -1237,7 +1237,7 @@ impl carrick_signal_core::HostSignalGlue for HvfGlue {
 /// EPIPE writes into the guest as a spurious SIGPIPE. (LTP sigaltstack01,
 /// kill02, pause02/03, sigrelse01 all break this way.)
 pub fn ensure_host_handler(linux_signum: i32) {
-    carrick_signal_core::host_glue::ensure_host_handler::<HvfGlue>(linux_signum);
+    carrick_signal_linux::host_glue::ensure_host_handler::<HvfGlue>(linux_signum);
 }
 
 /// Mirror a guest `SIG_IGN` disposition to the HOST disposition, so a
@@ -1261,7 +1261,7 @@ pub fn ensure_host_handler(linux_signum: i32) {
 ///     re-execute forever. carrick keeps catching these (handle_routed); a
 ///     cross-process instance is dropped at the dispatch layer instead.
 pub fn set_host_ignore(linux_signum: i32) {
-    carrick_signal_core::host_glue::set_host_ignore::<HvfGlue>(linux_signum);
+    carrick_signal_linux::host_glue::set_host_ignore::<HvfGlue>(linux_signum);
 }
 
 /// Reset a guest-mirrorable signal's HOST disposition back to `SIG_DFL` — the
@@ -1278,7 +1278,7 @@ pub fn set_host_ignore(linux_signum: i32) {
 /// host routing (resetting them to default would let a host-delivered instance
 /// take the lethal default action or break carrick's fault handling).
 pub fn set_host_default(linux_signum: i32) {
-    carrick_signal_core::host_glue::set_host_default::<HvfGlue>(linux_signum);
+    carrick_signal_linux::host_glue::set_host_default::<HvfGlue>(linux_signum);
 }
 
 /// Reset host signal dispositions that were installed only to route guest
@@ -1287,7 +1287,7 @@ pub fn set_host_default(linux_signum: i32) {
 /// host process would otherwise keep catching those signals after the emulated
 /// disposition was gone.
 pub fn reset_routed_handlers_after_execve(ignored: carrick_abi::SigSet) {
-    carrick_signal_core::host_glue::reset_routed_handlers_after_execve::<HvfGlue>(ignored);
+    carrick_signal_linux::host_glue::reset_routed_handlers_after_execve::<HvfGlue>(ignored);
 }
 
 /// Install the host SIGINT handler. Subsequent calls are no-ops. Safe
@@ -1860,7 +1860,7 @@ mod tests {
 
     #[test]
     fn darwin_brk_trap_is_classified_as_host_fault() {
-        use carrick_signal_core::HostSignalGlue;
+        use carrick_signal_linux::HostSignalGlue;
 
         assert!(
             HvfGlue::is_synchronous_self_fault(5, 0, 0),

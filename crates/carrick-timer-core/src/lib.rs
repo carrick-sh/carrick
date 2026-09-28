@@ -11,10 +11,25 @@
 //! `itimer` / `posix_timer` wrapper module via `pub use ...::itimer::*` /
 //! `pub use ...::posix::*`.
 
+#![no_std]
+
+#[cfg(test)]
+extern crate std;
+
 pub mod itimer;
 pub mod posix;
 
-use std::time::Duration;
+use core::time::Duration;
+
+/// Source of guest CPU time and active vCPU concurrency for CPU-time timers.
+pub trait CpuSampler {
+    /// Aggregate guest CPU nanoseconds.
+    fn total_cpu_ns(&self) -> u64;
+    /// Number of active vCPUs running guest code.
+    fn active_vcpus(&self) -> u64 {
+        1
+    }
+}
 
 // ─── Time-domain newtypes (value/interval adjacency + wall-vs-CPU axis) ─────
 //
@@ -90,5 +105,37 @@ impl TimerSpecNs {
             value: ns(value),
             interval: ns(interval),
         }
+    }
+}
+
+/// The clock domain a timer measures.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub enum ClockKind {
+    /// Wall-clock time (elapses with real time).
+    #[default]
+    Wall,
+    /// Aggregate guest process CPU time.
+    ProcessCpu,
+    /// Aggregate guest thread CPU time.
+    ThreadCpu,
+}
+
+impl ClockKind {
+    /// Whether this clock measures guest CPU time rather than wall-clock time.
+    #[inline]
+    pub const fn is_cpu(self) -> bool {
+        matches!(self, Self::ProcessCpu | Self::ThreadCpu)
+    }
+
+    /// Whether this clock measures per-thread guest CPU time.
+    #[inline]
+    pub const fn is_thread_cpu(self) -> bool {
+        matches!(self, Self::ThreadCpu)
+    }
+
+    /// Whether this clock measures per-process guest CPU time.
+    #[inline]
+    pub const fn is_process_cpu(self) -> bool {
+        matches!(self, Self::ProcessCpu)
     }
 }

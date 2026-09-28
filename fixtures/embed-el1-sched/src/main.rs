@@ -1093,6 +1093,7 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
     let editor = std::thread::spawn(move || {
         let mut edits = 0u64;
         let mut edit_failures = 0u64;
+        let mut edit_errors = Vec::new();
         while editor_stop.load(Ordering::Acquire) == 0 {
             let len = 8 * PAGE;
             let scratch = unsafe {
@@ -1107,6 +1108,12 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
             };
             if scratch == libc::MAP_FAILED {
                 edit_failures += 1;
+                if edit_errors.len() < 8 {
+                    edit_errors.push(format!(
+                        "mmap:{}",
+                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                    ));
+                }
                 continue;
             }
             for page in 0..8 {
@@ -1117,16 +1124,40 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
                 };
             }
             let rc_ro = unsafe { libc::mprotect(scratch, len, libc::PROT_READ) };
+            if rc_ro != 0 && edit_errors.len() < 8 {
+                edit_errors.push(format!(
+                    "mprotect_ro:{}",
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                ));
+            }
             let rc_rw = unsafe { libc::mprotect(scratch, len, libc::PROT_READ | libc::PROT_WRITE) };
+            if rc_rw != 0 && edit_errors.len() < 8 {
+                edit_errors.push(format!(
+                    "mprotect_rw:{}",
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                ));
+            }
             let rc_madv = unsafe { libc::madvise(scratch, len, libc::MADV_DONTNEED) };
+            if rc_madv != 0 && edit_errors.len() < 8 {
+                edit_errors.push(format!(
+                    "madvise:{}",
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                ));
+            }
             let rc_unmap = unsafe { libc::munmap(scratch, len) };
+            if rc_unmap != 0 && edit_errors.len() < 8 {
+                edit_errors.push(format!(
+                    "munmap:{}",
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                ));
+            }
             if rc_ro != 0 || rc_rw != 0 || rc_madv != 0 || rc_unmap != 0 {
                 edit_failures += 1;
             } else {
                 edits += 1;
             }
         }
-        (edits, edit_failures)
+        (edits, edit_failures, edit_errors)
     });
     let mut forked = 0;
     let mut snapshot_changes = 0;
@@ -1193,12 +1224,17 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
             join_failures += 1;
         }
     }
-    let (edits, edit_failures) = match editor.join() {
-        Ok((e, ef)) => (e, ef),
+    let (edits, edit_failures, edit_errors) = match editor.join() {
+        Ok((e, ef, errors)) => (e, ef, errors),
         Err(_) => {
             join_failures += 1;
-            (0, 1)
+            (0, 1, vec!["editor_join:0".to_string()])
         }
+    };
+    let edit_errors = if edit_errors.is_empty() {
+        "none".to_string()
+    } else {
+        edit_errors.join(",")
     };
     let torn = mismatches.load(Ordering::Relaxed);
     let unmap_rc = unsafe { libc::munmap(region, region_len) };
@@ -1215,7 +1251,7 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
         && join_failures == 0
         && unmap_ok;
     println!(
-        "mm-occupancy {role} writers={writers} forks={forked} edits={edits} edit_failures={edit_failures} torn={torn} \
+        "mm-occupancy {role} writers={writers} forks={forked} edits={edits} edit_failures={edit_failures} edit_errors={edit_errors} torn={torn} \
          snapshot_changes={snapshot_changes} child_failures={child_failures} join_failures={join_failures} ok={ok}"
     );
     ok

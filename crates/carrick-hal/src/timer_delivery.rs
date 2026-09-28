@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use crate::threaded::VcpuRegistry;
 
+pub use crate::posix_timer::PosixTimerSpec;
 pub use carrick_timer_core::TimerSpecNs;
 pub use carrick_timer_core::itimer::TimerArm;
-pub use carrick_timer_core::posix::PosixTimerSpec;
 
 /// Arm a POSIX per-process timer using the shared fallback firing thread.
 ///
@@ -29,20 +29,20 @@ pub fn arm_fallback_posix_timer(
     spec: TimerSpecNs,
     kicker: &Arc<dyn VcpuRegistry>,
 ) -> Option<PosixTimerSpec> {
-    let armed = carrick_timer_core::posix::arm(id, spec)?;
+    let armed = crate::posix_timer::arm(id, spec)?;
     if spec.value > 0 {
         let signum = armed.signum;
         let generation = armed.generation;
         let slot = armed.slot.clone();
         let kicker = Arc::clone(kicker);
         let on_fire = move || {
-            carrick_signal_core::publish_process_signal(signum);
+            carrick_signal_linux::publish_process_signal(signum);
             kicker.kick_all();
         };
         let _ = std::thread::Builder::new()
             .name(format!("carrick-ptimer-{id}"))
             .spawn(move || {
-                carrick_timer_core::posix::run_fallback(slot, generation, spec, on_fire);
+                crate::posix_timer::run_fallback(slot, generation, spec, on_fire);
             });
     }
     Some(armed.old)
@@ -53,7 +53,71 @@ pub fn arm_fallback_posix_timer(
 /// `TimerSpecNs::DISARM` bumps the timer-core generation, causing any in-flight
 /// fallback thread to retire before it can publish another signal.
 pub fn disarm_fallback_posix_timer(id: i32) {
-    let _ = carrick_timer_core::posix::arm(id, TimerSpecNs::DISARM);
+    let _ = crate::posix_timer::arm(id, TimerSpecNs::DISARM);
+}
+
+/// Shared fallback-timer timing loop body for interval timers.
+pub fn run_fallback(which: usize, generation: u64, spec: TimerSpecNs, on_fire: impl Fn()) {
+    run_fallback_with_sampler(which, generation, spec, None, on_fire);
+}
+
+/// Shared fallback-timer timing loop body with an optional CPU sampler.
+pub fn run_fallback_with_sampler(
+    which: usize,
+    generation: u64,
+    spec: TimerSpecNs,
+    cpu_sampler: Option<&dyn carrick_timer_core::CpuSampler>,
+    on_fire: impl Fn(),
+) {
+    if carrick_timer_core::itimer::is_cpu_timer(which) {
+        run_fallback_cpu(which, generation, cpu_sampler, &on_fire);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_nanos(spec.value));
+    loop {
+        if carrick_timer_core::itimer::generation(which) != generation
+            || !carrick_timer_core::itimer::is_armed(which)
+        {
+            break;
+        }
+        on_fire();
+        if spec.interval == 0 {
+            carrick_timer_core::itimer::complete_fire(which);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_nanos(spec.interval));
+    }
+}
+
+/// CPU-itimer fallback poll loop. Drives delivery off the aggregate guest CPU total.
+pub fn run_fallback_cpu(
+    which: usize,
+    generation: u64,
+    cpu_sampler: Option<&dyn carrick_timer_core::CpuSampler>,
+    on_fire: &impl Fn(),
+) {
+    loop {
+        if carrick_timer_core::itimer::generation(which) != generation
+            || !carrick_timer_core::itimer::is_armed(which)
+        {
+            break;
+        }
+        let now_ns = cpu_sampler.map_or(0, |s| s.total_cpu_ns());
+        let active_vcpus = cpu_sampler.map_or(0, |s| s.active_vcpus());
+        match carrick_timer_core::itimer::cpu_timer_decision(which, now_ns, active_vcpus) {
+            Some(carrick_timer_core::itimer::CpuTimerDecision::Fire) => {
+                on_fire();
+                if carrick_timer_core::itimer::interval_ns(which) == 0 {
+                    carrick_timer_core::itimer::complete_fire(which);
+                    break;
+                }
+            }
+            Some(carrick_timer_core::itimer::CpuTimerDecision::Wait { delay_ns }) => {
+                std::thread::sleep(std::time::Duration::from_nanos(delay_ns.raw()));
+            }
+            None => break,
+        }
+    }
 }
 
 pub trait TimerDelivery: Send + Sync {
@@ -130,8 +194,8 @@ mod tests {
         let _serial = crate::guest_timer_bridge::TIMER_REGISTRY_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        carrick_timer_core::posix::clear();
-        carrick_signal_core::clear_proc_pending();
+        crate::posix_timer::clear();
+        carrick_signal_linux::clear_proc_pending();
 
         let kicks = Arc::new(AtomicU64::new(0));
         let registry = Arc::new(GenericVcpuRegistry::new());
@@ -146,7 +210,7 @@ mod tests {
             VcpuRegistrationEnrollment::Registered
         ));
         let kicker: Arc<dyn VcpuRegistry> = registry;
-        let id = carrick_timer_core::posix::create(0, 14);
+        let id = crate::posix_timer::create(0, 14);
 
         let old = arm_fallback_posix_timer(
             id,
@@ -165,10 +229,97 @@ mod tests {
         }
 
         assert_eq!(kicks.load(Ordering::SeqCst), 1);
-        assert_eq!(carrick_signal_core::take_process_pending(), 14);
+        assert_eq!(carrick_signal_linux::take_process_pending(), 14);
 
         disarm_fallback_posix_timer(id);
-        let _ = carrick_timer_core::posix::delete(id);
-        carrick_signal_core::clear_proc_pending();
+        let _ = crate::posix_timer::delete(id);
+        carrick_signal_linux::clear_proc_pending();
+    }
+
+    use crate::guest_timer_bridge::TIMER_REGISTRY_TEST_LOCK as TEST_LOCK;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct MockCpuSampler(u64, u64);
+
+    impl carrick_timer_core::CpuSampler for MockCpuSampler {
+        fn total_cpu_ns(&self) -> u64 {
+            self.0
+        }
+
+        fn active_vcpus(&self) -> u64 {
+            self.1
+        }
+    }
+
+    #[test]
+    fn run_fallback_cpu_one_shot_fires_once_when_cpu_advances() {
+        use std::sync::atomic::AtomicUsize;
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        carrick_timer_core::itimer::clear();
+        let which = 1; // VIRTUAL, one-shot
+        let spec = TimerSpecNs {
+            value: 1_000,
+            interval: 0,
+        };
+        let generation = carrick_timer_core::itimer::arm_with_cpu_now(which, spec, false, 0);
+        let sampler = MockCpuSampler(10_000, 1);
+        let fires = Arc::new(AtomicUsize::new(0));
+        let fires2 = Arc::clone(&fires);
+        run_fallback_with_sampler(which, generation, spec, Some(&sampler), move || {
+            fires2.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            1,
+            "one-shot CPU timer fires once"
+        );
+        carrick_timer_core::itimer::disarm(which);
+    }
+
+    #[test]
+    fn run_fallback_cpu_retires_on_generation_bump() {
+        use std::sync::atomic::AtomicUsize;
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        carrick_timer_core::itimer::clear();
+        let which = 1;
+        let spec = TimerSpecNs {
+            value: 1_000_000,
+            interval: 1_000_000,
+        };
+        let generation = carrick_timer_core::itimer::arm_with_cpu_now(which, spec, false, 0);
+        let fires = Arc::new(AtomicUsize::new(0));
+        let fires2 = Arc::clone(&fires);
+        let sampler = MockCpuSampler(1_000_000, 1);
+        let runner = std::thread::spawn(move || {
+            run_fallback_with_sampler(which, generation, spec, Some(&sampler), move || {
+                fires2.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+        carrick_timer_core::itimer::disarm(which);
+        runner.join().expect("runner thread terminates");
+        assert_eq!(fires.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn run_fallback_real_retires_on_generation_bump() {
+        use std::sync::atomic::AtomicUsize;
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        carrick_timer_core::itimer::clear();
+        let which = 0;
+        let spec = TimerSpecNs {
+            value: 10_000_000,
+            interval: 10_000_000,
+        };
+        let generation = carrick_timer_core::itimer::arm(which, spec, false);
+        let fires = Arc::new(AtomicUsize::new(0));
+        let fires2 = Arc::clone(&fires);
+        let runner = std::thread::spawn(move || {
+            run_fallback(which, generation, spec, move || {
+                fires2.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+        carrick_timer_core::itimer::disarm(which);
+        runner.join().expect("runner thread terminates");
+        assert_eq!(fires.load(Ordering::SeqCst), 0);
     }
 }

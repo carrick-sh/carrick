@@ -439,14 +439,14 @@ fn host_slot_signal_is_reserved_and_cancelled_into_exact_kernel_ownership() {
     )
     .expect("continuation");
     let tid = context.thread().key().tid.raw();
-    carrick_signal_core::publish_pending_for(tid, 10);
+    carrick_signal_linux::publish_pending_for(tid, 10);
     let event = SignalReadinessProbe::from_continuation(&continuation)
         .event()
         .expect("host-slot readiness reservation");
     assert_eq!(event.reserved_signal().expect("reservation").signum(), 10);
     drop(event);
     assert_eq!(
-        carrick_signal_core::take_pending_for(tid),
+        carrick_signal_linux::take_pending_for(tid),
         0,
         "imported host ownership is not duplicated back into the lossy host bitmask"
     );
@@ -487,9 +487,9 @@ fn realtime_host_slot_import_preserves_fifo_multiplicity_and_exact_cancellation_
         state.record_pending_action(rt_b, action_b);
     });
     let tid = context.thread().key().tid.raw();
-    carrick_signal_core::publish_pending_for(tid, 32);
-    carrick_signal_core::publish_pending_for(tid, 32);
-    carrick_signal_core::publish_pending_for(tid, 33);
+    carrick_signal_linux::publish_pending_for(tid, 32);
+    carrick_signal_linux::publish_pending_for(tid, 32);
+    carrick_signal_linux::publish_pending_for(tid, 33);
 
     let continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::WaitOnFds {
@@ -598,7 +598,7 @@ fn kernel_native_guest_signal_continuation_cancels_and_delivers_without_host_sid
         carrick_kernel::kernel::ExactThreadSignalPost::Posted(Some(context.thread().key()))
     );
     assert_eq!(
-        carrick_signal_core::take_pending_for(context.thread().key().tid.raw()),
+        carrick_signal_linux::take_pending_for(context.thread().key().tid.raw()),
         0
     );
     let event = await_event(&service, wake_token).expect("Kernel-native guest signal readiness");

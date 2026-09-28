@@ -37,7 +37,7 @@ carrick-kernel-arena = { path = "../carrick-kernel-arena" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-observability = { path = "../carrick-observability" }
-carrick-signal-core = { path = "../carrick-signal-core" }
+carrick-signal-linux = { path = "../carrick-signal-linux" }
 carrick-timer-core = { path = "../carrick-timer-core" }
 carrick-thread = { path = "../carrick-thread" }
 carrick-fatal.workspace = true
