@@ -648,7 +648,7 @@ impl CarrierWaitServiceInner {
             let task_waker = entry.task_waker.take();
             (true, task_waker)
         };
-        let _ = self.scheduler.wake(token.thread);
+        let _ = self.scheduler.wake_exact(token.exact_target());
         self.nudge_reactor();
         if let Some(waker) = task_waker {
             waker.wake();
@@ -1094,6 +1094,7 @@ impl CarrierWaitService {
         let authority = continuation.authority();
         let token = ContinuationWakeToken {
             continuation: continuation.id(),
+            task: authority.task(),
             thread: authority.thread(),
             thread_serial: authority.thread().serial.raw(),
             execution: authority.execution_generation(),

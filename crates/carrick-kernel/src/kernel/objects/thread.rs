@@ -1068,6 +1068,10 @@ impl Thread {
         self.execution.lock().state
     }
 
+    pub fn execution_generation(&self) -> Option<ExecutionGeneration> {
+        self.execution_state().generation()
+    }
+
     pub fn exec_invalidation_pending(&self) -> bool {
         self.execution.lock().exec_invalidation_pending
     }
@@ -1160,7 +1164,84 @@ impl Thread {
         }
         let mut execution = self.execution.lock();
         let found = execution.state;
-        let action = match execution.state {
+        let action = self.decide_scheduler_wake_action(&mut execution)?;
+        drop(execution);
+        self.revision.publish();
+        crate::probes::hvpatch_scheduler_wake(
+            self.key.serial.raw(),
+            crate::probes::HvpatchSchedulerWakeKind::Wake,
+            found.probe_kind(),
+            found.generation().map_or(0, ExecutionGeneration::raw),
+            action.probe_generation(),
+        );
+        Ok(action)
+    }
+
+    /// Decide one exact scheduler wake targeting a specific execution generation.
+    ///
+    /// If the target generation is stale (the thread exited, failed, or moved
+    /// past this execution generation), returns `Ok(ThreadSchedulerAction::None)`
+    /// so the stale wake edge is dropped as a benign no-op without failing
+    /// the carrier.
+    pub(crate) fn scheduler_wake_exact(
+        &self,
+        expected: ThreadKey,
+        target_generation: ExecutionGeneration,
+    ) -> Result<ThreadSchedulerAction, ThreadExecutionError> {
+        if expected != self.key {
+            return Err(ThreadExecutionError::SchedulerThreadMismatch {
+                expected,
+                actual: self.key,
+            });
+        }
+        let mut execution = self.execution.lock();
+        let found = execution.state;
+        // A control quantum may advance the scheduler generation without
+        // consuming the blocked continuation. Its original authority remains
+        // the wake target until the continuation is retired.
+        let owns_continuation =
+            execution
+                .blocked_continuation
+                .as_ref()
+                .is_some_and(|continuation| {
+                    continuation.authority().execution_generation() == target_generation
+                });
+        let is_stale = match execution.state {
+            ThreadExecutionState::Uninitialized
+            | ThreadExecutionState::Exited { .. }
+            | ThreadExecutionState::Failed { .. } => true,
+            ThreadExecutionState::Blocked { generation, .. }
+            | ThreadExecutionState::Runnable { generation }
+            | ThreadExecutionState::Running { generation, .. }
+            | ThreadExecutionState::SwitchingOut { generation, .. } => {
+                !owns_continuation
+                    && generation != target_generation
+                    && target_generation.next() != Some(generation)
+            }
+        };
+
+        if is_stale {
+            return Ok(ThreadSchedulerAction::None);
+        }
+
+        let action = self.decide_scheduler_wake_action(&mut execution)?;
+        drop(execution);
+        self.revision.publish();
+        crate::probes::hvpatch_scheduler_wake(
+            self.key.serial.raw(),
+            crate::probes::HvpatchSchedulerWakeKind::Wake,
+            found.probe_kind(),
+            found.generation().map_or(0, ExecutionGeneration::raw),
+            action.probe_generation(),
+        );
+        Ok(action)
+    }
+
+    fn decide_scheduler_wake_action(
+        &self,
+        execution: &mut ThreadExecutionRecord,
+    ) -> Result<ThreadSchedulerAction, ThreadExecutionError> {
+        match execution.state {
             ThreadExecutionState::Blocked {
                 generation: predecessor,
                 ..
@@ -1170,7 +1251,7 @@ impl Thread {
                     .as_ref()
                     .is_some_and(|continuation| !continuation.accepts_scheduler_wake_now())
                 {
-                    ThreadSchedulerAction::None
+                    Ok(ThreadSchedulerAction::None)
                 } else {
                     let generation = predecessor
                         .next()
@@ -1181,19 +1262,15 @@ impl Thread {
                         );
                     }
                     execution.state = ThreadExecutionState::Runnable { generation };
-                    ThreadSchedulerAction::Queue {
+                    Ok(ThreadSchedulerAction::Queue {
                         key: self.key,
                         predecessor: Some(predecessor),
                         generation,
                         closing_authorized: true,
-                    }
+                    })
                 }
             }
             ThreadExecutionState::Runnable { generation } => {
-                // Runnable normally implies the producer edge was already
-                // consumed. A control-only quantum is the exception: it made
-                // the task runnable without guest readiness, so a racing real
-                // producer must still publish into the preserved continuation.
                 if execution.control_quantum.is_some()
                     && let Some(continuation) = execution.blocked_continuation.as_ref()
                     && continuation.accepts_scheduler_wake_now()
@@ -1201,12 +1278,12 @@ impl Thread {
                     continuation
                         .publish_ready_event(crate::kernel::continuation::ContinuationEvent::Ready);
                 }
-                ThreadSchedulerAction::Queue {
+                Ok(ThreadSchedulerAction::Queue {
                     key: self.key,
                     predecessor: None,
                     generation,
                     closing_authorized: false,
-                }
+                })
             }
             ThreadExecutionState::Running {
                 generation,
@@ -1220,12 +1297,12 @@ impl Thread {
                     executor_epoch,
                     wake_pending: true,
                 };
-                ThreadSchedulerAction::Kick {
+                Ok(ThreadSchedulerAction::Kick {
                     executor,
                     executor_epoch,
                     key: self.key,
                     generation,
-                }
+                })
             }
             ThreadExecutionState::SwitchingOut {
                 generation,
@@ -1239,25 +1316,13 @@ impl Thread {
                     executor_epoch,
                     wake_pending: true,
                 };
-                ThreadSchedulerAction::None
+                Ok(ThreadSchedulerAction::None)
             }
-            state => {
-                return Err(ThreadExecutionError::InvalidTransition {
-                    operation: "scheduler_wake",
-                    state,
-                });
-            }
-        };
-        drop(execution);
-        self.revision.publish();
-        crate::probes::hvpatch_scheduler_wake(
-            self.key.serial.raw(),
-            crate::probes::HvpatchSchedulerWakeKind::Wake,
-            found.probe_kind(),
-            found.generation().map_or(0, ExecutionGeneration::raw),
-            action.probe_generation(),
-        );
-        Ok(action)
+            state => Err(ThreadExecutionError::InvalidTransition {
+                operation: "scheduler_wake",
+                state,
+            }),
+        }
     }
 
     /// The host owns `record` now (a wake, or the executor of the vCPU slot

@@ -68,6 +68,7 @@ pub use self::wait_service::{
 pub(crate) use self::wait_service::{CarrierWaitServiceInner, RegistrationState};
 #[cfg(test)]
 pub(crate) use self::wait_service::{CarrierWaitState, RegistrationOperationGate};
+pub use crate::kernel::scheduler::ExactWakeTarget;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ContinuationId(u64);
