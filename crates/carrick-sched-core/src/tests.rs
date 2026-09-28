@@ -986,9 +986,8 @@ fn host_placement_respects_address_spaces_and_owes_resched_sgis() {
     );
 }
 
-/// Stealing never takes a home record or a host-service record: those belong
-/// to their existing executors. An EL0 thread of an address space the thief
-/// cannot install can still move to its queue for its executor to take.
+/// Stealing never takes a home record or a record needing the thief's host
+/// executor. Such a move would wake an idle vCPU only to exit immediately.
 #[test]
 fn stealing_takes_only_what_the_thief_may_run() {
     let zone = zone();
@@ -1009,8 +1008,8 @@ fn stealing_takes_only_what_the_thief_may_run() {
     let placed = zone.place_from_host(service).unwrap();
     assert_eq!(placed.slot, THIRD, "the idle slot is chosen first");
     assert!(zone.head_needs_host(THIRD));
-    // An idle slot of another address space leaves the service thread on
-    // THIRD, but takes an EL0 thread of MM for its own executor to load.
+    // An idle slot of another address space leaves both records on THIRD:
+    // it cannot install MM and would have to exit for its executor.
     let foreign = SlotId::new(11);
     assert!(zone.reset_slot(foreign));
     host_publish(&zone, foreign, MM + 7, Some(3), 0);
@@ -1021,25 +1020,22 @@ fn stealing_takes_only_what_the_thief_may_run() {
     assert_eq!(woken.unwrap(), [ready]);
     assert!(matches!(zone.record(ready).claim(), Claim::Queued { .. }));
     assert_eq!(zone.steal(foreign), None);
-    assert!(zone.head_needs_host(foreign));
+    assert!(!zone.head_needs_host(foreign));
     assert_eq!(zone.steal(foreign), None);
     assert_eq!(
         zone.record(ready).claim(),
         Claim::Queued {
-            slot: foreign,
+            slot: THIRD,
             seq: 1
         },
-        "the EL0 thread of another address space waits for the thief's executor"
+        "the EL0 thread remains on the vCPU that can run it"
     );
-    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 1);
+    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 0);
     assert_eq!(zone.runnable_head(THIRD), Some(service));
-    // The foreign executor takes the EL0 thread. THIRD's executor retains
-    // the service record without an extra guest exit on the foreign slot.
-    zone.leave_guest(foreign, &HostWait);
-    assert_eq!(zone.take_service_head(foreign), Some(ready));
+    // THIRD's executor retains its service record.
     zone.leave_guest(THIRD, &HostWait);
     assert_eq!(zone.take_service_head(THIRD), Some(service));
-    assert_eq!(zone.counters.foreign_adoptions.load(Ordering::Relaxed), 1);
+    assert_eq!(zone.counters.foreign_adoptions.load(Ordering::Relaxed), 0);
 }
 
 /// The executor sweeps records of retired threads off its run queue at an

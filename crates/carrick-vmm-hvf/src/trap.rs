@@ -690,6 +690,25 @@ static VCPU_RUN_EXIT_CLASSES: [std::sync::atomic::AtomicU64;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 static VCPU_HVC_NOT_SVC_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static VCPU_HVC_NOT_SVC_BY_EC: [std::sync::atomic::AtomicU64;
+    carrick_el1_abi::HvcNotSvcReason::COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; carrick_el1_abi::HvcNotSvcReason::COUNT];
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static VCPU_HVC_NOT_SVC_FAULT_STATUS: [std::sync::atomic::AtomicU64;
+    carrick_el1_abi::HvcNotSvcReason::COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; carrick_el1_abi::HvcNotSvcReason::COUNT];
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static VCPU_HVC_NOT_SVC_SYSREG: [std::sync::atomic::AtomicU64;
+    carrick_el1_abi::HvcSysregKind::COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; carrick_el1_abi::HvcSysregKind::COUNT];
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static VCPU_HVC_NOT_SVC_EMULATED_SYS64: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// The carrier's total count of vCPU exits to the host (`hv_vcpu_run`
 /// returns). Tests read deltas across a workload to count host exits per
 /// operation; the counter is carrier-global, so hold the guest lock.
@@ -708,6 +727,19 @@ pub fn vcpu_run_exit_classes() -> [u64; carrick_el1_abi::HostExitClass::COUNT] {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn vcpu_hvc_not_svc_total() -> u64 {
     VCPU_HVC_NOT_SVC_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Underlying EL0 exception reasons behind HVC #2, sampled while holding the
+/// embed guest lock when comparing before and after a fixture.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn vcpu_hvc_not_svc_reasons() -> carrick_el1_abi::HvcNotSvcCounts {
+    use std::sync::atomic::Ordering::Relaxed;
+    carrick_el1_abi::HvcNotSvcCounts {
+        by_ec: std::array::from_fn(|i| VCPU_HVC_NOT_SVC_BY_EC[i].load(Relaxed)),
+        fault_status: std::array::from_fn(|i| VCPU_HVC_NOT_SVC_FAULT_STATUS[i].load(Relaxed)),
+        sysreg: std::array::from_fn(|i| VCPU_HVC_NOT_SVC_SYSREG[i].load(Relaxed)),
+        emulated_sys64: VCPU_HVC_NOT_SVC_EMULATED_SYS64.load(Relaxed),
+    }
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 thread_local! {
@@ -7841,7 +7873,21 @@ impl HvfInner {
                     }
                     HvcExitOutcome::NotSvc { esr } => {
                         VCPU_HVC_NOT_SVC_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let reason = carrick_el1_abi::HvcNotSvcReason::from_esr(esr);
+                        VCPU_HVC_NOT_SVC_BY_EC[usize::from(reason.ec)]
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(fsc) = reason.fault_status {
+                            VCPU_HVC_NOT_SVC_FAULT_STATUS[usize::from(fsc)]
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if reason.ec == 0x18 {
+                            let reg = carrick_el1_abi::sys64_sysreg_kind(esr);
+                            VCPU_HVC_NOT_SVC_SYSREG[reg as usize]
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         if HvfVmState::emulate_el0_sys64_read_inner(vcpu, esr)? {
+                            VCPU_HVC_NOT_SVC_EMULATED_SYS64
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             // Serviced (ELR_EL1 advanced, target GPR written) — re-run.
                             continue;
                         }
