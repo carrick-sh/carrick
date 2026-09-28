@@ -360,9 +360,7 @@ pub fn clear() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    use crate::guest_timer_bridge::TIMER_REGISTRY_TEST_LOCK as TEST_LOCK;
 
     #[test]
     fn create_arm_remaining_delete_roundtrip() {
