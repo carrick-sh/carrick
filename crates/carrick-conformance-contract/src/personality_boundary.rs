@@ -34,7 +34,11 @@ use syn::visit::Visit;
 use thiserror::Error;
 
 /// Default allowlist of substrate crates subject to boundary verification.
-pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &["carrick-sched-core", "carrick-mmu-core"];
+pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
+    "carrick-sched-core",
+    "carrick-mmu-core",
+    "carrick-signal-core",
+];
 
 /// Designated Linux personality or ABI crates forbidden in substrate dependency closures.
 pub const FORBIDDEN_PERSONALITY_CRATES: &[&str] = &[

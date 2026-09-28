@@ -36,7 +36,7 @@ pub fn arm_fallback_posix_timer(
         let slot = armed.slot.clone();
         let kicker = Arc::clone(kicker);
         let on_fire = move || {
-            carrick_signal_core::publish_process_signal(signum);
+            carrick_signal_linux::publish_process_signal(signum);
             kicker.kick_all();
         };
         let _ = std::thread::Builder::new()
@@ -131,7 +131,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         carrick_timer_core::posix::clear();
-        carrick_signal_core::clear_proc_pending();
+        carrick_signal_linux::clear_proc_pending();
 
         let kicks = Arc::new(AtomicU64::new(0));
         let registry = Arc::new(GenericVcpuRegistry::new());
@@ -165,10 +165,10 @@ mod tests {
         }
 
         assert_eq!(kicks.load(Ordering::SeqCst), 1);
-        assert_eq!(carrick_signal_core::take_process_pending(), 14);
+        assert_eq!(carrick_signal_linux::take_process_pending(), 14);
 
         disarm_fallback_posix_timer(id);
         let _ = carrick_timer_core::posix::delete(id);
-        carrick_signal_core::clear_proc_pending();
+        carrick_signal_linux::clear_proc_pending();
     }
 }

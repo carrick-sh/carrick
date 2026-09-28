@@ -1256,15 +1256,15 @@ impl<'a> FsView<'a> {
         let armed = LinuxOpenFlags::from_bits_truncate(common.status_flags())
             .contains(LinuxOpenFlags::ASYNC);
         if !armed {
-            carrick_signal_core::fasync::disarm(pipe_id, open_file.description.id().raw());
+            carrick_signal_linux::fasync::disarm(pipe_id, open_file.description.id().raw());
             return;
         }
         let owner = common.captured_owner();
         let (owner_type, owner_pid) = (owner.visible.owner_type, owner.visible.owner_pid);
         let sig = common.async_sig();
-        carrick_signal_core::fasync::arm(
+        carrick_signal_linux::fasync::arm(
             pipe_id,
-            carrick_signal_core::fasync::FasyncOwner {
+            carrick_signal_linux::fasync::FasyncOwner {
                 registration_id: open_file.description.id().raw(),
                 owner_pid,
                 owner_type,
@@ -1319,7 +1319,7 @@ impl<'a> FsView<'a> {
         }
         // Hot path: skip the per-write inode fstat entirely unless some fd
         // somewhere is armed for signal-driven I/O (the common case is none).
-        if !carrick_signal_core::fasync::any_armed() {
+        if !carrick_signal_linux::fasync::any_armed() {
             return;
         }
         let Some(pipe_id) = self.host_pipe_pipe_id(fd) else {
@@ -1338,10 +1338,10 @@ pub(in crate::dispatch) fn fasync_notify_pipe_write(
     fd: i32,
     written: usize,
 ) {
-    if written == 0 || !carrick_signal_core::fasync::any_armed() {
+    if written == 0 || !carrick_signal_linux::fasync::any_armed() {
         return;
     }
-    let Some(owner) = carrick_signal_core::fasync::lookup(pipe_id) else {
+    let Some(owner) = carrick_signal_linux::fasync::lookup(pipe_id) else {
         return;
     };
     let sig = owner.sig;
