@@ -210,6 +210,10 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// access. SHARED by `CLONE_THREAD` siblings (`Arc` clone), COW'd on fork.
     protections: Arc<MemoryProtections>,
 
+    /// The immediately following protection edit initializes a new VMA. Its
+    /// cold reservation must discard retired predecessor leaf authority.
+    pending_new_mapping: Option<(u64, usize)>,
+
     /// Exact parent state retained across the host-thread spawn/materialization
     /// window of an in-process fork. Runtime commits it only after the child is
     /// materialized; a recoverable failure restores both authorities.
@@ -320,6 +324,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns: 0,
             page_tables,
             protections,
+            pending_new_mapping: None,
             pending_process_fork: None,
             exec_predecessor_shared: None,
             owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
@@ -558,6 +563,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_fork_image_allocations: 0,
             page_tables,
             protections,
+            pending_new_mapping: None,
             pending_process_fork,
             exec_predecessor_shared: None,
             owed_stage1_maintenance,
@@ -847,6 +853,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns: 0,
             page_tables,
             protections,
+            pending_new_mapping: None,
             pending_process_fork: None,
             exec_predecessor_shared: None,
             owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
@@ -968,6 +975,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns: 0,
             page_tables,
             protections,
+            pending_new_mapping: None,
             pending_process_fork: None,
             exec_predecessor_shared: None,
             owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
@@ -1743,21 +1751,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             return true;
         };
         let descriptor = carrick_mmu_core::aarch64::terminal_descriptor(walk);
-        if !carrick_mmu_core::aarch64::terminal_descriptor_has_el1_private_authority(descriptor) {
-            return true;
-        }
-        // A fork-COW armed leaf is read-only only because its frame is still
-        // shared; the host copyout path privatizes it before writing. Known
-        // gap: a leaf made read-only by an EL1-served mprotect also carries
-        // MAY_WRITE and is accepted here, because the host protection table
-        // does not see EL1 mprotect and a forked child's engine has no
-        // armed-range set to tell the two apart.
-        if access == carrick_mmu_core::aarch64::LeafAccess::Write
-            && carrick_mmu_core::aarch64::terminal_descriptor_may_write(descriptor)
-        {
-            return true;
-        }
-        carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(descriptor, access)
+        carrick_mmu_core::aarch64::terminal_descriptor_permits_host_buffer(descriptor, access)
     }
 
     fn el1_private_range_permits(
@@ -2180,6 +2174,11 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         no_write: bool,
         sharing: MappingSharing,
     ) {
+        // This operation is the dispatcher's new-mapping publication point.
+        // Its following protect_range may install PROT_NONE only to arm first
+        // touch even when the new VMA is writable. Retired leaf permissions
+        // from the predecessor must be cleared before that edit.
+        self.pending_new_mapping = Some((address, len));
         if let Some(protections) = self.vm.protections() {
             protections
                 .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
@@ -2428,11 +2427,22 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         } else {
             Vec::new()
         };
+        let new_mapping = self.pending_new_mapping.take() == Some((address, len));
         // pt_edit_AND_FLUSH: a guest can `mprotect` an ALREADY-TOUCHED page (e.g.
         // RELRO RW→RO), so the stale stage-1 TLB entry must be invalidated for the
         // new protection to take effect.
         self.pt_edit_and_flush_after_adopting(address, len, |editor| {
-            editor.apply_protection_edit(address, len, prot, &armed_cow)
+            let reset = if new_mapping {
+                editor.manager.clear_retired_for_new_mapping(
+                    address,
+                    len,
+                    editor.arena_source.as_deref_mut(),
+                )?
+            } else {
+                PageTableApplyOutcome::default()
+            };
+            let protection = editor.apply_protection_edit(address, len, prot, &armed_cow)?;
+            Ok(reset | protection)
         })?;
         self.vm
             .observe_frame_cow_protection(address, len, prot)

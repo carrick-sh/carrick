@@ -894,10 +894,14 @@ impl<'a> Stage1Editor<'a> {
         } else if prot & (LINUX_PROT_READ | LINUX_PROT_EXEC) != 0 {
             self.set_readonly(address, len, exec)?
         } else {
-            self.set_prot_none(address, len)?
+            self.manager.set_prot_none_denying_host_buffers(
+                address,
+                len,
+                self.arena_source.as_deref_mut(),
+            )?
         };
         for range in armed_cow {
-            outcome |= self.set_readonly(range.va, range.len, exec)?;
+            outcome |= self.set_fork_readonly(range.va, range.len)?;
         }
         Ok(outcome)
     }
@@ -1186,6 +1190,59 @@ mod tests {
                 |_, generation| Ok(generation),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn protection_edit_preserves_copyout_intent_when_rearming_cow() {
+        use carrick_abi::{LINUX_PROT_READ, LINUX_PROT_WRITE};
+        use carrick_mmu_core::aarch64::{
+            GuestLeafPublication, LeafAccess, terminal_descriptor, terminal_descriptor_permits_el0,
+            terminal_descriptor_permits_host_buffer,
+        };
+        let va = LINUX_MMAP_BASE;
+        let mut manager = test_manager();
+        manager
+            .publish_private_pages(
+                GuestLeafPublication {
+                    va,
+                    ipa: 0x009b_4000_0000,
+                    len: 4096,
+                    writable: true,
+                    executable: false,
+                },
+                va,
+                None,
+            )
+            .unwrap();
+        let mut source = None;
+        let mut editor = Stage1Editor {
+            manager: &mut manager,
+            arena_source: &mut source,
+        };
+        let cow = [crate::vmm::ForkCowRange {
+            va,
+            len: 4096,
+            executable: false,
+            kernel_only: false,
+            granule: crate::vmm::CowGranule::Page,
+        }];
+        for (prot, can_copyout) in [
+            (LINUX_PROT_READ | LINUX_PROT_WRITE, true),
+            (LINUX_PROT_READ, false),
+            (0, false),
+            (LINUX_PROT_READ | LINUX_PROT_WRITE, true),
+        ] {
+            editor.apply_protection_edit(va, 4096, prot, &cow).unwrap();
+            let descriptor = terminal_descriptor(editor.debug_walk(va));
+            assert!(!terminal_descriptor_permits_el0(
+                descriptor,
+                LeafAccess::Write
+            ));
+            assert_eq!(
+                terminal_descriptor_permits_host_buffer(descriptor, LeafAccess::Write),
+                can_copyout
+            );
+        }
     }
 
     #[test]
