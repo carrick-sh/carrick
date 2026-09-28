@@ -231,6 +231,44 @@ fn hvpatch_carrier_cpu_attribution_accepts_only_a_closed_complete_stack_populati
 }
 
 #[test]
+fn hvpatch_carrier_cpu_attribution_fails_closed_on_100_percent_other() {
+    let p_sha = carrier_cpu_attr_program_sha256();
+    let stream = [
+        &format!("HVPCARRIERATTR|header|program_sha256={p_sha}"),
+        "HVPCARRIERATTR|image|host_pid=4242|text_base=0x104664000|slide=0x4664000",
+        "HVPCARRIERATTR|summary|status=ok|root_exited=1|bounded=0|errors=0|saw_sample=1",
+        "HVPCARRIERATTR|sample-population|count=10",
+        "HVPCARRIERATTR|section=usdt-metrics",
+        "HVPCARRIERATTR|section=user-stacks",
+        "              0xdeadbeef",
+        "              10",
+        "",
+    ]
+    .join("\n");
+
+    validate_carrier_cpu_attr(&stream, &[])
+        .failure()
+        .stderr(contains("attribution failed closed"));
+}
+
+#[test]
+fn hvpatch_carrier_cpu_attribution_accepts_real_captured_python_trace() {
+    let trace_path = std::path::Path::new("target/cpa-python.trace");
+    if !trace_path.exists() {
+        return;
+    }
+    let mut command = cli();
+    command
+        .arg("__hvpatch-carrier-cpu-attribution-validate")
+        .arg("--input")
+        .arg(trace_path);
+    command
+        .assert()
+        .success()
+        .stdout(contains("HVPCARRIERATTR_VALID samples=1601"));
+}
+
+#[test]
 fn hvpatch_carrier_cpu_attribution_requires_a_retained_raw_capture() {
     assert_eq!(
         HVP_CARRIER_CPU_ATTR_PROGRAM

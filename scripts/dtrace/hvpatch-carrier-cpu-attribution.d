@@ -42,13 +42,15 @@
 #pragma D option bufsize=96m
 #pragma D option aggsize=128m
 #pragma D option dynvarsize=64m
-#pragma D option ustackframes=24
+#pragma D option ustackframes=32
+#pragma D option strsize=1024
 
 dtrace:::BEGIN
 {
     /* Replaced by the Rust profile launcher with the immutable template hash. */
     printf("HVPCARRIERATTR|header|program_sha256=/* CARRICK_HVPCARRIERCPUATTR_PROGRAM_SHA256 */\n");
     started = timestamp;
+    carrier_pid = 0;
     root_exited = 0;
     bounded = 0;
     errors = 0;
@@ -62,71 +64,72 @@ dtrace:::BEGIN
 carrick*:::host-image-base
 /pid == $target || progenyof($target)/
 {
+    carrier_pid = (int)arg0;
     printf("HVPCARRIERATTR|image|host_pid=%d|text_base=0x%llx|slide=0x%llx\n",
         (int)arg0, (uint64_t)arg1, (uint64_t)arg2);
 }
 
 carrick*:::hvpatch-syscall-service
-/pid == $target || progenyof($target)/
+/carrier_pid != 0 ? pid == carrier_pid : (pid == $target || progenyof($target))/
 {
     @usdt_syscall_services = count();
     @usdt_syscall_duration_ns = sum((uint64_t)arg4);
 }
 
 carrick*:::vcpu-fault
-/pid == $target || progenyof($target)/
+/carrier_pid != 0 ? pid == carrier_pid : (pid == $target || progenyof($target))/
 {
     @usdt_vcpu_faults = count();
 }
 
 carrick*:::hvpatch-frame-cow
-/pid == $target || progenyof($target)/
+/carrier_pid != 0 ? pid == carrier_pid : (pid == $target || progenyof($target))/
 {
     @usdt_cow_events = count();
 }
 
 carrick*:::hvpatch-el1-frame-grant-plan
-/pid == $target || progenyof($target)/
+/carrier_pid != 0 ? pid == carrier_pid : (pid == $target || progenyof($target))/
 {
     @usdt_frame_grants = count();
 }
 
 carrick*:::hv-vm-map-alias
-/pid == $target || progenyof($target)/
+/carrier_pid != 0 ? pid == carrier_pid : (pid == $target || progenyof($target))/
 {
     @usdt_stage2_aliases = count();
 }
 
 carrick*:::hvf-syscall-transport
-/pid == $target || progenyof($target)/
+/carrier_pid != 0 ? pid == carrier_pid : (pid == $target || progenyof($target))/
 {
     @usdt_mailbox_transports = count();
 }
 
 carrick*:::hvpatch-executor-claim
-/pid == $target || progenyof($target)/
+/carrier_pid != 0 ? pid == carrier_pid : (pid == $target || progenyof($target))/
 {
     @usdt_executor_claims = count();
 }
 
 carrick*:::hvpatch-scheduler-wake
-/pid == $target || progenyof($target)/
+/carrier_pid != 0 ? pid == carrier_pid : (pid == $target || progenyof($target))/
 {
     @usdt_scheduler_wakes = count();
 }
 
 syscall::psynch_cvwait:entry, syscall::psynch_mutexwait:entry, syscall::__ulock_wait:entry
-/pid == $target || progenyof($target)/
+/carrier_pid != 0 ? pid == carrier_pid : (pid == $target || progenyof($target))/
 {
     @usdt_lock_waits = count();
 }
 
 profile-997
-/pid == $target || progenyof($target)/
+/carrier_pid != 0 ? pid == carrier_pid : (pid == $target || progenyof($target))/
 {
     saw_sample = 1;
     @sample_population = count();
-    @user_stacks[ustack(24)] = count();
+    @user_stacks[ustack(32)] = count();
 }
 
 dtrace:::ERROR
