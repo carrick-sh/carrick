@@ -2281,6 +2281,7 @@ impl Vfs for RootFsVfs {
                     Some(&parent.leaf),
                     &parent.rel,
                     false,
+                    entry_info.kind == RootFsEntryKind::Symlink,
                 );
                 // Tombstone only if the rootfs also has this path, so a
                 // re-create still works.
@@ -2353,6 +2354,7 @@ impl Vfs for RootFsVfs {
                     Some(&parent.leaf),
                     &parent.rel,
                     true,
+                    false,
                 );
                 let rootfs_has_it = entry_info.in_rootfs
                     || self

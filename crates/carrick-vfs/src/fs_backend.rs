@@ -792,14 +792,17 @@ pub trait FsBackend: Send + Sync {
 
     /// Remove an entry using an already-held parent directory fd and leaf name
     /// resolved by Carrick's dentry layer, avoiding whole-path walks.
+    /// `may_alias_directory` is true for a symlink: cached directory paths
+    /// reached through that name must be invalidated when it disappears.
     fn remove_entry_at(
         &self,
         parent_fd: Option<&std::os::fd::OwnedFd>,
         leaf_c: Option<&std::ffi::CStr>,
         rel: &NormalizedRelPath,
         is_dir: bool,
+        may_alias_directory: bool,
     ) -> Result<bool, BackendError> {
-        let _ = (parent_fd, leaf_c, is_dir);
+        let _ = (parent_fd, leaf_c, is_dir, may_alias_directory);
         self.remove_entry_checked(rel.as_path().to_str().ok_or(BackendError::Invalid)?)
     }
 
