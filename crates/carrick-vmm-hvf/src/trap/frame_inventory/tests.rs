@@ -5,6 +5,47 @@
 use super::*;
 use crate::trap::frame_inventory_backend_tests::*;
 
+#[test]
+fn lease_retirement_visits_only_the_selected_extents() {
+    let mut observations = Vec::new();
+    for unrelated in [32_u64, 2048] {
+        let mut inventory = HvpatchFrameInventory::default();
+        let target = (0x8000_0000, 0x4000);
+        for index in 0..unrelated + 1 {
+            let lease = (target.0 + index * 0x4000, 0x4000);
+            let frame = carrick_hal::FrameId::from_kernel_allocation(id(10_000 + index));
+            inventory.extents.insert(
+                lease,
+                InventoryExtent {
+                    frame,
+                    mapping: carrick_hal::MappingId::from_kernel_allocation(id(20_000 + index)),
+                    backing: InventoryBackingIdentity::Private(index),
+                    stage2_base: lease.0,
+                    stage2_length: lease.1,
+                    stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
+                },
+            );
+            let mut registry = inventory.frames.lock();
+            registry.references.insert(frame, 1);
+            registry.stage2_references.insert(lease, 1);
+        }
+        let before = hot_path_rows_scanned(HotPathScan::FrameExtents);
+        let retirement = HvfVmState::inventory_lease_retirement_shape(
+            &inventory,
+            &std::collections::BTreeSet::from([target]),
+            &|_| Ok(Some(1)),
+        )
+        .unwrap();
+        let visited = hot_path_rows_scanned(HotPathScan::FrameExtents) - before;
+        assert_eq!(retirement.mappings.len(), 1);
+        observations.push((unrelated, visited));
+    }
+    assert!(
+        observations.iter().all(|&(_, visited)| visited <= 2),
+        "lease retirement must visit at most two extents at every scale: {observations:?}"
+    );
+}
+
 /// Two live containers in one carrier must never share private alias
 /// ownership.
 ///
