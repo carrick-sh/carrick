@@ -93,6 +93,16 @@ pub(crate) mod allocation_meter {
         let (val, stats) = measure_stats(run);
         (val, stats.bytes)
     }
+
+    /// Host-heap bytes and allocation calls requested by this thread while `run` executes.
+    pub(super) fn measure_with_count<T>(run: impl FnOnce() -> T) -> (T, u64, u64) {
+        let (value, stats) = measure_stats(run);
+        (value, stats.bytes, stats.calls)
+    }
+}
+
+pub(crate) fn measure_host_heap<T>(run: impl FnOnce() -> T) -> (T, u64, u64) {
+    allocation_meter::measure_with_count(run)
 }
 
 const SYS_BRK: u64 = 214;
