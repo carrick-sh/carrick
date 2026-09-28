@@ -2125,6 +2125,11 @@ impl SyscallDispatcher {
         self.mem_view().mmap_fault_is_sigbus(addr)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_mmap_bus_fault_range_for_test(&self, start: u64, len: u64) {
+        self.mem_view().record_mmap_bus_fault_range(start, len);
+    }
+
     #[inline]
     pub fn fault_requires_mm_mutation(&self, addr: u64) -> bool {
         self.mem_view().fault_requires_mm_mutation(addr)

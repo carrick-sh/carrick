@@ -2493,6 +2493,10 @@ mod hvpatch_guest_probe_abi {
             "stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));",
             "fn hvpatch__fault__delivery(_: u64, _: i32, _: i32, _: u32, _: i32) {}",
             "stub!(hvpatch_fault_delivery(far: u64, incoming: i32, delivered: i32, bus: bool, tid: i32));",
+            "fn hvpatch__fault__signal__frame__failure(_: u64, _: i32, _: i32) {}",
+            "stub!(hvpatch_fault_signal_frame_failure(far: u64, signum: i32, tid: i32));",
+            "fn hvpatch__fault__terminal(_: u64, _: i32, _: i32, _: i32) {}",
+            "stub!(hvpatch_fault_terminal(far: u64, signum: i32, si_code: i32, tid: i32));",
             "fn pt__fault__next__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
             "pub fn pt_fault_next_with(va: u64, walk: impl Fn() -> Option<[u64; 4]>) {",
             "fn hvpatch__sparse__boundary__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
@@ -5128,6 +5132,13 @@ mod real {
         /// Final signal classification for a forwarded EL0 fault. Args: FAR,
         /// incoming signal, delivered signal, BUS metadata match, guest TID.
         fn hvpatch__fault__delivery(_: u64, _: i32, _: i32, _: u32, _: i32) {}
+        /// A synchronous signal had a handler, but its sigframe could not be
+        /// installed, so Linux force-SIGSEGV replaces the classified signal.
+        /// Args: FAR, classified signal, Linux TID.
+        fn hvpatch__fault__signal__frame__failure(_: u64, _: i32, _: i32) {}
+        /// A synchronous fault's final default-action exit (including a
+        /// sigframe failure). Args: FAR, terminal signal, si_code, Linux TID.
+        fn hvpatch__fault__terminal(_: u64, _: i32, _: i32, _: i32) {}
         /// An EL0 fault that the software model no longer names, resolved by
         /// reading the LIVE stage-1 leaf: a sibling thread committed the page
         /// first, so the faulting thread flushes stage-1 and retries instead
@@ -6443,6 +6454,16 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_fault_delivery(far: u64, incoming: i32, delivered: i32, bus: bool, tid: i32) {
         carrick_usdt::hvpatch__fault__delivery!(|| (far, incoming, delivered, u32::from(bus), tid));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fault_signal_frame_failure(far: u64, signum: i32, tid: i32) {
+        carrick_usdt::hvpatch__fault__signal__frame__failure!(|| (far, signum, tid));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fault_terminal(far: u64, signum: i32, si_code: i32, tid: i32) {
+        carrick_usdt::hvpatch__fault__terminal!(|| (far, signum, si_code, tid));
     }
 
     /// A task offered the MM-scoped frame-COW runtime binding. See the
@@ -8694,6 +8715,8 @@ mod stub {
     stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));
     stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));
     stub!(hvpatch_fault_delivery(far: u64, incoming: i32, delivered: i32, bus: bool, tid: i32));
+    stub!(hvpatch_fault_signal_frame_failure(far: u64, signum: i32, tid: i32));
+    stub!(hvpatch_fault_terminal(far: u64, signum: i32, si_code: i32, tid: i32));
     stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));
     stub!(stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64));
     stub!(stage1_arena_replace(site: u32, source_before: u32, source_after: u32, authority: u64));
