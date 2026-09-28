@@ -12,9 +12,9 @@
 //! authoritative only when every emitted stack count closes exactly to it, and
 //! the capture fails closed on zero events or any lossy drop.
 
-use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, btree_map::Entry};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -80,198 +80,357 @@ pub(crate) enum CpuCategory {
     Other,
 }
 
+/// Find the carrick executable on the host to symbolize stack frames via `atos`.
+pub(crate) fn find_carrick_binary() -> Option<PathBuf> {
+    if let Ok(var) = std::env::var("CARRICK_BIN").or_else(|_| std::env::var("CARRICK_BINARY")) {
+        let p = PathBuf::from(var);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.file_name().and_then(|s| s.to_str()) == Some("carrick") && exe.exists() {
+            return Some(exe);
+        }
+        if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
+            for sub in ["release/carrick", "debug/carrick", "carrick"] {
+                let candidate = target_dir.join(sub);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    for candidate in [
+        "target/release/carrick",
+        "target/debug/carrick",
+        "../target/release/carrick",
+        "../target/debug/carrick",
+        "../../target/release/carrick",
+        "../../target/debug/carrick",
+    ] {
+        let p = PathBuf::from(candidate);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let p = dir.join("carrick");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    None
+}
+
+/// Offline symbol resolution of hex addresses using macOS `/usr/bin/atos`.
+pub(crate) fn resolve_addresses(
+    binary: &Path,
+    text_base: &str,
+    addresses: &[&str],
+) -> HashMap<String, String> {
+    let mut resolved = HashMap::new();
+    if addresses.is_empty() {
+        return resolved;
+    }
+
+    for chunk in addresses.chunks(500) {
+        let mut cmd = std::process::Command::new("/usr/bin/atos");
+        cmd.arg("-o")
+            .arg(binary)
+            .arg("-l")
+            .arg(text_base)
+            .args(chunk);
+        if let Some(output) = cmd.output().ok().filter(|o| o.status.success()) {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for (addr, line) in chunk.iter().zip(stdout.lines()) {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && trimmed != *addr {
+                    resolved.insert((*addr).to_owned(), trimmed.to_owned());
+                }
+            }
+        }
+    }
+
+    resolved
+}
+
+/// Classify a single frame string into an attribution category if it matches.
+pub(crate) fn classify_frame(frame: &str) -> Option<CpuCategory> {
+    // 1. Lock wait / contention primitives
+    if frame.contains("psynch_cvwait")
+        || frame.contains("psynch_mutexwait")
+        || frame.contains("__ulock_wait")
+        || frame.contains("hw_lock_lock_contended")
+        || frame.contains("lck_mtx_lock")
+        || frame.contains("lck_rw_lock_shared")
+        || frame.contains("RawMutex::lock_slow")
+        || frame.contains("parking_lot::raw_mutex")
+        || frame.contains("Condvar::wait")
+        || frame.contains("wait_until_internal")
+        || frame.contains("wait_timeout")
+    {
+        return Some(CpuCategory::LockWait);
+    }
+
+    // 2. Executor scheduling / park / unpark
+    if frame.contains("idle_condvar")
+        || frame.contains("park_spare")
+        || frame.contains("RunQueue::")
+        || frame.contains("Scheduler::")
+        || frame.contains("take_row_bound")
+        || frame.contains("run_worker")
+        || frame.contains("mn_admit")
+        || frame.contains("mn_reclaim")
+        || frame.contains("executor_claim")
+        || frame.contains("scheduler_wake")
+        || frame.contains("lease_settle")
+        || frame.contains("vtimer")
+        || frame.contains("run_executor_loop")
+        || frame.contains("executor_worker")
+        || frame.contains("ExecutorRegistration")
+        || frame.contains("destroy_raw_vcpu")
+        || frame.contains("executor::")
+        || frame.contains("::schedule")
+    {
+        return Some(CpuCategory::ExecutorScheduling);
+    }
+
+    // 3. Guest execution (hv_vcpu_run, vcpu execution loop)
+    if frame.contains("hv_vcpu_run")
+        || frame.contains("Vcpu::run")
+        || frame.contains("HvfAarch64Vcpu::run")
+        || frame.contains("HvfInner::run_to_exit")
+        || frame.contains("run_to_exit")
+        || frame.contains("timed_run")
+        || frame.contains("run_until_syscall")
+        || frame.contains("get_sys_reg")
+    {
+        return Some(CpuCategory::GuestExecution);
+    }
+
+    // 4. Fault service by fault class
+    if frame.contains("commit_resident_frame_grant")
+        || frame.contains("prepare_el1_frame_grant")
+        || frame.contains("publish_el1_frame_grant_on_host")
+        || frame.contains("resident_frame_grant_plan")
+        || frame.contains("hvpatch_el1_frame_grant_plan")
+        || frame.contains("handle_frame_grant")
+    {
+        return Some(CpuCategory::FaultService(FaultClass::FrameGrant));
+    }
+    if frame.contains("resolve_frame_cow_fault")
+        || frame.contains("note_cow_resolution")
+        || frame.contains("cow_engine")
+        || frame.contains("Stage1CowFault")
+        || frame.contains("frame_cow")
+        || frame.contains("handle_cow_fault")
+    {
+        return Some(CpuCategory::FaultService(FaultClass::Cow));
+    }
+    if frame.contains("inventory_hv_vm_map_replay")
+        || frame.contains("map_host_alias")
+        || frame.contains("lookup_shared_alias")
+        || frame.contains("global_frame_stage2")
+        || frame.contains("stage2_alias_map")
+        || frame.contains("hv_vm_map")
+    {
+        return Some(CpuCategory::FaultService(FaultClass::Stage2));
+    }
+    if frame.contains("commit_resident_fault")
+        || frame.contains("resident_fault_plan")
+        || frame.contains("apply_first_touch")
+        || frame.contains("commit_mmap_growdown")
+        || frame.contains("mmap_growdown_fault_plan")
+        || frame.contains("resolve_stale_stage1_fault")
+        || frame.contains("handle_user_abort")
+        || frame.contains("arm_fast_fault")
+        || frame.contains("vm_fault_internal")
+        || frame.contains("vm_fault")
+        || frame.contains("vcpu_fault")
+        || frame.contains("handle_guest_page_fault")
+    {
+        return Some(CpuCategory::FaultService(FaultClass::FirstTouch));
+    }
+
+    // 5. EL1 Mailbox / grant request handling
+    if frame.contains("claim_frame_grant_request")
+        || frame.contains("complete_grant")
+        || frame.contains("frame_grant_mailbox")
+        || frame.contains("publish_frame_grant_refusal")
+        || frame.contains("cancel_frame_grant_request")
+        || frame.contains("hvf_syscall_transport")
+        || frame.contains("handle_el1_mailbox")
+    {
+        return Some(CpuCategory::El1Mailbox);
+    }
+
+    // 6. Host syscall service by class
+    if frame.contains("openat")
+        || frame.contains("open_at_path")
+        || frame.contains("sys_openat")
+        || frame.contains("open_for_dispatch")
+        || frame.contains("fs::open")
+    {
+        return Some(CpuCategory::HostSyscall("openat".to_owned()));
+    }
+    if frame.contains("sys_mmap")
+        || frame.contains("handle_mmap")
+        || frame.contains("mmap_pgoff")
+        || frame.contains("dispatch::mem::mmap")
+    {
+        return Some(CpuCategory::HostSyscall("mmap".to_owned()));
+    }
+    if frame.contains("sys_munmap") || frame.contains("munmap") {
+        return Some(CpuCategory::HostSyscall("munmap".to_owned()));
+    }
+    if frame.contains("sys_brk")
+        || frame.contains("handle_brk")
+        || frame.contains("dispatch::mem::brk")
+    {
+        return Some(CpuCategory::HostSyscall("brk".to_owned()));
+    }
+    if frame.contains("sys_write")
+        || frame.contains("writev")
+        || frame.contains("pwrite64")
+        || frame.contains("::write::")
+        || frame.contains("::write(")
+        || frame.contains("dispatch::fs::write")
+    {
+        return Some(CpuCategory::HostSyscall("write".to_owned()));
+    }
+    if frame.contains("sys_read")
+        || frame.contains("readv")
+        || frame.contains("pread64")
+        || frame.contains("::read::")
+        || frame.contains("::read(")
+        || frame.contains("dispatch::fs::read")
+    {
+        return Some(CpuCategory::HostSyscall("read".to_owned()));
+    }
+    if frame.contains("newfstatat")
+        || frame.contains("sys_newfstatat")
+        || frame.contains("fstat")
+        || frame.contains("statx")
+        || frame.contains("fs::stat")
+    {
+        return Some(CpuCategory::HostSyscall("newfstatat".to_owned()));
+    }
+    if frame.contains("sys_futex")
+        || frame.contains("futex_route")
+        || frame.contains("::futex")
+        || frame.contains("dispatch::futex")
+    {
+        return Some(CpuCategory::HostSyscall("futex".to_owned()));
+    }
+    if frame.contains("sys_close")
+        || frame.contains("close_dup")
+        || frame.contains("::close::")
+        || frame.contains("::close(")
+        || frame.contains("dispatch::fs::close")
+    {
+        return Some(CpuCategory::HostSyscall("close".to_owned()));
+    }
+    if frame.contains("renameat")
+        || frame.contains("sys_renameat")
+        || frame.contains("rename_overlay_entry")
+        || frame.contains("do_renameat")
+    {
+        return Some(CpuCategory::HostSyscall("renameat".to_owned()));
+    }
+    if frame.contains("unlinkat")
+        || frame.contains("sys_unlinkat")
+        || frame.contains("do_unlinkat")
+        || frame.contains("remove_dir_all")
+    {
+        return Some(CpuCategory::HostSyscall("unlinkat".to_owned()));
+    }
+    if frame.contains("getdents64") || frame.contains("sys_getdents64") {
+        return Some(CpuCategory::HostSyscall("getdents64".to_owned()));
+    }
+    if frame.contains("sys_execve") || frame.contains("execve") {
+        return Some(CpuCategory::HostSyscall("execve".to_owned()));
+    }
+    if frame.contains("sys_clone")
+        || frame.contains("clone_task")
+        || frame.contains("dispatch::clone")
+    {
+        return Some(CpuCategory::HostSyscall("clone".to_owned()));
+    }
+    if frame.contains("pipe2")
+        || frame.contains("sys_pipe2")
+        || frame.contains("dispatch::fs::pipe")
+    {
+        return Some(CpuCategory::HostSyscall("pipe".to_owned()));
+    }
+    if frame.contains("sys_fcntl")
+        || frame.contains("fcntl")
+        || frame.contains("dispatch::fs::fcntl")
+    {
+        return Some(CpuCategory::HostSyscall("fcntl".to_owned()));
+    }
+    if frame.contains("sys_ppoll")
+        || frame.contains("ppoll")
+        || frame.contains("epoll_pwait")
+        || frame.contains("epoll_ctl")
+    {
+        return Some(CpuCategory::HostSyscall("poll".to_owned()));
+    }
+    if frame.contains("sys_socket")
+        || frame.contains("sys_bind")
+        || frame.contains("sys_connect")
+        || frame.contains("sys_sendto")
+        || frame.contains("sys_recvfrom")
+        || frame.contains("::socket::")
+        || frame.contains("::socket(")
+        || frame.contains("dispatch::net")
+    {
+        return Some(CpuCategory::HostSyscall("socket".to_owned()));
+    }
+    if frame.contains("complete_syscall_return")
+        || frame.contains("service_outcome")
+        || frame.contains("complete_returned")
+        || frame.contains("service_threaded_syscall")
+        || frame.contains("redispatch_threaded_syscall")
+        || frame.contains("dispatch_threaded")
+        || frame.contains("dispatch_normalized")
+        || frame.contains("SyscallDispatcher")
+        || frame.contains("dispatch_syscall")
+        || frame.contains("syscall_service")
+        || frame.contains("next_syscall")
+    {
+        return Some(CpuCategory::HostSyscall("dispatch".to_owned()));
+    }
+
+    None
+}
+
 /// Classify a user stack (frames ordered from leaf to root) into one of the
 /// attribution categories.
 pub(crate) fn classify_stack(frames: &[&str]) -> CpuCategory {
-    // Walk frames leaf-to-root to identify the primary on-CPU activity.
-    // 1. Check for executor parking on idle_condvar.
+    // 1. Explicit check for executor parking across the stack:
+    // When a thread is idle waiting in the scheduler's run queue, its leaf frame
+    // is `wait_until_internal` or `psynch_cvwait`. Identifying the parking caller
+    // attributes this to executor scheduling rather than lock contention.
     for frame in frames {
-        if frame.contains("idle_condvar") {
-            return CpuCategory::ExecutorScheduling;
-        }
-    }
-
-    // 2. Check for lock wait/contention near leaf (psynch, mutex, ulock, rwlock).
-    for frame in frames {
-        if frame.contains("psynch_cvwait")
-            || frame.contains("psynch_mutexwait")
-            || frame.contains("__ulock_wait")
-            || frame.contains("hw_lock_lock_contended")
-            || frame.contains("lck_mtx_lock")
-            || frame.contains("lck_rw_lock_shared")
-            || frame.contains("RawMutex::lock_slow")
-            || frame.contains("parking_lot::raw_mutex")
-        {
-            return CpuCategory::LockWait;
-        }
-        // Don't search too deep for leaf lock primitives.
-        if frame.contains("run_to_exit") || frame.contains("run_worker") {
-            break;
-        }
-    }
-
-    // 3. Check for EL1 mailbox / grant request handling.
-    for frame in frames {
-        if frame.contains("claim_frame_grant_request")
-            || frame.contains("complete_grant")
-            || frame.contains("frame_grant_mailbox")
-            || frame.contains("publish_frame_grant_refusal")
-            || frame.contains("cancel_frame_grant_request")
-            || frame.contains("hvf_syscall_transport")
-        {
-            return CpuCategory::El1Mailbox;
-        }
-    }
-
-    // 4. Check for fault service and specific fault classes.
-    for frame in frames {
-        if frame.contains("commit_resident_frame_grant")
-            || frame.contains("prepare_el1_frame_grant")
-            || frame.contains("publish_el1_frame_grant_on_host")
-            || frame.contains("resident_frame_grant_plan")
-        {
-            return CpuCategory::FaultService(FaultClass::FrameGrant);
-        }
-        if frame.contains("resolve_frame_cow_fault")
-            || frame.contains("note_cow_resolution")
-            || frame.contains("cow_engine")
-            || frame.contains("Stage1CowFault")
-            || frame.contains("frame_cow")
-        {
-            return CpuCategory::FaultService(FaultClass::Cow);
-        }
-        if frame.contains("inventory_hv_vm_map_replay")
-            || frame.contains("map_host_alias")
-            || frame.contains("lookup_shared_alias")
-            || frame.contains("global_frame_stage2")
-        {
-            return CpuCategory::FaultService(FaultClass::Stage2);
-        }
-        if frame.contains("commit_resident_fault")
-            || frame.contains("resident_fault_plan")
-            || frame.contains("apply_first_touch")
-            || frame.contains("commit_mmap_growdown")
-            || frame.contains("mmap_growdown_fault_plan")
-            || frame.contains("resolve_stale_stage1_fault")
-            || frame.contains("handle_user_abort")
-            || frame.contains("arm_fast_fault")
-            || frame.contains("vm_fault_internal")
-            || frame.contains("vm_fault")
-        {
-            return CpuCategory::FaultService(FaultClass::FirstTouch);
-        }
-    }
-
-    // 5. Check for host syscall service by class.
-    for frame in frames {
-        if frame.contains("openat")
-            || frame.contains("open_at_path")
-            || frame.contains("sys_openat")
-        {
-            return CpuCategory::HostSyscall("openat".to_owned());
-        }
-        if frame.contains("sys_mmap")
-            || frame.contains("handle_mmap")
-            || frame.contains("mmap_pgoff")
-            || (frame.contains("mmap")
-                && !frame.contains("hv_vm_map")
-                && !frame.contains("map_host_alias"))
-        {
-            return CpuCategory::HostSyscall("mmap".to_owned());
-        }
-        if frame.contains("munmap") || frame.contains("sys_munmap") {
-            return CpuCategory::HostSyscall("munmap".to_owned());
-        }
-        if frame.contains("sys_brk") || frame.contains("handle_brk") || frame.contains("brk") {
-            return CpuCategory::HostSyscall("brk".to_owned());
-        }
-        if frame.contains("sys_write") || frame.contains("writev") || frame.contains("pwrite64") {
-            return CpuCategory::HostSyscall("write".to_owned());
-        }
-        if frame.contains("sys_read") || frame.contains("readv") || frame.contains("pread64") {
-            return CpuCategory::HostSyscall("read".to_owned());
-        }
-        if frame.contains("newfstatat")
-            || frame.contains("sys_newfstatat")
-            || frame.contains("fstat")
-            || frame.contains("statx")
-        {
-            return CpuCategory::HostSyscall("newfstatat".to_owned());
-        }
-        if frame.contains("futex") || frame.contains("sys_futex") || frame.contains("futex_route") {
-            return CpuCategory::HostSyscall("futex".to_owned());
-        }
-        if frame.contains("sys_close") || frame.contains("close") {
-            return CpuCategory::HostSyscall("close".to_owned());
-        }
-        if frame.contains("renameat") || frame.contains("sys_renameat") {
-            return CpuCategory::HostSyscall("renameat".to_owned());
-        }
-        if frame.contains("unlinkat") || frame.contains("sys_unlinkat") {
-            return CpuCategory::HostSyscall("unlinkat".to_owned());
-        }
-        if frame.contains("getdents64") || frame.contains("sys_getdents64") {
-            return CpuCategory::HostSyscall("getdents64".to_owned());
-        }
-        if frame.contains("execve") || frame.contains("sys_execve") {
-            return CpuCategory::HostSyscall("execve".to_owned());
-        }
-        if frame.contains("sys_clone") || frame.contains("clone") {
-            return CpuCategory::HostSyscall("clone".to_owned());
-        }
-        if frame.contains("pipe2") || frame.contains("sys_pipe2") {
-            return CpuCategory::HostSyscall("pipe".to_owned());
-        }
-        if frame.contains("fcntl") || frame.contains("sys_fcntl") {
-            return CpuCategory::HostSyscall("fcntl".to_owned());
-        }
-        if frame.contains("ppoll")
-            || frame.contains("sys_ppoll")
-            || frame.contains("epoll_pwait")
-            || frame.contains("epoll_ctl")
-        {
-            return CpuCategory::HostSyscall("poll".to_owned());
-        }
-        if frame.contains("socket")
-            || frame.contains("bind")
-            || frame.contains("connect")
-            || frame.contains("sendto")
-            || frame.contains("recvfrom")
-        {
-            return CpuCategory::HostSyscall("socket".to_owned());
-        }
-        if frame.contains("SyscallDispatcher")
-            || frame.contains("dispatch_syscall")
-            || frame.contains("syscall_service")
-        {
-            return CpuCategory::HostSyscall("other-syscall".to_owned());
-        }
-    }
-
-    // 6. Check for executor scheduling/park/unpark.
-    for frame in frames {
-        if frame.contains("Scheduler::")
-            || frame.contains("take_row_bound")
-            || frame.contains("run_worker")
-            || frame.contains("mn_admit")
-            || frame.contains("mn_reclaim")
-            || frame.contains("executor_claim")
-            || frame.contains("scheduler_wake")
-            || frame.contains("lease_settle")
-            || frame.contains("vtimer")
+        if frame.contains("idle_condvar")
+            || frame.contains("park_spare")
+            || frame.contains("RunQueue::park_spare")
         {
             return CpuCategory::ExecutorScheduling;
         }
     }
 
-    // 7. Check for guest execution (hv_vcpu_run).
+    // 2. Walk leaf-to-root and take the first matched category.
     for frame in frames {
-        if frame.contains("hv_vcpu_run")
-            || frame.contains("Vcpu::run")
-            || frame.contains("HvfAarch64Vcpu::run")
-            || frame.contains("run_to_exit")
-        {
-            return CpuCategory::GuestExecution;
+        if let Some(category) = classify_frame(frame) {
+            return category;
         }
     }
 
@@ -319,6 +478,7 @@ impl HvpatchCarrierCpuAttributionSummary {
         let mut stack_frames = Vec::new();
         let mut stack_count = 0_u64;
         let mut stack_population = 0_u64;
+        let mut raw_stacks = Vec::new();
 
         let mut guest_execution_samples = 0_u64;
         let mut host_syscall_samples = 0_u64;
@@ -407,53 +567,7 @@ impl HvpatchCarrierCpuAttributionSummary {
                 stack_count = stack_count
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("{PREFIX} stack cardinality overflow"))?;
-
-                // Classify the completed stack trace.
-                let frame_slices: Vec<&str> = stack_frames.iter().map(String::as_str).collect();
-                let category = classify_stack(&frame_slices);
-                match category {
-                    CpuCategory::GuestExecution => {
-                        guest_execution_samples = guest_execution_samples
-                            .checked_add(count)
-                            .ok_or_else(|| anyhow!("guest execution overflow"))?;
-                    }
-                    CpuCategory::HostSyscall(class) => {
-                        host_syscall_samples = host_syscall_samples
-                            .checked_add(count)
-                            .ok_or_else(|| anyhow!("host syscall overflow"))?;
-                        *syscall_classes.entry(class).or_insert(0_u64) += count;
-                    }
-                    CpuCategory::FaultService(class) => {
-                        fault_service_samples = fault_service_samples
-                            .checked_add(count)
-                            .ok_or_else(|| anyhow!("fault service overflow"))?;
-                        *fault_classes
-                            .entry(class.as_str().to_owned())
-                            .or_insert(0_u64) += count;
-                    }
-                    CpuCategory::El1Mailbox => {
-                        el1_mailbox_samples = el1_mailbox_samples
-                            .checked_add(count)
-                            .ok_or_else(|| anyhow!("el1 mailbox overflow"))?;
-                    }
-                    CpuCategory::ExecutorScheduling => {
-                        executor_scheduling_samples = executor_scheduling_samples
-                            .checked_add(count)
-                            .ok_or_else(|| anyhow!("executor scheduling overflow"))?;
-                    }
-                    CpuCategory::LockWait => {
-                        lock_wait_samples = lock_wait_samples
-                            .checked_add(count)
-                            .ok_or_else(|| anyhow!("lock wait overflow"))?;
-                    }
-                    CpuCategory::Other => {
-                        other_samples = other_samples
-                            .checked_add(count)
-                            .ok_or_else(|| anyhow!("other samples overflow"))?;
-                    }
-                }
-
-                stack_frames.clear();
+                raw_stacks.push((std::mem::take(&mut stack_frames), count));
             } else {
                 stack_frames.push(trimmed.to_owned());
             }
@@ -487,6 +601,83 @@ impl HvpatchCarrierCpuAttributionSummary {
 
         let image_text_base = image_text_base
             .ok_or_else(|| anyhow!("{PREFIX} stream has no carrier image record"))?;
+
+        // Batch resolve raw hex addresses if carrick binary and /usr/bin/atos are available.
+        let mut sym_map = HashMap::new();
+        let mut unique_addrs = BTreeSet::new();
+        for (stack, _) in &raw_stacks {
+            for frame in stack {
+                let trimmed = frame.trim();
+                if trimmed.starts_with("0x") {
+                    unique_addrs.insert(trimmed);
+                }
+            }
+        }
+        if let Some(binary) = (!unique_addrs.is_empty())
+            .then(find_carrick_binary)
+            .flatten()
+        {
+            let addrs: Vec<&str> = unique_addrs.into_iter().collect();
+            sym_map = resolve_addresses(&binary, &image_text_base, &addrs);
+        }
+
+        for (stack, count) in raw_stacks {
+            let resolved_frames: Vec<&str> = stack
+                .iter()
+                .map(|f| {
+                    let trimmed = f.trim();
+                    sym_map.get(trimmed).map(String::as_str).unwrap_or(trimmed)
+                })
+                .collect();
+            let category = classify_stack(&resolved_frames);
+            match category {
+                CpuCategory::GuestExecution => {
+                    guest_execution_samples = guest_execution_samples
+                        .checked_add(count)
+                        .ok_or_else(|| anyhow!("guest execution overflow"))?;
+                }
+                CpuCategory::HostSyscall(class) => {
+                    host_syscall_samples = host_syscall_samples
+                        .checked_add(count)
+                        .ok_or_else(|| anyhow!("host syscall overflow"))?;
+                    *syscall_classes.entry(class).or_insert(0_u64) += count;
+                }
+                CpuCategory::FaultService(class) => {
+                    fault_service_samples = fault_service_samples
+                        .checked_add(count)
+                        .ok_or_else(|| anyhow!("fault service overflow"))?;
+                    *fault_classes
+                        .entry(class.as_str().to_owned())
+                        .or_insert(0_u64) += count;
+                }
+                CpuCategory::El1Mailbox => {
+                    el1_mailbox_samples = el1_mailbox_samples
+                        .checked_add(count)
+                        .ok_or_else(|| anyhow!("el1 mailbox overflow"))?;
+                }
+                CpuCategory::ExecutorScheduling => {
+                    executor_scheduling_samples = executor_scheduling_samples
+                        .checked_add(count)
+                        .ok_or_else(|| anyhow!("executor scheduling overflow"))?;
+                }
+                CpuCategory::LockWait => {
+                    lock_wait_samples = lock_wait_samples
+                        .checked_add(count)
+                        .ok_or_else(|| anyhow!("lock wait overflow"))?;
+                }
+                CpuCategory::Other => {
+                    other_samples = other_samples
+                        .checked_add(count)
+                        .ok_or_else(|| anyhow!("other samples overflow"))?;
+                }
+            }
+        }
+
+        if other_samples == sample_population && sample_population > 0 {
+            bail!(
+                "{PREFIX} attribution failed closed: 100% of samples ({sample_population}) across {stack_count} distinct stacks were unclassified 'other'; carrier symbols were unresolved or unclassified"
+            );
+        }
 
         Ok(Self {
             sample_population,
@@ -539,7 +730,7 @@ impl HvpatchCarrierCpuAttributionSummary {
     pub(crate) fn render_human(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!(
-            "HVPatch carrier CPU attribution: total_samples={}, user_stacks={}, image_text_base={}\n",
+            "HVPatch carrier CPU attribution: total_samples={}, distinct_stacks={}, image_text_base={}\n",
             self.sample_population, self.stack_count, self.image_text_base
         ));
         out.push_str(&format!(
@@ -903,6 +1094,167 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn rejects_100_percent_other_attribution() {
+        let p_sha = program_sha256();
+        let stream = [
+            &format!("HVPCARRIERATTR|header|program_sha256={p_sha}"),
+            "HVPCARRIERATTR|image|host_pid=1234|text_base=0x100000000|slide=0x0",
+            "HVPCARRIERATTR|summary|status=ok|root_exited=1|bounded=0|errors=0|saw_sample=1",
+            "HVPCARRIERATTR|sample-population|count=10",
+            "HVPCARRIERATTR|section=usdt-metrics",
+            "HVPCARRIERATTR|section=user-stacks",
+            "              0xdeadbeef",
+            "              10",
+            "",
+        ]
+        .join("\n");
+
+        let err =
+            HvpatchCarrierCpuAttributionSummary::from_raw(stream, ProfileCaptureStatus::default())
+                .expect_err("should fail closed on 100% other");
+        assert!(err.to_string().contains("attribution failed closed"));
+        assert!(err.to_string().contains("100% of samples"));
+    }
+
+    #[test]
+    fn classifies_real_captured_carrier_stacks() {
+        // 1. Guest execution via run_to_exit / Vcpu::run
+        let guest_stack = [
+            "applevisor::vcpu::Vcpu::get_sys_reg::h3efe6a3aabef6ac0 (in carrick) (vcpu.rs:0)",
+            "carrick_vmm_hvf::trap::HvfInner::run_to_exit::h86a02940b642697e (in carrick) (trap.rs:7474)",
+            "carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vcpu::run::h587b622a2811e9a5 (in carrick) (hvf_aarch64_engine.rs:595)",
+            "carrick_host::guest_cpu::timed_run::hc43419832bcd8d25 (in carrick) (guest_cpu.rs:191)",
+            "carrick_aarch64::engine::Aarch64EngineCore::next_syscall::h67df699a04747041 (in carrick) (engine.rs:2816)",
+        ];
+        assert_eq!(classify_stack(&guest_stack), CpuCategory::GuestExecution);
+
+        // 2. Syscall dispatch frame
+        let dispatch_stack = [
+            "carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vcpu::complete_syscall_return::h4c2248377b9b7249 (in carrick) (hvf_aarch64_engine.rs:509)",
+            "carrick_runtime::vcpu_loop::ThreadRuntimeState::complete_returned::h9234673c72a38347 (in carrick) (mod.rs:2017)",
+            "carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob::service_outcome::h2f161280967cc2d2 (in carrick) (binding.rs:2698)",
+            "carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob::poll_with_engine::h3929857070dd193c (in carrick) (binding.rs:4409)",
+        ];
+        assert_eq!(
+            classify_stack(&dispatch_stack),
+            CpuCategory::HostSyscall("dispatch".to_owned())
+        );
+
+        // 3. Fault service: first-touch via vcpu_fault
+        let fault_stack = [
+            "carrick_observability::probes::real::vcpu_fault::he21282493f7bc6e4 (in carrick) (probes.rs:4982)",
+            "carrick_vmm_hvf::trap::HvfInner::run_to_exit::h86a02940b642697e (in carrick) (trap.rs:7474)",
+            "carrick_host::guest_cpu::timed_run::hc43419832bcd8d25 (in carrick) (guest_cpu.rs:191)",
+        ];
+        assert_eq!(
+            classify_stack(&fault_stack),
+            CpuCategory::FaultService(FaultClass::FirstTouch)
+        );
+
+        // 4. Fault service: COW via cow_engine
+        let cow_stack = [
+            "carrick_vmm_hvf::trap::task_mapping_index::TaskMappingIndex::candidates_for_ipa_range::h2efd4d1d13f0246b (in carrick) (task_mapping_index.rs:820)",
+            "carrick_vmm_hvf::trap::cow_engine::HvfVmState::mapping_for_ipa_range::h9c28ca89f7489c5b (in carrick) (cow_engine.rs:5073)",
+            "carrick_runtime::vcpu_loop::signal::resolve_mutating_fault::h944919999724912b (in carrick) (signal.rs:620)",
+        ];
+        assert_eq!(
+            classify_stack(&cow_stack),
+            CpuCategory::FaultService(FaultClass::Cow)
+        );
+
+        // 5. Fault service: frame grant
+        let grant_stack = [
+            "carrick_observability::probes::real::hvpatch_el1_frame_grant_plan::hac6ed0fa9a9e3a53 (in carrick) (probes.rs:4982)",
+            "carrick_runtime::vcpu_loop::signal::resolve_mutating_fault::h944919999724912b (in carrick) (signal.rs:511)",
+        ];
+        assert_eq!(
+            classify_stack(&grant_stack),
+            CpuCategory::FaultService(FaultClass::FrameGrant)
+        );
+
+        // 6. Lock wait
+        let lock_stack = [
+            "0x18a8be50c",
+            "parking_lot::condvar::Condvar::wait_until_internal::heb307538a997ec5d (in carrick) (condvar.rs:334)",
+            "carrick_runtime::vcpu_loop::outcome::HvpatchLoopResult::wait_supervised::hbd45820ed4aba5a9 (in carrick) (outcome.rs:443)",
+        ];
+        assert_eq!(classify_stack(&lock_stack), CpuCategory::LockWait);
+
+        // 7. Executor scheduling (park_spare overrides leaf condvar wait)
+        let executor_stack = [
+            "0x18a8be50c",
+            "parking_lot::condvar::Condvar::wait_until_internal::heb307538a997ec5d (in carrick) (condvar.rs:334)",
+            "carrick_kernel::kernel::scheduler::RunQueue::park_spare::h15abbc763e994f34 (in carrick) (scheduler.rs:2779)",
+            "carrick_kernel::kernel::scheduler::Scheduler::try_take::h14837436f11fd1ad (in carrick) (scheduler.rs:4309)",
+        ];
+        assert_eq!(
+            classify_stack(&executor_stack),
+            CpuCategory::ExecutorScheduling
+        );
+
+        // 8. Host syscall: openat
+        let openat_stack = [
+            "0x18a8bc5a8",
+            "carrick_vfs::fs_backend::host::HostFsBackend::openat_for_guest::ha8d23ac5de91a7df (in carrick) (host.rs:1811)",
+            "carrick_kernel::dispatch::fs::open::FsView::open_at_path_string::h1dee222a19ff20b3 (in carrick) (open.rs:734)",
+        ];
+        assert_eq!(
+            classify_stack(&openat_stack),
+            CpuCategory::HostSyscall("openat".to_owned())
+        );
+
+        // 9. Host syscall: renameat
+        let renameat_stack = [
+            "0x18a8c8a00",
+            "carrick_vfs::fs_backend::host::HostFsBackend::rename_overlay_entry_at::h1d6a45c47169bb32 (in carrick) (host.rs:5405)",
+            "carrick_kernel::dispatch::fs::directory::FsView::do_renameat::h0e4b00408525f8f0 (in carrick) (directory.rs:403)",
+        ];
+        assert_eq!(
+            classify_stack(&renameat_stack),
+            CpuCategory::HostSyscall("renameat".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_real_python_trace_if_present() {
+        let trace_path = Path::new("target/cpa-python.trace");
+        if !trace_path.exists() {
+            return;
+        }
+        if find_carrick_binary().is_none() {
+            return;
+        }
+        let summary = HvpatchCarrierCpuAttributionSummary::from_path(
+            trace_path,
+            ProfileCaptureStatus::default(),
+        )
+        .expect("parse real python trace");
+
+        assert_eq!(summary.sample_population, 1601);
+        assert_eq!(summary.stack_count, 158);
+        assert!(
+            summary.guest_execution_samples > 400,
+            "guest execution was {}",
+            summary.guest_execution_samples
+        );
+        assert!(
+            summary.host_syscall_samples > 400,
+            "host syscall was {}",
+            summary.host_syscall_samples
+        );
+        assert!(
+            summary.fault_service_samples > 250,
+            "fault service was {}",
+            summary.fault_service_samples
+        );
+        assert!(
+            summary.other_share() < 0.10,
+            "other share was {}",
+            summary.other_share()
+        );
     }
 
     #[test]
