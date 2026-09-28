@@ -38,8 +38,8 @@
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use carrick_timer_core::TimerSpecNs;
 use crate::posix_timer::PosixArm;
+use carrick_timer_core::TimerSpecNs;
 
 use crate::{PosixTimerSpec, ThreadId, TimerDelivery, VcpuRegistry};
 

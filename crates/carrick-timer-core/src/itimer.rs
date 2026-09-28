@@ -266,7 +266,11 @@ pub fn complete_fire(which: usize) -> bool {
 
 /// For CPU timers, decide whether enough guest CPU has elapsed for this timer
 /// to fire given current guest CPU time `now_ns` and `active_vcpus`.
-pub fn cpu_timer_decision(which: usize, now_ns: u64, active_vcpus: u64) -> Option<CpuTimerDecision> {
+pub fn cpu_timer_decision(
+    which: usize,
+    now_ns: u64,
+    active_vcpus: u64,
+) -> Option<CpuTimerDecision> {
     if !is_cpu_timer(which) {
         return None;
     }
