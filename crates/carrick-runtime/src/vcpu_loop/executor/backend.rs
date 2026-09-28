@@ -844,11 +844,6 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             ));
         }
         self.validate_loaded_hardware_identity()?;
-        // Exec keeps this vCPU but changes its MM. `save` will see only the
-        // successor binding after retarget, so vacate the predecessor now.
-        if let Some(previous) = self.binding.as_ref() {
-            previous.quantum().end_residency();
-        }
         // Exec keeps the thread (and its tid) loaded on this vCPU: the record
         // stays published, and the kernel updates its file table when exec
         // installs the close-on-exec successor (`replace_resources`).
@@ -1065,13 +1060,6 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
     }
 
     fn detach_loaded_task(&mut self) -> Result<(), TrapError> {
-        // A consumed predecessor does not pass through `save`, whose first
-        // action normally vacates the MM. Relinquish its host port before
-        // detaching the vCPU: detachment may release the mailbox lease and
-        // let another executor install on this slot under host load.
-        if let Some(binding) = self.binding.as_ref() {
-            binding.quantum().end_residency();
-        }
         self.clear_live_current_task();
         if let Some(mut engine) = self.current.take() {
             let _ = engine.restore_persistent_executor_invariants();
@@ -1113,9 +1101,6 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
     }
 
     fn destroy(mut self) -> Result<(), TrapError> {
-        if let Some(binding) = self.binding.as_ref() {
-            binding.quantum().end_residency();
-        }
         self.clear_live_current_task();
         if let Some(mut engine) = self.current.take() {
             let _ = catch_unwind(AssertUnwindSafe(|| {

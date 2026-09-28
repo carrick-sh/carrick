@@ -6814,6 +6814,7 @@ fn run_production_exec_failure_pool_case(boundary: InjectedExecFailureBoundary, 
         state,
         phase: crate::vcpu_loop::HvpatchProductionPhase::Resident,
         registration_wait: None,
+        slot_wait: None,
         terminal_settlement: root_settlement,
         terminal_result: None,
         completion: root_completion.clone(),
@@ -7140,48 +7141,4 @@ fn preemption_driver_worker_failure_allows_clean_shutdown() {
         .expect_err("panicked worker must cause shutdown error");
     assert_eq!(err.retired_workers(), 1);
     assert!(!scheduler.is_preemption_driver_attached());
-}
-
-/// A consumed predecessor is detached without `save`; the backend must
-/// vacate its MM before detachment can give its mailbox slot to a successor.
-#[test]
-fn consumed_predecessor_detach_vacates_before_mailbox_handoff() {
-    let backend = include_str!("backend.rs");
-    let detach = backend
-        .split("impl PersistentExecutor for HvpatchPersistentExecutor")
-        .nth(1)
-        .expect("production backend")
-        .split("fn detach_loaded_task(&mut self)")
-        .nth(1)
-        .expect("production detach")
-        .split("fn destroy(")
-        .next()
-        .expect("detach body");
-    let vacate = detach.find("end_residency()").expect("vacate MM occupancy");
-    let relinquish = detach
-        .find("self.current.take()")
-        .expect("relinquish loaded vCPU");
-    assert!(vacate < relinquish, "vacate before releasing mailbox lease");
-}
-
-/// Exec transfers the loaded vCPU to a successor binding; the predecessor
-/// MM's port must be gone before that binding replaces the old one.
-#[test]
-fn exec_retarget_vacates_predecessor_before_binding_replacement() {
-    let backend = include_str!("backend.rs");
-    let retarget = backend
-        .split("impl PersistentExecutor for HvpatchPersistentExecutor")
-        .nth(1)
-        .expect("production backend")
-        .split("fn retarget_loaded_task(&mut self")
-        .nth(1)
-        .expect("production retarget")
-        .split("fn validate_loaded_hardware_identity(")
-        .next()
-        .expect("retarget body");
-    let vacate = retarget.find("end_residency()").expect("vacate old MM");
-    let replace = retarget
-        .find("self.binding = Some(binding)")
-        .expect("replace loaded binding");
-    assert!(vacate < replace, "vacate before replacing the MM binding");
 }

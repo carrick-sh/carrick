@@ -5522,6 +5522,10 @@ mod real {
         /// HVPatch thread-clone outcome: Linux tid, stable
         /// `HvpatchCloneThreadPhase` ordinal, and Linux errno (zero on success).
         fn mn__clone__outcome(_: i32, _: u32, _: i32) {}
+        /// Host MM port refusal. Slot, current MM, requested MM, installing
+        /// guest tid, and current port owner's guest tid identify both sides
+        /// of a delayed unload without inferring ownership from a host pid.
+        fn mm__slot__busy(_: u32, _: u64, _: u64, _: i32, _: i32) {}
         /// Persistent executor identity and exact task/ASID generation at one
         /// owner-thread lifecycle boundary.
         fn hvpatch__executor__lifecycle(_: u32, _: u32, _: u64, _: u64, _: u64) {}
@@ -6253,6 +6257,22 @@ mod real {
 
     pub fn mn_clone_outcome(tid: i32, phase: super::HvpatchCloneThreadPhase, errno: i32) {
         carrick_usdt::mn__clone__outcome!(|| (tid, phase.raw(), errno));
+    }
+
+    pub fn mm_slot_busy(
+        slot: u32,
+        running_mm: u64,
+        requested_mm: u64,
+        installing_tid: i32,
+        owner_tid: i32,
+    ) {
+        carrick_usdt::mm__slot__busy!(|| (
+            slot,
+            running_mm,
+            requested_mm,
+            installing_tid,
+            owner_tid
+        ));
     }
 
     pub fn hvpatch_executor_lifecycle(
@@ -8633,6 +8653,7 @@ mod stub {
     stub!(mn_admit(tid: i32, slot: u32, budget: u32));
     stub!(mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32));
     stub!(mn_clone_outcome(tid: i32, phase: super::HvpatchCloneThreadPhase, errno: i32));
+    stub!(mm_slot_busy(slot: u32, running_mm: u64, requested_mm: u64, installing_tid: i32, owner_tid: i32));
     stub!(hvpatch_executor_lifecycle(
         executor: u32,
         phase: super::HvpatchExecutorLifecyclePhase,
