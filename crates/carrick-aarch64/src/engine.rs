@@ -1779,6 +1779,71 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         true
     }
 
+    /// Host copyout does not take the EL0 translation fault that normally
+    /// validates a prepared EL1-private leaf. Publish each touched page through
+    /// the exact-MM resident-fault authority before resolving its backing.
+    fn commit_prepared_host_write(
+        &mut self,
+        address: u64,
+        length: usize,
+        checked: bool,
+    ) -> Result<(), MemoryError> {
+        if length == 0 {
+            return Ok(());
+        }
+        let end = address
+            .checked_add(length as u64)
+            .ok_or(MemoryError::OutOfBounds { address, length })?;
+        let mut page = address & !4095;
+        while page < end {
+            let descriptor = |engine: &Self| {
+                engine
+                    .diagnostic_fault_page_tables(page)
+                    .map(|(_, walk)| carrick_mmu_core::aarch64::terminal_descriptor(walk))
+            };
+            let live = descriptor(self);
+            let prepared = live
+                .is_some_and(carrick_mmu_core::aarch64::terminal_descriptor_is_prepared_private);
+            if (checked || prepared)
+                && live.is_some_and(|leaf| {
+                    !carrick_mmu_core::aarch64::terminal_descriptor_permits_host_buffer(
+                        leaf,
+                        carrick_mmu_core::aarch64::LeafAccess::Write,
+                    )
+                })
+            {
+                return Err(MemoryError::OutOfBounds { address, length });
+            }
+            if prepared {
+                let authority = self.vm.frame_cow_authority().ok_or_else(|| {
+                    MemoryError::HostMap("prepared host write lacks exact-MM authority".to_owned())
+                })?;
+                let committed = authority
+                    .commit_host_first_touch(page, &mut |page, prot| {
+                        <Self as GuestMemory>::protect_range(self, page, 4096, prot)
+                            .map_err(|error| error.to_string())
+                    })
+                    .map_err(|error| MemoryError::HostMap(format!("host first touch: {error}")))?;
+                // Another executor may have committed this leaf after our
+                // read-only walk. Its completed publication needs no second
+                // plan; an unchanged prepared leaf still does.
+                if !committed
+                    && descriptor(self).is_some_and(
+                        carrick_mmu_core::aarch64::terminal_descriptor_is_prepared_private,
+                    )
+                {
+                    return Err(MemoryError::HostMap(
+                        "prepared host write has no resident-fault plan".to_owned(),
+                    ));
+                }
+            }
+            page = page
+                .checked_add(4096)
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+        }
+        Ok(())
+    }
+
     /// One page-bounded VA→IPA segment of a syscall buffer. Page bounding is
     /// mandatory: a private prefix/middle/suffix overlay can make numerically
     /// adjacent guest VAs resolve to unrelated physical pages.
@@ -2008,21 +2073,17 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // syscall write observes the change. The backend's `translated_write` may
         // additionally enforce per-mapping write intent (HVF's boot/file mappings).
         if !bytes.is_empty()
-            && (self
+            && self
                 .vm
                 .protections()
                 .is_some_and(|p| p.range_write_denied(address, bytes.len()))
-                || !self.el1_private_range_permits(
-                    address,
-                    bytes.len(),
-                    carrick_mmu_core::aarch64::LeafAccess::Write,
-                ))
         {
             return Err(MemoryError::OutOfBounds {
                 address,
                 length: bytes.len(),
             });
         }
+        self.commit_prepared_host_write(address, bytes.len(), true)?;
         let length = bytes.len();
         let mut copied = 0usize;
         while copied < length {
@@ -2041,6 +2102,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // permission (the host page is writable). PROT_NONE is NOT re-gated (the
         // default `write_bytes_unchecked` doesn't gate either). The translated IPA
         // resolves a `repoint_private` overlay to the private backing.
+        self.commit_prepared_host_write(address, bytes.len(), false)?;
         let length = bytes.len();
         let mut copied = 0usize;
         while copied < length {
@@ -2093,6 +2155,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         true
     }
 
+    fn prepare_host_write(&mut self, address: u64, length: usize) -> Result<(), MemoryError> {
+        self.commit_prepared_host_write(address, length, false)
+    }
+
     fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
         if !self.el1_private_range_permits(
             address,
@@ -2105,13 +2171,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
-        if !self.el1_private_range_permits(
-            address,
-            len,
-            carrick_mmu_core::aarch64::LeafAccess::Write,
-        ) {
-            return None;
-        }
+        self.commit_prepared_host_write(address, len, true).ok()?;
         self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::GuestVisible)
             .ok()?;
         self.vm.host_ptr_for_write(address, len)

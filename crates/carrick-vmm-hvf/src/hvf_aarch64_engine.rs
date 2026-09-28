@@ -1585,6 +1585,10 @@ pub struct HvfAnonymousDiscard {
 impl Aarch64Vmm for HvfAarch64Vmm {
     type AnonymousDiscard = HvfAnonymousDiscard;
 
+    fn frame_cow_authority(&self) -> Option<Arc<dyn carrick_hal::FrameCowAuthority>> {
+        self.state.cow_authority.clone()
+    }
+
     fn anonymous_discard_granule(&self) -> Option<u64> {
         self.state.persistent_vm_lifecycle.then_some(16384)
     }

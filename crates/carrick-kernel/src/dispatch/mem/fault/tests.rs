@@ -160,6 +160,79 @@ fn committed_first_touch_page_still_routes_to_mutation_authority() {
     );
 }
 
+#[test]
+fn host_sigframe_copyout_commits_prepared_altstack_after_stage1_publish() {
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().expect("task context");
+    let mm = context.shared().mm().id();
+    let page = dispatcher.linux_page_size();
+    let altstack_page = LINUX_MMAP_BASE + 4 * page;
+    dispatcher.track_resident_fault_range(
+        altstack_page,
+        page,
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+    );
+    let mut guard = super::super::super::mm_quiesce::acquire_host_write_mutation_quiesce(
+        &dispatcher.pt_quiesce(),
+        mm,
+        dispatcher.mm_mutation_coordinator(),
+        crate::thread::ThreadId::synthetic_for_tests(context.thread().key().tid.raw()),
+        super::super::super::mm_quiesce::PtPauseBudget::DEFAULT,
+    )
+    .expect("exact-MM host-write authority");
+    let mut stage1_published = false;
+    assert!(
+        dispatcher
+            .commit_host_first_touch(&mut guard, altstack_page + 8, &mut |address, prot| {
+                assert_eq!(address, altstack_page);
+                assert_eq!(prot, (LinuxProtFlags::READ | LinuxProtFlags::WRITE).bits());
+                Err("stage-1 publication refused".to_owned())
+            })
+            .is_err()
+    );
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(altstack_page, |_| ())
+            .is_some()
+    );
+    assert_eq!(
+        dispatcher.commit_host_first_touch(&mut guard, altstack_page + 8, &mut |address, prot| {
+            assert_eq!(address, altstack_page);
+            assert_eq!(prot, (LinuxProtFlags::READ | LinuxProtFlags::WRITE).bits());
+            stage1_published = true;
+            Ok(())
+        }),
+        Ok(true)
+    );
+    assert!(stage1_published);
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(altstack_page, |_| ())
+            .is_none()
+    );
+
+    let read_only_page = altstack_page + page;
+    dispatcher.track_resident_fault_range(read_only_page, page, LinuxProtFlags::READ);
+    let mut protection_called = false;
+    assert!(
+        dispatcher
+            .commit_host_first_touch(&mut guard, read_only_page, &mut |_, _| {
+                protection_called = true;
+                Ok(())
+            })
+            .is_err()
+    );
+    assert!(
+        !protection_called,
+        "PROT_READ must refuse before stage-1 edit"
+    );
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(read_only_page, |_| ())
+            .is_some()
+    );
+}
+
 /// `mprotect` over an armed first-touch range must not silently make the
 /// pending pages accessible: the leaf stays invalid (so the first touch is
 /// still observed for `mincore`) and the recorded protection follows the new

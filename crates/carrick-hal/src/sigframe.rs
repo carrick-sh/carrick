@@ -221,6 +221,12 @@ pub fn build_sigframe<E: RegAccess + CurrentMmMemory>(
     // (LTP sigaltstack01 deliberately exercises that).
     let frame_bytes = frame.as_bytes();
     let new_sp = signal_frame_stack_pointer(frame.saved_sp, p.altstack, frame_bytes.len())?;
+    // A prepared lazy leaf is not yet a valid stage-1 translation. The
+    // backend authenticates Linux write intent and commits first touch before
+    // the ordinary whole-range host-buffer check below.
+    engine
+        .prepare_host_write(new_sp, frame_bytes.len())
+        .map_err(|_| TrapError::SignalDeliveryFault)?;
     if !engine.guest_range_is_writable(new_sp, frame_bytes.len()) {
         // Any unwritable signal stack is Linux force_sigsegv territory. This
         // check also prevents the unchecked frame write below from modifying
