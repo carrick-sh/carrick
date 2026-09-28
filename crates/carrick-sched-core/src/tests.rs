@@ -986,9 +986,9 @@ fn host_placement_respects_address_spaces_and_owes_resched_sgis() {
     );
 }
 
-/// Stealing never takes a home record (its thread must run where the host
-/// loaded it); a service thread, or a thread of an address space the thief
-/// does not run, moves to the thief's queue for its executor to take.
+/// Stealing never takes a home record or a host-service record: those belong
+/// to their existing executors. An EL0 thread of an address space the thief
+/// cannot install can still move to its queue for its executor to take.
 #[test]
 fn stealing_takes_only_what_the_thief_may_run() {
     let zone = zone();
@@ -1009,9 +1009,8 @@ fn stealing_takes_only_what_the_thief_may_run() {
     let placed = zone.place_from_host(service).unwrap();
     assert_eq!(placed.slot, THIRD, "the idle slot is chosen first");
     assert!(zone.head_needs_host(THIRD));
-    // An idle slot of another address space steals too: a service thread,
-    // or an EL0 thread of MM, goes to its own queue, where it leaves the vCPU
-    // for its executor, which loads it (EL1 does not switch address spaces).
+    // An idle slot of another address space leaves the service thread on
+    // THIRD, but takes an EL0 thread of MM for its own executor to load.
     let foreign = SlotId::new(11);
     assert!(zone.reset_slot(foreign));
     host_publish(&zone, foreign, MM + 7, Some(3), 0);
@@ -1032,11 +1031,14 @@ fn stealing_takes_only_what_the_thief_may_run() {
         },
         "the EL0 thread of another address space waits for the thief's executor"
     );
-    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 2);
-    // Its executor takes both from the head, the EL0 one to load.
+    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 1);
+    assert_eq!(zone.runnable_head(THIRD), Some(service));
+    // The foreign executor takes the EL0 thread. THIRD's executor retains
+    // the service record without an extra guest exit on the foreign slot.
     zone.leave_guest(foreign, &HostWait);
-    assert!(zone.take_service_head(foreign).is_some());
     assert_eq!(zone.take_service_head(foreign), Some(ready));
+    zone.leave_guest(THIRD, &HostWait);
+    assert_eq!(zone.take_service_head(THIRD), Some(service));
     assert_eq!(zone.counters.foreign_adoptions.load(Ordering::Relaxed), 1);
 }
 

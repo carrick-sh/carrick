@@ -711,6 +711,24 @@ fn host_runnable(zone: &ZoneTables, slot: SlotId, tid: u64) -> RecordId {
     record
 }
 
+/// A host-owned service record has an executor on its placement slot. An
+/// unrelated idle vCPU cannot serve it and must leave that queue alone.
+#[test]
+fn an_idle_vcpu_does_not_steal_host_service_work() {
+    const OTHER: SlotId = SlotId::new(4);
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(0), 0);
+    zone.enter_guest(SLOT);
+    let service = host_runnable(&zone, SLOT, 303);
+    host_publish(&zone, OTHER, MM, Some(1), 0);
+    zone.enter_guest(OTHER);
+
+    assert!(zone.steal(OTHER).is_none());
+    assert_eq!(zone.runnable_head(SLOT), Some(service));
+    assert_eq!(zone.runnable_head(OTHER), None);
+    assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 0);
+}
+
 /// A wait with a host-runnable thread at the head of the run queue parks
 /// the waiter and leaves for the host with no thread on the vCPU: EL1 never
 /// runs that thread at EL0.
