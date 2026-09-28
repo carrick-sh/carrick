@@ -4,6 +4,7 @@ use carrick_el1_abi::{
     Action, Counters, CurrentTask, EL1_FRAME_GRANT_TARGET_SIZE, FrameGrantMailbox,
     FrameGrantMailboxes, FrameGrantRequest, TrapFrame,
 };
+use carrick_mmu_core::aarch64::{GuestPreparedCommit, GuestPreparedCommitError, LeafAccess};
 use carrick_sched_core::AddressSpaces;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +59,60 @@ impl CowResolver for NoopCowResolver {
     }
 }
 
+pub trait PreparedPageResolver {
+    fn commit_prepared(
+        &mut self,
+        ttbr0: u64,
+        va: u64,
+        expected_ipa: u64,
+        access: LeafAccess,
+    ) -> Result<GuestPreparedCommit, GuestPreparedCommitError>;
+}
+
+pub struct NoopPreparedResolver;
+
+impl PreparedPageResolver for NoopPreparedResolver {
+    fn commit_prepared(
+        &mut self,
+        _ttbr0: u64,
+        _va: u64,
+        _expected_ipa: u64,
+        _access: LeafAccess,
+    ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+        Err(GuestPreparedCommitError::NotPrepared)
+    }
+}
+
+#[cfg(target_os = "none")]
+pub struct HardwarePreparedResolver;
+
+#[cfg(target_os = "none")]
+impl PreparedPageResolver for HardwarePreparedResolver {
+    fn commit_prepared(
+        &mut self,
+        ttbr0: u64,
+        va: u64,
+        expected_ipa: u64,
+        access: LeafAccess,
+    ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+        const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+        let outcome = unsafe {
+            carrick_mmu_core::aarch64::commit_existing_el1_prepared_page(
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE
+                    as *mut core::sync::atomic::AtomicU64,
+                ttbr0 & TTBR_BADDR_MASK,
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
+                va,
+                expected_ipa,
+                access,
+            )?
+        };
+        let mut cpu = crate::sched::HardwareCpu;
+        crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
+        Ok(outcome)
+    }
+}
+
 #[cfg(target_os = "none")]
 pub struct HardwareCowResolver;
 
@@ -109,7 +164,7 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
             counters.fault_taken.fetch_add(1, Ordering::Relaxed);
             return Action::Forward;
         };
-        dispatch_fault_with_regions(
+        dispatch_fault_with_prepared(
             frame,
             counters,
             current_tasks,
@@ -118,6 +173,8 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 own: mailbox,
                 peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
             },
+            Some(carrick_el1_abi::frame_grant_residency_guest()),
+            &mut HardwarePreparedResolver,
             &mut HardwareCowResolver,
         )
     }
@@ -153,6 +210,28 @@ pub fn dispatch_fault_with_regions<C: CowResolver>(
     current_tasks: &[CurrentTask],
     spaces: &AddressSpaces,
     mailboxes: GrantMailboxes<'_>,
+    cow_resolver: &mut C,
+) -> Action {
+    dispatch_fault_with_prepared(
+        frame,
+        counters,
+        current_tasks,
+        spaces,
+        mailboxes,
+        None,
+        &mut NoopPreparedResolver,
+        cow_resolver,
+    )
+}
+
+pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    spaces: &AddressSpaces,
+    mailboxes: GrantMailboxes<'_>,
+    residency: Option<&carrick_el1_abi::FrameGrantResidencyTable>,
+    prepared_resolver: &mut P,
     cow_resolver: &mut C,
 ) -> Action {
     let GrantMailboxes {
@@ -195,6 +274,39 @@ pub fn dispatch_fault_with_regions<C: CowResolver>(
     let mm_key = task.zone_mm.load(Ordering::Acquire);
     if mm_key == 0 {
         return Action::Forward;
+    }
+
+    if let Some(page) = residency.and_then(|table| table.lookup(mm_key, frame.far)) {
+        let Some(index) = spaces.find(mm_key) else {
+            return Action::Forward;
+        };
+        let Some(grant) = spaces.grant(index, mm_key) else {
+            return Action::Forward;
+        };
+        let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
+            return Action::Forward;
+        };
+        let Some(_editor) = spaces.try_begin_edit(index, mm_key, owner) else {
+            return Action::Forward;
+        };
+        let access = if access == 2 {
+            LeafAccess::Write
+        } else {
+            LeafAccess::Read
+        };
+        match prepared_resolver.commit_prepared(
+            grant.ttbr0,
+            frame.far & !4095,
+            page.expected_ipa,
+            access,
+        ) {
+            Ok(GuestPreparedCommit::Committed) => {
+                assert!(residency.is_some_and(|table| table.record_commit(page)));
+                return Action::Served;
+            }
+            Ok(GuestPreparedCommit::AlreadyResident) => return Action::Served,
+            Err(_) => {}
+        }
     }
 
     let found = mailbox
@@ -260,6 +372,48 @@ mod tests {
         spaces
     }
 
+    #[test]
+    fn prepared_grant_fault_commits_in_guest_and_records_residency() {
+        let mm = 77;
+        let va = 0x4000_1000;
+        let base = 0x4000_0000;
+        let table = carrick_el1_abi::FrameGrantResidencyTable::new();
+        let identity = carrick_el1_abi::FrameGrantResidencyIdentity {
+            mm_key: mm,
+            semantic_base: base,
+            physical_ipa: 0x9000_0000,
+            len: 3 * 4096,
+            mapping_id: 11,
+            frame_id: 12,
+            owner_generation: 13,
+            inventory_revision: 14,
+        };
+        let slot = table.publish(identity).unwrap();
+        let task = CurrentTask::new();
+        task.zone_mm.store(mm, Ordering::Release);
+        let tasks = [task];
+        let spaces = published_space(mm, 0x8800_0000);
+        let mailbox = FrameGrantMailbox::new();
+        let mut frame = write_translation_fault(0, va);
+        let mut prepared = RecordingPreparedResolver::default();
+        assert_eq!(
+            dispatch_fault_with_prepared(
+                &mut frame,
+                &Counters::default(),
+                &tasks,
+                &spaces,
+                GrantMailboxes::own(&mailbox),
+                Some(&table),
+                &mut prepared,
+                &mut NoopCowResolver,
+            ),
+            Action::Served
+        );
+        assert_eq!(prepared.calls, vec![(0x8800_0000, va, 0x9000_1000)]);
+        assert_eq!(table.committed_words(slot, identity).unwrap()[0], 0b10);
+        assert!(!mailbox.has_guest_work());
+    }
+
     #[derive(Default)]
     struct RecordingCowResolver {
         succeeds: bool,
@@ -270,6 +424,24 @@ mod tests {
         fn resolve_cow(&mut self, ttbr0: u64, far: u64) -> bool {
             self.calls.push((ttbr0, far));
             self.succeeds
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingPreparedResolver {
+        calls: Vec<(u64, u64, u64)>,
+    }
+
+    impl PreparedPageResolver for RecordingPreparedResolver {
+        fn commit_prepared(
+            &mut self,
+            ttbr0: u64,
+            va: u64,
+            expected_ipa: u64,
+            _access: LeafAccess,
+        ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+            self.calls.push((ttbr0, va, expected_ipa));
+            Ok(GuestPreparedCommit::Committed)
         }
     }
 
