@@ -24,7 +24,7 @@
 
 #![cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 
-use carrick_signal_core::HostSignalGlue;
+use carrick_signal_linux::HostSignalGlue;
 
 /// The native lane's kick signal: this OS's `SIGRTMIN`, used as a PAIR with
 /// `+1` (kick, nudge).

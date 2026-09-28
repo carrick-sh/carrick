@@ -40,5 +40,5 @@ carrick-host = { path = "../carrick-host" }
 # runtime integration.
 carrick-host-bsd = { path = "../carrick-host-bsd" }
 carrick-timer-core = { path = "../carrick-timer-core" }
-carrick-signal-core = { path = "../carrick-signal-core" }
+carrick-signal-linux = { path = "../carrick-signal-linux" }
 libc.workspace = true

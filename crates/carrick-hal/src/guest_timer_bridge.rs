@@ -170,7 +170,7 @@ pub fn register_kicker(
 /// arm/disarm only).
 pub fn deliver(signum: i32) {
     if let Some(d) = lock().as_ref() {
-        carrick_signal_core::publish_process_signal(signum);
+        carrick_signal_linux::publish_process_signal(signum);
         d.kicker.kick_all();
         (d.wake)();
     }
@@ -203,7 +203,7 @@ pub fn delivery() -> Option<Arc<dyn TimerDelivery>> {
 /// The firing half of a [`TimerCoreBridge`]: how a slot the neutral
 /// `carrick-timer-core` registry just armed becomes a delivered guest signal
 /// on this lane. Static methods, like
-/// [`HostSignalGlue`](carrick_signal_core::HostSignalGlue): the lane is a
+/// [`HostSignalGlue`](carrick_signal_linux::HostSignalGlue): the lane is a
 /// type, not a value.
 pub trait TimerFiring: 'static {
     /// Start the fallback thread for interval timer `which` at arm
@@ -444,7 +444,7 @@ mod tests {
         let _serial = TIMER_REGISTRY_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        carrick_signal_core::clear_proc_pending();
+        carrick_signal_linux::clear_proc_pending();
         let bridge = NullGuestTimerBridge::default();
         let id = bridge.posix_create_with_target_and_value(0, carrick_abi::LINUX_SIGALRM, None, 0);
         assert!(bridge.posix_exists(id));
@@ -464,8 +464,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         bridge.deliver(carrick_abi::LINUX_SIGALRM);
         assert_eq!(
-            carrick_signal_core::take_process_pending(),
-            carrick_signal_core::NO_PENDING_SIGNAL
+            carrick_signal_linux::take_process_pending(),
+            carrick_signal_linux::NO_PENDING_SIGNAL
         );
         assert!(bridge.posix_delete(id));
         assert!(!bridge.posix_exists(id));

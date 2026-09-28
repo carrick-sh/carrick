@@ -3399,8 +3399,8 @@ fn sysv_msg_wait_interrupted(
     tid: crate::thread::ThreadId,
 ) -> bool {
     this.has_deliverable_dispatch_pending_for_wait(context, tid, carrick_abi::WaitSigMask::NONE)
-        || carrick_signal_core::xsig::xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE)
-        || carrick_signal_core::has_pending_for(tid.raw())
+        || carrick_signal_linux::xsig::xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE)
+        || carrick_signal_linux::has_pending_for(tid.raw())
 }
 
 // Linux SysV semaphore command constants (linux/sem.h + ipc.h).

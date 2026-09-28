@@ -30,14 +30,14 @@
 //! a Linux<->macOS `SIGNUM_XLATE`; KVM is identity (host Linux signum == guest
 //! Linux signum). Only the policy CONSTANTS / mask logic are shared here.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use carrick_signal_core::DispositionSet;
 
 /// Bitmask of Linux signums for which a host disposition has been mirrored, so an
 /// install / ignore is idempotent per signal. Bit `n` (1..=64) = signum `n`. This
 /// is the SHARED idempotency state both backends consult, so the two cannot drift
 /// on which signals are considered "already routed". `fetch_or`/`fetch_and` are
 /// used so a concurrent install never loses a bit.
-static INSTALLED_MASK: AtomicU64 = AtomicU64::new(0);
+static INSTALLED_MASK: DispositionSet = DispositionSet::new();
 
 /// `INSTALLED_MASK` is process-global, and Rust runs tests in one binary in
 /// parallel. Any test that mutates the install mask must hold this lock.
@@ -49,44 +49,30 @@ pub(crate) static MASK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new((
 /// `signum` outside 1..=64 is ignored and reported as "already installed" so the
 /// caller skips it.
 pub fn mark_installed(signum: i32) -> bool {
-    let Some(bit) = pending_bit(signum) else {
-        return true;
-    };
-    INSTALLED_MASK.fetch_or(bit, Ordering::SeqCst) & bit != 0
+    INSTALLED_MASK.mark(signum)
 }
 
 /// Clear the installed bit for `signum` (the guest reset it to default, or an
 /// execve reset dropped its routing). Out-of-range signums are ignored.
 pub fn clear_installed(signum: i32) {
-    if let Some(bit) = pending_bit(signum) {
-        INSTALLED_MASK.fetch_and(!bit, Ordering::SeqCst);
-    }
+    INSTALLED_MASK.remove(signum);
 }
 
 /// Whether `signum` currently has a mirrored host disposition installed.
 pub fn is_installed(signum: i32) -> bool {
-    match pending_bit(signum) {
-        Some(bit) => INSTALLED_MASK.load(Ordering::SeqCst) & bit != 0,
-        None => false,
-    }
+    INSTALLED_MASK.contains(signum)
 }
 
 /// The full installed bitmask (bit `signum-1`). Used by the execve-reset walk to
 /// visit exactly the installed signals.
 pub fn installed_mask() -> u64 {
-    INSTALLED_MASK.load(Ordering::SeqCst)
+    INSTALLED_MASK.bits()
 }
 
 /// Clear ALL installed bits (fork / supervisor-fork reset, so a child does not
 /// inherit the parent's mirrored-disposition bookkeeping).
 pub fn clear_all() {
-    INSTALLED_MASK.store(0, Ordering::SeqCst);
-}
-
-/// Bit for `signum` (`1 << (signum-1)`), or `None` if out of 1..=64. Local copy
-/// so this leaf policy module has no cross-module dependency.
-fn pending_bit(signum: i32) -> Option<u64> {
-    (1..=64).contains(&signum).then(|| 1u64 << (signum - 1))
+    INSTALLED_MASK.clear();
 }
 
 /// The BASE policy of WHICH signals get a mirrored host disposition. Returns
