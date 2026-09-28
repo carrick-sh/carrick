@@ -20,6 +20,7 @@
 //! plus the backend's sigreturn trampoline base — see [`InjectParams`].
 
 use carrick_guest_mem::CurrentMmMemory;
+use carrick_guest_mem::MemoryError;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{Reg, RegAccess, TrapError};
@@ -68,6 +69,15 @@ pub struct SigframeRestore {
     pub saved_pc: u64,
     pub frame_sp: u64,
     pub magic: u64,
+}
+
+fn signal_frame_memory_error_code(error: &MemoryError) -> i32 {
+    match error {
+        MemoryError::OutOfBounds { .. } => 1,
+        MemoryError::Unsupported => 2,
+        MemoryError::HostMap(_) => 3,
+        MemoryError::MetadataAllocation => 4,
+    }
 }
 
 /// Build a `CarrickSigframe` for `p.signum`, write it to the guest's user
@@ -226,8 +236,22 @@ pub fn build_sigframe<E: RegAccess + CurrentMmMemory>(
     // the ordinary whole-range host-buffer check below.
     engine
         .prepare_host_write(new_sp, frame_bytes.len())
-        .map_err(|_| TrapError::SignalDeliveryFault)?;
+        .map_err(|error| {
+            carrick_observability::probes::hvpatch_signal_frame_step(
+                1,
+                new_sp,
+                frame_bytes.len() as u64,
+                signal_frame_memory_error_code(&error),
+            );
+            TrapError::SignalDeliveryFault
+        })?;
     if !engine.guest_range_is_writable(new_sp, frame_bytes.len()) {
+        carrick_observability::probes::hvpatch_signal_frame_step(
+            2,
+            new_sp,
+            frame_bytes.len() as u64,
+            1,
+        );
         // Any unwritable signal stack is Linux force_sigsegv territory. This
         // check also prevents the unchecked frame write below from modifying
         // runtime-owned executable mappings when a guest forges SP_EL0.
@@ -239,7 +263,15 @@ pub fn build_sigframe<E: RegAccess + CurrentMmMemory>(
     // thread-group by SIGSEGV rather than crashing carrick.
     engine
         .write_bytes_unchecked(new_sp, frame_bytes)
-        .map_err(|_| TrapError::SignalDeliveryFault)?;
+        .map_err(|error| {
+            carrick_observability::probes::hvpatch_signal_frame_step(
+                3,
+                new_sp,
+                frame_bytes.len() as u64,
+                signal_frame_memory_error_code(&error),
+            );
+            TrapError::SignalDeliveryFault
+        })?;
 
     // Adjust SP_EL0 to point past the freshly-written frame.
     engine.set_reg(Reg::Sp, new_sp)?;
