@@ -28,7 +28,6 @@ const LINUX_HEAP_SIZE: u64 = 128 * 1024 * 1024;
 const LINUX_MMAP_BASE: u64 = 0x60_0000_0000;
 const LINUX_MMAP_SIZE_MAX: u64 = 160 * 1024 * 1024 * 1024;
 
-const EACCES: i64 = 13;
 const EINVAL: i64 = 22;
 const ENOMEM: i64 = 12;
 const PAGE_SIZE: u64 = 4096;
@@ -408,7 +407,7 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
     match editor.protect_and_invalidate(grant.ttbr0, edit) {
         Ok(()) => MprotectDisposition::Return(0),
         Err(GuestPermissionEditError::BadRange) => MprotectDisposition::Return(-EINVAL),
-        Err(GuestPermissionEditError::PermissionWidening) => MprotectDisposition::Return(-EACCES),
+        Err(GuestPermissionEditError::PermissionWidening) => MprotectDisposition::Forward,
         Err(
             GuestPermissionEditError::TableOutsidePrimary
             | GuestPermissionEditError::MissingTable
@@ -483,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn ineligible_mapping_forwards_and_permission_widening_returns_eacces() {
+    fn ineligible_mapping_and_permission_widening_forward() {
         let (frame, tasks, spaces, _) = fixture(PROT_READ | PROT_WRITE);
         let mut ineligible = RecordingEditor {
             result: Some(GuestPermissionEditError::NotPrivateAnonymous),
@@ -500,7 +499,7 @@ mod tests {
         };
         assert_eq!(
             try_serve_mprotect(&frame, &tasks, &spaces, &mut widening),
-            MprotectDisposition::Return(-EACCES)
+            MprotectDisposition::Forward
         );
     }
 
