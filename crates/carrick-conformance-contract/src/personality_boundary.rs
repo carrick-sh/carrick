@@ -38,15 +38,23 @@ pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
     "carrick-sched-core",
     "carrick-mmu-core",
     "carrick-signal-core",
+    "carrick-timer-core",
 ];
 
 /// Designated Linux personality or ABI crates forbidden in substrate dependency closures.
 pub const FORBIDDEN_PERSONALITY_CRATES: &[&str] = &[
     "carrick-abi",
     "carrick-el1-abi",
-    "carrick-signal-core",
-    "carrick-timer-core",
+    "carrick-signal-linux",
     "carrick-kernel",
+];
+
+/// Designated host or std-only platform crates forbidden in substrate dependency closures.
+pub const FORBIDDEN_HOST_CRATES: &[&str] = &[
+    "carrick-host",
+    "carrick-portable",
+    "carrick-host-bsd",
+    "carrick-host-linux",
 ];
 
 /// Known Linux errno symbol names forbidden in production substrate source code.
@@ -138,6 +146,7 @@ pub enum BoundaryError {
 pub struct BoundaryConfig {
     pub substrate_allowlist: Vec<String>,
     pub forbidden_personality_crates: Vec<String>,
+    pub forbidden_host_crates: Vec<String>,
     pub forbidden_errno_symbols: Vec<String>,
     pub metadata_file: Option<PathBuf>,
     pub metadata_json: Option<String>,
@@ -155,6 +164,10 @@ impl Default for BoundaryConfig {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            forbidden_host_crates: FORBIDDEN_HOST_CRATES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             forbidden_errno_symbols: FORBIDDEN_ERRNO_SYMBOLS
                 .iter()
                 .map(|s| (*s).to_string())
@@ -166,13 +179,14 @@ impl Default for BoundaryConfig {
     }
 }
 
-/// A forbidden dependency edge reaching a personality crate.
+/// A forbidden dependency edge reaching a personality or host crate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DependencyViolation {
     pub substrate_crate: String,
     pub forbidden_crate: String,
     pub dependency_chain: Vec<String>,
     pub edge_kind: String,
+    pub violation_kind: String,
 }
 
 /// A forbidden literal or symbol found in production source code.
@@ -345,6 +359,8 @@ pub fn check_substrate_boundary(
         .iter()
         .cloned()
         .collect();
+    let forbidden_host_crates: BTreeSet<String> =
+        config.forbidden_host_crates.iter().cloned().collect();
     let forbidden_symbols: BTreeSet<String> =
         config.forbidden_errno_symbols.iter().cloned().collect();
 
@@ -364,6 +380,7 @@ pub fn check_substrate_boundary(
             crate_name,
             &metadata,
             &forbidden_crates,
+            &forbidden_host_crates,
             &mut report,
         )?;
 
@@ -385,8 +402,9 @@ pub fn check_substrate_boundary(
         for dv in &report.dependency_violations {
             total_violations += 1;
             violation_messages.push(format!(
-                "  [DEP] crate `{}` reaches forbidden personality crate `{}` via {} edge: {}",
+                "  [DEP] crate `{}` reaches forbidden {} crate `{}` via {} edge: {}",
                 dv.substrate_crate,
+                dv.violation_kind,
                 dv.forbidden_crate,
                 dv.edge_kind,
                 dv.dependency_chain.join(" -> ")
@@ -424,6 +442,7 @@ fn audit_crate_dependencies_metadata<'a>(
     substrate_crate: &str,
     metadata: &'a CargoMetadata,
     forbidden_crates: &BTreeSet<String>,
+    forbidden_host_crates: &BTreeSet<String>,
     report: &mut CrateAuditReport,
 ) -> Result<&'a MetadataPackage, BoundaryError> {
     let substrate_pkg = metadata
@@ -475,10 +494,11 @@ fn audit_crate_dependencies_metadata<'a>(
     for dep in &substrate_pkg.dependencies {
         let is_dev = dep.kind.as_deref() == Some("dev");
         if !is_dev {
-            let is_resolved = substrate_node
-                .deps
-                .iter()
-                .any(|d| d.name == dep.name || dep.rename.as_deref() == Some(&d.name));
+            let is_resolved = substrate_node.deps.iter().any(|d| {
+                d.name == dep.name
+                    || d.name == dep.name.replace('-', "_")
+                    || dep.rename.as_deref() == Some(&d.name)
+            });
             if !is_resolved && !dep.optional {
                 return Err(BoundaryError::UnresolvedDependencyGraph {
                     crate_name: dep.name.clone(),
@@ -537,12 +557,21 @@ fn audit_crate_dependencies_metadata<'a>(
 
             let chain = vec![substrate_crate.to_string(), dep_display];
 
-            if forbidden_crates.contains(&target_pkg.name) {
+            let violation_kind = if forbidden_crates.contains(&target_pkg.name) {
+                Some("personality")
+            } else if forbidden_host_crates.contains(&target_pkg.name) {
+                Some("host")
+            } else {
+                None
+            };
+
+            if let Some(kind) = violation_kind {
                 report.dependency_violations.push(DependencyViolation {
                     substrate_crate: substrate_crate.to_string(),
                     forbidden_crate: target_pkg.name.clone(),
                     dependency_chain: chain.clone(),
                     edge_kind,
+                    violation_kind: kind.to_string(),
                 });
             }
 
@@ -604,7 +633,15 @@ fn audit_crate_dependencies_metadata<'a>(
             let mut next_chain = chain.clone();
             next_chain.push(dep_display);
 
-            if forbidden_crates.contains(&target_pkg.name) {
+            let violation_kind = if forbidden_crates.contains(&target_pkg.name) {
+                Some("personality")
+            } else if forbidden_host_crates.contains(&target_pkg.name) {
+                Some("host")
+            } else {
+                None
+            };
+
+            if let Some(kind) = violation_kind {
                 let already_reported = report.dependency_violations.iter().any(|v| {
                     v.forbidden_crate == target_pkg.name && v.dependency_chain == next_chain
                 });
@@ -614,6 +651,7 @@ fn audit_crate_dependencies_metadata<'a>(
                         forbidden_crate: target_pkg.name.clone(),
                         dependency_chain: next_chain.clone(),
                         edge_kind,
+                        violation_kind: kind.to_string(),
                     });
                 }
             }
@@ -1366,6 +1404,23 @@ mod tests {
         f.package("abi", "carrick-abi");
         f.edge(0, "abi", "carrick_abi", None, None);
         assert!(matches!(f.check(), Err(BoundaryError::Violations { .. })));
+    }
+    #[test]
+    fn test_negative_direct_host_dependency_rejected() {
+        let mut f = Fixture::new("src/lib.rs", "pub fn value() {}");
+        f.package("host", "carrick-host");
+        f.edge(0, "host", "carrick_host", None, None);
+        let err = f.check().unwrap_err();
+        match err {
+            BoundaryError::Violations { report, count } => {
+                assert_eq!(count, 1);
+                assert!(
+                    report.contains("reaches forbidden host crate `carrick-host`"),
+                    "unexpected report: {report}"
+                );
+            }
+            other => panic!("expected BoundaryError::Violations, got {other:?}"),
+        }
     }
     #[test]
     fn test_negative_renamed_alias_dependency_rejected() {

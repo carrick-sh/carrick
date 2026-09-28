@@ -38,8 +38,8 @@
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::posix_timer::PosixArm;
 use carrick_timer_core::TimerSpecNs;
-use carrick_timer_core::posix::PosixArm;
 
 use crate::{PosixTimerSpec, ThreadId, TimerDelivery, VcpuRegistry};
 
@@ -222,6 +222,16 @@ pub trait TimerFiring: 'static {
 
     /// The backend [`TimerDelivery`] the run loop registered, if any.
     fn delivery() -> Option<Arc<dyn TimerDelivery>>;
+
+    /// Read the current guest CPU runtime in nanoseconds, if supported by the lane.
+    fn sample_cpu_now() -> Option<u64> {
+        None
+    }
+
+    /// Read the active guest vCPU count, if supported by the lane.
+    fn active_vcpus() -> u64 {
+        0
+    }
 }
 
 /// A [`GuestTimerBridge`] over the neutral `carrick-timer-core` registry —
@@ -251,7 +261,12 @@ impl<F: TimerFiring> std::fmt::Debug for TimerCoreBridge<F> {
 
 impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
     fn itimer_arm(&self, which: usize, spec: TimerSpecNs, needs_periodic: bool) -> u64 {
-        carrick_timer_core::itimer::arm(which, spec, needs_periodic)
+        let cpu_now = if carrick_timer_core::itimer::is_cpu_timer(which) {
+            F::sample_cpu_now().unwrap_or(0)
+        } else {
+            0
+        };
+        carrick_timer_core::itimer::arm_with_cpu_now(which, spec, needs_periodic, cpu_now)
     }
 
     fn itimer_disarm(&self, which: usize) {
@@ -259,7 +274,7 @@ impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
     }
 
     fn itimer_signum_for(&self, which: usize) -> i32 {
-        carrick_timer_core::itimer::signum_for(which)
+        itimer_signum_for(which)
     }
 
     fn itimer_spawn_fallback_timer(&self, which: usize, generation: u64, spec: TimerSpecNs) {
@@ -273,8 +288,15 @@ impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
         target_tid: Option<i32>,
         si_value: i64,
     ) -> i32 {
-        carrick_timer_core::posix::create_with_target_and_value(
-            clock_id, signum, target_tid, si_value,
+        let clock_kind = if is_thread_cpu_clock(clock_id) {
+            carrick_timer_core::ClockKind::ThreadCpu
+        } else if is_process_cpu_clock(clock_id) {
+            carrick_timer_core::ClockKind::ProcessCpu
+        } else {
+            carrick_timer_core::ClockKind::Wall
+        };
+        crate::posix_timer::create_with_clock_kind(
+            clock_id, clock_kind, signum, target_tid, si_value,
         )
     }
 
@@ -283,7 +305,7 @@ impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
     /// any firing thread); a non-zero value hands the arm to the lane's
     /// firing.
     fn posix_arm(&self, id: i32, spec: TimerSpecNs) -> Option<PosixTimerSpec> {
-        let armed = carrick_timer_core::posix::arm(id, spec)?;
+        let armed = crate::posix_timer::arm(id, spec)?;
         if spec.value > 0 {
             F::spawn_posix_firing(id, &armed, spec);
         }
@@ -291,27 +313,27 @@ impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
     }
 
     fn posix_remaining(&self, id: i32) -> Option<TimerSpecNs> {
-        carrick_timer_core::posix::remaining(id)
+        crate::posix_timer::remaining(id)
     }
 
     fn posix_getoverrun(&self, id: i32) -> Option<u32> {
-        carrick_timer_core::posix::getoverrun(id)
+        crate::posix_timer::getoverrun(id)
     }
 
     fn posix_seed_overrun(&self, id: i32, count: u32) {
-        carrick_timer_core::posix::seed_overrun(id, count);
+        crate::posix_timer::seed_overrun(id, count);
     }
 
     fn posix_exists(&self, id: i32) -> bool {
-        carrick_timer_core::posix::exists(id)
+        crate::posix_timer::exists(id)
     }
 
     fn posix_clock_id(&self, id: i32) -> i32 {
-        carrick_timer_core::posix::clock_id(id)
+        crate::posix_timer::clock_id(id)
     }
 
     fn posix_delete(&self, id: i32) -> bool {
-        carrick_timer_core::posix::delete(id)
+        crate::posix_timer::delete(id)
     }
 
     fn deliver(&self, signum: i32) {
@@ -321,6 +343,30 @@ impl<F: TimerFiring> GuestTimerBridge for TimerCoreBridge<F> {
     fn delivery(&self) -> Option<Arc<dyn TimerDelivery>> {
         F::delivery()
     }
+}
+
+/// Linux signal number delivered when `which`'s timer expires.
+#[inline]
+pub fn itimer_signum_for(which: usize) -> i32 {
+    match which {
+        1 => carrick_abi::LINUX_SIGVTALRM,
+        2 => carrick_abi::LINUX_SIGPROF,
+        _ => carrick_abi::LINUX_SIGALRM,
+    }
+}
+
+/// Linux per-thread CPU clock: `CLOCK_THREAD_CPUTIME_ID` or dynamic per-thread CPU clock.
+#[inline]
+pub fn is_thread_cpu_clock(clock_id: i32) -> bool {
+    clock_id == (carrick_abi::LINUX_CLOCK_THREAD_CPUTIME_ID as i32)
+        || (clock_id < 0 && (clock_id & 4) != 0)
+}
+
+/// Linux per-process CPU clock: `CLOCK_PROCESS_CPUTIME_ID` or dynamic per-process CPU clock.
+#[inline]
+pub fn is_process_cpu_clock(clock_id: i32) -> bool {
+    clock_id == (carrick_abi::LINUX_CLOCK_PROCESS_CPUTIME_ID as i32)
+        || (clock_id < 0 && (clock_id & 4) == 0)
 }
 
 /// The kick+futex lanes' [`TimerFiring`]: a helper thread per armed timer that
@@ -340,11 +386,11 @@ impl TimerFiring for KickerTimerFiring {
     /// while the guest is idle. At most one thread per `which` is live — a
     /// disarm/re-arm bumps the generation so the old thread exits.
     fn spawn_itimer_fallback(which: usize, generation: u64, spec: TimerSpecNs) {
-        let signum = carrick_timer_core::itimer::signum_for(which);
+        let signum = itimer_signum_for(which);
         let _ = std::thread::Builder::new()
             .name(format!("carrick-itimer-{which}"))
             .spawn(move || {
-                carrick_timer_core::itimer::run_fallback(which, generation, spec, || {
+                crate::timer_delivery::run_fallback(which, generation, spec, || {
                     deliver(signum);
                 });
             });
@@ -366,7 +412,7 @@ impl TimerFiring for KickerTimerFiring {
         let _ = std::thread::Builder::new()
             .name(format!("carrick-ptimer-{id}"))
             .spawn(move || {
-                carrick_timer_core::posix::run_fallback(slot, generation, spec, on_fire);
+                crate::posix_timer::run_fallback(slot, generation, spec, on_fire);
             });
     }
 

@@ -121,6 +121,7 @@ pub mod run_result;
 pub mod run_state;
 pub(crate) mod seccomp;
 pub mod syslog;
+pub mod timer_personality;
 pub mod vdso_policy;
 pub mod vfs;
 pub mod wedge_capture;
