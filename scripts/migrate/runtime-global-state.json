@@ -1925,9 +1925,9 @@
       "kind": "static",
       "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
       "symbol": "PORTS",
-      "fingerprint": "f55653b286f94e0f93d81d3b76eb4639336defd7c3fa4aaefaacca7936e0ad91",
+      "fingerprint": "0082f2145f659b8f835aa62446f68ff9aea90feb715812e2ddb5891074ab5c56",
       "classification": "carrier_infra",
-      "rationale": "Per-vCPU-execution-slot port table of the address-space occupancy authority in crates/carrick-kernel/src/kernel/mm_occupancy.rs: the pause endpoint and fence of the MM each slot runs, written under its slot lock by the executor that occupies the slot; carrier VM scope like the mailbox slots it is indexed by, and scoped per kernel graph by the MM's fence object."
+      "rationale": "Per-vCPU-execution-slot port table of the address-space occupancy authority in crates/carrick-kernel/src/kernel/mm_occupancy.rs: the pause endpoint and fence of the MM each slot runs plus the release waiters parked on an occupied slot, written under its slot lock by the executor that occupies the slot; carrier VM scope like the mailbox slots it is indexed by, and scoped per kernel graph by the MM's fence object."
     },
     {
       "kind": "static",

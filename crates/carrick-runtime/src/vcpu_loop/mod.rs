@@ -3230,6 +3230,7 @@ pub(crate) mod tests {
             state,
             phase,
             registration_wait: None,
+            slot_wait: None,
             terminal_settlement: HvpatchExternalTerminalSettlement::new(result, completion.clone()),
             terminal_result: None,
             completion,
