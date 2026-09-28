@@ -1592,9 +1592,12 @@ fn el1_anonymous_permission_transitions_stay_in_guest() {
         long.rounds,
         long.exits as i64 - short.exits as i64,
     );
+    // WEAKENED 2026-09-27 (owner-approved): was < 4.5. Each round forwards its
+    // four mprotect transitions to the host (7fce27c73), ~12 exits/round.
+    // Restore when work/el1-mprotect lands.
     assert!(
-        exit_slope < 4.5,
-        "permission-transition host-exit slope {exit_slope:.4} exceeds the two denied-signal cycles plus noise per round"
+        exit_slope < 16.0,
+        "permission-transition host-exit slope {exit_slope:.4} exceeds the forwarded mprotects plus denied-signal cycles per round"
     );
     assert_eq!(
         long.grants, short.grants,
