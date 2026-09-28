@@ -560,7 +560,7 @@ pub(crate) fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len
         mem.semantic_vmas.remove_range(start, end);
     }
     trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
-    trim_core_file_mappings_for_range(&mut mem.core_file_mappings, start, len);
+    mem.trim_core_file_mappings(start, len);
     trim_live_boot_regions_for_range(mem, start, len);
     trim_growdown_ranges_for_range(mem, start, len);
     trim_ranges_for_range(&mut mem.bus_fault_ranges, start, len);
@@ -584,25 +584,65 @@ pub(crate) fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len
     locked_ranges_remove(&mut mem.alias_vma_ranges, remove);
 }
 
+impl MemState {
+    fn trim_core_file_mappings(&mut self, start: u64, len: u64) {
+        let disjoint = *self.core_file_mappings_disjoint.get_or_insert_with(|| {
+            self.core_file_mappings
+                .sort_by_key(|mapping| (mapping.start, mapping.end));
+            self.core_file_mappings
+                .windows(2)
+                .all(|pair| pair[0].end <= pair[1].start)
+        });
+        trim_core_file_mappings_for_range(&mut self.core_file_mappings, start, len, disjoint);
+    }
+}
+
 pub(crate) fn trim_core_file_mappings_for_range(
     mappings: &mut Vec<crate::core_dump::FileMapping>,
     start: u64,
     len: u64,
+    disjoint: bool,
 ) {
     let Some(end) = start.checked_add(len) else {
         mappings.clear();
         return;
     };
-    // The rebuild is the identity when nothing overlaps and the set is
-    // already in its final order; skip it (every anonymous `mmap`/`munmap`
-    // reaches here while the process holds hundreds of file segments).
-    if mappings.is_sorted_by_key(|mapping| (mapping.start, mapping.end))
-        && !mappings
-            .iter()
-            .any(|mapping| start < mapping.end && mapping.start < end)
-    {
+    if disjoint {
+        let first = mappings.partition_point(|mapping| {
+            #[cfg(test)]
+            super::count_core_file_mapping_visit();
+            mapping.end <= start
+        });
+        let last = first
+            + mappings[first..].partition_point(|mapping| {
+                #[cfg(test)]
+                super::count_core_file_mapping_visit();
+                mapping.start < end
+            });
+        if first == last {
+            return;
+        }
+        let mut replacement = Vec::with_capacity(last - first + 2);
+        for mapping in &mappings[first..last] {
+            if mapping.start < start {
+                let mut left = mapping.clone();
+                left.end = start;
+                replacement.push(left);
+            }
+            if mapping.end > end {
+                let mut right = mapping.clone();
+                right.file_page_offset = right
+                    .file_page_offset
+                    .saturating_add((end - right.start) / crate::core_dump::GUEST_PAGE as u64);
+                right.start = end;
+                replacement.push(right);
+            }
+        }
+        mappings.splice(first..last, replacement);
         return;
     }
+    // An overlapping boot NT_FILE inventory lacks monotone ends; retain the
+    // general clipping path until that image is replaced at exec.
     let mut next = Vec::with_capacity(mappings.len() + 1);
     for mapping in mappings.drain(..) {
         if end <= mapping.start || start >= mapping.end {
@@ -917,7 +957,11 @@ impl<'a> MemView<'a> {
         } else {
             let mut semantic = semantic_vmas_from_boot_regions(
                 std::slice::from_ref(&entry),
-                &mem.core_file_mappings,
+                if commit.file_page_offset.is_some() {
+                    &mem.core_file_mappings
+                } else {
+                    &[]
+                },
                 mem.layout,
                 mem.brk_current,
             );
@@ -1346,7 +1390,7 @@ impl<'a> MemView<'a> {
         let (read, write, execute) = prot_to_proc_perms(prot);
         let mem_authority_4 = self.mem();
         let mut mem = mem_authority_4.lock();
-        trim_core_file_mappings_for_range(&mut mem.core_file_mappings, start, len);
+        mem.trim_core_file_mappings(start, len);
         if let Some(file_page_offset) = file_page_offset
             && !path.is_empty()
         {
@@ -1372,7 +1416,11 @@ impl<'a> MemView<'a> {
         let semantic = semantic_vmas.map(VmaMap::from_vec).unwrap_or_else(|| {
             let mut semantic = semantic_vmas_from_boot_regions(
                 std::slice::from_ref(&entry),
-                &mem.core_file_mappings,
+                if file_page_offset.is_some() {
+                    &mem.core_file_mappings
+                } else {
+                    &[]
+                },
                 mem.layout,
                 mem.brk_current,
             );

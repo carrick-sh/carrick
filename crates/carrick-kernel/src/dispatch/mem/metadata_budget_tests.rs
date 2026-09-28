@@ -259,6 +259,40 @@ fn assert_population_independent(name: &str, probe: impl Fn(&mut Process) + Copy
     );
 }
 
+fn core_file_visits(probe: impl FnOnce()) -> u64 {
+    CORE_FILE_MAPPING_VISITS.with(|visits| visits.set(0));
+    probe();
+    CORE_FILE_MAPPING_VISITS.with(|visits| visits.replace(0))
+}
+
+#[test]
+fn anonymous_mmap_visits_only_its_file_metadata() {
+    for population in [SMALL, 256, LARGE] {
+        let mut process = process_with_population(population);
+        let visits = core_file_visits(|| {
+            let address = process.mmap_anon(LINUX_PROT_READ | LINUX_PROT_WRITE);
+            assert_ne!(address, u64::MAX);
+        });
+        assert!(
+            visits <= 32,
+            "mmap with {population} unrelated file rows visited {visits}"
+        );
+    }
+}
+
+#[test]
+fn anonymous_munmap_visits_only_its_file_metadata() {
+    for population in [SMALL, 256, LARGE] {
+        let mut process = process_with_population(population);
+        let address = process.mmap_anon(LINUX_PROT_READ | LINUX_PROT_WRITE);
+        let visits = core_file_visits(|| process.munmap(address, PAGE));
+        assert!(
+            visits <= 32,
+            "munmap with {population} unrelated file rows visited {visits}"
+        );
+    }
+}
+
 /// One anonymous private `mmap` of a page, then its `munmap`. The grant
 /// comes from the free list (a hole of the same size), so both the
 /// allocator and every metadata set are exercised on the reuse path the
@@ -304,4 +338,29 @@ fn brk_grow_shrink_work_is_independent_of_mapping_population() {
             current
         );
     });
+}
+
+#[test]
+fn brk_existing_heap_growth_does_not_shift_unrelated_vmas() {
+    for population in [SMALL, 256, LARGE] {
+        let mut process = process_with_population(population);
+        let base = process.call(SYS_BRK, [0; 6]) as u64;
+        let current = base + 4 * PAGE;
+        assert_eq!(
+            process.call(SYS_BRK, [current, 0, 0, 0, 0, 0]) as u64,
+            current
+        );
+        VmaMap::reset_shift_count();
+        let grown = current + 4 * PAGE;
+        assert_eq!(process.call(SYS_BRK, [grown, 0, 0, 0, 0, 0]) as u64, grown);
+        assert_eq!(
+            process.call(SYS_BRK, [current, 0, 0, 0, 0, 0]) as u64,
+            current
+        );
+        let shifts = VmaMap::shift_count();
+        assert_eq!(
+            shifts, 0,
+            "brk moved {shifts} unrelated VMAs at population {population}"
+        );
+    }
 }
