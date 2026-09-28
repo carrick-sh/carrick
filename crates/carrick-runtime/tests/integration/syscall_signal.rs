@@ -565,7 +565,7 @@ fn kill_tkill_tgkill_validate_logical_targets_and_queue_exact_thread_signals() {
         dispatcher.take_deliverable_pending(&context, context.thread().registry_id()),
         Some(1)
     );
-    assert_eq!(carrick_signal_core::take_pending_for(thread_id as i32), 0);
+    assert_eq!(carrick_signal_linux::take_pending_for(thread_id as i32), 0);
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -967,7 +967,7 @@ fn fasync_self_owner_delivers_io_signal_to_sigtimedwait() {
     // The FASYNC registry lives in a MAP_SHARED table the production runtime
     // maps at startup (host_signal init); a bare lib test must init it itself or
     // arm/lookup silently no-op and nothing is delivered.
-    carrick_signal_core::fasync::fasync_init();
+    carrick_signal_linux::fasync::fasync_init();
 
     const SYS_PIPE2: u64 = 59;
     const SYS_FCNTL: u64 = 25;
