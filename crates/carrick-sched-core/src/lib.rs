@@ -2492,7 +2492,10 @@ impl ZoneTables {
             if owner != victim
                 || rec.home().is_some()
                 || rec.is_cancelled()
-                || rec.host_wanted()
+                // The victim's executor already owns host service. Moving
+                // this record to an idle thief only creates another exit;
+                // it does not make the thread runnable in EL1.
+                || rec.needs_host()
                 || !rec.allows_cpu(cpu)
             {
                 continue;
@@ -2514,9 +2517,8 @@ impl ZoneTables {
             self.remove_locked(&guard, record);
             drop(guard);
             self.counters.el1_steals.fetch_add(1, Ordering::Relaxed);
-            // It needs its executor (host service, or another address space
-            // than the thief's): queue it on the thief, whose idle loop then
-            // leaves for the host with it at its head.
+            // A different address space may still need the thief's executor
+            // if its translation roots cannot be installed here.
             if self.needs_executor(thief, rec) {
                 if let Some(own) = self.slot_lock(thief, &SpinForever) {
                     self.push_locked(&own, record, None);
