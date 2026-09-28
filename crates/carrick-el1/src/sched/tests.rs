@@ -6,13 +6,15 @@ use carrick_el1_abi::{
 
 extern crate std;
 
-use super::*;
+use crate::personality::sched::*;
+use carrick_el1_abi::TrapFrame;
 use carrick_el1_abi::{
     Claim, Counters, DelegatedFile, DelegatedInotify, DelegatedOpenFile, El1TaskId, FdMapSlot,
     Handback, InotifyNameCache, RecordId,
 };
 use carrick_sched_core::LockWait;
 use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering;
 use std::boxed::Box;
 
 const MM: u64 = 7;

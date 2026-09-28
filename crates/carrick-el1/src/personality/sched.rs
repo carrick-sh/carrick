@@ -3,12 +3,12 @@ pub use crate::substrate::sched::*;
 use carrick_el1_abi::TrapFrame;
 use core::sync::atomic::Ordering;
 pub const SYS_FUTEX: usize = 98;
-const FUTEX_WAIT_PRIVATE: u64 = 128;
-const FUTEX_WAKE_PRIVATE: u64 = 129;
-const FUTEX_WAIT_BITSET_PRIVATE: u64 = 128 | 9;
-const FUTEX_WAKE_BITSET_PRIVATE: u64 = 128 | 10;
-const EAGAIN: i64 = -11;
-const ETIMEDOUT_RESULT: u64 = (-110_i64) as u64;
+pub(crate) const FUTEX_WAIT_PRIVATE: u64 = 128;
+pub(crate) const FUTEX_WAKE_PRIVATE: u64 = 129;
+pub(crate) const FUTEX_WAIT_BITSET_PRIVATE: u64 = 128 | 9;
+pub(crate) const FUTEX_WAKE_BITSET_PRIVATE: u64 = 128 | 10;
+pub(crate) const EAGAIN: i64 = -11;
+pub(crate) const ETIMEDOUT_RESULT: u64 = (-110_i64) as u64;
 
 /// Whether `frame` is a futex operation EL1 may serve (the rest forward).
 /// A relative `FUTEX_WAIT_PRIVATE` timeout is servable here; whether this
@@ -94,5 +94,3 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         self.idle_entry(frame, ETIMEDOUT_RESULT)
     }
 }
-#[cfg(test)]
-mod tests;

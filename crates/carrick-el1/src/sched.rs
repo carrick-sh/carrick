@@ -593,7 +593,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     }
 }
 
-#[path = "../sched/hw.rs"]
+#[path = "sched/hw.rs"]
 pub(crate) mod hw;
 #[cfg(target_os = "none")]
 pub use hw::HardwareCpu;
@@ -747,3 +747,7 @@ impl ThreadCpu for FakeCpu {
         sgi_target_of(self.mpidr)
     }
 }
+
+#[cfg(test)]
+#[path = "sched/tests.rs"]
+mod tests;
