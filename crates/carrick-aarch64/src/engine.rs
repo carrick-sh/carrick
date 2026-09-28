@@ -3384,6 +3384,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         va: u64,
         ipa: u64,
         len: u64,
+        fault_va: u64,
         permissions: u64,
     ) -> Result<bool, TrapError> {
         let size = usize::try_from(len).map_err(|_| TrapError::MappingTooLarge(len))?;
@@ -3399,6 +3400,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                         writable: permissions & 2 != 0,
                         executable: permissions & 4 != 0,
                     },
+                    fault_va,
                     source,
                 )
                 .map_err(|error| match error {

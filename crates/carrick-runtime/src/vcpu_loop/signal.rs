@@ -471,6 +471,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     );
                     return Ok(true);
                 };
+                let fault_page = plan.fault_page();
                 let completed = mailbox.complete_grant(
                     carrick_el1_abi::FrameGrantReady {
                         mm_key: request.mm_key,
@@ -489,6 +490,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             grant.semantic_base,
                             grant.physical_ipa,
                             grant.len,
+                            fault_page,
                             grant.permissions,
                         )
                     },

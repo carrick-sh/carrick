@@ -476,3 +476,79 @@ fn anonymous_discard_avoids_scrub_contract() {
     )
     .unwrap();
 }
+
+#[test]
+fn frame_grant_dontneed_zeroes_one_page_and_preserves_its_neighbor() {
+    for backend_discard in [false, true] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let page = LINUX_PAGE_SIZE;
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, 2 * page as usize);
+        memory.discard_anon = backend_discard;
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let base = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        222,
+                        SyscallArgs([
+                            0,
+                            2 * page,
+                            LINUX_PROT_READ | LINUX_PROT_WRITE,
+                            LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                            u64::MAX,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        ) as u64;
+        dispatcher.track_resident_fault_range(
+            base,
+            2 * page,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        );
+        dispatcher
+            .with_resident_frame_grant_plan_for_test(base, 2 * 1024 * 1024, |plan| {
+                dispatcher.commit_resident_frame_grant(plan)
+            })
+            .unwrap();
+        let before_scrubs = memory.zero_backing_calls.get();
+        memory.bytes.fill(0xcc);
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        233,
+                        SyscallArgs([base, page, LINUX_MADV_DONTNEED, 0, 0, 0])
+                    ),
+                    &mut memory,
+                    &reporter
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert!(memory.bytes[..page as usize].iter().all(|byte| *byte == 0));
+        assert!(
+            memory.bytes[page as usize..]
+                .iter()
+                .all(|byte| *byte == 0xcc)
+        );
+        assert_eq!(
+            dispatcher.mincore_residency_vector(&memory, base, 1, page),
+            Some(vec![0])
+        );
+        dispatcher
+            .with_resident_fault_plan_for_test(base, |plan| dispatcher.commit_resident_fault(plan))
+            .expect("DONTNEED must re-arm first touch");
+        assert!(memory.bytes[..page as usize].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            memory.zero_backing_calls.get() - before_scrubs,
+            usize::from(!backend_discard)
+        );
+    }
+}
