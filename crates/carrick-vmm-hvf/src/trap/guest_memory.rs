@@ -636,18 +636,16 @@ impl HvfVmState {
                 std::backtrace::Backtrace::force_capture(),
             );
         }
-
-        // O(1) lock acquisitions across the operation: snapshot page-tables authority
-        // and COW-armed overlapping ranges upfront.
-        let page_tables = self.page_tables_authority();
-        let cow_ranges = self.cow_armed.lock().overlapping(address, length);
-
         let mut cleared = 0usize;
         let mut active_run: Option<ScrubRun> = None;
+        let mut active_key = None;
+        // Resolve every Linux page before coalescing writes. A mapping row's
+        // extent proves neither stage-1 continuity nor registry lifetime edges.
+        // Lookup/translation/registry work remains page-proportional; only the
+        // final writes are batched. See kernel.mm.backing-maintenance-lookup.
+        let page_tables = self.page_tables_authority();
         while cleared < length {
-            let chunk_va = address + cleared as u64;
-            let remaining = length - cleared;
-
+            let (chunk_va, chunk_len) = Self::guest_copy_chunk(address, cleared, length)?;
             // munmap invalidates the leaf but intentionally preserves its PA.
             // Backing maintenance runs before the replacement VMA is made
             // guest-visible, so an ordinary hardware-valid translation cannot
@@ -662,7 +660,6 @@ impl HvfVmState {
                     )
                 })
                 .unwrap_or((None, None));
-
             // A partial munmap can carve this 4 KiB Linux page out of a live
             // 16 KiB private frame while preserving the invalid leaf's output
             // IPA. Reusing that page does not pass through `add_alias`, so
@@ -674,12 +671,11 @@ impl HvfVmState {
                     &alias_registry().lock(),
                     chunk_va,
                     ipa,
-                    remaining.min(GUEST_STAGE1_PAGE_SIZE as usize),
+                    chunk_len,
                     self.mm_root_slot,
                     self.container_root,
                 )
             });
-
             // WRITE TARGETS ARE STAGE-1-AUTHENTICATED, PERIOD. This used to
             // fall back to `mapping_for_range_mut` — a VA-keyed search over
             // carrier-inherited rows with no scope filter — when the caller's
@@ -692,26 +688,19 @@ impl HvfVmState {
             // NULL me_keys by every worker (the CPython multiprocessing
             // SIGSEGV cluster).
             //
-            // The scrub's purpose is to keep STALE BYTES from being observed
-            // through THIS VA. If neither the live walk nor the retained
-            // invalid-leaf output names an IPA, the guest has no translation
-            // here and cannot observe anything — there is nothing to scrub,
-            // and skipping is the correct amount of writing. With an IPA in
-            // hand, `mapping_for_live_ipa_range` demands VA/IPA consistency
-            // plus a live authenticated owner, so the write can only land in
-            // this mm's own backing.
+            // With an IPA, prefer a VA/IPA-consistent authenticated owner.
+            // If that lookup fails (including when there is no translation),
+            // preserve the per-page boot/identity fallback below. Reusable
+            // global-frame backing is never eligible for that VA-only join.
             let ipa = live_ipa.or(retained_ipa);
-            let (chunk_len, chunk_resolved) = if let Some(ipa_val) = ipa {
-                // If this is a page-bounded retained fragment, scrub page by page.
-                if retained_fragment.is_some() {
-                    let page_remaining = (GUEST_STAGE1_PAGE_SIZE
-                        - (chunk_va & (GUEST_STAGE1_PAGE_SIZE - 1)))
-                        as usize;
-                    let chunk_len = remaining.min(page_remaining);
-                    let resolved = self
-                        .mapping_for_live_ipa_range(chunk_va, ipa_val, chunk_len)
+            let mut selected_mapping = None;
+            let chunk_resolved = ipa
+                .and_then(|ipa| {
+                    self.mapping_for_live_ipa_range(chunk_va, ipa, chunk_len)
                         .and_then(|mapping| {
-                            let offset = usize::try_from(ipa_val.checked_sub(mapping.ipa)?).ok()?;
+                            let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
+                            selected_mapping =
+                                Some((mapping.start, mapping.end, mapping.ipa, mapping.host_addr));
                             let target = unsafe { mapping.host_addr.add(offset) };
                             let is_alias = is_reusable_global_frame_extent(mapping.ipa, 1);
                             let eligible_without_cow = mapping.sharing
@@ -721,152 +710,44 @@ impl HvfVmState {
                                 && retained_fragment.is_none()
                                 && zero_anonymous_remap_enabled();
                             let eligible = scrub_remap_eligible(eligible_without_cow, || {
-                                self.physical_cow_source(chunk_va, ipa_val).is_some()
+                                self.physical_cow_source(chunk_va, ipa).is_some()
                             });
                             Some((target, eligible))
-                        });
-                    (chunk_len, resolved)
-                } else if let Some(mapping) = self.mapping_for_live_ipa_range(chunk_va, ipa_val, 1)
-                {
-                    let max_mapping_len =
-                        usize::try_from(mapping.end.saturating_sub(chunk_va)).unwrap_or(remaining);
-                    let mut extent_len = remaining.min(max_mapping_len);
-
-                    // If not page-aligned, advance to the page boundary first to keep
-                    // subsequent extents page-aligned.
-                    let page_off = (chunk_va & (GUEST_STAGE1_PAGE_SIZE - 1)) as usize;
-                    if page_off != 0 {
-                        extent_len = extent_len.min(GUEST_STAGE1_PAGE_SIZE as usize - page_off);
-                    } else if extent_len > GUEST_STAGE1_PAGE_SIZE as usize {
-                        // Check how many contiguous pages in stage-1 translation match this mapping.
-                        let contiguous_pages = page_tables
-                            .with_manager(|manager| {
-                                let total_pages = extent_len / (GUEST_STAGE1_PAGE_SIZE as usize);
-                                let mut count = 1usize;
-                                while count < total_pages {
-                                    let p_va = chunk_va + (count as u64) * GUEST_STAGE1_PAGE_SIZE;
-                                    let expected_ipa =
-                                        ipa_val + (count as u64) * GUEST_STAGE1_PAGE_SIZE;
-                                    let p_ipa = if live_ipa.is_some() {
-                                        manager.translate(p_va)
-                                    } else {
-                                        manager.translate_retained_output(p_va)
-                                    };
-                                    if p_ipa != Some(expected_ipa) {
-                                        break;
-                                    }
-                                    count += 1;
-                                }
-                                count
-                            })
-                            .unwrap_or(1);
-                        extent_len =
-                            extent_len.min(contiguous_pages * (GUEST_STAGE1_PAGE_SIZE as usize));
-                    }
-
-                    // Bound extent by COW-armed boundaries if any are present in the range.
-                    if !cow_ranges.is_empty() {
-                        let armed_span = self.cow_armed.lock().span_for(chunk_va);
-                        if let Some(span) = armed_span {
-                            let span_end = span.va.saturating_add(span.len as u64);
-                            if span_end < chunk_va + extent_len as u64 {
-                                extent_len = (span_end - chunk_va) as usize;
+                        })
+                })
+                .or_else(|| {
+                    // VA fallback, restricted to NON-reusable backing. Boot and
+                    // identity regions (the brk heap above all) are per-mm by
+                    // construction and sometimes reachable only by VA here;
+                    // skipping them left stale bytes where `ltp-brk02` demands
+                    // zeros. Reusable global-frame results stay excluded — a
+                    // VA-only join over carrier-inherited rows is exactly the
+                    // cross-process write this function must never make.
+                    self.mapping_for_range_mut(chunk_va, chunk_len)
+                        .and_then(|mapping| {
+                            // The view carries only the semantic IPA; that is
+                            // sufficient here — reusable-frame mappings' semantic
+                            // IPAs live inside the global-frame arena, identity
+                            // and boot mappings' do not.
+                            if is_reusable_global_frame_extent(mapping.ipa, 1) {
+                                return None;
                             }
-                        } else if let Some(next_start) =
-                            self.cow_armed.lock().next_armed_start_after(chunk_va)
-                        {
-                            if next_start < chunk_va + extent_len as u64 {
-                                extent_len = (next_start - chunk_va) as usize;
-                            }
-                        }
-                    }
-
-                    let offset = usize::try_from(ipa_val.checked_sub(mapping.ipa).ok_or(
-                        MemoryError::OutOfBounds {
-                            address: chunk_va,
-                            length: extent_len,
-                        },
-                    )?)
-                    .map_err(|_| MemoryError::OutOfBounds {
-                        address: chunk_va,
-                        length: extent_len,
-                    })?;
-                    let target = unsafe { mapping.host_addr.add(offset) };
-                    let is_alias = is_reusable_global_frame_extent(mapping.ipa, 1);
-                    let eligible_without_cow = mapping.sharing == GuestMappingSharing::Private
-                        && mapping.shared_key_base == 0
-                        && !is_alias
-                        && zero_anonymous_remap_enabled();
-                    let eligible = scrub_remap_eligible(eligible_without_cow, || {
-                        self.physical_cow_source(chunk_va, ipa_val).is_some()
-                    });
-                    (extent_len, Some((target, eligible)))
-                } else {
-                    let page_remaining = (GUEST_STAGE1_PAGE_SIZE
-                        - (chunk_va & (GUEST_STAGE1_PAGE_SIZE - 1)))
-                        as usize;
-                    (remaining.min(page_remaining), None)
-                }
-            } else {
-                // VA fallback, restricted to NON-reusable backing. Boot and
-                // identity regions (the brk heap above all) are per-mm by
-                // construction and sometimes reachable only by VA here;
-                // skipping them left stale bytes where `ltp-brk02` demands
-                // zeros. Reusable global-frame results stay excluded — a
-                // VA-only join over carrier-inherited rows is exactly the
-                // cross-process write this function must never make.
-                if let Some(mapping) = self.mapping_for_range_mut(chunk_va, 1) {
-                    let max_mapping_len =
-                        usize::try_from(mapping.end.saturating_sub(chunk_va)).unwrap_or(remaining);
-                    let mut extent_len = remaining.min(max_mapping_len);
-
-                    if is_reusable_global_frame_extent(mapping.ipa, 1) {
-                        (extent_len, None)
-                    } else {
-                        if !cow_ranges.is_empty() {
-                            let armed_span = self.cow_armed.lock().span_for(chunk_va);
-                            if let Some(span) = armed_span {
-                                let span_end = span.va.saturating_add(span.len as u64);
-                                if span_end < chunk_va + extent_len as u64 {
-                                    extent_len = (span_end - chunk_va) as usize;
-                                }
-                            } else if let Some(next_start) =
-                                self.cow_armed.lock().next_armed_start_after(chunk_va)
-                            {
-                                if next_start < chunk_va + extent_len as u64 {
-                                    extent_len = (next_start - chunk_va) as usize;
-                                }
-                            }
-                        }
-
-                        let offset = usize::try_from(chunk_va.checked_sub(mapping.start).ok_or(
-                            MemoryError::OutOfBounds {
-                                address: chunk_va,
-                                length: extent_len,
-                            },
-                        )?)
-                        .map_err(|_| MemoryError::OutOfBounds {
-                            address: chunk_va,
-                            length: extent_len,
-                        })?;
-                        let target = unsafe { mapping.host_addr.add(offset) };
-                        let eligible_without_cow = mapping.sharing == GuestMappingSharing::Private
-                            && mapping.shared_key_base == 0
-                            && retained_fragment.is_none()
-                            && zero_anonymous_remap_enabled();
-                        let eligible = scrub_remap_eligible(eligible_without_cow, || {
-                            self.physical_cow_source(chunk_va, mapping.ipa).is_some()
-                        });
-                        (extent_len, Some((target, eligible)))
-                    }
-                } else {
-                    let page_remaining = (GUEST_STAGE1_PAGE_SIZE
-                        - (chunk_va & (GUEST_STAGE1_PAGE_SIZE - 1)))
-                        as usize;
-                    (remaining.min(page_remaining), None)
-                }
-            };
-
+                            let offset =
+                                usize::try_from(chunk_va.checked_sub(mapping.start)?).ok()?;
+                            selected_mapping =
+                                Some((mapping.start, mapping.end, mapping.ipa, mapping.host_addr));
+                            let target = unsafe { mapping.host_addr.add(offset) };
+                            let eligible_without_cow = mapping.sharing
+                                == GuestMappingSharing::Private
+                                && mapping.shared_key_base == 0
+                                && retained_fragment.is_none()
+                                && zero_anonymous_remap_enabled();
+                            let eligible = scrub_remap_eligible(eligible_without_cow, || {
+                                self.physical_cow_source(chunk_va, mapping.ipa).is_some()
+                            });
+                            Some((target, eligible))
+                        })
+                });
             if let Some(debug_va) = fork_debug_va()
                 && chunk_va <= debug_va
                 && debug_va < chunk_va.saturating_add(chunk_len as u64)
@@ -878,6 +759,23 @@ impl HvfVmState {
                     chunk_resolved.map(|(target, _)| target),
                 );
             }
+            // Registry coverage can change within otherwise contiguous retained
+            // output. Conservatively end a write run at every retained page;
+            // publish its lifetime edge even if the backing lookup found no row.
+            let key = (
+                live_ipa.map(|ipa| ipa.wrapping_sub(chunk_va)),
+                selected_mapping,
+            );
+            if retained_ipa.is_some() || active_key != Some(key) {
+                if let Some(run) = active_run.take() {
+                    run.flush();
+                }
+            }
+            active_key = if retained_ipa.is_some() {
+                None
+            } else {
+                Some(key)
+            };
             if let Some(fragment) = retained_fragment {
                 register_shared_alias(fragment);
             }
@@ -1286,3 +1184,6 @@ impl HvfTaskState {
         Ok(write.view)
     }
 }
+
+#[cfg(test)]
+mod scrub_tests;
