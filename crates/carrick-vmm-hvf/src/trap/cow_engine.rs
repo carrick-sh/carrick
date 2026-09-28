@@ -5442,7 +5442,11 @@ impl HvfTaskState {
     ) -> Option<PhysicalCowSource> {
         let physical_ipa = align_down(ipa, CowArmedRanges::COMPOUND_SIZE);
         let physical_end = physical_ipa.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
-        let semantic_end = semantic_va.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
+        // The source question concerns this physical compound, not the next
+        // 16 KiB starting at the queried Linux page. Near a mapping boundary
+        // the latter offers unrelated next-extent rows to every trailing page.
+        let semantic_start = semantic_va.checked_sub(ipa - physical_ipa)?;
+        let semantic_end = semantic_start.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
         let affine_translation_matches = |mapping_start: u64, mapping_ipa: u64| {
             if semantic_va < mapping_start {
                 ipa.checked_add(mapping_start - semantic_va) == Some(mapping_ipa)
@@ -5453,7 +5457,7 @@ impl HvfTaskState {
         // Geometry under the registry lock; owner authentication on the
         // released candidates (lock order, see `containing_candidates`).
         let alias_candidates = alias_registry().lock().process_va_overlap_candidates(
-            semantic_va,
+            semantic_start,
             CowArmedRanges::COMPOUND_SIZE,
             self.mm_root_slot,
             self.container_root,
@@ -5512,7 +5516,7 @@ impl HvfTaskState {
         }
         let mapping = self
             .mappings
-            .candidates_for_range(GuestVa(semantic_va), CowArmedRanges::COMPOUND_SIZE)
+            .candidates_for_range(GuestVa(semantic_start), CowArmedRanges::COMPOUND_SIZE)
             .find(|mapping| {
                 let physical_mapping_end = mapping
                     .physical_ipa
