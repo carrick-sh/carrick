@@ -1966,11 +1966,10 @@ impl SyscallDispatcher {
             .and_then(|m| m.vfs.read_file(path).ok())
     }
 
-    /// Get or construct one stack-independent HvPatch exec image. The lock is
-    /// intentionally held through the first construction: concurrent Go tool
-    /// launches otherwise stampede into four identical ELF reads and patch
-    /// passes. The cache is bounded because retaining prepared binaries also
-    /// retains their immutable region payloads.
+    /// Get or construct one stack-independent HvPatch exec image. A per-key
+    /// lock single-flights the first construction without serializing different
+    /// Go tools behind an unrelated ELF parse or page-table build. Completed
+    /// images are bounded because they retain immutable region payloads.
     pub fn with_hvpatch_exec_cache<E>(
         &self,
         key: Option<String>,
@@ -1979,18 +1978,49 @@ impl SyscallDispatcher {
         let Some(key) = key else {
             return build();
         };
-        let mut cache = self.fs.hvpatch_exec_cache.lock();
-        if let Some(image) = cache.get(&key) {
+        let slot = {
+            let mut cache = self.fs.hvpatch_exec_cache.lock();
+            std::sync::Arc::clone(
+                cache
+                    .entry(key.clone())
+                    .or_insert_with(|| std::sync::Arc::new(parking_lot::Mutex::new(None))),
+            )
+        };
+        let mut prepared = slot.lock();
+        if let Some(image) = prepared.as_ref() {
             return Ok(image.clone());
         }
-        let image = build()?;
+        let image = match build() {
+            Ok(image) => image,
+            Err(error) => {
+                // A failed load is not cacheable. Remove its pending slot while
+                // it is still locked so a later lookup creates a fresh build.
+                let mut cache = self.fs.hvpatch_exec_cache.lock();
+                if cache
+                    .get(&key)
+                    .is_some_and(|current| std::sync::Arc::ptr_eq(current, &slot))
+                {
+                    cache.remove(&key);
+                }
+                return Err(error);
+            }
+        };
+        *prepared = Some(image.clone());
+        drop(prepared);
+
         const MAX_PREPARED_EXEC_IMAGES: usize = 16;
-        if cache.len() >= MAX_PREPARED_EXEC_IMAGES
-            && let Some(evicted) = cache.keys().next().cloned()
-        {
+        let mut cache = self.fs.hvpatch_exec_cache.lock();
+        while cache.len() > MAX_PREPARED_EXEC_IMAGES {
+            // Do not evict an in-flight builder: its key must remain available
+            // to concurrent callers. The transient excess is at most the
+            // number of simultaneous distinct builds and drains as they end.
+            let evicted = cache.iter().find_map(|(candidate, slot)| {
+                (candidate != &key && slot.try_lock().is_some_and(|ready| ready.is_some()))
+                    .then(|| candidate.clone())
+            });
+            let Some(evicted) = evicted else { break };
             cache.remove(&evicted);
         }
-        cache.insert(key, image.clone());
         Ok(image)
     }
 
