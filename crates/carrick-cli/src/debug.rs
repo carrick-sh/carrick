@@ -564,10 +564,7 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
         .open(ctx.lldb_log)
         .with_context(|| format!("failed to open {}", ctx.lldb_log.display()))?;
     writeln!(log, "RUN_ID={} WHY={}", ctx.run_id, ctx.why)?;
-    match kernel_capture {
-        Ok(path) => writeln!(log, "KERNEL_SNAPSHOT={}", path.display())?,
-        Err(error) => writeln!(log, "KERNEL_SNAPSHOT_ERROR={error:#}")?,
-    }
+    writeln!(log, "{}", kernel_capture.log_line())?;
     writeln!(log, "PS_MATCHES:")?;
     let mut attach_order = pids.clone();
     let parent_pids = pids
@@ -635,16 +632,128 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
     Ok(pids)
 }
 
-fn capture_hvpatch_kernel_snapshot(ctx: &LldbDumpContext<'_>) -> anyhow::Result<PathBuf> {
-    let snapshot = carrick_kernel::kernel::kernel_debug_fetch(ctx.run_id, None)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let path = ctx
-        .out_dir
-        .join(format!("{}.kernel-debug.json", ctx.run_id));
-    let bytes = serde_json::to_vec_pretty(&snapshot).context("serialize kernel debug snapshot")?;
-    fs::write(&path, bytes)
-        .with_context(|| format!("failed to write kernel snapshot {}", path.display()))?;
-    Ok(path)
+/// What one live kernel capture produced. Every outcome leaves an artifact
+/// and a manifest line: gbhang4's deadline capture left neither a
+/// `kernel-debug.json` nor a recorded error in its manifest, so the set of
+/// files alone could not say whether a snapshot was ever attempted.
+#[derive(Debug)]
+enum KernelCapture {
+    /// A coherent, validated snapshot.
+    Snapshot(PathBuf),
+    /// The runtime refused the coherent snapshot (a held authority) and
+    /// answered with per-task state and busy coordinators instead.
+    Degraded { path: PathBuf, reason: String },
+    /// No snapshot at all; the error text is also written to `path`.
+    Error {
+        path: Option<PathBuf>,
+        error: String,
+    },
+}
+
+impl KernelCapture {
+    fn log_line(&self) -> String {
+        match self {
+            Self::Snapshot(path) => format!("KERNEL_SNAPSHOT={}", path.display()),
+            Self::Degraded { path, reason } => format!(
+                "KERNEL_SNAPSHOT_DEGRADED={} reason={}",
+                path.display(),
+                one_line(reason)
+            ),
+            Self::Error { path, error } => format!(
+                "KERNEL_SNAPSHOT_ERROR={}{}",
+                one_line(error),
+                path.as_ref()
+                    .map(|path| format!(" error_file={}", path.display()))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+}
+
+fn one_line(text: &str) -> String {
+    text.replace(['\n', '\r'], " ")
+}
+
+fn capture_hvpatch_kernel_snapshot(ctx: &LldbDumpContext<'_>) -> KernelCapture {
+    let fetched = carrick_kernel::kernel::kernel_debug_fetch(ctx.run_id, None);
+    let manifest = ctx.out_dir.join(format!("{}.manifest.txt", ctx.run_id));
+    record_kernel_capture(ctx.out_dir, ctx.run_id, &manifest, fetched)
+}
+
+/// Write the capture's artifact and append its manifest line. Never fails:
+/// a write error becomes the recorded error, because the lldb dump that
+/// follows must still run.
+fn record_kernel_capture(
+    out_dir: &Path,
+    run_id: &str,
+    manifest: &Path,
+    fetched: Result<
+        carrick_kernel::kernel::KernelDebugSnapshot,
+        carrick_kernel::kernel::KernelDebugClientError,
+    >,
+) -> KernelCapture {
+    let written = match fetched {
+        Ok(snapshot) => {
+            let path = out_dir.join(format!("{run_id}.kernel-debug.json"));
+            write_json(&path, &snapshot).map(|()| KernelCapture::Snapshot(path))
+        }
+        Err(carrick_kernel::kernel::KernelDebugClientError::Degraded(degraded)) => {
+            let path = out_dir.join(format!("{run_id}.kernel-debug.degraded.json"));
+            let reason = degraded.strict_error.clone();
+            write_json(&path, &degraded).map(|()| KernelCapture::Degraded { path, reason })
+        }
+        Err(error) => {
+            let error = error.to_string();
+            let path = out_dir.join(format!("{run_id}.kernel-debug.error.txt"));
+            Ok(match fs::write(&path, format!("{error}\n")) {
+                Ok(()) => KernelCapture::Error {
+                    path: Some(path),
+                    error,
+                },
+                Err(write_error) => KernelCapture::Error {
+                    path: None,
+                    error: format!("{error} (writing {} failed: {write_error})", path.display()),
+                },
+            })
+        }
+    };
+    let capture = written.unwrap_or_else(|error| KernelCapture::Error {
+        path: None,
+        error: format!("{error:#}"),
+    });
+    let line = match &capture {
+        KernelCapture::Snapshot(path) => format!("kernel_snapshot={}", path.display()),
+        KernelCapture::Degraded { path, reason } => format!(
+            "kernel_snapshot_degraded={}\nkernel_snapshot_error={}",
+            path.display(),
+            one_line(reason)
+        ),
+        KernelCapture::Error { path, error } => format!(
+            "kernel_snapshot_error={}{}",
+            one_line(error),
+            path.as_ref()
+                .map(|path| format!("\nkernel_snapshot_error_file={}", path.display()))
+                .unwrap_or_default()
+        ),
+    };
+    if let Err(error) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(manifest)
+        .and_then(|mut file| writeln!(file, "{line}"))
+    {
+        eprintln!(
+            "carrick debug: could not append kernel capture to {}: {error}",
+            manifest.display()
+        );
+    }
+    capture
+}
+
+fn write_json(path: &Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value).context("serialize kernel debug capture")?;
+    fs::write(path, bytes)
+        .with_context(|| format!("failed to write kernel capture {}", path.display()))
 }
 
 fn run_lldb_attach(
@@ -959,10 +1068,24 @@ fn run_hvpatch_kernel_snapshot(
         Some(parsed)
     };
 
-    let snapshot = carrick_kernel::kernel::kernel_debug_fetch(run_id, selected)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    println!("{}", serde_json::to_string_pretty(&snapshot)?);
-    Ok(())
+    match carrick_kernel::kernel::kernel_debug_fetch(run_id, selected) {
+        Ok(snapshot) => {
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            Ok(())
+        }
+        // A wedged carrier cannot give a coherent graph; print what it could
+        // say (per-task state, busy coordinators and their holders) and
+        // still fail, so no caller mistakes it for a snapshot.
+        Err(carrick_kernel::kernel::KernelDebugClientError::Degraded(degraded)) => {
+            println!("{}", serde_json::to_string_pretty(&degraded)?);
+            bail!(
+                "kernel snapshot degraded: {}; printed the degraded view ({})",
+                degraded.strict_error,
+                carrick_kernel::kernel::debug::KERNEL_DEBUG_DEGRADED_SCHEMA
+            )
+        }
+        Err(error) => bail!("{error}"),
+    }
 }
 
 fn container_gate_request(
@@ -1121,10 +1244,100 @@ fn run_container_gate(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_esr_el1, lldb_eventring_capture_commands, modified_memory_core_command,
-        parse_fatal_hold_pid,
+        KernelCapture, decode_esr_el1, lldb_eventring_capture_commands,
+        modified_memory_core_command, parse_fatal_hold_pid, record_kernel_capture,
     };
     use std::path::Path;
+
+    /// gbhang4: a deadline capture whose kernel snapshot failed left no
+    /// `kernel-debug.json` and nothing in the manifest. A failed capture must
+    /// leave an error artifact and a manifest line naming the error.
+    #[test]
+    fn a_failed_kernel_capture_leaves_an_error_file_and_manifest_line() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir.path().join("gbhang4.manifest.txt");
+        std::fs::write(&manifest, "run_id=gbhang4\n").expect("manifest");
+        let capture = record_kernel_capture(
+            dir.path(),
+            "gbhang4",
+            &manifest,
+            Err(carrick_kernel::kernel::KernelDebugClientError::TimedOut),
+        );
+        let KernelCapture::Error {
+            path: Some(path),
+            error,
+        } = &capture
+        else {
+            panic!("expected a recorded error, got {capture:?}");
+        };
+        assert!(error.contains("timed out"), "{error}");
+        assert_eq!(path, &dir.path().join("gbhang4.kernel-debug.error.txt"));
+        assert!(
+            std::fs::read_to_string(path)
+                .expect("error file")
+                .contains("timed out")
+        );
+        let manifest = std::fs::read_to_string(&manifest).expect("manifest");
+        assert!(manifest.starts_with("run_id=gbhang4\n"), "{manifest}");
+        assert!(
+            manifest.contains("kernel_snapshot_error=kernel debug request timed out"),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains(&format!("kernel_snapshot_error_file={}", path.display())),
+            "{manifest}"
+        );
+        assert!(capture.log_line().starts_with("KERNEL_SNAPSHOT_ERROR="));
+    }
+
+    #[test]
+    fn a_degraded_kernel_capture_is_written_apart_from_a_snapshot() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir.path().join("gbk4.manifest.txt");
+        let degraded = carrick_kernel::kernel::KernelDebugDegraded {
+            schema: carrick_kernel::kernel::debug::KERNEL_DEBUG_DEGRADED_SCHEMA.to_owned(),
+            strict_error: "kernel snapshot deadline expired".to_owned(),
+            tasks: Vec::new(),
+            mm_coordinators: vec![carrick_kernel::kernel::debug::DegradedMmCoordinatorDto {
+                mm: 1,
+                has_backend: true,
+                observed: true,
+                alias_active: Some(true),
+                alias_holder_host_thread: Some(0x1234),
+                alias_held_ms: Some(90_000),
+                alias_waiters: Some(1),
+                snapshot_readers: Some(0),
+            }],
+            unreadable: Vec::new(),
+        };
+        let capture = record_kernel_capture(
+            dir.path(),
+            "gbk4",
+            &manifest,
+            Err(carrick_kernel::kernel::KernelDebugClientError::Degraded(
+                Box::new(degraded.clone()),
+            )),
+        );
+        let KernelCapture::Degraded { path, reason } = &capture else {
+            panic!("expected a degraded capture, got {capture:?}");
+        };
+        assert_eq!(path, &dir.path().join("gbk4.kernel-debug.degraded.json"));
+        assert!(!dir.path().join("gbk4.kernel-debug.json").exists());
+        assert_eq!(reason, "kernel snapshot deadline expired");
+        let decoded: carrick_kernel::kernel::KernelDebugDegraded =
+            serde_json::from_slice(&std::fs::read(path).expect("degraded file"))
+                .expect("degraded JSON");
+        assert_eq!(decoded, degraded);
+        let manifest = std::fs::read_to_string(&manifest).expect("manifest");
+        assert!(
+            manifest.contains(&format!("kernel_snapshot_degraded={}", path.display())),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("kernel_snapshot_error=kernel snapshot deadline expired"),
+            "{manifest}"
+        );
+    }
 
     #[test]
     fn fatal_hold_line_names_the_carrier_pid_to_attach() {
