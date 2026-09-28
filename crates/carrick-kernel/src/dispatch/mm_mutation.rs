@@ -7,9 +7,25 @@ use parking_lot::{Condvar, Mutex};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+/// Operation holding structural alias exclusion, readable directly in cores.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AliasOperation {
+    Mutation,
+    Dispatch,
+    Install,
+}
+
+#[derive(Debug)]
+struct AliasHolder {
+    #[allow(dead_code)] // Acquisition identity retained for offline core inspection.
+    host_thread: std::thread::ThreadId,
+    guest_tid: Option<carrick_hal::ThreadId>,
+    operation: AliasOperation,
+}
+
 #[derive(Debug)]
 struct CoordinatorState {
-    alias_active: bool,
+    alias_holder: Option<AliasHolder>,
     alias_waiters: usize,
     snapshot_readers: usize,
 }
@@ -27,7 +43,7 @@ impl MmMutationCoordinator {
         Self {
             mm,
             state: Mutex::new(CoordinatorState {
-                alias_active: false,
+                alias_holder: None,
                 alias_waiters: 0,
                 snapshot_readers: 0,
             }),
@@ -39,19 +55,33 @@ impl MmMutationCoordinator {
         self: &Arc<Self>,
         permit: &'permit HostAliasPermit<'_>,
     ) -> HostAliasCoordinatorGuard<'permit> {
+        self.begin_alias_for(permit, AliasOperation::Mutation)
+    }
+
+    pub(crate) fn begin_alias_for<'permit>(
+        self: &Arc<Self>,
+        permit: &'permit HostAliasPermit<'_>,
+        operation: AliasOperation,
+    ) -> HostAliasCoordinatorGuard<'permit> {
         assert!(
             permit.authorizes(self, self.mm),
             "host-alias permit belongs to another MM"
         );
         let mut state = self.state.lock();
-        if state.alias_active || state.snapshot_readers != 0 {
+        if state.alias_holder.is_some() || state.snapshot_readers != 0 {
             state.alias_waiters += 1;
-            while state.alias_active || state.snapshot_readers != 0 {
+            while state.alias_holder.is_some() || state.snapshot_readers != 0 {
                 self.idle.wait(&mut state);
             }
             state.alias_waiters -= 1;
         }
-        state.alias_active = true;
+        let holder = AliasHolder {
+            host_thread: std::thread::current().id(),
+            guest_tid: permit.guest_tid,
+            operation,
+        };
+        self.record_alias(&holder, false);
+        state.alias_holder = Some(holder);
         drop(state);
         HostAliasCoordinatorGuard {
             coordinator: Arc::clone(self),
@@ -59,12 +89,31 @@ impl MmMutationCoordinator {
         }
     }
 
+    fn record_alias(&self, holder: &AliasHolder, end: bool) {
+        let kind = if end {
+            crate::event_ring::ALIAS_END
+        } else {
+            match holder.operation {
+                AliasOperation::Mutation => crate::event_ring::ALIAS_MUTATION,
+                AliasOperation::Dispatch => crate::event_ring::ALIAS_DISPATCH,
+                AliasOperation::Install => crate::event_ring::ALIAS_INSTALL,
+            }
+        };
+        let address = self as *const Self as usize as u64;
+        crate::event_ring::rec(
+            kind,
+            (address >> 32) as i32,
+            address as i32,
+            holder.guest_tid.map_or(0, carrick_hal::ThreadId::raw),
+        );
+    }
+
     pub(crate) fn begin_snapshot_until(
         self: &Arc<Self>,
         deadline: std::time::Instant,
     ) -> Option<MmSnapshotGuard> {
         let mut state = self.state.lock();
-        while state.alias_active {
+        while state.alias_holder.is_some() {
             let now = std::time::Instant::now();
             if now >= deadline {
                 return None;
@@ -73,7 +122,7 @@ impl MmMutationCoordinator {
                 .idle
                 .wait_for(&mut state, deadline.saturating_duration_since(now))
                 .timed_out()
-                && state.alias_active
+                && state.alias_holder.is_some()
             {
                 return None;
             }
@@ -113,6 +162,7 @@ pub struct MmMutationGuard<'authority> {
     coordinator: Arc<MmMutationCoordinator>,
     mm: MmId,
     operation: carrick_observability::probes::HvpatchTopologyOperation,
+    guest_tid: Option<carrick_hal::ThreadId>,
     foreign_authority: Option<&'authority mut super::mm_quiesce::FrameCowExactMmGuard>,
     /// Held for the guard's lifetime: no guest EL1 stage-1 edit of `mm`
     /// runs concurrently with a host edit.
@@ -134,6 +184,7 @@ impl<'authority> MmMutationGuard<'authority> {
         HostAliasPermit {
             coordinator: Arc::clone(&self.coordinator),
             mm: self.mm,
+            guest_tid: self.guest_tid,
             _guard: PhantomData,
         }
     }
@@ -182,6 +233,7 @@ impl<'authority> MmMutationGuard<'authority> {
         let permit = HostAliasPermit {
             coordinator: Arc::clone(&coordinator),
             mm: self.mm,
+            guest_tid: self.guest_tid,
             _guard: PhantomData,
         };
         let _alias = coordinator.begin_alias(&permit);
@@ -293,6 +345,7 @@ pub fn from_pt_pause<'authority>(
         coordinator,
         mm,
         operation: carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+        guest_tid: None,
         foreign_authority: None,
         _el1_editor: crate::kernel::mm_occupancy::exclude_el1_editor(mm),
         _authority: PhantomData,
@@ -312,6 +365,7 @@ pub fn from_sole_executor<'authority>(
         coordinator,
         mm,
         operation: carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+        guest_tid: None,
         foreign_authority: None,
         _el1_editor: crate::kernel::mm_occupancy::exclude_el1_editor(mm),
         _authority: PhantomData,
@@ -327,6 +381,7 @@ pub fn from_executor<'authority>(
         coordinator,
         mm,
         operation: carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+        guest_tid: participation.guest_tid(),
         foreign_authority: None,
         _el1_editor: crate::kernel::mm_occupancy::exclude_el1_editor(mm),
         _authority: PhantomData,
@@ -347,6 +402,7 @@ pub(crate) fn from_frame_cow<'authority>(
         coordinator,
         mm,
         operation: carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
+        guest_tid: None,
         foreign_authority: Some(authority),
         _el1_editor: crate::kernel::mm_occupancy::exclude_el1_editor(mm),
         _authority: PhantomData,
@@ -364,6 +420,7 @@ pub(crate) fn from_frame_cow<'authority>(
 pub struct HostAliasPermit<'guard> {
     coordinator: Arc<MmMutationCoordinator>,
     mm: MmId,
+    guest_tid: Option<carrick_hal::ThreadId>,
     _guard: PhantomData<&'guard MmMutationGuard<'guard>>,
 }
 
@@ -444,8 +501,10 @@ impl Drop for MmSnapshotGuard {
 impl Drop for HostAliasCoordinatorGuard<'_> {
     fn drop(&mut self) {
         let mut state = self.coordinator.state.lock();
-        assert!(state.alias_active, "host-alias coordinator underflow");
-        state.alias_active = false;
+        let holder = state.alias_holder.take().unwrap_or_else(|| {
+            carrick_fatal!("dispatch::mm_mutation", "host-alias coordinator underflow");
+        });
+        self.coordinator.record_alias(&holder, true);
         self.coordinator.idle.notify_all();
     }
 }
@@ -489,6 +548,26 @@ mod tests {
 
     fn mm(raw: u64) -> MmId {
         MmId::from_registry_allocation(NonZeroU64::new(raw).expect("nonzero MM id"))
+    }
+
+    #[test]
+    fn alias_holder_names_acquisition_and_clears_on_drop() {
+        let coordinator = Arc::new(MmMutationCoordinator::new(mm(13)));
+        super::test_support::with_guard(Arc::clone(&coordinator), |guard| {
+            let tid = carrick_hal::ThreadId::synthetic_for_tests(42);
+            guard.guest_tid = Some(tid);
+            let permit = guard.host_alias_permit();
+            let alias = coordinator.begin_alias_for(&permit, super::AliasOperation::Install);
+            {
+                let state = coordinator.state.lock();
+                let holder = state.alias_holder.as_ref().expect("named holder");
+                assert_eq!(holder.host_thread, std::thread::current().id());
+                assert_eq!(holder.guest_tid, Some(tid));
+                assert!(matches!(holder.operation, super::AliasOperation::Install));
+            }
+            drop(alias);
+            assert!(coordinator.state.lock().alias_holder.is_none());
+        });
     }
 
     #[test]
