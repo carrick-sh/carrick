@@ -703,12 +703,12 @@ pub struct AllocatorDiagnostics {
     pub active_bins_mask: u32,
 }
 
-pub use crate::sched::hw::{IrqGuard, disable_irq_save, restore_irq};
+pub use crate::substrate::sched::hw::{IrqGuard, disable_irq_save, restore_irq};
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(always)]
 fn current_el1_slot() -> Option<usize> {
-    let sp = crate::sched::hw::read_current_sp();
+    let sp = crate::substrate::sched::hw::read_current_sp();
     let offset = sp.checked_sub(carrick_el1_abi::EL1_STACKS_BASE)?;
     if offset >= carrick_el1_abi::EL1_STACK_SLOTS * carrick_el1_abi::EL1_STACK_SIZE {
         return None;

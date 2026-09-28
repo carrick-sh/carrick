@@ -310,18 +310,20 @@ impl MmOccupancy {
     ) -> Result<Self, MmOccupancyError> {
         let mut port = PORTS[slot.index()].lock();
         if let Some(running) = port.as_ref() {
+            crate::event_ring::rec_mm_occupancy_refused(slot.index(), running.mm.raw(), mm.raw());
             return Err(MmOccupancyError::SlotBusy {
                 slot,
                 running: running.mm.raw(),
             });
         }
-        table
-            .install(slot, key(mm))
-            .map_err(|busy| MmOccupancyError::SlotWordWithoutOwner {
+        table.install(slot, key(mm)).map_err(|busy| {
+            crate::event_ring::rec_mm_occupancy_refused(slot.index(), busy.running.raw(), mm.raw());
+            MmOccupancyError::SlotWordWithoutOwner {
                 slot,
                 running: busy.running.raw(),
                 requested: mm.raw(),
-            })?;
+            }
+        })?;
         *port = Some(Port {
             mm,
             fence: Arc::clone(fence),

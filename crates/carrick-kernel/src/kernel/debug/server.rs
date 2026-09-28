@@ -18,11 +18,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::dto::{
-    KERNEL_DEBUG_RESPONSE_SCHEMA, KernelDebugRequest, KernelDebugSnapshot, KernelDebugTable,
+    KERNEL_DEBUG_RESPONSE_SCHEMA, KernelDebugDegraded, KernelDebugRequest, KernelDebugSnapshot,
+    KernelDebugTable,
 };
 use super::endpoint::{DebugEndpoint, EndpointError};
 use super::wire::{
-    self, DEADLINE, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, WireError, encode_canonical,
+    self, DEADLINE, DEGRADED_BUDGET, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, STRICT_SNAPSHOT_BUDGET,
+    WireError, encode_canonical,
 };
 use crate::kernel::core::Kernel;
 
@@ -193,7 +195,7 @@ fn handle_connection(mut stream: UnixStream, kernel: &Arc<Kernel>) -> Result<(),
 
     let payload = wire::read_frame(&mut stream, MAX_REQUEST_BYTES, deadline, "server-read")?;
     let request: KernelDebugRequest = wire::decode_exact(&payload)?;
-    let response = build_response(&request, kernel, deadline);
+    let response = build_response(&request, kernel, Instant::now());
     let encoded = encode_canonical(&response)?;
     wire::write_frame(
         &mut stream,
@@ -232,7 +234,7 @@ fn authenticate(stream: &UnixStream) -> Result<(), WireError> {
 fn build_response(
     request: &KernelDebugRequest,
     kernel: &Arc<Kernel>,
-    deadline: Instant,
+    started: Instant,
 ) -> ServerResponse {
     if let Err(error) = request.check_schema() {
         return ServerResponse::Error {
@@ -252,12 +254,25 @@ fn build_response(
         };
     }
     let selected = request.selected();
-    match kernel.snapshot(deadline) {
+    match kernel.snapshot(started + STRICT_SNAPSHOT_BUDGET) {
         Ok(snapshot) => {
             let aux = kernel.debug_aux_provider();
             let projected =
                 KernelDebugSnapshot::project_with_aux(&snapshot, &selected, aux.as_deref());
             ServerResponse::Snapshot(Box::new(projected))
+        }
+        // A held authority (a wedge's MM coordinator) refuses the coherent
+        // graph. Say what can still be read without waiting on it, and who
+        // holds it, instead of failing wholesale.
+        Err(
+            error @ (super::super::KernelSnapshotError::Busy
+            | super::super::KernelSnapshotError::TimedOut),
+        ) => {
+            let degraded = kernel.degraded_snapshot(Instant::now() + DEGRADED_BUDGET);
+            ServerResponse::Degraded(Box::new(KernelDebugDegraded::project(
+                error.to_string(),
+                &degraded,
+            )))
         }
         Err(error) => ServerResponse::Error {
             schema: KERNEL_DEBUG_RESPONSE_SCHEMA.to_owned(),
@@ -273,6 +288,9 @@ fn build_response(
 #[serde(untagged)]
 pub enum ServerResponse {
     Snapshot(Box<KernelDebugSnapshot>),
+    /// The coherent snapshot was refused by a busy authority; this is the
+    /// non-coherent per-object view plus the busy coordinators.
+    Degraded(Box<KernelDebugDegraded>),
     /// An abort was latched. The runtime performs the ONE capture at its next
     /// runner boundary; this response is the acknowledgement, not the
     /// artifact, so an abort never produces two answers to the same question.

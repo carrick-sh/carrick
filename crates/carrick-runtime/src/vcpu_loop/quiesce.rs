@@ -1060,7 +1060,19 @@ where
                 ),
             };
         let parent_mm_id = parent_context.shared().mm().id();
-        let parent_mutation = carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor);
+        let parent_mutation =
+            match carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor) {
+                Ok(mutation) => mutation,
+                Err(install_failure) => {
+                    tracing::warn!(
+                        ?install_failure,
+                        "dispatcher fork install could not pause the parent MM; fork(2) = EAGAIN"
+                    );
+                    return Ok(PreparedInProcessFork::Complete(Some(
+                        crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                    )));
+                }
+            };
         let mut inventory_transaction = None;
         let mut inventory_reserve =
             |frame_candidates: usize,

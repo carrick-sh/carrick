@@ -828,7 +828,7 @@ mod tests {
         let _g = crate::host_signal::pump_state_test_guard();
         crate::host_signal::reset_after_supervisor_fork();
         crate::host_signal::clear_proc_pending();
-        carrick_signal_core::publish_process_signal(crate::linux_abi::LINUX_SIGINT);
+        carrick_signal_linux::publish_process_signal(crate::linux_abi::LINUX_SIGINT);
         let (registry, kicks, futex) = pump_test_parts();
 
         let pump = spawn_signal_wake_pump(registry, futex);
@@ -842,9 +842,9 @@ mod tests {
     fn wake_pump_reconciles_xsignal_published_before_start() {
         let _g = crate::host_signal::pump_state_test_guard();
         crate::host_signal::reset_after_supervisor_fork();
-        carrick_signal_core::xsig::xsig_init();
-        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
-        assert!(carrick_signal_core::xsig::xsig_enqueue(
+        carrick_signal_linux::xsig::xsig_init();
+        let _ = carrick_signal_linux::xsig::xsig_drain_for_self();
+        assert!(carrick_signal_linux::xsig::xsig_enqueue(
             std::process::id() as i32,
             crate::linux_abi::LINUX_SIGUSR1,
             crate::linux_abi::LINUX_SI_USER,
@@ -858,7 +858,7 @@ mod tests {
         let pump = spawn_signal_wake_pump(registry, futex);
         wait_for_kick(&kicks);
         pump.stop();
-        let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+        let _ = carrick_signal_linux::xsig::xsig_drain_for_self();
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

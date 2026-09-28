@@ -39,7 +39,7 @@ carrick-host-bsd = { path = "../carrick-host-bsd" }
 # Neutral timer slot bookkeeping (BhyveTimerDelivery) + per-thread pending store
 # (the timer firing thread publishes here then kicks). Mirrors carrick-vmm-kvm.
 carrick-timer-core = { path = "../carrick-timer-core" }
-carrick-signal-core = { path = "../carrick-signal-core" }
+carrick-signal-linux = { path = "../carrick-signal-linux" }
 # The shared x86_64 VMM-backend engine scaffold (Axis 2). `BhyveVmm`/`BhyveX86Vcpu`
 # (bhyve_x86_engine) are the thin per-VMM trait pair `X86EngineCore<V>` is
 # parameterized over — the same crate carrick-vmm-kvm (KVM) and carrick-vmm-nvmm build on.

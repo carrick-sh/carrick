@@ -1,33 +1,4 @@
-//! The in-guest scheduler (EL1 plans 1b and 1c).
-//!
-//! EL1 serves `FUTEX_WAKE(_BITSET)_PRIVATE`, untimed
-//! `FUTEX_WAIT(_BITSET)_PRIVATE` and, for the thread the host loaded on this
-//! vCPU, `FUTEX_WAIT_PRIVATE` with a relative timeout, for a zone process, on
-//! the zone tables it shares with the host (`carrick_sched_core`):
-//!
-//! - a wake claims parked waiters of the same process and queues each where
-//!   it may run (`ZoneTables::wake_placed`): a thread the host loaded on some
-//!   vCPU goes back to that vCPU, any other to an idle vCPU of the process,
-//!   else to this vCPU's own run queue. A vCPU running a thread or parked in
-//!   WFI gets a reschedule SGI;
-//! - a wait parks the running thread and switches the vCPU to the next
-//!   runnable thread: register state, `SP_EL0`, the thread pointers,
-//!   `CONTEXTIDR_EL1` and FP/SIMD are saved to the parked record and loaded
-//!   from the next one, with no host exit. With nothing runnable the vCPU
-//!   idles in EL1: it polls its run queue for [`IDLE_SPIN_NS`], then parks in
-//!   WFI until an SGI, its virtual timer or a host kick;
-//! - an interrupt taken at EL0 ([`Sched::serve_irq`]): the virtual timer ends
-//!   this vCPU's timed park and preempts the running thread when a queued
-//!   one has waited [`PREEMPT_SLICE_NS`] (after moving what it can to idle
-//!   vCPUs); a reschedule SGI makes this vCPU look at its run queue; the host
-//!   kick SGI sends the vCPU to the host.
-//!
-//! Everything else is forwarded: timeouts of switched-in threads, absolute
-//! or `FUTEX_CLOCK_REALTIME` timeouts, requeue, `futex_waitv`, shared
-//! futexes, a busy bucket, a wake EL1 cannot place, a fault on the futex
-//! word. While threads are queued on this vCPU, any other syscall is
-//! forwarded too, so the host takes them at that exit.
-
+//! Context switching, wait enrollment, timer expiration and CPU hardware.
 use carrick_el1_abi::{
     Counters, CurrentTask, GIC_KICK_INTID, GIC_RESCHED_INTID, GIC_SPURIOUS_INTID, GIC_VTIMER_INTID,
     SlotId, ThreadCtx, ThreadIdentity, TrapFrame, Waker, ZoneTables,
@@ -35,36 +6,12 @@ use carrick_el1_abi::{
 use carrick_sched_core::{BoundedSpin, IDLE_SPIN_NS, PREEMPT_SLICE_NS, SwitchedIn, WakeEffects};
 use core::sync::atomic::Ordering;
 
-pub const SYS_FUTEX: usize = 98;
-const FUTEX_WAIT_PRIVATE: u64 = 128;
-const FUTEX_WAKE_PRIVATE: u64 = 129;
-const FUTEX_WAIT_BITSET_PRIVATE: u64 = 128 | 9;
-const FUTEX_WAKE_BITSET_PRIVATE: u64 = 128 | 10;
-const EAGAIN: i64 = -11;
-const ETIMEDOUT_RESULT: u64 = (-110_i64) as u64;
-
 /// Bucket-lock spins before EL1 gives up and forwards.
 const EL1_ZONE_LOCK_SPINS: u32 = 1024;
 
 /// The earliest the virtual timer is armed from now: a deadline that could
 /// not be served (a busy lock, a full run queue) is retried after this.
 const TIMER_RETRY_NS: u64 = 50_000;
-
-/// Whether `frame` is a futex operation EL1 may serve (the rest forward).
-/// A relative `FUTEX_WAIT_PRIVATE` timeout is servable here; whether this
-/// thread's timeout is, [`Sched::serve_futex`] decides.
-pub fn is_served_futex_op(frame: &TrapFrame) -> bool {
-    if frame.x[8] as usize != SYS_FUTEX || frame.x[0] & 3 != 0 {
-        return false;
-    }
-    match frame.x[1] {
-        FUTEX_WAIT_PRIVATE => true,
-        FUTEX_WAIT_BITSET_PRIVATE => frame.x[3] == 0 && frame.x[5] as u32 != 0,
-        FUTEX_WAKE_PRIVATE => (frame.x[2] as i32) > 0,
-        FUTEX_WAKE_BITSET_PRIVATE => (frame.x[2] as i32) > 0 && frame.x[5] as u32 != 0,
-        _ => false,
-    }
-}
 
 /// The CPU state and the per-vCPU hardware the in-guest scheduler uses.
 pub trait ThreadCpu {
@@ -172,32 +119,19 @@ pub struct IrqsTaken {
 }
 
 impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
-    fn ticks(&self, ns: u64) -> u64 {
+    pub(crate) fn ticks(&self, ns: u64) -> u64 {
         (u128::from(ns) * u128::from(self.cpu.freq()) / 1_000_000_000) as u64
     }
 
-    /// Serve a futex syscall at EL1, or `None` to forward it unchanged.
-    pub fn serve_futex(&mut self, frame: &mut TrapFrame) -> Option<Served> {
-        let mm = self.task.zone_mm.load(Ordering::Acquire);
-        if mm == 0 || !is_served_futex_op(frame) {
-            return None;
-        }
-        let uaddr = frame.x[0];
-        match frame.x[1] {
-            FUTEX_WAKE_PRIVATE | FUTEX_WAKE_BITSET_PRIVATE => self.serve_wake(frame, mm, uaddr),
-            FUTEX_WAIT_PRIVATE | FUTEX_WAIT_BITSET_PRIVATE => self.serve_wait(frame, mm, uaddr),
-            _ => None,
-        }
-    }
-
-    fn serve_wake(&mut self, frame: &mut TrapFrame, mm: u64, uaddr: u64) -> Option<Served> {
+    pub(crate) fn wake_word(
+        &mut self,
+        frame: &mut TrapFrame,
+        mm: u64,
+        uaddr: u64,
+        bitset: u32,
+        count: u32,
+    ) -> Option<Served> {
         let (zone, slot) = (self.zone, self.slot);
-        let bitset = if frame.x[1] == FUTEX_WAKE_PRIVATE {
-            u32::MAX
-        } else {
-            frame.x[5] as u32
-        };
-        let count = frame.x[2] as i32 as u32;
         let was_empty = zone.slot(slot).queued() == 0;
         let guard = zone.lock(
             ZoneTables::bucket_of(mm, uaddr),
@@ -233,34 +167,19 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         Some(Served::Returned { switched: false })
     }
 
-    fn serve_wait(&mut self, frame: &mut TrapFrame, mm: u64, uaddr: u64) -> Option<Served> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wait_word(
+        &mut self,
+        frame: &mut TrapFrame,
+        mm: u64,
+        uaddr: u64,
+        bitset: u32,
+        expected: u32,
+        deadline: Option<u64>,
+        mismatch_result: u64,
+        timeout_result: u64,
+    ) -> Option<Served> {
         let (zone, slot) = (self.zone, self.slot);
-        let bitset = if frame.x[1] == FUTEX_WAIT_PRIVATE {
-            u32::MAX
-        } else {
-            frame.x[5] as u32
-        };
-        let expected = frame.x[2] as u32;
-        // A timeout is served for the thread the host loaded on this vCPU
-        // (its deadline is this vCPU's to keep, and the host takes it over
-        // at an exit); a switched-in thread's timed wait forwards.
-        let deadline = if frame.x[3] != 0 {
-            let s = zone.slot(slot);
-            if s.current().is_some() && s.current() != s.host_record() {
-                return None;
-            }
-            let secs = self.user.read_u64(self.task, frame.x[3])? as i64;
-            let nanos = self.user.read_u64(self.task, frame.x[3] + 8)? as i64;
-            if secs < 0 || !(0..1_000_000_000).contains(&nanos) {
-                return None;
-            }
-            let ticks = (secs as u64)
-                .saturating_mul(self.cpu.freq())
-                .saturating_add(self.ticks(nanos as u64));
-            Some(self.cpu.now().saturating_add(ticks).max(1))
-        } else {
-            None
-        };
         let guard = zone.lock(
             ZoneTables::bucket_of(mm, uaddr),
             &BoundedSpin(EL1_ZONE_LOCK_SPINS),
@@ -271,7 +190,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         };
         if word != expected {
             drop(guard);
-            frame.x[0] = EAGAIN as u64;
+            frame.x[0] = mismatch_result;
             return Some(Served::Returned { switched: false });
         }
         let fresh = zone.slot(slot).current().is_none();
@@ -311,12 +230,12 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         drop(guard);
         zone.clear_current(slot);
         zone.counters.el1_parks.fetch_add(1, Ordering::Relaxed);
-        Some(self.run_next(frame))
+        Some(self.run_next(frame, timeout_result))
     }
 
     /// The running thread parked: run the next runnable thread, or leave
     /// for the host when that thread needs its executor, or idle.
-    fn run_next(&mut self, frame: &mut TrapFrame) -> Served {
+    fn run_next(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
         if let Some(switched) = self.zone.switch_in_full(self.slot) {
             if self.load(frame, switched) {
                 return Served::Returned { switched: true };
@@ -326,7 +245,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if self.zone.head_needs_host(self.slot) {
             return self.service_exit();
         }
-        self.idle(frame)
+        self.idle(frame, timeout_result)
     }
 
     /// The next thread on this vCPU needs its executor: leave for the host
@@ -426,7 +345,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// Nothing is runnable on this vCPU: poll, then park in WFI, until a
     /// thread is queued here (by another vCPU, or this vCPU's timer ending
     /// its timed park) or host work arrives.
-    fn idle(&mut self, frame: &mut TrapFrame) -> Served {
+    pub(crate) fn idle(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
         let (zone, slot) = (self.zone, self.slot);
         zone.counters
             .el1_idle_entries
@@ -442,7 +361,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 return Served::Idle;
             }
             let now = self.cpu.now();
-            let _ = zone.expire_timer(slot, now, ETIMEDOUT_RESULT);
+            let _ = zone.expire_timer(slot, now, timeout_result);
             if let Some(switched) = zone.switch_in_full(slot).or_else(|| zone.steal(slot)) {
                 zone.leave_idle(slot);
                 if self.load(frame, switched) {
@@ -505,7 +424,11 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
 
     /// An interrupt taken while EL0 ran on this vCPU. `Forward`: host work
     /// is pending, the vCPU leaves through the host at this EL0 boundary.
-    pub fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action {
+    pub fn interrupt(
+        &mut self,
+        frame: &mut TrapFrame,
+        timeout_result: u64,
+    ) -> carrick_el1_abi::Action {
         self.take_irqs();
         if self.task.has_pending_host_work() {
             return carrick_el1_abi::Action::Forward;
@@ -515,7 +438,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         }
         let (zone, slot) = (self.zone, self.slot);
         let now = self.cpu.now();
-        let _ = zone.expire_timer(slot, now, ETIMEDOUT_RESULT);
+        let _ = zone.expire_timer(slot, now, timeout_result);
         if zone.slot(slot).queued() != 0 {
             let mut since = zone.slot(slot).queued_since();
             if since == 0 {
@@ -556,12 +479,16 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// to load and started the vCPU in the scheduler. Run a queued thread
     /// (`Served`: the frame is now that thread's), or leave for the host
     /// (`Idle`): host work arrived, or the next thread needs its executor.
-    pub fn serve_idle_entry(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action {
+    pub fn idle_entry(
+        &mut self,
+        frame: &mut TrapFrame,
+        timeout_result: u64,
+    ) -> carrick_el1_abi::Action {
         self.take_irqs();
         if self.task.has_pending_host_work() {
             return carrick_el1_abi::Action::Idle;
         }
-        match self.idle(frame) {
+        match self.idle(frame, timeout_result) {
             Served::Returned { .. } => carrick_el1_abi::Action::Served,
             Served::Idle => carrick_el1_abi::Action::Idle,
         }
@@ -666,6 +593,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     }
 }
 
+#[path = "sched/hw.rs"]
 pub(crate) mod hw;
 #[cfg(target_os = "none")]
 pub use hw::HardwareCpu;
@@ -821,4 +749,5 @@ impl ThreadCpu for FakeCpu {
 }
 
 #[cfg(test)]
+#[path = "sched/tests.rs"]
 mod tests;

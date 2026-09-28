@@ -1565,7 +1565,7 @@ fn fcntl_async_io_setup_retains_o_async_and_round_trips_owner_and_sig() {
     const LINUX_SIGUSR1: u64 = 10;
 
     // The fork-coherent FASYNC registry must be mapped before arming.
-    carrick_signal_core::fasync::fasync_init();
+    carrick_signal_linux::fasync::fasync_init();
 
     let mut dispatcher = SyscallDispatcher::new();
     let reporter = CompatReporter::default();
