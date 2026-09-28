@@ -186,8 +186,9 @@ pub struct ResolvedDentry {
     pub dentry: PositiveDentry,
     pub canonical_path: String,
     pub parent_dir_fd: Option<Arc<OwnedFd>>,
-    pub leaf_name: String,
-    pub leaf_name_c: CString,
+    // A warm lookup clones this record on every open. Share the immutable
+    // leaf bytes instead of allocating another CString for each clone.
+    pub leaf_name_c: Arc<CString>,
 }
 
 const FAST_PATH_CAP: usize = 16384;
@@ -651,8 +652,7 @@ impl DentryCache {
                 },
                 canonical_path: "/".to_string(),
                 parent_dir_fd: None,
-                leaf_name: "/".to_string(),
-                leaf_name_c: CString::new("/").map_err(|_| LINUX_ENOENT)?,
+                leaf_name_c: Arc::new(CString::new("/").map_err(|_| LINUX_ENOENT)?),
             });
         }
 
@@ -688,8 +688,7 @@ impl DentryCache {
             dentry: node,
             canonical_path: path,
             parent_dir_fd: leaf_parent_fd,
-            leaf_name,
-            leaf_name_c,
+            leaf_name_c: Arc::new(leaf_name_c),
         })
     }
 
@@ -1025,8 +1024,7 @@ impl DentryCache {
                         dentry: node,
                         canonical_path: leaf_path,
                         parent_dir_fd: leaf_parent_fd,
-                        leaf_name: name.clone(),
-                        leaf_name_c,
+                        leaf_name_c: Arc::new(leaf_name_c),
                     });
                 }
                 symlinks_followed += 1;
@@ -1081,8 +1079,7 @@ impl DentryCache {
                         dentry: node,
                         canonical_path: dir.path.clone(),
                         parent_dir_fd: leaf_parent_fd,
-                        leaf_name: name.clone(),
-                        leaf_name_c,
+                        leaf_name_c: Arc::new(leaf_name_c),
                     });
                 }
                 continue;
@@ -1096,8 +1093,7 @@ impl DentryCache {
                     dentry: node,
                     canonical_path: leaf_path,
                     parent_dir_fd: leaf_parent_fd,
-                    leaf_name: name.clone(),
-                    leaf_name_c,
+                    leaf_name_c: Arc::new(leaf_name_c),
                 });
             } else {
                 return Err(LINUX_ENOTDIR);

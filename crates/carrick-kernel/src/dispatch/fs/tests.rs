@@ -2792,6 +2792,10 @@ mod serial_host {
             "warm open allocations grew with path depth: {warm_open_allocs:?}"
         );
         assert!(
+            warm_open_allocs.iter().all(|&calls| calls <= 15),
+            "warm open repeated cached-name allocations: {warm_open_allocs:?}"
+        );
+        assert!(
             warm_stat_bytes[2] <= warm_stat_bytes[0] + 16 * 10,
             "warm stat heap bytes grew with path depth: {warm_stat_bytes:?}"
         );
