@@ -57,6 +57,44 @@ fn el1_switch_then_host_unload_allows_another_mm_on_the_slot() {
     }
 }
 
+/// The mailbox lease may not be handed to a successor until its prior
+/// executor has unloaded. Delaying that unload on another host thread makes
+/// the ownership boundary explicit without scheduling or guest timing.
+#[test]
+fn delayed_unload_precedes_successor_slot_install() {
+    let slot = HostExecutionSlot::allocate().unwrap();
+    let previous = mm(42_320);
+    let successor = mm(42_321);
+    let previous_fence = fence();
+    let successor_fence = fence();
+    let (occupied_tx, occupied_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (unloaded_tx, unloaded_rx) = std::sync::mpsc::channel();
+
+    std::thread::scope(|scope| {
+        let slot_ref = &slot;
+        scope.spawn(move || {
+            let vcpu = Vcpu::new(42_322);
+            let owner = vcpu.occupy(slot_ref, previous, &previous_fence).unwrap();
+            occupied_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(owner);
+            unloaded_tx.send(()).unwrap();
+        });
+        occupied_rx.recv().unwrap();
+        let vcpu = Vcpu::new(42_323);
+        assert!(matches!(
+            vcpu.occupy(&slot, successor, &successor_fence),
+            Err(MmOccupancyError::SlotBusy { .. })
+        ));
+        release_tx.send(()).unwrap();
+        unloaded_rx.recv().unwrap();
+        let next = vcpu.occupy(&slot, successor, &successor_fence).unwrap();
+        assert_eq!(next.mm(), successor);
+        drop(next);
+    });
+}
+
 /// Refusing a word with no host owner is a different invariant failure
 /// from refusing a second live host admission. Preserve that distinction
 /// through RuntimeError::Configuration so a signed receipt identifies it.
