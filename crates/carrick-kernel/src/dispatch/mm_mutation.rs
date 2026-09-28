@@ -24,6 +24,10 @@ struct AliasHolder {
 }
 
 /// The calling thread's host OS thread id, as lldb prints it (`tid = ...`).
+///
+/// macOS only, where `carrick debug lldb-run` runs: other hosts have no
+/// reviewed, non-raw-syscall thread-id operation yet, so their degraded
+/// snapshot reports the holder as unknown rather than inventing one.
 fn current_host_thread_id() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
@@ -33,13 +37,7 @@ fn current_host_thread_id() -> Option<u64> {
         let rc = unsafe { libc::pthread_threadid_np(0, &mut id) };
         (rc == 0).then_some(id)
     }
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: gettid takes no arguments and cannot fail.
-        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
-        u64::try_from(tid).ok()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "macos"))]
     {
         None
     }
