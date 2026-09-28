@@ -41,6 +41,16 @@ fn is_aarch64_elf_head(bytes: &[u8]) -> bool {
             .is_some_and(|machine| u16::from_le_bytes([machine[0], machine[1]]) == 183)
 }
 
+/// Inspect the exact source selected for this exec. The shebang decision and
+/// direct-ELF cache classification must use the same bounded file snapshot.
+fn inspect_exec_head(
+    read_head: impl FnOnce(usize) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let head = read_head(256)?;
+    let direct_aarch64 = is_aarch64_elf_head(&head);
+    Ok((head, direct_aarch64))
+}
+
 fn finalize_hvf_exec_base(
     dispatcher: &SyscallDispatcher,
     raw: AddressSpace,
@@ -132,8 +142,13 @@ pub(crate) fn load_execve_image(
     let mut path = abs_path;
     let mut argv = argv;
     let mut source = named_source;
+    let mut direct_aarch64 = false;
+    let mut final_source_inspected = false;
     for _ in 0..4 {
-        let head = source.read_head(256).map_err(host_io_errno)?;
+        let (head, eligible) =
+            inspect_exec_head(|max| source.read_head(max)).map_err(host_io_errno)?;
+        direct_aarch64 = eligible;
+        final_source_inspected = true;
         if !head.starts_with(b"#!") {
             break;
         }
@@ -151,6 +166,15 @@ pub(crate) fn load_execve_image(
         argv = next_argv;
         source = acquire_source(&path).map_err(exec_source_errno)?;
         dispatcher.check_exec_source(&path, &source)?;
+        final_source_inspected = false;
+    }
+    // A fourth shebang replacement exhausts the loop after acquiring its
+    // interpreter. It has no preceding head snapshot to reuse.
+    if !final_source_inspected {
+        direct_aarch64 = source
+            .read_head(20)
+            .ok()
+            .is_some_and(|head| is_aarch64_elf_head(&head));
     }
     // Executing a `#!` script also opens its INTERPRETER for execution, and
     // Linux reports that as a second FAN_OPEN_EXEC. Skip it for a plain binary,
@@ -179,18 +203,16 @@ pub(crate) fn load_execve_image(
     // The cache is deliberately limited to direct little-endian AArch64 ELFs.
     // Rosetta redirects rewrite argv and carry target-specific AT_BASE state;
     // mutable/foreign images stay on the uncached path below.
-    let cache_key = source
-        .read_head(20)
-        .ok()
-        .filter(|head| is_aarch64_elf_head(head))
-        .and_then(|_| {
+    let cache_key = direct_aarch64
+        .then(|| {
             source.hvpatch_cache_key(
                 dispatcher.linux_page_size(),
                 vdso_enabled,
                 requires_syscall_traps,
                 false,
             )
-        });
+        })
+        .flatten();
     let (base, argv) = if cache_key.is_some() {
         let base = dispatcher.with_hvpatch_exec_cache(cache_key, || {
             let raw_bytes = source.read_all().map_err(host_io_errno)?;
@@ -360,6 +382,29 @@ mod tests {
         head[5] = 2;
         assert!(!is_aarch64_elf_head(&head));
         assert!(!is_aarch64_elf_head(&head[..10]));
+    }
+
+    #[test]
+    fn exec_head_budget_reads_one_prefix_per_direct_elf() {
+        // Contract runtime.exec.direct-elf-head: classification must reuse
+        // the shebang prefix, so N direct execs issue exactly N head reads.
+        let mut elf = vec![0_u8; 256];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[5] = 1;
+        elf[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        for count in [1, 8, 32] {
+            let mut reads = 0;
+            for _ in 0..count {
+                let (head, direct_aarch64) = inspect_exec_head(|max| {
+                    reads += 1;
+                    Ok(elf[..max].to_vec())
+                })
+                .expect("inspect direct ELF head");
+                assert_eq!(head, elf);
+                assert!(direct_aarch64);
+            }
+            assert_eq!(reads, count, "direct exec repeated the source head read");
+        }
     }
 
     #[test]
