@@ -467,6 +467,14 @@
     },
     {
       "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "symbol": "abort_on_guest_fault_signal_enabled::CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL",
+      "fingerprint": "443be15d2cd547a76da87478fc36c7535a7b54bc7e6841229cf50e0ad58bf080",
+      "classification": "config_debug",
+      "rationale": "Diagnostic hatch CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL=1 in crates/carrick-runtime/src/vcpu_loop/signal.rs that turns the first SIGSEGV/SIGBUS bound for a guest thread into carrick_fatal! for post-mortem capture; read once per carrier process."
+    },
+    {
+      "kind": "env_var",
       "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",
       "symbol": "tests::clone_admission_terminal_claim_cost_receipt::CARRICK_HANDOFF_PERF_ITERATIONS",
       "fingerprint": "d8c13a13ecbc912d8eefc2783675658f04dbc51fedcbe50a5e580828ae136b35",
@@ -2344,6 +2352,14 @@
       "fingerprint": "68f1c965cdc5df3062e0e69d4e0575047d68bc650b4206c04c92c2c85e425ce8",
       "classification": "test_only",
       "rationale": "Cfg(test)-only mutex serializes foreign-COW handshake fixtures that share process-wide test controls; it is absent from production builds."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "symbol": "abort_on_guest_fault_signal_enabled::ENABLED",
+      "fingerprint": "810e6edc6ac71f37c4eb86f28b68168eb8d1faac13e5facea0127a51501d3002",
+      "classification": "config_debug",
+      "rationale": "Cached value of the CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL diagnostic hatch in crates/carrick-runtime/src/vcpu_loop/signal.rs; read once, immutable for the carrier's life."
     },
     {
       "kind": "static",

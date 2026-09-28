@@ -485,6 +485,95 @@ def _signed64(x: int) -> int:
     return x - (1 << 64) if x & 0x8000000000000000 else x
 
 
+def _join64(low: int, high: int) -> int:
+    return (low & 0xFFFFFFFF) | ((high & 0xFFFFFFFF) << 32)
+
+
+# EL1 fault-forensics records (kinds 68..80). Mirrors the Rust decode and the
+# packing documented on the constants in `event_ring.rs`.
+_RING_ACCESS = ("unknown", "read", "write", "exec")
+_FRAME_GRANT_CLAIM_OUTCOMES = {0: "none", 1: "response-pending", 2: "accepted"}
+_FRAME_GRANT_DECISIONS = {
+    0: "plan",
+    1: "refused/no-plan",
+    2: "refused/first-touch",
+    3: "refused/prepare",
+    4: "ready",
+}
+_FIRST_TOUCH_RESIDENT = {
+    0: "not-reached",
+    1: "committed",
+    2: "no-plan",
+    3: "arming-denied",
+    4: "backend-refused",
+}
+_FIRST_TOUCH_GROWDOWN = ("not-reached", "committed", "no-plan", "protect-failed")
+_FIRST_TOUCH_STALE = ("not-reached", "retried", "not-retried", "access-unknown")
+_FRAME_GRANT_MAILBOX_STATES = {
+    0: "idle",
+    1: "guest-writing",
+    2: "requested",
+    3: "host-working",
+    4: "response",
+    5: "guest-consuming",
+}
+
+
+def _format_el1_grant_claim(tid: int, mm: int, packed: int) -> str:
+    packed &= 0xFFFFFFFF
+    outcome = _FRAME_GRANT_CLAIM_OUTCOMES.get(packed & 0x3, "unknown")
+    return (
+        f"tid={tid} mm={mm & 0xFFFFFFFF} outcome={outcome} "
+        f"access={_RING_ACCESS[(packed >> 2) & 0x3]} generation={packed >> 4}"
+    )
+
+
+def _format_el1_grant_decision(tid: int, generation: int, packed: int) -> str:
+    packed &= 0xFFFFFFFF
+    decision = _FRAME_GRANT_DECISIONS.get(packed & 0xF, "unknown")
+    return (
+        f"tid={tid} generation={generation & 0xFFFFFFFF} decision={decision} "
+        f"prot={(packed >> 4) & 0xF:#x} pages={packed >> 8}"
+    )
+
+
+def _format_first_touch(tid: int, mm: int, packed: int) -> str:
+    packed &= 0xFFFFFFFF
+    resident = _FIRST_TOUCH_RESIDENT.get(packed & 0x7, "unknown")
+    return (
+        f"tid={tid} mm={mm & 0xFFFFFFFF} resident={resident} "
+        f"growdown={_FIRST_TOUCH_GROWDOWN[(packed >> 3) & 0x3]} "
+        f"stale={_FIRST_TOUCH_STALE[(packed >> 5) & 0x3]} "
+        f"access={_RING_ACCESS[(packed >> 7) & 0x3]}"
+    )
+
+
+def _format_fault_signal(tid: int, mm: int, packed: int) -> str:
+    packed &= 0xFFFFFFFF
+    if packed & (1 << 17):
+        valid = "valid" if packed & (1 << 18) else "invalid"
+        permits = "permits" if packed & (1 << 19) else "denies"
+        walk = f"L{(packed >> 20) & 0x3}-{valid}-{permits}"
+    else:
+        walk = "unavailable"
+    return (
+        f"tid={tid} mm={mm & 0xFFFFFFFF} signal={packed & 0xFF} "
+        f"si_code={(packed >> 8) & 0xFF} mutating={str(bool(packed & (1 << 16))).lower()} "
+        f"walk={walk} access={_RING_ACCESS[(packed >> 22) & 0x3]} "
+        f"direct={str(bool(packed & (1 << 24))).lower()}"
+    )
+
+
+def _format_fault_signal_mailboxes(tid: int, packed: int, mask: int) -> str:
+    packed &= 0xFFFFFFFF
+    own = packed >> 16
+    own_slot = "none" if own == 0 else str(own - 1)
+    return (
+        f"tid={tid} busy={packed & 0xFFFF} own_slot={own_slot} "
+        f"mask0_31={mask & 0xFFFFFFFF:#010x}"
+    )
+
+
 # kind -> (name, formatter(a, b, c))
 _EVENTRING_KINDS = {
     1: ("BIND", lambda a, b, c: f"gfd={a} hfd={b} pathhash={c & 0xffffffff:#010x}"),
@@ -652,6 +741,30 @@ _EVENTRING_KINDS = {
     65: ("SCHED_PREEMPT", lambda a, b, c: f"tid={a} executor={b} reasons={c:#x}"),
     66: ("SCHED_BUDGET", lambda a, b, c: f"executor={a} budget_ms={b} generation={c}"),
     67: ("SCHED_DEADLINE", lambda a, b, c: f"executor={a} deadline_ms={b} ticket={c}"),
+    68: ("EL1GRANT_CLAIM", _format_el1_grant_claim),
+    69: ("FAULT_VA", lambda a, b, c: f"tid={c} va={_join64(a, b):#018x}"),
+    70: ("EL1GRANT_DECISION", _format_el1_grant_decision),
+    71: ("EL1GRANT_BASE", lambda a, b, c: f"tid={c} base={_join64(a, b):#018x}"),
+    72: ("EL1GRANT_IPA", lambda a, b, c: f"tid={c} ipa={_join64(a, b):#018x}"),
+    73: ("FIRST_TOUCH", _format_first_touch),
+    74: ("FAULTSIG", _format_fault_signal),
+    75: (
+        "FAULTSIG_ADDR",
+        lambda a, b, c: f"far={_join64(a, b):#018x} esr={c & 0xffffffff:#010x}",
+    ),
+    76: ("FAULTSIG_PC", lambda a, b, c: f"tid={c} pc={_join64(a, b):#018x}"),
+    77: ("FAULTSIG_LEAF", lambda a, b, c: f"tid={c} leaf={_join64(a, b):#018x}"),
+    78: ("FAULTSIG_MBOXES", _format_fault_signal_mailboxes),
+    79: (
+        "FAULTSIG_MBOX",
+        lambda a, b, c: f"tid={a} slot={b} state={_FRAME_GRANT_MAILBOX_STATES.get(c, 'unknown')}",
+    ),
+    80: (
+        "MMOCC_REFUSE",
+        lambda a, b, c: (
+            f"slot={a} running_mm={b & 0xffffffff} requested_mm={c & 0xffffffff}"
+        ),
+    ),
 }
 
 
