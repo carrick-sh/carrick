@@ -20,6 +20,74 @@ fn mm(raw: u64) -> MmId {
     MmId::from_registry_allocation(std::num::NonZeroU64::new(raw).unwrap())
 }
 
+/// `kernel.mm.address-space-occupancy`: EL1 changes the shared word,
+/// independently of the loaded host task. Unload must clear that word and
+/// release the host port before the next task installs on this vCPU.
+#[test]
+fn el1_switch_then_host_unload_allows_another_mm_on_the_slot() {
+    let table = Box::leak(Box::new(Occupancy::new()));
+    let slot = HostExecutionSlot::allocate().unwrap();
+    let vcpu = Vcpu::new(42_301);
+    let install = |space| {
+        MmOccupancy::install_in(
+            table,
+            slot.slot(),
+            space,
+            &fence(),
+            PauseEndpoint::Registered {
+                registry: vcpu.registry.clone(),
+                tid: vcpu.tid,
+            },
+        )
+    };
+    for switched in [false, true] {
+        let owner = install(mm(42_302)).unwrap();
+        if switched {
+            assert!(table.switch(slot.slot(), key(mm(42_302)), key(mm(42_303))));
+        }
+        assert!(matches!(
+            install(mm(42_304)),
+            Err(MmOccupancyError::SlotBusy { .. })
+        ));
+        drop(owner);
+        assert_eq!(table.running_raw(slot.slot()), 0);
+        let next = install(mm(42_304)).unwrap();
+        drop(next);
+        assert_eq!(table.running_raw(slot.slot()), 0);
+    }
+}
+
+/// Refusing a word with no host owner is a different invariant failure
+/// from refusing a second live host admission. Preserve that distinction
+/// through RuntimeError::Configuration so a signed receipt identifies it.
+#[test]
+fn unowned_occupancy_refusal_identifies_the_word_and_requested_mm() {
+    let table = Box::leak(Box::new(Occupancy::new()));
+    let slot = HostExecutionSlot::allocate().unwrap();
+    let vcpu = Vcpu::new(42_311);
+    table.install(slot.slot(), key(mm(42_312))).unwrap();
+    let error = MmOccupancy::install_in(
+        table,
+        slot.slot(),
+        mm(42_313),
+        &fence(),
+        PauseEndpoint::Registered {
+            registry: vcpu.registry.clone(),
+            tid: vcpu.tid,
+        },
+    )
+    .err()
+    .expect("refuse an unowned occupancy word");
+    assert_eq!(table.running_raw(slot.slot()), 42_312);
+    assert!(PORTS[slot.slot().index()].lock().is_none());
+    assert!(
+        error.to_string().contains("without a host owner"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("42313"), "{error}");
+    table.vacate_any(slot.slot());
+}
+
 fn fence() -> MmFence {
     Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new())
 }
