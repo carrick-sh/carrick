@@ -464,20 +464,16 @@ impl CarrierExecAdmission for ExecRuntime {
         {
             let mut table = self.inner.table.lock();
             self.purge_expired_results(&mut table, std::time::Instant::now());
+            if table.records.contains_key(&request_id) {
+                return Err(ExecAdmissionError::Rejected);
+            }
             if table.records.len() >= self.inner.record_capacity {
                 Self::evict_oldest_complete(&mut table);
                 if table.records.len() >= self.inner.record_capacity {
                     return Err(ExecAdmissionError::Unavailable);
                 }
             }
-            match table.records.entry(request_id) {
-                std::collections::hash_map::Entry::Occupied(_) => {
-                    return Err(ExecAdmissionError::Rejected);
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(ExecRecord::Pending);
-                }
-            }
+            table.records.insert(request_id, ExecRecord::Pending);
         }
         let work = ExecWork {
             runtime: self.clone(),
@@ -882,6 +878,31 @@ mod tests {
         while runtime.query(second) != ExecStatus::Pending {
             std::thread::yield_now();
         }
+        drop(take_claimed(&runtime));
+        assert_eq!(
+            thread.join().expect("submitter"),
+            Err(ExecAdmissionError::Rejected)
+        );
+    }
+
+    #[test]
+    fn duplicate_capability_at_capacity_is_rejected_not_unavailable() {
+        let runtime = ExecRuntime::new_for_test(1, Duration::from_secs(5));
+        let first = ExecCapability(ControlNonce([14; 16]));
+        let submit = runtime.clone();
+        let thread = std::thread::spawn(move || submit.admit(first, request()));
+        while runtime.query(first) != ExecStatus::Pending {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            runtime.admit(first, request()),
+            Err(ExecAdmissionError::Rejected)
+        );
+        let second = ExecCapability(ControlNonce([15; 16]));
+        assert_eq!(
+            runtime.admit(second, request()),
+            Err(ExecAdmissionError::Unavailable)
+        );
         drop(take_claimed(&runtime));
         assert_eq!(
             thread.join().expect("submitter"),
