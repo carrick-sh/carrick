@@ -1034,7 +1034,22 @@ impl Thread {
     /// Runnable thread without task_state is UNCLAIMABLE — claim_runnable
     /// fails `claim_runnable_without_cpu_state` and the queue row is shredded).
     pub fn execution_diagnostic(&self) -> String {
-        let execution = self.execution.lock();
+        Self::format_execution(&self.execution.lock())
+    }
+
+    /// [`Self::execution_diagnostic`] without waiting past `deadline`: the
+    /// degraded kernel snapshot of a wedged carrier must not block on a
+    /// thread whose execution record a stuck executor holds.
+    pub(in crate::kernel) fn execution_diagnostic_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<String> {
+        self.execution
+            .try_lock_until(deadline)
+            .map(|execution| Self::format_execution(&execution))
+    }
+
+    fn format_execution(execution: &ThreadExecutionRecord) -> String {
         format!(
             "{:?} task_state={} continuation={} control_quantum={:?}",
             execution.state,

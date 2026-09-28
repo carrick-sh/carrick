@@ -634,9 +634,9 @@ fn tgkill_to_self_raises_locally() {
             kernel_target: Some(context.thread().key()),
         }
     );
-    assert_eq!(carrick_signal_core::take_pending_for(2000), 0);
-    assert_eq!(carrick_signal_core::take_pending_for(main.raw()), 0);
-    assert_eq!(carrick_signal_core::take_process_pending(), 0);
+    assert_eq!(carrick_signal_linux::take_pending_for(2000), 0);
+    assert_eq!(carrick_signal_linux::take_pending_for(main.raw()), 0);
+    assert_eq!(carrick_signal_linux::take_process_pending(), 0);
     assert_eq!(
         dispatcher.take_deliverable_pending(&context, main),
         Some(SIGUSR1 as i32)

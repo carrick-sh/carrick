@@ -56,10 +56,27 @@ the scoped run and returns 124.
 - `--no-core` omits cores, not stacks/ring; avoid for real hang triage.
 
 Artifacts: `<run-id>.manifest.txt`, `.guest.log` (both streams), `.ps.txt`,
-`.lldb.txt`, `.kernel-debug.json`, and `<run-id>.<pid>.core`. Live kernel capture
-precedes attach. Failure is retained as `KERNEL_SNAPSHOT_ERROR`, not a fabricated
-snapshot. Check LLDB statuses and file existence. Manifest paths alone do not
-attest executable identity; preserve binary hashes and symbols separately.
+`.lldb.txt`, one kernel capture artifact, and `<run-id>.<pid>.core`. The live
+kernel capture always runs before attach and always leaves exactly one of:
+
+- `.kernel-debug.json`: a coherent snapshot. Manifest line `kernel_snapshot=`.
+- `.kernel-debug.degraded.json` (schema `carrick.kernel-debug-degraded.v1`):
+  the runtime refused the coherent snapshot because an authority was held,
+  typically an MM mutation coordinator a wedge owns. It reports per-task
+  lifecycle, per-thread execution state, `unreadable` objects, and each MM
+  coordinator's `alias_active`, `alias_holder_host_thread` (the lldb `tid`),
+  `alias_held_ms` and waiter counts. It is not coherent and not a snapshot.
+  Manifest lines `kernel_snapshot_degraded=` and `kernel_snapshot_error=`.
+- `.kernel-debug.error.txt`: no capture at all. Manifest lines
+  `kernel_snapshot_error=` and `kernel_snapshot_error_file=`.
+
+The `.lldb.txt` log repeats the outcome as `KERNEL_SNAPSHOT=`,
+`KERNEL_SNAPSHOT_DEGRADED=` or `KERNEL_SNAPSHOT_ERROR=`. Check LLDB statuses
+and file existence. Manifest paths alone do not attest executable identity;
+preserve binary hashes and symbols separately.
+
+`carrick debug hvpatch-kernel --run-id <id>` against a wedged carrier prints
+the same degraded JSON and exits non-zero rather than timing out.
 
 **Snapshot caveat:** help says processes remain stopped, but the audited
 implementation does not pre-freeze them and ends attachments with `detach`.
@@ -82,6 +99,7 @@ carrick guest-processes
 carrick guest-threads
 carrick guest-threads <guest-pid>
 carrick eventring 8192
+carrick eventring --high-rate 8192
 thread backtrace all
 image lookup -s CARRICK_LAST_FATAL
 p CARRICK_LAST_FATAL

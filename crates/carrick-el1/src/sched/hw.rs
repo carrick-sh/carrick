@@ -18,8 +18,8 @@ pub struct HardwareUserWord;
 impl UserWord for HardwareUserWord {
     #[cfg(target_os = "none")]
     fn read_u32(&self, task: &CurrentTask, uaddr: u64) -> Option<u32> {
-        use crate::file::MemoryValidator;
-        if crate::file::HardwareValidator.readable_bytes(uaddr, 4) < 4 {
+        use crate::substrate::file::MemoryValidator;
+        if crate::substrate::file::HardwareValidator.readable_bytes(uaddr, 4) < 4 {
             return None;
         }
         let fixup_ptr = &task.fixup_pc as *const _ as *const u64;
@@ -59,8 +59,8 @@ impl UserWord for HardwareUserWord {
 
     #[cfg(target_os = "none")]
     fn read_u64(&self, task: &CurrentTask, uaddr: u64) -> Option<u64> {
-        use crate::file::MemoryValidator;
-        if crate::file::HardwareValidator.readable_bytes(uaddr, 8) < 8 {
+        use crate::substrate::file::MemoryValidator;
+        if crate::substrate::file::HardwareValidator.readable_bytes(uaddr, 8) < 8 {
             return None;
         }
         let fixup_ptr = &task.fixup_pc as *const _ as *const u64;

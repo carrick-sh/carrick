@@ -888,7 +888,7 @@ impl<'a> SignalView<'a> {
         // must not hide an already-enqueued cross-process signal from the drain,
         // or a re-dispatched `rt_sigtimedwait`/sigwait would never consume it and
         // the waiter would re-block forever.
-        if !carrick_signal_core::xsig::xsig_has_unblocked_for_self(SigBlockMask::NONE) {
+        if !carrick_signal_linux::xsig::xsig_has_unblocked_for_self(SigBlockMask::NONE) {
             return;
         }
         for (signum, code, sender_ns, sender_uid, value, target_ns_tid) in
@@ -1095,7 +1095,7 @@ impl<'a> SignalView<'a> {
         self.cross
             .host_signal()
             .has_unblocked_pending_for(tid.raw(), non_eintr_block)
-            || carrick_signal_core::xsig::xsig_has_unblocked_for_self(non_eintr_block)
+            || carrick_signal_linux::xsig::xsig_has_unblocked_for_self(non_eintr_block)
             || self.has_deliverable_dispatch_pending_for_wait(
                 context,
                 tid,
@@ -4291,7 +4291,7 @@ mod tests {
     /// "cross-process" target available in-process) with overlapping signums,
     /// so they race each other if cargo runs them on parallel test threads.
     /// Serialised on one lock, mirroring the same-shaped `TEST_LOCK` already
-    /// used by `carrick-signal-core`'s and `carrick-vmm-hvf`'s own xsig ring
+    /// used by `carrick-signal-linux`'s and `carrick-vmm-hvf`'s own xsig ring
     /// tests for the identical reason.
     static XSIG_RING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -4330,9 +4330,9 @@ mod tests {
             SigSet::EMPTY.with(usr1),
         );
 
-        carrick_signal_core::xsig::xsig_init();
+        carrick_signal_linux::xsig::xsig_init();
         assert!(
-            carrick_signal_core::xsig::xsig_enqueue(
+            carrick_signal_linux::xsig::xsig_enqueue(
                 std::process::id() as i32,
                 usr1,
                 crate::linux_abi::LINUX_SI_USER,
@@ -4497,9 +4497,9 @@ mod tests {
         );
         let _endpoint = install_test_registry(&d, main, sibling);
 
-        carrick_signal_core::xsig::xsig_init();
+        carrick_signal_linux::xsig::xsig_init();
         assert!(
-            carrick_signal_core::xsig::xsig_enqueue(
+            carrick_signal_linux::xsig::xsig_enqueue(
                 std::process::id() as i32,
                 usr1,
                 crate::linux_abi::LINUX_SI_TKILL,
@@ -4577,9 +4577,9 @@ mod tests {
             SigSet::EMPTY.with(usr1),
         );
 
-        carrick_signal_core::xsig::xsig_init();
+        carrick_signal_linux::xsig::xsig_init();
         assert!(
-            carrick_signal_core::xsig::xsig_enqueue(
+            carrick_signal_linux::xsig::xsig_enqueue(
                 std::process::id() as i32,
                 usr1,
                 crate::linux_abi::LINUX_SI_USER,
@@ -4634,8 +4634,8 @@ mod tests {
         install_kernel_signal_threads(&d, &[main, sibling]);
         let _endpoint = install_test_registry(&d, main, sibling);
 
-        carrick_signal_core::xsig::xsig_init();
-        assert!(carrick_signal_core::xsig::xsig_enqueue(
+        carrick_signal_linux::xsig::xsig_init();
+        assert!(carrick_signal_linux::xsig::xsig_enqueue(
             std::process::id() as i32,
             usr1,
             crate::linux_abi::LINUX_SI_TKILL,
@@ -5029,7 +5029,7 @@ mod tests {
             ));
         }
         assert_eq!(
-            carrick_signal_core::take_pending_for(target.raw()),
+            carrick_signal_linux::take_pending_for(target.raw()),
             0,
             "guest-originated HVPatch signals never enter the host pending bitmask"
         );
@@ -5559,15 +5559,15 @@ mod tests {
                 "the regression is the ordinary non-namespaced route"
             );
 
-            carrick_signal_core::xsig::xsig_init();
+            carrick_signal_linux::xsig::xsig_init();
             let me = std::process::id() as i32;
             let usr1 = crate::linux_abi::LINUX_SIGUSR1;
-            let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+            let _ = carrick_signal_linux::xsig::xsig_drain_for_self();
             // Fill with null signals so parallel signal-wait tests cannot observe
             // this capacity fixture as deliverable pending work.
             for slot in 0..256 {
                 assert!(
-                    carrick_signal_core::xsig::xsig_enqueue(
+                    carrick_signal_linux::xsig::xsig_enqueue(
                         me,
                         0,
                         crate::linux_abi::LINUX_SI_QUEUE,
@@ -5580,7 +5580,7 @@ mod tests {
                 );
             }
             assert!(
-                !carrick_signal_core::xsig::xsig_enqueue(
+                !carrick_signal_linux::xsig::xsig_enqueue(
                     me,
                     0,
                     crate::linux_abi::LINUX_SI_QUEUE,
@@ -5633,7 +5633,7 @@ mod tests {
                 false,
             );
 
-            let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+            let _ = carrick_signal_linux::xsig::xsig_drain_for_self();
 
             assert_eq!(
                 outcome,
@@ -5660,13 +5660,13 @@ mod tests {
                 "the regression is the ordinary non-namespaced route"
             );
 
-            carrick_signal_core::xsig::xsig_init();
+            carrick_signal_linux::xsig::xsig_init();
             let me = std::process::id() as i32;
             let usr1 = crate::linux_abi::LINUX_SIGUSR1;
-            let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+            let _ = carrick_signal_linux::xsig::xsig_drain_for_self();
             // Null-signal entries consume capacity without waking parallel waiters.
             for slot in 0..256 {
-                assert!(carrick_signal_core::xsig::xsig_enqueue(
+                assert!(carrick_signal_linux::xsig::xsig_enqueue(
                     me,
                     0,
                     crate::linux_abi::LINUX_SI_QUEUE,
@@ -5730,7 +5730,7 @@ mod tests {
             );
 
             let _ = std::fs::remove_file(cred_path);
-            let _ = carrick_signal_core::xsig::xsig_drain_for_self();
+            let _ = carrick_signal_linux::xsig::xsig_drain_for_self();
 
             assert_eq!(published_euid, Some(target_euid));
             assert_eq!(

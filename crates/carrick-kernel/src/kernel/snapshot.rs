@@ -318,7 +318,125 @@ struct LeafChecks {
     frame_inventory_revisions: Vec<u64>,
 }
 
+/// What a wedged carrier can still say about itself when the coherent
+/// snapshot cannot complete: per-task and per-thread state read with
+/// deadline-bounded try-locks, and each MM mutation coordinator's current
+/// holder. Not coherent: rows are read one object at a time, and a row a
+/// lock refused is reported as unreadable rather than guessed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DegradedKernelSnapshot {
+    pub tasks: Vec<DegradedTaskRow>,
+    pub mm_coordinators: Vec<DegradedMmCoordinatorRow>,
+    /// Objects whose state lock was held past the deadline.
+    pub unreadable: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DegradedTaskRow {
+    pub key: TaskKey,
+    pub diagnostic_name: String,
+    /// `None`: the lifecycle lock was held past the deadline.
+    pub lifecycle: Option<TaskLifecycle>,
+    pub mm: MmId,
+    /// `None`: the thread-list lock was held past the deadline.
+    pub threads: Option<Vec<DegradedThreadRow>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DegradedThreadRow {
+    pub key: ThreadKey,
+    /// `None`: the execution record was held past the deadline.
+    pub execution: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DegradedMmCoordinatorRow {
+    pub mm: MmId,
+    /// `false`: the MM has no backend (reference model), so no coordinator.
+    pub has_backend: bool,
+    /// `None`: no coordinator, or its state could not be read without
+    /// waiting.
+    pub observation: Option<super::address::MmMutationObservation>,
+}
+
 impl Kernel {
+    /// Read what can be read without waiting on any authority a wedge may
+    /// hold. Every lock is a try-lock bounded by `deadline`; the MM mutation
+    /// coordinators are observed, never entered. Used when
+    /// [`Self::snapshot`] fails with `Busy`/`TimedOut`.
+    pub fn degraded_snapshot(&self, deadline: Instant) -> DegradedKernelSnapshot {
+        let mut unreadable = Vec::new();
+        let Some(state) = self.registry().state.try_read_until(deadline) else {
+            unreadable.push("task registry".to_owned());
+            return DegradedKernelSnapshot {
+                tasks: Vec::new(),
+                mm_coordinators: Vec::new(),
+                unreadable,
+            };
+        };
+        let records: Vec<_> = state
+            .tasks
+            .values()
+            .map(|record| (Arc::clone(&record.task), record.diagnostic_name.clone()))
+            .collect();
+        drop(state);
+
+        let mut tasks = Vec::with_capacity(records.len());
+        let mut mms = BTreeMap::new();
+        for (task, diagnostic_name) in records {
+            let key = task.key();
+            let lifecycle = task.lifecycle_until(deadline);
+            if lifecycle.is_none() {
+                unreadable.push(format!("task {key:?} lifecycle"));
+            }
+            let mm = task.shared().mm();
+            let mm_id = mm.id();
+            mms.entry(mm_id).or_insert(mm);
+            let threads = task.threads_until(deadline).map(|threads| {
+                threads
+                    .iter()
+                    .map(|thread| {
+                        let execution = thread.execution_diagnostic_until(deadline);
+                        if execution.is_none() {
+                            unreadable.push(format!("thread {:?} execution", thread.key()));
+                        }
+                        DegradedThreadRow {
+                            key: thread.key(),
+                            execution,
+                        }
+                    })
+                    .collect()
+            });
+            if threads.is_none() {
+                unreadable.push(format!("task {key:?} threads"));
+            }
+            tasks.push(DegradedTaskRow {
+                key,
+                diagnostic_name,
+                lifecycle,
+                mm: mm_id,
+                threads,
+            });
+        }
+        tasks.sort_by_key(|row| row.key);
+        let mm_coordinators = mms
+            .into_iter()
+            .map(|(mm, object)| {
+                let backend = object.backend();
+                DegradedMmCoordinatorRow {
+                    mm,
+                    has_backend: backend.is_some(),
+                    observation: backend.and_then(|backend| backend.mutation_observation()),
+                }
+            })
+            .collect();
+        DegradedKernelSnapshot {
+            tasks,
+            mm_coordinators,
+            unreadable,
+        }
+    }
+
     pub fn snapshot(&self, deadline: Instant) -> Result<KernelSnapshotV1, KernelSnapshotError> {
         self.snapshot_with(deadline, SnapshotValidation::Strict)
             .map(|forensic| forensic.snapshot)

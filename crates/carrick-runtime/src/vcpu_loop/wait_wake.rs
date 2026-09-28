@@ -16,9 +16,9 @@ use crate::vcpu_loop::{
 use carrick_kernel::run_result::RuntimeError;
 
 /// Runtime-only delivery endpoint for one live HVPatch task generation.
-/// Linux parentage remains authoritative in `Kernel`; this table only turns
-/// the parent key selected there into the host wake objects needed to deliver
-/// the configured child-exit signal.
+/// Linux parentage, the zombie, and the child-exit signal remain authoritative
+/// in `Kernel`; this table only gives a still-live parent an exact scheduler
+/// wake after that graph publication.
 #[derive(Clone)]
 pub(crate) struct HvpatchRuntimeEndpoint {
     pub(crate) kernel: Weak<KernelState>,
@@ -1046,8 +1046,19 @@ impl HvpatchRuntimeDirectory {
         result.map_err(RuntimeError::CarrierFailed)
     }
 
-    pub(crate) fn notify_child_exit(&self, parent: carrick_kernel::kernel::TaskKey) {
+    pub(crate) fn notify_child_exit(
+        &self,
+        parent: carrick_kernel::kernel::TaskKey,
+        graph: &carrick_kernel::kernel::Kernel,
+    ) {
         let Some(endpoint) = self.endpoints.lock().get(&parent).cloned() else {
+            // The exit transaction owns the zombie and its parent edge. If the
+            // parent has exited since that transaction committed, its own exit
+            // transaction reparented the zombie and notified the adopter. A
+            // retired runtime endpoint is not a lost Linux notification.
+            if !graph.task_key_is_live(parent) {
+                return;
+            }
             tracing::error!(
                 parent = ?parent,
                 "child exit notification dropped: no runtime endpoint for the parent"
@@ -1057,6 +1068,9 @@ impl HvpatchRuntimeDirectory {
         let signal_snapshot = match endpoint.task_binding.capture_signal_snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                if !graph.task_key_is_live(parent) {
+                    return;
+                }
                 tracing::error!(
                     parent = ?parent,
                     %error,
@@ -1124,6 +1138,19 @@ mod tests {
     use crate::thread::ThreadId;
     use crate::vcpu_loop::VcpuLoopOutcome;
     use carrick_kernel::dispatch::SyscallDispatcher;
+
+    struct ExitLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for ExitLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn alias_context(pid: i32) -> carrick_kernel::kernel::KernelContext {
         let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
@@ -1697,6 +1724,107 @@ mod tests {
                 .contains(chld),
             "post-exec parent with caught SIGCHLD receives pending SIGCHLD upon child exit"
         );
-        directory.notify_child_exit(task);
+        directory.notify_child_exit(task, post_exec.kernel());
+    }
+
+    #[test]
+    fn parent_exit_between_child_commit_and_runtime_wake_is_reparented_without_error() {
+        use carrick_kernel::kernel::{ClonePlan, LinuxWaitStatus, WaitMode, WaitOutcome};
+
+        let dispatcher = SyscallDispatcher::new();
+        let root = dispatcher.capture_one_task_context().expect("root");
+        let graph = Arc::clone(root.kernel());
+        let plan = ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).expect("fork plan");
+        let parent = graph
+            .reserve_fork(&root, plan, "parent".to_string(), None)
+            .expect("reserve parent")
+            .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(19_701))
+            .expect("prepare parent")
+            .commit()
+            .expect("commit parent")
+            .start_child()
+            .expect("start parent")
+            .into_parts()
+            .0;
+        let child = graph
+            .reserve_fork(&parent, plan, "child".to_string(), None)
+            .expect("reserve child")
+            .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(19_702))
+            .expect("prepare child")
+            .commit()
+            .expect("commit child")
+            .start_child()
+            .expect("start child")
+            .into_parts()
+            .0;
+        let parent_key = parent.task().key();
+        let child_key = child.task().key();
+        let directory = Arc::new(HvpatchRuntimeDirectory::default());
+        let state = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestSignalPump),
+            Arc::new(EndpointTestSignalArrival),
+            None,
+            None,
+        ));
+        directory.register_endpoint(
+            root.task().key(),
+            Arc::downgrade(&state),
+            root.task_binding(),
+        );
+        directory.register_endpoint(parent_key, Arc::downgrade(&state), parent.task_binding());
+
+        let (committed_tx, committed_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let child_graph = Arc::clone(&graph);
+        let child_directory = Arc::clone(&directory);
+        let child_log = Arc::clone(&log);
+        let child_exit = std::thread::spawn(move || {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || ExitLogWriter(Arc::clone(&child_log)))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                child_graph
+                    .exit_task_key_eventually_notifying(
+                        child_key,
+                        LinuxWaitStatus::from_wait_encoding(7 << 8),
+                        None,
+                        |parent| {
+                            assert_eq!(parent, Some(parent_key));
+                            committed_tx.send(()).expect("announce child commit");
+                            resume_rx
+                                .recv_timeout(std::time::Duration::from_secs(5))
+                                .expect("parent exit completes");
+                            child_directory.notify_child_exit(parent_key, &child_graph);
+                        },
+                    )
+                    .expect("child exit")
+            })
+        });
+        committed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("child committed before parent exit");
+        graph
+            .exit_task_key_eventually_notifying(
+                parent_key,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+                |parent| {
+                    directory.notify_child_exit(parent.expect("root adopter"), &graph);
+                },
+            )
+            .expect("parent exit");
+        directory.remove(parent_key);
+        resume_tx.send(()).expect("resume child notification");
+        child_exit.join().expect("child exit thread");
+
+        assert!(matches!(
+            graph.wait_child(root.task().key().id, Some(child_key.id), WaitMode::Observe),
+            Ok(WaitOutcome::Exited(_))
+        ));
+        let log = String::from_utf8(log.lock().clone()).expect("UTF-8 trace");
+        assert!(!log.contains("child exit notification dropped"), "{log}");
     }
 }

@@ -1,5 +1,5 @@
 //! bhyve's [`HostSignalGlue`] — the ~15-line backend seam the shared host-signal
-//! driver (`carrick_signal_core::host_glue` + `carrick_hal::signal_pump`) is
+//! driver (`carrick_signal_linux::host_glue` + `carrick_hal::signal_pump`) is
 //! generic over. Unlike KVM, bhyve runs on FreeBSD, whose host signal numbers
 //! differ from Linux for several signals, so the translation methods consult the
 //! `bhyve_signum` table (the SAME shared code then services both the identity and
@@ -7,7 +7,7 @@
 //! (FreeBSD `SIGRTMIN` = 65, with the `kick_pending`/`VM_EXITCODE_BOGUS`
 //! disambiguation); only its signal NUMBER is named here.
 
-use carrick_signal_core::HostSignalGlue;
+use carrick_signal_linux::HostSignalGlue;
 
 /// Zero-sized marker carrying bhyve's host-signal policy.
 pub struct BhyveGlue;
@@ -58,7 +58,7 @@ impl HostSignalGlue for BhyveGlue {
 mod tests {
     use super::BhyveGlue;
     use carrick_host_bsd::native_glue::BsdNativeGlue;
-    use carrick_signal_core::HostSignalGlue;
+    use carrick_signal_linux::HostSignalGlue;
 
     /// Drift guard for the aarch64 BSD lanes. On FreeBSD/aarch64 there is no
     /// bhyve crate (bhyve virtualizes the host ISA and is x86_64-only), so

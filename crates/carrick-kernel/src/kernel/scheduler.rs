@@ -5881,6 +5881,116 @@ mod tests {
         scheduler.settle_exited(next).unwrap();
     }
 
+    /// A delayed unload may leave the old MM's host port live after its
+    /// executor has offered the vCPU to another process. The successor parks
+    /// on that exact release and frees the only execution lane for a third
+    /// runnable process; the owner need not run to make that process progress.
+    #[test]
+    fn slot_install_before_owner_release_parks_and_lends_the_only_executor() {
+        use crate::kernel::mm_occupancy::{
+            HostExecutionSlot, MmOccupancy, MmOccupancyError, SlotVacancyEnrollment,
+            subscribe_slot_vacancy,
+        };
+
+        let (kernel, owner_context) = bootstrap(12_451);
+        let successor = process_child(&kernel, &owner_context, 22_451, "successor");
+        let helper = process_child(&kernel, &owner_context, 22_452, "helper");
+        publish(&successor, 451);
+        publish(&helper, 452);
+        let scheduler = Arc::new(Scheduler::new_with_policy(
+            kernel,
+            Arc::new(GuestCpuPolicy::new(1)),
+        ));
+        let kick = Arc::new(RecordingKick::default());
+        let executor = scheduler.register_executor(kick.clone()).unwrap();
+        let slot = HostExecutionSlot::allocate().unwrap();
+        let owner_mm = owner_context.shared().mm().id();
+        let successor_mm = successor.shared().mm().id();
+        let owner_fence = Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new());
+        let successor_fence = Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new());
+        let registry: Arc<dyn carrick_hal::VcpuRegistry> =
+            Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let owner_ready = Barrier::new(2);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        thread::scope(|scope| {
+            let slot_ref = &slot;
+            let owner_registry = Arc::clone(&registry);
+            let owner_ready_ref = &owner_ready;
+            let owner = scope.spawn(move || {
+                let occupied = MmOccupancy::install_registered_for_test(
+                    slot_ref.slot(),
+                    owner_mm,
+                    &owner_fence,
+                    owner_registry,
+                    ThreadId::synthetic_for_tests(32_451),
+                )
+                .unwrap();
+                owner_ready_ref.wait();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                drop(occupied);
+            });
+            owner_ready.wait();
+
+            scheduler.make_runnable(successor.thread().key()).unwrap();
+            let running = scheduler.take(&executor).unwrap();
+            assert_eq!(running.thread().key(), successor.thread().key());
+            let install = MmOccupancy::install_registered_for_test(
+                slot.slot(),
+                successor_mm,
+                &successor_fence,
+                Arc::clone(&registry),
+                ThreadId::synthetic_for_tests(32_452),
+            );
+            assert!(matches!(install, Err(MmOccupancyError::SlotBusy { .. })));
+
+            let wake_scheduler = Arc::clone(&scheduler);
+            let successor_key = successor.thread().key();
+            let enrollment = subscribe_slot_vacancy(
+                slot.slot(),
+                Arc::new(move || {
+                    wake_scheduler
+                        .wake(successor_key)
+                        .expect("wake released slot waiter");
+                }),
+            );
+            let SlotVacancyEnrollment::Waiting(subscription) = enrollment else {
+                panic!("owner has not unloaded yet");
+            };
+            scheduler
+                .settle_blocked(running, BlockedReason::HostWait)
+                .unwrap();
+            assert!(kick.current_binding().is_none(), "park freed its executor");
+
+            scheduler.make_runnable(helper.thread().key()).unwrap();
+            let helper_running = scheduler.try_take(&executor).unwrap().expect(
+                "a different process runs on the same executor before the slot owner releases",
+            );
+            assert_eq!(helper_running.thread().key(), helper.thread().key());
+            scheduler.settle_exited(helper_running).unwrap();
+            assert!(scheduler.try_take(&executor).unwrap().is_none());
+
+            release_tx.send(()).unwrap();
+            owner.join().unwrap();
+            let resumed = scheduler
+                .try_take(&executor)
+                .unwrap()
+                .expect("slot release wakes the parked successor");
+            assert_eq!(resumed.thread().key(), successor_key);
+            let admitted = MmOccupancy::install_registered_for_test(
+                slot.slot(),
+                successor_mm,
+                &successor_fence,
+                Arc::clone(&registry),
+                ThreadId::synthetic_for_tests(32_452),
+            )
+            .expect("successor installs after the exact owner releases");
+            drop(admitted);
+            scheduler.settle_exited(resumed).unwrap();
+            drop(subscription);
+        });
+    }
+
     #[test]
     fn control_wake_during_guest_retry_does_not_invent_a_blocked_continuation() {
         let (kernel, context) = bootstrap(12_101);

@@ -57,6 +57,75 @@ fn el1_switch_then_host_unload_allows_another_mm_on_the_slot() {
     }
 }
 
+/// A successor waits on the exact owner's release, without replacing its
+/// pause endpoint or polling the slot. The two barriers force the prior host
+/// admission to remain live after the successor has subscribed.
+#[test]
+fn delayed_unload_wakes_successor_slot_admission() {
+    let slot = HostExecutionSlot::allocate().unwrap();
+    let previous = mm(42_320);
+    let successor = mm(42_321);
+    let previous_fence = fence();
+    let successor_fence = fence();
+    let (occupied_tx, occupied_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let wake_count = Arc::new(AtomicUsize::new(0));
+
+    std::thread::scope(|scope| {
+        let slot_ref = &slot;
+        let owner_thread = scope.spawn(move || {
+            let vcpu = Vcpu::new(42_322);
+            let owner = vcpu.occupy(slot_ref, previous, &previous_fence).unwrap();
+            occupied_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(owner);
+        });
+        occupied_rx.recv().unwrap();
+        let vcpu = Vcpu::new(42_323);
+        assert!(matches!(
+            vcpu.occupy(&slot, successor, &successor_fence),
+            Err(MmOccupancyError::SlotBusy { .. })
+        ));
+        let wakes = Arc::clone(&wake_count);
+        let enrollment = subscribe_slot_vacancy(
+            slot.slot(),
+            Arc::new(move || {
+                wakes.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let SlotVacancyEnrollment::Waiting(_subscription) = enrollment else {
+            panic!("the delayed owner still holds its slot");
+        };
+        assert_eq!(wake_count.load(Ordering::SeqCst), 0);
+        release_tx.send(()).unwrap();
+        owner_thread.join().unwrap();
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        let next = vcpu.occupy(&slot, successor, &successor_fence).unwrap();
+        assert_eq!(next.mm(), successor);
+        drop(next);
+    });
+}
+
+#[test]
+fn release_before_subscription_is_observed_as_vacant() {
+    let slot = HostExecutionSlot::allocate().unwrap();
+    let vcpu = Vcpu::new(42_325);
+    let owner = vcpu.occupy(&slot, mm(42_326), &fence()).unwrap();
+    drop(owner);
+    let wake_count = Arc::new(AtomicUsize::new(0));
+    let wakes = Arc::clone(&wake_count);
+    assert!(matches!(
+        subscribe_slot_vacancy(
+            slot.slot(),
+            Arc::new(move || {
+                wakes.fetch_add(1, Ordering::SeqCst);
+            })
+        ),
+        SlotVacancyEnrollment::Vacant
+    ));
+    assert_eq!(wake_count.load(Ordering::SeqCst), 0);
+}
+
 /// Refusing a word with no host owner is a different invariant failure
 /// from refusing a second live host admission. Preserve that distinction
 /// through RuntimeError::Configuration so a signed receipt identifies it.
@@ -79,7 +148,7 @@ fn unowned_occupancy_refusal_identifies_the_word_and_requested_mm() {
     .err()
     .expect("refuse an unowned occupancy word");
     assert_eq!(table.running_raw(slot.slot()), 42_312);
-    assert!(PORTS[slot.slot().index()].lock().is_none());
+    assert!(PORTS[slot.slot().index()].lock().running.is_none());
     assert!(
         error.to_string().contains("without a host owner"),
         "{error}"
