@@ -2489,6 +2489,8 @@ mod hvpatch_guest_probe_abi {
             "stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));",
             "fn hvpatch__first__touch__deliver(_: u64, _: u32, _: i32) {}",
             "stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));",
+            "fn hvpatch__first__touch__refused(_: u64, _: u32, _: u32, _: &str) {}",
+            "stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));",
             "fn hvpatch__el1__frame__grant__plan(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
             "stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));",
             "fn pt__fault__next__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
@@ -5142,6 +5144,10 @@ mod real {
         /// (`HvpatchFirstTouchDeliverReason`), Linux TID. Fires once per
         /// delivered fault, never on a resolved one.
         fn hvpatch__first__touch__deliver(_: u64, _: u32, _: i32) {}
+        /// A first-touch or grow-down resolution was refused by the backend.
+        /// Args: fault page VA, access class (0=Read, 1=Write, 2=Execute, 3=Unknown),
+        /// site id (1=resident fault plan, 2=mmap growdown plan), formatted error.
+        fn hvpatch__first__touch__refused(_: u64, _: u32, _: u32, _: &str) {}
         /// Host plan selected for one accepted EL1 anonymous frame-grant
         /// request. Args: fault VA, semantic base, semantic length, Linux
         /// protection bits, request generation.
@@ -6416,6 +6422,18 @@ mod real {
         tid: i32,
     ) {
         carrick_usdt::hvpatch__first__touch__deliver!(|| (far, reason.raw(), tid));
+    }
+
+    /// A first-touch or grow-down resolution was refused by the backend.
+    /// Formatting occurs only when a consumer is attached.
+    #[inline(never)]
+    pub fn hvpatch_first_touch_refused(
+        page: u64,
+        access: u32,
+        site: u32,
+        error: &dyn std::fmt::Display,
+    ) {
+        carrick_usdt::hvpatch__first__touch__refused!(|| (page, access, site, format!("{error}")));
     }
 
     #[inline(never)]
@@ -8682,6 +8700,7 @@ mod stub {
     stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));
     stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));
     stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));
+    stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));
     stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));
     stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));
     stub!(stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64));
