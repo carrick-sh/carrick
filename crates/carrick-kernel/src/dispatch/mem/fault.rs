@@ -75,8 +75,8 @@ impl FirstTouchArming {
     }
 
     /// The armed range around `page`, clipped to one `max_len`-aligned bulk
-    /// window. A host frame grant may make the complete result resident in one
-    /// transaction without crossing a VMA/protection boundary.
+    /// window. A host frame grant may prepare backing for the result in one
+    /// transaction; first-touch publication remains page-granular.
     fn grant_for_page(&self, page: u64, max_len: u64) -> Option<ResidentFaultRange> {
         if max_len == 0 {
             return None;
@@ -239,8 +239,9 @@ pub struct ResidentFaultPlan<'permit> {
 }
 
 /// Owns alias exclusion from a bulk first-touch lookup through host backing
-/// preparation and whole-span residency publication.
+/// preparation and fault-page residency publication.
 pub struct ResidentFrameGrantPlan<'permit> {
+    pub(crate) fault_page: u64,
     pub(crate) start: u64,
     pub(crate) len: u64,
     pub(crate) prot: u64,
@@ -248,6 +249,10 @@ pub struct ResidentFrameGrantPlan<'permit> {
 }
 
 impl ResidentFrameGrantPlan<'_> {
+    pub fn fault_page(&self) -> u64 {
+        self.fault_page
+    }
+
     pub fn start(&self) -> u64 {
         self.start
     }
@@ -522,6 +527,7 @@ impl<'a> MemView<'a> {
         let mem = mem_authority.lock();
         let grant = mem.resident_fault_ranges.grant_for_page(page, max_len)?;
         Some(ResidentFrameGrantPlan {
+            fault_page: page,
             start: grant.range.start().raw(),
             len: grant.range.end().raw() - grant.range.start().raw(),
             prot: grant.prot.bits(),
@@ -589,17 +595,14 @@ impl<'a> MemView<'a> {
                 "caller lacks host alias dispatch exclusion during commit_resident_frame_grant"
             );
         }
-        let Some(end) = plan.start.checked_add(plan.len) else {
-            return;
-        };
-        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(plan.start), GuestVa(end))
-        else {
-            return;
-        };
-        let mem_authority = self.mem();
-        let mut mem = mem_authority.lock();
-        locked_ranges_insert(&mut mem.resident_ranges, range);
-        mem.resident_fault_ranges.disarm(range);
+        // Physical preparation can be bulk; only the faulting Linux page
+        // has become accessible. Keep every speculative page armed, so a
+        // later touch publishes its retained output and records residency.
+        self.commit_resident_fault(ResidentFaultPlan {
+            page: plan.fault_page,
+            prot: plan.prot,
+            exclusion: plan.exclusion,
+        });
     }
 
     pub(in crate::dispatch::mem) fn populate_resident_range(
@@ -628,3 +631,25 @@ impl<'a> MemView<'a> {
 
 #[cfg(test)]
 mod tests;
+
+/// Page-aligned data runs for a sparse core payload. Zero pages have identical
+/// contents when represented by holes, including pages prepared speculatively.
+/// Inspect bytes, not first-touch metadata: host writes also contribute data.
+pub fn core_data_runs(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    for (index, page) in bytes.chunks(LINUX_PAGE_SIZE as usize).enumerate() {
+        if page.iter().all(|byte| *byte == 0) {
+            continue;
+        }
+        let start = index * LINUX_PAGE_SIZE as usize;
+        let end = start + page.len();
+        if let Some(last) = runs.last_mut()
+            && last.end == start
+        {
+            last.end = end;
+        } else {
+            runs.push(start..end);
+        }
+    }
+    runs
+}
