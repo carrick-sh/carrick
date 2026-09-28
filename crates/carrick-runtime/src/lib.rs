@@ -233,7 +233,7 @@ pub use carrick_vmm_hvf::{
 
 /// Carrier-wide count of vCPU exits to the host (every `hv_vcpu_run` return).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use carrick_vmm_hvf::vcpu_run_exits_total;
+pub use carrick_vmm_hvf::{vcpu_run_exit_classes, vcpu_run_exits_total};
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -272,6 +272,11 @@ pub fn el1_frame_grant_stats() -> El1FrameGrantStats {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn vcpu_run_exits_total() -> u64 {
     0
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn vcpu_run_exit_classes() -> [u64; carrick_el1_abi::HostExitClass::COUNT] {
+    [0; carrick_el1_abi::HostExitClass::COUNT]
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
