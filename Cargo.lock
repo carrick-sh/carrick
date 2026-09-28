@@ -737,6 +737,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-pipe-core"
+version = "0.1.0"
+
+[[package]]
 name = "carrick-portable"
 version = "0.1.0"
 dependencies = [

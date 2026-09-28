@@ -40,6 +40,7 @@ pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
     "carrick-signal-core",
     "carrick-timer-core",
     "carrick-fd-core",
+    "carrick-pipe-core",
 ];
 
 /// Designated Linux personality or ABI crates forbidden in substrate dependency closures.
