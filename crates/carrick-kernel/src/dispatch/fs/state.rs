@@ -4,6 +4,11 @@ use super::super::*;
 use crate::linux_abi::LinuxDnotifyMask;
 use carrick_fatal::carrick_fatal;
 
+pub(in crate::dispatch) type PreparedExecImageSlot =
+    std::sync::Arc<parking_lot::Mutex<Option<crate::memory::AddressSpace>>>;
+pub(in crate::dispatch) type PreparedExecImageCache =
+    std::sync::Arc<parking_lot::Mutex<HashMap<String, PreparedExecImageSlot>>>;
+
 #[derive(Debug, Clone)]
 pub(in crate::dispatch) struct DnotifyRegistration {
     pub(in crate::dispatch) fd: i32,
@@ -188,8 +193,7 @@ pub(crate) struct FsState {
     /// host-file identity and mutation timestamps. Shared by every in-process
     /// child: repeatedly starting the Go compiler must not re-read, re-parse,
     /// and re-patch the same ELF. Non-host-backed targets bypass this cache.
-    pub(in crate::dispatch) hvpatch_exec_cache:
-        std::sync::Arc<parking_lot::Mutex<HashMap<String, crate::memory::AddressSpace>>>,
+    pub(in crate::dispatch) hvpatch_exec_cache: PreparedExecImageCache,
 
     /// Classic POSIX record locks for backends that multiplex multiple Linux
     /// processes inside one host process. HVPatch task generations are the
