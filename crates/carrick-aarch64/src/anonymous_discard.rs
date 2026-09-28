@@ -25,7 +25,14 @@ pub(crate) fn with_edges(
     let start = address.checked_add(granule - 1).ok_or_else(invalid)? & !(granule - 1);
     let stop = end & !(granule - 1);
     if start >= stop {
-        return Ok(false);
+        // A short DONTNEED has no retireable host compound. It still needs
+        // the same per-leaf decision as a long range's partial edges: an
+        // untouched prepared grant is already zero, while a resident or
+        // protected leaf needs authenticated physical maintenance.
+        memory
+            .zero_anonymous_discard_edge(address, len)
+            .map_err(RepointPrivateError::indeterminate)?;
+        return Ok(true);
     }
     // The aligned path authenticates, removes translations, flushes, retires
     // aliases and publishes fresh-zero provenance before any edge COW work.
@@ -36,7 +43,7 @@ pub(crate) fn with_edges(
     for (edge, length) in [(address, start - address), (stop, end - stop)] {
         if length != 0 {
             memory
-                .zero_backing(edge, length as usize)
+                .zero_anonymous_discard_edge(edge, length as usize)
                 .map_err(RepointPrivateError::indeterminate)?;
         }
     }
@@ -52,6 +59,7 @@ mod tests {
         bytes: Vec<u8>,
         peer: Vec<u8>,
         scrubbed: usize,
+        edge_method_calls: usize,
         events: Vec<&'static str>,
         refuse: bool,
         fail_edge: usize,
@@ -63,6 +71,7 @@ mod tests {
                 bytes: vec![0x5a; len],
                 peer: vec![0x5a; len],
                 scrubbed: 0,
+                edge_method_calls: 0,
                 events: Vec::new(),
                 refuse: false,
                 fail_edge: 0,
@@ -108,6 +117,15 @@ mod tests {
             self.bytes[address as usize..address as usize + len].fill(0);
             Ok(())
         }
+
+        fn zero_anonymous_discard_edge(
+            &mut self,
+            address: u64,
+            len: usize,
+        ) -> Result<(), MemoryError> {
+            self.edge_method_calls += 1;
+            self.zero_backing(address, len)
+        }
     }
 
     #[test]
@@ -142,6 +160,10 @@ mod tests {
                     );
                     max_scrubbed = max_scrubbed.max(memory.scrubbed);
                     assert_eq!(memory.events[0], "retire");
+                    assert_eq!(
+                        memory.edge_method_calls,
+                        usize::from(head != 0) + usize::from(tail != 0)
+                    );
                 }
             }
             let mut work = WorkSnapshot::new();
@@ -173,6 +195,17 @@ mod tests {
             &observations,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn short_discard_uses_the_edge_contract_without_an_aligned_interior() {
+        let mut memory = Memory::new(4 * 16384);
+        assert!(with_edges(&mut memory, 4096, 4096, 16384).unwrap());
+        assert_eq!(memory.edge_method_calls, 1);
+        assert_eq!(memory.scrubbed, 4096);
+        assert!(memory.bytes[..4096].iter().all(|&byte| byte == 0x5a));
+        assert!(memory.bytes[4096..8192].iter().all(|&byte| byte == 0));
+        assert!(memory.bytes[8192..].iter().all(|&byte| byte == 0x5a));
     }
 
     #[test]

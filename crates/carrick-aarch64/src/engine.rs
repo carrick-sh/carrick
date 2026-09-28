@@ -2261,6 +2261,46 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         self.vm.zero_backing(address, len)
     }
 
+    fn zero_anonymous_discard_edge(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        const PAGE: u64 = 4096;
+        let end = address
+            .checked_add(len as u64)
+            .ok_or(MemoryError::OutOfBounds {
+                address,
+                length: len,
+            })?;
+        if !address.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE as usize) {
+            return self.zero_backing(address, len);
+        }
+        let mut page = address;
+        let mut scrub_start = None;
+        while page < end {
+            // EL1 edits the live descriptor without refreshing the host's
+            // shadow. Classify the hardware-visible leaf before asking COW or
+            // the physical inventory to resolve its retained output.
+            let uncommitted = self
+                .diagnostic_fault_page_tables(page)
+                .is_some_and(|(_, walk)| {
+                    carrick_mmu_core::aarch64::terminal_descriptor_is_uncommitted_private_grant(
+                        carrick_mmu_core::aarch64::terminal_descriptor(walk),
+                    )
+                });
+            if uncommitted {
+                if let Some(start) = scrub_start.take() {
+                    let run_len = (page - start) as usize;
+                    self.zero_backing(start, run_len)?;
+                }
+            } else if scrub_start.is_none() {
+                scrub_start = Some(page);
+            }
+            page += PAGE;
+        }
+        if let Some(start) = scrub_start {
+            self.zero_backing(start, (end - start) as usize)?;
+        }
+        Ok(())
+    }
+
     fn discard_private_anonymous(
         &mut self,
         address: u64,

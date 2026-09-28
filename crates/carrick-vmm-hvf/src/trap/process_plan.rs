@@ -368,8 +368,20 @@ fn repoint_inherited_invalid_alias(
     eligible: bool,
     inventory_covers_compound: impl Fn(u64) -> bool,
 ) -> Result<bool, carrick_mmu_core::aarch64::PageTableError> {
+    use carrick_mmu_core::aarch64::{
+        El1PrivateLeafState, el1_private_leaf_state, terminal_descriptor,
+    };
     if !eligible || page_tables.translate(start).is_some() {
         return Ok(false);
+    }
+    let private_state = |tables: &carrick_mmu_core::aarch64::PageTableManager, va| {
+        el1_private_leaf_state(terminal_descriptor(tables.debug_walk(va)))
+    };
+    if matches!(
+        private_state(page_tables, start),
+        El1PrivateLeafState::Retired | El1PrivateLeafState::Malformed
+    ) {
+        return Err(carrick_mmu_core::aarch64::PageTableError::BadAddress);
     }
     let Some(retained) = page_tables.translate_retained_output(start) else {
         return Ok(false);
@@ -394,6 +406,12 @@ fn repoint_inherited_invalid_alias(
         let page_va = start
             .checked_add(offset)
             .ok_or(carrick_mmu_core::aarch64::PageTableError::BadAddress)?;
+        if matches!(
+            private_state(page_tables, page_va),
+            El1PrivateLeafState::Retired | El1PrivateLeafState::Malformed
+        ) {
+            return Err(carrick_mmu_core::aarch64::PageTableError::BadAddress);
+        }
         let target = current_ipa
             .checked_add(offset)
             .ok_or(carrick_mmu_core::aarch64::PageTableError::BadAddress)?;
@@ -1762,6 +1780,67 @@ mod tests {
             page_tables.translate_retained_output(alias_va - 0x1000),
             Some(old_ipa + 0x76_000),
             "unprojected neighbor retains its parent snapshot output"
+        );
+    }
+
+    #[test]
+    fn fork_repoints_prepared_grant_but_refuses_retired_leaf() {
+        use carrick_mmu_core::aarch64::{
+            El1PrivateLeafState, GuestLeafPublication, el1_private_leaf_state, terminal_descriptor,
+        };
+
+        let mut parent = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        parent.declare_offline_private_image();
+        let va = crate::memory::LINUX_MMAP_BASE + 0x80_0000;
+        let old_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0xa0_0000;
+        let new_ipa = old_ipa + 0x20_0000;
+        parent
+            .publish_private_pages(
+                GuestLeafPublication {
+                    va,
+                    ipa: old_ipa,
+                    len: 4 * 4096,
+                    writable: true,
+                    executable: false,
+                },
+                va,
+                None,
+            )
+            .expect("prepare grant");
+        let mut child = parent.snapshot_image().expect("fork image");
+        child.set_fork_readonly(va, 4 * 4096, None).unwrap();
+        let prepared_va = va + 4096;
+        assert!(
+            repoint_inherited_invalid_alias(
+                &mut child,
+                prepared_va,
+                new_ipa + 4096,
+                4096,
+                true,
+                |compound| compound == new_ipa,
+            )
+            .expect("repoint prepared grant")
+        );
+        assert_eq!(
+            el1_private_leaf_state(terminal_descriptor(child.debug_walk(prepared_va))),
+            El1PrivateLeafState::Prepared
+        );
+        child.invalidate(va + 2 * 4096, 4096, None).unwrap();
+        assert_eq!(
+            repoint_inherited_invalid_alias(
+                &mut child,
+                va + 2 * 4096,
+                new_ipa + 2 * 4096,
+                4096,
+                true,
+                |compound| compound == new_ipa,
+            ),
+            Err(carrick_mmu_core::aarch64::PageTableError::BadAddress),
+            "a retired output cannot be authenticated as an inherited grant"
         );
     }
 
