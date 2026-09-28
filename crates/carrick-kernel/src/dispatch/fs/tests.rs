@@ -2672,6 +2672,135 @@ mod serial_host {
         );
     }
 
+    /// `kernel.fs.openat-name-resolution`: a warm open/stat of the same name
+    /// must not repeat the component walk or probe either filesystem layer.
+    /// Heap bytes are measured around the whole dispatcher call, including
+    /// guest-path copying and fd installation; they may grow with path bytes,
+    /// but not with one allocation per previously resolved component.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn repeated_openat_newfstatat_name_resolution_budget() {
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+        let mut paths = Vec::new();
+        for depth in [2, 6, 12] {
+            let mut path = String::new();
+            for _ in 0..depth {
+                path.push_str("/dir");
+            }
+            backend.make_dir(&path).unwrap();
+            backend
+                .set_file_contents(&format!("{path}/leaf"), b"data".to_vec())
+                .unwrap();
+            paths.push((depth, format!("{path}/leaf")));
+        }
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let mut warm_open_bytes = Vec::new();
+        let mut warm_open_allocs = Vec::new();
+        let mut warm_stat_bytes = Vec::new();
+        let mut warm_stat_allocs = Vec::new();
+
+        for (depth, path) in paths {
+            let cache = dispatcher.fs.rootfs_vfs.dentry_cache.clone();
+            cache.reset_host_open_count();
+            cache.reset_layer_probe_count();
+            let cold = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, &path, 0);
+            assert!(cold >= 0, "cold open {path}: {cold}");
+            assert_eq!(
+                lane_syscall(
+                    &mut dispatcher,
+                    &mut memory,
+                    57,
+                    [cold as u64, 0, 0, 0, 0, 0]
+                ),
+                0
+            );
+            let cold_opens = cache.host_open_count();
+            let cold_probes = cache.layer_probe_count();
+            assert!(
+                cold_opens <= depth as u64 + 1,
+                "cold open component work exceeded affine budget: depth={depth} opens={cold_opens}"
+            );
+            assert!(
+                cold_probes > 0 && cold_probes <= depth as u64 + 1,
+                "cold open component probes exceeded affine budget: depth={depth} probes={cold_probes}"
+            );
+
+            cache.reset_host_open_count();
+            cache.reset_layer_probe_count();
+            let (warm, bytes, allocs) = crate::dispatch::mem::measure_host_heap(|| {
+                lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, &path, 0)
+            });
+            assert!(warm >= 0, "warm open {path}: {warm}");
+            let warm_opens = cache.host_open_count();
+            let warm_probes = cache.layer_probe_count();
+            assert_eq!(
+                lane_syscall(
+                    &mut dispatcher,
+                    &mut memory,
+                    57,
+                    [warm as u64, 0, 0, 0, 0, 0]
+                ),
+                0
+            );
+            assert_eq!(warm_opens, 1, "depth={depth} cold_opens={cold_opens}");
+            assert_eq!(warm_probes, 0, "depth={depth} cold_probes={cold_probes}");
+
+            memory
+                .write_bytes(0x4200, format!("{path}\0").as_bytes())
+                .unwrap();
+            cache.reset_host_open_count();
+            cache.reset_layer_probe_count();
+            let (stat, stat_bytes, stat_allocs) = crate::dispatch::mem::measure_host_heap(|| {
+                lane_syscall(
+                    &mut dispatcher,
+                    &mut memory,
+                    79,
+                    [LINUX_AT_FDCWD, 0x4200, 0x7000, 0, 0, 0],
+                )
+            });
+            assert_eq!(stat, 0, "stat {path}");
+            assert_eq!(
+                cache.host_open_count(),
+                0,
+                "stat opened host fd at depth={depth}"
+            );
+            assert_eq!(
+                cache.layer_probe_count(),
+                0,
+                "stat probed a layer at depth={depth}"
+            );
+            eprintln!(
+                "depth={depth} cold_opens={cold_opens} cold_layer_probes={cold_probes} warm_open_heap_bytes={bytes} warm_open_allocs={allocs} warm_stat_heap_bytes={stat_bytes} warm_stat_allocs={stat_allocs}"
+            );
+            warm_open_bytes.push(bytes);
+            warm_open_allocs.push(allocs);
+            warm_stat_bytes.push(stat_bytes);
+            warm_stat_allocs.push(stat_allocs);
+        }
+        // The ten added components add 40 input bytes. Cached resolution may
+        // copy the complete path a fixed number of times, but it must not
+        // allocate once per component or rebuild component-sized state.
+        assert!(
+            warm_open_bytes[2] <= warm_open_bytes[0] + 32 * 10,
+            "warm open heap bytes grew with path depth: {warm_open_bytes:?}"
+        );
+        assert_eq!(
+            warm_open_allocs[2], warm_open_allocs[0],
+            "warm open allocations grew with path depth: {warm_open_allocs:?}"
+        );
+        assert!(
+            warm_stat_bytes[2] <= warm_stat_bytes[0] + 16 * 10,
+            "warm stat heap bytes grew with path depth: {warm_stat_bytes:?}"
+        );
+        assert_eq!(
+            warm_stat_allocs[2], warm_stat_allocs[0],
+            "warm stat allocations grew with path depth: {warm_stat_allocs:?}"
+        );
+    }
+
     /// A directory listing is taken when the guest READS it, not when it opens
     /// it (Linux `getdents64` walks the live dentry tree; `rewinddir` re-reads).
     /// Two consequences the old open-time snapshot got wrong — and one cost:

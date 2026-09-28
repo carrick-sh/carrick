@@ -202,10 +202,16 @@ struct FastPathCache {
 
 pub struct DentryCache {
     proc_gen: AtomicU64,
+    shared_path_gen: AtomicU64,
+    local_path_bumps: AtomicU64,
+    last_dispatch_hook_gen: AtomicU64,
+    reset_lock: Mutex<()>,
     mutation_gen: AtomicU64,
     next_dentry_id: AtomicU64,
     is_shared: bool,
     host_opens: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    layer_probes: AtomicU64,
     capacity_bytes: usize,
     eviction_enabled: bool,
     approx_bytes: AtomicUsize,
@@ -306,10 +312,16 @@ impl DentryCache {
 
         Self {
             proc_gen: AtomicU64::new(crate::fs_resolve_cache::current_process_generation()),
+            shared_path_gen: AtomicU64::new(crate::fs_resolve_cache::current_generation()),
+            local_path_bumps: AtomicU64::new(crate::fs_resolve_cache::local_path_bump_count()),
+            last_dispatch_hook_gen: AtomicU64::new(1),
+            reset_lock: Mutex::new(()),
             mutation_gen: AtomicU64::new(1),
             next_dentry_id: AtomicU64::new(1),
             is_shared,
             host_opens: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            layer_probes: AtomicU64::new(0),
             capacity_bytes,
             eviction_enabled,
             approx_bytes: AtomicUsize::new(initial_bytes),
@@ -350,6 +362,17 @@ impl DentryCache {
         self.host_opens.store(0, Ordering::Relaxed);
     }
 
+    /// Count uncached parent/name probes across the upper and lower layers.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn layer_probe_count(&self) -> u64 {
+        self.layer_probes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_layer_probe_count(&self) {
+        self.layer_probes.store(0, Ordering::Relaxed);
+    }
+
     pub fn is_shared(&self) -> bool {
         self.is_shared
     }
@@ -362,6 +385,18 @@ impl DentryCache {
 
     fn bump_mutation(&self) {
         self.mutation_gen.fetch_add(1, Ordering::SeqCst);
+        let observed = self.shared_path_gen.load(Ordering::SeqCst);
+        let current = crate::fs_resolve_cache::current_generation();
+        let previous_local = self.local_path_bumps.load(Ordering::SeqCst);
+        let current_local = crate::fs_resolve_cache::local_path_bump_count();
+        // A local backend mutation publishes its generation before calling
+        // the dentry hook. Preserve unaffected names only when that one bump
+        // followed the generation already observed by this cache. A sibling
+        // bump or an intervening concurrent mutation requires a full refill.
+        if current.wrapping_sub(observed) == current_local.wrapping_sub(previous_local) {
+            self.local_path_bumps.store(current_local, Ordering::SeqCst);
+            self.shared_path_gen.store(current, Ordering::SeqCst);
+        }
         let mut fp = self.fast_path.write();
         fp.stat_follow.clear();
         fp.stat_nofollow.clear();
@@ -369,10 +404,40 @@ impl DentryCache {
         fp.lookup_nofollow.clear();
     }
 
+    /// The dispatcher's final shared-generation bump follows the VFS entry
+    /// hook. Record it without evicting unrelated names only when this call
+    /// actually passed through a hook (or returned an error without changing
+    /// the namespace), and no sibling process bumped the generation.
+    pub fn note_structural_dispatch(&self, succeeded: bool) {
+        let hooked = self.mutation_gen.load(Ordering::SeqCst);
+        let previous_hook = self.last_dispatch_hook_gen.load(Ordering::SeqCst);
+        if succeeded && hooked == previous_hook {
+            return;
+        }
+        let observed = self.shared_path_gen.load(Ordering::SeqCst);
+        let current = crate::fs_resolve_cache::current_generation();
+        let previous_local = self.local_path_bumps.load(Ordering::SeqCst);
+        let current_local = crate::fs_resolve_cache::local_path_bump_count();
+        if current.wrapping_sub(observed) == current_local.wrapping_sub(previous_local) {
+            self.local_path_bumps.store(current_local, Ordering::SeqCst);
+            self.shared_path_gen.store(current, Ordering::SeqCst);
+            self.last_dispatch_hook_gen.store(hooked, Ordering::SeqCst);
+        }
+    }
+
     /// Clear the cache if we crossed a host fork.
     fn check_fork(&self) {
         let cur_gen = crate::fs_resolve_cache::current_process_generation();
-        if self.proc_gen.load(Ordering::Relaxed) != cur_gen {
+        let shared_gen = crate::fs_resolve_cache::current_generation();
+        if self.proc_gen.load(Ordering::SeqCst) != cur_gen
+            || self.shared_path_gen.load(Ordering::SeqCst) != shared_gen
+        {
+            let _reset = self.reset_lock.lock();
+            if self.proc_gen.load(Ordering::SeqCst) == cur_gen
+                && self.shared_path_gen.load(Ordering::SeqCst) == shared_gen
+            {
+                return;
+            }
             let mut entries = self.entries.write();
             let mut dirs = self.dirs.write();
             let mut path_to_dir_id = self.path_to_dir_id.write();
@@ -403,8 +468,20 @@ impl DentryCache {
             dirs.insert(DentryId::ROOT, root_dir);
             path_to_dir_id.insert("/".to_string(), DentryId::ROOT);
             path_to_dir_id.insert("".to_string(), DentryId::ROOT);
-            self.proc_gen.store(cur_gen, Ordering::Relaxed);
-            self.bump_mutation();
+            self.proc_gen.store(cur_gen, Ordering::SeqCst);
+            self.local_path_bumps.store(
+                crate::fs_resolve_cache::local_path_bump_count(),
+                Ordering::SeqCst,
+            );
+            self.shared_path_gen.store(shared_gen, Ordering::SeqCst);
+            self.mutation_gen.fetch_add(1, Ordering::SeqCst);
+            self.last_dispatch_hook_gen
+                .store(self.mutation_gen.load(Ordering::SeqCst), Ordering::SeqCst);
+            let mut fp = self.fast_path.write();
+            fp.stat_follow.clear();
+            fp.stat_nofollow.clear();
+            fp.lookup_follow.clear();
+            fp.lookup_nofollow.clear();
         }
     }
 
@@ -1593,6 +1670,8 @@ impl DentryCache {
         &self,
         params: FillComponentParams<'_>,
     ) -> Result<PositiveDentry, LinuxErrno> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.layer_probes.fetch_add(1, Ordering::Relaxed);
         let FillComponentParams {
             parent_id,
             name,
@@ -3559,5 +3638,43 @@ mod tests {
             "second lookup of lower-negative path must issue 0 host opens"
         );
         let _ = first_opens;
+    }
+
+    #[test]
+    fn test_shared_generation_invalidates_positive_and_negative_names() {
+        let tmp = tempdir().unwrap();
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        let cache = DentryCache::new(false);
+        fs::create_dir(tmp.path().join("parent")).unwrap();
+        fs::write(tmp.path().join("parent/existing"), b"old").unwrap();
+
+        assert!(
+            cache
+                .stat("/parent/existing", false, &backend, None)
+                .is_ok()
+        );
+        assert_eq!(
+            cache.stat("/parent/new", false, &backend, None),
+            Err(LINUX_ENOENT)
+        );
+
+        // A sibling process changes the same private scratch namespace. Its
+        // own cache receives the entry hook; this cache sees only the shared
+        // generation bumped by the backend.
+        fs::remove_file(tmp.path().join("parent/existing")).unwrap();
+        fs::write(tmp.path().join("parent/new"), b"new").unwrap();
+        crate::fs_resolve_cache::simulate_sibling_path_bump();
+
+        assert_eq!(
+            cache.stat("/parent/existing", false, &backend, None),
+            Err(LINUX_ENOENT)
+        );
+        assert_eq!(
+            cache
+                .stat("/parent/new", false, &backend, None)
+                .unwrap()
+                .size,
+            3
+        );
     }
 }

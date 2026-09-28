@@ -93,6 +93,21 @@ fn generation_word() -> &'static AtomicU64 {
 /// Used by in-process caches to detect fork without issuing `libc::getpid()`.
 static PROCESS_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+// Process-private count of the generation bumps published by this host
+// process. The shared generation also includes sibling processes' bumps;
+// comparing deltas lets a dentry hook retain unaffected local names only when
+// every intervening bump came from this process.
+static LOCAL_PATH_BUMPS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn local_path_bump_count() -> u64 {
+    LOCAL_PATH_BUMPS.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(crate) fn simulate_sibling_path_bump() {
+    generation_word().fetch_add(1, Ordering::SeqCst);
+}
+
 static ATFORK_INIT: std::sync::Once = std::sync::Once::new();
 
 fn ensure_atfork_installed() {
@@ -136,6 +151,7 @@ pub fn current_generation() -> u64 {
 /// unlink/mknod/create), NOT from content writes.
 pub fn bump_generation() {
     generation_word().fetch_add(1, Ordering::SeqCst);
+    LOCAL_PATH_BUMPS.fetch_add(1, Ordering::SeqCst);
 }
 
 /// Current DIRECTORY-TOPOLOGY generation — the one the kernel's directory

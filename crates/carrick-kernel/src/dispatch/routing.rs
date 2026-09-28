@@ -177,6 +177,13 @@ impl SyscallDispatcher {
         // the set, so a syscall-bound write/lseek loop keeps its cached resolves.
         if fs::is_structural_namespace_mutation(canonical_nr) {
             carrick_vfs::fs_resolve_cache::bump_generation();
+            self.fs
+                .rootfs_vfs
+                .dentry_cache
+                .note_structural_dispatch(matches!(
+                    &outcome,
+                    Ok(DispatchOutcome::Returned { value }) if *value >= 0
+                ));
         }
         Some(outcome)
     }
