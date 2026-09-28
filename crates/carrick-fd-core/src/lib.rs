@@ -1,4 +1,4 @@
-//! Fixed-storage descriptor/OFD authority; no allocator or host dependencies.
+//! Venue-backed descriptor/OFD authority; no allocator or host dependencies.
 //!
 //! A venue provides exclusive access to this authority across table and OFD
 //! mutations. Threads with CLONE_FILES use the same TableId; fork copies a
@@ -44,6 +44,11 @@ pub enum Error {
     /// Authority storage exhausted (not the process's RLIMIT_NOFILE).
     NoMemory,
     StaleTable,
+    /// Supply at least this many descriptor slots and their bitmap, then retry.
+    /// This is an internal storage request, never EMFILE.
+    NeedsBacking {
+        descriptors: usize,
+    },
 }
 /// Generation-checked identity; IDs from another Core are rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,68 +86,160 @@ struct Entry {
     ofd: OfdId,
     cloexec: bool,
 }
-#[derive(Clone, Copy)]
-struct Table<const F: usize> {
-    entries: [Option<Entry>; F],
-    free: [u64; 64],
-    summary: u64,
+/// Caller-owned descriptor slot; only the authority can change its contents.
+#[derive(Clone, Copy, Default)]
+pub struct DescriptorSlot(Option<Entry>);
+
+// Representation limit of the signed descriptor ABI, not a resource policy.
+const MAX_DESCRIPTORS: usize = i32::MAX as usize + 1;
+const MAX_LEVELS: usize = usize::BITS as usize / 6 + 1;
+
+/// Number of u64 words needed for all levels of a 64-way free-slot bitmap.
+/// A venue allocates these words along with `capacity` DescriptorSlots.
+pub const fn bitmap_words(mut capacity: usize) -> usize {
+    let mut words = 0;
+    while capacity > 0 {
+        capacity = capacity.div_ceil(64);
+        words += capacity;
+        if capacity == 1 {
+            break;
+        }
+    }
+    words
+}
+
+/// Borrowed backing, not a wire ABI. Storage can live in host or guest memory.
+/// Growth swaps in larger venue-provided slices and returns old backing through
+/// the same value. The core never allocates or retains pointers to retired slices.
+pub struct TableStorage<'a> {
+    entries: &'a mut [DescriptorSlot],
+    bitmap: &'a mut [u64],
+    offsets: [usize; MAX_LEVELS],
+    sizes: [usize; MAX_LEVELS],
+    levels: usize,
+}
+impl<'a> TableStorage<'a> {
+    pub fn new(entries: &'a mut [DescriptorSlot], bitmap: &'a mut [u64]) -> Result<Self, Error> {
+        if entries.len() > MAX_DESCRIPTORS || bitmap.len() < bitmap_words(entries.len()) {
+            return Err(Error::InvalidArgument);
+        }
+        let mut result = Self::empty();
+        let mut count = entries.len();
+        let mut offset = 0;
+        while count > 0 {
+            count = count.div_ceil(64);
+            result.offsets[result.levels] = offset;
+            result.sizes[result.levels] = count;
+            result.levels += 1;
+            offset += count;
+            if count == 1 {
+                break;
+            }
+        }
+        result.entries = entries;
+        result.bitmap = bitmap;
+        result.clear();
+        Ok(result)
+    }
+    pub fn capacity(&self) -> usize {
+        self.entries.len()
+    }
+    /// Recover retired backing for reuse by the venue's storage allocator.
+    pub fn into_parts(self) -> (&'a mut [DescriptorSlot], &'a mut [u64]) {
+        (self.entries, self.bitmap)
+    }
+    fn empty() -> Self {
+        Self {
+            entries: &mut [],
+            bitmap: &mut [],
+            offsets: [0; MAX_LEVELS],
+            sizes: [0; MAX_LEVELS],
+            levels: 0,
+        }
+    }
+    fn clear(&mut self) {
+        self.entries.fill(DescriptorSlot(None));
+        self.rebuild();
+    }
+    fn rebuild(&mut self) {
+        self.bitmap.fill(0);
+        for (fd, entry) in self.entries.iter().enumerate() {
+            if entry.0.is_none() {
+                self.bitmap[fd / 64] |= 1 << (fd % 64);
+            }
+        }
+        for level in 1..self.levels {
+            for word in 0..self.sizes[level - 1] {
+                if self.bitmap[self.offsets[level - 1] + word] != 0 {
+                    self.bitmap[self.offsets[level] + word / 64] |= 1 << (word % 64);
+                }
+            }
+        }
+    }
+    fn mark_free(&mut self, mut bit: usize, mut free: bool) {
+        for level in 0..self.levels {
+            let word = bit / 64;
+            let value = &mut self.bitmap[self.offsets[level] + word];
+            let mask = 1u64 << (bit % 64);
+            if free {
+                *value |= mask;
+            } else {
+                *value &= !mask;
+            }
+            free = *value != 0;
+            bit = word;
+        }
+    }
+    // Search one partial word, ascend to a nonempty sibling and descend.
+    // At most 2*levels-1 word reads, independent of occupancy or hole position.
+    fn next_bit(&self, level: usize, min: usize, reads: &mut usize) -> Option<usize> {
+        let word = min / 64;
+        if level >= self.levels || word >= self.sizes[level] {
+            return None;
+        }
+        *reads += 1;
+        let bits = self.bitmap[self.offsets[level] + word] & (u64::MAX << (min % 64));
+        if bits != 0 {
+            return Some(word * 64 + bits.trailing_zeros() as usize);
+        }
+        let next = self.next_bit(level + 1, word + 1, reads)?;
+        *reads += 1;
+        Some(next * 64 + self.bitmap[self.offsets[level] + next].trailing_zeros() as usize)
+    }
+}
+struct Table<'a> {
+    storage: TableStorage<'a>,
     limit: usize,
 }
-impl<const F: usize> Table<F> {
-    fn new(limit: usize) -> Self {
-        let mut table = Self {
-            entries: [None; F],
-            free: [0; 64],
-            summary: 0,
-            limit,
-        };
-        for fd in 0..F {
-            table.mark_free(fd, true);
-        }
-        table
-    }
-    fn mark_free(&mut self, fd: usize, free: bool) {
-        let word = fd / 64;
-        let mask = 1u64 << (fd % 64);
-        if free {
-            self.free[word] |= mask;
-        } else {
-            self.free[word] &= !mask;
-        }
-        if self.free[word] == 0 {
-            self.summary &= !(1u64 << word);
-        } else {
-            self.summary |= 1u64 << word;
-        }
-    }
-    // At most two leaf-word reads and one summary-word read, at all occupancies.
+impl Table<'_> {
     fn lowest(&self, min: usize) -> (Option<usize>, usize) {
         if min >= self.limit {
             return (None, 0);
         }
-        let word = min / 64;
-        let candidates = self.free[word] & (u64::MAX << (min % 64));
-        if candidates != 0 {
-            let fd = word * 64 + candidates.trailing_zeros() as usize;
-            return ((fd < self.limit).then_some(fd), 1);
+        let mut reads = 0;
+        let fd = self
+            .storage
+            .next_bit(0, min, &mut reads)
+            .filter(|fd| *fd < self.limit);
+        (fd, reads)
+    }
+    fn allocate(&self, min: usize) -> Result<usize, Error> {
+        if let Some(fd) = self.lowest(min).0 {
+            return Ok(fd);
         }
-        let later = if word == 63 {
-            0
+        let next = min.max(self.storage.capacity());
+        if next < self.limit {
+            Err(Error::NeedsBacking {
+                descriptors: next + 1,
+            })
         } else {
-            self.summary & (u64::MAX << (word + 1))
-        };
-        if later == 0 {
-            return (None, 2);
+            Err(Error::TooManyFiles)
         }
-        let next = later.trailing_zeros() as usize;
-        let fd = next * 64 + self.free[next].trailing_zeros() as usize;
-        ((fd < self.limit).then_some(fd), 3)
     }
 }
-#[derive(Clone, Copy)]
-struct TableSlot<const F: usize> {
+struct TableSlot<'a> {
     generation: u64,
-    table: Option<Table<F>>,
+    table: Option<Table<'a>>,
 }
 #[derive(Clone, Copy)]
 struct OfdSlot {
@@ -150,19 +247,21 @@ struct OfdSlot {
     next: Option<usize>,
 }
 
-/// Fixed capacity: T tables, F descriptors/table (1..=4096), O shared OFDs.
+/// Venue-backed descriptor capacity, T table identities and O shared OFDs.
 /// All operations are allocation-free, including fork. Not Clone: copying the
 /// authority would duplicate backing-resource ownership without retaining it.
 /// Use close/destroy_table to collect releases before dropping the authority.
-pub struct Core<const T: usize, const F: usize, const O: usize> {
+pub struct Core<'a, const T: usize, const O: usize> {
     identity: u64,
-    tables: [TableSlot<F>; T],
+    tables: [TableSlot<'a>; T],
     ofds: [OfdSlot; O],
     free_ofd: Option<usize>,
 }
-impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
+impl<'a, const T: usize, const O: usize> Core<'a, T, O> {
     pub fn new() -> Result<Self, Error> {
-        if F == 0 || F > 4096 || T.checked_mul(F).is_none_or(|n| n == usize::MAX) {
+        if T.checked_mul(MAX_DESCRIPTORS)
+            .is_none_or(|n| n == usize::MAX)
+        {
             return Err(Error::InvalidArgument);
         }
         let identity = NEXT_AUTHORITY
@@ -170,9 +269,11 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
             .map_err(|_| Error::NoMemory)?;
         Ok(Self {
             identity,
-            tables: [TableSlot {
-                generation: 0,
-                table: None,
+            tables: [const {
+                TableSlot {
+                    generation: 0,
+                    table: None,
+                }
             }; T],
             ofds: core::array::from_fn(|i| OfdSlot {
                 ofd: None,
@@ -181,14 +282,14 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
             free_ofd: (O != 0).then_some(0),
         })
     }
-    fn table(&self, id: TableId) -> Result<&Table<F>, Error> {
+    fn table(&self, id: TableId) -> Result<&Table<'a>, Error> {
         self.tables
             .get(id.index)
             .filter(|s| s.generation == id.generation && id.authority == self.identity)
             .and_then(|s| s.table.as_ref())
             .ok_or(Error::StaleTable)
     }
-    fn table_mut(&mut self, id: TableId) -> Result<&mut Table<F>, Error> {
+    fn table_mut(&mut self, id: TableId) -> Result<&mut Table<'a>, Error> {
         self.tables
             .get_mut(id.index)
             .filter(|s| s.generation == id.generation && id.authority == self.identity)
@@ -197,10 +298,10 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
     }
     fn entry(&self, table: TableId, fd: Fd) -> Result<Entry, Error> {
         self.table(table)?
+            .storage
             .entries
             .get(fd.0 as usize)
-            .copied()
-            .flatten()
+            .and_then(|slot| slot.0)
             .ok_or(Error::BadFd)
     }
     fn ofd(&self, entry: Entry) -> &Ofd {
@@ -218,12 +319,16 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
     }
     fn install(&mut self, table: TableId, fd: usize, entry: Entry) -> Result<(), Error> {
         let table = self.table_mut(table)?;
-        table.entries[fd] = Some(entry);
-        table.mark_free(fd, false);
+        table.storage.entries[fd].0 = Some(entry);
+        table.storage.mark_free(fd, false);
         Ok(())
     }
-    pub fn create_table(&mut self, limit: usize) -> Result<TableId, Error> {
-        if limit > F {
+    pub fn create_table(
+        &mut self,
+        limit: usize,
+        storage: &mut TableStorage<'a>,
+    ) -> Result<TableId, Error> {
+        if limit > MAX_DESCRIPTORS {
             return Err(Error::InvalidArgument);
         }
         let index = self
@@ -233,7 +338,11 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
             .ok_or(Error::NoMemory)?;
         let slot = &mut self.tables[index];
         slot.generation += 1;
-        slot.table = Some(Table::new(limit));
+        storage.clear();
+        slot.table = Some(Table {
+            storage: core::mem::replace(storage, TableStorage::empty()),
+            limit,
+        });
         Ok(TableId {
             authority: self.identity,
             index,
@@ -241,9 +350,10 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
         })
     }
     /// Changing the soft limit never closes existing descriptors above it.
-    /// The venue must constrain its advertised hard limit to F.
+    /// The venue validates RLIMIT_NOFILE against its hard limit and nr_open;
+    /// neither soft nor hard limits are constrained by currently supplied backing.
     pub fn set_limit(&mut self, table: TableId, limit: usize) -> Result<(), Error> {
-        if limit > F {
+        if limit > MAX_DESCRIPTORS {
             return Err(Error::InvalidArgument);
         }
         self.table_mut(table)?.limit = limit;
@@ -260,11 +370,7 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
         if min.0 < 0 {
             return Err(Error::InvalidArgument);
         }
-        let fd = self
-            .table(table)?
-            .lowest(min.0 as usize)
-            .0
-            .ok_or(Error::TooManyFiles)?;
+        let fd = self.table(table)?.allocate(min.0 as usize)?;
         let index = self.free_ofd.ok_or(Error::NoMemory)?;
         self.free_ofd = self.ofds[index].next;
         self.ofds[index].ofd = Some(Ofd {
@@ -340,11 +446,7 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
         cloexec: bool,
     ) -> Result<Fd, Error> {
         let mut entry = self.entry(table, old)?;
-        let fd = self
-            .table(table)?
-            .lowest(min)
-            .0
-            .ok_or(Error::TooManyFiles)?;
+        let fd = self.table(table)?.allocate(min)?;
         entry.cloexec = cloexec;
         self.ofd_mut(entry).refs += 1;
         self.install(table, fd, entry)?;
@@ -383,6 +485,11 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
         if new.0 < 0 || new.0 as usize >= self.table(table)?.limit {
             return Err(Error::BadFd);
         }
+        if new.0 as usize >= self.table(table)?.storage.capacity() {
+            return Err(Error::NeedsBacking {
+                descriptors: new.0 as usize + 1,
+            });
+        }
         // Retain first, so replacing an alias cannot temporarily finalize it.
         self.ofd_mut(entry).refs += 1;
         let released = match self.close(table, new) {
@@ -398,8 +505,8 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
     pub fn close(&mut self, table: TableId, fd: Fd) -> Result<Option<Description>, Error> {
         let entry = self.entry(table, fd)?;
         let t = self.table_mut(table)?;
-        t.entries[fd.0 as usize] = None;
-        t.mark_free(fd.0 as usize, true);
+        t.storage.entries[fd.0 as usize].0 = None;
+        t.storage.mark_free(fd.0 as usize, true);
         let ofd = self.ofd_mut(entry);
         ofd.refs -= 1;
         if ofd.refs != 0 {
@@ -428,9 +535,9 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
             return Err(Error::InvalidArgument);
         }
         self.table(table)?;
-        let end = (last as usize).min(F - 1);
-        for fd in first as usize..=end {
-            if self.table(table)?.entries[fd].is_none() {
+        let end = (u64::from(last) + 1).min(self.table(table)?.storage.capacity() as u64) as usize;
+        for fd in first as usize..end {
+            if self.table(table)?.storage.entries[fd].0.is_none() {
                 continue;
             }
             if cloexec {
@@ -452,23 +559,57 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
         last: u32,
         cloexec: bool,
         release: impl FnMut(Description),
+        storage: &mut TableStorage<'a>,
     ) -> Result<TableId, Error> {
         if first > last {
             return Err(Error::InvalidArgument);
         }
-        let successor = self.fork(table)?;
+        let successor = self.fork(table, storage)?;
         self.close_range(successor, first, last, cloexec, release)?;
         Ok(successor)
     }
-    /// Copy descriptor flags/limit; retain each shared OFD once per copied fd.
-    /// O(T + F), allocation-free. No partial retain when table storage is full.
-    pub fn fork(&mut self, parent: TableId) -> Result<TableId, Error> {
-        let copy = *self.table(parent)?;
-        let child = self.create_table(copy.limit)?;
-        for entry in copy.entries.iter().flatten() {
-            self.ofd_mut(*entry).refs += 1;
+    /// Replace backing without changing table identity, entries or OFD refs.
+    /// The caller receives the old slices in storage, reusable or reclaimable
+    /// after this call. Failure changes neither input nor installed storage.
+    pub fn grow_table(
+        &mut self,
+        table: TableId,
+        storage: &mut TableStorage<'a>,
+    ) -> Result<(), Error> {
+        let t = self.table_mut(table)?;
+        if storage.capacity() < t.storage.capacity() {
+            return Err(Error::InvalidArgument);
         }
-        *self.table_mut(child)? = copy;
+        storage.clear();
+        storage.entries[..t.storage.capacity()].copy_from_slice(t.storage.entries);
+        storage.rebuild();
+        core::mem::swap(&mut t.storage, storage);
+        storage.clear();
+        Ok(())
+    }
+    /// Copy descriptor flags/limit, retaining each OFD once per copied fd.
+    /// Caller supplies backing at least as large as the parent's current backing.
+    /// No partial retain or consumed storage on a capacity failure.
+    pub fn fork(
+        &mut self,
+        parent: TableId,
+        storage: &mut TableStorage<'a>,
+    ) -> Result<TableId, Error> {
+        let p = self.table(parent)?;
+        let capacity = p.storage.capacity();
+        if storage.capacity() < capacity {
+            return Err(Error::NeedsBacking {
+                descriptors: capacity,
+            });
+        }
+        let child = self.create_table(p.limit, storage)?;
+        for fd in 0..capacity {
+            if let Some(entry) = self.table(parent)?.storage.entries[fd].0 {
+                self.ofd_mut(entry).refs += 1;
+                self.table_mut(child)?.storage.entries[fd].0 = Some(entry);
+            }
+        }
+        self.table_mut(child)?.storage.rebuild();
         Ok(child)
     }
     /// Venue must unshare a CLONE_FILES table before exec; otherwise siblings
@@ -479,8 +620,10 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
         mut release: impl FnMut(Description),
     ) -> Result<(), Error> {
         self.table(table)?;
-        for fd in 0..F {
-            if self.table(table)?.entries[fd].is_some_and(|e| e.cloexec)
+        for fd in 0..self.table(table)?.storage.capacity() {
+            if self.table(table)?.storage.entries[fd]
+                .0
+                .is_some_and(|e| e.cloexec)
                 && let Some(d) = self.close(table, Fd(fd as i32))?
             {
                 release(d);
@@ -493,12 +636,16 @@ impl<const T: usize, const F: usize, const O: usize> Core<T, F, O> {
         &mut self,
         table: TableId,
         release: impl FnMut(Description),
-    ) -> Result<(), Error> {
+    ) -> Result<TableStorage<'a>, Error> {
         self.close_range(table, 0, u32::MAX, false, release)?;
-        self.tables[table.index].table = None;
-        Ok(())
+        match self.tables[table.index].table.take() {
+            Some(t) => Ok(t.storage),
+            None => unreachable!(),
+        }
     }
 }
 
+#[cfg(test)]
+extern crate std;
 #[cfg(test)]
 mod tests;
