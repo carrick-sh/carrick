@@ -4074,7 +4074,13 @@ impl PageTableManager {
             let block_end = block_start
                 .checked_add(span)
                 .ok_or(PageTableError::BadAddress)?;
-            if descriptor & VALID == 0 && descriptor & SW_RETIRED != 0 {
+            // Only EL1-private retired leaves carry predecessor permission
+            // authority; other retired leaves keep their retained output for
+            // same-VA reuse and file-mapping fault classification.
+            if descriptor & VALID == 0
+                && descriptor & SW_RETIRED != 0
+                && descriptor & SW_EL1_PRIVATE != 0
+            {
                 if block_start < va || block_end > end {
                     self.split_block(location, level, source.as_deref_mut())?;
                     changed = true;
