@@ -1,5 +1,5 @@
 //! The kick+futex backends' self-pipe signal pump, generic over the backend's
-//! [`HostSignalGlue`](carrick_signal_core::HostSignalGlue). HVPatch does not host
+//! [`HostSignalGlue`](carrick_signal_linux::HostSignalGlue). HVPatch does not host
 //! fork guest tasks, so this module exposes startup control only.
 
 #![cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
@@ -7,7 +7,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use carrick_signal_core::HostSignalGlue;
+use carrick_signal_linux::HostSignalGlue;
 
 use crate::pump_fork_coord::{HostSignalPump, SignalPumpController};
 use crate::{PlatformFutex, VcpuRegistry};
@@ -32,7 +32,7 @@ impl<G: HostSignalGlue> HostSignalPump for SelfPipePump<G> {
         // where `init_xsig` is idempotent (no-ops on the inherited ring) and only
         // the nudge handler is re-asserted.
         G::install_kick_handler();
-        carrick_signal_core::host_glue::init_xsig::<G>();
+        carrick_signal_linux::host_glue::init_xsig::<G>();
     }
 
     fn start(&self, registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn PlatformFutex>) {

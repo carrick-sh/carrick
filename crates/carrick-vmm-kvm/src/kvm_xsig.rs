@@ -1,11 +1,11 @@
 //! KVM glue for the cross-process xsignal ring — now a thin forwarder to the
-//! SHARED [`carrick_signal_core::host_glue`], parameterized by [`crate::KvmGlue`].
-//! The ring core ([`carrick_signal_core::xsig`]) was always neutral; the nudge
+//! SHARED [`carrick_signal_linux::host_glue`], parameterized by [`crate::KvmGlue`].
+//! The ring core ([`carrick_signal_linux::xsig`]) was always neutral; the nudge
 //! handler + install + `kill`-the-target are now shared too. (The runtime calls
 //! the shared `host_glue::xsig_nudge` directly after the #6 cfg-flip.)
 
-use carrick_signal_core::HostSignalGlue;
-use carrick_signal_core::host_glue;
+use carrick_signal_linux::HostSignalGlue;
+use carrick_signal_linux::host_glue;
 
 use crate::KvmGlue;
 

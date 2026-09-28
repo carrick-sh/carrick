@@ -130,6 +130,9 @@ const SW_EL1_PRIVATE: u64 = 1 << 56;
 const SW_EL1_MAY_WRITE: u64 = 1 << 57;
 /// The originating Linux VMA permits a later `mprotect(PROT_EXEC)`.
 const SW_EL1_MAY_EXEC: u64 = 1 << 58;
+// With SW_EL1_PRIVATE clear, this bit instead authenticates a prepared grant
+// output. Host copyin must still treat the leaf as first-touch armed.
+const SW_EL1_PREPARED: u64 = SW_EL1_MAY_EXEC;
 
 // PA field masks per level (identical to memory.rs).
 const PA_MASK_1GIB: u64 = 0x0000_FFFF_C000_0000;
@@ -350,32 +353,37 @@ unsafe fn existing_terminal_descriptor(
         let word =
             unsafe { live_primary_descriptor(words, physical_base, byte_len, descriptor_pa)? };
         let descriptor = unsafe { (*word).load(Ordering::Acquire) };
-        if descriptor & VALID == 0 {
-            return Err(GuestLeafPublicationError::MissingTable);
-        }
         let descriptor_type = descriptor & TYPE_BITS;
         match level {
-            0 if descriptor_type == TYPE_TABLE_OR_PAGE => {
+            0 if descriptor & VALID != 0 && descriptor_type == TYPE_TABLE_OR_PAGE => {
                 table = descriptor & PA_MASK_TABLE;
             }
-            1 | 2 if descriptor_type == TYPE_TABLE_OR_PAGE => {
+            1 | 2 if descriptor & VALID != 0 && descriptor_type == TYPE_TABLE_OR_PAGE => {
                 table = descriptor & PA_MASK_TABLE;
             }
-            1 if descriptor_type == TYPE_BLOCK => {
+            1 if descriptor_type == TYPE_BLOCK
+                || (descriptor_type == 0
+                    && descriptor & (SW_EL1_PRIVATE | SW_EL1_PREPARED) != 0) =>
+            {
                 return Ok(ExistingTerminalDescriptor {
                     word,
                     semantic_base: va & PA_MASK_1GIB,
                     span: 1 << 30,
                 });
             }
-            2 if descriptor_type == TYPE_BLOCK => {
+            2 if descriptor_type == TYPE_BLOCK
+                || (descriptor_type == 0
+                    && descriptor & (SW_EL1_PRIVATE | SW_EL1_PREPARED) != 0) =>
+            {
                 return Ok(ExistingTerminalDescriptor {
                     word,
                     semantic_base: va & PA_MASK_2MIB,
                     span: 1 << 21,
                 });
             }
-            3 if descriptor_type == TYPE_TABLE_OR_PAGE => {
+            3 if descriptor_type == TYPE_TABLE_OR_PAGE
+                || descriptor_type == (TYPE_TABLE_OR_PAGE & !VALID) =>
+            {
                 return Ok(ExistingTerminalDescriptor {
                     word,
                     semantic_base: va & PA_MASK_4KIB,
@@ -612,9 +620,9 @@ pub unsafe fn retire_existing_el1_private_pages(
             return Err(GuestRetirementError::NotPrivateAnonymous);
         }
         let descriptor = unsafe { (*terminal.word).load(Ordering::Acquire) };
-        if descriptor & VALID == 0
-            || descriptor & SW_RETIRED != 0
-            || descriptor & SW_EL1_PRIVATE == 0
+        if descriptor & SW_RETIRED != 0
+            || (descriptor & SW_EL1_PRIVATE == 0
+                && (descriptor & SW_EL1_PREPARED == 0 || descriptor & PA_MASK_4KIB == 0))
         {
             return Err(GuestRetirementError::NotPrivateAnonymous);
         }
@@ -2640,6 +2648,33 @@ impl PageTableManager {
                 self.set_prot_none(start, (stop - start) as usize, source.as_deref_mut())
                     .map_err(GuestLeafPublicationError::Manager)?;
             }
+        }
+        // An untouched grant leaf owns prepared backing even though it must
+        // remain invalid and lack SW_EL1_PRIVATE for host first-touch copyin.
+        // Its separate software marker lets EL1 retire the whole lease later.
+        let mut untouched = publication.va;
+        while untouched < end {
+            if untouched != page {
+                let (location, level) = self
+                    .leaf_offset(untouched, false, None)
+                    .map_err(GuestLeafPublicationError::Manager)?;
+                if level != 3 {
+                    return Err(GuestLeafPublicationError::InvalidLeafShape);
+                }
+                let descriptor = self
+                    .read_desc(location)
+                    .map_err(GuestLeafPublicationError::Manager)?;
+                let expected = publication.ipa + untouched - publication.va;
+                if descriptor & VALID != 0 && descriptor & ACCESS_FLAG != 0
+                    || descriptor & SW_RETIRED != 0
+                    || descriptor & PA_MASK_4KIB != expected & PA_MASK_4KIB
+                {
+                    return Err(GuestLeafPublicationError::InvalidLeafShape);
+                }
+                self.write_desc(location, descriptor | SW_EL1_PREPARED)
+                    .map_err(GuestLeafPublicationError::Manager)?;
+            }
+            untouched += PT_PAGE;
         }
         self.mark_guest_private_publication(GuestLeafPublication {
             va: page,
@@ -8711,6 +8746,74 @@ mod tests {
     }
 
     #[test]
+    fn guest_retirement_accepts_prepared_and_af_clear_leaves() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        let root = 0x8800_0000_0000;
+        let va = 0x4000_0000;
+        let ipa = 0x009b_4000_0000;
+        let mut words: Vec<AtomicU64> = (0..(4 * 512)).map(|_| AtomicU64::new(0)).collect();
+        let indexes = indices(va);
+        words[indexes[0]].store((root + 0x1000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[512 + indexes[1]].store((root + 0x2000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        words[1024 + indexes[2]].store((root + 0x3000) | TYPE_TABLE_OR_PAGE, Ordering::Relaxed);
+        let leaf = 1536 + indexes[3];
+        let prepared = (ipa & PA_MASK_4KIB) | (USER_PAGE_FLAGS & !VALID) | NON_GLOBAL | UXN;
+        words[leaf].store(prepared | SW_EL1_PREPARED, Ordering::Relaxed);
+        words[leaf + 1].store(
+            ((ipa + PT_PAGE) & PA_MASK_4KIB)
+                | (USER_PAGE_FLAGS & !ACCESS_FLAG)
+                | NON_GLOBAL
+                | UXN
+                | SW_EL1_PRIVATE,
+            Ordering::Relaxed,
+        );
+        words[leaf + 2].store(
+            ((ipa + 2 * PT_PAGE) & PA_MASK_4KIB)
+                | USER_PAGE_FLAGS
+                | NON_GLOBAL
+                | UXN
+                | SW_EL1_PRIVATE,
+            Ordering::Relaxed,
+        );
+        words[leaf + 3].store(
+            ((ipa + 3 * PT_PAGE) & PA_MASK_4KIB)
+                | USER_PAGE_FLAGS
+                | NON_GLOBAL
+                | UXN
+                | SW_EL1_PREPARED,
+            Ordering::Relaxed,
+        );
+        words[leaf + 4].store(
+            ((ipa + 4 * PT_PAGE) & PA_MASK_4KIB)
+                | (USER_PAGE_FLAGS & !ACCESS_FLAG)
+                | NON_GLOBAL
+                | UXN
+                | SW_EL1_PREPARED,
+            Ordering::Relaxed,
+        );
+
+        assert_eq!(
+            unsafe {
+                retire_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    words.len() * core::mem::size_of::<AtomicU64>(),
+                    va,
+                    5 * PT_PAGE,
+                )
+            },
+            Ok(5)
+        );
+        for page in 0..5 {
+            let descriptor = words[leaf + page].load(Ordering::Acquire);
+            assert_eq!(descriptor & VALID, 0);
+            assert_ne!(descriptor & SW_RETIRED, 0);
+            assert_eq!(descriptor & PA_MASK_4KIB, ipa + page as u64 * PT_PAGE);
+        }
+    }
+
+    #[test]
     fn live_guest_publication_builds_missing_hierarchy_transactionally() {
         let resolver = MockLiveResolver::new();
         resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
@@ -9408,6 +9511,11 @@ mod tests {
                     mgr.debug_walk(address)
                 )),
                 "an untouched page must not be mistaken for EL1 PROT_NONE by host copyin"
+            );
+            assert_ne!(
+                terminal_descriptor(mgr.debug_walk(address)) & SW_EL1_PREPARED,
+                0,
+                "an untouched grant page must retain its retirement authority"
             );
         }
         assert_eq!(mgr.translate(va + PT_PAGE), Some(ipa + PT_PAGE));

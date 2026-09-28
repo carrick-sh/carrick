@@ -312,35 +312,13 @@
       "domain": "mem::el1_trampoline"
     },
     {
-      "file": "crates/carrick-signal-core/src/fasync.rs",
-      "function": "publish_slot",
+      "file": "crates/carrick-signal-linux/src/fasync.rs",
+      "function": "invariant_failure",
       "ordinal_in_function": 1,
-      "fingerprint": "1eeda924be67eb781915f5d2b4402b523aa789775b61e5b09b3d005e1fb546dc",
+      "fingerprint": "7aadcc81f8044bf5f25c13e99a500bdb2d24cb4510e3d2c976f0bbfd443f3101",
       "verdict": "carrier_fault",
       "failure_domain": "signal::fasync",
-      "rationale": "Seqlock sequence number was odd during slot publication start, indicating concurrent writer violation.",
-      "sink": "fatal",
-      "domain": "signal::fasync"
-    },
-    {
-      "file": "crates/carrick-signal-core/src/fasync.rs",
-      "function": "disarm",
-      "ordinal_in_function": 1,
-      "fingerprint": "c857591c241df68cbebc229c11ca4faf5d17d6ead35db561d612af358357a18c",
-      "verdict": "carrier_fault",
-      "failure_domain": "signal::fasync",
-      "rationale": "Seqlock sequence number was odd during slot disarm sequence, indicating concurrent writer violation.",
-      "sink": "fatal",
-      "domain": "signal::fasync"
-    },
-    {
-      "file": "crates/carrick-signal-core/src/fasync.rs",
-      "function": "disarm",
-      "ordinal_in_function": 2,
-      "fingerprint": "c857591c241df68cbebc229c11ca4faf5d17d6ead35db561d612af358357a18c",
-      "verdict": "carrier_fault",
-      "failure_domain": "signal::fasync",
-      "rationale": "Armed fasync registration count underflowed zero during disarm.",
+      "rationale": "Host adapter for the neutral fasync invariant callback. Slot publication or disarm observed an odd seqlock sequence, or disarm underflowed the armed count; all three retain the signal::fasync fatal domain and original diagnostic messages.",
       "sink": "fatal",
       "domain": "signal::fasync"
     },
