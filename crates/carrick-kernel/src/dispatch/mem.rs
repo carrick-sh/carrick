@@ -54,6 +54,7 @@ use super::*;
 use carrick_fatal::carrick_fatal;
 use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 
+pub use fault::core_data_runs;
 pub(crate) mod brk;
 #[cfg(test)]
 pub(super) use brk::update_semantic_heap_pages;

@@ -3387,6 +3387,43 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.prepare_el1_frame_grant(request)
     }
 
+    fn publish_el1_frame_grant_on_host(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        fault_va: u64,
+        permissions: u64,
+    ) -> Result<bool, TrapError> {
+        let size = usize::try_from(len).map_err(|_| TrapError::MappingTooLarge(len))?;
+        self.pt_edit_and_flush_after_adopting(va, size, |editor| {
+            let source = editor.arena_source.as_deref_mut();
+            editor
+                .manager
+                .publish_private_pages(
+                    carrick_mmu_core::aarch64::GuestLeafPublication {
+                        va,
+                        ipa,
+                        len,
+                        writable: permissions & 2 != 0,
+                        executable: permissions & 4 != 0,
+                    },
+                    fault_va,
+                    source,
+                )
+                .map_err(|error| match error {
+                    carrick_mmu_core::aarch64::GuestLeafPublicationError::Manager(error) => error,
+                    _ => PageTableError::BadAddress,
+                })?;
+            Ok(PageTableApplyOutcome {
+                changed: true,
+                flush_required: true,
+            })
+        })
+        .map_err(|error| memory_error_to_trap_error(error, "publish EL1 frame grant on host"))?;
+        Ok(true)
+    }
+
     fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
@@ -3797,14 +3834,18 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // child image is cloned and the parent is armed; otherwise both the
         // child snapshot and the parent's re-armed leaves resurrect the
         // pre-EL1 invalid descriptors and the next touch is a SIGSEGV.
-        for range in private_ranges.iter().filter(|range| !range.kernel_only) {
-            self.pt_edit_locked_after_adopting(Some((range.va, range.len)), |_| {
-                Ok(PageTableApplyOutcome::default())
-            })
-            .map_err(|error| {
-                memory_error_to_trap_error(error, "adopt live stage-1 tables before fork")
-            })?;
-        }
+        // Adopt the whole user address space, not just the backend's private
+        // ranges: EL1 publishes into tables it created for any first-touch
+        // range (Go's heap arenas are not all in that list), and the child
+        // image is cloned from this copy. The walk skips empty subtrees, so
+        // its cost follows the populated tables, not the span.
+        const USER_ADDRESS_SPACE: usize = 1 << 48;
+        self.pt_edit_locked_after_adopting(Some((0, USER_ADDRESS_SPACE)), |_| {
+            Ok(PageTableApplyOutcome::default())
+        })
+        .map_err(|error| {
+            memory_error_to_trap_error(error, "adopt live stage-1 tables before fork")
+        })?;
         let cow_ranges = if request.shares_mm() {
             Vec::new()
         } else {

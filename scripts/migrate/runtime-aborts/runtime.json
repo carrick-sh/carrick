@@ -118,7 +118,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/host_alias.rs",
-      "function": "<HostAliasDispatchGuard<'_> as Drop>::drop",
+      "function": "<HostAliasDispatchAdmission as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "f49624eac3ea22e23576535dcc326d7ff4bd0c9222c5b1611df9d57bfab1b38b",
       "verdict": "carrier_fault",
@@ -2504,6 +2504,17 @@
       "rationale": "The activated root could not recapture its exact kernel context before terminal-route publication; continuing could bind carrier-wide TTY service to the wrong task generation.",
       "sink": "fatal",
       "domain": "threaded_loop::root_activation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mm_mutation.rs",
+      "function": "<HostAliasCoordinatorGuard<'_> as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "f0de8987e30883cb162b389c41b2054895b410274c6f5970b25e785e43f03cfb",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_mutation",
+      "rationale": "Host-alias coordinator released with no recorded holder: alias_active accounting is corrupt, so later dispatchers could enter concurrently or wait forever.",
+      "sink": "fatal",
+      "domain": "dispatch::mm_mutation"
     }
   ]
 }
