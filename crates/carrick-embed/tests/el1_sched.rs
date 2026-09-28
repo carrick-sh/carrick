@@ -858,6 +858,7 @@ struct MmOccupancyRoleReport {
     forks: u64,
     edits: u64,
     edit_failures: u64,
+    edit_errors: String,
     torn: u64,
     snapshot_changes: u64,
     child_failures: u64,
@@ -893,6 +894,7 @@ fn parse_role_line(
     let mut forks = None;
     let mut edits = None;
     let mut edit_failures = None;
+    let mut edit_errors = None;
     let mut torn = None;
     let mut snapshot_changes = None;
     let mut child_failures = None;
@@ -939,6 +941,12 @@ fn parse_role_line(
                     return Err("duplicate edit_failures key".to_string());
                 }
                 edit_failures = Some(v);
+            }
+            "edit_errors" => {
+                if edit_errors.is_some() || value.is_empty() {
+                    return Err("duplicate or empty edit_errors key".to_string());
+                }
+                edit_errors = Some(value.to_string());
             }
             "torn" => {
                 let v = value
@@ -995,6 +1003,7 @@ fn parse_role_line(
     let forks = forks.ok_or_else(|| "missing forks counter".to_string())?;
     let edits = edits.ok_or_else(|| "missing edits counter".to_string())?;
     let edit_failures = edit_failures.ok_or_else(|| "missing edit_failures counter".to_string())?;
+    let edit_errors = edit_errors.unwrap_or_else(|| "none".to_string());
     let torn = torn.ok_or_else(|| "missing torn counter".to_string())?;
     let snapshot_changes =
         snapshot_changes.ok_or_else(|| "missing snapshot_changes counter".to_string())?;
@@ -1017,7 +1026,9 @@ fn parse_role_line(
         return Err("edits must be non-zero".to_string());
     }
     if edit_failures != 0 {
-        return Err(format!("edit_failures must be 0, saw {edit_failures}"));
+        return Err(format!(
+            "edit_failures must be 0, saw {edit_failures}: {edit_errors}"
+        ));
     }
     if torn != 0 {
         return Err(format!("torn must be 0, saw {torn}"));
@@ -1043,6 +1054,7 @@ fn parse_role_line(
         forks,
         edits,
         edit_failures,
+        edit_errors,
         torn,
         snapshot_changes,
         child_failures,
@@ -1129,14 +1141,12 @@ mm-occupancy child_ok=true
 #[test]
 fn occupancy_report_rejects_edit_failures() {
     let stdout = "\
-mm-occupancy parent writers=8 forks=150 edits=42 edit_failures=2 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
+mm-occupancy parent writers=8 forks=150 edits=42 edit_failures=2 edit_errors=munmap:12,mprotect_ro:16 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
 mm-occupancy child writers=8 forks=150 edits=45 edit_failures=0 torn=0 snapshot_changes=0 child_failures=0 join_failures=0 ok=true
 mm-occupancy child_ok=true
 ";
-    assert!(
-        validate_mm_occupancy_stdout(stdout, 150).is_err(),
-        "edit failures must be rejected"
-    );
+    let error = validate_mm_occupancy_stdout(stdout, 150).unwrap_err();
+    assert!(error.contains("munmap:12,mprotect_ro:16"), "{error}");
 }
 
 #[test]
@@ -1424,13 +1434,14 @@ fn el1_anonymous_mapping_retirement_returns_and_reuses_frames() {
             "every granted physical byte must return"
         );
         assert!(reused > 0, "repeated mapping never reused a returned IPA");
-        // WEAKENED 2026-09-27 (owner-approved): these were exact assertions
-        // (served == ROUNDS + 1, forwarded == 1). With per-page first-touch
-        // publication, extents holding untouched invalid leaves forward. Restore
-        // when work/munmap-retire and work/af-batching land.
-        println!(
-            "el1-sched mapping-retirement served_munmap={served_munmap} (contract {}) forwarded_munmap={forwarded_munmap} (contract 1)",
-            ROUNDS + 1
+        assert_eq!(
+            served_munmap,
+            ROUNDS + 1,
+            "EL1 must retire every target munmap plus the fixed eligible runtime cleanup"
+        );
+        assert_eq!(
+            forwarded_munmap, 1,
+            "only the fixed untagged runtime cleanup may forward"
         );
         runs.push((pages, measured.exits));
     }

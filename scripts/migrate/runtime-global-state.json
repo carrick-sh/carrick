@@ -443,6 +443,14 @@
     },
     {
       "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "symbol": "abort_on_guest_fault_signal_enabled::CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL",
+      "fingerprint": "443be15d2cd547a76da87478fc36c7535a7b54bc7e6841229cf50e0ad58bf080",
+      "classification": "config_debug",
+      "rationale": "Diagnostic hatch CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL=1 in crates/carrick-runtime/src/vcpu_loop/signal.rs that turns the first SIGSEGV/SIGBUS bound for a guest thread into carrick_fatal! for post-mortem capture; read once per carrier process."
+    },
+    {
+      "kind": "env_var",
       "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",
       "symbol": "tests::clone_admission_terminal_claim_cost_receipt::CARRICK_HANDOFF_PERF_ITERATIONS",
       "fingerprint": "d8c13a13ecbc912d8eefc2783675658f04dbc51fedcbe50a5e580828ae136b35",
@@ -1756,6 +1764,22 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/event_ring.rs",
+      "symbol": "SCHED_IDX",
+      "fingerprint": "72d6e03af8e0e2e7278f889b8b1695d7170e991ce682b5a67f4d375b9ddaca9e",
+      "classification": "carrier_infra",
+      "rationale": "Logical write index of the high-rate event ring SCHED_RING in crates/carrick-kernel/src/event_ring.rs; lock-free reservation counter, reset only in reinit_after_fork."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/event_ring.rs",
+      "symbol": "SCHED_RING",
+      "fingerprint": "29902818ebdd04b19125a4cc62699652ab9c4e0eb59666fc7f71da3c0779cb3f",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide always-on high-rate event ring in crates/carrick-kernel/src/event_ring.rs: per-dispatch scheduler and per-poll epoll/eventfd/futex records kept apart from RING so a spin cannot evict lifecycle history; read post-mortem by the lldb plugin."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/event_ring.rs",
       "symbol": "WATCHDOG",
       "fingerprint": "ee057f3981134b986886500eec0a6b454ff540fbc5b1db0a0eb60d1264875e89",
       "classification": "carrier_infra",
@@ -2312,6 +2336,14 @@
       "fingerprint": "68f1c965cdc5df3062e0e69d4e0575047d68bc650b4206c04c92c2c85e425ce8",
       "classification": "test_only",
       "rationale": "Cfg(test)-only mutex serializes foreign-COW handshake fixtures that share process-wide test controls; it is absent from production builds."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+      "symbol": "abort_on_guest_fault_signal_enabled::ENABLED",
+      "fingerprint": "810e6edc6ac71f37c4eb86f28b68168eb8d1faac13e5facea0127a51501d3002",
+      "classification": "config_debug",
+      "rationale": "Cached value of the CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL diagnostic hatch in crates/carrick-runtime/src/vcpu_loop/signal.rs; read once, immutable for the carrier's life."
     },
     {
       "kind": "static",

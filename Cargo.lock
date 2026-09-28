@@ -516,6 +516,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-fd-core"
+version = "0.1.0"
+
+[[package]]
 name = "carrick-guest-mem"
 version = "0.1.0"
 dependencies = [
@@ -537,7 +541,7 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
- "carrick-signal-core",
+ "carrick-signal-linux",
  "carrick-timer-core",
  "libc",
  "serde",
@@ -563,7 +567,7 @@ dependencies = [
  "carrick-abi",
  "carrick-hal",
  "carrick-host",
- "carrick-signal-core",
+ "carrick-signal-linux",
  "libc",
 ]
 
@@ -638,7 +642,7 @@ dependencies = [
  "carrick-observability",
  "carrick-portable",
  "carrick-sched-core",
- "carrick-signal-core",
+ "carrick-signal-linux",
  "carrick-spec",
  "carrick-test-support",
  "carrick-thread",
@@ -734,6 +738,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-pipe-core"
+version = "0.1.0"
+
+[[package]]
 name = "carrick-portable"
 version = "0.1.0"
 dependencies = [
@@ -768,7 +776,7 @@ dependencies = [
  "carrick-observability",
  "carrick-portable",
  "carrick-runtime",
- "carrick-signal-core",
+ "carrick-signal-linux",
  "carrick-spec",
  "carrick-test-support",
  "carrick-thread",
@@ -813,9 +821,14 @@ version = "0.1.0"
 [[package]]
 name = "carrick-signal-core"
 version = "0.1.0"
+
+[[package]]
+name = "carrick-signal-linux"
+version = "0.1.0"
 dependencies = [
  "carrick-abi",
  "carrick-fatal",
+ "carrick-signal-core",
  "libc",
  "tempfile",
 ]
@@ -859,11 +872,6 @@ dependencies = [
 [[package]]
 name = "carrick-timer-core"
 version = "0.1.0"
-dependencies = [
- "carrick-abi",
- "carrick-host",
- "carrick-portable",
-]
 
 [[package]]
 name = "carrick-vfs"
@@ -901,7 +909,7 @@ dependencies = [
  "carrick-host",
  "carrick-host-bsd",
  "carrick-mem",
- "carrick-signal-core",
+ "carrick-signal-linux",
  "carrick-thread",
  "carrick-timer-core",
  "carrick-x86",
@@ -927,7 +935,7 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
- "carrick-signal-core",
+ "carrick-signal-linux",
  "carrick-thread",
  "carrick-timer-core",
  "cc",
@@ -955,7 +963,7 @@ dependencies = [
  "carrick-hal",
  "carrick-host",
  "carrick-mem",
- "carrick-signal-core",
+ "carrick-signal-linux",
  "carrick-thread",
  "carrick-timer-core",
  "carrick-x86",
@@ -975,7 +983,7 @@ dependencies = [
  "carrick-host",
  "carrick-host-bsd",
  "carrick-mem",
- "carrick-signal-core",
+ "carrick-signal-linux",
  "carrick-thread",
  "carrick-timer-core",
  "carrick-x86",

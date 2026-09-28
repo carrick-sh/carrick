@@ -4159,7 +4159,9 @@ where
                 );
                 let interrupted_pc = from_el0_direct.then_some(elr);
                 let faulting_tid = self.state.linux_tid;
-                if self.kernel.dispatcher.fault_requires_mm_mutation(si_addr)
+                let requires_mm_mutation =
+                    self.kernel.dispatcher.fault_requires_mm_mutation(si_addr);
+                if requires_mm_mutation
                     && self
                         .state
                         .with_mm_mutation_authority(&self.kernel, |mutation| {
@@ -4198,6 +4200,29 @@ where
                             "capture synchronous-fault signal context: {error}"
                         ))
                     })?;
+                // Post-mortem record of the delivery decision: the live
+                // stage-1 walk and the frame-grant mailbox census are read
+                // here, off the resolved-fault hot path, with no allocation
+                // or lock. `carrick eventring` decodes it from a core.
+                let fault_record = carrick_kernel::event_ring::FaultSignalRecord {
+                    tid: faulting_tid.raw(),
+                    mm_key: self.state.zone_mm,
+                    signum,
+                    si_code,
+                    fault_address: si_addr,
+                    esr: syndrome,
+                    pc: elr,
+                    requires_mm_mutation,
+                    from_el0_direct,
+                    access: signal::ring_access(fault_access),
+                    walk: signal::ring_stage1_walk(&*engine, far, fault_access),
+                };
+                carrick_kernel::event_ring::rec_fault_signal(
+                    &fault_record,
+                    engine.mailbox_slot(),
+                    signal::busy_frame_grant_mailboxes(),
+                );
+                signal::abort_on_guest_fault_signal_if_armed(&fault_record);
                 if let Some(outcome) = deliver_fault_signal(
                     &self.kernel,
                     &fault_context,
@@ -4228,12 +4253,14 @@ where
                 let si_code = carrick_kernel::kernel::objects::signal::upgrade_protection_si_code(
                     &*engine, signum, si_code, fault_addr,
                 );
-                let interrupted_pc = Some(engine.current_pc()?);
+                let fault_pc = engine.current_pc()?;
+                let interrupted_pc = Some(fault_pc);
                 let faulting_tid = self.state.linux_tid;
-                if self
+                let requires_mm_mutation = self
                     .kernel
                     .dispatcher
-                    .fault_requires_mm_mutation(fault_addr)
+                    .fault_requires_mm_mutation(fault_addr);
+                if requires_mm_mutation
                     && self
                         .state
                         .with_mm_mutation_authority(&self.kernel, |mutation| {
@@ -4264,6 +4291,27 @@ where
                             "capture guest-fault signal context: {error}"
                         ))
                     })?;
+                // Same post-mortem record as the aarch64 arm; the ISA-neutral
+                // triple carries no syndrome and no decodable access.
+                let fault_record = carrick_kernel::event_ring::FaultSignalRecord {
+                    tid: faulting_tid.raw(),
+                    mm_key: self.state.zone_mm,
+                    signum,
+                    si_code,
+                    fault_address: fault_addr,
+                    esr: 0,
+                    pc: fault_pc,
+                    requires_mm_mutation,
+                    from_el0_direct: false,
+                    access: carrick_kernel::event_ring::RingAccess::Unknown,
+                    walk: None,
+                };
+                carrick_kernel::event_ring::rec_fault_signal(
+                    &fault_record,
+                    engine.mailbox_slot(),
+                    signal::busy_frame_grant_mailboxes(),
+                );
+                signal::abort_on_guest_fault_signal_if_armed(&fault_record);
                 if let Some(outcome) = deliver_fault_signal(
                     &self.kernel,
                     &fault_context,

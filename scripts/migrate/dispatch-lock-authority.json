@@ -557,7 +557,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/time.rs::SyscallDispatcher::getitimer::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 399,
+      "line": 387,
       "item": "SyscallDispatcher::getitimer",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -566,7 +566,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/time.rs::SyscallDispatcher::setitimer::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 422,
+      "line": 410,
       "item": "SyscallDispatcher::setitimer",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -575,7 +575,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/time.rs::SyscallDispatcher::setitimer::proc#2",
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 431,
+      "line": 419,
       "item": "SyscallDispatcher::setitimer",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -584,7 +584,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/time.rs::SyscallDispatcher::x86_alarm::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 503,
+      "line": 491,
       "item": "SyscallDispatcher::x86_alarm",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -593,7 +593,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/time.rs::SyscallDispatcher::x86_alarm::proc#2",
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 505,
+      "line": 493,
       "item": "SyscallDispatcher::x86_alarm",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -602,7 +602,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/time.rs::SyscallDispatcher::x86_alarm::proc#3",
       "file": "crates/carrick-kernel/src/dispatch/time.rs",
-      "line": 515,
+      "line": 503,
       "item": "SyscallDispatcher::x86_alarm",
       "category": "proc",
       "expression": ".proc.lock()",
