@@ -1582,11 +1582,20 @@ pub struct HvfAnonymousDiscard {
     prepared: crate::trap::PreparedProcessAliasRetirement,
 }
 
+const HVPATCH_ANONYMOUS_DISCARD_GRANULE: u64 = 4096;
+
+fn hvpatch_discard_admits(persistent: bool, va: u64, len: usize) -> bool {
+    persistent
+        && va.is_multiple_of(HVPATCH_ANONYMOUS_DISCARD_GRANULE)
+        && len != 0
+        && (len as u64).is_multiple_of(HVPATCH_ANONYMOUS_DISCARD_GRANULE)
+}
+
 impl Aarch64Vmm for HvfAarch64Vmm {
     type AnonymousDiscard = HvfAnonymousDiscard;
 
-    fn anonymous_discard_granule(&self) -> Option<u64> {
-        self.state.persistent_vm_lifecycle.then_some(16384)
+    fn frame_cow_authority(&self) -> Option<Arc<dyn carrick_hal::FrameCowAuthority>> {
+        self.state.cow_authority.clone()
     }
 
     fn prepare_anonymous_discard(
@@ -1594,9 +1603,16 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         va: u64,
         len: usize,
     ) -> Result<Option<Self::AnonymousDiscard>, TrapError> {
-        // Partial host granules keep the authenticated scrub until retained
-        // neighbor retirement has a separate structural proof.
-        if !self.state.persistent_vm_lifecycle || va % 16384 != 0 || len == 0 || len % 16384 != 0 {
+        crate::probes::hvpatch_anonymous_discard_entry(
+            va,
+            len as u64,
+            HVPATCH_ANONYMOUS_DISCARD_GRANULE,
+        );
+        // An exact-MM alias retirement splits partial host-frame aliases and
+        // keeps the physical lease while any neighboring Linux page owns it.
+        // The invalidated leaf plus fresh deferred provenance prevents its
+        // former bytes from being re-exposed, without a frame-COW scrub.
+        if !hvpatch_discard_admits(self.state.persistent_vm_lifecycle, va, len) {
             return Ok(None);
         }
         let identity = self
@@ -2286,6 +2302,78 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
 #[cfg(test)]
 mod persistent_worker_tests {
+
+    /// Model the shared-MM thread stack after an EL1 bulk grant, a sibling
+    /// thread's fork, and both observed glibc discard lengths. The parent
+    /// retires Linux pages without a backing-maintenance COW; the child keeps
+    /// its fork image. The HVPatch retirement granule must therefore be one
+    /// Linux page, including for a range starting one page into a host frame.
+    #[test]
+    fn forked_el1_stack_grant_discards_64k_and_8m_without_edge_cow() {
+        use carrick_mmu_core::aarch64::{
+            El1PrivateLeafState, GuestLeafPublication, PageTableManager, el1_private_leaf_state,
+            terminal_descriptor,
+        };
+
+        let base_va = crate::memory::LINUX_MMAP_BASE + 0x2000_0000;
+        let base_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x3000_0000;
+        const STACK_LEN: u64 = 8 * 1024 * 1024;
+        for stack_count in [1_u64, 2, 4] {
+            let mut parent = PageTableManager::new(
+                carrick_mem::memory::stage1_hvpatch_page_tables(),
+                crate::memory::LINUX_PAGE_TABLES_BASE,
+                carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+            );
+            parent.declare_offline_private_image();
+            for stack in 0..stack_count {
+                let va = base_va + stack * 4 * STACK_LEN;
+                let ipa = base_ipa + stack * 4 * STACK_LEN;
+                parent
+                    .publish_private_pages(
+                        GuestLeafPublication {
+                            va,
+                            ipa,
+                            len: STACK_LEN,
+                            writable: true,
+                            executable: false,
+                        },
+                        va + 0x1000,
+                        None,
+                    )
+                    .expect("bulk grant with a resident stack edge");
+            }
+            let mut child = parent.snapshot_image().expect("fork image");
+            for stack in 0..stack_count {
+                let va = base_va + stack * 4 * STACK_LEN;
+                parent
+                    .set_fork_readonly(va, STACK_LEN as usize, None)
+                    .unwrap();
+                child
+                    .set_fork_readonly(va, STACK_LEN as usize, None)
+                    .unwrap();
+                for len in [0x10000, 0x7de000] {
+                    assert!(super::hvpatch_discard_admits(true, va + 0x1000, len));
+                    parent
+                        .unmap_aliased(va + 0x1000, len, None)
+                        .expect("retire parent pages without frame COW");
+                    assert_eq!(
+                        el1_private_leaf_state(terminal_descriptor(parent.debug_walk(va + 0x1000))),
+                        El1PrivateLeafState::Retired
+                    );
+                    assert_eq!(
+                        el1_private_leaf_state(terminal_descriptor(child.debug_walk(va + 0x1000))),
+                        El1PrivateLeafState::Resident
+                    );
+                    assert_eq!(
+                        el1_private_leaf_state(terminal_descriptor(
+                            child.debug_walk(va + len as u64 - 0x1000)
+                        )),
+                        El1PrivateLeafState::Prepared
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn persistent_hvf_workers_install_and_run_the_scoped_asid_trampoline() {

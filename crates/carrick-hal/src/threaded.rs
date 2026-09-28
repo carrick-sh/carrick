@@ -2384,6 +2384,20 @@ pub trait FrameCowQuiesce {}
 impl<T> FrameCowQuiesce for T {}
 
 pub trait FrameCowAuthority: Send + Sync {
+    /// Commit an armed page before the host writes guest memory without an
+    /// EL0 first-touch exit. `protect` publishes the live stage-1 leaf; the
+    /// authority publishes residency only after that edit succeeds.
+    fn commit_host_first_touch(
+        &self,
+        _address: u64,
+        _protect: &mut dyn FnMut(u64, u64) -> Result<(), String>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "host first touch has no exact-MM authority",
+        )))
+    }
+
     /// Exact-MM pristine anonymous state, including task-only fork publication.
     fn deferred_anonymous_state(&self) -> Option<Arc<carrick_guest_mem::DeferredAnonymousState>> {
         None

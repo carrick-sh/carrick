@@ -691,6 +691,43 @@ pub fn acquire_frame_cow_quiesce(
     })
 }
 
+/// Exact-MM stage-1 and mutation identity for a privileged host copyout into
+/// an armed first-touch page. Unlike physical frame COW, this operation also
+/// commits the dispatcher's resident-page metadata.
+pub fn acquire_host_write_mutation_quiesce(
+    barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
+    mm: crate::kernel::MmId,
+    coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
+    tid: ThreadId,
+    budget: PtPauseBudget,
+) -> Result<FrameCowExactMmGuard, PtPauseError> {
+    if let Some(lease) = borrow_current_exact_mm_stage1(mm) {
+        return Ok(FrameCowExactMmGuard::Nested {
+            _lease: lease,
+            mutation_coordinator: Some(coordinator),
+            foreign_stage1: None,
+        });
+    }
+    begin_pt_pause(barrier, tid, budget)?;
+    let residents = crate::kernel::mm_occupancy::residents(mm, barrier, None);
+    if !residents.any_in_guest() {
+        return Ok(FrameCowExactMmGuard::Sole {
+            _guard: PtPauseGuard::new(
+                mm,
+                Some(Arc::clone(&coordinator)),
+                residents,
+                barrier.pause_guard(tid),
+            ),
+            mutation_coordinator: Some(coordinator),
+            foreign_stage1: None,
+        });
+    }
+    Ok(FrameCowExactMmGuard::Paused {
+        _guard: drain_exact_mm(barrier, mm, Some(coordinator), residents, tid),
+        foreign_stage1: None,
+    })
+}
+
 /// Stage-1 authority for a foreign-MM edit (the caller runs another MM).
 /// `Sole` only when no vCPU runs the target at all: a resident target vCPU
 /// must acknowledge the exact-ASID invalidation phase.

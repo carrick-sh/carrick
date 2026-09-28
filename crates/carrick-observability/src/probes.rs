@@ -2493,6 +2493,14 @@ mod hvpatch_guest_probe_abi {
             "stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));",
             "fn hvpatch__el1__frame__grant__plan(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
             "stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));",
+            "fn hvpatch__fault__delivery(_: u64, _: i32, _: i32, _: u32, _: i32) {}",
+            "stub!(hvpatch_fault_delivery(far: u64, incoming: i32, delivered: i32, bus: bool, tid: i32));",
+            "fn hvpatch__fault__signal__frame__failure(_: u64, _: i32, _: i32) {}",
+            "stub!(hvpatch_fault_signal_frame_failure(far: u64, signum: i32, tid: i32));",
+            "fn hvpatch__signal__frame__step(_: u32, _: u64, _: u64, _: i32) {}",
+            "stub!(hvpatch_signal_frame_step(step: u32, va: u64, len: u64, error: i32));",
+            "fn hvpatch__fault__terminal(_: u64, _: i32, _: i32, _: i32) {}",
+            "stub!(hvpatch_fault_terminal(far: u64, signum: i32, si_code: i32, tid: i32));",
             "fn pt__fault__next__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
             "pub fn pt_fault_next_with(va: u64, walk: impl Fn() -> Option<[u64; 4]>) {",
             "fn hvpatch__sparse__boundary__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
@@ -5125,6 +5133,20 @@ mod real {
         fn hvpatch__guest__fault(_: u64, _: u64, _: u64, _: i32, _: i32) {}
         /// Companion identity for `hvpatch__guest__fault`: PID, TID, ASID.
         fn hvpatch__guest__fault__asid(_: i32, _: i32, _: u32) {}
+        /// Final signal classification for a forwarded EL0 fault. Args: FAR,
+        /// incoming signal, delivered signal, BUS metadata match, guest TID.
+        fn hvpatch__fault__delivery(_: u64, _: i32, _: i32, _: u32, _: i32) {}
+        /// A synchronous signal had a handler, but its sigframe could not be
+        /// installed, so Linux force-SIGSEGV replaces the classified signal.
+        /// Args: FAR, classified signal, Linux TID.
+        fn hvpatch__fault__signal__frame__failure(_: u64, _: i32, _: i32) {}
+        /// AArch64 sigframe refusal. Args: step (1 first touch, 2 host-buffer
+        /// permission, 3 frame copy), frame VA, frame bytes, error class
+        /// (1 bounds/denied, 2 unsupported, 3 host map, 4 metadata allocation).
+        fn hvpatch__signal__frame__step(_: u32, _: u64, _: u64, _: i32) {}
+        /// A synchronous fault's final default-action exit (including a
+        /// sigframe failure). Args: FAR, terminal signal, si_code, Linux TID.
+        fn hvpatch__fault__terminal(_: u64, _: i32, _: i32, _: i32) {}
         /// An EL0 fault that the software model no longer names, resolved by
         /// reading the LIVE stage-1 leaf: a sibling thread committed the page
         /// first, so the faulting thread flushes stage-1 and retries instead
@@ -5186,6 +5208,13 @@ mod real {
         /// Byte-copy authentication computed only when this probe is enabled.
         /// Args: old FrameId/IPA, source/destination FNV-1a, exact byte length.
         fn hvpatch__frame__cow__copy(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// A private-anonymous discard reached the HVPatch backend. Args:
+        /// semantic VA, byte length, host retirement granule.
+        fn hvpatch__anonymous__discard__entry(_: u64, _: u64, _: u64) {}
+        /// Exact inventory coverage refused a COW source. Args: fault VA,
+        /// selected physical IPA, compound size, live terminal descriptor,
+        /// bit flags (1 EL1 private, 2 prepared, 4 EL1 fork COW).
+        fn hvpatch__frame__cow__inventory__miss(_: u64, _: u64, _: u64, _: u64, _: u32) {}
         /// Arms the per-fault mapping-index census and marks its start.
         /// Args: live rows and displaced rows in the faulting task's index.
         /// Row-visit counting is OFF until this probe is enabled, so an
@@ -6473,6 +6502,26 @@ mod real {
         ));
     }
 
+    #[inline(never)]
+    pub fn hvpatch_fault_delivery(far: u64, incoming: i32, delivered: i32, bus: bool, tid: i32) {
+        carrick_usdt::hvpatch__fault__delivery!(|| (far, incoming, delivered, u32::from(bus), tid));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fault_signal_frame_failure(far: u64, signum: i32, tid: i32) {
+        carrick_usdt::hvpatch__fault__signal__frame__failure!(|| (far, signum, tid));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_signal_frame_step(step: u32, va: u64, len: u64, error: i32) {
+        carrick_usdt::hvpatch__signal__frame__step!(|| (step, va, len, error));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fault_terminal(far: u64, signum: i32, si_code: i32, tid: i32) {
+        carrick_usdt::hvpatch__fault__terminal!(|| (far, signum, si_code, tid));
+    }
+
     /// A task offered the MM-scoped frame-COW runtime binding. See the
     /// `hvpatch__cow__runtime__bind` provider doc.
     #[inline(never)]
@@ -6614,6 +6663,28 @@ mod real {
             fnv1a(source),
             fnv1a(dest),
             source.len() as u64
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_anonymous_discard_entry(va: u64, len: u64, granule: u64) {
+        carrick_usdt::hvpatch__anonymous__discard__entry!(|| (va, len, granule));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_frame_cow_inventory_miss(
+        va: u64,
+        ipa: u64,
+        compound_size: u64,
+        descriptor: u64,
+        flags: u32,
+    ) {
+        carrick_usdt::hvpatch__frame__cow__inventory__miss!(|| (
+            va,
+            ipa,
+            compound_size,
+            descriptor,
+            flags
         ));
     }
 
@@ -8723,6 +8794,12 @@ mod stub {
     stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));
     stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));
     stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));
+    stub!(hvpatch_anonymous_discard_entry(va: u64, len: u64, granule: u64));
+    stub!(hvpatch_frame_cow_inventory_miss(va: u64, ipa: u64, compound_size: u64, descriptor: u64, flags: u32));
+    stub!(hvpatch_fault_delivery(far: u64, incoming: i32, delivered: i32, bus: bool, tid: i32));
+    stub!(hvpatch_fault_signal_frame_failure(far: u64, signum: i32, tid: i32));
+    stub!(hvpatch_signal_frame_step(step: u32, va: u64, len: u64, error: i32));
+    stub!(hvpatch_fault_terminal(far: u64, signum: i32, si_code: i32, tid: i32));
     stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));
     stub!(stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64));
     stub!(stage1_arena_replace(site: u32, source_before: u32, source_after: u32, authority: u64));

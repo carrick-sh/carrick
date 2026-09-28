@@ -162,6 +162,7 @@ struct FileBackedLoweringMemory {
     accept: bool,
     defer: bool,
     offers: std::cell::RefCell<Vec<(u64, usize, u64)>>,
+    bus_marks: std::cell::RefCell<Vec<(u64, usize)>>,
     deferred_offers:
         std::cell::RefCell<Vec<(u64, usize, u64, carrick_guest_mem::PrivateFileSource)>>,
 }
@@ -173,6 +174,7 @@ impl FileBackedLoweringMemory {
             accept,
             defer: false,
             offers: std::cell::RefCell::new(Vec::new()),
+            bus_marks: std::cell::RefCell::new(Vec::new()),
             deferred_offers: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -198,6 +200,11 @@ impl GuestMemory for FileBackedLoweringMemory {
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         self.inner.protect_range(address, len, prot)
+    }
+
+    fn mark_bus_fault(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.bus_marks.borrow_mut().push((address, len));
+        Ok(())
     }
 
     fn map_private_file_backed(
@@ -392,6 +399,11 @@ fn mmap_private_hostfile_backend_refusal_falls_back_to_snapshot() {
     assert!(
         dispatcher.mmap_fault_is_sigbus(address + PAGE_SIZE),
         "a private eager snapshot still faults on pages wholly beyond map-time EOF"
+    );
+    assert_eq!(
+        memory.bus_marks.borrow().as_slice(),
+        &[(address + PAGE_SIZE, PAGE_SIZE as usize)],
+        "the BUS tail must be removed from EL1-private authority before fork"
     );
 }
 

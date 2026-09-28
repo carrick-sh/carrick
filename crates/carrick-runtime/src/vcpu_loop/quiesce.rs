@@ -1528,6 +1528,7 @@ where
             asid: child_binding.asid.raw(),
         };
         let cow_authority = Arc::new(KernelFrameCowAuthority {
+            runtime: Arc::downgrade(&child_kernel),
             deferred_anonymous: child_kernel
                 .dispatcher
                 .deferred_anonymous_state(child_mm_id),

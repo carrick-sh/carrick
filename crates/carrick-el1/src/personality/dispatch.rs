@@ -188,12 +188,19 @@ where
         return Action::Forward;
     }
 
-    // mprotect stays on the host. Serving it here left the host's
-    // protection table stale, and host copyout (read(2) into a buffer the
-    // guest made PROT_READ/PROT_NONE) then wrote through it: probes
-    // roreadwrite/protnonesyscall reported WRITE-NOT-GATED.
-    if nr == 226 {
-        return Action::Forward;
+    #[cfg(target_os = "none")]
+    if nr == 226
+        && let Some(zone) = zone.as_ref()
+    {
+        let mut editor = memory::HardwareAnonymousPermissionEditor;
+        match memory::try_serve_mprotect(frame, current_tasks, &zone.tables.spaces, &mut editor) {
+            memory::MprotectDisposition::Forward => {}
+            memory::MprotectDisposition::Return(result) => {
+                frame.x[0] = result as u64;
+                counters.served[nr].fetch_add(1, Ordering::Relaxed);
+                return Action::Served;
+            }
+        }
     }
 
     #[cfg(target_os = "none")]

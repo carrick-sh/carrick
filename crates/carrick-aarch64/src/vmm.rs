@@ -498,6 +498,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         None
     }
 
+    fn frame_cow_authority(&self) -> Option<std::sync::Arc<dyn carrick_hal::FrameCowAuthority>> {
+        None
+    }
+
     fn audit_executor_boundary(&mut self, _vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "AArch64 VMM does not expose executor boundary audit authority".to_owned(),
@@ -963,12 +967,6 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         payload: &[u8],
         backing: HostAliasBacking,
     ) -> Result<(u64, bool), TrapError>;
-
-    /// Minimum aligned unit accepted by anonymous retirement. This also opts
-    /// into retiring an aligned interior before authenticating partial edges.
-    fn anonymous_discard_granule(&self) -> Option<u64> {
-        None
-    }
 
     /// Prepare private-anonymous backing retirement before any stage-1 edit.
     /// `None` refuses without mutation. The caller owns MM mutation exclusion.

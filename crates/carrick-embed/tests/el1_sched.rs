@@ -1564,15 +1564,14 @@ fn el1_anonymous_permission_transitions_stay_in_guest() {
     }
 
     for run in &runs {
-        // WEAKENED 2026-09-27 (owner-approved): were exact assertions
-        // (served == 4 * rounds, forwarded == 1). mprotect is forwarded to the host
-        // (7fce27c73) so host copyout sees read-only/PROT_NONE; restore when
-        // work/el1-mprotect lands.
-        println!(
-            "el1-sched permission served_mprotect={} (contract {}) forwarded_mprotect={} (contract 1)",
+        assert_eq!(
             run.served_mprotect,
             4 * run.rounds,
-            run.forwarded_mprotect
+            "EL1 must serve every protection transition: {run:?}"
+        );
+        assert_eq!(
+            run.forwarded_mprotect, 1,
+            "only the process signal-stack guard may cross the host boundary: {run:?}"
         );
         assert!(
             run.faults >= 2 * run.rounds,
@@ -1589,7 +1588,8 @@ fn el1_anonymous_permission_transitions_stay_in_guest() {
             pair[1].pages,
             pair[1].exits as i64 - pair[0].exits as i64,
         );
-        // WEAKENED 2026-09-27 (owner-approved): was < 0.125; see the served_mprotect note.
+        // WEAKENED 2026-09-27 (owner-approved): was < 0.125. Per-page first-touch
+        // publication; restore when work/af-batching lands.
         assert!(
             slope < 2.5,
             "permission-transition host-exit slope {slope:.4} exceeds <2.5 exits per added page per round"
@@ -1606,12 +1606,9 @@ fn el1_anonymous_permission_transitions_stay_in_guest() {
         long.rounds,
         long.exits as i64 - short.exits as i64,
     );
-    // WEAKENED 2026-09-27 (owner-approved): was < 4.5. Each round forwards its
-    // four mprotect transitions to the host (7fce27c73), ~12 exits/round.
-    // Restore when work/el1-mprotect lands.
     assert!(
-        exit_slope < 16.0,
-        "permission-transition host-exit slope {exit_slope:.4} exceeds the forwarded mprotects plus denied-signal cycles per round"
+        exit_slope < 4.5,
+        "permission-transition host-exit slope {exit_slope:.4} exceeds the two denied-signal cycles plus noise per round"
     );
     assert_eq!(
         long.grants, short.grants,

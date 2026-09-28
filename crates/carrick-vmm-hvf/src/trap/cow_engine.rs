@@ -2416,9 +2416,55 @@ impl HvfTaskState {
                 },
             );
             if shape.is_err() {
+                let compound_end = old_physical_ipa.checked_add(CowArmedRanges::COMPOUND_SIZE);
+                let exact_coverage = compound_end.is_some_and(|end| {
+                    inventory.extents.keys().any(|(base, length)| {
+                        old_physical_ipa >= *base && end <= base.saturating_add(*length)
+                    })
+                });
                 // The inventory refused the source this lookup selected; name
                 // the stage-1, alias and inventory evidence for it.
                 drop(inventory);
+                if !exact_coverage {
+                    let page_table_host = self
+                        .mapping_for_range_in(
+                            custody,
+                            crate::memory::LINUX_PAGE_TABLES_BASE,
+                            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                        )
+                        .map(|mapping| mapping.host_addr);
+                    let leaf = self
+                        .page_tables_authority()
+                        .with_manager(|manager| {
+                            page_table_host
+                                .and_then(|host| unsafe {
+                                    manager
+                                        .debug_walk_host(
+                                            self.page_table_resolver(manager.base(), Some(host)),
+                                            fault_va,
+                                        )
+                                        .ok()
+                                })
+                                .unwrap_or_else(|| manager.debug_walk(fault_va))
+                        })
+                        .map(carrick_mmu_core::aarch64::terminal_descriptor)
+                        .unwrap_or(0);
+                    use carrick_mmu_core::aarch64::{
+                        El1PrivateLeafState, el1_private_leaf_state,
+                        terminal_descriptor_is_fork_cow,
+                    };
+                    let state = el1_private_leaf_state(leaf);
+                    let flags = u32::from(state != El1PrivateLeafState::Unowned)
+                        | (u32::from(state == El1PrivateLeafState::Prepared) << 1)
+                        | (u32::from(terminal_descriptor_is_fork_cow(leaf)) << 2);
+                    carrick_observability::probes::hvpatch_frame_cow_inventory_miss(
+                        fault_va,
+                        old_physical_ipa,
+                        CowArmedRanges::COMPOUND_SIZE,
+                        leaf,
+                        flags,
+                    );
+                }
                 self.report_physical_cow_source_refusal(custody, span.va, old_ipa);
             }
             shape?

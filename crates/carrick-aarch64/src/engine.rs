@@ -210,6 +210,10 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// access. SHARED by `CLONE_THREAD` siblings (`Arc` clone), COW'd on fork.
     protections: Arc<MemoryProtections>,
 
+    /// The immediately following protection edit initializes a new VMA. Its
+    /// cold reservation must discard retired predecessor leaf authority.
+    pending_new_mapping: Option<(u64, usize)>,
+
     /// Exact parent state retained across the host-thread spawn/materialization
     /// window of an in-process fork. Runtime commits it only after the child is
     /// materialized; a recoverable failure restores both authorities.
@@ -320,6 +324,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns: 0,
             page_tables,
             protections,
+            pending_new_mapping: None,
             pending_process_fork: None,
             exec_predecessor_shared: None,
             owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
@@ -558,6 +563,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_fork_image_allocations: 0,
             page_tables,
             protections,
+            pending_new_mapping: None,
             pending_process_fork,
             exec_predecessor_shared: None,
             owed_stage1_maintenance,
@@ -847,6 +853,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns: 0,
             page_tables,
             protections,
+            pending_new_mapping: None,
             pending_process_fork: None,
             exec_predecessor_shared: None,
             owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
@@ -968,6 +975,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns: 0,
             page_tables,
             protections,
+            pending_new_mapping: None,
             pending_process_fork: None,
             exec_predecessor_shared: None,
             owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
@@ -1743,21 +1751,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             return true;
         };
         let descriptor = carrick_mmu_core::aarch64::terminal_descriptor(walk);
-        if !carrick_mmu_core::aarch64::terminal_descriptor_has_el1_private_authority(descriptor) {
-            return true;
-        }
-        // A fork-COW armed leaf is read-only only because its frame is still
-        // shared; the host copyout path privatizes it before writing. Known
-        // gap: a leaf made read-only by an EL1-served mprotect also carries
-        // MAY_WRITE and is accepted here, because the host protection table
-        // does not see EL1 mprotect and a forked child's engine has no
-        // armed-range set to tell the two apart.
-        if access == carrick_mmu_core::aarch64::LeafAccess::Write
-            && carrick_mmu_core::aarch64::terminal_descriptor_may_write(descriptor)
-        {
-            return true;
-        }
-        carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(descriptor, access)
+        carrick_mmu_core::aarch64::terminal_descriptor_permits_host_buffer(descriptor, access)
     }
 
     fn el1_private_range_permits(
@@ -1783,6 +1777,71 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page = next;
         }
         true
+    }
+
+    /// Host copyout does not take the EL0 translation fault that normally
+    /// validates a prepared EL1-private leaf. Publish each touched page through
+    /// the exact-MM resident-fault authority before resolving its backing.
+    fn commit_prepared_host_write(
+        &mut self,
+        address: u64,
+        length: usize,
+        checked: bool,
+    ) -> Result<(), MemoryError> {
+        if length == 0 {
+            return Ok(());
+        }
+        let end = address
+            .checked_add(length as u64)
+            .ok_or(MemoryError::OutOfBounds { address, length })?;
+        let mut page = address & !4095;
+        while page < end {
+            let descriptor = |engine: &Self| {
+                engine
+                    .diagnostic_fault_page_tables(page)
+                    .map(|(_, walk)| carrick_mmu_core::aarch64::terminal_descriptor(walk))
+            };
+            let live = descriptor(self);
+            let prepared = live
+                .is_some_and(carrick_mmu_core::aarch64::terminal_descriptor_is_prepared_private);
+            if (checked || prepared)
+                && live.is_some_and(|leaf| {
+                    !carrick_mmu_core::aarch64::terminal_descriptor_permits_host_buffer(
+                        leaf,
+                        carrick_mmu_core::aarch64::LeafAccess::Write,
+                    )
+                })
+            {
+                return Err(MemoryError::OutOfBounds { address, length });
+            }
+            if prepared {
+                let authority = self.vm.frame_cow_authority().ok_or_else(|| {
+                    MemoryError::HostMap("prepared host write lacks exact-MM authority".to_owned())
+                })?;
+                let committed = authority
+                    .commit_host_first_touch(page, &mut |page, prot| {
+                        <Self as GuestMemory>::protect_range(self, page, 4096, prot)
+                            .map_err(|error| error.to_string())
+                    })
+                    .map_err(|error| MemoryError::HostMap(format!("host first touch: {error}")))?;
+                // Another executor may have committed this leaf after our
+                // read-only walk. Its completed publication needs no second
+                // plan; an unchanged prepared leaf still does.
+                if !committed
+                    && descriptor(self).is_some_and(
+                        carrick_mmu_core::aarch64::terminal_descriptor_is_prepared_private,
+                    )
+                {
+                    return Err(MemoryError::HostMap(
+                        "prepared host write has no resident-fault plan".to_owned(),
+                    ));
+                }
+            }
+            page = page
+                .checked_add(4096)
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+        }
+        Ok(())
     }
 
     /// One page-bounded VA→IPA segment of a syscall buffer. Page bounding is
@@ -2014,21 +2073,17 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // syscall write observes the change. The backend's `translated_write` may
         // additionally enforce per-mapping write intent (HVF's boot/file mappings).
         if !bytes.is_empty()
-            && (self
+            && self
                 .vm
                 .protections()
                 .is_some_and(|p| p.range_write_denied(address, bytes.len()))
-                || !self.el1_private_range_permits(
-                    address,
-                    bytes.len(),
-                    carrick_mmu_core::aarch64::LeafAccess::Write,
-                ))
         {
             return Err(MemoryError::OutOfBounds {
                 address,
                 length: bytes.len(),
             });
         }
+        self.commit_prepared_host_write(address, bytes.len(), true)?;
         let length = bytes.len();
         let mut copied = 0usize;
         while copied < length {
@@ -2047,6 +2102,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // permission (the host page is writable). PROT_NONE is NOT re-gated (the
         // default `write_bytes_unchecked` doesn't gate either). The translated IPA
         // resolves a `repoint_private` overlay to the private backing.
+        self.commit_prepared_host_write(address, bytes.len(), false)?;
         let length = bytes.len();
         let mut copied = 0usize;
         while copied < length {
@@ -2099,6 +2155,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         true
     }
 
+    fn prepare_host_write(&mut self, address: u64, length: usize) -> Result<(), MemoryError> {
+        self.commit_prepared_host_write(address, length, false)
+    }
+
     fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
         if !self.el1_private_range_permits(
             address,
@@ -2111,13 +2171,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
-        if !self.el1_private_range_permits(
-            address,
-            len,
-            carrick_mmu_core::aarch64::LeafAccess::Write,
-        ) {
-            return None;
-        }
+        self.commit_prepared_host_write(address, len, true).ok()?;
         self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::GuestVisible)
             .ok()?;
         self.vm.host_ptr_for_write(address, len)
@@ -2140,6 +2194,14 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// TLB via `pt_edit_and_flush` + the EL0-fault→SIGSEGV path.
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
         self.vm.set_no_access(address, len, no_access);
+    }
+
+    fn mark_bus_fault(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.pt_edit_and_flush_after_adopting(address, len, |editor| {
+            editor
+                .manager
+                .mark_bus_fault(address, len, editor.arena_source.as_deref_mut())
+        })
     }
 
     fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
@@ -2180,6 +2242,11 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         no_write: bool,
         sharing: MappingSharing,
     ) {
+        // This operation is the dispatcher's new-mapping publication point.
+        // Its following protect_range may install PROT_NONE only to arm first
+        // touch even when the new VMA is writable. Retired leaf permissions
+        // from the predecessor must be cleared before that edit.
+        self.pending_new_mapping = Some((address, len));
         if let Some(protections) = self.vm.protections() {
             protections
                 .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
@@ -2223,13 +2290,6 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let Some(deferred) = self.vm.deferred_anonymous_state() else {
             return Ok(false);
         };
-        if let Some(granule) = self.vm.anonymous_discard_granule()
-            && granule.is_power_of_two()
-            && granule >= 4096
-            && (!address.is_multiple_of(granule) || !(len as u64).is_multiple_of(granule))
-        {
-            return crate::anonymous_discard::with_edges(self, address, len, granule);
-        }
         let Some(prepared) = self
             .vm
             .prepare_anonymous_discard(address, len)
@@ -2428,11 +2488,22 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         } else {
             Vec::new()
         };
+        let new_mapping = self.pending_new_mapping.take() == Some((address, len));
         // pt_edit_AND_FLUSH: a guest can `mprotect` an ALREADY-TOUCHED page (e.g.
         // RELRO RW→RO), so the stale stage-1 TLB entry must be invalidated for the
         // new protection to take effect.
         self.pt_edit_and_flush_after_adopting(address, len, |editor| {
-            editor.apply_protection_edit(address, len, prot, &armed_cow)
+            let reset = if new_mapping {
+                editor.manager.clear_retired_for_new_mapping(
+                    address,
+                    len,
+                    editor.arena_source.as_deref_mut(),
+                )?
+            } else {
+                PageTableApplyOutcome::default()
+            };
+            let protection = editor.apply_protection_edit(address, len, prot, &armed_cow)?;
+            Ok(reset | protection)
         })?;
         self.vm
             .observe_frame_cow_protection(address, len, prot)
