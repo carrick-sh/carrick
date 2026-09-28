@@ -143,12 +143,25 @@ const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
 /// live block is not misreported as an invalid page merely because the unused
 /// later walk slots are zero.
 pub fn terminal_descriptor(walk: [u64; 4]) -> u64 {
+    terminal_entry(walk).1
+}
+
+/// The level (0..=3) at which a serialized AArch64 stage-1 walk terminates,
+/// with the terminating descriptor: the first invalid descriptor, an L1/L2
+/// block, or the L3 page. Post-mortem records use the level to say WHICH
+/// table stopped the walk, which [`terminal_descriptor`] alone cannot.
+pub fn terminal_entry(walk: [u64; 4]) -> (usize, u64) {
     for (level, descriptor) in walk.into_iter().enumerate() {
         if descriptor & VALID == 0 || level == 3 || descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
-            return descriptor;
+            return (level, descriptor);
         }
     }
-    0
+    (3, 0)
+}
+
+/// Whether `descriptor` is a valid (present) stage-1 descriptor.
+pub const fn descriptor_is_valid(descriptor: u64) -> bool {
+    descriptor & VALID != 0
 }
 const PA_MASK_TABLE: u64 = 0x0000_FFFF_FFFF_F000; // next-level table PA (bits 47:12)
 // AF (Access Flag), bit 10. Carrick never uses hardware AF management, so a
@@ -6102,6 +6115,21 @@ mod tests {
         assert_eq!(terminal_descriptor([table, block, 0, 0]), block);
         assert_eq!(terminal_descriptor([table, table, table, page]), page);
         assert_eq!(terminal_descriptor([table, table, table, invalid]), invalid);
+    }
+
+    #[test]
+    fn terminal_entry_names_the_level_that_stopped_the_walk() {
+        let table = VALID | TYPE_TABLE_OR_PAGE;
+        let block = VALID | TYPE_BLOCK | 0x2000_0000;
+        let page = VALID | TYPE_TABLE_OR_PAGE | 0x1234_5000;
+
+        assert_eq!(terminal_entry([0, 0, 0, 0]), (0, 0));
+        assert_eq!(terminal_entry([table, 0, 0, 0]), (1, 0));
+        assert_eq!(terminal_entry([table, block, 0, 0]), (1, block));
+        assert_eq!(terminal_entry([table, table, 0x4000, 0]), (2, 0x4000));
+        assert_eq!(terminal_entry([table, table, table, page]), (3, page));
+        assert!(descriptor_is_valid(page));
+        assert!(!descriptor_is_valid(0x4000));
     }
 
     #[test]

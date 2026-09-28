@@ -24,9 +24,10 @@ pub use dto::{
     DebugMappingRow, DebugMmRow, DebugProcessGroupRow, DebugResidencyRow, DebugRunQueueRow,
     DebugSchedulerRow, DebugSessionRow, DebugSighandRow, DebugTaskRow, DebugTaskSharedRow,
     DebugTaskSignalRow, DebugThreadResourcesRow, DebugThreadRow, DebugThreadSignalRow, DebugVmaRow,
-    DebugZombieRow, KERNEL_DEBUG_REQUEST_SCHEMA, KERNEL_DEBUG_RESPONSE_SCHEMA, KernelDebugAction,
-    KernelDebugAuxProvider, KernelDebugDtoError, KernelDebugRequest, KernelDebugSnapshot,
-    KernelDebugTable, UnknownTable,
+    DebugZombieRow, DegradedMmCoordinatorDto, DegradedTaskDto, DegradedThreadDto,
+    KERNEL_DEBUG_DEGRADED_SCHEMA, KERNEL_DEBUG_REQUEST_SCHEMA, KERNEL_DEBUG_RESPONSE_SCHEMA,
+    KernelDebugAction, KernelDebugAuxProvider, KernelDebugDegraded, KernelDebugDtoError,
+    KernelDebugRequest, KernelDebugSnapshot, KernelDebugTable, UnknownTable,
 };
 pub use endpoint::{DebugEndpoint, EndpointError};
 pub use post_mortem::{
@@ -34,7 +35,10 @@ pub use post_mortem::{
     POST_MORTEM_SCHEMA, PostMortem, Truncated, ZombieSummary, request_abort, take_abort_request,
 };
 pub use server::{KernelDebugServer, ServerError};
-pub use wire::{DEADLINE, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, WireError};
+pub use wire::{
+    DEADLINE, DEGRADED_BUDGET, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, STRICT_SNAPSHOT_BUDGET,
+    WireError,
+};
 
 #[cfg(test)]
 mod tests {
@@ -105,6 +109,89 @@ mod tests {
 
     fn scoped_endpoint(run_id: &str) -> (tempfile::TempDir, DebugEndpoint) {
         super::endpoint::tests::scoped_endpoint(run_id)
+    }
+
+    /// An MM whose structural-mutation coordinator a wedge holds: the
+    /// coherent snapshot waits out its whole deadline (what
+    /// `begin_snapshot_until` does under a held alias phase), while a
+    /// non-waiting observation names the holder.
+    #[derive(Debug)]
+    struct WedgedMmBackend;
+
+    const WEDGED_HOLDER: u64 = 0x5eed_7001;
+
+    impl crate::kernel::MmBackend for WedgedMmBackend {
+        fn snapshot(
+            &self,
+            deadline: std::time::Instant,
+        ) -> Result<crate::kernel::MmBackendSnapshot, crate::kernel::SnapshotError> {
+            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+            Err(crate::kernel::SnapshotError::TimedOut)
+        }
+
+        fn revision(&self) -> u64 {
+            1
+        }
+
+        fn mutation_observation(&self) -> Option<crate::kernel::MmMutationObservation> {
+            Some(crate::kernel::MmMutationObservation {
+                alias_active: true,
+                alias_holder_host_thread: Some(WEDGED_HOLDER),
+                alias_held_for: Some(std::time::Duration::from_secs(90)),
+                alias_waiters: 2,
+                snapshot_readers: 0,
+            })
+        }
+    }
+
+    /// gbhang4 / gbk4: against a wedged carrier `carrick debug
+    /// hvpatch-kernel` and `lldb-run` got only "request timed out after 2s;
+    /// the runtime may be wedged", because the server let the snapshot wait
+    /// the full wire deadline and its named refusal lost the race. The
+    /// server must answer inside the client's deadline with the degraded
+    /// view: per-task state and the busy coordinator's holder.
+    #[test]
+    fn a_held_mm_coordinator_yields_a_degraded_view_not_a_client_timeout() {
+        let (_temp, endpoint) = scoped_endpoint("k1-debug-wedged-mm");
+        let bootstrap = crate::kernel::RootBootstrap::with_mm_backend(
+            4343,
+            carrick_hal::ThreadId::synthetic_for_tests(4343),
+            Arc::new(WedgedMmBackend),
+            "wedged-root".to_owned(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        )
+        .expect("root bootstrap input");
+        let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("root kernel");
+        let mut server =
+            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+
+        let degraded = match fetch_at(&endpoint, None) {
+            Err(ClientError::Degraded(degraded)) => degraded,
+            other => panic!("expected a degraded view, got {other:?}"),
+        };
+        assert_eq!(degraded.schema, KERNEL_DEBUG_DEGRADED_SCHEMA);
+        assert!(
+            degraded.strict_error.contains("deadline") || degraded.strict_error.contains("busy"),
+            "the strict refusal is named: {}",
+            degraded.strict_error
+        );
+        let root = degraded
+            .tasks
+            .iter()
+            .find(|task| task.diagnostic_name == "wedged-root")
+            .expect("the root task is reported");
+        assert_eq!(root.lifecycle.as_deref(), Some("live"));
+        let threads = root.threads.as_ref().expect("thread list readable");
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].execution.is_some(), "execution state readable");
+        let busy: Vec<_> = degraded.busy_coordinators().collect();
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].mm, root.mm);
+        assert_eq!(busy[0].alias_holder_host_thread, Some(WEDGED_HOLDER));
+        assert_eq!(busy[0].alias_waiters, Some(2));
+        assert!(busy[0].alias_held_ms.is_some_and(|held| held >= 90_000));
+        assert!(degraded.unreadable.is_empty(), "{:?}", degraded.unreadable);
+        server.shutdown();
     }
 
     #[test]
