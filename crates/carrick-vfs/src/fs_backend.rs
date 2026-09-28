@@ -823,6 +823,14 @@ pub trait FsBackend: Send + Sync {
         None
     }
 
+    /// Stream dirents and collect deleted (whiteout) child names in a single directory pass.
+    /// Default implementation calls `stream_dirents` and `deleted_child_names`.
+    fn stream_dirents_with_deleted(&self, dir: &str) -> Option<(Vec<RootFsDirEntry>, Vec<String>)> {
+        let entries = self.stream_dirents(dir)?;
+        let deleted = self.deleted_child_names(dir);
+        Some((entries, deleted))
+    }
+
     /// Archive-only bounded directory enumeration. Implementations must stop
     /// after producing `limit + 1` visible candidates and must never delegate
     /// to the unbounded [`FsBackend::child_names`] default. The extra entry is

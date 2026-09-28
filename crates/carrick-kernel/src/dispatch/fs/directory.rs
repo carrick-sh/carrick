@@ -99,7 +99,30 @@ impl<'a> FsView<'a> {
             }),
         };
         self.inject_mount_dir_entries(dir_path, &mut entries);
-        entries
+        if entries.first().map(|e| e.name.as_str()) != Some(".") {
+            let mut full = Vec::with_capacity(entries.len() + 2);
+            let parent = std::path::Path::new(dir_path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".to_string());
+            let dir_path_owned = dir_path.to_string();
+            let dot_entry = |name: &str, p: String| RootFsDirEntry {
+                name: name.to_string(),
+                metadata: RootFsMetadata {
+                    path: std::path::PathBuf::from(p),
+                    kind: RootFsEntryKind::Directory,
+                    mode: 0o755,
+                    size: 0,
+                },
+                ino: 0,
+            };
+            full.push(dot_entry(".", dir_path_owned));
+            full.push(dot_entry("..", parent));
+            full.extend(entries);
+            full
+        } else {
+            entries
+        }
     }
 
     /// Inject entries for mounts registered below `dir_path` so that injected
@@ -555,16 +578,16 @@ impl<'a> FsView<'a> {
                 entries.insert(0, dot_entry(".", dir_path));
             }
 
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity(length.min(65536));
             while *offset < entries.len() {
-                let record = dirent64_record(&entries[*offset], *offset + 1);
-                if record.len() > length {
+                let rec_len = dirent64_record_len(&entries[*offset]);
+                if rec_len > length {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                if out.len() + record.len() > length {
+                if out.len() + rec_len > length {
                     break;
                 }
-                out.extend_from_slice(&record);
+                append_dirent64_record(&entries[*offset], *offset + 1, &mut out);
                 *offset += 1;
             }
 
