@@ -2012,6 +2012,8 @@ pub type FileSlotMap = HashMap<i32, FileSlot, BuildHasherDefault<FileSlotHasher>
 pub(crate) struct FdOpenPaths {
     by_fd: HashMap<i32, String>,
     by_path: BTreeMap<String, Vec<i32>>,
+    description_by_fd: HashMap<i32, String>,
+    by_description_path: BTreeMap<String, Vec<i32>>,
 }
 
 impl FdOpenPaths {
@@ -2033,6 +2035,11 @@ impl FdOpenPaths {
     }
 
     pub(crate) fn insert(&mut self, fd: i32, path: String) -> Option<String> {
+        self.remove_description_index(fd);
+        self.replace_recorded_path(fd, path)
+    }
+
+    fn replace_recorded_path(&mut self, fd: i32, path: String) -> Option<String> {
         let previous = self.by_fd.insert(fd, path.clone());
         if let Some(ref old) = previous {
             self.remove_index(old, fd);
@@ -2041,10 +2048,40 @@ impl FdOpenPaths {
         previous
     }
 
+    pub(crate) fn insert_with_description_path(
+        &mut self,
+        fd: i32,
+        path: String,
+        description_path: Option<String>,
+    ) -> Option<String> {
+        let description_path = description_path.filter(|description| description != &path);
+        let previous = self.insert(fd, path);
+        if let Some(description_path) = description_path {
+            self.by_description_path
+                .entry(description_path.clone())
+                .or_default()
+                .push(fd);
+            self.description_by_fd.insert(fd, description_path);
+        }
+        previous
+    }
+
     pub(crate) fn remove(&mut self, fd: &i32) -> Option<String> {
         let path = self.by_fd.remove(fd)?;
         self.remove_index(&path, *fd);
+        self.remove_description_index(*fd);
         Some(path)
+    }
+
+    fn remove_description_index(&mut self, fd: i32) {
+        if let Some(path) = self.description_by_fd.remove(&fd)
+            && let Some(fds) = self.by_description_path.get_mut(&path)
+        {
+            fds.retain(|recorded| *recorded != fd);
+            if fds.is_empty() {
+                self.by_description_path.remove(&path);
+            }
+        }
     }
 
     fn remove_index(&mut self, path: &str, fd: i32) {
@@ -2059,23 +2096,55 @@ impl FdOpenPaths {
     fn rename(&mut self, old: &str, new: &str) -> (Vec<i32>, usize) {
         let prefix = format!("{old}/");
         let mut matches = Vec::new();
+        let mut affected_fds = std::collections::HashSet::new();
         if let Some(fds) = self.by_path.get(old) {
-            matches.extend(fds.iter().map(|fd| (*fd, old.to_owned())));
+            for fd in fds {
+                affected_fds.insert(*fd);
+                matches.push((*fd, old.to_owned()));
+            }
         }
         for (path, fds) in self
             .by_path
             .range(prefix.clone()..)
             .take_while(|(path, _)| path.starts_with(&prefix))
         {
-            matches.extend(fds.iter().map(|fd| (*fd, path.clone())));
+            for fd in fds {
+                affected_fds.insert(*fd);
+                matches.push((*fd, path.clone()));
+            }
         }
-        let visited = matches.len();
-        let mut affected = Vec::with_capacity(visited);
+        if let Some(fds) = self.by_description_path.get(old) {
+            affected_fds.extend(fds.iter().copied());
+        }
+        for (_, fds) in self
+            .by_description_path
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+        {
+            affected_fds.extend(fds.iter().copied());
+        }
+        let visited = affected_fds.len();
         for (fd, path) in matches {
             let updated = format!("{new}{}", &path[old.len()..]);
-            self.insert(fd, updated);
-            affected.push(fd);
+            self.replace_recorded_path(fd, updated);
         }
+        // Re-key canonical description paths independently of the guest's
+        // recorded spelling. A symlinked open may have two different names.
+        for fd in &affected_fds {
+            if let Some(path) = self.description_by_fd.get(fd).cloned()
+                && (path == old || path.starts_with(&prefix))
+            {
+                self.remove_description_index(*fd);
+                let updated = format!("{new}{}", &path[old.len()..]);
+                self.by_description_path
+                    .entry(updated.clone())
+                    .or_default()
+                    .push(*fd);
+                self.description_by_fd.insert(*fd, updated);
+            }
+        }
+        let mut affected = affected_fds.into_iter().collect::<Vec<_>>();
+        affected.sort_unstable();
         (affected, visited)
     }
 }

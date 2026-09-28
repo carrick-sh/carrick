@@ -1187,9 +1187,22 @@ impl<'a> FsView<'a> {
     }
 
     pub(super) fn record_fd_open_path(&self, fd: i32, path: String) {
-        self.captured_file_table()
+        let files = self.captured_file_table();
+        let description_path = files.read_open_files().get(&fd).and_then(|open| {
+            let description = open.description.read_for_io()?;
+            match &*description {
+                OpenDescription::File { path, .. } | OpenDescription::Directory { path, .. } => {
+                    Some(path.clone())
+                }
+                OpenDescription::HostFile { metadata, .. } => {
+                    metadata.path.to_str().map(str::to_owned)
+                }
+                _ => None,
+            }
+        });
+        files
             .write_fd_open_paths()
-            .insert(fd, path);
+            .insert_with_description_path(fd, path, description_path);
     }
 
     pub(super) fn lookup_recorded_fd_open_path(&self, fd: i32) -> Option<String> {
