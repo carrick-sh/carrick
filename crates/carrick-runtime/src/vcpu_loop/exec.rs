@@ -1990,6 +1990,7 @@ where
                 if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
                     table.retire_overlapping(old_mm_id.raw(), 0, u64::MAX);
                 }
+                super::signal::withdraw_guest_descriptor_work(old_mm_id.raw());
                 if let Err(error) = process
                     .kernel_graph()
                     .frame_inventory()
@@ -2138,6 +2139,10 @@ where
             crate::hvpatch::ProcessContext::asid_generation,
         );
         engine.bind_task_snapshot_identity(committed_mm.raw(), committed_asid_generation);
+        super::signal::select_guest_descriptor_lane(
+            engine,
+            super::signal::GuestDescriptorLanePrecondition::current(),
+        );
         #[cfg(test)]
         self.fail_exec_terminal_context_for_test(
             ExecTerminalContextFailpoint::SnapshotPublication,
