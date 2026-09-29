@@ -74,6 +74,9 @@ kernel/semantics 2,462 (one existing ignore), serial kernel 110, runtime 630
 on `3fb63f608` retained all 595 rows and positions; `852fedd48` records the
 source stamp. Final lint and contract coverage passed on `852fedd48`. The
 compiler census remains the macOS subset; other host profiles are unqualified.
+Full `just ci` passed on `f256ce2`; fresh musl/GNU ARM64 probe inputs
+(544 binaries each) are hashed in `arm64-acceptance/`. Signed batch runtime
+acceptance remains pending.
 
 VM-free additions now prove exact retirement after control/failed-load
 settlement (110 serial kernel passes) and enforce zero retired-delivery wake
