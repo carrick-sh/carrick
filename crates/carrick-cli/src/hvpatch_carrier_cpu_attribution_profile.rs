@@ -769,7 +769,7 @@ impl HvpatchCarrierCpuAttributionSummary {
         let image_text_base = image_text_base
             .ok_or_else(|| anyhow!("{PREFIX} stream has no carrier image record"))?;
 
-        // Batch resolve raw hex addresses if carrick binary and /usr/bin/atos are available.
+        // Resolve raw hex addresses in-process against the carrick image symbol table.
         let mut sym_map = HashMap::new();
         let mut unique_addrs = BTreeSet::new();
         for (stack, _) in &raw_stacks {
