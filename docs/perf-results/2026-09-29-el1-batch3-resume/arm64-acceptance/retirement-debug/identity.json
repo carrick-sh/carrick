@@ -1,0 +1,8 @@
+{
+  "tested_source": "e8db2fd518ee1149b1175a102f40ca851ca23d6a",
+  "release_sha256": "9d266e3aa63562d92764f6e3659f6be85e86aeb65691a862717ea1ed26c1b18a",
+  "diagnostic_sha256": "2812b5c7fcc98e8ea5c22309e4ae370d740fd4e044461c3f2636bc9654f86bc9",
+  "matching_text_sha256": "1218be0e9709e34a41d8a1dcd781b358d2f7bb7545a5c88bb57ef3de2ef36329",
+  "diagnostic_signing": "scripts/entitlements-debug.plist",
+  "purpose": "bounded capture, not acceptance"
+}

@@ -89,6 +89,10 @@ round2 conf-20571-c00 aborted while publishing terminal inventory retirement
 (frame2697 still mapped; kernel_mm14). The other19 passes do not clear it.
 The immediate priority is a deterministic reduction of this live-frame
 retirement refusal; batch3 promotion is stopped. See `arm64-acceptance/workloads/`.
+A bounded 20-run diagnostic population on a separately debug-signed copy
+completed without reproduction or core capture. This does not clear the red
+acceptance result. Sampling is stopped; next is a deterministic two-MM
+planning/publication interleaving. See `arm64-acceptance/retirement-debug/`.
 
 VM-free additions now prove exact retirement after control/failed-load
 settlement (110 serial kernel passes) and enforce zero retired-delivery wake
