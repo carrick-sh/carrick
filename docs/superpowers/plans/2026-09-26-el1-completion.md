@@ -38,7 +38,8 @@ At refresh, the implementation baseline on local `main` and local
 remote-tracking `origin/main` is `a70b40466`. The documentation commit for
 this refresh advances local main only; no remote fetch was performed.
 Batch 3 is on `integ/batch3`, unlanded. Its current implementation correction
-is `99c8cd5ac`; the broader signed EL1 regression source is `40a707ba0`
+is `a9da3196d`; its guest-publication preparation has VM-free proof only.
+The prior broader signed EL1 regression source is `40a707ba0`
 (subsequent receipt-only commits may follow). All twelve active
 batch/memory/IPC/sigsuspend worktrees inventoried below were clean at the
 initial refresh inspection; only batch 3 has been advanced in this goal.
