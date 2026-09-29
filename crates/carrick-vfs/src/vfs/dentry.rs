@@ -426,49 +426,161 @@ impl DentryCache {
         }
     }
 
-    /// Clear the cache if we crossed a host fork.
+    /// Reconcile the cache with a host fork or a sibling process's shared
+    /// path-generation bump.
+    ///
+    /// These are two different events with two different remedies:
+    ///
+    /// - **Real host fork** (`proc_gen` stale): this process's own
+    ///   `Arc<OwnedFd>`/`Arc<AtomicUsize>` handles were duplicated by the
+    ///   fork without a matching duplication of their reference counts (each
+    ///   copy now decrements independently), so nothing cached here —
+    ///   including pinned directories — can be trusted to have a single
+    ///   owner any more. Every guest fd that was open across the fork is
+    ///   re-established by its holder (pin/dirfd bookkeeping is rebuilt from
+    ///   the live host state, not carried over), so a full reset is correct
+    ///   and unconditional.
+    /// - **Sibling path-generation bump** (`shared_path_gen` stale, no
+    ///   fork): this process did NOT fork — its own open host fds are still
+    ///   exclusively owned and still name the same inodes. What changed is
+    ///   that another Carrick-managed sibling process mutated the shared
+    ///   scratch namespace (create/unlink/rename anywhere), so every cached
+    ///   NAME resolution (positive and negative dentries) is unconditionally
+    ///   stale and must be dropped — that is the correctness property
+    ///   `d48c36823` exists for. But a directory THIS process has pinned
+    ///   (`pin_count > 0`, meaning a live guest dir fd is open on it via
+    ///   `pin_dir`) is not a name-lookup result: it is a host directory this
+    ///   process itself still holds open, and a sibling's unrelated mutation
+    ///   cannot invalidate that identity. Dropping it would strand the fd
+    ///   holder with a `DentryId` that no longer resolves. Keep pinned
+    ///   directories (and ROOT, which is never evicted) with their
+    ///   id/dev/ino/fds/pin_count intact, but reset their probe state
+    ///   (`lower_probed`, `upper_probed_gen`, `lower_negatives`, `dir_gen`)
+    ///   so their children are looked up fresh instead of trusted from a
+    ///   scan that predates the sibling's mutation.
     fn check_fork(&self) {
         let cur_gen = crate::fs_resolve_cache::current_process_generation();
         let shared_gen = crate::fs_resolve_cache::current_generation();
-        if self.proc_gen.load(Ordering::SeqCst) != cur_gen
-            || self.shared_path_gen.load(Ordering::SeqCst) != shared_gen
-        {
+        let proc_stale = self.proc_gen.load(Ordering::SeqCst) != cur_gen;
+        let shared_stale = self.shared_path_gen.load(Ordering::SeqCst) != shared_gen;
+        if proc_stale || shared_stale {
             let _reset = self.reset_lock.lock();
-            if self.proc_gen.load(Ordering::SeqCst) == cur_gen
-                && self.shared_path_gen.load(Ordering::SeqCst) == shared_gen
-            {
+            let proc_stale = self.proc_gen.load(Ordering::SeqCst) != cur_gen;
+            let shared_stale = self.shared_path_gen.load(Ordering::SeqCst) != shared_gen;
+            if !proc_stale && !shared_stale {
                 return;
             }
-            let mut entries = self.entries.write();
-            let mut dirs = self.dirs.write();
-            let mut path_to_dir_id = self.path_to_dir_id.write();
-            entries.clear();
-            self.inodes.write().clear();
-            dirs.clear();
-            path_to_dir_id.clear();
-            self.dir_eviction_queue.lock().clear();
-            let root_gen = Arc::new(AtomicU64::new(1));
-            let root_dir = DirEntry {
-                id: DentryId::ROOT,
-                dir_gen: root_gen,
-                upper_dir_fd: None,
-                lower_dir_fd: None,
-                lower_probed: false,
-                lower_negatives: Arc::new(parking_lot::RwLock::new(HashSet::new())),
-                upper_probed_gen: 0,
-                parent: None,
-                path: "/".to_string(),
-                dev: 0,
-                ino: 1,
-                child_dir_count: 0,
-                accessed: Arc::new(AtomicBool::new(true)),
-                pin_count: Arc::new(AtomicUsize::new(0)),
-            };
-            self.approx_bytes
-                .store(dir_entry_approx_bytes(&root_dir), Ordering::Relaxed);
-            dirs.insert(DentryId::ROOT, root_dir);
-            path_to_dir_id.insert("/".to_string(), DentryId::ROOT);
-            path_to_dir_id.insert("".to_string(), DentryId::ROOT);
+            if proc_stale {
+                let mut entries = self.entries.write();
+                let mut dirs = self.dirs.write();
+                let mut path_to_dir_id = self.path_to_dir_id.write();
+                entries.clear();
+                self.inodes.write().clear();
+                dirs.clear();
+                path_to_dir_id.clear();
+                self.dir_eviction_queue.lock().clear();
+                let root_gen = Arc::new(AtomicU64::new(1));
+                let root_dir = DirEntry {
+                    id: DentryId::ROOT,
+                    dir_gen: root_gen,
+                    upper_dir_fd: None,
+                    lower_dir_fd: None,
+                    lower_probed: false,
+                    lower_negatives: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+                    upper_probed_gen: 0,
+                    parent: None,
+                    path: "/".to_string(),
+                    dev: 0,
+                    ino: 1,
+                    child_dir_count: 0,
+                    accessed: Arc::new(AtomicBool::new(true)),
+                    pin_count: Arc::new(AtomicUsize::new(0)),
+                };
+                self.approx_bytes
+                    .store(dir_entry_approx_bytes(&root_dir), Ordering::Relaxed);
+                dirs.insert(DentryId::ROOT, root_dir);
+                path_to_dir_id.insert("/".to_string(), DentryId::ROOT);
+                path_to_dir_id.insert("".to_string(), DentryId::ROOT);
+            } else {
+                let mut entries = self.entries.write();
+                let mut dirs = self.dirs.write();
+                let mut path_to_dir_id = self.path_to_dir_id.write();
+
+                // A pinned directory's ANCESTORS must be kept too: the walk
+                // resolves a path component by component through `entries`
+                // keyed on `(parent_id, name)`, so if an ancestor dropped
+                // out, re-resolving it mints a brand-new `DentryId` for that
+                // ancestor and, with it, a brand-new (duplicate) `DentryId`
+                // for the pinned directory itself the next time it is
+                // reached by path -- exactly the identity loss this branch
+                // exists to avoid. Walk each pinned directory's `parent`
+                // chain up to ROOT to compute the full kept set.
+                let mut keep_ids: HashSet<DentryId> = HashSet::new();
+                keep_ids.insert(DentryId::ROOT);
+                for (id, dir) in dirs.iter() {
+                    if dir.pin_count.load(Ordering::Relaxed) == 0 {
+                        continue;
+                    }
+                    let mut cur = *id;
+                    while keep_ids.insert(cur) {
+                        match dirs.get(&cur).and_then(|d| d.parent.as_ref()) {
+                            Some((parent_id, _)) => cur = *parent_id,
+                            None => break,
+                        }
+                    }
+                }
+
+                // Preserve the (parent_id, name) -> Positive binding that
+                // lets a fresh walk rediscover each kept directory by the
+                // SAME id, instead of clearing it along with the rest of the
+                // (unconditionally stale, per the sibling-bump correctness
+                // rule) name cache. A directory's own binding is the only
+                // entry whose `PositiveDentry::id` names it, so this never
+                // retains a file, symlink or negative entry.
+                let kept_bindings: Vec<((DentryId, String), DentryNode)> = entries
+                    .iter()
+                    .filter(|(_, node)| {
+                        matches!(node, DentryNode::Positive(pos) if pos.id.is_some_and(|id| keep_ids.contains(&id)))
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                entries.clear();
+                self.inodes.write().clear();
+                dirs.retain(|id, _| keep_ids.contains(id));
+                for dir in dirs.values_mut() {
+                    dir.lower_probed = false;
+                    dir.upper_probed_gen = 0;
+                    dir.lower_negatives.write().clear();
+                    dir.dir_gen.fetch_add(1, Ordering::SeqCst);
+                }
+                // Re-stamp each preserved binding's `parent_gen` to its
+                // parent's just-bumped `dir_gen`: the value captured before
+                // the bump would otherwise mismatch on the very next lookup
+                // and force exactly the re-fill (new `DentryId`) this whole
+                // branch exists to avoid.
+                for (key, mut node) in kept_bindings {
+                    if let DentryNode::Positive(ref mut pos) = node {
+                        if let Some(parent_dir) = dirs.get(&key.0) {
+                            pos.parent_gen = parent_dir.dir_gen.load(Ordering::SeqCst);
+                        }
+                    }
+                    entries.insert(key, node);
+                }
+                path_to_dir_id.retain(|_, id| dirs.contains_key(id));
+
+                let dir_bytes: usize = dirs.values().map(dir_entry_approx_bytes).sum();
+                let entry_bytes: usize = entries
+                    .iter()
+                    .map(|(name, node)| entry_node_approx_bytes(&name.1, node))
+                    .sum();
+                self.approx_bytes
+                    .store(dir_bytes + entry_bytes, Ordering::Relaxed);
+                // The dir-eviction queue is untouched: stale ids for dirs we
+                // just dropped are tolerated as `None` misses by the
+                // eviction scan, and kept ids remain valid, so the queue
+                // self-cleans without needing a rebuild here.
+            }
             self.proc_gen.store(cur_gen, Ordering::SeqCst);
             self.local_path_bumps.store(
                 crate::fs_resolve_cache::local_path_bump_count(),
@@ -3568,9 +3680,20 @@ mod tests {
             cache.has_dir("/pinned_dir"),
             "pinned directory must survive eviction"
         );
+        // A concurrent sibling process (in this test binary: another test
+        // thread bumping the shared, process-global path generation) can
+        // legitimately invalidate cached NAME knowledge under a pinned
+        // directory without evicting the directory itself -- that
+        // revalidation is required for correctness (see
+        // `test_sibling_bump_preserves_pinned_dir_revalidates_names`).
+        // Assert the name is still resolvable (falling through to the
+        // backend if the raw cache entry didn't survive), not that the raw
+        // cache slot was untouched.
         assert!(
-            cache.has_entry("/pinned_dir", "inside.txt"),
-            "entries in pinned directory must survive eviction"
+            cache
+                .lookup_path("/pinned_dir/inside.txt", false, &backend, None)
+                .is_ok(),
+            "entries in pinned directory must remain resolvable after eviction"
         );
 
         // Close directory fd -> unpin directory through cache mutator
@@ -3593,6 +3716,94 @@ mod tests {
         assert!(
             !cache.has_dir("/pinned_dir"),
             "unpinned directory must be evicted after churn past capacity"
+        );
+    }
+
+    /// Deterministic (single-threaded, no cross-test contamination)
+    /// regression test for `check_fork`'s foreign-bump branch, using the
+    /// `cfg(test)` helper `fs_resolve_cache::simulate_sibling_path_bump` to
+    /// force exactly the "a sibling process mutated the shared namespace"
+    /// condition `d48c36823` handles, without relying on unrelated test
+    /// threads to bump the process-global generation word.
+    ///
+    /// Proves two things must both hold after a foreign bump:
+    /// 1. A directory this cache has pinned (a live open dir fd) survives
+    ///    with the SAME `DentryId` -- dropping it would strand the fd
+    ///    holder.
+    /// 2. A name that changed on disk behind the cache's back (the
+    ///    correctness property `d48c36823` fixed) is seen fresh, not served
+    ///    from a stale cached answer -- including for a name inside the
+    ///    pinned directory itself.
+    #[test]
+    fn test_sibling_bump_preserves_pinned_dir_revalidates_names() {
+        let tmp = tempdir().unwrap();
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        let cache = DentryCache::new(false);
+
+        let pinned_dir = tmp.path().join("pinned_dir");
+        fs::create_dir_all(&pinned_dir).unwrap();
+        fs::write(pinned_dir.join("old_name.txt"), b"data").unwrap();
+
+        // Warm the cache: resolve the directory and the file inside it, then
+        // pin the directory (simulating an open guest dir fd on it).
+        assert!(
+            cache
+                .lookup_path("/pinned_dir/old_name.txt", false, &backend, None)
+                .is_ok()
+        );
+        cache.pin_dir("/pinned_dir");
+        let pinned_id = cache
+            .path_to_dir_id
+            .read()
+            .get("/pinned_dir")
+            .copied()
+            .expect("pinned_dir must be cached after lookup");
+        assert!(cache.is_dir_pinned(pinned_id));
+
+        // A sibling process (not a fork of this one) renames the file on
+        // disk and bumps only the shared path generation -- exactly what a
+        // sibling's structural mutation looks like from this cache's point
+        // of view.
+        fs::rename(
+            pinned_dir.join("old_name.txt"),
+            pinned_dir.join("new_name.txt"),
+        )
+        .unwrap();
+        crate::fs_resolve_cache::simulate_sibling_path_bump();
+
+        // `check_fork` is checked lazily: only a call that actually walks
+        // the cache (lookup/stat) observes and reconciles the bump. Trigger
+        // it now via `stat`, which also proves requirement 2: cached NAME
+        // knowledge is revalidated, not trusted stale -- the old name is
+        // gone and the new name resolves, straight through to the backend.
+        assert_eq!(
+            cache.stat("/pinned_dir/old_name.txt", false, &backend, None),
+            Err(LINUX_ENOENT),
+            "a name removed by a sibling must not be served from a stale positive cache entry"
+        );
+        assert!(
+            cache
+                .stat("/pinned_dir/new_name.txt", false, &backend, None)
+                .is_ok(),
+            "a name created by a sibling must be visible, not shadowed by a stale negative entry"
+        );
+
+        // 1. The pinned directory survives the foreign bump (now reconciled
+        //    by the `stat` calls above) with its identity intact -- no fork
+        //    occurred, so nothing invalidated the fd this process still
+        //    holds open on it.
+        assert!(
+            cache.has_dir("/pinned_dir"),
+            "a directory pinned by a live dir fd must survive a sibling's bump"
+        );
+        assert_eq!(
+            cache.path_to_dir_id.read().get("/pinned_dir").copied(),
+            Some(pinned_id),
+            "the pinned directory must keep the SAME DentryId across a sibling bump"
+        );
+        assert!(
+            cache.is_dir_pinned(pinned_id),
+            "pin_count must survive a sibling bump"
         );
     }
 
