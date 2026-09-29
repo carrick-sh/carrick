@@ -1,0 +1,9 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_fankLzRG1 as tmpdir (overlayfs filesystem)
+tst_sys_conf.c:84: TCONF: Path is not writable: /proc/sys/vm/vfs_cache_pressure: EROFS (30)
+
+Summary:
+passed   0
+failed   0
+broken   0
+skipped  1
+warnings 0

@@ -1,0 +1,23 @@
+tst_buffers.c:57: TINFO: Test is using guarded buffers
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_reaEShbrU as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+readv01.c:71: TPASS: readv() with 0 I/O vectors
+readv01.c:85: TPASS: readv() correctly read 0 bytes 
+readv01.c:71: TPASS: readv() with NULL I/O vectors
+readv01.c:85: TPASS: readv() correctly read 64 bytes 
+readv01.c:71: TPASS: readv() with too big I/O vectors
+readv01.c:85: TPASS: readv() correctly read 64 bytes 
+readv01.c:71: TPASS: readv() with multiple I/O vectors
+readv01.c:85: TPASS: readv() correctly read 48 bytes 
+readv01.c:71: TPASS: readv() with zero-len buffer
+readv01.c:85: TPASS: readv() correctly read 64 bytes 
+
+Summary:
+passed   10
+failed   0
+broken   0
+skipped  0
+warnings 0

@@ -1,0 +1,18 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_wriA8BAwC as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+writev01.c:124: TPASS: invalid iov_len, expected: -1 (EINVAL), got: -1 (EINVAL)
+writev01.c:124: TPASS: invalid fd, expected: -1 (EBADF), got: -1 (EBADF)
+writev01.c:124: TPASS: invalid iovcnt, expected: -1 (EINVAL), got: -1 (EINVAL)
+writev01.c:129: TPASS: zero iovcnt, expected: 0, got: 0
+writev01.c:129: TPASS: NULL and zero length iovec, expected: 64, got: 64
+writev01.c:124: TPASS: write to closed pipe, expected: -1 (EPIPE), got: -1 (EPIPE)
+
+Summary:
+passed   6
+failed   0
+broken   0
+skipped  0
+warnings 0

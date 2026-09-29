@@ -1,0 +1,18 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_fstfY4gzW as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+fstat02.c:28: TPASS: fstat(fildes, &stat_buf) passed
+fstat02.c:29: TPASS: stat_buf.st_uid == user_id (0)
+fstat02.c:30: TPASS: stat_buf.st_gid == group_id (0)
+fstat02.c:31: TPASS: stat_buf.st_size == FILE_SIZE (1024)
+fstat02.c:32: TPASS: stat_buf.st_mode & 0777 == FILE_MODE (420)
+fstat02.c:33: TPASS: stat_buf.st_nlink == NLINK (2)
+
+Summary:
+passed   6
+failed   0
+broken   0
+skipped  0
+warnings 0

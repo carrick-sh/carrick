@@ -1,0 +1,15 @@
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+inotify_init1_02.c:24: TPASS: tst_syscall(__NR_inotify_init1, 0) returned fd 3
+inotify_init1_02.c:27: TPASS: flags & O_NONBLOCK == 0 (0)
+inotify_init1_02.c:30: TPASS: tst_syscall(__NR_inotify_init1, IN_NONBLOCK) returned fd 3
+inotify_init1_02.c:33: TPASS: flags & O_NONBLOCK == O_NONBLOCK (2048)
+
+Summary:
+passed   4
+failed   0
+broken   0
+skipped  0
+warnings 0

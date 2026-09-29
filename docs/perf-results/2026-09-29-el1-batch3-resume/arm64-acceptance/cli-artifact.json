@@ -1,0 +1,9 @@
+{
+  "source_head": "e8db2fd518ee1149b1175a102f40ca851ca23d6a",
+  "sha256": "9d266e3aa63562d92764f6e3659f6be85e86aeb65691a862717ea1ed26c1b18a",
+  "cdhash": "adb70246cd203e290da51bc2ed26b31f05bb0636",
+  "uuid": "22F3FD17-19A5-35AA-99C7-61D1042B049E",
+  "hypervisor_entitlement": true,
+  "dof": true,
+  "path": "/Volumes/CaseSensitive/carrick/.worktrees/wt-batch3/target/release/carrick"
+}

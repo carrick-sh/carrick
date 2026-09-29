@@ -1,0 +1,14 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_duptvQpkO as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+dup01.c:22: TPASS: dup(fd) returned fd 4
+dup01.c:25: TPASS: buf1.st_ino == buf2.st_ino (3504553471)
+
+Summary:
+passed   2
+failed   0
+broken   0
+skipped  0
+warnings 0

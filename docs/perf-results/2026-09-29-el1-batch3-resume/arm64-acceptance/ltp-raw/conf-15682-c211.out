@@ -1,0 +1,2 @@
+writev02    0  TINFO  :  Using /tmp/LTP_wriMa3tgC as tmpdir (overlayfs filesystem)
+writev02    1  TPASS  :  Received EFAULT as expected

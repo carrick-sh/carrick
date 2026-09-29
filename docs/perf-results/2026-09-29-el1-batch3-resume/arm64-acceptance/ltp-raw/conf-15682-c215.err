@@ -1,0 +1,28 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_wri2DQfZD as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+writev07.c:54: TINFO: starting test with initial file offset: 0 
+writev07.c:98: TINFO: writev() has written 64 bytes
+writev07.c:109: TPASS: file has expected content
+writev07.c:120: TPASS: offset at 64 as expected
+writev07.c:54: TINFO: starting test with initial file offset: 65 
+writev07.c:98: TINFO: writev() has written 64 bytes
+writev07.c:109: TPASS: file has expected content
+writev07.c:120: TPASS: offset at 129 as expected
+writev07.c:54: TINFO: starting test with initial file offset: 4096 
+writev07.c:98: TINFO: writev() has written 64 bytes
+writev07.c:109: TPASS: file has expected content
+writev07.c:120: TPASS: offset at 4160 as expected
+writev07.c:54: TINFO: starting test with initial file offset: 4097 
+writev07.c:98: TINFO: writev() has written 64 bytes
+writev07.c:109: TPASS: file has expected content
+writev07.c:120: TPASS: offset at 4161 as expected
+
+Summary:
+passed   8
+failed   0
+broken   0
+skipped  0
+warnings 0

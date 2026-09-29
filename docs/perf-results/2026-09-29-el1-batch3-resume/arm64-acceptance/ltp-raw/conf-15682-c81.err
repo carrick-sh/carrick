@@ -1,0 +1,26 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_inohb7JAI as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+inotify10.c:91: TINFO: Test #0: Group with parent and child watches
+inotify10.c:162: TPASS: got event: wd=1 mask=40000004 cookie=0 len=12 name="test_dir"
+inotify10.c:162: TPASS: got event: wd=2 mask=40000004 cookie=0 len=0 name=""
+inotify10.c:162: TPASS: got event: wd=1 mask=0004 cookie=0 len=12 name="test_file"
+inotify10.c:162: TPASS: got event: wd=3 mask=0004 cookie=0 len=0 name=""
+inotify10.c:91: TINFO: Test #1: Group with child watches and other group with parent watch
+inotify10.c:162: TPASS: got event: wd=1 mask=40000004 cookie=0 len=0 name=""
+inotify10.c:162: TPASS: got event: wd=2 mask=0004 cookie=0 len=0 name=""
+inotify10.c:91: TINFO: Test #2: Group with parent watch and other group with child watches
+inotify10.c:162: TPASS: got event: wd=1 mask=40000004 cookie=0 len=12 name="test_dir"
+inotify10.c:162: TPASS: got event: wd=1 mask=0004 cookie=0 len=12 name="test_file"
+inotify10.c:91: TINFO: Test #3: Two Groups with parent and child watches for different events
+inotify10.c:162: TPASS: got event: wd=1 mask=40000004 cookie=0 len=12 name="test_dir"
+inotify10.c:162: TPASS: got event: wd=1 mask=0004 cookie=0 len=12 name="test_file"
+
+Summary:
+passed   10
+failed   0
+broken   0
+skipped  0
+warnings 0

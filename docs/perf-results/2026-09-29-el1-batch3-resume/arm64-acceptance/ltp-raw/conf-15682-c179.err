@@ -1,0 +1,16 @@
+tst_buffers.c:57: TINFO: Test is using guarded buffers
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_stak90pqY as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+statmount03.c:107: TBROK: unshare(131072) failed: EPERM (1)
+tst_device.c:558: TINFO: No device is mounted at LTP_DIR_B
+tst_device.c:558: TINFO: No device is mounted at LTP_DIR_A
+
+Summary:
+passed   0
+failed   0
+broken   1
+skipped  0
+warnings 0

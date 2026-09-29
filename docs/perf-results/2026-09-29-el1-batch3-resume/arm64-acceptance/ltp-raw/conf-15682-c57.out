@@ -1,0 +1,7 @@
+fstatat01    0  TINFO  :  Using /tmp/LTP_fstbFoZyg as tmpdir (overlayfs filesystem)
+fstatat01    1  TPASS  :  fstatat failed as expected: TEST_ERRNO=SUCCESS(0): Success
+fstatat01    2  TPASS  :  fstatat failed as expected: TEST_ERRNO=SUCCESS(0): Success
+fstatat01    3  TPASS  :  fstatat failed as expected: TEST_ERRNO=ENOTDIR(20): Not a directory
+fstatat01    4  TPASS  :  fstatat failed as expected: TEST_ERRNO=EBADF(9): Bad file descriptor
+fstatat01    5  TPASS  :  fstatat failed as expected: TEST_ERRNO=EINVAL(22): Invalid argument
+fstatat01    6  TPASS  :  fstatat failed as expected: TEST_ERRNO=SUCCESS(0): Success

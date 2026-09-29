@@ -1,0 +1,8 @@
+head e8db2fd51
+sha256 9d266e3aa63562d92764f6e3659f6be85e86aeb65691a862717ea1ed26c1b18a
+CDHash=adb70246cd203e290da51bc2ed26b31f05bb0636
+    uuid 22F3FD17-19A5-35AA-99C7-61D1042B049E
+com.apple.security.hypervisor
+dof present
+inotify09 EL1=1 wall 2.82
+inotify09 EL1=0 wall 40.67

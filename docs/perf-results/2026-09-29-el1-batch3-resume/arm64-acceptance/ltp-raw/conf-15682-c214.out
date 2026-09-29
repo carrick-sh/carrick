@@ -1,0 +1,2 @@
+writev06    0  TINFO  :  Using /tmp/LTP_wrinhQSgQ as tmpdir (overlayfs filesystem)
+writev06    1  TPASS  :  writev returned 2 as expected

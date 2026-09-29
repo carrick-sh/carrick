@@ -1,0 +1,13 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_wriSVIhiS as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+write01.c:40: TPASS: write() passed
+
+Summary:
+passed   1
+failed   0
+broken   0
+skipped  0
+warnings 0

@@ -1,0 +1,25 @@
+tst_tmpdir.c:308: TINFO: Using /tmp/LTP_creMzz07z as tmpdir (overlayfs filesystem)
+tst_test.c:2042: TINFO: LTP version: 20260529
+tst_test.c:2045: TINFO: Tested kernel: 6.12.0-carrick #1 SMP PREEMPT_DYNAMIC aarch64
+tst_kconfig.c:90: TINFO: Parsing kernel config '/proc/config.gz'
+tst_test.c:1870: TINFO: Overall timeout per run is 0h 00m 30s
+creat08.c:41: TINFO: User nobody: uid = 65534, gid = 65534
+creat08.c:43: TINFO: Found unused GID 11: SUCCESS (0)
+creat08.c:58: TPASS: dir_a/nosetgid: Owned by correct group
+creat08.c:69: TPASS: dir_a/nosetgid: Setgid bit not set
+creat08.c:58: TPASS: dir_a/setgid: Owned by correct group
+creat08.c:67: TPASS: dir_a/setgid: Setgid bit is set
+creat08.c:58: TPASS: dir_b/nosetgid: Owned by correct group
+creat08.c:69: TPASS: dir_b/nosetgid: Setgid bit not set
+creat08.c:58: TPASS: dir_b/setgid: Owned by correct group
+creat08.c:62: TINFO: dir_b/setgid: Skipping setgid bit check
+creat08.c:58: TPASS: dir_b/root_setgid: Owned by correct group
+creat08.c:67: TPASS: dir_b/root_setgid: Setgid bit is set
+tst_buffers.c:57: TINFO: Test is using guarded buffers
+
+Summary:
+passed   9
+failed   0
+broken   0
+skipped  0
+warnings 0
