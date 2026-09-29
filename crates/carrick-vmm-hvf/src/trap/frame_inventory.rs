@@ -2016,6 +2016,15 @@ impl HvfVmState {
         let candidate_frames: Vec<carrick_hal::FrameId> =
             local_frame_references.keys().copied().collect();
 
+        // Keep backend references stable while reading the kernel population.
+        // A sibling can publish its already-staged mapping and then stage its
+        // retirement between two unlocked reads: the old kernel count and new
+        // backend count may both equal `local` even though that sibling's
+        // kernel unmap is still pending. Neither count alone licenses retirement.
+        // This is the same backend-registry -> kernel-inventory order used by
+        // `final_exec_physical_extents`. Release it before physical cleanup
+        // and kernel publication; never enclose a guest wait.
+        let mut frames = inventory.frames.lock();
         let (extent_liveness, frame_counts) = authority
             .retirement_batch_query(&candidate_extents, &candidate_frames)
             .map_err(|error| {
@@ -2053,7 +2062,6 @@ impl HvfVmState {
                 .or_insert(0usize) += 1;
         }
 
-        let mut frames = inventory.frames.lock();
         let mut retired = std::collections::BTreeSet::new();
         let mut complete_frames = std::collections::BTreeSet::new();
         for (&frame, &local) in &local_frame_references {

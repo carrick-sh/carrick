@@ -93,6 +93,12 @@ A bounded 20-run diagnostic population on a separately debug-signed copy
 completed without reproduction or core capture. This does not clear the red
 acceptance result. Sampling is stopped; next is a deterministic two-MM
 planning/publication interleaving. See `arm64-acceptance/retirement-debug/`.
+The deterministic backend reduction now fails red on mixed-time population
+counts and passes after moving the existing backend-registry acquisition
+before the authority query. Eleven retirement tests, serial HVF 598 (three
+existing ignores), and affected Clippy pass. This is a branch-local correction,
+not attribution or clearance of the Go failure; signed candidate acceptance
+is next. See `retirement-population/` for limits and failed invocations.
 
 VM-free additions now prove exact retirement after control/failed-load
 settlement (110 serial kernel passes) and enforce zero retired-delivery wake

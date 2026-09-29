@@ -340,6 +340,7 @@ fn register_carrier_lease(mut lease: GlobalFrameStage2Lease, host_addr: usize) -
 enum TestFrameMappingCount {
     Exact(usize),
     ExactButMappingNotLive(usize),
+    SnapshotThenInterleave(Box<dyn Fn() + Send + Sync>),
     Error,
 }
 
@@ -384,6 +385,13 @@ impl carrick_hal::FrameCowAuthority for TestFrameMappingCount {
     ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
         match self {
             Self::Exact(count) | Self::ExactButMappingNotLive(count) => Ok(Some(*count)),
+            Self::SnapshotThenInterleave(interleave) => {
+                // The kernel snapshot sees only the retiring MM. A sibling
+                // already has a staged backend reference, then publishes its
+                // kernel mapping and starts retiring before we use the snapshot.
+                interleave();
+                Ok(Some(1))
+            }
             Self::Error => Err(Box::new(std::io::Error::other(
                 "injected mapping-count failure",
             ))),
@@ -2794,6 +2802,54 @@ fn process_retirement_reads_mapping_rows_once_not_once_per_inventory_extent() {
         extents * extents
     );
     drop(guards);
+}
+
+#[test]
+fn process_retirement_does_not_combine_counts_from_different_populations() {
+    let (mut task, frame, _, key, _guard) =
+        process_retirement_task(TestFrameMappingCount::Exact(1));
+    let frames = std::sync::Arc::clone(&task.frame_inventory.lock().frames);
+    {
+        let mut registry = frames.lock();
+        // The sibling has staged its reference but not yet published to the
+        // kernel. Its publication and subsequent backend retirement can both
+        // occur between our authority query and our backend-count read.
+        registry.references.insert(frame, 2);
+        registry.extent_references.insert((frame, key.0, key.1), 2);
+        registry.stage2_references.insert(key, 2);
+    }
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_attempts = std::sync::Arc::clone(&attempts);
+    task.cow_authority = Some(std::sync::Arc::new(
+        TestFrameMappingCount::SnapshotThenInterleave(Box::new(move || {
+            observed_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Deterministic contender: try the real backend registry lock
+            // once, never wait/retry. If admitted, the sibling's kernel map
+            // is now live, while its backend retirement removes its reference.
+            // Its kernel UnmapMapping has not been applied yet.
+            if let Some(mut registry) = frames.try_lock() {
+                registry.references.insert(frame, 1);
+                registry.extent_references.insert((frame, key.0, key.1), 1);
+                registry.stage2_references.insert(key, 1);
+            }
+        })),
+    ));
+    let authority = task.cow_authority.as_ref().unwrap();
+    let mut inventory = task.frame_inventory.lock();
+    let mut reservation = inventory.retirement_reservation.take().unwrap();
+    HvfVmState::stage_retirement(&mut inventory, &mut reservation, authority.as_ref())
+        .expect("stage retirement with one sibling publication attempt");
+    let commit = reservation.commit(());
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        commit.batch().events().iter().all(|event| !matches!(
+            event,
+            carrick_hal::FrameInventoryEvent::RetireFrame { frame: retired, .. }
+                if *retired == frame
+        )),
+        "a kernel count before sibling publication and a backend count after \
+         sibling retirement must not authorize retiring a still-mapped frame"
+    );
 }
 
 #[test]
