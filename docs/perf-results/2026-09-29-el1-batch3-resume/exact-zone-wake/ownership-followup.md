@@ -51,3 +51,31 @@ and scoped ContractObservation/WorkSnapshot infrastructure where this requires
 actual EL1 execution. Preserve the historical crash attribution separately.
 Park-sequence exhaustion remains an explicit unresolved identity edge; it is
 not the current explanation for the historical failures.
+
+## VM-free failed-load settlement witness
+
+The serial kernel witness
+`failed_zone_load_settlement_retires_only_its_owned_continuation` now installs
+a zeroed, aligned synthetic EL1 region and uses production scheduler and
+continuation transitions. A control wake claims the parked record before the
+thread can be taken. The taken lease owns the original continuation ID and
+RecordRef. `settle_failed(..., SnapshotRestoreFailed)` retires the record
+exactly once (one incarnation advance), leaves the thread Failed and queues
+nothing. Reusing the same index for a published service record followed by
+the old handback preserves the replacement and leaves the queue empty.
+
+All 110 serial kernel tests passed, including this witness; kernel all-target
+Clippy and contract registry validation passed. Full logs are the adjacent
+load-lifecycle files. The serial-host classification gate also passed.
+
+Two fixture issues were corrected before acceptance: the initial module
+placement duplicated the existing serial_host module, and the first reuse
+check allocated an unpublished Free record, which live() correctly rejects.
+The final test asserts replacement liveness before and after stale delivery.
+Neither fixture failure is a kernel red or historical crash attribution.
+
+This tests the production settlement called after failed backend load, not
+an actual HVF load refusal. It proves the valid-record control/failed-load
+path; it does not certify stale association handling, every terminal path,
+park-sequence exhaustion or deterministic signed interleavings. No production
+code changed and no new signed regression was run for this test-only change.

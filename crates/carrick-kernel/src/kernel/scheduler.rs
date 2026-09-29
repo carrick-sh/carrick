@@ -9392,6 +9392,129 @@ mod tests {
     }
     mod serial_host {
         use super::*;
+
+        struct ZoneRegion {
+            pointer: std::ptr::NonNull<u8>,
+            layout: std::alloc::Layout,
+        }
+
+        impl ZoneRegion {
+            fn new() -> Self {
+                assert_eq!(carrick_el1_abi::get_el1_region_host_ptr(), 0);
+                let size = carrick_el1_abi::EL1_REGION_SIZE as usize;
+                let layout = std::alloc::Layout::from_size_align(size, size).unwrap();
+                // SAFETY: the layout is nonzero and every zone field admits zero.
+                let pointer = std::ptr::NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })
+                    .expect("allocate synthetic EL1 region");
+                carrick_el1_abi::record_el1_region_host_ptr(pointer.as_ptr() as usize);
+                Self { pointer, layout }
+            }
+        }
+
+        impl Drop for ZoneRegion {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(0);
+                // SAFETY: all test users have been dropped and the global view cleared.
+                unsafe { std::alloc::dealloc(self.pointer.as_ptr(), self.layout) };
+            }
+        }
+
+        #[test]
+        fn failed_zone_load_settlement_retires_only_its_owned_continuation() {
+            let _region = ZoneRegion::new();
+            let zone = carrick_el1_abi::zone_tables().unwrap();
+            let (kernel, root) = bootstrap(12_468);
+            publish(&root, 33);
+            let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+            let service = CarrierWaitService::new(Arc::clone(&scheduler));
+            let executor = scheduler
+                .register_executor(Arc::new(RecordingKick::default()))
+                .unwrap();
+            scheduler.make_runnable(root.thread().key()).unwrap();
+            let running = scheduler.take(&executor).unwrap();
+            let identity = carrick_el1_abi::ThreadIdentity {
+                tid: root.thread().key().tid.raw() as u64,
+                serial: root.thread().key().serial.raw(),
+                mm: root.shared().mm().id().raw(),
+                file_table: 0,
+                generation: running.generation().raw(),
+                affinity: 0,
+            };
+            let record_id = zone.alloc_record(identity).unwrap();
+            let seq = zone.next_seq(record_id);
+            zone.publish_park(record_id, seq);
+            let record = zone.record_ref(record_id);
+            let current = root
+                .task_binding()
+                .capture(root.thread().key().tid)
+                .unwrap();
+            let continuation = BlockedContinuation::from_zone_park(
+                ContinuationCapture::from_lease(
+                    &current,
+                    running.lease(),
+                    SyscallRequest::new(98, SyscallArgs([0; 6])),
+                    RestartClass::Never,
+                )
+                .unwrap(),
+                crate::kernel::continuation::ZoneWait::new(record, seq),
+                None,
+            );
+            let continuation_id = continuation.id();
+            let mut registration = service.prepare_registration(&continuation);
+            service.enroll(&mut registration).unwrap();
+            scheduler
+                .settle_blocked_continuation(running, continuation, registration)
+                .unwrap();
+            assert!(matches!(
+                zone.live(record).unwrap().claim(),
+                carrick_el1_abi::Claim::Parked { .. }
+            ));
+
+            scheduler.wake_control(root.thread().key()).unwrap();
+            assert!(matches!(
+                zone.live(record).unwrap().claim(),
+                carrick_el1_abi::Claim::Host { .. }
+            ));
+            let running = scheduler.take(&executor).unwrap();
+            let owned = running.lease().blocked_continuation().unwrap();
+            assert_eq!(owned.id(), continuation_id);
+            assert_eq!(owned.zone_wait().unwrap().record, record);
+
+            // This is the scheduler settlement used after a backend refuses load.
+            scheduler
+                .settle_failed(
+                    running,
+                    crate::kernel::objects::ExecutionFailure::SnapshotRestoreFailed,
+                )
+                .unwrap();
+            assert!(
+                zone.live(record).is_none(),
+                "failed load retained its zone allocation"
+            );
+            assert_eq!(
+                zone.record(record_id).incarnation(),
+                record.incarnation + 1,
+                "failed-load settlement must retire the record exactly once"
+            );
+            assert!(matches!(
+                root.thread().execution_state(),
+                ThreadExecutionState::Failed { .. }
+            ));
+            assert_eq!(scheduler.queued_len(), 0);
+            let replacement = zone.alloc_host_runnable(identity).unwrap();
+            assert_eq!(replacement, record_id);
+            let replacement_ref = zone.record_ref(replacement);
+            assert_ne!(replacement_ref, record);
+            assert!(zone.live(replacement_ref).is_some());
+            scheduler.publish_zone_handback(record);
+            assert!(
+                zone.live(replacement_ref).is_some(),
+                "late handback retired replacement"
+            );
+            assert_eq!(scheduler.queued_len(), 0);
+            zone.free_record(replacement);
+        }
+
         /// A thread that is merely ABSENT from the exact scheduler registry is not
         /// a reaped thread: the kernel graph has no zombie and no retirement for
         /// it, so nothing proves that generation will never run again. Round 4
