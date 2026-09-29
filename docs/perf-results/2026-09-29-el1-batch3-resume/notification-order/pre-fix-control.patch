@@ -1,0 +1,24 @@
+diff --git a/crates/carrick-runtime/src/vcpu_loop/wait_wake.rs b/crates/carrick-runtime/src/vcpu_loop/wait_wake.rs
+index ef2895c02..586271669 100644
+--- a/crates/carrick-runtime/src/vcpu_loop/wait_wake.rs
++++ b/crates/carrick-runtime/src/vcpu_loop/wait_wake.rs
+@@ -43,18 +43,7 @@ impl HvpatchRuntimeEndpoint {
+         };
+         let mut delivered = false;
+         for thread in snapshot.threads() {
+-            let Some(generation) = thread.execution_state().generation() else {
+-                continue;
+-            };
+-            // Snapshot capture does not pin the parent's lifecycle. Exit,
+-            // reap or exec can retire this thread before notification arrives;
+-            // only its exact task and execution generation may be nudged.
+-            let target = carrick_kernel::kernel::scheduler::ExactWakeTarget::new(
+-                self.task_binding.task_key(),
+-                thread.key(),
+-                generation,
+-            );
+-            match scheduler.wake_exact(target) {
++            match scheduler.wake(thread.key()) {
+                 Ok(_) => delivered = true,
+                 Err(
+                     carrick_kernel::kernel::scheduler::SchedulerError::Thread(

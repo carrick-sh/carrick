@@ -37,7 +37,7 @@ status/order statements where explicitly corrected below.
 At refresh, the implementation baseline on local `main` and local
 remote-tracking `origin/main` is `a70b40466`. The documentation commit for
 this refresh advances local main only; no remote fetch was performed.
-Batch 3 is on `integ/batch3`, unlanded. Its current implementation is
+Batch 3 is on `integ/batch3`, unlanded. Its scheduler correction is
 `a2c0fcee3`, following the atomic re-park correction `0e1d7c12c` and exact
 zone handback targeting `da84671b7`. The latter has a deterministic red-first
 reaped-child witness, continuation authentication and pre-enrollment kick
@@ -54,6 +54,22 @@ retained `exact-zone-wake/signed-artifacts.jsonl`; full output and final
 source-gate logs are in that receipt directory. This replaces `8916e1fe2`
 as current scheduler regression evidence, but does not supply deterministic
 signed race bindings, historical crash attribution or full task-A acceptance.
+New focused signed source `2e6e3794a` adds the notification capture audit
+event (`b55e57803`) and a deterministic three-process fixture. Delivery is
+held across the exact parent's reap: the retained pre-fix method produces one
+reaped-wake rejection; restored exact targeting produces zero. Entitlement
+negative controls and cleanup passed. See `notification-order/` for both
+artifacts, the controlled source patch and the initially non-discriminating
+fixture result. This closes this producer's signed interleaving gap only; the
+49-execution receipt above predates the new audit event and is not full-tree
+acceptance for this source. Clean compiler gates and broad regressions remain
+pending for the audit event.
+
+VM-free additions now prove exact retirement after control/failed-load
+settlement (110 serial kernel passes) and enforce zero retired-delivery wake
+publications at 1/8/32 with excess-work negative controls. Those scoped
+observations do not establish total scheduler work or signed cost.
+
 All twelve active
 batch/memory/IPC/sigsuspend worktrees inventoried below were clean at the
 initial refresh inspection; only batch 3 has been advanced in this goal.
@@ -203,8 +219,12 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   Attribution to the historical Python crash is still open; see the branch
   receipt's deferred-handback section. A rebuilt, pinned Python run at
   `5ce5bd059` passed (395 tests, 51 skips), with no fatal capture triggered.
-- [ ] Close the notification contract's signed-interleaving and structural
-  observation gaps; run the complete batch gate below on the final candidate.
+- [x] Bind delayed parent notification to deterministic signed capture/reap/
+  delivery ordering. Source `2e6e3794a` passes with zero reaped wake attempts;
+  the same fixture with the retained pre-fix method fails at one attempt.
+  This is producer proof, not attribution of the original otmp failure.
+- [ ] Close the notification contract's scoped structural observation gap;
+  run the complete batch gate below on the final candidate.
 - [ ] Accept and integrate locally only when all blockers/gates close.
 
 Receipt on branch `integ/batch3`:
