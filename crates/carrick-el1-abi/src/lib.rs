@@ -18,6 +18,8 @@
 
 use core::cell::UnsafeCell;
 
+pub mod ipc;
+
 /// Guest VA/IPA base of the 64 MiB EL1 kernel region.
 /// Placed at 180 GiB + 64 MiB, cleanly within the 180..181 GiB L2 block table (L2_B)
 /// and disjoint from all other guest memory ranges.

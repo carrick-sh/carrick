@@ -4,7 +4,32 @@ Checkpoint 3.2 substrate only. No host/runtime/EL1 integration is included.
 The workspace's `crates/*` member declaration includes this crate. Production
 uses `core` only: no allocator, locks, syscalls, host dependencies or ABI crate.
 Like sched-core, storage is supplied by the venue. `Pipe` borrows a byte reserve
-and page metadata; `EventFd` is inline. Neither is a cross-address-space ABI.
+and page metadata; `EventFd` is inline. The borrowed slices are never
+persisted: the pipe's whole mutable state is the plain-data `repr(C)`
+`PipeRecord`, and `Page`/`EventFd`/`WriteProgress` are `repr(C)` plain data too,
+so a venue can keep them in memory shared by host and EL1 (the EL1 IPC records
+in `carrick-el1-abi::ipc` do). `Pipe<'_, &mut PipeRecord>` is a view attached
+under the object's lock (`Pipe::attach`, O(1) invariant checks, `Corrupt` on a
+record that does not describe the storage); `Pipe<'_>` owns its record. Both run
+the one algorithm.
+
+## Contract: `kernel.el1.ipc-object-state` (pipe/eventfd part)
+
+Staged copy/commit for venues whose copies can fault (guarded user copies):
+`Pipe::read_with` hands queued chunks to a copy callback and consumes only the
+bytes it reports delivered; `Pipe::write_with`/`write_progress` reserve ring
+space, let a fill callback supply it and publish only filled bytes;
+`EventFd::read_with` drains only after a successful delivery. A copy that
+delivers nothing is `Error::Fault` with no state change and no wake (EFAULT);
+a partial copy returns the delivered prefix. EOF, `WouldBlock`, `BrokenPipe` and
+small-write atomicity are decided before any copy runs, so a refused atomic
+write stages no byte. `try_read`/`try_write`/`WriteCursor` are these same
+functions over a slice. `WriteProgress {len, written}` is the owned
+continuation's byte offset: a resumed write never restarts at zero.
+VM-free bindings: `el1_ipc_*` unit tests in this crate (shared-view/owned
+equivalence over a 4000-step model, attach validation, all atomic sizes through
+the shared record, read/write faults preserving undelivered bytes, eventfd
+fault/semaphore/overflow, copy work exactly 2x transferred bytes at 1/4096/16384).
 
 ## Contract: `substrate.pipe-eventfd`
 
