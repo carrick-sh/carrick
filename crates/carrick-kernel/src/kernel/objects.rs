@@ -301,6 +301,10 @@ pub trait FileDescriptionBacking: Any + Send + Sync {
         None
     }
 
+    fn ipc_status_flags(&self) -> Option<Arc<crate::el1_ipc::HostDescriptionFlags>> {
+        None
+    }
+
     fn on_first_fd_ref(&self) {}
 
     fn on_last_fd_ref(&self) {}
@@ -802,6 +806,7 @@ impl SocketCork {
 #[derive(Debug)]
 pub struct DescriptionCommon {
     status_flags: AtomicU64,
+    ipc_status_flags: std::sync::OnceLock<Arc<crate::el1_ipc::HostDescriptionFlags>>,
     /// Number of Linux fd-table entries naming this description across every
     /// process namespace. Deliberately excludes transient Rust `Arc` clones
     /// held by in-flight syscalls: Linux removes an event-poll interest only after
@@ -835,6 +840,7 @@ impl DescriptionCommon {
     pub(crate) fn new(status_flags: u64) -> Self {
         Self {
             status_flags: AtomicU64::new(status_flags),
+            ipc_status_flags: std::sync::OnceLock::new(),
             fd_refs: AtomicUsize::new(0),
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
@@ -854,6 +860,7 @@ impl DescriptionCommon {
     pub(crate) fn new_with_seals(status_flags: u64, seals: Arc<Mutex<Option<u32>>>) -> Self {
         Self {
             status_flags: AtomicU64::new(status_flags),
+            ipc_status_flags: std::sync::OnceLock::new(),
             fd_refs: AtomicUsize::new(0),
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
@@ -874,12 +881,41 @@ impl DescriptionCommon {
         Arc::clone(&self.seals)
     }
 
+    fn bind_ipc_status_flags(&self, flags: Arc<crate::el1_ipc::HostDescriptionFlags>) {
+        let bound = self.ipc_status_flags.get_or_init(|| {
+            let initial = self.status_flags.load(Ordering::Relaxed);
+            flags.set_linux_flags(initial);
+            // Access mode and supported mutable bits have one shared owner.
+            // Retain only the remaining immutable personality bits locally.
+            self.status_flags.store(
+                initial
+                    & !(crate::el1_ipc::HostDescriptionFlags::MUTABLE_MASK
+                        | carrick_abi::LINUX_O_ACCMODE),
+                Ordering::Relaxed,
+            );
+            Arc::clone(&flags)
+        });
+        if !Arc::ptr_eq(bound, &flags) {
+            carrick_fatal::carrick_fatal!(
+                "ipc::description",
+                "common flags bound to different OFDs"
+            );
+        }
+    }
+
     pub(crate) fn status_flags(&self) -> u64 {
-        self.status_flags.load(Ordering::Relaxed)
+        let base = self.status_flags.load(Ordering::Relaxed);
+        self.ipc_status_flags
+            .get()
+            .map_or(base, |flags| base | flags.linux_flags())
     }
 
     pub(crate) fn set_status_flags(&self, next: u64) {
-        self.status_flags.store(next, Ordering::Relaxed);
+        if let Some(flags) = self.ipc_status_flags.get() {
+            flags.set_linux_flags(next);
+        } else {
+            self.status_flags.store(next, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn fd_refs(&self) -> usize {
@@ -1101,6 +1137,9 @@ impl FileDescription {
     where
         T: FileDescriptionBacking,
     {
+        if let Some(flags) = backing.ipc_status_flags() {
+            common.bind_ipc_status_flags(flags);
+        }
         Ok(Self {
             id: super::ids::allocate_file_description_id()?,
             kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
@@ -1133,6 +1172,9 @@ impl FileDescription {
     where
         T: FileDescriptionBacking,
     {
+        if let Some(flags) = backing.ipc_status_flags() {
+            common.bind_ipc_status_flags(flags);
+        }
         Ok(Self {
             id: super::ids::restore_file_description_id(stable_id)?,
             kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),

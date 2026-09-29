@@ -1,0 +1,88 @@
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 43.79s
+     Running unittests src/lib.rs (target/debug/deps/carrick_kernel-d0fe76dc24f313d1)
+
+running 65 tests
+test cred_ipc::tests::publication_cache_key_distinguishes_forked_host_processes ... ok
+test dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_description_refusal_rolls_back_object ... ok
+test dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_guest_pin_survives_last_host_close ... ok
+test dispatch::fd_table::tests::serial_host_el1_ipc_eventfd_mixed_subscriber_wakes_once ... ok
+test dispatch::fd_table::tests::serial_host_el1_ipc_guest_only_eventfd_has_no_host_readiness ... ok
+test dispatch::fd_table::tests::serial_host_el1_ipc_status_flags_share_one_description ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_guest_writer_pin_delays_eof_after_host_close ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_pipe_flags_are_shared_per_endpoint ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_pipe_guest_write_host_read_and_reverse ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_pipe_proxy_subscription_ends_with_lease ... ok
+test dispatch::fs::pipe::tests::serial_host_el1_ipc_pipe_second_description_refusal_rolls_back ... ok
+test dispatch::fs::tests::serial_host_el1_ipc_pipe_capacity_admission_matches_shared_rounding ... ok
+test dispatch::fs::tests::serial_host_el1_ipc_splice_endpoint_survives_final_slot_close ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_closes_enrollment_gap ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_retains_value_until_capacity ... ok
+test dispatch::overlay_dispatch_tests::serial_host_el1_ipc_blocking_eventfd_write_survives_fd_reuse ... ok
+test dispatch::sysv::ipc_set_tests::aborted_host_alias_leaves_sysv_attachment_and_nattch_exact ... ok
+test dispatch::sysv::ipc_set_tests::explicit_shmat_rejects_dynamic_vma_overlap_before_alias_install ... ok
+test dispatch::sysv::ipc_set_tests::explicit_shmat_rejects_real_boot_vma_overlap_before_alias_install ... ok
+test dispatch::sysv::ipc_set_tests::guest_nowait_semop_fails_immediately_instead_of_polling ... ok
+test dispatch::sysv::ipc_set_tests::immediate_semop_never_registers_a_blocked_waiter ... ok
+test dispatch::sysv::ipc_set_tests::logical_fork_shares_namespace_but_retires_only_its_own_attachments ... ok
+test dispatch::sysv::ipc_set_tests::logical_sempid_is_shared_across_in_process_fork_clones ... ok
+test dispatch::sysv::ipc_set_tests::logical_wait_counts_are_shared_across_in_process_fork_clones ... ok
+test dispatch::sysv::ipc_set_tests::pending_shmat_survives_sibling_rmid_and_commits_exact_generation ... ok
+test dispatch::sysv::ipc_set_tests::receipt_same_shmid_deadlock_reproducer_evidence ... ignored, controller receipt documenting pre-fix commit 560ce940e timeout vs fixed execution
+test dispatch::sysv::ipc_set_tests::remap_file_pages_observes_removed_attached_generation ... ok
+test dispatch::sysv::ipc_set_tests::removed_and_recreated_same_key_generations_keep_independent_counts ... ok
+test dispatch::sysv::ipc_set_tests::retained_semop_generation_closes_wake_before_enroll_and_drop_unwinds_counts ... ok
+test dispatch::sysv::ipc_set_tests::retained_semop_keeps_array_atomic_and_completes_exact_set ... ok
+test dispatch::sysv::ipc_set_tests::retained_semop_tombstone_cannot_retarget_and_keeps_deadline ... ok
+test dispatch::sysv::ipc_set_tests::scoped_host_sem_key_separates_run_scopes ... ok
+test dispatch::sysv::ipc_set_tests::semctl_getpid_reports_namespace_visible_operator ... ok
+test dispatch::sysv::ipc_set_tests::semget_new_set_at_semmni_returns_enospc_without_inserting ... ok
+test dispatch::sysv::ipc_set_tests::semop_wait_counts_rise_while_parked_and_unwind_on_every_exit ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::existing_shmget_rejects_a_larger_requested_size ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::message_queue_hot_path_does_not_rewrite_identity_file ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::msg_queue_wait_outcome_owns_send_state_without_executor_tls ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock ... 
+running 1 test
+test dispatch::sysv::ipc_set_tests::serial_host::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2328 filtered out; finished in 0.26s
+
+ok
+test dispatch::sysv::ipc_set_tests::serial_host::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting ... 
+running 1 test
+test dispatch::sysv::ipc_set_tests::serial_host::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2328 filtered out; finished in 0.00s
+
+ok
+test dispatch::sysv::ipc_set_tests::serial_host::semctl_setall_witness_revalidates_identity_and_fails_eidrm_when_removed ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::semctl_setall_witness_revalidates_permissions_and_fails_eacces_when_mode_revoked ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::semctl_setall_witness_succeeds_and_updates_values_when_valid ... ok
+test dispatch::sysv::ipc_set_tests::serial_host::shmdt_ambiguous_backend_unmap_failure_aborts_with_sigabrt ... carrick fatal [dispatch::sysv_shmdt]: ambiguous unmap failure leaving split shared memory backend ownership
+ok
+test dispatch::sysv::ipc_set_tests::serial_host::watchdog_kills_and_reaps_on_deadlock_timeout ... 
+running 1 test
+ok
+test dispatch::sysv::ipc_set_tests::shmctl_ipc_set_stores_mode_and_round_trips_via_ipc_stat ... ok
+test dispatch::sysv::ipc_set_tests::shmctl_rmid_authorizes_the_owner_even_without_write_mode_bits ... ok
+test dispatch::sysv::ipc_set_tests::shmdt_success_retires_all_committed_mmap_metadata_before_attachment ... ok
+test dispatch::sysv::ipc_set_tests::sysv_ipc_stamps_follow_the_guest_clock ... ok
+test dispatch::sysv::ipc_set_tests::sysv_scope_falls_back_when_no_active_context ... ok
+test dispatch::sysv::ipc_set_tests::sysv_scope_reads_container_run_id ... ok
+test dispatch::sysv::ipc_set_tests::unpublished_fork_drop_does_not_leak_inherited_nattch ... ok
+test el1_ipc::tests::serial_host_el1_ipc_descriptor_admission_reclaims_extents ... ok
+test el1_ipc::tests::serial_host_el1_ipc_host_subscription_lifetime_is_exact ... ok
+test el1_ipc::tests::serial_host_el1_ipc_pool_refusal_has_no_partial_admission ... ok
+test el1_ipc::tests::serial_host_el1_ipc_pool_reuses_released_storage ... ok
+test kernel::continuation::ipc::tests::el1_ipc_continue_rejects_a_stale_address_space_before_copying ... ok
+test kernel::continuation::ipc::tests::el1_ipc_continue_resumes_a_write_without_replay ... ok
+test kernel::continuation::ipc::tests::el1_ipc_exit_cancellation_releases_the_last_pin_and_wakes_the_peer ... ok
+test kernel::continuation::ipc::tests::el1_ipc_partial_progress_signal_returns_the_count ... ok
+test kernel::continuation::ipc::tests::el1_ipc_sigpipe_after_partial_write_completes_exactly_once ... ok
+test kernel::continuation::ipc::tests::el1_ipc_zero_progress_interruption_restarts_or_returns_eintr ... ok
+test kernel::continuation::ipc::tests::serial_host_el1_ipc_guest_wake_delivered_at_its_kernel_boundary ... ok
+test kernel::continuation::ipc::tests::serial_host_el1_ipc_runtime_backing_retains_the_kernel_authority ... ok
+test namespace::process::tests::docker_default_excludes_syslog_and_ipc_owner ... ok
+
+test result: ok. 64 passed; 0 failed; 1 ignored; 0 measured; 2264 filtered out; finished in 0.72s
+

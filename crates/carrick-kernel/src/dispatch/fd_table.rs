@@ -2448,6 +2448,23 @@ pub(super) fn listening_socket_readiness_sample(
 }
 
 impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
+    fn ipc_status_flags(&self) -> Option<Arc<crate::el1_ipc::HostDescriptionFlags>> {
+        match &*self.read() {
+            OpenDescription::EventFd { state, .. } => state
+                .lifetime
+                .lock()
+                .as_ref()
+                .map(crate::el1_ipc::HostDescription::flags),
+            OpenDescription::PipeReader { pipe, .. } => {
+                pipe.endpoint_status_flags(carrick_el1_abi::ipc::pipe::End::Reader)
+            }
+            OpenDescription::PipeWriter { pipe, .. } => {
+                pipe.endpoint_status_flags(carrick_el1_abi::ipc::pipe::End::Writer)
+            }
+            _ => None,
+        }
+    }
+
     fn listener_readiness(&self, interest: LinuxEpollEvents) -> Option<ListenerReadinessSample> {
         listening_socket_readiness_sample(&self.read(), interest)
     }
@@ -3936,6 +3953,89 @@ mod tests {
                 "eventfd admission allocated host readiness without a subscriber (initial={initial})"
             );
         }
+    }
+
+    #[test]
+    fn serial_host_el1_ipc_status_flags_share_one_description() {
+        use crate::el1_zone::HostLockWait;
+        use carrick_abi::LINUX_O_NONBLOCK;
+        use carrick_el1_abi::ipc::{EventMode, fd};
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let state =
+            Arc::new(EventFdState::create(Arc::clone(&owner), 0, EventMode::Counter).unwrap());
+        let host = kernel_file_description(
+            Arc::new(RwLock::new(OpenDescription::EventFd {
+                state: Arc::clone(&state),
+                base: OpenDescriptionBase::new(LINUX_O_NONBLOCK),
+            })),
+            LINUX_O_NONBLOCK,
+        );
+        let table = owner.create_table(64, 4).unwrap();
+        state
+            .lifetime
+            .lock()
+            .as_ref()
+            .unwrap()
+            .install(table, fd::Fd(0), false)
+            .unwrap();
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        assert_eq!(
+            host.common().status_flags() & carrick_abi::LINUX_O_ACCMODE,
+            carrick_abi::LINUX_O_RDWR,
+            "Linux eventfd is read/write"
+        );
+        assert!(
+            authority.getfl(table, fd::Fd(0)).unwrap().1.nonblock,
+            "host admission must initialize the shared flags"
+        );
+        authority
+            .setfl(table, fd::Fd(0), fd::StatusFlags::default())
+            .unwrap();
+        assert_eq!(
+            host.common().status_flags() & LINUX_O_NONBLOCK,
+            0,
+            "guest changes must be visible to the host"
+        );
+        let alias = crate::kernel::FileDescription::concrete_with_common(
+            Arc::new(RwLock::new(OpenDescription::EventFd {
+                state: Arc::clone(&state),
+                base: OpenDescriptionBase::new(0),
+            })),
+            host.common_arc(),
+        )
+        .unwrap();
+        assert!(
+            !authority.getfl(table, fd::Fd(0)).unwrap().1.nonblock,
+            "binding another view must not restore admission-time flags"
+        );
+        host.common().set_status_flags(LINUX_O_NONBLOCK);
+        assert_eq!(
+            alias.common().status_flags() & LINUX_O_NONBLOCK,
+            LINUX_O_NONBLOCK
+        );
+        assert!(
+            authority.getfl(table, fd::Fd(0)).unwrap().1.nonblock,
+            "host changes must be visible through the guest slot"
+        );
+        let (pin, _) = authority.pin(table, fd::Fd(0)).unwrap();
+        assert!(authority.close(table, fd::Fd(0)).unwrap().is_none());
+        state.close();
+        assert_eq!(
+            authority.holds(&pin).unwrap(),
+            (0, 1),
+            "retained host flag observations must not own a functional pin"
+        );
+        let released = authority.unpin(pin).unwrap().unwrap();
+        owner.release(released.backing).unwrap();
+        assert_eq!(
+            host.common().status_flags() & LINUX_O_NONBLOCK,
+            LINUX_O_NONBLOCK
+        );
+        let extent = authority
+            .destroy_table(table, |_| panic!("empty table"))
+            .unwrap();
+        owner.reclaim_descriptors(extent);
     }
 
     #[test]

@@ -164,11 +164,81 @@ struct HostWakeEntry {
 /// only if no descriptor or operation in either venue still holds it.
 #[derive(Debug)]
 pub struct HostDescription {
+    flags: std::sync::Arc<HostDescriptionFlags>,
+}
+
+/// Non-owning observation of a host description's shared mutable flags.
+/// Holding this view never retains an OFD pin. After host retirement it reads
+/// a terminal snapshot, without touching a potentially recycled shared slot.
+#[derive(Debug)]
+pub struct HostDescriptionFlags {
     owner: std::sync::Arc<HostIpc>,
-    pin: Option<fd::OfdPin>,
+    state: Mutex<HostDescriptionState>,
+}
+#[derive(Debug)]
+enum HostDescriptionState {
+    Live(fd::OfdPin),
+    Retired(fd::Description),
+}
+
+impl HostDescriptionFlags {
+    pub(crate) const MUTABLE_MASK: u64 =
+        carrick_abi::LINUX_O_APPEND | carrick_abi::LINUX_O_NONBLOCK | carrick_abi::LINUX_O_ASYNC;
+
+    pub(crate) fn linux_flags(&self) -> u64 {
+        let state = self.state.lock();
+        let description = match &*state {
+            HostDescriptionState::Live(pin) => self
+                .owner
+                .region()
+                .fd(HostLockWait)
+                .pinned(pin)
+                .unwrap_or_else(|_| {
+                    carrick_fatal::carrick_fatal!("ipc::description", "invalid flag observation")
+                }),
+            HostDescriptionState::Retired(description) => *description,
+        };
+        let flags = description.flags;
+        let access = match description.access {
+            fd::AccessMode::ReadOnly => carrick_abi::LINUX_O_RDONLY,
+            fd::AccessMode::WriteOnly => carrick_abi::LINUX_O_WRONLY,
+            fd::AccessMode::ReadWrite => carrick_abi::LINUX_O_RDWR,
+            fd::AccessMode::Path => carrick_abi::LINUX_O_PATH,
+        };
+        access
+            | (u64::from(flags.append) * carrick_abi::LINUX_O_APPEND)
+            | (u64::from(flags.nonblock) * carrick_abi::LINUX_O_NONBLOCK)
+            | (u64::from(flags.asynchronous) * carrick_abi::LINUX_O_ASYNC)
+    }
+
+    pub(crate) fn set_linux_flags(&self, value: u64) {
+        let state = self.state.lock();
+        let HostDescriptionState::Live(pin) = &*state else {
+            // A retired host observation has no mutation authority.
+            return;
+        };
+        let region = self.owner.region();
+        let authority = region.fd(HostLockWait);
+        let mut flags = authority
+            .pinned(pin)
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("ipc::description", "invalid flag mutation")
+            })
+            .flags;
+        flags.append = value & carrick_abi::LINUX_O_APPEND != 0;
+        flags.nonblock = value & carrick_abi::LINUX_O_NONBLOCK != 0;
+        flags.asynchronous = value & carrick_abi::LINUX_O_ASYNC != 0;
+        authority.set_pinned_flags(pin, flags).unwrap_or_else(|_| {
+            carrick_fatal::carrick_fatal!("ipc::description", "shared flag mutation rejected")
+        });
+    }
 }
 
 impl HostDescription {
+    pub(crate) fn flags(&self) -> std::sync::Arc<HostDescriptionFlags> {
+        std::sync::Arc::clone(&self.flags)
+    }
+
     /// Install the exact admitted description into a shared table. Caller
     /// supplies already-provisioned capacity and serializes slot admission.
     pub fn install(
@@ -177,35 +247,51 @@ impl HostDescription {
         target: fd::Fd,
         cloexec: bool,
     ) -> Result<(), fd::Error> {
-        self.owner.region().fd(HostLockWait).install_pin(
-            table,
-            target,
-            self.pin.as_ref().ok_or(fd::Error::StalePin)?,
-            cloexec,
-        )
+        let state = self.flags.state.lock();
+        let HostDescriptionState::Live(pin) = &*state else {
+            return Err(fd::Error::StalePin);
+        };
+        self.flags
+            .owner
+            .region()
+            .fd(HostLockWait)
+            .install_pin(table, target, pin, cloexec)
     }
 }
 
 impl Drop for HostDescription {
     fn drop(&mut self) {
-        let Some(pin) = self.pin.take() else {
-            return;
-        };
-        let description = self
-            .owner
-            .region()
-            .fd(HostLockWait)
-            .unpin(pin)
-            .unwrap_or_else(|_| {
+        let description = {
+            let mut state = self.flags.state.lock();
+            let HostDescriptionState::Live(pin) = &*state else {
+                return;
+            };
+            let region = self.flags.owner.region();
+            let authority = region.fd(HostLockWait);
+            let terminal = authority.pinned(pin).unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("ipc::description", "invalid closing description")
+            });
+            let HostDescriptionState::Live(pin) =
+                std::mem::replace(&mut *state, HostDescriptionState::Retired(terminal))
+            else {
+                carrick_fatal::carrick_fatal!("ipc::description", "description retired twice")
+            };
+            authority.unpin(pin).unwrap_or_else(|_| {
                 carrick_fatal::carrick_fatal!("ipc::description", "invalid owned description pin")
-            });
+            })
+        };
+        // Backing release can call host readiness callbacks: leave the
+        // description lock before delivering them.
         if let Some(description) = description {
-            self.owner.release(description.backing).unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!(
-                    "ipc::description",
-                    "invalid final description backing"
-                )
-            });
+            self.flags
+                .owner
+                .release(description.backing)
+                .unwrap_or_else(|_| {
+                    carrick_fatal::carrick_fatal!(
+                        "ipc::description",
+                        "invalid final description backing"
+                    )
+                });
         }
     }
 }
@@ -514,8 +600,10 @@ impl HostIpc {
     ) -> Result<HostDescription, fd::Error> {
         let pin = self.region().fd(HostLockWait).create_pinned(description)?;
         Ok(HostDescription {
-            owner: std::sync::Arc::clone(self),
-            pin: Some(pin),
+            flags: std::sync::Arc::new(HostDescriptionFlags {
+                owner: std::sync::Arc::clone(self),
+                state: Mutex::new(HostDescriptionState::Live(pin)),
+            }),
         })
     }
 

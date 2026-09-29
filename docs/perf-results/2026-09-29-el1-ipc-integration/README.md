@@ -128,3 +128,34 @@ pipe-regression.log, pipe-description-final.log, pipe-description-clippy.log.
 Tables remain unpublished. Shared flags and FileTable admission/mutation,
 fork/unshare, CLOEXEC and destruction are the next implementation boundary.
 No signed guest execution or checkpoint acceptance is claimed here.
+
+## Shared descriptor flags
+
+Pipe and eventfd FileDescriptions now bind their DescriptionCommon to the
+existing shared OFD. Supported mutable flags (APPEND/NONBLOCK/ASYNC) and access
+mode are read from that record. F_SETFL and ioctl updates write its flags;
+there is no second mutable host word for these bound descriptions. Rebinding
+the same common view does not reset admission-time flags. Other description
+kinds retain their existing authority, and existing DIRECT/NOATIME limitations
+are unchanged. The host-side observation retains no functional pin: final
+host close snapshots terminal flags and unpins even if diagnostic Arcs remain.
+
+The first witness failed because a nonblocking host eventfd admitted blocking
+shared flags. Final witnesses prove host-to-guest and guest-to-host changes,
+alias binding without reset, independent pipe-end flags and preserved access
+modes, and guest-pin retirement despite retained host observations.
+
+A native ARM64 Linux control on the retained python:3.12-slim image reports
+F_GETFL=2050 for eventfd(EFD_NONBLOCK): RDWR=2 plus NONBLOCK=2048. Host eventfd
+reporting had omitted RDWR; reading the shared access mode corrects it. Command:
+`docker run --rm --pull=never --platform linux/arm64 python:3.12-slim python3 -c
+'import os,fcntl,platform; print("machine="+platform.machine()); fd=os.eventfd(0,os.EFD_NONBLOCK); print("eventfd_getfl="+str(fcntl.fcntl(fd,fcntl.F_GETFL))); print("rdwr="+str(os.O_RDWR)); print("nonblock="+str(os.O_NONBLOCK)); os.close(fd)'`.
+Image identity: flags-oracle-image.log. This control is not a full differential
+or signed acceptance receipt. No Carrick guest was launched in this change.
+
+Final checks: 64 IPC tests passed, one existing ignored; 89 pipe, 9 eventfd and
+6 fcntl regressions passed (these populations overlap). Kernel/runtime Clippy
+and workspace formatting passed. Flags logs are retained alongside this file.
+The initial Clippy check found ambiguous arithmetic/bitwise precedence; explicit
+parentheses corrected it before the final checks. Shared descriptor table
+publication/create/mutation/fork/unshare/CLOEXEC/destroy remains unfinished.
