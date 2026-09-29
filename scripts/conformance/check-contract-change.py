@@ -47,15 +47,16 @@ def load_contracts(root: Path):
             data = tomllib.load(f)
             cid = data.get("id")
             if cid:
+                data["_descriptor_path"] = p.relative_to(root).as_posix()
                 contracts[cid] = data
     return contracts
 
 
 def is_evidence_path(path: str, contract_id: str, contracts: dict, surfaces: dict) -> bool:
-    # Contract descriptor itself is evidence
-    for fname in (f"{contract_id}.toml", f"{contract_id.split('.')[-1]}.toml"):
-        if path.endswith(fname):
-            return True
+    # Match the descriptor that actually declared this ID. Filenames are
+    # not derived from IDs (scheduler-cost.toml declares preemption-cost).
+    if path == contracts.get(contract_id, {}).get("_descriptor_path"):
+        return True
 
     # If the surface path contains tests or probes, it's evidence
     if "/tests/" in path or "conformance-probes/" in path or path.endswith("_test.rs"):
