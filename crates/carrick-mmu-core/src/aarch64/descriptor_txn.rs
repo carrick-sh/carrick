@@ -84,7 +84,7 @@ use super::{
 };
 
 /// Wire protocol revision of [`DescriptorTxnSlot`]. Both venues must agree.
-pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 1;
+pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 2;
 
 /// Maximum host-reserved table pages carried by one transaction. A 2 MiB
 /// grant needs at most one L1, one L2 and two L3 tables when it straddles a
@@ -197,6 +197,45 @@ pub enum DescriptorOp {
         new_ipa: SubstrateGpa,
         backing: BackingIdentity,
     },
+    /// Arm one parent range for fork COW with exactly the host editor's
+    /// per-descriptor rule (`PtOp::ForkReadOnly`, or `PtOp::KernelReadOnly`
+    /// for Carrick-owned EL1 pages): terminals that already satisfy it are
+    /// skipped without a split, covered blocks are armed in place, and only
+    /// range edges split. `arm` carries the image construction mode and the
+    /// IPA window no valid output may name.
+    ForkArm { span: PageSpan, arm: ForkArmMode },
+}
+
+/// How [`DescriptorOp::ForkArm`] arms its range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForkArmMode {
+    /// Carrick-owned EL1 page: EL1 read-only, EL0 no access.
+    pub kernel_only: bool,
+    /// Execute permission for a kernel-only arm (ignored otherwise: private
+    /// arming preserves each leaf's own execute permission).
+    pub executable: bool,
+    /// The live image builds nG leaves (every HVPatch MM does).
+    pub asid_scoped: bool,
+    /// IPA window no valid output may name (the in-kernel GIC).
+    pub excluded_ipa: u64,
+    pub excluded_len: u64,
+}
+
+impl ForkArmMode {
+    fn pt_op(self) -> super::PtOp {
+        if self.kernel_only {
+            super::PtOp::KernelReadOnly {
+                exec: self.executable,
+            }
+        } else {
+            super::PtOp::ForkReadOnly
+        }
+    }
+
+    fn excludes(self, output: u64, len: u64) -> bool {
+        super::PageTableLayoutConfig::new(0, 0, self.excluded_ipa, self.excluded_len)
+            .ipa_overlaps_excluded(output, len)
+    }
 }
 
 impl DescriptorOp {
@@ -205,13 +244,14 @@ impl DescriptorOp {
     const KIND_PROTECT: u64 = 3;
     const KIND_RETIRE: u64 = 4;
     const KIND_COW_REPOINT: u64 = 5;
+    const KIND_FORK_ARM: u64 = 6;
 
     /// The complete semantic span this operation may edit.
     #[must_use]
     pub fn span(&self) -> PageSpan {
         match *self {
             Self::Prepare { publication, .. } => PageSpan::new(publication.va, publication.len),
-            Self::Publish { span, .. } | Self::Retire(span) => span,
+            Self::Publish { span, .. } | Self::Retire(span) | Self::ForkArm { span, .. } => span,
             Self::Protect(edit) => PageSpan::new(edit.va, edit.len),
             Self::CowRepoint { va, .. } => PageSpan::new(va, PT_PAGE),
         }
@@ -233,6 +273,7 @@ impl DescriptorOp {
             Self::Protect(_) => Self::KIND_PROTECT,
             Self::Retire(_) => Self::KIND_RETIRE,
             Self::CowRepoint { .. } => Self::KIND_COW_REPOINT,
+            Self::ForkArm { .. } => Self::KIND_FORK_ARM,
         }
     }
 
@@ -274,6 +315,16 @@ impl DescriptorOp {
                 new_ipa,
                 ..
             } => [va, old_ipa.raw(), new_ipa.raw(), 0, 0, 0],
+            Self::ForkArm { span, arm } => [
+                span.va,
+                span.len,
+                bool_word(arm.kernel_only, 0)
+                    | bool_word(arm.executable, 1)
+                    | bool_word(arm.asid_scoped, 2),
+                arm.excluded_ipa,
+                arm.excluded_len,
+                0,
+            ],
         };
         (self.kind(), payload)
     }
@@ -317,6 +368,16 @@ impl DescriptorOp {
                 old_ipa: SubstrateGpa(payload[1]),
                 new_ipa: SubstrateGpa(payload[2]),
                 backing: backing?,
+            }),
+            Self::KIND_FORK_ARM if payload[2] & !0b111 == 0 => Some(Self::ForkArm {
+                span: PageSpan::new(payload[0], payload[1]),
+                arm: ForkArmMode {
+                    kernel_only: payload[2] & 1 != 0,
+                    executable: payload[2] & 2 != 0,
+                    asid_scoped: payload[2] & 4 != 0,
+                    excluded_ipa: payload[3],
+                    excluded_len: payload[4],
+                },
             }),
             _ => None,
         }
@@ -483,6 +544,7 @@ pub enum DescriptorRefusal {
     Contended = 18,
     BadEncoding = 19,
     WrongMm = 20,
+    ExcludedOutput = 21,
 }
 
 impl DescriptorRefusal {
@@ -509,6 +571,7 @@ impl DescriptorRefusal {
             18 => Self::Contended,
             19 => Self::BadEncoding,
             20 => Self::WrongMm,
+            21 => Self::ExcludedOutput,
             _ => return None,
         })
     }
@@ -947,9 +1010,10 @@ impl DescriptorTxnSlot {
         let kind = self.kind.load(Ordering::Relaxed);
         let span = match kind {
             DescriptorOp::KIND_PREPARE => PageSpan::new(payload[0], payload[2]),
-            DescriptorOp::KIND_PUBLISH | DescriptorOp::KIND_PROTECT | DescriptorOp::KIND_RETIRE => {
-                PageSpan::new(payload[0], payload[1])
-            }
+            DescriptorOp::KIND_PUBLISH
+            | DescriptorOp::KIND_PROTECT
+            | DescriptorOp::KIND_RETIRE
+            | DescriptorOp::KIND_FORK_ARM => PageSpan::new(payload[0], payload[1]),
             DescriptorOp::KIND_COW_REPOINT => PageSpan::new(payload[0], PT_PAGE),
             _ => return false,
         };
@@ -1342,6 +1406,27 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 Loc::Fresh(_) => Err(DescriptorRefusal::Malformed),
             };
         }
+        let covers_entry = self.start <= base && base + span <= self.end;
+        if let DescriptorOp::ForkArm { arm, .. } = self.op {
+            let Some(armed) =
+                super::pt_terminal_edit(arm.asid_scoped, arm.pt_op(), descriptor, level, base)
+            else {
+                return Ok(());
+            };
+            if level == 0 {
+                return Err(DescriptorRefusal::Malformed);
+            }
+            if level < 3 && !covers_entry {
+                return self.descend(level, loc, descriptor, base);
+            }
+            if armed & VALID != 0 && arm.excludes(armed & output_mask(level), span) {
+                return Err(DescriptorRefusal::ExcludedOutput);
+            }
+            if armed != descriptor {
+                self.store(loc, descriptor, armed, None)?;
+            }
+            return Ok(());
+        }
         if level == 0 {
             if descriptor != 0 {
                 return Err(DescriptorRefusal::Malformed);
@@ -1350,7 +1435,6 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 return Err(DescriptorRefusal::MissingTable);
             }
         }
-        let covers_entry = self.start <= base && base + span <= self.end;
         if level == 3 || (level > 0 && covers_entry && self.op_edits_blocks()) {
             let updated = self.edit(descriptor, level, base)?;
             if updated != descriptor {
@@ -1383,7 +1467,12 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
             // An invalidated table pointer records no output to split.
             return Err(DescriptorRefusal::Malformed);
         }
-        if empty && !matches!(self.op, DescriptorOp::Prepare { .. }) {
+        if empty
+            && !matches!(
+                self.op,
+                DescriptorOp::Prepare { .. } | DescriptorOp::ForkArm { .. }
+            )
+        {
             return Err(DescriptorRefusal::MissingTable);
         }
         let grant = self.take_grant()?;
@@ -1573,6 +1662,9 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 }
                 Ok((descriptor & !PA_MASK_4KIB & !SW_EL1_COW & !AP_MASK) | new_ipa.raw() | AP_RW)
             }
+            // Fork arming shares the host editor's terminal rule and is
+            // applied in `visit_entry` before this per-op table.
+            DescriptorOp::ForkArm { .. } => Err(DescriptorRefusal::Malformed),
         }
     }
 }
@@ -1620,6 +1712,9 @@ fn validate_op(op: &DescriptorOp) -> Result<(), DescriptorRefusal> {
             aligned(expected_ipa.raw()) && expected_ipa.raw().checked_add(span.len).is_some()
         }
         DescriptorOp::Protect(_) | DescriptorOp::Retire(_) => true,
+        DescriptorOp::ForkArm { arm, .. } => {
+            arm.excluded_ipa.checked_add(arm.excluded_len).is_some()
+        }
         DescriptorOp::CowRepoint {
             old_ipa, new_ipa, ..
         } => aligned(old_ipa.raw()) && aligned(new_ipa.raw()) && old_ipa != new_ipa,
@@ -2706,6 +2801,45 @@ mod tests {
                 DescriptorOutcome::Refused(DescriptorRefusal::JournalCapacity)
             );
             assert_eq!(words.image(), before);
+        }
+
+        #[test]
+        fn fork_arm_rolls_back_a_failed_split_and_arms_on_retry() {
+            let words = fixture(2);
+            let entry = resident_block(&words, 0x009c_0000_0000);
+            let before = words.image();
+            let op = DescriptorOp::ForkArm {
+                span: PageSpan::new(VA + 7 * PT_PAGE, PT_PAGE),
+                arm: ForkArmMode {
+                    kernel_only: false,
+                    executable: false,
+                    asid_scoped: true,
+                    excluded_ipa: 0,
+                    excluded_len: 0,
+                },
+            };
+            // The link after break-before-make observes a concurrent writer.
+            words.fail_cas_at.set(Some(1));
+            assert_eq!(
+                run(&words, op, &grants(&[8])),
+                DescriptorOutcome::RolledBack(DescriptorRefusal::Contended)
+            );
+            assert_eq!(words.get(entry), before[TestWords::index(entry)]);
+            let applied = applied(run(&words, op, &grants(&[8])));
+            assert_eq!(applied.tables_linked, 1);
+            let armed = words.get(page(8) + 7 * 8);
+            assert!(el1_cow(armed));
+            assert!(!terminal_descriptor_permits_el0(armed, LeafAccess::Write));
+            assert!(terminal_descriptor_permits_el0(
+                words.get(page(8) + 6 * 8),
+                LeafAccess::Write
+            ));
+            // Arming an already-armed page is a no-op without a grant.
+            assert_eq!(applied_stores(run(&words, op, &TableGrants::NONE)), 0);
+        }
+
+        fn applied_stores(outcome: DescriptorOutcome) -> u32 {
+            applied(outcome).live_stores
         }
 
         #[test]
