@@ -304,10 +304,10 @@ impl ObjectWaitGuard<'_> {
             cursor = rec.object.next.load(Ordering::Relaxed);
             report.visited += 1;
             if let Claim::Parked { seq } = rec.claim() {
-                if self.zone.placement(record, waker).is_none() {
-                    report.deferred += 1;
-                    continue;
-                }
+                // Readiness is already committed by the object. Even when no
+                // slot admits this MM now, queue the owned operation on the
+                // waker and request host handback via WakeEffects::misplaced.
+                // A generic pending-host flag alone cannot find this waiter.
                 if self
                     .zone
                     .claim_for_el1_with(record, seq, 0, waker, effects, || self.unlink(record))
@@ -489,6 +489,38 @@ mod host_tests {
             .notify_object_host(&mut |r| handed.push(r), &mut |_| {})
             .unwrap();
         (report, handed)
+    }
+
+    #[test]
+    fn el1_ipc_wait_unplaceable_wake_keeps_owned_operation_runnable() {
+        let zone = fixture(true);
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 202,
+                serial: 202,
+                mm: MM + 1, // No open address space or other admissible slot.
+                file_table: 202,
+                generation: 1,
+                affinity: 0,
+            })
+            .unwrap();
+        let guard = zone.object_wait(key(1), &SpinForever).unwrap();
+        guard
+            .park(
+                guard.snapshot(),
+                record,
+                OperationToken::new(202, 1).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(zone.placement(record, SLOT), None);
+        let mut effects = WakeEffects::default();
+        let report = guard.notify_object(SLOT, &mut effects).unwrap();
+        assert_eq!(report.queued, 1, "readiness must retain runnable ownership");
+        assert_eq!(report.deferred, 0);
+        assert!(effects.queued_own && effects.misplaced);
+        assert!(matches!(zone.record(record).claim(), Claim::Queued { slot, .. } if slot == SLOT));
+        assert!(zone.record(record).has_object_operation());
+        assert_eq!(zone.record(record).object.queue.load(Ordering::Acquire), 0);
     }
 
     #[test]
