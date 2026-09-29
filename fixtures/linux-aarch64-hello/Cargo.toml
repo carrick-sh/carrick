@@ -85,3 +85,7 @@ path = "src/scheduler_preemption.rs"
 [[bin]]
 name = "carrick-linux-aarch64-discard-fork-threads"
 path = "src/discard_fork_threads.rs"
+
+[[bin]]
+name = "carrick-linux-aarch64-crash-parked-thread"
+path = "src/crash_parked_thread.rs"
