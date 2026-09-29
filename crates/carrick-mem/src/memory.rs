@@ -497,9 +497,11 @@ pub const fn is_carrick_kernel_only_range(start: u64, end: u64) -> bool {
     let el1_end = LINUX_EL1_KERNEL_BASE + LINUX_EL1_KERNEL_SIZE;
     let dynamic_metadata_end =
         carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE;
+    let ipc_end = carrick_el1_abi::EL1_IPC_BASE + carrick_el1_abi::EL1_IPC_SIZE;
     (start >= LINUX_KERNEL_REGION_BASE && end <= hole_end)
         || (start >= LINUX_EL1_KERNEL_BASE && end <= el1_end)
         || (start >= carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE && end <= dynamic_metadata_end)
+        || (start >= carrick_el1_abi::EL1_IPC_BASE && end <= ipc_end)
 }
 
 /// Is `va` inside carrick's EL1 trap trampoline (the VBAR_EL1 vector table)?
@@ -2125,7 +2127,6 @@ impl AddressSpace {
             shared: true,
             bytes: carrick_el1_image::IMAGE.to_vec().into(),
         };
-
         let AddressSpace {
             entry,
             regions,
@@ -3473,6 +3474,9 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
                 ..carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
                     + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE)
                 .contains(&pa)
+            || (carrick_el1_abi::EL1_IPC_BASE
+                ..carrick_el1_abi::EL1_IPC_BASE + carrick_el1_abi::EL1_IPC_SIZE)
+                .contains(&pa)
         {
             KERNEL_BLOCK_FLAGS
         } else {
@@ -3644,6 +3648,17 @@ pub fn stage1_carrier_maintenance_page_tables() -> Vec<u8> {
         ((carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE - LINUX_KERNEL_REGION_BASE) >> 21) as usize;
     let dyn_blocks = (carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE >> 21) as usize;
     for index in dyn_first..dyn_first + dyn_blocks {
+        let pa = LINUX_KERNEL_REGION_BASE + ((index as u64) << 21);
+        let desc = (pa & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS | NON_GLOBAL;
+        let off = l2_off + index * 8;
+        bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
+    }
+
+    // The shared IPC window: an idle vCPU's EL1 wakes and releases IPC
+    // objects on this root too.
+    let ipc_first = ((carrick_el1_abi::EL1_IPC_BASE - LINUX_KERNEL_REGION_BASE) >> 21) as usize;
+    let ipc_blocks = (carrick_el1_abi::EL1_IPC_SIZE >> 21) as usize;
+    for index in ipc_first..ipc_first + ipc_blocks {
         let pa = LINUX_KERNEL_REGION_BASE + ((index as u64) << 21);
         let desc = (pa & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS | NON_GLOBAL;
         let off = l2_off + index * 8;
@@ -6990,11 +7005,14 @@ mod stage1_tests {
             >> 21) as usize;
         let dynamic_end =
             dynamic_first + (carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE >> 21) as usize;
+        let ipc_first = ((carrick_el1_abi::EL1_IPC_BASE - LINUX_KERNEL_REGION_BASE) >> 21) as usize;
+        let ipc_end = ipc_first + (carrick_el1_abi::EL1_IPC_SIZE >> 21) as usize;
         for index in 1..512usize {
             let d = read_u64_le(&bytes, 0x4000 + index * 8);
             assert!(valid_block(d), "L2_B[{}] must be a block", index);
             if (el1_first..el1_end).contains(&index)
                 || (dynamic_first..dynamic_end).contains(&index)
+                || (ipc_first..ipc_end).contains(&index)
             {
                 assert_eq!(ap(d), 0b00, "L2_B[{}] EL1 block must use AP=00", index);
                 assert_eq!(pxn(d), 0, "L2_B[{}] PXN must be 0", index);
@@ -8408,6 +8426,54 @@ mod el1_shim_tests {
                 0,
                 "hvpatch dynamic metadata block {i} nG=1"
             );
+        }
+    }
+
+    /// The shared IPC window (directory and pool spans) is kernel-only
+    /// (AP=00, UXN=1) in every translation regime EL1 runs on:
+    /// identity, per-process HVPatch tables and the carrier maintenance
+    /// root. No Linux VMA ever covers it.
+    #[test]
+    fn el1_ipc_window_is_mapped_kernel_only_everywhere() {
+        use stage1_tests::{ap, read_u64_le, uxn, valid_block};
+        let (base, size) = (carrick_el1_abi::EL1_IPC_BASE, carrick_el1_abi::EL1_IPC_SIZE);
+        assert!(
+            carrick_el1_abi::EL1_IPC_POOL_BASE + carrick_el1_abi::EL1_IPC_POOL_SPAN <= base + size
+        );
+        let image = minimal_image()
+            .with_el1_vectors_mailbox(true)
+            .expect("image with mailbox vectors");
+        assert!(
+            image
+                .regions()
+                .iter()
+                .all(|r| r.end <= base || r.start >= base + size),
+            "the IPC window is carrier memory the host's IPC authority owns, \
+             never a process image region"
+        );
+        assert!(is_carrick_kernel_only_range(base, base + size));
+        assert!(!is_carrick_kernel_only_range(base, base + size + 1));
+        let first = ((base >> 21) & 0x1ff) as usize;
+        for (name, tables, l2) in [
+            ("identity", stage1_identity_page_tables(), 0x4000),
+            ("hvpatch", stage1_hvpatch_page_tables(), 0x4000),
+            (
+                "maintenance",
+                stage1_carrier_maintenance_page_tables(),
+                0x2000,
+            ),
+        ] {
+            for i in 0..(size >> 21) as usize {
+                let entry = read_u64_le(&tables, l2 + (first + i) * 8);
+                assert!(valid_block(entry), "{name} IPC block {i}");
+                assert_eq!(ap(entry), 0b00, "{name} IPC block {i} AP=00");
+                assert_eq!(uxn(entry), 1, "{name} IPC block {i} UXN=1");
+                assert_eq!(
+                    entry & 0x0000_FFFF_FFE0_0000,
+                    base + ((i as u64) << 21),
+                    "{name} IPC block {i} identity mapped"
+                );
+            }
         }
     }
 

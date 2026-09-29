@@ -42,6 +42,7 @@ use carrick_el1_abi::ipc::{
     BackingToken, IpcBacking, IpcEventValue, IpcMmKey, IpcObjectHandle, IpcOpKind, IpcOpToken,
     IpcOperation, IpcRegion, IpcReleased, IpcTaskKey, IpcUserVa, OfdPin, RawTableId, WriteProgress,
 };
+use carrick_el1_abi::ipc_tables::IpcTableMap;
 use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, TrapFrame};
 use carrick_sched_core::object_wait::{ObjectWaitError, ObjectWaitSnapshot};
 use carrick_sched_core::{BoundedSpin, WakeEffects};
@@ -91,7 +92,7 @@ pub trait IpcTables {
 
 /// The shared IPC authority as this venue maps it.
 pub struct IpcVenue<'a> {
-    pub region: &'a IpcRegion<'a>,
+    pub region: IpcRegion<'a>,
     pub tables: &'a dyn IpcTables,
 }
 
@@ -110,11 +111,49 @@ pub enum IpcServed {
     Handback,
 }
 
-/// The shared IPC authority EL1 serves from. None until the runtime
-/// integration places the region in the EL1 address space and publishes
-/// each task's table ([`IpcTables`]); until then every call forwards.
+/// Tables resolved through the host-published [`IpcTableMap`], keyed by the
+/// running task's host file table (which an EL1 switch-in updates): a table
+/// with no entry is not served.
+pub struct MapTables<'a>(pub &'a IpcTableMap);
+
+impl IpcTables for MapTables<'_> {
+    fn table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
+        self.0.lookup(task.file_table.load(Ordering::Acquire))
+    }
+}
+
+/// The shared IPC authority EL1 serves from: the window the runtime maps at
+/// `EL1_IPC_BASE`, once the host authority has published its directory.
+/// Unmapped or unpublished, the attach fails and every call forwards.
+#[cfg(target_os = "none")]
+pub fn guest_venue() -> Option<IpcVenue<'static>> {
+    static TABLES: GuestTables = GuestTables;
+    // Unmapped at stage-2 until the carrier installs it: never touch the
+    // window before the host says so.
+    if !carrick_el1_abi::ipc_table_map_guest().window_published() {
+        return None;
+    }
+    let region = carrick_el1_abi::ipc_window_guest()?.attach().ok()?;
+    Some(IpcVenue {
+        region,
+        tables: &TABLES,
+    })
+}
+
+/// Host builds serve no guest: there is no EL1 window to attach.
+#[cfg(not(target_os = "none"))]
 pub fn guest_venue() -> Option<IpcVenue<'static>> {
     None
+}
+
+#[cfg(target_os = "none")]
+struct GuestTables;
+
+#[cfg(target_os = "none")]
+impl IpcTables for GuestTables {
+    fn table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
+        MapTables(carrick_el1_abi::ipc_table_map_guest()).table_of(task)
+    }
 }
 
 const EL1_WAIT: BoundedSpin = BoundedSpin(EL1_GUEST_LOCK_SPINS);
@@ -197,7 +236,7 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     owed: &mut Owed,
 ) -> Admission {
     let task = sched.task;
-    let region = venue.region;
+    let region = &venue.region;
     let Some(table) = venue.tables.table_of(task) else {
         return Admission::Forward;
     };
@@ -317,7 +356,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
     resumed: bool,
     mut owed: Owed,
 ) -> IpcServed {
-    let region = venue.region;
+    let region = &venue.region;
     let object = IpcObjectHandle::from_raw(op.object);
     let mut copy = PrefixCopy::new(user);
     loop {
@@ -538,7 +577,7 @@ fn bail<C: ThreadCpu, U: UserWord>(
     mut owed: Owed,
 ) -> IpcServed {
     if op.progress.written == 0 && !resumed {
-        finish(sched, token, venue.region, &mut owed);
+        finish(sched, token, &venue.region, &mut owed);
         return owed.forward(frame);
     }
     handback_continue(frame, token, op, venue, &mut owed)
@@ -728,15 +767,10 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct Tables(RefCell<HashMap<u64, RawTableId>>);
-    impl IpcTables for Tables {
-        fn table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
-            self.0
-                .borrow()
-                .get(&task.task_id.load(Ordering::Relaxed))
-                .copied()
-        }
+    /// The file table a test thread runs with: A's is 5, every other
+    /// thread's is its tid (one process each).
+    fn file_table_of(tid: u64, a_tid: u64) -> u64 {
+        if tid == a_tid { 5 } else { tid }
     }
 
     // ---- the world: region (host-initialized), zone, one slot, task A ----
@@ -748,7 +782,8 @@ mod tests {
         cpu: FakeCpu,
         counters: &'static Counters,
         mem: Memory,
-        tables: Tables,
+        map: &'static IpcTableMap,
+        tables: MapTables<'static>,
         a_tid: u64,
     }
 
@@ -757,7 +792,7 @@ mod tests {
             tid,
             serial: tid + 1000,
             mm,
-            file_table: 5,
+            file_table: tid,
             generation: 1,
             affinity: 0,
         }
@@ -788,6 +823,10 @@ mod tests {
         task.zone_mm.store(MM, Ordering::Relaxed);
         task.thread_serial.store(1101, Ordering::Relaxed);
         let a_tid = task.task_id.load(Ordering::Relaxed);
+        // SAFETY: all-zero is the empty table map.
+        let map: &'static IpcTableMap = unsafe {
+            &*std::alloc::alloc_zeroed(Layout::new::<IpcTableMap>()).cast::<IpcTableMap>()
+        };
         // The fake CPU records switches and SGIs in vectors: reserve them so
         // allocation accounting sees only the code under test.
         let mut cpu = FakeCpu::default();
@@ -802,7 +841,8 @@ mod tests {
             cpu,
             counters: Box::leak(Box::new(Counters::default())),
             mem: Memory::default(),
-            tables: Tables::default(),
+            map,
+            tables: MapTables(map),
             a_tid,
         }
     }
@@ -823,7 +863,9 @@ mod tests {
                 capacity: 64,
             };
             let t = self.host().create_table(1024, &mut { extent }).unwrap();
-            self.tables.0.borrow_mut().insert(tid, t.to_raw());
+            self.map
+                .publish(file_table_of(tid, self.a_tid), t.to_raw())
+                .unwrap();
             t
         }
         fn fork_table(&self, parent: TableId, tid: u64) -> TableId {
@@ -832,7 +874,9 @@ mod tests {
                 capacity: 64,
             };
             let t = self.host().fork(parent, &mut extent).unwrap();
-            self.tables.0.borrow_mut().insert(tid, t.to_raw());
+            self.map
+                .publish(file_table_of(tid, self.a_tid), t.to_raw())
+                .unwrap();
             t
         }
         /// pipe(2) as the host venue performs it.
@@ -909,7 +953,7 @@ mod tests {
         }
         fn venue(&self) -> IpcVenue<'_> {
             IpcVenue {
-                region: self.region,
+                region: *self.region,
                 tables: &self.tables,
             }
         }
@@ -925,7 +969,7 @@ mod tests {
                 counters: self.counters,
             };
             let venue = IpcVenue {
-                region: self.region,
+                region: *self.region,
                 tables: &self.tables,
             };
             let mut user = User {
@@ -1199,7 +1243,7 @@ mod tests {
         assert_eq!(w.call(&mut f), IpcServed::Forward);
         assert_eq!(f.x, before.x);
         // A task with no published table is not served at all.
-        w.tables.0.borrow_mut().clear();
+        w.map.withdraw(5);
         assert_eq!(w.call(&mut f), IpcServed::Forward);
     }
 
@@ -1329,7 +1373,7 @@ mod tests {
         assert_eq!(w.call(&mut f), SWITCHED);
         // Every read end closes (A's table and B's forked copy).
         w.host_close(a, r);
-        let b = TableId::from_raw(w.tables.0.borrow()[&202]);
+        let b = TableId::from_raw(w.map.lookup(202).unwrap());
         w.host_close(b, r);
         assert_eq!(f.elr, B_SVC);
         f = b_block;
@@ -1477,6 +1521,7 @@ mod tests {
             for p in &all {
                 let mut io = |tid: u64, nr, fd, buf, len| {
                     w.task.task_id.store(tid, Ordering::Relaxed);
+                    w.task.file_table.store(tid, Ordering::Relaxed);
                     let mut f = syscall(nr, fd, buf, len, A_SVC);
                     assert_eq!(w.call(&mut f), RETURNED);
                     copied.set(copied.get() + f.x[0] as usize);

@@ -8137,7 +8137,10 @@ mod stage2_backend;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use stage2_backend::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use stage2_backend::{read_el1_counters, read_el1_region_host_ptr, reset_el1_counters};
+pub use stage2_backend::{
+    IpcWindowBacking, read_el1_counters, read_el1_region_host_ptr, register_ipc_window_backing,
+    reset_el1_counters,
+};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(test)]
