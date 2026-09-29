@@ -1,4 +1,8 @@
 schema_version = 1
+# Executor handback adapter audit (2026-09-29): carrying the core's RecordRef
+# through adoption changes neither occupancy publication nor MM draining.
+# Retain the existing switched-slot and signed two-process bindings below;
+# identity reuse is owned by kernel.el1.deferred-handback-identity.
 id = "kernel.mm.address-space-occupancy"
 title = "One authority says which vCPUs run which address space: every pause, sole check, fork, crash snapshot and ASID retirement of an MM reads the vCPU slots occupied by it, never the thread an executor loaded"
 guest_surfaces = [

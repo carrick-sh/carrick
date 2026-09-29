@@ -1,15 +1,15 @@
 schema_version = 1
 id = "kernel.el1.deferred-handback-identity"
-title = "Deferred slot handback cannot acquire a reused record's identity"
+title = "Host handback preserves the original incarnation across publication and delivery"
 guest_surfaces = ["syscall:futex", "scheduler:lifecycle", "syscall:exit_group"]
 semantic_authority = ["man 2 futex: wake applies to the selected waiters", "man 2 exit_group: terminate all threads in the process"]
-fixture = "unit:deferred_slot_handback_does_not_wake_a_reused_record"
+fixture = "unit:deferred_slot_handback_does_not_wake_a_reused_record; unit:drain_handback_identity_survives_reuse_before_the_consumer_runs; unit:host_wake_batch_keeps_identity_after_return_and_reuse; unit:service_take_keeps_identity_after_return_and_reuse"
 scale_points = [1, 8, 32]
 structural_budgets = []
 rationale = "An evacuated record may be claimed, retired and reused before its deferred handback is published. The deferred work must retain the original incarnation and may never manufacture readiness for a replacement waiter. The deterministic schedule evacuates N records, retires and replaces each, then delivers the saved handbacks, asserting zero replacement publications and unchanged parked ownership. This is a reduction of a concrete identity gap, not attribution of the historical Python crash. No timing or structural-observation closure is claimed."
 
 [bindings]
-vm_free = "carrick-kernel::el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record"
+vm_free = "carrick-kernel::el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record; carrick-sched-core::tests::{drain_handback_identity_survives_reuse_before_the_consumer_runs,host_wake_batch_keeps_identity_after_return_and_reuse,service_take_keeps_identity_after_return_and_reuse} (identity captured before host publication, including consumer preemption and returned batches)"
 
 [bindings.unresolved]
 embed = "Deterministic signed evacuation/retirement/reuse interleaving remains to be bound."

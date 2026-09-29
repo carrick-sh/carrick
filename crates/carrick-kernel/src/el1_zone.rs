@@ -20,7 +20,7 @@
 use std::sync::OnceLock;
 
 use carrick_el1_abi::{
-    Handback, HostClaim, LockWait, RecordId, RecordRef, SlotId, Waker, ZoneTables, zone_tables,
+    Handback, HostClaim, LockWait, RecordRef, SlotId, Waker, ZoneTables, zone_tables,
 };
 
 /// The host waits for a bucket lock by spinning, then yielding. A holder is
@@ -155,7 +155,7 @@ pub fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> 
             bitset,
             count,
             schedules_in_guest(),
-            &mut |record| wake.handed.push(zone.record_ref(record)),
+            &mut |record| wake.handed.push(record),
             &mut |placement| placements.push(placement),
         );
     }
@@ -208,7 +208,7 @@ pub fn requeue<E>(
         };
         check()?;
         let mut remaining = wake_count;
-        let mut batch = [RecordId::PLACEHOLDER; 64];
+        let mut batch = [RecordRef::PLACEHOLDER; 64];
         while remaining > 0 {
             let Ok(n) = zone.wake(
                 from_guard,
@@ -221,7 +221,7 @@ pub fn requeue<E>(
             ) else {
                 break;
             };
-            woken.extend(batch[..n as usize].iter().map(|id| zone.record_ref(*id)));
+            woken.extend_from_slice(&batch[..n as usize]);
             if (n as usize) < batch.len() {
                 break;
             }
@@ -519,7 +519,7 @@ pub fn hand_back_wanted(slot: SlotId) {
         return;
     };
     let mut wanted = Vec::new();
-    zone.take_host_wanted(slot, &mut |record| wanted.push(zone.record_ref(record)));
+    zone.take_host_wanted(slot, &mut |record| wanted.push(record));
     for record in wanted {
         publish_handback(record);
     }
@@ -535,9 +535,9 @@ pub fn drain_to_host(slot: SlotId) {
     let mut handed = Vec::new();
     zone.drain_slot(slot, &mut |record, discard| {
         if discard {
-            zone.free_record(record);
+            zone.free_record(record.id);
         } else {
-            handed.push(zone.record_ref(record));
+            handed.push(record);
         }
     });
     for record in handed {
@@ -559,7 +559,7 @@ pub fn step_away_from_slot(slot: SlotId, driver: u64) {
     if zone.step_away(
         slot,
         driver,
-        &mut |record| records.push(zone.record_ref(record)),
+        &mut |record| records.push(record),
         &mut |placement| placements.push(placement),
     ) {
         settle_vacated(zone, Some(slot), records, placements, &mut publish_handback);
@@ -591,7 +591,7 @@ pub fn leave_slot_in(zone: &ZoneTables, slot: SlotId, driver: u64, now: Option<S
     if zone.leave_slot(
         slot,
         driver,
-        &mut |record| records.push(zone.record_ref(record)),
+        &mut |record| records.push(record),
         &mut |placement| placements.push(placement),
     ) {
         settle_vacated(zone, now, records, placements, &mut publish_handback);
@@ -696,7 +696,7 @@ mod tests {
             assert!(zone.leave_slot(
                 slot,
                 7,
-                &mut |record| records.push(zone.record_ref(record)),
+                &mut |record| records.push(record),
                 &mut |placement| placements.push(placement),
             ));
             assert_eq!(records.len(), count as usize);
@@ -751,7 +751,7 @@ mod tests {
         assert!(zone.leave_slot(
             slot,
             7,
-            &mut |record| records.push(zone.record_ref(record)),
+            &mut |record| records.push(record),
             &mut |placement| placements.push(placement),
         ));
         let mut published = Vec::new();

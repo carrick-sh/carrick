@@ -91,9 +91,9 @@ fn wake(
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, uaddr), &HostWait)
         .unwrap();
-    let mut woken = [RecordId::PLACEHOLDER; 64];
+    let mut woken = [RecordRef::PLACEHOLDER; 64];
     let n = zone.wake(&guard, MM, uaddr, u32::MAX, count, waker, &mut woken)?;
-    Ok(woken[..n as usize].to_vec())
+    Ok(woken[..n as usize].iter().map(|r| r.id).collect())
 }
 
 /// Drain `slot` as its executor does at an exit: (handed back, discarded).
@@ -102,9 +102,9 @@ fn drain(zone: &ZoneTables, slot: SlotId) -> (Vec<RecordId>, Vec<RecordId>, Slot
     let mut discarded = Vec::new();
     let drain = zone.drain_slot(slot, &mut |record, discard| {
         if discard {
-            discarded.push(record);
+            discarded.push(record.id);
         } else {
-            woken.push(record);
+            woken.push(record.id);
         }
     });
     (woken, discarded, drain)
@@ -155,7 +155,7 @@ fn bitsets_select_waiters() {
     zone.enqueue(&guard, record, seq, MM, 0x40, 0b10, 0)
         .unwrap();
     zone.publish_park(record, seq);
-    let mut woken = [RecordId::PLACEHOLDER; 4];
+    let mut woken = [RecordRef::PLACEHOLDER; 4];
     assert_eq!(
         zone.wake(&guard, MM, 0x40, 0b01, 1, Waker::Host, &mut woken),
         Ok(0)
@@ -243,7 +243,7 @@ fn el1_wakes_any_count_and_exactly_that_many() {
         assert_eq!(zone.switch_in(SLOT), Some(*record), "position {index}");
     }
     // The host takes batches of its buffer and its caller loops.
-    let mut small = [RecordId::PLACEHOLDER; 1];
+    let mut small = [RecordRef::PLACEHOLDER; 1];
     assert_eq!(
         zone.wake(&guard, MM, 0x5000, u32::MAX, 5, Waker::Host, &mut small),
         Ok(1)
@@ -358,6 +358,80 @@ fn requeue_moves_waiters_to_the_new_address() {
     assert_eq!(moved, 1);
     assert_eq!(wake(&zone, 0x5000, 5, Waker::Host).unwrap(), [a]);
     assert_eq!(wake(&zone, 0x1000, 5, Waker::Host).unwrap(), [b]);
+}
+
+/// A callback may be preempted before it inspects its argument. Publishing
+/// Host makes cancellation eligible, so the core must supply the identity
+/// from before that publication rather than asking its consumer to recover it.
+#[test]
+fn drain_handback_identity_survives_reuse_before_the_consumer_runs() {
+    let zone = zone();
+    let record = park(&zone, 1, 0x1000);
+    let expected = zone.record_ref(record);
+    let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
+    let mut observed = None;
+    zone.drain_slot(SLOT, &mut |handed, discard| {
+        assert!(!discard);
+        // Model cancellation and reuse while the consumer is descheduled.
+        assert_eq!(
+            zone.claim_for_host(expected, None, Handback::Cancelled, &HostWait),
+            HostClaim::AlreadyHost,
+        );
+        zone.free_record(record);
+        let replacement = zone.alloc_record(identity(2)).unwrap();
+        assert_eq!(replacement, record);
+        let seq = zone.next_seq(replacement);
+        zone.publish_park(replacement, seq);
+        assert_ne!(zone.record_ref(replacement), expected);
+        observed = Some(handed);
+    });
+    assert_eq!(
+        observed,
+        Some(expected),
+        "handback acquired a replacement identity"
+    );
+}
+
+#[test]
+fn host_wake_batch_keeps_identity_after_return_and_reuse() {
+    let zone = zone();
+    let record = park(&zone, 1, 0x1000);
+    let expected = zone.record_ref(record);
+    let mut batch = [RecordRef::PLACEHOLDER; 1];
+    {
+        let guard = zone
+            .lock(ZoneTables::bucket_of(MM, 0x1000), &HostWait)
+            .unwrap();
+        assert_eq!(
+            zone.wake(&guard, MM, 0x1000, u32::MAX, 1, Waker::Host, &mut batch),
+            Ok(1)
+        );
+    }
+    zone.free_record(record);
+    assert_eq!(zone.alloc_record(identity(2)).unwrap(), record);
+    let seq = zone.next_seq(record);
+    zone.publish_park(record, seq);
+    assert_eq!(
+        batch[0], expected,
+        "returned batch acquired a replacement identity"
+    );
+}
+
+#[test]
+fn service_take_keeps_identity_after_return_and_reuse() {
+    let zone = zone();
+    let record = service_record(&zone, 1);
+    let expected = zone.record_ref(record);
+    assert!(zone.requeue_on(SLOT, record));
+    let taken = zone.take_service_head(SLOT).unwrap();
+    zone.free_record(record);
+    assert_eq!(zone.alloc_record(identity(2)).unwrap(), record);
+    let seq = zone.next_seq(record);
+    zone.publish_park(record, seq);
+    assert_eq!(
+        taken, expected,
+        "returned service acquired a replacement identity"
+    );
 }
 
 #[test]
@@ -488,7 +562,7 @@ fn wake_effects(
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, uaddr), &HostWait)
         .unwrap();
-    let mut woken = [RecordId::PLACEHOLDER; 16];
+    let mut woken = [RecordRef::PLACEHOLDER; 16];
     let mut effects = WakeEffects::default();
     let result = zone
         .wake_placed(
@@ -501,7 +575,7 @@ fn wake_effects(
             &mut woken,
             &mut effects,
         )
-        .map(|n| woken[..n as usize].to_vec());
+        .map(|n| woken[..n as usize].iter().map(|r| r.id).collect());
     (result, effects)
 }
 
@@ -704,7 +778,7 @@ fn the_slot_timer_ends_a_timed_park_once() {
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, 0x1000), &HostWait)
         .unwrap();
-    let mut woken = [RecordId::PLACEHOLDER; 4];
+    let mut woken = [RecordRef::PLACEHOLDER; 4];
     assert_eq!(
         zone.wake(&guard, MM, 0x1000, u32::MAX, 1, Waker::Host, &mut woken),
         Ok(1)
@@ -1036,7 +1110,7 @@ fn stealing_takes_only_what_the_thief_may_run() {
     assert_eq!(zone.runnable_head(THIRD), Some(service));
     // THIRD's executor retains its service record.
     zone.leave_guest(THIRD, &HostWait);
-    assert_eq!(zone.take_service_head(THIRD), Some(service));
+    assert_eq!(zone.take_service_head(THIRD).map(|r| r.id), Some(service));
     assert_eq!(zone.counters.foreign_adoptions.load(Ordering::Relaxed), 0);
 }
 
@@ -1077,13 +1151,13 @@ fn an_executor_sweeps_cancelled_records_and_takes_its_service_head() {
     assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(SLOT));
     zone.leave_guest(SLOT, &HostWait);
     assert_eq!(
-        zone.take_service_head(SLOT),
+        zone.take_service_head(SLOT).map(|r| r.id),
         None,
         "a cancelled record is first"
     );
     assert_eq!(zone.sweep_cancelled(SLOT), 1);
     assert_eq!(zone.record(a).claim(), Claim::Free);
-    assert_eq!(zone.take_service_head(SLOT), Some(service));
+    assert_eq!(zone.take_service_head(SLOT).map(|r| r.id), Some(service));
     assert_eq!(zone.record(service).claim(), Claim::Host { seq: 1 });
     assert_eq!(zone.slot(SLOT).queued(), 0);
 }
@@ -1110,7 +1184,7 @@ fn host_wake(
         u32::MAX,
         count,
         place,
-        &mut |record| handed.push(record),
+        &mut |record| handed.push(record.id),
         &mut |placement| placed.push(placement),
     );
     (n, handed, placed)
@@ -1159,7 +1233,7 @@ fn relocation_moves_queued_threads_between_run_queues_without_host_ownership() {
     let moved = zone.relocate(
         SLOT,
         None,
-        &mut |record, discard| handed.push((record, discard)),
+        &mut |record, discard| handed.push((record.id, discard)),
         &mut |placement| placed.push(placement),
     );
     assert_eq!(moved, 2);
@@ -1177,7 +1251,7 @@ fn relocation_moves_queued_threads_between_run_queues_without_host_ownership() {
     let moved = zone.relocate(
         OTHER,
         None,
-        &mut |record, discard| handed.push((record, discard)),
+        &mut |record, discard| handed.push((record.id, discard)),
         &mut |placement| placed.push(placement),
     );
     assert_eq!(moved, 2);
@@ -1220,11 +1294,11 @@ fn only_the_executor_still_driving_a_slot_vacates_it() {
     let mut placed = Vec::new();
     // Another executor drives the slot now: nothing happens.
     zone.drive(SLOT, 9);
-    assert!(!zone.leave_slot(SLOT, 7, &mut |r| taken.push(r), &mut |p| placed.push(p)));
+    assert!(!zone.leave_slot(SLOT, 7, &mut |r| taken.push(r.id), &mut |p| placed.push(p)));
     assert_eq!(zone.runnable_head(SLOT), Some(service));
     // The executor still driving it leaves: the queue goes, the slot is
     // no longer live for placements.
-    assert!(zone.leave_slot(SLOT, 9, &mut |r| taken.push(r), &mut |p| placed.push(p)));
+    assert!(zone.leave_slot(SLOT, 9, &mut |r| taken.push(r.id), &mut |p| placed.push(p)));
     assert_eq!(taken, [service]);
     assert_eq!(zone.runnable_head(SLOT), None);
     assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(OTHER));
@@ -1268,9 +1342,9 @@ fn only_its_driver_steps_away_from_and_back_to_a_slot() {
     zone.leave_guest(SLOT, &HostWait);
     let mut taken = Vec::new();
     let mut placed = Vec::new();
-    assert!(!zone.step_away(SLOT, 9, &mut |r| taken.push(r), &mut |p| placed.push(p)));
+    assert!(!zone.step_away(SLOT, 9, &mut |r| taken.push(r.id), &mut |p| placed.push(p)));
     assert!(zone.slot(SLOT).is_live());
-    assert!(zone.step_away(SLOT, 7, &mut |r| taken.push(r), &mut |p| placed.push(p)));
+    assert!(zone.step_away(SLOT, 7, &mut |r| taken.push(r.id), &mut |p| placed.push(p)));
     assert!(!zone.slot(SLOT).is_live());
     assert_eq!(zone.slot(SLOT).driver(), Some(7), "away, not gone");
     let service = service_record(&zone, 5);
@@ -1280,12 +1354,12 @@ fn only_its_driver_steps_away_from_and_back_to_a_slot() {
     assert!(!zone.slot(SLOT).is_live());
     zone.step_back(SLOT, 7);
     assert!(zone.slot(SLOT).is_live());
-    assert_eq!(zone.take_service_head(SLOT), Some(service));
+    assert_eq!(zone.take_service_head(SLOT).map(|r| r.id), Some(service));
 
     // Another executor drives the slot, then leaves it: the first one's
     // late return finds nothing to come back to.
     zone.drive(SLOT, 9);
-    assert!(zone.leave_slot(SLOT, 9, &mut |r| taken.push(r), &mut |p| placed.push(p)));
+    assert!(zone.leave_slot(SLOT, 9, &mut |r| taken.push(r.id), &mut |p| placed.push(p)));
     zone.step_back(SLOT, 7);
     assert!(!zone.slot(SLOT).is_live());
     assert_eq!(zone.slot(SLOT).driver(), None);

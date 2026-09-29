@@ -1,4 +1,8 @@
 schema_version = 1
+# Executor handback adapter audit (2026-09-29): next_runnable now carries the
+# core's pre-publication RecordRef. This changes no vCPU creation/destruction
+# path. Retain the topology and signed two-root bindings below as regressions;
+# handback identity itself is kernel.el1.deferred-handback-identity.
 id = "kernel.vcpu.vm-lifetime"
 title = "Every vCPU lives for its VM's whole life: created before the VM's first run, destroyed only at teardown"
 guest_surfaces = ["scheduler:vcpu-lifecycle", "scheduler:executor-pool", "kernel:container-root-boot"]
