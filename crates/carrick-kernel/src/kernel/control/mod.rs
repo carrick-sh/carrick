@@ -1008,16 +1008,20 @@ mod tests {
             1,
             std::time::Duration::from_secs(5),
         ));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         runtime
-            .install_waker(Arc::new(|| {}))
+            .install_waker(Arc::new(move || ready_tx.send(()).expect("published work")))
             .expect("install waker");
         let first_runtime = Arc::clone(&runtime);
         let first = ExecCapability::from(ControlNonce([0x51; 16]));
         let first_submitter =
             std::thread::spawn(move || first_runtime.admit(first, minimal_exec_request()));
-        while runtime.query(first) != ExecStatus::Pending {
-            std::thread::yield_now();
-        }
+        // Pending reserves table capacity before the work is enqueued.
+        // The wake is the publication edge; only then may try_take consume it.
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("first work published");
+        assert_eq!(runtime.query(first), ExecStatus::Pending);
         assert_eq!(
             runtime.admit(first, minimal_exec_request()),
             Err(ExecAdmissionError::Rejected),
@@ -1027,7 +1031,7 @@ mod tests {
             runtime.admit(second, minimal_exec_request()),
             Err(ExecAdmissionError::Unavailable),
         );
-        drop(runtime.try_take());
+        drop(runtime.try_take().expect("first work"));
         assert_eq!(
             first_submitter.join().expect("first submitter"),
             Err(ExecAdmissionError::Rejected),
@@ -1036,9 +1040,10 @@ mod tests {
         let third_runtime = Arc::clone(&runtime);
         let third_submitter =
             std::thread::spawn(move || third_runtime.admit(third, minimal_exec_request()));
-        while runtime.query(third) != ExecStatus::Pending {
-            std::thread::yield_now();
-        }
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("third work published");
+        assert_eq!(runtime.query(third), ExecStatus::Pending);
         let mut work = runtime.try_take().expect("third work");
         assert!(work.admit(ControlTaskKey { pid: 53, serial: 1 }));
         assert_eq!(third_submitter.join().expect("third submitter"), Ok(third));
