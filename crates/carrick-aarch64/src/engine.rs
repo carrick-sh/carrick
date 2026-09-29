@@ -811,6 +811,31 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         self.is_forked_child = state.is_forked_child;
     }
 
+    /// If `resume_pc` addresses an HvPatch syscall island's return branch,
+    /// the original `svc #0` instruction's OWN address (not `+4`) it
+    /// answers for; `None` when there is no pending syscall dispatch, or the
+    /// bytes at `resume_pc-4`/`resume_pc` do not match an island's fixed
+    /// shape (a live EL0 PC that never went through one).
+    ///
+    /// The ONE decode both Linux-visible-PC consumers reuse
+    /// (`carrick_hal::aarch64::decode_hvpatch_island_origin`): a caller
+    /// wanting a symbol to look up (`diagnostic_wait_registers`) uses this
+    /// address directly; a caller wanting the Linux-visible resume PC of a
+    /// thread blocked in that syscall (`aarch64_core_registers`, matching
+    /// `ptrace`/a core file's convention of "the instruction after the
+    /// svc") adds 4 itself.
+    fn hvpatch_island_svc_addr(&self, resume_pc: u64) -> Option<u64> {
+        if self.process_asid.is_none() || self.pending_resume_pc.is_none() {
+            return None;
+        }
+        let start = resume_pc.checked_sub(4)?;
+        let mut island_words = [0_u8; 8];
+        self.read_into(start, &mut island_words).ok()?;
+        let svc = u32::from_le_bytes(island_words[..4].try_into().ok()?);
+        let return_branch = u32::from_le_bytes(island_words[4..].try_into().ok()?);
+        carrick_hal::aarch64::decode_hvpatch_island_origin(resume_pc, svc, return_branch)
+    }
+
     /// Build an engine around an already-constructed VM + vCPU (the backend's
     /// bring-up produces these). Mirrors `X86EngineCore::from_parts`: the
     /// tracking fields start cleared, and a freshly brought-up engine gets a
@@ -3611,16 +3636,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     fn diagnostic_wait_registers(&self) -> Option<carrick_hal::GuestWaitRegisters> {
         let live_pc = self.vcpu.get_reg(Reg::Pc).ok()?;
         let resume_pc = diagnostic_resume_pc(self.pending_resume_pc, live_pc);
-        let pc = if self.process_asid.is_some() && self.pending_resume_pc.is_some() {
-            let start = resume_pc.checked_sub(4)?;
-            let mut island_words = [0_u8; 8];
-            self.read_into(start, &mut island_words).ok()?;
-            let svc = u32::from_le_bytes(island_words[..4].try_into().ok()?);
-            let return_branch = u32::from_le_bytes(island_words[4..].try_into().ok()?);
-            decode_hvpatch_island_origin(resume_pc, svc, return_branch).unwrap_or(resume_pc)
-        } else {
-            resume_pc
-        };
+        // A symbol to look up: the svc instruction's own address, not +4.
+        let pc = self.hvpatch_island_svc_addr(resume_pc).unwrap_or(resume_pc);
         Some(carrick_hal::GuestWaitRegisters {
             pc,
             sp: self.vcpu.get_reg(Reg::Sp).ok()?,
@@ -3634,6 +3651,15 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         require_core_fpsimd_authority(self.vm.fpsimd_enabled())?;
         let snapshot = self.vcpu.snapshot()?;
         let (resume_pc, resume_pstate) = core_resume_pair(self.pending_resume_pc, &snapshot);
+        // The Linux-visible resume pc of a thread blocked in this syscall is
+        // the instruction AFTER its svc, so +4 past the island's decoded
+        // origin (which is the svc's own address) -- see
+        // `hvpatch_island_svc_addr`'s doc comment for why this differs from
+        // `diagnostic_wait_registers`'s bare-origin use above.
+        let resume_pc = self
+            .hvpatch_island_svc_addr(resume_pc)
+            .and_then(|origin| origin.checked_add(4))
+            .unwrap_or(resume_pc);
         Ok(Some(carrick_hal::Aarch64CoreRegisters {
             gprs: snapshot.gprs,
             sp_el0: snapshot.sp_el0,
@@ -4442,24 +4468,6 @@ fn require_migratable_fpsimd_authority(enabled: bool) -> Result<(), TrapError> {
     }
 }
 
-/// Recover the original patched `svc #0` address from an HvPatch island. At a
-/// host-dispatched syscall the pending resume PC addresses the island's return
-/// branch (`svc` is the preceding word); the branch target is original-svc+4.
-/// This keeps crash/wait symbols tied to guest code instead of generated stubs.
-fn decode_hvpatch_island_origin(resume_pc: u64, svc: u32, return_branch: u32) -> Option<u64> {
-    const SVC_ZERO: u32 = 0xd400_0001;
-    const B_OPCODE: u32 = 0x1400_0000;
-    const B_OPCODE_MASK: u32 = 0xfc00_0000;
-    if svc != SVC_ZERO || return_branch & B_OPCODE_MASK != B_OPCODE {
-        return None;
-    }
-    let imm26 = i64::from(return_branch & 0x03ff_ffff);
-    let signed_imm26 = (imm26 << 38) >> 38;
-    let target = i128::from(resume_pc).checked_add(i128::from(signed_imm26) * 4)?;
-    let origin = target.checked_sub(4)?;
-    u64::try_from(origin).ok()
-}
-
 /// `Aarch64EngineCore` is `Send` when the backend pair is: the VM/vCPU hold the
 /// host VMM fds (Send) and raw window pointers valid in every thread.
 //
@@ -4917,7 +4925,12 @@ mod tests {
     fn wait_diagnostics_decode_hvpatch_island_back_to_original_svc() {
         // Island layout: svc #0 at 0x2000, then `b 0x1004` at the trapped
         // resume PC 0x2004. The diagnostic call site is the original svc at
-        // target-4 = 0x1000.
+        // target-4 = 0x1000. The decode itself now lives in
+        // `carrick_hal::aarch64` (shared with `aarch64_core_registers`'s
+        // `+4` core-note use, `carrick-hal/src/aarch64.rs`'s own tests, and
+        // `carrick-runtime`'s EL1-parked-thread use); this keeps this
+        // crate's own call site covered too.
+        use carrick_hal::aarch64::decode_hvpatch_island_origin;
         assert_eq!(
             decode_hvpatch_island_origin(0x2004, 0xd400_0001, 0x17ff_fc00),
             Some(0x1000)

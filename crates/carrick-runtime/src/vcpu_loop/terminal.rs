@@ -566,6 +566,44 @@ pub(crate) fn core_note_resume_pair(
     }
 }
 
+/// Translate a core note's resume PC back to the guest-visible address a
+/// thread blocked in a syscall reports to Linux (the instruction after its
+/// `svc`), when it in fact addresses an HvPatch syscall island's return
+/// branch instead of guest `.text`.
+///
+/// `Aarch64EngineCore::aarch64_core_registers` already applies this
+/// translation for a thread the HOST parked mid-syscall (its `resume_pc`
+/// reaches here already correct). It cannot apply for a thread the in-guest
+/// scheduler (EL1) parked instead: EL1's own `ThreadCtx.pc` is filled
+/// straight from the trap frame's saved `ELR_EL1`
+/// (`carrick-el1/src/sched/hw.rs`'s `ThreadCpu::save`), which is exactly the
+/// same island-return-branch address for the identical reason (HvPatch
+/// patches every `svc #0` sitewide, and EL1's own futex dispatch traps
+/// through the same patched site as any other syscall) — with no engine
+/// access from `carrick-kernel`'s zone-record reader to decode it there.
+/// This is the one place both sources of a parked thread's resume PC are
+/// already uniform (`carrick_kernel::core_dump::ThreadState` conversion), so
+/// it is the single, correct place to apply the SAME decode
+/// (`carrick_hal::aarch64::decode_hvpatch_island_origin`) regardless of
+/// source: re-checking an already-corrected host-parked value is a safe
+/// no-op (the word before a genuine guest `svc`+4 address is the guest's own
+/// patched branch instruction, never `svc #0`, so the shape check fails and
+/// the value passes through unchanged).
+pub(crate) fn guest_visible_resume_pc<E: carrick_hal::ThreadedEngine>(
+    engine: &E,
+    resume_pc: u64,
+) -> u64 {
+    (|| {
+        let start = resume_pc.checked_sub(4)?;
+        let bytes = engine.read_core_bytes(start, 8).ok()?;
+        let svc = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
+        let return_branch = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
+        carrick_hal::aarch64::decode_hvpatch_island_origin(resume_pc, svc, return_branch)?
+            .checked_add(4)
+    })()
+    .unwrap_or(resume_pc)
+}
+
 #[derive(Debug)]
 pub(crate) struct FatalSignalState {
     pub(crate) image_generation: u64,
@@ -760,6 +798,57 @@ mod tests {
             (0x5555, 0x3c0),
             "a direct HVF EL0 abort must not publish stale ELR_EL1 state"
         );
+    }
+
+    /// The exact scenario a signed embed run reported: a thread parked in a
+    /// private futex wait whose saved resume pc addresses an HvPatch
+    /// syscall island's return branch (`0x234004`), not guest `.text`
+    /// (`svc` at `0x210270`, so Linux would report `0x210274`). Proves the
+    /// translation this file's `guest_visible_resume_pc` applies for a
+    /// thread the in-guest scheduler (EL1) parked, which has no engine
+    /// access where its `ThreadCtx.pc` is read.
+    #[test]
+    fn guest_visible_resume_pc_recovers_the_original_svc_return_address() {
+        use super::super::tests::CrashCaptureTestEngine;
+
+        const ORIGINAL_SVC: u64 = 0x210270;
+        const EXPECTED_RESUME_PC: u64 = ORIGINAL_SVC + 4;
+        const ISLAND_RETURN_BRANCH: u64 = 0x234004;
+
+        let delta = (EXPECTED_RESUME_PC as i64) - (ISLAND_RETURN_BRANCH as i64);
+        assert_eq!(delta % 4, 0);
+        let imm26 = ((delta / 4) as u32) & 0x03ff_ffff;
+        let return_branch: u32 = 0x1400_0000 | imm26;
+        let svc: u32 = 0xd400_0001;
+
+        let mut engine = CrashCaptureTestEngine::default();
+        let mut island_bytes = Vec::with_capacity(8);
+        island_bytes.extend_from_slice(&svc.to_le_bytes());
+        island_bytes.extend_from_slice(&return_branch.to_le_bytes());
+        engine
+            .guest_memory
+            .insert(ISLAND_RETURN_BRANCH - 4, island_bytes);
+
+        assert_eq!(
+            guest_visible_resume_pc(&engine, ISLAND_RETURN_BRANCH),
+            EXPECTED_RESUME_PC,
+            "an island's return-branch address must translate back to svc+4"
+        );
+    }
+
+    /// A resume pc that is NOT inside an island (no matching bytes at
+    /// `pc-4`/`pc`, e.g. a live EL0 pc preempted mid-instruction-stream) must
+    /// pass through unchanged rather than publish a decoded guess.
+    #[test]
+    fn guest_visible_resume_pc_passes_through_a_non_island_pc_unchanged() {
+        use super::super::tests::CrashCaptureTestEngine;
+
+        let engine = CrashCaptureTestEngine::default();
+        // No entry in `guest_memory` for `pc - 4`: the test engine's
+        // `read_bytes_raw` answers zero-filled bytes, which is not the
+        // `svc #0`/`B` shape.
+        let live_pc = 0x210300_u64;
+        assert_eq!(guest_visible_resume_pc(&engine, live_pc), live_pc);
     }
 
     #[test]
