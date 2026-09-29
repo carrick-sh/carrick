@@ -1053,7 +1053,7 @@ where
 #[cfg(test)]
 mod ipc_tests {
     //! Host-level bindings for kernel.el1.ipc-continuation at the runtime
-    //! boundary: result mapping, SIGPIPE, and the park decision.
+    //! boundary: syscall results, SIGPIPE, and the park decision.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use carrick_el1_abi::ipc::{EventMode, IpcDirectory, IpcOperation, IpcRegion};
