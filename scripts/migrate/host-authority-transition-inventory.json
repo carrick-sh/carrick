@@ -15821,8 +15821,8 @@
     "rationale": "At crates/carrick-kernel/src/el1_zone.rs:36 in `HostLockWait::wait`, `std::thread::yield_now` acts only on the current host thread waiting on an EL1 zone bucket lock held by EL1 or another host thread used by `HostLockWait::wait`; no guest identity selects its host target.",
     "review_id": "HA-000683",
     "source": {
-      "byte_end": 1699,
-      "byte_start": 1677,
+      "byte_end": 1689,
+      "byte_start": 1667,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
