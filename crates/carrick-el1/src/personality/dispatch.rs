@@ -27,9 +27,10 @@ pub enum AnonymousReservationRoute {
 pub fn dispatch_anonymous_with_reservations(
     frame: &mut TrapFrame,
     counters: &Counters,
+    current: &CurrentTask,
     model: &mut memory::reservations::Reservations<'_>,
 ) -> AnonymousReservationRoute {
-    match memory::decide_anonymous_syscall(frame, model) {
+    match memory::decide_anonymous_syscall(frame, current, model) {
         memory::ReservationDisposition::Forward => {
             if let Some(counter) = counters.forwarded.get(frame.x[8] as usize) {
                 counter.fetch_add(1, Ordering::Relaxed);

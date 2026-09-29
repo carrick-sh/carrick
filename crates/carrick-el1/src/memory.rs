@@ -41,9 +41,27 @@ pub enum ReservationDisposition {
     Work(PendingReservationSyscall),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReservationOrigin {
+    task: carrick_el1_abi::El1TaskId,
+    serial: NonZeroU64,
+    mm: carrick_el1_abi::ReservationMm,
+}
+impl ReservationOrigin {
+    fn capture(current: &CurrentTask) -> Option<Self> {
+        let raw = current.task_id.load(Ordering::Acquire);
+        let tid = i32::try_from(raw).ok().filter(|tid| *tid > 0)?;
+        Some(Self {
+            task: carrick_el1_abi::El1TaskId::from_linux_tid(tid),
+            serial: NonZeroU64::new(current.thread_serial.load(Ordering::Acquire))?,
+            mm: carrick_el1_abi::ReservationMm::new(current.zone_mm.load(Ordering::Acquire))?,
+        })
+    }
+}
+
 pub struct PendingReservationSyscall {
     request: carrick_el1_abi::ReservationRequest,
-    slot: u64,
+    origin: ReservationOrigin,
     elr: u64,
     syscall: u64,
     args: [u64; 6],
@@ -58,16 +76,12 @@ impl PendingReservationSyscall {
     pub fn complete(
         &mut self,
         frame: &mut TrapFrame,
+        current: &CurrentTask,
         counters: &carrick_el1_abi::Counters,
         model: &mut reservations::Reservations<'_>,
         completion: carrick_el1_abi::ReservationCompletion,
     ) -> Result<(), reservations::Refusal> {
-        if frame.slot != self.slot
-            || frame.elr != self.elr
-            || frame.x[8] != self.syscall
-            || frame.x[..6] != self.args
-            || !completion.authenticates(self.request)
-        {
+        if !self.owns_frame(frame, current) || !completion.authenticates(self.request) {
             return Err(reservations::Refusal::Stale);
         }
         let result = model.complete(completion)?;
@@ -75,16 +89,40 @@ impl PendingReservationSyscall {
         counters.served[self.syscall as usize].fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+    fn owns_frame(&self, frame: &TrapFrame, current: &CurrentTask) -> bool {
+        ReservationOrigin::capture(current) == Some(self.origin)
+            && frame.elr == self.elr
+            && frame.x[8] == self.syscall
+            && frame.x[..6] == self.args
+    }
+    /// Finish a clean backing/descriptor refusal on the originating thread.
+    /// The service must roll back before invoking this method.
     pub fn refuse(
+        &mut self,
+        frame: &mut TrapFrame,
+        current: &CurrentTask,
+        counters: &carrick_el1_abi::Counters,
+        model: &mut reservations::Reservations<'_>,
+    ) -> Result<(), reservations::Refusal> {
+        if !self.owns_frame(frame, current) {
+            return Err(reservations::Refusal::Stale);
+        }
+        model.refuse(self.request)?;
+        frame.x[0] = if self.syscall == SYS_BRK {
+            model.brk_current()
+        } else {
+            (-ENOMEM) as u64
+        };
+        counters.served[self.syscall as usize].fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    /// Cancel after service rollback when the originating thread is gone.
+    /// Cancellation delivers no syscall result and increments no served count.
+    pub fn cancel(
         self,
         model: &mut reservations::Reservations<'_>,
-    ) -> Result<i64, reservations::Refusal> {
-        model.refuse(self.request)?;
-        Ok(if self.syscall == SYS_BRK {
-            model.brk_current() as i64
-        } else {
-            -ENOMEM
-        })
+    ) -> Result<(), reservations::Refusal> {
+        model.refuse(self.request)
     }
 }
 
@@ -94,10 +132,17 @@ impl PendingReservationSyscall {
 /// retaining `Work` until completion instead of forwarding the original SVC.
 pub fn decide_anonymous_syscall(
     frame: &TrapFrame,
+    current: &CurrentTask,
     model: &mut reservations::Reservations<'_>,
 ) -> ReservationDisposition {
     use carrick_el1_abi::{ReservationProtection, ReservationRange};
     use reservations::{Decision, Placement, Refusal};
+    let Some(origin) = ReservationOrigin::capture(current) else {
+        return ReservationDisposition::Unavailable(Refusal::Stale);
+    };
+    if origin.mm != model.mm() {
+        return ReservationDisposition::Unavailable(Refusal::Stale);
+    }
     let nr = frame.x[8];
     let result = match nr {
         SYS_BRK => model.brk(frame.x[0]),
@@ -162,7 +207,7 @@ pub fn decide_anonymous_syscall(
         Ok(Decision::Complete(value)) => ReservationDisposition::Return(value as i64),
         Ok(Decision::Work(request)) => ReservationDisposition::Work(PendingReservationSyscall {
             request,
-            slot: frame.slot,
+            origin,
             elr: frame.elr,
             syscall: nr,
             args: [
