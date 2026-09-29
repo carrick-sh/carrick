@@ -799,6 +799,45 @@ fn el1_sched_pstate_seen_by_the_guest_is_unchanged() {
     );
 }
 
+/// Host vector I/O and guest scalar I/O mutate the same pipe/eventfd state.
+#[test]
+fn el1_ipc_mixed_venue_roundtrips() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    for kind in ["pipe", "eventfd"] {
+        let measured = run_fixture(&carrier, &["ipc-mixed", kind], Duration::from_secs(60));
+        println!(
+            "IPC mixed {kind} zone={:?} forwarded={:?} {}",
+            measured.zone,
+            measured.forwarded_syscalls,
+            describe(&measured)
+        );
+        assert!(measured.result.success(), "{}", describe(&measured));
+        assert_eq!(
+            measured.result.stdout_utf8().trim(),
+            format!("ipc-mixed kind={kind} completed=128")
+        );
+        for nr in [65, 66] {
+            let count = measured
+                .forwarded_syscalls
+                .iter()
+                .find(|(n, _)| *n == nr)
+                .map_or(0, |(_, count)| *count);
+            assert!(
+                count >= 128,
+                "host vector operations missing: {:?}",
+                measured.forwarded_syscalls
+            );
+        }
+        assert!(
+            measured.zone.el1_parks >= 64,
+            "guest blocking missing: {:?}",
+            measured.zone
+        );
+    }
+}
+
 /// Independent inherited-table replacement and final-close qualification.
 #[test]
 fn el1_ipc_inherited_descriptor_lifetime() {

@@ -1,0 +1,9 @@
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-cp3-adapter/crates/carrick-el1)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.63s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1-bd1deed3ff141365)
+
+running 1 test
+test personality::ipc::tests::el1_ipc_io_blocked_read_resumes_by_token_after_fd_reuse ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 87 filtered out; finished in 0.00s
+
